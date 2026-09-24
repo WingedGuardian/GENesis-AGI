@@ -23,6 +23,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENTRYPOINT = _REPO_ROOT / "scripts" / "lib" / "code_intel_index.sh"
 
@@ -2107,3 +2109,189 @@ def test_noop_worktree_skip_does_not_validate_child_oom_override(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "worktree" in res.stdout
     assert not log.exists()
+
+
+# ── Magnitude bounds: Bash arithmetic wraps, and a wrap admits ───────────────
+#
+# MEASURED against the pre-fix script: MemAvailable=9007199254740992 kB made
+# (avail * 1024) wrap to -9223372036854775808, and subtracting the 2 GiB sibling
+# reserve wrapped it BACK to +9223372034707292160 — comfortably past the
+# minimum-headroom check, so the run was admitted with no headroom at all.
+# Two of the cases below admitted before the bound existed; the rest already
+# refused for unrelated reasons and are here as the surrounding band, so a
+# future change that moves the boundary shows up as a row flipping rather than
+# as a single assertion silently still passing.
+_MEMINFO_ADMISSION_CASES = [
+    pytest.param("16777216", "16252928", True, id="sane-16GiB"),
+    # The kB bound is 14 digits, not 15, so that a legal kB value is still legal
+    # after the x1024 every caller applies (15 digits x 1024 is a 19-digit byte
+    # value, which the 18-digit byte bound would reject). These two rows are the
+    # boundary itself: move either constant and exactly one of them flips.
+    pytest.param("99999999999999", "99999999999999", True, id="14-digit-at-kb-bound"),
+    pytest.param("999999999999999", "999999999999999", False, id="15-digit-over-kb-bound"),
+    # The two that ADMITTED before the fix — the defect itself.
+    pytest.param("9007199254740992", "9007199254740992", False, id="wraps-via-subtraction"),
+    pytest.param("9007199254740991", "9007199254740991", False, id="2**53-minus-1"),
+    pytest.param("9223372036854775807", "9223372036854775807", False, id="int64-max"),
+    pytest.param("18446744073709551616", "18446744073709551616", False, id="beyond-int64"),
+    pytest.param("1" + "0" * 39, "1" + "0" * 39, False, id="40-digits"),
+]
+
+
+@pytest.mark.parametrize("total_kb,avail_kb,expect_admit", _MEMINFO_ADMISSION_CASES)
+def test_oversized_meminfo_cannot_wrap_its_way_into_admission(
+    tmp_path, total_kb, avail_kb, expect_admit
+):
+    """An unrepresentable MemTotal/MemAvailable must REFUSE, never admit.
+
+    The check is a digit count rather than a numeric comparison on purpose:
+    `[ 18446744073709551616 -gt 0 ]` exits 2, and an `&&` list continues
+    straight past it, so comparing an out-of-range value numerically is the
+    same failure one layer down.
+    """
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemTotal:       {total_kb} kB\nMemAvailable:   {avail_kb} kB\n")
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        # ONLY the meminfo varies. Blanking the ceiling/current seams — which an
+        # earlier version of this test did — routes admission into the real
+        # /proc/self/cgroup and the host's live memory.current, so the verdict
+        # became a property of this box rather than of the bound. (And
+        # CODE_INTEL_MEM_RAW_CURRENT_BYTES pins nothing here: it is read only by
+        # _genesis_mem_current, whose sole caller is the gitnexus leg.) The
+        # meminfo values still reach arithmetic with the ceiling pinned, via
+        # _cbm_host_spare_b, which is computed whatever the ceiling's source.
+        env_extra={"CODE_INTEL_MEMINFO": str(meminfo)},
+    )
+
+    refused = "SKIP cbm" in res.stdout
+    assert refused is not expect_admit, (
+        f"MemTotal={total_kb} MemAvailable={avail_kb}: "
+        f"expected {'admit' if expect_admit else 'refuse'}, got "
+        f"{'admit' if not refused else 'refuse'}\n{res.stdout}\n{res.stderr}"
+    )
+
+
+# MEASURED with the magnitude bound disabled (the verify-RED mutation): of the
+# three byte-valued operator seams, only CODE_INTEL_MEM_CEILING_BYTES reaches
+# admission carrying a wrappable value and ADMITS. CODE_INTEL_SIBLING_RESERVE_BYTES
+# and CODE_INTEL_MEM_CURRENT_BYTES are refused by pre-existing checks at every
+# value tried (10^17 through 10^30), so a cell asserting "refused" for those is
+# true for a reason unrelated to the bound. Both are kept and LABELLED as band
+# rows rather than dropped — they lock the refusal in, and the `bound_is_load_bearing`
+# column says plainly which row would survive the mechanism being deleted.
+_BYTE_OVERRIDE_SEAMS = [
+    pytest.param("CODE_INTEL_MEM_CEILING_BYTES", True, id="ceiling-bound-bites"),
+    pytest.param("CODE_INTEL_SIBLING_RESERVE_BYTES", False, id="reserve-band-row"),
+    pytest.param("CODE_INTEL_MEM_CURRENT_BYTES", False, id="current-band-row"),
+]
+
+# 19 digits, just under int64 max: large enough to wrap the sums downstream,
+# small enough that `[ "$v" -gt 0 ]` still SUCCEEDS — so it is inside the band
+# where the magnitude bound is the only thing that can refuse it. A value big
+# enough to make `-gt` itself error (exit 2) would be refused with or without
+# the bound and would prove nothing.
+_WRAPPABLE_BYTES = "9223372036854775000"
+
+
+@pytest.mark.parametrize("var,bound_is_load_bearing", _BYTE_OVERRIDE_SEAMS)
+def test_oversized_byte_override_is_refused_not_wrapped(
+    tmp_path, var, bound_is_load_bearing
+):
+    """A byte-valued override too large to compute with refuses the run.
+
+    These are the operator seams; each reaches `$(( ))` directly, so a value
+    that cannot be represented has to be rejected at the boundary rather than
+    detected after the sign has already gone wrong.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={var: _WRAPPABLE_BYTES},
+    )
+
+    assert "SKIP cbm" in res.stdout, (
+        f"{var}={_WRAPPABLE_BYTES} was not refused "
+        f"(bound is load-bearing here: {bound_is_load_bearing})\n"
+        f"{res.stdout}\n{res.stderr}"
+    )
+
+
+# ── Regressions: bounding a RESULT is not bounding its OPERANDS ──────────────
+#
+# Both cells below encode defects that a review found in the FIRST version of
+# the magnitude bound, where the validator was applied to the output of an
+# arithmetic expression rather than to the values going into it. In each case
+# the wrap had already happened by the time the bound ran, and it inspected a
+# plausible-looking small number.
+_OPERAND_WRAP_CASES = [
+    pytest.param(
+        # Drives `2836*1024*1024 + CHARGE` to wrap: the admission FLOOR became
+        # 98,305 bytes instead of 2.9 GiB, so a box with 100 KB of headroom
+        # was admitted — the same wrap-into-admission this change closes.
+        {"CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES": "18446744070735888385"},
+        id="workload-charge-is-an-operand",
+    ),
+    pytest.param(
+        # The K branch multiplies in Bash. This wrapped to 4876166144 and was
+        # accepted as a legitimate 4.87 GB cap, while the literal string was
+        # still handed to systemd as MemoryMax.
+        {"CODE_INTEL_CBM_MEMORY_MAX": "18014398514243865K"},
+        id="mantissa-multiplies-before-the-result-bound",
+    ),
+]
+
+
+@pytest.mark.parametrize("env_extra", _OPERAND_WRAP_CASES)
+def test_an_operand_that_wraps_is_refused_not_merely_recomputed(tmp_path, env_extra):
+    """A value that wraps its own expression must refuse, not produce a number.
+
+    The failure these guard against is silent by construction: the wrapped
+    result is in range, has the right sign, and passes every downstream check.
+    Nothing but a bound on the operand can see it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env_extra
+    )
+
+    assert "SKIP cbm" in res.stdout, (
+        f"{env_extra} was not refused — the wrap produced a usable-looking "
+        f"number instead\n{res.stdout}\n{res.stderr}"
+    )
+
+
+def test_the_inlined_isolation_default_tracks_the_real_constant():
+    """`_genesis_mem_working_set_from` hardcodes `:-18` as its fallback bound.
+
+    It has to: the suite extracts that function ALONE and sources it without
+    the rest of the file, so it cannot see `_GENESIS_MEM_MAX_DIGITS`. The cost
+    is a second copy of the number. If the constant ever moves and the inlined
+    default does not, the isolated tests keep asserting the old bound and
+    nothing else notices — so the two are pinned together here.
+    """
+    src = _ENTRYPOINT.read_text()
+    declared = re.search(r"^_GENESIS_MEM_MAX_DIGITS=(\d+)$", src, re.M)
+    assert declared, "_GENESIS_MEM_MAX_DIGITS is no longer declared as a bare constant"
+    inlined = set(re.findall(r"\$\{_GENESIS_MEM_MAX_DIGITS:-(\d+)\}", src))
+    assert inlined, "no inlined fallback found — did the isolated extraction change?"
+    assert inlined == {declared.group(1)}, (
+        f"_GENESIS_MEM_MAX_DIGITS={declared.group(1)} but inlined fallbacks are "
+        f"{sorted(inlined)} — the isolated-extraction copies have drifted"
+    )

@@ -158,6 +158,28 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
     # integer-only, so the multiply goes through awk. A bare number must be an
     # integer byte count — a unitless "5.5" is malformed, not 5.5 bytes.
     [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([GgMmKk])$ || "$v" =~ ^[0-9]+$ ]] || return 1
+    # Bound the MANTISSA before the multiply, per unit. Bounding the RESULT is
+    # not equivalent: the integer branches below multiply in Bash, so by the
+    # time a result bound runs, the product has already wrapped and the bound
+    # is inspecting a plausible-looking small number. MEASURED on the first
+    # version of this fix: "18014398514243865K" wrapped to 4876166144 and was
+    # accepted as a legitimate 4.87 GB cap, above the gitnexus minimum.
+    # Per-unit limits keep mantissa x scale under the byte bound:
+    #   G: 10^18 / 2^30 = 9.3e8  -> 9 digits
+    #   M: 10^18 / 2^20 = 9.5e11 -> 11 digits
+    #   K: 10^18 / 2^10 = 9.8e14 -> 14 digits
+    local _mb_mant _mb_lim
+    case "$v" in
+        *[Gg]) _mb_mant="${v%[Gg]}"; _mb_lim=9 ;;
+        *[Mm]) _mb_mant="${v%[Mm]}"; _mb_lim=11 ;;
+        *[Kk]) _mb_mant="${v%[Kk]}"; _mb_lim=14 ;;
+        *)     _mb_mant="$v";        _mb_lim="$_GENESIS_MEM_MAX_DIGITS" ;;
+    esac
+    # Integer part only: a fractional mantissa goes through awk (double), and
+    # the result bound below catches anything awk produces that is too large.
+    _genesis_uint_bounded "${_mb_mant%%.*}" "$_mb_lim" || return 1
+    local _mb_out
+    _mb_out="$(
     case "$v" in
         # `%.0f`, not `%d`: mawk implements %d through a signed 32-bit int and
         # clamps 8 GiB to 2147483647, which reads as "below the working set"
@@ -173,6 +195,46 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
                 || printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
         *) printf '%s' "$v" ;;
     esac
+    )"
+    # A parseable value can still be too large to compute with ("99999999999G").
+    # Emitting nothing routes it to the caller's existing "not a parseable
+    # memory value" refusal rather than into a wrapped cap.
+    _genesis_uint_bounded "$_mb_out" || return 1
+    printf '%s' "$_mb_out"
+}
+
+# Bash arithmetic is signed 64-bit and wraps SILENTLY. A wrapped product can
+# re-cross zero on the very next subtraction and present as enormous headroom:
+# MEASURED, MemAvailable=9007199254740992 kB makes (avail*1024)-reserve come out
+# at +9223372034707292160, which clears the minimum-headroom check with no
+# headroom at all. So every externally-sourced number is bounded BEFORE it
+# reaches arithmetic, not after.
+#
+# The bound is a DIGIT COUNT rather than a numeric limit, because comparing an
+# out-of-range value numerically is the same trap one layer down: `[ huge -gt x ]`
+# exits 2, and an `&&` list continues straight past it. Counting digits cannot
+# overflow and cannot error. Any value of at most 18 digits is below 10^18, so
+# two of them sum and difference well inside int64. The kB bound is 14 rather
+# than 15 so that a legal kB value stays legal AFTER the x1024 every caller
+# applies: 15 digits x 1024 is a 19-digit byte value, which the byte bound
+# would then reject — the two limits have to compose, not merely each hold.
+# Both ceilings sit astronomically above real hardware (10^18 B is 888 PiB).
+# This generalises the length guard the v1 cgroup branch above already uses.
+_GENESIS_MEM_MAX_DIGITS=18
+_GENESIS_MEM_MAX_KB_DIGITS=14
+
+# A nonnegative decimal integer small enough that the admission arithmetic
+# cannot wrap. Leading zeros are stripped so "0000000008" is judged as one
+# digit, not ten.
+_genesis_uint_bounded() {
+    local v="${1:-}" limit="${2:-$_GENESIS_MEM_MAX_DIGITS}"
+    # No leading zeros: $(( )) reads those as OCTAL while `[` reads them as
+    # decimal, so "0100" would mean 100 to one and 64 to the other, and "08"
+    # aborts the script under `set -u` with a raw bash error rather than a
+    # structured refusal. Rejecting the spelling is cheaper than teaching every
+    # arithmetic site to write 10#.
+    [[ "$v" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    [ "${#v}" -le "$limit" ]
 }
 
 # Resolve this process's memory-controller hierarchy from the two proc files
@@ -362,7 +424,12 @@ _genesis_cgroup_memory_ceiling() {
                     ;;
                 *)
                     value_len="${#value}"
-                    if [ "$_GENESIS_CGROUP_VERSION" = "v1" ] \
+                    if ! _genesis_uint_bounded "$value"; then
+                        # Too large to subtract from without wrapping. Treated
+                        # exactly like a v1 "unlimited" sentinel: not a finite
+                        # limit, so it never becomes a ceiling.
+                        :
+                    elif [ "$_GENESIS_CGROUP_VERSION" = "v1" ] \
                         && { [ "$value_len" -gt 16 ] \
                             || { [ "$value_len" -eq 16 ] \
                                 && [ "$value" -gt 4503599627370496 ]; }; }; then
@@ -402,6 +469,7 @@ _genesis_mem_ceiling() {
     # install. It doubles as the operator override when a container limit is
     # not discoverable.
     if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
+        _genesis_uint_bounded "$CODE_INTEL_MEM_CEILING_BYTES" || return 1
         printf '%s' "$CODE_INTEL_MEM_CEILING_BYTES"
         return
     fi
@@ -410,11 +478,13 @@ _genesis_mem_ceiling() {
     elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
         raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
     fi
-    if [ -n "$raw" ] && [ "$raw" != "max" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+    if [ -n "$raw" ] && [ "$raw" != "max" ] && _genesis_uint_bounded "$raw" \
+        && [ "$raw" -gt 0 ] 2>/dev/null; then
         # A v1 "unlimited" is a huge sentinel rather than a word; anything at or
         # above MemTotal is not a container limit worth honouring.
         local total_kb total_b
         total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+        _genesis_uint_bounded "${total_kb:-0}" "$_GENESIS_MEM_MAX_KB_DIGITS" || total_kb=0
         total_b=$(( ${total_kb:-0} * 1024 ))
         if [ "$total_b" -gt 0 ] && [ "$raw" -lt "$total_b" ]; then
             printf '%s' "$raw"
@@ -427,7 +497,8 @@ _genesis_mem_ceiling() {
     local total_kb meminfo
     meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
     total_kb="$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null)"
-    [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
+    _genesis_uint_bounded "$total_kb" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && printf '%s' "$(( total_kb * 1024 ))"
 }
 
 # MemTotal/MemAvailable in kB without awk — the rlimit/no-flock fallback path
@@ -443,7 +514,8 @@ _genesis_meminfo_kb() {
             MemAvailable:) _GENESIS_MEMINFO_AVAIL_KB="$val" ;;
         esac
     done < "$1" 2>/dev/null
-    [[ "$_GENESIS_MEMINFO_TOTAL_KB" =~ ^[0-9]+$ && "$_GENESIS_MEMINFO_AVAIL_KB" =~ ^[0-9]+$ ]]
+    _genesis_uint_bounded "$_GENESIS_MEMINFO_TOTAL_KB" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && _genesis_uint_bounded "$_GENESIS_MEMINFO_AVAIL_KB" "$_GENESIS_MEM_MAX_KB_DIGITS"
 }
 
 # Convert a cgroup's total charge into a conservative working-set estimate.
@@ -457,7 +529,12 @@ _genesis_meminfo_kb() {
 # closed to the raw charge.
 _genesis_mem_working_set_from() {
     local current="${1:-}" stat_path="${2:-}"
+    # Bounded in place rather than through _genesis_uint_bounded: the test suite
+    # extracts THIS FUNCTION ALONE and sources it in isolation, so it cannot
+    # reach the shared validator. Both call sites bound `current` before calling,
+    # making this the local belt to their braces.
     [[ "$current" =~ ^[0-9]+$ ]] || return 1
+    [ "${#current}" -le "${_GENESIS_MEM_MAX_DIGITS:-18}" ] || return 1
     [ -r "$stat_path" ] || { printf '%s' "$current"; return; }
 
     local fields inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback reserve reclaimable discount
@@ -490,6 +567,8 @@ _genesis_mem_working_set_from() {
 
     reserve="${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
     [[ "$reserve" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    [ "${#reserve}" -le "${_GENESIS_MEM_MAX_DIGITS:-18}" ] \
+        || { printf '%s' "$current"; return; }
     reclaimable=$(( inactive + active ))
     [ "$(( dirty + writeback ))" -lt "$reclaimable" ] \
         || { printf '%s' "$current"; return; }
@@ -508,7 +587,7 @@ _genesis_mem_working_set_from() {
 # MemTotal-MemAvailable. Unreadable means the caller falls back to the floor.
 _genesis_mem_current() {
     if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ]; then
-        [[ "$CODE_INTEL_MEM_CURRENT_BYTES" =~ ^[0-9]+$ ]] || return 1
+        _genesis_uint_bounded "$CODE_INTEL_MEM_CURRENT_BYTES" || return 1
         printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
         return
     fi
@@ -523,7 +602,7 @@ _genesis_mem_current() {
         raw="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
         stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory/memory.stat}"
     fi
-    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+    if [ -n "$raw" ] && _genesis_uint_bounded "$raw" && [ "$raw" -gt 0 ] 2>/dev/null; then
         _genesis_mem_working_set_from "$raw" "$stat_path"
         return
     fi
@@ -531,7 +610,9 @@ _genesis_mem_current() {
     meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
     total_kb="$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null)"
     avail_kb="$(awk '/^MemAvailable:/ {print $2}' "$meminfo" 2>/dev/null)"
-    [ -n "$total_kb" ] && [ -n "$avail_kb" ] && [ "$total_kb" -gt "$avail_kb" ] \
+    _genesis_uint_bounded "$total_kb" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && _genesis_uint_bounded "$avail_kb" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && [ "$total_kb" -gt "$avail_kb" ] \
         && printf '%s' "$(( (total_kb - avail_kb) * 1024 ))"
 }
 
@@ -547,14 +628,40 @@ CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 )
 # supervising shell, so the safe floor adds a non-RSS allowance to the measured
 # workload instead of treating the RSS peak as a sufficient cgroup ceiling.
 CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES="${CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES:-$(( 128 * 1024 * 1024 ))}"
+# Validated HERE rather than in the chain below, because this value is an
+# OPERAND of the very next line's sum: a bound applied afterwards inspects a
+# result that has already wrapped. MEASURED during review of the first version
+# of this fix, which did exactly that — a crafted charge drove the admission
+# floor to 98,305 bytes instead of 2.9 GiB with no refusal raised, re-opening
+# the wrap-into-admission hole this change exists to close. The value is reset
+# to the default so the sum below stays computable; the refusal is carried in
+# a separate variable and raised by the chain.
+_GENESIS_CHARGE_REFUSE=""
+if ! _genesis_uint_bounded "$CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES"; then
+    _GENESIS_CHARGE_REFUSE="CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+    CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES=$(( 128 * 1024 * 1024 ))
+fi
 CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 + CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES ))}"
 
 GENESIS_MEM_ENV_REFUSE=""
-if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
-    && [[ ! "$CODE_INTEL_MEM_CURRENT_BYTES" =~ ^[0-9]+$ ]]; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_MEM_CURRENT_BYTES is not a nonnegative integer"
-elif [[ ! "$CODE_INTEL_SIBLING_RESERVE_BYTES" =~ ^[0-9]+$ ]]; then
-    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_SIBLING_RESERVE_BYTES is not a nonnegative integer"
+if [ -n "$_GENESIS_CHARGE_REFUSE" ]; then
+    GENESIS_MEM_ENV_REFUSE="$_GENESIS_CHARGE_REFUSE"
+# F4: the ceiling override belongs in the SHARED chain. Refusing it only on the
+# cbm leg left the gitnexus leg unable to tell "refused" from "no ceiling
+# discoverable" — both are an empty string there — so it skipped admission
+# entirely. A new refusal path that fails open on one of two legs.
+elif [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ] \
+    && ! _genesis_uint_bounded "$CODE_INTEL_MEM_CEILING_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_MEM_CEILING_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+elif [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
+    && ! _genesis_uint_bounded "$CODE_INTEL_MEM_CURRENT_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_MEM_CURRENT_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+elif ! _genesis_uint_bounded "$CODE_INTEL_SIBLING_RESERVE_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_SIBLING_RESERVE_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+elif ! _genesis_uint_bounded "$CODE_INTEL_CBM_MIN_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_CBM_MIN_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+elif ! _genesis_uint_bounded "$CODE_INTEL_GITNEXUS_MIN_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="CODE_INTEL_GITNEXUS_MIN_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
 fi
 _GENESIS_CGROUP_FINITE_DIRS=()
 _GENESIS_CGROUP_FINITE_LIMITS=()
@@ -887,7 +994,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
             _cbm_ceiling_b=""
             _cbm_live_b="${CODE_INTEL_MEM_CURRENT_BYTES:-}"
             if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
-                if [[ "$CODE_INTEL_MEM_CEILING_BYTES" =~ ^[0-9]+$ ]] \
+                if _genesis_uint_bounded "$CODE_INTEL_MEM_CEILING_BYTES" \
                     && [ "$CODE_INTEL_MEM_CEILING_BYTES" -gt 0 ]; then
                     _cbm_ceiling_b="$CODE_INTEL_MEM_CEILING_BYTES"
                 else
@@ -937,7 +1044,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                         if [ -r "$_cbm_current_file" ]; then
                             read -r _cbm_raw_b < "$_cbm_current_file" 2>/dev/null || _cbm_raw_b=""
                         fi
-                        if [[ ! "$_cbm_raw_b" =~ ^[0-9]+$ ]]; then
+                        if ! _genesis_uint_bounded "$_cbm_raw_b"; then
                             CBM_MEM_REFUSE="cannot read current memory usage from $_cbm_current_file"
                             break
                         fi
@@ -949,7 +1056,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                     done
                 else
                     _cbm_claimed_b="$CODE_INTEL_SIBLING_RESERVE_BYTES"
-                    if [[ "$_cbm_live_b" =~ ^[0-9]+$ ]]; then
+                    if _genesis_uint_bounded "$_cbm_live_b"; then
                         _cbm_claimed_b=$(( _cbm_live_b + CODE_INTEL_SIBLING_RESERVE_BYTES ))
                     fi
                     _cbm_spare_b=$(( _cbm_ceiling_b - _cbm_claimed_b ))
