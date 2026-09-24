@@ -207,7 +207,18 @@ def _finish_chained(started) -> str:
             out, _ = proc.communicate(payload, timeout=_CHAINED_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             _kill_group(proc)
-            proc.communicate()  # reap; the pipes close with the group
+            # NO unbounded drain here. A descendant that left the group (setsid)
+            # survives the kill still holding the stdout pipe, so communicate()
+            # would wait for IT — MEASURED: a 1s cap held for 20s behind
+            # `setsid sleep 20 &`. Drop our end of the pipes and reap the shell
+            # with a bounded wait; an escaped descendant is outside anything a
+            # process-group kill can reach and is left to finish on its own.
+            for stream in (proc.stdin, proc.stdout):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=1)
             return ""
         if proc.returncode != 0 or not out:
             return ""

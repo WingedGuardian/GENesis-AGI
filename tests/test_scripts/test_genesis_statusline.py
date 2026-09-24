@@ -209,6 +209,19 @@ def test_a_hung_chained_command_is_killed_with_its_children(sl, tmp_path, monkey
     assert _pid_gone(pid), f"grandchild {pid} survived the timeout"
 
 
+def test_a_descendant_that_escaped_the_group_cannot_hold_the_cap_open(sl, monkeypatch, capsys):
+    """`setsid` moves a descendant out of the group we kill while it keeps the
+    stdout pipe; draining that pipe after the kill would wait for IT (measured:
+    a 1s cap held 20s). The cap must hold anyway."""
+    import time
+
+    monkeypatch.setattr(sl, "_CHAINED_TIMEOUT_S", 0.5)
+    t0 = time.monotonic()
+    rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"}, ["--then", "setsid sleep 20 &"])
+    assert time.monotonic() - t0 < 5, "an escaped descendant held the cap open"
+    assert rc == 0 and out.startswith("feat/x · ")
+
+
 def test_sigterm_to_the_script_takes_the_chained_group_with_it(tmp_path):
     """Claude Code cancels an in-flight status-line command by signalling it; the
     chained command lives in its own group, so the script must forward the kill."""
