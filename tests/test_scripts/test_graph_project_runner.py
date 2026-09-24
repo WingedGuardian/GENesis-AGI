@@ -118,6 +118,11 @@ def test_flock_missing_from_path_is_tempfail_not_success(tmp_path, fake_repo):
     assert "lock unavailable" in res.stdout
 
 
+@pytest.mark.skipif(
+    shutil.which("flock") is None,
+    reason="needs flock to HOLD the lock from outside; the runner's own "
+    "flock-missing path is covered by test_flock_missing_from_path_is_tempfail",
+)
 def test_a_held_lock_is_a_clean_no_op(tmp_path, fake_repo):
     """The ONE case that is legitimately 0: another tick is already projecting.
 

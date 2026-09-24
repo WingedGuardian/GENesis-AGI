@@ -857,6 +857,28 @@ class FalkorGraphStore:
         when a duplicate graph is most likely to already be straining memory,
         so the backstop matters more than the handler does.
 
+        PID NAMESPACES, asked about in review and worth answering here because
+        the pid check is NOT what makes this safe. The sweep runs from
+        ``_project_locked``, i.e. AFTER ``_acquire_publish_lock`` succeeded — so
+        while it runs, this process holds the cross-process publication lease
+        and no other projector can be between acquire and release. That property
+        is namespace-independent: it holds however the other process sees pids,
+        because it is enforced by the engine rather than by the OS.
+
+        The one gap in that argument is benign, and is stated rather than
+        glossed: a projector whose build outlasted the 300s lease TTL has
+        already LOST its claim, so we could acquire while it is still building
+        and reap its staging graph. Its publish was going to fail anyway — the
+        lease is gone — so nothing publishable is destroyed.
+
+        The pid check is therefore a second condition, not the first: it stops
+        this process reaping a key it might itself still want, and it keeps the
+        sweep inert on keys minted by something that is demonstrably alive.
+        Cross-namespace reachability would additionally require the engine's
+        unix socket to be visible in another namespace; it is created under
+        ``genesis_home()`` and the engine runs with ``--port 0``, so there is no
+        TCP path and the socket does not leave this filesystem by default.
+
         Conservative by construction: it deletes only keys matching this graph's
         own staging pattern whose pid suffix parses AND is provably gone. Its
         own pid is skipped (the caller deletes that directly, and an in-flight
