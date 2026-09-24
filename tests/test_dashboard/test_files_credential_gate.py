@@ -331,3 +331,58 @@ def test_a_wrong_bearer_is_still_refused(app, monkeypatch):
     )
     body = resp.get_json(silent=True) or {}
     assert resp.status_code == 403 and body.get("error") == "authentication required"
+
+
+# ── The bearer header is BYTES, not str ──────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("label", "url", "method", "want"),
+    [
+        ("read gate", "/api/genesis/files?path=.", "GET", 403),
+        ("mutation gate", "/api/genesis/files/write", "PUT", 401),
+    ],
+)
+def test_a_high_byte_bearer_is_refused_not_a_500(app, monkeypatch, label, url, method, want):
+    """A header byte must not turn a security gate into a stack trace.
+
+    WSGI decodes headers as latin-1, and ``hmac.compare_digest`` REFUSES
+    non-ASCII ``str`` operands — it raises ``TypeError``. Comparing the raw
+    header string therefore returned a 500 for any header carrying a high byte,
+    on the widest surface in the app. Still fail-closed, but a spammable 500
+    where a refusal belongs, and a stack trace per request.
+
+    ``check_bearer_token`` already solved this by comparing BYTES with
+    ``surrogateescape``; this pins that both bearer gates do the same. The
+    status codes differ by design (the read gate mirrors ``references.py`` at
+    403, the mutation gate answers 401) — what matters is that neither is 500.
+    """
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    app.before_request(auth_mod.check_api_mutation_auth)
+
+    resp = app.test_client().open(
+        url, method=method, headers={"Authorization": "Bearer \xff\xfe"}
+    )
+
+    assert resp.status_code != 500, f"{label} raised instead of refusing"
+    assert resp.status_code == want, f"{label} answered {resp.status_code}"
+
+
+def test_both_bearer_gates_share_one_implementation(monkeypatch):
+    """The two gates must not be able to disagree about who is trusted.
+
+    This is the defect the extraction exists to prevent, so it is asserted
+    structurally rather than by testing two behaviours and hoping they stay in
+    step: the mutation gate calls ``has_internal_bearer`` rather than carrying
+    its own copy of the compare.
+    """
+    import inspect
+
+    source = inspect.getsource(auth_mod.check_api_mutation_auth)
+    assert "has_internal_bearer()" in source, (
+        "the mutation gate no longer calls the shared helper"
+    )
+    assert "compare_digest" not in source, (
+        "the mutation gate has re-grown its own bearer compare — the two gates "
+        "can now drift apart, which is exactly what the helper prevents"
+    )

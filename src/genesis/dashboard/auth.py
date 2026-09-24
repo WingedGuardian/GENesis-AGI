@@ -181,7 +181,15 @@ def has_internal_bearer() -> bool:
     if not header.startswith("Bearer "):
         return False
     expected = get_or_create_internal_api_token()
-    return bool(expected) and hmac.compare_digest(header[7:], expected)
+    if not expected:
+        return False
+    # Compare BYTES, exactly as ``check_bearer_token`` above already does.
+    # ``compare_digest`` REFUSES non-ASCII str operands, and WSGI decodes
+    # headers as latin-1 — so any high byte in the header raised TypeError and
+    # surfaced as a 500 with a stack trace. Still fail-closed, but a spammable
+    # 500 where a 401 belongs, on the widest surface in the app.
+    presented = header[7:].encode("utf-8", "surrogateescape")
+    return hmac.compare_digest(presented, expected.encode("utf-8", "surrogateescape"))
 
 
 def check_password(input_password: str) -> bool:
@@ -340,11 +348,8 @@ def check_api_mutation_auth():
     # Trusted machine caller (internal bearer token) — CSRF-immune (an attacker
     # cannot read the 0600 token file), so it is checked FIRST and is
     # origin-independent.
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        expected = get_or_create_internal_api_token()
-        if expected and hmac.compare_digest(auth_header[7:], expected):
-            return None
+    if has_internal_bearer():
+        return None
 
     # Trusted browser session (session cookie). A cookie is NOT proof of
     # same-origin intent (``SameSite=Lax`` still attaches it on a same-site sibling
