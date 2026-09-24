@@ -47,7 +47,10 @@ class CCBudgetTracker:
     # _EXCLUDED_SOURCE_TAG_PREFIXES classification.
 
     async def _count_recent_sessions(self) -> int:
-        """Count sessions started in the last hour (active or completed).
+        """Count sessions started in the last hour that CONSUMED a CC start.
+
+        Counted: active, completed, expired, checkpointed. NOT failed — see
+        the comment on the predicate below, which carries the measurement.
 
         Voice conversation rows (source_tag='voice') are transcript-index
         entries, not CC invocations — they must not consume the budget or
@@ -64,7 +67,25 @@ class CCBudgetTracker:
         cursor = await self._db.execute(
             """SELECT COUNT(*) FROM cc_sessions
                WHERE started_at > ?
-                 AND status IN ('active', 'completed', 'expired', 'checkpointed', 'failed')
+                 -- 'checkpointed' is REQUIRED by this PR: the new dead-pid
+                 -- fast path can checkpoint a row ~31 minutes after it
+                 -- started, inside this 1-hour window, where previously the
+                 -- only route to that status was the 24h gate. Omitting it
+                 -- would undercount real starts.
+                 --
+                 -- 'failed' is deliberately NOT counted, and this is the
+                 -- interesting half. MEASURED on the live table: at
+                 -- 2026-09-21T04 this predicate reads 0 without it and 20
+                 -- with it — twenty rows, all 'failed', in one hour. At the
+                 -- default max_sessions_per_hour=20 that is usage 1.00, which
+                 -- `get_status` turns into RATE_LIMITED and `should_throttle`
+                 -- turns into "refuse everything at or above reflection
+                 -- priority". Failures are correlated, so counting them makes
+                 -- a CC failure cascade automatically suppress the background
+                 -- cognition that might diagnose it — backwards, and against
+                 -- the standing rule that cost tracking is observability and
+                 -- never automatic control.
+                 AND status IN ('active', 'completed', 'expired', 'checkpointed')
                  -- COALESCE for CONSISTENCY with the four sibling predicates
                  -- in db/crud/cc_sessions.py, not to fix a live defect: the
                  -- column is `TEXT NOT NULL DEFAULT 'foreground'`

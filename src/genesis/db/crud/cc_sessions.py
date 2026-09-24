@@ -233,9 +233,15 @@ def register_terminal_session_sync(
             conn.commit()
     except (sqlite3.Error, DatabaseIntegrityError):
         # DatabaseIntegrityError is the QUARANTINE refusal from the factory's
-        # admission check. It is not a sqlite3.Error, so without naming it here
-        # a quarantined database would raise out of a SessionStart hook or a
-        # prompt-time write — the one thing these helpers promise never to do.
+        # admission check. Named EXPLICITLY rather than relied upon: it does
+        # subclass sqlite3.DatabaseError today, so `sqlite3.Error` alone would
+        # in fact catch it — but that is an inherited detail of where the
+        # exception happens to sit, not a contract this module is entitled to
+        # assume. Spelling it out means a future re-parenting cannot silently
+        # let a quarantine refusal raise out of a SessionStart hook or a
+        # prompt-time write, which is the one thing these helpers promise never
+        # to do. (An earlier revision of this comment asserted it was NOT a
+        # sqlite3.Error. That was simply wrong.)
         return
 
 
@@ -279,9 +285,15 @@ def touch_terminal_session_row_sync(db_path: str, cc_session_id: str) -> None:
             conn.commit()
     except (sqlite3.Error, DatabaseIntegrityError):
         # DatabaseIntegrityError is the QUARANTINE refusal from the factory's
-        # admission check. It is not a sqlite3.Error, so without naming it here
-        # a quarantined database would raise out of a SessionStart hook or a
-        # prompt-time write — the one thing these helpers promise never to do.
+        # admission check. Named EXPLICITLY rather than relied upon: it does
+        # subclass sqlite3.DatabaseError today, so `sqlite3.Error` alone would
+        # in fact catch it — but that is an inherited detail of where the
+        # exception happens to sit, not a contract this module is entitled to
+        # assume. Spelling it out means a future re-parenting cannot silently
+        # let a quarantine refusal raise out of a SessionStart hook or a
+        # prompt-time write, which is the one thing these helpers promise never
+        # to do. (An earlier revision of this comment asserted it was NOT a
+        # sqlite3.Error. That was simply wrong.)
         return
 
 

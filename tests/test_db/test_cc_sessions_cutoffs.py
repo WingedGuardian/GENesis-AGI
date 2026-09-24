@@ -124,6 +124,45 @@ class TestBudgetSourceTag:
         assert await tracker._count_recent_sessions() == 0
 
 
+class TestBudgetExcludesFailed:
+    """A CC failure cascade must not throttle background cognition.
+
+    MEASURED on the live table while reviewing this PR: at 2026-09-21T04 the
+    budget predicate returns 0 without 'failed' and 20 with it — twenty rows,
+    all failed, in one hour. At the default max_sessions_per_hour=20 that is
+    usage 1.00, which `get_status` renders RATE_LIMITED and `should_throttle`
+    renders "refuse everything at or above reflection priority". Failures are
+    correlated, so counting them makes a cascade suppress exactly the thinking
+    that might explain it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_sessions_do_not_consume_the_budget(self, db):
+        from genesis.resilience.cc_budget import CCBudgetTracker
+
+        cur = await db.execute("SELECT datetime('now', '-10 minutes')")
+        recent = (await cur.fetchone())[0].replace(" ", "T") + "+00:00"
+        for i in range(5):
+            await _seed(db, f"failed-{i}", recent, status="failed")
+        await db.commit()
+
+        assert await CCBudgetTracker(db)._count_recent_sessions() == 0
+
+    @pytest.mark.asyncio
+    async def test_checkpointed_sessions_DO_consume_the_budget(self, db):
+        """The other half, and the one this PR actually requires: the dead-pid
+        fast path can reach 'checkpointed' ~31 minutes after a start, inside
+        this window, where before it took 24 hours. Omitting it undercounts."""
+        from genesis.resilience.cc_budget import CCBudgetTracker
+
+        cur = await db.execute("SELECT datetime('now', '-10 minutes')")
+        recent = (await cur.fetchone())[0].replace(" ", "T") + "+00:00"
+        await _seed(db, "ckpt-1", recent, status="checkpointed")
+        await db.commit()
+
+        assert await CCBudgetTracker(db)._count_recent_sessions() == 1
+
+
 class TestDeadPidCadence:
     """The dead-pid job's poll interval.
 

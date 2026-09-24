@@ -341,7 +341,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: cff02d745 2026-09-23
+verified: 18e41e1e1 2026-09-23
 ```
 
 - **The slot door heals a bare slot — by CONSENT, never silently**
@@ -646,8 +646,10 @@ verified: cff02d745 2026-09-23
   the 24h gate — `close_dead` is the lever, and anything but literal `true`
   degrades it to off. That needs a cadence the 6-hourly `session_reaper` cannot
   give, so `session_reaper_dead_pid` runs it with `dead_only=True` at the
-  configured interval; above an hour it switches to a CronTrigger, because an
-  IntervalTrigger resets on restart. It has no boot kick of its own and needs
+  configured interval, CAPPED at one hour (an IntervalTrigger resets on
+  restart, so a longer one may never fire; polling more often than the
+  eligibility age is harmless, which makes the cap free). It has no boot kick
+  of its own and needs
   none — `session_reaper`'s kick calls `reap_dark_foreground` with
   `dead_only=False`, which runs the dead-pid path too. **Alive-proof outranks
   death evidence on both paths**, and is checked TWICE: once as a pass-level
