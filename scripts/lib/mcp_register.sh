@@ -1,16 +1,26 @@
 # shellcheck shell=bash
 # (sourced fragment, not an executable script — no shebang)
 #
-# _register_mcp — register a code-intelligence MCP server with Claude Code,
-# healing DRIFTED user-scope registrations. Single source of truth, sourced by
-# scripts/install.sh (fresh install) and scripts/bootstrap.sh (every update via
-# update.sh), so both paths register identically and existing installs heal.
+# _register_mcp — register a code-intelligence MCP server with Claude Code.
+# Single source of truth, sourced by scripts/install.sh (fresh install) and
+# scripts/bootstrap.sh (every update via update.sh), so both paths register
+# identically.
 #
-# Why drift-healing exists: `claude mcp list` merges scopes, so a same-named
-# project-scope entry can mask a STALE user-scope command behind "already
-# registered" (real case: codebase-memory-mcp stayed pointed at the bare
-# binary, bypassing the memory-cap launcher). User scope is therefore checked
-# against ~/.claude.json directly and re-registered on mismatch.
+# THE TWO TRANSPORTS DIFFER ON WHAT THEY DO ABOUT A MISMATCH, deliberately:
+#
+#   _register_mcp (stdio)  HEALS a drifted command. `claude mcp list` merges
+#                          scopes, so a same-named project-scope entry can mask
+#                          a STALE user-scope command behind "already
+#                          registered" (real case: codebase-memory-mcp stayed
+#                          pointed at the bare binary, bypassing the memory-cap
+#                          launcher). User scope is checked against
+#                          ~/.claude.json directly and re-registered.
+#
+#   _register_mcp_http     NEVER heals. It does not remove or replace an entry
+#                          already under the name — it preserves it and tells
+#                          the operator how to adopt ours. See that function
+#                          for why the asymmetry is correct rather than an
+#                          inconsistency.
 #
 # Usage: _register_mcp <name> <scope> <command> [args...]
 #        _register_mcp_http <name> <scope> <url>
@@ -34,11 +44,17 @@ GENESIS_GREP_MCP_URL="${GENESIS_GREP_MCP_URL-https://mcp.grep.app}"
 # _register_mcp_http below — the stdio drift check reads "command" and would
 # see "" for every HTTP entry, re-registering it on every single run.
 
-# _mcp_entry_exists — is there a user-scope entry under this name AT ALL,
-# whatever its transport? Prints "1" or "". Deliberately transport-blind: the
-# drift-heal paths need to know a NAME is taken, which is what `claude mcp add`
-# refuses on, and the per-transport identity checks answer a different question
-# (is the stored value the one we intend).
+# _mcp_entry_exists — is there a user-scope entry under this name with a
+# TRUTHY value? Prints "1" or "". Deliberately transport-blind: the stdio
+# heal path needs to know a NAME is taken, which is what `claude mcp add`
+# refuses on, and the per-transport identity checks answer a different
+# question (is the stored value the one we intend).
+#
+# Truthiness, not membership — so `{}` and `null` read as absent, and a
+# python3 failure is swallowed to "". Kept as-is because _register_mcp's
+# behaviour is out of scope here; _register_mcp_http uses the stricter
+# _mcp_entry_present below. Closing the same gap for the stdio caller is
+# tracked separately.
 _mcp_entry_exists() {
     python3 - "$1" <<'PYEOF' 2>/dev/null
 import json, os, sys
@@ -47,6 +63,32 @@ try:
     print("1" if cfg.get("mcpServers", {}).get(sys.argv[1]) else "")
 except Exception:
     print("")
+PYEOF
+}
+
+# _mcp_entry_present — is the NAME taken at user scope, at all? Prints "1"
+# (taken), "" (free), or "unknown" (could not read the config).
+#
+# MEMBERSHIP, not truthiness, and it fails CLOSED. _register_mcp_http promises
+# never to replace an existing entry, and a detector that answers "absent" for
+# `{}`, for `null`, or because python3 fell over would send the caller to
+# `claude mcp add` against a name the operator owns. MEASURED (CC 2.1.246) that
+# `add` refuses a taken name — exit 1, "already exists in user config", entry
+# byte-identical — so nothing is destroyed today. That is a THIRD PARTY's
+# behaviour holding the guarantee up, and this whole function exists because
+# one predicate about ownership was wrong three revisions running. Genesis's
+# own layer answers for it.
+_mcp_entry_present() {
+    python3 - "$1" <<'PYEOF' 2>/dev/null || echo "unknown"
+import json, os, sys
+try:
+    cfg = json.load(open(os.path.expanduser("~/.claude.json")))
+except FileNotFoundError:
+    print("")          # no config at all is a genuine "free", not a failure
+except Exception:
+    print("unknown")   # unreadable/corrupt — do not claim the name is free
+else:
+    print("1" if sys.argv[1] in cfg.get("mcpServers", {}) else "")
 PYEOF
 }
 
@@ -139,9 +181,14 @@ _register_mcp_http() {
     # _warn_local_scope_shadow) is never to delete an operator's config
     # silently; surface it and give them the command.
     if [ -z "$url" ]; then
-        if [ "$scope" = "user" ] && [ -n "$(_mcp_entry_exists "$name")" ]; then
+        if [ "$scope" = "user" ] && [ -n "$(_mcp_entry_present "$name")" ]; then
             echo "  $name: declined (URL empty), but an EXISTING $scope registration remains ACTIVE"
             echo "    remove it with: claude mcp remove $name -s $scope"
+            # "remains ACTIVE" is a claim about what a session will REACH, and
+            # a local-scope entry outranks user scope — so removing the user
+            # one would not be the whole job. Every exit that says what is live
+            # owes this check.
+            _warn_local_scope_shadow "$name" "$url"
         else
             echo "  $name: skipped (URL empty — registration declined)"
         fi
@@ -164,35 +211,77 @@ PYEOF
 )"
         # A URL is an exact-match identity: unlike a command path there is no
         # basename form that is legitimately a different spelling of the same
-        # server, so any difference is drift and must heal.
+        # server, so anything that is not equal is a different configuration.
         if [ "$registered" = "$url" ]; then
             echo "  $name: already registered"
             _warn_local_scope_shadow "$name" "$url"
             return 0
         fi
-        # Ownership is decided by the NAME, which is why Genesis registers
-        # `grep-app` rather than the generic `grep` that grep.app's own docs
-        # use. Two earlier revisions tried to infer ownership from the stored
-        # value and produced one defect each, in opposite directions: removing
-        # a mismatch destroyed an operator's own server, and preserving every
-        # mismatch made GENESIS_GREP_MCP_URL inert on any box Genesis had
-        # already set up. No predicate over an ambiguous name can be right
-        # both ways, so the ambiguity is removed instead of adjudicated.
         #
-        # A URL mismatch under a Genesis-owned name is therefore OUR entry with
-        # a changed endpoint — heal it, which is what makes the override work
-        # on an existing install.
-        if [ -n "$registered" ]; then
-            echo "  $name: endpoint changed (stored: $registered) — re-registering"
-            claude mcp remove "$name" -s "$scope" 2>/dev/null || true
-        elif [ -n "$(_mcp_entry_exists "$name")" ]; then
-            # An entry with no "url" is a different TRANSPORT, which Genesis
-            # never writes here. Even under a name we own, that is something
-            # we did not create — preserve it and say so rather than deleting
-            # configuration whose origin we cannot account for.
-            echo "  WARNING: $name already exists at $scope scope with a different transport."
-            echo "    Genesis has NOT modified it — it did not create that entry."
-            echo "    To adopt the Genesis-managed server: claude mcp remove $name -s $scope   (then re-run)"
+        # NEVER HEAL — preserve and warn. Owner decision, 2026-09-24.
+        #
+        # Three revisions tried to decide OWNERSHIP from what was stored, and
+        # each produced one defect: healing every mismatch destroyed an
+        # operator's own server; preserving every mismatch made
+        # GENESIS_GREP_MCP_URL inert on a box Genesis had already set up;
+        # renaming to a Genesis-owned name and healing again destroyed an
+        # operator's entry, one name over. The pattern is the tell — no
+        # predicate over ~/.claude.json can distinguish an entry Genesis wrote
+        # from an identical one an operator wrote, because nothing in the file
+        # records who wrote it.
+        #
+        # So the predicate is deleted rather than narrowed a fourth time. An
+        # existing entry is ALWAYS the operator's to change. This CANNOT
+        # destroy configuration, needs no ownership state to maintain, and
+        # removes the remove-then-add window entirely: nothing is removed, so a
+        # failing `claude mcp add` can never leave the name unregistered.
+        #
+        # The accepted cost, stated so it is not discovered: changing
+        # GENESIS_GREP_MCP_URL on an already-registered box does NOT take
+        # effect by itself. The operator removes the entry first, which the
+        # warning below spells out. That is one manual step against a class of
+        # silent data loss.
+        #
+        # Deliberately NOT applied to _register_mcp above: that function heals
+        # STDIO entries, which Genesis has written under those names since long
+        # before this file grew an HTTP path, and its heal fixes a measured
+        # real failure. The asymmetry is the point — an established heal with a
+        # known provenance is not the same claim as a new one.
+        local present
+        present="$(_mcp_entry_present "$name")"
+        if [ -n "$present" ]; then
+            if [ "$present" = "unknown" ]; then
+                echo "  WARNING: could not read ~/.claude.json — cannot tell whether $name is"
+                echo "    already registered, so NOTHING was changed. Fix the file and re-run."
+                return 0
+            fi
+            if [ -n "$registered" ]; then
+                echo "  WARNING: $name already exists at $scope scope with a DIFFERENT URL."
+                echo "    stored: $registered"
+                echo "    ours:   $url"
+                # Exact-match identity, so a trailing slash reads as different
+                # and this warns on every run until the operator settles on one
+                # spelling. Noisy in the safe direction; not worth a normaliser
+                # that would have to model URL equivalence.
+            else
+                echo "  WARNING: $name already exists at $scope scope with a different value."
+            fi
+            echo "    Genesis has NOT modified it — an existing entry is never replaced."
+            echo "    To adopt the Genesis-managed server:"
+            echo "      claude mcp remove $name -s $scope   # then re-run scripts/bootstrap.sh"
+            # BOTH lines above are the only remedy this branch offers, and a
+            # local-scope entry outranks user scope — so where one exists, that
+            # remedy silently does nothing. Under the old heal behaviour this
+            # case fell THROUGH to the shared warning at the bottom; converting
+            # it to an early return took the warning with it, invisibly, since
+            # that call is untouched context in the diff.
+            #
+            # Compared against OURS, not against the stored value: the question
+            # this branch has to answer is "will a local entry still shadow the
+            # server after they adopt ours?". MEASURED — passing the stored URL
+            # goes silent exactly when a local entry matches it, which is the
+            # case where the remedy above does not work.
+            _warn_local_scope_shadow "$name" "$url"
             return 0
         fi
     else
