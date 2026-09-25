@@ -121,8 +121,18 @@ fi
 if [ "$_BRANCH_EXPLICIT" = "1" ]; then
     genesis_write_deploy_pending "$_DEPLOY_BRANCH"
 fi
+# The host checkout still has to be a sane deploy checkout -- the guardian is
+# installed from it -- but it is asserted against its OWN configured branch,
+# never against a container-scoped --branch selection. Binding the two made
+# `host-setup.sh --branch X` from a host checkout on main abort here, under
+# `set -euo pipefail`, before the container block ran at all: the ordinary
+# first-run flow (clone, then --branch dev) could not execute.
+#
+# Note the call deliberately omits the GENESIS_DEPLOY_BRANCH override used at
+# the resolution above, so it reads the HOST's own deploy.conf / origin/HEAD.
 if git -C "$_GENESIS_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    genesis_assert_deploy_checkout "$_GENESIS_ROOT" "$_DEPLOY_BRANCH"
+    _HOST_DEPLOY_BRANCH="$(genesis_resolve_deploy_branch "$_GENESIS_ROOT")"
+    genesis_assert_deploy_checkout "$_GENESIS_ROOT" "$_HOST_DEPLOY_BRANCH"
 fi
 BRANCH="$_DEPLOY_BRANCH"
 
@@ -899,19 +909,53 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         # add -f here.
         _CUR="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
         if [ -n "$_BRANCH" ] && [ "$_CUR" != "$_BRANCH" ]; then
+            # A detached HEAD carrying commits that are on no branch is the one
+            # shape where checkout does NOT protect the operator: it succeeds,
+            # returns 0, and warns on stderr that it is leaving those commits
+            # behind. Refuse instead, and tell them how to keep the work.
+            if [ -z "$_CUR" ] && [ -z "$(git branch --contains HEAD 2>/dev/null)" ]; then
+                echo "    ! container checkout is on a detached HEAD whose commits are on no branch"
+                echo "      Keep them first, in the container:"
+                echo "        git branch <name> $(git rev-parse --short HEAD 2>/dev/null)"
+                exit 1
+            fi
             echo "    . switching checkout: ${_CUR:-detached HEAD} -> $_BRANCH"
-            git fetch --quiet origin "$_BRANCH" 2>/dev/null || true
+            # The fetch error is captured, not discarded: without it an auth
+            # failure on a private repo surfaces only as a pathspec error from
+            # the checkout below, and the operator is told to resolve local
+            # changes that are not the cause.
+            _FETCH_ERR="$(git fetch --quiet origin "$_BRANCH" 2>&1)" || true
             # Not piped: after a pipeline the status is the LAST command in it, so
             # a checkout piped into tail would report the status of tail and hide a
             # failed switch.
             if ! _CO_ERR="$(git checkout "$_BRANCH" 2>&1)"; then
                 echo "    ! cannot switch the container checkout to $_BRANCH:"
                 echo "      $_CO_ERR"
+                [ -n "$_FETCH_ERR" ] && echo "      fetch also reported: $_FETCH_ERR"
                 echo "      Resolve or commit the local changes in the container, then re-run."
                 exit 1
             fi
+            # git warns on SUCCESS too. Swallowing that is how a checkout that
+            # left commits behind looks identical to a clean one.
+            [ -n "$_CO_ERR" ] && printf "      %s\n" "$_CO_ERR"
         fi
-        git pull --ff-only 2>/dev/null || true
+        # A silently failed pull is not cosmetic here: install.sh asserts the
+        # BRANCH and never the commit, so a branch that exists locally with no
+        # working upstream installs a stale revision while setup reports
+        # success. Refuse rather than install code nobody chose.
+        if ! _PULL_ERR="$(git pull --ff-only 2>&1)"; then
+            case "$_PULL_ERR" in
+                *"no tracking information"*|*"There is no tracking information"*)
+                    echo "    ! $_BRANCH has no upstream in the container, so its revision cannot be verified"
+                    ;;
+                *)
+                    echo "    ! could not fast-forward $_BRANCH in the container:"
+                    ;;
+            esac
+            echo "      $_PULL_ERR"
+            echo "      Set the upstream or resolve the divergence, then re-run."
+            exit 1
+        fi
     else
         GIT_TERMINAL_PROMPT=0 git clone --branch "$_BRANCH" "$_REPO_URL" "$_DEST" 2>&1 | tail -3
     fi

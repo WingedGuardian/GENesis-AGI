@@ -409,3 +409,109 @@ def test_branch_switch_refuses_rather_than_discarding_container_edits(
     assert (work / "f").read_text() == "uncommitted container edit\n", (
         "local container edit was discarded by the branch switch"
     )
+
+
+def _host_setup_preamble(genesis_root: Path) -> str:
+    """host-setup.sh from the script-dir resolution down to BRANCH assignment.
+
+    EXTRACTED and EXECUTED rather than asserted as a string. The defect this
+    guards against is a block that exists and is never reached: under
+    `set -euo pipefail` a sourced function returning 1 aborts the whole script,
+    and no string-presence test can see that. 17 of the 19 cells in this file
+    assert `<literal> in script_text`, which is why the class got through.
+    """
+    text = (REPO_ROOT / "scripts" / "host-setup.sh").read_text()
+    start = text.index('_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"')
+    end = text.index('BRANCH="$_DEPLOY_BRANCH"') + len('BRANCH="$_DEPLOY_BRANCH"')
+    block = text[start:end]
+    scripts_dir = REPO_ROOT / "scripts"
+    # Point the block at the real lib but a throwaway checkout.
+    block = block.replace(
+        '_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"', f'_SCRIPT_DIR="{scripts_dir}"', 1
+    )
+    block = block.replace(
+        '_GENESIS_ROOT="$(cd "$_SCRIPT_DIR/.." && pwd)"',
+        f'_GENESIS_ROOT="{genesis_root}"',
+        1,
+    )
+    return "set -euo pipefail\n" + block
+
+
+def _host_checkout(tmp_path: Path, branch: str = "main") -> Path:
+    repo = tmp_path / "hostco"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-b", branch], check=True, env=_clean_env()
+    )
+    for cmd in (
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "T"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=_clean_env())
+    (repo / "f").write_text("x\n")
+    subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=_clean_env())
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "i"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    return repo
+
+
+def _run_preamble(tmp_path: Path, repo: Path, *, branch: str, explicit: str):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    script = (
+        f'BRANCH="{branch}"\n_BRANCH_EXPLICIT={explicit}\n'
+        + _host_setup_preamble(repo)
+    )
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=_clean_env(HOME=str(home)),
+    )
+
+
+def test_container_branch_selection_does_not_abort_host_setup(tmp_path: Path) -> None:
+    """`--branch X` names the CONTAINER branch; a host checkout on main must run.
+
+    This is the ordinary first-run flow: clone the repo (lands on the default
+    branch), then `./scripts/host-setup.sh --branch dev`. Binding the container
+    selection to the host checkout aborted here, 774 lines before the container
+    block, so the branch-switch fix below it was unreachable for exactly the
+    flag it was written for.
+    """
+    repo = _host_checkout(tmp_path, branch="main")
+
+    result = _run_preamble(tmp_path, repo, branch="stable", explicit="1")
+
+    assert result.returncode == 0, (
+        "host-setup aborted in its preamble because --branch named a branch the "
+        f"HOST checkout is not on\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_the_host_checkout_assertion_still_fires_on_its_own_branch(
+    tmp_path: Path,
+) -> None:
+    """Paired control: the assertion must still refuse a genuinely wrong host checkout.
+
+    Without this, the cell above would pass just as well against the assertion
+    being deleted outright -- which is the other way to make it stop aborting.
+    """
+    repo = _host_checkout(tmp_path, branch="not-the-deploy-branch")
+    home = tmp_path / "home"
+    (home / ".genesis" / "config").mkdir(parents=True, exist_ok=True)
+    (home / ".genesis" / "config" / "deploy.conf").write_text("DEPLOY_BRANCH=main\n")
+
+    result = _run_preamble(tmp_path, repo, branch="stable", explicit="1")
+
+    assert result.returncode != 0, (
+        "the host checkout is on 'not-the-deploy-branch' while its own deploy.conf "
+        f"says 'main', and the assertion did not fire\n{result.stdout}\n{result.stderr}"
+    )
+    assert "refusing to deploy from branch" in (result.stdout + result.stderr), (
+        f"refused, but not by the deploy-checkout assertion\n{result.stdout}\n{result.stderr}"
+    )
