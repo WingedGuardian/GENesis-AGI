@@ -48,6 +48,7 @@ import fastmcp
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.server.tasks.config import TaskConfig
+from mcp.shared.exceptions import McpError
 
 from tests.conftest import private_module
 
@@ -302,9 +303,15 @@ async def test_task_lookups_error_rather_than_returning_data(caplog):
             ("get_task_result", client.get_task_result("missing-123")),
             ("cancel_task", client.cancel_task("missing-123")),
         ):
-            with pytest.raises(Exception) as excinfo:  # noqa: B017 — see assert below
+            # McpError SPECIFICALLY, not bare Exception. A first draft caught
+            # Exception and asserted only that one was raised, which would have
+            # passed on an ImportError, a typo in this test, or a transport
+            # failure — accepting unrelated failures as if they were the
+            # behaviour under test (raised in review, PR #2316).
+            with pytest.raises(McpError) as excinfo:
                 await coro
-            # The CONTRACT is "an impossible lookup errors", not the specific code:
-            # pinning the code would make this test fail on an upstream error-code
-            # change that harms nobody, which is how a test becomes noise.
-            assert excinfo.value is not None, f"{label} returned data for an impossible task id"
+            # The CONTRACT is "an impossible lookup errors at the PROTOCOL level
+            # and returns no data" — deliberately not the specific error code,
+            # since pinning that would make this fail on an upstream code change
+            # that harms nobody, which is how a test becomes noise.
+            assert str(excinfo.value), f"{label} raised an McpError with no message"
