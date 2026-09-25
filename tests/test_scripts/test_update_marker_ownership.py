@@ -22,6 +22,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
+# update.sh sources this lib before any cleanup site runs; the marker check
+# calls its deploy_marker_pid_live, so the harness sources it too. Extracted
+# ALONE, the function would hit "command not found" inside a negation and
+# delete a LIVE foreign marker -- a harness fail-open, not the shipped path.
+DEPLOY_LOCK_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_lock.sh"
 
 
 @pytest.fixture(scope="module")
@@ -65,6 +70,7 @@ def _run_clear(tmp_path: Path, text: str, marker_pid: str | None) -> tuple[bool,
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="{state}"
+source "{DEPLOY_LOCK_LIB}"
 {_extract_func(text, "_clear_deploy_state")}
 _clear_deploy_state
 """

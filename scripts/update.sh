@@ -63,10 +63,10 @@ GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 SCRIPT_DIR="$GENESIS_ROOT/scripts"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
-STATE_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_state.json"
+STATE_FILE="$HOME/.genesis/update_state.json"
 
 # Shared deploy-station pieces (issue #1699). deploy_lock.sh supplies the lock
-# PATH constant + the deploy-receipt appender (this script keeps its own inline
+# PATH constant + the linked-worktree check (this script keeps its own inline
 # `flock -n` below — refuse-immediately is its deliberate contract; the
 # code-only wrapper and validation holds are the paths that queue).
 # guardian_pause.sh holds the pause/resume/renew trio EXTRACTED from this file
@@ -111,7 +111,7 @@ _clear_deploy_state() {
     rm -f "$STATE_FILE" 2>/dev/null || true
     local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
     _pid="$(cat "$_m" 2>/dev/null || true)"
-    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; }; then
+    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! deploy_marker_pid_live "$_pid"; }; then
         rm -f "$_m" 2>/dev/null || true
     fi
 }
@@ -205,8 +205,9 @@ UPDATE_LOCK_FILE="$GENESIS_DEPLOY_LOCK"
 mkdir -p "$(dirname "$UPDATE_LOCK_FILE")"
 exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"
 if ! flock -n "$_UPDATE_LOCK_FD"; then
-    echo "ERROR: another Genesis update is already in progress ($UPDATE_LOCK_FILE)."
-    echo "       Refusing to run a second update concurrently."
+    echo "ERROR: the deploy-station lock is held ($UPDATE_LOCK_FILE)."
+    echo "       Holder: another update, a code-only deploy, a restore, or a validation"
+    echo "       hold via scripts/run_under_deploy_lock.sh. Retry when it ends."
     exit 1
 fi
 
@@ -1147,18 +1148,6 @@ _do_rollback() {
         _record_update_history "failed" "$reason (rollback incomplete)" "$degraded"
     fi
 
-    # Cross-path ledger (issue #1699): a failed full update belongs in the same
-    # ordered receipts the code-only path and validations write — without it the
-    # ledger shows a deploy followed by later validations with the intervening
-    # failed deploy invisible (Codex P2, #1804). The SHA names the tree AFTER
-    # the rollback attempt, which is what a later receipt correlates against;
-    # a git error degrades to "unknown", never aborts (append only warns).
-    _rollback_sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
-        append_deploy_receipt "deploy_failed" "$_rollback_sha" "update.sh" "rolled back: $reason"
-    else
-        append_deploy_receipt "deploy_failed" "$_rollback_sha" "update.sh" "rollback incomplete: $reason"
-    fi
 
     echo ""
     echo "  To diagnose: discuss with Claude Code"
@@ -2220,22 +2209,6 @@ if [ -n "${DEGRADED:-}" ]; then
     _p6_degraded="${_p6_degraded:+$_p6_degraded,}$DEGRADED"
 fi
 _record_update_history "success" "" "$_p6_degraded"
-# Deploy receipt (issue #1699): the cross-path ordered ledger both deploy
-# paths and validation holds share — full SHA, not the display-short one.
-# The substitution is ||-guarded: set -e is live again here and this is the
-# "never abort now" tail — a transient .git lock must not strand the state
-# file one line before its cleanup.
-_receipt_sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
-    # The server was deliberately stopped before this update and is NOT running
-    # now (no restart, no health check) — a bare "deployed" receipt would name a
-    # SHA nothing is serving, in the ledger built to make that claim
-    # attributable (Devin, #1804).
-    append_deploy_receipt "deployed_not_started" "$_receipt_sha" "update.sh" \
-        "operator-stopped: server was not running at update start — not restarted, not health-verified"
-else
-    append_deploy_receipt "deployed" "$_receipt_sha" "update.sh"
-fi
 
 _write_state "done"
 

@@ -72,7 +72,7 @@ re-registers services on top of a running server (this triggered the
 To deploy code changes, use the sanctioned path instead:
     scripts/update.sh
   or, for a code-only change (deploy lock + watchdog/guardian standdown +
-  health verify + SHA receipt — issue #1699):
+  health verify — issue #1699):
     scripts/deploy_code_only.sh
 
 To run bootstrap for deliberate live repair anyway:

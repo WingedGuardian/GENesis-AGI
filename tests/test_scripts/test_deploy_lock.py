@@ -13,7 +13,7 @@ The #1699 acceptance criteria covered here:
   * a shared (validation) hold excludes a deploy and vice versa; shared
     holders coexist
   * update.sh and the wrapper contend on the SAME lock file (cross-path)
-  * a validation's recorded SHA is the serving SHA for its whole run
+  * a validation hold forwards termination to its command before releasing
   * timeout leaves no partial state; a killed wrapper cleans its state
 """
 
@@ -52,7 +52,7 @@ def station(tmp_path, monkeypatch):
     (home / ".genesis").mkdir(parents=True)
     root = tmp_path / "root"
     root.mkdir()
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         [
             "git",
@@ -83,7 +83,7 @@ def station(tmp_path, monkeypatch):
     shims = tmp_path / "shims"
     shims.mkdir()
     # systemctl: restart succeeds; is-active succeeds. curl: succeeds, and
-    # RECORDS whether the update-state file existed when it ran — the
+    # RECORDS whether the watchdog PID marker existed when it ran — the
     # mid-window probe that proves the watchdog-standdown signal was up
     # exactly while the deploy was in flight.
     _write_exec(
@@ -93,7 +93,7 @@ def station(tmp_path, monkeypatch):
     _write_exec(
         shims / "curl",
         "#!/bin/bash\n"
-        f'if [ -f "{home}/.genesis/update_state.json" ]; then echo yes > "{tmp_path}/state_seen"; fi\n'
+        f'if [ -f "{home}/.genesis/update_in_progress.pid" ]; then echo yes > "{tmp_path}/state_seen"; fi\n'
         "exit 0\n",
     )
 
@@ -102,13 +102,18 @@ def station(tmp_path, monkeypatch):
         HOME=str(home),
         GENESIS_DEPLOY_ROOT=str(root),
         GENESIS_DEPLOY_LOCK=str(tmp_path / "station.lock"),
-        GENESIS_DEPLOY_RECEIPTS=str(tmp_path / "receipts.jsonl"),
         PATH=f"{shims}:{env['PATH']}",
         # Shrink the health-verify envelope (production: 12 x 15s) so the
         # failure-path tests don't burn 3 real minutes each.
         GENESIS_DEPLOY_HEALTH_ATTEMPTS="2",
         GENESIS_DEPLOY_HEALTH_INTERVAL="1",
     )
+    # The marker path honours GENESIS_HOME; an inherited one would point this
+    # test's writes at a real install instead of the fixture HOME.
+    env.pop("GENESIS_HOME", None)
+    # Likewise the alert queue root: the failure-path tests queue CRITICAL
+    # alerts, which must land in the fixture HOME, never a real queue.
+    env.pop("GENESIS_ALERT_QUEUE_ROOT", None)
     return {"env": env, "home": home, "root": root, "sha": sha, "tmp": tmp_path, "shims": shims}
 
 
@@ -158,13 +163,6 @@ def _kill(pid: int) -> None:
         return
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, 9)
-
-
-def _receipts(env) -> list[dict]:
-    p = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-    if not p.exists():
-        return []
-    return [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
 
 
 class TestLockPrimitives:
@@ -239,7 +237,7 @@ class TestLockPrimitives:
 
 class TestCodeOnlyWrapper:
     def test_full_flow_healthy(self, station):
-        env, sha = station["env"], station["sha"]
+        env = station["env"]
         r = subprocess.run(
             ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
             env=env,
@@ -247,15 +245,13 @@ class TestCodeOnlyWrapper:
             text=True,
         )
         assert r.returncode == 0, r.stderr
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deployed"]
-        assert rows[0]["sha"] == sha
-        assert rows[0]["path"] == "code-only"
-        # the watchdog-standdown state file was UP while the deploy ran…
+        assert station["sha"] in r.stdout
+        # the watchdog-standdown marker was UP while the deploy ran…
         assert (station["tmp"] / "state_seen").exists(), (
-            "update_state.json was not present when the health probe ran"
+            "update_in_progress.pid was not present when the health probe ran"
         )
-        # …and cleaned on exit, with the advisory window marker
+        # …removed on exit, and update.sh's recovery record never touched
+        assert not (station["home"] / ".genesis" / "update_in_progress.pid").exists()
         assert not (station["home"] / ".genesis" / "update_state.json").exists()
 
     def test_health_fail_alerts_and_holds(self, station):
@@ -268,9 +264,7 @@ class TestCodeOnlyWrapper:
             text=True,
         )
         assert r.returncode == 1
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["health_failed"]
-        # ALERT AND HOLD: tree untouched, alert queued, state cleaned
+        # ALERT AND HOLD: tree untouched, alert queued, marker removed
         head = subprocess.run(
             ["git", "-C", str(station["root"]), "rev-parse", "HEAD"],
             capture_output=True,
@@ -282,7 +276,7 @@ class TestCodeOnlyWrapper:
         alerts = list(queue.glob("*.json")) if queue.exists() else []
         assert len(alerts) == 1, "exactly one critical alert must be queued"
         assert json.loads(alerts[0].read_text())["severity"] == "critical"
-        assert not (station["home"] / ".genesis" / "update_state.json").exists()
+        assert not (station["home"] / ".genesis" / "update_in_progress.pid").exists()
 
     def test_lock_timeout_leaves_no_partial_state(self, station):
         env = station["env"]
@@ -295,8 +289,8 @@ class TestCodeOnlyWrapper:
                 text=True,
             )
             assert r.returncode == LOCK_HELD_RC
+            assert not (station["home"] / ".genesis" / "update_in_progress.pid").exists()
             assert not (station["home"] / ".genesis" / "update_state.json").exists()
-            assert _receipts(env) == []
         finally:
             holder.wait()
 
@@ -314,21 +308,59 @@ class TestCodeOnlyWrapper:
             stderr=subprocess.PIPE,
             text=True,
         )
-        state = station["home"] / ".genesis" / "update_state.json"
+        marker = station["home"] / ".genesis" / "update_in_progress.pid"
         deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not state.exists():
+        while time.monotonic() < deadline and not marker.exists():
             time.sleep(0.1)
-        assert state.exists(), "wrapper never reached its deploy window"
+        assert marker.exists(), "wrapper never reached its deploy window"
         p.terminate()
         p.wait(timeout=15)
-        assert not state.exists(), "SIGTERM must run the cleanup trap"
+        assert not marker.exists(), "SIGTERM must run the cleanup trap"
+
+    def test_sigkill_leaves_nothing_bootstrap_would_act_on(self, station):
+        """Devin 🔴 (#1804): a SIGKILLed code-only run used to leave its entry in
+        update.sh's update_state.json, which bootstrap reads as a crashed FULL
+        update and recovers by resetting the tree — discarding tracked edits.
+        The run now writes only the bare-PID marker: SIGKILL leaves a DEAD pid
+        there (read as "no deploy" by every reader) and no update_state.json."""
+        env, shims = station["env"], station["shims"]
+        _write_exec(shims / "curl", "#!/bin/bash\nsleep 30\n")
+        p = subprocess.Popen(
+            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            # Own session, so teardown can kill the whole group: SIGKILL to the
+            # wrapper alone orphans its health probe, which keeps running (and
+            # holding the inherited lock fd) until it exits by itself.
+            start_new_session=True,
+        )
+        marker = station["home"] / ".genesis" / "update_in_progress.pid"
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.1)
+            assert marker.exists(), "wrapper never reached its deploy window"
+            _kill(p.pid)
+            p.wait(timeout=15)
+        finally:
+            _kill(p.pid)
+            if p.pid > 1:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, 9)
+        assert not (station["home"] / ".genesis" / "update_state.json").exists(), (
+            "a code-only run must never write update.sh's crash-recovery record"
+        )
+        left = int(marker.read_text().strip())
+        assert left == p.pid and not _alive(left), (
+            "a killed run leaves only its own dead PID, which env.update_in_progress() ignores"
+        )
 
     def test_refuses_foreign_unfinished_state(self, station):
         """REFUSE-DON'T-CLOBBER (architect SF1): update.sh's crash/conflict
         path leaves update_state.json carrying the rollback identity that
-        `update.sh --post-merge` reads back. The dead owner's flock is free,
-        so only this refusal keeps a code-only deploy from destroying the
-        recovery state."""
+        `update.sh --post-merge` reads back. Deploying over it would build on a
+        half-recovered tree, so a code-only run refuses while it exists."""
         env = station["env"]
         state = station["home"] / ".genesis" / "update_state.json"
         state.write_text(
@@ -346,17 +378,16 @@ class TestCodeOnlyWrapper:
         assert state.read_text().startswith('{"phase": "merging"'), (
             "the recovery state must survive the refusal untouched"
         )
-        assert _receipts(env) == []
+        assert not (station["home"] / ".genesis" / "update_in_progress.pid").exists()
 
-    def test_stale_code_only_leftover_is_replaced(self, station):
-        """Our OWN dead leftover (a SIGKILLed code-only run) carries no
-        recovery state — the next run proceeds over it."""
+    def test_dead_pid_marker_is_replaced(self, station):
+        """A dead PID in the marker is a stale leftover every reader already
+        ignores — the next run proceeds over it and cleans up after itself."""
         env = station["env"]
-        state = station["home"] / ".genesis" / "update_state.json"
-        state.write_text(
-            '{"phase": "code-only", "started_at": "2026-01-01T00:00:00", '
-            '"pid": 999999, "path": "code-only"}'
-        )
+        marker = station["home"] / ".genesis" / "update_in_progress.pid"
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        marker.write_text(f"{dead.pid}\n")
         r = subprocess.run(
             ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
             env=env,
@@ -364,25 +395,191 @@ class TestCodeOnlyWrapper:
             text=True,
         )
         assert r.returncode == 0, r.stderr
-        assert [row["status"] for row in _receipts(env)] == ["deployed"]
+        assert not marker.exists()
 
-    def test_restart_failure_writes_deploy_failed_receipt(self, station):
-        """A failure AFTER the tree/install advanced must leave a ledger row
-        (architect SF6) — otherwise the next validation hold records
-        'validated' at a HEAD the server never loaded."""
-        env, shims = station["env"], station["shims"]
-        _write_exec(shims / "systemctl", "#!/bin/bash\nexit 1\n")
+    def test_a_marker_holding_zero_is_not_a_live_holder(self, station):
+        """`kill -0 0` SUCCEEDS (it addresses the caller's process group), so a
+        bare liveness probe would read a marker holding 0 as a live holder and
+        refuse every deploy forever, while env.update_in_progress() (pid > 1)
+        reports no deploy at all. The shared predicate floors it."""
+        marker = station["home"] / ".genesis" / "update_in_progress.pid"
+        marker.write_text("0\n")
         r = subprocess.run(
             ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
-            env=env,
+            env=station["env"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        assert not marker.exists()
+
+    def test_refuses_a_live_foreign_marker(self, station):
+        """A LIVE foreign holder (a dashboard update or a restore holding the
+        server stopped) is refused, exactly as restore.sh refuses us — and its
+        marker is left alone."""
+        env = station["env"]
+        marker = station["home"] / ".genesis" / "update_in_progress.pid"
+        holder = subprocess.Popen(["sleep", "30"])
+        try:
+            marker.write_text(f"{holder.pid}\n")
+            r = subprocess.run(
+                ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert r.returncode == 1
+            assert "held by a live process" in r.stderr
+            assert marker.read_text().strip() == str(holder.pid)
+        finally:
+            _kill(holder.pid)
+            holder.wait()
+
+    @staticmethod
+    def _with_upstream(station) -> Path:
+        """Give the fixture tree a real upstream: a clone it tracks as
+        origin/main, so the wrapper's fetch + `merge --ff-only @{u}` runs
+        against real git rather than a shim."""
+        root = station["root"]
+        up = station["tmp"] / "upstream"
+        subprocess.run(["git", "clone", "-q", str(root), str(up)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(up)], check=True)
+        subprocess.run(["git", "-C", str(root), "fetch", "-q", "origin"], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "branch", "-q", "--set-upstream-to=origin/main", "main"],
+            check=True,
+        )
+        return up
+
+    @staticmethod
+    def _commit(repo: Path, msg: str) -> str:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.email=t@local",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                msg,
+            ],
+            check=True,
+        )
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    @staticmethod
+    def _head(repo: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    def test_pull_fast_forwards_to_the_upstream_tip(self, station):
+        """The one line that changes the tree in production: fetch + ff-only
+        merge must land exactly where `git pull --ff-only` would."""
+        up = self._with_upstream(station)
+        tip = self._commit(up, "upstream advanced")
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--wait", "5"],
+            env=station["env"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        assert self._head(station["root"]) == tip
+        assert tip in r.stdout
+
+    def test_a_diverged_tree_aborts_untouched_and_quiet(self, station):
+        """A local commit the upstream lacks: ff-only must refuse, leave the
+        tree exactly where it was, and raise NO alert — nothing advanced, so
+        there is nothing for a human to converge."""
+        up = self._with_upstream(station)
+        self._commit(up, "upstream advanced")
+        local = self._commit(station["root"], "local-only commit")
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--wait", "5"],
+            env=station["env"],
             capture_output=True,
             text=True,
         )
         assert r.returncode != 0
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deploy_failed"]
-        assert rows[0]["note"] == "failed at installed"
-        assert not (station["home"] / ".genesis" / "update_state.json").exists()
+        assert self._head(station["root"]) == local
+        queue = station["home"] / ".genesis" / "alerts" / "queue"
+        assert not (queue.exists() and list(queue.glob("*.json"))), (
+            "a refused merge advanced nothing and must not page anyone"
+        )
+        assert not (station["home"] / ".genesis" / "update_in_progress.pid").exists()
+
+    def test_pull_refuses_a_non_main_branch(self, station):
+        """A pull advances whatever is checked out while every message says
+        main — so off main it refuses rather than deploy the wrong branch."""
+        self._with_upstream(station)
+        subprocess.run(
+            ["git", "-C", str(station["root"]), "checkout", "-qb", "feature"], check=True
+        )
+        before = self._head(station["root"])
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--wait", "5"],
+            env=station["env"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        assert "refusing to pull" in r.stderr
+        assert self._head(station["root"]) == before
+
+    def test_a_zero_fetch_timeout_is_refused(self, station):
+        """`timeout 0` means NO limit, so a zero knob must not silently
+        disable the bound."""
+        self._with_upstream(station)
+        env = dict(station["env"], GENESIS_DEPLOY_FETCH_TIMEOUT="0")
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        assert "must be a positive integer" in r.stderr
+
+    def test_a_hung_fetch_is_bounded(self, station, tmp_path):
+        """Codex P2 (#1804): a remote that accepts the connection then goes
+        silent must not hold the exclusive station lock indefinitely. The
+        fetch runs under a timeout; the knob exists for the suite only."""
+        env = dict(station["env"])
+        real_git = subprocess.run(
+            ["bash", "-c", "command -v git"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        _write_exec(
+            station["shims"] / "git",
+            "#!/bin/bash\n"
+            'for a in "$@"; do [ "$a" = fetch ] && exec sleep 60; done\n'
+            f'exec "{real_git}" "$@"\n',
+        )
+        env["GENESIS_DEPLOY_FETCH_TIMEOUT"] = "2"
+        t0 = time.monotonic()
+        r = subprocess.run(
+            ["bash", str(_WRAPPER), "--wait", "5"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert r.returncode == 1
+        assert "fetch failed or timed out" in r.stderr
+        assert time.monotonic() - t0 < 30, "the fetch bound did not hold"
+        assert not (station["home"] / ".genesis" / "update_in_progress.pid").exists()
 
     def test_install_failure_alerts_and_holds(self, station):
         """Codex P1 (#1804), --no-pull shape: pip install -e removes the old
@@ -390,7 +587,7 @@ class TestCodeOnlyWrapper:
         the package — the running server breaks on its next lazy import, and
         the tree on disk no longer matches the code in memory. The 'installing'
         phase marker (set BEFORE the pip call) is what makes cleanup see this
-        as a post-advance failure: receipt + critical alert, not silence."""
+        as a post-advance failure: a critical alert, not silence."""
         env = station["env"]
         _write_exec(station["root"] / ".venv" / "bin" / "pip", "#!/bin/bash\nexit 1\n")
         r = subprocess.run(
@@ -400,9 +597,6 @@ class TestCodeOnlyWrapper:
             text=True,
         )
         assert r.returncode == 1
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deploy_failed"]
-        assert rows[0]["note"] == "failed at installing"
         queue = station["home"] / ".genesis" / "alerts" / "queue"
         alerts = list(queue.glob("*.json")) if queue.exists() else []
         assert len(alerts) == 1, "an install failure must raise exactly one critical alert"
@@ -411,7 +605,7 @@ class TestCodeOnlyWrapper:
     def test_restart_failure_alerts_and_holds(self, station):
         """Codex P1 (#1804): a failed restart leaves the server down or running
         stale in-memory code against the on-disk tree — indefinitely, because
-        the failure was previously only a ledger row nobody reads live. The
+        nothing surfaced the failure live. The
         cleanup path must raise a critical alert, same doctrine as
         health_failed."""
         env, shims = station["env"], station["shims"]
@@ -429,61 +623,6 @@ class TestCodeOnlyWrapper:
         alert = json.loads(alerts[0].read_text())
         assert alert["severity"] == "critical"
         assert alert["source"] == "deploy-code-only"
-
-    def test_deployed_receipt_flags_a_tracked_dirty_tree(self, station):
-        """pip install -e means the TREE is the install: tracked modifications
-        are served, so a bare 'deployed <sha>' would misname what is serving.
-        The deploy proceeds (an operator's --no-pull tree is deliberate) but
-        the receipt must carry the dirty-tree note (Codex P2 / Devin, #1804)."""
-        env, root = station["env"], station["root"]
-        tracked = root / "served_module.py"
-        tracked.write_text("v1\n")
-        subprocess.run(["git", "-C", str(root), "add", tracked.name], check=True)
-        subprocess.run(
-            ["git", "-C", str(root), "-c", "user.email=t@local", "-c", "user.name=t",
-             "commit", "-qm", "track a served file"],
-            check=True,
-        )
-        tracked.write_text("v2 — dirty\n")
-        r = subprocess.run(
-            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 0, r.stderr
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deployed"]
-        assert "tracked-dirty" in rows[0].get("note", ""), (
-            "a dirty-tree deploy must be flagged on the receipt, not attributed bare"
-        )
-
-    def test_deploy_refuses_the_receipt_when_head_moves_mid_run(self, station):
-        """The exclusive hold coordinates cooperating lock users ONLY — if the
-        checkout moves mid-deploy, 'deployed <old sha>' is a false claim. The
-        health probe stands in for the mover, firing between restart and
-        receipt (Codex P2, #1804)."""
-        env, root, shims = station["env"], station["root"], station["shims"]
-        _write_exec(
-            shims / "curl",
-            "#!/bin/bash\n"
-            f'git -C "{root}" -c user.email=t@local -c user.name=t commit --allow-empty -qm moved\n'
-            "exit 0\n",
-        )
-        r = subprocess.run(
-            ["bash", str(_WRAPPER), "--no-pull", "--wait", "5"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deploy_failed"]
-        assert "HEAD moved" in rows[0]["note"]
-        queue = station["home"] / ".genesis" / "alerts" / "queue"
-        alerts = list(queue.glob("*.json")) if queue.exists() else []
-        assert len(alerts) == 1
-        assert json.loads(alerts[0].read_text())["severity"] == "critical"
 
     def test_worktree_refusal(self, station, tmp_path):
         """The refusal must hold for a linked worktree at an ARBITRARY path —
@@ -521,76 +660,25 @@ class TestCodeOnlyWrapper:
 
 
 class TestRunUnderDeployLock:
-    @staticmethod
-    def _seed_deploy_row(env, sha: str, status: str) -> None:
-        p = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-        p.write_text(
-            json.dumps(
-                {
-                    "ts": "2026-01-01T00:00:00+00:00",
-                    "status": status,
-                    "sha": sha,
-                    "path": "code-only",
-                    "by": "test",
-                }
-            )
-            + "\n"
-        )
-
-    def test_shared_hold_records_validated_sha_on_success(self, station):
-        """A validated receipt requires the ledger's latest deploy outcome for
-        the SHA to be `deployed` — tree identity alone does not prove the
-        serving process loaded it (Devin #1804)."""
-        env, sha = station["env"], station["sha"]
-        self._seed_deploy_row(env, sha, "deployed")
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
-            env=env,
-        )
-        assert r.returncode == 0
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deployed", "validated"]
-        assert rows[1]["sha"] == sha
-
-    @pytest.mark.parametrize("outcome", ["deploy_failed", "health_failed", "deployed_not_started"])
-    def test_no_validated_receipt_after_a_failed_deploy_outcome(self, station, outcome):
-        """Devin #1804: a pull that advanced HEAD then failed leaves the OLD
-        process serving — a `validated` row for that SHA is a false claim and
-        must be withheld (the wrapped command still exits 0)."""
-        env, sha = station["env"], station["sha"]
-        self._seed_deploy_row(env, sha, outcome)
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 0, "the command ran fine — only the receipt claim is withheld"
-        assert "no validated receipt" in r.stderr
-        assert [row["status"] for row in _receipts(env)] == [outcome]
-
-    def test_no_validated_receipt_without_a_deploy_row(self, station):
-        """No deploy receipt for the SHA at all → the serving process is
-        unproven; the validated row is withheld, fail-closed."""
+    def test_failure_propagates(self, station):
         env = station["env"]
         r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 0
-        assert "no validated receipt" in r.stderr
-        assert _receipts(env) == []
-
-    def test_failure_propagates_and_writes_no_receipt(self, station):
-        env = station["env"]
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "false"],
+            ["bash", str(_RUN_UNDER), "--wait", "5", "--", "false"],
             env=env,
         )
         assert r.returncode == 1
-        assert _receipts(env) == []
+
+    def test_receipt_flag_is_gone(self, station):
+        """The receipt ledger was cut from this PR (owner decision, #1804):
+        the flag must be refused, not silently ignored."""
+        r = subprocess.run(
+            ["bash", str(_RUN_UNDER), "--receipt", "--", "true"],
+            env=station["env"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 1
+        assert "unknown argument" in r.stderr
 
     def test_shared_hold_blocks_a_deploy_for_its_whole_run(self, station):
         """#1699's core: the wrapper QUEUES behind a live validation hold."""
@@ -708,135 +796,6 @@ class TestRunUnderDeployLock:
         assert acq.returncode == 0, "the lock must be free once wrapper AND child are gone"
 
 
-class TestRunUnderReceiptScope:
-    def test_receipt_refused_with_an_exclusive_hold(self, station):
-        """A `validated` receipt claims the recorded SHA was SERVING for the whole
-        run. The SHA is read before the command, and an exclusive hold is the writer
-        mode — it permits a command that moves the checkout, after which the receipt
-        names the old SHA. A false claim in the ledger built to make the claim
-        trustworthy (CodeRabbit Major, 2026-09-06)."""
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--exclusive", "--receipt", "--", "true"],
-            env=station["env"],
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1
-        assert "requires a SHARED hold" in r.stderr
-        assert _receipts(station["env"]) == []
-
-    def test_receipts_write_into_a_directory_that_does_not_exist_yet(self, station, tmp_path):
-        """Append mode raises when the parent is missing and the appender only WARNS,
-        so the row would vanish with a stderr line nobody reads — in the ledger that
-        is the whole point of the feature. Exercised at the appender: a validation
-        hold can no longer reach it (its `validated` write is gated on a `deployed`
-        row, which presupposes the ledger already exists — Devin #1804)."""
-        env = dict(station["env"])
-        env["GENESIS_DEPLOY_RECEIPTS"] = str(tmp_path / "fresh" / "nested" / "receipts.jsonl")
-        r = subprocess.run(
-            [
-                "bash",
-                "-c",
-                f'source "{_LIB}"; append_deploy_receipt "deployed" "$1" "code-only"',
-                "-",
-                station["sha"],
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 0, r.stderr
-        rows = _receipts(env)
-        assert [row["status"] for row in rows] == ["deployed"]
-
-    def test_receipt_refused_from_a_worktree_copy(self, station, tmp_path):
-        """--receipt's SHA claim is about the SERVING tree (architect SF4): a
-        worktree copy recording its branch HEAD as 'validated' would falsify
-        the ledger's core attribution. The worktree sits at an arbitrary path
-        with no marker substring — Git's git-dir/common-dir split catches it
-        (Codex P2, #1804)."""
-        env = dict(station["env"])
-        wt = tmp_path / "elsewhere" / "validation"
-        subprocess.run(
-            ["git", "-C", str(station["root"]), "worktree", "add", "--detach", "-q", str(wt)],
-            check=True,
-        )
-        env["GENESIS_DEPLOY_ROOT"] = str(wt)
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--", "true"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1
-        assert "serving tree" in r.stderr
-        assert _receipts(env) == []
-
-    def test_receipt_refused_when_the_command_moved_head(self, station):
-        """The shared hold coordinates cooperating lock users ONLY — the wrapped
-        command itself can still commit or check out another revision, and the
-        pre-read SHA would then attribute the run to a tree it did not validate
-        (Codex P2, #1804). Verify identity at receipt time; refuse instead."""
-        env = station["env"]
-        root = station["root"]
-        r = subprocess.run(
-            [
-                "bash",
-                str(_RUN_UNDER),
-                "--receipt",
-                "--wait",
-                "5",
-                "--",
-                "git",
-                "-C",
-                str(root),
-                "-c",
-                "user.email=t@local",
-                "-c",
-                "user.name=t",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "moved",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1
-        assert "HEAD moved" in r.stderr
-        assert _receipts(env) == []
-
-    def test_receipt_refused_on_a_tracked_dirty_tree(self, station):
-        """pip install -e means the tree IS the install: uncommitted TRACKED
-        modifications are served, so a 'validated <HEAD>' receipt on a dirty
-        tree names code that was not what ran (Codex P2, #1804)."""
-        env = station["env"]
-        tracked = station["root"] / "deploy_code_only_marker"
-        tracked.write_text("clean\n")
-        subprocess.run(
-            ["git", "-C", str(station["root"]), "add", tracked.name],
-            check=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(station["root"]), "-c", "user.email=t@local", "-c", "user.name=t",
-             "commit", "-qm", "track the marker"],
-            check=True,
-        )
-        tracked.write_text("dirty now\n")
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1
-        # The pre-run probe fires first: a tree dirty at acquire time can never
-        # produce an honest `validated <HEAD>` receipt (Codex P2, #1804).
-        assert "uncommitted" in r.stderr
-        assert _receipts(env) == []
-
-
 class TestGuardianComposition:
     """The wrapper's guardian pause/resume leg, with a fixture gateway: a
     guardian_remote.yaml in the fake HOME, an ssh shim that logs verbs, and a
@@ -889,27 +848,6 @@ class TestGuardianComposition:
         assert "resume" in log.splitlines()[-1], (
             "resume must fire on the alert-and-hold exit (cleanup composition)"
         )
-
-
-class TestReceipts:
-    def test_appender_emits_parseable_ordered_lines(self, station):
-        env = station["env"]
-        for i, status in enumerate(["deployed", "validated"]):
-            subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    f'source "{_LIB}"; append_deploy_receipt "{status}" "sha{i}" "code-only"',
-                ],
-                env=env,
-                check=True,
-            )
-        rows = _receipts(env)
-        assert [(r["status"], r["sha"]) for r in rows] == [
-            ("deployed", "sha0"),
-            ("validated", "sha1"),
-        ], "receipts must append in order — the ledger's ordering IS the claim"
-        assert all(r["ts"] for r in rows)
 
 
 class TestLockFdIsNotLeakedToChildren:
@@ -1127,176 +1065,3 @@ class TestLockErrorsAreReportedHonestly:
             "a flock usage error must not be reported as 'the lock is held'"
         )
         assert broken.returncode == 1
-
-
-class TestReceiptsPrune:
-    def test_prunes_to_the_cap_keeping_the_newest(self, station):
-        env = station["env"]
-        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-        keep = int(
-            subprocess.run(
-                ["bash", "-c", f'source "{_LIB}"; echo "$_DEPLOY_RECEIPTS_KEEP"'],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-        )
-        receipts.write_text("".join(f'{{"n": {i}}}\n' for i in range(keep + 5)))
-        r = subprocess.run(
-            ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 0, r.stderr
-        rows = [json.loads(x) for x in receipts.read_text().splitlines() if x.strip()]
-        assert len(rows) == keep
-        assert rows[-1]["n"] == keep + 4, "the NEWEST receipts are the ones kept"
-        assert not (receipts.parent / f"{receipts.name}.tmp").exists()
-
-    def test_under_the_cap_is_left_alone(self, station):
-        env = station["env"]
-        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-        receipts.write_text('{"n": 0}\n{"n": 1}\n')
-        subprocess.run(
-            ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
-            env=env,
-            check=True,
-        )
-        assert receipts.read_text() == '{"n": 0}\n{"n": 1}\n'
-
-    def test_busy_station_skips_rather_than_queues(self, station):
-        """A daily groom must never queue behind a 2h validation hold."""
-        env = station["env"]
-        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-        receipts.write_text('{"n": 0}\n')
-        # Bound the holder by the assertion, not by a short sleep: a 1.5s hold
-        # can expire before the probe subprocess starts on a loaded CI runner,
-        # and the probe would then read a FREE station as "skipped"
-        # (CodeRabbit, #1804). Killed in the finally via exec sleep.
-        holder = _hold_lock(env, "sh", 60)
-        try:
-            r = subprocess.run(
-                ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
-                env=env,
-                timeout=30,
-            )
-            assert r.returncode == 2, "busy station must report skip, not success"
-        finally:
-            _kill(holder.pid)
-            holder.wait(timeout=10)
-
-    def test_setup_failure_is_not_reported_as_contention(self, station):
-        """An unusable lock path is a FAULT, not a busy station: mapping it to 2
-        makes disk_hygiene skip forever while the ledger grows unpruned, and the
-        failure never surfaces (Codex P3 / CodeRabbit Minor, #1804)."""
-        env = dict(station["env"])
-        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-        receipts.write_text('{"n": 0}\n')
-        # A regular file where the lock's parent DIR must be: mkdir -p fails.
-        blocker = station["tmp"] / "not-a-dir"
-        blocker.write_text("x")
-        env["GENESIS_DEPLOY_LOCK"] = str(blocker / "station.lock")
-        r = subprocess.run(
-            ["bash", "-c", f'source "{_LIB}"; prune_deploy_receipts'],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1, (
-            f"a lock SETUP failure must propagate 1, not the contention rc — got {r.returncode}"
-        )
-
-    def test_disk_hygiene_calls_the_lib_not_its_own_copy(self):
-        """The prune moved into the lib so it could be tested; the groom must
-        CALL it rather than keep a second implementation (replica drift)."""
-        text = (_SCRIPTS / "disk_hygiene.sh").read_text()
-        assert "prune_deploy_receipts" in text
-        assert "_DEPLOY_RECEIPTS_KEEP" not in text, (
-            "the cap belongs to the lib; a copy here would drift"
-        )
-
-    def test_rewrite_failure_propagates_not_zero(self, station):
-        """A rewrite that cannot complete (the .tmp path is an orphaned
-        directory, the fs is full, mv is denied) must NOT return 0 — otherwise
-        disk_hygiene reports success daily while the ledger stays over cap
-        (Codex P2, #1804)."""
-        env = dict(station["env"])
-        receipts = Path(env["GENESIS_DEPLOY_RECEIPTS"])
-        receipts.write_text("".join(f'{{"n": {i}}}\n' for i in range(10)))
-        # A directory where the .tmp FILE must be: the tail redirect fails.
-        Path(str(receipts) + ".tmp").mkdir()
-        r = subprocess.run(
-            ["bash", "-c",
-             f'source "{_LIB}"; _DEPLOY_RECEIPTS_KEEP=5; prune_deploy_receipts'],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert r.returncode == 1, (
-            f"a failed rewrite must surface nonzero — got {r.returncode}"
-        )
-        assert receipts.read_text().count("\n") == 10, "ledger must be untouched"
-
-
-class TestServingDiffAndPrecheck:
-    """The receipt probes must see everything the editable install serves:
-    tracked changes anywhere + UNTRACKED files under code-bearing paths —
-    and a --receipt run must refuse a tree that was dirty at ACQUIRE time,
-    not only at receipt time (Codex P2s, #1804)."""
-
-    def test_untracked_code_under_src_marks_the_tree_dirty(self, station):
-        root = station["root"]
-        (root / "src" / "genesis").mkdir(parents=True)
-        (root / "src" / "genesis" / "sneaky.py").write_text("x = 1\n")
-        r = subprocess.run(
-            ["bash", "-c", f'source "{_LIB}"; deploy_tree_serving_diff "$1"', "_", str(root)],
-            env=station["env"], capture_output=True, text=True,
-        )
-        assert r.returncode == 0
-        assert "sneaky.py" in r.stdout
-
-    def test_untracked_scratch_outside_code_paths_stays_excluded(self, station):
-        root = station["root"]
-        (root / "scratch-note.txt").write_text("local scratch\n")
-        r = subprocess.run(
-            ["bash", "-c", f'source "{_LIB}"; deploy_tree_serving_diff "$1"', "_", str(root)],
-            env=station["env"], capture_output=True, text=True,
-        )
-        assert r.returncode == 0
-        assert r.stdout.strip() == ""
-
-    def test_receipt_refused_when_tree_dirty_at_acquire(self, station):
-        """`pytest; git checkout -- .` used to pass the post-command probe —
-        the receipt then claimed HEAD for code HEAD never contained."""
-        env = station["env"]
-        tracked = station["root"] / "marker.txt"
-        tracked.write_text("v1\n")
-        subprocess.run(
-            ["git", "-C", str(station["root"]), "add", "marker.txt"], check=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(station["root"]), "-c", "user.email=t@local",
-             "-c", "user.name=t", "commit", "-qm", "track marker"], check=True,
-        )
-        tracked.write_text("dirty\n")
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--", "true"],
-            env=env, capture_output=True, text=True,
-        )
-        assert r.returncode == 1
-        assert "uncommitted" in r.stderr
-        assert _receipts(env) == []
-
-    def test_receipt_refused_when_untracked_code_added_mid_run(self, station):
-        env = station["env"]
-        r = subprocess.run(
-            ["bash", str(_RUN_UNDER), "--receipt", "--wait", "5", "--",
-             "bash", "-c",
-             'mkdir -p "$GENESIS_DEPLOY_ROOT/src/genesis" && echo x=1 > "$GENESIS_DEPLOY_ROOT/src/genesis/late.py"'],
-            env=env, capture_output=True, text=True,
-        )
-        assert r.returncode == 1
-        assert "uncommitted" in r.stderr
-        assert _receipts(env) == []
