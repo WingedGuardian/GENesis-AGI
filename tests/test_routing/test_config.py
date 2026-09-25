@@ -220,7 +220,7 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["judge"].chain == [
         "openrouter-deepseek-v4",
         "nvidia-nim-deepseek",
-        "openrouter-deepseek-flash",
+        "openrouter-deepseek-v4-flash",
     ]
     assert cfg.call_sites["judge"].default_paid is True
     assert cfg.call_sites["judge"].dispatch == "api"
@@ -240,7 +240,7 @@ def test_load_full_yaml(monkeypatch):
         "mistral-medium-free",
     ]
     assert cfg.call_sites["31_outcome_classification"].chain == [
-        "glm",
+        "glm51",
         "mistral-large-free",
         "mistral-medium-free",
     ]

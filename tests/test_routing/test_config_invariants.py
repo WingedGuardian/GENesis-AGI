@@ -96,8 +96,8 @@ def test_default_judge_chain_has_no_duplicates_and_mirrors_config():
         "offline judge chain drifted from the runtime judge call site"
     )
     # the known-down-primary lever reorders without duplicating
-    led = default_judge_chain("openrouter-deepseek-flash")
-    assert led[0] == "openrouter-deepseek-flash"
+    led = default_judge_chain("openrouter-deepseek-v4-flash")
+    assert led[0] == "openrouter-deepseek-v4-flash"
     assert len(led) == len(set(led)), f"duplicate after reorder: {led}"
 
 
