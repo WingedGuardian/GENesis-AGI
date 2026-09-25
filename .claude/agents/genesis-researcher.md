@@ -22,7 +22,7 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 
 - **`gh search repos "query" --limit 10`** — Find repos by topic/description. Via Bash.
 - **`gh search code "query" --limit 10`** — Search code across all public repos. Via Bash.
-- **`web_fetch("https://grep.app/search?q=QUERY")`** — Semantic code search across GitHub. Better than GitHub native search for finding implementation patterns.
+- **`searchGitHub`** (the `grep-app` MCP server, `https://mcp.grep.app`, no API key) — LITERAL/regex code search over ~1M public repos. Query with real code (`useState(`, `def handle_`, `(?s)try {.*await`), never keywords or a question; it greps, it does not embed. Filter by `language`, `repo`, `path`; modify with `useRegexp`, `matchCase`, `matchWholeWords`. **Foreground sessions only** — a background research session gets health/memory/recon and nothing else, and `Bash` is denied to it as well (`PROFILES["research"]`), so the `gh` fallbacks above are unavailable there too. **There is no exact-code search in a background session, and no substitute for one**: `recon_github_search` finds repositories and issues, never code (`kind` accepts only `repositories`/`issues`), and `web_search` is semantic. Do the code search from a foreground session, or hand the session a concrete question its own tools can answer. Issue #2329 tracks exposing this as a Genesis-owned recon tool, which is what would close the gap.
 - **`gh api search/repositories?q=QUERY`** — Structured JSON results. Via Bash.
 
 **When to use:** Any time the prompt asks to "search GitHub," "find repos," "look for libraries," or "how do other projects handle X." These are FAR more targeted than web search for code discovery.
@@ -46,7 +46,8 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 | Fetch failed on anti-bot/paywall/JS | `web_fetch(url, backend="firecrawl")` (paid, last resort) |
 | Search the internet | `web_search(query)` |
 | Search GitHub repos | `gh search repos "query"` via Bash |
-| Search GitHub code | `gh search code "query"` or grep.app via `web_fetch` |
+| Search GitHub code (exact pattern) | `gh search code "query"` or `searchGitHub` (`grep-app`) — both foreground-only; no background equivalent exists |
+| Search GitHub code (concept, no pattern) | `web_search(query, backend="exa")` |
 | Find a function/class | CBM `search_graph` or Serena `find_symbol` |
 | Who calls this? | Serena `find_referencing_symbols` |
 | Call chain trace | CBM `trace_path` |
