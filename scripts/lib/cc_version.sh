@@ -28,6 +28,60 @@ CC_VERSION="${CC_VERSION:-2.1.280}"
 # host VM via the guardian-gateway `update-node` op — mirroring `update-cc`.
 NODE_MAJOR="${NODE_MAJOR:-22}"
 
+# Claude Code cuts every MCP tool description and server instruction at 2,048
+# characters (it logs the cut to its per-server mcp-logs and marks the text
+# `… [truncated]`, but the tail never reaches the model). CC 2.1.280 added
+# CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH to raise it. MEASURED on a live install
+# (2026-09-22): four third-party tools were cut (the longest 4,991 chars); at
+# 8,192 all arrive whole for roughly +1,200 tokens per session. Genesis's OWN
+# tools are kept under 2,048 regardless (tests/test_mcp/test_tool_description_
+# budget.py), because a description that relies on this lever is still cut on
+# an older CC or an install where the setting is absent.
+CC_MCP_DESCRIPTION_LIMIT="${CC_MCP_DESCRIPTION_LIMIT:-8192}"
+# A non-numeric override would be written into settings.json verbatim, and CC
+# reads the key as `env.X ?? <default>` — `??` falls back only on null/undefined,
+# so a garbage string would reach a numeric comparison. Reject it here.
+# Zero and leading-zero spellings are refused too: 0 is not a usable cap, and a
+# leading zero is ambiguous to any reader that parses it as octal. Said out loud,
+# never silently replaced.
+case "$CC_MCP_DESCRIPTION_LIMIT" in
+    ''|*[!0-9]*|0*)
+        echo "  cc_version: CC_MCP_DESCRIPTION_LIMIT='${CC_MCP_DESCRIPTION_LIMIT}' is not a" \
+             "positive integer — using 8192" >&2
+        CC_MCP_DESCRIPTION_LIMIT=8192
+        ;;
+esac
+
+# The CONTAINER-side user-settings defaults, all SET IF ABSENT (an operator value
+# is never overwritten). ONE list, passed by every container path that reconciles
+# ~/.claude/settings.json — install.sh (first run), cc_ensure_local (install.sh /
+# bootstrap.sh / update.sh) and cc_settings_align.sh (the daily timer) — so a
+# default added here reaches EXISTING installs on their next deploy or tick, not
+# only fresh clones (it used to be install.sh alone, which is the first-run
+# installer, not the deploy path). A first write of new defaults reports the
+# `defaults` state, never `repaired`.
+# host-setup.sh deliberately does NOT pass it: the host's recovery `claude -p` is
+# single-brain (never nests), runs no Genesis MCP server, and is not where a
+# claude.ai account's skills would be used.
+#   CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2 — CC 2.1.217+ made nesting opt-in;
+#       Genesis allows ONE level (session -> subagent -> subagent).
+#   CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH — see CC_MCP_DESCRIPTION_LIMIT above.
+#   syncClaudeAiSkills / syncClaudeAiPlugins=false — top-level booleans (CC
+#       2.1.275+). NOTE CC's own semantics: turning skill sync off moves skills
+#       ALREADY synced to ~/.claude/skills/.trash at the next launch (deleted after
+#       cleanupPeriodDays; re-downloaded, not restored, if re-enabled). Because this
+#       list reaches EXISTING installs, an install that was syncing loses its synced
+#       skills on its next deploy or settings tick. To keep the sync, set either key
+#       to `true` explicitly — an existing value is never touched.
+# To opt out of ANY default here, set that key to your own value; this list only
+# fills keys that are ABSENT (so deleting a key is not an opt-out — it is refilled).
+CC_CONTAINER_SETTINGS_DEFAULTS=(
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"
+    "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=${CC_MCP_DESCRIPTION_LIMIT}"
+    "top:syncClaudeAiSkills=false"
+    "top:syncClaudeAiPlugins=false"
+)
+
 # Known CC install prefixes (bin dirs), probed when `command -v claude` fails —
 # a PATH-blind install (user npm prefix whose PATH export only fires in
 # interactive shells) must be treated as installed, not reinstalled forever.
@@ -79,8 +133,30 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # three ways: clock rollback, snapshot restore, same-second overwrite).
 _CC_SUPP_OUTCOME_FILE="${HOME:-}/.genesis/cc_suppression_outcome"
 
+# The ONE definition of what each CC_SUPPRESSION_STATE value means to a caller.
+# Readers used to list the good states by hand in their own `case` arms; adding a
+# state then meant editing every reader, and missing one was silent (a reader that
+# did not know `defaults` would warn on every existing install's first deploy).
+#   verified — suppression is in effect after this call (nothing to warn about).
+#   clean    — verified AND nothing was wrong: no drift to record or escalate.
+cc_suppression_verified() {
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|defaults|repaired) return 0 ;;
+    esac
+    return 1
+}
+cc_suppression_clean() {
+    case "${CC_SUPPRESSION_STATE:-unverified}" in
+        ok|defaults) return 0 ;;
+    esac
+    return 1
+}
+
 _cc_supp_persist_outcome() {
-    [ "${CC_SUPPRESSION_STATE:-unverified}" = "ok" ] && return 0
+    # `defaults` is not persisted either: nothing was wrong (both suppression
+    # keys were already correct), and this breadcrumb's only reader (update.sh)
+    # folds whatever it finds into the deploy's degraded list.
+    cc_suppression_clean && return 0
     # A failed mkdir loses the channel exactly as a failed WRITE does — the
     # breadcrumb can never land in a directory that does not exist. This used
     # to be `|| return 0`: with ~/.genesis present-as-a-FILE (or uncreatable),
@@ -141,7 +217,7 @@ cc_ensure_updater_suppressed() {
     # "$@" MUST be forwarded: the inner function takes an optional settings
     # path ($1) and optional extra defaults ("$@"). Dropping it silently
     # discards both for any caller that uses them.
-    # shellcheck disable=SC2120  # optional args by design; no current caller passes any
+    # shellcheck disable=SC2120  # optional args by design (settings path + CC_CONTAINER_SETTINGS_DEFAULTS)
     # shellcheck disable=SC2034  # cross-file: update.sh folds this into HOST_CC_DEGRADED
     CC_SUPPRESSION_BREADCRUMB_LOST=0
     _cc_ensure_updater_suppressed_inner "$@" || _rc=$?
@@ -175,8 +251,10 @@ _cc_ensure_updater_suppressed_inner() {
     # duplicates the write contract (mode/xattr carry-over, CAS, fsync).
     local -a extra_defaults=("$@")
     # Outcome for callers that surface health (update.sh folds a non-ok value into
-    # HOST_CC_DEGRADED -> update_history -> deploy health). `ok` | `repaired` |
-    # `failed` | `contended` | `unverified`. A stderr line alone is not a signal —
+    # HOST_CC_DEGRADED -> update_history -> deploy health). `ok` | `defaults` |
+    # `repaired` | `failed` | `contended` | `unverified`. `ok` and `defaults`
+    # both mean "suppression verified, nothing wrong"; every consumer must treat
+    # them alike (see the state assignment at the end of this function). A stderr line alone is not a signal —
     # it dies in a long deploy log.
     #
     # The entry value is PESSIMISTIC on purpose. This used to start at `ok`,
@@ -759,19 +837,29 @@ PYEOF
     fi
 
     if [ -n "$out" ]; then
-        # A write landed and was verified by the post-write re-read. `repaired`
-        # for both shapes — the timer's repeat-repair escalation is safe because
-        # only install.sh passes defaults, and a set-if-absent default can be
-        # written at most once — but the MESSAGE must not cry "suppression was
-        # MISSING" over a defaults-only write.
-        CC_SUPPRESSION_STATE=repaired
+        # A write landed and was verified by the post-write re-read. Two shapes,
+        # two STATES, because their readers must react differently:
+        #   repaired — a suppression key was missing/wrong and was restored. Drift
+        #              was real, so update.sh records it and the settings timer
+        #              escalates a SECOND consecutive one.
+        #   defaults — both suppression keys were already correct; only
+        #              set-if-absent defaults were added. Nothing was wrong. This
+        #              is what EVERY existing install reports once, the first time
+        #              a new default reaches it (CC_CONTAINER_SETTINGS_DEFAULTS is
+        #              passed on every container reconcile path) — so it must never
+        #              read as a degraded deploy. It repeats only if something
+        #              DELETES the key (the timer re-adds an absent default daily);
+        #              an operator opts out with an explicit value, never by
+        #              deleting the key.
         # The two EXACT names, space-delimited — a glob on `DISABLE_` would also
         # fire for any default whose name merely contains it.
         case " $out " in
             *" DISABLE_AUTOUPDATER "*|*" DISABLE_UPDATES "*)
+                CC_SUPPRESSION_STATE=repaired
                 echo "  ! CC auto-updater suppression was MISSING in $settings_file — restored: $out" >&2
                 ;;
             *)
+                CC_SUPPRESSION_STATE=defaults
                 echo "  . set-if-absent default(s) applied to $settings_file: $out" \
                      "(suppression keys verified present)" >&2
                 ;;
@@ -814,7 +902,8 @@ cc_ensure_local() {
     # pin", which returns early, and that steady state is exactly when settings
     # drift would otherwise go unnoticed. Non-fatal: a failure here must never
     # stop the version align.
-    cc_ensure_updater_suppressed || true
+    # "" selects the default settings path, exactly as a bare call does.
+    cc_ensure_updater_suppressed "" "${CC_CONTAINER_SETTINGS_DEFAULTS[@]}" || true
 
     local pin="${CC_VERSION:-}"
     if [ -z "$pin" ]; then

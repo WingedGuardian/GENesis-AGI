@@ -1,0 +1,6 @@
+- **Existing installs now receive Genesis's Claude Code settings defaults**, not just fresh ones: on the next `update.sh` run or daily settings check, the container's `~/.claude/settings.json` gains any of these that are not already set. Values you have set yourself are never changed.
+  - `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`: one level of nested subagents.
+  - `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192`: MCP tool descriptions longer than Claude Code's 2,048-character default, such as some third-party code-intelligence tools, now reach the model whole, for roughly 1,200 extra tokens per session.
+  - `syncClaudeAiSkills` and `syncClaudeAiPlugins` set to `false`: stops syncing your claude.ai account's skills and plugins into this machine's Claude Code. **If that machine was syncing claude.ai skills, they stop working immediately and Claude Code moves them to `~/.claude/skills/.trash` at its next launch.** Turning sync back on downloads them again rather than restoring them. To keep syncing, set either key to `true` before updating; deleting a key is not an opt-out, because an absent key is filled back in.
+
+  The host VM is not changed. Adding these defaults is not reported as a degraded deploy.

@@ -188,7 +188,11 @@ unset CC_SUPPRESSION_STATE
 
 # Deliberately quiet on the common path: this runs on a timer, and a line per run
 # would train the operator to ignore the journal for this unit.
-cc_ensure_updater_suppressed || true
+# The SAME set-if-absent container defaults every other container path passes —
+# without them this timer would heal only the two suppression keys, and an install
+# that predates a default would receive it only on its next deploy. "" selects the
+# default settings path, exactly as a bare call does.
+cc_ensure_updater_suppressed "" "${CC_CONTAINER_SETTINGS_DEFAULTS[@]}" || true
 
 if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
     echo "cc_settings_align: cc_ensure_updater_suppressed did not set" \
@@ -208,6 +212,15 @@ _persist_outcome "${CC_SUPPRESSION_STATE}" || exit 3
 
 case "${CC_SUPPRESSION_STATE:-unverified}" in
     ok)
+        exit 0
+        ;;
+    defaults)
+        # Suppression was already correct; only set-if-absent defaults were added
+        # (the reconciler's line above names them). One line, exit 0: this happens
+        # once per install per new default, and again only if something deletes
+        # the key — neither drift in the suppression keys nor a reason to fail the
+        # unit. (An operator opts out with an explicit value, not by deleting.)
+        echo "cc_settings_align: suppression verified; new set-if-absent default(s) applied"
         exit 0
         ;;
     repaired)

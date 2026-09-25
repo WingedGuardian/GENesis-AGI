@@ -629,7 +629,7 @@ class TestTopLevelDefaults:
         s.parent.mkdir(parents=True, exist_ok=True)
         s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}))
         r = self._call(tmp_path, "top:syncClaudeAiPlugins=false")
-        assert "STATE=repaired" in r.stdout
+        assert "STATE=defaults" in r.stdout, "suppression was intact; only a default was added"
         assert json.loads(s.read_text())["syncClaudeAiPlugins"] is False
         assert "syncClaudeAiPlugins" in r.stderr, "the write must be reported, not silent"
         assert "MISSING" not in r.stderr, "a defaults-only write is not a suppression repair"
@@ -897,25 +897,166 @@ class TestCallerWiring:
         src = (_REPO_ROOT / "scripts" / "cc_align_host.sh").read_text()
         assert "cc_ensure_updater_suppressed" not in src
 
-    def test_install_sh_passes_the_nesting_default_through_one_call(self) -> None:
-        src = (_REPO_ROOT / "scripts" / "install.sh").read_text()
-        # One call, one atomic write: the env nesting default AND the two
-        # top-level sync opt-outs. The sync keys MUST use the `top:` form — as
-        # env KEY=VALUE they would land as the string "false" inside `env`,
-        # where CC never reads them, and the opt-out would silently not exist.
-        call = (
-            'cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2" \\\n'
-            '        "top:syncClaudeAiSkills=false" "top:syncClaudeAiPlugins=false"'
-        )
-        assert call in src, "install.sh must pass all three set-if-absent defaults in one call"
-        assert '"syncClaudeAiSkills=false"' not in src, "sync opt-out passed in env form"
-        # The real invariant is not how often the key is NAMED (a comment and a
-        # manual-fix hint legitimately mention it) but that install.sh no longer
-        # opens its OWN read-modify-write of the settings file.
-        assert 'python3 - "$_settings_file"' not in src, (
+    def test_the_shared_container_defaults_resolve_to_every_key(self) -> None:
+        """CC_CONTAINER_SETTINGS_DEFAULTS is EXECUTED, not grepped: sourcing the
+        library and printing the array is the only reading that says what callers
+        actually receive (a grep passes on an array defined but later emptied)."""
+        out = subprocess.run(
+            ["bash", "-c", f'set -u; source "{_LIB}"; printf "%s\\n" "${{CC_CONTAINER_SETTINGS_DEFAULTS[@]}}"'],
+            capture_output=True, text=True, check=True, timeout=60,
+        ).stdout.split()
+        assert out == [
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2",
+            "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192",
+            # The sync keys MUST use the `top:` form: as env KEY=VALUE they land as
+            # the string "false" inside `env`, where CC never reads them.
+            "top:syncClaudeAiSkills=false",
+            "top:syncClaudeAiPlugins=false",
+        ], out
+
+    @pytest.mark.parametrize("override", ["abc", "8192x", "", "-1"])
+    def test_a_non_numeric_description_limit_override_falls_back(self, override: str) -> None:
+        out = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; echo "$CC_MCP_DESCRIPTION_LIMIT"'],
+            capture_output=True, text=True, check=True, timeout=60,
+            env={"PATH": "/usr/bin:/bin", "CC_MCP_DESCRIPTION_LIMIT": override},
+        ).stdout.strip()
+        assert out == "8192", (override, out)
+
+    def test_every_container_reconcile_path_passes_the_shared_defaults(self) -> None:
+        """The defaults reach EXISTING installs, not only fresh clones.
+
+        They used to ride install.sh alone — the first-run installer, not the
+        deploy path. Every CONTAINER caller of the reconciler now passes the one
+        shared list; the host deliberately passes none. Asserted on the property,
+        not a literal argument list, so adding a default never fails this test.
+        """
+        shared = '"${CC_CONTAINER_SETTINGS_DEFAULTS[@]}"'
+
+        def calls(path: Path) -> list[str]:
+            folded = path.read_text().replace("\\\n", " ")
+            return [
+                ln.strip() for ln in folded.splitlines()
+                if "cc_ensure_updater_suppressed " in ln
+                and not ln.lstrip().startswith("#")
+                and "()" not in ln  # the definition
+                and "declare -F" not in ln
+                and not ln.lstrip().startswith("echo")
+            ]
+
+        container = {
+            "install.sh": _REPO_ROOT / "scripts" / "install.sh",
+            "cc_settings_align.sh": _REPO_ROOT / "scripts" / "cc_settings_align.sh",
+            "cc_version.sh (cc_ensure_local)": _LIB,
+        }
+        for label, path in container.items():
+            found = calls(path)
+            assert found, f"{label}: no cc_ensure_updater_suppressed call found"
+            for call in found:
+                assert shared in call, (
+                    f"{label} calls the reconciler without the shared defaults — "
+                    f"an install that runs this path never receives them: {call}"
+                )
+        host_calls = calls(_REPO_ROOT / "scripts" / "host-setup.sh")
+        assert host_calls, "host-setup.sh: no reconciler call found (test would pass vacuously)"
+        for call in host_calls:
+            assert "CC_CONTAINER_SETTINGS_DEFAULTS" not in call, (
+                f"host-setup.sh must NOT pass container defaults: {call}"
+            )
+        # install.sh must not open its OWN read-modify-write of the settings file.
+        assert 'python3 - "$_settings_file"' not in (
+            _REPO_ROOT / "scripts" / "install.sh"
+        ).read_text(), (
             "install.sh must not run a second read-modify-write on settings.json — "
             "it doubles the lost-update window and duplicates the write contract"
         )
+
+    def test_cc_ensure_local_delivers_the_defaults_to_an_existing_install(
+        self, tmp_path: Path
+    ) -> None:
+        """Behavioural: the deploy path (cc_ensure_local, run by bootstrap.sh and
+        update.sh) seeds the defaults into a PRE-EXISTING correct settings file and
+        reports `defaults`, not `repaired` — so an existing install is not recorded
+        as a degraded deploy. npm is absent from the harness PATH, so the version
+        align skips and only the settings reconcile runs."""
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps(
+            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, "theme": "dark"}
+        ))
+        r = _run(tmp_path, 'cc_ensure_local || true; echo "STATE=$CC_SUPPRESSION_STATE"')
+        assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
+        data = json.loads(s.read_text())
+        assert data["theme"] == "dark"
+        assert data["env"]["CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH"] == "8192"
+        assert data["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "2"
+        assert data["syncClaudeAiSkills"] is False and data["syncClaudeAiPlugins"] is False
+        # Second deploy: nothing absent any more -> untouched, `ok`.
+        r2 = _run(tmp_path, 'cc_ensure_local || true; echo "STATE=$CC_SUPPRESSION_STATE"')
+        assert "STATE=ok" in r2.stdout, (r2.stdout, r2.stderr)
+
+    _STATES = ("ok", "defaults", "repaired", "failed", "contended", "unverified")
+
+    @staticmethod
+    def _block(path: Path, start: str, end: str) -> str:
+        """The REAL reader text between two anchors, so the test executes what the
+        script executes rather than a copy of it."""
+        src = path.read_text()
+        i = src.index(start)
+        j = src.index(end, i)
+        return src[i:j]
+
+    def _run_block(self, tmp_path: Path, block: str, state: str) -> subprocess.CompletedProcess:
+        (tmp_path / "home").mkdir(exist_ok=True)
+        script = (
+            f'set -u; source "{_LIB}"; CC_SUPPRESSION_STATE={state}; '
+            f'HOST_CC_DEGRADED=""\n{block}\necho "DEGRADED=$HOST_CC_DEGRADED"'
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=60,
+            env={"HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"},
+        )
+
+    @pytest.mark.parametrize("script", ["bootstrap.sh", "install.sh"])
+    def test_setup_readers_warn_only_when_suppression_is_not_verified(
+        self, tmp_path: Path, script: str
+    ) -> None:
+        """bootstrap.sh / install.sh step 7 run AS WRITTEN against every state:
+        `ok`, `defaults` and `repaired` are verified (no warning); the rest warn.
+        A reader that did not know `defaults` would warn on every existing
+        install's first deploy after a new default — the regression a reviewer
+        showed the grep-level test could not see."""
+        block = self._block(
+            _REPO_ROOT / "scripts" / script, "if ! cc_suppression_verified; then", "\n    fi\n"
+        ) + "\n    fi\n"
+        for state in self._STATES:
+            r = self._run_block(tmp_path, block, state)
+            warned = "WARNING" in r.stdout
+            assert warned == (state not in {"ok", "defaults", "repaired"}), (script, state, r.stdout)
+
+    def test_update_sh_records_degradation_only_for_real_drift(self, tmp_path: Path) -> None:
+        """update.sh's suppression fold run AS WRITTEN: `ok` and `defaults` record
+        nothing; `repaired` and the failure states are recorded as degraded."""
+        block = self._block(
+            _REPO_ROOT / "scripts" / "update.sh",
+            'if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then',
+            "        cc_shadow_scan || true",
+        )
+        for state in self._STATES:
+            r = self._run_block(tmp_path, block, state)
+            degraded = r.stdout.strip().splitlines()[-1]
+            if state in {"ok", "defaults"}:
+                assert degraded == "DEGRADED=", (state, r.stdout, r.stderr)
+            else:
+                assert degraded == f"DEGRADED=cc_updater_suppression_{state}", (state, r.stdout)
+
+    def test_the_state_predicates_are_the_single_definition(self) -> None:
+        """No reader may hand-list good states again (that is how `defaults` was
+        nearly missed); the predicates own the meaning."""
+        for script in ("bootstrap.sh", "install.sh", "update.sh"):
+            src = (_REPO_ROOT / "scripts" / script).read_text()
+            assert "ok|defaults|repaired" not in src and "ok|repaired" not in src, script
+            assert '!= "ok"' not in src, script
 
 
 class TestSettingsAlignUnit:
@@ -1014,11 +1155,57 @@ class TestSettingsAlignScriptRuns:
         r = subprocess.run(["bash", "-n", str(self._SCRIPT)], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
 
+    # "Already correct" includes the shared container defaults: the timer passes
+    # CC_CONTAINER_SETTINGS_DEFAULTS, so a file holding only the two suppression
+    # keys is an install that has not yet received them.
+    _CORRECT = {
+        "env": {
+            "DISABLE_AUTOUPDATER": "1",
+            "DISABLE_UPDATES": "1",
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2",
+            "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH": "8192",
+        },
+        "syncClaudeAiSkills": False,
+        "syncClaudeAiPlugins": False,
+    }
+
     def test_exits_zero_and_quiet_when_already_correct(self, tmp_path: Path) -> None:
-        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        home = self._seed(tmp_path, self._CORRECT)
         r = self._run_script(home)
         assert r.returncode == 0, r.stdout + r.stderr
         assert r.stdout.strip() == "", "a timer that logs every run trains you to ignore it"
+
+    def test_an_existing_install_receives_the_defaults_once_then_goes_quiet(
+        self, tmp_path: Path
+    ) -> None:
+        """The deploy-path property on the TIMER: tick 1 seeds the defaults
+        (exit 0, one line, never 'MISSING'); tick 2 is silent. A set-if-absent
+        default can be written at most once, so the repeat-repair escalation can
+        never fire on it."""
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        first = self._run_script(home)
+        assert first.returncode == 0, first.stdout + first.stderr
+        assert "MISSING" not in first.stdout, first.stdout
+        assert "default(s) applied" in first.stdout, first.stdout
+        data = json.loads((home / ".claude" / "settings.json").read_text())
+        assert data["env"]["CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH"] == "8192"
+        assert data["syncClaudeAiSkills"] is False
+        second = self._run_script(home)
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert second.stdout.strip() == "", f"tick 2 must be quiet: {second.stdout!r}"
+
+    def test_a_real_repair_after_a_defaults_tick_is_a_first_repair(self, tmp_path: Path) -> None:
+        """`defaults` is persisted as the last outcome; a later genuine repair must
+        not be mistaken for the SECOND consecutive one (which fails the unit)."""
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        assert self._run_script(home).returncode == 0  # defaults tick
+        s = home / ".claude" / "settings.json"
+        data = json.loads(s.read_text())
+        data["env"].pop("DISABLE_UPDATES")
+        s.write_text(json.dumps(data))
+        r = self._run_script(home)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "SECOND consecutive" not in r.stdout, r.stdout
 
     def test_repairs_and_exits_zero(self, tmp_path: Path) -> None:
         home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1"}})
@@ -1394,14 +1581,20 @@ class TestVerifiedByConstruction:
             )
         return d
 
-    def test_a_defaults_only_write_reports_repaired_not_ok(self, tmp_path: Path) -> None:
-        """A run that MODIFIED the file must not report `ok` (= untouched).
+    def test_a_defaults_only_write_reports_defaults_not_ok_or_repaired(self, tmp_path: Path) -> None:
+        """A run that MODIFIED the file must not report `ok` (= untouched) —
+        and a defaults-only write must not report `repaired` either.
 
-        Before this contract, a write that filled only set-if-absent defaults
-        produced rc 0 with EMPTY stdout -- byte-identical to "already correct,
-        nothing written" -- so the caller reported `ok` for a run that wrote.
-        host-setup gates its created-as-root chown handback on `repaired`, so
-        the collapse had a consumer-visible cost, not just a naming one.
+        Before the first contract, a write that filled only set-if-absent
+        defaults produced rc 0 with EMPTY stdout — byte-identical to "already
+        correct, nothing written" — so the caller reported `ok` for a run that
+        wrote. It then reported `repaired`, which update.sh records as a
+        DEGRADED deploy; once the container defaults are passed on every deploy,
+        every existing install would log one false degradation per new default.
+        `defaults` is the third answer: wrote, and nothing was wrong.
+        (host-setup's created-as-root chown handback keys on `repaired`; it
+        passes no defaults, and a defaults-only write can never create the file —
+        an absent file means absent suppression keys, which is `repaired`.)
         """
         s = _settings(tmp_path)
         s.parent.mkdir(parents=True, exist_ok=True)
@@ -1411,7 +1604,10 @@ class TestVerifiedByConstruction:
             'cc_ensure_updater_suppressed "" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=9" || true; '
             'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
         )
-        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
+        assert not (tmp_path / "home" / ".genesis" / "cc_suppression_outcome").exists(), (
+            "a defaults-only write must not leave the breadcrumb update.sh reads as degradation"
+        )
         assert "set-if-absent default(s) applied" in r.stderr
         assert "MISSING" not in r.stderr, (
             "a defaults-only write must not cry 'suppression was MISSING' -- "
