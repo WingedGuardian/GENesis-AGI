@@ -122,13 +122,32 @@ isolation is still load-bearing for you — it is:
   absent.
 
   **This is not the whole class, and it should not be read as one.** The
-  carve-out reaches routes that have a redacted middle state — a response that
-  is still useful with the sensitive field absent. Routes whose entire product
-  IS the stored value have no such state, so credential-gating one removes the
-  function rather than narrowing the response; those remain on
-  `is_authenticated()` pending a product decision, and on a passwordless
-  install they are covered by the network isolation above and by nothing else.
-  Assume the default posture for them, not the carve-out.
+  carve-out is a list of FIELDS — not a property of a route, a helper, or the
+  shape of a response. Three shorter rules were tried here and all three were
+  false, so the list is given explicitly:
+
+  - the `value` of **every** key in the secrets registry (`_KEY_REGISTRY`,
+    parsed from `secrets.env.example`), which is the whole file rather than a
+    sensitive subset;
+  - the backup tier-2 target;
+  - the backup local path, share and username.
+
+  Two properties of that list are easy to get wrong. It **nests rather than
+  partitions**: the backup path, share and username are themselves registry
+  keys, so they appear in the first set as well, reached by a second route. And
+  the same underlying value can be treated **differently by each route that
+  serves it** — the backup config route strips credentials out of the
+  repository URL before returning it, while the secrets registry returns that
+  key's raw value, so a URL with an embedded token is disclosed there and not
+  here. Read the route, not the field name.
+
+  For every field not in that list, assume the default posture above: reads are
+  open, `is_authenticated()` opens up when no password is configured, and
+  network isolation is the control. Do not infer that a route is covered
+  because its response resembles one that is — a route elsewhere can mask
+  values behind an explicit reveal step and still sit outside this entirely,
+  and a route whose entire product IS the stored value has no middle state to
+  offer, so gating it would remove the function rather than narrow it.
 - It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
   not a fixed list, so any route added there in future is exempt by default.
   Today that prefix holds login, logout and an auth-status probe. None of them
@@ -330,7 +349,12 @@ If you suspect a security issue:
 2. Review logs for unauthorized actions or unexpected tool calls.
 3. Check for unexpected file modifications in the Genesis directory.
 4. Rotate all credentials.
-5. Report the incident to project maintainers.
+5. Delete `~/.genesis/flask_secret_key` and restart `genesis-server`. This is
+   what invalidates existing dashboard sessions — changing `DASHBOARD_PASSWORD`
+   alone does **not**. Sessions are signed with that key rather than with the
+   password, so a stolen cookie survives a password change and keeps whatever
+   the session reaches, including the web terminal.
+6. Report the incident to project maintainers.
 
 ## License
 

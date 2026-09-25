@@ -9,7 +9,6 @@ hmac.compare_digest (constant-time, no timing attacks).
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import logging
 import os
@@ -18,7 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import current_app, has_app_context, jsonify, redirect, request, session
+from flask import jsonify, redirect, request, session
 
 from genesis.dashboard._blueprint import blueprint
 
@@ -192,71 +191,46 @@ def has_verified_credential() -> bool:
     backup-config routes — and is what this predicate exists to prevent.
 
     Deliberately session-only: it does NOT accept the internal bearer token.
-    Both current callers are the dashboard's own browser front-end, so no
+    All three current callers are the dashboard's own browser front-end, so no
     machine caller needs it, and a process holding that 0600 token can already
     read the same values straight out of the environment — accepting it here
     would widen the surface while buying nothing.
+
+    NO ROTATION-EVICTION, and the reason is worth keeping because two reviewers
+    asked for it and an earlier revision of this file shipped it. The idea was
+    to bind the session to a keyed tag of the password it was issued against, so
+    rotating the password evicted stale cookies from the disclosure path. It was
+    removed because it is DOMINATED, not because it was expensive: a session
+    carrying a stale tag still satisfies ``is_authenticated``, which is what
+    gates ``routes/terminal.py`` (a bash PTY, so ``cat secrets.env``) and
+    ``routes/references.py`` ``/reveal`` (plaintext credentials, per its own
+    docstring). Rotation would therefore have evicted the holder from ONE
+    credential surface while leaving a shell and a reveal route open — a
+    defence whose absence is not the exposure it appears to be.
+
+    The sharpest leg is not either of those, though, and it is worth stating
+    because it settles the question without depending on the terminal or the
+    reveal route existing at all: with a password configured this predicate and
+    ``is_authenticated`` are the SAME expression, so a stale-tag cookie also
+    satisfied the API mutation gate. Same-origin is decided from a request
+    header a non-browser client sets for itself, so the holder could simply
+    write a NEW dashboard password through the secrets route and then log in
+    cleanly. Rotation-eviction of the READ path was defeated by the WRITE path
+    in one request — not merely dominated, circumventable.
+
+    The harvested-session hazard it was aimed at is addressed at the login route
+    below, which mints nothing when no password is configured — but that guard is
+    PROSPECTIVE, and the distinction matters enough to state rather than imply. A
+    cookie issued by an older revision, on an install that then set a password,
+    still satisfies this predicate. It is not chased here because it is dominated
+    by the same reasoning: that cookie already owns the terminal PTY and the
+    reveal route, so evicting it from value disclosure alone buys nothing. The
+    defence that would actually close it is a session epoch — rotating the Flask
+    signing key, or versioning sessions when the password changes — which evicts
+    every surface at once rather than one. That is a separate change and is not
+    made here.
     """
-    pw = get_dashboard_password()
-    if not pw:
-        return False
-    if session.get("authenticated") is not True:
-        return False
-    # Bind the session to the credential it was issued against, so rotating the
-    # password after a suspected compromise actually evicts the old cookie from
-    # the disclosure path. A session minted before this existed carries no
-    # fingerprint and is refused here — it must log in again to see values.
-    # Deliberately NOT applied to ``is_authenticated``: evicting gates would
-    # narrow access, which this change promises not to do.
-    return hmac.compare_digest(
-        str(session.get("pw_fingerprint", "")), _password_fingerprint(pw)
-    )
-
-
-def _password_fingerprint(password: str) -> str:
-    """A KEYED tag identifying WHICH password a session was issued for.
-
-    Keyed rather than bare, and that is the whole point of it. A Flask session
-    cookie is SIGNED but not ENCRYPTED, so everything inside it is readable by
-    anyone holding the cookie. A plain digest of the password would hand that
-    holder an offline dictionary attack against a password an operator very
-    likely chose by hand — and truncation buys nothing against it, because an
-    attacker testing candidates truncates their own digests the same way.
-    Truncation costs collision resistance, which is not the property under
-    attack. Keying with a secret the client never sees removes the attack.
-
-    NOT a slow KDF, deliberately, and the reasoning is worth keeping because
-    the obvious upgrade does not survive it. A KDF would only help against an
-    attacker who already holds the Flask secret — and such an attacker does not
-    need to crack anything: they forge ``authenticated: True`` directly, which
-    is what the terminal WebSocket gates on. The extra cost would buy defence
-    against someone who already has a shell, while forcing either a
-    per-request delay or a cache that RETAINS a rotated-away plaintext
-    password. Both are worse than the thing they defend.
-
-    The key is the one Flask signed the cookie with, so a fingerprint cannot
-    outlive the cookie carrying it: rotating the secret invalidates the
-    signature and the tag together, and no session is left half-valid.
-
-    Encoded as BYTES with ``surrogateescape`` throughout — the same discipline
-    ``check_bearer_token`` uses. That covers every password the environment can
-    actually deliver: Python decodes ``os.environ`` with ``surrogateescape``, so
-    a value containing bytes that are not valid UTF-8 arrives as U+DC80..U+DCFF
-    and re-encodes to the original bytes. VERIFIED, not assumed — a plain
-    ``.encode()`` raises on exactly those.
-
-    Stated limit: a LONE high surrogate (U+D800..U+DBFF) still raises, because
-    ``surrogateescape`` only reverses the escapes it creates. That range is not
-    producible by the environment decode and would have to be assigned to
-    ``os.environ`` in-process, so it is named here rather than defended against.
-    """
-    key = current_app.secret_key if has_app_context() else None
-    if not key:
-        key = get_or_create_secret_key()
-    if isinstance(key, str):
-        key = key.encode("utf-8", "surrogateescape")
-    message = password.encode("utf-8", "surrogateescape")
-    return hmac.new(key, message, hashlib.sha256).hexdigest()[:16]
+    return bool(get_dashboard_password()) and session.get("authenticated") is True
 
 
 def check_password(input_password: str) -> bool:
@@ -492,7 +466,6 @@ def auth_login():
     if check_password(password):
         session.permanent = True
         session["authenticated"] = True
-        session["pw_fingerprint"] = _password_fingerprint(pw)
         logger.info("Dashboard login successful from %s", ip)
         return jsonify({"status": "ok"})
 

@@ -431,6 +431,11 @@ def test_get_config_strips_creds_and_gates_nas(client):
     assert data["passphrase_set"] is True and data["nas_pass_set"] is True
     # Infra paths/shares are auth-gated — absent for unauthenticated callers.
     assert "nas" not in data and "nas_user" not in data and "local_path" not in data
+    assert "values_withheld" not in data, (
+        "no withheld signal on this route: backup_config_set skips empty values and "
+        "the form sends only non-empty fields, so the clearing hazard it would "
+        "guard cannot occur here"
+    )
     assert data["schedule_interval"] == "6h" and data["schedule_enabled"] is True
 
 

@@ -655,6 +655,16 @@ def backup_config_get():
     # Filesystem paths/shares and the NAS username are infra detail — only for a
     # caller that has PROVED it is the operator. Not ``is_authenticated``: that
     # opens up when no password is set, which disclosed these to the network.
+    # No ``values_withheld`` signal here, deliberately, and the reason is worth
+    # recording because the secrets registry DOES send one and the asymmetry
+    # looks like an oversight. The hazard that flag exists to prevent — an
+    # untouched field submitted as "" and read as a CLEAR — cannot occur on this
+    # route: ``backup_config_set`` below skips empty values outright
+    # (``if local_path:`` and its siblings), and the form sends a field only when
+    # it is non-empty. The SERVER layer is sufficient on its own; the form layer
+    # is a weaker second copy that only covers the browser, since any other
+    # client can post an empty field.
+    # A flag nothing reads, justified by a path that is blocked twice, is debt.
     if has_verified_credential():
         result["local_path"] = _key_value("GENESIS_BACKUP_LOCAL_PATH")
         result["nas"] = _key_value("GENESIS_BACKUP_NAS")

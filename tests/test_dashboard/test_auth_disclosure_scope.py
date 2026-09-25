@@ -23,15 +23,12 @@ behaviour as correct.
 
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 from flask import Flask
 
 # Importing for the side effect of registering routes on the shared blueprint.
 import genesis.dashboard.routes.backup  # noqa: F401
 import genesis.dashboard.routes.secrets  # noqa: F401
-from genesis.dashboard import auth
 from genesis.dashboard._blueprint import blueprint
 
 _FAKE_KEY = "fc-fake-not-a-real-credential-0123456789"
@@ -164,22 +161,6 @@ def test_a_harvested_session_does_not_survive_setting_a_password(app, monkeypatc
     )
 
 
-def test_rotating_the_password_evicts_disclosure_for_old_sessions(app, monkeypatch):
-    """Changing the password after a suspected compromise must mean something."""
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "first")
-    client = app.test_client()
-    assert client.post("/api/genesis/auth/login", json={"password": "first"}).status_code == 200
-    assert _sensitive_values(client.get("/api/genesis/secrets").get_json()), (
-        "guard-the-guard: the session must first be able to see values"
-    )
-
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "second")
-    payload = client.get("/api/genesis/secrets").get_json()
-    assert len(_sensitive_values(payload)) == 0, (
-        "a session bound to the OLD password still discloses after rotation"
-    )
-
-
 def test_backup_config_paths_are_redacted_when_no_password_is_set(app, monkeypatch):
     """Same inversion, lower severity: filesystem paths and a NAS username."""
     monkeypatch.setenv("GENESIS_BACKUP_LOCAL_PATH", "/srv/fake-backup-target")
@@ -187,8 +168,39 @@ def test_backup_config_paths_are_redacted_when_no_password_is_set(app, monkeypat
 
     payload = app.test_client().get("/api/genesis/backup/config").get_json()
 
+    # Guard-the-guard FIRST: an error payload satisfies both absence assertions
+    # below without the route ever having answered, so pin an ungated field.
+    assert payload.get("tier2_backend") is not None, "the route did not answer"
     assert not payload.get("local_path"), "backup path disclosed without a credential"
     assert not payload.get("nas_user"), "NAS username disclosed without a credential"
+
+
+def test_backup_status_target_is_redacted_when_no_password_is_set(app, monkeypatch, tmp_path):
+    """The THIRD disclosure site, and the only one exercised unpatched.
+
+    The other two backup cells in test_backup_config_api.py patch
+    ``has_verified_credential`` directly, which binds the route's branch and says
+    nothing about the predicate's semantics. This module's docstring claims all
+    three sites; without this case that claim covered two.
+    """
+    from genesis.dashboard.routes import backup as bk
+
+    # Point the status file at a path that does not exist. Without this the route
+    # reads THIS MACHINE's real backup_status.json, whose tier2_backend takes
+    # precedence over the environment — the first version of this test failed
+    # against a live install value, which is the hazard as much as the failure.
+    monkeypatch.setattr(bk, "_STATUS_FILE", tmp_path / "no-such-status.json")
+    monkeypatch.setenv("GENESIS_BACKUP_TIER2_BACKEND", "local")
+    monkeypatch.setenv("GENESIS_BACKUP_LOCAL_PATH", "/srv/fake-backup-target")
+
+    payload = app.test_client().get("/api/genesis/backup/status").get_json()
+    tier2 = (payload.get("destinations") or {}).get("tier2") or {}
+
+    # Guard-the-guard: the ungated half must still be present, or an error
+    # payload would satisfy the absence assertion below for the wrong reason.
+    assert tier2.get("backend") == "local", "the status route did not answer"
+    assert "target" not in tier2, "backup target disclosed without a credential"
+    assert "fake-backup-target" not in str(payload)
 
 
 def test_backup_config_paths_are_served_to_an_authenticated_session(app, monkeypatch):
@@ -204,78 +216,16 @@ def test_backup_config_paths_are_served_to_an_authenticated_session(app, monkeyp
 
 
 def test_gates_are_untouched_when_no_password_is_set(app):
-    """Nobody's ACCESS is narrowed — only what gets DISCLOSED changes.
+    """A gate keyed on the same predicate still passes on a passwordless install.
 
-    A gate keyed on the same predicate must still pass on a passwordless
-    install, or this change has quietly become a lockout.
+    SCOPE, stated because the obvious phrasing overclaims: this is ONE gated
+    mutation route, so it is a spot-check against the lockout failure mode, not
+    a proof that no caller anywhere is narrowed. The structural argument for
+    that is separate and lives in ``has_verified_credential``'s docstring — the
+    new predicate is used ONLY at disclosure sites and never replaces a gate, so
+    a gate's behaviour cannot change. This test is the tripwire for that claim
+    being violated by accident, not the evidence for it.
     """
     # A gated MUTATION route stays reachable on a passwordless install.
     resp = app.test_client().post("/api/genesis/recon/watchlist", json={"repo": "owner/name"})
     assert resp.status_code != 401, "a passwordless install must not start refusing gated mutations"
-
-
-def test_password_fingerprint_is_keyed_not_a_bare_digest():
-    """The session tag must not be an offline dictionary attack in a cookie.
-
-    A Flask session cookie is SIGNED but not ENCRYPTED, so everything in it is
-    readable by whoever holds the cookie. A bare digest of the dashboard
-    password would therefore hand that holder a candidate-testing oracle
-    against a password an operator very likely chose by hand — and truncating
-    it changes nothing, because an attacker truncates their own digests the
-    same way. Truncation costs collision resistance, which is not the property
-    under attack here.
-
-    Asserted as three separate properties because only the conjunction is the
-    security claim: not the bare digest, key-dependent, and stable under one
-    key. Drop the third and a "fix" that returns fresh randomness would pass
-    the first two while logging every operator out on each request.
-    """
-    pw = "correct-horse-battery-staple"
-    bare = hashlib.sha256(pw.encode()).hexdigest()[:16]
-
-    app_a = Flask(__name__)
-    app_a.secret_key = "secret-A"
-    app_b = Flask(__name__)
-    app_b.secret_key = "secret-B"
-
-    with app_a.app_context():
-        under_a = auth._password_fingerprint(pw)
-        under_a_again = auth._password_fingerprint(pw)
-    with app_b.app_context():
-        under_b = auth._password_fingerprint(pw)
-
-    assert under_a != bare, "the fingerprint is an unkeyed digest of the password"
-    assert under_a != under_b, "the fingerprint does not depend on the signing key"
-    assert under_a == under_a_again, "the fingerprint is unstable within one key"
-
-
-def test_fingerprint_handles_a_password_the_environment_can_deliver():
-    """A password containing bytes that are not valid UTF-8 must not raise.
-
-    Python decodes ``os.environ`` with ``surrogateescape``, so a password set
-    as raw bytes arrives as U+DC80..U+DCFF. A plain ``.encode()`` raises on
-    exactly those, which would turn the disclosure predicate into a 500 for an
-    operator whose password happens to contain one — a fail-closed crash where
-    a comparison belongs.
-
-    The lone-high-surrogate range (U+D800..U+DBFF) is deliberately NOT covered:
-    ``surrogateescape`` only reverses its own escapes, and that range cannot
-    come from the environment decode. Asserted here so the bound is explicit
-    rather than discovered later.
-    """
-    app = Flask(__name__)
-    app.secret_key = "test-secret-key"
-
-    # Exactly what os.environ yields for a value containing 0xFF 0xFE.
-    from_env = b"pw-\xff\xfe".decode("utf-8", "surrogateescape")
-    assert from_env.encode("utf-8", "surrogateescape") == b"pw-\xff\xfe"
-
-    with app.app_context():
-        tag = auth._password_fingerprint(from_env)
-        assert len(tag) == 16
-        # Distinct from an ordinary password under the same key — the escape
-        # must not collapse to a shared value.
-        assert tag != auth._password_fingerprint("pw-")
-
-    with app.app_context(), pytest.raises(UnicodeEncodeError):
-        auth._password_fingerprint("\ud800")

@@ -293,8 +293,6 @@
         secretsEditing: {},       // key_name → true when input open
         secretsSaving: false,
         secretsValues: {},        // key_name → input value during edit
-        secretsSeeded: {},        // key_name → the value the buffer OPENED with
-        secretsWithheld: false,   // server redacted every value (not logged in)
         // ── First-run onboarding wizard (Setup card on Overview) ──
         setupStatus: null,        // {onboarded,password_set,cc_oauth,llm_key_present,embedding_key_present,floor_met,identity_set}
         setupCardDismissed: false,
@@ -2486,35 +2484,13 @@
         async fetchSecrets() {
           try {
             const resp = await fetchApi("/api/genesis/secrets");
-            if (resp && resp.ok) {
-              const body = await resp.json();
-              this.secretsGroups = body.groups;
-              // Without this the editor cannot tell "not set" from "set but not
-              // readable by you" — the whole reason the server sends it.
-              const wasWithheld = this.secretsWithheld;
-              this.secretsWithheld = !!body.values_withheld;
-              // A SEED taken under the old disclosure state is stale the moment
-              // that state flips. Open a field while values are withheld, log
-              // in elsewhere, let a refresh land, then Save without typing: the
-              // untouched-and-withheld refusal no longer applies, and the empty
-              // seed reaches the clear path for an override the operator never
-              // saw. Drop the seeds so an open field must be re-opened.
-              if (wasWithheld !== this.secretsWithheld) {
-                this.secretsSeeded = {};
-                this.secretsEditing = {};
-                this.secretsValues = {};
-              }
-            }
+            if (resp && resp.ok) { this.secretsGroups = (await resp.json()).groups; }
           } catch (e) { console.warn("Secrets fetch failed:", e); }
         },
         toggleSecretEdit(keyName) {
           const opening = !this.secretsEditing[keyName];
           this.secretsEditing = {...this.secretsEditing, [keyName]: opening};
-          if (!opening) {
-            delete this.secretsValues[keyName];
-            delete this.secretsSeeded[keyName];
-            return;
-          }
+          if (!opening) { delete this.secretsValues[keyName]; return; }
           // SEED the buffer from the current value. Without this it stays undefined
           // until an `input` event, so opening a configured override and pressing
           // Save WITHOUT TYPING reads as empty — and since empty now means "unset",
@@ -2522,9 +2498,7 @@
           // change", never "delete".
           const def = (this.secretsGroups || []).flatMap(g => g.keys || [])
             .find(k => k.key === keyName);
-          const seed = (def && def.value) || '';
-          this.secretsValues = {...this.secretsValues, [keyName]: seed};
-          this.secretsSeeded = {...this.secretsSeeded, [keyName]: seed};
+          this.secretsValues = {...this.secretsValues, [keyName]: (def && def.value) || ''};
         },
         async saveSecret(keyName) {
           const val = (this.secretsValues[keyName] || '').trim();
@@ -2541,23 +2515,9 @@
             this.secretsMessage = {type: 'error', text: 'Value cannot be empty'};
             return;
           }
-          // A WITHHELD value seeds the buffer EMPTY, because the server sent no
-          // value to seed it with — not because the override is unset. So for an
-          // untouched field the two states are indistinguishable from here, and
-          // submitting would clear a configured override the operator cannot even
-          // see. A confirm() does not fix this: it asks "remove the override?"
-          // about a field the user never typed in, so the honest answer is not to
-          // send anything. Refuse, and say how to proceed either way.
-          const untouched = val === (this.secretsSeeded[keyName] || '').trim();
-          if (!val && this.secretsWithheld && untouched) {
-            this.secretsMessage = {type: 'error', text:
-              'Values are hidden until you log in, so this field opened empty ' +
-              'whether or not ' + keyName + ' is set. Nothing was saved. Type a ' +
-              'new value to replace it, or log in to see and clear the current one.'};
-            return;
-          }
-          // Clearing is destructive and easy to do by accident. Where the operator
-          // CAN see the value, emptying it is a deliberate act — confirm it.
+          // Clearing is destructive and easy to do by accident, and seeding the
+          // buffer cannot cover every case — a masked value is not readable, so it
+          // seeds empty. Make the deletion an explicit act.
           if (!val && clearable && !confirm(
                 'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
                 'genesis.yaml or its built-in default.')) {
@@ -2577,7 +2537,6 @@
               if (keyName === 'DASHBOARD_PASSWORD') { await this._establishSession(val); }
               this.secretsEditing = {...this.secretsEditing, [keyName]: false};
               delete this.secretsValues[keyName];
-              delete this.secretsSeeded[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
               this.fetchSecrets();
               // Keep the readiness panel + password nudge in sync: a provider key
