@@ -111,7 +111,7 @@ _write_state() {
     GH_PID="$$" \
     GH_WERE_RUNNING="$(printf '%s\n' "${WERE_RUNNING[@]:-}")" \
     GH_TIMESTAMP="$(date -Iseconds)" \
-    "$VENV_DIR/bin/python" <<'PY'
+    python3 <<'PY'
 import json
 import os
 
@@ -128,9 +128,12 @@ state = {
     "services_stopped": services,
     "timestamp": os.environ["GH_TIMESTAMP"],
 }
-with open(os.environ["GH_STATE_FILE"], "w", encoding="utf-8") as fh:
+state_path = os.environ["GH_STATE_FILE"]
+tmp_path = f"{state_path}.tmp"
+with open(tmp_path, "w", encoding="utf-8") as fh:
     json.dump(state, fh, indent=4)
     fh.write("\n")
+os.replace(tmp_path, state_path)
 PY
 }
 
@@ -139,7 +142,7 @@ _read_json_field() {
     local field="$2"
     [ -f "$file" ] || return 1
     GH_STATE_FILE="$file" GH_FIELD="$field" \
-        "$VENV_DIR/bin/python" -c \
+        python3 -c \
         "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get(os.environ['GH_FIELD'],''))" \
         2>/dev/null
 }
@@ -149,14 +152,19 @@ _read_json_field() {
 # suppression breadcrumb is cleared or the update lock is taken.
 _detect_update_remote() {
     local public_repo
-    public_repo=$(
-        "$VENV_DIR/bin/python" -c \
-        "from genesis.env import github_public_repo; print(github_public_repo())" \
-        2>/dev/null
-    ) || public_repo="GENesis-AGI"
+    public_repo="${GENESIS_GITHUB_PUBLIC_REPO:-$(genesis_local_github_value public_repo || true)}"
+    public_repo="${public_repo:-GENesis-AGI}"
     local remote
     remote=$(git -C "$GENESIS_ROOT" remote -v 2>/dev/null \
-        | awk "/$public_repo.*fetch/{print \$1; exit}")
+        | awk -v repo="$public_repo" '
+            $3 == "(fetch)" {
+                url = $2
+                sub(/\/+$/, "", url)
+                sub(/\.git$/, "", url)
+                n = split(url, parts, "/")
+                if (parts[n] == repo) { print $1; exit }
+            }
+        ')
     echo "${remote:-origin}"
 }
 UPDATE_REMOTE="$(_detect_update_remote)"
@@ -165,6 +173,11 @@ if [[ "$POST_MERGE" == "true" ]]; then
     _saved_prevalidate_deploy_branch="$(_read_json_field "$STATE_FILE" deploy_branch || true)"
     if [ -z "$_saved_prevalidate_deploy_branch" ] && [ -f "$CONFLICT_FILE" ]; then
         _saved_prevalidate_deploy_branch="$(_read_json_field "$CONFLICT_FILE" deploy_branch || true)"
+    fi
+    if [ -n "$_saved_prevalidate_deploy_branch" ] \
+        && ! git check-ref-format --branch "$_saved_prevalidate_deploy_branch" >/dev/null 2>&1; then
+        echo "ERROR: saved deploy branch '$_saved_prevalidate_deploy_branch' is not a valid branch name." >&2
+        exit 1
     fi
 fi
 DEPLOY_BRANCH="${_saved_prevalidate_deploy_branch:-$(genesis_resolve_deploy_branch "$GENESIS_ROOT" "$UPDATE_REMOTE")}"
@@ -752,10 +765,43 @@ _resolve_commit_object() {
     printf '%s\n' "$resolved"
 }
 
+_recorded_deploy_fetch_head() {
+    local resolved fetch_file recorded
+    resolved="$(
+        git -C "$GENESIS_ROOT" rev-parse --verify "$DEPLOY_FETCH_REF^{commit}" 2>/dev/null
+    )" && { printf '%s\n' "$resolved"; return 0; }
+
+    # Legacy crash recovery can predate the private deploy ref. FETCH_HEAD is
+    # the local record of the original fetch, so prefer it over a live fetch
+    # that can fail offline or advance past the merge being resumed.
+    fetch_file="$(git -C "$GENESIS_ROOT" rev-parse --git-path FETCH_HEAD 2>/dev/null)" || return 1
+    case "$fetch_file" in
+        /*) ;;
+        *) fetch_file="$GENESIS_ROOT/$fetch_file" ;;
+    esac
+    [ -f "$fetch_file" ] || return 1
+    recorded="$(
+        awk -v branch="'$DEPLOY_BRANCH'" '
+            {
+                for (i = 2; i < NF; i++) {
+                    if ($i == "branch" && $(i + 1) == branch) {
+                        print $1
+                        exit
+                    }
+                }
+            }
+        ' "$fetch_file" 2>/dev/null
+    )"
+    _resolve_commit_object "$recorded"
+}
+
 _verified_fetch_head=""
 _candidate_is_current_deploy_head() {
     local candidate="$1"
     [ -n "$candidate" ] || return 1
+    if [ -z "$_verified_fetch_head" ]; then
+        _verified_fetch_head="$(_recorded_deploy_fetch_head || true)"
+    fi
     if [ -z "$_verified_fetch_head" ]; then
         _fetch_deploy_refs || return 1
         _verified_fetch_head="$(
@@ -1188,7 +1234,6 @@ _record_update_history() {
     fi
     local db_path="$GENESIS_ROOT/data/genesis.db"
     [ -f "$db_path" ] || return 0
-    [ -x "$VENV_DIR/bin/python" ] || return 0
 
     # Run the insert in Python for parameterized SQL. The inline script
     # distinguishes three exit paths:
@@ -1214,17 +1259,22 @@ _record_update_history() {
         GH_NEW_COMMIT="$NEW_COMMIT" \
         GH_ROLLBACK_TAG="$ROLLBACK_TAG" \
         GH_STARTED_AT="$STARTED_AT" \
-        "$VENV_DIR/bin/python" - <<'PYEOF' 2>&1
+        PYTHONPATH="$GENESIS_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 - <<'PYEOF' 2>&1
 import os
 import sqlite3
 import sys
 import uuid
 from datetime import UTC, datetime
 
-from genesis.db.connection import connect_sqlite_rw
+from pathlib import Path
+
+from genesis.db.admission import assert_admitted
 
 try:
-    con = connect_sqlite_rw(os.environ["GH_DB_PATH"], timeout=5.0)
+    admission_path = Path(os.environ["GH_DB_PATH"]).expanduser()
+    assert_admitted(admission_path)
+    con = sqlite3.connect(str(admission_path.resolve()), timeout=5.0)
     con.execute(
         "INSERT INTO update_history "
         "(id, old_tag, new_tag, old_commit, new_commit, status, rollback_tag, "
@@ -1554,7 +1604,7 @@ done
 echo "--- Merging $UPDATE_REMOTE/$DEPLOY_BRANCH ---"
 MERGE_OUTPUT=""
 MERGE_RC=0
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
+MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$DEPLOY_FETCH_REF" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -1572,14 +1622,14 @@ if [[ $MERGE_RC -ne 0 ]]; then
         # whole conflict context. Filenames with quotes broke the array the same
         # way. Guarded with `if !` (ERR-trap-exempt): a failure to write this
         # advisory supervisor context must NOT trip the armed rollback trap.
-        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo 'untagged')"
-        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_HEAD" 2>/dev/null || echo 'unknown')"
+        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'untagged')"
+        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'unknown')"
         if ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
              UC_ROLLBACK_TAG="$ROLLBACK_TAG" \
              UC_DEPLOY_BRANCH="$DEPLOY_BRANCH" UC_DEPLOY_HEAD="$DEPLOY_HEAD" \
              UC_TARGET_TAG="$_uc_target_tag" UC_TARGET_COMMIT="$_uc_target_commit" \
              UC_FILES="$CONFLICTED_FILES" UC_MERGE_OUTPUT="$MERGE_OUTPUT" \
-             "$VENV_DIR/bin/python" - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
+             python3 - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
 import json
 import os
 from datetime import UTC, datetime
@@ -1646,7 +1696,7 @@ PYEOF
     fi
 fi
 
-if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD; then
+if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_FETCH_REF" HEAD; then
     trap - ERR INT TERM
     _do_rollback "merge completed without activating fetched deploy head $DEPLOY_HEAD"
     exit 1
@@ -1670,9 +1720,9 @@ NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 # src/genesis/observability/snapshots/deploy_health.py.
 _tier2_pending_since_baseline() {
     local _baseline=""
-    if [ -f "$GENESIS_ROOT/data/genesis.db" ] && [ -x "$VENV_DIR/bin/python" ]; then
+    if [ -f "$GENESIS_ROOT/data/genesis.db" ]; then
         _baseline=$(GH_DB_PATH="$GENESIS_ROOT/data/genesis.db" \
-            "$VENV_DIR/bin/python" - 2>/dev/null <<'PYEOF' || true
+            python3 - 2>/dev/null <<'PYEOF' || true
 import os
 import sqlite3
 
@@ -1686,7 +1736,8 @@ PYEOF
         )
     fi
     [ -n "$_baseline" ] || return 1
-    git -C "$GENESIS_ROOT" cat-file -e "${_baseline}^{commit}" 2>/dev/null || return 1
+    _baseline="$(_resolve_commit_object "$_baseline" || true)"
+    [ -n "$_baseline" ] || return 1
     ! git -C "$GENESIS_ROOT" diff --quiet "$_baseline" HEAD -- \
         scripts/systemd scripts/bootstrap.sh scripts/update.sh \
         scripts/lib/cc_version.sh scripts/hooks pyproject.toml 2>/dev/null

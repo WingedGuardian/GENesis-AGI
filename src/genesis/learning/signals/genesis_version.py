@@ -12,6 +12,7 @@ and checks for update failure context files left by update.sh.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -155,7 +156,7 @@ class GenesisVersionCollector:
 
         if should_fetch:
             try:
-                behind, summary = await self._check_upstream()
+                behind, summary, target_commit = await self._check_upstream()
                 self._last_fetch_at = now
 
                 if behind == 0:
@@ -172,7 +173,7 @@ class GenesisVersionCollector:
 
                 if behind > 0:
                     stored = await self._store_update_available(
-                        current_head, behind, summary,
+                        current_head, behind, summary, target_commit,
                     )
                     if stored:
                         await self._notify_update_available(config, behind, summary)
@@ -232,30 +233,33 @@ class GenesisVersionCollector:
             return None
         return stdout.decode().strip()
 
-    async def _check_upstream(self) -> tuple[int, str]:
-        """Fetch upstream and compare release tags.
+    async def _check_upstream(self) -> tuple[int, str, str]:
+        """Fetch upstream and measure the deployed commit's own distance.
 
         Uses the remote pointing to github_public_repo() (e.g. 'public'),
-        falling back to 'origin'. Tag-based comparison is robust against
-        squash-merge divergence — same release tag means same content even
-        if commit SHAs differ.
+        falling back to 'origin'. The fetched commit itself is the target:
+        release tags remain display metadata elsewhere, but a matching nearest
+        tag cannot suppress post-tag commits.
 
-        Returns (0, "") when tags match (up to date).
-        Returns (N, summary) where N is how far the DEPLOYED COMMIT is behind
-        the upstream ref, and summary lists that same range. Not the distance
-        between the release tags — the caller renders this as "N commits
+        Returns (0, "", target_commit) when up to date, otherwise
+        (N, summary, target_commit) where N is how far the DEPLOYED COMMIT is
+        behind the fetched target and summary lists that same range. Not the
+        distance between the release tags — the caller renders this as "N commits
         behind", which a reader takes as their own, and on an install that
         tracks the deploy branch between releases those numbers differ by an
         order of magnitude.
         Raises RuntimeError on git failure.
         """
-        remote, deploy_branch = deploy_target(_GENESIS_ROOT)
-        ref = _UPDATE_CHECK_REF
+        remote, deploy_branch = await asyncio.to_thread(
+            deploy_target, _GENESIS_ROOT
+        )
+        ref = f"{_UPDATE_CHECK_REF}/collector/{uuid.uuid4().hex}"
         tracking_ref = f"refs/remotes/{remote}/{deploy_branch}"
 
-        # Fetch the same deploy target update.sh uses. The private ref gives
-        # this check one immutable fetched commit; the remote-tracking refspec
-        # keeps @{upstream} and FETCH_HEAD freshness describing the same fetch.
+        # Fetch the same deploy target update.sh uses. The per-check ref is a
+        # one-shot name for the fetched commit; resolve the SHA immediately so a
+        # concurrent collector/dashboard check cannot move this measurement's
+        # target, then remove the private ref.
         proc = await asyncio.create_subprocess_exec(
             "git", "fetch", remote,
             f"+refs/heads/{deploy_branch}:{ref}",
@@ -272,92 +276,38 @@ class GenesisVersionCollector:
                 f"git fetch {remote} {deploy_branch} failed (exit {proc.returncode}): {stderr_text}"
             )
 
-        # Get local and remote release tags
-        local_tag = await self._git_output(
-            "describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD",
-        )
-        origin_tag = await self._git_output(
-            "describe", "--tags", "--match", "v*", "--abbrev=0", ref,
-        )
-
-        # If neither side has tags, fall back to commit-based comparison
-        if not local_tag and not origin_tag:
-            return await self._check_upstream_by_commits(ref)
-
-        # If only one side has tags, there's definitely an update
-        if local_tag != origin_tag:
-            # Count from the DEPLOYED COMMIT, never between the release tags.
-            #
-            # This used to count `local_tag..origin_tag`, and the alert that
-            # renders it says "N commits behind" — which every reader takes as
-            # their own distance from the target. Those two numbers diverge by
-            # more than an order of magnitude on any install that tracks the
-            # deploy branch between releases, because the tag moves at a release
-            # and HEAD moves constantly. MEASURED 2026-09-08: the dashboard read
-            # "v3.0b18 (668 commits behind)" on a tree that was 20 commits behind
-            # the b18 tag and 31 behind origin/main. The number was true about the tag range
-            # and false about the reader, which is worse than an arithmetic
-            # error — it wears verified grammar.
-            #
-            # `observability/snapshots/deploy_health.py` already had this right,
-            # and its field name says so: `commits_behind_upstream`, counted
-            # `HEAD..@{upstream}`. This is the same measurement.
-            count_str = await self._git_output("rev-list", "--count", f"HEAD..{ref}")
-            if count_str is None or not count_str.isdigit():
-                # Honour the docstring above rather than substituting a 1. A
-                # fabricated distance is the same defect as the tag-span one
-                # this method was rewritten to fix: it is false about the
-                # reader while wearing verified grammar.
-                # An earlier revision of this comment said "the caller logs and
-                # skips the cycle". It did not: collect() caught this, logged,
-                # and fell through to the explicit 0.0 "up to date" baseline
-                # with failed=False — turning an unknown state into a confident
-                # all-clear, which is the very class being fixed here. The
-                # caller now returns a FAILED reading; that is what makes
-                # raising the right move rather than a quieter bug.
-                raise RuntimeError(
-                    f"git rev-list --count HEAD..{ref} failed; distance unknown"
-                )
-            behind = int(count_str)
-
-            # The summary must describe the SAME range as the count, or the two
-            # halves of one alert disagree: the tag-range version ended "... and
-            # 658 more" beside a count the reader reads as theirs.
-            raw = await self._git_output(
-                "log", "--oneline", "--no-merges", f"HEAD..{ref}",
+        try:
+            target_out = await self._git_output("rev-parse", "--verify", f"{ref}^{{commit}}")
+        finally:
+            cleanup = await asyncio.create_subprocess_exec(
+                "git", "update-ref", "-d", ref,
+                cwd=str(_GENESIS_ROOT),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            summary = raw or ""
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(cleanup.communicate(), timeout=10)
+        if target_out is None:
+            raise RuntimeError(
+                f"git fetch {remote} {deploy_branch} did not leave a measurable head"
+            )
+        target_commit = target_out
 
-            # Truncate to first 10 lines
-            lines = summary.split("\n")
-            if len(lines) > 10:
-                summary = "\n".join(lines[:10]) + f"\n... and {len(lines) - 10} more"
-
-            # No max(behind, 1): when the tags differ but the deployed commit is
-            # not behind the ref, the reader's distance genuinely is 0 and the
-            # caller correctly stays silent. Clamping it to 1 announced an update
-            # that did not exist for this reader, which is the same class of
-            # falsehood as counting the release span.
-            return behind, summary
-
-        # Same tag — up to date
-        return 0, ""
+        # Matching nearest tags prove only a shared release ancestor; the
+        # fetched deploy head can still contain commits after that tag. Measure
+        # the deployed commit's own distance every time rather than turning a
+        # matching tag into a false all-clear.
+        behind, summary = await self._check_upstream_by_commits(target_commit)
+        return behind, summary, target_commit
 
     async def _check_upstream_by_commits(self, ref: str) -> tuple[int, str]:
-        """Fallback: count commits when no release tags exist."""
-        proc = await asyncio.create_subprocess_exec(
-            "git", "rev-list", "--count", f"HEAD..{ref}",
-            cwd=str(_GENESIS_ROOT),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        if proc.returncode != 0:
-            stderr_text = stderr.decode(errors="replace").strip()
+        """Count commits from the deployed commit to a fetched target."""
+        count_str = await self._git_output("rev-list", "--count", f"HEAD..{ref}")
+        if count_str is None or not count_str.isdigit():
             raise RuntimeError(
-                f"git rev-list failed (exit {proc.returncode}): {stderr_text}"
+                f"git rev-list --count HEAD..{ref} failed; distance unknown"
             )
-        behind = int(stdout.decode().strip())
+        behind = int(count_str)
 
         if behind == 0:
             return 0, ""
@@ -471,19 +421,10 @@ class GenesisVersionCollector:
         )
 
     async def _store_update_available(
-        self, current: str, behind: int, summary: str,
+        self, current: str, behind: int, summary: str, target_commit: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
-        ref = _UPDATE_CHECK_REF
-        # Get target commit for dedup
-        proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "--short", ref,
-            cwd=str(_GENESIS_ROOT),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        target = stdout.decode().strip() if proc.returncode == 0 else "unknown"
+        target = target_commit
 
         # Dedup: skip if we already have an unresolved observation for this target
         cursor = await self._db.execute(
@@ -502,7 +443,7 @@ class GenesisVersionCollector:
 
         # Get target tag if available
         proc = await asyncio.create_subprocess_exec(
-            "git", "describe", "--tags", "--match", "v*", "--abbrev=0", ref,
+            "git", "describe", "--tags", "--match", "v*", "--abbrev=0", target_commit,
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

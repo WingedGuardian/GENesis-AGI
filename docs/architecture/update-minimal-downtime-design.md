@@ -30,7 +30,7 @@ gated by the existing `POST_MERGE` guard:
 # (new, immediately before the "Pre-update DB snapshot" block ~547)
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" "$DEPLOY_BRANCH"; then
+    if ! _fetch_deploy_refs; then
         echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
         _clear_deploy_state
@@ -43,7 +43,12 @@ The old fetch line at 797 is removed (its `--- Fetching latest ---` echo moves
 with it). The merge now consumes the immutable `DEPLOY_HEAD` read from the
 private fetched ref, while the same fetch advances the remote-tracking ref so
 deploy health's upstream distance and fetch freshness describe one fetch. The
-script verifies that commit is an ancestor before restart or success reporting.
+script resolves the deploy branch from the persisted `github.deploy_branch` override,
+then the live remote's advertised HEAD (with cached remote-tracking HEAD and `main`
+as fallbacks) and verifies that commit is
+an ancestor before restart or success reporting. Dashboard and collector checks
+resolve their own one-shot fetched refs into immutable SHAs rather than sharing
+a mutable check ref.
 
 **Why an explicit `if ! … exit 1` and NOT the ERR trap:** the ERR trap arms at
 790, *after* the stop. Before the stop there is deliberately no trap — a failure

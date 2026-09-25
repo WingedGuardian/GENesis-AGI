@@ -34,6 +34,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.env import deploy_target
+
 # Same-package probe helper: never raises, rc -1 = timeout, -2 = exec failure.
 from genesis.observability.git_health import _CHEAP_TIMEOUT_S, _run_git
 
@@ -97,14 +99,26 @@ def collect_git_facts(repo: Path, now: datetime | None = None) -> dict:
         rc, out, _ = _run_git(repo, "rev-parse", "--short", "HEAD", timeout=_CHEAP_TIMEOUT_S)
         if rc == 0:
             facts["head"] = out.strip()
-        # Behind-count against the current branch's upstream (origin/main on a
-        # standard install). Counts against the LAST FETCHED state — pair with
-        # fetch_age_hours to judge how trustworthy the number is.
-        rc, out, _ = _run_git(
-            repo, "rev-list", "--count", "HEAD..@{upstream}", timeout=_CHEAP_TIMEOUT_S
-        )
-        if rc == 0:
-            facts["commits_behind_upstream"] = int(out.strip())
+        # Behind-count against the deploy target's remote-tracking ref. The
+        # update fetchers refresh refs/remotes/<resolved-remote>/<branch>, which
+        # is not necessarily the checkout's @{upstream} remote/branch. Counts
+        # against the LAST FETCHED state — pair with fetch_age_hours to judge
+        # how trustworthy the number is.
+        try:
+            remote, deploy_branch = deploy_target(repo, probe_remote_head=False)
+            deploy_ref = f"refs/remotes/{remote}/{deploy_branch}"
+        except (OSError, ValueError):
+            deploy_ref = ""
+        if deploy_ref:
+            rc, out, _ = _run_git(
+                repo,
+                "rev-list",
+                "--count",
+                f"HEAD..{deploy_ref}",
+                timeout=_CHEAP_TIMEOUT_S,
+            )
+            if rc == 0:
+                facts["commits_behind_upstream"] = int(out.strip())
         rc, gcd, _ = _run_git(repo, "rev-parse", "--git-common-dir", timeout=_CHEAP_TIMEOUT_S)
         if rc == 0 and gcd.strip():
             git_dir = Path(gcd.strip())

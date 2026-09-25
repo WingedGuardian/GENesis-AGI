@@ -3,22 +3,93 @@
 # update.sh has exactly one deploy object: the local checkout it is about to
 # mutate. Resolve the branch from the remote that will actually be fetched, then
 # prove that checkout can receive it before any deploy state is touched.
+genesis_local_github_value() {
+    local key="$1"
+    GH_KEY="$key" python3 - <<'PY' 2>/dev/null
+import os
+from pathlib import Path
+
+key = os.environ["GH_KEY"]
+config = Path.home() / ".genesis" / "config" / "genesis.yaml"
+
+
+def _scalar(value: str) -> str:
+    value = value.strip()
+    if value and value[0] in "'\"":
+        end = value.find(value[0], 1)
+        if end > 0:
+            return value[1:end].strip()
+    return value.split(" #", 1)[0].strip()
+
+
+try:
+    import yaml
+
+    github = (yaml.safe_load(config.read_text(encoding="utf-8")) or {}).get("github") or {}
+    value = github.get(key) if isinstance(github, dict) else None
+    print(str(value).strip() if value is not None else "")
+except Exception:
+    value = ""
+    try:
+        lines = config.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    in_github = False
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if indent == 0:
+            in_github = stripped.startswith("github:")
+            if in_github and stripped != "github:":
+                flow = stripped.split(":", 1)[1].strip()
+                if flow.startswith("{") and flow.endswith("}"):
+                    for item in flow[1:-1].split(","):
+                        item_key, separator, item_value = item.partition(":")
+                        if separator and item_key.strip() == key:
+                            value = _scalar(item_value)
+            continue
+        if in_github and stripped.startswith(f"{key}:"):
+            value = _scalar(stripped.split(":", 1)[1])
+    print(value)
+PY
+}
+
 genesis_resolve_deploy_branch() {
     local repo="$1"
     local remote="$2"
-    local branch="${GENESIS_DEPLOY_BRANCH:-}"
+    local branch
     local remote_head
 
+    branch="$(genesis_local_github_value deploy_branch || true)"
+
     if [ -z "$branch" ]; then
-        # Refresh the cached remote HEAD before trusting it; an ordinary fetch
-        # does not update refs/remotes/<remote>/HEAD when upstream's default
-        # branch changes.
-        timeout 15 git -C "$repo" remote set-head --auto "$remote" >/dev/null 2>&1 || true
+        # Ask the remote for its advertised HEAD without depending on a local
+        # tracking ref for that branch; refs/remotes/<remote>/HEAD is only the
+        # fallback when the live query cannot answer.
         remote_head="$(
-            git -C "$repo" symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" \
-                2>/dev/null || true
+            timeout 15 git -C "$repo" ls-remote --symref "$remote" HEAD 2>/dev/null |
+                awk '$1 == "ref:" && $2 ~ /^refs\/heads\// && $3 == "HEAD" {
+                    sub("^refs/heads/", "", $2); print $2; exit
+                }'
         )"
-        branch="${remote_head#"$remote"/}"
+        if [ -n "$remote_head" ] \
+            && git -C "$repo" check-ref-format --branch "$remote_head" >/dev/null 2>&1; then
+            # Cache the live default so local-only consumers see the same target.
+            git -C "$repo" symbolic-ref "refs/remotes/$remote/HEAD" \
+                "refs/remotes/$remote/$remote_head" >/dev/null 2>&1 || true
+        else
+            remote_head="$(
+                git -C "$repo" symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" \
+                    2>/dev/null || true
+            )"
+            case "$remote_head" in
+                "$remote/"*) remote_head="${remote_head#"$remote"/}" ;;
+                *) remote_head="" ;;
+            esac
+        fi
+        branch="$remote_head"
     fi
     branch="${branch:-main}"
 

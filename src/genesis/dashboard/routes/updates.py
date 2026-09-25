@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -194,28 +195,30 @@ def update_status():
 
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
-    """Force an upstream check (git fetch + tag comparison)."""
+    """Force an upstream check against the immutable fetched deploy head."""
     try:
         remote, deploy_branch = _deploy_target()
     except ValueError as exc:
         logger.error("invalid deploy target: %s", exc)
-        return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": "invalid deploy target"}), 400
 
-    # Fetch into a private ref so a concurrent fetch cannot move the target this
-    # check is about to measure; advance the remote-tracking ref too so deploy
-    # health's @{upstream} distance and FETCH_HEAD freshness describe one fetch.
+    # Fetch into a per-request ref, resolve the immutable SHA, then remove the
+    # ref. A shared ref can be overwritten between fetch and measurement by the
+    # collector or by a second overlapping Check call.
+    check_ref = f"{_UPDATE_CHECK_REF}/dashboard/{uuid.uuid4().hex}"
     tracking_ref = f"refs/remotes/{remote}/{deploy_branch}"
     branch_out, branch_err = _git_result(
         "fetch",
         remote,
-        f"+refs/heads/{deploy_branch}:{_UPDATE_CHECK_REF}",
+        f"+refs/heads/{deploy_branch}:{check_ref}",
         f"+refs/heads/{deploy_branch}:{tracking_ref}",
         timeout=30,
     )
     if branch_out is None:
         logger.error("git fetch failed: %s", branch_err)
         return jsonify({"error": "git fetch failed"}), 502
-    target_commit = _git("rev-parse", _UPDATE_CHECK_REF)
+    target_commit = _git("rev-parse", "--verify", f"{check_ref}^{{commit}}")
+    _git_result("update-ref", "-d", check_ref)
     if target_commit is None:
         logger.error("git fetch did not leave a measurable deploy head")
         return jsonify({"error": "could not resolve deploy head"}), 502
@@ -230,22 +233,11 @@ def update_check():
         "describe", "--tags", "--match", "v*", "--abbrev=0", target_commit
     )
 
-    if local_tag and target_tag and local_tag == target_tag:
-        # Same release tag — up to date
-        return jsonify({
-            "commits_behind": 0,
-            "local_tag": local_tag,
-            "target_tag": None,
-            "summary": None,
-        })
-
-    # Different tags or no tags — count from the DEPLOYED COMMIT, never between
-    # the release tags. The second copy of the same defect: this endpoint feeds a
-    # dashboard card reading "N commit(s) behind", and counting tag-to-tag made
-    # that number describe the release span rather than the reader. See the note
-    # in learning/signals/genesis_version.py for the measurement; the correct
-    # shape is observability/snapshots/deploy_health.py's
-    # `commits_behind_upstream`.
+    # Always count from the DEPLOYED COMMIT, never between the release tags.
+    # Matching nearest tags only prove a shared release ancestor; the fetched
+    # deploy head can still contain commits after that tag. The endpoint feeds a
+    # dashboard card reading "N commit(s) behind", so the count must describe
+    # the reader's own distance, matching deploy_health.commits_behind_upstream.
     distance = f"HEAD..{target_commit}"
     behind_str = _git("rev-list", "--count", distance)
     if behind_str is None or not behind_str.isdigit():

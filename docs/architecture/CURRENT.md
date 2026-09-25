@@ -1388,7 +1388,7 @@ verified: 949bac64 2026-09-25
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). `update.sh` resolves the deploy branch for the remote it will fetch
-  (`GENESIS_DEPLOY_BRANCH`, that remote's `HEAD`, then `main`), refuses linked
+  (`github.deploy_branch`, that remote's `HEAD`, then `main`), refuses linked
   worktrees, detached HEAD, and branch mismatches before mutation, and merges
   the immutable fetched SHA before verifying it is active. Tracked local edits
   to deploy-managed ephemeral files are externally backed up before clearing.

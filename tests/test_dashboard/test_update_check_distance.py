@@ -38,12 +38,20 @@ def _call(count, tags):
         return ""
 
     def git_result(*args, **kwargs):
-        assert args == (
-            "fetch",
-            "origin",
-            "+refs/heads/main:refs/genesis-update-check",
-            "+refs/heads/main:refs/remotes/origin/main",
-        )
+        if args[0] == "fetch":
+            check_ref = args[2].split(":", 1)[1]
+            assert check_ref.startswith("refs/genesis-update-check/dashboard/")
+            assert args == (
+                "fetch",
+                "origin",
+                f"+refs/heads/main:{check_ref}",
+                "+refs/heads/main:refs/remotes/origin/main",
+            )
+        elif args[0] == "update-ref":
+            assert args[:2] == ("update-ref", "-d")
+            assert args[2].startswith("refs/genesis-update-check/dashboard/")
+        else:
+            raise AssertionError(f"unexpected git call: {args}")
         return "", ""
 
     app = Flask(__name__)
@@ -61,7 +69,9 @@ def _call(count, tags):
 
 
 @pytest.mark.parametrize("count", ["0", "2", "20"])
-@pytest.mark.parametrize("tags", [("v1", "v2"), (None, "v2"), (None, None)])
+@pytest.mark.parametrize(
+    "tags", [("v1", "v2"), ("v1", "v1"), (None, "v2"), (None, None)]
+)
 def test_a_measured_distance_is_reported_as_measured(count, tags):
     payload, status = _call(count, tags)
     assert status == 200
@@ -70,7 +80,9 @@ def test_a_measured_distance_is_reported_as_measured(count, tags):
 
 
 @pytest.mark.parametrize("count", [None, "", "invalid"])
-@pytest.mark.parametrize("tags", [("v1", "v2"), (None, "v2"), (None, None)])
+@pytest.mark.parametrize(
+    "tags", [("v1", "v2"), ("v1", "v1"), (None, "v2"), (None, None)]
+)
 def test_an_unmeasurable_distance_is_an_error_not_a_number(count, tags):
     # The whole point: NO tag combination may turn an unreadable count into a
     # number. The previous behaviour returned 1 when both tags were present and
@@ -94,7 +106,7 @@ def test_deploy_target_uses_the_shared_resolver(monkeypatch):
     assert calls == [updates._GENESIS_ROOT]
 
 
-def test_shared_deploy_target_uses_public_repo_remote_and_env_branch(
+def test_shared_deploy_target_uses_public_repo_remote_and_configured_branch(
     monkeypatch, tmp_path,
 ):
     def run(cmd, **kwargs):
@@ -102,7 +114,7 @@ def test_shared_deploy_target_uses_public_repo_remote_and_env_branch(
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "origin https://github.com/other/repo.git (fetch)\n"
+                    "origin https://github.com/WingedGuardian/GENesis-AGI-backup.git (fetch)\n"
                     "upstream https://github.com/WingedGuardian/GENesis-AGI.git (fetch)"
                 ),
                 stderr="",
@@ -111,7 +123,7 @@ def test_shared_deploy_target_uses_public_repo_remote_and_env_branch(
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected git call: {cmd}")
 
-    monkeypatch.setenv("GENESIS_DEPLOY_BRANCH", "release")
+    monkeypatch.setattr(env, "deploy_branch_override", lambda: "release")
     monkeypatch.setattr(env, "github_public_repo", lambda: "GENesis-AGI")
     monkeypatch.setattr(env.subprocess, "run", run)
 
@@ -129,7 +141,17 @@ def test_shared_deploy_target_refreshes_the_live_remote_head(monkeypatch, tmp_pa
                 stdout="origin https://github.com/WingedGuardian/GENesis-AGI.git (fetch)",
                 stderr="",
             )
-        if cmd[3:] == ["remote", "set-head", "--auto", "origin"]:
+        if cmd[3:] == ["ls-remote", "--symref", "origin", "HEAD"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="ref: refs/heads/release\tHEAD\nabc123\tHEAD",
+                stderr="",
+            )
+        if cmd[3:] == [
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/release",
+        ]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if cmd[3:5] == ["symbolic-ref", "--quiet"]:
             return SimpleNamespace(returncode=0, stdout="origin/release\n", stderr="")
@@ -137,19 +159,61 @@ def test_shared_deploy_target_refreshes_the_live_remote_head(monkeypatch, tmp_pa
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected git call: {cmd}")
 
-    monkeypatch.delenv("GENESIS_DEPLOY_BRANCH", raising=False)
+    monkeypatch.setattr(env, "deploy_branch_override", lambda: "")
     monkeypatch.setattr(env, "github_public_repo", lambda: "GENesis-AGI")
     monkeypatch.setattr(env.subprocess, "run", run)
 
     assert env.deploy_target(tmp_path) == ("origin", "release")
-    assert ["remote", "set-head", "--auto", "origin"] in calls
+    assert ["ls-remote", "--symref", "origin", "HEAD"] in calls
+
+
+def test_shared_deploy_target_local_mode_uses_cached_remote_head(
+    monkeypatch, tmp_path,
+):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd[3:])
+        if cmd[3:] == ["remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="origin\thttps://example.test/WingedGuardian/GENesis-AGI.git (fetch)\n",
+                stderr="",
+            )
+        if cmd[3:5] == ["symbolic-ref", "--quiet"]:
+            return SimpleNamespace(returncode=0, stdout="origin/release\n", stderr="")
+        if "check-ref-format" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected git call: {cmd}")
+
+    monkeypatch.setattr(env, "deploy_branch_override", lambda: "")
+    monkeypatch.setattr(env, "github_public_repo", lambda: "GENesis-AGI")
+    monkeypatch.setattr(env.subprocess, "run", run)
+
+    assert env.deploy_target(tmp_path, probe_remote_head=False) == ("origin", "release")
+    assert ["ls-remote", "--symref", "origin", "HEAD"] not in calls
+
+
+def test_invalid_deploy_target_does_not_expose_exception_text():
+    app = Flask(__name__)
+    with app.test_request_context(), patch.object(
+        updates, "_deploy_target", side_effect=ValueError("secret path detail")
+    ):
+        response, status = updates.update_check()
+
+    assert status == 400
+    assert response.get_json() == {"error": "invalid deploy target"}
 
 
 def test_same_release_preserves_the_existing_update_policy():
     def git(*args, **kwargs):
-        assert args[0] in ("remote", "symbolic-ref", "rev-parse", "fetch", "describe")
+        assert args[0] in (
+            "remote", "symbolic-ref", "rev-parse", "fetch", "describe", "rev-list", "log"
+        )
         if args[0] == "rev-parse":
             return "abc123"
+        if args[0] == "rev-list":
+            return "0"
         return "v1" if args[0] == "describe" else ""
 
     app = Flask(__name__)

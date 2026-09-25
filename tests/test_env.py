@@ -364,6 +364,7 @@ _SECTION_ACCESSORS = [
     ("models_md_synthesis_enabled", "models_md_synthesis", True),
     ("github_user", "github", ""),
     ("github_public_repo", "github", "GENesis-AGI"),
+    ("deploy_branch_override", "github", ""),
 ]
 
 # Env vars that would short-circuit an accessor before it ever reads the config.

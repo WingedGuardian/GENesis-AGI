@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
 
+from genesis import env
 from genesis.learning.signals import genesis_version
 from genesis.learning.signals.genesis_version import GenesisVersionCollector
 
@@ -52,7 +54,7 @@ def _mock_head(version: str):
 def _mock_upstream(behind: int, summary: str = ""):
     return patch.object(
         GenesisVersionCollector, "_check_upstream",
-        new_callable=AsyncMock, return_value=(behind, summary),
+        new_callable=AsyncMock, return_value=(behind, summary, "target123"),
     )
 
 
@@ -262,7 +264,7 @@ class TestUpstreamCheck:
         await db.commit()
 
         async def zero_upstream(self):
-            return 0, ""
+            return 0, "", "target123"
 
         # HEAD deliberately UNCHANGED, so the HEAD-change resolve cannot fire
         # and only the measured-zero path can clear the alert.
@@ -295,7 +297,7 @@ class TestUpstreamCheck:
         # Pretend a fetch just happened
         collector._last_fetch_at = datetime.now(UTC)
 
-        upstream_mock = AsyncMock(return_value=(0, ""))
+        upstream_mock = AsyncMock(return_value=(0, "", "target123"))
         with _mock_head("abc123"), _mock_failure_file_check(), \
              patch.object(GenesisVersionCollector, "_check_upstream", upstream_mock):
             await collector.collect()
@@ -337,7 +339,9 @@ class TestUpdateAvailableDedup:
             "genesis.learning.signals.genesis_version.asyncio.create_subprocess_exec",
             side_effect=fake_subprocess_target,
         ):
-            stored = await collector._store_update_available("abc123", 2, "summary")
+            stored = await collector._store_update_available(
+                "abc123", 2, "summary", "def456"
+            )
 
         assert stored is False  # Dedup skipped
 
@@ -666,7 +670,7 @@ async def test_the_count_is_the_distance_from_the_DEPLOYED_commit(tagged_repo, d
     """
     collector = GenesisVersionCollector(db)
     with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
-        behind, summary = await collector._check_upstream()
+        behind, summary, target_commit = await collector._check_upstream()
 
     assert behind == 2, f"expected the deployed tree's distance, got {behind}"
     assert behind != 10, "counted the release span instead of the reader's distance"
@@ -686,16 +690,36 @@ async def test_the_collector_uses_the_configured_deploy_branch(
     _g(remote, "commit", "-qm", "release")
     release = _g(remote, "rev-parse", "HEAD")
     _g(remote, "checkout", "-q", "main")
-    monkeypatch.setenv("GENESIS_DEPLOY_BRANCH", "release")
+    monkeypatch.setattr(env, "deploy_branch_override", lambda: "release")
 
     collector = GenesisVersionCollector(db)
     with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
-        behind, summary = await collector._check_upstream()
+        behind, summary, target_commit = await collector._check_upstream()
 
     assert behind == 3
     assert "release" in summary
-    assert _g(tagged_repo, "rev-parse", "refs/genesis-update-check") == release
+    assert target_commit == release
+    assert _g(tagged_repo, "for-each-ref", "refs/genesis-update-check") == ""
     assert _g(tagged_repo, "rev-parse", "refs/remotes/origin/release") == release
+
+
+@pytest.mark.asyncio
+async def test_deploy_target_resolution_runs_off_the_event_loop(
+    tagged_repo, db, monkeypatch,
+):
+    calls = []
+    main_thread = threading.get_ident()
+
+    def resolve(repo):
+        calls.append((repo, threading.get_ident() != main_thread))
+        return "origin", "main"
+
+    monkeypatch.setattr(genesis_version, "deploy_target", resolve)
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
+        await collector._check_upstream()
+
+    assert calls == [(tagged_repo, True)]
 
 
 @pytest.mark.asyncio
@@ -712,7 +736,7 @@ async def test_the_untagged_fallback_measures_the_same_thing(tagged_repo, db):
             collector, "_check_upstream_by_commits", wraps=collector._check_upstream_by_commits
         ) as fallback,
     ):
-        behind, _ = await collector._check_upstream()
+        behind, _, _ = await collector._check_upstream()
     fallback.assert_awaited_once()
     assert behind == 2
 
@@ -760,5 +784,5 @@ async def test_a_measured_zero_stays_zero_when_the_tags_differ(tagged_repo, db):
     with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo), _count_returns(
         collector, "0"
     ):
-        behind, _ = await collector._check_upstream()
+        behind, _, _ = await collector._check_upstream()
     assert behind == 0, "a measured zero must survive; max(behind, 1) fabricated an update"
