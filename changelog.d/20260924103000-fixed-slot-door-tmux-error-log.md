@@ -1,5 +1,3 @@
-### Fixed
-
 - The slot door no longer adds three entries to tmux's server message log on
   every login. `cc-slot.sh` tested for a session with `tmux has-session`, which
   answers "absent" by ERRORING, and all three probes asked on paths where
