@@ -80,8 +80,16 @@ dependencies = [
                     # importer (there were zero before this change).
                     #
                     # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
-                    # configures no redis URL and never uses docket, so the surface is the
-                    # IMPORT chain, not a connection. Under fastmcp 2.14.6 + pydocket
+                    # configures no redis URL, so the surface is the IMPORT chain rather
+                    # than a network connection.
+                    # ⚠ CORRECTED 2026-09-24: an earlier version of this comment added
+                    # "and never uses docket", which was FALSE and cost ~1.58 cores of
+                    # idle CPU before anyone looked. FastMCP instantiates a live Docket
+                    # AND runs a Worker at every server start, over in-process fakeredis
+                    # — it just has an empty queue, because no Genesis tool opts into
+                    # background tasks. `_run_mcp` now suppresses that worker; see
+                    # scripts/genesis_mcp_server.py::_suppress_docket_worker. Under
+                    # fastmcp 2.14.6 + pydocket
                     # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
                     # and registers tools, docket._redis loads, fakeredis async round-trips,
                     # and redis.asyncio's unix-socket client behaves. The same probe passes
