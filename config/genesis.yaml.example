@@ -35,3 +35,25 @@ github:
   # this on first use — you usually don't need to set it manually.
   # Override here only if your fork has a non-default name.
   private_repo: ""
+
+# Approval prompts you have chosen to turn off on THIS install.
+#
+# Two hooks ask before they act: the push guard, before a branch is published,
+# and the credentials guard, before anything touches secrets.env. Both prompts
+# are deliberate — but on an install where every push goes to the same public
+# repo, the routine one stops being a decision, and a prompt answered by reflex
+# makes the prompts worth reading harder to notice. Name one here to silence it.
+#
+# ASKS ONLY. Nothing here can reach a BLOCK (a force push to origin, a merge
+# into main, a failing merge gate), nor the deny a Genesis-dispatched session
+# gets. The allow that replaces a silenced prompt names the setting, so the
+# transcript still records what happened. Leaving this section out — the
+# default — keeps every prompt.
+#
+#hooks:
+#  asks:
+#    # the first push of a branch, and a `gh pr create` that would push one.
+#    # NOT the force-push, no-open-PR, or close-then-push prompts.
+#    push_publish: off
+#    # the secrets.env credentials prompt.
+#    secrets_env: off

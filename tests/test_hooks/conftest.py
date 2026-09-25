@@ -89,6 +89,38 @@ def _pin_required_ci_workflows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_hook_ask_policy(monkeypatch):
+    """Pin the install-local ask policy to "nothing declared" for EVERY hook test.
+
+    ``hook_ask_policy`` reads the host's ``~/.genesis/config/genesis.yaml``, so a
+    developer who silences a prompt on their own box silently changes what these
+    tests assert. MEASURED 2026-09-25, and this fixture exists because of it:
+    setting ``hooks.asks.secrets_env: off`` on one install turned six passing
+    ``test_secrets_env_access_guard`` assertions red — the guard was now
+    correctly returning an ``allow`` the tests had no idea was possible. The
+    suite had passed on that same box an hour earlier, before the config line
+    was written, so nothing about the test run itself signalled the dependency.
+
+    The exposure is wider than the tests that assert an ask. These guards are
+    driven through ``subprocess.run`` in several files, and a child inherits the
+    parent's environment — so pinning the seam here reaches the subprocess tests
+    too, which patching individual call sites would not do for the next file
+    someone adds. "Absent in CI" is true of a GitHub runner and false of a
+    self-hosted install running its own suite, which is this repo's documented
+    dev workflow.
+
+    Empty string, not unset: the reader treats a SET-but-empty seam as "no policy
+    declared" and skips the config file entirely, whereas unsetting it would send
+    the reader back to the host's real file. Tests that exercise the config-file
+    path (``test_hook_ask_policy.TestConfigFile``) delete this seam and redirect
+    the module's path constant at a tmp file; per-test overrides simply setenv
+    later and win.
+    """
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_e2e_declaration(monkeypatch):
     """Keep the ADVISORY E2E read hermetic for EVERY hook test (§8.12).
 
