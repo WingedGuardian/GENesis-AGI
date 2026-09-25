@@ -68,6 +68,20 @@ fi
 CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 CC_TMP_BUDGET_MB=500
 SACRED_GROUND_MB=150
+# Below this many MB reclaimed, a RED pass is logged as having freed ~nothing.
+#
+# THIS NUMBER IS A JUDGEMENT, NOT A MEASUREMENT — argue with it rather than
+# inheriting it. It is set at the noise floor of the measurement that feeds it:
+# `fs_free_mb` reads a SHARED btrfs pool, so an unrelated writer elsewhere on
+# the volume moves it, and repeated idle readings here varied by ~1MB. 5MB
+# gives that a few times' margin while staying ~1% of the 500MB budget, so a
+# pass that genuinely helped is never called futile.
+#
+# It errs toward SILENCE: too high and a real futile pass logs as a success,
+# too low and a trickle reads as progress. Log-only today, so either error
+# costs a log line — 3b makes this number load-bearing and should re-derive it
+# rather than adopt it.
+CC_RECLAIM_FLOOR_MB=5
 # Units whose OOM kill is CONTAINMENT WORKING, not a container emergency: they
 # run inside their own MemoryMax scope on purpose (issue #1775 — 11 emergency
 # pages for the code-intel indexer dying at its own 2G cap, attributed to "the
@@ -100,6 +114,14 @@ load_config() {
         log WARN "watchgod.conf: SACRED_GROUND_MB=${SACRED_GROUND_MB} >= cc-tmp capacity ${_cap}MB — that pins the oxygen floor permanently ON and bypasses the in-flight guard on every RED run; clamping to 150"
         SACRED_GROUND_MB=150
     fi
+    # A non-numeric CC_RECLAIM_FLOOR_MB would be evaluated as 0 inside (( )),
+    # silently turning "freed ~nothing" into "freed < 0" — which is never true,
+    # so the futility log would go permanently quiet with no error. Restore the
+    # default loudly instead; this is a log-only signal, so never fail closed.
+    if ! [[ "${CC_RECLAIM_FLOOR_MB:-}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        log WARN "watchgod.conf: CC_RECLAIM_FLOOR_MB='${CC_RECLAIM_FLOOR_MB:-}' is not a non-negative integer — the futility signal would go silent; restoring default 5"
+        CC_RECLAIM_FLOOR_MB=5
+    fi
 }
 
 # ── Logging ──────────────────────────────────────────────────
@@ -115,7 +137,11 @@ dir_usage_mb() {
     # a spurious '0' when du exits non-zero but awk already emitted output.
     local result
     result=$(du -sm "$1" 2>/dev/null | awk '{print $1}') || true
-    echo "${result:-0}"
+    # Validate, do not merely default. `${x:-0}` fires only on EMPTY, so a
+    # NON-EMPTY non-integer passes straight through to a caller's (( )) — see
+    # fs_free_mb below for the measured abort that costs.
+    [[ "$result" =~ ^[0-9]+$ ]] || result=0
+    echo "$result"
 }
 
 tmp_usage_pct() {
@@ -141,10 +167,46 @@ tmp_usage_pct() {
 }
 
 fs_free_mb() {
-    # Free space on the filesystem containing the given path, in MB
+    # Free space on the filesystem containing the given path, in MB.
+    #
+    # ⚠ VALIDATE, DO NOT MERELY DEFAULT — `${result:-999999}` fires only when the
+    # pipeline produced NOTHING, so a NON-EMPTY non-integer sailed through to
+    # every caller's arithmetic. MEASURED 2026-09-25, on the real script:
+    #
+    #   df prints `not-a-number` -> fs_free_mb returns it -> `$(( a - b ))`
+    #   parses it as the expression `not - a - number`, `not` is an unset name,
+    #   and `set -u` aborts the DAEMON. Reproduced end-to-end: the poll died
+    #   mid-cleanup with `line 924: not: unbound variable`.
+    #
+    # `-` is the realistic trigger, not a contrived one: some pseudo-filesystems
+    # report `-` in the avail column, `tr -d ' M'` leaves it, and `$(( x - - ))`
+    # is a syntax error — also fatal.
+    #
+    # This is a PRE-EXISTING exposure (check_cc_tmp has done arithmetic on this
+    # value since long before the futility signal); it is fixed here rather than
+    # at the new call site because the primitive is where the class lives. The
+    # validate-or-fallback shape is already this file's own idiom — see
+    # clean_cc_red's `[[ "$headroom" =~ ^-?[0-9]+$ ]] || headroom=...`.
     local result
     result=$(df -BM --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
-    echo "${result:-999999}"
+    [[ "$result" =~ ^[0-9]+$ ]] || result=999999
+    echo "$result"
+}
+
+fs_free_mb_strict() {
+    # Same reading, but reports UNMEASURABLE as an EMPTY string instead of
+    # substituting a plausible number.
+    #
+    # `fs_free_mb`'s 999999 fallback keeps existing callers safe, and for a
+    # THRESHOLD question ("is there enough room?") an optimistic default is the
+    # right failure direction. For a DELTA it is the wrong one: 999999 minus a
+    # real 300 reads as `freed=999699MB`, i.e. a fabricated SUCCESS that
+    # silences the very signal the delta exists to raise. A caller computing a
+    # difference must be able to tell "no reading" from "a big number".
+    local result
+    result=$(df -BM --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
+    [[ "$result" =~ ^[0-9]+$ ]] || result=""
+    echo "$result"
 }
 
 fs_total_mb() {
@@ -155,6 +217,102 @@ fs_total_mb() {
     local result
     result=$(df -BM --output=size "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
     echo "${result:-0}"
+}
+
+cc_reclaim_snapshot() {
+    # One reading of BOTH space measures for "how much did that pass actually
+    # reclaim": `<du_mb>:<free_mb>`. Taken before and after a cleanup, the pair
+    # answers a question neither half can answer alone.
+    #
+    # WHY BOTH, and why `free` is the authoritative one here. MEASURED
+    # 2026-09-25 on this btrfs backend, writing 500 MB then unlinking it while a
+    # descriptor stayed open:
+    #
+    #   state            du     df-used
+    #   baseline           0     151752
+    #   after 500MB      500     152253
+    #   unlinked+held      0     152253   <-- du says 500 MB freed; NOTHING was
+    #   after close        0     151752
+    #
+    # `du` walks the visible tree, so an unlinked-but-held file leaves it the
+    # instant the name goes away — while the blocks stay allocated until the
+    # holder closes. A du-based before/after therefore reports a phantom
+    # reclaim on EXACTLY the pass this signal exists to catch: cleanup unlinked
+    # something a live process still holds, and freed nothing. `df` sees those
+    # blocks and is correct.
+    #
+    # This is NOT a contradiction of clean_cc_orange's "use du" comment, and
+    # that comment should not be read as applying here — it is answering a
+    # DIFFERENT question ("am I still over the line, should I kill sessions?"),
+    # where exiting the loop early is the safe direction. For "was this pass
+    # futile?", exiting early is the failure.
+    #
+    # The `free` half has two known limits, and BOTH BIAS TOWARD A FALSE
+    # FUTILE — the loud direction, not the quiet one. An earlier draft of this
+    # comment claimed the opposite; it was wrong on both limbs:
+    #   * on btrfs this measures the SHARED pool, so a concurrent writer
+    #     elsewhere CONSUMES free space, shrinking the delta -> toward futile;
+    #   * it settles lazily, so a reading taken right after a delete has not
+    #     yet risen, also shrinking the delta -> toward futile.
+    # That matters because the regime where it fires — a RED episode with
+    # sessions writing hard — is exactly when a concurrent writer is likeliest.
+    # Erring loud is the acceptable direction for a log-only signal, but "a
+    # check that cries wolf gets silenced", so 3b must not inherit this as a
+    # safety argument without measuring the busy case.
+    #
+    # ⚠ The 5MB floor's basis is IDLE jitter (~1MB across repeated readings on
+    # an idle pool; an independent review measured 0MB across six consecutive
+    # readings). Nobody has measured the busy case. Deriving a load-bearing
+    # threshold from the idle regime is deriving it in the wrong regime — see
+    # CC_RECLAIM_FLOOR_MB.
+    #
+    # Uses fs_free_mb_STRICT: an unmeasurable reading must come back empty, not
+    # as 999999, because 999999 minus a real number renders as a huge fabricated
+    # reclaim and silences the signal.
+    local path="$1"
+    printf '%s:%s' "$(dir_usage_mb "$path")" "$(fs_free_mb_strict "$path")"
+}
+
+live_open_paths_with_pid() {
+    # Open-descriptor targets WITH the holding pid: `<pid> <path>` per line.
+    #
+    # Deliberately NOT a change to `live_open_paths`. That one emits a bare path
+    # and every consumer (dir_has_live_writer, live_writer_units) assumes the
+    # path starts at column 1 — prefixing a pid there would break all of them
+    # silently, with no parse error and no test failure, just a guard that stops
+    # matching. A separate reader costs one extra /proc walk on a RED-only path
+    # and cannot regress the existing ones.
+    #
+    # Emits TAB-separated `<pid>\t<deleted|live>\t<path>`.
+    #
+    # TAB, not space: `%l` targets can contain spaces, and a space-split `$2`
+    # truncates `/tmp/my file.bin` to `/tmp/my` — a docstring that promises
+    # `<pid> <path>` while silently lying for any such path.
+    #
+    # The `deleted` flag is the DISCRIMINATOR, and dropping it was the original
+    # defect here. A futile pass has exactly two causes and they need OPPOSITE
+    # remedies:
+    #   * deleted-but-pinned — the sweep unlinked it and a live process holds
+    #     the inode. Deleting more cannot help; the holder must exit.
+    #   * spared-and-live — a guard (in-flight, freshness, active session)
+    #     declined to delete it. Deleting more MIGHT help; look at the guard.
+    # The kernel distinguishes them for free: an unlinked-but-held fd's target
+    # reads `/path/x (deleted)`. Reporting one string for both hands the
+    # operator the news and not the answer. This mirrors the reasoning already
+    # in this file for the headroom components — log the COMPONENTS, not just
+    # the result.
+    #
+    # `%h` is the dirname of the matched /proc/<pid>/fd/<n>, i.e.
+    # `/proc/<pid>/fd`; the pid is extracted from it. Fails OPEN (empty) like
+    # its sibling — a caller that needs a validated snapshot must self-test,
+    # because an empty result here is indistinguishable from "nothing is live".
+    find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%h\t%l\n' 2>/dev/null \
+        | awk -F'\t' '{
+              split($1, p, "/")
+              d = ($2 ~ / \(deleted\)$/) ? "deleted" : "live"
+              t = $2; sub(/ \(deleted\)$/, "", t)
+              print p[3] "\t" d "\t" t
+          }' 2>/dev/null || true
 }
 
 glob_escape() {
@@ -578,6 +736,15 @@ clean_cc_orange() {
 clean_cc_red() {
     log WARN "Zone A RED — NUCLEAR cleanup, preserving active session"
 
+    # Futility signal, part 1 of 2: snapshot BOTH space measures before the
+    # sweep. Paired with the reading at the end of this function, it turns
+    # "nuclear cleanup complete" — a line this daemon printed 356 times in one
+    # 2h45m episode while reclaiming zero — into a statement with a number in
+    # it. LOG-ONLY: nothing below changes a verdict, a tier, or what gets
+    # deleted. See cc_reclaim_snapshot for why `free` is the authoritative half.
+    local _reclaim_before
+    _reclaim_before=$(cc_reclaim_snapshot "$CC_TMP_DIR")
+
     # Find the most recently modified session UUID dir (the active workspace)
     local newest_session=""
     newest_session=$(find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*" \
@@ -823,7 +990,71 @@ clean_cc_red() {
             "watchgod:tmp_emergency"
     fi
     touch "$ALERT_DIR/tmp_emergency"
-    log WARN "Zone A RED — nuclear cleanup complete"
+
+    # Futility signal, part 2 of 2 — LOG-ONLY, no escalation, no verdict change.
+    local _reclaim_after _du_before _du_after _free_before _free_after
+    local _freed_mb
+    _reclaim_after=$(cc_reclaim_snapshot "$CC_TMP_DIR")
+    _du_before="${_reclaim_before%%:*}";  _free_before="${_reclaim_before##*:}"
+    _du_after="${_reclaim_after%%:*}";    _free_after="${_reclaim_after##*:}"
+    # free RISES as space is reclaimed; du FALLS. Both deltas are reported
+    # because their DISAGREEMENT is itself the diagnosis: du falling while free
+    # stays flat means the sweep unlinked something a live process still holds,
+    # so the name is gone and the blocks are not.
+    # An UNMEASURABLE reading is its own state — never rendered as a reclaim of
+    # any size. Saying "could not measure" is the honest answer; substituting a
+    # number here is how one failed `df` becomes a fabricated success.
+    if [[ -z "$_free_before" || -z "$_free_after" ]]; then
+        log WARN "Zone A RED — nuclear cleanup complete; reclaim UNMEASURABLE (df gave no usable reading). du ${_du_before}→${_du_after}MB. $(cc_pinned_by_live_holders)"
+        return 0
+    fi
+
+    _freed_mb=$(( _free_after - _free_before ))
+
+    if (( _freed_mb < CC_RECLAIM_FLOOR_MB )); then
+        log WARN "Zone A RED — nuclear cleanup complete but reclaimed ~nothing: freed=${_freed_mb}MB (floor ${CC_RECLAIM_FLOOR_MB}MB), du ${_du_before}→${_du_after}MB. $(cc_pinned_by_live_holders)"
+    else
+        # `${_du_before}→${_du_after}` already carries the sign unambiguously.
+        # An explicit `-${_du_delta}` renders as `du --5MB` whenever cc-tmp GREW
+        # during the sweep, which is the normal RED condition (a session writing
+        # while it runs), so the redundant field is dropped rather than fixed.
+        log WARN "Zone A RED — nuclear cleanup complete: freed=${_freed_mb}MB (du ${_du_before}→${_du_after}MB)"
+    fi
+}
+
+cc_pinned_by_live_holders() {
+    # One-line attribution for a futile pass: WHICH live pids hold descriptors
+    # under cc-tmp. Resolved AT the moment of detection, because the holder may
+    # be gone a second later and a log proving only WHEN buys another
+    # occurrence.
+    #
+    # Reports the count of distinct holders and names the top few by descriptor
+    # count. It deliberately does NOT claim how many MB each pins: mapping a
+    # holder to its pinned BYTES needs the unlinked inode's size, which is not
+    # available from the fd symlink target alone. Saying "pid X holds N open
+    # paths here" is what this can honestly support; 3b's page needs the byte
+    # figure and will have to earn it separately.
+    # The needle goes through the ENVIRONMENT, not `awk -v`, which expands
+    # backslash escapes in the value — this file already carries that lesson 650
+    # lines up: a directory named `ta\tb` silently fails to match under -v, and
+    # a fail-OPEN follows (here: "holders: none found" on a pass that has them).
+    local snapshot
+    snapshot=$(live_open_paths_with_pid 2>/dev/null \
+        | WG_CC_DIR="$CC_TMP_DIR/" awk -F'\t' 'index($3, ENVIRON["WG_CC_DIR"]) == 1' || true)
+    if [[ -z "$snapshot" ]]; then
+        # Fails OPEN like its siblings, and says so rather than asserting "no
+        # holders" — an unreadable /proc and an empty one are the same string.
+        echo "holders: none found (an unreadable /proc reads identically — not proof of absence)"
+        return 0
+    fi
+    local n_holders n_deleted top
+    n_holders=$(printf '%s\n' "$snapshot" | awk -F'\t' '{print $1}' | sort -u | wc -l)
+    # Split out the deleted-but-pinned holders: for THOSE, deleting more cannot
+    # reclaim anything and the holder has to go. That is the actionable half.
+    n_deleted=$(printf '%s\n' "$snapshot" | awk -F'\t' '$2 == "deleted" {print $1}' | sort -u | wc -l)
+    top=$(printf '%s\n' "$snapshot" | awk -F'\t' '{print $1}' | sort | uniq -c | sort -rn \
+          | awk 'NR<=3 {printf "pid %s(%s fds) ", $2, $1}')
+    echo "holders: ${n_holders} live pid(s) with descriptors under cc-tmp, ${n_deleted} pinning DELETED inodes (unreclaimable by further deletion) — ${top}"
 }
 
 # Record cc-tmp pressure + top consumers BEFORE a cleanup runs — so a filled-folder
