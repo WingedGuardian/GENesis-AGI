@@ -501,3 +501,76 @@ def test_collect_skills_recovers_description_past_apostrophe(tmp_path):
 
     row = next(s for s in skills if s["name"] == "taste")
     assert row["description"] == "Use for Genesis's own dashboard and other UIs."
+
+
+@pytest.mark.parametrize("marker", ["SKILL.md", "skill.md"])
+def test_nested_skill_is_found_by_every_self_marker(tmp_path, marker):
+    """The nested-skill glob and _has_own_skill_md must accept the SAME set.
+
+    They answer one question from opposite sides -- "is the child a skill?" --
+    and they disagreed: the glob matched only uppercase SKILL.md while
+    _has_own_skill_md also accepted skill.md. So a skill defined by skill.md
+    below a container was discovered as the CONTAINER, emitted with an empty
+    marker, and then aborted the whole export at the render guard.
+
+    MEASURED at the pre-fix head with a skill.md fixture: collect_skills
+    returned [('container', '')] and render_block raised ValueError.
+
+    SKILL.md is the ORACLE arm -- it passed before the fix too, so a harness
+    that cannot tell the two apart would show nothing here.
+    """
+    repo = tmp_path / "repo"
+    nested = repo / ".claude" / "skills" / "container" / "nested-skill"
+    nested.mkdir(parents=True)
+    (nested / marker).write_text(
+        f"---\nname: nested-skill\ndescription: defined by {marker}\n---\n# body\n",
+        encoding="utf-8",
+    )
+
+    skills = _exp.collect_skills(repo)
+
+    names = {s["name"] for s in skills}
+    assert "nested-skill" in names, f"{marker} skill was not discovered"
+    assert "container" not in names, "the container must not be emitted as a skill"
+    row = next(s for s in skills if s["name"] == "nested-skill")
+    assert row["marker"] == marker
+    # The render guard is what turned this into a hard failure, so prove the
+    # whole export survives rather than only that discovery improved.
+    _exp.render_block(skills, [])
+
+
+def test_readme_only_dir_in_a_container_is_not_a_skill(tmp_path):
+    """README.md is a DESCRIPTION source, never a self-marker.
+
+    The negative control for the test above, and the reason the fix is scoped
+    to _SELF_MARKERS rather than the wider SKILL_MARKERS. An external reviewer
+    recommended applying the full set to discovery; doing so makes a plugin
+    repo's docs/ or hooks/ directory -- which routinely carries a README --
+    look like a nested skill, and makes a container with its own README look
+    like a skill that shadows everything below it. `_scan_tier` deliberately
+    skips a no-self-marker directory inside a container for exactly that
+    reason.
+
+    What must NOT happen either way is the phantom-container abort, so this
+    also proves the export still renders.
+    """
+    repo = tmp_path / "repo"
+    docs = repo / ".claude" / "skills" / "container" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "README.md").write_text(
+        "---\nname: docs\ndescription: just documentation\n---\n# notes\n",
+        encoding="utf-8",
+    )
+
+    skills = _exp.collect_skills(repo)
+
+    assert "docs" not in {s["name"] for s in skills}, (
+        "a README-only support directory must not be indexed as a skill"
+    )
+    # NOT asserting render_block() survives this fixture. It does not: the
+    # container becomes a marker-less fallback entry and the render guard
+    # raises, taking the whole export with it. That is a SEPARATE defect in
+    # the guard's proportionality -- reachable from any marker-less top-level
+    # directory, not just this shape -- and it is tracked as its own issue
+    # rather than redesigned here. Scoping this test to discovery keeps it
+    # honest about what it proves.

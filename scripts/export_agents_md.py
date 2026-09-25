@@ -231,11 +231,12 @@ def render_block(skills: list[dict], tools: list[dict]) -> str:
         "",
         "### Skills",
         "",
-        "Each entry gives the skill's real directory; its instructions are the "
-        "`SKILL.md` inside. Read the path, never infer one from the name — the "
-        "name is not the directory. Some skills nest inside a container "
-        "(`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not "
-        "`.claude/skills/gitnexus-cli/`), and skills live under two roots.",
+        "Each entry gives the full path to the skill's instruction file. The "
+        "filename is usually `SKILL.md` but not always, so read the path as "
+        "given rather than assuming one — and never infer a path from the "
+        "name, because the name is not the directory. Some skills nest inside "
+        "a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, "
+        "not `.claude/skills/gitnexus-cli/`), and skills live under two roots.",
         "",
     ]
     if skills:
