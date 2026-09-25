@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import stat
 import subprocess
@@ -7,6 +8,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
+
+
+# See test_deploy_checkout.py for why GIT_* is stripped as well as GENESIS_*:
+# an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE redirects these fixture
+# commands -- and the ephemeral-premerge-backup block they drive -- at the
+# OUTER repository. None of the calls below passed an environment at all.
+_INHERITED_PREFIXES = ("GENESIS_", "GIT_")
+
+
+def _clean_env(**overrides: str) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_INHERITED_PREFIXES)
+    }
+    env.update(overrides)
+    return env
 
 
 def _block(text: str, marker: str) -> str:
@@ -56,22 +74,40 @@ def test_modified_ephemeral_file_is_backed_up_before_clear(tmp_path: Path) -> No
     home = tmp_path / "home"
     repo.mkdir()
     home.mkdir()
-    subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-b", "main"],
+        check=True,
+        env=_clean_env(),
+    )
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
         check=True,
+        env=_clean_env(),
     )
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.name", "Test"],
         check=True,
+        env=_clean_env(),
     )
     (repo / "AGENTS.md").write_text("tracked\n")
     (repo / "config").mkdir()
     (repo / "config" / "procedure_triggers.yaml").write_text("tracked\n")
-    subprocess.run(["git", "-C", str(repo), "add", "AGENTS.md", "config"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "AGENTS.md", "config"],
+        check=True,
+        env=_clean_env(),
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        env=_clean_env(),
+    )
     (repo / "AGENTS.md").write_text("staged work\n")
-    subprocess.run(["git", "-C", str(repo), "add", "AGENTS.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "AGENTS.md"],
+        check=True,
+        env=_clean_env(),
+    )
     (repo / "AGENTS.md").write_text("local work\n")
 
     script = (
@@ -83,6 +119,7 @@ def test_modified_ephemeral_file_is_backed_up_before_clear(tmp_path: Path) -> No
     result = subprocess.run(
         ["bash", "-c", script],
         check=True,
+        env=_clean_env(),
         capture_output=True,
         text=True,
     )
@@ -114,6 +151,7 @@ def test_success_degraded_helper_marks_server_not_restarted() -> None:
     result = subprocess.run(
         ["bash", "-c", script],
         check=True,
+        env=_clean_env(),
         capture_output=True,
         text=True,
     )
@@ -200,3 +238,174 @@ def test_host_setup_pending_branch_allows_branchless_retry() -> None:
     persist = text.index('genesis_ensure_deploy_config "$_DEPLOY_BRANCH" 1')
     clear_pending = text.index('rm -f "$(genesis_deploy_pending_file)"')
     assert pending_read < pending_match < write_pending < install < persist < clear_pending
+
+
+def test_printed_manual_install_command_carries_the_deploy_branch() -> None:
+    """The fallback command printed for a human must run as printed.
+
+    install.sh now ASSERTS the checkout matches the resolved deploy branch, so
+    a pasted command without GENESIS_DEPLOY_BRANCH fails the very validation
+    this change adds. A parenthetical telling the reader to add the arguments
+    is not the same as a command that works -- the reader pastes the command.
+    """
+    text = (REPO_ROOT / "scripts" / "host-setup.sh").read_text()
+    printed = [
+        line
+        for line in text.splitlines()
+        if "bash scripts/install.sh" in line and "incus exec" in line
+    ]
+    assert printed, "no printed manual install command found"
+    for line in printed:
+        assert "GENESIS_DEPLOY_BRANCH" in line, (
+            f"printed install command omits the deploy branch: {line.strip()}"
+        )
+        assert "GENESIS_PERSIST_DEPLOY_BRANCH" in line, (
+            f"printed install command omits the persist flag: {line.strip()}"
+        )
+
+
+def _container_repo_block(dest: Path) -> str:
+    """The existing-repo arm of host-setup.sh, retargeted at a tmp checkout.
+
+    The block is EXTRACTED from the shipped script rather than retyped, so it
+    cannot drift from what actually runs. _DEST is rewritten because the real
+    value is the hardcoded container path -- executing the block unmodified
+    would operate on this machine's own checkout.
+    """
+    text = (REPO_ROOT / "scripts" / "host-setup.sh").read_text()
+    start = text.index("    _DEST=/home/ubuntu/genesis")
+    end = text.index("\n    fi\n", start) + len("\n    fi\n")
+    block = text[start:end]
+    assert "_DEST=/home/ubuntu/genesis" in block
+    return block.replace("_DEST=/home/ubuntu/genesis", f'_DEST="{dest}"', 1)
+
+
+def _two_branch_repo(tmp_path: Path) -> tuple[Path, Path]:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(
+        ["git", "-C", str(origin), "init", "-b", "main", "--bare"],
+        check=True,
+        env=_clean_env(),
+    )
+    work = tmp_path / "work"
+    subprocess.run(
+        ["git", "clone", str(origin), str(work)],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    for cmd in (
+        ["config", "user.email", "test@example.com"],
+        ["config", "user.name", "Test"],
+    ):
+        subprocess.run(
+            ["git", "-C", str(work), *cmd], check=True, env=_clean_env()
+        )
+    (work / "f").write_text("main\n")
+    subprocess.run(["git", "-C", str(work), "add", "f"], check=True, env=_clean_env())
+    subprocess.run(
+        ["git", "-C", str(work), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    subprocess.run(
+        ["git", "-C", str(work), "push", "-u", "origin", "main"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    subprocess.run(
+        ["git", "-C", str(work), "checkout", "-b", "stable"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    (work / "f").write_text("stable\n")
+    subprocess.run(["git", "-C", str(work), "add", "f"], check=True, env=_clean_env())
+    subprocess.run(
+        ["git", "-C", str(work), "commit", "-m", "stable"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    subprocess.run(
+        ["git", "-C", str(work), "push", "-u", "origin", "stable"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    subprocess.run(
+        ["git", "-C", str(work), "checkout", "main"],
+        check=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+    return origin, work
+
+
+def _run_block(work: Path, branch: str) -> subprocess.CompletedProcess[str]:
+    script = f'_BRANCH="{branch}"\n_REPO_URL="unused"\n' + _container_repo_block(work)
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=_clean_env()
+    )
+
+
+def test_existing_container_checkout_switches_to_the_requested_branch(
+    tmp_path: Path,
+) -> None:
+    """`--branch X` on an EXISTING container must leave the checkout on X.
+
+    install.sh asserts the checkout matches the deploy branch it is handed, so
+    an existing-repo path that only pulls turns the flag into a mid-setup
+    assertion failure naming the checkout rather than the flag.
+    """
+    _origin, work = _two_branch_repo(tmp_path)
+    assert (
+        subprocess.run(
+            ["git", "-C", str(work), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=_clean_env(),
+        ).stdout.strip()
+        == "main"
+    )
+
+    result = _run_block(work, "stable")
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert (
+        subprocess.run(
+            ["git", "-C", str(work), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=_clean_env(),
+        ).stdout.strip()
+        == "stable"
+    ), "checkout did not end on the requested deploy branch"
+
+
+def test_branch_switch_refuses_rather_than_discarding_container_edits(
+    tmp_path: Path,
+) -> None:
+    """The paired control: a switch that would lose local work must FAIL.
+
+    Without this, the test above would pass just as well against a `checkout
+    -f`, which is the one implementation that must not ship -- an operator
+    with uncommitted work in the container gets told, not overwritten.
+    """
+    _origin, work = _two_branch_repo(tmp_path)
+    (work / "f").write_text("uncommitted container edit\n")
+
+    result = _run_block(work, "stable")
+
+    assert result.returncode != 0, (
+        "switch succeeded despite uncommitted work that it would have to "
+        f"discard\n{result.stdout}\n{result.stderr}"
+    )
+    assert (work / "f").read_text() == "uncommitted container edit\n", (
+        "local container edit was discarded by the branch switch"
+    )

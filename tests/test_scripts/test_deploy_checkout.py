@@ -11,8 +11,21 @@ HELPER = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 
 
+# GIT_* as well as GENESIS_*: a git-hook environment exports GIT_DIR,
+# GIT_WORK_TREE and GIT_INDEX_FILE, and any of them redirects a `git -C <tmp>`
+# invocation at the OUTER repository -- so a fixture running under a hook would
+# mutate the real checkout index, worktree or branch state rather than the
+# tmp_path one. Stripping is cheaper than auditing each call for whether it
+# happens to be safe.
+_INHERITED_PREFIXES = ("GENESIS_", "GIT_")
+
+
 def _clean_env(**overrides: str) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GENESIS_")}
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_INHERITED_PREFIXES)
+    }
     env.update(overrides)
     return env
 
@@ -23,6 +36,7 @@ def _git(repo: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=_clean_env(HOME=str(repo.parent)),
     )
     return result.stdout.strip()
 

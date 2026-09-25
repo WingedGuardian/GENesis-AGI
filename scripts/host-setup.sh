@@ -886,13 +886,38 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
     _DEST=/home/ubuntu/genesis
     if [ -d "$_DEST" ]; then
         echo "    . Genesis repo already exists"
-        cd "$_DEST" && git pull --ff-only 2>/dev/null || true
+        cd "$_DEST" || exit 1
+        # The checkout must END on _BRANCH. install.sh now ASSERTS that the
+        # checkout matches the deploy branch it is handed, so pulling whichever
+        # branch happens to be checked out turns `--branch X` on an existing
+        # container into a mid-setup assertion failure that names the checkout
+        # and never mentions the flag that caused it.
+        #
+        # `git checkout` REFUSES rather than clobbers when local changes would
+        # be lost, and that is the intended failure mode: an operator with
+        # uncommitted work in the container gets told, not overwritten. Do not
+        # add -f here.
+        _CUR="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        if [ -n "$_BRANCH" ] && [ "$_CUR" != "$_BRANCH" ]; then
+            echo "    . switching checkout: ${_CUR:-detached HEAD} -> $_BRANCH"
+            git fetch --quiet origin "$_BRANCH" 2>/dev/null || true
+            # Not piped: after a pipeline the status is the LAST command in it, so
+            # a checkout piped into tail would report the status of tail and hide a
+            # failed switch.
+            if ! _CO_ERR="$(git checkout "$_BRANCH" 2>&1)"; then
+                echo "    ! cannot switch the container checkout to $_BRANCH:"
+                echo "      $_CO_ERR"
+                echo "      Resolve or commit the local changes in the container, then re-run."
+                exit 1
+            fi
+        fi
+        git pull --ff-only 2>/dev/null || true
     else
         GIT_TERMINAL_PROMPT=0 git clone --branch "$_BRANCH" "$_REPO_URL" "$_DEST" 2>&1 | tail -3
     fi
 ' || {
     echo ""
-    echo "  FATAL: Git clone failed."
+    echo "  FATAL: Git clone or branch switch failed."
     echo "  If this is a private repo, push code manually:"
     echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
     echo "  Then run install.sh inside the container."
@@ -1080,8 +1105,7 @@ else
     echo "  ERROR: Genesis repo not found in container."
     echo "  Push the code manually, then run install.sh:"
     echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
-    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
-    echo "    (re-running install.sh requires --env GENESIS_DEPLOY_BRANCH=$BRANCH --env GENESIS_PERSIST_DEPLOY_BRANCH=1)"
+    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --env GENESIS_DEPLOY_BRANCH=$BRANCH --env GENESIS_PERSIST_DEPLOY_BRANCH=1 -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
 fi
 
 # ── Container smoke test ──────────────────────────────────────
