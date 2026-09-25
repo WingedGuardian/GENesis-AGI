@@ -11,12 +11,25 @@ ITSELF to it, passing ``project_type=REFERENCE_PROJECT`` on every query and
 refusing a non-reference row outright in ``references_detail``. The partition
 was one-sided: nothing here refused the reference rows, so these routes were a
 second, uncontrolled door onto the same values. ``_EXCLUDED_PROJECT`` closes
-the other half, so each module serves its own partition and refuses the other's.
+THIS module's half.
 
-Stated limit, so this is not read as a general guarantee: the exclusion names
-the reference store specifically. A FUTURE secret-bearing partition would not
-be covered and must be added here — these routes select by ``*`` and will
-return whatever columns a new store puts in a row.
+**That is one door, not the class, and this docstring previously said
+otherwise.** The same body is written to more than one store by a single call:
+``memory/knowledge_ingest.ingest_knowledge_unit`` upserts into
+``knowledge_units`` AND calls ``store.store(content, ...)``, which for the
+reference store lands the identical text in the episodic memory store. The
+routes under ``/api/genesis/memory/`` recall from that store without a
+partition predicate. So scoping the queries here does not make the values
+unreachable — it makes them unreachable THROUGH HERE. That gap is tracked
+separately and is not closed by this module.
+
+Two further limits, so nothing here is read as a general guarantee. The
+exclusion names the reference store specifically, so a FUTURE secret-bearing
+partition is not covered and must be added — these routes select by ``*`` and
+will return whatever columns a new store puts in a row. And the exclusion is
+OPT-IN at each call site rather than enforced by the store, so a new reader of
+``search_fts``/``stats`` is unscoped by default; that is the shape that
+produced this defect in the first place.
 """
 
 from __future__ import annotations

@@ -59,6 +59,27 @@ async def _seed(db: aiosqlite.Connection) -> None:
             "c",
             "q1",
         ),
+        # A second reference row whose domain does NOT carry the ``reference.``
+        # prefix. Without it every assertion here passes just as well against an
+        # exclusion keyed on the domain NAME (``domain NOT LIKE 'reference.%'``)
+        # as against one keyed on the partition — the test would pin the
+        # observable and not the mechanism. Production reference domains are
+        # always ``reference.{kind}``, which is exactly why the name-based
+        # shortcut would survive review and then be wrong the day a writer
+        # chooses another domain.
+        (
+            "ref-2",
+            REFERENCE_PROJECT,
+            "ops.keys",
+            "deploy token",
+            f"Value: {_SENTINEL}",
+            "",
+            "curated",
+            "2026-09-01",
+            1.0,
+            "c",
+            "q4",
+        ),
         (
             "kb-1",
             "genesis",
@@ -150,7 +171,7 @@ async def test_stats_excludes_the_partition_and_keeps_null_rows(db):
     scoped = await knowledge_crud.stats(db, exclude_project=REFERENCE_PROJECT)
     unscoped = await knowledge_crud.stats(db)
     assert scoped["total"] == 2, f"expected the 2 non-reference rows, got {scoped['total']}"
-    assert unscoped["total"] == 3, "the unscoped call must still see everything"
+    assert unscoped["total"] == 4, "the unscoped call must still see everything"
     assert REFERENCE_PROJECT not in str(scoped.get("domains", {})), (
         "a reference domain leaked into the knowledge stats breakdown"
     )
@@ -166,7 +187,7 @@ async def test_exclusion_is_opt_in_so_references_py_is_unaffected(db):
     here would notice.
     """
     rows = await knowledge_crud.search_fts(db, "Value", project=REFERENCE_PROJECT, limit=50)
-    assert [r["unit_id"] for r in rows] == ["ref-1"], (
+    assert [r["unit_id"] for r in rows] == ["ref-1", "ref-2"], (
         "the reference store lost access to its own partition"
     )
 
@@ -226,10 +247,24 @@ def test_route_recent_excludes_the_partition_in_its_sql(client):
     # BOTH statements — the page and the total — must be scoped, or paging
     # walks off the end of a list shorter than the total it was handed.
     assert db.execute.await_count == 2, "expected a page query and a total query"
-    for call in db.execute.await_args_list:
-        sql, params = call.args[0], call.args[1]
+
+    # POSITION, not membership. This fixture mocks db.execute, so no SQL is ever
+    # executed and the placeholders are never bound — which means an assertion
+    # that the value is merely PRESENT in the tuple cannot see argument ORDER.
+    # MEASURED: swapping the page query's parameters to (limit, offset,
+    # _EXCLUDED_PROJECT) — which binds 50 as the exclusion value and 'reference'
+    # as the LIMIT, a 500 on every call — left the membership form of this
+    # assertion green. Pinning the exact tuples is what makes it bite.
+    page_sql, page_params = db.execute.await_args_list[0].args[:2]
+    total_sql, total_params = db.execute.await_args_list[1].args[:2]
+    for sql in (page_sql, total_sql):
         assert "project_type IS NULL OR project_type != ?" in sql, f"unscoped SQL: {sql}"
-        assert REFERENCE_PROJECT in params, f"exclusion value not bound: {params}"
+    assert page_params == (REFERENCE_PROJECT, 50, 0), (
+        f"page query must bind the exclusion FIRST, then limit/offset: {page_params}"
+    )
+    assert total_params == (REFERENCE_PROJECT,), (
+        f"total query must bind exactly the exclusion: {total_params}"
+    )
 
 
 def test_route_detail_refuses_a_reference_row(client):
@@ -347,7 +382,7 @@ async def test_stats_composes_both_filters_rather_than_dropping_one(db):
 
     # Guard-the-guard: a WHERE that matched nothing regardless would pass the above.
     only_project = await knowledge_crud.stats(db, project=REFERENCE_PROJECT)
-    assert only_project["total"] == 1, "the project filter alone stopped working"
+    assert only_project["total"] == 2, "the project filter alone stopped working"
 
 
 # ── The partition has exactly one writer ─────────────────────────────
@@ -424,3 +459,36 @@ async def test_taxonomy_does_not_offer_the_reserved_partition(db):
         "autocomplete still offers the reserved partition"
     )
     assert "genesis" in tax["project_types"], "ordinary project types stopped being offered"
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_excludes_the_partition_on_BOTH_axes(db):
+    """project_type and domain are two columns of ONE boundary.
+
+    The first version scoped only ``project_type``, so the upload form stopped
+    offering ``reference`` as a project while going on offering
+    ``reference.credentials`` as a DOMAIN — the same partition leaking through
+    the other half of the same autocomplete. A fix applied to one column of a
+    two-column boundary is not applied.
+
+    The NULL-project row is the control rather than decoration: a bare
+    ``project_type != 'reference'`` is NULL for it, so a careless exclusion
+    would silently drop an ordinary domain from the suggestions. Asserting only
+    the absence of the reference domain would pass against that bug.
+    """
+    from genesis.db.crud.knowledge_uploads import taxonomy
+
+    tax = await taxonomy(db)
+
+    assert REFERENCE_PROJECT not in tax["project_types"]
+    assert "reference.credentials" not in tax["domains"]
+    # The one that binds the assertion to project_type rather than to the domain
+    # NAME: ref-2 is a reference row whose domain has no ``reference.`` prefix,
+    # so an exclusion spelled ``domain NOT LIKE 'reference.%'`` fails here while
+    # passing every other assertion in this test.
+    assert "ops.keys" not in tax["domains"]
+
+    # The ordinary rows still populate BOTH axes — the untouched-by-design half.
+    assert "genesis" in tax["project_types"]
+    assert "genesis.arch" in tax["domains"]
+    assert "misc" in tax["domains"], "the NULL-project row must keep its domain"

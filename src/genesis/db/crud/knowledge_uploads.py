@@ -117,8 +117,16 @@ async def taxonomy(db: aiosqlite.Connection) -> dict:
     )
     projects = [r[0] for r in await cursor.fetchall()]
 
+    # The SAME exclusion, on the domain axis. Scoping only project_type left
+    # the partition leaking through the other half of the same autocomplete:
+    # reference rows carry domains like ``reference.credentials``, so the
+    # upload form went on offering them. Two columns, one boundary — a fix
+    # applied to one of them is not applied.
     cursor = await db.execute(
-        "SELECT DISTINCT domain FROM knowledge_units WHERE domain IS NOT NULL",
+        "SELECT DISTINCT domain FROM knowledge_units"
+        " WHERE domain IS NOT NULL"
+        " AND (project_type IS NULL OR project_type != ?)",
+        (REFERENCE_PROJECT,),
     )
     domains = [r[0] for r in await cursor.fetchall()]
 
