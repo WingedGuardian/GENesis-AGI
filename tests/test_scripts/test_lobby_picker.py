@@ -65,14 +65,15 @@ case "$1" in
         # lobby-* match drops the throwaway per-connection sessions SERVER-side.
         # A fake that ignored `-f` would answer a question the picker no longer
         # asks, and every filtering assertion below would be vacuous.
-        _rows=${TMUX_ROWS:-"0 cc-1
-1 cc-2
-0 lobby
-0 lobby-999"}
+        _rows=${TMUX_ROWS:-'$0 0 cc-1
+$1 1 cc-2
+$2 0 lobby
+$3 0 lobby-999'}
         case " $* " in
             *"m:lobby-*"*)
                 printf '%s\n' "$_rows" | while IFS= read -r _r; do
-                    case "${_r#* }" in lobby-*) ;; *) printf '%s\n' "$_r" ;; esac
+                    _n=${_r#* }; _n=${_n#* }
+                    case "$_n" in lobby-*) ;; *) printf '%s\n' "$_r" ;; esac
                 done
                 ;;
             *) printf '%s\n' "$_rows" ;;
@@ -80,7 +81,23 @@ case "$1" in
         exit 0
         ;;
     switch-client)
+        [ -n "${TMUX_SWITCH_TIMES_OUT:-}" ] && exit 124
         [ -n "${TMUX_SWITCH_FAILS:-}" ] && exit 1
+        # Resolve the session ID to its name, as tmux does, and record it. The
+        # picker targets by ID now (a name can be reassigned between drawing the
+        # menu and the operator pressing Enter), so a log of raw ids would make
+        # every assertion below say `$2` instead of what the operator picked.
+        _want=$3
+        _rows=${TMUX_ROWS:-'$0 0 cc-1
+$1 1 cc-2
+$2 0 lobby
+$3 0 lobby-999'}
+        printf '%s\n' "$_rows" | while IFS= read -r _r; do
+            if [ "${_r%% *}" = "$_want" ]; then
+                _n=${_r#* }; _n=${_n#* }
+                printf 'RESOLVED\t%s\n' "$_n" >> "$TMUX_LOG"
+            fi
+        done
         exit 0
         ;;
     display-message) printf '%s\n' "${TMUX_IN_MODE:-0}"; exit 0 ;;
@@ -134,10 +151,11 @@ def _switches(tmux_log: str) -> list[str]:
     ]
 
 
-def _switch_targets(tmux_log: str) -> list[str]:
-    """The session NAME each switch-client asked for, `=` stripped.
+def _switch_attempts(tmux_log: str) -> list[str]:
+    """The `-t` argument of each switch-client CALL, resolved or not.
 
-    Reads the recorded argv field-wise, so a name containing spaces survives.
+    `_switch_targets` reads the fake's resolution, which only happens on
+    success -- so a test about a FAILING switch has to look at the call itself.
     """
     out = []
     for ln in tmux_log.splitlines():
@@ -145,8 +163,23 @@ def _switch_targets(tmux_log: str) -> list[str]:
             continue
         parts = ln.split("\t")[1:]
         if "-t" in parts:
-            out.append(parts[parts.index("-t") + 1].lstrip("="))
+            out.append(parts[parts.index("-t") + 1])
     return out
+
+
+def _switch_targets(tmux_log: str) -> list[str]:
+    """The session NAME each switch-client actually landed on.
+
+    The picker targets by session ID, so the fake resolves the id to its name
+    the way tmux would and records that. Asserting the raw id instead would make
+    every cell read `$2` rather than the session the operator chose -- and would
+    not catch an id that resolves to the wrong row, which is the whole point.
+    """
+    return [
+        ln.split("\t", 1)[1]
+        for ln in tmux_log.splitlines()
+        if ln.startswith("RESOLVED\t")
+    ]
 
 
 _ROW_RE = re.compile(r"^\s*(\d+)\)(\s*\*?)\s+(.*?)\s*$")
@@ -302,7 +335,8 @@ def test_an_unreachable_tmux_is_not_reported_as_an_empty_fleet(tmp_path):
 def test_a_failed_switch_says_so_instead_of_silently_redrawing(tmp_path):
     """The operator pressed a number; something must explain the non-event."""
     proc, log = _run(tmp_path, "1\n", TMUX_SWITCH_FAILS="1")
-    assert _switch_targets(log) == ["cc-1"], log
+    # The ATTEMPT, not the resolution: a failed switch resolves nothing.
+    assert _switch_attempts(log) == ["$0"], log
     assert "is gone" in proc.stdout, proc.stdout
 
 
@@ -322,7 +356,7 @@ def test_a_name_tmux_has_escaped_renders_verbatim_and_still_selects(tmp_path):
     that row switches to that exact name rather than to some unescaped variant.
     """
     name = r"cc-\033[2Jevil"
-    proc, log = _run(tmp_path, "1\n", TMUX_ROWS=f"0 {name}")
+    proc, log = _run(tmp_path, "1\n", TMUX_ROWS=f"$0 0 {name}")
 
     body = proc.stdout.split("Genesis Fleet", 1)[-1]
     assert "\033[2J" not in body, "a raw escape sequence reached the terminal"
@@ -483,7 +517,7 @@ def test_an_all_throwaway_server_offers_a_refresh_rather_than_exiting(tmp_path):
     The operator must get the refresh prompt twice -- once, then again after
     Enter -- which an `exit 0` on that branch cannot produce.
     """
-    proc, log = _run(tmp_path, "\n\n", TMUX_ROWS="0 lobby-777")
+    proc, log = _run(tmp_path, "\n\n", TMUX_ROWS="$0 0 lobby-777")
     assert "No sessions yet" in proc.stdout
     assert proc.stdout.count("No sessions yet") >= 2, (
         f"the empty-list branch did not loop; stdout={proc.stdout!r}"
@@ -509,7 +543,7 @@ def test_a_real_session_whose_name_contains_lobby_stays_visible(tmp_path):
         _run(
             tmp_path,
             "",
-            TMUX_ROWS="0 cc-1\n0 my lobby-notes\n0 lobby-999\n0 lobby",
+            TMUX_ROWS="$0 0 cc-1\n$1 0 my lobby-notes\n$2 0 lobby-999\n$3 0 lobby",
         )[0].stdout
     )
     names = [r[2] for r in rows]
@@ -524,9 +558,9 @@ def test_a_session_name_containing_spaces_selects_correctly(tmp_path):
     Verified against real tmux too: a session named `my scratch pad` lists as
     one row and selecting it switches to that exact name.
     """
-    rows = _menu_rows(_run(tmp_path, "", TMUX_ROWS="0 cc-1\n0 my scratch pad")[0].stdout)
+    rows = _menu_rows(_run(tmp_path, "", TMUX_ROWS="$0 0 cc-1\n$1 0 my scratch pad")[0].stdout)
     assert [r[2] for r in rows] == ["cc-1", "my scratch pad"], rows
-    _proc, log = _run(tmp_path, "2\n", TMUX_ROWS="0 cc-1\n0 my scratch pad")
+    _proc, log = _run(tmp_path, "2\n", TMUX_ROWS="$0 0 cc-1\n$1 0 my scratch pad")
     assert _switch_targets(log) == ["my scratch pad"], log
 
 
@@ -594,7 +628,7 @@ def test_a_session_named_like_a_glob_does_not_become_filenames(tmp_path):
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["TMUX_LOG"] = str(log)
     env["SHELL"] = str(shell)
-    env["TMUX_ROWS"] = "0 cc-1\n0 *\n0 cc-2"
+    env["TMUX_ROWS"] = "$0 0 cc-1\n$1 0 *\n$2 0 cc-2"
 
     proc = subprocess.run(
         ["sh", str(PICKER)],
@@ -656,3 +690,40 @@ def test_every_tmux_request_is_bounded():
         "these tmux calls are unbounded; a server that stops replying hangs the "
         "door with no menu and no error:\n  " + "\n  ".join(bare)
     )
+
+
+def test_the_switch_targets_an_immutable_session_id_not_a_name(tmp_path):
+    """The menu is a SNAPSHOT, and a session name is mutable.
+
+    Between drawing the list and the operator pressing Enter, a session can be
+    renamed and a different one can take the name that was displayed -- at which
+    point switching by name enters a session they never saw. Same "you land
+    somewhere you did not choose" outcome as the off-by-one, reached slowly.
+    MEASURED on tmux 3.4: after renaming a session away, `-t '=<old name>'` no
+    longer finds it while `-t '$1'` still resolves to the session that was on
+    that row. Raised by review on #2361.
+
+    Pins the MECHANISM (the target is an id) rather than only the outcome,
+    because the outcome test passes either way until a rename actually races.
+    """
+    _proc, log = _run(tmp_path, "2\n")
+    attempts = _switch_attempts(log)
+    assert attempts and all(a.startswith("$") for a in attempts), (
+        f"switch-client is not targeting a session id: {attempts}"
+    )
+    # ...and it still lands on the row the operator read.
+    assert _switch_targets(log) == ["cc-2"], log
+
+
+def test_a_slow_server_is_not_reported_as_a_dead_session(tmp_path):
+    """`_tmux` wraps every request in `timeout`, which exits 124.
+
+    Reporting that as "the session is gone" sends the operator after the wrong
+    problem: their next move differs between "retry, the server is busy" and
+    "stop expecting that session to come back". Raised by review on #2361, and
+    a defect introduced by the timeout wrapper itself.
+    """
+    proc, log = _run(tmp_path, "1\n", TMUX_SWITCH_TIMES_OUT="1")
+    assert _switch_attempts(log) == ["$0"], log
+    assert "did not answer in time" in proc.stdout, proc.stdout
+    assert "is gone" not in proc.stdout, proc.stdout

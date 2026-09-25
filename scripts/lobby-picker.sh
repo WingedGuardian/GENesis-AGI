@@ -95,10 +95,19 @@ _tmux() {
 # sessions" -- that tells the operator their fleet is empty when it is running.
 # Distinguish the two.
 _sessions() {
-    # `attached name`: attached is 0/1 and comes FIRST, so the split below is
-    # safe even for a session name containing spaces (tmux permits them).
-    # MEASURED against a real server: a session named `my scratch pad` lists as
-    # one row and selecting it switches to that exact name.
+    # `id attached name`. Both leading fields are space-free (`$0`, `$1`, … and
+    # 0/1), so the name may contain spaces and still survive the split --
+    # MEASURED, a session named `my scratch pad` lists as one row and selects
+    # correctly.
+    #
+    # The ID is carried because it is IMMUTABLE and the name is not. The menu is
+    # a SNAPSHOT: between drawing it and the operator pressing Enter, a session
+    # can be renamed and a different one can take the name that was displayed --
+    # at which point switching by name enters a session the operator never saw.
+    # That is the same "you land somewhere you did not choose" failure this
+    # screen exists to end, just reached by a slower route. MEASURED: after
+    # renaming a session away, `-t '=<old name>'` no longer finds it while
+    # `-t '$1'` still resolves to the session that was on that row.
     #
     # The `-f` expression is tmux's own, and it is the SAME one the `t` branch
     # hands choose-tree. It used to be a `grep -v ' lobby-'` on the rendered
@@ -108,7 +117,8 @@ _sessions() {
     # the operator owns, invisible in the menu and unreachable by number, with
     # the two halves of one screen disagreeing about what exists.
     _tmux list-sessions -f '#{!=:#{m:lobby-*,#{session_name}},1}' \
-                        -F '#{session_attached} #{session_name}' 2>/dev/null
+                        -F '#{session_id} #{session_attached} #{session_name}' \
+                        2>/dev/null
 }
 
 # CANNOT FIRE in production, and kept anyway. This comment used to claim a
@@ -173,8 +183,9 @@ while :; do
     n=0
     for entry in "$@"; do
         n=$((n + 1))
-        att=${entry%% *}
-        name=${entry#* }
+        _rest=${entry#* }          # drop the id
+        att=${_rest%% *}
+        name=${_rest#* }
         mark='  '
         [ "$att" != "0" ] && mark=' *'
         printf '  %2d)%s %s\n' "$n" "$mark" "$(_safe "$name")"
@@ -254,14 +265,33 @@ while :; do
             break
         fi
     done
+    sid=${target%% *}
     name=${target#* }
+    name=${name#* }
+    [ -n "$sid" ] || continue
     [ -n "$name" ] || continue
 
-    if ! _tmux switch-client -t "=${name}" 2>/dev/null; then
+    # By ID, not by name: the ID identifies the session that was ON THAT ROW
+    # when the menu was drawn, and no rename can redirect it.
+    # NOT `if ! _tmux ...` -- inside that branch `$?` is the status of the `!`
+    # pipeline, which is 0 precisely BECAUSE the command failed, so the timeout
+    # code could never be seen. Caught by the test below, which is the only
+    # reason it is not shipping: the wrong branch still printed a plausible
+    # message. Capture first, branch second.
+    _tmux switch-client -t "$sid" 2>/dev/null
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
         # Do not swallow it: the operator pressed a number and something has to
-        # explain why nothing happened. Usually the session died since the last
-        # redraw.
-        printf '\n  "%s" is gone. Enter to refresh: ' "$(_safe "$name")"
+        # explain why nothing happened. Say WHICH thing, though -- `_tmux` wraps
+        # every request in `timeout`, which exits 124, and reporting a slow
+        # server as a dead session sends the operator looking for the wrong
+        # problem. Their next move differs: retry, versus stop expecting that
+        # session to come back.
+        if [ "$_rc" -eq 124 ]; then
+            printf '\n  tmux did not answer in time. Enter to retry: '
+        else
+            printf '\n  "%s" is gone. Enter to refresh: ' "$(_safe "$name")"
+        fi
         read -r _ || _login_shell
         continue
     fi
