@@ -196,6 +196,7 @@ def _modules_imported_by_the_real_servers() -> set[str]:
     SERVER import this?" rather than "has ANYTHING in this session imported it?".
     """
     import json
+    import os
     import subprocess
     import sys
     import textwrap
@@ -203,22 +204,58 @@ def _modules_imported_by_the_real_servers() -> set[str]:
     probe = textwrap.dedent(
         f"""
         import importlib, json, sys
-        for name in {list(_REAL_SERVER_MODULES)!r}:
-            importlib.import_module(name)
-        print(json.dumps(sorted(m for m in sys.modules if m.startswith("genesis."))))
+        mods = [importlib.import_module(n) for n in {list(_REAL_SERVER_MODULES)!r}]
+        print(json.dumps({{
+            "modules": sorted(m for m in sys.modules if m.startswith("genesis.")),
+            "resolved_from": mods[0].__file__,
+        }}))
         """
     )
+    # THE SUBPROCESS DOES NOT INHERIT pytest's PATH GUARD, and without this it
+    # measures the wrong tree. `tests/conftest.py:29-39` puts THIS checkout's
+    # `src` at the front of `sys.path` precisely because the editable install is
+    # shared between main and every linked worktree — but that runs in the pytest
+    # process, not in a fresh interpreter. MEASURED 2026-09-25 from a worktree:
+    #
+    #   without PYTHONPATH: /home/…/genesis/src/genesis/mcp/health/__init__.py   (MAIN)
+    #   with    PYTHONPATH: /home/…/worktrees/<wt>/src/genesis/mcp/health/…      (HERE)
+    #
+    # So the import closure came from MAIN while the decorator scan below reads
+    # THIS worktree — the two halves describing different trees. Today they agree
+    # whenever a branch changes no MCP module, which is exactly why it would have
+    # gone unnoticed: a branch ADDING a tool module would fail this test for a
+    # reason that has nothing to do with the module being unimported.
+    env = dict(os.environ)
+    src = str(_REPO_ROOT / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src}{os.pathsep}{existing}" if existing else src
+
     result = subprocess.run(
         [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
         cwd=str(_REPO_ROOT),
+        env=env,
         timeout=600,
     )
     assert result.returncode == 0, (
         f"the import probe failed, so this test proved nothing:\n{result.stderr[-2000:]}"
     )
-    return set(json.loads(result.stdout))
+    payload = json.loads(result.stdout)
+
+    # THE PROBE VERIFIES ITS OWN PREMISE. Trusting PYTHONPATH to shadow the
+    # editable install is the assumption that was wrong a round ago, so it is
+    # asserted rather than assumed: if the probe ever resolves outside this
+    # checkout again, the import closure and the decorator scan below are
+    # describing DIFFERENT TREES, and every conclusion from the pair is void.
+    resolved = Path(payload["resolved_from"]).resolve()
+    assert _REPO_ROOT in resolved.parents, (
+        f"the import probe loaded {resolved} — outside this checkout ({_REPO_ROOT}). "
+        "The shared editable install is shadowing the worktree again, so the "
+        "imported-module set and the decorator scan describe different trees. "
+        "Fix the probe's PYTHONPATH rather than trusting this result."
+    )
+    return set(payload["modules"])
 
 
 #: Modules that carry ``@mcp.tool`` but are deliberately NOT imported when the
