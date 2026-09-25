@@ -181,6 +181,46 @@ def test_no_real_genesis_tool_opts_into_background_tasks(module_path):
         )
 
 
+def _modules_imported_by_the_real_servers() -> set[str]:
+    """What `sys.modules` holds after importing the five servers AND NOTHING ELSE.
+
+    Asked in a FRESH INTERPRETER on purpose. Reading `sys.modules` from inside the
+    pytest process answers a different question — it reflects everything the whole
+    suite has imported — and the difference is not academic: MEASURED 2026-09-25,
+    a single `import genesis.mcp.health.user_job_tools` before this test (which is
+    exactly what `genesis/runtime/init/user_jobs.py:21` does during runtime
+    bootstrap) makes the allowance below look stale and FAILS the test, for a
+    reason that has nothing to do with the property under test.
+
+    So the subprocess is not belt-and-braces; it is the only way to ask "does a
+    SERVER import this?" rather than "has ANYTHING in this session imported it?".
+    """
+    import json
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = textwrap.dedent(
+        f"""
+        import importlib, json, sys
+        for name in {list(_REAL_SERVER_MODULES)!r}:
+            importlib.import_module(name)
+        print(json.dumps(sorted(m for m in sys.modules if m.startswith("genesis."))))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        timeout=600,
+    )
+    assert result.returncode == 0, (
+        f"the import probe failed, so this test proved nothing:\n{result.stderr[-2000:]}"
+    )
+    return set(json.loads(result.stdout))
+
+
 #: Modules that carry ``@mcp.tool`` but are deliberately NOT imported when the
 #: five server modules are. Each entry is a hole in the inventory below, so each
 #: needs a reason, and a SIXTH one fails the test rather than joining the list
@@ -231,12 +271,9 @@ def test_every_tool_registering_module_is_visible_to_the_inventory():
     a repo-wide search for those returned zero at the time of writing, but
     "zero found" is not "impossible", so treat this as the spellings checked.
     """
-    import importlib
     import re
-    import sys
 
-    for module_path in _REAL_SERVER_MODULES:
-        importlib.import_module(module_path)
+    imported = _modules_imported_by_the_real_servers()
 
     mcp_src = _REPO_ROOT / "src" / "genesis" / "mcp"
     decorator = re.compile(r"^\s*@mcp\.tool\b", re.MULTILINE)
@@ -254,7 +291,7 @@ def test_every_tool_registering_module_is_visible_to_the_inventory():
         "which is far below the known population — the scan is broken, not the code"
     )
 
-    unimported = sorted(m for m in registering if m not in sys.modules)
+    unimported = sorted(m for m in registering if m not in imported)
     unexpected = sorted(set(unimported) - _TOOL_MODULES_NOT_SERVED_BY_MCP)
 
     assert not unexpected, (
@@ -269,6 +306,8 @@ def test_every_tool_registering_module_is_visible_to_the_inventory():
 
     # The allowance is not a free pass: an entry that has since become imported
     # is stale, and leaving it would quietly widen the exemption next time.
+    # Reliable only because `imported` came from a fresh interpreter — against
+    # this process's own sys.modules it would fire on unrelated test order.
     stale = sorted(_TOOL_MODULES_NOT_SERVED_BY_MCP - set(unimported))
     assert not stale, (
         f"{stale} are now imported by a server module, so the inventory covers them "
