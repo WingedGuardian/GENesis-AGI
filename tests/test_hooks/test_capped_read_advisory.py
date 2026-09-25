@@ -160,8 +160,8 @@ def test_global_flag_before_the_group_still_resolves(tmp_path: Path) -> None:
 def test_value_flag_between_group_and_sub_still_resolves(tmp_path: Path) -> None:
     """``gh pr -R o/r list`` -- the value must not be read as the subcommand.
 
-    Mutation: stop skipping _VALUE_FLAGS values -> 'o/r' is read as the
-    subcommand, no table entry, silent -> RED.
+    The skipping lives in `shell_parse.gh_command`, which this hook delegates
+    to; there is no local value-flag walk here to mutate.
     """
     assert "30" in _context(_run("gh pr -R o/r list", tmp_path))
 

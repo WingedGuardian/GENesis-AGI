@@ -101,12 +101,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import field, read_payload, session_id, session_path, tool_input  # noqa: E402
 from hook_output import DEFAULT_BUDGET, emit_cost, print_json_bounded  # noqa: E402
-from shell_parse import (  # noqa: E402
-    _GH_ALL_VALUE_FLAGS,
-    BlindSpot,
-    analyze_checked,
-    gh_command,
-)
+from shell_parse import BlindSpot, analyze_checked, gh_command  # noqa: E402
 
 
 def _envelope(context: str) -> dict:
@@ -155,11 +150,6 @@ _GH_DEFAULT_LIMITS: dict[tuple[str, str], int] = {
     ("search", "code"): 30,
     ("search", "commits"): 30,
 }
-
-#: Value-taking gh flags this hook steps over when walking argv for a limit —
-#: the union from the shared `shell_parse._GH_FLAG_TABLE`, so a subcommand-local
-#: flag can never put its own VALUE in the operand slot (#2209).
-_VALUE_FLAGS = _GH_ALL_VALUE_FLAGS
 
 #: The GitHub Search API's hard result ceiling, which gh enforces CLIENT-SIDE.
 #: MEASURED on gh 2.98.0: ``gh search prs --limit 1500`` is REFUSED outright with
