@@ -199,20 +199,37 @@ _register_mcp_http() {
         return 0
     fi
     if [ "$scope" = "user" ]; then
-        local registered
-        registered="$(python3 - "$name" <<'PYEOF' 2>/dev/null
+        local stored reg_type registered
+        stored="$(python3 - "$name" <<'PYEOF' 2>/dev/null
 import json, os, sys
 try:
     cfg = json.load(open(os.path.expanduser("~/.claude.json")))
-    print(cfg.get("mcpServers", {}).get(sys.argv[1], {}).get("url", ""))
+    entry = cfg.get("mcpServers", {}).get(sys.argv[1])
 except Exception:
-    print("")
+    entry = None
+if not isinstance(entry, dict):
+    entry = {}
+# Tab-separated: a URL cannot contain a raw tab, so this cannot be ambiguous.
+print(f"{entry.get('type', '')}\t{entry.get('url', '')}")
 PYEOF
 )"
-        # A URL is an exact-match identity: unlike a command path there is no
-        # basename form that is legitimately a different spelling of the same
-        # server, so anything that is not equal is a different configuration.
-        if [ "$registered" = "$url" ]; then
+        reg_type="${stored%%	*}"
+        registered="${stored#*	}"
+        # TRANSPORT IS PART OF THE IDENTITY, not just the URL. `claude mcp add
+        # --transport sse` stores the SAME url under `"type": "sse"` (MEASURED
+        # on CC 2.1.246), and an sse client cannot speak to an http-only
+        # endpoint — so matching on url alone reports "already registered" for
+        # an entry that cannot reach the server, and code search is silently
+        # absent while the installer says it is fine.
+        #
+        # An entry with NO type is accepted: `--transport sse` always records
+        # one, so a missing type is never the failing case, and rejecting it
+        # would warn forever on a box registered by an older Claude Code.
+        #
+        # Beyond that a URL is an exact-match identity — unlike a command path
+        # there is no basename form that is legitimately a different spelling
+        # of the same server.
+        if [ "$registered" = "$url" ] && { [ "$reg_type" = "http" ] || [ -z "$reg_type" ]; }; then
             echo "  $name: already registered"
             _warn_local_scope_shadow "$name" "$url"
             return 0
@@ -255,7 +272,13 @@ PYEOF
                 echo "    already registered, so NOTHING was changed. Fix the file and re-run."
                 return 0
             fi
-            if [ -n "$registered" ]; then
+            if [ "$registered" = "$url" ]; then
+                # Same endpoint, wrong transport — the case that used to read
+                # as "already registered" and leave code search unreachable.
+                echo "  WARNING: $name already exists at $scope scope on a DIFFERENT TRANSPORT."
+                echo "    stored: ${reg_type:-<none>}   ours: http"
+                echo "    Same URL, but an ${reg_type:-untyped} client cannot reach an http-only endpoint."
+            elif [ -n "$registered" ]; then
                 echo "  WARNING: $name already exists at $scope scope with a DIFFERENT URL."
                 echo "    stored: $registered"
                 echo "    ours:   $url"

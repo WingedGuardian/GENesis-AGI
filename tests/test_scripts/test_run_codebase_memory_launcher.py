@@ -819,6 +819,50 @@ def test_http_early_returns_still_warn_about_a_local_shadow(tmp_path, url, why):
     assert "-s local" in res.stdout, "the remedy must name the local scope"
 
 
+def test_http_same_url_wrong_transport_is_not_already_registered(tmp_path):
+    """Transport is part of the identity, not just the URL.
+
+    MEASURED on CC 2.1.246: `claude mcp add --transport sse` stores
+    {"type": "sse", "url": "https://mcp.grep.app"} -- the SAME url our http
+    registration uses. Matching on url alone reported "already registered" for
+    an entry that cannot reach an http-only endpoint, so code search was
+    silently absent while the installer said it was fine.
+
+    Preserve-and-warn still applies: we do not replace their entry, we name
+    the conflict. Flagged by an external reviewer.
+    """
+    res, clog = _run_register_http(
+        tmp_path, ["grep-app", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep-app": {"type": "sse", "url": "https://mcp.grep.app"}}})
+
+    assert res.returncode == 0
+    assert "already registered" not in res.stdout, (
+        "an sse entry at our url cannot serve an http-only endpoint"
+    )
+    assert "DIFFERENT TRANSPORT" in res.stdout
+    assert "stored: sse" in res.stdout
+    log = clog.read_text() if clog.exists() else ""
+    assert "mcp remove" not in log, "still never replaces the operator's entry"
+    assert "mcp add" not in log
+
+
+def test_http_untyped_entry_at_our_url_is_still_already_registered(tmp_path):
+    """Negative control for the transport check: a missing type is NOT sse.
+
+    `--transport sse` always records a type, so an entry with none is a legacy
+    http registration. Rejecting it would preserve-and-warn on every bootstrap
+    run forever on a box set up by an older Claude Code -- noise with no
+    hazard behind it.
+    """
+    res, clog = _run_register_http(
+        tmp_path, ["grep-app", "user", "https://mcp.grep.app"],
+        {"mcpServers": {"grep-app": {"url": "https://mcp.grep.app"}}})
+
+    assert res.returncode == 0
+    assert "already registered" in res.stdout
+    assert "mcp add" not in (clog.read_text() if clog.exists() else "")
+
+
 def test_http_preserve_shadow_warning_compares_against_OURS(tmp_path):
     """The shadow check must ask "after they adopt ours, will this shadow it?"
 
