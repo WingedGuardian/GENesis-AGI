@@ -554,7 +554,11 @@ def test_an_absent_policy_module_leaves_the_ask_standing(tmp_path) -> None:
     env = {**os.environ, "_TEST_HOOK_ASK_POLICY": "push_publish=off,secrets_env=off"}
     for script, command, cwd in (
         ("git_push_guard.py", "git push -u origin HEAD", str(repo)),
-        ("secrets_env_access_guard.py", "cat /home/ubuntu/genesis/secrets.env", str(repo)),
+        # `~/genesis/secrets.env` rather than an absolute path: the guard matches
+        # by RESOLVED path, tilde expansion included, and a literal home
+        # directory would both hardcode one developer's layout and put a
+        # username into a public repo. Same spelling the sibling suite uses.
+        ("secrets_env_access_guard.py", "cat ~/genesis/secrets.env", str(repo)),
     ):
         proc = subprocess.run(
             [sys.executable, str(tree / script)],
