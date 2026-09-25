@@ -1340,7 +1340,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 63c3e544 2026-09-24
+verified: 949bac64 2026-09-25
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
