@@ -329,23 +329,27 @@ def test_the_writer_refuses_None_rather_than_writing_KEY_equals_None(tmp_path, m
     assert env_file.read_text() == "OLLAMA_URL=http://was-set.invalid:11434\n"
 
 
-def test_clearing_a_DUPLICATED_assignment_only_comments_the_first(tmp_path, monkeypatch):
-    """CHARACTERIZATION of a known limit — documenting, not endorsing.
+def test_clearing_a_DUPLICATED_assignment_comments_out_EVERY_occurrence(tmp_path, monkeypatch):
+    """A clear must leave NO active assignment, however many there were.
 
-    ``_update_secrets_file`` pops from ``remaining`` on the first match, so a key
-    assigned twice keeps its SECOND assignment and the route still answers 200.
-    The surviving line is what the environment picks up, so the clear silently
-    does nothing from the operator's point of view.
+    This test previously CHARACTERIZED the opposite — the writer popped on the
+    first match, so a key assigned twice kept its second assignment. That was
+    recorded as a documented limit. It is not a limit, it is a defect, and
+    external review surfaced the consequence: the route answers 200 and the
+    editor tells the operator the override was cleared, while a restart brings it
+    straight back.
 
-    Fixing it changes writer semantics and is deliberately out of scope for the
-    write-protocol change; this test exists so the behaviour cannot drift
-    unnoticed, and so the next reader finds it stated rather than discovering it.
+    MEASURED, which is what settles it: the loader takes the LAST assignment
+    (`DUPKEY=first` then `DUPKEY=second` resolves to "second", under both
+    dotenv_values and load_dotenv(override=True)). So commenting only the first
+    occurrence is not a partial clear — it is no clear at all.
     """
     from genesis.dashboard.routes import secrets as mod
 
     env_file = tmp_path / "secrets.env"
     env_file.write_text(
         "OLLAMA_URL=http://first.invalid:11434\n"
+        "API_KEY_GROQ=untouched\n"
         "OLLAMA_URL=http://second.invalid:11434\n"
     )
     monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
@@ -353,12 +357,40 @@ def test_clearing_a_DUPLICATED_assignment_only_comments_the_first(tmp_path, monk
     mod._update_secrets_file({"OLLAMA_URL": ""})
 
     text = env_file.read_text()
-    assert "# OLLAMA_URL=http://first.invalid:11434" in text
-    assert "OLLAMA_URL=http://second.invalid:11434" in text
     active = [ln for ln in text.splitlines() if ln.startswith("OLLAMA_URL=")]
-    assert active == ["OLLAMA_URL=http://second.invalid:11434"], (
-        f"expected exactly the second assignment to survive, got {active}"
+    assert active == [], f"a cleared key must have NO active assignment left, got {active}"
+    assert "# OLLAMA_URL=http://first.invalid:11434" in text
+    assert "# OLLAMA_URL=http://second.invalid:11434" in text
+    # An unrelated key between the duplicates must survive verbatim.
+    assert "API_KEY_GROQ=untouched" in text
+
+
+def test_SETTING_a_DUPLICATED_assignment_leaves_only_the_new_value(tmp_path, monkeypatch):
+    """The sibling nobody reported, and the more dangerous of the two.
+
+    Same generator as the clear case: the writer touched only the first match.
+    Because the LAST assignment wins at load time, replacing the first while
+    leaving a stale second meant the operator's new value never took effect —
+    they set an API key, the route answered 200, and the old key kept being used.
+    A silent wrong-value is worse than a silent no-op.
+    """
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text(
+        "OLLAMA_URL=http://stale-one.invalid:11434\n"
+        "OLLAMA_URL=http://stale-two.invalid:11434\n"
     )
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": "http://new.invalid:11434"})
+
+    text = env_file.read_text()
+    active = [ln for ln in text.splitlines() if ln.startswith("OLLAMA_URL=")]
+    assert active == ["OLLAMA_URL=http://new.invalid:11434"], (
+        f"exactly one active assignment, carrying the NEW value, got {active}"
+    )
+    assert "# OLLAMA_URL=http://stale-two.invalid:11434" in text
 
 
 def test_opening_an_editor_seeds_the_value_so_save_is_not_a_delete():

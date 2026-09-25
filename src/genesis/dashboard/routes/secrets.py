@@ -209,35 +209,46 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
             os.chmod(path, 0o600)
 
     lines = path.read_text().splitlines(keepends=True)
-    remaining = dict(updates)
+    seen: set[str] = set()
     new_lines: list[str] = []
 
+    # EVERY matching assignment is rewritten, not just the first. MEASURED: the
+    # loader takes the LAST assignment (`DUPKEY=first` then `DUPKEY=second`
+    # resolves to "second", via dotenv and os.environ alike), so touching only
+    # the first occurrence is silently a no-op whenever a key is assigned twice:
+    #   * a CLEAR left the later assignment active, so the setting came back on
+    #     restart while the route answered 200 and the editor said "cleared";
+    #   * a SET rewrote the earlier line while the stale later one kept winning,
+    #     so the operator's new value never took effect at all.
+    # The second is the more dangerous and was the one nobody reported.
     for line in lines:
         m = _KEY_RE.match(line.strip())
-        if m and m.group(1) in remaining:
-            key = m.group(1)
-            val = remaining.pop(key)
-            if val == "":
-                # UNSET: comment the assignment out rather than writing `KEY=`.
-                # An empty assignment is NOT the same as no assignment — the
-                # accessors read `os.environ.get(key) is not None`, so `KEY=`
-                # still shadows genesis.yaml, just with an empty string, which is
-                # worse than the value it replaced. Commenting preserves the line
-                # (and any inline note beside it) as documentation of what the
-                # key was, which is exactly how the template ships these.
+        key = m.group(1) if m else None
+        if key is not None and key in updates:
+            val = updates[key]
+            if val == "" or key in seen:
+                # UNSET, or a DUPLICATE of a key already written above. Comment
+                # the assignment out rather than writing `KEY=`: an empty
+                # assignment is NOT the same as no assignment — the accessors
+                # read `os.environ.get(key) is not None`, so `KEY=` still shadows
+                # genesis.yaml, just with an empty string, which is worse than the
+                # value it replaced. Commenting preserves the line (and any inline
+                # note beside it) as documentation of what the key was, which is
+                # exactly how the template ships these.
                 new_lines.append(f"# {key}={line.strip().split('=', 1)[1]}\n")
             else:
                 new_lines.append(f"{key}={val}\n")
+            seen.add(key)
         else:
             new_lines.append(line)
 
     # Append any keys not found in the existing file
-    if remaining:
+    to_append = [(k, v) for k, v in updates.items() if k not in seen and v != ""]
+    if to_append:
         if new_lines and not new_lines[-1].endswith("\n"):
             new_lines.append("\n")
-        for key, val in remaining.items():
-            if val == "":
-                continue  # unset stays unset — never append a shadowing `KEY=`
+        for key, val in to_append:
+            # unset stays unset — never append a shadowing `KEY=`
             new_lines.append(f"{key}={val}\n")
 
     # Atomic write
@@ -320,17 +331,17 @@ def secrets_update():
     cached JS across a deploy, and it fails as a 422 REFUSAL rather than a
     destructive write — the safe direction — so the message says to reload.
 
-    Two limits of a CLEAR, neither introduced here, both worth knowing:
+    ONE limit of a CLEAR remains, and it is not introduced here: a clear cannot
+    remove an assignment the file never had — one exported by the systemd unit or
+    the shell. Nothing matches, nothing is written, ``os.environ.pop`` makes it
+    LOOK gone, and a restart brings it back. So the ``cleared`` list in the
+    response echoes what was ASKED FOR, not what changed on disk.
 
-    * A key assigned TWICE in ``secrets.env`` has only its FIRST line commented
-      out (``_update_secrets_file`` pops from ``remaining`` on first match), so
-      the second assignment survives and this route still answers 200.
-    * A clear cannot remove an assignment the file never had — one exported by
-      the systemd unit or the shell. Nothing matches, nothing is written,
-      ``os.environ.pop`` makes it LOOK gone, and a restart brings it back.
-
-    Because of both, the ``cleared`` list in the response echoes what was ASKED
-    FOR, not what changed on disk.
+    (A second limit used to sit here: a key assigned TWICE had only its first
+    line rewritten. External review showed that was not a limit but a defect —
+    the loader takes the LAST assignment, so a clear left the setting live while
+    this route answered 200, and a SET left the stale duplicate winning. Both are
+    fixed in ``_update_secrets_file``, which now rewrites every occurrence.)
     """
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
@@ -472,10 +483,11 @@ def secrets_update():
             #
             # It echoes the REQUEST, not the disk outcome: clearing a key the
             # file never assigned writes nothing (the writer skips an empty
-            # append) and the key still appears here. That is deliberate — the
-            # caller asked, and the two documented limits in the docstring above
-            # mean "asked" and "changed on disk" genuinely differ — but it is
-            # not an assertion that anything was removed.
+            # append) and the key still appears here. That residual gap is the
+            # shell/systemd-export case in the docstring above, which no write to
+            # this file can close. It is NOT an assertion that anything was
+            # removed — the duplicate-assignment case that used to make this
+            # actively misleading is now fixed in the writer.
             "cleared": cleared,
             "needs_restart": True,
         })
