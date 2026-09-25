@@ -1016,4 +1016,22 @@ jobs:
         # stay at 102 -- a prediction, not a measurement: the run that would
         # confirm it has not happened. If it is 103 again, read the skip
         # message, which now carries the attach failure's own words.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23440
+        #
+        # UNION with this branch: the slot-door probe fix adds
+        # tests/test_scripts/test_cc_slot_silent_probe.py, which does not exist
+        # on main, so its delta is its FULL collected count.
+        #   pytest tests/test_scripts/test_cc_slot_silent_probe.py \
+        #     --collect-only -q  -> 2 tests collected
+        # so the floor is 23440 + 2 = 23442.
+        #
+        # The CEILING stays at 102 on the SAME UNCONFIRMED PREDICTION as the
+        # paragraph above -- now covering two behavioural tests rather than one,
+        # so the exposure doubled. Both are @skipif-ed on tmux/script(1), which
+        # the runners have; both then attach a real client and take a RUNTIME
+        # skip if that fails, which is the path #2298 mistook for a skipif.
+        # This branch replaces that test's fixed 2s wait with a 30s poll, which
+        # removes the load-sensitivity but does not turn the prediction into a
+        # measurement. If the run reports 103 or 104, read each skip's own
+        # message before touching this number: raising it to green can CERTIFY
+        # a dormant test, and the ceiling cannot say WHICH test skipped.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23442
