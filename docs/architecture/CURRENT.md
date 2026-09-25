@@ -1340,7 +1340,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 84c7259d 2026-08-31
+verified: 63c3e544 2026-09-24
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1387,8 +1387,13 @@ verified: 84c7259d 2026-08-31
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
-  skill). Known wart: the watchdog's stale-alert wording inverts when the
-  deployed script is NEWER than the host checkout.
+  skill). `update.sh` resolves the deploy branch for the remote it will fetch
+  (`GENESIS_DEPLOY_BRANCH`, that remote's `HEAD`, then `main`), refuses linked
+  worktrees, detached HEAD, and branch mismatches before mutation, and merges
+  the immutable fetched SHA before verifying it is active. Tracked local edits
+  to deploy-managed ephemeral files are externally backed up before clearing.
+  Known wart: the watchdog's stale-alert wording inverts when the deployed
+  script is NEWER than the host checkout.
 - **Planned-maintenance stand-down** (`check.py::_gateway_pause_active`): reads a
   self-expiring `<state_dir>/paused.json` — written by the gateway `pause [ttl]`
   verb, bounded by `expires_at` and capped by `gateway_pause_max_ahead_s` — and

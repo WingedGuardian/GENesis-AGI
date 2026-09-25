@@ -20,16 +20,18 @@ def _call(count, tags):
     """Drive update_check with a stubbed git, returning (payload, status)."""
 
     def git(*args, **kwargs):
+        if args[0] == "rev-parse":
+            return "abc123"
         if args[0] == "describe":
             return tags[0] if args[-1] == "HEAD" else tags[1]
         if args[0] == "rev-list":
             # The range itself is the fix. Asserted here rather than in a value
             # comparison, because a tag-span implementation would still return a
             # plausible number — it is the ARGUMENTS that distinguish them.
-            assert args == ("rev-list", "--count", "HEAD..origin/main")
+            assert args == ("rev-list", "--count", "HEAD..abc123")
             return count
         if args[0] == "log":
-            assert args[-1] == "HEAD..origin/main"
+            assert args[-1] == "HEAD..abc123"
             return "two\none"
         return ""
 
@@ -67,9 +69,27 @@ def test_an_unmeasurable_distance_is_an_error_not_a_number(count, tags):
     assert "error" in payload
 
 
+def test_deploy_target_uses_public_repo_remote_and_env_branch(monkeypatch):
+    def git(*args, **kwargs):
+        if args == ("remote", "-v"):
+            return (
+                "origin https://github.com/other/repo.git (fetch)\n"
+                "upstream https://github.com/WingedGuardian/GENesis-AGI.git (fetch)"
+            )
+        raise AssertionError(f"unexpected git call: {args}")
+
+    monkeypatch.setenv("GENESIS_DEPLOY_BRANCH", "release")
+    monkeypatch.setattr(updates, "_git", git)
+    monkeypatch.setattr(updates, "github_public_repo", lambda: "GENesis-AGI")
+
+    assert updates._deploy_target() == ("upstream", "release")
+
+
 def test_same_release_preserves_the_existing_update_policy():
     def git(*args, **kwargs):
-        assert args[0] in ("fetch", "describe")
+        assert args[0] in ("remote", "symbolic-ref", "rev-parse", "fetch", "describe")
+        if args[0] == "rev-parse":
+            return "abc123"
         return "v1" if args[0] == "describe" else ""
 
     app = Flask(__name__)

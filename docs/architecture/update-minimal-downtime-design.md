@@ -30,16 +30,19 @@ gated by the existing `POST_MERGE` guard:
 # (new, immediately before the "Pre-update DB snapshot" block ~547)
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    if ! git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
-        echo "  Fetch failed (network?) — server NOT stopped, nothing changed."
+    if ! timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" "$DEPLOY_BRANCH"; then
+        echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        _clear_deploy_state
         exit 1
     fi
 fi
 ```
 
 The old fetch line at 797 is removed (its `--- Fetching latest ---` echo moves
-with it). The merge (836) still consumes `$UPDATE_REMOTE/main` — now already
-fetched.
+with it). The merge now consumes the immutable `DEPLOY_HEAD` read from the
+private fetched ref, and the script verifies that commit is an ancestor before
+restart or success reporting.
 
 **Why an explicit `if ! … exit 1` and NOT the ERR trap:** the ERR trap arms at
 790, *after* the stop. Before the stop there is deliberately no trap — a failure
