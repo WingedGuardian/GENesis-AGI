@@ -615,3 +615,91 @@ def test_a_valid_overlay_section_is_still_applied(tmp_path):
         "a VALID overlay section was dropped — a guard is over-broad"
     )
     assert set(loaded.providers) >= {"glm", "mistral-large-free"}
+
+
+# ── A NEW bodiless entry, not just an override of a known one ───────────────
+#
+# Found by review on the fix above. The top-level guard deliberately leaves an
+# overlay key the base does not define ALONE, because `_parse` ignores
+# unrecognised top-level keys. I carried that reasoning one level down, where it
+# does not hold: `_parse` ITERATES entries, so a NEW name is parsed like any
+# other and a bodiless one is exactly as fatal as a bodiless override.
+#
+# MEASURED 2026-09-25 with the base-presence condition still in place — `retry`
+# was the only section with no protection at all for a new name:
+#
+#   retry:      {custom:}  (new)   AttributeError, router dark
+#   retry:      {default:} (known) caught by the sanitizer
+#   call_sites: {99_new:}  (new)   caught by the stale-call-site filter
+#   providers:  {newprov:} (new)   caught by _parse's own shape guard
+
+
+@pytest.mark.parametrize(
+    "overlay",
+    [
+        "retry:\n  custom:\n",
+        "retry:\n  custom: oops\n",
+        "call_sites:\n  99_brand_new:\n",
+        "providers:\n  brand_new_provider:\n",
+    ],
+    ids=["retry_new", "retry_new_str", "call_site_new", "provider_new"],
+)
+def test_a_bodiless_NEW_entry_does_not_take_the_router_dark(tmp_path, overlay):
+    """A profile nothing references must not be able to disable all routing."""
+    cfg = _write(tmp_path, _BASE, overlay)
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert "31_outcome_classification" in loaded.call_sites
+    assert set(loaded.providers) >= {"glm", "mistral-large-free"}
+    assert "default" in loaded.retry_profiles
+
+
+def test_parse_skips_a_malformed_retry_profile_in_the_BASE_config(tmp_path):
+    """The backstop, bound independently of the sanitizer.
+
+    The sanitizer only ever sees the OVERLAY, so it cannot protect against a typo
+    in the shipped config. `_parse` guards providers this way already; retry had
+    no equivalent, which is why a single unfinished profile could take every call
+    site down. Tested with NO overlay at all, so only the parser can be what saves
+    it.
+    """
+    base = _BASE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+          half_written:
+        """
+    )
+    cfg = _write(tmp_path, base, None)
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert "default" in loaded.retry_profiles
+    assert "half_written" not in loaded.retry_profiles
+    assert "31_outcome_classification" in loaded.call_sites
+
+
+@pytest.mark.parametrize(
+    "section,name",
+    [("retry", "brand_new_profile"), ("providers", "brand_new_provider")],
+)
+def test_the_sanitizer_removes_a_poisoned_NEW_entry_from_what_is_written_back(
+    section, name
+):
+    """Binds the sanitizer's widened entry predicate, which nothing else holds.
+
+    `_parse`'s shape guards make the CONFIG correct whether or not the sanitizer
+    drops a new bodiless entry, so no end-to-end assertion can see this — measured:
+    restoring the old base-presence condition leaves every load test green. What
+    only the sanitizer does is remove the poison from the dict
+    `update_call_site_in_yaml` writes back at :786, so the operator's file is
+    healed at the next dashboard save rather than carrying an entry that is
+    silently skipped at every load forever.
+    """
+    from genesis.routing.config import _sanitize_local_overlay
+
+    result = _sanitize_local_overlay(_base_dict(), {section: {name: None}})
+
+    assert name not in result.get(section, {})

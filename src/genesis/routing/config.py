@@ -304,9 +304,25 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
         entries = result.get(section)
         if not isinstance(entries, dict):
             continue
-        base_entries = base_raw.get(section) or {}
         for name, entry in list(entries.items()):
-            if isinstance(base_entries.get(name), dict) and not isinstance(entry, dict):
+            # NOT conditioned on the base holding that name. The top-level rule
+            # above deliberately leaves an unknown KEY alone, because `_parse`
+            # ignores unrecognised top-level keys — but that reasoning does NOT
+            # survive one level down, where `_parse` ITERATES the entries. A NEW
+            # name here is parsed like any other, so a bodiless one is as fatal as
+            # a bodiless override, and within these three sections every entry
+            # must be a mapping regardless of origin.
+            #
+            # MEASURED 2026-09-25, with the base-presence condition still in place:
+            #   retry:      {custom:}  (new)  -> AttributeError, router dark
+            #   retry:      {default:} (known)-> caught here
+            #   call_sites: {99_new:}  (new)  -> caught by the stale-call-site
+            #                                    filter below, which drops any name
+            #                                    absent from base
+            #   providers:  {newprov:} (new)  -> caught by _parse's guard at :576
+            # `retry` was the one section with neither protection, which is what
+            # made a new bodiless profile nothing references take routing offline.
+            if not isinstance(entry, dict):
                 logger.warning(
                     "Local overlay %s entry '%s' is not a mapping (%s) — dropping "
                     "it rather than leaving a half-finished edit in the file",
@@ -547,6 +563,23 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     # --- Retry profiles ---
     retry_profiles: dict[str, RetryPolicy] = {}
     for name, rp in (raw.get("retry") or {}).items():
+        # Same shape guard providers get at :576, and for the same reason: a
+        # half-edited overlay leaves `retry:\n  custom:` as None, and `rp.get`
+        # below would raise AttributeError. That escapes `load_config` into
+        # `runtime/init/router.py`, which swallows it into `_bootstrapped = False`
+        # — every LLM call site dark because of one unfinished retry profile that
+        # nothing even references. MEASURED 2026-09-25.
+        #
+        # This is the BACKSTOP; the sanitizer drops the entry before it gets here.
+        # It is kept because the sanitizer only ever sees the OVERLAY, so a typo in
+        # the shipped config would otherwise still reach this line.
+        if not isinstance(rp, dict):
+            logger.warning(
+                "Retry profile '%s' is not a mapping (%s) — skipping it. This is "
+                "the shape a half-edited local overlay leaves behind.",
+                name, type(rp).__name__,
+            )
+            continue
         retry_profiles[name] = RetryPolicy(
             max_retries=rp.get("max_retries", 3),
             base_delay_ms=rp.get("base_delay_ms", 500),
