@@ -89,6 +89,99 @@ def _load_local_overlay(path: Path) -> dict:
         return {}
 
 
+#: Providers renamed upstream, mapped legacy -> current.
+#:
+#: A rename is a BREAKING UPGRADE for any install carrying a local overlay, because
+#: the overlay is the one reference set the renaming diff cannot see. Without this
+#: map a partial provider override deep-merges onto nothing and `_parse` raises
+#: `KeyError: 'type'` (which `runtime/init/router.py` swallows, leaving the runtime
+#: up with `_bootstrapped = False` and every LLM call site dark), while a chain
+#: pinned to a legacy name is filtered out as "unknown" and the operator's pin is
+#: silently replaced by the shipped chain.
+#:
+#: ADD AN ENTRY HERE IN THE SAME PR THAT RENAMES A PROVIDER. Entries stay
+#: indefinitely: an install can upgrade from any older version, so removing one
+#: re-opens the hole for exactly the installs that upgrade least often.
+_RENAMED_PROVIDERS: dict[str, str] = {
+    # 2026-09: names that encoded a model version (PR #2215).
+    "glm51": "glm",
+    "kimi-k2.5": "kimi",
+    "minimax-m25": "minimax",
+    "openrouter-deepseek-v4-flash": "openrouter-deepseek-flash",
+    "openrouter-gpt55": "openrouter-gpt-max",
+    "gpt-5.4": "openrouter-gpt",
+    "openai-gpt5": "openai-gpt",
+}
+
+
+def _current_provider_name(name: str) -> str:
+    """Resolve a provider name through CHAINED renames, with a cycle guard.
+
+    The map is append-only by contract, so a second rename of an
+    already-renamed provider leaves two hops (`glm51 -> glm`, `glm -> glm-v2`).
+    A single `.get()` would stop at `glm`, which no longer exists in base — and
+    the override would then be dropped as stale, reproducing the original bug one
+    upgrade later. Resolving transitively is what makes "entries stay
+    indefinitely" actually safe.
+    """
+    seen: set[str] = set()
+    while name in _RENAMED_PROVIDERS and name not in seen:
+        seen.add(name)
+        name = _RENAMED_PROVIDERS[name]
+    return name
+
+
+def _migrate_renamed_providers(result: dict, base_providers: set[str]) -> None:
+    """Rewrite legacy provider keys in an overlay's ``providers`` section, in place.
+
+    Collision rule, stated rather than left to merge order: if the overlay carries
+    BOTH the legacy key and its replacement, the replacement is the operator's
+    current intent — it wins, and the legacy entry is dropped with a warning.
+    """
+    local_providers = result.get("providers")
+    if not isinstance(local_providers, dict):
+        return
+
+    for legacy in list(_RENAMED_PROVIDERS):
+        if legacy not in local_providers:
+            continue
+        current = _current_provider_name(legacy)
+        entry = local_providers.pop(legacy)
+        # A half-edited overlay leaves `glm51:` with no body (None) or a scalar.
+        # Migrating that onto the live key would DESTROY the base provider's
+        # entry — strictly worse than the stale key it replaces — so drop it.
+        if not isinstance(entry, dict):
+            logger.warning(
+                "Local overlay provider '%s' is not a mapping (%s) — dropping it "
+                "rather than migrating an unusable value onto '%s'",
+                legacy, type(entry).__name__, current,
+            )
+            continue
+        if current in local_providers:
+            logger.warning(
+                "Local overlay carries both the legacy provider '%s' and its "
+                "replacement '%s' — keeping '%s' and dropping the legacy entry",
+                legacy, current, current,
+            )
+            continue
+        if current in base_providers:
+            local_providers[current] = entry
+            logger.warning(
+                "Local overlay provider '%s' was renamed upstream to '%s' — "
+                "migrating the override",
+                legacy, current,
+            )
+        else:
+            logger.warning(
+                "Local overlay provider '%s' no longer exists in the base config "
+                "(and neither does its replacement '%s') — dropping the stale override",
+                legacy, current,
+            )
+
+    if not local_providers:
+        result.pop("providers", None)
+
+
 def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     """Filter stale references from a local overlay before merging.
 
@@ -97,11 +190,20 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     .local.yaml from breaking startup after an upstream update removes
     a provider.
 
+    Also MIGRATES renamed providers — in the ``providers`` section and in
+    call-site chains — so a rename is not a breaking upgrade for an install
+    carrying an overlay. See ``_RENAMED_PROVIDERS``.
+
     Returns a sanitized copy — does NOT mutate the input.
     """
     result = copy.deepcopy(local_raw)
     base_providers = set((base_raw.get("providers") or {}).keys())
     base_call_sites = set((base_raw.get("call_sites") or {}).keys())
+
+    # Before anything reads the overlay's names, bring them up to date. Doing this
+    # FIRST is what lets the stale-reference filter below stay a pure filter.
+    _migrate_renamed_providers(result, base_providers)
+
     local_call_sites = (result.get("call_sites") or {})
 
     for cs_name, cs in list(local_call_sites.items()):
@@ -120,7 +222,21 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
             continue
         if not isinstance(cs, dict) or "chain" not in cs:
             continue
-        original_chain = cs["chain"]
+        # Translate renamed providers BEFORE the stale-reference filter, or a
+        # legacy name is discarded as "unknown" and the operator's deliberate pin
+        # is silently replaced by the shipped chain. The dashboard writes these
+        # chains (`update_call_site_in_yaml`), so an operator who never hand-edited
+        # anything can still hold a stale pin.
+        # dict.fromkeys DEDUPES while preserving order. A chain naming both a
+        # legacy name and its replacement (`[glm51, glm]`) would otherwise
+        # translate to `['glm', 'glm']` — a duplicate the WRITE path explicitly
+        # rejects ("Chain must not contain duplicate providers"), and which would
+        # make failover retry one provider twice against the same breaker and
+        # daily-budget ledger. Pre-fix the legacy entry was filtered as stale, so
+        # this duplicate is only reachable once translation exists.
+        original_chain = list(
+            dict.fromkeys(_current_provider_name(p) for p in cs["chain"])
+        )
         filtered = [p for p in original_chain if p in base_providers]
         stale = set(original_chain) - set(filtered)
         if stale:
@@ -333,6 +449,23 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     disabled_providers: set[str] = set()
     disabled_provider_types: dict[str, str] = {}  # name → provider_type
     for name, p in (raw.get("providers") or {}).items():
+        # A non-mapping provider entry is what a half-edited overlay leaves behind
+        # (`glm51:` with no body parses as None; `glm51: broken` as a str). Both
+        # used to raise AttributeError out of the `.get` below, and that exception
+        # is caught by runtime/init/router.py — so the runtime came up with every
+        # LLM call site dark behind one log line. Check the SHAPE before any field
+        # access, and register it as disabled so the existing chain filter strips
+        # it rather than leaving a name that is in neither set.
+        if not isinstance(p, dict):
+            logger.warning(
+                "Provider '%s' is not a mapping (%s) — skipping it. This is the "
+                "shape a half-edited local overlay leaves behind.",
+                name, type(p).__name__,
+            )
+            disabled_providers.add(name)
+            disabled_provider_types[name] = "unknown"
+            continue
+
         # Parse enabled field — supports bool, string from env var expansion
         enabled_raw = p.get("enabled", True)
         if isinstance(enabled_raw, str):
@@ -344,6 +477,32 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             disabled_providers.add(name)
             disabled_provider_types[name] = p.get("type", "unknown")
             logger.info("Provider '%s' disabled via config", name)
+            continue
+
+        # A provider entry missing `type`/`model` is almost always a stale local
+        # overlay whose base key was renamed or removed upstream — `_RENAMED_PROVIDERS`
+        # migrates the ones we know about, and this is the backstop for the next one.
+        # Raising here is NOT a loud failure: runtime/init/router.py catches it, so the
+        # runtime comes up with `_bootstrapped = False` and every LLM call site dark,
+        # announced by a single log line. Losing one provider is strictly better than
+        # losing routing entirely.
+        missing = [k for k in ("type", "model") if k not in p]
+        if missing:
+            logger.warning(
+                "Provider '%s' is missing %s — this is the shape a stale local "
+                "overlay leaves behind after an upstream rename. Skipping this "
+                "provider rather than failing router init; add the rename to "
+                "_RENAMED_PROVIDERS if it was one.",
+                name, " and ".join(f"'{k}'" for k in missing),
+            )
+            # Register as DISABLED rather than merely absent. A name in neither
+            # `providers` nor `disabled_providers` still trips the call-site
+            # validation below ("references unknown provider"), which raises —
+            # the router-dark path this guard exists to avoid. Disabled names are
+            # stripped from chains by the existing filter, and surface on the
+            # dashboard's disabled list instead of becoming a second half-state.
+            disabled_providers.add(name)
+            disabled_provider_types[name] = p.get("type", "unknown")
             continue
 
         cfg = ProviderConfig(
@@ -491,9 +650,19 @@ def update_call_site_in_yaml(
     ):
         return load_config(path)
 
-    # Start with existing local overlay for this call site
+    # Start with existing local overlay for this call site.
+    #
+    # SANITIZE IT FIRST — this is the third reader of the overlay and the only
+    # one that WRITES. Reading it raw was measured to produce two failures once
+    # `_parse` learned to skip incomplete providers: a save carrying a legacy
+    # provider key succeeded while silently dropping the operator's override from
+    # the live router (`reload_config` installs the parsed result), and a legacy
+    # name in a chain failed every save with "references unknown provider 'glm51'"
+    # — a name the dashboard no longer displays, because the LOAD path had already
+    # migrated it. Routing this read through the same chokepoint as the other two
+    # closes both, and heals the overlay on disk at the next save.
     local_path = _local_path_for(path)
-    local_raw = _load_local_overlay(path)
+    local_raw = _sanitize_local_overlay(base_raw, _load_local_overlay(path))
     local_cs = local_raw.setdefault("call_sites", {}).setdefault(call_site_id, {})
 
     # Resolve effective call site (base + existing local) for validation
