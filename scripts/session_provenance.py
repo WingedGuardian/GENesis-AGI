@@ -326,6 +326,29 @@ def _is_patch_merged(branch: str) -> bool:
     return not any(line.startswith("+") for line in out.splitlines())
 
 
+def _db_fenced(db_path: Path) -> bool:
+    """Admission fence: True when the database must not be touched.
+
+    A fenced (quarantined) database is skipped rather than opened — including
+    for a read, because the gate over scripts-side SQLite openers requires the
+    consult, and because a fenced DB's contents are precisely what cannot be
+    trusted. The shim lives in scripts/hooks and fails CLOSED: a present shim
+    that cannot establish the fence state reads as fenced. A checkout that
+    predates the admission machinery has no fence to consult — unfenced.
+    """
+    hooks = str(Path(__file__).resolve().parent / "hooks")
+    try:
+        if hooks not in sys.path:
+            sys.path.insert(0, hooks)
+        from db_admission_check import database_is_fenced
+    except ImportError:
+        return False
+    try:
+        return bool(database_is_fenced(db_path))
+    except Exception:  # noqa: BLE001 - the shim's own policy: never crash here
+        return True
+
+
 def enrich(session_id: str) -> dict:
     """Whatever else is known about a session id. Absence is a real answer.
 
@@ -340,11 +363,14 @@ def enrich(session_id: str) -> dict:
         # corrupt DB or unreadable directory is "unknown", and reporting it as
         # "no DB row" turns a failed check into a confident false provenance.
         "db_error": False,
+        "db_fenced": False,
         "transcript_error": False,
         "transcript_ambiguous": 0,
     }
 
-    if DB_PATH.exists():
+    if DB_PATH.exists() and _db_fenced(DB_PATH):
+        info["db_fenced"] = True
+    elif DB_PATH.exists():
         try:
             con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
             try:
@@ -402,7 +428,9 @@ def _describe(info: dict) -> str:
         head = f"{db.get('type', '?')}/{db.get('status', '?')} started {db.get('started_at', '?')}"
         return f"{head}{' — ' + topic[:70] if topic else ''}"
     parts: list[str] = []
-    if info.get("db_error"):
+    if info.get("db_fenced"):
+        parts.append("DB fenced (quarantined)")
+    elif info.get("db_error"):
         parts.append("DB unreadable")
     else:
         parts.append("no DB row")
@@ -416,7 +444,7 @@ def _describe(info: dict) -> str:
         parts.append("transcript on disk")
     else:
         parts.append("no transcript")
-    if info.get("db_error") or info.get("transcript_error"):
+    if info.get("db_error") or info.get("db_fenced") or info.get("transcript_error"):
         return "; ".join(parts) + " — enrichment INCOMPLETE, not absent"
     if info.get("transcript"):
         return "no DB row, transcript on disk"

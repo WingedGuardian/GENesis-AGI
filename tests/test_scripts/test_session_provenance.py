@@ -492,6 +492,20 @@ def test_enrich_marks_a_broken_store_unknown_not_absent(repo, tmp_path, monkeypa
     assert "INCOMPLETE" in desc, f"a failed read must not claim absence: {desc}"
 
 
+def test_enrich_skips_a_fenced_database(repo, tmp_path, monkeypatch):
+    """CI gate: script-side SQLite openers consult the admission fence — a
+    fenced (quarantined) DB is skipped and reported INCOMPLETE, not opened."""
+    db = tmp_path / "g.db"
+    db.write_bytes(b"whatever")
+    monkeypatch.setattr(sp, "DB_PATH", db)
+    monkeypatch.setattr(sp, "_db_fenced", lambda _p: True)
+    info = sp.enrich("deadbeef")
+    assert info["db"] is None
+    assert info["db_fenced"] is True
+    desc = sp._describe(info)
+    assert "fenced" in desc.lower() and "INCOMPLETE" in desc, desc
+
+
 def test_ambiguous_transcript_prefixes_are_not_pick_one(repo, tmp_path, monkeypatch):
     """P2: `next(glob(...))` picks an arbitrary filesystem-order match."""
     proj = tmp_path / "projects" / "p"
