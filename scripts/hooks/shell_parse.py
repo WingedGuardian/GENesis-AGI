@@ -923,6 +923,10 @@ _KNOWN_SIGILS = (
     "ci-override",
     "stale-review-override",
     "scheduled-review-override",
+    # git_push_guard: accept a Devin/CodeRabbit review AT HEAD in Codex's place,
+    # with the owner's approval given in conversation (2026-09-24). Loses to
+    # stale-review-override when both are present.
+    "substitute-review",
     "discard-override",
     # Both were passed to has_trailing_override from the day they shipped but never
     # listed here, so the "kept in sync" claim above was false. The consequence is

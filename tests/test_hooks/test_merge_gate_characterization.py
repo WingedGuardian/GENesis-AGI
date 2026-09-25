@@ -1607,3 +1607,203 @@ def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys)
     assert rc == 0
     assert "scheduled-review gate n/a" in err
     assert "owner/some-other-public-repo" in err  # names the canonical public repo
+
+
+# ── the Codex stand-in: `# substitute-review` (owner standing order, 2026-09-24) ──
+# Driven through main() because the load-bearing properties live in the merge ARM,
+# not in the helper: the owner approves IN CONVERSATION and the sigil records it,
+# so the gate shows NO permission prompt (ruling f7e8d2ed, 2026-09-24); a
+# dispatched session is REFUSED; every later hard block still applies; the merge
+# stays bound to the substitute-verified head; and the override log marks a row
+# whose stand-in was actually used.
+
+_DEVIN = "devin-ai-integration[bot]"
+
+
+def _devin_at(head: str = HEAD, *, has_body: bool = True) -> str:
+    # `has_body` is explicit: the reader defaults an ABSENT field to True, so a
+    # fixture that omitted it could never show the requirement is enforced.
+    return json.dumps(
+        {"login": _DEVIN, "commit_id": head, "state": "COMMENTED", "has_body": has_body}
+    )
+
+
+def _asked(out: str) -> bool:
+    return '"permissionDecision": "ask"' in out or '"permissionDecision":"ask"' in out
+
+
+def test_substitute_review_proceeds_with_a_note_and_no_prompt(monkeypatch, capsys):
+    """Owner ruling f7e8d2ed: approval is given in chat, the sigil records it."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(),
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert not _asked(captured.out), "the stand-in still raised a permission prompt"
+    assert "devin-ai-integration[bot]" in captured.err and HEAD[:12] in captured.err
+    assert "stands in for Codex" in captured.err
+
+
+def test_substitute_review_is_refused_in_a_dispatched_session(monkeypatch, capsys):
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(),
+    )
+    captured = capsys.readouterr()
+    assert rc == 2, "an unattended session merged on a substitute nobody approved"
+    assert not _asked(captured.out)
+    assert "dispatched session" in captured.err
+
+
+def test_substitute_review_without_a_review_at_head_still_blocks(monkeypatch, capsys):
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(STALE),
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "no Devin or CodeRabbit review at head" in err
+
+
+def test_a_body_less_record_at_head_does_not_substitute(monkeypatch, capsys):
+    """An empty-body record is the wrapper GitHub creates for a thread reply."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(has_body=False),
+    )
+    captured = capsys.readouterr()
+    assert rc == 2, "a thread-reply wrapper stood in for a review of the head"
+    assert not _asked(captured.out)
+    assert "no Devin or CodeRabbit review at head" in captured.err
+
+
+def test_without_the_sigil_a_substitute_review_changes_nothing(monkeypatch, capsys):
+    rc = _run(monkeypatch, _merge_cmd(), reviews=_devin_at())
+    captured = capsys.readouterr()
+    assert rc == 2, "a Devin review at head satisfied freshness with no sigil and no ask"
+    assert "substitute-review" in captured.err  # the block names the route
+
+
+def test_stale_review_override_wins_over_substitute(monkeypatch, capsys):
+    """Owner ruling 2026-09-24: with both, the broader, ask-free waiver applies."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# stale-review-override substitute-review"),
+        reviews=_devin_at(),
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert not _asked(out)
+
+
+def test_the_sigil_is_inert_when_codex_reviewed_the_head(monkeypatch, capsys):
+    rows = "\n".join([_reviews_jsonl(HEAD), _devin_at()])
+    rc = _run(monkeypatch, _merge_cmd(trailer="# substitute-review"), reviews=rows)
+    captured = capsys.readouterr()  # ONE read: a second one returns empty streams
+    assert rc == 0
+    assert not _asked(captured.out), "the owner was asked about a substitute Codex made unnecessary"
+    assert "stands in for Codex" not in captured.err, "a stand-in was used though Codex is current"
+
+
+def test_a_substitute_never_waives_a_later_hard_block(monkeypatch, capsys):
+    """The stand-in answers the freshness check only: an unresolved P1 still BLOCKS."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=_devin_at(),
+        router=_router(inline_lines=_INLINE_P1_LINE),
+    )
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert not _asked(captured.out)
+    # Both halves, or a broken stand-in would pass this too (the freshness gate
+    # also returns 2): the stand-in ENGAGED, and the P1 is what blocked.
+    assert "stands in for Codex" in captured.err, captured.err
+    assert "inline review gate did not pass" in captured.err, captured.err
+
+
+def test_a_substitute_merge_stays_bound_to_the_substitute_head(monkeypatch, capsys):
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# substitute-review"),
+        reviews=_devin_at(),
+    )
+    err = capsys.readouterr().err
+    assert rc == 2, "an unbound merge proceeded on a substitute review"
+    assert "devin-ai-integration[bot]-verified" in err
+
+
+def test_the_override_log_records_a_substitute_merge(monkeypatch, capsys):
+    import os as _os
+
+    log_dir = Path(_os.environ["GENESIS_MERGE_OVERRIDE_DIR"])
+    _run(monkeypatch, _merge_cmd(trailer="# substitute-review"), reviews=_devin_at())
+    rows = [
+        json.loads(line)
+        for f in sorted(log_dir.glob("*.jsonl"))
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    subs = [r for r in rows if r.get("sigil") == "substitute-review"]
+    assert subs, f"no override row for the substitute merge: {rows}"
+    assert subs[0].get("outcome") == "allowed"
+    # A stand-in that was actually USED is marked, so the log separates it from
+    # a sigil that was merely present (Codex current, or stale-override beside it).
+    assert subs[0].get("waived") == "codex-freshness:used", subs[0]
+
+
+def test_an_unused_substitute_sigil_is_not_marked_used(monkeypatch, capsys):
+    import os as _os
+
+    log_dir = Path(_os.environ["GENESIS_MERGE_OVERRIDE_DIR"])
+    _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# stale-review-override substitute-review"),
+        reviews=_devin_at(),
+    )
+    rows = [
+        json.loads(line)
+        for f in sorted(log_dir.glob("*.jsonl"))
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    subs = [r for r in rows if r.get("sigil") == "substitute-review"]
+    assert subs and subs[0].get("waived") == "codex-freshness", subs
+
+
+def test_every_logged_sigil_records_what_it_waived(monkeypatch, capsys):
+    """The whole sigil table, driven through main(). `waived` is stored only when
+    it fits the log's closed shape, so a label that does not fit is written as an
+    empty field on EVERY row, and no test that calls the writer directly can see
+    it. This one reads the rows the live table actually produced."""
+    import os as _os
+
+    log_dir = Path(_os.environ["GENESIS_MERGE_OVERRIDE_DIR"])
+    sigils = (
+        "ci-override",
+        "stale-review-override",
+        "review-override",
+        "scheduled-review-override",
+        "substitute-review",
+    )
+    _run(
+        monkeypatch,
+        _merge_cmd(match=None, trailer="# " + " ".join(sigils)),
+        reviews=_devin_at(),
+    )
+    rows = [
+        json.loads(line)
+        for f in sorted(log_dir.glob("*.jsonl"))
+        for line in f.read_text().splitlines()
+        if line.strip()
+    ]
+    by_sigil = {r.get("sigil"): r for r in rows}
+    assert set(by_sigil) == set(sigils), f"rows written: {sorted(by_sigil)}"
+    empty = sorted(s for s, r in by_sigil.items() if not r.get("waived"))
+    assert not empty, f"these sigils logged an empty waived field: {empty}"
