@@ -113,9 +113,7 @@ async def memory_recall(
             user content excluded.
         rerank: If True (default), apply cross-encoder reranking (~300ms).
         include_deprecated: If True, include superseded memories (audit /
-            history queries), and traverse them for ``graph_neighbors`` too. Any
-            neighbour that is itself hidden is flagged ``"hidden": true``; the key
-            is absent on visible ones. Default False.
+            history queries). Default False.
     """
     import time as _time
 
