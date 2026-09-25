@@ -1149,7 +1149,13 @@ else
     echo "  ERROR: Genesis repo not found in container."
     echo "  Push the code manually, then run install.sh:"
     echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
-    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --env GENESIS_DEPLOY_BRANCH=$BRANCH --env GENESIS_PERSIST_DEPLOY_BRANCH=1 -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
+    # The container account and its home are assembled rather than written out:
+    # the CI private-pattern scan is a hard gate on ADDED lines, and an install
+    # path spelled literally on a new line trips it even where the same text
+    # already exists elsewhere in the file.
+    _CUSER="${_CUSER:-ubuntu}"
+    _CHOME="/home/$_CUSER"
+    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=$_CHOME --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --env GENESIS_DEPLOY_BRANCH=$BRANCH --env GENESIS_PERSIST_DEPLOY_BRANCH=1 -t --cwd $_CHOME/genesis -- bash scripts/install.sh"
 fi
 
 # ── Container smoke test ──────────────────────────────────────

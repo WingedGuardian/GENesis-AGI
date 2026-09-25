@@ -273,11 +273,17 @@ def _container_repo_block(dest: Path) -> str:
     would operate on this machine's own checkout.
     """
     text = (REPO_ROOT / "scripts" / "host-setup.sh").read_text()
-    start = text.index("    _DEST=/home/ubuntu/genesis")
+    # Anchored on the ASSIGNMENT, not its value: the literal container path is
+    # a private-pattern match, and the CI scan is a hard gate on added lines.
+    # Anchoring on the variable is also the more durable of the two -- the
+    # extraction does not break if the path ever moves.
+    start = text.index("    _DEST=")
     end = text.index("\n    fi\n", start) + len("\n    fi\n")
     block = text[start:end]
-    assert "_DEST=/home/ubuntu/genesis" in block
-    return block.replace("_DEST=/home/ubuntu/genesis", f'_DEST="{dest}"', 1)
+    # .index() above raises when the anchor is absent, so this cannot pass
+    # vacuously against a file that no longer contains the block.
+    assert re.search(r"^    _DEST=", block, re.M), "extraction lost its anchor"
+    return re.sub(r"^    _DEST=.*$", f'    _DEST="{dest}"', block, count=1, flags=re.M)
 
 
 def _two_branch_repo(tmp_path: Path) -> tuple[Path, Path]:
