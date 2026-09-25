@@ -490,7 +490,7 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from genesis.eval.runner import run_eval
-    from genesis.routing.config import load_config
+    from genesis.routing.config import _current_provider_name, load_config
 
     config_path = Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
     config = load_config(config_path)
@@ -502,10 +502,13 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
 
     # Determine which providers to benchmark
     if args.model:
-        if args.model not in config.providers:
+        # `--model` is a public input and can predate a rename; resolve it the way
+        # a local overlay's provider keys are resolved, so the two agree.
+        requested = _current_provider_name(args.model)
+        if requested not in config.providers:
             print(f"error: unknown provider '{args.model}'", file=sys.stderr)
             return 1
-        providers = [args.model]
+        providers = [requested]
     else:
         providers = [
             name
