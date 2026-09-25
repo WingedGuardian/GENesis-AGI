@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -83,7 +84,15 @@ async def _sqlite_wal_truncate(db) -> None:
 _WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024  # 100 MB → "high" (morning report)
 _WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024  # 500 MB → "critical" (Telegram now)
 _WAL_ALERT_COOLDOWN_S = 3600  # one alert per hour max
-_WAL_TRUNCATE_EVERY_N_TICKS = 12  # hourly TRUNCATE (tick ≈ 5 min)
+#: Hourly TRUNCATE (tick ≈ 5 min). NOTE the first fire is NOT at T+60m: the
+#: scheduler uses ``next_run_time=now`` so tick 1 lands at T+0, ``_tick_count``
+#: is incremented before the ``% N`` test, and tick 12 therefore falls at
+#: T + 11x5 = T+55m. The CADENCE is 60m; only the first interval is 55m. Both
+#: halves of that have been misread — 12x5=60 ignores the immediate first tick,
+#: and "every 55 minutes" over-generalises one interval — and it matters when
+#: correlating this block against an incident timeline, where T is the awareness
+#: loop's start, not the server's (init lag was ~4 min on one measured restart).
+_WAL_TRUNCATE_EVERY_N_TICKS = 12
 # None = "never alerted". Must NOT be 0.0: time.monotonic() is since boot, so on a
 # freshly-booted host `now - 0.0` is small and would wrongly suppress the first alert.
 _last_wal_alert_at: float | None = None
@@ -1638,6 +1647,15 @@ async def _resolve_follow_up_watchdog(db) -> None:
 _NOCOW_ALERT_COOLDOWN_S = 24 * 3600
 # None = "never alerted" (same monotonic-since-boot caveat as the WAL alert).
 _last_nocow_alert_at: float | None = None
+#: The one probe child we SIGKILLed and could not collect, if any. Holds the
+#: accumulation bounded at ONE — see :func:`_nocow_flag`'s "at most one
+#: survivor" clause. None means there is nothing outstanding.
+_stuck_nocow_probe = None
+#: When that survivor was recorded (``time.monotonic``). Only for the WARNING
+#: that says how long this monitor has been disabled — nothing branches on it,
+#: deliberately: a deadline that re-probed would re-open the very leak the
+#: survivor represents.
+_stuck_nocow_probe_since: float | None = None
 _FS_IOC_GETFLAGS = 0x80086601
 _FS_NOCOW_FL = 0x00800000
 
@@ -1663,25 +1681,288 @@ def _fs_type_for(path) -> str | None:
         return None
 
 
+#: Reads FS_IOC_GETFLAGS in a CHILD process and prints 1/0 for the nodatacow bit.
+#: The ioctl needs a descriptor on the file, and that is the whole problem — see
+#: :func:`_nocow_flag` for why this cannot run in the server's own process. The
+#: constants are passed in as argv rather than re-spelled here so this string
+#: cannot drift away from the module-level definitions above.
+_NOCOW_PROBE_SRC = (
+    "import fcntl, os, struct, sys\n"
+    "path, getflags, nocow = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])\n"
+    "fd = os.open(path, os.O_RDONLY)\n"
+    "try:\n"
+    "    raw = fcntl.ioctl(fd, getflags, struct.pack('l', 0))\n"
+    "finally:\n"
+    "    os.close(fd)\n"
+    "print(1 if struct.unpack('l', raw)[0] & nocow else 0)\n"
+)
+
+
+#: Bound on the flag probe. MEASURED latency over 15 runs: median 25.9 ms, max
+#: 28.9 ms. The failure mode this guards is a child wedged in uninterruptible
+#: sleep on a stuck filesystem — not slowness, which does not happen here. 3s is
+#: ~100x the measured worst case and stays far under the tick's
+#: ``misfire_grace_time=60``, which matters because the tick awaits this inline
+#: and a stall delays every check after it.
+_NOCOW_PROBE_TIMEOUT_S = 3
+
+#: Separate, much SHORTER bound on reaping a child we have already SIGKILLed.
+#: Reusing the probe timeout here silently doubled the worst-case tick stall to
+#: 6s (measured at a scaled constant), and bought nothing for it: a killed child
+#: that has not been collected within a few hundred milliseconds is in
+#: uninterruptible sleep and will not exit in three seconds either. MEASURED: a
+#: killed child reaches GONE within 0.5s via asyncio's child watcher. So the only
+#: outcomes are "collected almost immediately" or "not collected at all", and a
+#: long bound merely delays the tick before reaching the same conclusion.
+_NOCOW_REAP_TIMEOUT_S = 0.5
+
+
+async def _kill_probe(proc) -> None:
+    """Reap a probe child we are abandoning. Never raises, never blocks forever.
+
+    The wait is BOUNDED, and that bound is the whole point. SIGKILL cannot
+    complete while the child sits in uninterruptible sleep — which is precisely
+    the failure mode :data:`_NOCOW_PROBE_TIMEOUT_S` exists to bound. An unbounded
+    ``await proc.wait()`` here would therefore defeat that timeout and hang the
+    awareness tick indefinitely: the probe would be bounded and its reaper would
+    not.
+
+    If the bounded wait expires the child is left UN-REAPED — not, as an earlier
+    revision of this docstring claimed, "left for the OS to reap". The OS cannot
+    reap a live parent's child; only a wait from this process does. MEASURED: a
+    killed child whose ``wait()`` is never awaited still reaches ``GONE`` within
+    0.5s, collected by asyncio's own ``PidfdChildWatcher`` independently of any
+    awaiter — and in the one case this bound exists for, a genuinely
+    uninterruptible child, nothing collects it at all and the pidfd registration
+    stays. So: the watcher will collect it if it ever leaves uninterruptible
+    sleep, and one leaked registration is strictly better than a stalled tick.
+    The decision was right; the reason given for it was false.
+
+    "ONE leaked registration" is only true because the CALLER makes it true.
+    Review pointed out that this function alone bounds nothing: the check runs
+    hourly, so a filesystem wedged for a week would leave ~168 un-reaped
+    children and as many watcher registrations, not one. :func:`_nocow_flag`
+    records the survivor in :data:`_stuck_nocow_probe` and declines to spawn
+    beside it, which is where the bound actually lives. Do not read this
+    docstring as a guarantee this function provides.
+
+    ``CancelledError`` derives from ``BaseException``, so neither handler below
+    catches it and it propagates by construction — correct, because this is
+    called from the cancellation path and must not convert a cancellation into a
+    shrug. VERIFIED rather than recalled: ``TimeoutError is asyncio.TimeoutError``
+    and its MRO is (TimeoutError, OSError, Exception, BaseException, object), so
+    ``except TimeoutError`` catches what ``wait_for`` raises while
+    ``CancelledError`` passes through both handlers untouched.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_NOCOW_REAP_TIMEOUT_S)
+    except TimeoutError:
+        logger.debug(
+            "nodatacow probe child survived SIGKILL for %ss (uninterruptible?); "
+            "leaving it un-reaped rather than blocking the tick",
+            _NOCOW_REAP_TIMEOUT_S,
+        )
+    except Exception:
+        logger.debug("nodatacow probe reap failed", exc_info=True)
+
+
+async def _nocow_flag(db_path: Path) -> bool | None:
+    """Is the nodatacow (+C) attribute set on *db_path*? None = could not tell.
+
+    Runs the ioctl in a SHORT-LIVED CHILD PROCESS, and that indirection is the
+    entire point of this function.
+
+    POSIX releases EVERY record lock a process holds on a file as soon as that
+    process closes ANY descriptor to it — not merely the descriptor that took
+    the lock. SQLite's unix VFS defends against this for descriptors IT opened
+    (``unixInodeInfo`` defers the real close) but it cannot see a descriptor
+    opened by other code in the same process. This function runs inside the
+    server, which holds SQLite's locks on this exact file.
+
+    So the obvious spelling — ``open(db_path, "rb")`` for the ioctl — silently
+    dropped the server's SHARED lock on the main database every time it ran.
+    The next short-lived opener could then take an exclusive lock, conclude it
+    was the last connection, checkpoint its partial view into the main file and
+    unlink the ``-shm`` and ``-wal``. The server kept writing through the now
+    detached descriptors while other processes wrote the live ones, and the
+    database was malformed inside two minutes.
+
+    MEASURED 2026-09-21, five arms with controls, on both ext4 and btrfs:
+    with the in-process open the holder's main-file lock went 1 -> 0 and a
+    following opener orphaned the sidecars while the holder was still writing;
+    without it the identical opener left the lineage untouched. A child process
+    closing its own descriptor cannot release this process's locks, and the
+    same harness measured the lock surviving (1 -> 1) through this path.
+
+    Two alternatives were measured rather than reasoned about:
+
+    * ``O_PATH`` — REFUTED. ``FS_IOC_GETFLAGS`` on such a descriptor fails with
+      ``EBADF``.
+    * **A descriptor on the parent DIRECTORY** — works, and preserves the locks
+      (confirmed independently on btrfs). Rejected only because it answers a
+      PROXY question: the directory's flag governs files created inside it, not
+      the flag on the database that is actually there. The two normally agree —
+      ``restore.sh`` stages at ``${DB_FILE}.restore-stage.$$``, inside the same
+      directory, so its swap inherits ``+C`` and does NOT diverge — but they can
+      part company if the file is renamed in from a directory without the
+      attribute, or has it cleared explicitly. Reading the file keeps the check
+      answering the question its own alert text asks.
+
+    The cost of that fidelity is one short-lived process per hourly check.
+
+    AT MOST ONE SURVIVOR, EVER. A child wedged in uninterruptible sleep cannot
+    be collected — :func:`_kill_probe` gives up on it deliberately rather than
+    stall the tick. Left there, the hourly cadence would accumulate one such
+    child (and one asyncio child-watcher registration) per hour for as long as
+    the filesystem stayed wedged. So the survivor is recorded in
+    :data:`_stuck_nocow_probe` and no new probe is spawned while it is still
+    running; the check simply reports "could not tell", which is the same answer
+    the spawn would have produced. The latch clears itself the first time the
+    child's ``returncode`` is set — asyncio's watcher does that without an
+    awaiter — so recovery needs no timer and no cleanup path.
+
+    Returns None — never raises — for EVERY failure mode: spawn failure, a
+    timeout, a non-zero exit, unparseable output. The caller's own blanket
+    ``except`` would swallow an exception anyway, so raising here would only
+    make the failure harder to see, not safer.
+    """
+    global _stuck_nocow_probe, _stuck_nocow_probe_since
+
+    if _stuck_nocow_probe is not None:
+        if _stuck_nocow_probe.returncode is None:
+            # A previous probe is STILL wedged. Spawning beside it is what turns
+            # one leaked child into one per hour, so decline instead — the answer
+            # would be "could not tell" either way, which is what we return.
+            #
+            # WARNING, not debug, and that is the point. While this holds, the
+            # nodatacow monitor is OFF: it reports "could not tell" every hour
+            # and raises nothing. The shipped log level is INFO, so a debug line
+            # here would make a disabled health check invisible — which is the
+            # failure this very function's spawn-failure comment warns about.
+            # It does not self-clear on a timer: a child that never leaves
+            # uninterruptible sleep keeps the monitor off until the server
+            # restarts, and saying so out loud is the remedy, because retrying
+            # into a wedged filesystem buys nothing and re-opens the leak.
+            held_for = (
+                time.monotonic() - _stuck_nocow_probe_since
+                if _stuck_nocow_probe_since is not None
+                else float("nan")
+            )
+            logger.warning(
+                "nodatacow check SKIPPED and will stay skipped: probe pid %s has "
+                "not exited after %.0fs (uninterruptible — a wedged filesystem?). "
+                "This monitor is disabled until that child exits or the server "
+                "restarts.",
+                getattr(_stuck_nocow_probe, "pid", "?"),
+                held_for,
+            )
+            return None
+        # It exited on its own. asyncio's child watcher sets ``returncode``
+        # without anyone awaiting — MEASURED on this install (Python 3.12.3,
+        # PidfdChildWatcher, returncode set ~10ms after SIGKILL with no awaiter)
+        # — so this clears itself on the next check with no extra machinery and
+        # no timer.
+        _stuck_nocow_probe = None
+        _stuck_nocow_probe_since = None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _NOCOW_PROBE_SRC,
+            str(db_path),
+            str(_FS_IOC_GETFLAGS),
+            str(_FS_NOCOW_FL),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        # A broken/missing interpreter path. The contract is bool | None, and
+        # the caller's blanket except would hide this entirely — log it, because
+        # a permanently failing probe silently disables the monitor forever on
+        # the one filesystem where its alert matters.
+        logger.debug("nodatacow probe could not be spawned", exc_info=True)
+        return None
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S
+        )
+    except TimeoutError:
+        # RECORD FIRST, clear on success — never the other way round. `_kill_probe`
+        # awaits, so it is a cancellation point: a tick cancelled during the reap
+        # would propagate CancelledError straight past a trailing assignment,
+        # leaving the child killed but UNTRACKED and the next check free to spawn
+        # beside it. That is precisely the accumulation this latch exists to stop,
+        # so the window must not exist. Review found this by executing it:
+        # `kills=1 latch=None -> LEAKED, UNTRACKED`.
+        _stuck_nocow_probe = proc
+        _stuck_nocow_probe_since = time.monotonic()
+        await _kill_probe(proc)
+        if proc.returncode is not None:
+            # collected; nothing is outstanding
+            _stuck_nocow_probe = None
+            _stuck_nocow_probe_since = None
+        logger.debug("nodatacow probe timed out after %ss", _NOCOW_PROBE_TIMEOUT_S)
+        return None
+    except asyncio.CancelledError:
+        # Shutdown, or the tick being cancelled. The old code was synchronous
+        # and had no await point, so this window is NEW: without the kill the
+        # child outlives us. Reap it, then let cancellation propagate — never
+        # convert it into a verdict.
+        #
+        # Same record-first ordering, and here it is not a corner: this handler
+        # runs BECAUSE something cancelled us, so a second cancellation arriving
+        # during the reap is the ordinary case rather than the exotic one.
+        _stuck_nocow_probe = proc
+        _stuck_nocow_probe_since = time.monotonic()
+        await _kill_probe(proc)
+        if proc.returncode is not None:
+            _stuck_nocow_probe = None
+            _stuck_nocow_probe_since = None
+        raise
+
+    if proc.returncode != 0:
+        logger.debug(
+            "nodatacow probe exited %s: %s",
+            proc.returncode,
+            stderr.decode(errors="replace").strip()[:200],
+        )
+        return None
+    out = stdout.decode(errors="replace").strip()
+    if out in ("0", "1"):
+        return out == "1"
+    logger.debug("nodatacow probe returned unparseable output: %r", out[:80])
+    return None
+
+
 async def _check_db_nodatacow(db) -> None:
     """Create a 'high' observation (morning-report tier) when the SQLite DB
     sits on btrfs WITHOUT the nodatacow attribute. Non-btrfs filesystems are
     exempt (the flag is meaningless there). Best-effort; never raises into the
-    tick, and never alerts on a probe failure."""
+    tick, and never alerts on a probe failure.
+
+    The flag read is delegated to :func:`_nocow_flag`, which runs it out of
+    process. Do NOT inline it back here: this function runs on the server's own
+    event loop, and a descriptor opened on the database from inside that process
+    drops SQLite's locks on close. That is not a theoretical hazard — it was the
+    root cause of repeated database corruption on a btrfs install, and this
+    branch is reached ONLY on btrfs, which is exactly why one install corrupted
+    and its ext4 sibling never did."""
     global _last_nocow_alert_at
     try:
-        import fcntl
-        import struct
-
         from genesis.env import genesis_db_path
 
         db_path = genesis_db_path()
         if not db_path.exists() or _fs_type_for(db_path) != "btrfs":
             return
-        with open(db_path, "rb") as fh:
-            raw = fcntl.ioctl(fh.fileno(), _FS_IOC_GETFLAGS, struct.pack("l", 0))
-        if struct.unpack("l", raw)[0] & _FS_NOCOW_FL:
-            return  # +C set — healthy
+        flag = await _nocow_flag(db_path)
+        if flag is not False:
+            # True  -> +C set, healthy.
+            # None  -> could not determine; never alert on a probe failure.
+            return
     except Exception:
         return  # can't determine — nothing to alert on
 
@@ -1958,8 +2239,14 @@ async def _publish_repo_bundle_if_due() -> None:
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
 # suppress the first alert for a slot.
-_last_slot_alert_at: dict[str, float] = {}
-_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour
+# pid-key -> (last alert monotonic time, priority it was sent at). The priority
+# rides along because the cooldown must NOT swallow an ESCALATION: a WARN
+# ("high") at minute 0 used to silence the CRIT that crossed ten minutes later
+# for the rest of the hour — and CRIT is the tier that actually reaches
+# Telegram. With the tree denominator this is a live shape, not a theoretical
+# one: a session that starts a heavy job can cross WARN->CRIT within one window.
+_last_slot_alert_at: dict[str, tuple[float, str]] = {}
+_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour (per severity step)
 
 
 async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
@@ -1990,10 +2277,20 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
     # lifetime); an entry older than the cooldown no longer suppresses anything,
     # so dropping it is behaviour-neutral and prevents slow growth on a
     # long-running server.
-    for k in [k for k, t in _last_slot_alert_at.items() if now - t >= _SLOT_ALERT_COOLDOWN_S]:
+    for k in [k for k, v in _last_slot_alert_at.items() if now - v[0] >= _SLOT_ALERT_COOLDOWN_S]:
         del _last_slot_alert_at[k]
     for slot in slots:
-        rss = slot.get("rss_mb", 0.0)
+        # `rss_mb` is the slot's WHOLE TREE (claude + Serena + the MCP fleet).
+        # Comparing the threshold against the root process alone — which is what
+        # this did before — meant the alert could not fire in the regime it
+        # exists for: the root stays ~0.8 GB while the tree balloons.
+        # `or`, not a .get default, on BOTH keys: a present-None survives a
+        # default, and `rss` is compared outside the inner try, where a None
+        # raises out of a function whose contract is "never raises into the
+        # tick". Defensive — no production caller passes rows today (the one
+        # call site enumerates live slots).
+        rss = slot.get("rss_mb") or 0.0
+        proc_rss = slot.get("proc_rss_mb") or rss
         if rss < SLOT_RSS_WARN_MB:
             continue
         # Key the cooldown by PID (unique per process), never the slot label: rows
@@ -2005,15 +2302,22 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         pid = slot.get("pid")
         key = f"pid:{pid}"
         label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
+        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         last = _last_slot_alert_at.get(key)
-        if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
+        # Within the window a repeat at the SAME (or lower) severity stays
+        # suppressed; an escalation high -> critical always re-alerts, since
+        # critical is the tier that reaches Telegram.
+        if (
+            last is not None
+            and (now - last[0]) < _SLOT_ALERT_COOLDOWN_S
+            and not (priority == "critical" and last[1] == "high")
+        ):
             continue
         if db is None:
             continue  # can't write the observation now; retry next tick
-        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         # Consumed only once we can actually write (after the db-None guard), and
         # set before the await so a failed create still suppresses per-tick retries.
-        _last_slot_alert_at[key] = now
+        _last_slot_alert_at[key] = (now, priority)
         try:
             await observations.create(
                 db,
@@ -2022,9 +2326,14 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 type="infrastructure_alert",
                 content=(
                     f"CC {label} (pid {pid}) is using "
-                    f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
-                    f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting {label}."
+                    f"{rss / 1024:.1f} GB RAM across its whole process tree "
+                    f"({proc_rss / 1024:.1f} GB in the claude process itself, the rest "
+                    f"in its Serena and MCP children) — warn "
+                    f"{SLOT_RSS_WARN_MB // 1024} GB, crit {SLOT_RSS_CRIT_MB // 1024} GB. "
+                    f"A single Claude Code session may be leaking — or may be "
+                    f"running a legitimately memory-heavy job (the tree counts "
+                    f"anything the session started). Check {label}'s process "
+                    f"tree before restarting it."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),

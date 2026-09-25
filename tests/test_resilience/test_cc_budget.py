@@ -117,7 +117,15 @@ class TestThrottling:
 
 
 class TestRecordSession:
-    async def test_record_increases_count(self, tracker, db):
+    async def test_deleted_writer_stays_deleted(self, tracker):
+        """record_session_start was removed (a fourth raw-SQL creation path
+        with no closer; its rows sat 'active' forever). The budget counts
+        rows the real creation paths write — a private recorder returning
+        would reintroduce unclosable rows."""
+        assert not hasattr(tracker, "record_session_start")
+
+    async def test_real_rows_increase_count(self, tracker, db):
         assert await tracker.get_usage_pct() == pytest.approx(0.0)
-        await tracker.record_session_start("foreground", P_FOREGROUND)
+        recent = (datetime(2026, 3, 11, 11, 55, 0, tzinfo=UTC)).isoformat()
+        await _insert_sessions(db, 1, recent)
         assert await tracker.get_usage_pct() == pytest.approx(0.05)

@@ -1146,6 +1146,55 @@ every edit" mandate — that just gates work behind a tool that's stale-by-desig
 Full syntax and Cypher examples: `.claude/docs/code-intelligence-guide.md`;
 tool-selection decision matrix: `.claude/docs/code-intelligence.md`
 
+### Advisory is the default; a BLOCK is what needs the argument
+
+Before the fail-direction question below, there is a prior one, and it is the
+one that gets skipped: **should this refuse at all?**
+
+**Advisory is the default and the first step.** Escalating to a BLOCK needs a
+specific, credible, MEASURED reason — the risk is that severe, or that frequent.
+*"For safety"* and *"defense in depth"* are not reasons. Neither is having just
+been bitten once: an n=1 incident earns a COUNTER, not a gate.
+
+**Fail-open is not an automatic defect — but say WHICH question you are
+answering, because there are two and they get opposite defaults.** (1) The
+VERDICT question: when a guard evaluates successfully, should its design be an
+advisory or a block? Advisory by default, per the above. (2) The DEGRADE
+question — what a guard does when it CANNOT evaluate — is decided per boundary
+by the section below, and many of this repo's Bash hooks are REQUIRED to fail
+closed there by the degrade-direction contract test
+(`test_every_bash_hook_declares_its_degrade_direction`); nothing in this
+section loosens that, and satisfying it with a false advisory claim in the
+exemption list is the named failure, not compliance. The claim here is about
+(1): a control that fights the operator daily against a harm that is usually
+hypothetical is a cost, not a defense. Ask which direction THIS boundary should
+fail in — open, closed, or open-and-loud — from consequence, never from which
+one sounds safer.
+
+⚠ **This governs GUARDS — advisory nudges and friction hooks — never APPROVAL
+BOUNDARIES.** Anything that gates autonomy expansion, spending, destruction of
+data, or publication to an external surface is a sovereignty boundary, not
+friction to be tuned: never a downgrade candidate, and proposing to relax one
+is itself the failure. The autonomous-CLI gate, ego proposals, per-transaction
+financial approval and destructive-command confirmation are canonical members
+of that class, not an exhaustive list — classify by what the boundary GATES,
+never by whether it appears here.
+
+Two consequences worth stating, because they are easy to get backwards:
+
+- **Blocking stops foreground and background equally; advisory stops neither.
+  Both are fine.** What is NOT fine is an ask that reaches an UNATTENDED
+  session — an ask with no human present is a block nobody intended — or a
+  block that impedes background work nobody meant to impede. An ask leg is
+  legitimate exactly where the shipped ones sit: at an approval boundary in a
+  foreground flow, degrading to a DEFINED verdict when dispatched (the push
+  guard's ask converts to deny under `_is_dispatched()`) rather than hanging.
+- **A guard is written for the agent, not the user.** Nine times in ten the user
+  need not know it fired.
+
+This is a design axiom, not a preference: changing it is a redesign
+conversation, not a session's call.
+
 ### Guard failure semantics — the third option is fail OPEN, LOUDLY
 
 Every guard has TWO INDEPENDENT axes when it cannot evaluate, and collapsing
@@ -2019,7 +2068,7 @@ reviewed diff's FULL content, so re-staging different content after the audit
 re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
 substantial change — not clearance. Depth is override-exempt: a findings
 `# review-override` does NOT waive it; only a loud, announced-on-stderr `# depth-ack`
-does (announced, not RECORDED — nothing persists it, unlike the four PR-merge sigils
+does (announced, not RECORDED — nothing persists it, unlike the five PR-merge sigils
 below, whose rows survive the session; the word "logged" now means a durable row) (the
 audited escape for a genuine format mismatch). "Adversarial" is verified
 STRUCTURALLY, and the recognised vocabulary is NOT what an earlier version of this
@@ -3428,11 +3477,23 @@ real-world life — so the issue carries technical detail only. Borderline, in
 either direction? Ask. See CLAUDE.md, "Where deferred work goes".
 
 **The exception that is NEVER waived: a security defect is not filed publicly
-before it is fixed.** An unpatched bypass, a credential exposure, anything
-exploitable — that goes to a private record under `~/.genesis/output/` plus a
-`follow_up_create` row, and nothing about it reaches a public surface — the
-relaxed filing rule above does not touch this one. If a finding is both adjacent and a live bypass,
-the security rule wins.
+before it is fixed.** It goes to a private record under `~/.genesis/output/`
+plus a `follow_up_create` row, and nothing about it reaches a public surface —
+the relaxed filing rule above does not touch this one.
+
+**The test is WHO GAINS, not the word "bypass"** (see CLAUDE.md, "Where
+deferred work goes", for the full rule this mirrors). Security-class means
+disclosure hands someone a capability they do not already have: a credential
+exposure, an auth or privilege bypass, an injection path, anything reachable by
+a party with LESS access than it grants. A fail-open in a LOCAL development
+guard is usually not that — it runs only where an install wires it, whoever can
+trigger it already has commit access to that checkout, and the worst case is
+typically an under-reviewed change reaching a PR that still waits on maintainer
+approval. Apply the test rather than the label; the catch-all phrasing this
+replaces swept in most of what this repo builds. The exception the test catches
+and the label does not: a guard whose job is stopping a SECRET or PRIVATE DATA
+from reaching a public surface is security-class however local it is, because a
+branch on a public repo is public the moment it is pushed, merged or not.
 
 Write the issue while the context is in your head — the measurement, the
 file:line, the falsifier, and why it was out of scope for the PR. An issue that
@@ -3667,6 +3728,24 @@ findings below, a gated `gh pr merge`:
   ⚠ An earlier version of this bullet claimed the split meant one waiver "can't
   silently disarm an unrelated gate", and listed this sigil as waiving "ONLY"
   the review-context gates. Both were false of this one sigil.
+- **`# substitute-review` is the NARROW Codex stand-in** (owner standing order,
+  2026-09-24). When Codex has not reviewed the head, a NON-dismissed,
+  NON-pending Devin or CodeRabbit review whose `commit_id` is EXACTLY the head
+  satisfies the Codex freshness check. The owner approves each use IN
+  CONVERSATION before you add the sigil — the sigil is the record of that yes, so
+  never add it without asking (owner ruling 2026-09-24, which replaced a native
+  permission prompt the first version raised). The gate prints a NOTE naming the
+  stand-in and marks its override-log row `codex-freshness:used`; a dispatched
+  session is refused, since nobody there can have approved it. Every other gate
+  still applies. Unlike `# stale-review-override` it keeps the base-branch check and
+  the `--match-head-commit` binding (labelled with the reviewer that verified the
+  head), so no fallback-evidence file is needed on this path. Only a review
+  record with a BODY counts: an empty-body record at head is the wrapper GitHub
+  makes when the bot replies inside a thread, not a review of the head. With
+  both sigils present, `# stale-review-override` wins and the stand-in is never
+  used — it is already the broader waiver. `--check-pr` says when a stand-in exists:
+  `codex-at-head : BLOCK — … — substitute available: <reviewer> reviewed this
+  head`. Codex remains the official reviewer; this exists for its outages.
 
 The review-findings gate specifically:
 
@@ -3678,19 +3757,48 @@ The review-findings gate specifically:
    VOLUME.** Two independent rules, checked in that order:
 
    **(a) The always-fix floor, every lane, before the score is consulted.** Any
-   unresolved Codex **P1**, or any unresolved CodeRabbit **Critical/Major**,
-   blocks the merge outright — whatever the change is. This is
-   `floor_hits = len(p1) + len(cr_block)` in `_check_inline_review_findings`.
+   unresolved Codex **P1**, any unresolved CodeRabbit **Critical/Major**, or any
+   unresolved Devin **severe bug / critical security** finding (🔴/🟥) blocks the
+   merge outright — whatever the change is. This is
+   `floor_hits = len(p1) + len(cr_block) + len(devin_block)` in
+   `_check_inline_review_findings`.
    It is a RULE because it used to be an ACCIDENT: before the lanes existed the
    single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
    arithmetic, unnamed and untested — and raising any threshold would have
    deleted it in silence.
 
    **(b) The per-lane score threshold, for everything below the floor.** Weights
-   are unchanged — **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR
-   Major = 1.0 each** (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`,
-   `_CR_BLOCKING_WEIGHT = 1.0`) — but what a change can AFFORD now depends on
-   what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`):
+   — **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR Major = 1.0
+   each · Devin severe/critical (🔴/🟥) = 1.0 · Devin non-severe bug or security
+   warning (🟡/🟨) = 0.5** (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`,
+   `_CR_BLOCKING_WEIGHT = 1.0`, `_DEVIN_MARKERS`) — but what a change can AFFORD
+   depends on what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`).
+
+   **Devin scores like Codex (owner ruling, 2026-09-24).** Its comments open
+   with `<!-- devin-review-comment {json} -->` and a marker: red is Devin's severe
+   tier (bug / critical security), yellow its non-severe tier (bug / security
+   warning), and 🔍 is informational, surfaced and never scored. The marker agrees
+   with the metadata `kind` on every comment measured. A
+   marker outside that closed set is FORMAT DRIFT: surfaced, never scored. A
+   finding Devin posted twice counts once (dedup on its metadata `id`). It is
+   parsed only for the `devin-ai-integration[bot]` Bot account, and its branch
+   runs before the Codex badge match, so a Devin body QUOTING `![P1 Badge]` is
+   scored once, as Devin. CodeRabbit Minor and below stay SURFACE-ONLY by owner
+   ruling — only Devin gained scoring.
+
+   **Clearing a finding:** a MAINTAINER's in-thread reply, as always — or, for
+   a DEVIN finding only, Devin itself replying in that finding's thread with a
+   first line starting `✅ **Resolved**` (Devin may withdraw its own finding; no
+   bot can clear another's, free prose such as "Fixed in …" clears nothing, and
+   Codex and CodeRabbit findings still need a maintainer reply). Devin's reviewer
+   and its builder post under ONE login, so a self-withdrawal is reply text, not
+   an identity: it still clears, but the gate always LISTS it as
+   `[Devin self-withdrawn]` so you can check the fix landed. A thread
+   resolved in the GitHub UI does NOT clear a finding; reply instead. A finding
+   Devin posted more than once counts once: each copy's diff and documentation
+   scope is judged on its OWN anchor, the finding scores on its strongest copy
+   that is eligible to score, and every copy carrying an unrecognised marker is
+   reported as format drift, answered or not.
 
    | lane | blocks at | what lands there |
    |---|---|---|
@@ -3802,9 +3910,11 @@ The review-findings gate specifically:
    `_check_codex_reviewed_head` returns a block for `if not reviewed`, whatever
    the reason for the absence (quota, never triggered, still running). The only
    things that clear it are a review at head, a clean re-review comment naming
-   head, a provably review-trivial delta since a stale review, or a conscious
+   head, a provably review-trivial delta since a stale review, a conscious
    `# stale-review-override` — except on a hook-surface PR, where that sigil also
-   requires the exact base-and-head fallback-review evidence described above.
+   requires the exact base-and-head fallback-review evidence described above — or
+   an owner-approved `# substitute-review` resting on a Devin or CodeRabbit review
+   at that exact head.
    ⚠ This item previously read "no review comments at all (quota exhausted) →
    merge allowed on CI alone", which is FALSE and contradicted the Pre-Merge Gate
    section above ("an ABSENT review always blocks") four hundred lines earlier.
@@ -3829,9 +3939,10 @@ The review-findings gate specifically:
    prompt sit downstream of this guard and can still stop the command.
    Never any command text — the row is metadata only, because a trailing comment
    rides a Bash command that can carry a credential.
-   **Scope, stated so the log is not read as more complete than it is:** the four
+   **Scope, stated so the log is not read as more complete than it is:** the five
    PR-merge sigils are covered (`# review-override`, `# ci-override`,
-   `# stale-review-override`, `# scheduled-review-override`), from the point the
+   `# stale-review-override`, `# scheduled-review-override`,
+   `# substitute-review`), from the point the
    PR is resolved onward. A merge rejected BEFORE that point writes nothing —
    no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
    operations, or a merge compounded with a local `git merge` into main are the

@@ -1018,10 +1018,33 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     fi
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
+    # CCTMPVOL_SIZE_GIB must cross into the container: install.sh writes
+    # CC_TMP_CAPACITY_MB from it, and the watchdog's oxygen floor keys on that
+    # number because statfs cannot see a btrfs volume's qgroup cap. Without the
+    # pass-through a custom-size volume records the 2 GiB default, and the
+    # watchdog would treat a larger volume as full — bypassing its in-flight
+    # guard and deleting active work at false headroom.
+    #
+    # Passed ONLY when isolation actually happened. cc_tmp_volume_apply returns
+    # 0 on unsupported-pool, volume-create-failed, attach-failed and
+    # verify-failed-rolledback, so an unconditional pass-through would record a
+    # custom cap for a volume that does not exist — cementing a fictional
+    # ceiling onto exactly the shared-filesystem install where it is least
+    # recoverable. The value is normalized through the volume lib's own helper.
+    #
+    # Residual, deliberately not papered over: the helper reports the REQUESTED
+    # size, and the lib has no resize branch — so re-running against a volume
+    # created at a different size records a number that disagrees with it.
+    # Tracked with the update-path reset in the same issue.
+    _cctmp_size_env=()
+    if [ "${_cctmpvol_result:-}" = "applied" ] || [ "${_cctmpvol_result:-}" = "already-isolated" ]; then
+        _cctmp_size_env=(--env "CCTMPVOL_SIZE_GIB=$(_cctmpvol_size_gib)")
+    fi
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         --env "HOME=/home/ubuntu" \
         --env "XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID" \
         --env "GENESIS_TIMEZONE=$_final_tz" \
+        ${_cctmp_size_env[@]+"${_cctmp_size_env[@]}"} \
         $_incus_tty --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""

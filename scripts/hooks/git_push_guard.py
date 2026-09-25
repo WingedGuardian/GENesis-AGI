@@ -208,14 +208,28 @@ except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-bl
 # separator starved it. Both copies carried it, so both were corrected — fixing the
 # degraded one alone would have left the LIVE net starved while the comment claimed
 # the class was closed.
+# `commit` IS here, and it is the one word whose membership differs by consumer.
+# MEASURED: paired with a `shell_parse` that predates `_REPARSE_CARRIERS`, the
+# import above fails and this matcher becomes the ONLY enforcement — and without
+# `commit` BOTH `eval git commit -n -m x` AND the direct `git commit -n -m x`
+# exited 0, i.e. the hook-skip gate vanished entirely in that pairing. This PR
+# adds `_REPARSE_CARRIERS` to that import, so it is this change that makes the
+# pairing reachable; the gap is therefore this change's to close.
+#
+# It does NOT follow that `_GATED_MENTION` should carry it — that one is read by
+# the LIVE blind-spot arm, where the same word cost +283 refusals on ordinary
+# heredocs (see its own note). This matcher only ever runs against a BROKEN hook
+# tree, where the file's stated direction is deliberate over-breadth and the
+# remedy printed to the caller is "repair the tree".
 _DEGRADED_GATED = (
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
-    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
+    r"|\b(?:push|merge|commit)\b|\bgh\b|\bsqlite3\b"
 )
 
 try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
+        _REPARSE_CARRIERS,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -267,6 +281,31 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
 _GATED_MENTION = re.compile(
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
+)
+
+# The CARRIER arm's own net. It is `_GATED_MENTION` plus `\bcommit\b`, and it is
+# SEPARATE on purpose — the two arms are different consumers with costs that
+# differ by more than an order of magnitude, and widening the shared pattern
+# charged the difference to a path that had no reason to pay it.
+#
+# Why `commit` is needed here: `git commit`'s short hook-skip form is `-n`, and a
+# pattern holding only `--no-verify` let `eval git commit -n -m x` through while
+# the direct spelling blocked via `commit_skips_hooks` (MEASURED). A narrower
+# `commit … -Xn` clause was measured and REJECTED — length-bounded, so it missed
+# `git commit --amend --no-edit --author="A B" --date=now -n`, and a case it did
+# match matched the word `commit` inside "commit message" rather than the
+# subcommand, i.e. passed for a reason unrelated to its intent.
+#
+# Why it must NOT be in the shared pattern. MEASURED over 83,201 recorded
+# commands: on the carrier arm the word costs 13 -> 22 (+9). On the BLIND-SPOT
+# arm, which reads the same pattern, it costs 404 -> 687 (+283) — and those are
+# real: 12 of 12 sampled corpus commands go allow on origin/main and BLOCK on
+# the widened pattern through the actual guard. They are ordinary
+# `python - <<'PY'` heredocs whose BODY happens to mention commit. An earlier
+# revision published the +9 as this guard's rate, having counted one arm of a
+# two-arm change.
+_CARRIER_GATED_MENTION = re.compile(
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b"
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -1342,6 +1381,48 @@ _CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # the SAME weighted machinery as the Codex findings rather than a second blocking
 # path, so there is one score and one threshold to reason about.
 _CR_BLOCKING_WEIGHT = 1.0
+
+# ── Devin's inline findings — SCORED, like Codex (owner ruling, 2026-09-24) ──
+# Until this existed every Devin comment fell to the unrecognised bucket:
+# surfaced, never scored, so a severe bug Devin raised could not stop a merge.
+# MEASURED 2026-09-24 over every Devin comment on the 33 open non-draft PRs:
+# 166 comments, each opening with `<!-- devin-review-comment {json} -->` and
+# then exactly one of the five markers below. Red is Devin's severe tier (a
+# severe bug, or a critical security finding on the red square), yellow its
+# non-severe tier (a bug, or a security warning on the yellow square), and the
+# magnifier is informational. The strongest evidence for that reading is the
+# comments themselves: on a later count of 253 open-queue comments the marker
+# agreed with the metadata `kind` every time (red/yellow = bug, the squares =
+# security, magnifier = analysis). The owner kept the yellow security warning at
+# the same weight as any yellow finding rather than lifting it to the floor.
+#
+# A CLOSED set, and deliberately so: a marker this table has not seen is
+# surfaced as format drift and never scored. Guessing a severity from an
+# unknown marker would be worse than the blindness, and the vendor adding a
+# level must not silently start blocking every PR.
+_DEVIN_LOGINS = frozenset({"devin-ai-integration[bot]"})
+_DEVIN_META_PREFIX = "<!-- devin-review-comment "
+# Strength order among the copies of a duplicated finding. Compared only AFTER
+# each copy's scope is judged on its own anchor (see `_devin_disposition`).
+_DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
+_DEVIN_MARKERS: dict[str, str] = {
+    "🔴": "floor",  # severe bug
+    "🟥": "floor",  # critical security
+    "🟡": "minor",  # non-severe bug
+    "🟨": "minor",  # security warning
+    "🔍": "analysis",  # informational — asserts no defect
+}
+# Devin may WITHDRAW its own finding: a reply from the SAME bot login, in that
+# finding's thread, whose first line starts with this marker clears it (owner
+# ruling, 2026-09-24). Consulted for DEVIN findings only — Codex and CodeRabbit
+# findings still clear on a maintainer reply alone. MEASURED on the open queue in a
+# later snapshot than the 166-comment count above (so the denominators differ): 50
+# of 167 Devin finding groups carried Devin's own "resolved" reply and no
+# maintainer reply. Only
+# this exact lead counts — Devin also posts builder-style prose ("Fixed in …"),
+# which is a claim about work, not the reviewer's verdict — and no bot can clear
+# ANOTHER reviewer's finding.
+_BOT_SELF_RESOLVED_LEAD = "✅ **Resolved**"
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
 # is half (0.5). What that BUYS depends on the lane: see the per-lane thresholds
 # below. Two P2s block a `critical` change, four a `standard` one, six a `light`
@@ -1370,6 +1451,66 @@ _INLINE_REVIEW_BOTS = {
     "chatgpt-codex-connector[bot]",
     "github-advanced-security[bot]",
 }
+#: The template's distinctive sentence. A body that does not contain it is NOT
+#: this template and is never suppressed, however short it is — see the gate at
+#: the top of `_is_wrapper_review_body`, which exists because the residue test
+#: alone silently dropped brief real findings.
+_WRAPPER_REVIEW_BODY_SIGNATURE = "automated review suggestions for this pull request"
+#: Pieces of the known review TEMPLATE, removed one at a time to see whether
+#: anything a human would read is left. Order does not matter; each is deleted
+#: wherever it appears. The `<details>` block is matched non-greedily and its
+#: content is vendor chrome ("About Codex in GitHub"), not review output.
+_WRAPPER_REVIEW_BODY_PARTS = (
+    re.compile(r"<details>.*?</details>", re.S),
+    re.compile(r"^#+.*Codex Review.*$", re.M),
+    re.compile(r"Here are some automated review suggestions for this pull request\.?"),
+    re.compile(r"\*\*Reviewed commit:\*\*\s*`?[0-9a-f]{7,40}`?"),
+)
+#: Below this many characters of residue, what is left of a stripped template is
+#: punctuation and whitespace rather than content. MEASURED: the live template
+#: leaves 0 characters; the smallest real finding body in the same corpus is
+#: over 400. Any value in that gap behaves identically, so this is a threshold
+#: with a measured margin either side rather than a number chosen to fit.
+_WRAPPER_RESIDUE_MAX_CHARS = 24
+
+
+def _is_wrapper_review_body(body: str) -> bool:
+    """True when a review BODY is a template carrying no findings of its own.
+
+    SUBTRACTIVE, not a marker denylist. An earlier revision asked "does this
+    body contain the template's two marker phrases?", which suppressed anything
+    that OPENED with the template and then appended real content — re-creating
+    the review-body blind spot for the one shape most likely to carry a finding
+    (Codex P2, and its own suggested remedy). This instead REMOVES the template
+    and asks what survives: a pure wrapper leaves nothing, a wrapper with a
+    summary bolted on leaves the summary, and the summary is what gets surfaced.
+
+    Used to keep the uncounted tail from annotating every PR. A list of logins
+    whose bodies are wrappers was measured WORSE on fail direction, not on
+    accuracy: when the template changes this predicate stops matching and the
+    body is SURFACED (noise, visible, recoverable), where a login list silently
+    drops a body that had started carrying findings.
+
+    Bounded work: each pattern is anchored to a literal and the `<details>`
+    match is non-greedy, so this is linear in the body. That matters because it
+    runs on a hook path, where a scan an author can make slow is a fail-open —
+    a killed hook does not block.
+    """
+    # GATE ON THE SIGNATURE FIRST. Without this the residue test alone suppresses
+    # any SHORT body — "first pass: found a race." reduces to 19 characters of
+    # content and would be silently dropped. Caught by its own test, and it is
+    # the same silent-drop class this bucket exists to close: a threshold that
+    # cannot tell "a template with nothing left" from "a brief real finding".
+    if _WRAPPER_REVIEW_BODY_SIGNATURE not in body:
+        return False
+    residue = body
+    for part in _WRAPPER_REVIEW_BODY_PARTS:
+        residue = part.sub("", residue)
+    # Strip markdown furniture the template leaves behind so residue measures
+    # CONTENT, not the punctuation between removed pieces.
+    return len(re.sub(r"[\s*_`>#|:\-]", "", residue)) <= _WRAPPER_RESIDUE_MAX_CHARS
+
+
 # A reply "engages" (silences) an inline P1 finding ONLY when authored by someone with
 # repository authority — otherwise any GitHub account (a throwaway, or the PR author on
 # their own PR) could post a one-word reply and clear a real P1 (PR #1434 security
@@ -1378,7 +1519,7 @@ _INLINE_REVIEW_BOTS = {
 # NOT count as acknowledgement.
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
-_INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+_INLINE_MARKUP_RE = re.compile(r"<!--.*?-->|!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}", re.S)
 # A finding title is a one-line PREVIEW in a list of them; the full body is on
 # the PR, so this bounds a pointer-backed value rather than cutting the only
 # copy. `_inline_title` states the cut when it makes one.
@@ -1569,6 +1710,15 @@ def _inline_title(body: str) -> str:
     """
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
+    #
+    # Line 0 of the STRIPPED text, which is load-bearing and was nearly
+    # over-engineered away: one review bot opens every comment with an HTML
+    # metadata comment, and a first attempt at fixing that added a scan for the
+    # first NON-EMPTY line, on the belief that removing the comment left line 0
+    # blank. MEASURED over 35 real comments from that bot: the scan and plain
+    # line 0 agree on 35/35 and neither renders empty, because `.strip()`
+    # already removes the leading newlines the comment left behind. The scan was
+    # justified by an artifact of the probe that "found" it, not by the data.
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return _safe_title(first[0].strip() if first else "")
 
@@ -1842,6 +1992,46 @@ def _cr_findings(body: str) -> list[str]:
         else:
             out[-1] = out[-1] + "\n---\n" + part
     return out or [body]
+
+
+def _devin_finding(body: str) -> tuple[str | None, str | None]:
+    """``(finding_id, severity_class)`` for a Devin inline comment.
+
+    ``severity_class`` is a value of ``_DEVIN_MARKERS`` ("floor" / "minor" /
+    "analysis"), or None when the comment is not in the recognised shape — no
+    leading metadata tag, unparseable metadata, or a marker outside the closed
+    set. None is FORMAT DRIFT: the caller surfaces it and never scores it.
+
+    ``finding_id`` is Devin's own id from the metadata, used to count a finding
+    ONCE however many times it was posted (measured: Devin sometimes posts one
+    finding twice, as two comments with one id). None when the metadata could
+    not be read.
+
+    Linear, no regex: this runs on a hook path whose deadline is a security
+    boundary, over third-party text, so a scan that can backtrack is a
+    fail-open waiting for a long enough body. `find`/`split` cannot.
+    """
+    text = body.lstrip()
+    if not text.startswith(_DEVIN_META_PREFIX):
+        return None, None
+    end = text.find("-->", len(_DEVIN_META_PREFIX))
+    if end < 0:
+        return None, None
+    finding_id: str | None = None
+    try:
+        meta = json.loads(text[len(_DEVIN_META_PREFIX) : end])
+    except Exception:
+        meta = None
+    if isinstance(meta, dict) and isinstance(meta.get("id"), str) and meta["id"]:
+        finding_id = meta["id"]
+    rest = text[end + 3 :].split(None, 1)
+    marker = rest[0] if rest else ""
+    if finding_id is None:
+        # Unreadable metadata is drift even when the marker looks familiar: the
+        # id is what dedup and reply-grouping rest on, and scoring a finding we
+        # cannot identify would let one post count twice.
+        return None, None
+    return finding_id, _DEVIN_MARKERS.get(marker)
 
 
 def _coderabbit_title(body: str) -> str:
@@ -2672,7 +2862,9 @@ def _findings_distribution(
     ]
     for path, sevs in ranked[:6]:
         share = 100.0 * len(sevs) / total
-        mix = ", ".join(f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR") if sevs.count(s))
+        mix = ", ".join(
+            f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR", "DV", "DVm") if sevs.count(s)
+        )
         lines.append(
             f"    {len(sevs):>2} ({share:4.0f}%)  "
             f"{_safe_report_path(path) if path is not None else '(no path)'}  [{mix}]"
@@ -2727,6 +2919,7 @@ def _check_inline_review_findings(
     *,
     force: bool = False,
     repo: str | None = None,
+    uncounted_out: list[dict[str, int]] | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
 
@@ -2807,6 +3000,51 @@ def _check_inline_review_findings(
         for c in raw
         if c.get("reply_to") and c.get("assoc") in _MAINTAINER_ASSOCIATIONS
     }
+    # DEVIN, grouped BEFORE the classify loop — for the same reason `replied_to`
+    # is: a finding posted twice is two comments sharing one Devin id, and a
+    # reply attaches to only one of them. Deciding per COMMENT would clear the
+    # answered copy and keep scoring its twin. So a group is cleared when ANY
+    # copy carries a maintainer reply, or Devin's own `✅ **Resolved**` reply —
+    # the second only when the reply comes from the SAME bot login as the copy
+    # it answers, so a reviewer can withdraw its own finding and never another's.
+    _login_of = {c.get("id"): c.get("login") or "" for c in raw if c.get("id") is not None}
+    self_withdrawn = {
+        c.get("reply_to")
+        for c in raw
+        if c.get("reply_to")
+        and c.get("type") == "Bot"
+        and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
+        and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
+    }
+    devin_cleared: set[str] = set()
+    # Groups a MAINTAINER answered. A group cleared only by Devin's own reply is
+    # surfaced below rather than dropped: Devin's reviewer and its builder post
+    # under ONE login (MEASURED: the same account posts "Fixed in <sha>" replies
+    # on a devin/* branch), so a self-withdrawal is reply TEXT, not an identity.
+    # It still clears (owner ruling), but never silently (owner, 2026-09-24).
+    devin_maint_cleared: set[str] = set()
+    devin_copies: dict[str, list[dict]] = {}
+    for c in raw:
+        if c.get("reply_to") or (c.get("login") or "") not in _DEVIN_LOGINS:
+            continue
+        if c.get("type") != "Bot":
+            continue
+        fid, _sev = _devin_finding(c.get("body") or "")
+        if fid is None:
+            continue
+        devin_copies.setdefault(fid, []).append(c)
+        if c.get("id") in replied_to or c.get("id") in self_withdrawn:
+            devin_cleared.add(fid)
+        if c.get("id") in replied_to:
+            devin_maint_cleared.add(fid)
+    devin_seen: set[str] = set()
+    devin_block: list[str] = []  # severe bug / critical security — the floor, 1.0 each
+    devin_minor: list[str] = []  # non-severe bug / security warning — 0.5 each
+    devin_analysis: list[str] = []  # informational — surfaced, never scored
+    devin_unknown: list[str] = []  # unrecognised shape — surfaced as drift, never scored
+    devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
+    devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
+    devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
     p1: list[str] = []
     p2: list[str] = []
     # (severity, path) for every finding that SCORES, kept alongside the title
@@ -2855,13 +3093,156 @@ def _check_inline_review_findings(
             _scope_cache.append(set(files) if files else None)
         changed = _scope_cache[0]
         return changed is not None and path not in changed
+
+    def _devin_disposition(copy: dict) -> tuple[str, str | None]:
+        """Where ONE copy of a Devin finding lands, judged on its OWN anchor.
+
+        ``("drift" | "analysis" | "off_diff" | "doc" | "scored", severity)``.
+        Severity and scope are decided per copy and only THEN compared, never
+        folded into one ranking key: a finding Devin posted twice can carry a
+        different marker AND a different anchor on each copy, and a single
+        (severity, in-diff) key let an off-diff red copy outrank an in-diff
+        yellow one and take the whole group out of scoring with it.
+        """
+        sev = _devin_finding(copy.get("body") or "")[1]
+        if sev is None:
+            return "drift", None
+        if sev == "analysis":
+            return "analysis", sev
+        path = copy.get("path")
+        if _off_diff(path):
+            return "off_diff", sev
+        # The doc-path lever, read the way each Codex branch reads it for the
+        # matching weight: a floor finding is excluded only under `skip`, a
+        # 0.5 finding under `skip` or `p1_only`. Same modes, same meaning, so
+        # one reviewer is never enforced where the other is not.
+        if _is_doc_path(path or ""):
+            mode = _doc_findings_mode()
+            if mode == "skip" or (sev == "minor" and mode == "p1_only"):
+                return "doc", sev
+        return "scored", sev
+
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
-        if utype != "Bot" and login not in _INLINE_REVIEW_BOTS:
-            continue
+        # NO AUTHOR FILTER. This used to drop every non-Bot, non-allowlisted
+        # author with a bare `continue`, so a human collaborator's inline review
+        # comment reached no accumulator and the row could still read `ok`.
+        #
+        # OWNER DIRECTIVE 2026-09-20: never willfully ignore a review that offers
+        # to help — another bot, or just another GitHub user. The gate's job is to
+        # make the session AWARE the input exists; judging it is the session's.
+        # These land in the unrecognised bucket below: surfaced, never scored,
+        # never blocking, and they make the rendered total a FLOOR rather than an
+        # equality, because nothing here read their finding cardinality.
+        #
+        # `pulls/N/comments` carries DIFF-ANCHORED comments only — PR chatter
+        # lives on the issue endpoint, which this scan never reads — so the
+        # population widened to is review-shaped by the endpoint's own contract,
+        # not by an assumption about who wrote it.
         if c.get("reply_to"):
             continue  # replies aren't findings
+        # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY — deliberately the SAME
+        # population the removed filter used to admit: a Bot, or an allowlisted
+        # review account. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
+        #
+        # This distinction is load-bearing and its absence was caught by an
+        # existing lock (`test_human_inline_comments_ignored`) rather than by
+        # review: `_INLINE_P1_RE` matches the BODY, not the author, so simply
+        # deleting the filter let ANY GitHub account block a merge by posting a
+        # comment carrying a P1 badge. That is the authority hole
+        # `_MAINTAINER_ASSOCIATIONS` exists to prevent on the reply side,
+        # reproduced on the finding side.
+        #
+        # So an unrecognised author skips the matchers entirely and falls to the
+        # unrecognised branch: SURFACED, never scored, never blocking.
+        parseable = utype == "Bot" or login in _INLINE_REVIEW_BOTS
+        if login in _DEVIN_LOGINS and utype == "Bot":
+            # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
+            # Devin quotes guard output and code in its findings, so a body can
+            # contain `![P1 Badge]` as QUOTED TEXT. Falling through to the badge
+            # match would score one finding twice — once as a P1 on the floor and
+            # once as Devin's own severity. Keyed on the login AND Bot type, so a
+            # human pasting Devin's exact body is never believed (the authority
+            # rule the unrecognised-author branch below exists to keep).
+            fid, _sev = _devin_finding(body)
+            if fid is None:
+                # An unidentifiable comment is FORMAT DRIFT and is reported as
+                # such even when a maintainer answered it: the note is about this
+                # gate's parser, not the finding, and it never scored either way.
+                devin_unknown.append(_inline_title(body))
+                continue
+            if fid in devin_seen:
+                continue  # another post of a finding already classified
+            devin_seen.add(fid)
+            copies = devin_copies.get(fid, [c])
+            # Drift is a fact about a COMMENT, so every unreadable copy is
+            # reported: before dedup can fold it into a readable sibling under
+            # the same id, and before clearing, for the reason given above.
+            # This is the parser alone. The per-copy SCOPE judgement below
+            # reads the PR's changed files, so it must stay AFTER the clearing
+            # check: an answered finding never pays for that read, exactly as
+            # the Codex and CodeRabbit branches check `replied_to` first.
+            has_readable = any(_devin_finding(cp.get("body") or "")[1] is not None for cp in copies)
+            for cp in copies:
+                if _devin_finding(cp.get("body") or "")[1] is None:
+                    drift_title = _inline_title(cp.get("body") or "")
+                    if has_readable:
+                        drift_title += " (a copy of a finding classified by its readable copy)"
+                    devin_unknown.append(drift_title)
+            if fid in devin_cleared:
+                # Answered: a maintainer reply, or Devin withdrew it. The second
+                # is listed, from the parser alone (no file-list read).
+                if fid not in devin_maint_cleared:
+                    devin_self_withdrawn.append(
+                        next(
+                            (
+                                _inline_title(cp.get("body") or "")
+                                for cp in copies
+                                if _devin_finding(cp.get("body") or "")[1] is not None
+                            ),
+                            _inline_title(copies[0].get("body") or ""),
+                        )
+                    )
+                continue
+            judged = [(cp, *_devin_disposition(cp)) for cp in copies]
+            # The group SCORES on its strongest copy that is eligible to score.
+            # Only when no copy is eligible is it reported, once, through its
+            # strongest copy's reason. So neither a weaker copy nor an
+            # out-of-scope one can hide a scoring finding. `sorted` is stable,
+            # so equal severities keep their posting order.
+            readable = sorted(
+                (t for t in judged if t[1] != "drift"),
+                key=lambda t: _DEVIN_SEVERITY_RANK[t[2]],
+                reverse=True,
+            )
+            if not readable:
+                continue  # every copy was drift, reported above
+            eligible = [t for t in readable if t[1] == "scored"]
+            best, disp, sev = eligible[0] if eligible else readable[0]
+            title = _inline_title(best.get("body") or "")
+            dv_path = best.get("path")
+            # A stronger copy that could not score is not dropped silently: the
+            # reader sees that Devin marked the same finding more severely on an
+            # anchor this gate did not score (off-diff, or an excluded doc path).
+            # Surfaced on the title only, so no count changes.
+            if eligible and _DEVIN_SEVERITY_RANK[readable[0][2]] > _DEVIN_SEVERITY_RANK[sev]:
+                title += (
+                    " (another copy was marked more severe on an anchor this gate did not score)"
+                )
+            if disp == "analysis":
+                devin_analysis.append(title)
+            elif disp == "off_diff":
+                devin_off_diff.append((title, dv_path or ""))
+            elif disp == "doc":
+                devin_doc_skipped.append(title)
+            elif sev == "floor":
+                devin_block.append(title)
+                scored_at.append(("DV", dv_path or ""))
+            else:
+                devin_minor.append(title)
+                scored_at.append(("DVm", dv_path or ""))
+            continue
         if login in _CODERABBIT_LOGINS:
             # Engagement is checked ONCE, for the whole comment, BEFORE severity —
             # not per-severity below. It used to sit inside the blocking branch, so
@@ -2923,7 +3304,7 @@ def _check_inline_review_findings(
                 cr_block.append(_coderabbit_title(seg))
                 scored_at.append(("CR", c.get("path") or ""))
             continue
-        if _INLINE_P1_RE.search(body):
+        if parseable and _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
             if _off_diff(c.get("path")):
@@ -2942,7 +3323,7 @@ def _check_inline_review_findings(
                 continue
             p1.append(_inline_title(body))
             scored_at.append(("P1", c.get("path") or ""))
-        elif _INLINE_P2_RE.search(body):
+        elif parseable and _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
             if _off_diff(c.get("path")):
@@ -2970,6 +3351,16 @@ def _check_inline_review_findings(
             # Surfaced, never scored: recognising a format is what earns a weight,
             # and guessing a severity from an unknown format would be worse than
             # the blindness. The point is that it can no longer be INVISIBLE.
+            #
+            # ENGAGEMENT applies here too, and it became load-bearing when the
+            # author filter above was removed: without it, a comment a maintainer
+            # has already answered in-thread keeps re-surfacing on every run
+            # forever. That is the same burial this branch exists to prevent —
+            # "a growing list of already-settled advisories is how a genuinely
+            # unresolved one gets buried", two comments up — so the rule that
+            # protects the CodeRabbit path protects this one on the same terms.
+            if c.get("id") in replied_to:
+                continue
             unmatched_bot.append((login, _inline_title(body)))
 
     # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
@@ -2994,15 +3385,40 @@ def _check_inline_review_findings(
     # A body that declares more findings than this parser read: an INCOMPLETE
     # scan, which blocks like any other incomplete read.
     outside_shortfall: list[str] = []
+    # Review bodies from an author this scan does not recognise — another bot, or
+    # a human collaborator. Until this existed the loop below dropped them with a
+    # bare `continue`, so a reviewer who delivered findings in a review BODY
+    # contributed NOTHING to any accumulator and the row fell back to a bare
+    # `ok` — the exact blind spot this change exists to remove, one channel over.
+    #
+    # OWNER DIRECTIVE 2026-09-20: never willfully ignore a review that offers to
+    # help, whoever wrote it. The gate's job here is AWARENESS, not adjudication —
+    # it makes the session aware the input exists and lets the session judge it.
+    # So these are SURFACED and make the total a floor; they are never SCORED,
+    # because guessing a severity from an unrecognised reviewer would be worse
+    # than the blindness, and never BLOCK, because a human comment is not a gate.
+    # ONE ENTRY PER REVIEW, not per reviewer. Deduping on login understated the
+    # input and mislabelled its own unit (Codex P2): re-reviews are routine after
+    # a push, and MEASURED on PR #2191 a single author posted FOUR distinct
+    # bodies — potentially four different findings — which a login-deduped list
+    # announced as "1 review". The count and the unit have to describe the same
+    # thing, which is the defect class this whole change exists to remove.
+    unclassified_reviews: list[str] = []  # one login per REVIEW, order preserved
     reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
-    # An unreadable second channel still BLOCKS — but at the END, next to the
+    # An unreadable second channel is handled at the END, next to the
     # incomplete-read check, not by returning from here. Returning early would
     # discard every list the inline loop just built (p1, p2, cr_block,
     # cr_unknown, off-diff, doc-skipped, unmatched_bot) BEFORE any of them is
     # printed, so one transient `gh` failure would replace the whole pre-merge
-    # report with a single "UNREADABLE" line. Same fail direction, far less
-    # information — and this function's docstring promises nothing unaddressed
-    # is dropped.
+    # report with a single "UNREADABLE" line. Far less information — and this
+    # function's docstring promises nothing unaddressed is dropped.
+    #
+    # It does NOT block. This comment used to say "still BLOCKS", which stopped
+    # being true when the review-body channel became advisory (see the long note
+    # at the emit site below) — the tail only prints and falls through to a clean
+    # return. Corrected here because it is the comment a reader would use to
+    # conclude that an under-read channel cannot reach a passing row: it can, and
+    # `channel_under_read` above is what keeps that state from rendering as `ok`.
     reviews_unreadable = reviews is None
     if reviews is None:
         reviews = []
@@ -3034,7 +3450,63 @@ def _check_inline_review_findings(
             # actor would need the timeline endpoint and another call on the
             # merge clock; that trade is open, not settled.
             continue
-        if (review.get("login") or "") not in _CODERABBIT_LOGINS:
+        review_login = review.get("login") or ""
+        if review_login not in _CODERABBIT_LOGINS:
+            # NOT a silent drop any more. An author this scan cannot parse still
+            # gets NAMED, so the session knows the input exists.
+            #
+            # Narrowed by CONTENT, never by AUTHORSHIP. An empty body is a bare
+            # approval; a WRAPPER body is a template that carries no findings by
+            # construction. Deduped on login: one reviewer re-reviewing is one.
+            #
+            # MEASURED 2026-09-20 over 21 live review bodies on 6 PRs — which is
+            # the step whose absence caused both of this change's regressions:
+            #   * one reviewer posts a byte-identical 621-byte template on 6 of 6
+            #     PRs. Its findings go INLINE; the body is a wrapper. PR #2194
+            #     itself carried findings in BOTH rounds and its body was 621
+            #     bytes both times, so the body is constant regardless.
+            #   * another reviewer's bodies vary 432-690 bytes and say things
+            #     like "found 3 potential issues" and "1 flag NOT posted on this
+            #     PR" — a finding that never reached the PR at all, which is
+            #     exactly the invisible-finding class this scan exists to expose.
+            # So AUTHORSHIP does not predict whether a body carries findings, and
+            # an earlier revision that excluded every recognised login made this
+            # tail fire on 6 of 6 PRs — a signal that is always on is a signal
+            # nobody reads, and it also pinned `approx >= 1`, which meant the
+            # exact/approx split could never render an exact count on this repo.
+            #
+            # FAIL DIRECTION, and it is why this is a content test rather than a
+            # list of logins: if the template changes, this stops matching and
+            # the body is SURFACED — noise, visible, recoverable. A login list
+            # fails the other way, silently dropping a body that started
+            # carrying findings, which is the defect class this change removes.
+            #
+            # Substring tests, not a regex: this runs on a hook path where a
+            # super-linear scan over third-party text is a fail-open, and two
+            # `in` checks cannot backtrack.
+            #
+            # ⚠ A SECOND narrowing was here and was WRONG — Codex P2, round 2,
+            # confirmed by reading all three readers. It skipped every recognised
+            # review login on the grounds that they are "already handled by
+            # another path". They are not, for BODIES: `_check_pr_review_findings`
+            # reads `issues/N/comments`, the inline scanner reads
+            # `pulls/N/comments`, and `_codex_reviews`'s jq projection keeps
+            # `{login, commit_id, state}` and discards `body` entirely. So NOTHING
+            # in this file reads a Codex or Advanced-Security review BODY, and
+            # excluding them re-created a silent drop for the reviewers we trust
+            # MOST — inside the change written to remove silent drops.
+            #
+            # Recognised or not, an unparsed body is surfaced. The noise this was
+            # meant to avoid is bounded by the empty-body test above: a routine
+            # boilerplate approval has no body to surface. Surfacing a Codex body
+            # that DOES carry prose is the correct outcome, not noise.
+            #
+            # This still SURFACES rather than PARSES. Reading a review body for
+            # findings is a different capability and a different risk (see the
+            # filed issue); awareness is the contract here.
+            review_body = (review.get("body") or "").strip()
+            if review_body and not _is_wrapper_review_body(review_body):
+                unclassified_reviews.append(review_login)
             continue
         parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
             review.get("body") or ""
@@ -3148,13 +3620,47 @@ def _check_inline_review_findings(
 
     if unmatched_bot:
         print(
-            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
-            f"format this gate does not recognise. NOT scored; listed so an "
-            f"unrecognised reviewer cannot be silently invisible:",
+            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} inline review comment(s) in a "
+            f"format this gate does not recognise, or from an author it does not "
+            f"know. NOT scored — read them yourself; listed so a reviewer cannot "
+            f"be silently invisible:",
             file=sys.stderr,
         )
         for bot_login, title in unmatched_bot[:5]:
             print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+        if len(unmatched_bot) > 5:
+            print(
+                f"  … and {len(unmatched_bot) - 5} more (listing bounded to 5; the "
+                f"count above is the total)",
+                file=sys.stderr,
+            )
+    if unclassified_reviews:
+        # The SECOND channel's version of the same silent drop. Logins only — no
+        # body text: this NOTE's line 0 is not the one `check_pr_report` renders
+        # raw, but the whole block is untrusted third-party content and a login
+        # is the smallest thing that still makes the input findable.
+        # BOTH numbers, because they answer different questions and reporting
+        # either alone misleads: the REVIEW count is how many bodies went
+        # unread, the REVIEWER count is how many distinct sources they came
+        # from. A login-deduped total announced four bodies as one review.
+        distinct = sorted(set(unclassified_reviews))
+        print(
+            f"NOTE: PR #{pr_num} — {len(unclassified_reviews)} review(s) from "
+            f"{len(distinct)} reviewer(s), delivered in a review BODY this gate "
+            f"cannot parse. NOT scored and NOT blocking — go read them; a review "
+            f"that offers to help is never willfully ignored here, whoever wrote it:",
+            file=sys.stderr,
+        )
+        for who in distinct[:5]:
+            count = unclassified_reviews.count(who)
+            suffix = f" ×{count}" if count > 1 else ""
+            print(f"  [unclassified reviewer: {who}{suffix}]", file=sys.stderr)
+        if len(distinct) > 5:
+            print(
+                f"  … and {len(distinct) - 5} more reviewer(s) (listing bounded to 5; "
+                f"the counts above are the totals)",
+                file=sys.stderr,
+            )
     if _scope_cache and _scope_cache[0] is None:
         # Resolution was ATTEMPTED (a candidate finding consulted it) and
         # failed — say so loudly, because from here the scan behaves exactly
@@ -3247,11 +3753,79 @@ def _check_inline_review_findings(
     # Criticals in 27 findings across 23 PRs (2026-09-07, all 84 then-open
     # non-draft PRs), so this path has never once fired on live data, while the
     # surfacing keeps 100% of the value the channel was built for.
+    # Devin sits on the SAME weights as Codex (owner ruling, 2026-09-24): a
+    # severe bug or critical security finding is a full 1.0 and joins the floor
+    # below; a non-severe bug or security warning is a P2's 0.5. One score, one
+    # threshold — never a second blocking path.
     score = (
         len(p1)
         + _INLINE_P2_SCORE_WEIGHT * len(p2)
         + _CR_BLOCKING_WEIGHT * len(cr_block)
+        + len(devin_block)
+        + _INLINE_P2_SCORE_WEIGHT * len(devin_minor)
     )
+    if devin_analysis:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_analysis)} Devin informational "
+            f"finding(s) (an explanation, not a defect claim) — surfaced and NOT "
+            f"counted toward the review score:",
+            file=sys.stderr,
+        )
+        for title in devin_analysis[:5]:
+            print(f"  [Devin analysis] {title}", file=sys.stderr)
+    if devin_self_withdrawn:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_self_withdrawn)} Devin finding(s) "
+            f"cleared by Devin's own '✅ Resolved' reply, with no maintainer reply. "
+            f"Devin's reviewer and builder share one login, so check the fix "
+            f"really landed before relying on it:",
+            file=sys.stderr,
+        )
+        for title in devin_self_withdrawn[:5]:
+            print(f"  [Devin self-withdrawn] {title}", file=sys.stderr)
+    if devin_unknown:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_unknown)} Devin comment(s) whose "
+            f"format this gate could not read (no metadata tag, unreadable "
+            f"metadata, or a severity marker outside the known set — the format "
+            f"may have changed). NOT scored — verify the level by hand:",
+            file=sys.stderr,
+        )
+        for title in devin_unknown[:5]:
+            print(f"  [Devin unknown format] {title}", file=sys.stderr)
+    if devin_off_diff:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_off_diff)} Devin finding(s) on files "
+            f"outside this PR's diff (base-branch content) — NOT scored:",
+            file=sys.stderr,
+        )
+        for title, fpath in devin_off_diff[:5]:
+            print(f"  [off-diff Devin] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
+    if devin_doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_doc_skipped)} Devin finding(s) on "
+            f"documentation paths — surfaced for conscious acceptance, NOT counted "
+            f"toward the review score:",
+            file=sys.stderr,
+        )
+        for title in devin_doc_skipped[:5]:
+            print(f"  [doc Devin] {title}", file=sys.stderr)
+    if devin_block:
+        print(
+            f"WARNING: PR #{pr_num} has {len(devin_block)} Devin severe-bug / "
+            f"critical-security finding(s) (each adds 1.0 and is always-fix):",
+            file=sys.stderr,
+        )
+        for title in devin_block[:8]:
+            print(f"  [Devin severe] {title}", file=sys.stderr)
+    if devin_minor:
+        print(
+            f"WARNING: PR #{pr_num} has {len(devin_minor)} Devin non-severe "
+            f"finding(s) (each adds {_INLINE_P2_SCORE_WEIGHT} to the review score):",
+            file=sys.stderr,
+        )
+        for title in devin_minor[:8]:
+            print(f"  [Devin] {title}", file=sys.stderr)
     if cr_advisory:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_advisory)} CodeRabbit finding(s) below "
@@ -3303,6 +3877,92 @@ def _check_inline_review_findings(
         )
         if distribution:
             print(distribution, file=sys.stderr)
+    # ONE write point for the uncounted categories, deliberately — not one per
+    # return. Every accumulator above is final here, and no `return` sits between
+    # this line and the four exits below, so a single record cannot miss one of
+    # them. Recording at each return instead would be a convention four sites had
+    # to remember, which is the shape that produces "the fifth return forgot".
+    #
+    # The two EARLY returns above (`force`, and an unreadable first page) are
+    # deliberately NOT recorded: they exit before these lists exist, so the
+    # caller sees an EMPTY out-param and must render UNKNOWN rather than zero.
+    # "0 uncounted" on a path that counted nothing is the false confidence this
+    # gate exists to remove, and reproducing it one field over would be worse
+    # than the row it replaces.
+    #
+    # ⚠ THAT STATE IS A FORWARD GUARD, NOT A LIVE ONE, and saying so is the
+    # point — an earlier revision described it as shipped behaviour and put that
+    # claim in a public changelog. VERIFIED: exactly one caller passes
+    # `uncounted_out` (`check_pr_report`) and it never passes `force`, while the
+    # unreadable-first-page return goes through `_scan_unreadable`, which blocks,
+    # so the row renders BLOCK and the clause is never called. `_uncounted_clause
+    # ([])` is therefore unreachable from production TODAY. The branch stays
+    # because it is right for the next caller; the claim about it does not.
+    if uncounted_out is not None:
+        uncounted_out.append(
+            {
+                # TWO SUB-DICTS, and the split is the POINT — it is a lock, not
+                # tidiness. Every bucket here is a count of something the scan
+                # did not score, but they do NOT share a UNIT, and an earlier
+                # version summed them into one number labelled "finding(s)".
+                #
+                # `exact` holds buckets where one comment IS one finding, because
+                # the format was RECOGNISED and its cardinality read.
+                #
+                # `approx` holds review output whose finding cardinality is
+                # UNKNOWN — an unrecognised format, or an unrecognised author. One
+                # such comment may carry five findings or none, so its length is a
+                # count of COMMENTS and can never be a count of findings. Anything
+                # in here makes the rendered total a FLOOR, never an equality.
+                #
+                # Nesting rather than a flat dict plus a remembered list: a new
+                # bucket cannot be added without choosing a side, so "which of
+                # these were exact again?" is not a question a later reader has to
+                # answer correctly from memory. That question is exactly what
+                # produced the defect — the convention-not-chokepoint shape.
+                "exact": {
+                    "doc_path": (
+                        len(doc_skipped)
+                        + len(doc_skipped_p2)
+                        + len(cr_doc_skipped)
+                        + len(devin_doc_skipped)
+                    ),
+                    "below_major": len(cr_advisory),
+                    "off_diff": (
+                        len(cr_off_diff)
+                        + len(off_diff_p1)
+                        + len(off_diff_p2)
+                        + len(devin_off_diff)
+                    ),
+                    "unanchored": (
+                        len(outside_critical) + len(outside_major) + len(outside_minor)
+                    ),
+                },
+                "approx": {
+                    "unrecognised_format": len(cr_unknown) + len(devin_unknown),
+                    "unrecognised_reviewer": len(unmatched_bot),
+                    "unclassified_review_bodies": len(unclassified_reviews),
+                },
+                # NOT a count — a FLAG, popped before the sum.
+                #
+                # The counters above are correct about the ACCUMULATORS and can
+                # still be wrong about the world. When the review-body channel
+                # under-reports — unreadable, an incomplete read, a declared-count
+                # shortfall, or a surplus batch quarantined whole — findings may
+                # exist that NO accumulator could ever have counted, and every
+                # counter is legitimately 0. Without this flag that renders as
+                # "nothing went uncounted", which is the bare `ok` this change
+                # exists to remove, one field over.
+                #
+                # MEASURED on the pre-fix tree: a clean scan, an unreadable channel
+                # and an incomplete channel all printed BYTE-IDENTICAL rows. The
+                # flags were already in scope here; only the design was not looking
+                # at them.
+                "channel_under_read": int(
+                    reviews_unreadable or not reviews_complete or bool(outside_shortfall)
+                ),
+            }
+        )
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
@@ -3330,15 +3990,18 @@ def _check_inline_review_findings(
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
     # mechanical floor is the labelled subset; the rest still rests on somebody
     # reading the report.
-    floor_hits = len(p1) + len(cr_block)
+    floor_hits = len(p1) + len(cr_block) + len(devin_block)
     if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
+            + [f"  [Devin severe] {t}" for t in devin_block[:5]]
         )
         return True, (
             f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
-            f"CodeRabbit Critical/Major finding(s), none maintainer-replied "
+            f"CodeRabbit Critical/Major + {len(devin_block)} Devin severe "
+            f"finding(s), none cleared (a maintainer reply, or Devin's own "
+            f"'Resolved' reply to a Devin finding) "
             f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
             f"change is {lane.upper()}); the per-lane score threshold "
             f"({threshold:.1f} here) governs how many P2s may accumulate, never "
@@ -3347,17 +4010,19 @@ def _check_inline_review_findings(
             f"to the merge command to acknowledge and proceed."
         )
     if score >= threshold:
-        # P1s and CodeRabbit Critical/Majors cannot reach here — the floor above
-        # returned on any of them — so this branch is purely a P2 accumulation,
-        # and naming the other two terms would describe counts that are provably
-        # zero.
-        listing = "\n".join(f"  [P2] {t}" for t in p2[:8])
+        # Floor findings cannot reach here — the floor above returned on any of
+        # them — so this branch is purely an accumulation of 0.5-weight findings
+        # (Codex P2 and Devin non-severe), and naming the floor terms would
+        # describe counts that are provably zero.
+        listing = "\n".join(
+            [f"  [P2] {t}" for t in p2[:8]] + [f"  [Devin] {t}" for t in devin_minor[:8]]
+        )
         return True, (
             f"review score {score:.1f} >= {threshold:.1f} blocks this "
-            f"{lane.upper()} change: {len(p2)} unresolved [P2] finding(s) at "
-            f"{_INLINE_P2_SCORE_WEIGHT} each, none maintainer-replied. (A P1 or a "
-            f"CodeRabbit Critical/Major would have blocked at the always-fix "
-            f"floor, whatever the lane.)\n{listing}\n"
+            f"{lane.upper()} change: {len(p2)} unresolved [P2] + {len(devin_minor)} "
+            f"Devin non-severe finding(s) at {_INLINE_P2_SCORE_WEIGHT} each, none "
+            f"cleared. (A P1, a CodeRabbit Critical/Major or a Devin severe finding "
+            f"would have blocked at the always-fix floor, whatever the lane.)\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )
@@ -3635,19 +4300,13 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha
 
 
-def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
-    """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
-    or None on any API/parse error (distinct from ``[]`` = query succeeded, no
-    Codex review). INCLUDES ``DISMISSED`` reviews — consumers filter per their
-    need: freshness (``_codex_review_commit_ids``) skips dismissed (a dismissed
-    review vouches for NO commit); the escalation counter COUNTS them (a
-    dismissed round already RAN and consumed the review budget — #1385 round-5:
-    3 dismissed rounds must still trip the 3-round cap). Uses GitHub's
-    authoritative per-review ``commit_id`` (immune to prefix grinding); the
-    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
-    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login,
-    commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
-    """
+def _pr_review_records(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """EVERY review record ``{login, commit_id, state}`` on the PR, oldest-first, or
+    None on any API/parse error. The one implementation behind both the Codex reader
+    below and the substitute-review lookup, so they parse GitHub's answer the same
+    way. It is NOT one fetch: the substitute path calls it again after the Codex
+    check, which costs a second read on that path only. Same seam as before: ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
+    per line, ``{login, commit_id[, state]}``; missing ``state`` = active)."""
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:
         try:
@@ -3658,7 +4317,8 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/reviews",
                     "--paginate",
                     "--jq",
-                    ".[] | {login: .user.login, commit_id: .commit_id, state: .state}",
+                    ".[] | {login: .user.login, commit_id: .commit_id, state: .state, "
+                    "has_body: (((.body // \"\") | length) > 0)}",
                 ],
                 capture_output=True,
                 text=True,
@@ -3672,7 +4332,7 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
             raw = result.stdout
         except Exception:
             return None
-    reviews: list[dict] = []
+    records: list[dict] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -3683,15 +4343,41 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
             continue
         if not isinstance(obj, dict):
             continue
-        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
-            continue
-        reviews.append(
+        records.append(
             {
+                "login": obj.get("login") or "",
                 "commit_id": (obj.get("commit_id") or "").strip().lower(),
                 "state": (obj.get("state") or "").upper(),
+                # Absent (the test seam, an older projection) reads as True so the
+                # Codex reader keeps its exact behaviour; only the substitute
+                # lookup consults it.
+                "has_body": bool(obj.get("has_body", True)),
             }
         )
-    return reviews
+    return records
+
+
+def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
+    or None on any API/parse error (distinct from ``[]`` = query succeeded, no
+    Codex review). INCLUDES ``DISMISSED`` reviews — consumers filter per their
+    need: freshness (``_codex_review_commit_ids``) skips dismissed (a dismissed
+    review vouches for NO commit); the escalation counter COUNTS them (a
+    dismissed round already RAN and consumed the review budget — #1385 round-5:
+    3 dismissed rounds must still trip the 3-round cap). Uses GitHub's
+    authoritative per-review ``commit_id`` (immune to prefix grinding); the
+    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
+    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login,
+    commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
+    """
+    records = _pr_review_records(pr_num, repo=repo)
+    if records is None:
+        return None
+    return [
+        {"commit_id": r["commit_id"], "state": r["state"]}
+        for r in records
+        if r["login"] == _CODEX_REVIEW_BOT
+    ]
 
 
 def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] | None:
@@ -5513,7 +6199,7 @@ def _classify_base_advance_delta(
     return "inline"
 
 
-def _check_codex_reviewed_head(
+def _check_codex_reviewed_head_core(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
     """Block a merge unless Codex has reviewed the PR's CURRENT head commit —
@@ -5710,6 +6396,143 @@ def _check_codex_reviewed_head(
             None,
         )
     return False, "", head
+
+
+# The reviewers that may stand in for Codex at head — owner standing order,
+# 2026-09-24, ASKED AND APPROVED per PR. Codex stays the official cross-model
+# reviewer; this exists for its outages. Both review automatically on every push
+# here (MEASURED 2026-09-24: of 33 open non-draft PRs, 25 carried a Devin or
+# CodeRabbit review at their current head, 4 a Codex one).
+_SUBSTITUTE_REVIEW_LOGINS: tuple[str, ...] = ("devin-ai-integration[bot]", "coderabbitai[bot]")
+
+
+def _substitute_reviewers_at_head(
+    pr_num: str, head: str, repo: str | None = None
+) -> tuple[list[str], list[tuple[str, str]]] | None:
+    """``(reviewers_at_head, substitute_reviews_elsewhere)`` or None when unreadable.
+
+    ONE implementation for both consumers — the merge gate and the ``--check-pr``
+    row — so the report can never offer a substitute the gate would refuse.
+    A review counts only when it is NOT dismissed, NOT pending and NOT
+    body-less: a dismissal vouches for nothing (the Codex reader applies the
+    same rule), a pending review is an unpublished draft, and an empty-body
+    record is a thread-reply wrapper rather than a review of the head (see the
+    measurement at the skip). Any other state, CHANGES_REQUESTED included,
+    counts: freshness asks only that a review EXISTS at head; what it found is the
+    findings scans' job. ``reviewers_at_head`` is in ``_SUBSTITUTE_REVIEW_LOGINS``
+    order and holds only those fixed logins, so it is safe to print raw.
+    """
+    records = _pr_review_records(pr_num, repo=repo)
+    if records is None:
+        return None
+    at_head: list[str] = []
+    elsewhere: list[tuple[str, str]] = []
+    for login in _SUBSTITUTE_REVIEW_LOGINS:
+        for r in records:
+            if r["login"] != login or r["state"] in ("DISMISSED", "PENDING"):
+                continue
+            # A review record with an EMPTY body is, on this repo, the wrapper
+            # GitHub creates when the bot replies inside a thread — stamped with
+            # the head at reply time. MEASURED 2026-09-24: of the empty records
+            # at head sampled, every one held only replies ("agreed, I withdraw
+            # this finding", "same finding re-anchored…"), and on 4 of 23 open
+            # PRs such wrappers were the ONLY substitute record at head. Counting
+            # them would tell the owner "<bot> reviewed this exact head" when it
+            # only replied in a thread. A real review carries its summary body
+            # ("Devin Review found N potential issues", "Actionable comments
+            # posted: N") — 19 of 29 open PRs had one at head.
+            if not r.get("has_body", True):
+                continue
+            if r["commit_id"] == head:
+                if login not in at_head:
+                    at_head.append(login)
+            elif r["commit_id"] and (login, r["commit_id"]) not in elsewhere:
+                elsewhere.append((login, r["commit_id"]))
+    return at_head, elsewhere
+
+
+def _check_codex_reviewed_head(
+    pr_num: str,
+    *,
+    force: bool = False,
+    repo: str | None = None,
+    substitute: bool = False,
+    substitute_out: list[dict] | None = None,
+) -> tuple[bool, str, str | None]:
+    """The Codex freshness gate, plus the owner-approved SUBSTITUTE path.
+
+    Everything the core does is unchanged; see
+    ``_check_codex_reviewed_head_core``. What this adds runs ONLY when the core
+    would block AND the merge carries ``# substitute-review``: a non-dismissed,
+    non-pending Devin or CodeRabbit review whose ``commit_id`` is EXACTLY the
+    current head then satisfies freshness, the head is returned so the merge stays
+    bound to it by ``--match-head-commit``, and the substitute is recorded in
+    ``substitute_out`` so the caller can announce and log it. The owner's
+    approval is given IN CONVERSATION before the session adds the sigil (owner
+    ruling f7e8d2ed, 2026-09-24, which replaced a native permission prompt): the
+    sigil is the record of that yes. This function only reports that a
+    substitute exists; it never authorises the merge by itself.
+
+    ``# stale-review-override`` wins over the substitute (owner ruling,
+    2026-09-24): the core's force arm returns before this is consulted, so the
+    substitute is never used. That is no looser than the stale override on its
+    own, which is already permitted.
+
+    Unlike the stale override, the substitute does NOT waive the base-branch
+    check and does NOT drop the head binding, and it asks for no fallback-evidence
+    file. That file does two jobs on the stale-override path: it vouches for the
+    BASE (which this path still checks directly) and it proves a substantive
+    review of the head (its length floor plus the head sha). Here the second job
+    is carried by the substitute review itself — a body-bearing review record at
+    the exact head — and by the owner's per-merge approval. The owner ruled
+    (2026-09-24) that this bar applies on the hook surface too.
+    """
+    blocked, msg, verified = _check_codex_reviewed_head_core(pr_num, force=force, repo=repo)
+    if not blocked or force:
+        return blocked, msg, verified
+    if not substitute:
+        return (
+            True,
+            msg
+            + (
+                "\nIf Codex is unavailable: with the owner's approval, append "
+                "'# substitute-review' to accept a Devin or CodeRabbit review AT THIS "
+                "HEAD in Codex's place (ask the owner in conversation first; the sigil "
+                "records their yes)."
+            ),
+            None,
+        )
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return blocked, msg, verified
+    head = head.strip().lower()
+    # The lane and the off-diff scoping downstream must judge the file list of
+    # the head this path returns (and `--match-head-commit` then binds), not a
+    # memo populated against an earlier read. Same reason the core binds it.
+    _bind_pr_files_cache_head(head)
+    found = _substitute_reviewers_at_head(pr_num, head, repo=repo)
+    if found is None:
+        return (
+            True,
+            msg + "\n'# substitute-review' could not be evaluated: the review list was unreadable.",
+            None,
+        )
+    at_head, elsewhere = found
+    if at_head:
+        if substitute_out is not None:
+            substitute_out.append({"reviewers": at_head, "head": head})
+        return False, "", head
+    seen = ", ".join(f"{login}@{sha[:12]}" for login, sha in elsewhere) or "none"
+    return (
+        True,
+        msg
+        + (
+            f"\n'# substitute-review' found no Devin or CodeRabbit review at head "
+            f"{head[:12]} (substitute reviews on other commits: {seen}). A substitute "
+            f"must have reviewed the EXACT head being merged."
+        ),
+        None,
+    )
 
 
 # ── Scheduled Claude review FRESHNESS (a review by the repo OWNER, at HEAD) ──
@@ -9123,6 +9946,67 @@ def _run_merge_and_push_gates() -> int:
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
         hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # A LAUNCHER THE RESOLVER REFUSES TO MODEL, carrying a gated operation.
+        # `eval git push --no-verify` parses CLEANLY — `blind` is None — and
+        # resolves to `exe == "eval"`, so every predicate above sees no push and
+        # the raw-text net below never runs. MEASURED on the deployed guard:
+        # silent allow, where the bare spelling asks. Same class as
+        # `hidden_gated_verb` (an unreadable program naming a publish is worth
+        # refusing) and so it arms the SAME deferred deny, but it must sit
+        # OUTSIDE the `blind is not None` conjunct below — that is the whole
+        # defect: these segments are not blind, they are opaque.
+        # The carrier is what arms this, but the guard's own SUBJECT MATTER is
+        # what scopes it — the same shape `protected_paths_guard` uses at :262,
+        # where `\brm\b` gates its carrier arm.
+        #
+        # The distinction matters and an earlier revision of this line got it
+        # backwards. A text test is unsound for FINDING the operation: bash
+        # concatenates adjacent quoted fragments, so `eval "git pu""sh origin
+        # main"` runs `git push` while carrying no `push` token (MEASURED). It
+        # is sound for SCOPING a guard to the thing it gates, because a command
+        # that mentions no publish at all is not this guard's business however
+        # it is spelled. Dropping the scope made the branch ban the launcher
+        # rather than gate the operation: `eval ls -la`, `unshare -r whoami` and
+        # `systemd-run --user --scope -- /bin/true` were all refused by a PUSH
+        # guard, and the deny text told the reader to "run the git/gh command
+        # directly" on a command containing no git.
+        #
+        # MEASURED over the recorded corpus: 126 carrier hits unscoped, 22 once
+        # scoped — an 83% cut, with every attack spelling this change documents
+        # still refused, because each contains the literal `git`.
+        #
+        # STATED RESIDUAL: `eval "gi""t push"` escapes this bound, since the
+        # bound is itself text. That is the SAME exposure already accepted one
+        # file over, where a split `r""m` escapes the `\brm\b` prefilter — so
+        # the two guards now fail identically instead of taking opposite sides
+        # of one question. Closing it properly needs the resolver to report a
+        # carrier as a blind-spot cause, which is filed, not built here.
+        # PER SEGMENT, not per command. A carrier verdict is "a fact about a
+        # SPECIFIC segment" — this file says so where it explains why
+        # `hidden_gated_verb` must not be suppressed by a different segment
+        # parsing — and reading the whole command string made it a fact about
+        # the command. MEASURED cost of that: `eval "$(ssh-agent -s)" && git
+        # commit -m x` was REFUSED, where the `eval` carries nothing gated and
+        # the `git commit` is a separate, fully-parsed segment the ordinary
+        # commit gate already handles.
+        #
+        # `_mentions_gated_op` OR the carrier net: the former is this guard's
+        # own definition of its business and already includes `gh pr create` —
+        # the FOURTH gated operation, which a hand-built regex silently dropped
+        # (MEASURED: `eval gh pr create …` scored mentions_gated=True,
+        # carrier_net=False, and was ALLOWED). The carrier net adds only
+        # `commit`, which the shared pattern must not carry — see its
+        # definition.
+        #
+        # Every attack spelling keeps the gated word INSIDE the carrier's own
+        # segment, so none of them is affected: `eval git push`,
+        # `eval git commit -n -m x`, `eval "git pu""sh origin main"`,
+        # `su ubuntu -c 'git push'`, `eval gh pr create …`.
+        carried_gated_op = any(
+            s.exe in _REPARSE_CARRIERS
+            and (_mentions_gated_op(s.raw) or bool(_CARRIER_GATED_MENTION.search(s.raw)))
+            for s in segs
+        )
         # The two predicates are NOT suppressed by the same thing, and collapsing
         # them into one `not (…parsed…)` guard was the defect.
         #
@@ -9160,6 +10044,29 @@ def _run_merge_and_push_gates() -> int:
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)
                 return 2
+
+        if carried_gated_op and blind_spot_deny is None:
+            # Its OWN message: the blind one interpolates `blind.cause`/`.hint`,
+            # and there is no `blind` here — these segments parse cleanly. The
+            # blind branch keeps precedence when both fire, because its
+            # diagnosis is the sharper one.
+            #
+            # The remedy is deliberately NOT "rephrase until the guard stops
+            # matching" — that would be a bypass instruction. Both routes it
+            # offers submit to the gate: drop the launcher so the operation is
+            # visible, or keep the launcher and run the gated command as its own
+            # tool call where the ordinary gates see it.
+            blind_spot_deny = (
+                "BLOCKED: this command names a gated operation and runs a "
+                "launcher whose payload this guard cannot recover, so it "
+                "cannot verify what would actually run. The payload is not "
+                "inspected on purpose: adjacent quoted fragments concatenate, "
+                "so a carried command can be spelled past any inspection.\n"
+                "To proceed: run the git/gh command directly, without the "
+                "launcher, so the ordinary push and merge gates can see it — or "
+                "keep the launcher for the work that needs it and issue the "
+                "gated command as its own Bash call."
+            )
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -9573,6 +10480,13 @@ def _run_merge_and_push_gates() -> int:
                 sched_override = has_trailing_override(
                     merge_seg.raw, "scheduled-review-override"
                 )
+                # The owner-approved Codex stand-in (standing order, 2026-09-24).
+                # Like every row here it records the sigil's PRESENCE, noted before
+                # any gate can return. When the stand-in is actually USED, the merge
+                # arm amends the row's `waived` to `codex-freshness:used`; with Codex
+                # current, or with `# stale-review-override` beside it, the row keeps
+                # plain `codex-freshness`.
+                substitute_review = has_trailing_override(merge_seg.raw, "substitute-review")
                 # The FINDINGS waiver, read off the parsed segment rather than via
                 # has_trailing_override — which is why enumerating that helper's
                 # call sites missed the one sigil SKILL.md documents as logged.
@@ -9582,6 +10496,11 @@ def _run_merge_and_push_gates() -> int:
                     ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
                     ("review-override", force_override, "review-body+inline-findings"),
                     ("scheduled-review-override", sched_override, "scheduled-claude-review"),
+                    (
+                        "substitute-review",
+                        substitute_review,
+                        "codex-freshness",
+                    ),
                 ):
                     if _present:
                         # `repo` is BLANK on one path, deliberately: a legacy
@@ -9619,7 +10538,10 @@ def _run_merge_and_push_gates() -> int:
                 # (derive 6 + resolve 6 + mergeable 8 + ci 8 + base 6+6 +
                 # freshness 6+8 + delta 8 = 62s absolute worst; the FORCE
                 # branch swaps freshness+delta for its hook-surface evidence
-                # reads, files 8 + head 6 = strictly less) each reach
+                # reads, files 8 + head 6 = strictly less; a `# substitute-review`
+                # merge whose core freshness blocked adds head 6 + reviews 8,
+                # each clamped by `_gh_timeout` to what is left, so an overrun
+                # still fail-closes rather than running past the wall) each reach
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);
@@ -9889,10 +10811,15 @@ def _run_merge_and_push_gates() -> int:
                 # blocks unless the unreviewed delta is provably review-trivial
                 # (smart-delta — see _check_codex_reviewed_head). Waived by
                 # # stale-review-override (NOT # review-override).
+                substitute_used: list[dict] = []
+                fresh_kwargs: dict = {}
+                if substitute_review:
+                    fresh_kwargs = {"substitute": True, "substitute_out": substitute_used}
                 should_block, fresh_msg, verified_head = _check_codex_reviewed_head(
                     pr_num,
                     force=stale_override,
                     repo=merge_repo,
+                    **fresh_kwargs,
                 )
                 if should_block:
                     print(
@@ -9901,6 +10828,36 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(fresh_msg), file=sys.stderr)
                     return 2
+                bind_source = "Codex-verified"
+                if substitute_used:
+                    # A stand-in satisfied freshness. The owner approves each use IN
+                    # CONVERSATION before the session adds the sigil (ruling f7e8d2ed,
+                    # 2026-09-24, which replaced the native permission prompt this
+                    # arm used to raise): the sigil is the record of that yes, so the
+                    # gate announces the stand-in and marks the log row rather than
+                    # asking again. A dispatched session has nobody present who could
+                    # have approved it, so there the sigil cannot mean a yes: refused.
+                    _who = " and ".join(substitute_used[0]["reviewers"])
+                    bind_source = f"{_who}-verified"
+                    if _is_dispatched():
+                        print(
+                            f"BLOCKED: PR #{pr_num} — '# substitute-review' records the "
+                            f"owner's approval given in conversation, and a dispatched "
+                            f"session has nobody who could have given it. Codex has not "
+                            f"reviewed head "
+                            f"{verified_head[:12]}; {_who} has.",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    _amend_note("substitute-review", waived="codex-freshness:used")
+                    print(
+                        f"NOTE: PR #{pr_num} — Codex has not reviewed head "
+                        f"{verified_head[:12]}; {_who} reviewed that exact head and "
+                        f"stands in for Codex under '# substitute-review' (the owner's "
+                        f"approval, given in conversation). Every other merge gate still "
+                        f"applies.",
+                        file=sys.stderr,
+                    )
 
                 # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
                 # landing between the check above and the merge would otherwise
@@ -9917,7 +10874,7 @@ def _run_merge_and_push_gates() -> int:
                 # TOCTOU race — must run first, while budget is guaranteed.
                 if verified_head:
                     bind_msg = _require_match_head(
-                        merge_seg.argv, pr_num, verified_head, merge_repo, "Codex-verified"
+                        merge_seg.argv, pr_num, verified_head, merge_repo, bind_source
                     )
                     if bind_msg:
                         print("BLOCKED: " + bind_msg, file=sys.stderr)
@@ -10279,6 +11236,88 @@ def _sanitize_gate_text(text: str) -> str:
     )
 
 
+def _uncounted_clause(uncounted: list[dict[str, int]]) -> str:
+    """Render the non-blocking `inline-findings` tail. COUNTS ONLY, never text.
+
+    The row this feeds is printed OUTSIDE ``_sanitize_gate_text`` — the caller
+    renders line 0 itself and ``_print_gate_detail`` sanitizes only lines 1+ — so
+    anything interpolated here reaches a terminal un-defanged. Integers are safe
+    there; a finding title, a path or a bot login is not. That is why this returns
+    a count and a pointer to the NOTEs rather than the findings themselves, and it
+    is a CONSTRAINT rather than a stylistic choice (issue #2044).
+
+    FIVE states. The count is the easy one; the other four are the point:
+
+    * findings exist and none went uncounted   -> "" (the row keeps its old text)
+    * findings went uncounted, all countable   -> the exact count, "finding(s)"
+    * some reviewer output could not be PARSED -> a FLOOR, and the unit is
+                                                  "item(s)" rather than findings
+    * a review CHANNEL under-reported          -> a FLOOR, or UNKNOWN
+    * the scan never got far enough to count   -> UNKNOWN
+
+    The UNIT matters as much as the number, and conflating them was a real defect
+    here rather than a hypothetical: an unrecognised reviewer's comment is ONE
+    entry in its bucket whatever it contains, so summing it with parsed findings
+    and labelling the result "N finding(s)" asserts a cardinality nobody read. It
+    can understate a bundle of five and overstate a comment carrying none. Hence
+    the producer's `exact`/`approx` split, and hence "item(s)" whenever `approx`
+    contributes: the sentence has to be true of the weakest bucket in it.
+
+    The third state is the one an adversarial review had to find, because the
+    first version of this function did not have it. Every counter can be 0 and
+    still be wrong about the world: when the review-body channel is unreadable,
+    incomplete, or short of its own declared count, findings may exist that no
+    accumulator could have counted. MEASURED on that version — a clean scan and
+    an unreadable channel printed byte-identical rows, which is precisely the
+    false confidence this whole change removes, reproduced one field over.
+
+    So a total under-read renders UNKNOWN, and a partial one renders `N+` rather
+    than `N`: the number is a floor, and saying `N` would assert a completeness
+    nobody measured.
+
+    An empty list means the scan returned BEFORE its accumulators existed (a
+    '# review-override' force, or an unreadable first page).
+    """
+    if not uncounted:
+        return " — uncounted findings UNKNOWN (scan exited before counting)"
+    record = uncounted[0]
+    # A flag, never a count — read separately, so it can never inflate a total.
+    under_read = bool(record.get("channel_under_read", 0))
+    exact = sum(record.get("exact", {}).values())
+    approx = sum(record.get("approx", {}).values())
+    total = exact + approx
+    # Either cause makes the number a LOWER BOUND, and they are INDEPENDENT, so
+    # both are rendered when both hold: `approx` means the scan READ some input
+    # and cannot count the findings inside it, while `under_read` means a channel
+    # did not deliver everything it had. Only the second is recoverable by
+    # re-running, so a reader shown one cause cannot tell whether retrying helps.
+    #
+    # An earlier version returned on `approx` FIRST and silently discarded a
+    # simultaneously-true `under_read` — while the sentence above it claimed the
+    # reason was "carried rather than collapsed". Codex P2, round 2. A comment
+    # asserting a property the code three lines below does not have is the defect
+    # class this whole change exists to remove, reproduced in its own renderer.
+    if total:
+        causes = []
+        if approx:
+            causes.append("some reviewer output could not be parsed into findings")
+        if under_read:
+            causes.append("a review channel under-reported")
+        if not causes:
+            return f" — but {total} finding(s) NOT scored, see the NOTEs above"
+        # The UNIT follows `approx` alone: an under-read channel withholds
+        # findings it never handed over, which makes the total a floor without
+        # making the things already counted stop being findings.
+        unit = "item(s)" if approx else "finding(s)"
+        return f" — but {total}+ {unit} NOT scored ({'; '.join(causes)}), see the NOTEs above"
+    # Reached only when `total` is 0 — the branch above returns on every path.
+    if under_read:
+        return " — uncounted findings UNKNOWN (a review channel under-reported, see the NOTEs above)"
+    # Nothing uncounted and nothing under-read: leave the row exactly as it was.
+    # A gate that annotates every row teaches nobody to read the annotation.
+    return ""
+
+
 def _print_gate_detail(msg: str) -> None:
     """Render lines 1+ of a gate message underneath its one-line report line.
 
@@ -10387,6 +11426,19 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]
+        # Say when an owner-approved stand-in exists, through the SAME lookup the
+        # merge gate uses, so the report can never offer a substitute the gate
+        # would refuse. Only fixed logins from `_SUBSTITUTE_REVIEW_LOGINS` reach
+        # this raw row — never reviewer-controlled text.
+        _sub_head = _pr_head_sha(pr_num, repo=repo)
+        if _sub_head:
+            _sub = _substitute_reviewers_at_head(pr_num, _sub_head.strip().lower(), repo=repo)
+            if _sub and _sub[0]:
+                label += (
+                    f" — substitute available: {' and '.join(_sub[0])} reviewed this "
+                    f"head (with the owner's yes in conversation, merge with "
+                    f"'# substitute-review')"
+                )
     else:
         # Distinguish a genuinely-current review from a stale-but-trivial-delta
         # allow — both return the same tuple, but the report must NOT assert
@@ -10473,10 +11525,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
-    print(
-        f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
+    # The out-param is INFORMATIONAL and must never move the verdict: uncounted
+    # findings are uncounted BY DESIGN (below-Major, outside-diff, doc-path,
+    # unrecognised reviewer), so scoring them here would be a policy change wearing
+    # a reporting change's clothes. `failures` is untouched below for that reason —
+    # and the characterization suite locks report/enforcement agreement on the
+    # VERDICT, not on the text, which is what makes an informational tail safe here
+    # while a verdict flip would not be.
+    uncounted: list[dict[str, int]] = []
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, uncounted_out=uncounted)
+    inline_state = (
+        "BLOCK — " + msg.splitlines()[0]
+        if blocked
+        else "ok (P2s, if any, printed above)" + _uncounted_clause(uncounted)
     )
+    print(f"inline-findings: {inline_state}")
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0

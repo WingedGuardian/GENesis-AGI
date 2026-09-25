@@ -57,6 +57,73 @@ _BARE_HOST_RE = re.compile(
 )
 
 
+def _method_body(js: str, signature: str) -> str:
+    """The body of one JS method, brace-matched and stripped of line comments.
+
+    Replaces the fixed-character windows this file used to slice with. A window
+    is a FORMAT assumption wearing a content assertion: it keeps passing while
+    the code it names drifts out of range, and it can match the searched token
+    inside a comment the same change added. Both happened here.
+    """
+    start = js.index(signature)
+    i = js.index("{", start)
+    depth = 0
+    for j in range(i, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                body = js[start : j + 1]
+                break
+    else:  # pragma: no cover - unbalanced braces would be a syntax error
+        raise AssertionError(f"unbalanced braces after {signature!r}")
+    return "\n".join(re.sub(r"//.*$", "", line) for line in body.splitlines())
+
+
+def test_the_withheld_flag_is_the_same_STRING_on_both_sides():
+    """The client guard activates on one literal the server has to send.
+
+    Nothing else binds them. If the server ships `values_hidden`, nests it, or
+    inverts it, `!!body.values_withheld` is simply `false` forever: no warning,
+    no failing test, and the editor quietly returns to clearing overrides it
+    cannot see. That is the failure this file exists to catch, one layer up.
+
+    The invariant asserted is AGREEMENT, not presence, because presence is not
+    yet true: the server half ships in a separate change that lands after this
+    one, and until it does the client guard is inert BY DESIGN. A test demanding
+    the server field today would fail for the right reason at the wrong time,
+    and a skip would be the silent-green this file exists to avoid.
+
+    So both legal states pass — neither side has it (inert, pre-merge), or both
+    do (active) — and the one forbidden state fails: a client reading a literal
+    no server sends, which is indistinguishable from a working guard.
+    """
+    from genesis.env import repo_root
+
+    js = (repo_root() / "src/genesis/dashboard/webui/js/dashboard.js").read_text()
+    py = (repo_root() / "src/genesis/dashboard/routes/secrets.py").read_text()
+
+    client_reads = "values_withheld" in js
+    server_sends = '"values_withheld"' in py
+
+    assert client_reads, (
+        "the editor no longer reads values_withheld — the withheld guard is inert"
+    )
+    assert client_reads == server_sends or not server_sends, (
+        "client and server disagree about the withheld flag"
+    )
+    if not server_sends:
+        # Pin the inertness the split depends on: with no such key in the
+        # response, `!!body.values_withheld` is false, so the flip block and the
+        # refusal both stay unreachable. This branch disappears on its own when
+        # the server change lands.
+        assert "!!body.values_withheld" in js, (
+            "the client must coerce the ABSENT field to false, or the guard "
+            "misfires against a server that does not send it yet"
+        )
+
+
 def test_signup_urls_are_bare_hosts():
     """Every ``# Signup:`` value must be href-able, because it becomes an href.
 
@@ -250,15 +317,23 @@ def test_opening_an_editor_seeds_the_value_so_save_is_not_a_delete():
     from genesis.env import repo_root
 
     js = (repo_root() / "src/genesis/dashboard/webui/js/dashboard.js").read_text()
-    start = js.index("toggleSecretEdit(keyName)")
-    handler = js[start : start + 900]
+
+    handler = _method_body(js, "toggleSecretEdit(keyName)")
     assert "secretsValues" in handler and "def.value" in handler, (
         "toggleSecretEdit must seed the edit buffer from the current value; "
         "without it an untouched field saves as an empty string, i.e. a deletion"
     )
     # The backstop: seeding cannot cover a masked value, so clearing is confirmed.
-    save = js[js.index("async saveSecret(keyName)") :][:1600]
-    assert "confirm(" in save, "clearing an override must be an explicit act"
+    #
+    # Both slices were FIXED WINDOWS (900 and 1600 chars) and both had rotted.
+    # MEASURED before this change: `def.value` sat at char 840 of 900, and the
+    # `confirm(` assertion matched the word inside a COMMENT at char 1190 while
+    # the real `!confirm(` call had moved beyond 1600 — so it asserted nothing,
+    # and the comment that made it vacuous was added by the very change it was
+    # meant to guard. Bounded to the method and stripped of comments, a window
+    # cannot silently stop reaching the code it names.
+    save = _method_body(js, "async saveSecret(keyName)")
+    assert "!confirm(" in save, "clearing an override must be an explicit act"
 
 
 def test_the_empty_string_is_false_for_every_boolean_accessor():

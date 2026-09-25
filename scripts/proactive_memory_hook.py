@@ -239,6 +239,33 @@ def _sqlite_connect(
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         raise _RunBudgetExpired
+    # Admission fence at the single connect chokepoint (fail-closed): a
+    # quarantined database is never opened. Raised as
+    # OperationalError so each caller degrades exactly as it does for a locked
+    # database — per-feature, never crashing the hook.
+    _fence_blocked = True
+    try:
+        from db_admission_check import database_is_fenced
+
+        _fence_blocked = database_is_fenced(db_path)
+    except Exception:
+        _fence_blocked = True
+    if _fence_blocked:
+        raise sqlite3.OperationalError(
+            "database quarantined — admission refused"
+        )
+    # Re-derive the remaining budget AFTER the fence check, which consumed
+    # real time (MEASURED ~74ms on a cold hook process, ~0.3ms warm). The
+    # outer `asyncio.timeout_at` cannot interrupt the SYNCHRONOUS sqlite3 work
+    # below, so a stale `remaining` is the one that actually overruns the
+    # hook's aggregate budget. Same correction as `_connect_with_deadline` in
+    # scripts/hooks/session_heartbeat.py — the two connect chokepoints must
+    # agree, or the budget means something different depending on which one a
+    # caller happens to use.
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _RunBudgetExpired
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
     conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
     if deadline is not None:
@@ -1789,6 +1816,7 @@ def _heartbeat_write(
         model = cached_model(session_id)
         topic = resolve_topic(db_path, session_id, deadline=deadline)
 
+        from genesis.db.crud.cc_sessions import touch_terminal_session_row_sync
         from genesis.db.crud.session_heartbeats import upsert_sync
 
         upsert_sync(
@@ -1800,6 +1828,10 @@ def _heartbeat_write(
             genesis_summary=genesis_summary,
             deadline=deadline,
         )
+        # Prompt-time truth repair for the terminal session row: advance the
+        # reaper's idle clock and undo an adoption-era 'completed' lie the
+        # moment the user types (2026-09-04 ghost). Same best-effort posture.
+        touch_terminal_session_row_sync(str(db_path), session_id)
     except Exception:
         pass  # Best-effort — never block
 

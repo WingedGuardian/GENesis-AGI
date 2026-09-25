@@ -52,6 +52,15 @@
                 "hooks": [
                     {
                         "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/register_cc_session.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook check_stale_pending.py",
                         "timeout": 30
                     }
@@ -296,6 +305,11 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/capped_read_advisory.py",
                         "timeout": 10
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/pr_close_advisory.py",
+                        "timeout": 10
                     }
                 ]
             },
@@ -329,7 +343,7 @@
                 ]
             },
             {
-                "matcher": "Write|Edit",
+                "matcher": "Write|Edit|NotebookEdit",
                 "hooks": [
                     {
                         "type": "command",
@@ -358,6 +372,26 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
                         "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "ExitPlanMode",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/adopt_first_gate.py --plan",
+                        "timeout": 15
+                    }
+                ]
+            },
+            {
+                "matcher": "Write|Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/adopt_first_gate.py --new-file",
+                        "timeout": 15
                     }
                 ]
             },
@@ -397,6 +431,26 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_cwd_guard.py --enter-worktree",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash|Read|Grep|Glob|Edit|Write|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/secrets_env_access_guard.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook behavioral_linter.py",
                         "timeout": 10
                     }
                 ]

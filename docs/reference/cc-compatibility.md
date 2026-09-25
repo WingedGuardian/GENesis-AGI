@@ -1064,6 +1064,56 @@ Mitigated, not eliminated.
 
 ---
 
+### MCP tool descriptions are TRUNCATED at 2,048 characters (measured 2.1.280, 2026-09-22)
+
+Claude Code cuts every MCP tool description (and server-instruction string) at
+**2,048 characters** before the model sees it. The cut is logged — CC writes
+`Tool "X" description truncated from N to 2048 chars` to its per-server
+`mcp-logs-*` files under `~/.cache/claude-cli-nodejs/` — and the text is marked
+`… [truncated]`, but everything past the cut is absent from the model's contract
+regardless.
+
+**MEASURED with a control arm** (a fresh `claude -p` against this repo's real
+`.mcp.json`, asked whether a named tail sentence was present): `follow_up_create`
+(then 4,733 chars) read back **CUT**; the 211-char `module_list` read **FULL**; the
+same probe with `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192` read `follow_up_create`
+**FULL**. On a live install CC's logs showed six tools cut: `follow_up_create`
+(4,735 by CC's count), `memory_recall` (3,525), and four third-party gitnexus tools
+(`impact` 4,991, `cypher` 3,142, `explain` 2,655, `pdg_query` 2,095).
+
+What sat past the cut was *call-time contract* — `follow_up_create`'s `work_state`
+enum, the rule that `blocked_on_trigger` REQUIRES `revisit_condition`, the invalid
+`blocked_on_trigger` + `surplus_task` pairing; `memory_recall`'s `time_range`
+format and `include_subsystem` modes. A caller cannot choose from an enum it cannot
+see.
+
+**Genesis's response:**
+
+1. Both descriptions were cut back to their contract so they fit CC's own cap:
+   `follow_up_create` 4,733 → 2,031 and `memory_recall` 3,525 → 1,952. They now
+   arrive whole with no setting involved. Kept: every enum, format string,
+   required-when rule and invalid combination, and `follow_up_create`'s routing
+   rules (repo work → issue, except from a dispatched session, for an unfixed
+   security defect, or for something consciously not pursued → tabled). Cut:
+   prose duplicating CLAUDE.md, rationale, some latency figures, and a
+   `blocked_on_trigger` steer the implementation's own error message repeats
+   verbatim.
+2. `tests/test_mcp/test_tool_description_budget.py` fails any Genesis MCP tool
+   description over 2,048, so the next oversized one is caught in CI.
+
+**Not done here, deliberately:** raising the cap. `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`
+exists only from CC 2.1.280, and the pin this doc describes may predate it; a
+description that relies on it is still cut on an older CC or where the setting is
+absent. Fitting under 2,048 is the portable fix. Seeding the lever would matter
+only for third-party servers (gitnexus above), which is its own decision.
+
+**Measure it the way CC does:** CC's logged lengths match the NFKC-normalized
+description, not the raw one — the pre-change `follow_up_create` logged 4,735
+where `inspect.getdoc` gives 4,733, because its one `…` normalizes to `...` (+2);
+`memory_recall` matched at 3,525 either way (2 of 2 tools). The test counts NFKC
+length for that reason. Closest to the cap after this change: `follow_up_create`
+2,031 and `direct_session_run` 2,006.
+
 ### Hook stdout is silently FILED above 10,000 characters (measured 2.1.246, 2026-08-30)
 
 **Undocumented in the hooks reference, settings reference, troubleshooting and
@@ -1077,12 +1127,25 @@ the preview.
 
 **Measured on this install's pinned binary, via ~25 real probe sessions**
 (`GENESIS_CTX_PROBE_BYTES=<n>` makes `scripts/genesis_session_context.py` emit
-exactly n filler characters; classify from the new session's transcript —
-inline vs `Output too large`):
+n filler characters; classify from the new session's transcript — inline vs
+`Output too large`).
+
+> ⚠ **The threshold is on TOTAL EMITTED characters, and `n` is NOT the total.**
+> The probe wraps its filler in markers, so a run at `n` emits **n + 22** chars
+> (MEASURED 2026-09-22: the filed payload for `n=10,000` is 10,022 chars —
+> `PROBE-START` + filler + ` PROBE-END`). Subtract the overhead before comparing
+> `n` against the threshold below. This is not pedantry: reading the table as if
+> `n` were the total makes an UNCHANGED cap look like it dropped, which is
+> exactly what happened during the 2.1.280 validation — `n=10,000` filed, the
+> alarm was raised, and the cap turned out to be untouched. Classify the probe by
+> the session's OWN `tool-results/hook-*-stdout.txt` files (the probe session id
+> comes back in `--output-format json`), never by grepping a transcript: a
+> session that merely DISCUSSES these markers matches every pattern you would
+> search for.
 
 | Fact | Value | Evidence |
 |---|---|---|
-| Threshold | **exactly 10,000 chars** | 10,000 inline / 10,001 filed |
+| Threshold | **exactly 10,000 chars TOTAL** | 10,000 inline / 10,001 filed. RE-MEASURED on **2.1.280** (2026-09-22): unchanged — `n=9,978` (total 10,000) inline, `n=9,979` (total 10,001) filed |
 | Unit | **characters**, not bytes | 6,000 two-byte chars (12,044 B) inline |
 | Scope | **per hook entry** | two SessionStart hooks × 9,000 chars → both inline |
 | Mode | same in `-p` and interactive | both file at 10,001 |

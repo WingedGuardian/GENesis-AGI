@@ -835,13 +835,37 @@ mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
 # Watchgod config — 500MB budget, 150MB sacred ground
+#
+# Normalized to the SAME contract the volume-creation lib applies in
+# _cctmpvol_size_gib (scripts/lib/cc_tmp_volume.sh): a non-numeric or sub-1
+# value becomes 2 GiB. Using the raw value here diverged from the volume in
+# both directions — under `set -u` an alphabetic value aborts the install at
+# the arithmetic, and 0 writes a capacity of 0, which makes every computed
+# headroom negative and so pins the oxygen floor permanently ON, bypassing the
+# in-flight guard on every RED run.
+_cc_cap_gib="${CCTMPVOL_SIZE_GIB:-2}"
+if [[ ! "$_cc_cap_gib" =~ ^[0-9]+$ ]] || (( 10#$_cc_cap_gib < 1 )); then
+    _cc_cap_gib=2
+fi
+_cc_cap_mb=$(( 10#$_cc_cap_gib * 1024 ))
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
 CC_TMP_BUDGET_MB=500
 SACRED_GROUND_MB=150
+# True capacity of the cc-tmp volume in MB. On a btrfs storage backend df
+# CANNOT see the volume's cap (statfs reports the shared pool; the quota
+# lives in a qgroup), so the watchgod computes true headroom from THIS
+# number: headroom = min(fs_total, capacity) - used. Derived from the same
+# variable the volume-creation lib uses (scripts/lib/cc_tmp_volume.sh,
+# CCTMPVOL_SIZE_GIB, default 2GiB) rather than hardcoded. host-setup.sh creates
+# the volume and passes the normalized override into the container, so this
+# matches the volume that was actually created. A mismatch in the LARGER
+# direction fires the oxygen floor early and bypasses the in-flight guard
+# permanently, which is why the value is normalized rather than trusted.
+CC_TMP_CAPACITY_MB=$_cc_cap_mb
 WEOF
-echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB, capacity: ${_cc_cap_mb}MB)"
 
 # Auto-cd to genesis on login so Claude Code finds the project (slash
 # commands, hooks, .claude/settings.json all depend on cwd = project root)
@@ -1106,6 +1130,12 @@ if command -v claude &>/dev/null; then
     fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+    # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
+    # repos. Registered under a Genesis-owned name, not the generic `grep`, so
+    # an operator's own grep server is never touched.
+    # No API key and no local binary, so nothing to gate on `command -v`: it is
+    # a remote endpoint. User scope so worktree sessions get it too.
+    _register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 fi
 
 # Queue initial code intelligence indexing — write an index-request marker for

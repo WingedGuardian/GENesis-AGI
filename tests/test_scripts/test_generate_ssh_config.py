@@ -344,8 +344,24 @@ class TestLobbyDoorScript:
             f"attaches to the existing session instead of refusing: {attach}"
         )
         # And a taken name is stepped off rather than turning into a hard denial.
-        assert any("has-session" in ln and "SESSION" in ln for ln in code), (
-            "a taken picker name should be stepped off, not simply fatal"
+        #
+        # Asserted on the SHAPE of the step-off, not on the probe's spelling.
+        # This used to require the literal string `has-session`, which pinned
+        # HOW the door asks rather than WHAT it does — so replacing that probe
+        # (it made tmux emit a status-line message on every connection, see
+        # lobby-door.sh) broke this test while the behaviour was unchanged. A
+        # test that fails on a correct refactor is testing the wrong thing.
+        loop = [
+            ln for ln in code
+            if ln.strip().startswith("while ") and "SESSION" in ln
+        ]
+        assert loop, (
+            "a taken picker name should be stepped off, not simply fatal: no "
+            "loop over SESSION found"
+        )
+        assert any('SESSION="lobby-$$-' in ln for ln in code), (
+            "the step-off loop must derive a DIFFERENT name, or it spins on "
+            "the taken one"
         )
 
     def test_transient_pickers_are_hidden_from_the_tree(self):
