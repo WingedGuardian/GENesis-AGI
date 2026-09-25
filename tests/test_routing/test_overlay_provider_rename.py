@@ -370,3 +370,248 @@ def test_a_dashboard_save_is_not_blocked_by_a_legacy_name_in_a_chain(tmp_path):
     updated = update_call_site_in_yaml(cfg, "31_outcome_classification", default_paid=True)
 
     assert updated.call_sites["31_outcome_classification"].chain == ["glm"]
+
+
+# ── A BODILESS overlay key wipes what the base holds there ──────────────────
+#
+# Variant C, found in review on this PR and then widened by an adversarial audit
+# of the first fix. Same router-dark outcome as variant A, reached with no rename
+# involved: an operator opens the overlay, types a key, and saves before writing
+# its body. YAML loads that as None, and `_deep_merge` used to plain-assign it
+# over whatever the base held.
+#
+# The review named the SECTION level (`providers:`). The audit showed the first
+# fix closed only that level, and that the ENTRY level below it
+# (`call_sites: {<id>:}`) was still fatal — and likelier, because
+# `call_sites: {<id>: {...}}` is the nesting the dashboard itself writes.
+#
+# There are now TWO mechanisms and they are tested SEPARATELY on purpose. Once
+# `_deep_merge` refuses a non-mapping over a mapping, an end-to-end `load_config`
+# assertion passes even with the sanitizer's drop deleted — so an end-to-end test
+# alone would stop binding the sanitizer at all. The split below is what keeps
+# each one held:
+#
+#   `_deep_merge`            — CORRECTNESS. The router loads. Tested directly.
+#   `_sanitize_local_overlay`— HEALING. The poison is removed from the dict that
+#                              `update_call_site_in_yaml` writes back to disk, and
+#                              its `.setdefault(...)` at :695 therefore returns
+#                              `{}` instead of a `None` that raises outside the
+#                              validation try. Tested by inspecting the returned
+#                              overlay, not the loaded config.
+
+
+def _base_dict():
+    """The shipped-config shape, as `yaml.safe_load` returns it."""
+    import yaml
+
+    return yaml.safe_load(_BASE)
+
+
+# ── mechanism 1: _deep_merge refuses a non-mapping over a mapping ───────────
+
+@pytest.mark.parametrize(
+    "bad", [None, "oops", 5, ["a"]], ids=["none", "str", "int", "list"]
+)
+def test_deep_merge_keeps_the_base_mapping_against_a_non_mapping(bad):
+    """The root-cause guard, at the level the recursion actually reaches."""
+    from genesis.routing.config import _deep_merge
+
+    merged = _deep_merge({"providers": {"glm": {"type": "zenmux"}}}, {"providers": bad})
+
+    assert merged["providers"] == {"glm": {"type": "zenmux"}}, (
+        f"a {type(bad).__name__} overlay replaced a base mapping — every provider "
+        "or call site under it would be gone and the router would load dark"
+    )
+
+
+def test_deep_merge_applies_a_non_mapping_where_the_base_has_no_mapping(bad=None):
+    """CONTROL. The guard is about mappings, not about None.
+
+    Overwriting a scalar, a list, or an absent key with whatever the overlay says
+    is the merge's entire job. Without this, a guard that refused every None would
+    pass the tests above while silently breaking ordinary overrides.
+    """
+    from genesis.routing.config import _deep_merge
+
+    merged = _deep_merge(
+        {"free": True, "chain": ["a"], "n": 1},
+        {"free": None, "chain": ["b"], "n": 2, "brand_new": None},
+    )
+
+    assert merged["free"] is None
+    assert merged["chain"] == ["b"]
+    assert merged["n"] == 2
+    assert merged["brand_new"] is None
+
+
+def test_deep_merge_survives_a_non_mapping_overlay_argument():
+    """`update_call_site_in_yaml:699` hits this shape with a poisoned entry.
+
+    It raised there OUTSIDE the validation try at :778, so the dashboard save
+    returned 500 with no backup written, rather than failing validation cleanly.
+    """
+    from genesis.routing.config import _deep_merge
+
+    assert _deep_merge({"chain": ["glm"]}, None) == {"chain": ["glm"]}
+
+
+@pytest.mark.parametrize("section", ["providers", "call_sites"])
+@pytest.mark.parametrize("body", ["", "  # just a comment\n"])
+def test_a_bodiless_section_does_not_delete_the_base_section(tmp_path, section, body):
+    """End to end: the config still loads with everything the base shipped.
+
+    Both spellings of "no body" are kept for documentation rather than coverage —
+    `yaml.safe_load` returns None for each, so they are one path.
+    """
+    cfg = _write(tmp_path, _BASE, f"{section}:\n{body}")
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert set(loaded.providers) >= {"glm", "mistral-large-free"}
+    assert "31_outcome_classification" in loaded.call_sites
+
+
+@pytest.mark.parametrize(
+    "overlay",
+    [
+        "call_sites:\n  31_outcome_classification:\n",
+        "call_sites:\n  31_outcome_classification: oops\n",
+        "call_sites:\n  31_outcome_classification: [glm]\n",
+        "providers:\n  glm:\n",
+    ],
+    ids=["call_site_none", "call_site_str", "call_site_list", "provider_none"],
+)
+def test_a_bodiless_ENTRY_does_not_take_the_router_dark(tmp_path, overlay):
+    """The level the first fix missed, and the likelier one.
+
+    MEASURED before this fix, each of these escaped `load_config` as a TypeError
+    or AttributeError — `cs["chain"]` at config.py:578 and `rp.get` at :462 have
+    no shape guard — and `runtime/init/router.py` swallowed it into
+    `_bootstrapped = False`: Genesis up, every LLM call site dark, one log line.
+    """
+    cfg = _write(tmp_path, _BASE, overlay)
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert "31_outcome_classification" in loaded.call_sites
+    assert loaded.call_sites["31_outcome_classification"].chain
+    assert set(loaded.providers) >= {"glm", "mistral-large-free"}
+
+
+# ── mechanism 2: the sanitizer HEALS the file the dashboard writes back ─────
+
+@pytest.mark.parametrize(
+    "overlay,gone",
+    [
+        ({"providers": None}, "providers"),
+        ({"call_sites": None}, "call_sites"),
+        ({"providers": "oops"}, "providers"),
+    ],
+    ids=["providers_none", "call_sites_none", "providers_str"],
+)
+def test_the_sanitizer_removes_a_poisoned_SECTION_from_what_is_written_back(
+    overlay, gone
+):
+    """Asserted on the RETURNED OVERLAY, not on the loaded config.
+
+    `update_call_site_in_yaml` dumps this dict straight to disk (:786), so what
+    survives here is what the operator's file looks like after the next dashboard
+    save. A `load_config` assertion cannot see this — `_deep_merge` already makes
+    the config correct either way — which is exactly why it is tested here.
+    """
+    from genesis.routing.config import _sanitize_local_overlay
+
+    result = _sanitize_local_overlay(_base_dict(), overlay)
+
+    assert gone not in result, (
+        f"'{gone}' survived sanitization, so it would be written back to the "
+        "operator's overlay and silently re-ignored at every load"
+    )
+
+
+@pytest.mark.parametrize(
+    "section,name",
+    [
+        ("call_sites", "31_outcome_classification"),
+        ("providers", "glm"),
+    ],
+)
+def test_the_sanitizer_removes_a_poisoned_ENTRY_from_what_is_written_back(
+    section, name
+):
+    """The entry level of the same property — and the dashboard-500 fix.
+
+    `update_call_site_in_yaml:695` calls `.setdefault(call_site_id, {})` on this
+    result. A surviving `None` entry makes `setdefault` return it, and the
+    `_deep_merge` at :699 then raised OUTSIDE the try at :778 — a 500 with no
+    backup written. Dropping the entry here makes `setdefault` return `{}`.
+    """
+    from genesis.routing.config import _sanitize_local_overlay
+
+    result = _sanitize_local_overlay(_base_dict(), {section: {name: None}})
+
+    assert name not in result.get(section, {})
+
+
+def test_the_sanitizer_leaves_an_overlay_key_the_base_does_not_have(tmp_path):
+    """Binds the half of the predicate an audit measured as UNBOUND.
+
+    The guard reads `isinstance(base_raw.get(key), dict) and not isinstance(val, dict)`.
+    A mutation battery showed the FIRST conjunct could be deleted with every test
+    still green — so nothing held it. Deleting an operator's own addition would be
+    its own silent defect, and `_parse` ignores unknown top-level keys, so the
+    correct behaviour is to leave it alone.
+    """
+    from genesis.routing.config import _sanitize_local_overlay
+
+    result = _sanitize_local_overlay(_base_dict(), {"brand_new_section": None})
+
+    assert "brand_new_section" in result
+
+
+def test_an_overlay_that_is_not_a_mapping_at_all_is_ignored():
+    """A top-level list or scalar used to raise on `.items()` — router dark."""
+    from genesis.routing.config import _sanitize_local_overlay
+
+    assert _sanitize_local_overlay(_base_dict(), ["a", "b"]) == {}
+    assert _sanitize_local_overlay(_base_dict(), "nonsense") == {}
+
+
+def test_the_dropped_section_is_announced(tmp_path, caplog):
+    """Dropping silently would trade one invisible failure for another."""
+    import logging
+
+    cfg = _write(tmp_path, _BASE, "providers:\n")
+
+    with caplog.at_level(logging.WARNING, logger="genesis.routing.config"):
+        load_config(cfg, check_api_keys=False)
+
+    assert any(
+        "providers" in r.message and "not a mapping" in r.message
+        for r in caplog.records
+    ), f"the dropped section was not announced; records={[r.message for r in caplog.records]}"
+
+
+def test_a_valid_overlay_section_is_still_applied(tmp_path):
+    """CONTROL — the guards must not become a blanket drop.
+
+    Without this, widening either predicate until the tests above pass would
+    eventually discard every overlay, and the operator's real overrides would
+    vanish with the same silence this whole change exists to remove.
+    """
+    cfg = _write(
+        tmp_path,
+        _BASE,
+        """
+        providers:
+          glm:
+            rpm_limit: 7
+        """,
+    )
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert loaded.providers["glm"].rpm_limit == 7, (
+        "a VALID overlay section was dropped — a guard is over-broad"
+    )
+    assert set(loaded.providers) >= {"glm", "mistral-large-free"}

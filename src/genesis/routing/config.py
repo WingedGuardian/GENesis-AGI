@@ -62,13 +62,65 @@ def _normalize_dispatch(raw: object, *, call_site_name: str) -> str:
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
-    """Recursively merge overlay into base. Lists are replaced, not appended."""
+    """Recursively merge overlay into base. Lists are replaced, not appended.
+
+    A NON-MAPPING NEVER REPLACES A MAPPING, at any depth. That rule is the whole
+    fix for a defect class this function used to create rather than absorb.
+
+    The trigger is ordinary: an operator opens `model_routing.local.yaml`, types a
+    key, and saves before writing its body. YAML loads a bodiless key as ``None``,
+    not as ``{}``. The original condition required BOTH sides to be mappings before
+    recursing, so a ``None`` fell through to the plain assignment below and
+    replaced whatever the base held. MEASURED 2026-09-25, every level, against the
+    real loader:
+
+      ``providers:``                 -> all providers deleted, every chain then
+                                        references an unknown provider
+      ``call_sites:``                -> all call sites deleted
+      ``call_sites: {<id>:}``        -> TypeError: 'NoneType' is not subscriptable
+                                        at :578 (``cs["chain"]``)
+      ``call_sites: {<id>: oops}``   -> TypeError: string indices must be integers
+      ``retry: {<name>:}``           -> AttributeError at :462 (``rp.get``)
+
+    Each escapes ``load_config`` into ``runtime/init/router.py``, which swallows it
+    into ``_bootstrapped = False`` — Genesis starts, every LLM call site is dark,
+    and one log line is the only evidence. The entry-level shapes are the LIKELIER
+    ones, because ``call_sites: {<id>: {...}}`` is exactly the nesting the dashboard
+    writes, so that is what an operator is hand-editing.
+
+    Guarding HERE rather than at each caller is deliberate: an earlier revision put
+    the check in ``_sanitize_local_overlay`` for top-level keys only, which closed
+    the section level while leaving the entry level fatal — and a guard sited at
+    one nesting level of a recursive merge can only ever close that level. The
+    non-mapping ``overlay`` check does the same job for the argument itself, which
+    is the shape ``update_call_site_in_yaml:699`` hits when a poisoned entry
+    reaches it (an AttributeError raised OUTSIDE the validation try at :778, so the
+    dashboard save 500s with no backup written).
+
+    The overlay's value is DROPPED, not merged, and said out loud — replacing a
+    mapping with a scalar is never a coherent operator intent, and silence here is
+    what made the original failure so hard to attribute.
+    """
     merged = copy.deepcopy(base)
+    if not isinstance(overlay, dict):
+        logger.warning(
+            "Refusing to merge a non-mapping overlay (%s) over a mapping — "
+            "keeping the base unchanged",
+            type(overlay).__name__,
+        )
+        return merged
     for key, val in overlay.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
-            merged[key] = _deep_merge(merged[key], val)
-        else:
-            merged[key] = val
+        if key in merged and isinstance(merged[key], dict):
+            if isinstance(val, dict):
+                merged[key] = _deep_merge(merged[key], val)
+            else:
+                logger.warning(
+                    "Overlay key '%s' is %s where the base holds a mapping — "
+                    "keeping the base value rather than replacing it",
+                    key, type(val).__name__,
+                )
+            continue
+        merged[key] = val
     return merged
 
 
@@ -196,7 +248,72 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
 
     Returns a sanitized copy — does NOT mutate the input.
     """
+    if not isinstance(local_raw, dict):
+        logger.warning(
+            "Local overlay is %s, not a mapping — ignoring it entirely",
+            type(local_raw).__name__,
+        )
+        return {}
+
     result = copy.deepcopy(local_raw)
+
+    # HEALING, not containment. `_deep_merge` is what actually stops a bodiless
+    # overlay key wiping the base — it refuses to put a non-mapping over a mapping
+    # at any depth, and that is the guard the router's correctness rests on (see
+    # its docstring for the measured failure table).
+    #
+    # This pass exists for the two things that guard cannot do. First, the overlay
+    # dict this function returns is what `update_call_site_in_yaml` WRITES BACK to
+    # disk (:786 `yaml.dump(local_raw, ...)`), so dropping the poison here removes
+    # it from the operator's file at the next dashboard save instead of leaving it
+    # there to be re-ignored forever. Second, `update_call_site_in_yaml:695` does
+    # `.setdefault(call_site_id, {})` on this result and hands it to `_deep_merge`
+    # at :699 — a surviving `None` entry makes that call raise OUTSIDE the
+    # validation try at :778, so the save 500s with no backup written. Removing the
+    # entry here means `setdefault` returns `{}` and the save proceeds normally.
+    #
+    # Both levels are walked, because they fail differently and only one of them is
+    # absorbed downstream. MEASURED 2026-09-25 against the real loader, with
+    # `_deep_merge`'s guard removed so each shape reaches `_parse`:
+    #
+    #   SECTION  `providers:`              -> 0 of 2 providers survive
+    #   SECTION  `call_sites:`             -> 0 of 2 call sites survive
+    #   ENTRY    `call_sites: {<id>:}`     -> TypeError at :578, router dark
+    #   ENTRY    `call_sites: {<id>: oops}`-> TypeError, router dark
+    #   ENTRY    `retry: {<name>:}`        -> AttributeError at :462, router dark
+    #   ENTRY    `providers: {<name>:}`    -> already absorbed by `_parse`, which
+    #                                         skips it with a warning and disables
+    #                                         the provider. Loud and non-fatal, and
+    #                                         the reason `providers` and
+    #                                         `call_sites` behave differently at
+    #                                         the same nesting level.
+    #
+    # Only a key the BASE holds as a mapping is dropped: an overlay key absent from
+    # base is left alone (`_parse` ignores unknown keys, and silently deleting an
+    # operator's addition would be its own defect).
+    for key, val in list(result.items()):
+        if isinstance(base_raw.get(key), dict) and not isinstance(val, dict):
+            logger.warning(
+                "Local overlay section '%s' is not a mapping (%s) — dropping it "
+                "rather than leaving it to be ignored at every merge",
+                key, type(val).__name__,
+            )
+            result.pop(key)
+
+    for section in ("providers", "call_sites", "retry"):
+        entries = result.get(section)
+        if not isinstance(entries, dict):
+            continue
+        base_entries = base_raw.get(section) or {}
+        for name, entry in list(entries.items()):
+            if isinstance(base_entries.get(name), dict) and not isinstance(entry, dict):
+                logger.warning(
+                    "Local overlay %s entry '%s' is not a mapping (%s) — dropping "
+                    "it rather than leaving a half-finished edit in the file",
+                    section, name, type(entry).__name__,
+                )
+                entries.pop(name)
+
     base_providers = set((base_raw.get("providers") or {}).keys())
     base_call_sites = set((base_raw.get("call_sites") or {}).keys())
 
