@@ -467,6 +467,132 @@ EOF
 #   Orange : > 75%  — yellow + delete caches + kill idle sessions + alert
 #   Red    : > 90% OR fs free < sacred — nuclear cleanup + emergency alert
 
+reap_stale_session_dirs() {
+    # Reap per SESSION, judging staleness by the session's CONTENTS.
+    #
+    # WHAT THIS REPLACES, and why it was data loss. The old predicate was
+    #
+    #     find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d \
+    #          -path "*/claude-*/???*" -mtime +7 -exec rm -rf {} +
+    #
+    # which is wrong on all three counts:
+    #
+    #   * DEPTH 2 is the PROJECT directory, so one `rm -rf` took every session
+    #     under it, not the stale one.
+    #   * `-mtime +7` on a DIRECTORY tests the directory's OWN mtime, and a
+    #     project directory's mtime moves only when a session dir is created or
+    #     removed directly under it — never when a live session writes inside
+    #     one. So it answers "when did a session last START here", not "is
+    #     anything here still in use".
+    #   * `claude-*` is unanchored and also matches sibling caches such as
+    #     `claude-skills` (see #1878, which absorbed #2297).
+    #
+    # REPRODUCED against the unfixed predicate: a project whose newest file was
+    # written SECONDS ago, with its own directory mtime backdated 30 days, was
+    # selected for deletion. Work in one project for a month without starting a
+    # new session there and it ages out with every session it holds.
+    #
+    # FAILS CLOSED. The freshness probe distinguishes "nothing inside is fresh"
+    # from "could not look" by EXIT STATUS, not by empty output — the two are
+    # the same string, and conflating them is how #2342 shipped a fail-open
+    # twice in one review. MEASURED on GNU findutils 4.9.0, which is what the
+    # daemon resolves `find` to: rc=0 for a match AND for no-match, rc=1 for a
+    # missing or unreadable directory. An unreadable session is SPARED and said
+    # so out loud.
+    local root="$1" age_days="$2"
+    shift 2
+    local -a excl=("$@")
+
+    # VALIDATE the age before it becomes a date string. `find -newermt` does not
+    # reject garbage — GNU parse_datetime REINTERPRETS most of it, usually as a
+    # timezone, and returns SUCCESS. MEASURED 2026-09-25 against GNU findutils
+    # 4.9.0, with today at 2026-09-25:
+    #
+    #     '7 days ago'   -> 2026-09-18   rc=0   (intended)
+    #     '7d days ago'  -> 2026-09-23   rc=0   <- 2 days, not 7
+    #     ' days ago'    -> 2026-09-24   rc=0   <- today
+    #     'X days ago'   -> 2026-09-24   rc=0   <- today
+    #     'abc days ago' -> UNPARSEABLE  rc=1
+    #
+    # Every rc=0 row moves the cutoff FORWARD, so a caller passing "7d", or an
+    # unset variable, reaps nearly every session in the tree — silently, with
+    # the fail-closed path never firing because the status is 0, and with the
+    # log line still reading "newer than 7d". Only the last row errors.
+    # The sole caller hardcodes 7 today; this is here so that stays safe when
+    # it becomes configurable.
+    if ! [[ "$age_days" =~ ^[1-9][0-9]*$ ]]; then
+        log WARN "YELLOW session reap: age_days='${age_days}' is not a positive integer — refusing to reap (a malformed age silently widens the cutoff instead of erroring)"
+        return 0
+    fi
+    local cutoff="${age_days} days ago"
+    local sess probe reaped=0 spared_live=0 spared_blind=0
+    local -a blind_paths=()
+
+    # ANCHOR THE GLOB TO $root. `-path`'s `*` matches `/`, so the unanchored
+    # `*/claude-[0-9]*/*/*` is satisfied by a `claude-<digit>` component in the
+    # ROOT'S OWN PATH — after which the pattern stops discriminating and every
+    # depth-3 directory under the root is eligible. MEASURED: with a root of
+    # `…/claude-1000/fakeroot`, the unanchored form matched (and would have
+    # reaped) `pip-unpack-xyz/wheels/numpy` and `tsx-cache/v1/build`; the
+    # anchored form matches nothing. Reachable on any install whose $HOME
+    # contains such a component, and this ships to every clone. Same bug class
+    # as the `claude-*` defect this function exists to fix — that one was fixed
+    # at the instance and left open one level up.
+    # The enumeration's STATUS is taken by a separate no-output walk rather than
+    # from the loop, because neither obvious shortcut works: a process
+    # substitution's exit status is not available to the `while` that reads it,
+    # and `$(...)` cannot carry `-print0` output at all — bash drops NUL bytes
+    # from a command substitution, so the separator is destroyed. `-printf ''`
+    # walks without forking or emitting, which is cheap beside the per-session
+    # probes the loop already runs.
+    local enum_rc=0
+    find "$root" -mindepth 3 -maxdepth 3 -type d -path "$root/claude-[0-9]*/*/*" \
+         -printf '' 2>/dev/null || enum_rc=1
+
+    while IFS= read -r -d '' sess; do
+        if ! probe=$(find "$sess" -newermt "$cutoff" -print -quit 2>/dev/null); then
+            spared_blind=$((spared_blind + 1))
+            (( ${#blind_paths[@]} < 3 )) && blind_paths+=("$sess")
+            continue
+        fi
+        if [[ -n "$probe" ]]; then
+            spared_live=$((spared_live + 1))
+            continue
+        fi
+        rm -rf -- "$sess" 2>/dev/null && reaped=$((reaped + 1))
+    done < <(find "$root" -mindepth 3 -maxdepth 3 -type d -path "$root/claude-[0-9]*/*/*" \
+                  ${excl[@]+"${excl[@]}"} -print0 2>/dev/null)
+
+    # A project directory left with no sessions is an empty shell; remove it so
+    # the tree does not accumulate them. `-empty` is exact — MEASURED: `-delete`
+    # uses rmdir semantics and refuses a non-empty directory — so this can never
+    # take a project that still holds a session.
+    #
+    # `-mmin +60` is NOT redundant with `-empty`. A project directory is EMPTY
+    # for the instant between its own mkdir and its first session's mkdir, and
+    # YELLOW polls every 30s whenever cc-tmp is over half its budget. MEASURED:
+    # a project created that instant was deleted by this pass. The live-writer
+    # exclusions cannot help — a directory created a millisecond ago holds no
+    # open descriptor. An empty shell is never urgent, so it gets the same hour
+    # of grace the sibling temp-file sweep already gives.
+    find "$root" -mindepth 2 -maxdepth 2 -type d -path "$root/claude-[0-9]*/*" \
+        -empty -mmin +60 ${excl[@]+"${excl[@]}"} -delete 2>/dev/null || true
+
+    # Both blind spots are LOUD. An earlier version made the per-session probe
+    # loud and left the ENUMERATION silent, so an unreadable PROJECT produced an
+    # entirely empty log — indistinguishable from "nothing to reclaim", which is
+    # the failure `zone_a_live_exclusions` already argues against in this file.
+    if (( enum_rc != 0 )); then
+        log WARN "YELLOW session reap: enumeration hit unreadable subtrees under ${root} — some sessions were never examined this sweep"
+    fi
+    if (( spared_blind > 0 )); then
+        log WARN "YELLOW session reap: SPARED ${spared_blind} session dir(s) whose freshness could not be determined (unreadable) — failing closed, not deleting; first: ${blind_paths[*]}"
+    fi
+    if (( reaped > 0 || spared_live > 0 )); then
+        log INFO "YELLOW session reap: reaped ${reaped} stale session dir(s), spared ${spared_live} with content newer than ${age_days}d"
+    fi
+}
+
 clean_cc_yellow() {
     # Same in-flight exclusions the tiers above use. YELLOW fires at 50% of
     # budget — more often than either — and deletes *.tmp older than 60min: a
@@ -476,10 +602,9 @@ clean_cc_yellow() {
     zone_a_live_exclusions _yellow_excl "$(live_open_paths)" "$CC_TMP_DIR"
     log INFO "Zone A YELLOW — cleaning stale session dirs and temp files"
 
-    # Clean session dirs with mtime > 7 days
-    find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*/???*" \
-        -mtime +7 ${_yellow_excl[@]+"${_yellow_excl[@]}"} \
-        -exec rm -rf {} + 2>/dev/null || true
+    # Reap stale SESSIONS by their contents. See reap_stale_session_dirs for
+    # why the old per-project, directory-mtime form was data loss.
+    reap_stale_session_dirs "$CC_TMP_DIR" 7 ${_yellow_excl[@]+"${_yellow_excl[@]}"}
 
     # Clean old temp files (*.tmp, *.env, *.yaml) > 1 hour old
     find "$CC_TMP_DIR" -type f \( -name "*.tmp" -o -name "*.env" -o -name "*.yaml" \) \
