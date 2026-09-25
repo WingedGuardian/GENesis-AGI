@@ -1315,12 +1315,19 @@ profiles:
     anti_sycophancy: C
     context_window: 1048576
     cost_tier: cheap
-    # CARRIED from the gemini-3.5-flash entry, NOT re-measured — Google's direct
-    # listing does not expose per-token price the way OpenRouter does, and this
-    # provider is reached on the Google API, not through OpenRouter. Same caveat
-    # applies to cost_tier and latency on this entry.
-    cost_per_mtok_in: 0.50
-    cost_per_mtok_out: 3.00
+    # READ from Google's own pricing page (ai.google.dev/gemini-api/docs/pricing)
+    # and the 3.8 Flash launch post, consulted 2026-09-24 via review. An earlier
+    # revision CARRIED gemini-3.5-flash's 0.50/3.00 without re-measuring, which
+    # UNDER-RECORDED every paid call priced through `_cost_from_profile`.
+    #
+    # ⚠ INTRODUCTORY RATE — these DOUBLE to 1.50 / 7.50 on 2027-01-01. Google
+    # prints both figures in the same cell, so this is a scheduled edit, not a
+    # rumour. Output price includes thinking tokens.
+    #
+    # `cost_tier` and `latency` on this entry are still hand judgements anchored
+    # on price and vendor position, not measurements.
+    cost_per_mtok_in: 0.75
+    cost_per_mtok_out: 3.75
     latency: low
     strengths:
       - speed (instant first token)
