@@ -143,6 +143,71 @@ async def test_memory_expand_threads_the_visibility_choice(_mcp_state, monkeypat
     assert rec.calls[0]["include_deprecated"] is asked
 
 
+@pytest.mark.parametrize("mode", ["drift", "standard"])
+async def test_the_drift_pipeline_does_not_get_the_visibility_choice(_mcp_state, monkeypatch, mode):
+    """Enrichment must match the pipeline that PRODUCED the results, not the ask.
+
+    `drift_recall` takes no `include_deprecated` at all and hides deprecated
+    memories in BOTH its lanes — `search_ranked` filters them in SQL, and
+    `qdrant.search` defaults the flag False and adds a `must_not deprecated`
+    condition. So honouring the caller's flag during enrichment on a drift recall
+    puts an id in `graph_neighbors` that the same call's `results` could never
+    contain: the identical defect as the expired-memory one, one pipeline over,
+    and introduced by the #1896 fix rather than pre-existing (before it the
+    traversal always hid deprecated, so it agreed with drift by accident).
+
+    Parametrized against `standard` as the CONTROL: without it, a bug that
+    withheld the flag from every pipeline would pass the drift arm and look like
+    correct behaviour.
+    """
+    from unittest.mock import AsyncMock
+
+    from genesis.mcp.memory import core as core_mod
+    from genesis.memory.types import RetrievalResult
+
+    hit = RetrievalResult(
+        memory_id="33333333-3333-3333-3333-333333333333",
+        content="c",
+        source="test",
+        memory_type="episodic",
+        score=0.9,
+        vector_rank=1,
+        fts_rank=1,
+        activation_score=0.8,
+        payload={},
+    )
+    rec = _TraverseRecorder()
+    monkeypatch.setattr(core_mod, "graph_traverse", rec)
+    # Patch the module attribute drift mode imports, so the drift arm never needs
+    # Qdrant or an embedding provider.
+    drift_mod = __import__("genesis.memory.drift", fromlist=["drift_recall"])
+    monkeypatch.setattr(drift_mod, "drift_recall", AsyncMock(return_value=[hit]))
+    _mcp_state._retriever.recall = AsyncMock(return_value=[hit])
+
+    await core_mod.memory_recall.fn(
+        query="q",
+        mode=mode,
+        include_deprecated=True,
+        compact=False,
+        include_graph=True,
+        corrective=False,
+    )
+
+    assert rec.calls, "graph enrichment never ran — this test proves nothing"
+    got = rec.calls[0]["include_deprecated"]
+    if mode == "drift":
+        assert got is False, (
+            "the drift pipeline hides deprecated memories in both lanes and takes "
+            "no visibility flag, so enrichment must not un-hide them — that would "
+            "return a neighbour this recall's own results could never contain"
+        )
+    else:
+        assert got is True, (
+            "the standard pipeline DOES honour include_deprecated, so withholding "
+            "it here would reproduce #1896 for every ordinary audit recall"
+        )
+
+
 # ── the hidden neighbours are LABELLED, not merely returned ───────────────
 
 

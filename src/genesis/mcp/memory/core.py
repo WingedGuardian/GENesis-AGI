@@ -425,6 +425,27 @@ async def memory_recall(
             for r in results
         ]
 
+    # Which visibility the ENRICHMENT may use, as opposed to which the caller
+    # asked for. The two differ on the drift pipelines, and the rule this whole
+    # change serves is that enrichment must agree with the search that actually
+    # produced these results — not with the search the standard path would have
+    # run. `drift_recall` takes no `include_deprecated` at all and hides
+    # deprecated memories in BOTH its lanes (`search_ranked` filters in SQL;
+    # `qdrant.search` defaults the flag False and adds `must_not deprecated`),
+    # so honouring the caller here would put a deprecated id in
+    # `graph_neighbors` that this recall's own `results` could never contain.
+    # Same defect as the expired-memory one above, one pipeline over.
+    #
+    # `pipeline_used` is the RESOLVED pipeline, not the requested `mode`: the
+    # auto path can silently swap sparse standard results for drift ones
+    # (`pipeline_used = "auto_drift"`), and that swap has to move this flag with
+    # it. Keying on `mode` would miss exactly that case.
+    #
+    # Teaching drift the flag instead would be the wider fix and a real
+    # capability gain for audit recalls — filed separately rather than expanding
+    # this change into another subsystem.
+    traversal_include_deprecated = include_deprecated and pipeline_used == "standard"
+
     enriched = []
     graph_budget_ms = 500.0
     graph_elapsed_ms = 0.0
@@ -449,7 +470,10 @@ async def memory_recall(
                     # one (:212), so widening here would hand the model a
                     # neighbour id its own results array could never contain.
                     # An earlier version of this code did exactly that.
-                    include_deprecated=include_deprecated,
+                    #
+                    # Not the raw parameter — see `traversal_include_deprecated`
+                    # above, which also withholds it on the drift pipelines.
+                    include_deprecated=traversal_include_deprecated,
                 )
                 graph_elapsed_ms += traversal.query_ms
                 if traversal.nodes:
