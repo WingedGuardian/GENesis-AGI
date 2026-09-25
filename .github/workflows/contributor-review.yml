@@ -15,26 +15,65 @@ name: Contributor review trigger
 #
 # ── SECURITY: why this is `pull_request_target`, and what that obliges ───────
 # A `pull_request` run for a fork gets a READ-ONLY token, so it cannot comment.
-# `pull_request_target` gets a writable token — but it runs in the BASE repo's
-# context with that token available, so if it ever executed head-ref code, an
+# `pull_request_target` gets a writable token AND access to repository secrets —
+# but it runs in the BASE repo's context, so if it ever executed head-ref code an
 # outside contributor would be running arbitrary code with repository write
-# access. That is the single well-known footgun of this trigger.
+# access and could read those secrets. That is the well-known footgun.
 #
-# The mitigation here is structural rather than careful: this workflow NEVER
-# obtains the head code. There is no `actions/checkout`, no build, no install, no
-# test, and no `run:` step that consumes PR-authored content. It reads metadata
-# through the API and posts one comment. Nothing an author writes is executed,
-# and the one author-influenced input — WHICH issue is linked — decides nothing
-# on its own: the issue must be in this repository, must carry a label only a
-# maintainer can set, and must be ASSIGNED BY A MAINTAINER to this PR's author.
-# No author-supplied string is interpolated into a shell, a template, or a query.
+# THIS WORKFLOW CARRIES A PRIVILEGED CREDENTIAL. The review request is posted
+# under a MAINTAINER identity via `secrets.REVIEW_REQUEST_TOKEN`, because the
+# reviewer resolves the requester from the comment AUTHOR and rejects
+# `github-actions[bot]` outright — it has no reviewer seat, so a request posted
+# by the default token is refused in seconds without the diff ever being read.
+# MEASURED: three of three such requests were rejected that way.
+#
+# So the "never obtains the head code" property below is NOT belt-and-braces any
+# more. It is the ONLY thing standing between an outside author and a
+# maintainer-scoped token, and it must be preserved exactly:
+#   - no `actions/checkout`
+#   - no build, no install, no test
+#   - no `run:` step, and nothing that consumes PR-authored content
+#   - every `uses:` PINNED TO A COMMIT SHA. `@v9` is a mutable tag: whoever can
+#     re-point it chooses the code that runs next to the token. (A tag OBJECT
+#     sha is equally immutable, being content-addressed; the commit form is
+#     pinned because it is the documented and tool-recognised one, not because
+#     the other is forgeable.)
+# The workflow reads metadata through the API and posts one comment. Nothing an
+# author writes is executed, and the one author-influenced input — WHICH issue is
+# linked — decides nothing on its own: the issue must be in this repository, must
+# carry a label only a maintainer can set, and must be ASSIGNED BY A MAINTAINER
+# to this PR's author. No author-supplied string is interpolated into a shell, a
+# template, or a query.
+#
+# WHICH ACCOUNT OWNS THE TOKEN IS THE LOAD-BEARING PROPERTY, not its scope. The
+# reviewer accepts a request because the AUTHOR holds a reviewer seat. A token
+# owned by a seatless collaborator satisfies every permission requirement here
+# and still reproduces the exact defect this split was made to fix, silently.
+#
+# Scope it as narrowly as the platform allows: fine-grained, `Pull requests:
+# write` and nothing else, ideally this repository only. (Posting a comment on a
+# PR is an Issues-API call, which `Pull requests: write` satisfies.) What matters
+# for containment is what it CANNOT do: push, merge, or reach a private
+# repository. Read access to public repositories is not a meaningful escalation,
+# since that content is public already. It is handed ONLY to the
+# final post step, which contains no eligibility logic and no author-derived
+# value beyond an integer PR number. The eligibility step below runs on the
+# default `GITHUB_TOKEN`, which is now read-only.
 #
 # The one-review-per-issue budget further down is a courtesy bound, not part of
 # this boundary: it reads author-mutable state and must never be relied on as a
 # control. Assignment is what holds.
 #
+# One side effect worth stating, because it is invisible until it matters: a
+# comment posted by a PAT DOES start other workflow runs, where one posted by
+# GITHUB_TOKEN does not. Every request here therefore also fires the
+# `issue_comment` triggers elsewhere in this repository. Checked: none of them
+# comment back, so nothing loops. Re-check that before adding one that does.
+#
 # Keep it that way. If this workflow ever needs to inspect the diff, that work
 # belongs in a separate `pull_request` job with the default read-only token.
+# A SECOND JOB IS NOT AN ESCAPE HATCH: the test enumerates every job in this
+# file, so a checkout added anywhere here fails, not just one added above.
 
 on:
   # ELIGIBILITY IS A FUNCTION OF TWO OBJECTS — the pull request AND the issue —
@@ -69,12 +108,13 @@ on:
     # maintainer-only, same as the issues actions above.
     types: [edited]
 
-# Least privilege. `pull-requests: write` is the ONLY elevated scope, and it
-# exists solely to post the trigger comment.
+# Least privilege. The default token now holds NO elevated scope: the only write
+# this workflow performs is the trigger comment, and that is posted by the
+# separate maintainer-token step, not by `GITHUB_TOKEN`.
 permissions:
   contents: read
   issues: read
-  pull-requests: write
+  pull-requests: read
 
 concurrency:
   # Serialises repeat events for the SAME subject — a draft opened then marked
@@ -101,8 +141,9 @@ jobs:
       (github.event.pull_request.head.repo.full_name != github.repository &&
        github.event.pull_request.draft == false)
     steps:
-      - name: Trigger a review when the PR answers a labelled issue
-        uses: actions/github-script@v9
+      - name: Decide whether this PR has earned an automatic review
+        id: eligible
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             // ─────────────────────────────────────────────────────────────
@@ -379,11 +420,15 @@ jobs:
             for (const prNumber of candidates) {
               for (const issueNumber of await issuesClosedBy(prNumber)) {
                 if (!(await mayClaim(prNumber, issueNumber))) continue;
-                await github.rest.issues.createComment({
-                  ...R, issue_number: prNumber, body: '@codex review',
-                });
+                // The REQUEST ITSELF is posted by the next step, under a
+                // maintainer identity. It cannot be posted here: this step runs
+                // on GITHUB_TOKEN, and a request authored by github-actions[bot]
+                // is rejected by the reviewer on identity alone, before the diff
+                // is ever read. Hand the decision on; do not widen this token.
+                core.setOutput('pr', String(prNumber));
+                core.setOutput('issue', String(issueNumber));
                 core.info(
-                  `Requested a review on PR #${prNumber} — it closes invited issue ` +
+                  `PR #${prNumber} has earned a review — it closes invited issue ` +
                   `#${issueNumber}, which is assigned to its author, and that issue's ` +
                   `automatic review had not been requested.`
                 );
@@ -391,3 +436,67 @@ jobs:
               }
             }
             core.info('No claimable PR/issue pair — no review requested.');
+
+      # The ONLY step that holds the maintainer token, and the only one that
+      # writes. It contains no eligibility logic: it posts a fixed string to an
+      # integer PR number the previous step already validated. Keep it that way —
+      # every line added here is a line running next to a privileged credential
+      # in a `pull_request_target` context.
+      - name: Post the review request under a maintainer identity
+        if: steps.eligible.outputs.pr != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          # EVERYTHING the script reads arrives through env, never through a
+          # `${{ }}` interpolation into the script body. Actions substitutes those
+          # BEFORE node parses the file, so an interpolated value is code, not
+          # data — the standard `actions/github-script` injection shape. These two
+          # values are integers from the API and not author text, but the rule is
+          # kept mechanical rather than argued case by case.
+          #
+          # MAINTAINER_TOKEN is read separately from `github-token` so the script
+          # can tell "secret absent" from "secret present": with the fallback
+          # below octokit is constructed either way, and posting under the WRONG
+          # identity is the exact defect this workflow exists to fix.
+          MAINTAINER_TOKEN: ${{ secrets.REVIEW_REQUEST_TOKEN }}
+          TARGET_PR: ${{ steps.eligible.outputs.pr }}
+          TARGET_ISSUE: ${{ steps.eligible.outputs.issue }}
+        with:
+          # The fallback keeps the step from failing to initialise when the secret
+          # is unset. It is never used to post: the guard below returns first.
+          github-token: ${{ secrets.REVIEW_REQUEST_TOKEN || github.token }}
+          script: |
+            const prNumber = Number(process.env.TARGET_PR);
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('Refusing to comment: bad PR number from the eligibility step.');
+              return;
+            }
+            if (!process.env.MAINTAINER_TOKEN) {
+              core.warning(
+                `REVIEW_REQUEST_TOKEN is not configured, so no review was requested for PR ` +
+                `#${prNumber}. Posting under the default token is not a fallback: the ` +
+                `reviewer rejects a bot-authored request on identity alone. Set a ` +
+                `fine-grained token (this repository, Pull requests: write) to enable this.`
+              );
+              return;
+            }
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '@codex review',
+              });
+            } catch (err) {
+              // An EXPIRED or revoked token throws here. Unhandled, that is a red
+              // job on an outside contributor first PR with nothing saying why.
+              core.setFailed(
+                `Could not post the review request on PR #${prNumber}: ${err.message}. ` +
+                `If this is a 401 or 403 the REVIEW_REQUEST_TOKEN has expired or lost ` +
+                `its Pull requests: write permission.`
+              );
+              return;
+            }
+            core.info(
+              `Requested a review on PR #${prNumber} (closes invited issue ` +
+              `#${process.env.TARGET_ISSUE}) under a maintainer identity.`
+            );
