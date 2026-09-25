@@ -293,6 +293,8 @@
         secretsEditing: {},       // key_name → true when input open
         secretsSaving: false,
         secretsValues: {},        // key_name → input value during edit
+        secretsSeeded: {},        // key_name → the value the buffer OPENED with
+        secretsWithheld: false,   // server redacted every value (not logged in)
         // ── First-run onboarding wizard (Setup card on Overview) ──
         setupStatus: null,        // {onboarded,password_set,cc_oauth,llm_key_present,embedding_key_present,floor_met,identity_set}
         setupCardDismissed: false,
@@ -578,7 +580,16 @@
               this._sessionsInterval = setInterval(() => this.fetchSessions(), 30000);
               break;
             case "config":
-              if (first) { this.fetchConfigFiles(); this.fetchBudgets(); this.fetchSettingsDomains(); this.fetchAutonomousCliPolicy(); this.fetchSecrets(); }
+              if (first) { this.fetchConfigFiles(); this.fetchBudgets(); this.fetchSettingsDomains(); this.fetchAutonomousCliPolicy(); }
+              // Secrets refresh on EVERY activation, not just the first. The
+              // panel renders a disclosure decision, and that decision can
+              // change while the operator is on another tab — setting a
+              // password through the Overview wizard is the ordinary way it
+              // happens. Fetching only once left the editor believing values
+              // were still withheld, blocking reveal and clear until a full
+              // page reload. Same reasoning the Chat tab already applies to
+              // directives and goals.
+              this.fetchSecrets();
               break;
             case "chat":
               // Re-fit terminal on tab re-entry
@@ -2484,13 +2495,69 @@
         async fetchSecrets() {
           try {
             const resp = await fetchApi("/api/genesis/secrets");
-            if (resp && resp.ok) { this.secretsGroups = (await resp.json()).groups; }
+            if (resp && resp.ok) {
+              const body = await resp.json();
+              this.secretsGroups = body.groups;
+              // Without this the editor cannot tell "not set" from "set but not
+              // readable by you" — the whole reason the server sends it.
+              const wasWithheld = this.secretsWithheld;
+              this.secretsWithheld = !!body.values_withheld;
+              // A SEED taken under the old disclosure state is stale the moment
+              // that state flips. Open a field while values are withheld, log
+              // in elsewhere, let a refresh land, then Save without typing: the
+              // untouched-and-withheld refusal no longer applies, and the empty
+              // seed reaches the clear path for an override the operator never
+              // saw.
+              //
+              // Drop the stale SEEDS — but NOT a value the operator TYPED.
+              // Wiping every buffer here discards unsaved work: setting a
+              // password in one field triggers this refresh and would erase a
+              // key half-entered in another, silently. A typed value is input,
+              // not a stale seed. Untouched fields are closed instead, so they
+              // re-seed correctly under the new state when re-opened.
+              if (wasWithheld !== this.secretsWithheld) {
+                const editing = {}, values = {}, seeded = {};
+                for (const k of Object.keys(this.secretsValues)) {
+                  const touched = (this.secretsValues[k] || '')
+                    !== (this.secretsSeeded[k] || '');
+                  if (touched) {
+                    editing[k] = true;
+                    values[k] = this.secretsValues[k];
+                    // KEEP the seed for a field we are keeping open. An earlier
+                    // version cleared the whole map here, reasoning that every
+                    // seed is stale — true except for the one value the feature
+                    // is about. With the seed gone, `untouched` on the save path
+                    // degenerates to `val === ''`, so an operator who DELIBERATELY
+                    // emptied a field they could read gets the withheld-refusal
+                    // instead of their clear, with a message that is false for
+                    // that field (it did not open empty). The seed of a RETAINED
+                    // field is not stale in the sense that matters: it is the
+                    // record of what the operator started from, which is exactly
+                    // what distinguishes a typed clear from an empty seed.
+                    seeded[k] = this.secretsSeeded[k];
+                  }
+                }
+                // Dropped fields lose their seeds, which was the point.
+                this.secretsSeeded = seeded;
+                this.secretsEditing = editing;
+                this.secretsValues = values;
+                // A refusal banner raised under the OLD state is wrong under the
+                // new one — it tells an operator who has just logged in to log in.
+                if (this.secretsMessage && this.secretsMessage.type === 'error') {
+                  this.secretsMessage = null;
+                }
+              }
+            }
           } catch (e) { console.warn("Secrets fetch failed:", e); }
         },
         toggleSecretEdit(keyName) {
           const opening = !this.secretsEditing[keyName];
           this.secretsEditing = {...this.secretsEditing, [keyName]: opening};
-          if (!opening) { delete this.secretsValues[keyName]; return; }
+          if (!opening) {
+            delete this.secretsValues[keyName];
+            delete this.secretsSeeded[keyName];
+            return;
+          }
           // SEED the buffer from the current value. Without this it stays undefined
           // until an `input` event, so opening a configured override and pressing
           // Save WITHOUT TYPING reads as empty — and since empty now means "unset",
@@ -2498,7 +2565,9 @@
           // change", never "delete".
           const def = (this.secretsGroups || []).flatMap(g => g.keys || [])
             .find(k => k.key === keyName);
-          this.secretsValues = {...this.secretsValues, [keyName]: (def && def.value) || ''};
+          const seed = (def && def.value) || '';
+          this.secretsValues = {...this.secretsValues, [keyName]: seed};
+          this.secretsSeeded = {...this.secretsSeeded, [keyName]: seed};
         },
         async saveSecret(keyName) {
           const val = (this.secretsValues[keyName] || '').trim();
@@ -2515,9 +2584,23 @@
             this.secretsMessage = {type: 'error', text: 'Value cannot be empty'};
             return;
           }
-          // Clearing is destructive and easy to do by accident, and seeding the
-          // buffer cannot cover every case — a masked value is not readable, so it
-          // seeds empty. Make the deletion an explicit act.
+          // A WITHHELD value seeds the buffer EMPTY, because the server sent no
+          // value to seed it with — not because the override is unset. So for an
+          // untouched field the two states are indistinguishable from here, and
+          // submitting would clear a configured override the operator cannot even
+          // see. A confirm() does not fix this: it asks "remove the override?"
+          // about a field the user never typed in, so the honest answer is not to
+          // send anything. Refuse, and say how to proceed either way.
+          const untouched = val === (this.secretsSeeded[keyName] || '').trim();
+          if (!val && this.secretsWithheld && untouched) {
+            this.secretsMessage = {type: 'error', text:
+              'Values are hidden until you log in, so this field opened empty ' +
+              'whether or not ' + keyName + ' is set. Nothing was saved. Type a ' +
+              'new value to replace it, or log in to see and clear the current one.'};
+            return;
+          }
+          // Clearing is destructive and easy to do by accident. Where the operator
+          // CAN see the value, emptying it is a deliberate act — confirm it.
           if (!val && clearable && !confirm(
                 'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
                 'genesis.yaml or its built-in default.')) {
@@ -2537,6 +2620,7 @@
               if (keyName === 'DASHBOARD_PASSWORD') { await this._establishSession(val); }
               this.secretsEditing = {...this.secretsEditing, [keyName]: false};
               delete this.secretsValues[keyName];
+              delete this.secretsSeeded[keyName];
               this.secretsMessage = {type: 'restart', text: `${keyName} saved. Changes take effect after server restart.`};
               this.fetchSecrets();
               // Keep the readiness panel + password nudge in sync: a provider key

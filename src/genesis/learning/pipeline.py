@@ -49,6 +49,11 @@ _CHANNEL_ORIGIN = {
     "telegram": "owner",
     "whatsapp": "owner",
     "web": "owner",
+    # Enumerated but deliberately NOT "owner": an agent-connector conversation
+    # is external. Present so its routine refusals log INFO instead of firing
+    # the not-enumerated WARNING at every turn, which would make that signal
+    # routine — the exact degradation the comment below warns about.
+    "agent": "external_untrusted",
 }
 
 # Channels whose text may feed PROCEDURE EXTRACTION. The extractor's output

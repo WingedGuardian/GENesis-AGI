@@ -76,6 +76,21 @@ class GraphUnavailableError(RuntimeError):
     it alone."""
 
 
+class DatabaseUnreachable(GraphUnavailableError):
+    """The DATABASE could not be opened or read — not the graph engine.
+
+    Lives here, beside the error it refines, because more than one module needs
+    to RAISE it: the projector opens the database, and the Falkor store reads it
+    while projecting. A private type in either one leaves the other raising the
+    generic error, which is exactly the defect this exists to close — an
+    operator told to check the graph engine service when the graph engine was
+    working and the database was not.
+
+    A subclass, so every existing `except GraphUnavailableError` keeps catching
+    it and no caller has to learn a new type to stay correct.
+    """
+
+
 # The predicate normal recall uses to decide a memory is still visible, kept
 # HERE so every backend applies the same one. READ from the two live readers,
 # not invented: db/crud/memory.py::search_ranked filters

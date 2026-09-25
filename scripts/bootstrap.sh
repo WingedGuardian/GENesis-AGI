@@ -792,6 +792,15 @@ if command -v serena &>/dev/null; then
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
     ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
 fi
+# grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
+# Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
+# Genesis owns is one whose entries it can safely heal, and it leaves an
+# operator's own `grep` server alone.
+# No API key and no local binary: it is a REMOTE server, so there is nothing to
+# gate on `command -v`. User scope so it reaches worktree sessions too, which is
+# where most work here happens; project scope would cover only the main tree.
+# Registering does not start anything and costs nothing when unused.
+_register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 echo
 
 # --- Code Intelligence Indexing ---
@@ -874,13 +883,38 @@ mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
 # Watchgod config — 500MB budget, 150MB sacred ground
+#
+# Normalized to the SAME contract the volume-creation lib applies in
+# _cctmpvol_size_gib (scripts/lib/cc_tmp_volume.sh): a non-numeric or sub-1
+# value becomes 2 GiB. Using the raw value here diverged from the volume in
+# both directions — under `set -u` an alphabetic value aborts the install at
+# the arithmetic, and 0 writes a capacity of 0, which makes every computed
+# headroom negative and so pins the oxygen floor permanently ON, bypassing the
+# in-flight guard on every RED run.
+_cc_cap_gib="${CCTMPVOL_SIZE_GIB:-2}"
+if [[ ! "$_cc_cap_gib" =~ ^[0-9]+$ ]] || (( 10#$_cc_cap_gib < 1 )); then
+    _cc_cap_gib=2
+fi
+_cc_cap_mb=$(( 10#$_cc_cap_gib * 1024 ))
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
 CC_TMP_BUDGET_MB=500
 SACRED_GROUND_MB=150
+# True capacity of the cc-tmp volume in MB. On a btrfs storage backend df
+# CANNOT see the volume's cap (statfs reports the shared pool; the quota
+# lives in a qgroup), so the watchgod computes true headroom from THIS
+# number: headroom = min(fs_total, capacity) - used. Derived from the same
+# variable the volume-creation lib uses (scripts/lib/cc_tmp_volume.sh,
+# CCTMPVOL_SIZE_GIB, default 2GiB) rather than hardcoded. host-setup.sh passes
+# that override into the container for install.sh; a bootstrap run WITHOUT it
+# in the environment falls back to the 2 GiB default, so an install on a
+# custom-size volume re-exports it or edits watchgod.conf. A mismatch in the
+# LARGER direction fires the oxygen floor early and bypasses the in-flight
+# guard permanently, which is why the value is normalized rather than trusted.
+CC_TMP_CAPACITY_MB=$_cc_cap_mb
 WEOF
-echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB, capacity: ${_cc_cap_mb}MB)"
 
 echo "  ~/.genesis/ initialized"
 echo
@@ -1151,10 +1185,32 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # Every token any template uses must appear here, and `sed` will NOT
+        # tell you when one is missing — an unknown `__TOKEN__` passes through
+        # verbatim into a unit that then installs and enables reporting success.
+        # __AZ_ROOT__ is the instance that proves it: install.sh gained the
+        # expression, this loop never did, and agent-zero.service rendered here
+        # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
+        # install) while the venv path one line below it came out correct.
+        # Default matches install.sh and scripts/vendor_assets.sh.
+        # Parity with install.sh is pinned by
+        # tests/test_scripts/test_systemd_template_placeholders.py.
+        #
+        # ESCAPED, unlike the four above it, and the asymmetry is deliberate:
+        # AZ_ROOT is the only one an OPERATOR supplies (an env var), while the
+        # others are computed here. MEASURED what unescaped does — `&` is sed's
+        # whole-match backreference, so AZ_ROOT=/tmp/R&D renders
+        # `WorkingDirectory=/tmp/R__AZ_ROOT__D`, putting the literal token BACK
+        # into the unit this line exists to fix; and a `|` makes sed exit 1,
+        # which under this script's `set -euo pipefail` aborts the whole render
+        # loop with units half-written. install.sh escapes all five via
+        # _sed_repl_esc; this matches it rather than widening the gap.
+        _az_root_esc=$(printf '%s' "${AZ_ROOT:-$HOME/agent-zero}" | sed -e 's/[\\&|]/\\&/g')
         rendered=$(sed -e "s|__HOME__|$HOME|g" \
                        -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
                        -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
                        -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

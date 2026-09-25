@@ -456,13 +456,93 @@ def _run_mcp(mcp_instance, transport_kwargs: dict) -> None:
     For HTTP with auth: injects a raw ASGI auth wrapper via FastMCP's
     middleware parameter, then delegates to mcp.run() so lifespan
     handling works correctly.
+
+    Also suppresses FastMCP's docket task-queue worker — see
+    ``_suppress_docket_worker``. This is the single chokepoint every
+    bootstrapper routes through, which is why the suppression lives here
+    rather than in each of the five.
     """
     auth_token = transport_kwargs.pop("_auth_token", None)
 
     if auth_token and transport_kwargs["transport"] != "stdio":
         transport_kwargs["middleware"] = [_bearer_auth_middleware(auth_token)]
 
+    _suppress_docket_worker(mcp_instance)
+
     mcp_instance.run(**transport_kwargs)
+
+
+def _suppress_docket_worker(mcp_instance) -> None:
+    """Stop FastMCP starting a docket task-queue worker we never use.
+
+    MEASURED 2026-09-24: 41 idle MCP server processes burned 1.37 CPU cores
+    CONTINUOUSLY, uniformly across all five server types. None of it was
+    Genesis code. fastmcp 2.14.6 enters ``_docket_lifespan`` as a sibling of the
+    user lifespan (server.py:572-575), builds ``Docket(url="memory://")`` and
+    runs ``worker.run_forever()`` (server.py:476). ``memory://`` is fakeredis,
+    whose pubsub read is a literal ``await asyncio.sleep(0.01)`` loop that its
+    own comment calls a "kludge" (fakeredis/aioredis.py:143-154) — a 100 Hz spin
+    for a queue that is always empty.
+
+    Always empty because Genesis registers NOTHING with it: we never pass
+    ``tasks=`` to ``FastMCP``, so every tool resolves to ``mode="forbidden"`` and
+    fastmcp's own registration loop skips all of them (server.py:418-423).
+    Suppressing the worker therefore removes no capability — a claim pinned by
+    ``tests/test_mcp/test_docket_worker_suppressed.py``, which fails if any tool
+    ever opts in.
+
+    ``_is_mounted`` is the attribute fastmcp's own ``mount()`` sets for exactly
+    this purpose (server.py:2714), and server.py:403 is its only read. Upstream
+    reached the same conclusion: prefecthq/fastmcp#2887 closed with the
+    maintainer noting docket "has been removed as a default in 3.0". This is a
+    backport of that decision.
+
+    ⚠ It is a PRIVATE attribute. **Delete this function and its tests when
+    Genesis moves to fastmcp 3.x/4.x** — the pin exists so a version bump that
+    renames or removes the gate fails loudly in tests instead of silently
+    restoring ~1.4 cores of idle burn.
+
+    One reachable protocol delta, stated so nobody re-derives it: the three
+    ``tasks/*`` LOOKUP handlers (``fastmcp/server/tasks/protocol.py:70,171,304``)
+    return ``INTERNAL_ERROR "Background tasks require Docket"`` instead of
+    ``INVALID_PARAMS "Task <id> not found"`` for a bogus taskId. No task can ever
+    exist — ``server.py:715`` raises METHOD_NOT_FOUND for a ``forbidden`` tool
+    before docket is consulted — so nothing reachable changes. The initialize
+    handshake is byte-identical (``get_task_capabilities`` is unconditional).
+
+    Best-effort by design: a failure here costs CPU, never correctness, so it
+    must never stop a server booting.
+
+    **Why a pre-state check and not a try/except.** ``FastMCP`` defines no
+    ``__slots__``, so ``obj._is_mounted = True`` SUCCEEDS on a version that
+    renamed or removed the attribute — it just creates a dead one nobody reads.
+    A ``try/except`` there guards the failure that cannot happen and misses the
+    one that will: the burn would return silently, on every install, with no
+    exception and no log line. Checking that the attribute EXISTS FIRST is what
+    makes version drift loud at runtime rather than only in CI.
+    """
+    sentinel = object()
+    if getattr(mcp_instance, "_is_mounted", sentinel) is sentinel:
+        logger.warning(
+            "fastmcp (%s) no longer exposes _is_mounted; the docket-worker "
+            "suppression is INERT and every MCP server will idle-spin at ~4%% "
+            "of a CPU core (see tests/test_mcp/test_docket_worker_suppressed.py "
+            "and _suppress_docket_worker's docstring)",
+            _fastmcp_version(),
+        )
+        return
+
+    mcp_instance._is_mounted = True
+
+
+def _fastmcp_version() -> str:
+    """fastmcp's version, for the drift warning. Never raises."""
+    try:
+        import fastmcp
+
+        return getattr(fastmcp, "__version__", "unknown")
+    except Exception:  # noqa: BLE001 — a diagnostic must not break startup
+        return "unknown"
 
 
 def _bearer_auth_middleware(expected_token: str):

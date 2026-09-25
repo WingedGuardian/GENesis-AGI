@@ -341,7 +341,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: d0627c854 2026-09-11
+verified: 18e41e1e1 2026-09-23
 ```
 
 - **The slot door heals a bare slot — by CONSENT, never silently**
@@ -430,7 +430,14 @@ verified: d0627c854 2026-09-11
   is the trap: `cc_sessions` (+ a `/proc` walk, `observability/cc_slots.
   enumerate_cc_slots`) is what the DASHBOARD renders; `session_heartbeats` is
   what SESSIONS tell each other. They share no source and neither substitutes
-  for the other. `session_heartbeats` has exactly ONE reader in the tree —
+  for the other. The trap in READING the slot rows: `rss_mb` is the slot's
+  WHOLE PROCESS TREE (the `claude` process plus its Serena LSP and MCP-server
+  children — most of a session's real cost), while `proc_rss_mb` is the root
+  process alone. It used to report only the root, which understated a slot
+  roughly threefold and kept the slot-memory thresholds from ever firing; the
+  measurements and the threshold basis live in the constants' own comment in
+  `observability/cc_slots.py`, not here. `session_heartbeats` has exactly ONE
+  reader in the tree —
   `scripts/proactive_memory_hook.py`, which prints a `[Concurrent | …]` tag into
   each peer session's context on UserPromptSubmit — so it is an AGENT-ONLY
   channel with no human surface. Written by that same hook and refreshed
@@ -633,6 +640,22 @@ verified: d0627c854 2026-09-11
   "I'll report back" signal is shadow-logged only until its precision is measured.
   Observability-only (never re-dispatches). Lever: `cc_foreground_reaper`
   (`off|observe|notify`, default `notify`) + `GENESIS_FOREGROUND_REAPER_DISABLED`.
+  **Evidence fast path + its own job:** a terminal-registered row (pid recorded
+  at SessionStart, `id == cc_session_id`) whose process is provably GONE is
+  checkpointed after `dead_process_minutes` (default 30) instead of waiting out
+  the 24h gate — `close_dead` is the lever, and anything but literal `true`
+  degrades it to off. That needs a cadence the 6-hourly `session_reaper` cannot
+  give, so `session_reaper_dead_pid` runs it with `dead_only=True` at the
+  configured interval, CAPPED at one hour (an IntervalTrigger resets on
+  restart, so a longer one may never fire; polling more often than the
+  eligibility age is harmless, which makes the cap free). It has no boot kick
+  of its own and needs
+  none — `session_reaper`'s kick calls `reap_dark_foreground` with
+  `dead_only=False`, which runs the dead-pid path too. **Alive-proof outranks
+  death evidence on both paths**, and is checked TWICE: once as a pass-level
+  snapshot, and again inside `checkpoint_dark`'s conditional UPDATE, because a
+  heartbeat landing between the two would otherwise checkpoint a running
+  session and tell its user the work was interrupted.
 - **Perimeter-session hardening:** `_NO_WEB_TOOLS` / `_NO_OUTREACH_EXTRAS`
   blocklists strip risky tools from perimeter profiles — a security edge, not
   configuration convenience.

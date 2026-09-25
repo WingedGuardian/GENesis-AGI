@@ -79,60 +79,41 @@ async def memory_recall(
     include_deprecated: bool = False,
     corrective: bool = True,
 ) -> list[dict]:
-    """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
+    """Hybrid search: Qdrant vectors + FTS5, RRF fusion, optional graph enrichment.
 
-    Routing: for ingested docs/APIs use knowledge_recall, for credentials/URLs
-    use reference_lookup, for learned procedures use procedure_recall.
-    memory_recall with source='both' searches everything but without
-    domain-specific filtering or credential audit logging.
+    Routing: ingested docs/APIs -> knowledge_recall; credentials/URLs ->
+    reference_lookup; learned procedures -> procedure_recall.
 
     Args:
-        source: 'episodic' | 'knowledge' | 'both' | None. Defaults to
-            ``'both'`` — searches episodic and knowledge_base collections.
-            Knowledge results below a score floor are filtered to reduce noise.
-            Use ``knowledge_recall`` MCP tool for knowledge-base lookups,
-            or pass ``'both'`` / ``'knowledge'`` explicitly if needed.
-        compact: If True, return lightweight previews only (memory_id, preview,
-            score, wing, room, memory_class, source). Use memory_expand to
-            fetch full content for specific IDs. Saves tokens and ~500ms.
-        wing: Filter results to this structural domain. Controlled vocabulary —
-            one of: autonomy, career, channels, dev_workflow, employment,
-            general, infrastructure, integrations, learning, memory, research,
-            routing. Enumerated here, as `life_domain` below is, because this
-            docstring IS the schema the caller sees: an unlisted value is
-            refused, and a caller that can be told the valid set should not
-            have to learn it by failing a call.
-        room: Filter results to this topic within a wing.
-        life_domain: Filter by life domain: "personal", "employment", or "genesis".
-        include_graph: If False, skip graph traversal (saves ~500ms per call).
-        expand_query_terms: If True, expand the FTS5 query via tag co-occurrence
-            analysis (~500ms first call, ~10ms cached). Broadens recall for
-            ambiguous queries. Default on — catches poor query formulation.
-            Note: does not apply to the drift_recall fallback path (if wired).
-        mode: Retrieval mode. "auto" = standard + drift fallback (default).
-            "standard" = hybrid only, no drift fallback. "drift" = skip
-            standard recall, use 3-phase drift retrieval directly. Drift
-            mode ignores wing/room filters (discovers clusters dynamically).
-        time_range: Explicit date range filter as "YYYY-MM-DD/YYYY-MM-DD".
-            Queries the SVO event calendar and boosts temporally matching
-            memories in RRF fusion. Automatic temporal detection also runs
-            on queries with temporal language (e.g., "what happened last week").
-        include_subsystem: Subsystem-filter additive mode. ``False`` (default)
-            excludes automated-subsystem writes (ego corrections, triage
-            signals, reflection observations). ``True`` returns everything.
-            A list (e.g. ``["ego"]``) augments user content with the named
-            subsystems. Mutually exclusive with ``only_subsystem``.
-        only_subsystem: Subsystem-filter replace mode. Return ONLY rows
-            tagged with the named subsystem(s); user content excluded.
-            Used by ego's own self-recall path.
-        rerank: If True, apply Voyage AI cross-encoder reranking after RRF
-            fusion. Improves precision by rescoring candidates on semantic
-            relevance. Adds ~300ms latency. Default True — disable with
-            rerank=False for latency-sensitive calls.
-        include_deprecated: If True, include superseded/deprecated memories
-            in results. Default False — only current (non-deprecated) memories
-            are returned. Use True for audit/history queries (e.g., tracing
-            how a belief evolved over time).
+        source: 'episodic' | 'knowledge' | 'both' | None. Default 'both'
+            (episodic + knowledge_base; low-score knowledge filtered).
+        compact: If True, return previews only (memory_id, preview, score,
+            wing, room, memory_class, source); fetch full content with
+            memory_expand.
+        wing: Filter to this structural domain — one of: autonomy, career,
+            channels, dev_workflow, employment, general, infrastructure,
+            integrations, learning, memory, research, routing. Enumerated
+            because an unlisted value is refused.
+        room: Filter to this topic within a wing.
+        life_domain: "personal", "employment", or "genesis".
+        include_graph: If False, skip graph traversal (~500ms faster).
+        expand_query_terms: If True (default), broaden the FTS5 query via tag
+            co-occurrence.
+        mode: "auto" (default) = standard + drift fallback; "standard" =
+            hybrid only; "drift" = 3-phase drift retrieval directly, which
+            ignores wing/room filters (an invalid wing is still refused).
+        time_range: Date range as "YYYY-MM-DD/YYYY-MM-DD"; boosts temporally
+            matching memories. Temporal language in the query is also
+            detected automatically.
+        include_subsystem: False (default) excludes automated-subsystem writes
+            (ego corrections, triage signals, reflection observations); True
+            returns everything; a list (e.g. ["ego"]) adds the named
+            subsystems to user content. Mutually exclusive with only_subsystem.
+        only_subsystem: Return ONLY rows tagged with the named subsystem(s);
+            user content excluded.
+        rerank: If True (default), apply cross-encoder reranking (~300ms).
+        include_deprecated: If True, include superseded memories (audit /
+            history queries). Default False.
     """
     import time as _time
 

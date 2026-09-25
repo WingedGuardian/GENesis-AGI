@@ -13,6 +13,33 @@ create a charter for it, send its identifiers to session tools, or add lifecycle
 hooks that make Genesis manage the conversation. See
 `.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
 
+## Genesis skill path resolution
+
+The generated "Genesis Capability Surface" below lists Genesis skill names, not
+their filesystem paths, and the name does not always map to the path the same
+way. **Locate the file rather than constructing the path** — the exporter
+indexes TWO roots recursively, `.claude/skills/` (Tier 1) and
+`src/genesis/skills/` (Tier 2), so a name in that inventory can sit at any depth
+under either one.
+
+Measured at the time of writing: of 43 inventory entries, 20 are Tier 1 — 14 of
+those flat (`genesis-development` →
+`.claude/skills/genesis-development/SKILL.md`) and the six `gitnexus-*` skills
+nested one level deeper (`gitnexus-cli` →
+`.claude/skills/gitnexus/gitnexus-cli/SKILL.md`, **not**
+`.claude/skills/gitnexus-cli/`). The other 23 are Tier 2 and do not appear under
+`.claude/skills/` at all (`evaluate` →
+`src/genesis/skills/evaluate/SKILL.md`). The converse does not hold: a name CAN
+exist under both roots — `voice-master` does today, with differing content — and
+the inventory always means the Tier 1 copy, so `.claude/skills/` wins a
+collision. Treat those counts as a snapshot, not a contract — a new family can
+be added at a new depth, or under a new root, without touching this file.
+
+Do not infer that a skill listed in that inventory lives under
+`.agents/skills/` either: only the external-client skill named above does.
+Every part of this section is the same mistake — generalising a path rule from
+whichever example you happened to see first.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
