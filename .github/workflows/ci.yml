@@ -1039,14 +1039,15 @@ jobs:
         # UNION with this branch: tests/test_scripts/test_lobby_picker.py does
         # not exist on main, so its delta is its FULL collected count.
         #   pytest tests/test_scripts/test_lobby_picker.py --collect-only -q
-        #     -> 27 tests collected
-        # so the floor is 23443 + 27 = 23470. test_generate_ssh_config.py is
-        # count-neutral: MEASURED 20 on this branch and 20 on main -- two tests
-        # that pinned an exact command SPELLING became two property tests.
+        #     -> 30 tests collected
+        # and test_generate_ssh_config.py goes 20 -> 21 (the two tests that
+        # pinned an exact command SPELLING became two property tests, so that
+        # part is count-neutral; the +1 is a new cell for the space-in-path
+        # case). So the floor is 23443 + 30 + 1 = 23474.
         #
         # The CEILING stays at 102, and this branch does not lean on the
         # prediction the paragraph above flags. test_lobby_picker.py carries NO
         # skipif and attaches no client: it drives the real picker over a pipe
         # with a fake tmux on PATH, so there is no runner capability it can miss
         # and no runtime-skip path to lose a coin-flip on.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23470
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23474

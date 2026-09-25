@@ -553,3 +553,106 @@ def test_a_tree_that_fails_to_open_says_so(tmp_path):
     assert any(ln.startswith("ARGV\tchoose-tree") for ln in log.splitlines()), log
     assert "Could not open the session tree" in proc.stdout, proc.stdout
     assert _switches(log) == [], log
+
+
+# --------------------------------------------------------------------------
+# The row split is an UNQUOTED expansion -- that is how it splits on newlines --
+# and an unquoted expansion GLOBS as well as splitting. Raised by review on
+# #2361, and it is the same failure class the whole screen exists to end: the
+# menu says one thing and the switch does another.
+# --------------------------------------------------------------------------
+
+
+def test_a_session_named_like_a_glob_does_not_become_filenames(tmp_path):
+    """MEASURED before this test existed: with a session named `*` and two files
+    in the pane's directory, the split turned ONE row into TWO rows named after
+    those files, the real session vanished, and selecting a phantom row would
+    have asked tmux to switch to a session that does not exist.
+
+    tmux permits that name and `-t '=*'` targets it exactly, so this is
+    reachable rather than theoretical. The decoy files are the whole point --
+    without something for the glob to match, the bug is invisible and this test
+    passes against the broken code.
+    """
+    workdir = tmp_path / "pane_cwd"
+    workdir.mkdir()
+    (workdir / "0 decoy-alpha").write_text("")
+    (workdir / "0 decoy-beta").write_text("")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    tmux = bin_dir / "tmux"
+    tmux.write_text(_FAKE_TMUX)
+    tmux.chmod(0o755)
+    shell = bin_dir / "fakeshell"
+    shell.write_text(_FAKE_SHELL)
+    shell.chmod(0o755)
+    log = tmp_path / "glob.log"
+    log.write_text("")
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["TMUX_LOG"] = str(log)
+    env["SHELL"] = str(shell)
+    env["TMUX_ROWS"] = "0 cc-1\n0 *\n0 cc-2"
+
+    proc = subprocess.run(
+        ["sh", str(PICKER)],
+        input="2\n",
+        env=env,
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    rows = _menu_rows(proc.stdout)
+    names = [r[2] for r in rows]
+    assert names == ["cc-1", "*", "cc-2"], (
+        f"the row split expanded a glob against the pane's directory: {names}"
+    )
+    assert not any("decoy" in n for n in names), names
+    assert _switch_targets(log.read_text()) == ["*"], log.read_text()
+
+
+def test_pathname_expansion_is_disabled_for_the_whole_script():
+    """Structural companion to the behavioural test above.
+
+    A local `set -f`/`set +f` pair is the kind of thing a later edit moves code
+    out from between; `-f` on the shebang line's `set` covers every expansion in
+    the file, including ones nobody has written yet.
+    """
+    code = _code(PICKER)
+    assert re.search(r"^set -[a-z]*f", code, re.M), (
+        "pathname expansion is not disabled; the unquoted row split will glob"
+    )
+
+
+def test_every_tmux_request_is_bounded():
+    """A wedged server must not hang the door with no menu and no error.
+
+    The script has a whole branch for "Cannot reach tmux", so a server that
+    ACCEPTS a request and stops replying is exactly the case it claims to
+    handle -- but only the pane_in_mode poll was bounded. An unbounded refresh,
+    tree or switch blocks forever, which is strictly worse than the failure the
+    retry branch was written for. Raised by review on #2361.
+    """
+    code = _code(PICKER)
+    # Bind to a tmux SUBCOMMAND, not to the bare word. Matching `tmux ` alone
+    # also matched the prose inside `printf '... Cannot reach tmux ...'`, which
+    # is a message, not a call -- a false positive that would have been "fixed"
+    # by loosening the check until it stopped catching anything.
+    bare = [
+        ln
+        for ln in code.split("\n")
+        if re.search(
+            r"(?<![-\w])tmux\s+(list-sessions|choose-tree|switch-client|"
+            r"display-message|has-session|new-session|kill-session)",
+            ln,
+        )
+        and "timeout " not in ln
+    ]
+    assert not bare, (
+        "these tmux calls are unbounded; a server that stops replying hangs the "
+        "door with no menu and no error:\n  " + "\n  ".join(bare)
+    )

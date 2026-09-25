@@ -218,7 +218,20 @@ PICKER="${_dir}/lobby-picker.sh"
 # count: keeping the invariant checkable is worth more than the extra branch, and
 # loosening the test to accept two would retire the check for every future edit.
 if [ -x "$PICKER" ]; then
-    set -- "$PICKER"
+    # `/bin/sh` is passed as a SEPARATE argument, not folded into one string.
+    # With a single shell-command argument tmux runs it through `sh -c`, which
+    # word-splits -- so a repo path containing a space becomes two nonexistent
+    # paths, the pane command fails, and this door's failure mode for that is a
+    # LOGOUT: the window is destroyed, then the session, then the client is
+    # detached. MEASURED on tmux 3.4 with the picker under a directory named
+    # `dir with space`:
+    #   new-session -d -s doorA "$PICKER"            -> session does NOT exist
+    #   new-session -d -s doorB /bin/sh "$PICKER"    -> menu drawn
+    # With two or more arguments tmux execs them directly, so nothing splits.
+    # Latent on this install (no space in the path today) and one word to close;
+    # the consequence is the exact failure the picker-missing branch below exists
+    # to prevent, so it is not left to luck about where the repo is cloned.
+    set -- /bin/sh "$PICKER"
 else
     printf 'lobby: picker missing or not executable (%s) -- plain shell.\n' \
         "$PICKER" >&2

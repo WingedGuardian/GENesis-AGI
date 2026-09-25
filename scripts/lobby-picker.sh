@@ -39,7 +39,21 @@
 # landing, which is the whole trade -- but it is not zero, so it is written down
 # rather than implied away.
 
-set -u
+# `-f` disables PATHNAME EXPANSION for the whole script, and it is load-bearing
+# rather than tidiness. The row split below is an unquoted expansion -- that is
+# how it splits on newlines -- and an unquoted expansion GLOBS as well as splits.
+# MEASURED: with a session named `*` and two files in the pane's directory, the
+# split turned one row into TWO rows named after those files, the real session
+# vanished from the menu, and selecting a phantom row would have asked tmux to
+# switch to a session that does not exist. Fabricated rows on the one screen
+# whose job is to say truthfully what exists. tmux does permit that name, and
+# `-t '=*'` targets it exactly, so this is reachable rather than theoretical.
+#
+# Nothing here wants pathname expansion. `case` patterns are unaffected -- they
+# are pattern matching, not globbing -- so the whole script is safer with it off
+# than one site would be with a local `set -f`/`set +f` pair somebody later
+# moves code out from between.
+set -uf
 
 # Every "drop to a shell" path goes through here. A failed `exec` EXITS the
 # shell -- MEASURED under dash, rc=127 for a missing target and 126 for a
@@ -60,6 +74,23 @@ _login_shell() {
     exec "$_sh" -l
 }
 
+# Every tmux request this script makes, with a wall-clock bound.
+#
+# This screen already states that a wedged server is possible -- it has a whole
+# branch for "Cannot reach tmux" -- and then bounded only the `pane_in_mode`
+# poll. A server that ACCEPTS a request and stops replying would block the
+# others forever: the refresh, the tree, and the switch. The operator's door
+# hangs with no menu, no error and no way out but killing the process, which is
+# strictly worse than the failure the retry branch was written to handle.
+#
+# 5s, not the poll's 2s: these are one-shot requests on a healthy server
+# (MEASURED ~7ms) and a slow-but-alive server should not be declared dead over a
+# hiccup. `timeout` exits 124 on expiry, which every caller already treats as
+# failure -- the retry screen, or the "is gone" message.
+_tmux() {
+    timeout 5 tmux "$@"
+}
+
 # A tmux that is not there, or a query that fails, must never read as "no
 # sessions" -- that tells the operator their fleet is empty when it is running.
 # Distinguish the two.
@@ -76,8 +107,8 @@ _sessions() {
     # `my lobby-notes` and `cc-9 lobby-x` while the tree showed them. Sessions
     # the operator owns, invisible in the menu and unreachable by number, with
     # the two halves of one screen disagreeing about what exists.
-    tmux list-sessions -f '#{!=:#{m:lobby-*,#{session_name}},1}' \
-                       -F '#{session_attached} #{session_name}' 2>/dev/null
+    _tmux list-sessions -f '#{!=:#{m:lobby-*,#{session_name}},1}' \
+                        -F '#{session_attached} #{session_name}' 2>/dev/null
 }
 
 # CANNOT FIRE in production, and kept anyway. This comment used to claim a
@@ -161,8 +192,8 @@ while :; do
     case "$reply" in
         q | Q) _login_shell ;;
         t | T)
-            if ! tmux choose-tree -Zs \
-                      -f '#{!=:#{m:lobby-*,#{session_name}},1}' 2>/dev/null; then
+            if ! _tmux choose-tree -Zs \
+                       -f '#{!=:#{m:lobby-*,#{session_name}},1}' 2>/dev/null; then
                 # Do not swallow it, for the same reason the failed switch below
                 # does not: the operator pressed a key and something has to
                 # explain why nothing happened.
@@ -226,7 +257,7 @@ while :; do
     name=${target#* }
     [ -n "$name" ] || continue
 
-    if ! tmux switch-client -t "=${name}" 2>/dev/null; then
+    if ! _tmux switch-client -t "=${name}" 2>/dev/null; then
         # Do not swallow it: the operator pressed a number and something has to
         # explain why nothing happened. Usually the session died since the last
         # redraw.

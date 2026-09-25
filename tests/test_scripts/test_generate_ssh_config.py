@@ -262,6 +262,45 @@ class TestLobbyDoorScript:
             f"predicate for when it is safe has failed three times: {offenders}"
         )
 
+    def test_the_picker_is_exec_ed_directly_not_through_a_shell(self):
+        """A space in the repo path must not log the operator out.
+
+        tmux runs a SINGLE shell-command argument through `sh -c`, which
+        word-splits it. So `new-session … "$PICKER"` with a space anywhere in
+        the path becomes two nonexistent paths, the pane command fails, and this
+        door's failure mode for that is a logout: window destroyed, then
+        session, then the client detached.
+
+        MEASURED on tmux 3.4, picker placed under a directory named
+        `dir with space`:
+            new-session -d -s doorA "$PICKER"          -> session does NOT exist
+            new-session -d -s doorB /bin/sh "$PICKER"  -> menu drawn
+        With two or more arguments tmux execs them directly and nothing splits.
+
+        Asserted as a PROPERTY -- the pane command carries more than one
+        argument -- rather than by pinning the spelling, so any form that makes
+        tmux exec directly passes and only the single-argument form fails.
+        """
+        code = _code_lines(_LOBBY).replace("\\\n", " ")
+        line = next(
+            (
+                ln
+                for ln in code.split("\n")
+                if ln.strip().startswith("set --") and "PICKER" in ln
+            ),
+            None,
+        )
+        assert line is not None, (
+            "no `set -- … $PICKER` line in lobby-door.sh; if the pane command is "
+            "built some other way now, re-express this property against it "
+            "rather than deleting it"
+        )
+        args = line.strip()[len("set --") :].split()
+        assert len(args) >= 2, (
+            "the picker is passed to tmux as a SINGLE argument, so tmux will run "
+            f"it through `sh -c` and a space in the path logs the operator out: {line}"
+        )
+
     def test_the_session_is_per_connection(self):
         """Named by pid, so two windows cannot meet.
 
