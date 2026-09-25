@@ -1222,18 +1222,21 @@ done
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
 echo ""
 
-# Genesis-importing metadata writers need Python 3.12 even when .venv is the
-# component being repaired; stdlib-only readers remain on system python3.
+# Metadata writers declare their own Python floor: Genesis-importing writers
+# need 3.12 (genesis.env), datetime.UTC writers need 3.11. Pure-stdlib readers
+# remain on bare python3 and do not use this selector.
 _metadata_python() {
+    local min_minor="${1:?usage: _metadata_python <minor-version>}"
+    [[ "$min_minor" =~ ^[0-9]+$ ]] || return 1
     local candidate
-    for candidate in "$VENV_DIR/bin/python" python3.12 python3; do
+    for candidate in "$VENV_DIR/bin/python" python3.12 python3.11 python3; do
         if [ "$candidate" = "$VENV_DIR/bin/python" ]; then
             [ -x "$candidate" ] || continue
         else
             candidate="$(command -v "$candidate" 2>/dev/null || true)"
             [ -n "$candidate" ] || continue
         fi
-        if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+        if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, $min_minor) else 1)" 2>/dev/null; then
             printf '%s\n' "$candidate"
             return 0
         fi
@@ -1266,7 +1269,7 @@ _record_update_history() {
     # on any non-zero $() assignment (including the expected rc=2 for
     # "table missing" case).
     local metadata_py=""
-    metadata_py="$(_metadata_python || true)"
+    metadata_py="$(_metadata_python 12 || true)"
     if [ -z "$metadata_py" ]; then
         echo "  WARNING: failed to record update_history entry: no Python 3.12+ interpreter" >&2
         return 0
@@ -1649,9 +1652,9 @@ if [[ $MERGE_RC -ne 0 ]]; then
         # advisory supervisor context must NOT trip the armed rollback trap.
         _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'untagged')"
         _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'unknown')"
-        _uc_py="$(_metadata_python || true)"
+        _uc_py="$(_metadata_python 11 || true)"
         if [ -z "$_uc_py" ]; then
-            echo "  WARNING: could not write structured conflict context (no Python 3.12+ interpreter)"
+            echo "  WARNING: could not write structured conflict context (no Python 3.11+ interpreter)" >&2
             rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
         elif ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
              UC_ROLLBACK_TAG="$ROLLBACK_TAG" \

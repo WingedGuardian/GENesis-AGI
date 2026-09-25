@@ -231,6 +231,42 @@ def test_update_history_uses_python312_when_system_python_is_old(
     assert row == ("success", "old", "new")
 
 
+def test_metadata_python_honors_a_per_writer_version_floor(tmp_path: Path) -> None:
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    python312 = shutil.which("python3.12") or shutil.which("python3")
+    assert python312 is not None
+    fake311 = shim_dir / "python3"
+    fake311.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *"(3, 12)"*) exit 1;;\n'
+        '  *"(3, 11)"*) exit 0;;\n'
+        "esac\n"
+        f'exec {python312} "$@"\n'
+    )
+    fake311.chmod(0o755)
+
+    script = (
+        "set -u\n"
+        f'VENV_DIR="{tmp_path / "missing-venv"}"\n'
+        + _function(UPDATE.read_text(), "_metadata_python")
+        + "\n"
+        'if _metadata_python 12 >/dev/null; then echo unexpected-312; fi\n'
+        "_metadata_python 11\n"
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PATH": str(shim_dir), "HOME": str(tmp_path / "home")},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "unexpected-312" not in result.stdout
+    assert result.stdout.strip().splitlines() == [str(fake311)]
+
+
 def test_update_resolves_branch_from_the_remote_it_fetches() -> None:
     text = UPDATE.read_text()
     remote = text.index('UPDATE_REMOTE="$(_detect_update_remote)"')
@@ -665,6 +701,8 @@ def test_conflict_resolution_prompts_merge_saved_deploy_head() -> None:
 def test_post_merge_recovers_target_from_durable_conflict_context() -> None:
     text = UPDATE.read_text()
     assert 'CONFLICT_FILE="$HOME/.genesis/update_conflicts.json"' in text
+    assert '_uc_py="$(_metadata_python 11 || true)"' in text
+    assert 'metadata_py="$(_metadata_python 12 || true)"' in text
     assert '"$_uc_py" - > "$HOME/.genesis/update_conflicts.json.tmp"' in text
     assert '"rollback_tag": os.environ.get("UC_ROLLBACK_TAG", "")' in text
     assert '_read_json_field "$CONFLICT_FILE" deploy_head' in text
