@@ -677,22 +677,73 @@ async def update_rate_limit(
     return cursor.rowcount > 0
 
 
-async def increment_cost(
+async def record_turn_cost(
     db: aiosqlite.Connection,
     id: str,
     *,
-    cost_usd: float = 0.0,
+    cc_session_id: str,
+    reported_cost_usd: float,
+    cumulative: bool,
     input_tokens: int = 0,
     output_tokens: int = 0,
 ) -> bool:
-    """Add cost and token counts to an existing session (incremental)."""
+    """Record one conversation turn's cost on a row that SUMS turns.
+
+    From CC 2.1.277 a RESUMED session reports a session-cumulative
+    ``total_cost_usd`` (see ``CCOutput.cost_is_cumulative``). Adding that value
+    re-adds every earlier turn, so this records the DIFFERENCE from the last total
+    reported for the same CC session, kept as ``metadata.cost_cursor`` =
+    ``{"cc_session_id", "total"}``. The cursor is keyed by CC session because one
+    row can span two: ``_reconstruct_resume`` may degrade to a fresh CC session on
+    the same row, whose running total restarts from its own first call.
+
+    Rules: a per-call report (``cumulative`` False) is added whole; a cumulative
+    report for the cursor's CC session, at or above the cursor, adds
+    ``reported - cursor.total``; a cumulative report with no cursor for that
+    session, or BELOW its cursor (impossible for a true running total), is added
+    whole — the only reading available. Every report moves the cursor. A row
+    active at deploy time has no cursor, so its first cumulative report is added
+    whole once; earlier over-counted rows are not repaired. Tokens are always per call
+    and always added. Corrupt ``metadata`` is treated as ``{}`` (as
+    ``merge_metadata`` does) and rewritten with the cursor.
+    """
+    cursor = await db.execute("SELECT metadata FROM cc_sessions WHERE id = ?", (id,))
+    row = await cursor.fetchone()
+    if row is None:
+        return False
+    meta: dict = {}
+    if row[0]:
+        try:
+            loaded = json.loads(row[0])
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+    reported = float(reported_cost_usd or 0.0)
+    prev = meta.get("cost_cursor")
+    delta = reported
+    # A true cumulative total never DROPS within one CC session, so a report below
+    # the cursor cannot be cumulative against it — it is a per-call report the
+    # detector mis-flagged (e.g. subagent tokens on a CC that restarts totals per
+    # call). Add it whole rather than clamping a real turn to zero.
+    if (
+        cumulative
+        and isinstance(prev, dict)
+        and prev.get("cc_session_id") == cc_session_id
+        and isinstance(prev.get("total"), (int, float))
+        and reported >= float(prev["total"])
+    ):
+        delta = reported - float(prev["total"])
+    if cc_session_id:
+        meta["cost_cursor"] = {"cc_session_id": cc_session_id, "total": reported}
     cursor = await db.execute(
         """UPDATE cc_sessions
            SET cost_usd = COALESCE(cost_usd, 0) + ?,
                input_tokens = COALESCE(input_tokens, 0) + ?,
-               output_tokens = COALESCE(output_tokens, 0) + ?
+               output_tokens = COALESCE(output_tokens, 0) + ?,
+               metadata = ?
            WHERE id = ?""",
-        (cost_usd, input_tokens, output_tokens, id),
+        (delta, input_tokens, output_tokens, json.dumps(meta), id),
     )
     await db.commit()
     return cursor.rowcount > 0

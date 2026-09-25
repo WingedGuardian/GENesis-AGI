@@ -2540,6 +2540,28 @@ class CCInvoker:
             if model_usage
             else str(inv.model)
         )
+        # Cumulative-cost detection, from the output itself rather than a CC
+        # version check. MEASURED on 2.1.280: in a resumed session `modelUsage`
+        # output tokens run 101 -> 134 -> 167 while `usage.output_tokens` runs
+        # 101 -> 33 -> 33, and `total_cost_usd` tracks the running figure. So
+        # when the model totals exceed this call's own tokens, the totals carry
+        # earlier calls — and so does the cost. On a first call, or on CC before
+        # 2.1.277 (totals restarted at zero per call), the two are equal.
+        # The MAIN model's entry only: other entries (subagents, CC's auxiliary
+        # calls on older versions) carry tokens `usage` does not, which would make
+        # a per-call report look cumulative. `record_turn_cost` also refuses a
+        # "cumulative" report that went DOWN, which bounds any residual misread.
+        # Never raises: this is the single parse point for every CC call, so a
+        # null or odd-shaped modelUsage degrades to "not cumulative".
+        cost_is_cumulative = False
+        _main = model_usage.get(model_name) if isinstance(model_usage, dict) else None
+        if isinstance(_main, dict) and isinstance(usage, dict):
+            try:
+                cost_is_cumulative = int(_main.get("outputTokens") or 0) > int(
+                    usage.get("output_tokens") or 0
+                )
+            except (TypeError, ValueError):
+                cost_is_cumulative = False
         downgraded = self._detect_downgrade(inv.model, model_name)
         if downgraded:
             logger.warning(
@@ -2560,6 +2582,7 @@ class CCInvoker:
             model_requested=str(inv.model),
             downgraded=downgraded,
             via_proxy=bool(inv.anthropic_base_url),
+            cost_is_cumulative=cost_is_cumulative,
         )
 
     def _parse_output(self, raw: str, inv: CCInvocation, elapsed_ms: int) -> CCOutput:

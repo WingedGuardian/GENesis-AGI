@@ -611,12 +611,16 @@ class ConversationLoop:
             except Exception:
                 logger.warning("Failed to update session activity", exc_info=True)
 
-            # Record cost incrementally (session stays active)
+            # Record cost incrementally (session stays active). This turn usually
+            # RESUMED the CC session, whose reported cost is session-cumulative from
+            # CC 2.1.277 — record_turn_cost adds only the difference.
             if output.cost_usd or output.input_tokens or output.output_tokens:
                 try:
-                    await cc_sessions.increment_cost(
+                    await cc_sessions.record_turn_cost(
                         self._db, session["id"],
-                        cost_usd=output.cost_usd or 0.0,
+                        cc_session_id=output.session_id or "",
+                        reported_cost_usd=output.cost_usd or 0.0,
+                        cumulative=output.cost_is_cumulative,
                         input_tokens=output.input_tokens or 0,
                         output_tokens=output.output_tokens or 0,
                     )
@@ -1021,12 +1025,16 @@ class ConversationLoop:
             except Exception:
                 logger.warning("Failed to update session activity", exc_info=True)
 
-            # Record cost incrementally (session stays active)
+            # Record cost incrementally (session stays active). This turn usually
+            # RESUMED the CC session, whose reported cost is session-cumulative from
+            # CC 2.1.277 — record_turn_cost adds only the difference.
             if output.cost_usd or output.input_tokens or output.output_tokens:
                 try:
-                    await cc_sessions.increment_cost(
+                    await cc_sessions.record_turn_cost(
                         self._db, session["id"],
-                        cost_usd=output.cost_usd or 0.0,
+                        cc_session_id=output.session_id or "",
+                        reported_cost_usd=output.cost_usd or 0.0,
+                        cumulative=output.cost_is_cumulative,
                         input_tokens=output.input_tokens or 0,
                         output_tokens=output.output_tokens or 0,
                     )
