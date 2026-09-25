@@ -33,6 +33,32 @@ def test_delegates_to_session_cap(script_text):
     assert "-m genesis.cc.session_cap --existing" in script_text
 
 
+def _strip_comments(text: str) -> str:
+    """Drop shell comments before matching call sites.
+
+    The fix deliberately KEEPS the words `has-session` in prose explaining why
+    it was wrong, so matching raw text would find the explanation and call it a
+    defect.
+    """
+    import re as _re
+
+    return "\n".join(_re.sub(r"#.*$", "", ln) for ln in text.splitlines())
+
+
+def _session_exists_body(text: str) -> str:
+    """The shipped `_session_exists` definition, verbatim.
+
+    Extracted rather than matched by line number so the has-session exemption
+    stays bound to that function and cannot drift onto whatever else happens to
+    occupy those lines later.
+    """
+    import re as _re
+
+    m = _re.search(r"^_session_exists\(\) \{\n.*?^\}$", text, _re.M | _re.S)
+    assert m, "cc-slot.sh no longer defines _session_exists() at column 0"
+    return m.group(0)
+
+
 def test_old_collapsing_formula_is_gone(script_text):
     assert "ram_cap" not in script_text
     assert "PER_SESSION_MB=900" not in script_text
@@ -40,8 +66,37 @@ def test_old_collapsing_formula_is_gone(script_text):
 
 
 def test_reattach_bypass_and_session_exists_preserved(script_text):
-    assert 'tmux has-session -t "=$SESSION_NAME"' in script_text
+    """The reattach bypass must still be gated on the session EXISTING.
+
+    This pinned the spelling `tmux has-session -t "=$SESSION_NAME"`. That verb
+    answers "absent" by ERRORING, and a tmux error is a server-side message
+    logged in the server's message log -- on ordinary logins, since
+    a brand new slot is absent every first time (#2140). The probe is now the
+    silent `_session_exists`, so this asserts what the test was actually for:
+    the bypass is still gated on an existence check of THIS session, and the
+    noisy verb is gone.
+    """
     assert "_SESSION_EXISTS=1" in script_text
+    assert '_session_exists "$SESSION_NAME"' in script_text
+
+    # The noisy verb must be gone from every CALL SITE. One use survives on
+    # purpose, inside _session_exists itself: when the filtered query ERRORS
+    # (an older tmux has no `list-sessions -f`) the helper falls back to the
+    # legacy probe, because answering CORRECTLY matters more there than the log
+    # entry it costs -- a filtered-listing error read as "absent" would hand out
+    # an occupied slot and push a reattach through the capacity gate. Scoped by
+    # the helper own body rather than by a count, so a second stray call cannot
+    # hide behind the exemption.
+    body = _session_exists_body(script_text)
+    outside = _strip_comments(script_text).replace(_strip_comments(body), "")
+    assert "tmux has-session" not in outside, (
+        "cc-slot.sh probes with `tmux has-session` outside _session_exists, "
+        "which logs a server-side error on the absent path"
+    )
+    assert body.count("tmux has-session") == 1, (
+        "_session_exists should use the legacy probe exactly once, as the "
+        "fallback for a filtered query that errored"
+    )
 
 
 def test_fail_open_and_reclaim_present(script_text):
@@ -113,11 +168,12 @@ def _setup(tmp_path, *, action, exists, session_names, rc, attached=""):
     _write(
         fakebin / "tmux",
         f"""#!/bin/bash
-sub=""; fmt=""; target=""; posfmt=""
+sub=""; fmt=""; target=""; posfmt=""; filt=""
 while [ $# -gt 0 ]; do
   case "$1" in
     has-session|list-sessions|kill-session|new-session|display-message) sub="$1" ;;
     -F) shift; fmt="${{1:-}}" ;;
+    -f) shift; filt="${{1:-}}" ;;
     -t) shift; target="${{1:-}}" ;;
     -p) : ;;
     -*) : ;;
@@ -126,7 +182,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$sub" in
-  has-session) exit {0 if exists else 1} ;;
+  # `exists` survives only to drive this arm, and the door no longer calls
+  # has-session at all -- test_cc_slot_silent_probe.py fails if it ever does
+  # again. Existence for every live query is answered from FAKE_NAMES above.
+  has-session) exit {0 if exists else 1} ;;   # legacy: the door no longer calls this
   display-message)
     # Per-name attach/activity query (display-message -p -t =cc-N of att|activity).
     nm="${{target#=}}"; att=0
@@ -134,6 +193,23 @@ case "$sub" in
     printf '%s|t0\\n' "$att"
     exit 0 ;;
   list-sessions)
+    case "$filt" in
+      *"#{{==:#{{session_name}},"*)
+        # ONE oracle: the name list. This branch used to short-circuit on
+        # `exists` and report ANY queried name as present, which is the same
+        # two-oracle split this fake was repaired to remove -- just pointing the
+        # other way. It was latent rather than live (no test passed exists=True
+        # with mode="manual"), and the failure it would have produced is nasty:
+        # every slot reads present, so the free-slot loop never terminates, and
+        # under _run_pty the waitpid after the select timeout has no timeout of
+        # its own and hangs the suite. A test that wants a session present lists
+        # it in session_names.
+        want=$(printf '%s' "$filt" | sed 's/^#{{==:#{{session_name}},//; s/}}$//')
+        while IFS= read -r n; do
+          [ "$n" = "$want" ] && printf '%s\n' "$want"
+        done <<< "$FAKE_NAMES"
+        exit 0 ;;
+    esac
     while IFS= read -r n; do
       [ -z "$n" ] && continue
       case "$fmt" in
@@ -256,10 +332,18 @@ def test_allow_spawns(tmp_path):
 
 
 def test_deny_exits_without_spawning(tmp_path):
+    # The slot being REQUESTED is cc-4 (mode genesis-3-4), so it must not also
+    # appear in the session list: four sessions that exist, none of them this
+    # one, is "at cap, asking for a new slot". The list previously contained
+    # cc-4 while `exists` stayed False -- a state real tmux cannot produce, and
+    # one that only passed because the fake answered existence from `exists`
+    # and enumeration from the name list, two oracles that could disagree. With
+    # a single oracle the contradiction surfaces, so the fixture is made
+    # coherent rather than the oracle re-split.
     proc, spawned, _ = _run(
         tmp_path,
         action="DENY\nSession cap reached (4/4).",
-        session_names=["cc-1", "cc-2", "cc-3", "cc-4"],
+        session_names=["cc-1", "cc-2", "cc-3", "cc-5"],
     )
     assert not spawned
     assert proc.returncode == 1
@@ -267,8 +351,12 @@ def test_deny_exits_without_spawning(tmp_path):
 
 
 def test_reattach_bypasses_gate_and_spawns(tmp_path):
+    # cc-4 is the slot the default mode targets, so listing it is what makes it
+    # exist -- `exists=True` used to do that by fiat, from a second oracle.
     proc, spawned, _ = _run(
-        tmp_path, action="DENY\nshould not be consulted", exists=True, session_names=_THREE
+        tmp_path,
+        action="DENY\nshould not be consulted",
+        session_names=[*_THREE, "cc-4"],
     )
     assert spawned, proc.stderr
     assert proc.returncode == 0
