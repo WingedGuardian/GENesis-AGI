@@ -911,6 +911,63 @@ def test_http_preserves_an_entry_that_is_present_but_falsy(tmp_path, stored):
     assert "has NOT modified it" in res.stdout
 
 
+def test_http_decline_does_not_claim_an_entry_is_live_it_could_not_read(tmp_path):
+    """`unknown` is not `present` -- the decline branch must not assert either.
+
+    _mcp_entry_present is THREE-valued ("1" / "" / "unknown"). The decline
+    branch tested it with `[ -n ... ]`, which is true for "unknown" too, so an
+    unreadable ~/.claude.json produced "an EXISTING registration remains
+    ACTIVE" -- a positive claim about state it had just failed to read -- plus
+    an instruction to remove an entry that may not exist.
+
+    Found by an external reviewer on the commit that introduced the helper:
+    one of its two call sites learned about the third value and the other did
+    not. The preserve branch handled `unknown` from the start.
+    """
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / ".claude.json").write_text("{not json at all", encoding="utf-8")
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir(exist_ok=True)
+    _write_exec(fakebin / "claude", "#!/usr/bin/env bash\nexit 0\n")
+    harness = tmp_path / "harness_decline_unknown.sh"
+    harness.write_text(
+        f'#!/usr/bin/env bash\n. "{_REGISTER_LIB}"\n'
+        "_register_mcp_http 'grep-app' 'user' ''\n",
+        encoding="utf-8",
+    )
+    res = subprocess.run(
+        ["bash", str(harness)],
+        env={"PATH": f"{fakebin}:{_SYSTEM_PATH}", "HOME": str(home)},
+        capture_output=True, text=True, timeout=30,
+    )
+
+    assert res.returncode == 0
+    assert "remains ACTIVE" not in res.stdout, (
+        "must not assert a live registration from a config it could not read"
+    )
+    assert "remove it with" not in res.stdout, (
+        "must not tell the operator to remove an entry it cannot confirm exists"
+    )
+    assert "UNKNOWN" in res.stdout
+    assert "claude mcp list" in res.stdout, "say how to find out instead"
+
+
+def test_http_decline_still_reports_a_confirmed_entry_as_active(tmp_path):
+    """Negative control: a READABLE config with an entry must still say ACTIVE.
+
+    The fix above must narrow the claim, not delete it -- an operator who
+    declines while a registration is genuinely live still needs telling.
+    """
+    res, _clog = _run_register_http(
+        tmp_path, ["grep-app", "user", ""],
+        {"mcpServers": {"grep-app": {"type": "http", "url": "https://mcp.grep.app"}}})
+
+    assert res.returncode == 0
+    assert "remains ACTIVE" in res.stdout
+    assert "UNKNOWN" not in res.stdout
+
+
 def test_http_unreadable_config_does_not_claim_the_name_is_free(tmp_path):
     """Fail CLOSED: a config we cannot parse is not evidence the name is free.
 
