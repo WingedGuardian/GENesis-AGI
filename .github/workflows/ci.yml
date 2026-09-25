@@ -1017,10 +1017,44 @@ jobs:
         # confirm it has not happened. If it is 103 again, read the skip
         # message, which now carries the attach failure's own words.
         #
-        # 23440 -> 23488, the deploy-station PR (#1804), counted as a DELTA
+        # UNION with this branch: the slot-door probe fix adds
+        # tests/test_scripts/test_cc_slot_silent_probe.py, which does not exist
+        # on main, so its delta is its FULL collected count.
+        #   pytest tests/test_scripts/test_cc_slot_silent_probe.py \
+        #     --collect-only -q  -> 3 tests collected
+        # so the floor is 23440 + 3 = 23443. (The third arrived in review: a
+        # filtered query that ERRORS must not read as "absent".)
+        #
+        # The CEILING stays at 102 on the SAME UNCONFIRMED PREDICTION as the
+        # paragraph above -- now covering two behavioural tests rather than one,
+        # so the exposure doubled. Both are @skipif-ed on tmux/script(1), which
+        # the runners have; both then attach a real client and take a RUNTIME
+        # skip if that fails, which is the path #2298 mistook for a skipif.
+        # This branch replaces that test's fixed 2s wait with a 30s poll, which
+        # removes the load-sensitivity but does not turn the prediction into a
+        # measurement. If the run reports 103 or 104, read each skip's own
+        # message before touching this number: raising it to green can CERTIFY
+        # a dormant test, and the ceiling cannot say WHICH test skipped.
+        #
+        # UNION with this branch: tests/test_scripts/test_lobby_picker.py does
+        # not exist on main, so its delta is its FULL collected count.
+        #   pytest tests/test_scripts/test_lobby_picker.py --collect-only -q
+        #     -> 32 tests collected
+        # and test_generate_ssh_config.py goes 20 -> 21 (the two tests that
+        # pinned an exact command SPELLING became two property tests, so that
+        # part is count-neutral; the +1 is a new cell for the space-in-path
+        # case). So the floor is 23443 + 30 + 1 = 23474.
+        #
+        # The CEILING stays at 102, and this branch does not lean on the
+        # prediction the paragraph above flags. test_lobby_picker.py carries NO
+        # skipif and attaches no client: it drives the real picker over a pipe
+        # with a fake tmux on PATH, so there is no runner capability it can miss
+        # and no runtime-skip path to lose a coin-flip on.
+        #
+        # 23476 -> 23524, the deploy-station PR (#1804), counted as a DELTA
         # against main, never a total. MEASURED by --collect-only on
         # 2026-09-25: the four test files it adds tests to collect 87 on the
         # branch (test_deploy_lock.py is new) against 39 for the three that
         # exist on main, so +48 (test_update_marker_ownership.py changed only
         # its harness, delta 0). It adds no skips; the ceiling holds at 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23488
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23524
