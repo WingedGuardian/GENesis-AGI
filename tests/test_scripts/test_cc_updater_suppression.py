@@ -899,10 +899,16 @@ class TestCallerWiring:
 
     def test_install_sh_passes_the_nesting_default_through_one_call(self) -> None:
         src = (_REPO_ROOT / "scripts" / "install.sh").read_text()
-        assert (
-            'cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"'
-            in src
+        # One call, one atomic write: the env nesting default AND the two
+        # top-level sync opt-outs. The sync keys MUST use the `top:` form — as
+        # env KEY=VALUE they would land as the string "false" inside `env`,
+        # where CC never reads them, and the opt-out would silently not exist.
+        call = (
+            'cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2" \\\n'
+            '        "top:syncClaudeAiSkills=false" "top:syncClaudeAiPlugins=false"'
         )
+        assert call in src, "install.sh must pass all three set-if-absent defaults in one call"
+        assert '"syncClaudeAiSkills=false"' not in src, "sync opt-out passed in env form"
         # The real invariant is not how often the key is NAMED (a comment and a
         # manual-fix hint legitimately mention it) but that install.sh no longer
         # opens its OWN read-modify-write of the settings file.
