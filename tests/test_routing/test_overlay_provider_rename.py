@@ -703,3 +703,45 @@ def test_the_sanitizer_removes_a_poisoned_NEW_entry_from_what_is_written_back(
     result = _sanitize_local_overlay(_base_dict(), {section: {name: None}})
 
     assert name not in result.get(section, {})
+
+
+# ── The class, swept rather than reported ───────────────────────────────────
+#
+# Three review rounds each found ONE instance of the same shape: a bodiless YAML
+# key reaching a parser that assumes a mapping. Rather than wait for a fourth,
+# every section `_parse` iterates was swept with a malformed entry in the BASE
+# config and NO overlay, so only the parser's own guards can be what saves it.
+#
+# MEASURED 2026-09-25 at the time of the sweep: providers guarded, retry guarded
+# (added the round before), call_sites RAISING `TypeError: 'NoneType' object is
+# not subscriptable`. This test is what stops the set drifting apart again.
+
+
+@pytest.mark.parametrize("section", ["providers", "call_sites", "retry"])
+@pytest.mark.parametrize("bad", [None, "oops", ["a"]], ids=["none", "str", "list"])
+def test_parse_skips_a_malformed_entry_in_ANY_base_section(tmp_path, section, bad):
+    """One unusable entry must never take the whole router down.
+
+    No overlay is written, so the sanitizer and `_deep_merge` are both out of the
+    picture — this binds `_parse`'s own shape guards and nothing else.
+    """
+    import yaml
+
+    raw = yaml.safe_load(_BASE)
+    # _BASE ships no `retry` section, so create it WITH a usable default — the
+    # point is that a malformed sibling is skipped, not that the section is absent.
+    raw.setdefault(section, {})
+    if section == 'retry':
+        raw[section].setdefault('default', {'max_retries': 3})
+    raw[section]['deliberately_malformed'] = bad
+    cfg = tmp_path / "model_routing.yaml"
+    cfg.write_text(yaml.dump(raw))
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert "31_outcome_classification" in loaded.call_sites, (
+        f"a malformed entry under '{section}' took down an unrelated call site"
+    )
+    assert "glm" in loaded.providers
+    assert "default" in loaded.retry_profiles
+    assert "deliberately_malformed" not in loaded.call_sites

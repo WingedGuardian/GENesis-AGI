@@ -696,6 +696,26 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     # --- Call sites ---
     call_sites: dict[str, CallSiteConfig] = {}
     for name, cs in (raw.get("call_sites") or {}).items():
+        # The third and last section to get this guard, and it is here by
+        # ENUMERATION rather than by report. Three review rounds each found one
+        # instance of the same shape — a bodiless YAML key reaching a parser that
+        # assumes a mapping — so rather than wait for a fourth, every section
+        # `_parse` iterates was swept with a malformed entry in the BASE config
+        # and no overlay at all. MEASURED 2026-09-25: providers was guarded,
+        # retry had just been guarded, call_sites raised `TypeError: 'NoneType'
+        # object is not subscriptable` on the next line.
+        #
+        # Skipping rather than raising matters because the alternative is total:
+        # one unusable call site would otherwise take the whole router down
+        # through `runtime/init/router.py`, including every site that is fine.
+        if not isinstance(cs, dict) or "chain" not in cs:
+            logger.warning(
+                "Call site '%s' is not a usable mapping (%s) — skipping it. This "
+                "is the shape a half-edited config or overlay leaves behind; the "
+                "other call sites are unaffected.",
+                name, type(cs).__name__,
+            )
+            continue
         chain = cs["chain"]
         # Chains stay intact — keyless providers are NOT filtered. The
         # router skips them at routing time (treats them as down).
