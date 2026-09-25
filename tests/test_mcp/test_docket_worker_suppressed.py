@@ -157,6 +157,124 @@ def test_no_real_genesis_tool_opts_into_background_tasks(module_path):
             "docket suppression would break"
         )
 
+    # TOOLS ARE NOT THE ONLY THING DOCKET COVERS. fastmcp's registration loop
+    # (server.py:418-453) walks five registries, and this test inspects one.
+    # MEASURED 2026-09-25 across all five Genesis servers: the other four are
+    # EMPTY, which is why checking only tools is sufficient TODAY and why
+    # `_support_tasks_by_default is False` above carries the default case.
+    #
+    # This is a tripwire rather than a check: it deliberately does not guess at a
+    # task-config API for prompts and resources that nothing here exercises. It
+    # fires the moment the premise gets wider than the thing being verified, so
+    # the next author extends the inventory instead of inheriting a silent gap.
+    for registry, holder, attr in (
+        ("prompts", server._prompt_manager, "_prompts"),
+        ("resources", server._resource_manager, "_resources"),
+        ("templates", server._resource_manager, "_templates"),
+        ("mounted servers", server, "_mounted_servers"),
+    ):
+        assert not getattr(holder, attr, None), (
+            f"{module_path} now registers {registry}, which fastmcp's task "
+            "registration also covers but this inventory does not inspect. The "
+            "docket suppression's premise is 'nothing opts into background "
+            f"tasks' — extend the check to {registry} before trusting it again."
+        )
+
+
+#: Modules that carry ``@mcp.tool`` but are deliberately NOT imported when the
+#: five server modules are. Each entry is a hole in the inventory below, so each
+#: needs a reason, and a SIXTH one fails the test rather than joining the list
+#: silently.
+_TOOL_MODULES_NOT_SERVED_BY_MCP = {
+    # 4 tools bound to the same `genesis.mcp.health.mcp` object as everything
+    # else, but reached only through `genesis/runtime/init/user_jobs.py:21` —
+    # the in-process runtime, not the standalone MCP child that `_run_mcp`
+    # starts. So in the process the docket suppression actually runs in, this
+    # module is never imported and its tools never register. MEASURED
+    # 2026-09-25: importing it takes the health server from 81 tools to 85, and
+    # all 4 are `forbidden`, so it is a gap in what the inventory can SEE rather
+    # than a live break. If user-job tools are ever wired into standalone MCP
+    # the way direct_session_tools already were, delete this entry — the
+    # inventory will then cover them on its own.
+    "genesis.mcp.health.user_job_tools",
+}
+
+
+def test_every_tool_registering_module_is_visible_to_the_inventory():
+    """The inventory above is a complete premise only if nothing registers later.
+
+    Raised in review: the per-module inventory runs on a freshly imported server,
+    so a tool registered LATER — during a lifespan — is never inspected, and could
+    opt into background tasks while the docket suppression silently disabled it.
+    The review named two modules the health lifespan imports, direct_session_tools
+    and campaign_tools.
+
+    Those two do not hold. What the lifespan imports from them is
+    ``init_direct_session_tools`` and ``init_campaign_tools``
+    (scripts/genesis_mcp_server.py:181 and :196) — WIRING functions handing a db
+    handle to tools that already exist — and both modules are imported at
+    genesis/mcp/health/__init__.py:74 and :68, so by the time any lifespan runs
+    they are in sys.modules and no decorator re-runs. MEASURED 2026-09-25: 81
+    tools before the health lifespan, 81 after.
+
+    But answering it with a check on THOSE TWO NAMES would be a denylist built
+    from the two instances a reviewer happened to think of, and an adversarial
+    audit found a third — ``user_job_tools`` — that walked straight through such
+    a check while both guards stayed green. So this is written the other way
+    round: DERIVE every module that registers tools, and require each to be
+    imported by a server module. A module added next year is covered by
+    construction, which is the property a denylist cannot have.
+
+    Enumeration bound, stated rather than implied: the scan finds the
+    ``@mcp.tool`` decorator spelling. An aliased decorator, a bare
+    ``mcp.add_tool(...)`` call, or a mounted sub-server would not be found —
+    a repo-wide search for those returned zero at the time of writing, but
+    "zero found" is not "impossible", so treat this as the spellings checked.
+    """
+    import importlib
+    import re
+    import sys
+
+    for module_path in _REAL_SERVER_MODULES:
+        importlib.import_module(module_path)
+
+    mcp_src = _REPO_ROOT / "src" / "genesis" / "mcp"
+    decorator = re.compile(r"^\s*@mcp\.tool\b", re.MULTILINE)
+
+    registering: set[str] = set()
+    for path in sorted(mcp_src.rglob("*.py")):
+        if not decorator.search(path.read_text(encoding="utf-8", errors="ignore")):
+            continue
+        rel = path.relative_to(_REPO_ROOT / "src")
+        registering.add(str(rel.with_suffix("")).replace("/", ".").removesuffix(".__init__"))
+
+    # Guard the guard: a broken scan finds nothing and passes an empty loop.
+    assert len(registering) > 20, (
+        f"the decorator scan found only {len(registering)} tool-registering modules, "
+        "which is far below the known population — the scan is broken, not the code"
+    )
+
+    unimported = sorted(m for m in registering if m not in sys.modules)
+    unexpected = sorted(set(unimported) - _TOOL_MODULES_NOT_SERVED_BY_MCP)
+
+    assert not unexpected, (
+        f"{unexpected} carry @mcp.tool decorators but are NOT imported when the five "
+        "server modules are. If any runtime path imports one, its tools register "
+        "where test_no_real_genesis_tool_opts_into_background_tasks cannot see them, "
+        "and the docket suppression in _run_mcp no longer has a complete premise. "
+        "Either import it from the server module that owns it, or add it to "
+        "_TOOL_MODULES_NOT_SERVED_BY_MCP with the reason it can never reach a "
+        "standalone MCP process."
+    )
+
+    # The allowance is not a free pass: an entry that has since become imported
+    # is stale, and leaving it would quietly widen the exemption next time.
+    stale = sorted(_TOOL_MODULES_NOT_SERVED_BY_MCP - set(unimported))
+    assert not stale, (
+        f"{stale} are now imported by a server module, so the inventory covers them "
+        "— remove them from _TOOL_MODULES_NOT_SERVED_BY_MCP"
+    )
+
 
 def test_is_mounted_is_still_read_only_by_the_docket_gate():
     """The whole safety argument is 'only the docket lifespan reads this flag'.
