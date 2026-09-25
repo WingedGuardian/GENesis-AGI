@@ -502,8 +502,11 @@ def test_fails_closed_on_a_NON_EMPTY_but_blind_snapshot(tmp_path):
     res = _run(
         home,
         bind,
+        # Plausible, non-empty, and wholly unrelated to the sandbox root. No
+        # home-shaped path: these are literals in a public repo, and a synthetic
+        # one still costs a reviewer the work of deciding it is synthetic.
         "live_open_paths() { printf '%s\\n' /usr/lib/libc.so.6 /var/log/syslog "
-        "/home/someone/.cache/thing /proc/1/maps; }; "
+        "/var/cache/unrelated/thing /proc/1/maps; }; "
         f'reclaim_dead_pytest_dirs 60 "{systmp}"',
     )
 
