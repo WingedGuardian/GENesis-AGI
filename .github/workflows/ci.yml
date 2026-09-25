@@ -1035,4 +1035,18 @@ jobs:
         # measurement. If the run reports 103 or 104, read each skip's own
         # message before touching this number: raising it to green can CERTIFY
         # a dormant test, and the ceiling cannot say WHICH test skipped.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23443
+        #
+        # UNION with this branch: tests/test_scripts/test_lobby_picker.py does
+        # not exist on main, so its delta is its FULL collected count.
+        #   pytest tests/test_scripts/test_lobby_picker.py --collect-only -q
+        #     -> 27 tests collected
+        # so the floor is 23443 + 27 = 23470. test_generate_ssh_config.py is
+        # count-neutral: MEASURED 20 on this branch and 20 on main -- two tests
+        # that pinned an exact command SPELLING became two property tests.
+        #
+        # The CEILING stays at 102, and this branch does not lean on the
+        # prediction the paragraph above flags. test_lobby_picker.py carries NO
+        # skipif and attaches no client: it drives the real picker over a pipe
+        # with a fake tmux on PATH, so there is no runner capability it can miss
+        # and no runtime-skip path to lose a coin-flip on.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23470

@@ -14,6 +14,7 @@ first-match *resolution* (not merely text order) is verified.
 
 from __future__ import annotations
 
+import os
 import shutil
 import stat
 import subprocess
@@ -196,6 +197,22 @@ class TestHeredocHasNoCommandSubstitution:
             )
 
 
+_PICKER = _LOBBY.parent / "lobby-picker.sh"
+
+
+def _code_lines(path) -> str:
+    """The script with comment-only lines dropped.
+
+    Both scripts deliberately KEEP the words `choose-tree` in prose explaining
+    why it is no longer the landing screen, so matching raw text finds the
+    explanation and calls it an invocation.
+    """
+    return "\n".join(
+        ln for ln in path.read_text().split("\n")
+        if ln.strip() and not ln.strip().startswith("#")
+    )
+
+
 class TestLobbyDoorScript:
     """The door destroys NOTHING, and that is a structural property, not a
     predicate.
@@ -372,12 +389,27 @@ class TestLobbyDoorScript:
         shared-pane defect this door was written to remove, restored through its
         own picker. MEASURED: the filter keeps `cc-*` and the persistent
         `lobby`, and drops `lobby-12345` / `lobby-67890`.
+
+        The filter moved: the door no longer lands in ``choose-tree`` at all
+        (a terminal's DECRPM reply leaks into it as keystrokes — see
+        ``lobby-picker.sh``), so the tree is now opened from the picker. This
+        asserts the PROPERTY against whichever file invokes it, rather than
+        pinning the invocation to one script.
         """
-        code = [
-            ln for ln in _LOBBY.read_text().split("\n")
-            if ln.strip() and not ln.strip().startswith("#")
-        ]
-        tree = next(ln for ln in code if "choose-tree" in ln)
+        owner = next(
+            (f for f in (_PICKER, _LOBBY) if "choose-tree" in _code_lines(f)), None
+        )
+        assert owner is not None, (
+            "no script invokes choose-tree in a code line; if the tree was "
+            "removed deliberately, delete this test rather than loosening it"
+        )
+        # Read the whole INVOCATION, not one line. The call is wrapped in an
+        # `if !` so a failure to open the tree can be reported instead of
+        # swallowed, which puts `-f` on a continuation line -- and a
+        # line-granularity assertion fails there for a reason that has nothing
+        # to do with the property. Join continuations first.
+        code = _code_lines(owner).replace("\\\n", " ")
+        tree = next(ln for ln in code.split("\n") if "choose-tree" in ln)
         assert "-f " in tree, (
             f"choose-tree must filter out transient pickers: {tree}"
         )
@@ -386,5 +418,18 @@ class TestLobbyDoorScript:
         )
 
     def test_the_picker_opens(self):
-        """The door's entire remaining job."""
-        assert "choose-tree" in _LOBBY.read_text()
+        """The door's entire remaining job — and it must not be a COMMENT.
+
+        This asserted ``"choose-tree" in _LOBBY.read_text()``, which kept
+        passing after the door stopped invoking it: the words survive in prose
+        explaining why the tree is no longer the landing screen. A test that
+        matches its own explanation is worse than no test.
+        """
+        code = _code_lines(_LOBBY)
+        assert "lobby-picker.sh" in code, (
+            "the door must exec the picker as its landing screen"
+        )
+        assert _PICKER.exists(), f"the door's landing screen is missing: {_PICKER}"
+        assert os.access(_PICKER, os.X_OK), (
+            f"the picker is not executable, so the door would fail to launch it: {_PICKER}"
+        )

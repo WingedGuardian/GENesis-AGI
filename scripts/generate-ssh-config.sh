@@ -47,13 +47,25 @@ cat << SSHEOF
 # Paste into ~/.ssh/config on your client devices.
 # Usage: ssh ${TS_HOSTNAME}-1, ssh ${TS_HOSTNAME}-2, etc.
 # Each slot maps to a persistent tmux session with claude.
-# Or:    ssh ${TS_HOSTNAME}-lobby  → opens the session picker; pick any live slot.
+# Or:    ssh ${TS_HOSTNAME}-lobby  → opens the Genesis Fleet menu; pick any live slot.
 
-# One-click "lobby": a FRESH picker over ALL live cc-* slots, every connection.
+# One-click "lobby": a FRESH menu over your live sessions, every connection.
+# It lists EVERY session except the throwaway per-connection ones -- the cc-*
+# slots and any scratch session of your own, not just cc-*.
 # After a client/reboot, ONE reconnect here brings the whole fleet back — the
-# slots never died (they live in tmux on the box). It opens straight into the
-# session picker (choose-tree): pick a slot and jump into it, in the state you
-# left it; Ctrl-b s reopens the picker anytime.
+# slots never died (they live in tmux on the box). It opens the Genesis Fleet
+# menu: type a number and press Enter to land in that slot, in the state you
+# left it. \`t\` opens tmux's own session tree (with previews), \`r\` refreshes,
+# and \`q\` (or Ctrl-D) drops to a login shell -- your profile is sourced, and
+# you stay connected. Ctrl-b s opens the tree from anywhere, as always.
+#
+# The menu reads a LINE rather than acting on single keys, and that is a fix
+# rather than a style choice: a terminal that answers a DECRQM mode query has
+# the reply's bytes delivered as KEYSTROKES by tmux's client key parser, which
+# consumes Device-Attributes replies but not these. Landing directly in a
+# chooser meant a stray reply could open its search prompt (\`?\`) and CHOOSE an
+# entry (a bare digit) before the operator touched anything. A line-based menu
+# turns the same bytes into an unparseable line, so the worst case is a redraw.
 #
 # The picker itself is throwaway, named per connection and destroyed when you
 # leave it. Anything you want to KEEP lives in its own session — a cc-* slot, or
@@ -68,7 +80,8 @@ cat << SSHEOF
 # tmux resolves even where it is user-local — mirrors cc-slot.sh's toolchain PATH
 # so the lobby door matches the numeric-slot door's behavior.
 #
-# The door is a SCRIPT (lobby-door.sh), not an inline tmux command chain, for
+# The door is a SCRIPT (lobby-door.sh, which runs lobby-picker.sh in its pane),
+# not an inline tmux command chain, for
 # the same reason the numeric slot door is one: an inline chain has to survive
 # ssh_config -> remote shell -> tmux quoting, which is the documented failure
 # mode of this block, and a script can be tested. A bare
@@ -105,7 +118,7 @@ echo "Copy the above into ~/.ssh/config on your client devices — REPLACING any
 echo "earlier Genesis block for ${TS_HOSTNAME} (don't append a second one, or the" >&2
 echo "old block would win by ssh's first-match rule)." >&2
 echo "Then: ssh ${TS_HOSTNAME}-1        (a specific slot, or any positive integer)" >&2
-echo "  or: ssh ${TS_HOSTNAME}-lobby    (opens the session picker → pick any live slot)" >&2
+echo "  or: ssh ${TS_HOSTNAME}-lobby    (opens the Genesis Fleet menu → pick any live slot)" >&2
 echo "" >&2
 echo "Windows one-click: create a shortcut whose target is" >&2
 echo "    wt.exe ssh ${TS_HOSTNAME}-lobby     (or:  ssh.exe ${TS_HOSTNAME}-lobby)" >&2
