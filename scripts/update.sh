@@ -1222,6 +1222,25 @@ done
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
 echo ""
 
+# Genesis-importing metadata writers need Python 3.12 even when .venv is the
+# component being repaired; stdlib-only readers remain on system python3.
+_metadata_python() {
+    local candidate
+    for candidate in "$VENV_DIR/bin/python" python3.12 python3; do
+        if [ "$candidate" = "$VENV_DIR/bin/python" ]; then
+            [ -x "$candidate" ] || continue
+        else
+            candidate="$(command -v "$candidate" 2>/dev/null || true)"
+            [ -n "$candidate" ] || continue
+        fi
+        if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── update_history helper ────────────────────────────────
 # Records an entry in update_history. Silently no-ops if the table
 # doesn't exist yet (first update before migration 0001 has run).
@@ -1246,6 +1265,12 @@ _record_update_history() {
     # Note: we use `|| py_rc=$?` pattern because set -e otherwise triggers
     # on any non-zero $() assignment (including the expected rc=2 for
     # "table missing" case).
+    local metadata_py=""
+    metadata_py="$(_metadata_python || true)"
+    if [ -z "$metadata_py" ]; then
+        echo "  WARNING: failed to record update_history entry: no Python 3.12+ interpreter" >&2
+        return 0
+    fi
     local py_output=""
     local py_rc=0
     py_output=$(
@@ -1260,7 +1285,7 @@ _record_update_history() {
         GH_ROLLBACK_TAG="$ROLLBACK_TAG" \
         GH_STARTED_AT="$STARTED_AT" \
         PYTHONPATH="$GENESIS_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 - <<'PYEOF' 2>&1
+        "$metadata_py" - <<'PYEOF' 2>&1
 import os
 import sqlite3
 import sys
@@ -1624,12 +1649,16 @@ if [[ $MERGE_RC -ne 0 ]]; then
         # advisory supervisor context must NOT trip the armed rollback trap.
         _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'untagged')"
         _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'unknown')"
-        if ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
+        _uc_py="$(_metadata_python || true)"
+        if [ -z "$_uc_py" ]; then
+            echo "  WARNING: could not write structured conflict context (no Python 3.12+ interpreter)"
+            rm -f "$HOME/.genesis/update_conflicts.json.tmp" || true
+        elif ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
              UC_ROLLBACK_TAG="$ROLLBACK_TAG" \
              UC_DEPLOY_BRANCH="$DEPLOY_BRANCH" UC_DEPLOY_HEAD="$DEPLOY_HEAD" \
              UC_TARGET_TAG="$_uc_target_tag" UC_TARGET_COMMIT="$_uc_target_commit" \
              UC_FILES="$CONFLICTED_FILES" UC_MERGE_OUTPUT="$MERGE_OUTPUT" \
-             python3 - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
+             "$_uc_py" - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
 import json
 import os
 from datetime import UTC, datetime

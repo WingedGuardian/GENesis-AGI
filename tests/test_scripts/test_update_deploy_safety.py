@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -174,6 +176,61 @@ def test_write_state_json_encodes_deploy_fields_without_venv(tmp_path: Path) -> 
     assert data["services_stopped"] == ["svc-a", 'svc "b"']
 
 
+def test_update_history_uses_python312_when_system_python_is_old(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "data").mkdir(parents=True)
+    db_path = repo / "data" / "genesis.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "CREATE TABLE update_history ("
+        "id TEXT, old_tag TEXT, new_tag TEXT, old_commit TEXT, new_commit TEXT, "
+        "status TEXT, rollback_tag TEXT, failure_reason TEXT, "
+        "degraded_subsystems TEXT, started_at TEXT, completed_at TEXT)"
+    )
+    con.commit()
+    con.close()
+
+    python312 = shutil.which("python3.12") or shutil.which("python3")
+    assert python312 is not None
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    (shim_dir / "python3").write_text("#!/bin/sh\nexit 3\n")
+    (shim_dir / "python3").chmod(0o755)
+    (shim_dir / "python3.12").write_text(
+        f"#!/bin/sh\nexec {python312} \"$@\"\n"
+    )
+    (shim_dir / "python3.12").chmod(0o755)
+
+    script = (
+        "set -u\n"
+        f'GENESIS_ROOT="{repo}"\n'
+        f'VENV_DIR="{tmp_path / "missing-venv"}"\n'
+        'OLD_TAG=old\nOLD_COMMIT=old\nNEW_TAG=new\nNEW_COMMIT=new\n'
+        'ROLLBACK_TAG=rollback\nSTARTED_AT=started\n'
+        + _function(UPDATE.read_text(), "_metadata_python")
+        + "\n"
+        + _function(UPDATE.read_text(), "_record_update_history")
+        + '\n_record_update_history "success" "" ""\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=_clean_env(
+            HOME=str(tmp_path / "home"),
+            PATH=f"{shim_dir}:{os.environ['PATH']}",
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    con = sqlite3.connect(db_path)
+    row = con.execute("SELECT status, old_commit, new_commit FROM update_history").fetchone()
+    con.close()
+    assert row == ("success", "old", "new")
+
+
 def test_update_resolves_branch_from_the_remote_it_fetches() -> None:
     text = UPDATE.read_text()
     remote = text.index('UPDATE_REMOTE="$(_detect_update_remote)"')
@@ -284,6 +341,8 @@ def test_record_update_history_uses_bootstrap_safe_python(tmp_path: Path) -> Non
         f'GENESIS_ROOT="{repo}"\nVENV_DIR="{tmp_path / "missing-venv"}"\n'
         'OLD_TAG=old\nNEW_TAG=new\nOLD_COMMIT=oldsha\nNEW_COMMIT=newsha\n'
         'ROLLBACK_TAG=tag\nSTARTED_AT=start\nPRE_UPDATE_DEGRADED="backup:process_exit"\n'
+        + _function(UPDATE.read_text(), "_metadata_python")
+        + "\n"
         + _function(UPDATE.read_text(), "_record_update_history")
         + '\n_record_update_history success "" "container_cc_sync"\n'
     )
@@ -606,7 +665,7 @@ def test_conflict_resolution_prompts_merge_saved_deploy_head() -> None:
 def test_post_merge_recovers_target_from_durable_conflict_context() -> None:
     text = UPDATE.read_text()
     assert 'CONFLICT_FILE="$HOME/.genesis/update_conflicts.json"' in text
-    assert 'python3 - > "$HOME/.genesis/update_conflicts.json.tmp"' in text
+    assert '"$_uc_py" - > "$HOME/.genesis/update_conflicts.json.tmp"' in text
     assert '"rollback_tag": os.environ.get("UC_ROLLBACK_TAG", "")' in text
     assert '_read_json_field "$CONFLICT_FILE" deploy_head' in text
     assert '_read_json_field "$CONFLICT_FILE" deploy_branch' in text
