@@ -16,7 +16,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 from genesis.db.connection import connect_sqlite_rw
-from genesis.env import github_public_repo, update_in_progress
+from genesis.env import deploy_target, update_in_progress
 
 logger = logging.getLogger(__name__)
 
@@ -59,24 +59,7 @@ _UPDATE_CHECK_REF = "refs/genesis-update-check"
 
 def _deploy_target() -> tuple[str, str]:
     """Resolve the remote and branch update.sh will deploy."""
-    remote = "origin"
-    public_repo = github_public_repo()
-    remote_lines = _git("remote", "-v")
-    if remote_lines:
-        for line in remote_lines.splitlines():
-            fields = line.split()
-            if len(fields) >= 3 and public_repo in fields[1] and fields[2] == "(fetch)":
-                remote = fields[0]
-                break
-
-    branch = os.environ.get("GENESIS_DEPLOY_BRANCH", "").strip()
-    if not branch:
-        remote_head = _git(
-            "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"
-        )
-        if remote_head and remote_head.startswith(f"{remote}/"):
-            branch = remote_head[len(remote) + 1 :]
-    return remote, branch or "main"
+    return deploy_target(_GENESIS_ROOT)
 
 
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
@@ -212,12 +195,22 @@ def update_status():
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
     """Force an upstream check (git fetch + tag comparison)."""
-    remote, deploy_branch = _deploy_target()
+    try:
+        remote, deploy_branch = _deploy_target()
+    except ValueError as exc:
+        logger.error("invalid deploy target: %s", exc)
+        return jsonify({"error": str(exc)}), 400
 
     # Fetch into a private ref so a concurrent fetch cannot move the target this
-    # check is about to measure; resolve it to a commit before comparing.
+    # check is about to measure; advance the remote-tracking ref too so deploy
+    # health's @{upstream} distance and FETCH_HEAD freshness describe one fetch.
+    tracking_ref = f"refs/remotes/{remote}/{deploy_branch}"
     branch_out, branch_err = _git_result(
-        "fetch", remote, f"+{deploy_branch}:{_UPDATE_CHECK_REF}", timeout=30
+        "fetch",
+        remote,
+        f"+refs/heads/{deploy_branch}:{_UPDATE_CHECK_REF}",
+        f"+refs/heads/{deploy_branch}:{tracking_ref}",
+        timeout=30,
     )
     if branch_out is None:
         logger.error("git fetch failed: %s", branch_err)

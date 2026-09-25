@@ -1,7 +1,7 @@
 """GenesisVersionCollector — detects Genesis repo updates available upstream.
 
-Checks local HEAD against origin/main on a self-throttled interval
-(default 6h, configurable via config/updates.yaml). When upstream has
+Checks local HEAD against the resolved deploy branch on a self-throttled
+interval (default 6h, configurable via config/updates.yaml). When upstream has
 new commits, stores a genesis_update_available observation and optionally
 sends a Telegram notification via the outreach pipeline.
 
@@ -23,7 +23,7 @@ import aiosqlite
 import yaml
 
 from genesis.awareness.types import SignalReading
-from genesis.env import update_in_progress
+from genesis.env import deploy_target, update_in_progress
 
 if TYPE_CHECKING:
     pass
@@ -37,6 +37,7 @@ _FAILURE_ARCHIVE_DIR = Path.home() / ".genesis" / "update-failures"
 # Keep only the N most recent archived failures. Older ones are pruned
 # on each archive call so the directory can't grow unbounded.
 _FAILURE_ARCHIVE_CAP = 10
+_UPDATE_CHECK_REF = "refs/genesis-update-check"
 
 
 def _load_updates_config() -> dict:
@@ -49,29 +50,6 @@ def _load_updates_config() -> dict:
             raw = yaml.safe_load(f) or {}
         return merge_local_overlay(raw, path)
     return {"check": {"enabled": True, "interval_hours": 6}}
-
-
-def _update_remote() -> str:
-    """Return the git remote that points to the public/primary repo.
-
-    Reads github.public_repo from genesis.env and matches it against
-    'git remote -v'. Falls back to 'origin' if detection fails.
-    """
-    import subprocess
-    try:
-        from genesis.env import github_public_repo
-        public_repo = github_public_repo()
-        result = subprocess.run(
-            ["git", "-C", str(_GENESIS_ROOT), "remote", "-v"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if public_repo in line and "(fetch)" in line:
-                    return line.split()[0]
-    except Exception:
-        pass
-    return "origin"
 
 
 class GenesisVersionCollector:
@@ -267,16 +245,22 @@ class GenesisVersionCollector:
         the upstream ref, and summary lists that same range. Not the distance
         between the release tags — the caller renders this as "N commits
         behind", which a reader takes as their own, and on an install that
-        tracks main between releases those numbers differ by an order of
-        magnitude.
+        tracks the deploy branch between releases those numbers differ by an
+        order of magnitude.
         Raises RuntimeError on git failure.
         """
-        remote = _update_remote()
-        ref = f"{remote}/main"
+        remote, deploy_branch = deploy_target(_GENESIS_ROOT)
+        ref = _UPDATE_CHECK_REF
+        tracking_ref = f"refs/remotes/{remote}/{deploy_branch}"
 
-        # Fetch (updates remote refs + tags, doesn't change working tree)
+        # Fetch the same deploy target update.sh uses. The private ref gives
+        # this check one immutable fetched commit; the remote-tracking refspec
+        # keeps @{upstream} and FETCH_HEAD freshness describing the same fetch.
         proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", remote, "main", "--tags",
+            "git", "fetch", remote,
+            f"+refs/heads/{deploy_branch}:{ref}",
+            f"+refs/heads/{deploy_branch}:{tracking_ref}",
+            "--tags",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -285,7 +269,7 @@ class GenesisVersionCollector:
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
             raise RuntimeError(
-                f"git fetch {remote} main failed (exit {proc.returncode}): {stderr_text}"
+                f"git fetch {remote} {deploy_branch} failed (exit {proc.returncode}): {stderr_text}"
             )
 
         # Get local and remote release tags
@@ -298,7 +282,7 @@ class GenesisVersionCollector:
 
         # If neither side has tags, fall back to commit-based comparison
         if not local_tag and not origin_tag:
-            return await self._check_upstream_by_commits()
+            return await self._check_upstream_by_commits(ref)
 
         # If only one side has tags, there's definitely an update
         if local_tag != origin_tag:
@@ -307,11 +291,11 @@ class GenesisVersionCollector:
             # This used to count `local_tag..origin_tag`, and the alert that
             # renders it says "N commits behind" — which every reader takes as
             # their own distance from the target. Those two numbers diverge by
-            # more than an order of magnitude on any install that tracks main
-            # between releases, because the tag moves at a release and HEAD moves
-            # constantly. MEASURED 2026-09-08: the dashboard read "v3.0b18 (668
-            # commits behind)" on a tree that was 20 commits behind the b18 tag
-            # and 31 behind origin/main. The number was true about the tag range
+            # more than an order of magnitude on any install that tracks the
+            # deploy branch between releases, because the tag moves at a release
+            # and HEAD moves constantly. MEASURED 2026-09-08: the dashboard read
+            # "v3.0b18 (668 commits behind)" on a tree that was 20 commits behind
+            # the b18 tag and 31 behind origin/main. The number was true about the tag range
             # and false about the reader, which is worse than an arithmetic
             # error — it wears verified grammar.
             #
@@ -359,9 +343,8 @@ class GenesisVersionCollector:
         # Same tag — up to date
         return 0, ""
 
-    async def _check_upstream_by_commits(self) -> tuple[int, str]:
+    async def _check_upstream_by_commits(self, ref: str) -> tuple[int, str]:
         """Fallback: count commits when no release tags exist."""
-        ref = f"{_update_remote()}/main"
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
@@ -491,7 +474,7 @@ class GenesisVersionCollector:
         self, current: str, behind: int, summary: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
-        ref = f"{_update_remote()}/main"
+        ref = _UPDATE_CHECK_REF
         # Get target commit for dedup
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-parse", "--short", ref,
@@ -544,7 +527,7 @@ class GenesisVersionCollector:
             created_at=now,
         )
         logger.info(
-            "Genesis update available: %d commits behind origin/main (%s)",
+            "Genesis update available: %d commits behind deploy target (%s)",
             behind, target_tag,
         )
         return True

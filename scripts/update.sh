@@ -100,20 +100,38 @@ GUARDIAN_PAUSE_RENEW_MAX=4
 _write_state() {
     local phase="$1"
     mkdir -p "$HOME/.genesis"
-    cat > "$STATE_FILE" << SEOF
-{
-    "phase": "$phase",
-    "rollback_tag": "${ROLLBACK_TAG:-}",
-    "old_tag": "${OLD_TAG:-}",
-    "old_commit": "${OLD_COMMIT:-}",
-    "deploy_branch": "${DEPLOY_BRANCH:-}",
-    "deploy_head": "${DEPLOY_HEAD:-}",
-    "started_at": "$STARTED_AT",
-    "pid": $$,
-    "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
-    "timestamp": "$(date -Iseconds)"
+    GH_PHASE="$phase" \
+    GH_STATE_FILE="$STATE_FILE" \
+    GH_ROLLBACK_TAG="${ROLLBACK_TAG:-}" \
+    GH_OLD_TAG="${OLD_TAG:-}" \
+    GH_OLD_COMMIT="${OLD_COMMIT:-}" \
+    GH_DEPLOY_BRANCH="${DEPLOY_BRANCH:-}" \
+    GH_DEPLOY_HEAD="${DEPLOY_HEAD:-}" \
+    GH_STARTED_AT="$STARTED_AT" \
+    GH_PID="$$" \
+    GH_WERE_RUNNING="$(printf '%s\n' "${WERE_RUNNING[@]:-}")" \
+    GH_TIMESTAMP="$(date -Iseconds)" \
+    "$VENV_DIR/bin/python" <<'PY'
+import json
+import os
+
+services = [line for line in os.environ["GH_WERE_RUNNING"].splitlines() if line]
+state = {
+    "phase": os.environ["GH_PHASE"],
+    "rollback_tag": os.environ["GH_ROLLBACK_TAG"],
+    "old_tag": os.environ["GH_OLD_TAG"],
+    "old_commit": os.environ["GH_OLD_COMMIT"],
+    "deploy_branch": os.environ["GH_DEPLOY_BRANCH"],
+    "deploy_head": os.environ["GH_DEPLOY_HEAD"],
+    "started_at": os.environ["GH_STARTED_AT"],
+    "pid": int(os.environ["GH_PID"]),
+    "services_stopped": services,
+    "timestamp": os.environ["GH_TIMESTAMP"],
 }
-SEOF
+with open(os.environ["GH_STATE_FILE"], "w", encoding="utf-8") as fh:
+    json.dump(state, fh, indent=4)
+    fh.write("\n")
+PY
 }
 
 _read_json_field() {
@@ -704,9 +722,49 @@ fi
 # ── Post-merge target recovery ───────────────────────────
 # Validate the already-merged deploy target before creating any state. State
 # files written by the pre-fix updater do not carry deploy_branch/deploy_head;
-# for those, recover the fetched commit from the durable conflict record, an
-# unfinished MERGE_HEAD, or the second parent of the completed merge commit.
+# for those, recover the fetched commit from the durable conflict record, or
+# from MERGE_HEAD / HEAD^2 only when it matches the deploy branch's fetched head.
 ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
+DEPLOY_FETCH_REF="refs/genesis-update-head"
+DEPLOY_TRACKING_REF="refs/remotes/$UPDATE_REMOTE/$DEPLOY_BRANCH"
+
+_fetch_deploy_refs() {
+    timeout 120 git -C "$GENESIS_ROOT" fetch \
+        "$UPDATE_REMOTE" "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF" \
+        "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF"
+}
+
+# Persisted commit names are abbreviated. Resolve them against the object
+# store only: a branch or tag named after a prefix must never shadow the commit
+# update state actually recorded.
+_resolve_commit_object() {
+    local name="$1" resolved kind
+    local -a matches=()
+    [[ "$name" =~ ^[0-9a-f]{4,40}$ ]] || return 1
+    mapfile -t matches < <(
+        git -C "$GENESIS_ROOT" rev-parse "--disambiguate=$name" 2>/dev/null | awk 'NF'
+    )
+    [ "${#matches[@]}" -eq 1 ] || return 1
+    resolved="${matches[0]}"
+    [[ "$resolved" =~ ^[0-9a-f]{40}$ ]] || return 1
+    kind="$(git -C "$GENESIS_ROOT" cat-file -t "$resolved" 2>/dev/null)" || return 1
+    [ "$kind" = "commit" ] || return 1
+    printf '%s\n' "$resolved"
+}
+
+_verified_fetch_head=""
+_candidate_is_current_deploy_head() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 1
+    if [ -z "$_verified_fetch_head" ]; then
+        _fetch_deploy_refs || return 1
+        _verified_fetch_head="$(
+            git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_FETCH_REF" 2>/dev/null
+        )" || return 1
+    fi
+    [ "$candidate" = "$_verified_fetch_head" ]
+}
+
 _saved_rt=""
 _saved_old_tag=""
 _saved_old_commit=""
@@ -729,9 +787,7 @@ if [[ "$POST_MERGE" == "true" ]]; then
         _saved_target_commit="$(_read_json_field "$CONFLICT_FILE" target_commit || true)"
     fi
     if [ -n "$_saved_old_commit" ]; then
-        _saved_old_commit_rev="$(
-            git -C "$GENESIS_ROOT" rev-parse --verify "$_saved_old_commit^{commit}" 2>/dev/null || true
-        )"
+        _saved_old_commit_rev="$(_resolve_commit_object "$_saved_old_commit" || true)"
     fi
 
     if [ -n "$_saved_deploy_branch" ] && [ "$_saved_deploy_branch" != "$DEPLOY_BRANCH" ]; then
@@ -739,19 +795,26 @@ if [[ "$POST_MERGE" == "true" ]]; then
         exit 1
     fi
 
-    DEPLOY_HEAD="$_saved_deploy_head"
-    if ! git -C "$GENESIS_ROOT" rev-parse --verify "${DEPLOY_HEAD:-}^{commit}" >/dev/null 2>&1; then
-        DEPLOY_HEAD="$_saved_target_commit"
+    DEPLOY_HEAD="$(_resolve_commit_object "$_saved_deploy_head" || true)"
+    if [ -z "$DEPLOY_HEAD" ]; then
+        DEPLOY_HEAD="$(_resolve_commit_object "$_saved_target_commit" || true)"
     fi
-    if ! git -C "$GENESIS_ROOT" rev-parse --verify "${DEPLOY_HEAD:-}^{commit}" >/dev/null 2>&1; then
-        DEPLOY_HEAD="$(git -C "$GENESIS_ROOT" rev-parse --verify 'MERGE_HEAD^{commit}' 2>/dev/null || true)"
+    if [ -z "$DEPLOY_HEAD" ]; then
+        _candidate="$(git -C "$GENESIS_ROOT" rev-parse --verify 'MERGE_HEAD^{commit}' 2>/dev/null || true)"
+        if _candidate_is_current_deploy_head "$_candidate"; then
+            DEPLOY_HEAD="$_candidate"
+        fi
     fi
-    if ! git -C "$GENESIS_ROOT" rev-parse --verify "${DEPLOY_HEAD:-}^{commit}" >/dev/null 2>&1; then
-        DEPLOY_HEAD="$(git -C "$GENESIS_ROOT" rev-parse --verify 'HEAD^2^{commit}' 2>/dev/null || true)"
+    if [ -z "$DEPLOY_HEAD" ]; then
+        _candidate="$(git -C "$GENESIS_ROOT" rev-parse --verify 'HEAD^2^{commit}' 2>/dev/null || true)"
+        if _candidate_is_current_deploy_head "$_candidate"; then
+            DEPLOY_HEAD="$_candidate"
+        fi
     fi
-    if ! git -C "$GENESIS_ROOT" rev-parse --verify "${DEPLOY_HEAD:-}^{commit}" >/dev/null 2>&1; then
+    if [ -z "$DEPLOY_HEAD" ]; then
         echo "ERROR: post-merge update cannot identify the fetched deploy head." >&2
-        echo "       Expected durable deploy_head, conflict target_commit, MERGE_HEAD, or HEAD's merge parent." >&2
+        echo "       Expected durable deploy_head, conflict target_commit, or a merge" >&2
+        echo "       parent matching the deploy branch's fetched head." >&2
         exit 1
     fi
     if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD; then
@@ -813,9 +876,7 @@ echo ""
 # up and exits with the server untouched.
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    DEPLOY_FETCH_REF="refs/genesis-update-head"
-    if ! timeout 120 git -C "$GENESIS_ROOT" fetch \
-        "$UPDATE_REMOTE" "+$DEPLOY_BRANCH:$DEPLOY_FETCH_REF"; then
+    if ! _fetch_deploy_refs; then
         echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
         git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
         _clear_deploy_state

@@ -29,10 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 
 # Command-line markers (unique real statements, not comment prose).
-FETCH = (
-    'git -C "$GENESIS_ROOT" fetch \\\n'
-    '        "$UPDATE_REMOTE" "+$DEPLOY_BRANCH:$DEPLOY_FETCH_REF"'
-)
+FETCH = "if ! _fetch_deploy_refs; then"
 STOP = "--- Stopping services for update ---"
 TRAP = "\ntrap _on_err ERR"
 MERGE = 'git -C "$GENESIS_ROOT" merge "$DEPLOY_HEAD" --no-edit'

@@ -41,8 +41,9 @@ fi
 
 The old fetch line at 797 is removed (its `--- Fetching latest ---` echo moves
 with it). The merge now consumes the immutable `DEPLOY_HEAD` read from the
-private fetched ref, and the script verifies that commit is an ancestor before
-restart or success reporting.
+private fetched ref, while the same fetch advances the remote-tracking ref so
+deploy health's upstream distance and fetch freshness describe one fetch. The
+script verifies that commit is an ancestor before restart or success reporting.
 
 **Why an explicit `if ! … exit 1` and NOT the ERR trap:** the ERR trap arms at
 790, *after* the stop. Before the stop there is deliberately no trap — a failure

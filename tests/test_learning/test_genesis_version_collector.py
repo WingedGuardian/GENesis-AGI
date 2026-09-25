@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -672,6 +673,29 @@ async def test_the_count_is_the_distance_from_the_DEPLOYED_commit(tagged_repo, d
     # The summary must describe the SAME range, or one alert's two halves
     # disagree — a count the reader reads as theirs beside a list that is not.
     assert len([ln for ln in summary.splitlines() if ln.strip()]) == 2, summary
+
+
+@pytest.mark.asyncio
+async def test_the_collector_uses_the_configured_deploy_branch(
+    tagged_repo, db, monkeypatch,
+):
+    remote = Path(_g(tagged_repo, "remote", "get-url", "origin"))
+    _g(remote, "checkout", "-q", "-b", "release")
+    (remote / "release.txt").write_text("release\n")
+    _g(remote, "add", "release.txt")
+    _g(remote, "commit", "-qm", "release")
+    release = _g(remote, "rev-parse", "HEAD")
+    _g(remote, "checkout", "-q", "main")
+    monkeypatch.setenv("GENESIS_DEPLOY_BRANCH", "release")
+
+    collector = GenesisVersionCollector(db)
+    with patch.object(genesis_version, "_GENESIS_ROOT", tagged_repo):
+        behind, summary = await collector._check_upstream()
+
+    assert behind == 3
+    assert "release" in summary
+    assert _g(tagged_repo, "rev-parse", "refs/genesis-update-check") == release
+    assert _g(tagged_repo, "rev-parse", "refs/remotes/origin/release") == release
 
 
 @pytest.mark.asyncio

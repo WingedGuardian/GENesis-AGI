@@ -66,6 +66,27 @@ def test_resolve_uses_the_fetch_remote_head(tmp_path: Path) -> None:
     assert result.stdout.strip() == "stable"
 
 
+def test_resolve_refreshes_the_live_remote_head(tmp_path: Path) -> None:
+    remote = tmp_path / "remote"
+    repo = _repo(tmp_path)
+    _git(tmp_path, "init", "--bare", "-b", "main", str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "origin", "main")
+    _git(repo, "checkout", "-b", "stable")
+    (repo / "file.txt").write_text("stable\n")
+    _git(repo, "commit", "-am", "stable")
+    _git(repo, "push", "origin", "stable")
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/stable")
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+    result = _run_helper(
+        f'genesis_resolve_deploy_branch "{repo}" origin',
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "stable"
+
+
 def test_resolve_honors_explicit_env_override(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
 

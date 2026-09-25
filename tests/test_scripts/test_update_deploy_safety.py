@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +34,15 @@ def _block(text: str, marker: str) -> str:
     return match.group(1)
 
 
+def _function(text: str, name: str) -> str:
+    start = text.index(f"{name}() {{")
+    next_function = re.search(
+        r"\n[A-Za-z_][A-Za-z0-9_]*\(\) \{", text[start + 1 :]
+    )
+    assert next_function, f"missing function boundary after {name}"
+    return text[start : start + 1 + next_function.start()]
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -44,22 +54,40 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _merged_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    remote = tmp_path / "remote"
     repo = tmp_path / "repo"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(remote))
     repo.mkdir()
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
+    _git(repo, "remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n")
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "base")
     base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "origin", "main")
     _git(repo, "checkout", "-b", "incoming")
     (repo / "file.txt").write_text("incoming\n")
     _git(repo, "commit", "-am", "incoming")
     incoming = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "origin", "incoming:main")
     _git(repo, "checkout", "main")
     _git(repo, "merge", "--no-ff", "incoming", "-m", "merge incoming")
     return repo, base, incoming
+
+
+def _unrelated_merge_repo(tmp_path: Path) -> tuple[Path, str, str, str]:
+    repo, base, incoming = _merged_repo(tmp_path)
+    _git(repo, "reset", "--hard", "HEAD^1")
+    _git(repo, "checkout", "-b", "feature", base)
+    (repo / "feature.txt").write_text("feature\n")
+    _git(repo, "add", "feature.txt")
+    _git(repo, "commit", "-m", "feature")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    _git(repo, "merge", "--no-ff", "feature", "-m", "merge feature")
+    return repo, base, feature, incoming
 
 
 def _json_reader_stub() -> str:
@@ -94,7 +122,8 @@ def _run_post_merge_block(
         f'GENESIS_ROOT="{repo}"\n'
         f'STATE_FILE="{state_file}"\n'
         f'CONFLICT_FILE="{conflict_file}"\n'
-        'POST_MERGE=true\nDEPLOY_BRANCH=main\nOLD_TAG=old\nOLD_COMMIT=old\n'
+        'POST_MERGE=true\nDEPLOY_BRANCH=main\nUPDATE_REMOTE=origin\n'
+        'OLD_TAG=old\nOLD_COMMIT=old\n'
         + _json_reader_stub()
         + _block(UPDATE.read_text(), "post-merge-target-recovery")
         + 'printf \'%s\\n%s\\n\' "$DEPLOY_HEAD" "$ROLLBACK_TAG"\n'
@@ -107,15 +136,54 @@ def _run_post_merge_block(
     )
 
 
+def test_write_state_json_encodes_deploy_fields(tmp_path: Path) -> None:
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    state = tmp_path / "state.json"
+    script = (
+        "set -euo pipefail\n"
+        f'HOME="{tmp_path / "home"}"\n'
+        f'VENV_DIR="{tmp_path / "venv"}"\n'
+        f'STATE_FILE="{state}"\n'
+        'ROLLBACK_TAG=\'pre-update-"x\'\n'
+        'OLD_TAG=\'v"old\'\n'
+        'OLD_COMMIT=\'abc"def\'\n'
+        'DEPLOY_BRANCH=\'release/"x\'\n'
+        'DEPLOY_HEAD=\'feed"beef\'\n'
+        'STARTED_AT=\'start"ed\'\n'
+        'WERE_RUNNING=("svc-a" \'svc "b"\')\n'
+        + _function(UPDATE.read_text(), "_write_state")
+        + '_write_state "fetching"\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(state.read_text())
+    assert data["phase"] == "fetching"
+    assert data["rollback_tag"] == 'pre-update-"x'
+    assert data["old_tag"] == 'v"old'
+    assert data["old_commit"] == 'abc"def'
+    assert data["deploy_branch"] == 'release/"x'
+    assert data["deploy_head"] == 'feed"beef'
+    assert data["started_at"] == 'start"ed'
+    assert data["services_stopped"] == ["svc-a", 'svc "b"']
+
+
 def test_update_resolves_branch_from_the_remote_it_fetches() -> None:
     text = UPDATE.read_text()
     remote = text.index('UPDATE_REMOTE="$(_detect_update_remote)"')
     resolve = text.index('genesis_resolve_deploy_branch "$GENESIS_ROOT" "$UPDATE_REMOTE"')
     assert remote < resolve
-    assert 'fetch \\\n        "$UPDATE_REMOTE" "+$DEPLOY_BRANCH:$DEPLOY_FETCH_REF"' in text
+    assert 'fetch \\\n        "$UPDATE_REMOTE" "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF" \\\n        "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF"' in text
 
 
-def test_private_fetch_ref_bypasses_narrow_tracking_refspec(tmp_path: Path) -> None:
+def test_private_fetch_ref_and_tracking_ref_survive_narrow_refspec(tmp_path: Path) -> None:
     remote = tmp_path / "remote"
     work = tmp_path / "work"
     _git(tmp_path, "init", "--bare", "-b", "main", str(remote))
@@ -135,17 +203,26 @@ def test_private_fetch_ref_bypasses_narrow_tracking_refspec(tmp_path: Path) -> N
     incoming = _git(work, "rev-parse", "HEAD")
     _git(work, "push", "origin", "main")
 
-    _git(work, "fetch", "origin", "+main:refs/genesis-update-head")
+    _git(
+        work,
+        "fetch",
+        "origin",
+        "+refs/heads/main:refs/genesis-update-head",
+        "+refs/heads/main:refs/remotes/origin/main",
+    )
 
     assert _git(work, "rev-parse", "refs/genesis-update-head") == incoming
+    assert _git(work, "rev-parse", "refs/remotes/origin/main") == incoming
     _git(work, "push", "--force", "origin", f"{base}:main")
-    _git(work, "fetch", "origin", "+main:refs/genesis-update-head")
+    _git(
+        work,
+        "fetch",
+        "origin",
+        "+refs/heads/main:refs/genesis-update-head",
+        "+refs/heads/main:refs/remotes/origin/main",
+    )
     assert _git(work, "rev-parse", "refs/genesis-update-head") == base
-    assert subprocess.run(
-        ["git", "-C", str(work), "show-ref", "--verify", "refs/remotes/origin/main"],
-        capture_output=True,
-        env=_clean_env(),
-    ).returncode != 0
+    assert _git(work, "rev-parse", "refs/remotes/origin/main") == base
 
 
 def test_update_merges_and_verifies_fetched_remote_head() -> None:
@@ -257,6 +334,37 @@ def test_post_merge_recovers_target_from_conflict_target_commit(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     deploy_head, rollback_tag = result.stdout.splitlines()[-2:]
     assert deploy_head == incoming
+    assert _git(repo, "rev-parse", f"{rollback_tag}^{{commit}}") == base
+
+
+def test_post_merge_rejects_unrelated_merge_parent(tmp_path: Path) -> None:
+    repo, base, _feature, _incoming = _unrelated_merge_repo(tmp_path)
+    home = tmp_path / "home"
+    result = _run_post_merge_block(
+        repo,
+        home,
+        state={"old_commit": base[:12], "rollback_tag": ""},
+        conflict=None,
+    )
+
+    assert result.returncode != 0
+    assert "parent matching the deploy branch's fetched head" in result.stderr
+    assert _git(repo, "tag", "--list", "pre-update-*") == ""
+
+
+def test_saved_old_commit_cannot_be_shadowed_by_a_ref(tmp_path: Path) -> None:
+    repo, base, incoming = _merged_repo(tmp_path)
+    _git(repo, "branch", base[:12], incoming)
+    home = tmp_path / "home"
+    result = _run_post_merge_block(
+        repo,
+        home,
+        state={"old_commit": base[:12], "rollback_tag": ""},
+        conflict=None,
+    )
+
+    assert result.returncode == 0, result.stderr
+    _deploy_head, rollback_tag = result.stdout.splitlines()[-2:]
     assert _git(repo, "rev-parse", f"{rollback_tag}^{{commit}}") == base
 
 

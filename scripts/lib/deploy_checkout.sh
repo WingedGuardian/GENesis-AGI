@@ -10,6 +10,10 @@ genesis_resolve_deploy_branch() {
     local remote_head
 
     if [ -z "$branch" ]; then
+        # Refresh the cached remote HEAD before trusting it; an ordinary fetch
+        # does not update refs/remotes/<remote>/HEAD when upstream's default
+        # branch changes.
+        timeout 15 git -C "$repo" remote set-head --auto "$remote" >/dev/null 2>&1 || true
         remote_head="$(
             git -C "$repo" symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" \
                 2>/dev/null || true

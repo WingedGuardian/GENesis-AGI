@@ -8,11 +8,13 @@ known update, 1 fabricates a distance nobody measured. Both wear the grammar of
 a measurement, which is precisely the defect this endpoint was changed to stop.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from flask import Flask
 
+from genesis import env
 from genesis.dashboard.routes import updates
 
 
@@ -35,10 +37,21 @@ def _call(count, tags):
             return "two\none"
         return ""
 
+    def git_result(*args, **kwargs):
+        assert args == (
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/genesis-update-check",
+            "+refs/heads/main:refs/remotes/origin/main",
+        )
+        return "", ""
+
     app = Flask(__name__)
     with app.test_request_context(), patch.object(
+        updates, "_deploy_target", return_value=("origin", "main")
+    ), patch.object(
         updates, "_git", side_effect=git
-    ), patch.object(updates, "_git_result", return_value=("", "")):
+    ), patch.object(updates, "_git_result", side_effect=git_result):
         result = updates.update_check()
 
     if isinstance(result, tuple):
@@ -69,20 +82,67 @@ def test_an_unmeasurable_distance_is_an_error_not_a_number(count, tags):
     assert "error" in payload
 
 
-def test_deploy_target_uses_public_repo_remote_and_env_branch(monkeypatch):
-    def git(*args, **kwargs):
-        if args == ("remote", "-v"):
-            return (
-                "origin https://github.com/other/repo.git (fetch)\n"
-                "upstream https://github.com/WingedGuardian/GENesis-AGI.git (fetch)"
+def test_deploy_target_uses_the_shared_resolver(monkeypatch):
+    calls = []
+
+    def resolve(repo):
+        calls.append(repo)
+        return "upstream", "release"
+
+    monkeypatch.setattr(updates, "deploy_target", resolve)
+    assert updates._deploy_target() == ("upstream", "release")
+    assert calls == [updates._GENESIS_ROOT]
+
+
+def test_shared_deploy_target_uses_public_repo_remote_and_env_branch(
+    monkeypatch, tmp_path,
+):
+    def run(cmd, **kwargs):
+        if cmd[3:] == ["remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "origin https://github.com/other/repo.git (fetch)\n"
+                    "upstream https://github.com/WingedGuardian/GENesis-AGI.git (fetch)"
+                ),
+                stderr="",
             )
-        raise AssertionError(f"unexpected git call: {args}")
+        if "check-ref-format" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected git call: {cmd}")
 
     monkeypatch.setenv("GENESIS_DEPLOY_BRANCH", "release")
-    monkeypatch.setattr(updates, "_git", git)
-    monkeypatch.setattr(updates, "github_public_repo", lambda: "GENesis-AGI")
+    monkeypatch.setattr(env, "github_public_repo", lambda: "GENesis-AGI")
+    monkeypatch.setattr(env.subprocess, "run", run)
 
-    assert updates._deploy_target() == ("upstream", "release")
+    assert env.deploy_target(tmp_path) == ("upstream", "release")
+
+
+def test_shared_deploy_target_refreshes_the_live_remote_head(monkeypatch, tmp_path):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd[3:])
+        if cmd[3:] == ["remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="origin https://github.com/WingedGuardian/GENesis-AGI.git (fetch)",
+                stderr="",
+            )
+        if cmd[3:] == ["remote", "set-head", "--auto", "origin"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[3:5] == ["symbolic-ref", "--quiet"]:
+            return SimpleNamespace(returncode=0, stdout="origin/release\n", stderr="")
+        if "check-ref-format" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected git call: {cmd}")
+
+    monkeypatch.delenv("GENESIS_DEPLOY_BRANCH", raising=False)
+    monkeypatch.setattr(env, "github_public_repo", lambda: "GENesis-AGI")
+    monkeypatch.setattr(env.subprocess, "run", run)
+
+    assert env.deploy_target(tmp_path) == ("origin", "release")
+    assert ["remote", "set-head", "--auto", "origin"] in calls
 
 
 def test_same_release_preserves_the_existing_update_policy():
@@ -94,6 +154,8 @@ def test_same_release_preserves_the_existing_update_policy():
 
     app = Flask(__name__)
     with app.test_request_context(), patch.object(
+        updates, "_deploy_target", return_value=("origin", "main")
+    ), patch.object(
         updates, "_git", side_effect=git
     ), patch.object(updates, "_git_result", return_value=("", "")):
         result = updates.update_check().get_json()
