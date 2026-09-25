@@ -33,35 +33,68 @@ def big_tmp_dir() -> str:
 
 def should_redirect_pytest_basetemp(
     current_basetemp: str | None,
-    tmpdir_env: str | None,
-    home: str,
+    ci_env: str | None,
 ) -> bool:
-    """Whether pytest's basetemp should be steered off cc-tmp. Pure — no I/O.
+    """Whether pytest's basetemp should be steered to ``~/tmp``. Pure — no I/O.
 
-    pytest's ``tmp_path``/``basetemp`` default to ``<TMPDIR>/pytest-of-<user>/``.
-    On a Genesis install ``TMPDIR`` is ``~/.genesis/cc-tmp`` (set for CC sessions
-    by ``scripts/cc-slot.sh``), the budget-policed dir the ``genesis-tmp-watchgod``
-    service reacts to — so an un-redirected suite dumps hundreds of MB there and
-    trips the watchgod.
+    pytest's ``tmp_path``/``basetemp`` default to ``<TMPDIR>/pytest-of-<user>/``,
+    and on this project BOTH of the places that resolves to are small and policed:
 
-    Redirect ONLY when BOTH hold (else ``False`` — leave pytest's default AND do
-    no filesystem work):
-      * the caller did not already pass ``--basetemp`` (``current_basetemp is None``);
-      * ``TMPDIR`` resolves to ``<home>/.genesis/cc-tmp`` or a path under it.
+    * ``TMPDIR=~/.genesis/cc-tmp`` in a CC session (set by ``scripts/cc-slot.sh``) —
+      the budget-policed dir ``genesis-tmp-watchgod`` reclaims by killing idle
+      sessions;
+    * ``TMPDIR`` unset or ``/tmp`` anywhere else — and on an install whose
+      ``/tmp`` is a tmpfs mount (common, and the case this was written for) that
+      is RAM behind a hard kernel cap, typically a few hundred MB.
 
-    On CI ``TMPDIR`` is unset → ``False`` → no-op (CI keeps its own tmp). Being a
-    pure predicate (no ``big_tmp_dir()`` call) is deliberate: the caller must not
-    create ``~/tmp`` on the no-op / explicit-``--basetemp`` path (that would break
-    a read-only-home or CI run during config). The caller redirects to a
-    per-process leaf under :func:`big_tmp_dir` (``~/tmp``) only when this is True;
+    MEASURED 2026-09-24 on one such install: a suite run from a context with no
+    ``TMPDIR`` put two basetemp trees totalling 255 MB into a 512 MB RAM disk
+    and paged the operator. Where ``/tmp`` is an ordinary on-disk directory the
+    redirect costs nothing but the move; it is not conditioned on detecting
+    which one you have, because a size probe is a runtime-varying decision on a
+    path that otherwise has none, and the project's own temp policy sends large
+    temp to ``~/tmp`` either way. The earlier form of this predicate redirected *only* when ``TMPDIR``
+    already resolved to cc-tmp, so every other entry path — a ``systemd-run`` unit,
+    a detached shell, a subprocess with a scrubbed environment, a plain
+    ``TMPDIR=/tmp`` — fell through to that default.
+
+    So the polarity is now ALLOWLIST rather than a list of temp dirs known to be
+    hazardous: **redirect by default**, with exactly two exemptions.
+
+      * an explicit ``--basetemp`` (``current_basetemp is not None``) — never
+        override a caller who named a location;
+      * CI (``ci_env`` set to anything but a falsey spelling) — a hosted runner
+        keeps its own ample temp, and its ``$HOME`` may be read-only.
+
+    Enumerating hazardous locations instead would be a denylist, and the next
+    small temp dir to appear would silently not be on it.
+
+    ``GENESIS_BIG_TMP`` is the supported relocation knob for an operator who wants
+    the suite's temp somewhere other than ``~/tmp`` (see :func:`big_tmp_dir`); it
+    keeps the redirect and moves its destination, which ``--basetemp`` does not.
+
+    Purity is deliberate: the caller must not create ``~/tmp`` on the no-op path
+    (that would break a read-only-home run during config). The caller redirects to
+    a per-process leaf under :func:`big_tmp_dir` only when this is True —
     per-process because pytest clears an explicit basetemp at session start, so
     concurrent runs sharing one path would delete each other's temp. This never
     rewrites the process ``TMPDIR`` (see the module docstring).
     """
     if current_basetemp is not None:
         return False
-    if not tmpdir_env:
+    return not _is_ci(ci_env)
+
+
+# ``CI`` is the de-facto cross-vendor signal; GitHub Actions (this repo's only CI —
+# 9 workflows, none of which set it themselves) documents it as "Always set to
+# ``true``" in its default-variables reference, consulted 2026-09-24. The falsey
+# spellings are honoured because ``CI=false`` is the conventional way tooling opts
+# a run OUT of CI behaviour, and reading that as "on CI" would invert it.
+_CI_FALSEY = frozenset({"", "0", "false", "no", "off"})
+
+
+def _is_ci(ci_env: str | None) -> bool:
+    """Whether a raw ``$CI`` value means "running on CI". Pure."""
+    if ci_env is None:
         return False
-    cc_tmp = os.path.realpath(os.path.join(home, ".genesis", "cc-tmp"))
-    resolved = os.path.realpath(tmpdir_env)
-    return resolved == cc_tmp or resolved.startswith(cc_tmp + os.sep)
+    return ci_env.strip().lower() not in _CI_FALSEY

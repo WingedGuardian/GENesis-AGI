@@ -229,10 +229,13 @@ async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
     edited): pytest wipes ``--basetemp`` before collection, so a basetemp nested
     in the project would delete any top-level file/dir of the same name the
     fixture or the model's solution legitimately created → a false failure. It is
-    also off cc-tmp — this foreign fixture has its own rootdir, so the genesis
-    ``tests/conftest.py`` redirect never loads for it (see
-    ``genesis.util.tmp.should_redirect_pytest_basetemp``); without an explicit
-    basetemp its tmp would default to ``$TMPDIR`` (watchgod-policed cc-tmp).
+    also kept off every policed temp dir, and that is this call's own job rather
+    than something it inherits: a foreign fixture has its own rootdir, so the
+    genesis ``tests/conftest.py`` redirect never loads for it (see
+    ``genesis.util.tmp.should_redirect_pytest_basetemp``). Without an explicit
+    basetemp its tmp would follow ``$TMPDIR`` — the watchgod-policed cc-tmp in a
+    CC session, and pytest's default, commonly a small tmpfs ``/tmp``, anywhere
+    else.
 
     That same "own rootdir" fact is why the box-wide test lock is taken HERE
     explicitly: the genesis ``tests/conftest.py`` that normally acquires it
