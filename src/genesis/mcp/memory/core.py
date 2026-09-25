@@ -113,7 +113,9 @@ async def memory_recall(
             user content excluded.
         rerank: If True (default), apply cross-encoder reranking (~300ms).
         include_deprecated: If True, include superseded memories (audit /
-            history queries). Default False.
+            history queries), and traverse them for ``graph_neighbors`` too. Any
+            neighbour that is itself hidden is flagged ``"hidden": true``; the key
+            is absent on visible ones. Default False.
     """
     import time as _time
 
@@ -437,6 +439,15 @@ async def memory_recall(
                     r.memory_id,
                     max_depth=2,
                     min_strength=0.3,
+                    # The caller's choice, honoured rather than overridden
+                    # (issue #1896). Without this the search above returns the
+                    # deprecated memory the caller explicitly asked for and the
+                    # enrichment here silently drops all of its neighbours,
+                    # because every backend re-applies the predicate the caller
+                    # just opted out of. The store-level name is wider on
+                    # purpose — it also un-hides bitemporally expired memories,
+                    # which is the same audit/history question.
+                    include_hidden=include_deprecated,
                 )
                 graph_elapsed_ms += traversal.query_ms
                 if traversal.nodes:
@@ -446,6 +457,10 @@ async def memory_recall(
                             "link_type": n.link_type,
                             "depth": n.depth,
                             "strength": n.strength,
+                            # A `hidden` key may be added below, after the loop —
+                            # see `_label_hidden_neighbours`. Labelling is one
+                            # scoped query over the ids actually collected, so it
+                            # cannot be done from inside this comprehension.
                         }
                         for n in traversal.nodes[:5]
                     ]
@@ -456,6 +471,15 @@ async def memory_recall(
                     exc_info=True,
                 )
         enriched.append(d)
+
+    # Label the hidden neighbours in ONE scoped pass, after the loop. A False
+    # return means visibility could not be determined, so the "no `hidden` key
+    # means visible" contract does not hold for this response and the caller is
+    # told rather than left to assume the safe-sounding reading.
+    if not await _label_hidden_neighbours(
+        memory_mod._db, enriched, include_hidden=include_deprecated
+    ):
+        _mark_visibility_unknown(enriched)
 
     # Selective corrective retrieval (CRAG) — high-stakes explicit recall path.
     # Default ON; gated + fail-fast so a confident/healthy recall is untouched.
@@ -535,6 +559,82 @@ async def memory_recall(
     return enriched
 
 
+async def _label_hidden_neighbours(db, results: list[dict], *, include_hidden: bool) -> bool:
+    """Mark neighbours that normal recall hides. Returns whether it could check.
+
+    Annotates in place: a neighbour the predicate hides gains ``"hidden": True``,
+    and the key is ABSENT on a visible one — so its absence is information, which
+    is why the return value matters. ``False`` means the check could not run, and
+    the caller must not let absence be read as "visible" for that response.
+
+    Exists because un-hiding neighbours without LABELLING them hands a caller
+    superseded ids indistinguishable from live ones, and the documented next step
+    is to expand them. MEASURED on the live graph at these tools' parameters:
+    11,032 of 73,823 visible memories with out-edges (14.9%) gain at least one
+    hidden neighbour at depth 1 ALONE — a common case, not an edge one.
+
+    SCOPED to the ids actually present, and run ONCE after the results are built
+    rather than per neighbour or per call. MEASURED on a live install: the
+    unscoped predicate is a full `SCAN memory_metadata` over 97,971 rows at
+    33.8ms, while the scoped `IN (…)` uses the autoindex at 0.100ms — 338x
+    cheaper for the same answer. Running it after the loop also means a call that
+    returns no results performs no query at all, which matters because
+    ``memory_expand`` defaults this flag ON and would otherwise pay a full scan
+    on every id that resolves to nothing.
+
+    No query when ``include_hidden`` is False: the traversal applied the
+    predicate, so no hidden neighbour can be present. Skipping is correctness as
+    well as thrift — the query would be guaranteed-empty on the hot path.
+
+    FAIL-OPEN, but LOUDLY. A label is an enrichment and must not cost the caller
+    their neighbours; returning "nothing is hidden" on a call that could not look
+    would instead assert the opposite of the truth, which on this install would
+    mislabel 4,276 ids as live in a payload whose next step is to trust them.
+    """
+    if not include_hidden:
+        return True
+    candidates = {
+        n["memory_id"]
+        for r in results
+        for n in r.get("graph_neighbors") or ()
+        if n.get("memory_id")
+    }
+    if not candidates:
+        return True
+    try:
+        from genesis.memory.graphstore import invalid_memory_ids_among
+
+        hidden = await invalid_memory_ids_among(db, candidates)
+    except Exception:
+        # WARNING, not debug: the caller explicitly asked to see hidden
+        # memories, so failing to tell them apart is a failure of the thing they
+        # asked for — not a background detail, and not something to hide behind
+        # a log level that is off in production.
+        logger.warning(
+            "hidden-neighbour labelling failed — neighbours are returned "
+            "UNLABELLED and their visibility is unknown",
+            exc_info=True,
+        )
+        return False
+    for r in results:
+        for n in r.get("graph_neighbors") or ():
+            if n.get("memory_id") in hidden:
+                n["hidden"] = True
+    return True
+
+
+def _mark_visibility_unknown(results: list[dict]) -> None:
+    """Withdraw the absence-means-visible contract for this response.
+
+    Only reached when labelling could not run. Without it the caller cannot
+    distinguish "these neighbours are all live" from "nobody checked", and the
+    first reading is the dangerous one.
+    """
+    for d in results:
+        if d.get("graph_neighbors"):
+            d["graph_neighbors_visibility"] = "unknown"
+
+
 _UUID_LEN = 36
 # Hex (with optional dashes) 4–35 chars — a partial memory UUID. Anything
 # else (full UUIDs, non-hex ids) bypasses prefix resolution untouched.
@@ -582,6 +682,7 @@ async def _resolve_id_prefixes(
 @mcp.tool()
 async def memory_expand(
     memory_ids: list[str],
+    include_deprecated: bool = True,
 ) -> list[dict]:
     """Fetch full content + graph neighbors for specific memory IDs.
 
@@ -591,7 +692,35 @@ async def memory_expand(
     enrichment for each ID found; unresolved or ambiguous handles are reported
     in a trailing ``{"not_found": [...], "ambiguous": [...]}`` entry instead
     of being silently dropped.
+
+    Args:
+        memory_ids: Full UUIDs or short ``id:`` handles to expand.
+        include_deprecated: Include graph neighbours for memories normal recall
+            hides — superseded/deprecated or bitemporally expired. Defaults to
+            **True** here, unlike ``memory_recall``, because this tool already
+            returns the named memory whatever its state. Each such neighbour is
+            flagged ``"hidden": true``; the key is absent on visible ones.
     """
+    # WHY the default differs from `memory_recall` (issue #1896, owner decision
+    # 2026-09-24) — kept as a COMMENT, not in the docstring: FastMCP publishes a
+    # tool's docstring as its model-facing description, billed on every session's
+    # handshake, so reviewer-facing rationale there is a permanent token cost.
+    #
+    # This function retrieves by id straight from Qdrant and applies no
+    # visibility predicate to the memory ITSELF, so it already returns a
+    # deprecated memory when one is named. Defaulting the neighbours to hidden
+    # made the tool asymmetric with itself — handing back the memory while
+    # suppressing its edges is the #1896 symptom left in place as a default.
+    #
+    # Who it bites decided it: the proactive hook emits `[→ related: id:xxx]`
+    # handles and this tool is the documented expansion path, so a caller
+    # following that hint has no signal the handle is deprecated, no reason to
+    # set a flag, and no way to tell "hidden neighbours" from "no neighbours".
+    #
+    # The flag is per-CALL, not per-root, so it also un-hides neighbours of
+    # VISIBLE memories — MEASURED: 11,032 of 73,823 visible memories with
+    # out-edges (14.9%) gain one at depth 1 alone. That is why each hidden
+    # neighbour carries a `hidden` label rather than arriving unmarked.
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
@@ -711,6 +840,7 @@ async def memory_expand(
                 mid,
                 max_depth=2,
                 min_strength=0.3,
+                include_hidden=include_deprecated,
             )
             if traversal.nodes:
                 d["graph_neighbors"] = [
@@ -719,6 +849,10 @@ async def memory_expand(
                         "link_type": n.link_type,
                         "depth": n.depth,
                         "strength": n.strength,
+                        # A `hidden` key may be added after the loop — see
+                        # `_label_hidden_neighbours`. This tool defaults the flag
+                        # ON, so the label is the ordinary case here rather than
+                        # the exception.
                     }
                     for n in traversal.nodes[:5]
                 ]
@@ -726,6 +860,15 @@ async def memory_expand(
             logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
 
         results.append(d)
+
+    # After the loop AND strictly after the not-found early return above, so an
+    # expand whose ids resolve to nothing performs no visibility query at all.
+    # This tool defaults the flag ON, so the previous hoisted placement paid a
+    # full table scan on every miss.
+    if not await _label_hidden_neighbours(
+        memory_mod._db, results, include_hidden=include_deprecated
+    ):
+        _mark_visibility_unknown(results)
 
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # expand prompt (observe-only). memory_mod._db is asserted non-None above.

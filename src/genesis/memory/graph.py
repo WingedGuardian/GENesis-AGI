@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.memory.graphstore import (
+    GraphModeUnsupported,
     GraphNode,
     GraphStore,
     GraphUnavailableError,
@@ -52,6 +53,7 @@ if TYPE_CHECKING:  # pragma: no cover
     import aiosqlite
 
 logger = logging.getLogger(__name__)
+
 
 __all__ = [
     "GraphNode",
@@ -142,12 +144,43 @@ def invalidate_graph_cache() -> None:
         _falkor_store.invalidate()
 
 
+async def _cte_or_unavailable(
+    db: aiosqlite.Connection,
+    root_id: str,
+    max_depth: int,
+    min_strength: float,
+    include_hidden: bool,
+) -> list[GraphNode]:
+    """The SQL fallback, with the seam's typed-error contract enforced.
+
+    A HELPER rather than a second try/except, because the guard below was
+    previously inlined in one fallback path and a later change added a second
+    path without it. An exception raised inside an `except` clause is not caught
+    by that clause's siblings, so the new path re-opened the exact leak this
+    guard exists to close — MEASURED: a decline whose CTE then failed raised a
+    bare `ValueError: no active connection` at the caller, while the older path
+    correctly raised `GraphUnavailableError`.
+
+    The fallback reads the SAME connection a store may have just failed on, so
+    every non-transient cause — a closed handle, a missing table, a corrupt
+    file — fails it identically. The one cause it genuinely rescues is a
+    transient `database is locked`, which is why it still runs.
+    """
+    try:
+        return await _traverse_cte(db, root_id, max_depth, min_strength, include_hidden)
+    except Exception as cte_exc:
+        raise GraphUnavailableError(
+            f"the graph store and its SQL fallback both failed: {cte_exc}"
+        ) from cte_exc
+
+
 async def traverse(
     db: aiosqlite.Connection,
     root_id: str,
     *,
     max_depth: int = 3,
     min_strength: float = 0.0,
+    include_hidden: bool = False,
 ) -> TraversalResult:
     """Traverse the memory graph from a root node.
 
@@ -159,6 +192,15 @@ async def traverse(
         root_id: Starting memory ID.
         max_depth: Maximum traversal depth (default 3).
         min_strength: Minimum link strength to follow (default 0.0).
+        include_hidden: Traverse memories normal recall hides — deprecated or
+            bitemporally expired — as root AND as intermediate hops. Defaults
+            to False, which is the correct default and stays the hot path: the
+            point of the predicate is that graph enrichment must not surface
+            what the search beside it hides. True is the caller's explicit
+            opt-out, threaded from ``memory_recall(include_deprecated=True)``
+            (issue #1896), and it is honoured identically by all three
+            implementations below — which is the property that matters, since
+            which backend answers must never change WHICH memories are shown.
 
     Returns:
         TraversalResult with connected nodes and query timing.
@@ -169,6 +211,34 @@ async def traverse(
     try:
         nodes = await active.traverse(
             db, root_id, max_depth=max_depth, min_strength=min_strength,
+            include_hidden=include_hidden,
+        )
+    except GraphModeUnsupported as exc:
+        # NOT a degradation, and deliberately handled BEFORE the generic
+        # handler below: the backend is reachable and healthy, it simply does
+        # not implement this READ MODE. Today that is the NetworkX store
+        # declining `include_hidden=True`, because its projection is filtered at
+        # build time and serving hidden memories would mean holding a second
+        # unfiltered graph — measured at ~148 MiB never freed, 4.2s to build,
+        # never warm in practice, and billed into a recall budget that then
+        # dropped 6 of 7 enrichments (see `graphstore_nx.traverse`).
+        #
+        # Route straight to the CTE, skipping the NetworkX tier: the store that
+        # just declined IS that tier, so trying it would decline again. The CTE
+        # answers this mode from SQL in ~1ms per root with nothing resident, and
+        # returns byte-identical rows — MEASURED 70/70 field-for-field against
+        # every backend with the flag on.
+        #
+        # DEBUG, not WARNING, and that is the point of the distinct type: this
+        # path is expected and correct, so logging it at warning level with a
+        # traceback would train readers to ignore the genuine unavailability
+        # warning below, which fires for a dead engine.
+        logger.debug(
+            "Graph store %r does not serve this mode — using the SQL tier: %s",
+            getattr(active, "name", "?"), exc,
+        )
+        nodes = await _cte_or_unavailable(
+            db, root_id, max_depth, min_strength, include_hidden,
         )
     except GraphUnavailableError as exc:
         # Traversal is an ENRICHMENT path — its readers already treat a thin
@@ -191,36 +261,25 @@ async def traverse(
             try:
                 nodes = await _store.traverse(
                     db, root_id, max_depth=max_depth, min_strength=min_strength,
+                    include_hidden=include_hidden,
                 )
+            except GraphModeUnsupported:
+                # Reached when the PRIMARY store was unavailable AND the caller
+                # asked for hidden memories: NetworkX declines that mode, so the
+                # CTE below answers it. Quiet, for the same reason as above —
+                # the loud warning already fired for the real failure, and this
+                # second line would only describe a tier that was never going to
+                # serve this mode.
+                pass
             except GraphUnavailableError as nx_exc:
                 logger.warning(
                     "NetworkX store also unavailable — falling back to the recursive CTE: %s",
                     nx_exc, exc_info=True,
                 )
         if nodes is None:
-            try:
-                nodes = await _traverse_cte(db, root_id, max_depth, min_strength)
-            except Exception as cte_exc:
-                # The fallback reads the SAME connection the store just failed on,
-                # so every non-transient cause — a closed handle, a missing table, a
-                # corrupt file — fails it identically. Without this, making the
-                # store raise properly only moved the leak one layer: the store's
-                # error was caught here and the CTE's raw one escaped in its place.
-                # MEASURED against this facade on a closed connection: `traverse()`
-                # raised a bare `ValueError: no active connection` at the caller,
-                # after logging a line that said it was falling back.
-                #
-                # The one cause the fallback genuinely rescues is a transient
-                # `database is locked`, which is why it still runs first.
-                #
-                # KEPT ACROSS THE RECONCILE ON PURPOSE. This guard and the tiered
-                # chain above it arrived from opposite sides of this merge, and
-                # taking either alone is a silent regression: main's version has
-                # no FalkorDB tier, and this branch's version left the CTE call
-                # bare, which is the exact leak the guard was written to close.
-                raise GraphUnavailableError(
-                    f"the graph store and its SQL fallback both failed: {cte_exc}"
-                ) from cte_exc
+            nodes = await _cte_or_unavailable(
+                db, root_id, max_depth, min_strength, include_hidden,
+            )
 
     elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -263,6 +322,7 @@ async def _traverse_cte(
     root_id: str,
     max_depth: int,
     min_strength: float,
+    include_hidden: bool = False,
 ) -> list[GraphNode]:
     """Original recursive CTE traversal (fallback).
 
@@ -329,6 +389,10 @@ async def _traverse_cte(
     if max_depth < 1:
         return []
     now = datetime.now(UTC).isoformat()
+    # An INT, not the bool: sqlite3 adapts bools to 0/1 already, but `1 OR ...`
+    # is what the clauses read as and spelling it here keeps the query's own
+    # semantics legible from the params tuple.
+    hidden_ok = 1 if include_hidden else 0
     cursor = await db.execute(
         """
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
@@ -345,14 +409,23 @@ async def _traverse_cte(
               -- path returns nothing for. MEASURED: 2,827 live memories are
               -- hidden AND have out-edges, and the two forms otherwise
               -- classify 6,503 edges (2.5% of the graph) differently.
-              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+              --
+              -- All three visibility clauses are gated on the same bound
+              -- `include_hidden` flag (issue #1896). The `? OR` form keeps ONE
+              -- query string for both modes: two near-identical recursive CTEs
+              -- would be a drift hazard, and this walk's agreement with the two
+              -- graph stores is the property the whole function exists to
+              -- provide. With the flag off SQLite short-circuits nothing away
+              -- and the plan is what it always was; with it on, every clause is
+              -- satisfied by the literal and the predicate is never evaluated.
+              AND (? OR NOT EXISTS (SELECT 1 FROM memory_metadata m
                               WHERE m.memory_id = memory_links.source_id
                                 AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
-                                  OR m.deprecated != 0))
-              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+                                  OR m.deprecated != 0)))
+              AND (? OR NOT EXISTS (SELECT 1 FROM memory_metadata m
                               WHERE m.memory_id = memory_links.target_id
                                 AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
-                                  OR m.deprecated != 0))
+                                  OR m.deprecated != 0)))
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
                    c.path || ',' || ml.target_id
@@ -361,10 +434,14 @@ async def _traverse_cte(
             WHERE c.depth < ?
               AND ml.strength >= ?
               AND c.path NOT LIKE '%' || ml.target_id || '%'
-              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
+              -- Only the TARGET is gated in the recursive step, unchanged: a
+              -- row's source is some earlier row's target and was already
+              -- checked there, so the anchor is the only place a source needs
+              -- its own clause.
+              AND (? OR NOT EXISTS (SELECT 1 FROM memory_metadata m
                               WHERE m.memory_id = ml.target_id
                                 AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
-                                  OR m.deprecated != 0))
+                                  OR m.deprecated != 0)))
         )
         SELECT target_id, link_type, depth, strength
         FROM (
@@ -378,7 +455,16 @@ async def _traverse_cte(
         WHERE rn = 1
         ORDER BY depth, strength DESC, target_id
         """,
-        (root_id, min_strength, now, now, max_depth, min_strength, now),
+        # Positional, so the order tracks the clauses above exactly: each
+        # visibility gate contributes its `include_hidden` flag immediately
+        # before the `now` its predicate compares against.
+        (
+            root_id, min_strength,
+            hidden_ok, now,          # anchor source visibility
+            hidden_ok, now,          # anchor target visibility
+            max_depth, min_strength,
+            hidden_ok, now,          # recursive target visibility
+        ),
     )
     rows = await cursor.fetchall()
     return [

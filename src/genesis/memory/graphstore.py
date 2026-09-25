@@ -91,6 +91,35 @@ class DatabaseUnreachable(GraphUnavailableError):
     """
 
 
+class GraphModeUnsupported(GraphUnavailableError):
+    """This backend does not implement this READ MODE. It is reachable and well.
+
+    Distinct from unreachability, and the distinction is what stops the facade
+    logging a warning-with-traceback on a perfectly healthy, expected path. The
+    seam already blesses a backend declining a read it cannot serve — FalkorDB
+    raises for `centrality` because it has no betweenness, and this module's own
+    contract says "a backend that cannot support a particular read (betweenness
+    over SQL, say) raises the same error". This names the case rather than
+    leaving it indistinguishable from a dead engine.
+
+    Raised today by the NetworkX store for `traverse(include_hidden=True)`: its
+    projection is filtered at BUILD time, so serving hidden memories would mean
+    holding a second unfiltered graph. MEASURED on the live graph, which is why
+    it declines rather than doing that — a second projection costs ~148 MiB held
+    for the process lifetime and 4.2s to build, and it is never warm in practice
+    (the staleness token moves on ordinary memory writes, so a second call
+    moments later rebuilds again). Billed into the recall enrichment budget that
+    dropped 6 of 7 results. The recursive-CTE tier answers the identical
+    question in 59ms for 7 roots with nothing resident, and returns
+    byte-identical results — MEASURED 70/70 field-for-field across all three
+    backends with the flag on.
+
+    A subclass for the same reason `DatabaseUnreachable` is: every existing
+    handler keeps working, and only a caller that WANTS to route differently has
+    to know the type exists.
+    """
+
+
 # The predicate normal recall uses to decide a memory is still visible, kept
 # HERE so every backend applies the same one. READ from the two live readers,
 # not invented: db/crud/memory.py::search_ranked filters
@@ -107,11 +136,21 @@ class DatabaseUnreachable(GraphUnavailableError):
 # anything not in (NULL, 0); SQL's NULL != 0 is NULL, so unstamped rows stay
 # visible. No `IS NOT NULL` guard: the column is NOT NULL DEFAULT 0 in the base
 # CREATE, so that clause would be dead.
-_INVALID_MEMORY_SQL = """
+#: The predicate ALONE, parenthesised, so a caller can AND another clause onto it
+#: without changing its meaning. Kept separate from the statement below because
+#: `AND` binds tighter than `OR` in SQL: appending `AND memory_id IN (…)` to an
+#: unparenthesised `(expired) OR deprecated != 0` parses as
+#: `(expired) OR (deprecated AND in_set)` — which returns expired memories from
+#: OUTSIDE the requested set, silently and with a plausible-looking row count.
+_INVALID_MEMORY_PREDICATE = """(
+        (invalid_at IS NOT NULL AND invalid_at <= ?)
+        OR deprecated != 0
+    )"""
+
+_INVALID_MEMORY_SQL = f"""
     SELECT memory_id FROM memory_metadata
-    WHERE (invalid_at IS NOT NULL AND invalid_at <= ?)
-       OR deprecated != 0
-"""
+    WHERE {_INVALID_MEMORY_PREDICATE}
+"""  # noqa: S608 — interpolates a literal predicate constant, never a value
 
 
 async def invalid_memory_ids(db: aiosqlite.Connection) -> set[str]:
@@ -125,6 +164,49 @@ async def invalid_memory_ids(db: aiosqlite.Connection) -> set[str]:
     now = datetime.now(UTC).isoformat()
     cursor = await db.execute(_INVALID_MEMORY_SQL, (now,))
     return {row[0] for row in await cursor.fetchall()}
+
+
+#: Chunk size for the scoped variant. SQLite's default variadic-parameter ceiling
+#: is 999 (`SQLITE_MAX_VARIABLE_NUMBER`), so a caller with a large candidate set
+#: must not build one statement out of all of it. 500 leaves headroom for the
+#: timestamp parameter and for a build with a lower ceiling.
+_INVALID_CHUNK = 500
+
+
+async def invalid_memory_ids_among(
+    db: aiosqlite.Connection, memory_ids: set[str] | frozenset[str]
+) -> set[str]:
+    """Which of ``memory_ids`` normal recall hides. Scoped, not a table scan.
+
+    Same predicate as ``invalid_memory_ids`` — it shares
+    ``_INVALID_MEMORY_SQL`` rather than restating it, because two copies of a
+    visibility rule are two chances to disagree about what "hidden" means.
+
+    Use this when the candidate set is already known. MEASURED on a live install
+    (97,971 ``memory_metadata`` rows, 4,276 hidden): the unscoped form is a full
+    `SCAN memory_metadata` at 33.8ms, while an ``IN (…)`` over ~50 known ids uses
+    `sqlite_autoindex_memory_metadata_1` at 0.100ms — 338x cheaper for the same
+    answer. It is also TOTAL over the ids asked about, rather than a snapshot of
+    the whole table that a caller then intersects.
+    """
+    if not memory_ids:
+        return set()
+    now = datetime.now(UTC).isoformat()
+    ids = list(memory_ids)
+    found: set[str] = set()
+    for start in range(0, len(ids), _INVALID_CHUNK):
+        chunk = ids[start : start + _INVALID_CHUNK]
+        # Only the PLACEHOLDER COUNT is interpolated — never a value. Every id is
+        # a bound parameter, so this is not an injection vector despite the
+        # f-string (ruff S608 cannot distinguish the two).
+        placeholders = ",".join("?" * len(chunk))
+        cursor = await db.execute(
+            "SELECT memory_id FROM memory_metadata "  # noqa: S608
+            f"WHERE {_INVALID_MEMORY_PREDICATE} AND memory_id IN ({placeholders})",
+            (now, *chunk),
+        )
+        found.update(row[0] for row in await cursor.fetchall())
+    return found
 
 
 class GraphStore(Protocol):
@@ -142,12 +224,37 @@ class GraphStore(Protocol):
         *,
         max_depth: int,
         min_strength: float,
+        include_hidden: bool = False,
     ) -> list[GraphNode]:
         """Neighbours reachable from ``root_id``.
 
         Ordered ``(depth, -strength)``. A root that is absent from the graph
         yields ``[]`` — that is genuinely "no neighbours", not unavailability.
         Raises ``GraphUnavailableError`` if the backend cannot be reached.
+
+        ``include_hidden`` carries the CALLER'S visibility choice to the store,
+        and it defaults to False so every existing call site keeps its exact
+        present behaviour. True means the predicate above is not applied AT ALL
+        — not to the root, not to any hop — so a traversal can both START from
+        and PASS THROUGH a memory normal recall hides.
+
+        Why the parameter has to live here rather than above the seam: the
+        predicate is applied INSIDE each backend (a build-time row filter in
+        NetworkX, a Cypher clause in FalkorDB, a SQL clause in the CTE
+        fallback), so a caller had no way to express the choice at all. That is
+        issue #1896: ``memory_recall(include_deprecated=True)`` returned the
+        deprecated memory it was asked for and then silently dropped its
+        ``graph_neighbors``, because the traversal re-applied a filter the
+        caller had explicitly opted out of. MEASURED on the live graph at the
+        real recall parameters (max_depth=2, min_strength=0.3): five hidden
+        roots carrying 10–24 out-edges each returned 0 neighbours on ALL THREE
+        backends, while visible controls returned 23–41.
+
+        Named ``include_hidden``, NOT ``include_deprecated``, because the
+        predicate hides two different things — a non-zero ``deprecated`` AND a
+        bitemporally expired ``invalid_at`` — and this flag un-hides both. The
+        MCP-facing parameter keeps its public name (``include_deprecated``) and
+        maps onto this one; the wider name is the honest one at this layer.
         """
         ...
 

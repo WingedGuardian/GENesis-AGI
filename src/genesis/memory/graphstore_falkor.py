@@ -154,10 +154,21 @@ _VALID = (
 # `max(strength)` and the type separately would pair a strength with another
 # edge's label -- and that label is emitted straight to the model at
 # mcp/memory/core.py:465 and :738.
+# `$include_hidden` carries the caller's visibility choice into the engine
+# (issue #1896). ONE query constant rather than two, deliberately: a second
+# near-identical Cypher string is a drift hazard, and every future edit to the
+# traversal would have to be made twice or silently diverge between the two
+# visibility modes. MEASURED against the live engine before this shape was
+# chosen -- FalkorDB accepts a boolean parameter in that position, and on a
+# hidden root carrying 24 out-edges >= 0.3 it returns 0 rows with the flag off
+# and 36 with it on, which is the defect and the fix in one probe.
+#
+# `$now` therefore stays referenced in BOTH modes, so the params dict does not
+# have to become conditional on the flag.
 _TRAVERSE = f"""
 MATCH p=(a:Memory {{id: $root}})-[:LINK*1..{{depth}}]->(b:Memory)
 WHERE ALL(x IN relationships(p) WHERE x.strength >= $min_strength)
-  AND ALL(x IN nodes(p) WHERE {_VALID})
+  AND ALL(x IN nodes(p) WHERE $include_hidden OR ({_VALID}))
 WITH b.id AS id, length(p) AS d, relationships(p)[-1] AS e
 ORDER BY d ASC, e.strength DESC, e.link_type DESC
 WITH id, head(collect(d)) AS depth, head(collect(e)) AS best
@@ -556,8 +567,15 @@ class FalkorGraphStore:
         *,
         max_depth: int,
         min_strength: float,
+        include_hidden: bool = False,
     ) -> list[GraphNode]:
         """Neighbours of ``root_id``, ordered ``(depth, -strength)``.
+
+        ``include_hidden=True`` suppresses the validity predicate for this call
+        (issue #1896) — root and every hop alike, since the predicate is applied
+        per-path-node. It is resolved in the ENGINE via a query parameter rather
+        than by post-filtering here, so a hidden root's subtree costs the same
+        single round trip a visible one does.
 
         ``db`` is unused: unlike the NetworkX store, the validity predicate is
         answered from properties already in the projection rather than from a
@@ -619,6 +637,7 @@ class FalkorGraphStore:
                 # (`db/timeutil.py`), so the precision is real data, not a
                 # theoretical tail.
                 "now": time.time(),
+                "include_hidden": bool(include_hidden),
             },
         )
         nodes = [
