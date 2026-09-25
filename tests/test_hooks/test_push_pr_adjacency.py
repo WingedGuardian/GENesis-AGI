@@ -270,11 +270,22 @@ def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys, command="gi
     return rc, out.out, out.err
 
 
-def test_a_republished_branch_with_no_open_pr_asks_instead_of_sliding(
+def test_a_republished_branch_with_no_open_pr_is_BLOCKED(
     monkeypatch, tmp_path, capsys
 ) -> None:
     """The re-push relaxation is earned by first-push approval; a PR-less
-    public branch does not get to keep it silently."""
+    public branch does not get to keep it.
+
+    This asserted an ASK until 2026-09-25. The ask was MEASURED not to work: it
+    fired on every such push and was approved on every such push, so publication
+    was authorised and the PR still never followed. Ten public branches had
+    accumulated with no PR by the time anyone counted. An ask that is always
+    answered the same way reports the gap without closing it.
+
+    A block is also the right shape per this repo hook axioms: it stops
+    foreground and background equally, where an ask silently becomes a deny in a
+    dispatched session with no human to answer it.
+    """
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
@@ -283,12 +294,13 @@ def test_a_republished_branch_with_no_open_pr_asks_instead_of_sliding(
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
-    assert rc == 0
-    doc = json.loads(out)
-    decision = doc["hookSpecificOutput"]["permissionDecision"]
-    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
-    assert decision == "ask", (rc, out, err)
-    assert "NO OPEN PR" in reason and "leak scan" in reason
+    assert rc == 2, (rc, out, err)
+    assert "NO OPEN PR" in err and "leak detector" in err
+    assert "gh pr create" in err, "the block must name the way out, not just refuse"
+    assert not out.strip(), (
+        "a block writes to stderr and returns 2; emitting hook JSON as well would "
+        "hand Claude Code a permission decision that contradicts the exit code"
+    )
 
 
 def test_a_republished_branch_with_an_open_pr_stays_silent(monkeypatch, tmp_path, capsys) -> None:
@@ -438,8 +450,8 @@ def test_a_dry_run_keeps_its_silence(monkeypatch, tmp_path, capsys, cmd) -> None
         assert doc["hookSpecificOutput"]["permissionDecision"] != "ask", out
 
 
-def test_a_real_push_still_asks(monkeypatch, tmp_path, capsys) -> None:
-    """The control for the dry-run skip: without it the prompt must still fire,
+def test_a_real_push_is_still_stopped(monkeypatch, tmp_path, capsys) -> None:
+    """The control for the dry-run skip: without it the block must still fire,
     or the exclusion has silently disabled the whole check."""
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
@@ -449,10 +461,8 @@ def test_a_real_push_still_asks(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
-    assert rc == 0
-    doc = json.loads(out)
-    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
-    assert "NO OPEN PR" in doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert rc == 2, (rc, out, err)
+    assert "NO OPEN PR" in err
 
 
 def test_a_full_result_window_is_unanswerable_not_absent(monkeypatch) -> None:

@@ -9894,6 +9894,11 @@ def _run_merge_and_push_gates() -> int:
     blind_spot_deny: str | None = None
     round_compound_deny: str | None = None
     round_autonomous_deny: str | None = None
+    #: A re-push to a PUBLIC branch with no open PR. A BLOCK rather than an ask,
+    #: because the ask was measured not to work: it fired every time and was
+    #: approved every time, so publication was authorised and the PR simply never
+    #: followed. See the site below for the full rationale.
+    no_open_pr_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
@@ -10319,11 +10324,36 @@ def _run_merge_and_push_gates() -> int:
                         and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
                     ):
                         push_allow_reason = None
-                        ask_reason = (
-                            f"re-push to '{cur}': this branch is PUBLIC but has "
-                            f"NO OPEN PR, so CI and the leak scan never run on "
-                            f"it. Approve to push, then open its PR "
-                            f"(gh pr create) — or close the branch out."
+                        # BLOCKED, not asked. This was an ask, and the ask was
+                        # MEASURED not to work: it fired on every such push and
+                        # was approved on every such push, so publication was
+                        # authorised and the PR still never followed. An ask that
+                        # is always answered the same way is approval fatigue
+                        # wearing a gate's clothes — it reports the gap without
+                        # closing it, and 10 public branches had accumulated with
+                        # no PR by the time anyone counted.
+                        #
+                        # A block is also the right SHAPE per this repo's hook
+                        # axioms: a block stops foreground and background equally,
+                        # where an ask silently becomes a deny in a dispatched
+                        # session with no human to answer it. Nothing here is lost
+                        # to a background session that a human would have granted.
+                        #
+                        # The FIRST push of a branch is untouched — this arm only
+                        # runs when `push_allow_reason` is set, i.e. the branch is
+                        # already on the remote. That ordering is load-bearing:
+                        # `gh pr create` requires the branch to be pushed first,
+                        # so blocking the first push would make opening a PR
+                        # impossible rather than mandatory.
+                        no_open_pr_deny = (
+                            f"BLOCKED: re-push to '{cur}' — this branch is PUBLIC "
+                            f"but has NO OPEN PR, so CI and the leak detector "
+                            f"never run on it (ci.yml triggers on pull_request; a "
+                            f"branch with no PR matches no trigger).\n"
+                            f"Open its PR first — `gh pr create` — then push "
+                            f"again. Or close the branch out if it is finished "
+                            f"with. Both leave the branch in a state something "
+                            f"actually looks at."
                         )
                 else:
                     ask_reason = (
@@ -11016,6 +11046,9 @@ def _run_merge_and_push_gates() -> int:
             return 2
         if round_autonomous_deny is not None:
             print(round_autonomous_deny, file=sys.stderr)
+            return 2
+        if no_open_pr_deny is not None:
+            print(no_open_pr_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
             return _ask(ask_reason)
