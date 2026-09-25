@@ -69,18 +69,28 @@ _session_exists() {
     # `cc`, and SLOT is either a counter or is rejected unless it matches
     # ^[1-9][0-9]*$. That is a property of the CALLERS, not of this helper --
     # a future caller passing a user-supplied name needs to re-check it.
-    # FEATURE DEPENDENCY the old probe did not have: `list-sessions -f` and the
-    # `#{==:a,b}` comparison are both documented on tmux 3.4 (this box), but
-    # `has-session` predates them. On a tmux lacking either, the command errors,
-    # `|| true` swallows it, and this answers "absent" for EVERY name -- quietly.
-    # Consequences if that ever happens: the free-slot loop always returns 1
-    # (harmless, `new-session -A` below still attaches) and a reattach is put
-    # through the capacity gate it is meant to bypass. The kill guard is
-    # unaffected, since absent is its skip direction.
+    # An EMPTY successful query means absent. A FAILED query does not, and
+    # collapsing the two is how a correctness bug hides behind a cosmetic one.
+    # `list-sessions -f` and `#{==:a,b}` are both documented on tmux 3.4 (this
+    # box), but `has-session` predates them, so on an older tmux the filtered
+    # query errors while the server is perfectly healthy. Swallowing that would
+    # answer "absent" for EVERY name: manual mode would hand out an occupied
+    # slot, and a reattach would be pushed through the capacity gate it exists
+    # to bypass -- which can DENY the login, or reclaim another session, instead
+    # of attaching to the slot that is sitting right there.
+    #
+    # So fall back to the exact legacy probe, which every tmux has. It is the
+    # thing this helper replaced, and that is fine here: it runs only when the
+    # filtered query has already failed, where answering CORRECTLY matters more
+    # than the log entry it costs. When there is no server at all, has-session
+    # fails too and "absent" is then the right answer, not a swallowed error.
     local _found
-    _found=$(tmux list-sessions -F '#{session_name}' \
-                  -f "#{==:#{session_name},$1}" 2>/dev/null || true)
-    [[ -n "$_found" ]]
+    if _found=$(tmux list-sessions -F '#{session_name}' \
+                    -f "#{==:#{session_name},$1}" 2>/dev/null); then
+        [[ -n "$_found" ]]
+    else
+        tmux has-session -t "=$1" 2>/dev/null
+    fi
 }
 
 

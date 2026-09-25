@@ -45,6 +45,20 @@ def _strip_comments(text: str) -> str:
     return "\n".join(_re.sub(r"#.*$", "", ln) for ln in text.splitlines())
 
 
+def _session_exists_body(text: str) -> str:
+    """The shipped `_session_exists` definition, verbatim.
+
+    Extracted rather than matched by line number so the has-session exemption
+    stays bound to that function and cannot drift onto whatever else happens to
+    occupy those lines later.
+    """
+    import re as _re
+
+    m = _re.search(r"^_session_exists\(\) \{\n.*?^\}$", text, _re.M | _re.S)
+    assert m, "cc-slot.sh no longer defines _session_exists() at column 0"
+    return m.group(0)
+
+
 def test_old_collapsing_formula_is_gone(script_text):
     assert "ram_cap" not in script_text
     assert "PER_SESSION_MB=900" not in script_text
@@ -64,9 +78,24 @@ def test_reattach_bypass_and_session_exists_preserved(script_text):
     """
     assert "_SESSION_EXISTS=1" in script_text
     assert '_session_exists "$SESSION_NAME"' in script_text
-    assert "tmux has-session" not in _strip_comments(script_text), (
-        "cc-slot.sh probes with `tmux has-session`, which logs a server-side "
-        "error on the absent path"
+
+    # The noisy verb must be gone from every CALL SITE. One use survives on
+    # purpose, inside _session_exists itself: when the filtered query ERRORS
+    # (an older tmux has no `list-sessions -f`) the helper falls back to the
+    # legacy probe, because answering CORRECTLY matters more there than the log
+    # entry it costs -- a filtered-listing error read as "absent" would hand out
+    # an occupied slot and push a reattach through the capacity gate. Scoped by
+    # the helper own body rather than by a count, so a second stray call cannot
+    # hide behind the exemption.
+    body = _session_exists_body(script_text)
+    outside = _strip_comments(script_text).replace(_strip_comments(body), "")
+    assert "tmux has-session" not in outside, (
+        "cc-slot.sh probes with `tmux has-session` outside _session_exists, "
+        "which logs a server-side error on the absent path"
+    )
+    assert body.count("tmux has-session") == 1, (
+        "_session_exists should use the legacy probe exactly once, as the "
+        "fallback for a filtered query that errored"
     )
 
 

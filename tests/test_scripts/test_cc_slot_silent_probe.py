@@ -85,6 +85,12 @@ def _extract_helper() -> str:
     return m.group(0)
 
 
+def _helper_lines() -> set[str]:
+    """The lines of the shipped `_session_exists` body, for exempting its own
+    fallback from the has-session scan without hardcoding a line number."""
+    return {ln for ln in _extract_helper().splitlines()}
+
+
 def _tmux(sock: str, *args: str):
     env = dict(os.environ)
     env.pop("TMUX", None)
@@ -216,6 +222,12 @@ def test_no_has_session_call_site_survives_in_the_slot_door():
         # (`tmux \` / newline / `has-session`) or an indirected binary
         # (`"$TMUX_BIN" has-session`) would not be seen either.
         if re.search(r"\btmux has-session\b", re.sub(r"#.*$", "", line))
+        # ONE call site is legitimate: _session_exists falls back to the legacy
+        # probe when the filtered query ERRORS, because answering correctly then
+        # matters more than the log entry. Scoping by the helper's own body
+        # rather than by a line number, so the exemption cannot drift onto some
+        # other call that happens to move into that range.
+        and line not in _helper_lines()
     ]
     assert not offenders, (
         "cc-slot.sh calls `tmux has-session`, which logs a server-side error on "
@@ -226,3 +238,77 @@ def test_no_has_session_call_site_survives_in_the_slot_door():
         "cc-slot.sh must define _session_exists -- the silent replacement for "
         "has-session. Its absence means the probes went somewhere unreviewed."
     )
+
+
+def _run_helper_with_fake_tmux(tmp_path, name, *, filter_supported, present):
+    """Run the SHIPPED helper against a fake tmux with a chosen capability.
+
+    Extracted, not retyped, for the same reason as everywhere else in this file:
+    a copy would pass forever while the real function rotted.
+    """
+    bin_dir = tmp_path / f"bin-{name}-{filter_supported}-{present}"
+    bin_dir.mkdir()
+    names = "cc-1\ncc-2" if present else "cc-9"
+    fake = bin_dir / "tmux"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list-sessions" ]; then\n'
+        f"    if [ {'0' if filter_supported else '1'} -ne 0 ]; then\n"
+        "        echo 'unknown option -- f' >&2; exit 1\n"
+        "    fi\n"
+        "    want=''\n"
+        "    for a in \"$@\"; do\n"
+        '        case "$a" in "#{==:#{session_name},"*)\n'
+        "            want=${a#\\#\\{==:\\#\\{session_name\\},}; want=${want%\\}} ;;\n"
+        "        esac\n"
+        "    done\n"
+        f"    printf '%s\\n' '{names}' | grep -xF -- \"$want\" || true\n"
+        "    exit 0\n"
+        "fi\n"
+        'if [ "$1" = "has-session" ]; then\n'
+        "    want=$3; want=${want#=}\n"
+        f"    printf '%s\\n' '{names}' | grep -qxF -- \"$want\" || "
+        "{ echo \"can't find session: $want\" >&2; exit 1; }\n"
+        "    exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    fake.chmod(0o755)
+
+    probe = tmp_path / f"probe-{name}-{filter_supported}-{present}.sh"
+    probe.write_text("#!/bin/bash\nset -euo pipefail\n" + _extract_helper() + '\n_session_exists "$1"\n')
+    probe.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    return subprocess.run([str(probe), name], env=env, capture_output=True, timeout=60)
+
+
+def test_a_filtered_query_that_ERRORS_is_not_read_as_absent(tmp_path):
+    """The correctness half of the fix, and the half a silent fallback loses.
+
+    `list-sessions -f` and `#{==:}` postdate `has-session`, so on an older tmux
+    the filtered query errors while the server is perfectly healthy. Collapsing
+    that into "absent" would let manual mode hand out an OCCUPIED slot, and
+    would push a reattach through the capacity gate it exists to bypass --
+    denying the login, or reclaiming another session, instead of attaching to
+    the slot sitting right there. Raised by review on #2341.
+
+    Run as a 2x2 rather than just the fallback arm. If the filter-supported
+    cells agreed with the filter-erroring ones by accident -- because the
+    helper was answering from the fallback all along -- a single-arm test would
+    pass while measuring nothing.
+    """
+    for name, filt, present, want_rc in (
+        ("cc-1", True, True, 0),     # filter works, session present
+        ("cc-1", True, False, 1),    # filter works, session absent
+        ("cc-1", False, True, 0),    # filter ERRORS, session present  <- the fix
+        ("cc-1", False, False, 1),   # filter ERRORS, session absent
+    ):
+        got = _run_helper_with_fake_tmux(
+            tmp_path, name, filter_supported=filt, present=present
+        )
+        assert got.returncode == want_rc, (
+            f"filter_supported={filt} present={present}: expected rc={want_rc}, "
+            f"got {got.returncode}; stderr={got.stderr!r}"
+        )

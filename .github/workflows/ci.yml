@@ -1021,8 +1021,9 @@ jobs:
         # tests/test_scripts/test_cc_slot_silent_probe.py, which does not exist
         # on main, so its delta is its FULL collected count.
         #   pytest tests/test_scripts/test_cc_slot_silent_probe.py \
-        #     --collect-only -q  -> 2 tests collected
-        # so the floor is 23440 + 2 = 23442.
+        #     --collect-only -q  -> 3 tests collected
+        # so the floor is 23440 + 3 = 23443. (The third arrived in review: a
+        # filtered query that ERRORS must not read as "absent".)
         #
         # The CEILING stays at 102 on the SAME UNCONFIRMED PREDICTION as the
         # paragraph above -- now covering two behavioural tests rather than one,
@@ -1034,4 +1035,4 @@ jobs:
         # measurement. If the run reports 103 or 104, read each skip's own
         # message before touching this number: raising it to green can CERTIFY
         # a dormant test, and the ceiling cannot say WHICH test skipped.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23442
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23443
