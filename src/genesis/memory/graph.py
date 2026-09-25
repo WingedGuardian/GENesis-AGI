@@ -39,6 +39,7 @@ from genesis.memory.graphstore import (
     GraphStore,
     GraphUnavailableError,
     TraversalResult,
+    hidden_predicate,
 )
 
 # Re-exported deliberately: `_bfs_with_strength` is imported ACROSS packages by
@@ -53,6 +54,13 @@ if TYPE_CHECKING:  # pragma: no cover
     import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+#: The gated visibility predicate, aliased for the CTE's correlated subqueries.
+#: Bound ONCE and interpolated at all three sites, so the anchor's two clauses and
+#: the recursive step's clause cannot drift apart — they were three separate
+#: hand-written copies until a review on PR #2339 pointed out that the constant
+#: introduced to prevent exactly that drift had no consumer at all.
+_HIDDEN_CTE = hidden_predicate(alias="m", gated=True)
 
 
 __all__ = [
@@ -149,7 +157,7 @@ async def _cte_or_unavailable(
     root_id: str,
     max_depth: int,
     min_strength: float,
-    include_hidden: bool,
+    include_deprecated: bool,
 ) -> list[GraphNode]:
     """The SQL fallback, with the seam's typed-error contract enforced.
 
@@ -167,7 +175,7 @@ async def _cte_or_unavailable(
     transient `database is locked`, which is why it still runs.
     """
     try:
-        return await _traverse_cte(db, root_id, max_depth, min_strength, include_hidden)
+        return await _traverse_cte(db, root_id, max_depth, min_strength, include_deprecated)
     except Exception as cte_exc:
         raise GraphUnavailableError(
             f"the graph store and its SQL fallback both failed: {cte_exc}"
@@ -180,7 +188,7 @@ async def traverse(
     *,
     max_depth: int = 3,
     min_strength: float = 0.0,
-    include_hidden: bool = False,
+    include_deprecated: bool = False,
 ) -> TraversalResult:
     """Traverse the memory graph from a root node.
 
@@ -192,15 +200,21 @@ async def traverse(
         root_id: Starting memory ID.
         max_depth: Maximum traversal depth (default 3).
         min_strength: Minimum link strength to follow (default 0.0).
-        include_hidden: Traverse memories normal recall hides — deprecated or
-            bitemporally expired — as root AND as intermediate hops. Defaults
-            to False, which is the correct default and stays the hot path: the
-            point of the predicate is that graph enrichment must not surface
-            what the search beside it hides. True is the caller's explicit
-            opt-out, threaded from ``memory_recall(include_deprecated=True)``
-            (issue #1896), and it is honoured identically by all three
-            implementations below — which is the property that matters, since
-            which backend answers must never change WHICH memories are shown.
+        include_deprecated: Traverse DEPRECATED memories — as root AND as
+            intermediate hops. Defaults to False, which is the correct default
+            and stays the hot path: the point of the predicate is that graph
+            enrichment must not surface what the search beside it hides. True is
+            the caller's explicit opt-out, threaded from
+            ``memory_recall(include_deprecated=True)`` (issue #1896), and it is
+            honoured identically by all three implementations below — which is
+            the property that matters, since which backend answers must never
+            change WHICH memories are shown.
+
+            A bitemporally EXPIRED memory is NOT reached at any value of this
+            flag. That is deliberate and matches ``search_ranked``, which
+            applies its ``invalid_at`` clause unconditionally and gates only the
+            ``deprecated`` one — so the two halves of one recall agree about
+            what is visible.
 
     Returns:
         TraversalResult with connected nodes and query timing.
@@ -211,13 +225,13 @@ async def traverse(
     try:
         nodes = await active.traverse(
             db, root_id, max_depth=max_depth, min_strength=min_strength,
-            include_hidden=include_hidden,
+            include_deprecated=include_deprecated,
         )
     except GraphModeUnsupported as exc:
         # NOT a degradation, and deliberately handled BEFORE the generic
         # handler below: the backend is reachable and healthy, it simply does
         # not implement this READ MODE. Today that is the NetworkX store
-        # declining `include_hidden=True`, because its projection is filtered at
+        # declining `include_deprecated=True`, because its projection is filtered at
         # build time and serving hidden memories would mean holding a second
         # unfiltered graph — measured at ~148 MiB never freed, 4.2s to build,
         # never warm in practice, and billed into a recall budget that then
@@ -238,7 +252,7 @@ async def traverse(
             getattr(active, "name", "?"), exc,
         )
         nodes = await _cte_or_unavailable(
-            db, root_id, max_depth, min_strength, include_hidden,
+            db, root_id, max_depth, min_strength, include_deprecated,
         )
     except GraphUnavailableError as exc:
         # Traversal is an ENRICHMENT path — its readers already treat a thin
@@ -261,7 +275,7 @@ async def traverse(
             try:
                 nodes = await _store.traverse(
                     db, root_id, max_depth=max_depth, min_strength=min_strength,
-                    include_hidden=include_hidden,
+                    include_deprecated=include_deprecated,
                 )
             except GraphModeUnsupported:
                 # Reached when the PRIMARY store was unavailable AND the caller
@@ -278,7 +292,7 @@ async def traverse(
                 )
         if nodes is None:
             nodes = await _cte_or_unavailable(
-                db, root_id, max_depth, min_strength, include_hidden,
+                db, root_id, max_depth, min_strength, include_deprecated,
             )
 
     elapsed_ms = (time.monotonic() - start) * 1000
@@ -322,7 +336,7 @@ async def _traverse_cte(
     root_id: str,
     max_depth: int,
     min_strength: float,
-    include_hidden: bool = False,
+    include_deprecated: bool = False,
 ) -> list[GraphNode]:
     """Original recursive CTE traversal (fallback).
 
@@ -389,12 +403,15 @@ async def _traverse_cte(
     if max_depth < 1:
         return []
     now = datetime.now(UTC).isoformat()
-    # An INT, not the bool: sqlite3 adapts bools to 0/1 already, but `1 OR ...`
-    # is what the clauses read as and spelling it here keeps the query's own
+    # An INT, not the bool: sqlite3 adapts bools to 0/1 already, but `? = 0` is
+    # what the clauses read as and spelling it here keeps the query's own
     # semantics legible from the params tuple.
-    hidden_ok = 1 if include_hidden else 0
+    dep_ok = 1 if include_deprecated else 0
+    # The f-string interpolates `_HIDDEN_CTE` — a literal predicate built at
+    # import time from constants in `graphstore`, never a value. Every id, depth
+    # and flag below is a bound parameter; ruff S608 cannot tell the two apart.
     cursor = await db.execute(
-        """
+        f"""
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
             SELECT target_id, link_type, 1, strength,
                    source_id || ',' || target_id
@@ -410,22 +427,28 @@ async def _traverse_cte(
               -- hidden AND have out-edges, and the two forms otherwise
               -- classify 6,503 edges (2.5% of the graph) differently.
               --
-              -- All three visibility clauses are gated on the same bound
-              -- `include_hidden` flag (issue #1896). The `? OR` form keeps ONE
-              -- query string for both modes: two near-identical recursive CTEs
-              -- would be a drift hazard, and this walk's agreement with the two
-              -- graph stores is the property the whole function exists to
-              -- provide. With the flag off SQLite short-circuits nothing away
-              -- and the plan is what it always was; with it on, every clause is
-              -- satisfied by the literal and the predicate is never evaluated.
-              AND (? OR NOT EXISTS (SELECT 1 FROM memory_metadata m
+              -- All three visibility clauses carry the same bound
+              -- `include_deprecated` flag (issue #1896), and the flag sits
+              -- INSIDE the predicate rather than in front of the whole
+              -- `NOT EXISTS`. That placement is the fix for a review finding on
+              -- #2339: the earlier `(<flag> OR NOT EXISTS ...)` form switched
+              -- off BOTH hiding reasons at once, so asking for deprecated
+              -- memories also returned bitemporally EXPIRED ones — which the
+              -- search beside this walk (`search_ranked`) can never return,
+              -- since it applies its `invalid_at` clause unconditionally. Here
+              -- the expiry term is outside the flag and the `<flag> = 0` guard
+              -- kills only the deprecation term, so no flag value un-hides an
+              -- expired
+              -- memory. Still ONE query string for both modes: two
+              -- near-identical recursive CTEs would be a drift hazard, and this
+              -- walk's agreement with the two graph stores is the property the
+              -- whole function exists to provide.
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
                               WHERE m.memory_id = memory_links.source_id
-                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
-                                  OR m.deprecated != 0)))
-              AND (? OR NOT EXISTS (SELECT 1 FROM memory_metadata m
+                                AND {_HIDDEN_CTE})
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
                               WHERE m.memory_id = memory_links.target_id
-                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
-                                  OR m.deprecated != 0)))
+                                AND {_HIDDEN_CTE})
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
                    c.path || ',' || ml.target_id
@@ -438,10 +461,9 @@ async def _traverse_cte(
               -- row's source is some earlier row's target and was already
               -- checked there, so the anchor is the only place a source needs
               -- its own clause.
-              AND (? OR NOT EXISTS (SELECT 1 FROM memory_metadata m
+              AND NOT EXISTS (SELECT 1 FROM memory_metadata m
                               WHERE m.memory_id = ml.target_id
-                                AND ((m.invalid_at IS NOT NULL AND m.invalid_at <= ?)
-                                  OR m.deprecated != 0)))
+                                AND {_HIDDEN_CTE})
         )
         SELECT target_id, link_type, depth, strength
         FROM (
@@ -454,16 +476,18 @@ async def _traverse_cte(
         )
         WHERE rn = 1
         ORDER BY depth, strength DESC, target_id
-        """,
+        """,  # noqa: S608 — interpolates a literal predicate constant, never a value
         # Positional, so the order tracks the clauses above exactly: each
-        # visibility gate contributes its `include_hidden` flag immediately
-        # before the `now` its predicate compares against.
+        # visibility gate contributes the `now` its expiry limb compares
+        # against, then the `include_deprecated` flag its deprecation limb is
+        # guarded by. (now, flag) — NOT the reverse; the flag moved INSIDE the
+        # predicate when the expiry limb was taken out from under it.
         (
             root_id, min_strength,
-            hidden_ok, now,          # anchor source visibility
-            hidden_ok, now,          # anchor target visibility
+            now, dep_ok,             # anchor source visibility
+            now, dep_ok,             # anchor target visibility
             max_depth, min_strength,
-            hidden_ok, now,          # recursive target visibility
+            now, dep_ok,             # recursive target visibility
         ),
     )
     rows = await cursor.fetchall()

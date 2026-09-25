@@ -100,20 +100,20 @@ async def memory_recall(
         expand_query_terms: If True (default), broaden the FTS5 query via tag
             co-occurrence.
         mode: "auto" (default) = standard + drift fallback; "standard" =
-            hybrid only; "drift" = 3-phase drift retrieval directly, which
-            ignores wing/room filters (an invalid wing is still refused).
+            hybrid only; "drift" = drift retrieval directly, which ignores
+            wing/room filters.
         time_range: Date range as "YYYY-MM-DD/YYYY-MM-DD"; boosts temporally
-            matching memories. Temporal language in the query is also
-            detected automatically.
-        include_subsystem: False (default) excludes automated-subsystem writes
-            (ego corrections, triage signals, reflection observations); True
-            returns everything; a list (e.g. ["ego"]) adds the named
+            matching memories. Temporal language is also auto-detected.
+        include_subsystem: False (default) excludes automated-subsystem writes;
+            True returns everything; a list (e.g. ["ego"]) adds the named
             subsystems to user content. Mutually exclusive with only_subsystem.
         only_subsystem: Return ONLY rows tagged with the named subsystem(s);
             user content excluded.
         rerank: If True (default), apply cross-encoder reranking (~300ms).
         include_deprecated: If True, include superseded memories (audit /
-            history queries). Default False.
+            history queries) and traverse them for ``graph_neighbors``. A
+            superseded neighbour carries ``"hidden": true``; no such key means
+            visible. Expired memories stay hidden either way. Default False.
     """
     import time as _time
 
@@ -442,10 +442,14 @@ async def memory_recall(
                     # deprecated memory the caller explicitly asked for and the
                     # enrichment here silently drops all of its neighbours,
                     # because every backend re-applies the predicate the caller
-                    # just opted out of. The store-level name is wider on
-                    # purpose — it also un-hides bitemporally expired memories,
-                    # which is the same audit/history question.
-                    include_hidden=include_deprecated,
+                    # just opted out of. DEPRECATION ONLY: an expired memory is
+                    # not reached at any value of this flag. `search_ranked`
+                    # applies its `invalid_at` clause unconditionally
+                    # (db/crud/memory.py:207) and gates only the `deprecated`
+                    # one (:212), so widening here would hand the model a
+                    # neighbour id its own results array could never contain.
+                    # An earlier version of this code did exactly that.
+                    include_deprecated=include_deprecated,
                 )
                 graph_elapsed_ms += traversal.query_ms
                 if traversal.nodes:
@@ -475,7 +479,7 @@ async def memory_recall(
     # means visible" contract does not hold for this response and the caller is
     # told rather than left to assume the safe-sounding reading.
     if not await _label_hidden_neighbours(
-        memory_mod._db, enriched, include_hidden=include_deprecated
+        memory_mod._db, enriched, include_deprecated=include_deprecated
     ):
         _mark_visibility_unknown(enriched)
 
@@ -557,7 +561,7 @@ async def memory_recall(
     return enriched
 
 
-async def _label_hidden_neighbours(db, results: list[dict], *, include_hidden: bool) -> bool:
+async def _label_hidden_neighbours(db, results: list[dict], *, include_deprecated: bool) -> bool:
     """Mark neighbours that normal recall hides. Returns whether it could check.
 
     Annotates in place: a neighbour the predicate hides gains ``"hidden": True``,
@@ -580,16 +584,23 @@ async def _label_hidden_neighbours(db, results: list[dict], *, include_hidden: b
     ``memory_expand`` defaults this flag ON and would otherwise pay a full scan
     on every id that resolves to nothing.
 
-    No query when ``include_hidden`` is False: the traversal applied the
+    No query when ``include_deprecated`` is False: the traversal applied the
     predicate, so no hidden neighbour can be present. Skipping is correctness as
     well as thrift — the query would be guaranteed-empty on the hot path.
+
+    The predicate here stays the WIDE one (``invalid_memory_ids_among``, both
+    hiding reasons) even though traversal now only ever surfaces a DEPRECATED
+    neighbour. Deliberate: the two reads are not in one transaction, so a
+    neighbour can expire between the traversal and this label, and marking that
+    one hidden is right. A narrow label predicate would instead report it as
+    visible — the one direction a fail must not go.
 
     FAIL-OPEN, but LOUDLY. A label is an enrichment and must not cost the caller
     their neighbours; returning "nothing is hidden" on a call that could not look
     would instead assert the opposite of the truth, which on this install would
     mislabel 4,276 ids as live in a payload whose next step is to trust them.
     """
-    if not include_hidden:
+    if not include_deprecated:
         return True
     candidates = {
         n["memory_id"]
@@ -693,11 +704,12 @@ async def memory_expand(
 
     Args:
         memory_ids: Full UUIDs or short ``id:`` handles to expand.
-        include_deprecated: Include graph neighbours for memories normal recall
-            hides — superseded/deprecated or bitemporally expired. Defaults to
-            **True** here, unlike ``memory_recall``, because this tool already
-            returns the named memory whatever its state. Each such neighbour is
-            flagged ``"hidden": true``; the key is absent on visible ones.
+        include_deprecated: Include graph neighbours that normal recall hides as
+            SUPERSEDED. Defaults to **True** here, unlike ``memory_recall``,
+            because this tool already returns the named memory whatever its
+            state. Each such neighbour is flagged ``"hidden": true``; the key is
+            absent on visible ones. Expired memories stay hidden either way, so
+            an expired id expands with no ``graph_neighbors``.
     """
     # WHY the default differs from `memory_recall` (issue #1896, owner decision
     # 2026-09-24) — kept as a COMMENT, not in the docstring: FastMCP publishes a
@@ -838,7 +850,7 @@ async def memory_expand(
                 mid,
                 max_depth=2,
                 min_strength=0.3,
-                include_hidden=include_deprecated,
+                include_deprecated=include_deprecated,
             )
             if traversal.nodes:
                 d["graph_neighbors"] = [
@@ -864,7 +876,7 @@ async def memory_expand(
     # This tool defaults the flag ON, so the previous hoisted placement paid a
     # full table scan on every miss.
     if not await _label_hidden_neighbours(
-        memory_mod._db, results, include_hidden=include_deprecated
+        memory_mod._db, results, include_deprecated=include_deprecated
     ):
         _mark_visibility_unknown(results)
 

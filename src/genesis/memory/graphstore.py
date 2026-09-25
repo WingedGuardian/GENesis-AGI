@@ -102,7 +102,7 @@ class GraphModeUnsupported(GraphUnavailableError):
     over SQL, say) raises the same error". This names the case rather than
     leaving it indistinguishable from a dead engine.
 
-    Raised today by the NetworkX store for `traverse(include_hidden=True)`: its
+    Raised today by the NetworkX store for `traverse(include_deprecated=True)`: its
     projection is filtered at BUILD time, so serving hidden memories would mean
     holding a second unfiltered graph. MEASURED on the live graph, which is why
     it declines rather than doing that — a second projection costs ~148 MiB held
@@ -142,10 +142,55 @@ class GraphModeUnsupported(GraphUnavailableError):
 #: unparenthesised `(expired) OR deprecated != 0` parses as
 #: `(expired) OR (deprecated AND in_set)` — which returns expired memories from
 #: OUTSIDE the requested set, silently and with a plausible-looking row count.
-_INVALID_MEMORY_PREDICATE = """(
-        (invalid_at IS NOT NULL AND invalid_at <= ?)
-        OR deprecated != 0
+#: The two independent reasons a memory is hidden, each named once so the two
+#: widths below cannot drift apart. `deprecated != 0` is NULL-safe by omission:
+#: a NULL `deprecated` (legacy pre-migration rows) yields NULL, which leaves the
+#: row OUT of the hidden set — i.e. visible, which is the intended reading.
+def _expired_limb(prefix: str) -> str:
+    return f"({prefix}invalid_at IS NOT NULL AND {prefix}invalid_at <= ?)"
+
+
+def _deprecated_limb(prefix: str) -> str:
+    return f"{prefix}deprecated != 0"
+
+
+def hidden_predicate(*, alias: str = "", gated: bool) -> str:
+    """The visibility predicate, in ONE of its two widths. Never a value.
+
+    ``gated=False`` is the WIDE form: both reasons hide, unconditionally. Used by
+    the NetworkX build-time row filter and by the labelling query, which must
+    treat an expired memory as hidden however the caller asked.
+
+    ``gated=True`` is the TRAVERSAL form, narrower and deliberately so. Expiry
+    hides UNCONDITIONALLY; deprecation hides only when the caller did not ask for
+    it. That mirrors ``db.crud.memory.search_ranked`` exactly — it applies its
+    ``invalid_at`` clause always ("The bitemporal ``invalid_at`` filter is ALWAYS
+    applied", its own docstring at :174) and gates only the ``deprecated`` clause
+    on ``include_deprecated`` (:212). Matching it is the point: enrichment must
+    not surface what the search beside it hides, and an earlier version of this
+    code un-hid BOTH limbs, so ``include_deprecated=True`` returned expired graph
+    neighbours the same call's search could never return (review on PR #2339).
+
+    Parameter order is ``(now,)`` wide and ``(now, include_deprecated)`` gated,
+    in textual order. The ``? = 0`` guard kills the deprecation limb rather than
+    widening the expiry one, so no value of the flag un-hides an expired memory.
+
+    ``alias`` qualifies the columns for a correlated subquery (``alias="m"`` ->
+    ``m.invalid_at``). A FUNCTION rather than two module constants because the
+    recursive-CTE caller needs the aliased spelling and hand-wrote its own copy
+    when only unaliased constants existed — three copies of the gated form, which
+    is exactly the drift this predicate is supposed to be the single source for.
+    """
+    prefix = f"{alias}." if alias else ""
+    expired, deprecated = _expired_limb(prefix), _deprecated_limb(prefix)
+    tail = f"(? = 0 AND {deprecated})" if gated else deprecated
+    return f"""(
+        {expired}
+        OR {tail}
     )"""
+
+
+_INVALID_MEMORY_PREDICATE = hidden_predicate(gated=False)
 
 _INVALID_MEMORY_SQL = f"""
     SELECT memory_id FROM memory_metadata
@@ -224,7 +269,7 @@ class GraphStore(Protocol):
         *,
         max_depth: int,
         min_strength: float,
-        include_hidden: bool = False,
+        include_deprecated: bool = False,
     ) -> list[GraphNode]:
         """Neighbours reachable from ``root_id``.
 
@@ -232,11 +277,12 @@ class GraphStore(Protocol):
         yields ``[]`` — that is genuinely "no neighbours", not unavailability.
         Raises ``GraphUnavailableError`` if the backend cannot be reached.
 
-        ``include_hidden`` carries the CALLER'S visibility choice to the store,
-        and it defaults to False so every existing call site keeps its exact
-        present behaviour. True means the predicate above is not applied AT ALL
-        — not to the root, not to any hop — so a traversal can both START from
-        and PASS THROUGH a memory normal recall hides.
+        ``include_deprecated`` carries the CALLER'S visibility choice to the
+        store, and it defaults to False so every existing call site keeps its
+        exact present behaviour. True un-hides the DEPRECATION limb only — not
+        to the root, not to any hop — so a traversal can both START from and
+        PASS THROUGH a deprecated memory. A bitemporally EXPIRED memory stays
+        hidden at every value of this flag.
 
         Why the parameter has to live here rather than above the seam: the
         predicate is applied INSIDE each backend (a build-time row filter in
@@ -250,11 +296,15 @@ class GraphStore(Protocol):
         roots carrying 10–24 out-edges each returned 0 neighbours on ALL THREE
         backends, while visible controls returned 23–41.
 
-        Named ``include_hidden``, NOT ``include_deprecated``, because the
-        predicate hides two different things — a non-zero ``deprecated`` AND a
-        bitemporally expired ``invalid_at`` — and this flag un-hides both. The
-        MCP-facing parameter keeps its public name (``include_deprecated``) and
-        maps onto this one; the wider name is the honest one at this layer.
+        The name matches the MCP-facing parameter because the WIDTHS now match.
+        The default predicate hides two independent things — a non-zero
+        ``deprecated`` AND a bitemporally expired ``invalid_at`` — and this flag
+        un-hides only the first, exactly as ``search_ranked`` does. An earlier
+        version of this parameter was called ``include_hidden`` and un-hid both,
+        which let ``memory_recall(include_deprecated=True)`` return an expired
+        neighbour that its own search could never return. Widening beyond the
+        search contract is a change to the PUBLIC contract, so it does not get
+        to happen as a side effect of naming a store-level flag broadly.
         """
         ...
 

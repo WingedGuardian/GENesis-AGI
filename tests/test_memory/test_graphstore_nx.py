@@ -183,7 +183,7 @@ def _assert_accepts_visibility_choice(store) -> None:
     """A member EXISTING is not that member ACCEPTING the facade's call.
 
     ``hasattr(store, "traverse")`` is satisfied by a store carrying the
-    pre-#1896 signature, and ``memory/graph.py`` now passes ``include_hidden``
+    pre-#1896 signature, and ``memory/graph.py`` now passes ``include_deprecated``
     UNCONDITIONALLY. Such a store raises ``TypeError``, which is not
     ``GraphUnavailableError`` — so it bypasses the facade's entire degrade chain
     (no NetworkX tier, no CTE fallback, no warning) and lands in the bare
@@ -200,13 +200,13 @@ def _assert_accepts_visibility_choice(store) -> None:
     import inspect
 
     params = inspect.signature(store.traverse).parameters
-    assert "include_hidden" in params, (
+    assert "include_deprecated" in params, (
         "GraphStore.traverse must accept the caller's visibility choice — "
-        "memory/graph.py passes include_hidden unconditionally, and a store "
+        "memory/graph.py passes include_deprecated unconditionally, and a store "
         "without it raises TypeError, which the facade does not catch"
     )
-    assert params["include_hidden"].default is False, (
-        "include_hidden must default to False, or every existing caller "
+    assert params["include_deprecated"].default is False, (
+        "include_deprecated must default to False, or every existing caller "
         "silently starts traversing memories recall hides"
     )
 

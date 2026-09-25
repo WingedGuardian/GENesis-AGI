@@ -8,7 +8,7 @@ it, and each backend applied the predicate internally.
 
 Two properties are pinned here, and the FIRST is the one that matters most:
 
-  * with ``include_hidden`` OFF, every backend answers exactly as before — this
+  * with ``include_deprecated`` OFF, every backend answers exactly as before — this
     is the hot path and the regression that would actually hurt;
   * with it ON, a hidden memory can be a root AND an intermediate hop, and the
     backends still agree with each other.
@@ -91,19 +91,46 @@ _LINKS = [
     # deeper-hop behaviour.
     ("C", "W", "supports", 0.9),
     # The BITEMPORAL limb. Every other node is seeded `invalid_at = NULL`, so
-    # without this the whole suite exercised only `deprecated != 0` — while four
-    # docstrings claim the flag un-hides an EXPIRED memory too. A mutation
-    # gating only the deprecated limb passed everywhere.
+    # without this the whole suite exercised only `deprecated != 0`, and a
+    # mutation gating just that limb passed everywhere. Q is what makes the
+    # limbs' DIFFERENT widths observable: expiry hides at every flag value,
+    # deprecation only at the default. Adding this row is what surfaced the
+    # PR #2339 finding — the flag was un-hiding both.
     ("D", "Q", "supports", 0.9),
+    # Q needs an OUT-EDGE or the "not traversable as a ROOT" assertions are
+    # VACUOUS: with no row whose `source_id` is Q, `traverse("Q")` returns []
+    # because there is nothing to walk, and the anchor-SOURCE expiry clause is
+    # never the deciding predicate. MEASURED (PR #2339 review): neutralising that
+    # clause was invisible across all 8 roots x 2 flag values without this row,
+    # and is RED with it. Exactly the hole W was added to close for depth, in the
+    # other limb. E is already visible, so no oracle expectation moves.
+    ("Q", "E", "supports", 0.9),
 ]
-#: Hidden because superseded.
+#: Hidden because superseded. `include_deprecated=True` un-hides THESE.
 _DEPRECATED = {"H", "W"}
 #: Hidden because bitemporally expired — a DIFFERENT limb of the same predicate,
-#: and the one nothing reached before.
+#: and one the flag must NEVER un-hide, because `search_ranked` applies its
+#: `invalid_at` clause unconditionally. If these ever became reachable via the
+#: flag, graph enrichment would surface what the search beside it cannot.
 _EXPIRED = {"Q"}
+#: Hidden under the DEFAULT. Not "hidden under every flag value" — that is the
+#: distinction the two sets above exist to keep, and conflating them is the
+#: defect this suite now pins (review finding on PR #2339).
 _HIDDEN = _DEPRECATED | _EXPIRED
 #: Far enough in the past to be expired under any clock this test runs on.
 _PAST = "2020-01-01T00:00:00+00:00"
+
+
+def _oracle_visible(node: str, include_deprecated: bool) -> bool:
+    """Whether traversal may reach ``node`` at this flag value.
+
+    Expiry is unconditional; deprecation is the caller's choice. Written as the
+    two separate limbs rather than as one set difference so that a future change
+    to either width has to touch the limb it actually changes.
+    """
+    if node in _EXPIRED:
+        return False
+    return include_deprecated or node not in _DEPRECATED
 
 
 @pytest.fixture
@@ -160,33 +187,33 @@ def pin_nx_store(monkeypatch):
     monkeypatch.setattr(graph_mod, "_traversal_store", lambda: graph_mod._store)
 
 
-async def _ids(store, db, root, *, include_hidden=False, depth=3):
+async def _ids(store, db, root, *, include_deprecated=False, depth=3):
     """Ids from a store DIRECTLY. Visible mode only — the NetworkX store
-    declines `include_hidden=True` by design, so a hidden traversal is a facade
+    declines `include_deprecated=True` by design, so a hidden traversal is a facade
     question (`_facade_ids`), not a store one."""
     nodes = await store.traverse(
-        db, root, max_depth=depth, min_strength=0.0, include_hidden=include_hidden
+        db, root, max_depth=depth, min_strength=0.0, include_deprecated=include_deprecated
     )
     return [n.memory_id for n in nodes]
 
 
-async def _cte_ids(db, root, *, include_hidden=False, depth=3):
-    nodes = await _traverse_cte(db, root, depth, 0.0, include_hidden)
+async def _cte_ids(db, root, *, include_deprecated=False, depth=3):
+    nodes = await _traverse_cte(db, root, depth, 0.0, include_deprecated)
     return [n.memory_id for n in nodes]
 
 
-async def _facade_ids(db, root, *, include_hidden=False, depth=3):
+async def _facade_ids(db, root, *, include_deprecated=False, depth=3):
     """Ids through the PUBLIC facade — the path a caller actually takes, decline
     and re-route included. This is what must be asserted for the hidden mode."""
     from genesis.memory import graph as graph_mod
 
     result = await graph_mod.traverse(
-        db, root, max_depth=depth, min_strength=0.0, include_hidden=include_hidden
+        db, root, max_depth=depth, min_strength=0.0, include_deprecated=include_deprecated
     )
     return [n.memory_id for n in result.nodes]
 
 
-def _oracle_ids(root, *, depth=3, include_hidden):
+def _oracle_ids(root, *, depth=3, include_deprecated):
     """An INDEPENDENT expectation, from the walk over a graph built in the test.
 
     The withdrawn design gave hidden-mode parity between the walk and the CTE for
@@ -198,7 +225,7 @@ def _oracle_ids(root, *, depth=3, include_hidden):
     """
     g = nx.MultiDiGraph()
     for src, tgt, lt, strength in _LINKS:
-        if include_hidden or (src not in _HIDDEN and tgt not in _HIDDEN):
+        if _oracle_visible(src, include_deprecated) and _oracle_visible(tgt, include_deprecated):
             g.add_edge(src, tgt, key=lt, link_type=lt, strength=strength)
     if root not in g:
         return []
@@ -249,13 +276,15 @@ async def test_default_traversal_does_not_pass_through_a_hidden_node(vis_db):
     )
 
 
-async def test_include_hidden_defaults_to_false(vis_db):
+async def test_include_deprecated_defaults_to_false(vis_db):
     """Passing nothing must behave exactly as passing False — the entire
     existing call graph relies on it (drift.py, dream centrality, the compact
     recall path)."""
     store = NetworkxGraphStore()
-    assert await _ids(store, vis_db, "A") == await _ids(store, vis_db, "A", include_hidden=False)
-    assert await _cte_ids(vis_db, "A") == await _cte_ids(vis_db, "A", include_hidden=False)
+    assert await _ids(store, vis_db, "A") == await _ids(
+        store, vis_db, "A", include_deprecated=False
+    )
+    assert await _cte_ids(vis_db, "A") == await _cte_ids(vis_db, "A", include_deprecated=False)
 
 
 # ── the fix ───────────────────────────────────────────────────────────────
@@ -264,18 +293,18 @@ async def test_include_hidden_defaults_to_false(vis_db):
 async def test_hidden_root_returns_its_neighbours_when_asked(vis_db):
     """THE defect (#1896): the caller asked for the deprecated memory, so its
     neighbours must come back too."""
-    assert await _facade_ids(vis_db, "H", include_hidden=True) == ["E"]
-    assert await _cte_ids(vis_db, "H", include_hidden=True) == ["E"]
+    assert await _facade_ids(vis_db, "H", include_deprecated=True) == ["E"]
+    assert await _cte_ids(vis_db, "H", include_deprecated=True) == ["E"]
     # Independent expectation, not a second reading of the same engine.
-    assert _oracle_ids("H", include_hidden=True) == ["E"]
+    assert _oracle_ids("H", include_deprecated=True) == ["E"]
 
 
 async def test_hidden_neighbour_appears_when_asked(vis_db):
     """Distinct from the root question, and the issue says so explicitly: this
     is about a hidden neighbour of a VISIBLE root."""
-    assert "H" in await _facade_ids(vis_db, "A", include_hidden=True)
-    assert "H" in await _cte_ids(vis_db, "A", include_hidden=True)
-    assert "H" in _oracle_ids("A", include_hidden=True)
+    assert "H" in await _facade_ids(vis_db, "A", include_deprecated=True)
+    assert "H" in await _cte_ids(vis_db, "A", include_deprecated=True)
+    assert "H" in _oracle_ids("A", include_deprecated=True)
 
 
 async def test_traversal_passes_through_a_hidden_node_when_asked(vis_db):
@@ -284,13 +313,13 @@ async def test_traversal_passes_through_a_hidden_node_when_asked(vis_db):
     from genesis.memory import graph as graph_mod
 
     result = await graph_mod.traverse(
-        vis_db, "A", max_depth=2, min_strength=0.0, include_hidden=True
+        vis_db, "A", max_depth=2, min_strength=0.0, include_deprecated=True
     )
     by_id = {n.memory_id: n for n in result.nodes}
     assert "E" in by_id and by_id["E"].depth == 2, "E at depth 2 requires crossing H"
     cte = await _traverse_cte(vis_db, "A", 2, 0.0, True)
     assert {n.memory_id for n in cte} >= {"H", "E"}
-    assert "E" in _oracle_ids("A", depth=2, include_hidden=True)
+    assert "E" in _oracle_ids("A", depth=2, include_deprecated=True)
 
 
 async def test_flag_on_never_loses_a_node_the_default_showed(vis_db):
@@ -300,24 +329,24 @@ async def test_flag_on_never_loses_a_node_the_default_showed(vis_db):
     store = NetworkxGraphStore()
     for root in ("A", "C", "D", "X", "W", "Q"):
         off = set(await _ids(store, vis_db, root))
-        on = set(await _facade_ids(vis_db, root, include_hidden=True))
+        on = set(await _facade_ids(vis_db, root, include_deprecated=True))
         assert off <= on, f"{root}: {off - on} disappeared when un-hiding"
 
 
 # ── cross-backend parity: which backend answers must not matter ───────────
 
 
-@pytest.mark.parametrize("include_hidden", [False, True])
+@pytest.mark.parametrize("include_deprecated", [False, True])
 @pytest.mark.parametrize("root", ["A", "C", "D", "E", "H", "X", "W", "Q"])
-async def test_backends_agree_field_for_field(vis_db, root, include_hidden):
-    cte = await _traverse_cte(vis_db, root, 3, 0.0, include_hidden)
+async def test_backends_agree_field_for_field(vis_db, root, include_deprecated):
+    cte = await _traverse_cte(vis_db, root, 3, 0.0, include_deprecated)
     cte_ids = [n.memory_id for n in cte]
 
-    if not include_hidden:
+    if not include_deprecated:
         # Two real engines answering the same question, field for field.
         store = NetworkxGraphStore()
         walk = await store.traverse(
-            vis_db, root, max_depth=3, min_strength=0.0, include_hidden=False
+            vis_db, root, max_depth=3, min_strength=0.0, include_deprecated=False
         )
 
         def shape(ns):
@@ -328,10 +357,10 @@ async def test_backends_agree_field_for_field(vis_db, root, include_hidden):
         # The NetworkX store declines this mode, so there is no second engine to
         # compare against — the ORACLE stands in, which is stronger than
         # comparing the facade (which re-routes here) to the CTE it routes to.
-        assert cte_ids == _oracle_ids(root, include_hidden=True), (
+        assert cte_ids == _oracle_ids(root, include_deprecated=True), (
             "the CTE's hidden-mode answer diverges from the walk's semantics"
         )
-        assert await _facade_ids(vis_db, root, include_hidden=True) == cte_ids, (
+        assert await _facade_ids(vis_db, root, include_deprecated=True) == cte_ids, (
             "the facade did not route this mode to the CTE"
         )
 
@@ -420,149 +449,39 @@ async def test_centrality_is_not_reachable_by_the_hidden_flag(vis_db):
     import inspect
 
     sig = inspect.signature(NetworkxGraphStore.centrality)
-    assert "include_hidden" not in sig.parameters
-
-
-# ── the callers: the flag has to actually be threaded ─────────────────────
-#
-# Everything above proves the stores HONOUR the flag. These prove the two MCP
-# surfaces PASS it — which is the defect as reported. Written as behavioural
-# tests driving the real tool functions, not as an AST check for the keyword: a
-# call site can contain `include_hidden=...` and still be unreachable, and a
-# keyword can be present and bound to the wrong thing.
-
-
-@pytest.fixture
-async def labelled_db():
-    """A real database for the label tests, closed UNCONDITIONALLY.
-
-    Deliberately a fixture rather than an open/close pair inside the test body.
-    An `await conn.close()` on the last line does not run when an assertion above
-    it fails, and an unclosed aiosqlite connection holds a live THREAD — which
-    blocks event-loop teardown, so the run HANGS instead of reporting the
-    failure. Measured while verify-RED was mutating this file: a mutation that
-    should have produced a clean red produced a 180s timeout.
-    """
-    db = await aiosqlite.connect(":memory:")
-    await db.execute(
-        """CREATE TABLE memory_metadata (
-               memory_id TEXT PRIMARY KEY, invalid_at TEXT, deprecated INTEGER)"""
-    )
-    try:
-        yield db
-    finally:
-        await db.close()
-
-
-@pytest.fixture
-def _mcp_state():
-    from unittest.mock import MagicMock
-
-    from genesis.mcp import memory_mcp
-
-    memory_mcp.init(db=MagicMock(), qdrant_client=MagicMock(), embedding_provider=MagicMock())
-    yield memory_mcp
-    memory_mcp._store = None
-    memory_mcp._retriever = None
-    memory_mcp._user_model_evolver = None
-    memory_mcp._db = None
-    memory_mcp._qdrant = None
-
-
-class _TraverseRecorder:
-    """Stands in for graph_traverse and records the visibility argument."""
-
-    def __init__(self):
-        self.calls: list[dict] = []
-
-    async def __call__(self, db, root_id, **kwargs):
-        self.calls.append({"root_id": root_id, **kwargs})
-
-        class _R:
-            nodes: list = []
-            query_ms = 0.0
-
-        return _R()
-
-
-@pytest.mark.parametrize("asked", [False, True])
-async def test_memory_recall_threads_the_visibility_choice(_mcp_state, monkeypatch, asked):
-    from unittest.mock import AsyncMock
-
-    from genesis.mcp.memory import core as core_mod
-    from genesis.memory.types import RetrievalResult
-
-    rec = _TraverseRecorder()
-    monkeypatch.setattr(core_mod, "graph_traverse", rec)
-    _mcp_state._retriever.recall = AsyncMock(
-        return_value=[
-            RetrievalResult(
-                memory_id="11111111-1111-1111-1111-111111111111",
-                content="c",
-                source="test",
-                memory_type="episodic",
-                score=0.9,
-                vector_rank=1,
-                fts_rank=1,
-                activation_score=0.8,
-                payload={},
-            )
-        ]
-    )
-
-    await core_mod.memory_recall.fn(
-        query="q",
-        include_deprecated=asked,
-        compact=False,
-        include_graph=True,
-        corrective=False,
-    )
-
-    assert rec.calls, "graph enrichment never ran — this test proves nothing"
-    assert rec.calls[0]["include_hidden"] is asked
-
-
-@pytest.mark.parametrize("asked", [False, True])
-async def test_memory_expand_threads_the_visibility_choice(_mcp_state, monkeypatch, asked):
-    from types import SimpleNamespace
-
-    from genesis.mcp.memory import core as core_mod
-
-    rec = _TraverseRecorder()
-    monkeypatch.setattr(core_mod, "graph_traverse", rec)
-    mid = "22222222-2222-2222-2222-222222222222"
-    point = SimpleNamespace(id=mid, payload={"content": "c", "origin_class": "x"})
-    _mcp_state._qdrant.retrieve = lambda collection_name, ids, with_payload: (
-        [point] if collection_name == "episodic_memory" else []
-    )
-
-    await core_mod.memory_expand.fn(memory_ids=[mid], include_deprecated=asked)
-
-    assert rec.calls, "graph enrichment never ran — this test proves nothing"
-    assert rec.calls[0]["include_hidden"] is asked
+    assert "include_deprecated" not in sig.parameters
 
 
 # ── both limbs of the predicate, not just the deprecated one ──────────────
 
 
 @pytest.mark.parametrize("backend", ["nx", "cte"])
-async def test_an_EXPIRED_memory_is_hidden_by_default_and_shown_when_asked(vis_db, backend):
-    """`include_hidden` is named for VISIBILITY, not for deprecation, and the
-    predicate has two independent limbs: a non-zero `deprecated` and an
-    `invalid_at` in the past. Q is expired and NOT deprecated, so it reaches the
-    second limb only.
+async def test_an_EXPIRED_memory_stays_hidden_even_when_deprecated_is_asked_for(vis_db, backend):
+    """The flag un-hides ONE of the predicate's two limbs, and this pins which.
 
-    Nothing exercised this before: every fixture row was seeded
-    `invalid_at = NULL`, so a change gating only the deprecated limb passed the
-    entire suite while four docstrings claimed otherwise.
+    The predicate hides for two independent reasons: a non-zero `deprecated` and
+    an `invalid_at` in the past. Q is expired and NOT deprecated, so it reaches
+    the second limb only — and no value of `include_deprecated` may reach it.
+
+    This test asserted the OPPOSITE until a review finding on PR #2339. The flag
+    used to be called `include_hidden` and suppressed the whole predicate, so
+    `memory_recall(include_deprecated=True)` returned expired graph neighbours
+    that its own search could never return: `db.crud.memory.search_ranked`
+    applies its `invalid_at` clause unconditionally and gates only the
+    `deprecated` one. Graph enrichment must not surface what the search beside it
+    hides, which is the rule the wider flag broke.
+
+    Nothing exercised this limb at all before the fixture gained Q: every other
+    row is seeded `invalid_at = NULL`, so a change gating only the deprecated
+    limb passed the entire suite.
     """
 
-    async def run(root, *, include_hidden):
+    async def run(root, *, include_deprecated):
         if backend == "nx":
             # Via the facade: the store declines this mode and the facade
             # re-routes it, which is the behaviour a caller actually sees.
-            return await _facade_ids(vis_db, root, include_hidden=include_hidden)
-        return await _cte_ids(vis_db, root, include_hidden=include_hidden)
+            return await _facade_ids(vis_db, root, include_deprecated=include_deprecated)
+        return await _cte_ids(vis_db, root, include_deprecated=include_deprecated)
 
     # Guard-the-guard: Q must really be expired-and-not-deprecated, or this test
     # is just another deprecation test wearing a different name.
@@ -574,14 +493,26 @@ async def test_an_EXPIRED_memory_is_hidden_by_default_and_shown_when_asked(vis_d
         f"fixture does not isolate the bitemporal limb: {invalid_at=} {deprecated=}"
     )
 
-    assert "Q" not in await run("D", include_hidden=False), (
+    assert "Q" not in await run("D", include_deprecated=False), (
         "an expired memory must be hidden by default"
     )
-    assert "Q" in await run("D", include_hidden=True), (
-        "include_hidden must un-hide an EXPIRED memory, not only a deprecated one"
+    assert "Q" not in await run("D", include_deprecated=True), (
+        "include_deprecated must NOT un-hide an EXPIRED memory — the search beside "
+        "this traversal applies its invalid_at filter unconditionally, so a caller "
+        "would get a neighbour it could never retrieve as a hit (PR #2339 review)"
     )
-    # And it is a root in its own right, symmetrically with the deprecated case.
-    assert await run("Q", include_hidden=False) == []
+    # Unreachable as a ROOT at either flag value, for the same reason.
+    assert await run("Q", include_deprecated=False) == []
+    assert await run("Q", include_deprecated=True) == [], (
+        "an expired memory must not become traversable as a root either"
+    )
+    # CONTROL, so this cannot pass by the traversal being broken outright: the
+    # DEPRECATED limb must still respond to the flag on the very same call.
+    assert "W" not in await run("A", include_deprecated=False)
+    assert "W" in await run("A", include_deprecated=True), (
+        "the deprecated limb stopped responding to the flag — this test would "
+        "otherwise pass simply because nothing is ever reachable"
+    )
 
 
 @pytest.mark.parametrize("backend", ["nx", "cte"])
@@ -592,24 +523,26 @@ async def test_a_hidden_node_at_DEPTH_2_is_gated(vis_db, backend):
     fixture combinations before W existed.
     """
 
-    async def run(root, *, include_hidden, depth=3):
+    async def run(root, *, include_deprecated, depth=3):
         if backend == "nx":
-            return await _facade_ids(vis_db, root, include_hidden=include_hidden, depth=depth)
-        return await _cte_ids(vis_db, root, include_hidden=include_hidden, depth=depth)
+            return await _facade_ids(
+                vis_db, root, include_deprecated=include_deprecated, depth=depth
+            )
+        return await _cte_ids(vis_db, root, include_deprecated=include_deprecated, depth=depth)
 
     # Guard-the-guard: W must be at depth 2 from A and depth 1 from C.
-    assert "W" in await run("C", include_hidden=True, depth=1), (
+    assert "W" in await run("C", include_deprecated=True, depth=1), (
         "fixture moved: W is no longer a direct neighbour of C"
     )
-    assert "W" not in await run("A", include_hidden=True, depth=1), (
+    assert "W" not in await run("A", include_deprecated=True, depth=1), (
         "fixture moved: W is reachable from A at depth 1, so this is not a depth-2 case at all"
     )
 
-    assert "W" not in await run("A", include_hidden=False), (
+    assert "W" not in await run("A", include_deprecated=False), (
         "a hidden node at depth 2 leaked with the flag off — the recursive-step "
         "visibility clause is not binding"
     )
-    assert "W" in await run("A", include_hidden=True)
+    assert "W" in await run("A", include_deprecated=True)
 
 
 # ── the NetworkX store DECLINES this mode, and the facade routes it ───────
@@ -626,7 +559,7 @@ async def test_the_networkx_store_declines_hidden_traversal(vis_db):
     """
     store = NetworkxGraphStore()
     with pytest.raises(GraphModeUnsupported):
-        await store.traverse(vis_db, "H", max_depth=2, min_strength=0.0, include_hidden=True)
+        await store.traverse(vis_db, "H", max_depth=2, min_strength=0.0, include_deprecated=True)
     # Still a GraphUnavailableError, so every existing handler keeps working.
     assert issubclass(GraphModeUnsupported, GraphUnavailableError)
 
@@ -637,7 +570,7 @@ async def test_declining_is_cheap_and_builds_no_projection(vis_db):
     withdrawn design's cost is exactly what this route exists to avoid."""
     store = NetworkxGraphStore()
     with pytest.raises(GraphModeUnsupported):
-        await store.traverse(vis_db, "H", max_depth=2, min_strength=0.0, include_hidden=True)
+        await store.traverse(vis_db, "H", max_depth=2, min_strength=0.0, include_deprecated=True)
     assert store._graph is None, "the store built a projection on its way to declining"
 
 
@@ -654,7 +587,7 @@ async def test_the_facade_routes_a_declined_mode_to_the_CTE(vis_db, monkeypatch)
 
     hidden_off = await graph_mod.traverse(vis_db, "H", max_depth=3, min_strength=0.0)
     hidden_on = await graph_mod.traverse(
-        vis_db, "H", max_depth=3, min_strength=0.0, include_hidden=True
+        vis_db, "H", max_depth=3, min_strength=0.0, include_deprecated=True
     )
     assert [n.memory_id for n in hidden_off.nodes] == [], (
         "the default must still hide a hidden root"
@@ -674,276 +607,13 @@ async def test_the_facade_does_not_log_a_warning_for_a_declined_mode(vis_db, mon
     monkeypatch.setattr(graph_mod, "_traversal_store", lambda: graph_mod._store)
     with caplog.at_level(logging.WARNING, logger="genesis.memory.graph"):
         result = await graph_mod.traverse(
-            vis_db, "H", max_depth=3, min_strength=0.0, include_hidden=True
+            vis_db, "H", max_depth=3, min_strength=0.0, include_deprecated=True
         )
     assert [n.memory_id for n in result.nodes] == ["E"], (
         "guard-the-guard: the call must have actually taken the decline path"
     )
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
         f"declining logged at WARNING: {[r.getMessage() for r in caplog.records]}"
-    )
-
-
-# ── the hidden neighbours are LABELLED, not merely returned ───────────────
-
-
-class _TwoNodeTraversal:
-    """A traversal result carrying one hidden and one visible neighbour."""
-
-    def __init__(self, hidden_id, visible_id):
-        from genesis.memory.graphstore import GraphNode
-
-        self.nodes = [
-            GraphNode(memory_id=hidden_id, link_type="supports", depth=1, strength=0.9),
-            GraphNode(memory_id=visible_id, link_type="supports", depth=1, strength=0.8),
-        ]
-        self.query_ms = 0.0
-
-
-@pytest.mark.parametrize("tool", ["memory_recall", "memory_expand"])
-async def test_a_hidden_neighbour_is_LABELLED_when_the_caller_opted_in(
-    _mcp_state, monkeypatch, tool, labelled_db
-):
-    """Un-hiding without labelling hands a caller superseded ids that look live.
-
-    The flag is per-CALL, not per-root, so it also un-hides neighbours of VISIBLE
-    memories — MEASURED on the live graph: 11,032 of 73,823 visible memories with
-    out-edges (14.9%) gain at least one hidden neighbour at depth 1 alone. A
-    caller following a ``[→ related: id:…]`` hint would otherwise have no way to
-    tell a superseded neighbour from a live one, and the documented next step is
-    to expand it.
-
-    ``hidden`` is present ONLY on a hidden neighbour, so its ABSENCE means
-    visible — asserted in both directions here, because a label that is always
-    present or always absent carries no information.
-    """
-    from unittest.mock import AsyncMock
-
-    from genesis.mcp.memory import core as core_mod
-    from genesis.memory.types import RetrievalResult
-
-    hidden_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-    visible_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-    root_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
-
-    async def _fake_traverse(db, rid, **kw):
-        return _TwoNodeTraversal(hidden_id, visible_id)
-
-    monkeypatch.setattr(core_mod, "graph_traverse", _fake_traverse)
-    # A REAL database, and `_hidden_neighbour_ids` is NOT mocked. An earlier
-    # version of this test monkeypatched it, which made the test grade a mock —
-    # so deleting the real label logic entirely left it green. A mutation sweep
-    # caught that. The lesson: the one function under test is the one thing a
-    # test must never stand in for.
-    await labelled_db.executemany(
-        "INSERT INTO memory_metadata VALUES (?, NULL, ?)",
-        [(hidden_id, 1), (visible_id, 0), (root_id, 0)],
-    )
-    await labelled_db.commit()
-    monkeypatch.setattr(_mcp_state, "_db", labelled_db)
-
-    async def run(*, include_deprecated):
-        if tool == "memory_recall":
-            _mcp_state._retriever.recall = AsyncMock(
-                return_value=[
-                    RetrievalResult(
-                        memory_id=root_id,
-                        content="c",
-                        source="t",
-                        memory_type="episodic",
-                        score=0.9,
-                        vector_rank=1,
-                        fts_rank=1,
-                        activation_score=0.8,
-                        payload={},
-                    )
-                ]
-            )
-            out = await core_mod.memory_recall.fn(
-                query="q",
-                include_deprecated=include_deprecated,
-                compact=False,
-                include_graph=True,
-                corrective=False,
-            )
-        else:
-            from types import SimpleNamespace
-
-            point = SimpleNamespace(id=root_id, payload={"content": "c", "origin_class": "x"})
-            _mcp_state._qdrant.retrieve = lambda collection_name, ids, with_payload: (
-                [point] if collection_name == "episodic_memory" else []
-            )
-            out = await core_mod.memory_expand.fn(
-                memory_ids=[root_id],
-                include_deprecated=include_deprecated,
-            )
-        return {n["memory_id"]: n for n in out[0]["graph_neighbors"]}
-
-    by_id = await run(include_deprecated=True)
-    assert by_id[hidden_id].get("hidden") is True, (
-        "a hidden neighbour came back unlabelled — indistinguishable from a live one"
-    )
-    assert "hidden" not in by_id[visible_id], (
-        "a VISIBLE neighbour was labelled hidden, so the label means nothing"
-    )
-
-    off = await run(include_deprecated=False)
-    assert not any("hidden" in n for n in off.values()), (
-        "the label appeared with the flag off, where no hidden neighbour can exist"
-    )
-
-
-async def test_the_label_lookup_is_skipped_entirely_when_not_opted_in(_mcp_state):
-    """With the predicate applied, no hidden id can be in the result — so the
-    lookup is a guaranteed-useless query on the hot path and must not run.
-
-    `db=None` is the proof: it would raise if anything touched the database.
-    """
-    from genesis.mcp.memory import core as core_mod
-
-    results = [{"graph_neighbors": [{"memory_id": "x"}]}]
-    assert await core_mod._label_hidden_neighbours(None, results, include_hidden=False) is True
-    assert "hidden" not in results[0]["graph_neighbors"][0]
-
-
-async def test_no_query_runs_when_there_are_no_neighbours_to_label(_mcp_state):
-    """The other free case: the flag is ON but nothing came back. `memory_expand`
-    defaults the flag on, so this is its every-miss path — it must not pay a
-    query for an empty candidate set."""
-    from genesis.mcp.memory import core as core_mod
-
-    for empty in ([], [{"graph_neighbors": []}], [{"graph_neighbors": None}], [{}]):
-        assert await core_mod._label_hidden_neighbours(None, empty, include_hidden=True) is True, (
-            f"a query was attempted for {empty!r}"
-        )
-
-
-async def test_the_label_fails_open_but_REPORTS_that_it_could_not_check(_mcp_state, caplog):
-    """A label is an enrichment: failing to compute one must not cost the caller
-    their neighbours. But it must not silently assert the opposite of the truth
-    either.
-
-    Returning "nothing is hidden" for a call that could not look would mark every
-    neighbour live — MEASURED, 4,276 hidden ids on one live install — in a payload
-    whose documented next step is to expand and trust them. So the contract is:
-    neighbours survive, the return value is False, and it logs at WARNING rather
-    than DEBUG, because the caller explicitly asked to see hidden memories and
-    this is a failure of that request.
-    """
-    import logging
-
-    from genesis.mcp.memory import core as core_mod
-
-    class _Boom:
-        async def execute(self, *a, **k):
-            raise RuntimeError("database is gone")
-
-    results = [{"graph_neighbors": [{"memory_id": "x"}, {"memory_id": "y"}]}]
-    with caplog.at_level(logging.WARNING, logger="genesis.mcp.memory.core"):
-        ok = await core_mod._label_hidden_neighbours(_Boom(), results, include_hidden=True)
-    assert ok is False, "a failed check must report itself, not return silently"
-    assert len(results[0]["graph_neighbors"]) == 2, (
-        "fail-open broken: the caller lost their neighbours"
-    )
-    assert not any("hidden" in n for n in results[0]["graph_neighbors"]), (
-        "labels were invented on a call that could not check"
-    )
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING], (
-        "the failure was logged below WARNING, where production will not see it"
-    )
-
-
-@pytest.mark.parametrize("tool", ["memory_recall", "memory_expand"])
-async def test_a_failed_label_check_withdraws_the_absence_contract(_mcp_state, monkeypatch, tool):
-    """END TO END: when labelling cannot run, the response must not let absence be
-    read as "visible". Both tools mark it.
-
-    Without this, a caller sees five unlabelled neighbours and cannot tell "all
-    five are live" from "nobody checked" — and the safe-sounding reading is the
-    wrong one.
-    """
-    from unittest.mock import AsyncMock
-
-    from genesis.mcp.memory import core as core_mod
-    from genesis.memory.types import RetrievalResult
-
-    root_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
-
-    async def _fake_traverse(db, rid, **kw):
-        return _TwoNodeTraversal("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", root_id)
-
-    monkeypatch.setattr(core_mod, "graph_traverse", _fake_traverse)
-    monkeypatch.setattr(core_mod, "_label_hidden_neighbours", AsyncMock(return_value=False))
-
-    if tool == "memory_recall":
-        _mcp_state._retriever.recall = AsyncMock(
-            return_value=[
-                RetrievalResult(
-                    memory_id=root_id,
-                    content="c",
-                    source="t",
-                    memory_type="episodic",
-                    score=0.9,
-                    vector_rank=1,
-                    fts_rank=1,
-                    activation_score=0.8,
-                    payload={},
-                )
-            ]
-        )
-        out = await core_mod.memory_recall.fn(
-            query="q",
-            include_deprecated=True,
-            compact=False,
-            include_graph=True,
-            corrective=False,
-        )
-    else:
-        from types import SimpleNamespace
-
-        point = SimpleNamespace(id=root_id, payload={"content": "c", "origin_class": "x"})
-        _mcp_state._qdrant.retrieve = lambda collection_name, ids, with_payload: (
-            [point] if collection_name == "episodic_memory" else []
-        )
-        out = await core_mod.memory_expand.fn(memory_ids=[root_id], include_deprecated=True)
-
-    assert out[0].get("graph_neighbors"), (
-        "guard-the-guard: there must be neighbours for the marker to apply to"
-    )
-    assert out[0].get("graph_neighbors_visibility") == "unknown", (
-        "a response whose labels could not be computed did not say so"
-    )
-
-
-async def test_the_two_tools_defaults_are_deliberately_different(_mcp_state):
-    """`memory_recall` defaults to hiding, `memory_expand` to showing, and the
-    asymmetry is a decision rather than drift — so it is pinned here instead of
-    being left to a reader.
-
-    `memory_recall` is a SEARCH: enrichment must not surface what the search
-    beside it hides. `memory_expand` is an explicit id lookup that already
-    returns the named memory whatever its state, so suppressing only its
-    neighbours made the tool asymmetric with itself — and it is the surface the
-    proactive hook points callers at, where nothing signals that a handle is
-    deprecated.
-
-    This test existed, was deleted by accident during a restructure, and was
-    restored only because a mutation sweep noticed that nothing failed when the
-    default flipped back. A deleted test is invisible; a green sweep cell is not.
-    """
-    import inspect
-
-    from genesis.mcp.memory import core as core_mod
-
-    recall = inspect.signature(core_mod.memory_recall.fn).parameters
-    expand = inspect.signature(core_mod.memory_expand.fn).parameters
-    assert recall["include_deprecated"].default is False, (
-        "memory_recall must keep hiding by default — graph enrichment must not "
-        "surface what the search beside it hides"
-    )
-    assert expand["include_deprecated"].default is True, (
-        "memory_expand must default to showing neighbours: it already returns "
-        "the deprecated memory itself, so hiding only its edges is incoherent"
     )
 
 
@@ -965,8 +635,8 @@ class _DeadPrimary:
     def __init__(self):
         self.calls: list[bool] = []
 
-    async def traverse(self, db, root_id, *, max_depth, min_strength, include_hidden=False):
-        self.calls.append(include_hidden)
+    async def traverse(self, db, root_id, *, max_depth, min_strength, include_deprecated=False):
+        self.calls.append(include_deprecated)
         raise GraphUnavailableError("the engine is not answering")
 
     async def centrality(self, db, top_n):
@@ -1006,7 +676,7 @@ async def test_primary_down_AND_hidden_asked_still_reaches_the_CTE(vis_db, monke
 
     with caplog_at(logging.WARNING) as records:
         result = await graph_mod.traverse(
-            vis_db, "H", max_depth=3, min_strength=0.0, include_hidden=True
+            vis_db, "H", max_depth=3, min_strength=0.0, include_deprecated=True
         )
     assert dead.calls == [True], "the primary was not tried first, so this is not the degraded path"
     assert [n.memory_id for n in result.nodes] == ["E"], (
@@ -1048,7 +718,9 @@ async def test_a_declined_mode_whose_CTE_then_fails_raises_the_SEAM_type(vis_db,
 
     # The DECLINE path (NetworkX active, hidden asked).
     with pytest.raises(GraphUnavailableError) as declined:
-        await graph_mod.traverse(vis_db, "H", max_depth=3, min_strength=0.0, include_hidden=True)
+        await graph_mod.traverse(
+            vis_db, "H", max_depth=3, min_strength=0.0, include_deprecated=True
+        )
     assert "both failed" in str(declined.value), (
         "the decline path leaked a raw error instead of the seam's type"
     )
@@ -1087,11 +759,11 @@ async def test_the_mode_is_declined_even_without_networkx(vis_db, monkeypatch):
 
     store = NetworkxGraphStore()
     with pytest.raises(GraphModeUnsupported):
-        await store.traverse(vis_db, "H", max_depth=3, min_strength=0.0, include_hidden=True)
+        await store.traverse(vis_db, "H", max_depth=3, min_strength=0.0, include_deprecated=True)
 
     with caplog_at(logging.WARNING) as records:
         result = await graph_mod.traverse(
-            vis_db, "H", max_depth=3, min_strength=0.0, include_hidden=True
+            vis_db, "H", max_depth=3, min_strength=0.0, include_deprecated=True
         )
     assert [n.memory_id for n in result.nodes] == ["E"], (
         "guard-the-guard: the answer must still be correct"

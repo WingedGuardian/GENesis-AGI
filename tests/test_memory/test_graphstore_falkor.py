@@ -1577,7 +1577,7 @@ async def test_the_facade_reaches_sql_when_both_stores_are_down(monkeypatch):
 async def test_the_visibility_choice_reaches_the_ENGINE_not_just_the_signature(
     tmp_path, asked
 ):
-    """`include_hidden` must arrive as a bound query PARAMETER (issue #1896).
+    """`include_deprecated` must arrive as a bound query PARAMETER (issue #1896).
 
     This store's traversal semantics need a live engine, so CI never runs the
     real Cypher — which left the conformance test's `inspect.signature` check as
@@ -1588,7 +1588,7 @@ async def test_the_visibility_choice_reaches_the_ENGINE_not_just_the_signature(
     handed.
 
     Asserted here: the flag is present, is a genuine BOOLEAN (not a string or an
-    int, which would make `$include_hidden OR (...)` evaluate on truthiness rules
+    int, which would make `$include_deprecated OR (...)` evaluate on truthiness rules
     this code never verified), tracks the caller's argument, and the predicate it
     gates is actually in the query text. `$now` must remain bound in BOTH modes —
     the one-query-string design depends on it.
@@ -1621,23 +1621,39 @@ async def test_the_visibility_choice_reaches_the_ENGINE_not_just_the_signature(
         patch.object(store, "_assert_projection_exists", AsyncMock(return_value=None)),
     ):
         await store.traverse(
-            None, "root", max_depth=2, min_strength=0.3, include_hidden=asked
+            None, "root", max_depth=2, min_strength=0.3, include_deprecated=asked
         )
 
     assert seen, "the engine was never queried — this test proves nothing"
     params = seen["params"]
-    assert "include_hidden" in params, (
+    assert "include_deprecated" in params, (
         "the caller's visibility choice never reached the engine"
     )
-    assert params["include_hidden"] is asked, (
-        f"expected include_hidden={asked}, engine got {params['include_hidden']!r}"
+    assert params["include_deprecated"] is asked, (
+        f"expected include_deprecated={asked}, engine got {params['include_deprecated']!r}"
     )
-    assert isinstance(params["include_hidden"], bool), (
+    assert isinstance(params["include_deprecated"], bool), (
         "must be a real boolean: Cypher's OR over a non-boolean is not the "
         "semantics this predicate was measured against"
     )
-    assert "$include_hidden" in seen["cypher"], (
+    assert "$include_deprecated" in seen["cypher"], (
         "the parameter is bound but the query does not gate on it"
+    )
+    # COMPOSITION, not presence. A containment check on `$include_deprecated`
+    # cannot tell the fixed query from the defective one it replaced — MEASURED:
+    # reverting `_TRAVERSE` to `WHERE $include_deprecated OR (_VALID)`, the shape
+    # that let the flag un-hide EXPIRED memories, left 112/112 falkor tests green
+    # (PR #2339 review). These two assertions are what make that revert RED, and
+    # they are the only guard on this backend's half of the fix, because no engine
+    # runs in CI.
+    norm = " ".join(seen["cypher"].split())
+    assert f"WHERE {falkor_mod._NOT_EXPIRED} AND ($include_deprecated" in norm, (
+        "the expiry limb must sit OUTSIDE the flag — underneath it, "
+        "include_deprecated=True un-hides bitemporally expired memories, which "
+        "search_ranked can never return (db/crud/memory.py:207)"
+    )
+    assert f"($include_deprecated OR {falkor_mod._NOT_DEPRECATED})" in norm, (
+        "the flag must gate the DEPRECATION limb and nothing else"
     )
     # Params are keyed by BARE name; the `$` sigil appears only in the query
     # text. Both halves are asserted because the design's claim is that one query

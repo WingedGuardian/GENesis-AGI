@@ -439,12 +439,12 @@ class NetworkxGraphStore:
         *,
         max_depth: int,
         min_strength: float,
-        include_hidden: bool = False,
+        include_deprecated: bool = False,
     ) -> list[GraphNode]:
         """Neighbours of ``root_id``, ordered (depth, -strength).
 
         This store answers the VISIBLE question ONLY, and declines
-        ``include_hidden=True`` rather than serving it (issue #1896). The
+        ``include_deprecated=True`` rather than serving it (issue #1896). The
         projection is filtered at BUILD time, so a hidden traversal would need a
         second, unfiltered graph — and that was built, measured, and withdrawn:
 
@@ -469,7 +469,7 @@ class NetworkxGraphStore:
         logging a dead-engine warning on a healthy path.
         """
         # The MODE check comes FIRST, before the importability check, and the
-        # order is deliberate: this store cannot serve `include_hidden` whether or
+        # order is deliberate: this store cannot serve `include_deprecated` whether or
         # not NetworkX imports, so the honest verdict is "unsupported mode" rather
         # than "unavailable backend". Checking importability first was measured to
         # send an install without NetworkX down the facade's LOUD degrade path for
@@ -479,10 +479,10 @@ class NetworkxGraphStore:
         #
         # Also before any graph work: declining must be cheap, and must not warm
         # or build a projection the caller will never read.
-        if include_hidden:
+        if include_deprecated:
             raise GraphModeUnsupported(
                 "the NetworkX projection is filtered at build time, so it cannot "
-                "serve include_hidden=True — the SQL fallback answers this mode"
+                "serve include_deprecated=True — the SQL fallback answers this mode"
             )
         if not _NX_AVAILABLE:
             raise GraphUnavailableError(
