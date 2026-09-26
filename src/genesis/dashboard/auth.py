@@ -164,6 +164,34 @@ def is_authenticated() -> bool:
     return session.get("authenticated") is True
 
 
+def has_internal_bearer() -> bool:
+    """Is this request carrying the valid internal API bearer token?
+
+    Extracted rather than re-implemented at each gate: ``check_api_mutation_auth``
+    performs the same check inline, and two gates disagreeing about who counts as
+    a trusted machine caller is precisely the defect this exists to prevent — a
+    caller the mutation gate blesses being refused by a sibling gate on the same
+    request.
+
+    CSRF-immune by construction, which is why the mutation gate checks it FIRST
+    and origin-independently: an attacker in a browser cannot read a 0600 file to
+    forge the header. Never true when no token can be produced.
+    """
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    expected = get_or_create_internal_api_token()
+    if not expected:
+        return False
+    # Compare BYTES, exactly as ``check_bearer_token`` above already does.
+    # ``compare_digest`` REFUSES non-ASCII str operands, and WSGI decodes
+    # headers as latin-1 — so any high byte in the header raised TypeError and
+    # surfaced as a 500 with a stack trace. Still fail-closed, but a spammable
+    # 500 where a 401 belongs, on the widest surface in the app.
+    presented = header[7:].encode("utf-8", "surrogateescape")
+    return hmac.compare_digest(presented, expected.encode("utf-8", "surrogateescape"))
+
+
 def check_password(input_password: str) -> bool:
     """Constant-time password comparison."""
     pw = get_dashboard_password()
@@ -320,11 +348,8 @@ def check_api_mutation_auth():
     # Trusted machine caller (internal bearer token) — CSRF-immune (an attacker
     # cannot read the 0600 token file), so it is checked FIRST and is
     # origin-independent.
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        expected = get_or_create_internal_api_token()
-        if expected and hmac.compare_digest(auth_header[7:], expected):
-            return None
+    if has_internal_bearer():
+        return None
 
     # Trusted browser session (session cookie). A cookie is NOT proof of
     # same-origin intent (``SameSite=Lax`` still attaches it on a same-site sibling

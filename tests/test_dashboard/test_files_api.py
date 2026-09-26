@@ -187,10 +187,30 @@ def test_upload_relpath_traversal_stays_contained(client, tmp_path):
 
 
 def test_upload_absolute_relpath_reinterpreted_under_uploads(client, tmp_path):
-    """An absolute-looking relpath is treated as relative to the uploads root."""
-    resp = _post_upload(client, b"x", "passwd", relpath="/etc/passwd")
+    """An absolute-looking relpath is treated as relative to the uploads root.
+
+    The leaf name is deliberately neutral. This case is about PATH
+    REINTERPRETATION, and it previously used ``/etc/passwd`` — whose leaf the
+    credential vocabulary now refuses on its own merits, so the assertion would
+    have passed or failed for a reason that has nothing to do with the property
+    under test. The credential-leaf behaviour is pinned separately below.
+    """
+    resp = _post_upload(client, b"x", "hosts", relpath="/etc/hosts")
     assert resp.status_code == 200
-    assert (tmp_path / "uploads" / "etc" / "passwd").exists()
+    assert (tmp_path / "uploads" / "etc" / "hosts").exists()
+
+
+def test_upload_credential_named_leaf_is_refused_even_when_contained(client, tmp_path):
+    """Containment is not the only reason an upload is refused.
+
+    ``/etc/passwd`` reinterprets to a path safely inside the uploads root, so
+    the containment rules have no objection to it. It is refused because the
+    leaf NAMES a credential — which is what stops the file browser being used
+    to plant one at a name the reader will later trust.
+    """
+    resp = _post_upload(client, b"x", "passwd", relpath="/etc/passwd")
+    assert resp.status_code == 403
+    assert not (tmp_path / "uploads" / "etc" / "passwd").exists()
 
 
 def test_upload_deduplicates_within_folder(client, tmp_path):
