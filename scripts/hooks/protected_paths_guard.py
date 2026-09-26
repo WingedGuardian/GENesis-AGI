@@ -92,7 +92,14 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
 _DEGRADED_GATED = r"\brm\b|\brmdir\b"
 
 try:
-    from shell_parse import _REPARSE_CARRIERS, analyze_checked  # noqa: E402
+    from shell_parse import (  # noqa: E402
+        _REPARSE_CARRIERS,
+        analyze_checked,
+        blind_is_continuation,
+        continuation_groups,
+        group_text,
+        mention_view,
+    )
 except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
     if __name__ != "__main__":
         # A test importing a deliberately broken tree must see the real error, not a
@@ -258,8 +265,11 @@ def main() -> int:
     if discarded_write is not None:
         discarded_write.remember(cmd)
 
-    # Fast path: no rm/rmdir word anywhere in the command.
-    if not _RM_PATTERN.search(cmd):
+    # Fast path: no rm/rmdir word anywhere in the command — read in its raw AND its
+    # continuation-folded form, since a continuation inside the word
+    # (`r<continuation>m -rf <protected>`) hid the verb from the raw test and the
+    # guard exited without parsing a removal the shell runs. MEASURED allowed on main.
+    if not _RM_PATTERN.search(mention_view(cmd)):
         return 0
 
     dirs = _protected_dirs()
@@ -313,6 +323,20 @@ def main() -> int:
         # scanned. `blind.hint` says to write the payload to a file, which is the
         # action that shape wants anyway.
         if blind.bounds_induced:
+            return _block(
+                f"an rm command that {blind.cause}, so its real targets cannot be "
+                f"resolved. To proceed: {blind.hint}"
+            )
+        # A LINE CONTINUATION INSIDE A REMOVAL refuses outright, for the reason the
+        # bounds do: the segment scan below reads operands from segments whose
+        # boundaries the continuation moved, and the substring fallback cannot see
+        # an ancestor or a glob, so `rm -rf <continuation>$HOME/genesis` — the
+        # PARENT of the production database — would reach neither. Scoped to the
+        # continued commands that name rm (`continuation_groups`), so a continuation
+        # elsewhere in the line costs nothing.
+        if blind_is_continuation(blind) and any(
+            _RM_PATTERN.search(group_text(g)) for g in continuation_groups(segs)
+        ):
             return _block(
                 f"an rm command that {blind.cause}, so its real targets cannot be "
                 f"resolved. To proceed: {blind.hint}"

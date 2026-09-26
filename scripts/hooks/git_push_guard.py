@@ -232,10 +232,14 @@ try:
         _REPARSE_CARRIERS,
         analyze,
         analyze_checked,
+        blind_is_continuation,
         commit_skips_hooks,
+        continuation_groups,
         gh_pr_subcommand,
         git_subcommand,
+        group_text,
         has_trailing_override,
+        mention_view,
         split_segments,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -323,6 +327,7 @@ _CARRIER_GATED_MENTION = re.compile(
 # `create`, and in `gh pr create` the `gh` is BEHIND it, so that pattern matches
 # nothing and would have measured 0 false positives by never firing at all.
 _GH_MENTION = re.compile(r"\bgh\b")
+_GATED_PROGRAM = re.compile(r"\b(?:git|gh)\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
 
 #: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
@@ -10023,11 +10028,39 @@ def _run_merge_and_push_gates() -> int:
         # the prompt it raised names the VISIBLE push — so a human approving it
         # is told about the wrong command. The multiple-publish rejection is
         # skipped too, since only one segment parses as a push.
+        # A THIRD case the "no parsed gated segment" exclusion gets wrong: a line
+        # continuation (which the shell joins and the parser keeps apart) touched a
+        # gated command. Whether or not a push segment parsed, its boundaries were
+        # drawn where the shell does not draw them, so a flag or the verb itself can
+        # sit on the far side. MEASURED on main: `git push origin main
+        # <continuation>--force` asked as an ORDINARY push, the prompt never naming
+        # the force, while bash joined the lines and force-pushed; the same with the
+        # continuation inside double quotes; and with it inside the verb the push
+        # was not seen at all. Consent obtained under a description that omits the
+        # dangerous flag is worse than a silent allow, so this refuses.
+        #
+        # READ FROM THE CONTINUED COMMANDS ONLY (`continuation_groups`, joined as
+        # the shell joins them), and for the continuation cause the whole-line
+        # mention arm below stands down. Everything outside the groups was split
+        # where the shell splits it, and the ordinary gates judge it. Reading the
+        # whole line refused continued commands that merely mentioned "push" or
+        # "merge" in prose — MEASURED over the recorded corpus, none of them a
+        # gated operation.
+        # The joined text must name the PROGRAM as well as the operation: a gated
+        # word alone is prose (`echo "merge later"` continued onto a second line
+        # was refused as a merge). A launcher spelling still names the program; a
+        # verb built by an expansion is `hidden_gated_verb`'s case.
+        split_gated = any(
+            _GATED_PROGRAM.search(t) and _mentions_gated_op(t)
+            for t in (group_text(g) for g in continuation_groups(segs))
+        )
         if blind is not None and (
             hidden_gated_verb
+            or split_gated
             or (
-                not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-                and _mentions_gated_op(cmd)
+                not blind_is_continuation(blind)
+                and not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
+                and _mentions_gated_op(mention_view(cmd))
             )
         ):
             # Defer the syntax refusal so specific sqlite/no-verify blocks keep

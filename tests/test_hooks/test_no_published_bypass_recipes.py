@@ -60,6 +60,13 @@ _CONSTRUCTS = (
     "ANSI-C",
     "apostrophe",
     "line continuation",
+    # Spelling variants of the construct above. A term the detector lists is not
+    # a construct it catches: MEASURED 2026-09-25, adding "backslash-newline"
+    # surfaced a real pairing the listed spelling missed. The bare word
+    # "continuation" was measured and deliberately NOT added — it is ordinary
+    # English, and its hits were all mechanism descriptions.
+    "line" + "-continuation",
+    "backslash" + "-newline",
 )
 # The other half of the pairing: the claim that a gate stopped working.
 _OUTCOMES = (
@@ -143,6 +150,13 @@ _WINDOW = 240
 # escape hatch silences by line and gets copied to the next file without its
 # justification.
 _ALLOWED: dict[tuple[str, str, str], str] = {
+    (".claude/skills/genesis-development/SKILL.md", "backslash" + "-newline", "bypass"): (
+        "The doc's own worked example of a CLOSED defect: the destructive-command "
+        "guard's continuation fold, fixed in #1547 by folding only odd-length "
+        "runs. It is kept precisely because it teaches the case-split that "
+        "produced the defect, and it names the fix alongside the failure. "
+        "Re-examine if that fold ever changes again."
+    ),
     ("scripts/hooks/git_push_guard.py", "heredoc", "bypass"): (
         "Design rationale for a REJECTED alternative: it records that a "
         "two-token match could be split by anything inserted between the "

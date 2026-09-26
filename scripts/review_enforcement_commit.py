@@ -88,10 +88,14 @@ _DEGRADED_GATED = r"\bcommit\b"
 try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
+        blind_is_continuation,
         commit_skips_hooks,
+        continuation_groups,
         gh_pr_subcommand,
         git_subcommand,
+        group_text,
         has_trailing_override,
+        mention_view,
         split_segments,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -1005,6 +1009,17 @@ def _commit_budget_reason(result: dict) -> str:
     )
 
 
+_GIT_COMMIT_WORDS = (re.compile(r"\bgit\b"), re.compile(r"\bcommit\b"))
+
+
+def _continued_commit(segs) -> bool:
+    """Whether a command a line continuation touched names `git commit` once joined."""
+    return any(
+        all(p.search(group_text(g)) for p in _GIT_COMMIT_WORDS)
+        for g in continuation_groups(segs)
+    )
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -1013,7 +1028,10 @@ def main() -> None:
     # consumed by read_payload, so nothing further down can read it again.
     if discarded_write is not None:
         discarded_write.remember(command)
-    if not _COMMIT_PATTERN.search(command):
+    # The raw text AND its continuation-folded form: a continuation inside the verb
+    # (`com<continuation>mit`) hid it from a raw test, so the gate exited before
+    # parsing a commit the shell runs. MEASURED allowed on main.
+    if not _COMMIT_PATTERN.search(mention_view(command)):
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through
@@ -1033,7 +1051,16 @@ def main() -> None:
         # parse reports blindness. Refuse in every session type: user ruling
         # 2026-09-08 prices a false positive in an agent rewrite, not a human
         # approval. Keep main's bounds refusal and its cause-specific remedy.
-        if blind is not None:
+        #
+        # A CONTINUATION is scoped to the command it touched: it refuses only when a
+        # continued command, joined as the shell joins it, names `git commit`.
+        # Everything else in the line was split where the shell splits it, and the
+        # search above found no commit there. Unscoped, it refused any continued
+        # command that merely MENTIONED a commit — MEASURED over the recorded
+        # corpus, mostly heredoc bodies calling a database `.commit()`.
+        if blind is not None and (
+            not blind_is_continuation(blind) or _continued_commit(segs)
+        ):
             _deny(
                 f"BLOCKED: this command {blind.cause} and mentions a commit, so "
                 "review enforcement cannot verify what it would actually run.\n"
@@ -1058,6 +1085,33 @@ def main() -> None:
             "Remove it and establish a review first (`/review` where the optional "
             "`superpowers` plugin is installed, else `/deep-review`, or review and "
             "then `python3 scripts/review_state.py mark --agent-output <file>`)."
+        )
+        return
+
+    # A commit segment parsed, but the parse split it at a line continuation, which
+    # the shell joins and the parser keeps apart, so the segment's argv stops
+    # where the shell's command does not. Rule 0 above cannot see a hook-skipping
+    # flag that landed on the far side of the split. MEASURED on main and on the
+    # branch that added this: `git commit -m <continuation>x --no-verify` ASKED as
+    # an ordinary commit while bash joined the lines and skipped every hook. The
+    # gate cannot judge a commit whose argv is incomplete, so it refuses; the
+    # remedy is the one-line form, which the rules below then judge in full.
+    if _continued_commit(segs):
+        cause = (
+            blind.cause
+            if blind is not None
+            else "continues a line with a trailing backslash, which the shell joins "
+            "into one command while the parser keeps the lines apart"
+        )
+        hint = (
+            blind.hint
+            if blind is not None
+            else "put the command on one line, or split it into separate steps"
+        )
+        _deny(
+            f"BLOCKED: this commit {cause}, so review enforcement cannot see its "
+            f"full argument list (a hook-skipping flag could sit past the split).\n"
+            f"To proceed: {hint}."
         )
         return
 

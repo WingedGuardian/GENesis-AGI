@@ -691,6 +691,15 @@ def test_invalidate_clears_when_the_parse_went_blind(repo: Path, home: Path) -> 
     )
 
 
+def test_invalidate_clears_for_a_commit_split_inside_the_verb(repo: Path, home: Path) -> None:
+    """A line continuation inside `commit` hid the verb from the raw early-out, so
+    the hook exited without clearing, and the next commit reused a review that no
+    longer applied. The early-out now reads the continuation-folded text too."""
+    assert _mark(repo, home).returncode == 0
+    _run_invalidate("git com\\\nmit -m done", repo, home)
+    assert _markers(home) == []
+
+
 @pytest.mark.parametrize(
     "form",
     [

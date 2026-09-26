@@ -523,6 +523,12 @@ class Segment:
     #: See :func:`_verb_unresolved`. A guard must not read a False verdict off
     #: this segment's verb; :func:`analyze_checked` reports it as a blind spot.
     verb_unresolved: bool = False
+    #: The scanner ENDED this segment at an unquoted line continuation: the shell
+    #: joins it to the next segment of the same script, the parse keeps them apart.
+    cont_split: bool = False
+    #: A line continuation INSIDE double quotes: the shell removes it, joining the
+    #: two halves of a word, while this segment's text still carries it.
+    cont_inner: bool = False
 
 
 def _redirect_operator_len(command: str, i: int) -> int | None:
@@ -571,6 +577,8 @@ class _ParsedSegment(NamedTuple):
     raw: str
     argv_src: str
     redirects: tuple[str, ...]
+    cont_split: bool = False
+    cont_inner: bool = False
 
 
 def _command_sub_end(command: str, i: int, n: int) -> int:
@@ -697,18 +705,95 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     other direction (locked by the ``$(;)``/``$(&&)``/``$(|)`` cases in the redirect-argv
     test's EXPLOITS).
     """
-    pairs: list[tuple[str, str, list[str]]] = []
+    segs, _open_quote, quote_shift = _scan_segments(command, escape_quotes=True, comments=True)
+    if quote_shift:
+        # TWO READINGS, BOTH KEPT, whenever they can disagree about quoting. Reading an
+        # escaped quote as an escape, and a quote inside a `#` comment as a literal, is
+        # right for shell code, but the scanner cannot tell code from a heredoc BODY,
+        # where the shell reads neither. There, those two rules move where every later
+        # quoted span begins and ends, and a span that begins in the body can swallow
+        # the real commands after it. MEASURED over a real command corpus: a `(#NNN)`
+        # in a commit-message heredoc made an apostrophe literal, the next apostrophe
+        # opened a span, and a `git push` and three `git commit`s after the heredoc
+        # vanished, with no blind spot reported, because `shlex` has no comment rule
+        # and tokenized the command fine. So the reading with neither rule (the older
+        # scanner's quoting) is taken too and its segments ADDED, never swapped in:
+        # neither reading can then hide a command the other shows. The trigger is
+        # that one of the two rules touched a quote character at all, not that the
+        # scan ended inside an open quote: an even number of such quotes leaves the
+        # scan balanced while still moving the spans.
+        alt, _, _ = _scan_segments(command, escape_quotes=False, comments=False)
+        seen = {(p.raw, p.argv_src) for p in segs}
+        segs = segs + [p for p in alt if (p.raw, p.argv_src) not in seen]
+    return segs
+
+
+#: A `#` opens a comment only at the start of a word: after whitespace, at the start
+#: of a segment, or after a metacharacter the scanner keeps in the buffer.
+_COMMENT_AFTER = frozenset(" \t\n()")
+
+
+def _scan_segments(
+    command: str, *, escape_quotes: bool, comments: bool,
+) -> tuple[list[_ParsedSegment], bool, bool]:
+    """One pass of :func:`parse_segments`: ``(segments, ends_in_open_quote,
+    quote_shift)``. ``escape_quotes`` False reads an unquoted backslash before a
+    quote as a literal backslash; ``comments`` False reads ``#`` as an ordinary
+    character. Both False is the older scanner's quoting. ``quote_shift`` is True
+    when either rule, where on, met a quote character, which is exactly when the
+    two readings can pair quotes differently.
+    """
+    pairs: list[tuple[str, str, list[str], bool, bool]] = []
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
+    cont_split = cont_inner = False
     i, n = 0, len(command)
     quote: str | None = None
+    in_comment = False
+    quote_shift = False
+
+    def _flush() -> None:
+        nonlocal raw_buf, argv_buf, redirs, cont_split, cont_inner
+        pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs), cont_split, cont_inner))
+        raw_buf, argv_buf, redirs = [], [], []
+        cont_split = cont_inner = False
+
     while i < n:
         c = command[i]
+        if in_comment:
+            # A COMMENT IS LITERAL TEXT TO THE SHELL, up to the newline: no quote,
+            # escape, redirect or substitution inside it means anything. Modelling it
+            # closes two holes that share a cause. An apostrophe in a comment used to
+            # open a quoted span that swallowed the lines after it; and a backslash
+            # ending a comment line read as a line continuation, which the shell does
+            # not do there. Separators still split, exactly as before comments were
+            # modelled, so a comment can only ever yield MORE segments than the shell
+            # runs, never fewer. The comment stays in `raw`, where the override
+            # sigils are read.
+            if c == "\n":
+                in_comment = False
+                _flush()
+            elif c in (";", "|", "&"):
+                _flush()
+            else:
+                if c in ("'", '"'):
+                    quote_shift = True
+                raw_buf.append(c)
+                argv_buf.append(c)
+            i += 1
+            continue
         if quote:
             raw_buf.append(c)
             argv_buf.append(c)
             if quote == '"' and c == "\\" and i + 1 < n:
+                if command[i + 1] == "\n":
+                    # Inside double quotes the shell REMOVES a backslash-newline,
+                    # joining two halves of a word (`"--for<continuation>ce"` runs as
+                    # `--force`). The text is kept verbatim, as before; the scanner
+                    # records that a join happened here so a guard can read the
+                    # joined word instead of the split one.
+                    cont_inner = True
                 raw_buf.append(command[i + 1])
                 argv_buf.append(command[i + 1])
                 i += 2
@@ -717,16 +802,51 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
                 quote = None
             i += 1
             continue
+        if comments and c == "#" and (not raw_buf or raw_buf[-1] in _COMMENT_AFTER):
+            in_comment = True
+            raw_buf.append(c)
+            argv_buf.append(c)
+            i += 1
+            continue
         if c in ("'", '"'):
             quote = c
             raw_buf.append(c)
             argv_buf.append(c)
             i += 1
             continue
+        if c == "\\" and i + 1 < n and command[i + 1] == "\n":
+            # AN UNQUOTED LINE CONTINUATION. The shell deletes the pair and joins the
+            # two lines; the scanner keeps the backslash and splits at the newline,
+            # and RECORDS that it did. Joining here is the move that made a real
+            # command vanish when the join landed where the shell does not continue
+            # (a comment); reporting it fails closed instead. Not recorded when
+            # nothing precedes it on the segment (`a && <continuation> b`): the
+            # shell's join gives the same two commands the split does.
+            if "".join(raw_buf).strip():
+                cont_split = True
+            raw_buf.append(c)
+            argv_buf.append(c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n and (escape_quotes or command[i + 1] not in ("'", '"')):
+            # AN UNQUOTED BACKSLASH ESCAPES THE NEXT CHARACTER, which is how the shell
+            # reads it and how this module's two other scanners already read it
+            # (`_command_sub_end`, `_redirect_target_end`). The pair is kept verbatim in
+            # both views and the escapee is never dispatched: an escaped `;` `|` `&`
+            # `<` `>` is a literal, and an escaped quote opens no quoted span. Without
+            # this, an escaped quote opened a span that ran to end of string and hid
+            # every later command — and every separator after it — from all consumers.
+            if command[i + 1] in ("'", '"'):
+                quote_shift = True
+            raw_buf.append(c)
+            raw_buf.append(command[i + 1])
+            argv_buf.append(c)
+            argv_buf.append(command[i + 1])
+            i += 2
+            continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
-            raw_buf, argv_buf, redirs = [], [], []
+            _flush()
             i += 2
             continue
         op_len = _redirect_operator_len(command, i)
@@ -773,19 +893,22 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             i = j
             continue
         if c in (";", "|", "&", "\n"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
-            raw_buf, argv_buf, redirs = [], [], []
+            _flush()
             i += 1
             continue
         raw_buf.append(c)
         argv_buf.append(c)
         i += 1
-    pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
-    return [
-        _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d))
-        for (r, a, d) in pairs
+    _flush()
+    segs = [
+        _ParsedSegment(
+            raw=r.strip(), argv_src=a.strip(), redirects=tuple(d),
+            cont_split=cs, cont_inner=ci,
+        )
+        for (r, a, d, cs, ci) in pairs
         if r.strip()  # filter on RAW — keeps the exact set/alignment split_segments had
     ]
+    return segs, quote is not None, quote_shift
 
 
 def split_segments(command: str) -> list[str]:
@@ -1560,6 +1683,47 @@ _BLIND_UNCLASSIFIED_OPTION = BlindSpot(
 #: work here — which this rule does not have, and guessing at one is how a net
 #: becomes an outage.
 
+#: The parse SUCCEEDED, every word was readable — and the scanner ended a segment on
+#: an unescaped backslash, which means it split at a LINE CONTINUATION: the shell
+#: deletes a backslash-newline and joins the two lines, while the scanner keeps them
+#: apart on purpose (see `parse_segments`: joining is the move that makes a real
+#: command vanish when it lands in a context the shell does not continue). Every
+#: OTHER escaped character — `\;`, `\|`, `\&`, `\"` — is consumed as a literal pair
+#: by the scanner and never splits. So the words on both sides of the reported split
+#: belong to the SAME command and the parse shows them in two. Like
+#: :data:`_BLIND_UNRESOLVED_VERB`, this leaves a caller with a confident wrong answer
+#: rather than with nothing: a gate searching for its operation finds no segment that
+#: has it, and cannot tell that reading apart from a command that genuinely has none.
+#:
+#: MEASURED against the guards on the tree this was written for: four of them — the
+#: protected-path net, the discard guard, the push/merge gate and the commit gate —
+#: refused a gated command and ALLOWED the identical command with a continuation in
+#: front of the verb, with the shell proven to run both the same way through a shim
+#: that records its own argv.
+#:
+#: WHY THIS IS REPORTED RATHER THAN JOINED, which is the obvious fix and is the wrong
+#: one. Joining the two halves is what the shell does — but only where the shell
+#: CONTINUES a line. A join made where it does not (inside a `#` comment, which the
+#: shell ends at the newline) deletes a real separator and makes the next command
+#: vanish from every consumer; an earlier attempt at the join drew exactly that
+#: fail-open in two consecutive review rounds. Splitting is wrong in a direction that
+#: costs a rewrite; joining is wrong in a direction that costs the thing the guard
+#: protects. So the split stays and the caller is TOLD, which is what this whole class
+#: of value is for.
+#:
+#: ``bounds_induced`` is False for the same reason it is on the two causes above: no
+#: bound fired, and the consumers that key on that flag exist to restore what a bound
+#: took away.
+_BLIND_CONTINUATION = BlindSpot(
+    bounds_induced=False,
+    cause=(
+        "continues a line with a trailing backslash, which the shell joins into ONE "
+        "command while this parser keeps the two lines apart, so the operation the "
+        "command performs cannot be established"
+    ),
+    hint="put the command on one line, or split it into separate steps",
+)
+
 #: Every blind spot this module can report. Exported so a test can enforce the
 #: invariant `refuse ⟹ bounds_induced` over the WHOLE domain rather than over the
 #: examples a test author happened to think of.
@@ -1575,6 +1739,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_OVER_LONG,
     _BLIND_UNRESOLVED_VERB,
     _BLIND_UNCLASSIFIED_OPTION,
+    _BLIND_CONTINUATION,
 )
 
 
@@ -1656,13 +1821,18 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
     2 of 45,956 real commands a reclassification and no change of verdict.
 
-    :data:`_BLIND_UNRESOLVED_VERB` is reported LAST, which means it is reported only
+    :data:`_BLIND_CONTINUATION` is reported LAST, which means it is reported only
     where this function previously returned None. That is a property worth stating
     rather than a rank: every command that already had a blind spot keeps the exact
-    cause and hint it had, so the rule can only add net coverage and can never
+    cause and hint it had, so a new cause can only add net coverage and can never
     reword or re-rank an existing refusal. It also makes the change measurable — the
     flips it causes are exactly the commands moving from "clean parse" to "blind",
-    with nothing else shifting underneath them.
+    with nothing else shifting underneath them. The rule for the next cause follows:
+    APPEND it after the last return. Inserting one above an existing return
+    re-ranks a live refusal, and its cost is then no longer measurable as flips.
+    What that ordering does NOT make free is the flips themselves — a new cause is a
+    new refusal, and its cost is the commands it newly blocks, which must be measured
+    separately.
     """
     segments, reason = _analyze_bounded(command)
     if reason == "length":
@@ -1684,7 +1854,145 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         if any(_unclassified_global(s.argv) for s in hidden):
             return segments, _BLIND_UNCLASSIFIED_OPTION
         return segments, _BLIND_UNRESOLVED_VERB
+    if split_at_continuation(segments):
+        return segments, _BLIND_CONTINUATION
     return segments, None
+
+
+def split_at_continuation(segments: list[Segment]) -> bool:
+    """True when the scanner recorded a line continuation in any segment, at any depth.
+
+    THE ANSWER COMES FROM THE SCAN ITSELF: `_scan_segments` sets ``cont_split`` on a
+    segment it ended at an unquoted continuation and ``cont_inner`` on one holding a
+    continuation inside double quotes. Nothing here re-reads the text. An earlier
+    version inferred the split from ``raw`` ending in an odd backslash run, and the
+    inference was wrong both ways: it missed a continuation inside double quotes
+    (no split happens there, yet the shell still joins the word), and it reported a
+    comment line ending in a backslash, a backslash before a carriage return, and a
+    backslash followed by spaces, none of which the shell continues.
+
+    EVERY DEPTH: a nested script is scanned by the same function, so a continuation
+    inside ``bash -c '…'`` or ``$( … )`` is recorded exactly as at the top level.
+
+    ONE KNOWN OVER-REPORT, stated rather than left to be found: a heredoc BODY line
+    ending in a backslash. The scanner has no heredoc model, so it reads the body as
+    commands and records the continuation. With an unquoted delimiter the shell does
+    join such a line; with a quoted one it does not. The refusal names a rewrite that
+    works (a quoted-delimiter heredoc written with the Write tool, or one line).
+    """
+    return bool(continued_segments(segments))
+
+
+def continued_segments(segments: list[Segment]) -> list[Segment]:
+    """The segments :func:`split_at_continuation` reads as continued, in order."""
+    return [s for s in segments if s.cont_split or s.cont_inner]
+
+
+def continuation_groups(segments: list[Segment]) -> list[list[Segment]]:
+    """The COMMANDS a continuation touched, each as the segments the shell joins.
+
+    A group is a segment the scanner ended at a continuation plus the next segment
+    of the SAME script (skipping deeper segments, which belong to a substitution
+    inside it), repeated while that one was also ended at a continuation. A segment
+    holding a continuation inside double quotes is a group on its own unless a split
+    already put it in one. Everything outside the groups was parsed where the shell
+    splits it, so a guard can judge those segments as usual and read only the groups
+    through :func:`group_text`.
+
+    Where two sibling scripts sit at the same depth under one parent (`$(a) $(b)`),
+    a continuation ending the first can pull the second into its group. That only
+    widens the group's text, which can only widen what a guard refuses.
+    """
+    groups: list[list[Segment]] = []
+    used: set[int] = set()
+    for i, seg in enumerate(segments):
+        if i in used or not (seg.cont_split or seg.cont_inner):
+            continue
+        group = [seg]
+        used.add(i)
+        cur = i
+        while segments[cur].cont_split:
+            nxt = _next_sibling(segments, cur)
+            if nxt is None:
+                break
+            group.append(segments[nxt])
+            used.add(nxt)
+            cur = nxt
+        groups.append(group)
+    return groups
+
+
+def _next_sibling(segments: list[Segment], i: int) -> int | None:
+    depth = segments[i].depth
+    for j in range(i + 1, len(segments)):
+        if segments[j].depth < depth:
+            return None
+        if segments[j].depth == depth:
+            return j
+    return None
+
+
+def group_text(group: list[Segment]) -> str:
+    """The joined text of a continuation group, as the shell reads its words.
+
+    A DECISION VIEW (see :func:`fold_continuations`): a guard reads it to ask what
+    the continued command NAMES. It is never parsed.
+
+    TWO JOINS, because the segments' text is stripped and cannot say whether the
+    shell saw whitespace at the split. A split inside a word (`cl<continuation>ean`)
+    reads correctly only joined directly; a split between words written with no
+    space before the backslash (`git<continuation> push`) reads correctly only
+    joined with a space — joined directly it is `gitpush`, which names neither.
+    Both are returned, so a guard's search can only find more.
+    """
+    direct = fold_continuations("\n".join(seg.raw for seg in group))
+    spaced = fold_continuations(
+        " ".join(seg.raw[:-1] if seg.cont_split else seg.raw for seg in group)
+    )
+    return direct if direct == spaced else direct + "\n" + spaced
+
+
+def blind_is_continuation(blind: BlindSpot | None) -> bool:
+    """Whether ``blind`` is the line-continuation cause, so a guard can scope its
+    refusal to :func:`continuation_groups` instead of the whole command."""
+    return blind is _BLIND_CONTINUATION
+
+
+#: An odd backslash run immediately before a newline: a line continuation. The pairs
+#: before it are kept; the last backslash and the newline are what the shell deletes.
+_CONTINUATION_NL = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+
+
+def fold_continuations(text: str) -> str:
+    """``text`` with every line continuation deleted, as the shell deletes it.
+
+    A DECISION VIEW, NEVER A PARSE INPUT. It answers "does this command name X once
+    its lines are joined" for a caller that is about to REFUSE, so an error here can
+    only widen or narrow that one refusal; nothing is ever segmented from it. Parsing
+    a folded string is the join approach, which makes a real command vanish when the
+    fold lands in a context the shell does not continue (a `#` comment) — this module
+    reports a continuation instead of joining it for exactly that reason.
+
+    Parity is the same as the scanner's: an even run is escaped backslashes followed
+    by a real newline, and is left alone. Quoting is not modelled (inside single
+    quotes the shell keeps the sequence literally), which is acceptable only because
+    of the rule above.
+    """
+    return _CONTINUATION_NL.sub(r"\1", text)
+
+
+def mention_view(command: str) -> str:
+    """The text a guard's early exit must search: the command, plus its folded form.
+
+    A guard that asks "does this command mention my verb?" BEFORE parsing reads the
+    raw text, and a continuation inside the word (`cl<continuation>ean`) hides the
+    verb from it — the guard exits without ever parsing a command the shell runs as
+    `clean`. Searching the raw text AND the folded text can only ever widen what the
+    early exit lets through to the parser, never narrow it.
+    """
+    if "\\\n" not in command:
+        return command
+    return command + "\n" + fold_continuations(command)
 
 
 def _basename(token: str) -> str:
@@ -2818,6 +3126,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                 raw=raw,
                 redirects=list(seg.redirects),
                 verb_unresolved=_verb_unresolved(argv),
+                cont_split=seg.cont_split,
+                cont_inner=seg.cont_inner,
             )
         )
         nested = []
@@ -2853,6 +3163,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                         depth=inner.depth + 1,
                         redirects=inner.redirects,
                         verb_unresolved=inner.verb_unresolved,
+                        cont_split=inner.cont_split,
+                        cont_inner=inner.cont_inner,
                     )
                 )
     return out, ("depth" if truncated else None)
@@ -2913,6 +3225,7 @@ def _substitutions(text: str) -> list[str]:
     subs: list[str] = []
     i, n = 0, len(text)
     in_sq = False
+    in_dq = False
     while i < n:
         c = text[i]
         if in_sq:
@@ -2920,9 +3233,28 @@ def _substitutions(text: str) -> list[str]:
                 in_sq = False
             i += 1
             continue
-        if c == "'":
+        if c == "'" and not in_dq:
+            # An apostrophe inside double quotes is a literal character. Reading it as
+            # an opener hid every substitution after it (`"it's $(cmd)"`) from all
+            # consumers, although the shell runs them.
             in_sq = True
             i += 1
+            continue
+        if c == '"':
+            in_dq = not in_dq
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            # An escaped `$` or backtick opens nothing: `\$(x)` and `\`x\`` are
+            # literal text to the shell, both unquoted and inside double quotes. Read
+            # as openers they became bogus "nested scripts", which is where almost
+            # every nested backslash-ending segment came from. MEASURED 2026-09-26 over
+            # 86,684 unique recorded commands: commands whose only odd-backslash
+            # segment was nested fell from 371 to 8 with this skip (a sample of 10 of
+            # the 371 were all backticked words in a double-quoted argument).
+            # Skipping the PAIR keeps the parity right: `\\$(x)` is an escaped
+            # backslash followed by a real substitution.
+            i += 2
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)  # index past matching ')'
@@ -2930,13 +3262,29 @@ def _substitutions(text: str) -> list[str]:
             i = end
             continue
         if c == "`":
-            j = text.find("`", i + 1)
-            if j != -1:
-                subs.append(text[i + 1 : j])
+            # The body ends at the first UNESCAPED backtick, and the shell removes the
+            # backslash before `` ` ``, `$` and `\` in it before running it — and,
+            # inside double quotes, before `"` too (bash(1), "Command Substitution",
+            # the old-style form; MEASURED). Closing on an escaped one cut the body
+            # mid-word and produced a bogus nested script ending in a backslash; not
+            # un-escaping hid a nested `` `…\`cmd\`…` `` from every consumer. An
+            # unterminated span is not a substitution the shell runs.
+            j = i + 1
+            while j < n and text[j] != "`":
+                j += 2 if text[j] == "\\" else 1
+            if j < n:
+                unescape = _BACKTICK_UNESCAPE_DQ if in_dq else _BACKTICK_UNESCAPE
+                subs.append(unescape.sub(r"\1", text[i + 1 : j]))
                 i = j + 1
                 continue
         i += 1
     return subs
+
+
+#: Inside an old-style ``` `…` ``` substitution, a backslash keeps its literal meaning
+#: except before `` ` ``, ``$`` or ``\``, where the shell removes it.
+_BACKTICK_UNESCAPE = re.compile(r"\\([`$\\])")
+_BACKTICK_UNESCAPE_DQ = re.compile(r'\\([`$\\"])')
 
 
 def _nested_script(argv: list[str], interpreter: str) -> str:

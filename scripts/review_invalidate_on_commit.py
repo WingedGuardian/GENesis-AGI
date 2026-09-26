@@ -57,11 +57,14 @@ from review_state import clear_all_markers, clear_marker  # noqa: E402
 # NOTHING → every marker stays valid for its TTL = the bypass). Detection degrades
 # to a strict regex; resolution degrades to clearing the candidate set.
 try:
-    from shell_parse import analyze_checked, git_subcommand  # noqa: E402
+    from shell_parse import analyze_checked, git_subcommand, mention_view  # noqa: E402
 
     _PARSE_OK = True
 except Exception:  # pragma: no cover - defensive
     _PARSE_OK = False
+
+    def mention_view(command: str) -> str:  # degraded: the raw text alone
+        return command
 
 try:
     from review_enforcement_commit import (  # noqa: E402
@@ -191,7 +194,11 @@ def main() -> None:
 
     # Cheap early-out: no "commit" token anywhere → definitely not a commit.
     command = field(payload, "command")
-    if not _COMMIT_PATTERN.search(command):
+    # Raw AND continuation-folded: `git com<continuation>mit` is a commit the shell
+    # runs, and a raw test never saw it, so the review marker survived the commit
+    # it should have been cleared by. Over-clearing is this hook's safe direction.
+    view = mention_view(command)
+    if not _COMMIT_PATTERN.search(view):
         sys.exit(0)
 
     # Confirm a REAL executed `git commit` segment before clearing anything — the
@@ -243,7 +250,7 @@ def main() -> None:
     elif blind is None and segs is not None:
         if not has_commit_seg:
             sys.exit(0)  # complete parse, no commit segment: nothing to invalidate
-    elif not has_commit_seg and not _STRICT_COMMIT.search(command):
+    elif not has_commit_seg and not _STRICT_COMMIT.search(view):
         # No parser, or an unreliable one that found nothing: neither source of
         # evidence names a commit.
         sys.exit(0)

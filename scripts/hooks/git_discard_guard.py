@@ -106,6 +106,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -168,8 +169,11 @@ _DEGRADED_GATED = r"\bclean\b|--recurse-submodules|submodule\.recurse"
 try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
+        continuation_groups,
         git_subcommand_index,
+        group_text,
         has_trailing_override,
+        mention_view,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -575,6 +579,14 @@ _CLEAN_PARSE_FAILED_MSG = (
 )
 
 
+_CLEAN_WORD = re.compile(r"\bclean\b")
+_GIT_WORD = re.compile(r"\bgit\b")
+
+
+def _names_git_clean(text: str) -> bool:
+    return bool(_GIT_WORD.search(text) and _CLEAN_WORD.search(text))
+
+
 def _clean_violation(cmd: str) -> str | None:
     """The ONE block this otherwise snapshot-only guard still makes: a
     non-dry-run ``git clean``. Returns a block message if any ``git`` segment
@@ -633,6 +645,67 @@ def _clean_violation(cmd: str) -> str | None:
         )
         if not is_exact_dry_run:
             return _CLEAN_BLOCK_MSG
+    naming = [g for g in continuation_groups(segs) if _names_git_clean(group_text(g))]
+    if naming:
+        # A line continuation touched a command that, once its lines are joined the
+        # way the shell joins them, names `git` and `clean`. Its segments are not the
+        # commands the shell runs, so no per-segment verdict above can be trusted.
+        # MEASURED: a `git clean` with a continuation before the verb was ALLOWED
+        # here while the identical one-line command was refused, with the shell
+        # proven to run both the same way.
+        #
+        # SCOPED TO THE CONTINUED COMMAND (`continuation_groups`), not the whole
+        # command line. Keyed on the raw text instead, this refused continued
+        # commands that merely contained the word — MEASURED over the recorded
+        # corpus: every such refusal was prose ("working tree clean", "ruff clean")
+        # in a PR body or heredoc, none a `git clean`, and each was told it named
+        # one. A verb split mid-word (`cl<continuation>ean`) still reads as `clean`
+        # in the joined text.
+        #
+        # NOT CONDITIONED ON "no clean segment was judged". That conjunct is what a
+        # decoy satisfies: in `git clean -n && git <continuation> clean -fd` the dry
+        # run is judged and allowed, and the real `clean -fd` is never examined.
+        #
+        # KEYED ON THE CONTINUATION, NOT ON BLINDNESS: refusing on `blind is not
+        # None` re-introduces the measured over-block on clean-mentioning commands
+        # that merely fail to tokenize (`test_an_untokenizable_clean_mentioning_
+        # command_is_still_ALLOWED`).
+        #
+        # THE OVERRIDE BINDS TO THE CONTINUED COMMAND, as it binds to the clean
+        # segment on the one-line form: the refusal is waived only when EVERY
+        # continued command that names `git clean` carries the override on its last
+        # segment. MEASURED before this: an override on a different, benign command
+        # waived a continued `git clean`, and one on the continued clean itself was
+        # ignored when a command followed. A continuation inside a nested script is
+        # never waived: on the one-line form the nested segment's raw does not carry
+        # the sigil either.
+        if all(
+            not any(s.depth for s in g) and has_trailing_override(g[-1].raw, _OVERRIDE_SIGIL)
+            for g in naming
+        ):
+            return None
+        # The message does not assume `blind` is set. Today `analyze_checked` always
+        # reports a cause when a segment is continued, but that is a property of
+        # another module's ordering; if it ever stops holding, this branch must
+        # still REFUSE, so it falls back to its own words.
+        cause = (
+            blind.cause
+            if blind is not None
+            else "continues a line with a trailing backslash, which the shell joins "
+            "into one command while the parser keeps the lines apart"
+        )
+        hint = (
+            blind.hint
+            if blind is not None
+            else "put the command on one line, or split it into separate steps"
+        )
+        return (
+            "[git-discard-guard] BLOCKED: once its lines are joined this command "
+            f"mentions `clean`, and it {cause}, so the guard cannot establish whether "
+            "it runs `git clean` or what it would delete. `git clean` is not "
+            "recoverable from the snapshot (it removes UNTRACKED files, which "
+            f"`git stash create` does not capture). To proceed: {hint}."
+        )
     return None
 
 
@@ -1683,18 +1756,25 @@ def main() -> int:
             Exception
         ):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
             discarded_write.remember(cmd)
-    if not cmd or "git" not in cmd:
+    if not cmd:
         return 0
-    if not any(s in cmd for s in _TRIGGER_SUBSTRINGS):
+    # The early exits read the command AND its continuation-folded form: a line
+    # continuation inside a word (`cl<continuation>ean`) hid the verb from a raw
+    # substring test, so the guard exited before parsing a command the shell runs as
+    # `git clean`. MEASURED allowed on main, with the shell proven to run it.
+    view = mention_view(cmd)
+    if "git" not in view:
+        return 0
+    if not any(s in view for s in _TRIGGER_SUBSTRINGS):
         return 0
 
     # Phase 1 — the clean BLOCK (UNRECOVERABLE → fail CLOSED).
-    if "clean" in cmd:
+    if "clean" in view:
         try:
             block_msg = _clean_violation(cmd)
         except Exception:
             # ROBUST-BY-CONSTRUCTION crash path: we are already inside
-            # `"clean" in cmd`, so the command the parser choked on mentions clean
+            # `"clean" in view`, so the command the parser choked on mentions clean
             # and we cannot prove it safe. Rather than re-parse it with a bespoke
             # coarse detector (the hand-rolled-parser trap that drew a CRITICAL),
             # fail CLOSED unconditionally and tell the user to simplify. Over-blocks

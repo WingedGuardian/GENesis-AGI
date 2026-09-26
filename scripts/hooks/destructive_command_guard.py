@@ -199,8 +199,10 @@ _COMMAND_OPENERS = frozenset(
 # and here it is not. Same shape as `protected_paths_guard`'s guarded import.
 try:  # noqa: SIM105
     from shell_parse import analyze_checked as _analyze_checked
+    from shell_parse import blind_is_continuation as _blind_is_continuation
 except Exception:  # noqa: BLE001 — degraded, never permissive
     _analyze_checked = None
+    _blind_is_continuation = None
 
 # The launchers the RESOLVER refuses to model. The shells are deliberately NOT
 # here: the resolver recovers `sh -c "…"` into real segments (MEASURED:
@@ -235,6 +237,18 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
             "this command cannot be analysed and it names a removal — refused "
             "conservatively rather than scanned with a weaker pattern."
         ), False
+    if blind is not None and _blind_is_continuation is not None and _blind_is_continuation(blind):
+        # A LINE CONTINUATION IS NOT UNREADABLE TO THIS GUARD. Its own scan folds
+        # continuations with a context-aware model (`_fold_continuations`) and was
+        # measured correct on them before the resolver reported the cause. What the
+        # resolver cannot do on a continued command is draw segment boundaries,
+        # which is all the carrier arm below reads — so report "not analysed" and
+        # let the caller keep its token-level carrier refusal ON, the fallback that
+        # exists for exactly this. Refusing here instead refused ordinary continued
+        # commands that merely contained `rm` (`docker run --rm`, `rm -f /tmp/x`,
+        # a `trap` cleanup) — MEASURED over the recorded corpus, with no command
+        # the fallback does not also catch.
+        return None, False
     if blind is not None:
         # AN UNREADABLE COMMAND THAT NAMES A REMOVAL. Refuse; do not degrade to
         # the glued-`-rf` regex, which a split-flag spelling walks past.
@@ -854,7 +868,13 @@ def main() -> int:
         # SURVIVE the whole suite for exactly that reason — behaviourally null,
         # not an untested mechanism. The property moved; the constant that
         # carries it is `_RM_CARRIER_WORD`, and that one is mutation-pinned.
-        if not cmd or not _RM_WORD.search(cmd):
+        # The raw text AND its continuation-folded form: a continuation inside the
+        # word (`r<continuation>m -rf ~`) hid the verb from a raw test, so the guard
+        # exited without scanning a removal the shell runs. MEASURED allowed on main.
+        if not cmd:
+            return 0
+        folded = _fold_continuations(cmd)
+        if not (_RM_WORD.search(cmd) or _RM_WORD.search(folded)):
             return 0
 
         # THE RESOLVER DECIDES CARRIERS, not a name list over flat tokens.
@@ -884,7 +904,7 @@ def main() -> int:
         # carrier pre-pass has no business with, not one nothing could read.
         carrier_reason, analysed = (
             _resolver_carrier_refusal(cmd)
-            if _RM_CARRIER_WORD.search(cmd)
+            if _RM_CARRIER_WORD.search(cmd) or _RM_CARRIER_WORD.search(folded)
             else (None, True)
         )
         if carrier_reason:
