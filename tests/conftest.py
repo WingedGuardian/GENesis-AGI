@@ -61,16 +61,165 @@ def _safe_killpg(pgid: int, sig: int) -> None:
 os.killpg = _safe_killpg  # type: ignore[assignment]
 
 
-# ── Redirect pytest's temp tree OFF the watchgod-policed cc-tmp ───────────
-# A CC session's TMPDIR is ``~/.genesis/cc-tmp`` (set by scripts/cc-slot.sh),
-# and pytest's ``tmp_path``/basetemp default under ``$TMPDIR``. Left alone, a
-# broad suite dumps hundreds of MB of ``pytest-of-<user>/`` into that
-# budget-policed dir and trips ``genesis-tmp-watchgod`` (stuck-ORANGE churn).
+# ── Redirect pytest's temp tree onto disk, off every policed temp dir ─────
+# pytest's ``tmp_path``/basetemp default under ``$TMPDIR``, and both places that
+# resolves to here are small: a CC session's ``~/.genesis/cc-tmp`` (set by
+# scripts/cc-slot.sh, budget-policed by ``genesis-tmp-watchgod``), and — with
+# ``TMPDIR`` unset or ``/tmp`` — a 512 MB tmpfs, i.e. RAM. Left alone, a broad
+# suite dumps hundreds of MB into one of them and pages the operator (MEASURED
+# 2026-09-24: 255 MB of basetemp in the 512 MB RAM disk).
 # This steers pytest's own basetemp to ``~/tmp`` (``big_tmp_dir``) instead —
 # WITHOUT touching the process ``TMPDIR`` (which would desync CC's
 # TMPDIR/CLAUDE_CODE_TMPDIR). Runs at config time, before any ``tmp_path``
-# fixture resolves. No-op on CI (TMPDIR unset) and when ``--basetemp`` is
-# passed explicitly. See ``genesis.util.tmp.should_redirect_pytest_basetemp``.
+# fixture resolves. Redirects by DEFAULT; no-ops on CI and when ``--basetemp``
+# is passed. See ``genesis.util.tmp.should_redirect_pytest_basetemp``.
+def _warn_without_escalating(message: str) -> None:
+    """Emit a RuntimeWarning that CANNOT be turned into an exception.
+
+    Both call sites run inside ``pytest_configure``, where any escaping
+    exception is an INTERNALERROR that kills collection for the entire
+    repository — and because the crash happens before the cleanup completes,
+    the next run hits it again. That failure has now been reached twice by two
+    different exception types (a ``TypeError`` from an ``onexc`` handler, then
+    this), so the fix is the BOUNDARY rather than another predicate.
+
+    ``RuntimeWarning`` is an ``Exception``, not an ``OSError``, so the
+    ``except OSError`` around the caller does not stop it. MEASURED: under
+    ``PYTHONWARNINGS=error`` (and ``python -W error``) a real pytest run dies
+    with ``INTERNALERROR ... RuntimeWarning``. Note ``pytest -W error`` does
+    NOT do this — pytest applies its own ``-W`` inside a ``catch_warnings``
+    block, later than configure time — which is exactly why the interpreter-level
+    form is easy to miss, and why the person most likely to have it exported is
+    the one debugging this very warning.
+
+    ``simplefilter("always")`` inside ``catch_warnings`` restores the global
+    filter state on exit, so this neither leaks a filter nor suppresses anyone
+    else's.
+    """
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
+def _force_rmtree(path: str) -> None:
+    """Remove a tree even when it contains unreadable or unwritable directories.
+
+    ``shutil.rmtree(..., ignore_errors=True)`` CANNOT do this, and that is not a
+    corner case here. Unlinking a file needs write+execute on its PARENT
+    directory, so a single ``0o500`` dir strands the whole subtree — and
+    ``ignore_errors`` discards the PermissionError without a trace, so the
+    failure is perfectly silent.
+
+    MEASURED 2026-09-25 on this install before the fix: ``~/tmp/pytest`` held 55
+    leaves, all 55 with dead PIDs (so the reaper considered every one of them
+    eligible) and all 55 containing an unwritable directory. Nothing had ever
+    removed a single one of them. The producer is ordinary rather than exotic:
+    ``tests/test_cc/conftest.py`` has an AUTOUSE fixture whose sealed gh config
+    the code under test chmods read-only, and this suite chmods ``0o000`` at
+    more than twenty sites. Those restore in a ``finally:`` — which is exactly
+    what does not run on the SIGKILL this reaper exists for.
+
+    WHY A PRE-PASS RATHER THAN A RETRY HANDLER, which is the whole design and
+    was got wrong once. The obvious shape is an ``onexc`` handler that chmods
+    and calls ``func(path)`` again. It does not work, for two independent
+    reasons, both read from CPython 3.12's ``shutil`` rather than assumed:
+
+    * ``onexc`` is invoked with the function that failed, and that is NOT always
+      a one-path call. ``shutil.py:682`` and ``:781`` pass ``os.open`` (which
+      needs ``(path, flags)``) and ``:692/:712/:808`` pass ``os.close`` (which
+      needs a descriptor). Calling either with a single path raises
+      ``TypeError`` — which is not an ``OSError``, so it escapes every
+      ``except OSError`` around it, propagates out of ``pytest_configure``, and
+      turns every run in the repository into an ``INTERNALERROR``. pytest's own
+      handler guards exactly this with an allowlist
+      (``_pytest/pathlib.py:101``: ``if func not in (os.rmdir, os.remove,
+      os.unlink)``), which a reimplementation is very likely to drop, because
+      the allowlist looks like defensive noise rather than the load-bearing line.
+    * Even with the allowlist, retrying cannot fix an unreadable directory.
+      After ``onexc(os.open, ...)`` at ``:682``, ``_rmtree_safe_fd`` falls past
+      the ``else:`` and never descends — so the subtree is orphaned whatever the
+      handler did. pytest's own ``rm_rf`` cannot remove a ``0o000`` directory
+      either; it emits ``PytestWarning: (rm_rf) error removing ...`` and leaves
+      it. Only granting the permission BEFORE the walk reaches the directory
+      works.
+
+    So: attempt the cheap removal first, and only if something survives, walk
+    the tree top-down granting ``u+rwx`` on each directory before ``os.walk``
+    descends into it, then remove again. ``topdown=True`` is what makes that
+    possible — the descent into ``dirnames`` happens after the loop body, so
+    chmod-ing them in the body is in time.
+
+    No ``onexc`` handler ever calls ``func``, so the ``TypeError`` class above
+    cannot recur. Nothing outside ``path`` is ever chmod-ed. Symlinks are never
+    followed (``followlinks=False``, and directory symlinks are skipped
+    explicitly) so a link inside the tree cannot be used to relax permissions on
+    a target outside it, and a hardlink's shared inode is never touched because
+    only DIRECTORIES are chmod-ed.
+
+    Best-effort, and LOUD when it fails: anything still present after both
+    passes is warned about rather than left silent, because a silently leaked
+    leaf is the exact defect this replaced.
+    """
+    import shutil
+    import stat
+
+    def _swallow(func, failed_path, exc):
+        # Deliberately does NOTHING — in particular it never calls `func`. See
+        # the docstring: `func` may be `os.open`/`os.close`, whose signatures a
+        # single-path call does not satisfy, and the resulting TypeError is not
+        # an OSError and would escape pytest_configure.
+        return
+
+    # A SYMLINK AS THE ROOT defeats both guards below, so it is handled before
+    # them. `os.chmod` follows links, and `os.walk` follows its TOP regardless of
+    # `followlinks` (os.py:344 vs :401) — so a leaf that is a link would relax
+    # permissions on, and walk into, a tree outside this one. The reaper selects
+    # leaves by NAME (an all-digits dead pid) and never checks the type, so this
+    # is reachable rather than theoretical. Unlink the link; never its target.
+    if os.path.islink(path):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        return
+
+    shutil.rmtree(path, onexc=_swallow)
+    # lexists, not exists: `exists` follows symlinks and reports False for a
+    # DANGLING one, so a leaf left behind as a broken link would read as a clean
+    # removal. Belt-and-braces rather than load-bearing, and labelled as such
+    # because the distinction is invisible: the symlink-root guard above already
+    # handles every dangling leaf this function is actually given, so the only
+    # way here is a TOCTOU (a directory swapped for a broken link between that
+    # check and this one). No test binds it — MEASURED: reverting to `exists`
+    # leaves the suite green — and it is kept because it is free and correct,
+    # not because anything proves it necessary.
+    if not os.path.lexists(path):
+        return
+
+    # Something survived — grant traversal+write top-down, then try once more.
+    def _grant(target: str) -> None:
+        # Suppressed, not ignored: a directory we cannot chmod is reported by the
+        # warning at the end rather than raised out of pytest_configure.
+        with contextlib.suppress(OSError):
+            os.chmod(target, os.stat(target).st_mode | stat.S_IRWXU)
+
+    _grant(path)
+    for dirpath, dirnames, _files in os.walk(path, topdown=True, followlinks=False):
+        for name in dirnames:
+            child = os.path.join(dirpath, name)
+            if os.path.islink(child):
+                continue  # never chmod through a link — the target may be outside
+            _grant(child)
+
+    shutil.rmtree(path, onexc=_swallow)
+    if os.path.lexists(path):
+        _warn_without_escalating(
+            f"genesis: could not fully remove the pytest temp tree at {path}; "
+            "something under it is undeletable by this user. It will be retried "
+            "on the next run."
+        )
+
+
 def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
     """Remove per-PID basetemp dirs left by runs that exited abnormally (SIGKILL/
     host crash — ``pytest_unconfigure`` never ran). A leaf is stale iff its name
@@ -78,8 +227,6 @@ def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
     spared, so this never touches another in-flight suite. Best-effort — this is
     the safety net that makes cleanup survive abnormal exits (``pytest_unconfigure``
     handles the normal path)."""
-    import shutil
-
     try:
         names = os.listdir(pytest_base)
     except OSError:
@@ -97,7 +244,7 @@ def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            shutil.rmtree(os.path.join(pytest_base, name), ignore_errors=True)  # dead → reap
+            _force_rmtree(os.path.join(pytest_base, name))  # dead → reap
         except (OSError, OverflowError):
             # alive-but-not-ours (PermissionError), transient, or an out-of-PID-range
             # name (os.kill(10**30,0) → OverflowError, which is NOT an OSError) → spare.
@@ -171,11 +318,10 @@ def pytest_configure(config):
 
     # Decide FIRST (pure, no I/O) — only touch the filesystem when we actually
     # redirect, so the no-op / CI / explicit-`--basetemp` path never creates
-    # `~/tmp` (which would break a read-only-home or CI run during config).
+    # `~/tmp` (which would break a read-only-home run during config).
     if not should_redirect_pytest_basetemp(
         current_basetemp=config.option.basetemp,
-        tmpdir_env=os.environ.get("TMPDIR"),
-        home=os.path.expanduser("~"),
+        ci_env=os.environ.get("CI"),
     ):
         return
     # Scope the leaf per-process. pytest CLEARS an explicit basetemp at session
@@ -184,13 +330,43 @@ def pytest_configure(config):
     # live temp. The box lock now serializes runs that load this conftest, but a
     # deliberate override (GENESIS_PYTEST_LOCK=0) or a foreign-rootdir run can
     # still overlap, so the per-pid leaf remains what keeps their temp isolated.
-    pytest_base = os.path.join(big_tmp_dir(), "pytest")
-    # Reap dead-PID leaves from prior abnormal exits BEFORE creating ours, so the
-    # ~/tmp/pytest dir can't accumulate (the daily hygiene job only prunes direct
-    # children of ~/tmp, whose mtime every run refreshes — so it never ages out).
-    _reap_stale_pytest_basetemps(pytest_base)
-    target = os.path.join(pytest_base, str(os.getpid()))
-    Path(target).mkdir(parents=True, exist_ok=True)
+    #
+    # FAIL OPEN on any filesystem error. The predicate above redirects by default
+    # and exempts CI by reading `$CI`, so an unrecognised CI with a read-only
+    # `$HOME` would reach this block — and an OSError escaping `pytest_configure`
+    # kills collection for the WHOLE suite, which is strictly worse than the RAM
+    # disk this redirect exists to protect. Falling back leaves pytest's own
+    # default, i.e. exactly the behaviour that environment has today. This is what
+    # makes CI detection an optimisation rather than a correctness requirement.
+    # BROAD by design, and this is the second layer rather than the first. The
+    # narrow `except OSError` below was correct for the filesystem calls it was
+    # written for, and twice now something in this block has raised a class it
+    # does not cover (a TypeError out of an onexc handler; a RuntimeWarning
+    # escalated by an interpreter-level filter). Cleanup is best-effort by
+    # contract, and an exception escaping pytest_configure kills collection for
+    # the whole repository — so at THIS boundary, breadth is the safer error.
+    # Each specific cause is still fixed at its source; this stops the next one
+    # being catastrophic rather than cosmetic.
+    try:
+        pytest_base = os.path.join(big_tmp_dir(), "pytest")
+        # Reap dead-PID leaves from prior abnormal exits BEFORE creating ours, so
+        # the ~/tmp/pytest dir can't accumulate (the daily hygiene job only prunes
+        # direct children of ~/tmp, whose mtime every run refreshes — so it never
+        # ages out).
+        _reap_stale_pytest_basetemps(pytest_base)
+        target = os.path.join(pytest_base, str(os.getpid()))
+        Path(target).mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001 — see the note above the try
+        # Say so. A silent fall-back lands the temp tree back on whatever
+        # pytest's default is — which on an install with a tmpfs /tmp is the
+        # RAM disk this redirect exists to avoid. The operator's next signal
+        # would otherwise be the incident recurring.
+        _warn_without_escalating(
+            f"genesis: could not place pytest basetemp on disk ({exc}); "
+            "falling back to pytest's default, which may be a small tmpfs. "
+            "Set GENESIS_BIG_TMP to a writable on-disk directory."
+        )
+        return
     config.option.basetemp = target
     config._genesis_basetemp_cleanup = target
 
@@ -200,19 +376,24 @@ def pytest_unconfigure(config):
     explicit basetemp at session START but never at exit, and each run gets a new
     PID, so without this the ``~/tmp/pytest/<pid>`` dirs would accumulate (the
     daily hygiene job only prunes direct children of ``~/tmp``, whose mtime every
-    new run refreshes — so it never ages out). Best-effort."""
-    import shutil
+    new run refreshes — so it never ages out). Best-effort.
 
+    Uses :func:`_force_rmtree`, not ``shutil.rmtree(ignore_errors=True)`` — see
+    that function for why the plain form silently leaks every tree this suite
+    produces."""
     target = getattr(config, "_genesis_basetemp_cleanup", None)
-    if target:
-        shutil.rmtree(target, ignore_errors=True)
-
-    # Release the box-wide lock LAST, so it spans the whole session including
-    # this cleanup. (flock also drops on process death, so a crash cannot wedge
-    # the box — this is the orderly path, not the only one.)
-    lock = getattr(config, "_genesis_pytest_lock", None)
-    if lock is not None:
-        lock.release()
+    try:
+        if target:
+            _force_rmtree(target)
+    finally:
+        # Release the box-wide lock LAST, so it spans the whole session including
+        # this cleanup — but in a `finally`, so a cleanup that raises cannot leave
+        # the lock held and block every other test run on the machine. (flock also
+        # drops on process death, so a crash cannot wedge the box permanently;
+        # this is the orderly path, not the only one.)
+        lock = getattr(config, "_genesis_pytest_lock", None)
+        if lock is not None:
+            lock.release()
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──
