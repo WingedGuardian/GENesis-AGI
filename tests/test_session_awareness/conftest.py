@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,6 +11,30 @@ import pytest
 from genesis.session_awareness.statefiles import empty_state, save_state
 
 DIM = 8
+
+#: Every migration that shapes ``pr_verifications``, in id order.
+#:
+#: It lives in the shared conftest rather than in one test module because the
+#: failure it prevents is CROSS-FILE: an adversarial review MEASURED the CRUD
+#: suite running this table at fourteen columns while the lane suite ran it at
+#: ten, each applying its own hand-maintained list. Both were green — the lane's
+#: ``SELECT *`` reads by name — so nothing would have caught the divergence, and
+#: a "ONE list" comment inside a single test module is true of that module and
+#: false of the table. Any suite that needs this table calls
+#: :func:`build_pr_verifications`; adding a migration then reaches every caller.
+PR_VERIFICATION_MIGRATIONS = tuple(
+    importlib.import_module(f"genesis.db.migrations.{name}")
+    for name in (
+        "20260906234824_pr_verifications",
+        "20260926061637_pr_verification_verdict",
+    )
+)
+
+
+async def build_pr_verifications(conn) -> None:
+    """Apply the migrated build path for ``pr_verifications``, in id order."""
+    for mig in PR_VERIFICATION_MIGRATIONS:
+        await mig.up(conn)
 
 
 def seed_theme(
