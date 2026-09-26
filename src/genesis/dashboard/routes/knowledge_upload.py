@@ -11,6 +11,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.memory.reference_ops import REFERENCE_PROJECT
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,30 @@ async def knowledge_ingest_upload():
 
     if not upload_id or not project_type:
         return jsonify({"error": "upload_id and project_type required"}), 400
+
+    # Reference rows carry a structured body that ``parse_reference_body``
+    # requires, and the paths that produce it are the reference-store MCP tools
+    # and the auto-capture extraction pipeline — NOT this route.
+    #
+    # Deliberately NOT stated as "the partition has exactly one writer": an
+    # earlier revision of this comment said that and named a module which
+    # contains no writer at all. What this guard closes is the HTTP upload door
+    # specifically. The free-form ``project`` / ``project_type`` arguments on
+    # the ingest tools can still land an arbitrary body in the partition, so the
+    # invariant belongs at the shared ingest chokepoint rather than here; that
+    # is tracked separately. Claiming it here would be a structural guarantee
+    # this route cannot make.
+    # A document ingested here would satisfy neither: the References browser
+    # renders it blank (that parser fails CLOSED and never falls back to the
+    # raw body) and the knowledge browser excludes the partition outright — so
+    # the document would be reachable through neither, which is data loss
+    # wearing the shape of a successful upload.
+    if project_type == REFERENCE_PROJECT:
+        return jsonify({
+            "error": f"project_type '{REFERENCE_PROJECT}' is reserved for the reference store",
+            "detail": "Reference entries are created through the references API, "
+                      "not by document upload. Choose a different project type.",
+        }), 400
 
     if mode not in ("extract", "store"):
         return jsonify({"error": "mode must be 'extract' or 'store'"}), 400
