@@ -255,12 +255,14 @@ ESCALATION_ROUND_CAP = 3
 STANDING_REVIEWED_HEAD_LIMIT = 4
 GATE_DISCOVERY_ROUND_LIMIT = 2
 STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
-# Legacy compatibility only. Older hook trees import this name and may still
-# carry the one-shot final-accept state below. Current gates use GitHub-backed
-# distinct reviewed heads and native per-action approval; they do not consult
-# this constant or honor ``final-round-accept``. Keep the value at 7 so a stale
-# worktree does not activate its old sigil at the new four-head boundary.
-FINAL_ROUND_CAP = 7
+# `FINAL_ROUND_CAP = 7` lived here until 2026-09-25 and is DELETED, not deprecated
+# again. It was consulted by no gate — verified across the tree, zero conditionals
+# — while its value had been chosen specifically to avoid colliding with the
+# four-head boundary, so a retired constant was still shaping the live one and
+# reading as though a seventh round were a real tier. The `final-round-accept`
+# sigil remains PARSED and loudly REFUSED (`shell_parse._KNOWN_SIGILS`, plus the
+# retired-NOTE paths in both gates): a stale worktree must still be told the sigil
+# is dead, and none of those paths references a cap.
 # Legacy single-file marker (pre per-worktree scoping). Only read as a fallback
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
