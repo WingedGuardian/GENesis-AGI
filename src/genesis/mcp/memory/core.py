@@ -260,7 +260,11 @@ async def memory_recall(
             except Exception:
                 logger.warning("drift_recall fallback failed", exc_info=True)
 
-    # Boost event-calendar matches from explicit time_range
+    # Boost event-calendar matches from explicit time_range.
+    #
+    # Ids this loop actually appended, for the enrichment visibility decision far
+    # below. Declared outside the `if` so the predicate can read it unconditionally.
+    boosted_ids: set[str] = set()
     if event_boost_ids:
         from genesis.db.crud import memory as memory_crud
         from genesis.memory.types import RetrievalResult
@@ -271,6 +275,15 @@ async def memory_recall(
             try:
                 row = await memory_crud.get_by_id(memory_mod._db, mid)
                 if row:
+                    # Recorded at the PRODUCER, by identity. Enrichment below needs
+                    # to know which rows came from this unfiltered read, and the
+                    # obvious alternative — reading `source_pipeline == "event_calendar"`
+                    # off the row later — keys a visibility decision on a PERSISTABLE
+                    # string: `retrieval.py` reads that field straight out of the
+                    # Qdrant payload, and "event_calendar" is already a blessed
+                    # member of `provenance._FIRST_PARTY_PIPELINES`, so a future
+                    # writer could store it on a row this loop never produced.
+                    boosted_ids.add(mid)
                     results.append(
                         RetrievalResult(
                             memory_id=mid,
@@ -444,7 +457,36 @@ async def memory_recall(
     # Teaching drift the flag instead would be the wider fix and a real
     # capability gain for audit recalls — filed separately rather than expanding
     # this change into another subsystem.
-    traversal_include_deprecated = include_deprecated and pipeline_used == "standard"
+    #
+    # PER RESULT, not per pipeline, because `pipeline_used` does not describe
+    # every row in `results`. The event-calendar boost above appends rows through
+    # `memory_crud.get_by_id`, whose query is `WHERE f.memory_id = ?` with NO
+    # visibility clause at all — so those rows were produced by a read that
+    # filtered NOTHING, and the rule this change serves ("enrichment agrees with
+    # the search that actually produced this result") therefore says to honour the
+    # caller for them even in drift mode. A pipeline-wide flag stripped their
+    # neighbours instead, which is the same defect as the drift leak it fixed,
+    # pointing the other way: over-hiding rather than over-showing.
+    #
+    # THE TWO RULES, RECONCILED, because stated loosely they contradict each other
+    # and give opposite answers here. "Enrichment must not surface what the search
+    # beside it hides" is the PR's rule and it is about the SEARCH THAT PRODUCED THE
+    # ROW, never about the call's nominal pipeline. Read that way both cases fall
+    # out of one principle rather than needing a precedence order:
+    #   * a drift row was produced by a search that filters deprecated, so its
+    #     neighbours stay hidden even when the caller asked otherwise;
+    #   * a boosted row was produced by a read that filters NOTHING, so there is no
+    #     hiding for enrichment to contradict and the caller's choice governs.
+    # The drift comment above is the first clause of this, not a competing rule.
+    #
+    # Keyed on IDENTITY (`boosted_ids`, recorded at the producer) rather than on the
+    # row's `source_pipeline`, which is persistable — see the note at the boost.
+    def _traversal_allows_deprecated(result) -> bool:
+        if not include_deprecated:
+            return False
+        if pipeline_used == "standard":
+            return True
+        return result.memory_id in boosted_ids
 
     enriched = []
     graph_budget_ms = 500.0
@@ -464,16 +506,26 @@ async def memory_recall(
                     # enrichment here silently drops all of its neighbours,
                     # because every backend re-applies the predicate the caller
                     # just opted out of. DEPRECATION ONLY: an expired memory is
-                    # not reached at any value of this flag. `search_ranked`
+                    # not reached AS A NEIGHBOUR at any value of this flag — the
+                    # traversal predicate keeps its expiry limb unconditional.
+                    # That is narrower than "results never contain an expired
+                    # memory", which is FALSE today and is not this change's to
+                    # fix: the event-calendar boost above hydrates ids through two
+                    # reads that filter neither limb, so a `time_range` recall can
+                    # hand back an expired ROOT whose neighbours are then traversed
+                    # from here. Issue #2392, which also has to decide whether that
+                    # exemption is intended before it can be closed.
+                    # `search_ranked`
                     # applies its `invalid_at` clause unconditionally
                     # (db/crud/memory.py:207) and gates only the `deprecated`
                     # one (:212), so widening here would hand the model a
                     # neighbour id its own results array could never contain.
                     # An earlier version of this code did exactly that.
                     #
-                    # Not the raw parameter — see `traversal_include_deprecated`
-                    # above, which also withholds it on the drift pipelines.
-                    include_deprecated=traversal_include_deprecated,
+                    # Not the raw parameter — see `_traversal_allows_deprecated`
+                    # above, which withholds it on the drift pipelines except for
+                    # rows the calendar boost produced through an unfiltered read.
+                    include_deprecated=_traversal_allows_deprecated(r),
                 )
                 graph_elapsed_ms += traversal.query_ms
                 if traversal.nodes:

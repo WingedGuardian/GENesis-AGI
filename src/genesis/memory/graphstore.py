@@ -280,9 +280,9 @@ class GraphStore(Protocol):
         ``include_deprecated`` carries the CALLER'S visibility choice to the
         store, and it defaults to False so every existing call site keeps its
         exact present behaviour. True un-hides the DEPRECATION limb only — not
-        to the root, not to any hop — so a traversal can both START from and
-        PASS THROUGH a deprecated memory. A bitemporally EXPIRED memory stays
-        hidden at every value of this flag.
+        just at the root, but at EVERY hop — so a traversal can both START from
+        and PASS THROUGH a deprecated memory. A bitemporally EXPIRED memory
+        stays hidden at every value of this flag.
 
         Why the parameter has to live here rather than above the seam: the
         predicate is applied INSIDE each backend (a build-time row filter in

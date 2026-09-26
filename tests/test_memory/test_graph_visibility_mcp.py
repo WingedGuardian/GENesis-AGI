@@ -469,3 +469,121 @@ async def test_the_two_tools_defaults_are_deliberately_different(_mcp_state):
         "memory_expand must default to showing neighbours: it already returns "
         "the deprecated memory itself, so hiding only its edges is incoherent"
     )
+
+
+async def test_a_calendar_boosted_row_keeps_the_callers_visibility_in_drift_mode(
+    _mcp_state, monkeypatch
+):
+    """Visibility is per RESULT, because `pipeline_used` does not describe every row.
+
+    The event-calendar boost appends rows through `memory_crud.get_by_id`, whose
+    query is `WHERE f.memory_id = ?` with NO visibility clause — so those rows came
+    from a read that filtered NOTHING. The rule this module exists to enforce is
+    that enrichment agrees with the search that actually PRODUCED a result, and for
+    an unfiltered read that means honouring the caller. A pipeline-wide flag hid
+    their neighbours instead: the same defect as the drift leak above, pointing the
+    other way — over-hiding rather than over-showing.
+
+    Both rows are driven through ONE call deliberately. A per-pipeline
+    implementation cannot pass this test, while a test that used two separate calls
+    would pass against one, since each call would see a uniform pipeline.
+
+    Found by external review on PR #2339 (Devin, medium tier).
+
+    THE TWO ROWS ARE IDENTICAL IN EVERY FIELD BUT `memory_id`, deliberately, and
+    that includes `source_pipeline="event_calendar"` on the DRIFT row — which is not
+    a production shape. It is the negative control. An earlier version of this test
+    let the rows differ in eight fields, so roughly eight wrong predicates would
+    have passed it (`vector_rank is None`, `score < 0.5`, `source_pipeline !=
+    "drift"` …): the mutation proved the clause was load-bearing, never WHICH
+    property it read. Making the rows differ only in identity is what pins the
+    implementation to identity.
+
+    It also falsifies the shape this fix deliberately did NOT use. Keying on
+    `source_pipeline` would allow the drift row here, because that field is
+    PERSISTABLE — `retrieval.py` reads it straight out of the Qdrant payload and
+    "event_calendar" is already a blessed member of
+    `provenance._FIRST_PARTY_PIPELINES` — so a stored value could claim a
+    provenance the row never had. The predicate reads `boosted_ids`, recorded at the
+    producer, which no payload can forge.
+    """
+    from unittest.mock import AsyncMock
+
+    from genesis.db.crud import memory as memory_crud
+    from genesis.db.crud import memory_events
+    from genesis.mcp.memory import core as core_mod
+    from genesis.memory.types import RetrievalResult
+
+    drift_id = "44444444-4444-4444-4444-444444444444"
+    calendar_id = "55555555-5555-5555-5555-555555555555"
+
+    # Exactly the keys `memory_crud.get_by_id` returns — read from its SELECT, which
+    # carries NO `deprecated` column. An earlier version of this test mocked a
+    # `deprecated` key, a shape the real function cannot produce.
+    def _row(mid: str) -> dict:
+        return {
+            "memory_id": mid,
+            "content": "same content",
+            "source_type": "test",
+            "tags": "",
+            "collection": "episodic_memory",
+            "created_at": "2026-06-01T00:00:00Z",
+            "confidence": 0.5,
+            "embedding_status": "done",
+            "valid_at": "2026-06-01T00:00:00Z",
+            "invalid_at": None,
+        }
+
+    # Field-for-field what the calendar boost constructs, so the only difference
+    # between the two rows is which id the boost actually produced.
+    drift_hit = RetrievalResult(
+        memory_id=drift_id,
+        content="same content",
+        source="test",
+        memory_type="episodic_memory",
+        score=0.01,
+        vector_rank=None,
+        fts_rank=None,
+        activation_score=0.0,
+        payload=_row(drift_id),
+        source_pipeline="event_calendar",
+        collection="episodic_memory",
+    )
+
+    rec = _TraverseRecorder()
+    monkeypatch.setattr(core_mod, "graph_traverse", rec)
+    drift_mod = __import__("genesis.memory.drift", fromlist=["drift_recall"])
+    monkeypatch.setattr(drift_mod, "drift_recall", AsyncMock(return_value=[drift_hit]))
+    _mcp_state._retriever.recall = AsyncMock(return_value=[drift_hit])
+
+    # The calendar id is NOT among the drift results, so the boost hydrates it.
+    monkeypatch.setattr(
+        memory_events, "get_memory_ids_in_range", AsyncMock(return_value=[calendar_id])
+    )
+    monkeypatch.setattr(memory_crud, "get_by_id", AsyncMock(return_value=_row(calendar_id)))
+
+    await core_mod.memory_recall.fn(
+        query="q",
+        mode="drift",
+        time_range="2026-01-01/2026-12-31",
+        include_deprecated=True,
+        compact=False,
+        include_graph=True,
+        corrective=False,
+    )
+
+    by_root = {c["root_id"]: c["include_deprecated"] for c in rec.calls}
+    assert calendar_id in by_root, (
+        "the calendar-boosted row was never enriched — this test proves nothing; "
+        f"enriched roots were {sorted(by_root)}"
+    )
+    assert by_root[calendar_id] is True, (
+        "a calendar-boosted row is produced by an UNFILTERED get_by_id, so the "
+        "caller's include_deprecated must be honoured for its neighbours even in "
+        "drift mode — hiding them drops neighbours of a result the caller asked for"
+    )
+    # The CONTROL, in the same call: the drift-produced row must still be hidden.
+    assert by_root.get(drift_id) is False, (
+        "the drift row must keep its suppression; a fix that honoured the caller "
+        "for every row in drift mode would reintroduce the leak this file pins above"
+    )
