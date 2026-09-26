@@ -363,19 +363,33 @@ harness fires.
 draws from, not a count of what passes it. A script that deletes, prunes,
 restores, deploys to the host, pushes, posts or sends a message, or writes to any
 live store (the database, Qdrant, the graph engine) does NOT run before it
-merges, except in its own `--dry-run` mode when the diff does not touch that
-mode. Do not improvise isolation: `GENESIS_HOME` moves neither the database nor
-Qdrant, and many files hard-code `~/.genesis`. Tests are how such a script is
-verified.
+merges. A `--dry-run` flag is not an exception by itself: `restore.sh --dry-run`
+still takes the live update and backup-restore locks, runs `git pull --rebase` on
+the backup repository, and overwrites `~/.genesis/restore_status.json` on exit.
+Run a dry-run only after reading that mode's code and finding that it writes
+nothing. Do not improvise isolation: `GENESIS_HOME` moves neither
+the database nor Qdrant, and many files hard-code `~/.genesis`. Tests are how such
+a script is verified.
 
-**Never run on the live install before it merges:** a branch's migration (test it
-in a pytest fixture against a copy via `GENESIS_DB_PATH`), privacy, egress or
-credential handling, anything that loosens a gate other sessions rely on, and anything whose
-verification needs days or a machine the owner does not control. NEW behaviour on
-a risky surface (memory, graph, database) ships behind a shadow flag, and the
-session never flips it: the owner does, after verifying. Entity adjudication is
-the house example: `config/entity_adjudication.yaml` ships it in shadow, and the
-verdicts from the shadow period apply when the owner flips it.
+**Never run on the live install before it merges:** a branch's migration, privacy,
+egress or credential handling, anything that loosens a gate other sessions rely
+on, and anything whose verification needs days or a machine the owner does not
+control. Test a migration in a pytest fixture, and patch EVERY store it touches on
+the migration MODULE itself. The suite-wide fixture patches
+`genesis.env.genesis_db_path`, but data migrations import that name directly
+(`from genesis.env import genesis_db_path`), so the patch never reaches them and
+the migration still opens the live database. A migration can also reach live
+Qdrant and write under `~/.genesis`. `d0008_reconcile_memory_cross_store`, for
+example, deletes the Qdrant points it judges to be ghosts. Its test patches the
+module's `genesis_db_path`, `get_client` and `_export_path`:
+`tests/test_db/test_d0008_reconcile_memory_cross_store.py` is the pattern to copy. NEW behaviour on a risky surface (memory, graph, database) ships behind a
+shadow flag, and the session never flips it: the owner does, after verifying.
+Entity adjudication is the house example. `config/entity_adjudication.yaml` ships
+it in `propose_only`, so a merge is recorded as a proposal. The owner reviews and
+approves proposals and applies the approved ones (`entity_adjudication_approve`,
+then `entity_adjudication_apply`) without changing the mode. Switching to `live`
+is a separate decision: it applies only approved backlog rows, but from then on
+it merges each NEW pair automatically with no approval step.
 
 **Iterate with the owner.** When acceptance needs the owner's hands (a device, a
 chat channel, another machine they use, or something only they can see), do not
@@ -383,13 +397,27 @@ open the PR on a guess. Tell them exactly what to try and what they should see,
 ask through `AskUserQuestion`, fix what they report, and re-ask while it blocks.
 Open the PR once they confirm it works. Waiting on the owner here is the design,
 not a stall: no review round could have caught what they are about to see.
-- **A dispatched session never waits on the owner.** It commits to its branch and
-  ends, and its report plus a `follow_up_create` row name the owner test still
-  owed (what to try, what they should see) AND where the code is: branch,
-  worktree path and head SHA, since nothing has been pushed.
+- **Do not dispatch work whose acceptance needs the owner's hands.** No
+  dispatched path checked so far (the autonomy executor and
+  `direct_session_run`) can hold a change for the owner's test today.
+  - The autonomy executor pushes every code task's branch and opens a draft PR
+    for a build-lane task that passes its scope gate. It then deletes the
+    worktree and the local branch, so there is nothing left to test locally
+    (#2421).
+  - The executor's code steps have no MCP write except `observation_write`, so
+    they cannot create a follow-up row (#2422).
+  - A `direct_session_run` session has no Bash or Edit tool, so it cannot
+    commit code at all.
+  If a dispatched session finds an owner test is owed anyway, it states what to
+  try and what they should see in its final output. For an executor task that
+  output is read through `task_detail`, and it reaches no notification. A
+  follow-up row that a dispatched session creates (on a profile that allows it)
+  lands on the hidden tabled lane, so its `reason` must say it awaits the owner's
+  test in a foreground session.
 - **The owner says they cannot test it this session, or the session ends
-  before they confirm:** the same follow-up row. Never write the change up as
-  verified.
+  before they confirm:** a `follow_up_create` row naming the owner test still
+  owed and where the code is (branch, worktree path, head SHA). Never write the
+  change up as verified.
 
 ### Acceptance Bar + Measured Rate — the primary methodology
 

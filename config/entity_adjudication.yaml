@@ -12,11 +12,16 @@ enabled: true
 #   off          — the job exits immediately (no drain, no sweep)
 #   propose_only — (default) LLM judges each fuzzy entity pair and RECORDS the
 #                  verdict; a "merge" is stored as `proposed_merge` and NOT
-#                  applied. Review the proposals, then flip to live.
-#   live         — a double-agreed "merge" is APPLIED (loser entity tombstoned
-#                  into the survivor via merge_entity). Stored proposed_merge
-#                  verdicts from the shadow period apply on the flip, guarded
-#                  against staleness (re-adjudicate if identity drifted).
+#                  applied. To act on proposals, approve them
+#                  (entity_adjudication_approve) and apply the approved ones
+#                  (entity_adjudication_apply) — no mode change needed.
+#   live         — a double-agreed "merge" on a NEW pair is APPLIED with NO
+#                  approval step (loser entity tombstoned into the survivor
+#                  via merge_entity). Of the stored shadow-period proposals,
+#                  only human-APPROVED rows are applied, guarded against
+#                  staleness (re-adjudicate if identity drifted). Flipping to
+#                  live is therefore a decision to authorize unattended merges
+#                  from then on, not a way to apply the shadow backlog.
 #
 # Merges are effectively irreversible (the loser's mentions/links are rewritten
 # onto the survivor), so the default is propose_only — the conservative posture
