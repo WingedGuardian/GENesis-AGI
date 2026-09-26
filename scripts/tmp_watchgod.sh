@@ -96,6 +96,7 @@ load_config() {
     # trade a real signal for a warning on every poll.
     local _cap
     _cap="$(cc_tmp_capacity_mb)"
+    CC_TMP_DIR="$(canon_dir "$CC_TMP_DIR")"
     if [[ "${SACRED_GROUND_MB:-}" =~ ^[0-9]+$ ]] && (( _cap > 150 && SACRED_GROUND_MB >= _cap )); then
         log WARN "watchgod.conf: SACRED_GROUND_MB=${SACRED_GROUND_MB} >= cc-tmp capacity ${_cap}MB — that pins the oxygen floor permanently ON and bypasses the in-flight guard on every RED run; clamping to 150"
         SACRED_GROUND_MB=150
@@ -164,6 +165,18 @@ glob_escape() {
     # excluded by -not -path ".../sp[a]re/*" and is reaped anyway — a silent
     # fail-OPEN in the exact direction this guard exists to prevent.
     printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'
+}
+
+canon_dir() {
+    # Collapse trailing slashes so a configured path and the paths find(1)
+    # emits under it agree. GNU find reproduces its START POINT verbatim,
+    # repeated slashes included — MEASURED: `find "$root//" -maxdepth 1`
+    # emits `$root//child`. Normalising only the EXCLUSION side therefore
+    # relocates the mismatch instead of closing it, which is why this is
+    # applied to the value where it ENTERS rather than at each consumer.
+    local d="$1"
+    while [[ "$d" == */ && "$d" != "/" ]]; do d="${d%/}"; done
+    printf '%s' "$d"
 }
 
 live_open_paths() {
@@ -449,8 +462,14 @@ cc_control_plane_paths() {
     # no exclusion can matter there.
     local uid
     uid="$(id -u 2>/dev/null || echo 0)"
+    # CANONICALIZE the trailing slash. CC_TMP_DIR is config-settable, and
+    # `dir/` yields the exclusion `dir//cc-socks` while find(1), rooted at
+    # `dir/`, emits `dir/cc-socks` — the exclusion then matches nothing and
+    # the sweep deletes the directory this function exists to spare.
+    # REPRODUCED 2026-09-26: with a trailing slash the empty cc-socks was
+    # DELETED while a plain-path control arm spared it.
     printf '%s\n' \
-        "$CC_TMP_DIR/cc-socks" \
+        "$(canon_dir "$CC_TMP_DIR")/cc-socks" \
         "/tmp/cc-socks" \
         "/tmp/cc-socks-${uid}" \
         "/tmp/cc-daemon-${uid}"
@@ -469,7 +488,19 @@ cc_control_plane_excl() {
         # contract test_red_reclaims_files_inside_socket_dir has pinned since
         # the 2026-09-05 fix: a log file beside a socket is garbage, only the
         # DIRECTORY is control plane. Sockets are already spared by -not -type s.
-        _cp_out+=( -not -path "$p" -not \( -type d -path "$p/*" \) )
+        # -path takes a GLOB, not a literal, so a bracket/star/question mark
+        # in a config-settable CC_TMP_DIR silently stops the exclusion from
+        # matching its own directory. Same fail-OPEN glob_escape already
+        # guards for live-writer paths. REPRODUCED 2026-09-26: with
+        # CC_TMP_DIR=.../home[x] the empty cc-socks was DELETED while the
+        # plain-path control arm spared it.
+        #
+        # The ESCAPED form is only for the predicates. Callers that test the
+        # path on disk or log it keep the literal from cc_control_plane_paths,
+        # which is why the escaping lives here and not there.
+        local esc
+        esc="$(glob_escape "$p")"
+        _cp_out+=( -not -path "$esc" -not \( -type d -path "$esc/*" \) )
     done < <(cc_control_plane_paths)
 }
 
@@ -561,6 +592,7 @@ clean_cc_yellow() {
     # Snapshot cost ~50-100ms per poll, measured.
     local -a _yellow_excl=()
     zone_a_live_exclusions _yellow_excl "$(live_open_paths)" "$CC_TMP_DIR"
+    CC_TMP_DIR="$(canon_dir "$CC_TMP_DIR")"
     log INFO "Zone A YELLOW — cleaning stale session dirs and temp files"
 
     # Clean session dirs with mtime > 7 days
@@ -663,6 +695,7 @@ clean_cc_orange() {
 }
 
 clean_cc_red() {
+    CC_TMP_DIR="$(canon_dir "$CC_TMP_DIR")"
     log WARN "Zone A RED — NUCLEAR cleanup, preserving active session"
 
     # Find the most recently modified session UUID dir (the active workspace)
@@ -832,7 +865,15 @@ clean_cc_red() {
     # sweeps actually sweeping.
     local -a session_excl=()
     if (( ! floor )) && [[ -n "$newest_session" ]]; then
-        session_excl=(-not -path "$newest_session/*")
+        # ESCAPED, for the same reason the control-plane exclusions are, and
+        # this one is reachable without touching any config: newest_session is
+        # derived from a real project directory name, and CC builds that name
+        # from the repository path. REPRODUCED 2026-09-26 with a stock
+        # CC_TMP_DIR — a project named `genesis[wt]` made RED delete the ACTIVE
+        # session's loose working files, while a plain-named control kept them.
+        local _sess_esc
+        _sess_esc="$(glob_escape "$newest_session")"
+        session_excl=(-not -path "$_sess_esc/*")
     fi
 
     # Delete all reclaimable loose files except those modified in the last 60s.
@@ -892,8 +933,18 @@ clean_cc_red() {
     # conditioned on sock_count alone goes silent in exactly the situation it
     # is meant to make visible, which is the same invisibility the comment
     # above blames for the 2026-09-05 incident going unnoticed.
+    # Count ONLY the control-plane dirs under the root this sweep actually
+    # walked. The enumeration also carries /tmp roots, which Zone A never
+    # touches — counting those would let an unrelated /tmp/cc-daemon-<uid>
+    # report a preserved directory and mask the absence of the in-budget
+    # cc-socks, which is the one case this line exists to make visible.
     cp_count=0
+    local _cp_root; _cp_root="$(canon_dir "$CC_TMP_DIR")"
+    # A root of "/" canonicalises to "/", and "$_cp_root"/* would then be the
+    # pattern "//*", which matches nothing — the count would read 0 forever.
+    [[ "$_cp_root" == "/" ]] && _cp_root=""
     while IFS= read -r _cp_dir; do
+        [[ "$_cp_dir" == "$_cp_root"/* ]] || continue
         [[ -d "$_cp_dir" ]] && cp_count=$(( cp_count + 1 ))
     done < <(cc_control_plane_paths)
     if (( sock_count > 0 || cp_count > 0 )); then

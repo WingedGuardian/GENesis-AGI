@@ -83,6 +83,12 @@ def _mksock(path: Path) -> None:
     os.mknod(path, stat.S_IFSOCK | 0o600)
 
 
+def _age(path: Path, seconds: int) -> None:
+    """Backdate mtime/atime so a freshness predicate treats the file as stale."""
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
 def _log(home: Path) -> str:
     return (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
 
@@ -407,4 +413,140 @@ def test_zone_b_sweep_still_calls_the_shared_resolver(tmp_path):
     assert "cc-socks*" not in code and "cc-daemon-*" not in code, (
         "a name GLOB is back in the Zone B sweep; it makes an unbounded subtree "
         "immortal and spares CC's mkdtemp husks forever"
+    )
+
+
+# --------------------------------------------------------------------------
+# The path CC_TMP_DIR takes is CONFIG-SETTABLE, and find(1)'s -path takes a
+# GLOB. Both arms below were REPRODUCED against the unfixed code (2026-09-26,
+# review round 1): the empty sockets directory was DELETED in each, while a
+# plain-path control arm spared it. Each arm carries its own negative control
+# — an unrelated empty `junk/` that must still be reaped — so a guard that
+# simply stopped deleting anything cannot pass them.
+# --------------------------------------------------------------------------
+
+
+def test_red_spares_the_sockets_dir_under_a_glob_character_path(tmp_path):
+    """A bracket in CC_TMP_DIR must not turn the exclusion into a pattern that
+    fails to match its own directory. This is the same fail-OPEN `glob_escape`
+    already guards for live-writer paths, one level up."""
+    home, _cctmp, bind = _sandbox(tmp_path)
+    root = home / ".genesis" / "cc-tmp[x]"
+    (root / "cc-socks").mkdir(parents=True)
+    (root / "junk").mkdir()
+
+    proc = _run(
+        home, bind, _PRELUDE + f"CC_TMP_DIR={shlex.quote(str(root))}; clean_cc_red"
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (root / "cc-socks").is_dir(), "RED deleted the sockets dir under a glob path"
+    assert not (root / "junk").exists(), "negative control: unrelated junk survived"
+
+
+def test_red_spares_the_sockets_dir_when_CC_TMP_DIR_has_a_trailing_slash(tmp_path):
+    """`dir/` builds the exclusion `dir//cc-socks` while find, rooted at `dir/`,
+    emits `dir/cc-socks` — so the exclusion matches nothing."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir()
+    (cctmp / "junk").mkdir()
+
+    proc = _run(
+        home, bind, _PRELUDE + f"CC_TMP_DIR={shlex.quote(str(cctmp) + '/')}; clean_cc_red"
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (cctmp / "cc-socks").is_dir(), "RED deleted the sockets dir on a trailing slash"
+    assert not (cctmp / "junk").exists(), "negative control: unrelated junk survived"
+
+
+def test_red_counts_only_control_plane_dirs_under_the_root_it_swept(tmp_path):
+    """The enumeration also carries /tmp roots, which Zone A never walks. If
+    those are counted, an unrelated one reports a preserved directory and masks
+    the absence of the in-budget sockets dir — the single case this log line
+    exists to make visible.
+
+    The resolver is stubbed so the arm does not depend on whether this machine
+    happens to have a /tmp control-plane root: one path inside the swept root,
+    one outside it, both present on disk. The fixed code must count ONE.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir()
+    outside = home / "outside-the-swept-root"
+    outside.mkdir()
+
+    stub = (
+        "cc_control_plane_paths() { printf '%s\\n' "
+        f'"$CC_TMP_DIR/cc-socks" {shlex.quote(str(outside))}; }}; '
+    )
+    proc = _run(home, bind, _PRELUDE + stub + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert outside.is_dir(), "the arm's premise: the outside path is still on disk"
+    assert " and 1 control-plane dir(s)" in _log(home), (
+        "RED counted a control-plane dir it never swept:\n" + _log(home)
+    )
+
+
+def test_red_reclaims_an_unrelated_cc_socks_husk_elsewhere_in_the_tree(tmp_path):
+    """The arm that pins the MECHANISM, not just the outcome.
+
+    Audit finding, round 2: the three arms above are all satisfied by a
+    BASENAME exclusion (`-not -name 'cc-socks'`), which this file spends
+    thirteen comment lines rejecting — under it, an unrelated `cc-socks`
+    directory anywhere in the tree becomes immortal and leaks its inode
+    forever. The exclusions are EXACT PATHS, and only an arm that reaps a
+    same-named directory at a different path can tell the two apart.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir()
+    husk = cctmp / "junkproj" / "cc-socks"
+    husk.mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (cctmp / "cc-socks").is_dir(), "the real control-plane dir was reaped"
+    assert not husk.exists(), (
+        "an unrelated cc-socks husk survived — the exclusion is matching by "
+        "NAME, not by exact path, and every such husk is now immortal"
+    )
+
+
+def test_red_spares_the_active_sessions_files_under_a_bracketed_project(tmp_path):
+    """`-path` takes a glob at the ACTIVE-SESSION exclusion too, and that one
+    needs no config change to reach: CC derives the project directory name from
+    the repository path, so a bracket in the repo name is enough.
+
+    REPRODUCED against the unfixed predicate with a plain-named control:
+    control KEPT, `genesis[wt]` DELETED, `home-u-repo[1]` DELETED.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    sess = cctmp / "claude-1000" / "genesis[wt]" / "session-uuid"
+    sess.mkdir(parents=True)
+    live = sess / "working.txt"
+    live.write_bytes(b"w" * 2048)
+    _age(live, 600)
+
+    other = cctmp / "claude-1000" / "plainproj" / "old-session"
+    other.mkdir(parents=True)
+    stale = other / "working.txt"
+    stale.write_bytes(b"j" * 2048)
+    _age(stale, 600)
+    # newest_session is the depth-2 PROJECT dir chosen by mtime, so make the
+    # bracketed one unambiguously the active workspace. Without this the arm
+    # would be about whichever project happened to be created last.
+    _age(other, 3600)
+    _age(cctmp / "claude-1000" / "plainproj", 3600)
+
+    proc = _run(home, bind, _PRELUDE + "SACRED_GROUND_MB=1; clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "OXYGEN FLOOR" not in _log(home), "the arm's premise: RED is above the floor"
+
+    assert live.exists(), (
+        "RED deleted the ACTIVE session's working file because a bracket in "
+        "the project name turned its exclusion into a non-matching glob"
+    )
+    assert not stale.exists(), (
+        "the older session's file survived too — the sweep did not run"
     )

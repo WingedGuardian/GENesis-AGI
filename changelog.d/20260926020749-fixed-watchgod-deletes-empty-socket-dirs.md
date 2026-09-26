@@ -26,3 +26,16 @@
   lost race — a sweep landing between the path check and the directory's
   creation makes that session refuse to bind, and it runs without
   cross-session messaging for its lifetime rather than retrying.
+  The exclusions are also escaped and normalised before they reach the search
+  tool, which takes a *pattern* rather than a literal path. The temp directory
+  is configurable, so a bracket, star or question mark in it — or a trailing
+  slash — used to leave the exclusion matching nothing at all, deleting the
+  very directory it was written to spare. The same omission was found on the
+  exclusion protecting the active session's own files, and that one needs no
+  configuration change at all to reach: the project directory name comes from
+  the repository path, so a bracket in a repository name was enough to make
+  the emergency sweep delete the running session's working files. Reproduced
+  in every shape against a plain-path control that kept them. Path
+  normalisation now happens where the configured value enters rather than at
+  each place it is compared, because normalising one side of a comparison
+  moves the mismatch instead of closing it.
