@@ -112,23 +112,40 @@ class SnapshotConfig:
     take_pre_recovery: bool = True  # Take snapshot before recovery action
     # Daily 'healthy' snapshot while the guardian state is HEALTHY — produces
     # the offline SNAPSHOT_ROLLBACK lifeline (without it, rollback has no
-    # target and always fails). Rotated on each take: exactly one healthy
-    # snapshot, ≤1 maintenance interval old, so CoW divergence never
-    # accumulates. Set false to stop taking (existing healthy snapshots then
-    # age out via max_age_days / expiry).
+    # target and always fails). Rotation is create-then-delete, so it keeps
+    # exactly one healthy snapshot ONLY while creates succeed: a refused
+    # create (the pool gate, or LVM's own threshold) leaves the old one in
+    # place, still diverging. mark_healthy therefore rotates delete-first when
+    # the create was refused by the pool AND pool_pressure's measured runway
+    # says the pool is under pressure AND the lifeline is over a day old; a
+    # full-but-stable pool keeps it. pool_pressure also bounds its age under
+    # pressure. Set false to stop taking
+    # (existing healthy snapshots then age out via expiry / pool relief).
     healthy_enabled: bool = True
+    # Age past which the healthy lifeline becomes expendable UNDER POOL
+    # PRESSURE (pool_pressure's early stage). Deliberately not an unconditional
+    # cap: the lifeline is only refreshed while the container is HEALTHY, so an
+    # outage longer than this would otherwise delete the only rollback target
+    # exactly when it is needed. Without any bound, one refused rotation kept a
+    # snapshot for a week while its copy-on-write divergence filled the thin
+    # pool. <= 0 means the early stage never takes the lifeline (the urgent
+    # stage still can).
+    lifeline_max_age_hours: float = 48.0
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
     min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
     # Age-based prune: delete guardian-* snapshots older than this many days,
-    # regardless of retention count — EXCEPT the newest and the latest healthy
-    # (the offline snapshot-rollback lifeline). Backstops the incident where
+    # regardless of retention count — EXCEPT the latest healthy snapshot, which
+    # is instead bounded by lifeline_max_age_hours. Backstops the incident where
     # stale guardian-pre-recovery snapshots accumulated CoW divergence for months.
     max_age_days: int = 14
-    # incus `snapshots.expiry` — daemon-side auto-deletion of SCHEDULED snapshots
-    # after this interval (units: s/m/h/d/w/M/y). A guardian-independent kill
-    # switch that fires even if the guardian process is dead. Deliberately does
-    # NOT set `snapshots.expiry.manual` (instance-wide; would expire snapshots
-    # the user creates by hand). Empty string disables enforcement.
+    # incus `snapshots.expiry` — daemon-side auto-deletion after this interval
+    # (units: s/m/h/d/w/M/y). A guardian-independent kill switch that fires even
+    # if the guardian process is dead. Which snapshots it covers depends on the
+    # Incus version: on Incus 6.0.0 it was measured stamping manually-created
+    # snapshots too (a guardian snapshot carried expires_at = created + 2w);
+    # newer releases split manual snapshots out to `snapshots.expiry.manual`,
+    # which this deliberately does not set (instance-wide; it would expire
+    # snapshots the user creates by hand). Empty string disables enforcement.
     expiry: str = "2w"
 
 
@@ -168,6 +185,46 @@ class StoragePoolConfig:
     # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
     # a live problem visible). Tier *increases* always alert immediately.
     realert_hours: float = 6.0
+
+    # --- Pressure RELIEF (pool_pressure.py) ---------------------------------
+    # The tiers above only ALERT. A thin pool once filled to 100% while CRITICAL
+    # alerts fired every 6h for four days, because the space was held by a
+    # guardian snapshot nothing was allowed to delete. Relief acts on MEASURED
+    # growth rather than a fixed percentage: it keeps a bounded pool history,
+    # derives the growth rate and worst burst, and frees guardian-owned space
+    # when the pool would fill within the horizons below, or free space drops
+    # below the burst reserve.
+    #   live       — extend (LVM, opt-in profile) then delete guardian snapshots
+    #   alert_only — compute and alert, never act
+    #   off        — no history, no relief
+    # Invalid values degrade to alert_only. Env kill switch:
+    # GUARDIAN_POOL_RELIEF_DISABLED=1 forces alert_only.
+    relief_mode: str = "live"
+    # Two stages, by measured runway (hours until data or metadata is full):
+    #   early  (< early_horizon_hours): free what is expendable — extend the
+    #          pool (LVM opt-in), delete pre-recovery snapshots and a healthy
+    #          lifeline older than snapshots.lifeline_max_age_hours;
+    #   urgent (< urgent_horizon_hours, or free below the burst reserve):
+    #          any guardian snapshot, the rollback lifeline last.
+    # A pool NOT under pressure never loses its rollback lifeline, however long
+    # an outage keeps the guardian from refreshing it.
+    early_horizon_hours: float = 48.0
+    urgent_horizon_hours: float = 24.0
+    # Reserve = max(worst 10-minute rise in the LAST DAY x burst_multiplier,
+    # min_reserve_pct of the pool). The percentage is only the floor used while
+    # history is too short to show bursts (a fresh install); it is sized to
+    # cover a backup-sized write burst (~2 GB) on a ~70 GB pool. One day, not
+    # the whole history: a single restore-sized burst must not pin the reserve
+    # (and so the relief) high for a week.
+    burst_multiplier: float = 2.0
+    min_reserve_pct: float = 3.0
+    # History: one sample per interval, bounded (2016 x 300s = 7 days).
+    history_sample_interval_s: int = 300
+    history_max_samples: int = 2016
+    # LVM-thin partial extend leaves this much VG space unallocated so thin-pool
+    # METADATA can still be grown by hand (a full metadata LV is the harder
+    # outage to recover from).
+    extend_keep_free_mib: int = 512
 
 
 @dataclass

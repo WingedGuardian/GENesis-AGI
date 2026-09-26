@@ -104,8 +104,16 @@ Before recommending IO_TRIAGE, check the PSI trend:
   host-survival backstop, not a workload cap), OOMScoreAdjust=0 (neutral): the
   Guardian is last-ditch recovery, never expendable, but must not preferentially
   kill the user's host-side Claude Code or the container
-- Snapshot gating: headroom-based check (requires free > max(5GB, 2x avg recent
-  snapshots)), not fixed percentage
+- Snapshot gating: on LVM-thin pools a new snapshot is refused at the
+  storage_pool high tiers (and LVM itself refuses past its 80% autoextend
+  threshold); other backends use a headroom check
+- Pool-pressure relief runs every tick BEFORE the recovery cycle and may delete
+  `guardian-*` snapshots (and, with the `genesis-thinpool` profile, grow the
+  thin pool) as the measured runway shortens. If you are diagnosing a full
+  pool, read `pool_history.jsonl` in the guardian state dir and the relief
+  alerts first. Never delete a snapshot WITHOUT the `guardian-` prefix — those
+  belong to the user. Runbook: `docs/reference/thin-pool-recovery.md` in the
+  Genesis repo
 
 ## Genesis Context
 

@@ -481,6 +481,16 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # no action and never touches the state machine, so running it first is free.
     await _check_guard_layer_and_alert(config, dispatcher)
 
+    # Pool-pressure relief, also BEFORE the cycle and for the same reason: a
+    # filling pool is most likely exactly when the cycle is busy (a container
+    # outage → diagnosis for up to cc.timeout_s), and relief that waits behind
+    # it arrives an hour later in this tick. (The tick is a oneshot, so the
+    # NEXT tick still waits for this one's diagnosis: during an outage relief
+    # runs about hourly, which the day-scale horizons tolerate.) Measures,
+    # records history, and frees at most ONE guardian-owned thing per tick.
+    # Never raises.
+    await _check_pool_pressure(config, dispatcher, snapshots)
+
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
@@ -494,6 +504,7 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             snapshots,
             is_healthy=sm.current_state == GuardianState.HEALTHY,
             snapshot_size_history=sm.state.snapshot_size_history,
+            dispatcher=dispatcher,
         )
         # Heartbeat means "Guardian process is alive and watching" —
         # NOT "Genesis container is healthy". Any successful check cycle
@@ -664,6 +675,7 @@ async def _maintain_snapshots(
     snapshots: SnapshotManager,
     is_healthy: bool = False,
     snapshot_size_history: list[int] | None = None,
+    dispatcher: AlertDispatcher | None = None,
 ) -> None:
     """Enforce snapshot expiry, prune, and take the daily healthy snapshot.
 
@@ -706,21 +718,103 @@ async def _maintain_snapshots(
     except Exception:
         logger.warning("Snapshot prune failed", exc_info=True)
 
+    # A refused/failed healthy snapshot retries in ~1h instead of a day later:
+    # the marker is back-dated so the 24h throttle opens again soon.
+    retry_soon = False
     if is_healthy and config.snapshots.healthy_enabled:
         try:
-            name = await snapshots.mark_healthy(snapshot_size_history)
+            # Delete-first rotation is allowed only when the MEASURED model
+            # (the same one relief acts on) says the pool is under pressure —
+            # never on the static gate alone (a full-but-stable pool would
+            # lose its rollback lifeline for nothing).
+            from genesis.guardian.pool_pressure import LEVEL_NONE, current_pressure
+
+            under_pressure = await current_pressure(config) != LEVEL_NONE
+            name = await snapshots.mark_healthy(
+                snapshot_size_history, under_pressure=under_pressure,
+            )
+            note = getattr(snapshots, "last_rotation_note", None)
             if name:
                 logger.info("Healthy snapshot refreshed: %s", name)
             else:
+                retry_soon = True
+                refusal = getattr(snapshots, "last_refusal", None)
                 logger.warning(
-                    "Healthy snapshot NOT taken (pool gate or create failure) "
-                    "— offline rollback lifeline not refreshed this cycle",
+                    "Healthy snapshot NOT taken (%s) — offline rollback lifeline "
+                    "not refreshed this cycle; retrying in ~1h",
+                    refusal if isinstance(refusal, str) else "unknown",
                 )
+            # A refused rotation used to be only the log line above, and a
+            # week of them preceded a thin pool filling to 100%. Say it out loud
+            # — but throttled: the retry is hourly, and 24 identical WARNs a
+            # day would teach the same thing the ignored alerts did.
+            refused_marker = config.state_path / ".healthy_refused_alert"
+            if name:
+                refused_marker.unlink(missing_ok=True)
+            if isinstance(note, str) or (
+                not name and _marker_due(refused_marker, config.storage_pool.realert_hours)
+            ):
+                await _alert_healthy_snapshot(
+                    dispatcher, name, note if isinstance(note, str) else None,
+                    getattr(snapshots, "last_refusal", None),
+                )
+                if not name:
+                    _touch_marker(refused_marker)
         except Exception:
+            retry_soon = True
             logger.warning("Healthy snapshot take failed", exc_info=True)
 
     prune_marker.parent.mkdir(parents=True, exist_ok=True)
-    prune_marker.write_text(datetime.now(UTC).isoformat())
+    stamp = datetime.now(UTC)
+    if retry_soon:
+        stamp -= timedelta(hours=23)
+    prune_marker.write_text(stamp.isoformat())
+
+
+def _marker_due(marker: Path, hours: float) -> bool:
+    """True when ``marker`` (an ISO timestamp file) is absent, unreadable, in
+    the future, or older than ``hours``."""
+    try:
+        last = datetime.fromisoformat(marker.read_text().strip())
+    except (OSError, ValueError):
+        return True
+    now = datetime.now(UTC)
+    return last > now or (now - last) >= timedelta(hours=hours)
+
+
+def _touch_marker(marker: Path) -> None:
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now(UTC).isoformat())
+    except OSError:
+        logger.warning("could not write %s", marker, exc_info=True)
+
+
+async def _alert_healthy_snapshot(
+    dispatcher: AlertDispatcher | None,
+    name: str | None,
+    note: str | None,
+    refusal: object,
+) -> None:
+    """WARN when the rollback lifeline could not be refreshed normally."""
+    if dispatcher is None:
+        return
+    if name:
+        title = "Healthy snapshot rotated delete-first"
+        body = f"{note}. The pool refused a create-first rotation."
+    else:
+        title = "Healthy snapshot NOT refreshed"
+        why = refusal if isinstance(refusal, str) else "unknown"
+        body = (
+            f"The daily rollback snapshot was not taken ({why}); retrying in ~1h. "
+            + (f"{note}. " if note else "")
+            + "If the pool refused it, pool relief frees guardian snapshots as the "
+            "measured runway shortens."
+        )
+    try:
+        await dispatcher.send(Alert(severity=AlertSeverity.WARNING, title=title, body=body))
+    except Exception:
+        logger.warning("failed to send healthy-snapshot alert", exc_info=True)
 
 
 _POOL_TIER_SEVERITY = {
@@ -816,6 +910,44 @@ async def _check_memory_and_alert(
         await check_memory_and_alert(config, dispatcher)
     except Exception:
         logger.warning("RAM watch failed", exc_info=True)
+
+
+async def _check_pool_pressure(
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
+    snapshots: SnapshotManager,
+) -> None:
+    """Pool-pressure relief pass (delegates to pool_pressure). Never raises.
+
+    A relief pass that crashes every tick would otherwise be a journal line
+    nobody reads — the exact silence this feature exists to end — so a crash
+    also alerts, at most daily.
+    """
+    try:
+        from genesis.guardian.pool_pressure import check_pool_pressure
+        outcome = await check_pool_pressure(config, dispatcher, snapshots)
+        acted = outcome.split(":", 1)[0] in (
+            "extended", "deleted", "delete_failed", "list_failed",
+        )
+        (logger.warning if acted else logger.info)("pool pressure: %s", outcome)
+    except Exception as exc:
+        logger.warning("pool-pressure relief failed", exc_info=True)
+        marker = config.state_path / ".pool_relief_error"
+        if _marker_due(marker, 24):
+            _touch_marker(marker)
+            try:
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.WARNING,
+                    title="Pool relief is failing",
+                    body=(
+                        f"The pool-pressure relief pass raised {type(exc).__name__}: "
+                        f"{html_escape(str(exc))[:300]}. The guardian will NOT free "
+                        "pool space until this is fixed; the tier alerts still run. "
+                        "Details in the guardian journal."
+                    ),
+                ))
+            except Exception:
+                logger.warning("failed to send relief-failure alert", exc_info=True)
 
 
 async def _check_storage_pool_and_alert(

@@ -1416,3 +1416,131 @@ class TestHealthySnapshotWiring:
         snapshots.mark_healthy = AsyncMock(side_effect=RuntimeError("incus down"))
         await _maintain_snapshots(config, snapshots, is_healthy=True)
         assert (config.state_path / ".last_prune").exists()
+
+
+class TestPoolReliefWiring:
+    """Relief must run every tick BEFORE the cycle, and a refused lifeline
+    refresh must be loud and retried soon — it was a log line once, for a week."""
+
+    @pytest.mark.asyncio
+    async def test_relief_runs_before_the_cycle(self, config: GuardianConfig) -> None:
+        order: list[str] = []
+
+        async def relief(*a, **k):
+            order.append("relief")
+
+        async def cycle(*a, **k):
+            order.append("cycle")
+
+        with (
+            patch("genesis.guardian.check._check_pool_pressure", relief),
+            patch("genesis.guardian.check._check_cycle", cycle),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+        assert order == ["relief", "cycle"]
+
+    @pytest.mark.asyncio
+    async def test_relief_failure_never_breaks_the_tick(self, config: GuardianConfig) -> None:
+        from genesis.guardian.check import _check_pool_pressure
+
+        with patch(
+            "genesis.guardian.pool_pressure.check_pool_pressure",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            await _check_pool_pressure(config, AsyncMock(), MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_refused_refresh_alerts_and_retries_in_an_hour(
+        self, config: GuardianConfig,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(return_value=None)
+        snapshots.last_refusal = "pool_space"
+        snapshots.last_rotation_note = None
+        dispatcher = AsyncMock()
+
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+
+        dispatcher.send.assert_awaited_once()
+        alert = dispatcher.send.await_args.args[0]
+        assert "NOT refreshed" in alert.title and "pool_space" in alert.body
+        stamp = datetime.fromisoformat((config.state_path / ".last_prune").read_text())
+        hours_since = (datetime.now(UTC) - stamp).total_seconds() / 3600
+        assert 22.9 < hours_since < 23.1  # the 24h throttle reopens in ~1h
+
+    @pytest.mark.asyncio
+    async def test_delete_first_rotation_is_reported(self, config: GuardianConfig) -> None:
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(return_value="guardian-20260101-000000-healthy")
+        snapshots.last_refusal = None
+        snapshots.last_rotation_note = "pool refused the create (pool_space); deleted ..."
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        alert = dispatcher.send.await_args.args[0]
+        assert "delete-first" in alert.title
+
+    @pytest.mark.asyncio
+    async def test_plain_rotation_is_silent(self, config: GuardianConfig) -> None:
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(return_value="guardian-20260101-000000-healthy")
+        snapshots.last_rotation_note = None
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        dispatcher.send.assert_not_called()
+
+
+class TestReliefReviewFixes:
+
+    def _refusing(self):
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(return_value=None)
+        snapshots.last_refusal = "pool_gate"
+        snapshots.last_rotation_note = None
+        return snapshots
+
+    @pytest.mark.asyncio
+    async def test_refusal_alert_is_throttled_not_hourly(self, config: GuardianConfig) -> None:
+        snapshots = self._refusing()
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        # the hourly retry: force the daily marker open again
+        (config.state_path / ".last_prune").unlink()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        assert snapshots.mark_healthy.await_count == 2
+        assert dispatcher.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rotation_passes_measured_pressure(self, config: GuardianConfig) -> None:
+        snapshots = self._refusing()
+        with patch(
+            "genesis.guardian.pool_pressure.current_pressure",
+            AsyncMock(return_value="early"),
+        ):
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        assert snapshots.mark_healthy.await_args.kwargs["under_pressure"] is True
+
+    @pytest.mark.asyncio
+    async def test_relief_crash_alerts_once_a_day(self, config: GuardianConfig) -> None:
+        from genesis.guardian.check import _check_pool_pressure
+
+        dispatcher = AsyncMock()
+        with patch(
+            "genesis.guardian.pool_pressure.check_pool_pressure",
+            AsyncMock(side_effect=ValueError("bad config")),
+        ):
+            await _check_pool_pressure(config, dispatcher, MagicMock())
+            await _check_pool_pressure(config, dispatcher, MagicMock())
+        assert dispatcher.send.await_count == 1
+        assert "failing" in dispatcher.send.await_args.args[0].title

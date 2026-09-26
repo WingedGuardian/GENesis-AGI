@@ -1340,7 +1340,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 84c7259d 2026-08-31
+verified: 33b49a10 2026-09-26
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1422,6 +1422,30 @@ verified: 84c7259d 2026-08-31
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
   `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
   the same measurement to the container.
+- **Pool-pressure RELIEF** (`pool_pressure.py`) runs every tick, BEFORE
+  `_check_cycle`. The tick is a oneshot, though, so during an outage's
+  diagnosis relief runs about hourly, not every 30s. The tiers above only
+  alert, and a thin pool once filled to 100% under six-hourly CRITICALs.
+  - It keeps a bounded `pool_history.jsonl` (7d).
+  - It derives the measured runway: the worse of the 6h and 24h slopes, plus a
+    burst reserve.
+  - It frees ONE guardian-owned thing per tick in two stages:
+    - early (<48h): extend the LVM pool, then pre-recovery snapshots, then a
+      lifeline older than 48h;
+    - urgent (<24h, or below the reserve): any `guardian-` snapshot, lifeline
+      last.
+  - The extend applies only with the `genesis-thinpool` opt-in profile, at or
+    above the autoextend threshold, and when VG free is below one autoextend step
+    (where dmeventd refuses). It is recorded in the provisioning ledger as
+    `pool_extend`.
+  - One action per tick, then a history-interval settle (btrfs frees
+    asynchronously). At most one extend a day.
+  - Companion change in `snapshots.py`: `mark_healthy` rotates delete-first when
+    the POOL refused the create AND `current_pressure()` agrees there is
+    pressure. A full-but-stable pool keeps its lifeline. A refused refresh
+    retries in ~1h, with a throttled alert.
+  - Levers: `storage_pool.relief_mode` and `GUARDIAN_POOL_RELIEF_DISABLED`.
+  - Runbook: `docs/reference/thin-pool-recovery.md`.
 - **Container-swap invariant reconciler** (`swap_watch.py`) runs every tick:
   re-asserts `limits.memory.swap=true` (incus config) and live-activates the
   cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the

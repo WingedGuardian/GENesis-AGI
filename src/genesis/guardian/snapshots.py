@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 # eviction exempt the latest one and mark_healthy() rotates the rest.
 _HEALTHY_LABEL = "healthy"
 _HEALTHY_SUFFIX = f"-{_HEALTHY_LABEL}"
+# Public alias: pool_pressure classifies the lifeline by the SAME suffix.
+HEALTHY_SUFFIX = _HEALTHY_SUFFIX
 
 
 def _parse_created_at(raw: object) -> datetime | None:
@@ -46,6 +48,43 @@ def _parse_created_at(raw: object) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
+_NAME_TS_RE = re.compile(r"(\d{8})-(\d{6})")
+
+
+def _created_from_name(name: str) -> datetime | None:
+    """Creation time from a guardian snapshot name (``<prefix>YYYYmmdd-HHMMSS…``).
+
+    take() stamps the UTC creation time into every name, so this is the
+    fallback when incus omits ``created_at``.
+    """
+    m = _NAME_TS_RE.search(name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+# Substrings of an `incus snapshot create` failure that mean "the pool has no
+# room" rather than some other fault. Measured on an LVM-thin pool whose
+# autoextend profile threshold was exceeded: "Error creating LVM logical volume
+# snapshot: ... Cannot create new thin volume, free space in thin pool
+# vg0/IncusThinPool reached threshold."
+_POOL_SPACE_ERRORS = ("free space in thin pool", "no space left", "insufficient free space")
+
+# Delete-first rotation only replaces a lifeline at least this old. The
+# healthy snapshot is refreshed once per ~24h maintenance pass; one hour of
+# slack absorbs tick jitter so a normally-aged lifeline still qualifies, while
+# a lifeline taken minutes ago (a retry storm) never does.
+_DELETE_FIRST_MIN_AGE = timedelta(hours=23)
+
+# take() outcomes that mean the POOL refused the snapshot (vs any other fault).
+REFUSED_POOL_GATE = "pool_gate"
+REFUSED_POOL_SPACE = "pool_space"
+REFUSED_OTHER = "create_failed"
+
+
 class SnapshotManager:
     """Manage incus snapshots for the Genesis container."""
 
@@ -54,6 +93,12 @@ class SnapshotManager:
         self._container = config.container_name
         self._prefix = config.snapshots.prefix
         self._retention = config.snapshots.retention
+        # The names take() generates: <prefix><YYYYmmdd>-<HHMMSS>[-<label>].
+        self._owned_re = re.compile(re.escape(self._prefix) + r"\d{8}-\d{6}(?:-[A-Za-z0-9-]+)?")
+        # Why the last take() returned None (REFUSED_*), or None after success.
+        self.last_refusal: str | None = None
+        # What mark_healthy() had to do beyond a plain rotation, for alerting.
+        self.last_rotation_note: str | None = None
 
     async def check_pool_space(self) -> float:
         """Check genesis pool disk usage. Returns usage percentage (0-100).
@@ -218,7 +263,9 @@ class SnapshotManager:
         Checks disk space before proceeding. Deletes excess snapshots
         before creating the new one to stay within retention limit.
         """
+        self.last_refusal = None
         if not await self.safe_to_snapshot(snapshot_size_history):
+            self.last_refusal = REFUSED_POOL_GATE
             return None
 
         # Delete-before-create: remove excess snapshots to stay within
@@ -252,6 +299,11 @@ class SnapshotManager:
         )
         if rc != 0:
             logger.error("Failed to create snapshot %s: %s", name, stderr)
+            low = (stderr or "").lower()
+            self.last_refusal = (
+                REFUSED_POOL_SPACE if any(m in low for m in _POOL_SPACE_ERRORS)
+                else REFUSED_OTHER
+            )
             return None
 
         logger.info("Created snapshot: %s", name)
@@ -332,6 +384,46 @@ class SnapshotManager:
         result.sort(key=lambda t: t[0], reverse=True)
         return result
 
+    async def list_snapshot_meta_strict(self) -> list[tuple[str, datetime | None]] | None:
+        """Guardian-GENERATED snapshots only, or None when the list FAILED.
+
+        Two differences from :meth:`_list_snapshots_with_meta`, both because
+        this listing feeds AUTOMATIC deletes:
+
+        * None, not [], on an incus or parse error — a caller asking "are there
+          any guardian snapshots left?" would otherwise read "none".
+        * Ownership is the full generated name (``<prefix>YYYYmmdd-HHMMSS`` plus
+          an optional ``-<label>``), not the bare prefix: a snapshot someone
+          named ``guardian-demo`` by hand is not the guardian's to delete.
+
+        Missing ``created_at`` falls back to the name's timestamp.
+        """
+        rc, stdout, stderr = await _run_subprocess(
+            "incus", "snapshot", "list", self._container, "--format", "json",
+            timeout=30.0,
+        )
+        if rc != 0:
+            logger.warning("Failed to list snapshots: %s", stderr)
+            return None
+        try:
+            snapshots = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to parse snapshot list: %s", exc)
+            return None
+        if not isinstance(snapshots, list):
+            return None
+        out: list[tuple[str, datetime | None]] = []
+        for s in snapshots:
+            if not isinstance(s, dict):
+                continue
+            name = s.get("name", "")
+            if not isinstance(name, str) or not self._owned_re.fullmatch(name):
+                continue
+            created = _parse_created_at(s.get("created_at")) or _created_from_name(name)
+            out.append((name, created))
+        out.sort(key=lambda t: t[0], reverse=True)
+        return out
+
     async def list_snapshots(self) -> list[str]:
         """List all guardian snapshots, newest first."""
         return [name for name, _ in await self._list_snapshots_with_meta()]
@@ -408,19 +500,62 @@ class SnapshotManager:
         return True
 
     async def mark_healthy(
-        self, snapshot_size_history: list[int] | None = None,
+        self,
+        snapshot_size_history: list[int] | None = None,
+        *,
+        under_pressure: bool = False,
     ) -> str | None:
         """Take a 'healthy' snapshot, then rotate superseded healthy ones.
 
-        Create-then-delete ordering: the new lifeline must exist before the
-        old one goes, so a failed create leaves the previous healthy snapshot
-        intact and there is never a zero-lifeline window. Rotation keeps
-        exactly one healthy snapshot → CoW divergence stays bounded to one
-        maintenance interval (the incident was 2 months of divergence).
+        Create-then-delete ordering by default: the new lifeline must exist
+        before the old one goes, so an ordinary failed create leaves the
+        previous healthy snapshot intact with no zero-lifeline window.
+
+        EXCEPT when the POOL refused the create (the guardian's pool gate, or
+        LVM's own "free space in thin pool reached threshold"), the caller's
+        MEASURED model says the pool is under pressure (``under_pressure`` —
+        pool_pressure's runway assessment, not the static gate that refused),
+        and the lifeline is at least a rotation interval old. Then
+        create-first cannot succeed while the old snapshot's divergence keeps
+        filling the pool — retrying it daily is how one snapshot once survived
+        a week and filled the pool to 100%. So delete the stale lifeline FIRST,
+        then create. The zero-lifeline window is a few seconds, or lasts until
+        the pool recovers if the retry is still refused; either is recorded in
+        ``last_rotation_note`` for the caller to alert on.
+
+        Why the pressure condition: a pool that is merely FULL but stable
+        (sitting above the static gate, growing little) also refuses the
+        create. There the old snapshot holds almost nothing, deleting it frees
+        nothing, the retry is refused again, and the rollback target is gone
+        for good — a regression, measured in review. Stable-but-full keeps its
+        aging lifeline; relief (pool_pressure) acts if that ever changes.
         """
+        self.last_rotation_note = None
         name = await self.take(
             label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
         )
+        if (
+            name is None
+            and under_pressure
+            and self.last_refusal in (REFUSED_POOL_GATE, REFUSED_POOL_SPACE)
+        ):
+            refusal = self.last_refusal
+            stale = await self._stale_lifeline(datetime.now(UTC))
+            if stale is not None and await self.delete(stale):
+                logger.warning(
+                    "Pool refused the healthy snapshot (%s): deleted stale lifeline %s "
+                    "first, retrying the create", refusal, stale,
+                )
+                name = await self.take(
+                    label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
+                )
+                self.last_rotation_note = (
+                    f"pool refused the create ({refusal}); deleted the stale lifeline "
+                    f"{stale} first, then "
+                    + (f"created {name}" if name else
+                       f"the retry was refused too ({self.last_refusal}) — NO rollback "
+                       "lifeline until the pool recovers")
+                )
         if name is None:
             return None
 
@@ -429,6 +564,26 @@ class SnapshotManager:
             if is_superseded and await self.delete(old_name):
                 logger.info("Rotated superseded healthy snapshot: %s", old_name)
         return name
+
+    async def _stale_lifeline(self, now: datetime) -> str | None:
+        """The healthy snapshot to delete first, or None.
+
+        None unless the NEWEST healthy snapshot is at least a rotation old (a
+        fresh lifeline is never deleted-first). When it is, return the OLDEST
+        healthy snapshot: a superseded one left behind by a failed rotation
+        delete holds the most divergence and is the worse rollback target, so
+        it goes before the newest.
+        """
+        meta = await self.list_snapshot_meta_strict()
+        if not meta:
+            return None
+        healthy = [(n, c) for n, c in meta if n.endswith(_HEALTHY_SUFFIX)]  # newest first
+        if not healthy:
+            return None
+        newest_created = healthy[0][1]
+        if newest_created is None or now - newest_created < _DELETE_FIRST_MIN_AGE:
+            return None
+        return healthy[-1][0]
 
     async def get_latest_healthy(self) -> str | None:
         """Get the name of the most recent 'healthy' snapshot."""

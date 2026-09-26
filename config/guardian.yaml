@@ -56,18 +56,27 @@ snapshots:
   prefix: "guardian-"
   take_pre_recovery: false
   # Daily 'healthy' snapshot while state is HEALTHY — the offline
-  # SNAPSHOT_ROLLBACK lifeline (rotated: exactly one, <=1 day old, so CoW
-  # divergence never accumulates). Requires pool headroom (refused at the
-  # storage_pool high tiers). Set false to disable.
+  # SNAPSHOT_ROLLBACK lifeline. Rotated create-then-delete, so it stays one
+  # day old only while the pool accepts the create; when the POOL refuses it
+  # (the storage_pool high tier, or LVM's own autoextend threshold), the
+  # measured runway says the pool is under pressure, and the lifeline is over
+  # a day old, rotation deletes the old one FIRST. A full-but-stable pool keeps
+  # its lifeline. A refused refresh retries in ~1h and alerts (throttled by
+  # storage_pool.realert_hours). Set false to disable.
   healthy_enabled: true
+  # Age at which pool-pressure relief (early stage) may delete the lifeline.
+  # Only under pressure: a long outage never costs the rollback target.
+  lifeline_max_age_hours: 48
   max_pool_usage_pct: 80
   # Age-prune backstop: delete guardian-* snapshots older than this many days,
-  # except the newest and the latest healthy (the rollback lifeline). Catches
-  # stale guardian-pre-recovery snapshots that retention alone can protect
+  # except the latest healthy (the rollback lifeline). Catches stale
+  # guardian-pre-recovery snapshots that retention alone can protect
   # indefinitely as the "newest".
   max_age_days: 14
-  # incus daemon-side auto-expiry of scheduled snapshots (guardian-independent
-  # safety net). Empty string disables. NOT applied to manual snapshots.
+  # incus daemon-side auto-expiry (guardian-independent safety net). Empty
+  # string disables. Coverage varies by Incus version: 6.0.0 was measured
+  # applying it to manual (guardian) snapshots too; newer releases limit it to
+  # scheduled ones.
   expiry: "2w"
 
 # Host storage-pool monitoring (LVM-thin data% + metadata% + VG headroom;
@@ -89,6 +98,19 @@ storage_pool:
   pool_used_high_pct: 85
   pool_used_crit_pct: 92
   realert_hours: 6
+  # Pressure RELIEF — acts on MEASURED growth, not the tiers above (which only
+  # alert). Frees guardian-owned space when the pool would fill within the
+  # horizons. Runbook: docs/reference/thin-pool-recovery.md.
+  #   "live" | "alert_only" | "off"   (invalid → alert_only; env
+  #   GUARDIAN_POOL_RELIEF_DISABLED=1 also forces alert_only)
+  relief_mode: "live"
+  early_horizon_hours: 48    # extend (LVM opt-in), pre-recovery + >48h lifeline
+  urgent_horizon_hours: 24   # any guardian snapshot, lifeline last
+  burst_multiplier: 2.0
+  min_reserve_pct: 3.0
+  history_sample_interval_s: 300
+  history_max_samples: 2016
+  extend_keep_free_mib: 512
 
 # Guardian-side RAM tiered alert (E-rest PR-E1). The container's own RAM alert
 # (infra:container_memory_high) dies exactly when it thrashes/OOMs; the guardian

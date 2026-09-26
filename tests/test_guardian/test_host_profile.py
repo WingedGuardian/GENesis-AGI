@@ -269,4 +269,12 @@ class TestGatherHostProfile:
             "vg_free_bytes",
             "pool_used_pct",
             "detail",
+            # Pool-pressure relief (revisited: all five land in METRICS via
+            # collectors/host.py's allowlist — sizes change on every extend,
+            # and the identity fields add nothing drift should hash on today).
+            "pool_size_bytes",
+            "metadata_size_bytes",
+            "vg_name",
+            "thinpool_lv",
+            "thinpool_profile",
         }
