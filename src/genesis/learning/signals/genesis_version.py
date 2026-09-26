@@ -220,6 +220,22 @@ class GenesisVersionCollector:
             raise RuntimeError(f"git rev-parse failed: {stderr.decode(errors='replace')}")
         return stdout.decode().strip()
 
+    @staticmethod
+    async def _reap(proc: asyncio.subprocess.Process) -> None:
+        """Kill a subprocess whose wait timed out, and actually collect it.
+
+        `asyncio.wait_for` cancels the AWAIT, not the child. Returning after a
+        timeout without this leaves the git process running unobserved, so a
+        stalled remote accumulates one more every collector interval — and those
+        children can still write refs later, concurrently with a real update.
+        """
+        if proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+
     async def _delete_ref(self, ref: str) -> None:
         """Remove a private per-check ref. Never raises; cleanup is not the job."""
         cleanup = await asyncio.create_subprocess_exec(
@@ -228,8 +244,10 @@ class GenesisVersionCollector:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        with contextlib.suppress(TimeoutError):
+        try:
             await asyncio.wait_for(cleanup.communicate(), timeout=10)
+        except TimeoutError:
+            await self._reap(cleanup)
 
     async def _best_effort_fetch(self, *args: str, what: str) -> None:
         """Refresh something convenient. A failure is logged, never raised.
@@ -249,6 +267,10 @@ class GenesisVersionCollector:
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         except TimeoutError:
+            # Reap it. Cancelling the await does not stop the fetch, and an
+            # unobserved `git fetch` per collector interval both leaks processes
+            # and can update refs later, racing a real update.
+            await self._reap(proc)
             logger.warning("Refreshing %s timed out (non-fatal)", what)
             return
         if proc.returncode != 0:

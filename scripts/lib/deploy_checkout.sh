@@ -57,6 +57,14 @@ except Exception:
     except OSError:
         lines = []
     in_github = False
+    # The DIRECT-child indentation of the github block, learned from its first
+    # child. Without it this loop ignores YAML hierarchy entirely and a nested
+    # mapping wins: `github:` with `deploy_branch: right` and then
+    # `credentials:` containing `deploy_branch: wrong` resolved to `wrong` here
+    # while yaml.safe_load and every Python consumer resolved `right`. Both are
+    # valid branch names, so nothing downstream catches it and update.sh could
+    # fetch and activate a branch no other reader agrees on.
+    child_indent = None
     for raw in lines:
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -64,6 +72,7 @@ except Exception:
         indent = len(raw) - len(raw.lstrip())
         if indent == 0:
             in_github = stripped.startswith("github:")
+            child_indent = None
             if in_github and stripped != "github:":
                 flow = stripped.split(":", 1)[1].strip()
                 if flow.startswith("{") and flow.endswith("}"):
@@ -72,7 +81,19 @@ except Exception:
                         if separator and item_key.strip() == key:
                             value = _scalar(item_value)
             continue
-        if in_github and stripped.startswith(f"{key}:"):
+        if not in_github:
+            continue
+        if child_indent is None:
+            child_indent = indent
+        if indent > child_indent:
+            # Deeper than a direct child, so it belongs to some nested mapping.
+            continue
+        if indent < child_indent:
+            # Dedented out of the github block without returning to column 0,
+            # which this parser cannot model. Stop rather than guess.
+            in_github = False
+            continue
+        if stripped.startswith(f"{key}:"):
             value = _scalar(stripped.split(":", 1)[1])
     print(value)
 PY

@@ -223,10 +223,14 @@ def update_check():
     # hierarchy change an existing refs/remotes/<remote>/release blocks
     # refs/remotes/<remote>/release/v2, and bundled into the fetch above that
     # turned a successful measurement into a 502 until someone pruned by hand.
-    _, tracking_err = _git_result(
+    # Test the STATUS, not stderr. `_git_result` signals failure with a None
+    # stdout; git writes its "From ..." line and ref-update progress to stderr on
+    # SUCCESS, so keying the warning off stderr told the operator to run
+    # `git remote prune` every time the ref refreshed correctly.
+    tracking_out, tracking_err = _git_result(
         "fetch", remote, f"+refs/heads/{deploy_branch}:{tracking_ref}", timeout=30
     )
-    if tracking_err:
+    if tracking_out is None:
         logger.warning(
             "Could not refresh %s (non-fatal, deploy head unaffected): %s. "
             "If this persists: git remote prune %s",
