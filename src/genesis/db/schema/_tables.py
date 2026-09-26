@@ -2056,7 +2056,11 @@ TABLES = {
             closed_reason TEXT,
             closed_at     TEXT,
             evidence      TEXT,
-            created_at    TEXT NOT NULL
+            created_at    TEXT NOT NULL,
+            verdict           TEXT,
+            attempt_count     INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at   TEXT,
+            last_attempt_note TEXT
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────

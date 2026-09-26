@@ -27,6 +27,23 @@ import aiosqlite
 
 STATUSES = ("open", "closed")
 
+#: The four verdicts a validator session returns (owner standing ruling,
+#: 2026-09-26). Enforced HERE rather than by a CHECK constraint: SQLite cannot
+#: ALTER a CHECK, so a vocabulary this young — invented before the validator had
+#: run once — would cost a full table rebuild to widen. A raise also gives the
+#: caller (an LLM session) a message naming the legal values instead of
+#: ``IntegrityError: CHECK constraint failed``.
+VERDICTS = (
+    "pass-mechanical",
+    "pass-with-measured-gaps",
+    "fail-intent",
+    "cannot-verify",
+)
+
+#: The verdicts that DISCHARGE the obligation and therefore close the row. The
+#: other two record an attempt and leave it OPEN, because the work is not done.
+PASS_VERDICTS = ("pass-mechanical", "pass-with-measured-gaps")
+
 # Per-CONNECTION-TARGET cache: only the TRUE result is cached — a missing table
 # (pre-migration window) is re-checked every call so a subprocess writer
 # self-heals the moment the server migration lands.
@@ -142,13 +159,40 @@ async def close_verification(
     *,
     repo: str,
     pr_number: int,
+    verdict: str,
     reason: str,
     evidence: str | None,
     now: str,
 ) -> bool:
     """Close an OPEN obligation with its verification record (the validator's
     write). True iff a row changed — a closed row never flips back or gets its
-    reason overwritten, so two validators cannot fight over one PR."""
+    reason overwritten, so two validators cannot fight over one PR.
+
+    ``verdict`` MUST be in :data:`PASS_VERDICTS`, and it is set in the SAME
+    UPDATE that moves ``status``. Both halves of that matter:
+
+    * **Same statement**, because ``status`` and ``verdict`` together carry one
+      meaning and two statements leave a window where they disagree. An
+      adversarial review MEASURED the earlier shape — this function not touching
+      ``verdict`` at all — producing ``closed`` + ``verdict IS NULL`` on every
+      call, which collapsed THREE distinct meanings onto one state (docs-only
+      path exemption, pre-verdict legacy row, and validator-closed) with only
+      free text to tell them apart. A cross-column invariant cannot be held by
+      two writers that do not read each other's column, so it is held by one.
+    * **PASS only**, because ``fail-intent`` and ``cannot-verify`` do not
+      discharge the obligation — they belong to :func:`record_attempt`, which
+      leaves the row open. One writer per state transition.
+
+    ``attempt_count`` is incremented here too, so it counts every attempt rather
+    than only the failed ones: without this a cleanly verified PR would read
+    ``attempt_count = 0``, indistinguishable from never attempted.
+    """
+    if verdict not in PASS_VERDICTS:
+        raise ValueError(
+            f"close_verification accepts only {list(PASS_VERDICTS)}, got {verdict!r}. "
+            f"'fail-intent' and 'cannot-verify' do not discharge the obligation — "
+            f"record them with record_attempt(), which leaves the row OPEN."
+        )
     if not reason or not reason.strip():
         # A closed row with no reason is an unverifiable claim in permanent
         # record — the row would say "handled" and carry nothing. The schema
@@ -159,27 +203,170 @@ async def close_verification(
         raise ValueError("close_verification requires a non-empty reason")
     if not await _tables_available(db):
         return False
+    if not await _verdict_columns_available(db):
+        return False
     cursor = await db.execute(
         "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
-        "closed_at = ?, evidence = ? "
+        "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
+        "attempt_count = attempt_count + 1 "
         "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (reason, now, evidence, repo, pr_number),
+        (reason, now, evidence, verdict, now, repo, pr_number),
     )
     await db.commit()
     return bool(cursor.rowcount)
 
 
-async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]:
-    """Open obligations, OLDEST merge first — the backlog reader.
+async def _verdict_columns_available(db: aiosqlite.Connection) -> bool:
+    """Do the verdict/attempt columns exist? Asked EVERY time, uncached.
 
-    Oldest-first because the backlog's point is what has waited longest.
-    Assumes a Row factory. Empty pre-migration.
+    Uncached for the reason ``_tables_available`` is: two caching attempts there
+    were wrong and the mechanism was deleted rather than fixed.
+
+    LOAD-BEARING, not belt-and-braces. The window where the TABLE exists and
+    these COLUMNS do not is structural on every install that already ran the
+    original migration: the numbered runner catches up at the next restart, and
+    until then a subprocess writer is looking at a ten-column table. Without this
+    guard that writer raises ``no such column`` inside a caller's ``except`` and
+    the run reports success having written nothing.
+    """
+    if not await _tables_available(db):
+        return False
+    cursor = await db.execute("PRAGMA table_info(pr_verifications)")
+    cols = {row[1] for row in await cursor.fetchall()}
+    return {"verdict", "attempt_count", "last_attempt_at", "last_attempt_note"} <= cols
+
+
+async def record_attempt(
+    db: aiosqlite.Connection,
+    *,
+    repo: str,
+    pr_number: int,
+    verdict: str,
+    note: str,
+    now: str,
+) -> str:
+    """Record a NON-closing validation attempt. ``"recorded" | "missing" | "unavailable"``.
+
+    The row STAYS OPEN — ``status`` is deliberately absent from the SET list, so
+    the "keep it open" rule is enforced by the SQL rather than by every caller
+    remembering it. ``WHERE status = 'open'`` means a closed row can never be
+    re-annotated, the same already-decided rule :func:`close_verification`
+    carries.
+
+    A validator that could not reach a verdict, or reached ``fail-intent``, has
+    not discharged the obligation: the row must remain in the backlog so it is
+    re-validated once the fix lands or the precondition becomes reachable. What
+    this adds is that the next validator can see an attempt was MADE and why it
+    did not finish, instead of re-deriving it.
+
+    ``note`` is required and non-empty for the same reason ``reason`` is on the
+    closer: "attempted but could not be completed" with no stated cause is
+    precisely the unverifiable claim that guard exists to refuse.
+    """
+    if verdict not in VERDICTS:
+        raise ValueError(
+            f"record_attempt: verdict must be one of {list(VERDICTS)}, got {verdict!r}"
+        )
+    if verdict in PASS_VERDICTS:
+        raise ValueError(
+            f"record_attempt refuses {verdict!r}: a PASS discharges the obligation and "
+            f"must go through close_verification, so exactly one writer moves the row "
+            f"to 'closed'."
+        )
+    if not note or not note.strip():
+        raise ValueError(
+            "record_attempt requires a non-empty note — the whole point of the row "
+            "staying open is that the next validator learns WHY it could not finish."
+        )
+    if not await _verdict_columns_available(db):
+        return "unavailable"
+    cursor = await db.execute(
+        "UPDATE pr_verifications SET verdict = ?, last_attempt_at = ?, "
+        "last_attempt_note = ?, attempt_count = attempt_count + 1 "
+        "WHERE repo = ? AND pr_number = ? AND status = 'open'",
+        (verdict, now, note, repo, pr_number),
+    )
+    await db.commit()
+    return "recorded" if cursor.rowcount else "missing"
+
+
+async def open_repos_for_pr(db: aiosqlite.Connection, *, pr_number: int) -> list[str]:
+    """Repo slugs holding an OPEN row for this PR number. Empty pre-migration.
+
+    The EXACT-key question, asked exactly. A caller that needs "which repo holds
+    open PR N" must not answer it by pulling the whole open set and filtering in
+    Python: at saturation the target falls outside the window and the caller
+    reports a confident FALSE "no such row" — the truncated-listing failure, in a
+    writer. ``(repo, pr_number)`` is the row identity, so guessing the slug is
+    how one repo's obligation gets closed with another's evidence.
+
+    Row-factory agnostic (indexes ``row[0]``), like :func:`counts`. Note this is
+    not an index seek: there is no index with ``pr_number`` leading, so it scans
+    the open set via ``idx_prv_status`` — still bounded, and vastly cheaper than
+    materialising 2000 rows.
+    """
+    if not await _tables_available(db):
+        return []
+    cursor = await db.execute(
+        "SELECT repo FROM pr_verifications WHERE pr_number = ? AND status = 'open' ORDER BY repo",
+        (int(pr_number),),
+    )
+    return [row[0] for row in await cursor.fetchall()]
+
+
+async def list_closed(db: aiosqlite.Connection, *, limit: int = 200) -> list[dict]:
+    """Closed obligations, most recently closed FIRST. Empty pre-migration.
+
+    A separate function rather than a flag on :func:`list_open` because the
+    ordering key differs and that function's "oldest merge first, because the
+    point is what waited longest" is meaningless once a row is discharged: what
+    a reader wants from closed rows is what was decided most recently.
+
+    Assumes a Row factory.
     """
     if not await _tables_available(db):
         return []
     lim = max(1, min(int(limit), 2000))
     cursor = await db.execute(
-        "SELECT * FROM pr_verifications WHERE status = 'open' ORDER BY merged_at ASC LIMIT ?",
+        "SELECT * FROM pr_verifications WHERE status = 'closed' "
+        "ORDER BY closed_at DESC, pr_number DESC LIMIT ?",
+        (lim,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]:
+    """Open obligations — NEVER-ATTEMPTED first, then oldest merge first.
+
+    Oldest-first within each group because the backlog's point is what has
+    waited longest. The group split is newer and exists because this store now
+    has a PARKED class: ``record_attempt`` leaves a row open with a verdict set,
+    and a ``cannot-verify`` row whose precondition is unreachable on this install
+    cannot be discharged here at all. Those rows are typically the OLDEST, so
+    under a pure ``merged_at`` sort they collect at the head of a capped window
+    and push never-attempted work out of it — head-of-line blocking of this
+    ledger's only reader, degrading as the parked set grows. An adversarial
+    review caught this; the class did not exist before the attempt record did,
+    so the ordering is part of that change rather than an unrelated fix.
+
+    ``verdict IS NOT NULL`` is the discriminator and it is exact on an open row:
+    a PASS verdict closes the row, so the only way an OPEN row carries a verdict
+    is a recorded non-closing attempt.
+
+    Assumes a Row factory. Empty pre-migration — and on a pre-migration database
+    the ordering degrades to plain oldest-first rather than failing, because the
+    column it keys on does not exist yet.
+    """
+    if not await _tables_available(db):
+        return []
+    lim = max(1, min(int(limit), 2000))
+    order = (
+        "verdict IS NOT NULL ASC, merged_at ASC"
+        if await _verdict_columns_available(db)
+        else "merged_at ASC"
+    )
+    cursor = await db.execute(
+        f"SELECT * FROM pr_verifications WHERE status = 'open' ORDER BY {order} LIMIT ?",
         (lim,),
     )
     return [dict(r) for r in await cursor.fetchall()]
