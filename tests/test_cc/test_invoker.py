@@ -4167,7 +4167,16 @@ async def test_a_clean_stream_still_reports_an_empty_inventory(invoker):
 
 
 def _seal(monkeypatch, tmp_path, *, hosts: str | None = "github.com:\n  oauth_token: x\n"):
-    """Point the sealer at a synthetic source and target, and run it."""
+    """Point the sealer at a synthetic source and target, and run it.
+
+    ``hosts`` writes a credential into the SOURCE directory, and since 2026-09-25
+    the sealer does not read it — which is exactly why the parameter stays: the
+    invariant worth testing is that a readable source credential does NOT reach
+    the seal, and a fixture with no credential to leak could not test it.
+    ``hosts=None`` is the never-authenticated arm. The source ``config.yml``
+    carries a shell alias for the same reason: config.yml IS synthesised, so the
+    alias must not appear either.
+    """
     import genesis.cc.invoker as inv_mod
 
     source = tmp_path / "src-gh"
@@ -4190,7 +4199,14 @@ def test_sealed_gh_config_is_unwritable_by_the_session(monkeypatch, tmp_path):
     """
     sealed = Path(_seal(monkeypatch, tmp_path))
     assert sealed.stat().st_mode & 0o777 == 0o500, "session could create new files here"
-    for name in ("config.yml", "hosts.yml"):
+    # config.yml is the whole seal now — the credential copy was removed, so the
+    # loop this used to run over ("config.yml", "hosts.yml") would raise
+    # FileNotFoundError rather than fail an assertion.
+    # Assert the expected SET first: iterating whatever happens to be present
+    # would pass VACUOUSLY on an empty seal, which is the state this seal exists
+    # to prevent.
+    assert sorted(f.name for f in sealed.iterdir()) == ["config.yml"]
+    for name in ("config.yml",):
         mode = (sealed / name).stat().st_mode & 0o777
         assert mode == 0o400, f"{name} is writable ({oct(mode)}) — gh could rewrite it"
 
@@ -4209,15 +4225,69 @@ def test_sealed_gh_config_carries_no_aliases_and_a_shell_free_pager(monkeypatch,
     assert "whoami" not in body, "the operator's own aliases leaked into the seal"
 
 
-def test_sealed_gh_config_copies_the_credential_at_owner_only_mode(monkeypatch, tmp_path):
-    """hosts.yml has to be copied — it is the only place gh finds the token.
+def test_the_seal_never_carries_the_credential_even_with_a_readable_source(
+    monkeypatch, tmp_path
+):
+    """THE INVARIANT THIS PR EXISTS FOR — asserted with a READABLE source.
 
-    The copy must be no more reachable than the original, so pin the mode: this
-    moves a secret, and the test is what stops it widening later.
+    Until 2026-09-25 the seal copied `hosts.yml`, handing every gh-allowlisted
+    dispatch the operator OAuth token (MEASURED scopes: delete_repo, gist,
+    read:org, repo, workflow). An absent-source test cannot catch a regression
+    here, because the copy is conditional on the source existing — so the
+    fixture deliberately WRITES a source credential and this asserts it does not
+    arrive.
+
+    The seal is a closed set, not a denylist of one name: assert the exact
+    contents, so a future key added to `desired` has to be justified here.
     """
     sealed = Path(_seal(monkeypatch, tmp_path))
-    assert (sealed / "hosts.yml").read_text().startswith("github.com:")
-    assert (sealed / "hosts.yml").stat().st_mode & 0o777 == 0o400
+    assert not (sealed / "hosts.yml").exists(), (
+        "the operator credential was copied into the seal — a dispatched "
+        "session can authenticate as the operator"
+    )
+    assert sorted(f.name for f in sealed.iterdir()) == ["config.yml"]
+    body = (sealed / "config.yml").read_text(encoding="utf-8")
+    assert "oauth_token" not in body, "the credential arrived inside config.yml"
+
+
+def test_an_existing_seal_holding_a_credential_is_healed_on_the_next_launch(
+    monkeypatch, tmp_path
+):
+    """The arm operators actually depend on: installs that ALREADY copied it.
+
+    Nothing runs a migration. The seal self-heals because `hosts.yml` is no
+    longer in `desired`, so `_seal_matches` reports a mismatch and the stale
+    sweep unlinks it. VERIFIED on the live install: the real seal went from
+    ['config.yml', 'hosts.yml'] to ['config.yml'] on the first call.
+
+    `_seal_matches` has a fast path, which is exactly what could skip the
+    repair — so the pre-existing seal here is built at the CORRECT modes, the
+    shape that fast path accepts.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "sealed"
+    target.mkdir()
+    for name, body in (
+        ("config.yml", inv_mod._SEALED_GH_CONFIG_YML),
+        ("hosts.yml", "github.com:\n  oauth_token: LEAKED\n"),
+    ):
+        (target / name).write_text(body, encoding="utf-8")
+        (target / name).chmod(0o400)
+    target.chmod(0o500)
+
+    source = tmp_path / "src-gh"
+    source.mkdir()
+    (source / "hosts.yml").write_text("github.com:\n  oauth_token: x\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(source))
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    assert inv_mod._sealed_gh_config_dir() == str(target)
+    assert not (target / "hosts.yml").exists(), (
+        "an existing seal kept its copied credential — the stale sweep did not "
+        "reach it, so every install that ran the old code stays exposed"
+    )
+    assert target.stat().st_mode & 0o777 == 0o500, "the repair left the seal writable"
 
 
 def test_sealed_gh_config_seals_even_when_gh_was_never_authenticated(monkeypatch, tmp_path):
@@ -4348,53 +4418,17 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
 
-def test_the_seal_finds_the_credential_where_gh_itself_would(tmp_path, monkeypatch):
-    """gh's source precedence is GH_CONFIG_DIR, XDG_CONFIG_HOME/gh, ~/.config/gh.
-
-    Implementing only the first and last builds a valid-LOOKING seal with no
-    credential in it on any install that sets XDG_CONFIG_HOME. The session then
-    launches unauthenticated and every call fails — which reads as a broken
-    profile rather than as a missed config path, and no check here would have
-    caught it because the seal itself is perfectly well-formed.
-
-    Precedence taken from `gh help environment`, not from memory.
-    """
-    import genesis.cc.invoker as inv_mod
-
-    xdg = tmp_path / "xdgconf"
-    (xdg / "gh").mkdir(parents=True)
-    (xdg / "gh" / "hosts.yml").write_text("github.com:\n  oauth_token: t\n", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
-    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
-
-    seal = tmp_path / "seal"
-    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
-    assert inv_mod._sealed_gh_config_dir() == str(seal)
-    assert (seal / "hosts.yml").exists(), (
-        "the credential was not carried into the seal — gh resolves its config "
-        "from XDG_CONFIG_HOME/gh when that is set, so the session would launch "
-        "unauthenticated."
-    )
-    assert (seal / "hosts.yml").read_text(encoding="utf-8") == "github.com:\n  oauth_token: t\n"
-
-
-def test_gh_config_dir_still_wins_over_xdg(tmp_path, monkeypatch):
-    """The explicit override outranks XDG — the order matters, not just membership."""
-    import genesis.cc.invoker as inv_mod
-
-    explicit = tmp_path / "explicit"
-    explicit.mkdir()
-    (explicit / "hosts.yml").write_text("EXPLICIT\n", encoding="utf-8")
-    xdg = tmp_path / "xdgconf"
-    (xdg / "gh").mkdir(parents=True)
-    (xdg / "gh" / "hosts.yml").write_text("XDG\n", encoding="utf-8")
-
-    monkeypatch.setenv("GH_CONFIG_DIR", str(explicit))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
-    seal = tmp_path / "seal"
-    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
-    inv_mod._sealed_gh_config_dir()
-    assert (seal / "hosts.yml").read_text(encoding="utf-8") == "EXPLICIT\n"
+# DELETED 2026-09-25 with the credential copy: two tests pinned gh's SOURCE
+# precedence (GH_CONFIG_DIR > $XDG_CONFIG_HOME/gh > ~/.config/gh). That chain
+# existed only to locate `hosts.yml` and went with it — the seal is now
+# synthesised from a constant and reads nothing from the operator's config, so
+# there is no source to resolve and nothing left for those tests to assert. They
+# are deleted rather than retargeted: a test kept alive against a rewritten
+# subject asserts whatever the rewrite happens to do.
+#
+# The invariant that replaced them is
+# `test_the_seal_never_carries_the_credential_even_with_a_readable_source`, which
+# runs WITH a readable source credential present.
 
 
 # --- The seal is a FLAT SET OF FILES, and a directory is never legitimate ---
@@ -4648,6 +4682,12 @@ def test_the_gh_confinement_pins_every_documented_program_route(monkeypatch):
         "EDITOR": "true",
         "GH_BROWSER": "true",
         "BROWSER": "true",
+        # Not a program route. It is here because gh resolves GH_TOKEN AHEAD of
+        # hosts.yml (MEASURED: a bogus token returns 401 against a good
+        # hosts.yml), so an inherited value would outrank the credential-free
+        # seal. Pinned in the hardening, not only in `_build_env`, so that
+        # `_assert_hardening_present` enforces it fail-closed.
+        "GH_TOKEN": "",
     }
     assert "GH_PATH" not in hardened
 
@@ -4667,6 +4707,115 @@ def test_the_confinement_reaches_the_env_a_dispatch_would_receive(invoker, monke
     assert env["GH_CONFIG_DIR"] == "/seal"
     assert env["BROWSER"] == "true"
     assert env["EDITOR"] == "true"
+
+
+# --- No dispatched session inherits a GitHub credential --------------------
+#
+# Two separate mechanisms, and they close different holes. The GH_TOKEN pin
+# closes the INHERITED-ENV route for every dispatch. The GH_CONFIG_DIR pin
+# closes the ON-DISK route, and only for external-untrusted origins. MEASURED
+# 2026-09-25, which is why both exist: `GH_TOKEN="" gh auth status` with no
+# GH_CONFIG_DIR pin is STILL FULLY AUTHENTICATED, because gh reads an empty
+# GH_TOKEN as unset and falls back to hosts.yml. Anyone who deletes one of
+# these two believing the other covers it is repeating that error.
+
+
+def test_every_dispatched_session_gets_gh_token_pinned_empty(invoker, monkeypatch):
+    """The pin is UNCONDITIONAL — not gated on the gh allowlist.
+
+    `bash_allowlist=` is assigned at exactly ONE call site in the tree, so every
+    other dispatch takes the `()` default and `_build_env` skips the whole
+    hardening block. Gating the pin there would have left those sessions holding
+    the operator token, including ones that run Bash on external input.
+
+    Both arms are asserted, because the no-allowlist arm is the one a
+    hardening-only implementation fails.
+    """
+    monkeypatch.setenv("GH_TOKEN", "ghp_INHERITED_FROM_THE_OPERATOR")
+    for inv in (
+        CCInvocation(prompt="hi"),
+        CCInvocation(prompt="hi", bash_allowlist=("gh",)),
+        CCInvocation(prompt="hi", bash_allowlist=("jq",)),
+    ):
+        env = invoker._build_env(inv)
+        assert env["GH_TOKEN"] == "", (
+            f"an inherited GH_TOKEN survived into a dispatch with "
+            f"bash_allowlist={inv.bash_allowlist!r} — gh resolves GH_TOKEN "
+            f"ahead of hosts.yml, so this outranks the credential-free seal"
+        )
+
+
+def test_no_session_without_a_gh_allowlist_has_gh_pointed_anywhere(invoker, monkeypatch):
+    """The SCOPE of the token pin, asserted from the other side.
+
+    `GH_CONFIG_DIR` is pinned by `_gh_hardening` and NOWHERE else, so a dispatch
+    with no gh allowlist must not acquire one however it is stamped. This is a
+    guard against a specific REJECTED design, kept because the design looked
+    right: pinning the seal for `origin == external_untrusted`, to close the
+    ON-DISK route that the empty token demonstrably does not close.
+
+    It was rejected on two MEASURED grounds. That origin is far wider than it
+    reads — SIX dispatch profiles via `_PROFILE_ORIGIN` (campaign,
+    community-responder, interact, mail, research, steward) plus every
+    non-owner-attended conversation channel via `session_origin_for_channel`,
+    dashboard included — and it would also have pinned `XDG_DATA_HOME`, a
+    process-global base directory, at a read-only tree for those sessions. And
+    pinning the SEAL is a fail-OPEN on exactly the installs that need it:
+    REPRODUCED, a rewrite that fails before the stale sweep leaves a pre-heal
+    seal still holding the copied credential, and a fallback that pins the path
+    anyway points the session AT it.
+
+    The arms below therefore include external-untrusted DELIBERATELY: if a later
+    change reintroduces that pin, this fails and sends the reader to this
+    docstring instead of to a rediscovery.
+
+    `delenv` first — `_build_env` copies `os.environ` wholesale, so a developer
+    with GH_CONFIG_DIR exported would otherwise see this fail for a reason that
+    has nothing to do with the code.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_FIRST_PARTY
+
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    for inv in (
+        CCInvocation(prompt="hi", origin=ORIGIN_EXTERNAL_UNTRUSTED),
+        CCInvocation(prompt="hi", origin=ORIGIN_FIRST_PARTY),
+        CCInvocation(prompt="hi"),
+        CCInvocation(prompt="hi", bash_allowlist=("jq",)),
+    ):
+        env = invoker._build_env(inv)
+        assert "GH_CONFIG_DIR" not in env, (
+            f"gh was pointed somewhere for a session with no gh allowlist "
+            f"(origin={inv.origin!r}, allowlist={inv.bash_allowlist!r}) — read "
+            f"this test's docstring before making that deliberate"
+        )
+        assert "XDG_DATA_HOME" not in env, (
+            "XDG_DATA_HOME is a process-global base dir; pinning it at the "
+            "read-only seal outside the allowlisted path is unmeasured"
+        )
+        # The TOKEN pin IS unconditional — the two have different scopes.
+        assert env["GH_TOKEN"] == ""
+
+
+def test_the_gh_token_pin_is_enforced_fail_closed_not_merely_set(monkeypatch):
+    """The hardening pin is what makes it REFUSE, not just default.
+
+    `_build_env` setting a key is overridable by `env_overrides`;
+    `_assert_hardening_present` recomputes the hardening and compares every key,
+    so a launch whose GH_TOKEN was changed raises. Asserting only that
+    `_build_env` sets it would miss that difference entirely.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    hardened = inv_mod._gh_hardening()
+    assert hardened is not None and hardened["GH_TOKEN"] == ""
+
+    # The value the builder produces is accepted...
+    inv_mod._assert_hardening_present({**hardened}, ("gh",))
+    # ...and a re-introduced credential is REFUSED.
+    with pytest.raises(RuntimeError, match="GH_TOKEN"):
+        inv_mod._assert_hardening_present({**hardened, "GH_TOKEN": "ghp_x"}, ("gh",))
 
 
 @pytest.mark.parametrize("key", ["GH_CONFIG_DIR", "GH_PAGER"])
@@ -4703,18 +4852,9 @@ def test_a_seal_with_the_right_bytes_at_the_wrong_modes_is_not_a_seal(monkeypatc
     import genesis.cc.invoker as inv_mod
 
     sealed = Path(_seal(monkeypatch, tmp_path))
-    assert inv_mod._seal_matches(
-        sealed,
-        {
-            "config.yml": (sealed / "config.yml").read_text(),
-            "hosts.yml": (sealed / "hosts.yml").read_text(),
-        },
-    )
+    assert inv_mod._seal_matches(sealed, {"config.yml": (sealed / "config.yml").read_text()})
 
-    desired = {
-        "config.yml": (sealed / "config.yml").read_text(),
-        "hosts.yml": (sealed / "hosts.yml").read_text(),
-    }
+    desired = {"config.yml": (sealed / "config.yml").read_text()}
 
     # DIRECTORY mode alone, files left at 0400. Asserted separately because the
     # file-mode check below would otherwise catch a combined case and the
@@ -4730,13 +4870,9 @@ def test_a_seal_with_the_right_bytes_at_the_wrong_modes_is_not_a_seal(monkeypatc
 
     sealed.chmod(0o700)
     (sealed / "config.yml").chmod(0o600)
-    assert not inv_mod._seal_matches(
-        sealed,
-        {
-            "config.yml": (sealed / "config.yml").read_text(),
-            "hosts.yml": (sealed / "hosts.yml").read_text(),
-        },
-    ), "a writable seal compared equal — the repair would be skipped"
+    assert not inv_mod._seal_matches(sealed, desired), (
+        "a writable seal compared equal — the repair would be skipped"
+    )
 
 
 def test_seal_rewrites_are_serialised_against_a_concurrent_writer(monkeypatch, tmp_path):
@@ -4780,10 +4916,4 @@ def test_seal_rewrites_are_serialised_against_a_concurrent_writer(monkeypatch, t
     # Lock released: it should now finish on its own.
     assert done.wait(timeout=10), "the rewrite never completed after the lock was freed"
     worker.join(timeout=5)
-    assert inv_mod._seal_matches(
-        target,
-        {
-            "config.yml": inv_mod._SEALED_GH_CONFIG_YML,
-            "hosts.yml": "github.com:\n  oauth_token: x\n",
-        },
-    )
+    assert inv_mod._seal_matches(target, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML})

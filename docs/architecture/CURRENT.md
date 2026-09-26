@@ -341,9 +341,26 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 18e41e1e1 2026-09-23
+verified: 489d021f7 2026-09-25
 ```
 
+- **A dispatched session holds NO GitHub credential unless deliberately armed**
+  (`cc/invoker.py` `_sealed_gh_config_dir` / `_gh_hardening` / `_build_env`). The
+  sealed `GH_CONFIG_DIR` used to carry a copy of the operator's `hosts.yml`, so
+  every gh-allowlisted dispatch ran with the operator's own scopes (install-
+  specific; on the box where this was measured, `delete_repo` among them). The
+  copy is gone and `GH_TOKEN` is pinned empty for EVERY dispatch — it outranks
+  `hosts.yml`, so an inherited value would beat the seal — fail-closed via
+  `_assert_hardening_present`, which refuses any other value and so is also why
+  no arming path exists yet. Existing installs self-heal: `hosts.yml` left
+  `desired`, so the stale sweep unlinks it on the next allowlisted launch
+  (VERIFIED on a live seal, `['config.yml','hosts.yml']` → `['config.yml']`).
+  **SCOPE — do not over-read it:** `GH_CONFIG_DIR` is pinned only on the
+  allowlisted path, so a session with `Bash` and no declared allowlist still
+  reaches the credential on disk (MEASURED: an empty `GH_TOKEN` alone does not
+  de-authenticate). Widening that pin by origin was measured wrong twice over and
+  is documented in `.claude/docs/background-sessions.md`; the remedy is denying
+  `Bash`, not an env pin.
 - **The slot door heals a bare slot — by CONSENT, never silently**
   (`scripts/cc-slot.sh`, the block above every latch; probe:
   `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —

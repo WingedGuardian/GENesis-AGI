@@ -351,12 +351,26 @@ PROFILES: dict[str, list[str]] = {
     #
     # READ THIS BEFORE RELYING ON IT: a first-token allowlist bounds which
     # BINARY runs, not what the session can do. The permitted binary writes
-    # files to caller-chosen paths and makes authenticated API calls, so this
-    # profile is NOT confined to commenting — the tool blocks describe the
-    # TOOLS, not the capability. Treat it as a session acting with the
-    # operator's credentials and filesystem access, which matters because it
-    # also ingests external, attacker-authored PR content. A subcommand-level
-    # allowlist is what would make "confined" true.
+    # files to caller-chosen paths and makes API calls, so this profile is NOT
+    # confined to commenting — the tool blocks describe the TOOLS, not the
+    # capability. A subcommand-level allowlist is what would make "confined"
+    # true, and it does not exist yet.
+    #
+    # It no longer acts with the OPERATOR's credentials, as of 2026-09-25: the
+    # sealed gh config carries no `hosts.yml` and `GH_TOKEN` is pinned empty, so
+    # a dispatch is UNAUTHENTICATED (MEASURED). What remains is filesystem write
+    # and unauthenticated network reach — which still matters, because this
+    # profile ingests external, attacker-authored PR content. Read the floor as
+    # "no GitHub identity", never as "cannot reach the network or the disk".
+    #
+    # CONSEQUENCE, STATED RATHER THAN DISCOVERED: the mandate below still asks
+    # for authenticated writes (comment / reopen / re-request review / close) and
+    # NONE of them can succeed now. There is no arming path — `_gh_hardening`
+    # pins GH_TOKEN empty and `_assert_hardening_present` refuses any other
+    # value, so a credential cannot even be injected via `env_overrides`.
+    # Survivable only because this profile has never run: MEASURED 0 rows in
+    # `cc_sessions` for it. Giving it a credential deliberately, and rewriting
+    # the mandate to match, is follow-up work — not a gap to paper over here.
     "steward": (
         [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
         + _NO_BROWSER_INTERACTION
