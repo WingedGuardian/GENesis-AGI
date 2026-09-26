@@ -1050,4 +1050,11 @@ jobs:
         # skipif and attaches no client: it drives the real picker over a pipe
         # with a fake tmux on PATH, so there is no runner capability it can miss
         # and no runtime-skip path to lose a coin-flip on.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23476
+        #
+        # 23476 -> 23524, the deploy-station PR (#1804), counted as a DELTA
+        # against main, never a total. MEASURED by --collect-only on
+        # 2026-09-25: the four test files it adds tests to collect 87 on the
+        # branch (test_deploy_lock.py is new) against 39 for the three that
+        # exist on main, so +48 (test_update_marker_ownership.py changed only
+        # its harness, delta 0). It adds no skips; the ceiling holds at 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23524

@@ -164,7 +164,7 @@ _UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
 mkdir -p "$(dirname "$_UPDATE_LOCK_FILE")"
 exec {_RESTORE_UPDATE_LOCK_FD}>"$_UPDATE_LOCK_FILE"
 if ! flock -n "$_RESTORE_UPDATE_LOCK_FD"; then
-    die "Genesis update lock is held — refusing concurrent update+restore"
+    die "deploy-station lock is held (an update, a code-only deploy, or a validation hold via scripts/run_under_deploy_lock.sh) — refusing to restore concurrently; retry when it ends"
 fi
 
 # ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
