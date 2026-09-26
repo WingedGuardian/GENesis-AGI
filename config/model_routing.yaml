@@ -169,10 +169,13 @@ providers:
   # circuit breakers was a redundant footgun; consolidated to groq-free.
   gemini-free:
     type: google
-    # GA stable (was gemini-3-flash-preview; gemini-3.5-flash is Google's own
-    # recommended replacement for that preview — escape preview deprecation churn).
-    model: gemini-3.5-flash
-    profile: gemini-3.5-flash
+    # GA stable (was gemini-3-flash-preview; 3.5-flash replaced that preview to
+    # escape preview deprecation churn, and 3.8-flash is the current GA).
+    # Bumped 3.5 -> 3.8 on 2026-09-21: a live generateContent call returned 200
+    # on this install's key. That proves the model is CALLABLE here; it does not
+    # by itself prove free-tier eligibility, so re-check if quota behaviour changes.
+    model: gemini-3.8-flash
+    profile: gemini-3.8-flash
     free: true
     rpm_limit: 15
     # NO rpd_limit yet, deliberately: live 429s show "limit: 20" and Genesis
@@ -180,11 +183,26 @@ providers:
     # proven. A wrong shipped daily cap would deselect the provider on every
     # install. Measure (count successes per UTC day vs 20) before setting.
     open_duration_s: 120
-    # gemini-3.5-flash reasons by default (~70-90 thinking tokens even on trivial
+    # This family reasons by default (~70-90 thinking tokens even on trivial
     # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
     # the fast-flash lane (fact extraction, tagging, surplus brainstorm), so
     # suppress thinking. reasoning_effort=disable → Gemini thinkingBudget=0
-    # (verified live 2026-06-23: content correct, 0 reasoning tokens at mt=20).
+    # (verified live 2026-06-23 on 3.5-flash: content correct, 0 reasoning
+    # tokens at mt=20).
+    #
+    # RE-VERIFIED 2026-09-21 on 3.8-flash, because the suppression is a
+    # per-version behaviour and the bump would otherwise have carried the old
+    # model's verification forward unexamined. At maxOutputTokens=256 with
+    # thinkingBudget=0: content='ok', finishReason=STOP, thoughtsTokenCount
+    # absent — the suppression still holds.
+    # KNOWN FLOOR, measured in the same session: at maxOutputTokens=16 the same
+    # setting produced EMPTY content (finishReason=MAX_TOKENS, 12 thought
+    # tokens), where 3.5-flash had answered. 3.8-flash therefore needs more
+    # headroom than its predecessor before it will emit anything. No caller in
+    # this repo is near that edge — the routed callers use 150-2000, the one
+    # max_tokens=10 site is `eval/longmemeval/judge.py`, which its own docstring
+    # documents as deliberately independent of this routing table — but a new
+    # caller asking for a double-digit budget should know the floor is there.
     params:
       reasoning_effort: disable
   openrouter-free:
@@ -219,15 +237,15 @@ providers:
     open_duration_s: 120
   openrouter-sonnet:
     type: openrouter
-    model: anthropic/claude-sonnet-4.6
-    profile: claude-sonnet-4.6
+    model: anthropic/claude-sonnet-5
+    profile: claude-sonnet-5
     free: false
     rpm_limit: 20
     open_duration_s: 120
   openrouter-opus:
     type: openrouter
-    model: anthropic/claude-opus-4.6
-    profile: claude-opus-4.6
+    model: anthropic/claude-opus-5
+    profile: claude-opus-5
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -279,15 +297,17 @@ providers:
     open_duration_s: 120
   openrouter-deepseek-v4-flash:
     type: openrouter
-    model: deepseek/deepseek-v4-flash
-    profile: deepseek-v4-flash
+    model: deepseek/deepseek-v4.1-flash
+    profile: deepseek-v4.1-flash
     free: false
     rpm_limit: 20
     open_duration_s: 120
+  # The frontier GPT lane: hard reasoning where correctness outweighs cost.
+  # Renamed from `openrouter-gpt55` (version-neutral) on 2026-09-21.
   openrouter-gpt55:
     type: openrouter
-    model: openai/gpt-5.5
-    profile: gpt-5.5
+    model: openai/gpt-6-astra
+    profile: gpt-6-astra
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -311,33 +331,33 @@ providers:
     open_duration_s: 120
   openai-gpt5:
     type: openai
-    model: gpt-5.4
-    profile: gpt-5.4
+    model: gpt-5.6-sol
+    profile: gpt-5.6-sol
     free: false
     open_duration_s: 120
   xai-grok:
     type: xai
-    model: grok-3-mini
-    profile: grok-3-mini
+    model: grok-4.6
+    profile: grok-4.6
     free: false
     open_duration_s: 120
   qwen-plus:
     type: qwen
-    model: qwen3.5-plus
-    profile: qwen-3.5-plus
+    model: qwen3.6-plus
+    profile: qwen-3.6-plus
     free: false
     open_duration_s: 120
   glm51:
     type: zenmux
-    model: z-ai/glm-5.1
-    profile: glm-5.1
+    model: z-ai/glm-5.3
+    profile: glm-5.3
     base_url: https://zenmux.ai/api/v1
     free: false
     open_duration_s: 120
   minimax-m25:
     type: minimax
-    model: MiniMax-M2.7
-    profile: minimax-m2.7
+    model: MiniMax-M3
+    profile: minimax-m3
     base_url: https://api.minimaxi.com/v1
     free: false
     open_duration_s: 120
@@ -348,16 +368,19 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
+  # The general GPT lane: most work, cost-held. Renamed from `gpt-5.4`
+  # (version-neutral) on 2026-09-21; it was also the only provider whose name
+  # carried no route prefix, so it read like a sibling of `openai-gpt*`.
   gpt-5.4:
     type: openrouter
-    model: openai/gpt-5.4
-    profile: gpt-5.4
+    model: openai/gpt-5.6-sol
+    profile: gpt-5.6-sol
     free: false
     open_duration_s: 120
   kimi-k2.5:
     type: openrouter
-    model: moonshotai/kimi-k2.6
-    profile: kimi-k2.6
+    model: moonshotai/kimi-k3
+    profile: kimi-k3
     free: false
     rpm_limit: 20
     open_duration_s: 120

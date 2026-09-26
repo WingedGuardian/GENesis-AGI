@@ -62,8 +62,51 @@ def _normalize_dispatch(raw: object, *, call_site_name: str) -> str:
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
-    """Recursively merge overlay into base. Lists are replaced, not appended."""
+    """Recursively merge overlay into base. Lists are replaced, not appended.
+
+    A NON-MAPPING OVERLAY VALUE REPLACES THE BASE VALUE, deliberately, including
+    at a key whose base value is a mapping. That is not an oversight and it is not
+    the same question as whether a bodiless SECTION may wipe a section — see below,
+    because a revision of this function got exactly that wrong.
+
+    An overlay setting ``providers.<name>.params: null`` is an operator CLEARING an
+    inherited parameter map, and it has to keep working: ``ProviderConfig.params``
+    is ``dict | None``, and three shipped providers carry one (``groq-free``,
+    ``gemini-free``, ``openrouter-free``). Without the clear there is no way to run
+    ``gemini-free`` against a model that rejects ``reasoning_effort``, because the
+    shipped ``{reasoning_effort: disable}`` is inherited with no way off.
+
+    HOW THAT WAS LEARNED, so the rule is not re-broken by the same reasoning: a
+    revision of this function refused every non-mapping over a mapping, at every
+    depth, to stop a half-edited overlay (``providers:`` with no body, which YAML
+    loads as ``None``) deleting a whole section and taking the router dark. The
+    intent was right and the SITING was wrong — the rule cannot tell a structural
+    section from a nullable leaf field, so it also silently removed the clear
+    above. MEASURED 2026-09-25: with that guard, ``params: null`` left
+    ``{reasoning_effort: disable}`` in place; without it, the clear works, and all
+    nine bodiless-key shapes are STILL contained, because the two places that can
+    actually tell the difference already handle them:
+
+      * ``_sanitize_local_overlay`` drops a non-mapping SECTION and a non-mapping
+        ENTRY under providers/call_sites/retry — it knows which keys are structural
+        because it is written against that structure;
+      * ``_parse`` skips a malformed provider, call site or retry profile, so one
+        bad entry can never take down the rest.
+
+    The only shape guarded HERE is the whole ``overlay`` argument not being a
+    mapping, which is a statement about the argument rather than about any key —
+    the shape ``update_call_site_in_yaml:699`` would hit with a poisoned entry, and
+    that raises OUTSIDE the validation try at :778, so the dashboard save 500s with
+    no backup written.
+    """
     merged = copy.deepcopy(base)
+    if not isinstance(overlay, dict):
+        logger.warning(
+            "Refusing to merge a non-mapping overlay (%s) over a mapping — "
+            "keeping the base unchanged",
+            type(overlay).__name__,
+        )
+        return merged
     for key, val in overlay.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
             merged[key] = _deep_merge(merged[key], val)
@@ -89,6 +132,24 @@ def _load_local_overlay(path: Path) -> dict:
         return {}
 
 
+def _overlay_retry_names(local_raw: object) -> frozenset[str]:
+    """Retry-profile names the overlay MENTIONS, read before sanitizing.
+
+    `_sanitize_local_overlay` drops a malformed entry, which is correct for the
+    file it heals and lossy for the parse that follows: afterwards nothing can
+    distinguish `retry:\n  background:` (an operator mid-edit) from a call site
+    naming a profile that was never written at all. A name in this set is the
+    former, so substituting is safe; a name outside it is a typo and still
+    raises.
+    """
+    if not isinstance(local_raw, dict):
+        return frozenset()
+    retry = local_raw.get("retry")
+    if not isinstance(retry, dict):
+        return frozenset()
+    return frozenset(k for k in retry if isinstance(k, str))
+
+
 def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     """Filter stale references from a local overlay before merging.
 
@@ -99,9 +160,91 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
 
     Returns a sanitized copy — does NOT mutate the input.
     """
+    if not isinstance(local_raw, dict):
+        logger.warning(
+            "Local overlay is %s, not a mapping — ignoring it entirely",
+            type(local_raw).__name__,
+        )
+        return {}
+
     result = copy.deepcopy(local_raw)
+
+    # HEALING, not containment. `_deep_merge` is what actually stops a bodiless
+    # overlay key wiping the base — it refuses to put a non-mapping over a mapping
+    # at any depth, and that is the guard the router's correctness rests on (see
+    # its docstring for the measured failure table).
+    #
+    # This pass exists for the two things that guard cannot do. First, the overlay
+    # dict this function returns is what `update_call_site_in_yaml` WRITES BACK to
+    # disk (:786 `yaml.dump(local_raw, ...)`), so dropping the poison here removes
+    # it from the operator's file at the next dashboard save instead of leaving it
+    # there to be re-ignored forever. Second, `update_call_site_in_yaml:695` does
+    # `.setdefault(call_site_id, {})` on this result and hands it to `_deep_merge`
+    # at :699 — a surviving `None` entry makes that call raise OUTSIDE the
+    # validation try at :778, so the save 500s with no backup written. Removing the
+    # entry here means `setdefault` returns `{}` and the save proceeds normally.
+    #
+    # Both levels are walked, because they fail differently and only one of them is
+    # absorbed downstream. MEASURED 2026-09-25 against the real loader, with
+    # `_deep_merge`'s guard removed so each shape reaches `_parse`:
+    #
+    #   SECTION  `providers:`              -> 0 of 2 providers survive
+    #   SECTION  `call_sites:`             -> 0 of 2 call sites survive
+    #   ENTRY    `call_sites: {<id>:}`     -> TypeError at :578, router dark
+    #   ENTRY    `call_sites: {<id>: oops}`-> TypeError, router dark
+    #   ENTRY    `retry: {<name>:}`        -> AttributeError at :462, router dark
+    #   ENTRY    `providers: {<name>:}`    -> already absorbed by `_parse`, which
+    #                                         skips it with a warning and disables
+    #                                         the provider. Loud and non-fatal, and
+    #                                         the reason `providers` and
+    #                                         `call_sites` behave differently at
+    #                                         the same nesting level.
+    #
+    # Only a key the BASE holds as a mapping is dropped: an overlay key absent from
+    # base is left alone (`_parse` ignores unknown keys, and silently deleting an
+    # operator's addition would be its own defect).
+    for key, val in list(result.items()):
+        if isinstance(base_raw.get(key), dict) and not isinstance(val, dict):
+            logger.warning(
+                "Local overlay section '%s' is not a mapping (%s) — dropping it "
+                "rather than leaving it to be ignored at every merge",
+                key, type(val).__name__,
+            )
+            result.pop(key)
+
+    for section in ("providers", "call_sites", "retry"):
+        entries = result.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for name, entry in list(entries.items()):
+            # NOT conditioned on the base holding that name. The top-level rule
+            # above deliberately leaves an unknown KEY alone, because `_parse`
+            # ignores unrecognised top-level keys — but that reasoning does NOT
+            # survive one level down, where `_parse` ITERATES the entries. A NEW
+            # name here is parsed like any other, so a bodiless one is as fatal as
+            # a bodiless override, and within these three sections every entry
+            # must be a mapping regardless of origin.
+            #
+            # MEASURED 2026-09-25, with the base-presence condition still in place:
+            #   retry:      {custom:}  (new)  -> AttributeError, router dark
+            #   retry:      {default:} (known)-> caught here
+            #   call_sites: {99_new:}  (new)  -> caught by the stale-call-site
+            #                                    filter below, which drops any name
+            #                                    absent from base
+            #   providers:  {newprov:} (new)  -> caught by _parse's guard at :576
+            # `retry` was the one section with neither protection, which is what
+            # made a new bodiless profile nothing references take routing offline.
+            if not isinstance(entry, dict):
+                logger.warning(
+                    "Local overlay %s entry '%s' is not a mapping (%s) — dropping "
+                    "it rather than leaving a half-finished edit in the file",
+                    section, name, type(entry).__name__,
+                )
+                entries.pop(name)
+
     base_providers = set((base_raw.get("providers") or {}).keys())
     base_call_sites = set((base_raw.get("call_sites") or {}).keys())
+
     local_call_sites = (result.get("call_sites") or {})
 
     for cs_name, cs in list(local_call_sites.items()):
@@ -120,7 +263,7 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
             continue
         if not isinstance(cs, dict) or "chain" not in cs:
             continue
-        original_chain = cs["chain"]
+        original_chain = list(cs["chain"])
         filtered = [p for p in original_chain if p in base_providers]
         stale = set(original_chain) - set(filtered)
         if stale:
@@ -156,12 +299,17 @@ def load_config(path: str | Path, *, check_api_keys: bool = True) -> RoutingConf
     base_raw = yaml.safe_load(_expand_env_vars(text))
 
     local_raw = _load_local_overlay(path)
+    overlay_retry = _overlay_retry_names(local_raw)
     if local_raw:
         local_raw = _sanitize_local_overlay(base_raw, local_raw)
         if local_raw:
             base_raw = _deep_merge(base_raw, local_raw)
 
-    return _parse(base_raw, check_api_keys=check_api_keys)
+    return _parse(
+        base_raw,
+        check_api_keys=check_api_keys,
+        overlay_retry_names=overlay_retry,
+    )
 
 
 def load_config_from_string(text: str, *, check_api_keys: bool = True) -> RoutingConfig:
@@ -305,7 +453,12 @@ def _parse_daily_limit(provider: str, key: str, value) -> int | None:
     return parsed
 
 
-def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
+def _parse(
+    raw: dict,
+    *,
+    check_api_keys: bool = True,
+    overlay_retry_names: frozenset[str] = frozenset(),
+) -> RoutingConfig:
     """Parse raw YAML dict into a validated RoutingConfig."""
     if not isinstance(raw, dict):
         msg = "Config must be a YAML mapping"
@@ -313,7 +466,29 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
 
     # --- Retry profiles ---
     retry_profiles: dict[str, RetryPolicy] = {}
+    # Names that were DEFINED but malformed, so the loop below skipped them.
+    # Kept distinct from "never mentioned at all" for the same reason
+    # `disabled_providers` is: see the call-site substitution further down.
+    skipped_retry_profiles: set[str] = set()
     for name, rp in (raw.get("retry") or {}).items():
+        # Same shape guard providers get at :576, and for the same reason: a
+        # half-edited overlay leaves `retry:\n  custom:` as None, and `rp.get`
+        # below would raise AttributeError. That escapes `load_config` into
+        # `runtime/init/router.py`, which swallows it into `_bootstrapped = False`
+        # — every LLM call site dark because of one unfinished retry profile that
+        # nothing even references. MEASURED 2026-09-25.
+        #
+        # This is the BACKSTOP; the sanitizer drops the entry before it gets here.
+        # It is kept because the sanitizer only ever sees the OVERLAY, so a typo in
+        # the shipped config would otherwise still reach this line.
+        if not isinstance(rp, dict):
+            logger.warning(
+                "Retry profile '%s' is not a mapping (%s) — skipping it. This is "
+                "the shape a half-edited local overlay leaves behind.",
+                name, type(rp).__name__,
+            )
+            skipped_retry_profiles.add(name)
+            continue
         retry_profiles[name] = RetryPolicy(
             max_retries=rp.get("max_retries", 3),
             base_delay_ms=rp.get("base_delay_ms", 500),
@@ -333,6 +508,23 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     disabled_providers: set[str] = set()
     disabled_provider_types: dict[str, str] = {}  # name → provider_type
     for name, p in (raw.get("providers") or {}).items():
+        # A non-mapping provider entry is what a half-edited overlay leaves behind
+        # (`glm51:` with no body parses as None; `glm51: broken` as a str). Both
+        # used to raise AttributeError out of the `.get` below, and that exception
+        # is caught by runtime/init/router.py — so the runtime came up with every
+        # LLM call site dark behind one log line. Check the SHAPE before any field
+        # access, and register it as disabled so the existing chain filter strips
+        # it rather than leaving a name that is in neither set.
+        if not isinstance(p, dict):
+            logger.warning(
+                "Provider '%s' is not a mapping (%s) — skipping it. This is the "
+                "shape a half-edited local overlay leaves behind.",
+                name, type(p).__name__,
+            )
+            disabled_providers.add(name)
+            disabled_provider_types[name] = "unknown"
+            continue
+
         # Parse enabled field — supports bool, string from env var expansion
         enabled_raw = p.get("enabled", True)
         if isinstance(enabled_raw, str):
@@ -344,6 +536,30 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             disabled_providers.add(name)
             disabled_provider_types[name] = p.get("type", "unknown")
             logger.info("Provider '%s' disabled via config", name)
+            continue
+
+        # A provider entry missing `type`/`model` is almost always a stale local
+        # overlay whose base key was renamed or removed upstream.
+        # Raising here is NOT a loud failure: runtime/init/router.py catches it, so the
+        # runtime comes up with `_bootstrapped = False` and every LLM call site dark,
+        # announced by a single log line. Losing one provider is strictly better than
+        # losing routing entirely.
+        missing = [k for k in ("type", "model") if k not in p]
+        if missing:
+            logger.warning(
+                "Provider '%s' is missing %s — this is the shape a stale local "
+                "overlay leaves behind after an upstream rename. Skipping this "
+                "provider rather than failing router init.",
+                name, " and ".join(f"'{k}'" for k in missing),
+            )
+            # Register as DISABLED rather than merely absent. A name in neither
+            # `providers` nor `disabled_providers` still trips the call-site
+            # validation below ("references unknown provider"), which raises —
+            # the router-dark path this guard exists to avoid. Disabled names are
+            # stripped from chains by the existing filter, and surface on the
+            # dashboard's disabled list instead of becoming a second half-state.
+            disabled_providers.add(name)
+            disabled_provider_types[name] = p.get("type", "unknown")
             continue
 
         cfg = ProviderConfig(
@@ -387,6 +603,26 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     # --- Call sites ---
     call_sites: dict[str, CallSiteConfig] = {}
     for name, cs in (raw.get("call_sites") or {}).items():
+        # The third and last section to get this guard, and it is here by
+        # ENUMERATION rather than by report. Three review rounds each found one
+        # instance of the same shape — a bodiless YAML key reaching a parser that
+        # assumes a mapping — so rather than wait for a fourth, every section
+        # `_parse` iterates was swept with a malformed entry in the BASE config
+        # and no overlay at all. MEASURED 2026-09-25: providers was guarded,
+        # retry had just been guarded, call_sites raised `TypeError: 'NoneType'
+        # object is not subscriptable` on the next line.
+        #
+        # Skipping rather than raising matters because the alternative is total:
+        # one unusable call site would otherwise take the whole router down
+        # through `runtime/init/router.py`, including every site that is fine.
+        if not isinstance(cs, dict) or "chain" not in cs:
+            logger.warning(
+                "Call site '%s' is not a usable mapping (%s) — skipping it. This "
+                "is the shape a half-edited config or overlay leaves behind; the "
+                "other call sites are unaffected.",
+                name, type(cs).__name__,
+            )
+            continue
         chain = cs["chain"]
         # Chains stay intact — keyless providers are NOT filtered. The
         # router skips them at routing time (treats them as down).
@@ -414,13 +650,61 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
                 msg = f"Call site '{name}' references unknown provider '{provider}'"
                 raise ValueError(msg)
 
-        retry_profile = cs.get("retry_profile", "default")
-        if retry_profile not in retry_profiles:
+        retry_profile = cs.get("retry_profile")
+        # `retry_profile: null` is an operator CLEARING an inherited value, the
+        # same gesture `params: null` supports one section up — refusing it was a
+        # measured regression there, and it reached `_parse` as
+        # "unknown retry profile 'None'" here, i.e. router dark.
+        if retry_profile is None:
+            retry_profile = "default"
+        elif not isinstance(retry_profile, str):
+            # A mapping or a number is a config error, not a clearing gesture.
+            # Named explicitly because `x in retry_profiles` raises TypeError on
+            # an unhashable value, which escapes as a stack trace rather than a
+            # sentence an operator can act on.
             msg = (
-                f"Call site '{name}' references unknown "
-                f"retry profile '{retry_profile}'"
+                f"Call site '{name}' retry_profile must be a string or null, "
+                f"got {type(retry_profile).__name__}"
             )
             raise ValueError(msg)
+
+        # VALIDITY FIRST. Ordering this after a "was the name mentioned" test
+        # shadows every VALID profile sharing that name: an overlay overriding
+        # `background` had its override discarded and all 24 shipped call sites
+        # naming it silently dropped to `default` — while the profile sat in
+        # `retry_profiles`, unused, and the warning called the healthy file
+        # malformed. Found by an adversarial audit; the test that let it through
+        # asserted `in {"background", "default"}`, which is the whole reachable
+        # set and therefore binds nothing.
+        if retry_profile not in retry_profiles:
+            if retry_profile in skipped_retry_profiles or retry_profile in overlay_retry_names:
+                # SKIPPED, or edited away in the overlay, is not UNKNOWN. The
+                # shape guard above stopped the AttributeError and left this
+                # raise standing, so a half-edited entry still escaped `_parse`
+                # into `runtime/init/router.py`'s catch-all and left `_router`
+                # None — every call site dark. Substituting matches what a
+                # malformed PROVIDER already gets (registered disabled, stripped
+                # from chains) rather than inventing a second policy for the same
+                # accident. "default" is guaranteed present a few lines above.
+                logger.warning(
+                    "Call site '%s' references retry profile '%s', which is not "
+                    "usable (malformed, or a half-finished local-overlay edit) — "
+                    "falling back to 'default'. Fix the profile to restore its "
+                    "own retry policy.",
+                    name, retry_profile,
+                )
+                retry_profile = "default"
+            else:
+                # Never defined anywhere: a typo, not a half-edit. Kept as a hard
+                # error because an operator typo must not be papered over —
+                # though `runtime/init/router.py`'s catch-all currently swallows
+                # it into a dark router, so it is not as loud as it reads.
+                # Making that catch loud is a separate concern.
+                msg = (
+                    f"Call site '{name}' references unknown "
+                    f"retry profile '{retry_profile}'"
+                )
+                raise ValueError(msg)
 
         call_sites[name] = CallSiteConfig(
             id=name,
@@ -491,9 +775,21 @@ def update_call_site_in_yaml(
     ):
         return load_config(path)
 
-    # Start with existing local overlay for this call site
+    # Start with existing local overlay for this call site.
+    #
+    # SANITIZE IT FIRST — this is the third reader of the overlay and the only
+    # one that WRITES. Reading it raw was measured to produce two failures once
+    # `_parse` learned to skip incomplete providers: a save carrying a legacy
+    # provider key succeeded while silently dropping the operator's override from
+    # the live router (`reload_config` installs the parsed result), and a legacy
+    # name in a chain failed every save with "references unknown provider 'glm51'"
+    # — a name the dashboard no longer displays. Routing this read through the same
+    # chokepoint as the other two keeps the three readers agreeing, and heals the
+    # overlay on disk at the next save.
     local_path = _local_path_for(path)
-    local_raw = _load_local_overlay(path)
+    _unsanitized_local = _load_local_overlay(path)
+    overlay_retry = _overlay_retry_names(_unsanitized_local)
+    local_raw = _sanitize_local_overlay(base_raw, _unsanitized_local)
     local_cs = local_raw.setdefault("call_sites", {}).setdefault(call_site_id, {})
 
     # Resolve effective call site (base + existing local) for validation
@@ -579,7 +875,7 @@ def update_call_site_in_yaml(
     # Merges local_raw (with new changes) onto base_raw and parses it.
     try:
         merged_raw = _deep_merge(base_raw, local_raw)
-        new_config = _parse(merged_raw)
+        new_config = _parse(merged_raw, overlay_retry_names=overlay_retry)
     except Exception as e:
         msg = f"Generated config failed validation: {e}"
         raise ValueError(msg) from e
