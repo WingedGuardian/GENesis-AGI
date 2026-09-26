@@ -901,6 +901,213 @@ check_cc_tmp() {
 #   Orange : 70-85% — clean files not accessed in 3+ days + alert
 #   Red    : > 85%  — aggressive cleanup + emergency alert
 
+live_open_paths_selftested() {
+    # `live_open_paths` with a POSITIVE self-test, printed on stdout. Returns 1 —
+    # printing nothing — when the self-test fails.
+    #
+    # WHY: `live_open_paths` ends in `2>/dev/null || true`, and
+    # `dir_has_live_writer` opens with `[[ -n "$snapshot" ]] || return 1`. BOTH
+    # halves fail OPEN, so a failed or partial /proc read is indistinguishable
+    # from "nothing is live" — and the caller is a loop that DELETES whatever it
+    # believes to be dead.
+    #
+    # The test is POSITIVE, not an emptiness check: a partial read, another uid's
+    # writer, or a root spelling the kernel does not use all yield a NON-empty
+    # snapshot with a structurally blind guard. So open a descriptor we KNOW
+    # about, under the same root the caller will match against, and require it
+    # back.
+    #
+    # THE RETURN IS THE VALIDATED STRING ITSELF, and that is a fix rather than a
+    # style choice. An earlier version piped it through
+    # `printf ... | grep -vxF -- "$probe" || true` to drop the probe's own
+    # record — and that one line reintroduced the exact fail-open this function
+    # exists to close: ANY failure of that pipeline yields rc 0 with EMPTY
+    # stdout, which the caller reads as a valid snapshot in which nothing is
+    # alive. Written two lines below its own fix, by the same `|| true` idiom the
+    # comment above condemns. The strip was also unnecessary: the probe lives at
+    # "<root>/.wg-bprobe.XXXXXX" while every candidate is matched under
+    # "<root>/pytest-of-*/", so the probe's record can never match a candidate.
+    #
+    # DUPLICATION, acknowledged: Zone A does this too (`clean_cc_red`). They are
+    # not merged here because Zone A's degrade policy is deliberately the
+    # opposite — it keeps an unvalidated snapshot and warns, because its floor
+    # path has a reason to press on — and because folding a refactor of a
+    # freshly hardened sibling into this change is how both get broken at once.
+    local probe_dir="$1" probe="" probe_fd snap=""
+    probe="$(mktemp "$probe_dir/.wg-bprobe.XXXXXX" 2>/dev/null)" || probe=""
+    if [[ -n "$probe" ]]; then
+        # Guarded `exec` inside a brace group: an unguarded failing `exec {fd}>`
+        # exits the daemon under set -e, and an `exec` with no command applies
+        # its redirection PERMANENTLY. Same two hazards Zone A documents.
+        if { exec {probe_fd}>"$probe"; } 2>/dev/null; then
+            snap="$(live_open_paths)"
+            exec {probe_fd}>&-
+        fi
+        rm -f "$probe"
+    fi
+    # Whole-line containment in pure bash, never `printf | grep -q`: grep -q
+    # exits on its first match and SIGPIPEs the printf, which under pipefail
+    # reports 141 and reads as a FAILED self-test on every large snapshot.
+    [[ -n "$probe" && $'\n'"$snap"$'\n' == *$'\n'"$probe"$'\n'* ]] || return 1
+    printf '%s\n' "$snap"
+}
+
+reclaim_dead_pytest_dirs() {
+    # Reclaim pytest base directories under $2 (default /tmp) that no live run
+    # owns and that are older than the caller's tier gate ($1).
+    #
+    # WHY THIS EXISTS. Every generic sweep below carries `-not -path "*/pytest-*"`,
+    # to avoid deleting files out from under a running suite. The exclusion cannot
+    # tell a live run from a dead one, so it protects the garbage equally — and
+    # MEASURED 2026-09-24, that is not a theoretical cost: 255 MB of dead pytest
+    # trees, half of a 512 MB tmpfs, survived the emergency tier while it churned
+    # every 30 seconds for 22 minutes reporting "aggressive cleanup complete".
+    #
+    # So the generic sweeps keep their exclusion — they must never nibble
+    # individual files out of a live tree — and pytest directories are handled
+    # here instead, WHOLE, by liveness rather than by name.
+    #
+    # ENUMERATION IS `find -P`, NOT A GLOB, and that is a containment fix rather
+    # than a tidy-up. `/tmp` is mode 1777, so any uid can plant a SYMLINK named
+    # `pytest-of-something` pointing anywhere. A bash glob follows it: MEASURED,
+    # `for d in "$root"/pytest-of-*/*` yields paths inside the link's target, and
+    # they satisfy `[[ -d ]]`, so the recursive delete below leaves $root
+    # entirely. A per-leaf `[[ -L "$d" ]]` guard does not help — the leaf is a
+    # real directory; the escape is the PARENT. `find -P` never follows a symlink
+    # and refuses to descend a symlinked component at all (measured: zero results
+    # against the same fixture), which closes the class rather than one level of
+    # it. -print0 because a newline in a directory name would otherwise split one
+    # record into two, and neither half would match.
+    #
+    # THE AGE GATE IS UNCONDITIONAL AND COMES FIRST. That ordering is the fix for
+    # a defect found in this function's first draft, and it is worth stating
+    # because the broken shape looks entirely reasonable: the gate lived in the
+    # `elif` of the no-lock branch, so a LOCKED directory whose owner had exited
+    # fell straight through to the delete with no age test at all. Since this
+    # project always writes a lock, that was the common path — the tier constants
+    # were cosmetic, and YELLOW (at 51% of the filesystem, every 30s) would have
+    # deleted a tree the instant its suite exited. A dead owner is a NECESSARY
+    # condition for reclaiming, never a sufficient one: pytest deliberately
+    # retains the last `keep` runs so a developer can open the artifacts of a
+    # failing run (`make_numbered_dir_with_cleanup`, _pytest/pathlib.py:363-396).
+    #
+    # THE LIVENESS SIGNALS, each read from pytest's own contract or from /proc.
+    # Past the age gate, a directory is spared if ANY holds:
+    #
+    #   1. It is a symlink. pytest maintains `pytest-current` pointing at the
+    #      newest run. Mirrors `ensure_deletable` (_pytest/pathlib.py:312).
+    #   2. A live process holds a descriptor open underneath it — the Zone A
+    #      signal, reused. Catches a live run whatever its lock says, including
+    #      `--basetemp` and keep=0 runs that have no lock at all.
+    #   3. Its `.lock` names a pid with a live `/proc` entry. pytest writes its
+    #      own pid INTO the lock at creation (pathlib.py:254-256) and unlinks it
+    #      at exit behind a fork guard (:263-279).
+    #
+    #      `/proc/<pid>`, NOT `kill -0`. MEASURED on bash 5.2.21: `kill -0 1`
+    #      returns 1 ("Operation not permitted") and `kill -0 999999` returns 1
+    #      ("No such process") — EPERM and ESRCH are indistinguishable, so
+    #      signalling reads a LIVE process owned by another uid as dead.
+    #
+    #      The pid is SHAPE-CHECKED before it is used, which the first /proc
+    #      version dropped along with the `kill` it replaced. `tr -dc` produces a
+    #      digit string from anything, and two spellings then skip signal 4 and
+    #      go straight to the delete: a 36-digit run of garbage (no such /proc
+    #      entry, so "dead"), and a zero-padded pid like `0755` for a LIVE
+    #      process 755 (no `/proc/0755`, so "dead"). Anything that is not a plain
+    #      1-7 digit decimal falls through to the mtime rule instead.
+    #   4. The lock exists but carries no usable pid. Fall back to pytest's own
+    #      published threshold and spare until the lock is LOCK_TIMEOUT old,
+    #      exactly as `ensure_deletable` does (pathlib.py:327).
+    #
+    # A directory with no lock at all is reclaimable once past the age gate — the
+    # same answer `ensure_deletable` gives (pathlib.py:316-317). That covers a
+    # project configured with retention `none`, where `if keep != 0`
+    # (pathlib.py:390) means a live run holds no lock; signal 2 and the age gate
+    # are what protect it.
+    #
+    # Nothing here ever unlinks a `.lock`. pytest's own GC does that when it
+    # expires one (pathlib.py:333); a watchdog doing it would hand a second
+    # cleaner a directory this one had decided to spare.
+    local min_age_min="$1" root="${2:-/tmp}"
+    local d lock pid reclaimed=0 failed=0 snapshot
+
+    # pytest's own staleness threshold, from the installed _pytest/pathlib.py:46
+    # (`LOCK_TIMEOUT = 60 * 60 * 24 * 3`), verified against pytest 9.0.2, in
+    # MINUTES for `find -mmin`. Anything shorter is more aggressive than pytest's
+    # own garbage collector and reaps a suite that legitimately runs longer.
+    #
+    # LOCAL, not a top-level global. `load_config` re-sources watchgod.conf on
+    # every poll with no key allowlist, so a global of this name would be
+    # settable from configuration — and setting it to 0 makes the daemon reap
+    # trees pytest's published rule says are live. The same reasoning moved the
+    # sweep root to a parameter; this is the other half of that class.
+    local lock_timeout_min=4320
+
+    if ! snapshot="$(live_open_paths_selftested "$root")" || [[ -z "$snapshot" ]]; then
+        # FAIL CLOSED, on a failed self-test OR an empty result.
+        #
+        # THE EMPTINESS TEST IS THE GUARD; the unstripped return above is
+        # simplification. Stated this way round because the obvious reading is
+        # the opposite, and an earlier version of this comment asserted the
+        # opposite before it was checked.
+        #
+        # A passing self-test proves the probe's own path is in the snapshot, so
+        # with an unstripped return this branch is unreachable — the value cannot
+        # be empty. It is kept for the case where it is not: the first version
+        # returned `... | grep -vxF -- "$probe" || true`, whose failure mode is
+        # rc 0 with EMPTY stdout, and the caller then tested only the status.
+        #
+        # MEASURED, and the number is the point: restoring the strip, removing
+        # this test, and doing BOTH all leave the suite green. The pair is NOT
+        # bound by any test here, and no fixture was found that distinguishes
+        # them — an empty snapshot arises only when /proc showed nothing but the
+        # probe, and in that state both variants reclaim the same directories.
+        # So this is defence in depth against a future edit, not a behaviour any
+        # arm observes. Do not delete it on the grounds that nothing fails.
+        #
+        # The limit worth knowing: the self-test is POSITIVE, not complete. A
+        # partial /proc read that happens to include the probe passes it, and
+        # neither guard helps there.
+        #
+        # Skipping one 30-second poll costs nothing; deleting on a blind reading
+        # destroys a live suite's work.
+        log WARN "Zone B — /proc snapshot failed its self-test under $root (this process's own open probe was not visible, or the reading came back empty); SKIPPING the pytest reclaim this poll rather than deleting on a reading that cannot see live writers"
+        return 0
+    fi
+
+    while IFS= read -r -d '' d; do
+        [[ -L "$d" ]] && continue
+        [[ -d "$d" ]] || continue
+        # (0) the caller's tier gate — unconditional, and before every signal
+        [[ -z "$(find -P "$d" -maxdepth 0 -mmin "+$min_age_min" 2>/dev/null)" ]] && continue
+        # (2) an open descriptor underneath is decisive, whatever the lock says
+        dir_has_live_writer "$d" "$snapshot" && continue
+        lock="$d/.lock"
+        if [[ -f "$lock" ]]; then
+            pid="$(head -c 32 "$lock" 2>/dev/null | tr -dc '0-9')"
+            if [[ "$pid" =~ ^[1-9][0-9]{0,6}$ ]]; then
+                [[ -d "/proc/$pid" ]] && continue      # (3) owner alive -> spare
+            # (4) no usable pid -> pytest's own three-day rule
+            elif [[ -z "$(find -P "$lock" -maxdepth 0 -mmin "+$lock_timeout_min" 2>/dev/null)" ]]; then
+                continue
+            fi
+        fi
+        if rm -rf -- "$d" 2>/dev/null; then
+            reclaimed=$((reclaimed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done < <(find -P "$root" -mindepth 2 -maxdepth 2 -path "$root/pytest-of-*" \
+                 \( -name 'pytest-*' -o -name 'garbage-*' \) -print0 2>/dev/null)
+
+    (( reclaimed > 0 )) && log INFO "Zone B reclaimed $reclaimed dead pytest dir(s) (age gate ${min_age_min}min)"
+    # A PARTIAL delete must be loud. Silence here would reproduce the exact
+    # pathology this function exists to fix: the tier reports "cleanup complete",
+    # reclaims nothing, and retries every 30 seconds with nobody able to see why.
+    (( failed > 0 )) && log WARN "Zone B — $failed pytest dir(s) could not be removed (possibly PARTIALLY deleted); something under them is undeletable by this uid"
+    return 0
+}
+
 clean_sys_yellow() {
     log INFO "Zone B YELLOW — cleaning /tmp files not accessed in 7+ days"
     find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
@@ -930,6 +1137,10 @@ clean_sys_red() {
     if (( pct_after > 85 )); then
         find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
             -mmin +60 -delete 2>/dev/null || true
+        # Emergency gate for pytest trees — 60 minutes, matching the file sweep
+        # immediately above, and tighter than the tier's own 1440 gate applied
+        # by check_sys_tmp before this point.
+        reclaim_dead_pytest_dirs 60
     fi
 
     # Emergency alert — transition-only (see clean_cc_red). Zones A/B share the
@@ -950,14 +1161,22 @@ check_sys_tmp() {
     pct=$(tmp_usage_pct)
     local tier="green"
 
+    # The pytest reclaim is dispatched HERE, once per poll with the tier's own
+    # age gate, rather than inside each clean_sys_* function. clean_sys_orange
+    # calls clean_sys_yellow for its file sweep, so a reclaim living in both ran
+    # twice per poll — two full /proc walks at ~50-120ms each — with the first
+    # pass strictly subsumed by the second.
     if (( pct > 85 )); then
         tier="red"
+        reclaim_dead_pytest_dirs 1440
         clean_sys_red
     elif (( pct > 70 )); then
         tier="orange"
+        reclaim_dead_pytest_dirs 4320
         clean_sys_orange
     elif (( pct > 50 )); then
         tier="yellow"
+        reclaim_dead_pytest_dirs 10080
         clean_sys_yellow
     fi
 
