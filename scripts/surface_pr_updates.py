@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""SessionStart hook: surface unseen upstream-PR-steward notifications inline.
+"""SessionStart hook: surface unseen GitHub-steward notifications inline.
 
-The upstream-pr-steward campaign already Telegram-pings the owner when a tracked
-external PR changes, and logs each ping to outreach_history. Those pings are
-easy to miss on Telegram, so this hook mirrors the unseen ones into the CC
-session as a one-line nudge:
+Genesis already Telegram-pings the owner when a tracked external PR changes, and
+logs each ping to outreach_history. Those pings are easy to miss on Telegram, so
+this hook mirrors the unseen ones into the CC session as a one-line nudge:
 
     [PRs] 1 external-PR update you may not have seen — PR steward: … (Jul 9).
     Ask "show PRs" to review.

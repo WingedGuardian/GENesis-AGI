@@ -1457,10 +1457,16 @@ verified: 788dd9a9 2026-09-06
 
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
-  `upstream-pr-steward` campaign's own owner notifications — the ones it already
-  logs to `outreach_history` (category `notification`, topic `%steward%`) when a
-  tracked EXTERNAL PR changes — into foreground CC sessions as a one-line
+  GitHub-steward owner notifications already in `outreach_history` (category
+  `notification`, topic `%steward%`) into foreground CC sessions as a one-line
   `[PRs] …` nudge, so a status change missed on Telegram still reaches the user.
+  Those rows are written by `recon/account_activity.py` — a Python poller inside
+  genesis-server, whose topics are prefixed `GitHub steward: …`, which is what
+  the `%steward%` LIKE matches — and by the `github-activity-digest` campaign's
+  digests. There is **no** `upstream-pr-steward` campaign — MEASURED, the slug
+  names none of the 6 `campaigns` rows and was never committed as a campaign
+  definition. #792 added the `steward` DirectSession profile and referred to an
+  intended campaign for it; the profile is real, the campaign is not.
   Read-only, **home-anchored DB** (NOT `genesis_db_path()`/`repo_root()`, which
   would read an empty `<worktree>/data/` — the same trap `_charter_db_path`
   avoids). Seen-state is a home-anchored JSON sidecar
@@ -1470,8 +1476,7 @@ verified: 788dd9a9 2026-09-06
   window (no retention step). Lever: settings domain `pr_watch`
   (`config/pr_watch.yaml` + `pr_watch_config.py`) + `GENESIS_PR_WATCH_DISABLED`
   kill switch; skips dispatched sessions (`GENESIS_CC_SESSION=1`) so the human's
-  next foreground session still gets the nudge. The campaign's discovery/notify
-  behavior lives in its install-local strategy doc (campaigns ship zero defaults).
+  next foreground session still gets the nudge.
 - **Infra protection posture (2026-07-16; network plane 2026-07-17)**: hourly
   `_check_infra_protection_posture` reads the infra profile's effective facts
   and raises one `high` `infrastructure_alert` when a memory-plane protection

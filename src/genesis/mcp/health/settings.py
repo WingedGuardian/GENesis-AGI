@@ -213,9 +213,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="pr_watch",
         description=(
             "PR-watch inline surface — master `enabled` plus lookback/resurface/"
-            "max_surface knobs. Mirrors the upstream-pr-steward campaign's own "
-            "owner notifications into foreground CC sessions as a one-line nudge, "
-            "so a tracked-PR status change missed on Telegram still reaches the "
+            "max_surface knobs. Mirrors the GitHub-steward owner notifications "
+            "(written by recon/account_activity.py and the github-activity-digest "
+            "campaign) into foreground CC sessions as a one-line nudge, so a "
+            "tracked-PR status change missed on Telegram still reaches the "
             "user next session. Read live by the SessionStart hook — takes effect "
             "next session start. Hook kill switch: GENESIS_PR_WATCH_DISABLED=1."
         ),
