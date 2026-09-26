@@ -177,7 +177,26 @@ def _key_value(key_name: str) -> str:
 
 
 def _update_secrets_file(updates: dict[str, str]) -> None:
-    """Update keys in secrets.env atomically. Preserves comments and structure."""
+    """Update keys in secrets.env atomically. Preserves comments and structure.
+
+    An empty-string value UNSETS the key: the assignment is commented out rather
+    than written as ``KEY=``. ``None`` is NOT a value here and RAISES, because it
+    would otherwise be written literally as ``KEY=None`` — which ``_key_value``
+    reads back as ``''`` while ``os.environ`` still holds the string "None" and
+    keeps shadowing genesis.yaml. The dashboard would then report the key as unset
+    while the live process ignored the yaml: exactly the corruption the
+    ``os.environ.pop`` in ``secrets_update`` exists to prevent, reached by another
+    door. Callers translate their own spelling of "clear" to ``""`` BEFORE calling
+    (``secrets_update`` maps the wire protocol's ``null`` here), so a ``None``
+    arriving is a caller bug and fails loudly rather than corrupting the file.
+    """
+    none_keys = sorted(k for k, v in updates.items() if v is None)
+    if none_keys:
+        raise TypeError(
+            f"_update_secrets_file received None for {none_keys}; pass '' to unset "
+            f"(None would be written literally as KEY=None)"
+        )
+
     path = secrets_path()
     if not path.exists():
         # Create from example if missing
@@ -190,35 +209,46 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
             os.chmod(path, 0o600)
 
     lines = path.read_text().splitlines(keepends=True)
-    remaining = dict(updates)
+    seen: set[str] = set()
     new_lines: list[str] = []
 
+    # EVERY matching assignment is rewritten, not just the first. MEASURED: the
+    # loader takes the LAST assignment (`DUPKEY=first` then `DUPKEY=second`
+    # resolves to "second", via dotenv and os.environ alike), so touching only
+    # the first occurrence is silently a no-op whenever a key is assigned twice:
+    #   * a CLEAR left the later assignment active, so the setting came back on
+    #     restart while the route answered 200 and the editor said "cleared";
+    #   * a SET rewrote the earlier line while the stale later one kept winning,
+    #     so the operator's new value never took effect at all.
+    # The second is the more dangerous and was the one nobody reported.
     for line in lines:
         m = _KEY_RE.match(line.strip())
-        if m and m.group(1) in remaining:
-            key = m.group(1)
-            val = remaining.pop(key)
-            if val == "":
-                # UNSET: comment the assignment out rather than writing `KEY=`.
-                # An empty assignment is NOT the same as no assignment — the
-                # accessors read `os.environ.get(key) is not None`, so `KEY=`
-                # still shadows genesis.yaml, just with an empty string, which is
-                # worse than the value it replaced. Commenting preserves the line
-                # (and any inline note beside it) as documentation of what the
-                # key was, which is exactly how the template ships these.
+        key = m.group(1) if m else None
+        if key is not None and key in updates:
+            val = updates[key]
+            if val == "" or key in seen:
+                # UNSET, or a DUPLICATE of a key already written above. Comment
+                # the assignment out rather than writing `KEY=`: an empty
+                # assignment is NOT the same as no assignment — the accessors
+                # read `os.environ.get(key) is not None`, so `KEY=` still shadows
+                # genesis.yaml, just with an empty string, which is worse than the
+                # value it replaced. Commenting preserves the line (and any inline
+                # note beside it) as documentation of what the key was, which is
+                # exactly how the template ships these.
                 new_lines.append(f"# {key}={line.strip().split('=', 1)[1]}\n")
             else:
                 new_lines.append(f"{key}={val}\n")
+            seen.add(key)
         else:
             new_lines.append(line)
 
     # Append any keys not found in the existing file
-    if remaining:
+    to_append = [(k, v) for k, v in updates.items() if k not in seen and v != ""]
+    if to_append:
         if new_lines and not new_lines[-1].endswith("\n"):
             new_lines.append("\n")
-        for key, val in remaining.items():
-            if val == "":
-                continue  # unset stays unset — never append a shadowing `KEY=`
+        for key, val in to_append:
+            # unset stays unset — never append a shadowing `KEY=`
             new_lines.append(f"{key}={val}\n")
 
     # Atomic write
@@ -273,8 +303,52 @@ def secrets_list():
 
 @blueprint.route("/api/genesis/secrets", methods=["PUT"])
 def secrets_update():
-    """Update one or more keys in secrets.env. Write-only."""
+    """Update one or more keys in secrets.env. Write-only.
+
+    The payload says what it means, rather than leaving the caller to infer it:
+
+    ==========================  ===============================================
+    key ABSENT from ``keys``    no change (only keys present here are touched)
+    ``null``                    CLEAR — optional overrides only
+    ``""`` or whitespace        **422** — ambiguous, refused
+    non-empty string            set to that value
+    ==========================  ===============================================
+
+    The empty string used to mean BOTH "I did not change this field" and "clear
+    this setting", and no client could express the difference — so an editor that
+    had not been served the current value (they are withheld from a caller that
+    has not proved it is the operator) submitted an untouched field as ``""`` and
+    silently deleted the override. Making the two spellings distinct removes that
+    by construction: an untouched field can no longer produce a destructive write
+    from ANY client, however the client is written.
+
+    Same shape as ``routes/attention.py``'s ``acceptance_note`` (present —
+    including null — means set, absent means preserve), with one deliberate
+    difference: there ``""`` is a legitimate set, here it is the exact collision
+    being removed, so it is refused outright.
+
+    Hard switch, no deprecation window. The skew case is a browser tab holding
+    cached JS across a deploy, and it fails as a 422 REFUSAL rather than a
+    destructive write — the safe direction — so the message says to reload.
+
+    ONE limit of a CLEAR remains, and it is not introduced here: a clear cannot
+    remove an assignment the file never had — one exported by the systemd unit or
+    the shell. Nothing matches, nothing is written, ``os.environ.pop`` makes it
+    LOOK gone, and a restart brings it back. So the ``cleared`` list in the
+    response echoes what was ASKED FOR, not what changed on disk.
+
+    (A second limit used to sit here: a key assigned TWICE had only its first
+    line rewritten. External review showed that was not a limit but a defect —
+    the loader takes the LAST assignment, so a clear left the setting live while
+    this route answered 200, and a SET left the stale duplicate winning. Both are
+    fixed in ``_update_secrets_file``, which now rewrites every occurrence.)
+    """
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        # A truthy non-dict body ([1,2], "hi", 7) survives `or {}` and used to
+        # reach `data.get` as an AttributeError — an HTTP 500 for what is plainly
+        # a malformed request.
+        return jsonify({"error": "Body must be a JSON object"}), 400
     updates = data.get("keys")
     if not updates or not isinstance(updates, dict):
         return jsonify({"error": "Body must contain 'keys' object"}), 400
@@ -285,24 +359,70 @@ def secrets_update():
         if key not in _KNOWN_KEYS:
             errors.append(f"Unknown key: {key}")
             continue
+        if val is None:
+            # EXPLICIT CLEAR. Ordered deliberately: AFTER the _KNOWN_KEYS check so
+            # {"NOPE": null} reports an unknown key rather than an un-clearable
+            # one, and BEFORE the isinstance check so a null reports the right
+            # problem instead of "must be a string".
+            #
+            # `val is None`, never `if not val`: 0 and False are falsy and are NOT
+            # a clear — they fall through to the isinstance check and are rejected
+            # as non-strings, which is what they are.
+            #
+            # Only an OPTIONAL OVERRIDE may be cleared. Without that limit the
+            # editor is a one-way door: setting one writes an assignment into
+            # secrets.env, the environment then shadows genesis.yaml for good, and
+            # later yaml edits appear to do nothing — recoverable only by hand-
+            # editing the file the dashboard exists to avoid. A required credential
+            # has no "unset" state that is not simply a broken install.
+            if key not in _OPTIONAL_OVERRIDE_KEYS:
+                errors.append(
+                    f"{key} cannot be cleared — it has no unset state. "
+                    f"Send a new value instead."
+                )
+            continue
         if not isinstance(val, str):
-            errors.append(f"Value for {key} must be a string")
+            errors.append(f"Value for {key} must be a string, or null to clear")
             continue
         if not val.strip():
-            # EMPTY MEANS UNSET, and only for an optional override. Without this the
-            # editor is a one-way door: setting one of these writes an assignment
-            # into secrets.env, the environment then shadows genesis.yaml for good,
-            # and later yaml edits appear to do nothing — recoverable only by hand-
-            # editing the file the dashboard exists to avoid. A required credential
-            # still cannot be blanked; there is no "unset" state for those that is
-            # not simply a broken install.
-            if key not in _OPTIONAL_OVERRIDE_KEYS:
-                errors.append(f"Value for {key} must be a non-empty string")
+            # THE AMBIGUITY, refused. This is the whole point of the contract: an
+            # empty value cannot say whether it means "unchanged" or "delete it",
+            # so it is never acted on. A deliberate clear says null.
+            #
+            # The remedy is branched because this arm is reached by BOTH kinds of
+            # key, and 76 of the 86 have no unset state. Telling those operators
+            # to "send null" routes them straight into the next refusal — a
+            # two-step dead end in a message whose entire job is to say what to
+            # do instead.
+            how = (
+                "send null to clear it, or a value to set it"
+                if key in _OPTIONAL_OVERRIDE_KEYS
+                else "this key has no unset state, so send a value"
+            )
+            errors.append(
+                f"Value for {key} is empty, which is ambiguous — {how}. "
+                f"If this came from the dashboard, reload the page."
+            )
             continue
         if len(val) > 500:
             errors.append(f"Value for {key} too long (max 500 chars)")
-        if "\n" in val or "\x00" in val:
-            errors.append(f"Value for {key} contains invalid characters")
+        if len(val.splitlines()) > 1 or "\x00" in val:
+            # ANY line separator, not a list of the ones we happened to think of.
+            # This previously checked "\n" alone, and MEASURED, a bare "\r" got
+            # through: the value is written as one physical line, but both
+            # `Path.read_text()` (universal newlines) and python-dotenv — which
+            # loads this file with `override=True` at startup — treat a lone CR
+            # as a line boundary, so `KEY=good\rOTHER=x` parses as TWO
+            # assignments. The second one never passed _KNOWN_KEYS or any
+            # per-key rule, i.e. an arbitrary env var written straight past the
+            # registry allowlist.
+            #
+            # `str.splitlines()` splits on the full Unicode set — \n \r \r\n \v
+            # \f \x1c \x1d \x1e \x85     — which is a SUPERSET of what
+            # the loader treats as a boundary. Deriving the check from that
+            # instead of enumerating characters means a separator nobody thought
+            # of is refused for free, and there is no list to keep in sync.
+            errors.append(f"Value for {key} contains a line break or null byte")
         # Telegram-specific: ALLOWED_USERS must be numeric IDs
         if key == "TELEGRAM_ALLOWED_USERS":
             for uid in val.split(","):
@@ -325,8 +445,17 @@ def secrets_update():
     if errors:
         return jsonify({"error": "Validation failed", "details": errors}), 422
 
-    # Clean values
-    clean = {k: v.strip() for k, v in updates.items() if k in _KNOWN_KEYS}
+    # Clean values. THE WIRE PROTOCOL'S `null` BECOMES `""` HERE, at the route
+    # boundary, and nowhere deeper: _update_secrets_file keeps its own
+    # ""-means-unset contract untouched, so its direct-call tests and its OTHER
+    # caller (routes/backup.py) are unaffected by this change. The ambiguity was
+    # in the HTTP contract, so the translation belongs in the HTTP layer.
+    clean = {
+        k: ("" if v is None else v.strip())
+        for k, v in updates.items()
+        if k in _KNOWN_KEYS
+    }
+    cleared = sorted(k for k, v in clean.items() if v == "")
 
     try:
         _update_secrets_file(clean)
@@ -342,10 +471,24 @@ def secrets_update():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        logger.info("Secrets updated via dashboard: %s", list(clean.keys()))
+        logger.info(
+            "Secrets updated via dashboard: %s (cleared: %s)",
+            list(clean.keys()),
+            cleared or "none",
+        )
         return jsonify({
             "status": "ok",
             "updated": list(clean.keys()),
+            # Which of `updated` were asked to be CLEARED rather than set.
+            #
+            # It echoes the REQUEST, not the disk outcome: clearing a key the
+            # file never assigned writes nothing (the writer skips an empty
+            # append) and the key still appears here. That residual gap is the
+            # shell/systemd-export case in the docstring above, which no write to
+            # this file can close. It is NOT an assertion that anything was
+            # removed — the duplicate-assignment case that used to make this
+            # actively misleading is now fixed in the writer.
+            "cleared": cleared,
             "needs_restart": True,
         })
     except Exception:

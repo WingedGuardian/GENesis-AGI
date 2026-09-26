@@ -2571,26 +2571,26 @@
         },
         async saveSecret(keyName) {
           const val = (this.secretsValues[keyName] || '').trim();
-          // An OPTIONAL OVERRIDE may be cleared — empty means "unset", which removes
-          // the assignment and hands the setting back to genesis.yaml or its default.
-          // Without this the editor is a one-way door: once set, the environment
-          // shadows the yaml permanently and later config edits appear to do nothing.
-          // A required credential still cannot be blanked.
-          const def = (this.secretsGroups || [])
-            .flatMap(g => g.keys || [])
-            .find(k => k.key === keyName);
-          const clearable = !!(def && def.is_optional_override);
-          if (!val && !clearable) {
-            this.secretsMessage = {type: 'error', text: 'Value cannot be empty'};
-            return;
-          }
-          // A WITHHELD value seeds the buffer EMPTY, because the server sent no
-          // value to seed it with — not because the override is unset. So for an
-          // untouched field the two states are indistinguishable from here, and
-          // submitting would clear a configured override the operator cannot even
-          // see. A confirm() does not fix this: it asks "remove the override?"
-          // about a field the user never typed in, so the honest answer is not to
-          // send anything. Refuse, and say how to proceed either way.
+          // SAVE NEVER CLEARS. Clearing is its own button and its own request
+          // (clearSecret, which sends an explicit null), so an empty field is
+          // never read as destructive intent by anything — not this handler, not
+          // the server, which answers 422 for an empty value. That is what makes
+          // the untouched-field hazard impossible rather than merely guarded:
+          // the old code had to INFER whether a blank box meant "unchanged" or
+          // "delete it", and no client could tell those apart.
+          //
+          // A WITHHELD value seeds the buffer EMPTY because the server sent no
+          // value to seed it with, not because the override is unset. Checked
+          // FIRST so such a field gets the message explaining WHY it looks
+          // empty, instead of the generic one below.
+          //
+          // INERT TODAY, and kept deliberately: `secretsWithheld` is
+          // `!!body.values_withheld` and the server sends no such field yet, so
+          // this branch cannot fire at runtime. It is the client half of a
+          // two-PR contract and lands with its server half; deleting it now
+          // would only mean re-adding it there. When that lands it gives the
+          // operator a message the generic refusal below cannot — WHY the field
+          // looks empty — rather than any additional protection.
           const untouched = val === (this.secretsSeeded[keyName] || '').trim();
           if (!val && this.secretsWithheld && untouched) {
             this.secretsMessage = {type: 'error', text:
@@ -2599,11 +2599,9 @@
               'new value to replace it, or log in to see and clear the current one.'};
             return;
           }
-          // Clearing is destructive and easy to do by accident. Where the operator
-          // CAN see the value, emptying it is a deliberate act — confirm it.
-          if (!val && clearable && !confirm(
-                'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
-                'genesis.yaml or its built-in default.')) {
+          if (!val) {
+            this.secretsMessage = {type: 'error', text:
+              'Value cannot be empty. Use Clear to remove an override.'};
             return;
           }
           this.secretsSaving = true;
@@ -2628,6 +2626,56 @@
               this.loadSetupStatus();
             } else {
               this.secretsMessage = {type: 'error', text: d.error || 'Save failed'};
+            }
+          } catch (e) { this.secretsMessage = {type: 'error', text: e.message}; }
+          this.secretsSaving = false;
+        },
+        async clearSecret(keyName) {
+          // Clearing is a GESTURE of its own, never an inference from an empty
+          // field: an explicit button sending an explicit `null`. On the wire
+          // `null` means clear, `""` is refused as ambiguous, and omitting the
+          // key means no change — so this request cannot be confused with a save
+          // that happened to have nothing typed in it.
+          //
+          // Deliberately NOT carrying saveSecret's `_establishSession` branch:
+          // that exists because SETTING DASHBOARD_PASSWORD arms the mutation gate
+          // mid-flight, and DASHBOARD_PASSWORD is not clearable (it ships
+          // uncommented, so it is not an optional override and the server 422s a
+          // null for it). Copying that branch here would mint a session on a clear.
+          if (!confirm(
+                'Remove the ' + keyName + ' override?\n\nThe setting falls back to ' +
+                'genesis.yaml or its built-in default.')) {
+            return;
+          }
+          this.secretsSaving = true;
+          try {
+            const resp = await fetchApi("/api/genesis/secrets", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({keys: {[keyName]: null}}),
+            });
+            const d = await resp.json();
+            if (resp.ok) {
+              this.secretsEditing = {...this.secretsEditing, [keyName]: false};
+              delete this.secretsValues[keyName];
+              delete this.secretsSeeded[keyName];
+              // READ the echo rather than assume. This is the only site that can
+              // send a null, so it is the only place the clear half of the
+              // contract can be checked at all: if a future server stops
+              // reporting the key as cleared — a renamed field, a changed
+              // contract — the operator must not be told it worked. An absent
+              // field and an absent key both degrade to a caveat, never to a
+              // false success and never to a blocked request.
+              const confirmedCleared = Array.isArray(d.cleared) && d.cleared.includes(keyName);
+              this.secretsMessage = confirmedCleared
+                ? {type: 'restart', text: `${keyName} cleared. Changes take effect after server restart.`}
+                : {type: 'error', text: `${keyName}: the server accepted the request but did not report it as cleared. Check its status before assuming the override is gone.`};
+              // The same two refreshes the save path does. Without them the row
+              // keeps reading `configured` after a successful clear, and the
+              // readiness panel keeps counting a key that is gone.
+              this.fetchSecrets();
+              this.loadSetupStatus();
+            } else {
+              this.secretsMessage = {type: 'error', text: d.error || 'Clear failed'};
             }
           } catch (e) { this.secretsMessage = {type: 'error', text: e.message}; }
           this.secretsSaving = false;

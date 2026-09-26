@@ -303,6 +303,96 @@ def test_an_unset_key_is_not_appended_as_empty(tmp_path, monkeypatch):
     assert "OLLAMA_URL" not in env_file.read_text()
 
 
+def test_the_writer_refuses_None_rather_than_writing_KEY_equals_None(tmp_path, monkeypatch):
+    """None is not a value here — it must fail LOUDLY, not corrupt the file.
+
+    MEASURED before the guard existed: ``_update_secrets_file({"K": None})``
+    raised nothing and wrote the literal ``K=None``. ``_key_value`` then reads
+    that back as ``''`` (it filters "None"/"NA"), so the dashboard reports the
+    key as NOT SET while os.environ still holds the string and keeps shadowing
+    genesis.yaml — the exact corruption the ``os.environ.pop`` in
+    ``secrets_update`` exists to prevent, arrived at by another door.
+
+    The HTTP layer translates its ``null`` to ``""`` before calling, so a None
+    reaching here is a caller bug. Unreachable today; this pins it that way.
+    """
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text("OLLAMA_URL=http://was-set.invalid:11434\n")
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    with pytest.raises(TypeError, match="OLLAMA_URL"):
+        mod._update_secrets_file({"OLLAMA_URL": None})
+
+    # And it refused BEFORE touching the file.
+    assert env_file.read_text() == "OLLAMA_URL=http://was-set.invalid:11434\n"
+
+
+def test_clearing_a_DUPLICATED_assignment_comments_out_EVERY_occurrence(tmp_path, monkeypatch):
+    """A clear must leave NO active assignment, however many there were.
+
+    This test previously CHARACTERIZED the opposite — the writer popped on the
+    first match, so a key assigned twice kept its second assignment. That was
+    recorded as a documented limit. It is not a limit, it is a defect, and
+    external review surfaced the consequence: the route answers 200 and the
+    editor tells the operator the override was cleared, while a restart brings it
+    straight back.
+
+    MEASURED, which is what settles it: the loader takes the LAST assignment
+    (`DUPKEY=first` then `DUPKEY=second` resolves to "second", under both
+    dotenv_values and load_dotenv(override=True)). So commenting only the first
+    occurrence is not a partial clear — it is no clear at all.
+    """
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text(
+        "OLLAMA_URL=http://first.invalid:11434\n"
+        "API_KEY_GROQ=untouched\n"
+        "OLLAMA_URL=http://second.invalid:11434\n"
+    )
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": ""})
+
+    text = env_file.read_text()
+    active = [ln for ln in text.splitlines() if ln.startswith("OLLAMA_URL=")]
+    assert active == [], f"a cleared key must have NO active assignment left, got {active}"
+    assert "# OLLAMA_URL=http://first.invalid:11434" in text
+    assert "# OLLAMA_URL=http://second.invalid:11434" in text
+    # An unrelated key between the duplicates must survive verbatim.
+    assert "API_KEY_GROQ=untouched" in text
+
+
+def test_SETTING_a_DUPLICATED_assignment_leaves_only_the_new_value(tmp_path, monkeypatch):
+    """The sibling nobody reported, and the more dangerous of the two.
+
+    Same generator as the clear case: the writer touched only the first match.
+    Because the LAST assignment wins at load time, replacing the first while
+    leaving a stale second meant the operator's new value never took effect —
+    they set an API key, the route answered 200, and the old key kept being used.
+    A silent wrong-value is worse than a silent no-op.
+    """
+    from genesis.dashboard.routes import secrets as mod
+
+    env_file = tmp_path / "secrets.env"
+    env_file.write_text(
+        "OLLAMA_URL=http://stale-one.invalid:11434\n"
+        "OLLAMA_URL=http://stale-two.invalid:11434\n"
+    )
+    monkeypatch.setattr(mod, "secrets_path", lambda: env_file)
+
+    mod._update_secrets_file({"OLLAMA_URL": "http://new.invalid:11434"})
+
+    text = env_file.read_text()
+    active = [ln for ln in text.splitlines() if ln.startswith("OLLAMA_URL=")]
+    assert active == ["OLLAMA_URL=http://new.invalid:11434"], (
+        f"exactly one active assignment, carrying the NEW value, got {active}"
+    )
+    assert "# OLLAMA_URL=http://stale-two.invalid:11434" in text
+
+
 def test_opening_an_editor_seeds_the_value_so_save_is_not_a_delete():
     """An UNTOUCHED field must mean "no change", never "delete".
 
@@ -332,8 +422,21 @@ def test_opening_an_editor_seeds_the_value_so_save_is_not_a_delete():
     # and the comment that made it vacuous was added by the very change it was
     # meant to guard. Bounded to the method and stripped of comments, a window
     # cannot silently stop reaching the code it names.
+    # The backstop MOVED, and that is the point of the write-protocol change:
+    # saveSecret can no longer clear anything at all, so there is nothing left
+    # for it to confirm. Clearing is a separate handler sending an explicit
+    # null, and THAT is what must be a deliberate act.
     save = _method_body(js, "async saveSecret(keyName)")
-    assert "!confirm(" in save, "clearing an override must be an explicit act"
+    assert "confirm(" not in save, (
+        "saveSecret must have no clear path left — clearing is clearSecret's job, "
+        "and a Save that can clear is the ambiguity this protocol removed"
+    )
+    clear = _method_body(js, "async clearSecret(keyName)")
+    assert "!confirm(" in clear, "clearing an override must be an explicit act"
+    assert "null" in clear, (
+        "clearSecret must send an explicit null — an empty string is refused by "
+        "the server as ambiguous"
+    )
 
 
 def test_the_empty_string_is_false_for_every_boolean_accessor():
@@ -353,3 +456,39 @@ def test_the_empty_string_is_false_for_every_boolean_accessor():
     assert _yaml_bool("true") is True
     assert _yaml_bool(False) is False
     assert _yaml_bool(True) is True
+
+
+def test_the_clear_button_is_not_gated_on_a_status_that_lies():
+    """The Clear control must not derive reachability from `_key_status`.
+
+    `_key_status` reports `not_set` for `KEY=`, `KEY=None` and `KEY=NA` as well as
+    for a genuinely absent key — it filters exactly those strings. But those ARE
+    assignments: they sit in secrets.env shadowing genesis.yaml, which is the
+    one-way door the optional-override mechanism exists to prevent.
+
+    MEASURED: the server accepts a clear for that state and comments the line out
+    (see test_a_shadowing_empty_assignment_is_repairable). So gating the button on
+    `status !== 'not_set'` would hide the dashboard's ONLY repair path for it —
+    a UI predicate silently removing a capability the server still offers.
+
+    Structural, because there is no browser harness here; the behaviour it guards
+    is measured on the server side in the contract suite.
+    """
+    from genesis.env import repo_root
+
+    html = (
+        repo_root() / "src/genesis/dashboard/templates/partials/tabs/config.html"
+    ).read_text()
+
+    i = html.index("clearSecret(k.key)")
+    # The enclosing <template x-if="..."> guard for the Clear button.
+    guard_start = html.rindex("<template x-if=", 0, i)
+    guard = html[guard_start: html.index(">", guard_start)]
+
+    assert "is_optional_override" in guard, (
+        "Clear must be offered only for keys that HAVE an unset state to fall back to"
+    )
+    assert "status" not in guard, (
+        "Clear must NOT be gated on k.status — `not_set` also covers KEY= / KEY=None, "
+        "the shadowing assignments that most need clearing (see this test's docstring)"
+    )
