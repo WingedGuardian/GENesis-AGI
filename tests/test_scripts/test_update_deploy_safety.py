@@ -272,7 +272,41 @@ def test_update_resolves_branch_from_the_remote_it_fetches() -> None:
     remote = text.index('UPDATE_REMOTE="$(_detect_update_remote)"')
     resolve = text.index('genesis_resolve_deploy_branch "$GENESIS_ROOT" "$UPDATE_REMOTE"')
     assert remote < resolve
-    assert 'fetch \\\n        "$UPDATE_REMOTE" "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF" \\\n        "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF"' in text
+    # Both refspecs are fully qualified on the source side, so a tag sharing the
+    # branch name cannot win git's disambiguation.
+    assert '"+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF"' in text
+    assert '"+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF"' in text
+
+
+def test_only_the_private_deploy_ref_is_a_fatal_fetch() -> None:
+    """The tracking ref must not be able to fail an otherwise-good update.
+
+    This previously asserted the two refspecs appeared in ONE `git fetch`, which
+    pinned the defect: after a default-branch hierarchy change an existing
+    refs/remotes/<remote>/release blocks refs/remotes/<remote>/release/v2, git
+    exits non-zero, and bundled together that failed every update until someone
+    ran `git remote prune` by hand -- while the deploy ref had already been
+    fetched successfully.
+    """
+    text = UPDATE.read_text()
+    fatal = text.index('"+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF" || return')
+    tracking = text.index('"+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF"')
+    assert fatal < tracking, "the deploy ref must be fetched first, and alone"
+
+    # The tracking refresh lives in its own function, and that function must not
+    # be able to propagate a failure: `|| return` in the caller would reinstate
+    # the bug, so the helper swallows and reports.
+    helper = text.index("_refresh_deploy_tracking_ref() {")
+    body = text[helper : text.index("\n}\n", helper)]
+    assert ">/dev/null 2>&1" in body, "a failed refresh must not spam the deploy log"
+    assert "remote prune" in body, "the note must name the operator's remedy"
+    assert body.rstrip().endswith("return 0"), (
+        "the helper must always succeed; a non-zero exit here is the defect"
+    )
+    assert "_refresh_deploy_tracking_ref\n" in text, "and it must actually be called"
+    assert "_refresh_deploy_tracking_ref || " not in text, (
+        "the call must not be chained to anything that could make it fatal"
+    )
     assert 'public_repo="${GENESIS_GITHUB_PUBLIC_REPO:-$(genesis_local_github_value public_repo || true)}"' in text
 
 

@@ -39,14 +39,25 @@ def _call(count, tags):
 
     def git_result(*args, **kwargs):
         if args[0] == "fetch":
-            check_ref = args[2].split(":", 1)[1]
-            assert check_ref.startswith("refs/genesis-update-check/dashboard/")
-            assert args == (
-                "fetch",
-                "origin",
-                f"+refs/heads/main:{check_ref}",
-                "+refs/heads/main:refs/remotes/origin/main",
-            )
+            # Three distinct fetches, and only the FIRST may be fatal. The
+            # tracking ref and the tags are conveniences that fail for reasons
+            # unrelated to the deploy head — a stale ancestor blocking its own
+            # descendant, a rewritten upstream tag — and bundling either into the
+            # measuring fetch turned a good measurement into a 502.
+            if len(args) > 2 and ":refs/genesis-update-check/" in args[2]:
+                check_ref = args[2].split(":", 1)[1]
+                assert check_ref.startswith("refs/genesis-update-check/dashboard/")
+                assert args == ("fetch", "origin", f"+refs/heads/main:{check_ref}"), (
+                    "the measuring fetch must carry the private ref ALONE"
+                )
+            elif "--tags" in args:
+                assert "--force" in args, "a rewritten tag must not fail the sync"
+            else:
+                assert args == (
+                    "fetch",
+                    "origin",
+                    "+refs/heads/main:refs/remotes/origin/main",
+                ), f"unexpected fetch: {args}"
         elif args[0] == "update-ref":
             assert args[:2] == ("update-ref", "-d")
             assert args[2].startswith("refs/genesis-update-check/dashboard/")

@@ -742,9 +742,34 @@ DEPLOY_FETCH_REF="refs/genesis-update-head"
 DEPLOY_TRACKING_REF="refs/remotes/$UPDATE_REMOTE/$DEPLOY_BRANCH"
 
 _fetch_deploy_refs() {
+    # Only the PRIVATE deploy ref is fatal. It is what the merge reads and what
+    # every recovery path resolves, and it lives outside refs/remotes/ so no
+    # remote-tracking layout can collide with it.
     timeout 120 git -C "$GENESIS_ROOT" fetch \
-        "$UPDATE_REMOTE" "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF" \
-        "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF"
+        "$UPDATE_REMOTE" "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_FETCH_REF" || return
+    _refresh_deploy_tracking_ref
+}
+
+# Best effort, DELIBERATELY. The remote-tracking ref is a convenience — for
+# humans reading the checkout, and for measuring distance — and it fails for
+# reasons that say nothing about whether the deploy target was fetched. The
+# sharp one is a directory/file conflict after a default-branch hierarchy
+# change: an existing refs/remotes/<remote>/release blocks
+# refs/remotes/<remote>/release/v2, git answers "cannot lock ref ... exists"
+# and points at `git remote prune`. Bundled into the same fetch as the deploy
+# ref, that made EVERY update fail until someone pruned by hand, while the
+# deploy ref had already been updated successfully.
+_refresh_deploy_tracking_ref() {
+    if timeout 60 git -C "$GENESIS_ROOT" fetch \
+        "$UPDATE_REMOTE" "+refs/heads/$DEPLOY_BRANCH:$DEPLOY_TRACKING_REF" \
+        >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "  Note: could not refresh $DEPLOY_TRACKING_REF. The deploy target was" \
+         "fetched and is unaffected; this ref is only used for display and" \
+         "distance. If it persists, an obsolete tracking ref is in the way:" \
+         "git -C \"$GENESIS_ROOT\" remote prune $UPDATE_REMOTE"
+    return 0
 }
 
 # Persisted commit names are abbreviated. Resolve them against the object

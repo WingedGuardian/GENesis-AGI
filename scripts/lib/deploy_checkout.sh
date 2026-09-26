@@ -14,11 +14,33 @@ config = Path.home() / ".genesis" / "config" / "genesis.yaml"
 
 
 def _scalar(value: str) -> str:
+    """Read a SIMPLE YAML scalar, or nothing at all.
+
+    This fallback exists only for a python3 without PyYAML, and the one thing it
+    must never do is return a LOSSY reading. `'release/it''s'` is a valid
+    single-quoted scalar meaning `release/it's`; stopping at the doubled quote
+    yields `release/it`, which is ALSO a valid branch name, so no later
+    validation catches the difference and update.sh would fetch and activate a
+    different branch from the one every Python consumer resolves with
+    yaml.safe_load.
+
+    Returning nothing lets the caller fall through to the remote HEAD and be
+    refused by the checkout validation if that disagrees. Returning half a branch
+    name is the failure this whole script exists to prevent.
+    """
     value = value.strip()
     if value and value[0] in "'\"":
-        end = value.find(value[0], 1)
-        if end > 0:
-            return value[1:end].strip()
+        quote = value[0]
+        end = value.find(quote, 1)
+        if end < 1:
+            return ""
+        rest = value[end + 1 :].strip()
+        # Anything but a comment after the closing quote means the scalar uses
+        # syntax this parser does not implement -- a doubled quote, an escape,
+        # a continuation -- so decline instead of guessing.
+        if rest and not rest.startswith("#"):
+            return ""
+        return value[1:end].strip()
     return value.split(" #", 1)[0].strip()
 
 

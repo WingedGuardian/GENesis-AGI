@@ -211,12 +211,29 @@ def update_check():
         "fetch",
         remote,
         f"+refs/heads/{deploy_branch}:{check_ref}",
-        f"+refs/heads/{deploy_branch}:{tracking_ref}",
         timeout=30,
     )
     if branch_out is None:
         logger.error("git fetch failed: %s", branch_err)
         return jsonify({"error": "git fetch failed"}), 502
+
+    # The remote-tracking ref is refreshed SEPARATELY and non-fatally, for the
+    # same reason the tag sync below is: it fails for causes that say nothing
+    # about whether the deploy head was fetched. After a default-branch
+    # hierarchy change an existing refs/remotes/<remote>/release blocks
+    # refs/remotes/<remote>/release/v2, and bundled into the fetch above that
+    # turned a successful measurement into a 502 until someone pruned by hand.
+    _, tracking_err = _git_result(
+        "fetch", remote, f"+refs/heads/{deploy_branch}:{tracking_ref}", timeout=30
+    )
+    if tracking_err:
+        logger.warning(
+            "Could not refresh %s (non-fatal, deploy head unaffected): %s. "
+            "If this persists: git remote prune %s",
+            tracking_ref,
+            tracking_err,
+            remote,
+        )
     target_commit = _git("rev-parse", "--verify", f"{check_ref}^{{commit}}")
     _git_result("update-ref", "-d", check_ref)
     if target_commit is None:

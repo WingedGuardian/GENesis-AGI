@@ -220,6 +220,44 @@ class GenesisVersionCollector:
             raise RuntimeError(f"git rev-parse failed: {stderr.decode(errors='replace')}")
         return stdout.decode().strip()
 
+    async def _delete_ref(self, ref: str) -> None:
+        """Remove a private per-check ref. Never raises; cleanup is not the job."""
+        cleanup = await asyncio.create_subprocess_exec(
+            "git", "update-ref", "-d", ref,
+            cwd=str(_GENESIS_ROOT),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(cleanup.communicate(), timeout=10)
+
+    async def _best_effort_fetch(self, *args: str, what: str) -> None:
+        """Refresh something convenient. A failure is logged, never raised.
+
+        Kept separate from the deploy-head fetch on purpose: a tag that was
+        rewritten upstream, or a remote-tracking ref blocked by an obsolete
+        ancestor, says nothing about whether the deploy head was fetched, and
+        treating it as fatal made this collector report a failed check every six
+        hours on a repository that was perfectly reachable.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "git", "fetch", *args,
+            cwd=str(_GENESIS_ROOT),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except TimeoutError:
+            logger.warning("Refreshing %s timed out (non-fatal)", what)
+            return
+        if proc.returncode != 0:
+            logger.warning(
+                "Could not refresh %s (non-fatal, deploy head unaffected): %s",
+                what,
+                stderr.decode(errors="replace").strip(),
+            )
+
     async def _git_output(self, *args: str, timeout: int = 10) -> str | None:
         """Run a git command and return stdout, or None on failure."""
         proc = await asyncio.create_subprocess_exec(
@@ -260,33 +298,45 @@ class GenesisVersionCollector:
         # one-shot name for the fetched commit; resolve the SHA immediately so a
         # concurrent collector/dashboard check cannot move this measurement's
         # target, then remove the private ref.
+        # ONE fatal fetch: the private per-check ref, which is the only thing
+        # this measurement needs. The tracking ref and the tags are refreshed
+        # separately and best-effort below, because both fail for reasons that
+        # say nothing about whether the deploy head was fetched -- and bundled
+        # here, either one turned a good measurement into a failed check every
+        # six hours. A rewritten upstream tag makes `--tags` exit non-zero with
+        # "would clobber existing tag", and after a default-branch hierarchy
+        # change an existing refs/remotes/<remote>/release blocks
+        # refs/remotes/<remote>/release/v2. The dashboard already split the tags
+        # out for exactly this reason; this path had not.
         proc = await asyncio.create_subprocess_exec(
             "git", "fetch", remote,
             f"+refs/heads/{deploy_branch}:{ref}",
-            f"+refs/heads/{deploy_branch}:{tracking_ref}",
-            "--tags",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode != 0:
+            # Delete the private ref before raising. A partially successful
+            # fetch creates it and still exits non-zero, and the cleanup below
+            # only runs once this point is passed, so raising here used to leak
+            # one uniquely-named ref per failed check.
+            await self._delete_ref(ref)
             stderr_text = stderr.decode(errors="replace").strip()
             raise RuntimeError(
                 f"git fetch {remote} {deploy_branch} failed (exit {proc.returncode}): {stderr_text}"
             )
 
+        await self._best_effort_fetch(
+            remote, f"+refs/heads/{deploy_branch}:{tracking_ref}", what=tracking_ref
+        )
+        # `--force` because a rewritten tag is the case that made this fatal.
+        await self._best_effort_fetch(remote, "--tags", "--force", what="tags")
+
         try:
             target_out = await self._git_output("rev-parse", "--verify", f"{ref}^{{commit}}")
         finally:
-            cleanup = await asyncio.create_subprocess_exec(
-                "git", "update-ref", "-d", ref,
-                cwd=str(_GENESIS_ROOT),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(cleanup.communicate(), timeout=10)
+            await self._delete_ref(ref)
         if target_out is None:
             raise RuntimeError(
                 f"git fetch {remote} {deploy_branch} did not leave a measurable head"
