@@ -1124,9 +1124,11 @@ see.
 
 **Raising the cap is seeded for THIRD-PARTY servers only.** Container installs get
 `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192` set-if-absent (`CC_CONTAINER_SETTINGS_DEFAULTS`
-in `scripts/lib/cc_version.sh`; override with `CC_MCP_DESCRIPTION_LIMIT=<n>` at install or
-update time — a value below CC's own 2,048 default is refused with a warning and 8192 is
-used), so the gitnexus tools above arrive whole — MEASURED
+in `scripts/lib/cc_version.sh`), so the gitnexus tools above arrive whole. To use another cap,
+edit the key in `~/.claude/settings.json` (an existing value is never overwritten). The
+`CC_MCP_DESCRIPTION_LIMIT=<n>` variable only seeds the key where it is ABSENT (a fresh install);
+once the key exists it is a no-op, and a value below CC's own 2,048 default is refused with a
+warning and 8192 used. MEASURED
 cost roughly +1,200 tokens per session. Genesis's OWN tools stay under 2,048
 regardless (`tests/test_mcp/test_tool_description_budget.py`), because a description
 that relies on the lever is still cut on an older CC or wherever the setting is absent.

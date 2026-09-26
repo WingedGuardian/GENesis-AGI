@@ -946,7 +946,9 @@ class TestCallerWiring:
         # reach `[ -lt ]`, which would print "integer expression expected".
         assert err.strip() == "", err
 
-    def test_every_container_reconcile_path_goes_through_the_one_chokepoint(self) -> None:
+    def test_every_container_reconcile_path_goes_through_the_one_chokepoint(
+        self, tmp_path: Path
+    ) -> None:
         """The defaults reach EXISTING installs, not only fresh clones.
 
         They used to ride install.sh alone — the first-run installer, not the
@@ -956,17 +958,34 @@ class TestCallerWiring:
         none can forget the defaults or the sync check. The host deliberately uses
         neither.
         """
+        import re
+
         def calls(path: Path, name: str) -> list[str]:
+            """Every line that INVOKES `name`, in any shell spelling: bare,
+            `if`/`if !`, `$(...)`, after `&&`/`||`/`;`. A word boundary that also
+            refuses `_` and `-` keeps `_cc_ensure_updater_suppressed_inner` out."""
+            word = re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])")
             folded = path.read_text().replace("\\\n", " ")
             return [
                 ln.strip() for ln in folded.splitlines()
-                if f"{name} " in ln or ln.strip().startswith(f"{name}")
-                if not ln.lstrip().startswith("#")
-                and f"{name}()" not in ln  # the definition
+                if word.search(ln)
+                and not ln.lstrip().startswith("#")
+                and not re.search(rf"(?<![\w-]){re.escape(name)}\s*\(\)", ln)  # a definition
                 and "declare -F" not in ln
                 and "for _fn in" not in ln
                 and not ln.lstrip().startswith("echo")
             ]
+
+        # Self-check: the matcher must see the spellings a regression would use.
+        probe = tmp_path / "probe_spellings.sh"
+        probe.write_text(
+            "if cc_ensure_updater_suppressed; then :; fi\n"
+            "if ! cc_ensure_updater_suppressed \"$f\"; then :; fi\n"
+            "x=$(cc_ensure_updater_suppressed)\n"
+            "true && cc_ensure_updater_suppressed || true\n"
+            "_cc_ensure_updater_suppressed_inner \"$@\"\n"
+        )
+        assert len(calls(probe, "cc_ensure_updater_suppressed")) == 4
 
         container = {
             "install.sh": _REPO_ROOT / "scripts" / "install.sh",
@@ -978,9 +997,19 @@ class TestCallerWiring:
                 f"{label}: does not reconcile through cc_reconcile_container_settings — "
                 "an install that runs this path never receives the defaults"
             )
-        for label in ("install.sh", "cc_settings_align.sh"):
-            direct = calls(container[label], "cc_ensure_updater_suppressed")
-            assert not direct, f"{label} calls the reconciler directly, skipping the chokepoint: {direct}"
+        # EVERY shell script on disk, not a hand-picked list: a new container path
+        # added next year that calls the reconciler directly fails here. The only
+        # permitted direct callers are the host leg and the chokepoint itself.
+        scripts = sorted((_REPO_ROOT / "scripts").rglob("*.sh"))
+        assert len(scripts) > 10, "enumeration found too few scripts to be trusted"
+        for path in scripts:
+            if path.name in ("host-setup.sh", "cc_version.sh"):
+                continue
+            direct = calls(path, "cc_ensure_updater_suppressed")
+            assert not direct, (
+                f"{path.relative_to(_REPO_ROOT)} calls the reconciler directly, "
+                f"skipping the container chokepoint: {direct}"
+            )
         # In the library, the ONLY direct call is the chokepoint's own.
         lib_direct = calls(_LIB, "cc_ensure_updater_suppressed")
         assert lib_direct == [
@@ -2566,7 +2595,7 @@ class TestClaudeAiSyncOptOut:
         finally:
             d.chmod(0o755)
         assert "syncClaudeAiSkills" not in json.loads(s.read_text())
-        assert "an unreadable set of skills" in r.stderr, r.stderr
+        assert "synced exists but cannot be read" in r.stderr, r.stderr
 
     def test_a_withheld_opt_out_still_reports_defaults_not_degraded(self, tmp_path: Path) -> None:
         """Holding one key back is not a failure: the deploy reads `defaults`."""
@@ -2576,10 +2605,58 @@ class TestClaudeAiSyncOptOut:
         assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
 
     def test_the_settings_timer_applies_the_same_rule(self, tmp_path: Path) -> None:
-        """cc_settings_align.sh reconciles through the same chokepoint."""
+        """The chokepoint itself, called the way cc_settings_align.sh calls it (the
+        script's own run is covered by TestSettingsAlignScriptRuns)."""
         s = self._seed(tmp_path)
         self._synced(tmp_path, "plugins")
         r = _run(tmp_path, 'cc_reconcile_container_settings || true; echo "STATE=$CC_SUPPRESSION_STATE"')
         data = json.loads(s.read_text())
         assert "syncClaudeAiPlugins" not in data and data["syncClaudeAiSkills"] is False
         assert "plugins sync is left ON" in r.stderr
+
+    def test_a_withheld_opt_out_stays_withheld_when_the_synced_dir_empties(
+        self, tmp_path: Path
+    ) -> None:
+        """Sticky: the operator may have emptied synced/ by turning every skill off
+        on claude.ai, and writing `false` then would silently disable a sync they
+        chose to keep. Only the operator's own value ends the withholding."""
+        s = self._seed(tmp_path)
+        d = self._synced(tmp_path, "skills")
+        _run(tmp_path, self._CALL)
+        (d / "item0").rmdir()  # now empty
+        r = _run(tmp_path, self._CALL)
+        assert "syncClaudeAiSkills" not in json.loads(s.read_text()), "never written without a decision"
+        assert "was syncing skills when Genesis first checked" in r.stderr, r.stderr
+        rec = tmp_path / "home" / ".genesis" / "cc_sync_optout_withheld"
+        assert rec.read_text().splitlines() == ["skills"], "recorded once, not appended per run"
+
+    @pytest.mark.parametrize("value", [None, "true", 1])
+    def test_a_non_boolean_value_is_flagged_not_silenced(self, tmp_path: Path, value) -> None:
+        """CC treats any non-boolean as false, so the sync is OFF: saying nothing
+        would hide that synced items are about to be trashed."""
+        s = self._seed(tmp_path, {"syncClaudeAiSkills": value})
+        self._synced(tmp_path, "skills")
+        r = _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] == value, "never overwritten"
+        assert "is not true/false" in r.stderr, r.stderr
+        assert "skills sync is left ON" not in r.stderr
+
+    def test_the_install_hint_omits_a_withheld_opt_out(self, tmp_path: Path) -> None:
+        """install.sh's manual-fix hint must not suggest the key the check held
+        back — pasting it would retire what the check protected. Runs the REAL
+        block from install.sh, not a copy."""
+        src = (_REPO_ROOT / "scripts" / "install.sh").read_text()
+        start = src.index('    _sync_hint=""')
+        end = src.index("\n", src.index("CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", start))
+        block = src[start:end]
+        for withheld, expect_skills in (("", True), ("skills:syncClaudeAiSkills:2", False)):
+            arr = f'("{withheld}")' if withheld else "()"
+            r = subprocess.run(
+                ["bash", "-c", f'set -u; source "{_LIB}"; CC_SYNC_OPTOUT_WITHHELD={arr}\n{block}'],
+                capture_output=True, text=True, timeout=60,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+            )
+            assert r.returncode == 0, r.stderr
+            assert ('"syncClaudeAiSkills": false' in r.stdout) is expect_skills, r.stdout
+            assert '"syncClaudeAiPlugins": false' in r.stdout, r.stdout
+            assert r.stdout.rstrip().endswith("}"), r.stdout  # the hint still closes its object

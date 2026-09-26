@@ -1648,8 +1648,18 @@ else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
     echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\","
-    echo "                            \"CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH\": \"${CC_MCP_DESCRIPTION_LIMIT:-8192}\"},"
-    echo "                   \"syncClaudeAiSkills\": false, \"syncClaudeAiPlugins\": false}"
+    # Only the sync opt-outs cc_reconcile_container_settings did NOT hold back: an
+    # opt-out withheld because something is already synced must not be suggested
+    # here either — pasting it would retire the synced items the check protected.
+    _sync_hint=""
+    for _pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
+        _k="${_pair#*:}"
+        case " ${CC_SYNC_OPTOUT_WITHHELD[*]:-} " in
+            *":${_k}:"*) continue ;;
+        esac
+        _sync_hint="${_sync_hint}, \"${_k}\": false"
+    done
+    echo "                            \"CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH\": \"${CC_MCP_DESCRIPTION_LIMIT:-8192}\"}${_sync_hint}}"
     setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 
