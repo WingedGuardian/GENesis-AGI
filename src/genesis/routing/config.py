@@ -132,6 +132,24 @@ def _load_local_overlay(path: Path) -> dict:
         return {}
 
 
+def _overlay_retry_names(local_raw: object) -> frozenset[str]:
+    """Retry-profile names the overlay MENTIONS, read before sanitizing.
+
+    `_sanitize_local_overlay` drops a malformed entry, which is correct for the
+    file it heals and lossy for the parse that follows: afterwards nothing can
+    distinguish `retry:\n  background:` (an operator mid-edit) from a call site
+    naming a profile that was never written at all. A name in this set is the
+    former, so substituting is safe; a name outside it is a typo and still
+    raises.
+    """
+    if not isinstance(local_raw, dict):
+        return frozenset()
+    retry = local_raw.get("retry")
+    if not isinstance(retry, dict):
+        return frozenset()
+    return frozenset(k for k in retry if isinstance(k, str))
+
+
 def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     """Filter stale references from a local overlay before merging.
 
@@ -139,9 +157,6 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     exist in the base config's providers section. This prevents a stale
     .local.yaml from breaking startup after an upstream update removes
     a provider.
-
-    Also MIGRATES renamed providers — in the ``providers`` section and in
-    call-site chains — so a rename is not a breaking upgrade for an install
 
     Returns a sanitized copy — does NOT mutate the input.
     """
@@ -284,12 +299,17 @@ def load_config(path: str | Path, *, check_api_keys: bool = True) -> RoutingConf
     base_raw = yaml.safe_load(_expand_env_vars(text))
 
     local_raw = _load_local_overlay(path)
+    overlay_retry = _overlay_retry_names(local_raw)
     if local_raw:
         local_raw = _sanitize_local_overlay(base_raw, local_raw)
         if local_raw:
             base_raw = _deep_merge(base_raw, local_raw)
 
-    return _parse(base_raw, check_api_keys=check_api_keys)
+    return _parse(
+        base_raw,
+        check_api_keys=check_api_keys,
+        overlay_retry_names=overlay_retry,
+    )
 
 
 def load_config_from_string(text: str, *, check_api_keys: bool = True) -> RoutingConfig:
@@ -433,7 +453,12 @@ def _parse_daily_limit(provider: str, key: str, value) -> int | None:
     return parsed
 
 
-def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
+def _parse(
+    raw: dict,
+    *,
+    check_api_keys: bool = True,
+    overlay_retry_names: frozenset[str] = frozenset(),
+) -> RoutingConfig:
     """Parse raw YAML dict into a validated RoutingConfig."""
     if not isinstance(raw, dict):
         msg = "Config must be a YAML mapping"
@@ -441,6 +466,10 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
 
     # --- Retry profiles ---
     retry_profiles: dict[str, RetryPolicy] = {}
+    # Names that were DEFINED but malformed, so the loop below skipped them.
+    # Kept distinct from "never mentioned at all" for the same reason
+    # `disabled_providers` is: see the call-site substitution further down.
+    skipped_retry_profiles: set[str] = set()
     for name, rp in (raw.get("retry") or {}).items():
         # Same shape guard providers get at :576, and for the same reason: a
         # half-edited overlay leaves `retry:\n  custom:` as None, and `rp.get`
@@ -458,6 +487,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
                 "the shape a half-edited local overlay leaves behind.",
                 name, type(rp).__name__,
             )
+            skipped_retry_profiles.add(name)
             continue
         retry_profiles[name] = RetryPolicy(
             max_retries=rp.get("max_retries", 3),
@@ -620,13 +650,61 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
                 msg = f"Call site '{name}' references unknown provider '{provider}'"
                 raise ValueError(msg)
 
-        retry_profile = cs.get("retry_profile", "default")
-        if retry_profile not in retry_profiles:
+        retry_profile = cs.get("retry_profile")
+        # `retry_profile: null` is an operator CLEARING an inherited value, the
+        # same gesture `params: null` supports one section up — refusing it was a
+        # measured regression there, and it reached `_parse` as
+        # "unknown retry profile 'None'" here, i.e. router dark.
+        if retry_profile is None:
+            retry_profile = "default"
+        elif not isinstance(retry_profile, str):
+            # A mapping or a number is a config error, not a clearing gesture.
+            # Named explicitly because `x in retry_profiles` raises TypeError on
+            # an unhashable value, which escapes as a stack trace rather than a
+            # sentence an operator can act on.
             msg = (
-                f"Call site '{name}' references unknown "
-                f"retry profile '{retry_profile}'"
+                f"Call site '{name}' retry_profile must be a string or null, "
+                f"got {type(retry_profile).__name__}"
             )
             raise ValueError(msg)
+
+        # VALIDITY FIRST. Ordering this after a "was the name mentioned" test
+        # shadows every VALID profile sharing that name: an overlay overriding
+        # `background` had its override discarded and all 24 shipped call sites
+        # naming it silently dropped to `default` — while the profile sat in
+        # `retry_profiles`, unused, and the warning called the healthy file
+        # malformed. Found by an adversarial audit; the test that let it through
+        # asserted `in {"background", "default"}`, which is the whole reachable
+        # set and therefore binds nothing.
+        if retry_profile not in retry_profiles:
+            if retry_profile in skipped_retry_profiles or retry_profile in overlay_retry_names:
+                # SKIPPED, or edited away in the overlay, is not UNKNOWN. The
+                # shape guard above stopped the AttributeError and left this
+                # raise standing, so a half-edited entry still escaped `_parse`
+                # into `runtime/init/router.py`'s catch-all and left `_router`
+                # None — every call site dark. Substituting matches what a
+                # malformed PROVIDER already gets (registered disabled, stripped
+                # from chains) rather than inventing a second policy for the same
+                # accident. "default" is guaranteed present a few lines above.
+                logger.warning(
+                    "Call site '%s' references retry profile '%s', which is not "
+                    "usable (malformed, or a half-finished local-overlay edit) — "
+                    "falling back to 'default'. Fix the profile to restore its "
+                    "own retry policy.",
+                    name, retry_profile,
+                )
+                retry_profile = "default"
+            else:
+                # Never defined anywhere: a typo, not a half-edit. Kept as a hard
+                # error because an operator typo must not be papered over —
+                # though `runtime/init/router.py`'s catch-all currently swallows
+                # it into a dark router, so it is not as loud as it reads.
+                # Making that catch loud is a separate concern.
+                msg = (
+                    f"Call site '{name}' references unknown "
+                    f"retry profile '{retry_profile}'"
+                )
+                raise ValueError(msg)
 
         call_sites[name] = CallSiteConfig(
             id=name,
@@ -705,11 +783,13 @@ def update_call_site_in_yaml(
     # provider key succeeded while silently dropping the operator's override from
     # the live router (`reload_config` installs the parsed result), and a legacy
     # name in a chain failed every save with "references unknown provider 'glm51'"
-    # — a name the dashboard no longer displays, because the LOAD path had already
-    # migrated it. Routing this read through the same chokepoint as the other two
-    # closes both, and heals the overlay on disk at the next save.
+    # — a name the dashboard no longer displays. Routing this read through the same
+    # chokepoint as the other two keeps the three readers agreeing, and heals the
+    # overlay on disk at the next save.
     local_path = _local_path_for(path)
-    local_raw = _sanitize_local_overlay(base_raw, _load_local_overlay(path))
+    _unsanitized_local = _load_local_overlay(path)
+    overlay_retry = _overlay_retry_names(_unsanitized_local)
+    local_raw = _sanitize_local_overlay(base_raw, _unsanitized_local)
     local_cs = local_raw.setdefault("call_sites", {}).setdefault(call_site_id, {})
 
     # Resolve effective call site (base + existing local) for validation
@@ -795,7 +875,7 @@ def update_call_site_in_yaml(
     # Merges local_raw (with new changes) onto base_raw and parses it.
     try:
         merged_raw = _deep_merge(base_raw, local_raw)
-        new_config = _parse(merged_raw)
+        new_config = _parse(merged_raw, overlay_retry_names=overlay_retry)
     except Exception as e:
         msg = f"Generated config failed validation: {e}"
         raise ValueError(msg) from e

@@ -519,3 +519,191 @@ def test_parse_skips_a_malformed_entry_in_ANY_base_section(tmp_path, section, ba
     assert "glm" in loaded.providers
     assert "default" in loaded.retry_profiles
     assert "deliberately_malformed" not in loaded.call_sites
+
+
+# --- A REFERENCED malformed retry profile -----------------------------------
+#
+# The shape guard above stops the AttributeError. It does NOT stop the raise
+# further down, which fires for any call site naming a profile that is not in
+# `retry_profiles` — and a SKIPPED profile is not in `retry_profiles`. So the
+# guard converted "AttributeError, router dark" into "ValueError, router dark"
+# for the one case that matters most: the profile something actually uses.
+#
+# Every test above pairs a malformed profile with a call site that does NOT
+# reference it, which is why the suite was green while this path was live.
+#
+# MEASURED on this branch before the substitution landed, all three rows raised
+# `ValueError: Call site '31_outcome_classification' references unknown retry
+# profile 'background'` out of `_parse` -> `load_config` ->
+# `runtime/init/router.py`'s catch-all -> `_router = None`, every call site dark.
+
+_BASE_WITH_REFERENCE = _BASE.replace(
+    "chain: [glm, mistral-large-free]",
+    "chain: [glm, mistral-large-free]\n    retry_profile: background",
+)
+
+
+def test_a_REFERENCED_malformed_retry_profile_in_the_base_does_not_raise(tmp_path):
+    """The shipped-config case: only the parser can save this one."""
+    base = _BASE_WITH_REFERENCE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+          background:
+        """
+    )
+    cfg = _write(tmp_path, base, None)
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert "background" not in loaded.retry_profiles
+    assert loaded.call_sites["31_outcome_classification"].retry_profile == "default"
+
+
+def test_a_REFERENCED_profile_malformed_in_the_overlay_but_valid_in_the_base(tmp_path):
+    """An operator half-edits an override of a profile that already worked.
+
+    The base definition is fine; the overlay blanks it. Whichever layer wins,
+    the call site must keep routing.
+    """
+    base = _BASE_WITH_REFERENCE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+          background:
+            max_retries: 5
+        """
+    )
+    cfg = _write(tmp_path, base, "retry:\n  background:\n")
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    # DETERMINISTIC, measured: the sanitizer drops the overlay's bodiless entry,
+    # so the VALID base definition survives and the call site must keep using it.
+    # The first version of this test asserted `in {"background", "default"}` —
+    # the entire reachable set, so it passed while a real defect substituted
+    # 'default' for every valid profile the overlay merely mentioned.
+    site = loaded.call_sites["31_outcome_classification"]
+    assert site.retry_profile == "background", (
+        "a valid base profile was replaced because the overlay MENTIONED its "
+        "name — the operator's retry policy silently vanished"
+    )
+    assert loaded.retry_profiles["background"].max_retries == 5
+
+
+def test_a_REFERENCED_profile_malformed_in_the_overlay_and_absent_from_the_base(
+    tmp_path,
+):
+    """The likeliest real shape: a new profile referenced before it is written."""
+    cfg = _write(
+        tmp_path, _BASE_WITH_REFERENCE, "retry:\n  background:\n"
+    )
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert loaded.call_sites["31_outcome_classification"].retry_profile == "default"
+
+
+def test_a_retry_profile_that_was_never_defined_STILL_raises(tmp_path):
+    """The control, and the reason this is a substitution and not a fallback.
+
+    A name defined-but-malformed is a half-edit and must degrade. A name that
+    appears nowhere is a TYPO, and swallowing it would hide a real config error
+    behind a silent downgrade to `default` retries. This mirrors providers,
+    where a skipped entry is registered disabled and stripped from chains while
+    an unknown one still trips call-site validation.
+
+    Without that split this test goes green on a blanket fallback, which is
+    exactly the weaker fix it exists to refuse.
+    """
+    base = _BASE_WITH_REFERENCE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+        """
+    )
+    cfg = _write(tmp_path, base, None)
+
+    with pytest.raises(ValueError, match="unknown retry profile 'background'"):
+        load_config(cfg, check_api_keys=False)
+
+
+def test_a_VALID_overlay_retry_profile_is_still_applied(tmp_path):
+    """CONTROL — the substitution must never become a blanket downgrade.
+
+    The sibling control for `providers` has existed since this file was written;
+    `retry` never had one, and that gap let a defect ship green: keying the
+    substitution on "the overlay mentioned this name" rather than "the name is
+    unusable" discarded a valid override and dropped all 24 shipped call sites
+    that name `background` to `default`.
+
+    MEASURED before the reorder: override `max_retries: 99`, site resolved to
+    `default` with 3, while `background` sat in `retry_profiles` unused.
+    """
+    base = _BASE_WITH_REFERENCE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+        """
+    )
+    cfg = _write(tmp_path, base, "retry:\n  background:\n    max_retries: 9\n")
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    site = loaded.call_sites["31_outcome_classification"]
+    assert site.retry_profile == "background"
+    assert loaded.retry_profiles["background"].max_retries == 9
+
+
+def test_a_null_retry_profile_CLEARS_to_default_rather_than_failing(tmp_path):
+    """`retry_profile: null` is the clearing idiom, not a config error.
+
+    This file already establishes that `params: null` is an operator clearing an
+    inherited value, and that refusing it was a measured regression. The same
+    gesture on `retry_profile` reached `_parse` as "unknown retry profile 'None'"
+    and took every call site dark.
+    """
+    base = _BASE_WITH_REFERENCE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+          background:
+            max_retries: 5
+        """
+    )
+    cfg = _write(tmp_path, base, "call_sites:\n  31_outcome_classification:\n    retry_profile:\n")
+
+    loaded = load_config(cfg, check_api_keys=False)
+
+    assert loaded.call_sites["31_outcome_classification"].retry_profile == "default"
+
+
+def test_a_non_string_retry_profile_fails_with_a_sentence_not_a_TypeError(tmp_path):
+    """A mapping is a config error, and the operator deserves a readable one.
+
+    `retry_profile: {a: 1}` used to reach `x in retry_profiles`, where an
+    unhashable key raises TypeError — a stack trace swallowed by the router's
+    catch-all, with nothing naming the call site or the field.
+    """
+    base = _BASE_WITH_REFERENCE + textwrap.dedent(
+        """
+        retry:
+          default:
+            max_retries: 3
+          background:
+            max_retries: 5
+        """
+    )
+    cfg = _write(
+        tmp_path,
+        base,
+        "call_sites:\n  31_outcome_classification:\n    retry_profile:\n      a: 1\n",
+    )
+
+    with pytest.raises(ValueError, match="retry_profile must be a string or null"):
+        load_config(cfg, check_api_keys=False)
