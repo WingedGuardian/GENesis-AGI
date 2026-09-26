@@ -66,7 +66,7 @@ import sys
 import tarfile
 import time
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Two lanes, by whether the work is already in main (owner ruling 2026-09-10).
 # MERGED work is a duplicate of main, so it drains fast. UNMERGED work may be the
@@ -1537,7 +1537,307 @@ def _trash_worktree(
 # ---------------------------------------------------------------------------
 
 
-def _recover(name: str, repo_root: Path) -> bool:
+def _describe_recovery(stored: Path, repo_root: Path) -> bool:
+    """Dry-run preview for a resolved trash entry: what recovery WOULD do.
+
+    Read-only. Reads the entry's ``.trash_meta.json`` — from the directory, or
+    from inside the archive in memory, without extracting anything to disk —
+    and prints the same facts a real recovery reports, in the conditional
+    tense: a dry-run that printed completed-actions prose would leave a reader
+    who missed the flag with no second signal that nothing happened (#2188).
+
+    The pre-flight refusals (missing metadata, incomplete metadata, an occupied
+    destination) are reported exactly as a real run would report them, so the
+    preview cannot promise a recovery the real run would refuse.
+    """
+    candidates: list[str] = []
+    if stored.is_dir():
+        meta_path = stored / ".trash_meta.json"
+        if not meta_path.exists():
+            print(f"No .trash_meta.json in {stored}", file=sys.stderr)
+            return False
+        meta = json.loads(meta_path.read_text())
+        # Same walk `_restore_from_dir` uses: symlinks and files only, `.git`
+        # and every `.trash_meta.json` basename excluded.
+        for item in stored.rglob("*"):
+            rel = item.relative_to(stored)
+            if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                continue
+            if item.is_symlink() or item.is_file():
+                candidates.append(rel.as_posix())
+        consume_note = (
+            "WOULD CONSUME the trash entry "
+            "(directory form; recovery moves its contents back)"
+        )
+    else:
+        try:
+            with tarfile.open(stored, "r:gz") as tf:
+                members = tf.getmembers()
+                # The entry's OWN metadata sits at depth two: `<name>/.trash_meta.json`.
+                # A worktree may legitimately contain a deeper file of the same
+                # name, so a bare endswith() search can bind the nested copy and
+                # report — or refuse — the wrong entry. Prefer the root member;
+                # fall back to the first match for archives laid out differently.
+                meta_member = next(
+                    (m for m in members
+                     if m.isfile()
+                     and len(PurePosixPath(m.name).parts) == 2
+                     and PurePosixPath(m.name).name == ".trash_meta.json"),
+                    None,
+                )
+                if meta_member is None:
+                    meta_member = next(
+                        (m for m in members
+                         if m.isfile()
+                         and PurePosixPath(m.name).name == ".trash_meta.json"),
+                        None,
+                    )
+                if meta_member is None:
+                    print(f"No .trash_meta.json in {stored}", file=sys.stderr)
+                    return False
+                meta = json.loads(tf.extractfile(meta_member).read())
+                for m in members:
+                    parts = PurePosixPath(m.name).parts
+                    if len(parts) < 2:
+                        continue  # the root dir member itself
+                    rel = PurePosixPath(*parts[1:])
+                    if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                        continue
+                    if m.isfile() or m.issym() or m.islnk():
+                        candidates.append(rel.as_posix())
+        except (OSError, tarfile.TarError, EOFError, json.JSONDecodeError) as e:
+            print(f"Failed to read {stored}: {e}", file=sys.stderr)
+            return False
+        consume_note = (
+            f"Archive would be KEPT at {stored} "
+            "(recovery copies; it does not consume)"
+        )
+
+    original_path = meta.get("original_path", "")
+    branch = meta.get("branch", "")
+    commit = meta.get("commit", "")
+    detached = meta.get("detached", False)
+    if not original_path or (not branch and not commit):
+        print(f"Incomplete metadata in {stored}", file=sys.stderr)
+        return False
+    if Path(original_path).exists():
+        print(f"Original path already exists: {original_path}", file=sys.stderr)
+        return False
+
+    # A stored branch name does not mean the branch still EXISTS — the reaper's
+    # callers routinely `git branch -D` right after archiving, and a real run
+    # then retries DETACHED at the recorded commit. Preview what recovery would
+    # actually do, not what the metadata last recorded.
+    # Three states here too: a completed nonzero rev-parse PROVES the branch is
+    # absent; an exception (timeout, no git) only says we could not ask.
+    branch_state = "absent"
+    if branch:
+        try:
+            bp = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet",
+                 f"refs/heads/{branch}"],
+                capture_output=True, cwd=str(repo_root), timeout=10,
+                env=_git_env(),
+            )
+            branch_state = "exists" if bp.returncode == 0 else "absent"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            branch_state = "unknown"
+    if branch and not detached and branch_state == "exists":
+        ref_note = f"branch: {branch}"
+        checkout_ref = branch
+    elif branch and not detached and branch_state == "unknown":
+        ref_note = f"branch: {branch} (existence could not be verified)"
+        checkout_ref = branch
+    elif branch and not detached:
+        ref_note = (
+            f"detached at {commit[:8]} — branch {branch!r} no longer exists"
+        ) if commit else f"branch {branch!r} no longer exists, no commit recorded"
+        checkout_ref = commit
+    else:
+        ref_note = f"detached at {commit[:8]}"
+        checkout_ref = commit
+
+    # Does the ref we would check out still RESOLVE? A trash entry can outlive
+    # its commit (registration lock failed, or predates the locking scheme). This
+    # is THREE states, not two: only a completed nonzero `cat-file` PROVES the
+    # object is gone — a timeout or spawn failure is unknown, and must not be
+    # previewed as the plain-directory fallback a real run may not take.
+    # `cat-file -e`, not `rev-parse --verify`: the latter echoes a well-formed
+    # sha back with rc 0 whether or not the object exists.
+    def _ref_state(ref: str) -> str:
+        """'resolves' | 'missing' | 'unknown' — only a completed nonzero
+        `cat-file` PROVES the object is gone; a timeout or spawn failure is
+        unknown and must not be previewed as a fallback a real run may not take.
+        `cat-file -e`, not `rev-parse --verify`: the latter echoes a well-formed
+        sha back with rc 0 whether or not the object exists."""
+        try:
+            probe = subprocess.run(
+                ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                capture_output=True, cwd=str(repo_root), timeout=15,
+                env=_git_env(),
+            )
+            return "resolves" if probe.returncode == 0 else "missing"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return "unknown"
+
+    ref_state = "unknown"
+    if checkout_ref:
+        ref_state = _ref_state(checkout_ref)
+        # The real run retries the recorded COMMIT after the branch's worktree
+        # add fails — a missing or unverifiable branch does not by itself mean
+        # plain-directory fallback. Probe the commit before calling it that.
+        if ref_state == "missing" and branch and not detached and commit \
+                and checkout_ref != commit:
+            commit_state = _ref_state(commit)
+            if commit_state == "resolves":
+                checkout_ref = commit
+                ref_state = "resolves"
+                ref_note = (
+                    f"detached at {commit[:8]} — branch {branch!r} does not "
+                    "resolve, recovery would retry the recorded commit"
+                )
+
+    # `git worktree add` recreates TRACKED files; the restore step then fills in
+    # only what the checkout left missing (copy-only-missing). Count the files
+    # recovery would actually write — everything stored that is not tracked at
+    # the recovery ref — rather than everything stored, which labels tracked
+    # checkout files and `.git` as "untracked" and overstates the count by the
+    # size of the tree.
+    #
+    # `-z` + bytes, not `--name-only` + splitlines: the text form QUOTES paths
+    # containing non-ASCII or control characters (core.quotePath), so a tracked
+    # `café.txt` would never equal its archive name and would be counted as a
+    # restorable untracked file. surrogateescape decoding matches the
+    # filesystem spelling candidates carry.
+    tree: tuple[set[str], set[str]] | None = None
+    if checkout_ref:
+        try:
+            ls = subprocess.run(
+                ["git", "ls-tree", "-rz", checkout_ref],
+                capture_output=True, cwd=str(repo_root), timeout=30,
+                env=_git_env(),
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            ls = None
+        if ls is not None and ls.returncode == 0:
+            tracked, link_paths = set(), set()
+            for entry in ls.stdout.split(b"\0"):
+                meta, _, name = entry.partition(b"\t")
+                if not name:
+                    continue
+                p = name.decode("utf-8", "surrogateescape")
+                tracked.add(p)
+                if meta.split(b" ", 1)[0] == b"120000":
+                    link_paths.add(p)
+            tree = (tracked, link_paths)
+
+    link_target_cache: dict[str, str | None] = {}
+
+    def _link_escapes(link_path: str, seen: frozenset[str]) -> bool | None:
+        """Whether a tracked symlink resolves OUTSIDE the worktree. None =
+        cannot say confidently (unreadable target or a link cycle).
+
+        Resolves recursively: a target can sit lexically inside the tree while
+        passing through ANOTHER tracked link that escapes (`link -> safe`,
+        `safe -> ../../outside`). `_restore_from_dir` calls `realpath` on the
+        full destination parent, so it catches the chain; the preview must too.
+        """
+        if link_path in seen:
+            return None  # cycle — cannot resolve
+        if link_path not in link_target_cache:
+            try:
+                out = _run_git(
+                    repo_root, ["show", f"{checkout_ref}:{link_path}"], timeout=10
+                )
+            except (UnicodeDecodeError, ValueError):
+                out = None
+            # Verbatim blob content — a symlink target is raw bytes to POSIX:
+            # newlines and spaces are legal characters in it, so splitting or
+            # stripping changes which path the link actually names.
+            link_target_cache[link_path] = out
+        target = link_target_cache[link_path]
+        if target is None or not target:
+            return None
+        if os.path.isabs(target):
+            return True
+        resolved = os.path.normpath(
+            os.path.join(os.path.dirname(link_path), target)
+        )
+        if resolved == ".." or resolved.startswith("../"):
+            return True
+        # The resolved path is lexically inside, but may itself traverse a
+        # tracked link — walk its ancestors.
+        parts = resolved.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            if prefix in tree[1]:
+                return _link_escapes(prefix, seen | {link_path})
+        return False
+
+    def _classify(c: str) -> str:
+        """'restorable' | 'collides' | 'escapes' | 'unknown', from the tree.
+
+        'collides': a tracked NON-directory ancestor (`a` is a regular file
+        while the archive holds `a/b`) — recovery does NOT skip it; mkdir on the
+        existing file RAISES and aborts the restore partway, so it is reported
+        separately rather than silently discounted. 'escapes': a tracked
+        symlink ancestor resolves outside the worktree (invariant 2 — skipped).
+        'unknown': an ancestor's escape could not be determined."""
+        for i in range(1, c.count("/") + 1):
+            ancestor = c.rsplit("/", i)[0]
+            if ancestor not in tree[0]:
+                continue
+            if ancestor in tree[1]:
+                escapes = _link_escapes(ancestor, frozenset())
+                if escapes is not False:
+                    return "escapes" if escapes else "unknown"
+                continue  # in-tree link — the write still lands inside
+            return "collides"  # tracked regular file in the way
+        return "restorable"
+
+    _log(f"WOULD RECOVER {original_path} ({ref_note})")
+    if ref_state == "missing":
+        # An unresolvable ref is more than an uncertain count: BOTH worktree-add
+        # attempts in `_restore_from_dir` would fail, and recovery would end as
+        # a plain-directory move. Preview that, not a checkout that can't happen.
+        _log("  the recorded ref no longer resolves — a real run would fall "
+             "back to a PLAIN DIRECTORY move (no usable worktree checkout)")
+        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+    elif ref_state == "unknown":
+        _log("  could not verify whether the recorded ref still resolves")
+        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+    elif tree is None:
+        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+    else:
+        restorable = 0
+        uncertain = False
+        collisions: list[str] = []
+        for c in candidates:
+            if c in tree[0]:
+                continue
+            kind = _classify(c)
+            if kind == "restorable":
+                restorable += 1
+            elif kind == "unknown":
+                uncertain = True
+            elif kind == "collides":
+                collisions.append(c)
+        if uncertain:
+            _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+        else:
+            _log(f"WOULD RESTORE {restorable} untracked file(s) from {stored}")
+        if collisions:
+            _log(
+                f"  WARNING {len(collisions)} stored file(s) sit under a path "
+                f"the checkout recreates as a non-directory (e.g. "
+                f"{collisions[0]}) — a real recovery RAISES on mkdir there and "
+                "aborts partway"
+            )
+    _log(consume_note)
+    return True
+
+
+def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
     """Resolve a trash entry by name prefix and restore it.
 
     A stored entry is either a directory or a ``.tar.gz``. Archives are extracted
@@ -1550,6 +1850,10 @@ def _recover(name: str, repo_root: Path) -> bool:
     consumed instead: `_restore_from_dir` moves its contents back and removes the
     entry, because for those the trash directory IS the only copy and leaving a
     duplicate would double the disk for no benefit.
+
+    Under ``dry_run`` the entry is only resolved and described (see
+    `_describe_recovery`): no extraction, no ``git worktree add``, no moves —
+    the same "show, don't do" contract the reap path honours (#2188).
     """
     if not TRASH_DIR.exists():
         print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
@@ -1580,6 +1884,11 @@ def _recover(name: str, repo_root: Path) -> bool:
         return False
 
     stored = matches[0]
+    if dry_run:
+        # Resolution and ambiguity checks above are read-only, so running them
+        # in dry-run keeps the preview's error messages identical to a real
+        # run's. Everything below this line writes.
+        return _describe_recovery(stored, repo_root)
     if stored.is_dir():
         return _restore_from_dir(stored, repo_root)
 
@@ -2001,7 +2310,11 @@ def main() -> int:
     repo_root = _repo_root()
 
     if args.recover:
-        return 0 if _recover(args.recover, repo_root) else 1
+        # --dry-run must reach the recover path too (#2188): the flag's contract
+        # ("Show what would happen without doing it") is taught by the reap path
+        # ("WOULD TRASH ..."), so silently dropping it here would perform a full
+        # real recovery — thousands of files — under a no-op flag.
+        return 0 if _recover(args.recover, repo_root, dry_run=args.dry_run) else 1
 
     if args.report_json:
         try:
