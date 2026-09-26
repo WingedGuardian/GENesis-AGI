@@ -30,7 +30,7 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 | `genesis-server` (systemd) | `EnvironmentFile=<repo>/secrets.env` in `scripts/systemd/genesis-server.service.template` **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
 | `agent-zero` unit | `EnvironmentFile=` in its template | file (systemd) |
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
-| MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) |
+| MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
 | CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) | `load_dotenv(<main checkout>/secrets.env)`, default `override=False`; path hardcoded, ignores `SECRETS_PATH` | **inherited env wins** |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
@@ -48,7 +48,10 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
   `src/genesis/dashboard/routes/secrets.py`) writes the file atomically **and** sets
   `os.environ` in the server process only; it returns `needs_restart: true`. Code that
   reads env per call in the server sees the new value; anything that captured it at
-  construction does not; MCP children and CC sessions never do.
+  construction does not. CC sessions the server dispatches AFTER the edit inherit it
+  (`CCInvoker._build_env` copies the server's environment), and so can their MCP
+  children; already-running processes, foreground sessions and their MCP servers keep
+  their snapshot.
 
 ### The registry role of `secrets.env.example`
 
@@ -128,7 +131,7 @@ Base files in `config/` are tracked upstream defaults. Four patterns exist:
 **user-dir first**: `~/.genesis/config/<name>.local.yaml` if it exists, else the repo
 sibling `config/<name>.local.yaml` (gitignored). **Only one of the two is read.**
 Deep merge; lists replace. An unparseable or non-mapping overlay is ignored with a
-warning (once per file mtime); a broken base degrades toward `DEFAULTS` per module.
+warning (once per file mtime). A broken BASE file is not uniformly safe: some loaders fall back to `DEFAULTS`, while others (e.g. `src/genesis/resilience/config.py`, `src/genesis/inbox/config.py`) call `yaml.safe_load` unguarded and raise, which stops the initialization path that loads them.
 Many loaders re-read on every call (e.g. `src/genesis/session_awareness/pr_watch_config.py`);
 the domain's `needs_restart` flag is the stated contract.
 
@@ -180,7 +183,7 @@ overlay key.
   put these in `secrets.env` or the unit environment.
 - **Identity** — `src/genesis/identity/*.md`. Tracked prompts, plus gitignored per-install
   files: `USER.md` (user-edited, seeded from `USER.md.example`) and runtime-generated
-  `USER_KNOWLEDGE.md`, `TRIAGE_CALIBRATION.md`, `EGO_NOTEPAD.md`. `IdentityLoader` caches
+  `USER_KNOWLEDGE.md` and `TRIAGE_CALIBRATION.md`. `IdentityLoader` caches
   per instance (the runtime's perception loader is built at init, so hand edits need a
   restart); `src/genesis/cc/system_prompt.py` re-reads per call. The dashboard file editor
   may edit these, and may create one only where a `.example` exists.
@@ -188,8 +191,10 @@ overlay key.
   `.claude/settings.local.json` (gitignored); `~/.claude/settings.json` (user level;
   `scripts/setup_claude_config.py --global` applies `config/cc-global-settings.yaml`, and
   `scripts/cc_settings_align.sh` re-asserts the auto-updater keys daily). How they merge is
-  Claude Code's rule, not Genesis's. `.mcp.json` is rendered at install from
-  `config/mcp.json.template` (never overwritten if present); its Genesis servers carry
+  Claude Code's rule, not Genesis's. `.mcp.json` is rendered from
+  `config/mcp.json.template`: `install.sh` leaves an existing file alone, but
+  `scripts/bootstrap.sh` runs `scripts/setup_claude_config.py`, which REWRITES it whenever
+  it differs from the template, so custom entries do not survive a bootstrap. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---
