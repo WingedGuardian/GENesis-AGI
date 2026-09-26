@@ -1,0 +1,65 @@
+# gh-capable background dispatch — operator lever.
+# Semantics: src/genesis/cc/steward_config.py
+#
+# This gates whether a background Claude Code session may be dispatched with the
+# `gh` CLI in its Bash allowlist. The only shipped profile with that grant is
+# `steward`; an install that grants `gh` to its own profile via the
+# `genesis.cc.profile_overlay` module is gated by the same lever, because the gate
+# asks about the CAPABILITY (is `gh` in this profile's allowlist) and not about
+# the profile's name.
+#
+# NOT the same lever as config/github_steward.yaml, despite the name. That one
+# gates a deterministic Python poller watching the owner's GitHub account. This
+# one gates dispatching an LLM with a shell.
+#
+# mode: "off" | "live"
+#   off   — a gh-capable dispatch is REFUSED. SHIPPED DEFAULT (a capability that
+#           runs a shell stays inert until the owner opts in).
+#   live  — a gh-capable dispatch is permitted.
+#
+# ("off" is quoted so YAML does not parse it as the boolean false. Same for
+#  "live" — unquoted is fine there, but quoting both keeps the pair symmetrical
+#  and stops the next editor rediscovering the trap on the other value.)
+#
+# There is deliberately NO middle "observe" rung. It would have to mean "reads but
+# never writes", and nothing enforces that: a first-token allowlist bounds which
+# BINARY runs, so `gh pr comment` is as reachable as `gh pr view`. A rung whose
+# name promises a restriction it cannot apply is worse than its absence. It
+# becomes possible once a subcommand-level allowlist exists.
+#
+# ARMING IT, and what arming does NOT give you:
+#   1. Create ~/.genesis/config/cc_steward.local.yaml containing:
+#        mode: "live"
+#   2. The next dispatch honours it — the config is read fresh per spawn, so no
+#      restart is needed.
+#
+#   USE THAT PATH, not a sibling next to this file. The overlay resolves
+#   USER-DIR-FIRST and falls back to config/cc_steward.local.yaml only for
+#   back-compat (see _config_overlay._resolve_overlay_path). The sibling is
+#   gitignored so it is safe, but it is the LOSER if both exist — so an operator
+#   who hand-edits the sibling and later flips this lever from the dashboard (which
+#   writes to the user dir) gets two overlays and the one they did not edit wins,
+#   silently.
+#
+#   ARMING PERMITS THE DISPATCH. Whether the session can then AUTHENTICATE is a
+#   property of the invoker and of this install, and is NOT stated here on
+#   purpose: an earlier version of this file claimed "unauthenticated", which was
+#   false while the sealed gh config still copied the operator's credential.
+#
+#   CHECK IT BEFORE ARMING — one command:
+#     GH_CONFIG_DIR=~/.genesis/gh-sealed GH_TOKEN="" gh auth status
+#
+#   "not logged into any GitHub hosts"  -> arming grants the `gh` binary only.
+#   anything else                       -> arming grants that account's full
+#                                          reach, to a session whose input is
+#                                          attacker-authored pull-request text.
+#                                          Decide deliberately.
+#
+#   Note `gh` needs authentication even to READ (including public data), so an
+#   unauthenticated armed session cannot do the profile's job at all.
+#
+# Env kill switch: GENESIS_CC_STEWARD_DISABLED=1 forces off, whatever this says.
+# Install-specific values belong in the gitignored cc_steward.local.yaml overlay,
+# never here.
+enabled: true
+mode: "off"

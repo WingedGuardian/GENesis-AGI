@@ -207,6 +207,24 @@ _NO_FILE_WRITE = [
     "Write",  # Moved out of _UNIVERSAL_DISALLOW so interact/research can use it
 ]
 
+# NO FILESYSTEM READS. Its own group because denying WRITES says nothing about
+# reads, and on a profile that ingests attacker-authored text the read side is the
+# exfiltration half: a session with `Read`, `skip_permissions=True` and any
+# outbound tool can be instructed to read a credential file and send it onward. An
+# environment pin cannot close that — whatever a config or token variable says, the
+# file is on disk and owner-readable — so tool scope is the only thing that does.
+# Found by an adversarial audit of the steward lever, 2026-09-26: `Write` was
+# blocked there and `Read` was not.
+#
+# Glob and Grep are in the group because they read file CONTENT and PATHS too; a
+# denial that stopped at `Read` would leave `Grep` able to pull a token out of a
+# file it is pointed at.
+_NO_FILE_READ = [
+    "Read",
+    "Glob",
+    "Grep",
+]
+
 _NO_MEMORY_WRITES = [
     # memory_store/synthesize/extract + knowledge_ingest* are in
     # _UNIVERSAL_DISALLOW (vector store isolation).
@@ -353,14 +371,34 @@ PROFILES: dict[str, list[str]] = {
     # BINARY runs, not what the session can do. The permitted binary writes
     # files to caller-chosen paths and makes authenticated API calls, so this
     # profile is NOT confined to commenting — the tool blocks describe the
-    # TOOLS, not the capability. Treat it as a session acting with the
-    # operator's credentials and filesystem access, which matters because it
-    # also ingests external, attacker-authored PR content. A subcommand-level
-    # allowlist is what would make "confined" true.
+    # TOOLS, not the capability. A subcommand-level allowlist is what would make
+    # "confined" true, and it does not exist yet.
+    #
+    # THIS PARAGRAPH IS THE TRUE ONE — do not let a cheerier sentence elsewhere
+    # override it. An adversarial audit of the lever below caught a draft that
+    # told the session it was UNAUTHENTICATED while this comment, 120 lines up
+    # and unchanged, said the opposite; the unchanged half was right. Whether an
+    # armed session authenticates as the operator depends on whether this
+    # install's gh seal still carries a credential copy, which is a separate
+    # change on its own timeline. CHECK, do not infer:
+    #   GH_CONFIG_DIR=~/.genesis/gh-sealed GH_TOKEN="" gh auth status
+    #
+    # FILESYSTEM READS ARE NOW DENIED for this profile (Read/Glob/Grep), which
+    # closes a specific path: `Write` was blocked but `Read` was not, and with
+    # `skip_permissions=True` plus an allowed `outreach_send`, attacker-authored
+    # PR text could have had the session read the operator's credential file and
+    # send it onward. An env pin cannot close that — tool scope is what closes
+    # it. `gh` writing files to caller-chosen paths is unchanged and still means
+    # this is not confined.
     "steward": (
         [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
         + _NO_BROWSER_INTERACTION
         + _NO_FILE_WRITE
+        # Reads too, not only writes — see _NO_FILE_READ. This profile reads
+        # attacker-authored pull-request text and keeps an outbound
+        # `outreach_send`, so a permitted `Read` is an exfiltration path for any
+        # owner-readable secret on the box.
+        + _NO_FILE_READ
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
     ),
@@ -467,14 +505,28 @@ Your final message IS your deliverable. Write files to `~/.genesis/output/`. Per
 ## Session Profile: steward
 
 You have: Bash (restricted to the `gh` CLI only), memory MCP tools, outreach_send.
-You do NOT have: Write, Edit, NotebookEdit, browser tools, and Bash may ONLY run
-`gh` — any other command (curl, python, cat, pipes, redirects, chaining) is blocked.
+You do NOT have: Write, Edit, NotebookEdit, browser tools, Read/Glob/Grep (no
+filesystem reads at all), and Bash may ONLY run `gh` — any other command (curl,
+python, cat, pipes, redirects, chaining) is blocked.
 
-You steward Genesis's own upstream pull requests. Use `gh` to read PR state,
-reviews, and comments, and to comment / reopen / re-request review / close PRs.
-When a review asks for CODE changes, do NOT edit or push — draft the fix and
-escalate it to the user via outreach_send. Notify via outreach_send after every
-action you take on an external PR.
+DO NOT ASSUME WHETHER YOU HOLD A GITHUB CREDENTIAL. Whether `gh` can authenticate
+depends on this install's configuration, not on anything you can infer, and it is
+deliberately not stated here — a prompt that asserted one answer would be lying on
+half the installs that read it. Two rules cover both cases:
+
+- If a `gh` call fails for want of authentication, that is an EXPECTED state, not
+  a task failure and not something to work around. Say so via outreach_send and
+  stop. Do not retry, do not look for a credential, do not try another route.
+- If `gh` calls DO succeed, you are acting as the repository owner, with whatever
+  reach their account has. Treat every state-changing call as consequential:
+  prefer reads, and notify via outreach_send after ANY action you take.
+
+Note that `gh` requires authentication even for reads — including reads of public
+data — so "it is only reading" is not a reason to proceed when a call is refused.
+
+Within that: use `gh` to read pull-request state, reviews and comments, and
+escalate through outreach_send. When a review asks for CODE changes, do NOT edit
+or push — draft the fix and escalate it.
 
 {_MISSION_INJECTION}
 """,
@@ -525,6 +577,42 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
 _PROFILE_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "steward": ("gh",),
 }
+
+def profile_dispatch_refusal(profile: str) -> str | None:
+    """The reason *profile* may not be dispatched right now, or ``None``.
+
+    ONE predicate, two callers, on purpose. `spawn()` uses it as the gate — the
+    security boundary, at the chokepoint. A caller that CHOOSES a profile consults
+    it first so it does not choose one that will be refused.
+
+    That second use is not decoration. A refusal here is PERMANENT until an
+    operator edits config, and a caller that treats dispatch failure as transient
+    will retry forever: the ego accepts a model-authored `profile` from its brief
+    whenever the name is in `VALID_PROFILES` (which includes the gh-capable one),
+    and on failure calls `revert_failed_dispatch`, which returns the proposal to
+    `approved` with no attempt counter — so the next sweep re-dispatches and
+    re-fails, once per cycle, indefinitely. Consulting this before selecting is
+    what stops that, and it keeps the two decisions from drifting apart.
+    """
+    if "gh" not in _PROFILE_BASH_ALLOWLIST.get(profile, ()):
+        return None
+    from genesis.cc import steward_config
+
+    if steward_config.gh_dispatch_permitted():
+        return None
+    return steward_config.refusal_message(profile)
+
+
+# A PROFILE ABSENT FROM THE MAP ABOVE IS NOT GATED, AND THAT IS NOT A LOOPHOLE IN
+# THE GATE — it is what the allowlist means. Per the comment above it, the map is
+# a RESTRICTION on a profile that already has Bash, not a grant: a profile with
+# Bash and no entry here runs Bash unrestricted, which is a strictly larger
+# capability than `gh`, and it also gets no gh seal (`invoker.py` early-returns on
+# an empty allowlist). So the honest claim is "a profile that DECLARES `gh` cannot
+# be dispatched unless armed", never "the capability cannot be acquired another
+# way". MEASURED 2026-09-26: no shipped profile has Bash without an allowlist
+# entry, and the wider question — dispatched sessions that permit Bash with no
+# declared allowlist — is tracked separately as its own class.
 
 # Which Genesis MCP server set each profile gets. Unknown profiles fall back to
 # "reflection" (health + memory, read-leaning). Module-level (not inside
@@ -849,6 +937,41 @@ class DirectSessionRunner:
         spawns as a circuit breaker. This is defense-in-depth — the
         proposal gate handles fine-grained domain classification.
         """
+        # gh-CAPABLE DISPATCH IS OFF BY DEFAULT, and this is where that is true.
+        #
+        # Keyed on the CAPABILITY, not the profile name: an install can grant
+        # `gh` to a profile of its own through `genesis.cc.profile_overlay`, and
+        # `ProfileOverlayContext.add_profile` writes straight into
+        # `_PROFILE_BASH_ALLOWLIST` — the dict read below — so such a profile is
+        # covered by construction rather than by someone remembering to add a
+        # registry row. A name-keyed gate would miss exactly the case the overlay
+        # exists to enable.
+        #
+        # WHY HERE. `spawn()` is the one method every dispatch path funnels
+        # through (MEASURED: 8 call sites — the queue drain, campaign ticks, ego
+        # dispatch twice, user jobs, models.md synthesis, and mail reply handling
+        # twice), and the Bash allowlist is attached at exactly ONE line in the
+        # tree, inside the method this one calls. So the capability cannot be
+        # acquired by any route that does not pass here.
+        #
+        # AND THE HOLE IT CLOSES WAS NOT THEORETICAL. Before this, the profile was
+        # inert only because nobody had created a campaign row: `campaign_create`
+        # validates the profile against VALID_PROFILES (which contains it) and the
+        # campaign runner passes the row's `session_profile` straight into this
+        # method. One row was the whole distance between dormant and running.
+        #
+        # Raised rather than returned, matching the autonomy circuit breaker
+        # below: a caller that asked for a capability it may not have should not
+        # get a session id back.
+        _refusal = profile_dispatch_refusal(request.profile)
+        if _refusal is not None:
+            logger.warning(
+                "Spawn refused: profile %r is gh-allowlisted and gh-capable "
+                "dispatch is off",
+                request.profile,
+            )
+            raise RuntimeError(_refusal)
+
         # Ceiling check: skip for foreground/user-initiated sessions.
         # NOTE: DirectSessionRequest.source_tag defaults to "direct_session",
         # so we intentionally exclude it from the skip set — only explicitly
