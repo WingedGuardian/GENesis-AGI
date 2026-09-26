@@ -57,6 +57,7 @@ from pathlib import Path
 from genesis.guardian.config import StoragePoolConfig
 from genesis.guardian.pool import StoragePoolStatus
 from genesis.guardian.snapshots import HEALTHY_SUFFIX
+from genesis.util.atomic import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -236,9 +237,8 @@ def record_sample(
         path.parent.mkdir(parents=True, exist_ok=True)
         if len(history) + 1 > max_samples + max(1, max_samples // 10):
             keep = [*history, sample][-max_samples:]
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text("".join(_dump(s) + "\n" for s in keep))
-            os.replace(tmp, path)
+            # mkstemp-based: 0600, and the temp never outlives a failed write.
+            atomic_write_text(path, "".join(_dump(s) + "\n" for s in keep))
         else:
             with path.open("a") as fh:
                 fh.write(_dump(sample) + "\n")
@@ -489,11 +489,9 @@ def _load_state(path: Path) -> dict:
 
 def _save_state(path: Path, state: dict) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(state))
-        os.chmod(tmp, 0o600)  # it gates destructive actions (settle/extend throttles)
-        os.replace(tmp, path)
+        # mkstemp-based: 0600 (it gates destructive actions via the settle and
+        # extend throttles), and the temp never outlives a failed write.
+        atomic_write_text(path, json.dumps(state))
     except OSError:
         logger.warning("could not persist pool relief state %s", path, exc_info=True)
 
