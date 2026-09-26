@@ -1,0 +1,29 @@
+[Unit]
+Description=Genesis star-milestone watcher — daily check
+
+[Timer]
+# Daily, and deliberately no faster. The thing being watched is a star count
+# that moves over weeks; the cost of noticing a crossing a day late is a day,
+# against work that has already waited for the number. A tighter schedule buys
+# nothing and spends the unauthenticated rate limit for no reason.
+#
+# Persistent=true so a box powered off across the scheduled hour replays the
+# missed run on the next activation — a milestone crossed while the machine was
+# down must still be announced, since the script compares against the highest
+# already-announced value rather than against yesterday's count.
+#
+# Deliberately NO OnBootSec, for the reason written out at length in
+# genesis-cc-settings-align.timer.template: it is boot-relative, so a moment
+# already in the past elapses IMMEDIATELY on activation, and install/bootstrap
+# run `enable --now` on every deploy. Persistent already covers the missed-run
+# case that a boot-relative trigger would be reaching for.
+#
+# 05:20 sits between the cc-settings-align run (04:40) and recon's email pass
+# (05:00), and RandomizedDelaySec de-correlates it further.
+OnCalendar=*-*-* 05:20:00
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target
