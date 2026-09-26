@@ -36,8 +36,6 @@ _KNOWN_MALFORMED_SIGNUP = frozenset(
         "API_KEY_MINIMAX",
         "API_KEY_NVIDIA_NIM",
         "API_KEY_GITHUB",
-        "API_KEY_AZURE",
-        "API_KEY_BEDROCK",
         "API_KEY_TAVILY",
         "API_KEY_EXA",
         "API_KEY_CLOUDFLARE",
@@ -46,7 +44,6 @@ _KNOWN_MALFORMED_SIGNUP = frozenset(
         "API_KEY_FISH_AUDIO",
         "API_KEY_DEEPINFRA",
         "API_KEY_PAGEINDEX",
-        "TESTSPRITE_API_KEY",
     }
 )
 
