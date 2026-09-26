@@ -1032,7 +1032,7 @@ _cc_remove_shadow() {
     if [[ "$target" == *"@anthropic-ai/claude-code"* ]]; then
         # npm-style symlink → the package dir it points into (resolve relative
         # to the symlink's own directory).
-        pkg_dir="$(cd "$(dirname "$candidate")" 2>/dev/null && cd "$(dirname "$target")" 2>/dev/null && pwd)"
+        pkg_dir="$(unset CDPATH; cd "$(dirname "$candidate")" 2>/dev/null && cd "$(dirname "$target")" 2>/dev/null && pwd)"
         pkg_dir="${pkg_dir%%/@anthropic-ai/claude-code*}/@anthropic-ai/claude-code"
         [[ "$pkg_dir" == *"@anthropic-ai/claude-code" && -d "$pkg_dir" ]] || pkg_dir=""
     elif [[ "$candidate" == "$HOME/.claude/local/claude" ]]; then

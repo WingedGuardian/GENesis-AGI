@@ -29,7 +29,7 @@ NETRES_LIBEXEC_DIR="${NETRES_LIBEXEC_DIR:-/usr/local/lib/genesis}"
 # at source time from this file's own location; overridable for tests. The
 # trailing `; true` keeps a failed resolution from aborting the sourcing caller
 # under `set -e` — a bad path is caught later by the readable-source guard.
-NETRES_WATCHDOG_SRC="${NETRES_WATCHDOG_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-network-watchdog.sh}"
+NETRES_WATCHDOG_SRC="${NETRES_WATCHDOG_SRC:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-network-watchdog.sh}"
 
 # KeepConfiguration=true (superset of =dhcp): retains BOTH DHCP-provided and
 # static/foreign config across a networkd failure or daemon stop. `true` is

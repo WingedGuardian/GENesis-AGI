@@ -41,7 +41,7 @@ if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ]; then
     chmod +x "$TEMP_COPY"
     export GENESIS_UPDATE_FROM_TEMP=1
     # Pass original script dir so GENESIS_ROOT resolves correctly
-    export GENESIS_UPDATE_ORIG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    export GENESIS_UPDATE_ORIG_DIR="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
     exec "$TEMP_COPY" "$@"
 fi
 # Running from temp copy — clean up on exit
@@ -59,7 +59,7 @@ for _arg in "$@"; do
     [[ "$_arg" == "--post-merge" ]] && POST_MERGE=true
 done
 
-GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)}"
 SCRIPT_DIR="$GENESIS_ROOT/scripts"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"

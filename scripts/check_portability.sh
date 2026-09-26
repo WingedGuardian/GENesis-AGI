@@ -39,7 +39,7 @@ if [ "${1:-}" = "--warn" ]; then
     shift
 fi
 
-REPO_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO_DIR="${1:-$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)}"
 
 patterns=(
   # RFC1918 IPv4 literals (any private address, not just known subnets)

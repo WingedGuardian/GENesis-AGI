@@ -31,7 +31,7 @@ PASS=0
 FAIL=0
 FAIL_DETAILS=()
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_ROOT=$(mktemp -d ~/tmp/phase6-caveat-XXXXXX)
