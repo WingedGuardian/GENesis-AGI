@@ -1334,8 +1334,10 @@ verified: 975d3944 2026-08-31
 
 ## 8. Guardian & sentinel — infrastructure self-healing
 
-Two complementary watchdogs: the host-VM Guardian (outside the container blast
-radius) and the container-side Sentinel (CC-driven diagnosis/repair).
+Three watchdogs: the host-VM Guardian (outside the container blast radius),
+the container-side Sentinel (CC-driven diagnosis/repair), and the cc-tmp
+watchgod (a standalone bash daemon policing the temp directories whose
+exhaustion kills CC sessions outright).
 
 ```yaml subsystem-map
 entry: guardian-sentinel
@@ -1442,6 +1444,58 @@ verified: 84c7259d 2026-08-31
   action requires human approval. `InfrastructureMonitor` (call site 37, free
   models) observes each awareness tick and wakes the dispatcher; state persists
   to `~/.genesis/sentinel_state.json`.
+- **cc-tmp watchgod** (`scripts/tmp_watchgod.sh`, `genesis-tmp-watchgod.service`) is
+  a standalone bash daemon, not a `src/genesis` package, and it polices the one
+  resource whose exhaustion kills CC sessions outright: Claude Code's working
+  temp directory. It polls two ZONES on a 30s loop — **Zone A** is `cc-tmp`
+  against a configured budget (default 500 MB), **Zone B** is the `/tmp`
+  filesystem against a percentage — and each zone runs its own tier ladder.
+  Zone A: GREEN < 50%, YELLOW > 50% (reap stale session dirs and old temp
+  files), ORANGE > 75% (evict rebuildable caches, then re-measure), RED > 90%
+  or filesystem free below the sacred-ground floor (nuclear reclaim, preserving
+  the active session).
+- **Liveness is judged by FACT, not by proxy — this is the subsystem's
+  through-line and every past data-loss incident here was a proxy failing.**
+  A directory is spared because a live process holds a descriptor into it
+  (`/proc/*/fd`), not because its name matches a pattern or its mtime looks
+  recent. Two consequences worth knowing before editing a sweep: an mtime on a
+  DIRECTORY answers "when was an entry added or removed", never "is anything
+  inside in use", so freshness is probed recursively over contents; and the
+  descriptor probe is a POSITIVE self-test (it holds its own descriptor open
+  and requires the snapshot to show it) rather than an emptiness check, because
+  an empty snapshot and a structurally blind probe look identical.
+- **The tiers re-measure after acting.** ORANGE was dispatched from a figure
+  taken BEFORE its own cleanup, so without a post-clean re-measure the daemon
+  re-enters the tier every poll and repeats the work forever — a measured 4.5h
+  runaway. ORANGE records a stuck tier once behind a dedupe flag rather than
+  re-logging it; per the tier design only RED pages.
+- **ORANGE does not kill sessions.** It once reaped unattached CC tmux sessions
+  idle over two hours; that was removed after it was measured never to fire and
+  shown unable to help if it had (sessions are not what fills cc-tmp). RED still
+  kills every unattached `cc-` session.
+- **Deletion spares the local control plane.** Claude Code binds one unix socket
+  per session for cross-session messaging, under
+  `${XDG_RUNTIME_DIR:-<temp dir>}/cc-socks/` — or `/tmp/cc-socks-<uid>/` when
+  the primary path would exceed the ~103-byte unix-socket path limit. The
+  reclaim path is object-level: it never deletes a socket, and never deletes
+  those directories or the directories beneath them, while still reclaiming
+  regular files inside them. Sockets are 0 bytes, so sparing them costs no
+  reclaimed space.
+- **A sweep that reclaims nothing says so, and names who is holding the
+  space.** Zone B's `/tmp` is mode 1777 — sticky — so only an entry's owner may
+  unlink it, and the sweeps discard their errors, which makes a permission
+  failure indistinguishable from "nothing matched". Above the lowest tier the
+  daemon re-measures after cleaning and, when nothing moved, records once how
+  much it cannot reclaim and which accounts own it. A tree it may not *read* is
+  reported as an owner found but not sized rather than as no owner at all; the
+  record is kept per severity so an escalation is not silenced by the milder
+  tier's record; and directories the sweeps spare by policy are left out of the
+  attribution, because they survive for a reason unrelated to ownership. The
+  record is a log line, so a long episode can rotate it away — the durable
+  surface is the per-poll state file, not yet wired.
+- **Known wart:** the budget is a configured number, not the volume's real
+  capacity. A budget set above the filesystem means the tier ladder never
+  reaches RED.
 - GROUNDWORK: guardian-cgroup, guardian-bidirectional, sentinel-live-autonomy.
 
 ## 9. Ambient cognition — heartbeat, reflection, attention
