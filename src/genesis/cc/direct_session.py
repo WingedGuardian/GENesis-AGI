@@ -341,29 +341,38 @@ PROFILES: dict[str, list[str]] = {
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL),
-    # ── Steward profile ──────────────────────────────────────────
-    # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
-    # grants Bash (so it can run `gh`) — every other profile blocks Bash.
-    # `GENESIS_BASH_ALLOWLIST` restricts the first token to `gh`, and that
-    # restriction is now actually ENFORCED — by the guard the invoker injects
-    # into the dispatch's settings, NOT by scripts/bash_safety_hook.sh, which
-    # this repository wires nowhere. Write/Edit/browser stay blocked.
+    # NO PROFILE SHIPS WITH Bash. A `steward` profile did until 2026-09-26 — the
+    # only one — for upstream-PR stewardship, with `GENESIS_BASH_ALLOWLIST`
+    # restricting its first token to `gh`. It was removed rather than fixed, and
+    # the reasoning is kept here because it is the specification for anyone
+    # adding a Bash-granting profile next.
     #
-    # READ THIS BEFORE RELYING ON IT: a first-token allowlist bounds which
-    # BINARY runs, not what the session can do. The permitted binary writes
-    # files to caller-chosen paths and makes authenticated API calls, so this
-    # profile is NOT confined to commenting — the tool blocks describe the
-    # TOOLS, not the capability. Treat it as a session acting with the
-    # operator's credentials and filesystem access, which matters because it
-    # also ingests external, attacker-authored PR content. A subcommand-level
-    # allowlist is what would make "confined" true.
-    "steward": (
-        [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
-        + _NO_BROWSER_INTERACTION
-        + _NO_FILE_WRITE
-        + _NO_MARKETING_SEND
-        + _NO_OUTREACH_QUEUE_CONTROL
-    ),
+    # It never ran (0 sessions, against 257/167/154 for the three busiest), so
+    # nothing depended on it. What removed it was the accumulation of MEASURED
+    # facts that a first-token allowlist bounds which BINARY runs and nothing
+    # else:
+    #
+    #   * `gh` runs arbitrary programs through its OWN config — alias, pager,
+    #     editor, extension — each reached with `gh` as the first token, so the
+    #     allowlist permits both installing an escape and firing it. VERIFIED by
+    #     execution: two permitted calls ran an arbitrary program. Closed by the
+    #     sealed config dir, which is retained (see `cc/invoker.py`).
+    #   * `gh` READS arbitrary local files through documented flags —
+    #     `gh pr comment -F <file>`, `gh api --input <file>`. So denying the
+    #     `Read`/`Glob`/`Grep` TOOLS does not deny filesystem reads while `gh`
+    #     is permitted, and a tool-scope fix cannot make "no file reads" true.
+    #   * `gh` WRITES files to caller-chosen paths, so "it only comments" was
+    #     never a property the allowlist gave.
+    #   * A profile's tool denials are re-enablable per request via
+    #     `tool_exceptions` unless the tool is in a protected set.
+    #
+    # Those converge on one unbuilt thing: a SUBCOMMAND-level allowlist. Until it
+    # exists, a Bash-granting profile that ingests external text cannot be
+    # confined, and gating it behind a lever only moves the decision. Do not
+    # re-add one without that mechanism — and if you do, `_PROFILE_ORIGIN` and
+    # the coverage test in tests/test_cc/test_direct_session_profiles.py are
+    # where it has to be classified.
+    #
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
@@ -462,22 +471,6 @@ Your final message IS your deliverable. Write files to `~/.genesis/output/`. Per
 
 {_MISSION_INJECTION}
 """,
-    "steward": f"""
-
-## Session Profile: steward
-
-You have: Bash (restricted to the `gh` CLI only), memory MCP tools, outreach_send.
-You do NOT have: Write, Edit, NotebookEdit, browser tools, and Bash may ONLY run
-`gh` — any other command (curl, python, cat, pipes, redirects, chaining) is blocked.
-
-You steward Genesis's own upstream pull requests. Use `gh` to read PR state,
-reviews, and comments, and to comment / reopen / re-request review / close PRs.
-When a review asks for CODE changes, do NOT edit or push — draft the fix and
-escalate it to the user via outreach_send. Notify via outreach_send after every
-action you take on an external PR.
-
-{_MISSION_INJECTION}
-""",
     "community-responder": f"""
 
 ## Session Profile: community-responder
@@ -513,18 +506,43 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
     "research": ["web-research"],
     "observe": [],
     "campaign": ["voice-master"],
-    "steward": ["voice-master"],
     "community-responder": ["genesis-voice"],
     "mail": ["genesis-voice"],
 }
 
 # Profiles that grant Bash run it under an allowlist of permitted command
-# binaries, enforced by scripts/bash_safety_hook.sh (GENESIS_BASH_ALLOWLIST).
-# A profile absent from this map gets no allowlist (its Bash, if any, is
-# governed only by the global destructive-op blocks).
-_PROFILE_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = {
-    "steward": ("gh",),
-}
+# binaries, enforced by the guard the invoker injects into the dispatch's
+# settings (GENESIS_BASH_ALLOWLIST).
+#
+# EMPTY SINCE 2026-09-26, and deliberately still here. The only entry was the
+# removed `steward` profile. Two things follow, and both have bitten:
+#
+#   1. The map is a RESTRICTION on a profile that already grants Bash, NEVER a
+#      grant. A profile absent from it and granting Bash runs Bash unrestricted,
+#      which is strictly MORE than any entry here would allow — so "not in this
+#      map" must never be read as "cannot run commands".
+#   2. The machinery this feeds is NOT dead code and must not be removed as
+#      such. `cc/invoker.py`'s `_BINARY_HARDENING` is keyed on the BINARY, so an
+#      install that grants `gh` to its own profile through
+#      `genesis.cc.profile_overlay` gets the sealed config dir and the
+#      program-route pins with no further wiring. Emptying this map is what
+#      removing the shipped profile means; it is not a statement about the
+#      mechanism.
+#
+# THE VALUES here are matched by EXACT TOKEN against `_BINARY_HARDENING`'s keys in
+# `cc/invoker.py`, and a mismatch is not a detection nuisance — it is a MISSING
+# SEAL. MEASURED: `("/usr/bin/gh",)`, `("gh ",)` and `("GH",)` are each PERMITTED
+# by the shell guard (which compares the first command token), while
+# `_BINARY_HARDENING.get()` returns None for all three — so the hardening loop
+# skipped them and the session launched against the operator's own WRITABLE gh
+# config, which is the escape the seal exists to close. An overlay spelling the
+# binary any way but the bare token got the allowlist without the hardening.
+# NOT YET FIXED, and stated that way deliberately: `cc/invoker.py`'s hardening
+# loop still does `_BINARY_HARDENING.get(binary)` and `continue`s on None, so it
+# skips rather than refuses. The refusal belongs in that file and is being made
+# there; until it lands, an overlay MUST spell the binary as the bare token.
+# Tracked — do not read this paragraph as describing a guard that exists.
+_PROFILE_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = {}
 
 # Which Genesis MCP server set each profile gets. Unknown profiles fall back to
 # "reflection" (health + memory, read-leaning). Module-level (not inside
@@ -537,7 +555,6 @@ _PROFILE_TO_MCP: dict[str, str] = {
     "research": "research",
     "interact": "sentinel",
     "campaign": "campaign",
-    "steward": "campaign",  # health + memory + outreach (for notify)
     "community-responder": "community-responder",
     "mail": "mail",
 }
@@ -548,7 +565,6 @@ _PROFILE_TO_MCP: dict[str, str] = {
 #   research  — web/knowledge ingestion is the job.
 #   interact  — the browser profile; arbitrary external page content.
 #   campaign  — engages external platforms, reads external replies.
-#   steward   — reads GitHub PR content (external contributors/bots).
 #   community-responder — reads external Discord messages.
 #   mail      — external email bodies (belt-and-suspenders: its MCP profile has
 #               no memory server today, but the classification is content-true).
@@ -563,7 +579,6 @@ _PROFILE_ORIGIN: dict[str, str] = {
     "research": "external_untrusted",
     "interact": "external_untrusted",
     "campaign": "external_untrusted",
-    "steward": "external_untrusted",
     "community-responder": "external_untrusted",
     "mail": "external_untrusted",
 }
@@ -667,6 +682,34 @@ def _load_profile_overlays() -> None:
     except Exception:  # pragma: no cover - defensive; never block spawning
         logger.exception("profile overlay registration failed; ignoring overlay")
 
+
+# WHAT THIS REPOSITORY SHIPS, snapshotted BEFORE the overlay loader runs.
+#
+# `ProfileOverlayContext.add_profile` MUTATES the registries in place, so every
+# later read of `PROFILES` / `_PROFILE_BASH_ALLOWLIST` / … sees shipped ∪
+# install-local. Anything asserting a property of what WE ship must read the
+# snapshot, or it is making a claim about the operator's machine: a check named
+# "no shipped profile grants Bash" that reads the live dicts FAILS on an install
+# that deliberately grants Bash to a profile of its own — an install this
+# mechanism exists to serve. Measured, not hypothetical: that is the defect this
+# snapshot was added to fix.
+#
+# Built by the same discovery the tests use, so a registry renamed or added is
+# picked up here without a second list to maintain. It captures KEYS only —
+# membership is the question these guards ask, and an overlay cannot redefine a
+# built-in (`add_profile` refuses on collision), so a shipped profile's VALUES are
+# unchanged by any overlay.
+#
+# NOTE the type filter: `isinstance(obj, dict)`. A registry of another type is NOT
+# captured — `_PROFILE_ORIGIN_FIRST_PARTY` is a frozenset and is asserted
+# separately. Do not read this as total coverage of "every registry".
+_SHIPPED_REGISTRY_KEYS: dict[str, frozenset[str]] = {
+    _name: frozenset(_obj)
+    for _name, _obj in list(globals().items())
+    if _name.startswith(("PROFILES", "_PROFILE_")) and isinstance(_obj, dict)
+}
+_SHIPPED_PROFILE_NAMES: frozenset[str] = frozenset(PROFILES)
+_SHIPPED_BASH_ALLOWLIST: dict[str, tuple[str, ...]] = dict(_PROFILE_BASH_ALLOWLIST)
 
 _load_profile_overlays()
 

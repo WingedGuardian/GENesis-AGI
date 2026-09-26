@@ -68,7 +68,7 @@ if [ -z "$CMD" ]; then
     exit 0
 fi
 
-# Bash allowlist gate — scoped background profiles (e.g. "steward") export
+# Bash allowlist gate — a scoped background profile exports
 # GENESIS_BASH_ALLOWLIST. The predicate itself lives in hooks/bash_allowlist_lib.sh
 # so that this global chokepoint and the hook injected into dispatched sessions
 # (hooks/bash_allowlist_guard.sh) share ONE implementation and cannot drift;

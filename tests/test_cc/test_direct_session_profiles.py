@@ -12,7 +12,11 @@ import pytest
 from genesis.cc.direct_session import (
     _BG_CC_TMP_ROOT,
     _PROFILE_ADDENDA,
+    _PROFILE_ORIGIN_FIRST_PARTY,
     _PROFILE_TO_MCP,
+    _SHIPPED_BASH_ALLOWLIST,
+    _SHIPPED_PROFILE_NAMES,
+    _SHIPPED_REGISTRY_KEYS,
     PROFILES,
     VALID_PROFILES,
     DirectSessionRequest,
@@ -614,60 +618,158 @@ def test_mail_profile_does_not_upgrade_model():
     assert inv.model == CCModel.SONNET
 
 
-# --- Steward profile: Bash-enabled, gh-scoped, upstream-PR stewardship ---
+# --- No profile ships with Bash ---------------------------------------------
+#
+# The `steward` profile was the only one that did, and it was REMOVED rather than
+# confined (2026-09-26). Its own test block lived here. What replaces it is
+# coverage that the removal is COMPLETE and that the mechanism it used is still
+# intact for an install that wants it — those are different claims and both were
+# easy to get wrong.
 
 
-def test_steward_profile_exists():
-    assert "steward" in PROFILES
-    assert "steward" in VALID_PROFILES
+def test_the_steward_profile_is_gone_from_every_shipped_registry():
+    """A profile lives in SIX registries, and a partial removal is a live bug.
+
+    `VALID_PROFILES` derives from `PROFILES`, so dropping only that entry leaves the
+    name un-dispatchable while `_PROFILE_BASH_ALLOWLIST` still answers `("gh",)` for
+    it — and anything keying capability off the allowlist would then believe a
+    profile that cannot run has a shell.
+
+    Reads the SHIPPED snapshot, not the live dicts. An overlay may legitimately
+    register a profile named `steward` now that the name is free, and that is the
+    operator's business — asserting over live state would fail this repository's
+    floor on their machine.
+
+    Two honest limits, because an earlier version of this docstring overstated the
+    sweep. It filters to `dict`, so a registry of another TYPE is not covered —
+    `_PROFILE_ORIGIN_FIRST_PARTY` is a frozenset and gets its own line below. And
+    the count assertion makes a RENAME loud; it does not prove completeness.
+    """
+    assert len(_SHIPPED_REGISTRY_KEYS) >= 6, (
+        f"expected at least the six known dict registries, snapshotted "
+        f"{sorted(_SHIPPED_REGISTRY_KEYS)} — has one been renamed?"
+    )
+    leaked = sorted(n for n, keys in _SHIPPED_REGISTRY_KEYS.items() if "steward" in keys)
+    assert not leaked, f"`steward` still ships in {leaked}"
+    assert "steward" not in _SHIPPED_PROFILE_NAMES
+    assert "steward" not in _PROFILE_ORIGIN_FIRST_PARTY
 
 
-def test_steward_grants_bash():
-    """The whole point of steward: Bash is NOT disallowed (it runs gh)."""
-    assert "Bash" not in PROFILES["steward"]
+def test_no_shipped_profile_grants_a_bash_allowlist():
+    """The consequence worth stating: nothing ships with Bash-for-a-binary.
+
+    Asserted as EMPTY rather than as "steward absent", because the interesting
+    property is the floor — if a future profile is added here, this fails and
+    sends the author to the specification comment above `_PROFILE_BASH_ALLOWLIST`,
+    which is where the reasons live.
+    """
+    assert _SHIPPED_BASH_ALLOWLIST == {}, (
+        f"a SHIPPED profile now declares a Bash allowlist "
+        f"({sorted(_SHIPPED_BASH_ALLOWLIST)}). "
+        f"Read the comment above that map first: a first-token allowlist does not "
+        f"confine the binary, and `gh` specifically reads and writes arbitrary "
+        f"files through its own documented flags."
+    )
 
 
-def test_steward_blocks_other_universal_tools():
-    """Everything else in the universal block stays blocked (defense in depth)."""
-    for tool in _UNIVERSAL_BLOCKED - {"Bash"}:
-        assert tool in PROFILES["steward"], f"steward should still block {tool}"
+def test_no_shipped_profile_permits_bash_at_all():
+    """Distinct from the allowlist claim, and the stronger of the two.
+
+    An empty allowlist map is NOT the same as "no profile has Bash" — the map is a
+    restriction on a profile that already grants it, so a profile permitting Bash
+    with no entry runs it UNRESTRICTED. That is the shape this asserts against.
+    """
+    # SHIPPED names only — see the `_SHIPPED_*` note in direct_session.py. An
+    # install granting Bash to its own overlay profile is using a supported
+    # mechanism and must not redden this repository's floor.
+    permitting = sorted(
+        name for name in _SHIPPED_PROFILE_NAMES if "Bash" not in PROFILES[name]
+    )
+    assert not permitting, (
+        f"profile(s) {permitting} permit Bash. If that is deliberate, they need an "
+        f"allowlist entry AND the subcommand-level bound that does not exist yet — "
+        f"an entry alone was measured insufficient."
+    )
 
 
-def test_steward_blocks_write_and_edit():
-    """Steward escalates code fixes — it does not write or edit files itself."""
-    assert "Write" in PROFILES["steward"]
-    assert "Edit" in PROFILES["steward"]
+def test_an_overlay_granting_bash_does_not_redden_this_repositorys_floor():
+    """THE CONTRADICTION THIS PR ALMOST SHIPPED, and why the snapshot exists.
+
+    The retained-machinery story is "an install may grant `gh` to a profile of its
+    own through `genesis.cc.profile_overlay`". The two floor guards above originally
+    read `PROFILES` / `_PROFILE_BASH_ALLOWLIST` as live module attributes — which
+    `add_profile` MUTATES — so on exactly that install both went RED while their
+    names promised "no SHIPPED profile". A floor that breaks on the supported
+    configuration is not a floor, and it contradicted the change's own thesis.
+
+    Simulated the way the loader does it: mutate the live registries, then assert the
+    SNAPSHOT is unmoved and the guards' predicates still hold. `monkeypatch.setitem`
+    restores both dicts afterwards, so this cannot leak into another test.
+    """
+    import genesis.cc.direct_session as d
+
+    # Pre-condition: the snapshot and the live dicts agree before we interfere, or
+    # the assertions below would pass for having compared two already-different
+    # things.
+    assert set(d._PROFILE_BASH_ALLOWLIST) == set(d._SHIPPED_BASH_ALLOWLIST)
+
+    import pytest as _pytest
+
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setitem(
+            d.PROFILES,
+            "install-local-gh",
+            [t for t in d._UNIVERSAL_DISALLOW if t != "Bash"],
+        )
+        mp.setitem(d._PROFILE_BASH_ALLOWLIST, "install-local-gh", ("gh",))
+
+        # The live dicts now carry a Bash-granting, gh-allowlisted profile — the
+        # supported configuration.
+        assert "Bash" not in d.PROFILES["install-local-gh"]
+        assert d._PROFILE_BASH_ALLOWLIST["install-local-gh"] == ("gh",)
+
+        # ...and this repository's floor is UNMOVED, because it reads the snapshot.
+        assert d._SHIPPED_BASH_ALLOWLIST == {}
+        assert "install-local-gh" not in d._SHIPPED_PROFILE_NAMES
+        still_shipped_bash_free = sorted(
+            name for name in d._SHIPPED_PROFILE_NAMES if "Bash" not in d.PROFILES[name]
+        )
+        assert not still_shipped_bash_free, (
+            f"a SHIPPED profile appears to permit Bash ({still_shipped_bash_free}) — "
+            f"the overlay leaked into the shipped view"
+        )
+        for name, keys in d._SHIPPED_REGISTRY_KEYS.items():
+            assert "install-local-gh" not in keys, (
+                f"the overlay profile leaked into the {name} snapshot"
+            )
+    finally:
+        mp.undo()
+
+    assert "install-local-gh" not in d.PROFILES, "monkeypatch did not restore PROFILES"
+    assert "install-local-gh" not in d._PROFILE_BASH_ALLOWLIST
 
 
-def test_steward_blocks_browser_interaction():
-    assert "mcp__genesis-health__browser_click" in PROFILES["steward"]
+def test_the_binary_hardening_machinery_survives_the_removal():
+    """The mechanism is keyed on the BINARY, so it must still work with no
+    profile using it.
 
+    Emptying `_PROFILE_BASH_ALLOWLIST` makes the seal look like dead code, and the
+    next reader may delete it. It is not dead: an install that grants `gh` to its
+    own profile through `genesis.cc.profile_overlay` gets the sealed config dir and
+    the program-route pins with no further wiring. Driven with a synthetic
+    allowlist rather than a registered profile, which is exactly the overlay's
+    shape.
+    """
+    import genesis.cc.invoker as inv_mod
 
-def test_steward_allows_outreach_send():
-    """Steward notifies via outreach_send after each action."""
-    assert "mcp__genesis-outreach__outreach_send" not in PROFILES["steward"]
-
-
-def test_steward_addendum_has_mission():
-    addendum = _build_profile_addendum("steward")
-    assert "Adapt and overcome" in addendum
-
-
-def test_steward_does_not_upgrade_model():
-    runner = _make_runner()
-    req = DirectSessionRequest(prompt="test", profile="steward", model=CCModel.SONNET)
-    inv = runner._build_invocation(req, "test-session")
-    assert inv.model == CCModel.SONNET
-
-
-# --- Bash allowlist plumbing ---
-
-
-def test_steward_invocation_sets_gh_bash_allowlist():
-    runner = _make_runner()
-    req = DirectSessionRequest(prompt="test", profile="steward", model=CCModel.SONNET)
-    inv = runner._build_invocation(req, "test-session")
-    assert inv.bash_allowlist == ("gh",)
+    assert "gh" in inv_mod._BINARY_HARDENING, (
+        "the gh hardening was removed along with the profile; an overlay profile "
+        "granting gh would now launch against the operator's own writable config"
+    )
+    hardened = inv_mod._BINARY_HARDENING["gh"]()
+    assert hardened is not None
+    assert hardened["GH_CONFIG_DIR"], "the seal is no longer pinned"
 
 
 def test_non_steward_invocation_has_empty_bash_allowlist():
@@ -834,7 +936,7 @@ def test_overlay_add_profile_defaults(overlay_ctx):
 def test_overlay_cannot_override_builtin_profile(overlay_ctx):
     """An overlay may only ADD profiles, never silently redefine a shipped one."""
     with pytest.raises(ValueError, match="may not override"):
-        overlay_ctx.add_profile("steward", disallow=[], addendum="x")
+        overlay_ctx.add_profile("research", disallow=[], addendum="x")
 
 
 def test_overlay_profile_flows_through_build_invocation(overlay_ctx, monkeypatch):
@@ -895,7 +997,7 @@ def test_load_profile_overlays_raises_on_builtin_collision(monkeypatch):
     from genesis.cc import direct_session as ds
 
     def _register(ctx):
-        ctx.add_profile("steward", disallow=[], addendum="x")
+        ctx.add_profile("research", disallow=[], addendum="x")
 
     fake = types.SimpleNamespace(register=_register)
     monkeypatch.setitem(sys.modules, "genesis.cc.profile_overlay", fake)
@@ -1092,9 +1194,11 @@ def test_no_background_profile_can_read_or_cancel_the_pending_queue():
     rather than over a hand-maintained perimeter list.
 
     That distinction is the finding: enumerating the perimeter profile-by-profile
-    left `steward` reachable, and steward ingests external GitHub PR content and
-    can publish `gh` comments — so an injected PR body could read queued-message
-    previews out through a comment, or silently cancel the owner's alerts.
+    left `steward` reachable. That profile HAS SINCE BEEN REMOVED (2026-09-26), so
+    the example is historical — it ingested external GitHub PR content and could
+    publish `gh` comments, so an injected PR body could have read queued-message
+    previews out through a comment, or silently cancelled the owner's alerts.
+    The finding it illustrates is not historical.
     `interact` (arbitrary browser pages) and `campaign` (external platform
     replies) have the same shape. Iterating PROFILES removes the judgement call,
     and a NEW profile is covered the moment it is added.

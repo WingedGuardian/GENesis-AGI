@@ -2446,6 +2446,27 @@ class EgoSession:
                 # Infer from proposal action_type if available
                 brief_action = brief.get("action_type", "")
                 profile = _infer_profile(brief_action)
+                # SAY SO. The substitute has a DIFFERENT tool scope, not a smaller
+                # one: measured against the removed `steward`, `research` gains
+                # `Write` and `interact` gains `Write` plus browser tools, while
+                # both correctly lose Bash. So the work runs with capabilities the
+                # brief did not ask for, and the session's outcome is recorded as
+                # this proposal's outcome — a proposal can be marked executed by a
+                # session that could not do what it described.
+                #
+                # Logged rather than refused because refusing is a design decision
+                # about what the ego's dispatchable set IS, not a repair; that is
+                # tracked separately. The unknown-MODEL fallback nine lines below
+                # already warns on exactly this shape, so this is the missing half
+                # of an existing convention, not a new one.
+                if brief_profile:
+                    logger.warning(
+                        "Execution brief %s requested profile %r, which is not "
+                        "registered — running as %r instead, whose tool scope "
+                        "differs. The outcome will be recorded against this "
+                        "proposal regardless.",
+                        proposal_id, brief_profile, profile,
+                    )
             # Resolve straight from the enum so any valid tier (incl. fable) is
             # honored; an unknown value logs and falls back to sonnet rather than
             # silently downgrading a real tier.

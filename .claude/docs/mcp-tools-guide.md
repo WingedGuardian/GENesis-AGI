@@ -173,12 +173,14 @@ retro-post). So it cannot serve "file this now".
 ### Dispatched / background sessions
 
 A dispatched session must NOT file issues — nothing gates the path and there is no one
-to approve. (`steward` gets `gh`-restricted Bash, so for that profile this is a policy
-line, not a locked door.) It records locally instead — but check the profile first:
+to approve. No shipped profile grants a shell, so for a shipped profile this is a
+locked door rather than a policy line; an install that grants one to a profile of its
+own through the overlay hook is back to policy. It records locally instead — but check
+the profile first:
 **naming a route a session cannot take is worse than naming none.** Check your OWN
 denylist rather than trusting a list here; three tiers exist today:
 
-- HAS `follow_up_create` (`interact`, `research`, `campaign`, `steward`; and
+- HAS `follow_up_create` (`interact`, `research`, `campaign`; and
   `sentinel` when NOT degraded) → file there AND state the finding in the session's
   returned output. Both, not either: the row is FORCED onto the cold `tabled` lane by
   sacred-board authorization whatever `work_state` you pass, tabled rows are excluded
