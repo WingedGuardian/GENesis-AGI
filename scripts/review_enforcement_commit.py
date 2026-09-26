@@ -985,23 +985,52 @@ def _commit_budget_reason(result: dict) -> str:
         )
     pr = result.get("pr")
     count = int(result.get("count") or 0)
+    # The fix-commit approval is protected exactly like the review-request one, so
+    # it owes the owner the same terminal framing — without it, continued round-5
+    # work reads as routine at the one surface where the decision is actually made.
+    # Single-sourced from the evaluator so the two gates cannot drift: the push
+    # guard's `_review_budget_message` states the identical rule. Imported locally,
+    # mirroring `_branch_review_budget`; reaching this point required that import
+    # to have already succeeded there, since `status == "ok"` comes from it.
+    import review_budget  # noqa: PLC0415 — local by the same convention as above.
+
     if result.get("gate_surface"):
+        # Unlike the push guard's gate-surface branch, this one has no
+        # still-within-budget sub-state to get wrong: reaching here needs
+        # `commit_approval`, which is `count > GATE_DISCOVERY_ROUND_LIMIT`, while
+        # `confirmation_exempt` requires `count == GATE_DISCOVERY_ROUND_LIMIT`. The
+        # two are mutually exclusive, so the budget genuinely IS spent and the
+        # terminal decision is the truthful thing to name. Recorded so the next
+        # audit does not re-raise the push guard's defect against this branch.
         return (
             f"PR #{pr} changes the review-gate surface and has {count} distinct "
-            "reviewed heads. Its two discovery rounds plus confirmation are spent. "
-            "Approve this one additional fix commit only; earlier approval does not "
-            "carry forward."
+            f"reviewed heads. Its {review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery "
+            "rounds plus confirmation are spent. "
+            f"{review_budget.TERMINAL_DECISION} Approve this one additional fix "
+            "commit only; earlier approval does not carry forward."
         )
     if result.get("strongly_discouraged"):
+        # TERMINAL_DECISION, never ORDINARY_TERMINAL_RULE: this branch fires at
+        # STRONGLY_DISCOURAGED_REVIEWED_HEADS, so the rule's "there is no ordinary
+        # round 5" would be rendered to someone who already holds five heads.
         return (
-            f"PR #{pr} has {count} distinct reviewed heads. Further work is strongly "
-            "discouraged: stop, narrow or redesign, accept documented residue, or "
-            "abandon it. Approve only this single additional fix commit."
+            f"PR #{pr} has {count} distinct reviewed heads — past the terminal "
+            "boundary. Further work is strongly discouraged: stop, narrow or "
+            "redesign, accept documented residue, or abandon it. "
+            f"{review_budget.TERMINAL_DECISION} Approve only this single additional "
+            "fix commit; every commit past the boundary needs its own approval, and "
+            "earlier approval never carries forward."
         )
+    # The RULE, not the NOTICE: this gate authorizes a COMMIT, so the notice's
+    # "approve one further round" clause would be false here and would contradict
+    # the sentence after it. The boundary claim is true in this branch, where the
+    # count is exactly the ordinary limit.
     return (
         f"PR #{pr} has {count} distinct reviewed heads; standing authorization ended "
-        "after four. Approve this single fix commit. A previous approval cannot "
-        "authorize another commit."
+        f"after {review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
+        f"{review_budget.ORDINARY_TERMINAL_RULE} Approve this single fix commit only — "
+        "it authorizes no review round, and a previous approval cannot authorize "
+        "another commit."
     )
 
 

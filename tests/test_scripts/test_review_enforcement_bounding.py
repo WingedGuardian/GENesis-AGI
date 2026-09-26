@@ -33,6 +33,7 @@ Install-agnostic: synthetic payloads, no network, no live DB.
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -252,3 +253,84 @@ def test_a_reminder_in_the_window_between_the_two_constants_is_rejected() -> Non
         "is under the harness cap — which is why the bound is asserted against "
         "DEFAULT_BUDGET and not HOOK_STDOUT_CAP"
     )
+
+
+def _budget_constants() -> tuple[int, int, int]:
+    """The live round constants, with sys.path restored (see _load_from_scripts)."""
+    saved = list(sys.path)
+    try:
+        sys.path.insert(0, str(_REPO / "scripts"))
+        import review_budget
+
+        return (
+            review_budget.STANDING_REVIEWED_HEAD_LIMIT,
+            review_budget.STRONGLY_DISCOURAGED_REVIEWED_HEADS,
+            review_budget.GATE_DISCOVERY_ROUND_LIMIT,
+        )
+    finally:
+        sys.path[:] = saved
+
+
+def test_the_discouraged_tier_sits_exactly_one_head_past_the_ordinary_limit():
+    """Nothing else pins this adjacency, and a gap SILENTLY empties a branch.
+
+    `_commit_budget_reason` and `_review_budget_message` both render their
+    four-head boundary message in a fall-through branch whose real window is
+    `STANDING_REVIEWED_HEAD_LIMIT <= count < STRONGLY_DISCOURAGED_REVIEWED_HEADS`.
+    Raise STANDING to 5 without raising STRONGLY and that window is EMPTY: the
+    boundary message becomes unreachable, the discouraged text fires at the
+    boundary instead, and no existing test notices because every one of them
+    drives a hardcoded count that still lands somewhere.
+    """
+    limit, discouraged, _gate = _budget_constants()
+    assert discouraged == limit + 1, (
+        f"STRONGLY_DISCOURAGED_REVIEWED_HEADS ({discouraged}) must be exactly one "
+        f"past STANDING_REVIEWED_HEAD_LIMIT ({limit}); any gap leaves the ordinary "
+        "terminal-boundary branch with an empty window and no message"
+    )
+
+
+def test_the_reminders_terminal_numbers_track_the_budget_constants():
+    """The per-prompt reminder hardcodes these numbers, by deliberate design.
+
+    It is NOT single-sourced from `review_budget`, and that was a considered
+    trade: the shared sentence reads "The decision HERE is ...", which is dialog
+    grammar and false in a reminder injected on every prompt, and this hook
+    imports only os and sys — adding an import to the prompt path puts a new
+    failure mode in front of every prompt to buy a cosmetic gain.
+
+    The exposure that trade leaves is DRIFT: bump the constant and this prose
+    keeps telling every session the old boundary, silently. A test costs the
+    prompt path nothing and fails loudly on a bump, which is why the drift is
+    pinned here rather than by an import there.
+
+    Asserted by EQUALITY on the extracted number, not by substring presence: a
+    presence check passes when someone adds the new sentence and leaves the old
+    one, which is the stale-duplicate failure this file already guards against
+    elsewhere.
+    """
+    reminder = _base_reminder()
+    limit, _discouraged, _gate = _budget_constants()
+
+    terminal_headlines = re.findall(r"ROUND (\d+) IS TERMINAL", reminder)
+    assert terminal_headlines == [str(limit)], (
+        f"the reminder's terminal headline(s) {terminal_headlines} must be exactly "
+        f"[{limit!s}] — STANDING_REVIEWED_HEAD_LIMIT is {limit}"
+    )
+
+    no_ordinary = re.findall(r"no ordinary round (\d+)", reminder)
+    assert no_ordinary == [str(limit + 1)], (
+        f"the reminder says there is no ordinary round {no_ordinary}, but the first "
+        f"non-standing round is {limit + 1}"
+    )
+
+    # The same boundary is also spelled as a WORD twice ("after four ordinary heads",
+    # "past four heads"). Only the values actually in play are mapped: a limit that
+    # falls outside it fails loudly here rather than silently skipping the check.
+    words = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+    assert limit in words, (
+        f"STANDING_REVIEWED_HEAD_LIMIT is {limit}, which this test cannot spell; "
+        "extend the map and re-check the reminder's word forms"
+    )
+    assert f"after {words[limit]} ordinary heads" in reminder
+    assert f"past {words[limit]} heads" in reminder

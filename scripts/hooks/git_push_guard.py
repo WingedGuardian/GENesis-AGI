@@ -4702,11 +4702,47 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     count = int(result.get("count") or 0)
     next_round = count + 1
     if result.get("gate_surface"):
+        # The gate lane is terminal at its OWN limit, not at four, and this branch
+        # returns before the ordinary notice below can ever be reached — so the
+        # decision has to be named here too. But it has TWO sub-states and only one
+        # of them is terminal, which a single message got wrong: naming the terminal
+        # decision forecloses options, so it is a terminality claim even without the
+        # literal "no round N+1" sentence, and it must not appear while the evaluator
+        # is still holding a round open.
+        limit = _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if result.get("confirmation_exempt"):
+            # STILL WITHIN BUDGET (`reason="gate_confirmation"`): this lane grants one
+            # exact-head confirmation dispatch at the limit, and evaluate_pr has just
+            # said this PR qualifies. Naming the terminal decision here would
+            # foreclose an option the evaluator is holding open.
+            # No "an earlier segment already spent it" sub-state is needed, and adding
+            # one would be speculative: a compound command carrying two review
+            # requests is DENIED at the `len(triggers) > 1` check above, before any
+            # budget lookup or exemption is consulted, so a later segment can never
+            # reach this message with the exemption already used. That deny is the
+            # stronger protection and it is pinned by test, including in this exempt
+            # state where an exact-head marker could otherwise license a sibling.
+            #
+            # Deliberately does NOT assert WHY the exemption did not apply. Four
+            # conditions gate it, and only one is "the marker is absent": the body
+            # may be OPAQUE to this guard (`--body-file`, an editor body), in which
+            # case a request that really does carry the marker lands here and must
+            # not be told it does not.
+            return (
+                f"PR #{pr_num} changes the review-gate surface and has {count} "
+                f"distinct reviewed heads, its {limit} discovery rounds. One "
+                "exact-head confirmation request is STILL BUDGETED, but this guard "
+                "cannot see the current head's marker in this request — either it is "
+                "absent, or the body is opaque here (--body-file, editor). If you did "
+                "post the marked confirmation, approving is correct; otherwise post "
+                "it rather than spending a further discovery round."
+            )
         return (
             f"PR #{pr_num} changes the review-gate surface and already has {count} "
-            f"distinct reviewed heads. Its expedited budget is two discovery rounds; "
-            f"this is another discovery request (round {next_round}). Approve only "
-            "after deciding that another gate-design round is worth the risk."
+            f"distinct reviewed heads, past its {limit} discovery rounds. "
+            f"{_review_budget.TERMINAL_DECISION} Approve only after deciding that "
+            "another gate-design round is worth the risk; earlier approval never "
+            "carries forward."
         )
     # ROUND 4 IS TERMINAL (owner ruling, 2026-09-25), and this is the surface the
     # owner reads AT the decision — so it must not frame round 5 as an ordinary
@@ -4717,12 +4753,11 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     # STANDING_REVIEWED_HEAD_LIMIT=4 / STRONGLY_DISCOURAGED_REVIEWED_HEADS=5);
     # aligning it is later work, and until then this prompt is what carries the
     # rule to the person deciding.
-    terminal = (
-        "ROUND 4 IS TERMINAL: there is no ordinary round 5. The decision here is "
-        "to MERGE with the outstanding issues accepted and filed, or to SEND IT "
-        "BACK for rework. Approve only to authorize one further round anyway, and "
-        "only if that is genuinely the least costly option."
-    )
+    #
+    # Read from the evaluator rather than spelled here: the commit gate states the
+    # same rule at its own approval, and two copies drift. See
+    # `review_budget.ORDINARY_TERMINAL_NOTICE` for why no local fallback is owed.
+    terminal = _review_budget.ORDINARY_TERMINAL_NOTICE
     if result.get("strongly_discouraged"):
         return (
             f"PR #{pr_num} already has {count} distinct reviewed heads — past the "
@@ -4733,7 +4768,8 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
         )
     return (
         f"PR #{pr_num} already has {count} distinct reviewed heads; standing "
-        f"authorization ended after four. {terminal} This approval covers exactly "
+        f"authorization ended after {_review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
+        f"{terminal} This approval covers exactly "
         f"this one round-{next_round} request and does not carry forward."
     )
 
