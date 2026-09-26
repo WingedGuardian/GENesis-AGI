@@ -181,7 +181,19 @@ _register_mcp_http() {
     # _warn_local_scope_shadow) is never to delete an operator's config
     # silently; surface it and give them the command.
     if [ -z "$url" ]; then
-        if [ "$scope" = "user" ] && [ -n "$(_mcp_entry_present "$name")" ]; then
+        local declined_present
+        [ "$scope" = "user" ] && declined_present="$(_mcp_entry_present "$name")"
+        # THREE-VALUED, and the third value is why this is not `[ -n … ]`.
+        # _mcp_entry_present answers "1" (present), "" (absent) or "unknown"
+        # (~/.claude.json could not be read). A presence test that accepts
+        # "unknown" asserts a registration is live having failed to read the
+        # file it would have read that from — and then tells the operator to
+        # remove an entry that may not exist. Say what is actually known.
+        if [ "$declined_present" = "unknown" ]; then
+            echo "  $name: declined (URL empty). Could not read ~/.claude.json, so"
+            echo "    whether an existing $scope registration is still live is UNKNOWN."
+            echo "    Check with: claude mcp list"
+        elif [ -n "$declined_present" ]; then
             echo "  $name: declined (URL empty), but an EXISTING $scope registration remains ACTIVE"
             echo "    remove it with: claude mcp remove $name -s $scope"
             # "remains ACTIVE" is a claim about what a session will REACH, and
