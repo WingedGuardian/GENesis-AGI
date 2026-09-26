@@ -593,3 +593,251 @@ def test_a_retired_chain_rung_STILL_MIGRATES(tmp_path):
         "call_sites:\n  triage:\n    chain: [glm51, groq-free]\n",
     )
     assert cfg.call_sites["triage"].chain == ["glm", "groq-free"]
+
+
+# ── RC2: state persisted under a provider NAME survives the rename ───────────
+
+
+def _providers_for(names):
+    """Minimal ProviderConfig map keyed by ``names``."""
+    from genesis.routing.types import ProviderConfig
+
+    return {
+        n: ProviderConfig(
+            name=n,
+            provider_type="openrouter",
+            model_id="x/y",
+            is_free=False,
+            rpm_limit=None,
+            open_duration_s=120,
+        )
+        for n in names
+    }
+
+
+def _registry(tmp_path, providers, persisted: dict):
+    import json
+
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+
+    f = tmp_path / "circuit_breaker_state.json"
+    f.write_text(json.dumps(persisted))
+    return CircuitBreakerRegistry(providers=providers, state_file=f, persist=False)
+
+
+@pytest.mark.parametrize("held", ["open", "half_open"])
+def test_a_held_breaker_survives_a_rename_across_restart(tmp_path, held):
+    """THE finding: a provider being HELD BACK must not resume taking traffic.
+
+    `load_state` matched persisted rows to providers EXACTLY, so after a rename
+    the row was silently dropped and the renamed provider got a fresh CLOSED
+    breaker. An install with an actively failing provider therefore resumed
+    routing to it on the first restart after the upgrade, until enough NEW
+    failures tripped it again — reintroducing the latency and paid-fallback churn
+    that persisting this state exists to prevent. (Codex P1, Devin severe.)
+
+    Both non-closed states are parametrized because both are persisted: `.state`
+    assigns HALF_OPEN when merely READ, so a held provider is as likely to be on
+    disk as half_open as open.
+    """
+    from genesis.routing.types import ProviderState
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    reg = _registry(
+        tmp_path,
+        _providers_for([current]),
+        {legacy: {"state": held, "consecutive_failures": 3, "trip_count": 2}},
+    )
+
+    cb = reg._breakers.get(current)
+    assert cb is not None, f"the row under '{legacy}' was dropped instead of migrated"
+    assert cb._state is not ProviderState.CLOSED, (
+        f"'{current}' restored CLOSED from a persisted '{held}' — it would take traffic"
+    )
+    assert cb._trip_count > 0, "the trip count was lost, so backoff restarts from scratch"
+
+
+def test_the_current_names_row_wins_when_both_generations_are_persisted(tmp_path):
+    """Ordering, stated rather than left to dict order.
+
+    A state file written across an upgrade boundary can hold BOTH keys. One pass
+    in dict order would let whichever row came first decide — the same
+    order-dependence the overlay migration was already fixed for. The row under
+    the CURRENT name is the newer fact and must win, whichever order they appear
+    in, so both orderings are asserted.
+    """
+    from genesis.routing.types import ProviderState
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    for ordering in (
+        {legacy: {"state": "open", "trip_count": 9}, current: {"state": "closed", "trip_count": 0}},
+        {current: {"state": "closed", "trip_count": 0}, legacy: {"state": "open", "trip_count": 9}},
+    ):
+        reg = _registry(tmp_path, _providers_for([current]), ordering)
+        cb = reg._breakers[current]
+        assert cb._state is ProviderState.CLOSED, (
+            f"the legacy row overrode the current one (order: {list(ordering)})"
+        )
+        assert cb._trip_count == 0
+
+
+def test_an_exact_row_is_untouched_when_no_rename_applies(tmp_path):
+    """The control. A fix that migrated indiscriminately would pass the tests
+    above while corrupting every ordinary restore."""
+    from genesis.routing.types import ProviderState
+
+    reg = _registry(
+        tmp_path,
+        _providers_for(["groq-free"]),
+        {"groq-free": {"state": "open", "trip_count": 4}},
+    )
+    cb = reg._breakers["groq-free"]
+    assert cb._state is ProviderState.OPEN
+    # 3, not 4: `load_state` deliberately caps the trip count on an OPEN restore,
+    # because escalating backoff is for consecutive failures within a session, not
+    # across restarts that may span weeks. Asserting the cap rather than the raw
+    # persisted value keeps this a control for the MIGRATION without silently
+    # re-specifying behaviour that predates it.
+    assert cb._trip_count == 3
+
+
+def test_a_row_for_a_provider_that_no_longer_exists_is_still_dropped(tmp_path):
+    """The other control: migration must not resurrect a genuinely removed
+    provider. `_resolve_provider_alias` returns the name unchanged when neither
+    generation is configured, and an unknown name has no breaker to create."""
+    reg = _registry(
+        tmp_path,
+        _providers_for(["groq-free"]),
+        {"retired-entirely": {"state": "open", "trip_count": 4}},
+    )
+    assert "retired-entirely" not in reg._breakers
+
+
+def test_a_held_breaker_survives_a_rename_across_a_HOT_RELOAD(tmp_path):
+    """The path a restart test cannot reach, and it needs no restart to lose the hold.
+
+    `update_providers` MERGES rather than replaces, so after a rename the registry
+    holds both generations in `_providers` while `_breakers` still holds the live
+    breaker under the OLD key — and `Router.reload_config`'s subsequent
+    `get(new_name)` creates a fresh CLOSED breaker beside it. The provider resumes
+    taking traffic mid-run, with no restart and no sign to the operator.
+    """
+    from genesis.routing.types import ProviderState
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    reg = _registry(tmp_path, _providers_for([legacy]), {})
+    cb = reg.get(legacy)
+    cb._state = ProviderState.OPEN
+    cb._trip_count = 2
+
+    reg.update_providers(_providers_for([current]))
+
+    assert legacy not in reg._breakers, "the stale key kept the breaker"
+    moved = reg._breakers.get(current)
+    assert moved is cb, "a NEW breaker was created instead of moving the live one"
+    assert moved._state is ProviderState.OPEN
+    assert moved._trip_count == 2
+
+
+def test_a_hot_reload_never_overwrites_an_existing_breaker(tmp_path):
+    """The control for the move: an existing breaker under the new name is live
+    state and must win. Overwriting it would discard a real hold to honour a
+    stale one."""
+    from genesis.routing.types import ProviderState
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    reg = _registry(tmp_path, _providers_for([legacy, current]), {})
+    old = reg.get(legacy)
+    old._state = ProviderState.OPEN
+    new = reg.get(current)
+    new._trip_count = 7
+
+    reg.update_providers(_providers_for([current]))
+
+    assert reg._breakers[current] is new, "the live breaker was replaced by a stale one"
+    assert reg._breakers[current]._trip_count == 7
+
+
+def test_one_unresolvable_row_does_not_abort_every_other_restore(tmp_path):
+    """An unresolvable row must be SKIPPED, not allowed to kill the whole load.
+
+    Found by a mutation sweep, and the failure mode is worse than the one the
+    sibling test covers. `_alias_target` returns None when neither generation is
+    configured; without that check `get()` is called with an unknown name, raises
+    `KeyError` from `self._providers[provider]`, and the blanket `except` around
+    `load_state` swallows it — so ONE stale row silently discards EVERY restore in
+    the file, including live holds. A single-row fixture cannot see that: it looks
+    identical to correctly skipping the row.
+    """
+    from genesis.routing.types import ProviderState
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    reg = _registry(
+        tmp_path,
+        _providers_for([current]),
+        {
+            # Ordered first on purpose: the damage is done before the good row.
+            "retired-entirely": {"state": "open", "trip_count": 5},
+            legacy: {"state": "open", "trip_count": 2},
+        },
+    )
+
+    assert "retired-entirely" not in reg._breakers
+    cb = reg._breakers.get(current)
+    assert cb is not None, (
+        "a stale row aborted the whole restore — the live hold on "
+        f"'{current}' was lost with it"
+    )
+    assert cb._state is ProviderState.OPEN
+
+
+def test_the_legacy_pass_runs_AFTER_the_current_pass(tmp_path):
+    """Ordering asserted by its CONSEQUENCE, not by reading the loops.
+
+    The sibling test asserts the current row wins, but it survived a mutation that
+    deleted the legacy pass outright — with no legacy pass the current row is the
+    only one, so it "wins" trivially. This pins the pass ORDER: both rows carry a
+    live state, the legacy one carries a DIFFERENT trip count, and the current
+    one's value must be the one that lands whichever order the dict lists them.
+    """
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    for ordering in (
+        {legacy: {"state": "open", "trip_count": 3}, current: {"state": "open", "trip_count": 1}},
+        {current: {"state": "open", "trip_count": 1}, legacy: {"state": "open", "trip_count": 3}},
+    ):
+        reg = _registry(tmp_path, _providers_for([current]), ordering)
+        cb = reg._breakers[current]
+        assert cb._trip_count == 1, (
+            f"the legacy row's trip count landed (order: {list(ordering)}) — the "
+            "legacy pass ran first, or the already-restored guard did not hold"
+        )
+
+
+def test_the_standalone_router_resolves_a_legacy_name_BEHAVIOURALLY(tmp_path):
+    """The source grep cannot say WHICH site calls the resolver — this can.
+
+    Found by a mutation sweep: removing `_resolve`'s call left the file's OTHER
+    call (in `default_judge_chain`) in place, so the grep-based boundary test
+    stayed green while the boundary under test was broken. Drives the constructor
+    with a legacy name against a config that defines only the current one.
+    """
+    from genesis.experimentation.standalone_router import StandaloneLiteLLMRouter
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+    base = tmp_path / "model_routing.yaml"
+    base.write_text(
+        f"providers:\n"
+        f"  {current}:\n"
+        f"    type: openrouter\n"
+        f"    model: some/model\n"
+        f"retry_profiles:\n  default:\n    max_attempts: 2\n"
+        f"call_sites:\n  judge:\n    chain: [{current}]\n"
+    )
+    cfg = load_config(base, check_api_keys=False)
+
+    router = StandaloneLiteLLMRouter(provider_name=legacy, config=cfg)
+
+    assert router._provider_name == current, (
+        f"a saved experiment naming '{legacy}' did not resolve to '{current}' — "
+        "it would raise 'unknown provider' before issuing a call"
+    )
