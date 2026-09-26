@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -86,6 +87,47 @@ def test_resolve_refreshes_the_live_remote_head(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0
+    assert result.stdout.strip() == "stable"
+
+
+def test_resolve_falls_back_when_the_live_probe_fails_under_pipefail(
+    tmp_path: Path,
+) -> None:
+    """An unsuccessful remote probe must read as EMPTY, never as fatal.
+
+    update.sh runs with `set -Eeuo pipefail`, so a non-zero `ls-remote` inside the
+    probe's command substitution takes the shell down at the ASSIGNMENT — before
+    the cached-HEAD fallback underneath it can run. An unreachable or slow remote
+    would then refuse a deployment that the local symbolic ref could resolve
+    perfectly well.
+
+    The shim fails ONLY `ls-remote`, so every other git call still works and the
+    cached ref really is readable; otherwise this would pass for the wrong reason.
+    """
+    repo = _repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/public/stable", "HEAD")
+    _git(repo, "symbolic-ref", "refs/remotes/public/HEAD", "refs/remotes/public/stable")
+
+    real_git = shutil.which("git")
+    assert real_git, "git must be on PATH for this test to mean anything"
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '    [ "$arg" = "ls-remote" ] && exit 128\n'
+        "done\n"
+        f'exec {real_git} "$@"\n'
+    )
+    shim.chmod(0o755)
+
+    result = _run_helper(
+        f'set -Eeuo pipefail\ngenesis_resolve_deploy_branch "{repo}" public',
+        PATH=f"{shim_dir}:{os.environ['PATH']}",
+    )
+
+    assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "stable"
 
 

@@ -90,11 +90,19 @@ genesis_resolve_deploy_branch() {
         # Ask the remote for its advertised HEAD without depending on a local
         # tracking ref for that branch; refs/remotes/<remote>/HEAD is only the
         # fallback when the live query cannot answer.
+        # `|| true` is load-bearing. update.sh runs under `set -Eeuo pipefail`,
+        # so a timed-out or refused `ls-remote` makes this substitution non-zero
+        # even though awk completed, and the ASSIGNMENT then exits the shell —
+        # before the cached-HEAD fallback below can run. An unreachable remote
+        # would refuse a deployment that the local symbolic ref could have
+        # resolved. An unsuccessful probe must read as an EMPTY answer, not as a
+        # fatal one; the `check-ref-format` validation below still gates whatever
+        # either path produces.
         remote_head="$(
             timeout 15 git -C "$repo" ls-remote --symref "$remote" HEAD 2>/dev/null |
                 awk '$1 == "ref:" && $2 ~ /^refs\/heads\// && $3 == "HEAD" {
                     sub("^refs/heads/", "", $2); print $2; exit
-                }'
+                }' || true
         )"
         if [ -n "$remote_head" ] \
             && git -C "$repo" check-ref-format --branch "$remote_head" >/dev/null 2>&1; then
