@@ -31,17 +31,38 @@ never obtains the head code, so nothing an author writes is executed. That
 property used to be belt-and-braces; once a maintainer token is present it is
 the only thing standing between an outside author and that credential.
 
-Polarity is ALLOWLIST for steps, and the checks enumerate EVERY JOB. Both
-choices are load-bearing and both were learned from a checker that lacked them:
-a denylist passes the next spelling nobody thought of, and a single-job walk
-passes a SECOND job that checks out head code beside the same secret.
+Polarity is ALLOWLIST throughout, at three levels, and every one of them was
+learned from a checker that lacked it:
+
+  ACTIONS    only a SHA-pinned `actions/github-script` may run, so an action
+             nobody anticipated fails rather than passes.
+  LOCATIONS  every `secrets` read in the document is a violation except in the
+             two KEYS the post step may hold one in, so a channel nobody
+             anticipated fails. A single-job walk would miss a SECOND job that
+             checks out head code beside the same secret, so every job is
+             enumerated.
+  VALUES     the post step's token, its MAINTAINER_TOKEN env and its `if`
+             guard are compared to exact literals, so an EXPRESSION nobody
+             anticipated fails.
+
+The third level is the newest and the most expensive to have learned. Each
+earlier form reasoned about the secret NAME inside an expression, and an
+adversarial pass defeated every one of them with an expression carrying the
+right name and resolving to something else -- including one that reinstates
+this file's original defect in a single line. A name is not what a slot
+resolves to; only the literal is.
 
 Every invariant below is exercised in BOTH directions -- the shipped file must
 be clean, and a deliberately broken copy must be caught. An assertion group
 that only ever sees a clean fixture passes just as well when it checks nothing.
-Where an assertion could be satisfied by a string that does not actually BIND
-the behaviour, it checks the binding instead: `if: always()` is non-empty and
-would pass a presence test while disabling the gate it is supposed to be.
+And where an assertion could be satisfied by a string that does not actually
+BIND the behaviour, it compares the whole value: `if: always()` fails a
+presence test, but `if: always() || steps.eligible.outputs.pr != ''` passes
+one while gating nothing, and only equality rejects both.
+
+What this file does NOT establish is in `_secret_locations` -- a lexical scan
+cannot see runtime dataflow, which is why the structural rules about step ids
+and step order are there instead.
 """
 
 from __future__ import annotations
@@ -65,17 +86,52 @@ _PERMITTED_USES = re.compile(r"^actions/github-script@[0-9a-f]{40}\b")
 
 _POST_STEP = "Post the review request under a maintainer identity"
 
-#: The secret the post step must use, in BOTH channels. `github-token` is what
-#: octokit authenticates with; `env.MAINTAINER_TOKEN` is what the missing-secret
-#: guard tests. If they name different secrets the guard passes while the post
-#: authenticates as something else, so they are checked together, not apart.
-_EXPECTED_SECRET = "REVIEW_REQUEST_TOKEN"
+#: The three expressions the post step is allowed to carry, compared as EXACT
+#: LITERALS rather than parsed.
+#:
+#: Extracting a secret NAME from an expression and reasoning about it is the
+#: wrong primitive for a credential gate, because the name is only one of the
+#: things that decides what the slot resolves to. Three separate defeats of the
+#: name-based form were MEASURED on this file, and a literal comparison closes
+#: all three at once:
+#:
+#:   ${{ secrets['ATTACKER_PAT'] || secrets.REVIEW_REQUEST_TOKEN }}
+#:       index syntax is documented first-class context access, so a
+#:       dot-only pattern does not see the operand that actually wins.
+#:   env.MAINTAINER_TOKEN: ${{ secrets.REVIEW_REQUEST_TOKEN || github.token }}
+#:       the only name present is the expected one, and yet with the secret
+#:       unset this resolves to the DEFAULT TOKEN, so the missing-secret guard
+#:       sees a value, returns false, and the request posts as
+#:       github-actions[bot] -- silently recreating the defect this whole file
+#:       exists to prevent. A fallback is harmless in the token slot, where the
+#:       guard returns first, and guard-defeating in the env slot.
+#:   if: always() || steps.eligible.outputs.pr != ''
+#:       contains the gating token and gates nothing.
+#:
+#: An allowlist over VALUES has no expression surface left to attack. The cost
+#: is that a deliberate change to any of these three strings fails CI until the
+#: constant is updated, which on a credential expression is the review
+#: checkpoint we want rather than a maintenance burden.
+_PERMITTED_TOKEN = "${{ secrets.REVIEW_REQUEST_TOKEN || github.token }}"
+_PERMITTED_MAINTAINER_ENV = "${{ secrets.REVIEW_REQUEST_TOKEN }}"
+_PERMITTED_GUARD = "steps.eligible.outputs.pr != ''"
 
-#: Anything that reads `secrets.` inside a step, whatever the channel. The
-#: credential does not only arrive via `with.github-token`: an `env:` block is
-#: the idiom THIS FILE introduces, so copying it onto the eligibility step is
-#: the natural mistake, and it is the one the header explicitly forbids.
-_SECRET_REF = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)")
+#: The only step that may carry an `id`. A later step can read an earlier one's
+#: output, which is runtime dataflow and therefore invisible to any lexical
+#: scan: the post step could emit its own token with `core.setOutput` and a
+#: downstream step could consume it with no `secrets` reference anywhere in the
+#: file. Forbidding the downstream step removes the channel instead of trying
+#: to detect it.
+_PERMITTED_STEP_IDS = {"eligible"}
+
+#: Any read of the `secrets` context, in EITHER documented spelling. GitHub
+#: documents both `secrets.NAME` and `secrets['NAME']`; a pattern matching only
+#: the first is a denylist one spelling wide, which is how the maintainer
+#: credential reached the eligibility step with the suite fully green. A
+#: bracket read whose name cannot be resolved statically is reported as
+#: `<unresolved>` -- named, not skipped, because failing closed on something
+#: unreadable is the only safe direction for a credential.
+_SECRET_REF = re.compile(r"secrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[)")
 
 
 def _load() -> dict:
@@ -91,6 +147,47 @@ def _all_steps(doc: dict):
     for job_name, job in _jobs(doc).items():
         for step in job.get("steps") or []:
             yield job_name, step
+
+
+def _secret_locations(node, path: str = "") -> list[str]:
+    """`<dotted path>:<secret name>` for every `secrets.X` reference in a tree.
+
+    Channel-agnostic on purpose. Enumerating the places a credential can arrive
+    is a DENYLIST, and successive review rounds each supplied the next spelling
+    the previous one had missed: `with.github-token`, then a step `env:`, then
+    a workflow- or job-level `env:` that every step INHERITS, then any other
+    action input. So nothing is enumerated: the whole document is walked and
+    the two KEYS the credential may occupy are removed before the walk rather
+    than recognised during it.
+
+    STATE THE GUARANTEE EXACTLY, because the previous version of this docstring
+    claimed a channel nobody had thought of would "fail by construction" and an
+    audit falsified that in three lines of YAML. What this walk gives is: every
+    LOCATION in the document, for every `secrets` read it can DETECT LEXICALLY.
+    Two limits follow directly, and neither is fixable by widening a pattern:
+
+    - A value that arrives by runtime DATAFLOW carries no `secrets` text at
+      all. The post step could publish its own token with `core.setOutput` and
+      a later step could read `${{ steps.<id>.outputs.x }}`. That is why
+      `_PERMITTED_STEP_IDS` and the last-step rule exist -- the channel is
+      removed rather than detected.
+    - Only VALUES are walked, never mapping keys. No Actions shape is known
+      where a credential in key position is exploitable, but the walk does not
+      cover it, and "the whole document" would be the wrong thing to claim.
+    """
+    if isinstance(node, dict):
+        return [
+            loc
+            for key, value in node.items()
+            for loc in _secret_locations(value, f"{path}.{key}" if path else str(key))
+        ]
+    if isinstance(node, list):
+        return [
+            loc
+            for index, value in enumerate(node)
+            for loc in _secret_locations(value, f"{path}[{index}]")
+        ]
+    return [f"{path}:{m.group(1) or '<unresolved>'}" for m in _SECRET_REF.finditer(str(node))]
 
 
 def _eligibility_step(doc: dict):
@@ -148,6 +245,54 @@ def _violations(doc: dict) -> list[str]:
     if elig_jobs and post_jobs and not (elig_jobs & post_jobs):
         out.append("post-step-in-a-different-job-than-eligibility")
 
+    # The post step is identified BY NAME, so it has to be unique: a second
+    # step wearing the same name would have its credential slots blessed by the
+    # walk below and then satisfy every post-step check.
+    posts = _post_steps(doc)
+    if len(posts) != 1:
+        out.append(f"post-step-is-not-unique:{len(posts)}")
+
+    # Nothing may follow the post step, and no other step may carry an `id`.
+    # See `_PERMITTED_STEP_IDS`: a step output is runtime dataflow and a
+    # lexical walk cannot see it, so the downstream step is forbidden rather
+    # than inspected.
+    for name, job in _jobs(doc).items():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        if steps is not None and not isinstance(steps, list):
+            out.append(f"steps-not-a-list:{name}")
+            continue
+        for index, step in enumerate(steps or []):
+            if not isinstance(step, dict):
+                out.append(f"step-not-a-mapping:{name}[{index}]")
+                continue
+            step_id = step.get("id")
+            if step_id is not None and step_id not in _PERMITTED_STEP_IDS:
+                out.append(f"unexpected-step-id:{name}:{step_id}")
+            if step.get("name") == _POST_STEP and index != len(steps) - 1:
+                out.append(f"post-step-is-not-the-last-step:{name}")
+
+    # Credential LOCATION. Blank the two KEYS the post step may hold the
+    # credential in, then any `secrets` read left ANYWHERE in the file is a
+    # violation -- including one in a workflow- or job-level scope that names
+    # no step but is inherited by all of them. Only those two keys are blanked,
+    # never the whole `env` or `with` block, so a SECOND credential smuggled in
+    # beside them is still reported.
+    #
+    # Blanking REPLACES the mapping rather than mutating it. `yaml.safe_load`
+    # materialises a YAML anchor and its aliases as ONE object and `deepcopy`
+    # preserves that sharing, so popping a key would blank it for every step
+    # aliasing the same mapping and hide a real violation elsewhere.
+    probe = copy.deepcopy(doc)
+    probe_posts = _post_steps(probe)
+    if len(probe_posts) == 1:
+        post = probe_posts[0]
+        for block, key in (("with", "github-token"), ("env", "MAINTAINER_TOKEN")):
+            held = post.get(block)
+            if isinstance(held, dict):
+                post[block] = {k: v for k, v in held.items() if k != key}
+    for loc in _secret_locations(probe):
+        out.append(f"secret-outside-the-post-step:{loc}")
+
     saw_post = False
     for job_name, step in _all_steps(doc):
         label = f"{job_name}/{step.get('name') or '<unnamed>'}"
@@ -161,49 +306,41 @@ def _violations(doc: dict) -> list[str]:
         elif not _PERMITTED_USES.match(str(uses)):
             out.append(f"unpermitted-action:{label}:{uses}")
 
-        with_ = step.get("with") or {}
+        with_raw = step.get("with")
+        if with_raw is not None and not isinstance(with_raw, dict):
+            out.append(f"with-not-a-mapping:{label}")
+            with_ = {}
+        else:
+            with_ = with_raw or {}
         if "${{" in (with_.get("script") or ""):
             # Actions substitutes these before node parses the body, so an
             # interpolated value is code rather than data.
             out.append(f"interpolation-in-script:{label}")
 
         token = str(with_.get("github-token", ""))
-        env_secrets = {
-            m.group(1)
-            for v in (step.get("env") or {}).values()
-            for m in _SECRET_REF.finditer(str(v))
-        }
         if step.get("name") == _POST_STEP:
             saw_post = True
-            # Both channels must name the SAME secret, and it must be the
-            # expected one -- a guard that tests a different secret than
-            # octokit posts with is a guard that proves nothing.
-            if _EXPECTED_SECRET not in env_secrets:
-                out.append("post-step-env-does-not-carry-the-expected-secret")
-            if token and _EXPECTED_SECRET not in token:
-                out.append("post-step-token-is-not-the-expected-secret")
+            # Each of the three slots is compared to its permitted LITERAL.
+            # See the constants: every previous form of these checks reasoned
+            # about the secret NAME inside the expression, and each one was
+            # defeated by an expression carrying the right name and resolving
+            # to something else.
             if not token:
                 out.append("post-step-uses-default-token")
-            elif "secrets." not in token:
-                out.append("post-step-token-not-from-secrets")
-            elif re.search(r"secrets\.GITHUB_TOKEN", token):
-                # secrets.GITHUB_TOKEN contains "secrets." and is exactly the
-                # bot identity the reviewer refuses, so it needs naming.
-                out.append("post-step-token-is-the-default-token")
-            # The guard must BIND to the eligibility output, not merely exist.
-            # `if: always()` is non-empty and would satisfy a presence check
-            # while doing the opposite of gating: the token is materialised
-            # into a process environment on every contributor event, including
-            # declined ones, and the step runs with an empty PR number.
-            guard = str(step.get("if") or "")
-            if "steps.eligible.outputs.pr" not in guard:
-                out.append("post-step-not-guarded-by-eligibility")
-        else:
-            if token:
-                out.append(f"non-post-step-holds-a-token:{label}")
-            if env_secrets:
-                # The exact threat the docstring and the workflow header name.
-                out.append(f"non-post-step-holds-a-secret-in-env:{label}")
+            elif token.strip() != _PERMITTED_TOKEN:
+                out.append(f"post-step-token-is-not-the-permitted-expression:{token}")
+            env = step.get("env")
+            env = env if isinstance(env, dict) else {}
+            if str(env.get("MAINTAINER_TOKEN", "")).strip() != _PERMITTED_MAINTAINER_ENV:
+                out.append("post-step-maintainer-env-is-not-the-permitted-expression")
+            if str(step.get("if") or "").strip() != _PERMITTED_GUARD:
+                out.append("post-step-guard-is-not-the-permitted-expression")
+        elif token:
+            # A secret on a non-post step is caught by location above, whatever
+            # channel carries it. This catches the remaining case: a credential
+            # that is not a secret reference at all, such as `${{ github.token
+            # }}`, handed to a step that applies author-influenced predicates.
+            out.append(f"non-post-step-holds-a-token:{label}")
 
     if not saw_post:
         out.append("post-step-missing")
@@ -363,9 +500,132 @@ def _neuter_the_guard_with_always(doc):
 
 def _put_the_secret_in_the_eligibility_env(doc):
     """The natural mistake: copy the post step env block onto the eligibility step."""
+    _first_job(doc)["steps"][0]["env"] = {"MAINTAINER_TOKEN": "${{ secrets.REVIEW_REQUEST_TOKEN }}"}
+
+
+def _workflow_level_env_secret(doc):
+    """Inherited by every step in every job, and named by no step at all."""
+    doc["env"] = {"MAINTAINER_TOKEN": "${{ secrets.REVIEW_REQUEST_TOKEN }}"}
+
+
+def _job_level_env_secret(doc):
+    """Same inheritance, one scope down."""
+    _first_job(doc)["env"] = {"MAINTAINER_TOKEN": "${{ secrets.REVIEW_REQUEST_TOKEN }}"}
+
+
+def _secret_in_another_action_input(doc):
+    """Not `github-token`, so a check that reads only that input is blind."""
+    _first_job(doc)["steps"][0].setdefault("with", {})["result-encoding"] = (
+        "${{ secrets.REVIEW_REQUEST_TOKEN }}"
+    )
+
+
+def _token_prefers_another_secret(doc):
+    """Actions resolves `a || b` to `a`, so this posts as OTHER.
+
+    The expected name is still present as a substring, which is exactly what
+    makes a containment check pass while authentication happens as something
+    else entirely.
+    """
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["with"]["github-token"] = "${{ secrets.OTHER || secrets.REVIEW_REQUEST_TOKEN }}"
+
+
+def _bracket_secret_on_the_eligibility_step(doc):
+    """Index syntax -- documented, first-class, and invisible to a dot pattern."""
     _first_job(doc)["steps"][0]["env"] = {
-        "MAINTAINER_TOKEN": "${{ secrets.REVIEW_REQUEST_TOKEN }}"
+        "MAINTAINER_TOKEN": "${{ secrets['REVIEW_REQUEST_TOKEN'] }}"
     }
+
+
+def _bracket_secret_in_workflow_env(doc):
+    doc["env"] = {"MAINTAINER_TOKEN": "${{ secrets['REVIEW_REQUEST_TOKEN'] }}"}
+
+
+def _bracket_secret_by_computed_name(doc):
+    """A name no static reader can resolve. Must fail CLOSED, not be skipped."""
+    _first_job(doc)["steps"][0]["env"] = {
+        "MAINTAINER_TOKEN": "${{ secrets[format('REVIEW_{0}', 'REQUEST_TOKEN')] }}"
+    }
+
+
+def _token_prefers_a_bracket_secret(doc):
+    """The winning operand is bracket-spelled, so a name check never sees it."""
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["with"]["github-token"] = (
+                "${{ secrets['ATTACKER_PAT'] || secrets.REVIEW_REQUEST_TOKEN }}"
+            )
+
+
+def _maintainer_env_falls_back_to_the_default_token(doc):
+    """The only name present is the right one, and it still posts as the bot.
+
+    With the secret unset this resolves to the default token rather than the
+    empty string, so the script missing-secret guard sees a value and returns
+    false -- and the request goes out under the identity the reviewer refuses.
+    """
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["env"]["MAINTAINER_TOKEN"] = "${{ secrets.REVIEW_REQUEST_TOKEN || github.token }}"
+
+
+def _extra_secret_beside_the_permitted_one(doc):
+    """Blanking a whole `env` block would bless this; blanking one key does not."""
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["env"]["SECOND"] = "${{ secrets.ANOTHER_PAT }}"
+
+
+def _shared_with_mapping_via_anchor(doc):
+    """One mapping aliased onto two steps, as `yaml.safe_load` materialises it.
+
+    Mutating the post step credential out of a SHARED mapping would blank it
+    for the other step too, and the walk would report nothing.
+    """
+    shared = None
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            shared = step["with"]
+    _first_job(doc)["steps"][0]["with"] = shared
+
+
+def _launder_the_token_through_a_step_output(doc):
+    """No `secrets` reference anywhere on the receiving step."""
+    job = _first_job(doc)
+    for step in job["steps"]:
+        if step.get("name") == _POST_STEP:
+            step["id"] = "poster"
+    job["steps"].append(
+        {
+            "name": "use it",
+            "uses": job["steps"][0]["uses"],
+            "env": {
+                "T": "${{ steps.poster.outputs.t }}",
+                "BODY": "${{ github.event.pull_request.body }}",
+            },
+            "with": {"script": "core.info('x')"},
+        }
+    )
+
+
+def _duplicate_post_step_name(doc):
+    """A second step wearing the post step name gets its slots blessed."""
+    job = _first_job(doc)
+    twin = copy.deepcopy(job["steps"][-1])
+    twin["with"] = dict(twin["with"])
+    twin["with"]["script"] = "core.info(process.env.BODY)"
+    twin["env"] = dict(twin["env"])
+    twin["env"]["BODY"] = "${{ github.event.pull_request.body }}"
+    job["steps"].insert(0, twin)
+
+
+def _neuter_the_guard_with_always_or(doc):
+    """Contains the gating token, short-circuits past it, gates nothing."""
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["if"] = "always() || steps.eligible.outputs.pr != ''"
 
 
 def _repoint_the_guarded_secret(doc):
@@ -389,9 +649,7 @@ def _job_level_container(doc):
 
 def _split_post_into_another_job(doc):
     post = [s for s in _first_job(doc)["steps"] if s.get("name") == _POST_STEP]
-    _first_job(doc)["steps"] = [
-        s for s in _first_job(doc)["steps"] if s.get("name") != _POST_STEP
-    ]
+    _first_job(doc)["steps"] = [s for s in _first_job(doc)["steps"] if s.get("name") != _POST_STEP]
     doc["jobs"]["poster"] = {"runs-on": "ubuntu-latest", "steps": post}
 
 
@@ -420,15 +678,48 @@ def _drop_the_post_step(doc):
         (_job_level_permission_override, "default-token-write-scope:job:"),
         (_interpolate_into_script, "interpolation-in-script:"),
         (_post_as_bot, "post-step-uses-default-token"),
-        (_token_not_from_secrets, "post-step-token-not-from-secrets"),
-        (_token_is_the_default_token, "post-step-token-is-the-default-token"),
-        (_drop_the_eligibility_guard, "post-step-not-guarded-by-eligibility"),
-        (_neuter_the_guard_with_always, "post-step-not-guarded-by-eligibility"),
+        (_token_not_from_secrets, "post-step-token-is-not-the-permitted-expression"),
+        (_token_is_the_default_token, "post-step-token-is-not-the-permitted-expression"),
+        (_drop_the_eligibility_guard, "post-step-guard-is-not-the-permitted-expression"),
+        (
+            _neuter_the_guard_with_always,
+            "post-step-guard-is-not-the-permitted-expression",
+        ),
+        (
+            _neuter_the_guard_with_always_or,
+            "post-step-guard-is-not-the-permitted-expression",
+        ),
         (_widen_default_token, "default-token-write-scope:workflow:"),
         (_arm_the_eligibility_step, "non-post-step-holds-a-token:"),
         (_drop_the_post_step, "post-step-missing"),
-        (_put_the_secret_in_the_eligibility_env, "non-post-step-holds-a-secret-in-env:"),
-        (_repoint_the_guarded_secret, "post-step-env-does-not-carry-the-expected-secret"),
+        (_put_the_secret_in_the_eligibility_env, "secret-outside-the-post-step:"),
+        (_workflow_level_env_secret, "secret-outside-the-post-step:env."),
+        (_job_level_env_secret, "secret-outside-the-post-step:jobs."),
+        (_secret_in_another_action_input, "secret-outside-the-post-step:"),
+        (
+            _token_prefers_another_secret,
+            "post-step-token-is-not-the-permitted-expression",
+        ),
+        (
+            _token_prefers_a_bracket_secret,
+            "post-step-token-is-not-the-permitted-expression",
+        ),
+        (
+            _repoint_the_guarded_secret,
+            "post-step-maintainer-env-is-not-the-permitted-expression",
+        ),
+        (
+            _maintainer_env_falls_back_to_the_default_token,
+            "post-step-maintainer-env-is-not-the-permitted-expression",
+        ),
+        (_bracket_secret_on_the_eligibility_step, "secret-outside-the-post-step:"),
+        (_bracket_secret_in_workflow_env, "secret-outside-the-post-step:env."),
+        (_bracket_secret_by_computed_name, "secret-outside-the-post-step:"),
+        (_extra_secret_beside_the_permitted_one, "secret-outside-the-post-step:"),
+        (_shared_with_mapping_via_anchor, "secret-outside-the-post-step:"),
+        (_duplicate_post_step_name, "post-step-is-not-unique:"),
+        (_launder_the_token_through_a_step_output, "unexpected-step-id:"),
+        (_launder_the_token_through_a_step_output, "post-step-is-not-the-last-step:"),
         (_reusable_workflow_job, "job-calls-a-reusable-workflow:"),
         (_reusable_workflow_job, "job-forwards-secrets:"),
         (_reusable_workflow_job, "job-without-steps:"),
