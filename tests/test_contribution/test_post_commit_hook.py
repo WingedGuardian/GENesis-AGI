@@ -93,6 +93,19 @@ def test_fix_local_opt_out_no_marker(fix_repo):
     assert not pending.exists() or not list(pending.glob("*.json"))
 
 
+def test_user_overlay_disables_offer(fix_repo):
+    """settings_update writes ~/.genesis/config/contribution.local.yaml; the
+    hook must honour it, not just the repo-local sibling."""
+    repo, home, git = fix_repo["repo"], fix_repo["home"], fix_repo["git"]
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "contribution.local.yaml").write_text("offer_enabled: false\n")
+    (repo / "a").write_text("x\n")
+    git("add", "a")
+    git("commit", "-m", "fix: should be suppressed")
+    pending = home / "pending-offers"
+    assert not pending.exists() or not list(pending.glob("*.json"))
+
+
 def test_subject_with_quotes_produces_valid_json(fix_repo):
     """Regression: subjects containing double-quotes must round-trip."""
     repo, home, git = fix_repo["repo"], fix_repo["home"], fix_repo["git"]

@@ -1,4 +1,4 @@
-"""Load the spans config (``config/observability.yaml``) — defensive defaults.
+"""Load the spans config (``config/observability.yaml`` + ``.local.yaml`` overlay) — defensive defaults.
 
 Single source for both the bootstrap (which passes ``enabled`` to
 ``spans.set_writer``) and the prune job (which reads ``retention_days``). Any
@@ -28,9 +28,12 @@ def load_spans_config() -> tuple[bool, int]:
     try:
         import yaml
 
+        from genesis._config_overlay import merge_local_overlay
+
         path = _config_path()
         if path.exists():
             data = yaml.safe_load(path.read_text()) or {}
+            data = merge_local_overlay(data, path)
             spans = data.get("spans") or {}
             enabled = bool(spans.get("enabled", _DEFAULT_ENABLED))
             retention = int(spans.get("retention_days", _DEFAULT_RETENTION_DAYS))

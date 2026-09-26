@@ -84,16 +84,20 @@ if [[ -n "$_REPO_ROOT" ]]; then
     fi
     _CONTRIB_CFG_DIR="$_MAIN_ROOT/config"
     _CONTRIB_DISABLED=""
+    # Overlay resolution mirrors _config_overlay._resolve_overlay_path: the user
+    # overlay (where settings_update writes) wins, else the repo sibling.
+    _CONTRIB_LOCAL="$GENESIS_HOME/config/contribution.local.yaml"
+    [[ -f "$_CONTRIB_LOCAL" ]] || _CONTRIB_LOCAL="$_CONTRIB_CFG_DIR/contribution.local.yaml"
     # Local override takes precedence (if the key is present in it)
-    if [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
-       && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; then
+    if [[ -f "$_CONTRIB_LOCAL" ]] \
+       && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_LOCAL" 2>/dev/null; then
         _CONTRIB_DISABLED="local"
     # Fall through to base config (also checked when local exists but lacks the key)
     elif [[ -f "$_CONTRIB_CFG_DIR/contribution.yaml" ]] \
          && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.yaml" 2>/dev/null; then
         # Only use base if local doesn't explicitly set offer_enabled to true
-        if ! { [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
-               && grep -qiE '^\s*offer_enabled:\s*(true|yes|on)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; }; then
+        if ! { [[ -f "$_CONTRIB_LOCAL" ]] \
+               && grep -qiE '^\s*offer_enabled:\s*(true|yes|on)\s*(#.*)?$' "$_CONTRIB_LOCAL" 2>/dev/null; }; then
             _CONTRIB_DISABLED="base"
         fi
     fi

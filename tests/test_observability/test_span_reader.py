@@ -137,6 +137,21 @@ class TestSpanConfig:
         monkeypatch.setattr(span_config, "_config_path", lambda: bad)
         assert span_config.load_spans_config() == (True, 14)
 
+    def test_user_overlay_wins(self, tmp_path, monkeypatch) -> None:
+        from genesis import _config_overlay
+        from genesis.observability import span_config
+
+        base = tmp_path / "observability.yaml"
+        base.write_text("spans: {enabled: true, retention_days: 14}\n")
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        (user_dir / "observability.local.yaml").write_text(
+            "spans: {enabled: false, retention_days: 3}\n"
+        )
+        monkeypatch.setattr(span_config, "_config_path", lambda: base)
+        monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: user_dir)
+        assert span_config.load_spans_config() == (False, 3)
+
 
 class TestSettingsDomain:
 
