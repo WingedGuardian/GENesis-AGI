@@ -9783,74 +9783,6 @@ def _pr_create_head_raw(argv: list[str]) -> str | None:
     return result
 
 
-def _gh_last_flag_value(argv: list[str], *names: str) -> str | None:
-    """The LAST value of any of ``names`` in ``argv``, or None if none is given.
-
-    Last-wins mirrors gh's pflag semantics for a repeated string flag, the same
-    rule ``_pr_create_head_raw`` documents — an earlier value must never answer
-    for a later one. ``--flag=value`` and ``--flag value`` both handled; None
-    means the flag is absent, which is distinct from an empty value.
-    """
-    result: str | None = None
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok in names and i + 1 < len(argv):
-            result = argv[i + 1]
-        else:
-            for name in names:
-                if tok.startswith(f"{name}="):
-                    result = tok.split("=", 1)[1]
-                    break
-        i += 1
-    return result
-
-
-def _pr_create_covers_branch(seg, cur: str | None, cwd: str | None = None) -> bool:
-    """Whether this ``gh pr create`` would open a PR that actually COVERS ``cur``.
-
-    The no-open-PR block exempts a command that also creates the PR it demands.
-    That exemption has to be bound to the SAME question the count asks — an open
-    PR from THIS repo's ``cur`` into THIS repo's default base — or it answers with
-    a PR that provides no coverage at all. MEASURED as reported (Devin severe):
-    ``git push && gh pr create --head feat/y --base main`` pushes ``feat/x`` while
-    the PR it opens runs CI for ``feat/y``.
-
-    ALLOWLIST posture, and the reason the unverifiable cases return False rather
-    than True: this predicate's False costs a prompt-free command an extra step,
-    while its True lets an unchecked branch onto the public repo. Every clause
-    must be POSITIVELY established:
-
-      * ``--repo`` absent. A create aimed at another repository cannot cover a
-        branch here, and confirming that it is in fact this repository would cost
-        a round-trip on the push path for a case nobody runs.
-      * ``--head`` absent (gh uses the current branch, which is ``cur``), or a
-        head naming ``cur`` exactly — with an ``owner:`` prefix stripped, since
-        ``owner:feat/x`` is still ``feat/x``. A shell-expandable value (``$VAR``,
-        ``$(…)``, backtick) needs no clause of its own: it cannot equal ``cur``
-        literally, so the exact match already refuses it. An earlier draft
-        screened for those metacharacters separately; a mutation sweep showed
-        the clause was unreachable, and an unreachable guard is worse than none —
-        it reads as protection and cannot be tested.
-      * ``--base`` absent (gh uses the repo's default branch, which is what the
-        count requires), or a base equal to the resolved default. Only this last
-        clause can cost a lookup, and only when ``--base`` was actually written —
-        so the ordinary ``gh pr create --title … --body …`` pays nothing.
-    """
-    argv = getattr(seg, "argv", None) or []
-    if _push_repo_flag(argv):
-        return False
-    head = _pr_create_head_raw(argv)
-    if head is not None and (not cur or head.split(":", 1)[-1] != cur):
-        return False
-    base = _gh_last_flag_value(argv, "--base", "-B")
-    if base is not None:
-        identity = _base_repo_identity(cwd=cwd)
-        if identity is None or base != identity[0]:
-            return False
-    return True
-
-
 def _pr_create_would_publish(argv: list[str]) -> bool:
     """Whether a ``gh pr create`` might PUSH/fork its branch (bypassing the push gate).
 
@@ -10413,29 +10345,27 @@ def _run_merge_and_push_gates() -> int:
                     closes_pr = any(
                         gh_pr_subcommand(s.argv) == "close" for s in segs
                     )
-                    # A `gh pr create` ANYWHERE in the same command supplies the
-                    # very PR this block demands, so the block must not fire.
-                    # Order does not rescue it either way and that is the point:
-                    # `create && push` runs the create first, and `push && create`
-                    # is the sequence this repo's own workflow prescribes — the
-                    # count is taken BEFORE any of the command executes, so it
-                    # reads 0 in both. Blocking would make the prescribed
-                    # workflow impossible while claiming to enforce it. (Codex P2,
-                    # reported against the `--head` form specifically; the cause
-                    # is not `--head`, it is that a pre-execution count cannot see
-                    # a create that has not happened yet — the same blindness the
-                    # `closes_pr` clause exists for, in the opposite direction.)
-                    # ...but only a create that would actually COVER this branch.
-                    # `bool(create_segs)` was the first cut and it was too wide:
-                    # `git push && gh pr create --head feat/y` exempted the push
-                    # of feat/x on the strength of a PR that runs CI for feat/y
-                    # (Devin severe, round 2). The exemption has to answer the
-                    # SAME question the count asks — an open PR from this repo's
-                    # `cur` into this repo's default base — and anything it cannot
-                    # positively establish is not coverage.
-                    creates_pr = any(
-                        _pr_create_covers_branch(s, cur, cwd=pcwd) for s in create_segs
-                    )
+                    # NO `gh pr create` EXEMPTION, deliberately, and this is the
+                    # second design it has had. A create in the same command does
+                    # supply the PR this block demands — that premise is true —
+                    # but WHETHER it will is not decidable from argv, and two
+                    # rounds of narrowing proved it: `bool(create_segs)` exempted
+                    # a create for a DIFFERENT branch, and binding it to head,
+                    # base and repo then drew four more findings (a glued flag, a
+                    # `--dry-run` that creates nothing, a create that FAILS and
+                    # leaves the `&&` push to run anyway, and a configured merge
+                    # base). Each fix created the surface for the next, which is
+                    # the signature of a space with no enumerable edge rather than
+                    # a defect being closed.
+                    #
+                    # So the compound blocks, and the cost of that is close to
+                    # nothing: a FIRST push is not a republish, so the ordinary
+                    # push-then-create flow never reaches this arm at all. What
+                    # blocks is re-pushing an already-published PR-less branch in
+                    # the same breath as creating its PR — and the remedy is the
+                    # two adjacent commands this repo's publish rule already asks
+                    # for, which is also the only form where each gets judged on
+                    # the state it actually runs in.
                     # ONE condition, not a chain. The two states that reach this
                     # block are the same state — "after this command runs, a
                     # public branch is on the remote with no open PR" — and
@@ -10459,7 +10389,6 @@ def _run_merge_and_push_gates() -> int:
                     if (
                         push_allow_reason
                         and not _push_is_dry_run(push_segs[0])
-                        and not creates_pr
                         and (
                             closes_pr
                             or _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0

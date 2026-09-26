@@ -270,95 +270,6 @@ def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys, command="gi
     return rc, out.out, out.err
 
 
-# ─── _pr_create_covers_branch: the exemption is bound to the count's question ──
-
-
-class _Seg:
-    def __init__(self, argv: list[str]) -> None:
-        self.argv = argv
-
-
-def _create(*args: str) -> _Seg:
-    return _Seg(["gh", "pr", "create", *args])
-
-
-@pytest.mark.parametrize(
-    ("seg", "covers", "why"),
-    [
-        (_create("--title", "t", "--body", "b"), True, "no --head: gh uses the current branch"),
-        (_create("--head", "feat/x"), True, "names this branch"),
-        (_create("--head", "owner:feat/x"), True, "an owner: prefix is still this branch"),
-        (_create("--head", "feat/x", "--base", "main"), True, "base IS the default"),
-        (_create("--head", "feat/y"), False, "a DIFFERENT branch — the reported defect"),
-        (_create("--head", ""), False, "empty head is not an established one"),
-        # A shell-expandable head needs no clause of its own: it cannot equal
-        # `cur` literally, so the exact match already refuses it. Kept as rows
-        # because the BEHAVIOUR matters even though the mechanism is the general
-        # one — a later change to exact-matching would break these first.
-        (_create("--head", "$BRANCH"), False, "resolves after this hook has decided"),
-        (_create("--head", "$(git branch --show-current)"), False, "same"),
-        # --base is read by the shared last-wins reader, so it gets the same
-        # repeated-flag rows --head has. Without these, a first-wins mutation of
-        # that reader survives the whole file.
-        (_create("--base", "develop", "--base", "main"), True, "gh takes the LAST base"),
-        (_create("--base", "main", "--base", "develop"), False, "same rule, other order"),
-        (_create("--base=main",), True, "--flag=value form"),
-        (_create("--base=develop",), False, "--flag=value form, wrong base"),
-        (_create("--head", "feat/x", "--base", "develop"), False, "a feature base runs no CI"),
-        (_create("--head", "feat/x", "--repo", "owner/other"), False, "another repository"),
-        (_create("--head", "feat/y", "--head", "feat/x"), True, "gh takes the LAST value"),
-        (_create("--head", "feat/x", "--head", "feat/y"), False, "same rule, other order"),
-    ],
-)
-def test_only_a_create_that_covers_this_branch_exempts(
-    monkeypatch, seg, covers: bool, why: str
-) -> None:
-    """The exemption must answer the SAME question `_open_pr_count_for_branch`
-    asks — an open PR from THIS repo's `cur` into THIS repo's default base.
-
-    `bool(create_segs)` was the first cut and it was too wide: `git push && gh pr
-    create --head feat/y` exempted the push of feat/x on the strength of a PR
-    that runs CI for feat/y. Allowlist posture — anything not positively
-    established is not coverage, because a False here costs one extra step while
-    a True puts an unchecked branch on the public repo."""
-    monkeypatch.setattr(gpg, "_base_repo_identity", lambda cwd=None: ("main", "owner", "u"))
-    assert gpg._pr_create_covers_branch(seg, "feat/x") is covers, why
-
-
-@pytest.mark.parametrize("cur", [None, ""])
-@pytest.mark.parametrize("head", ["feat/x", ""])
-def test_a_create_cannot_cover_an_unknown_current_branch(monkeypatch, cur, head: str) -> None:
-    """Detached HEAD: there is no `cur` for an explicit head to match.
-
-    The `head=""` rows are the ones that make the `not cur` clause load-bearing,
-    and they exist because a mutation removing it SURVIVED a version of this test
-    that only passed `cur=None` with a real head — `"feat/x" != None` refuses on
-    the comparison alone, so the clause was never reached. The discriminating
-    pair is a falsy `cur` against a falsy head, where the comparison is EQUAL and
-    only `not cur` stands between that and a false claim of coverage."""
-    monkeypatch.setattr(gpg, "_base_repo_identity", lambda cwd=None: ("main", "owner", "u"))
-    assert gpg._pr_create_covers_branch(_create("--head", head), cur) is False
-
-
-def test_an_unresolvable_default_base_does_not_exempt(monkeypatch) -> None:
-    """`--base` was written, so it has to be checked; `gh` cannot answer, so the
-    create is not established as coverage. Costs a step, never a silent push."""
-    monkeypatch.setattr(gpg, "_base_repo_identity", lambda cwd=None: None)
-    assert gpg._pr_create_covers_branch(_create("--base", "main"), "feat/x") is False
-
-
-def test_the_base_lookup_is_skipped_when_no_base_flag_is_given(monkeypatch) -> None:
-    """The ordinary form pays no round-trip: the aggregate of these probes, not
-    any one of them, is what overruns the hook's registration."""
-    calls = []
-    monkeypatch.setattr(
-        gpg, "_base_repo_identity",
-        lambda cwd=None: (calls.append(1), ("main", "owner", "u"))[1],
-    )
-    assert gpg._pr_create_covers_branch(_create("--title", "t"), "feat/x") is True
-    assert not calls, "a create with no --base must not trigger a repo lookup"
-
-
 # ─── _no_pr_block_applies: the block is scoped, and fails toward NOT blocking ──
 
 
@@ -593,54 +504,32 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
     [
         "gh pr create --head feat/x --title t --body b && git push",
         "git push && gh pr create --title t --body b",
+        "git push && gh pr create --dry-run --title t --body b",
+        "git push && gh pr create --head=feat/x --title t --body b",
     ],
 )
-def test_a_pr_create_in_the_same_command_is_not_blocked(
+def test_a_same_command_pr_create_does_NOT_exempt(
     monkeypatch, tmp_path, capsys, on_the_public_repo, command: str
 ) -> None:
-    """`gh pr create` in the command supplies the very PR the block demands.
+    """There is no create exemption, and these rows are why.
 
-    The count is taken BEFORE any segment executes, so it reads 0 whichever
-    order the two appear in — and `git push && gh pr create` is the sequence
-    this repo's own workflow prescribes. Blocking it would make the prescribed
-    workflow impossible while claiming to enforce it. (Codex P2, reported
-    against the `--head` form; the cause is the pre-execution count, not the
-    flag.)"""
-    fake = FakeRun()
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
-    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
-    monkeypatch.setattr(gpg, "push_allowlist", None)
-    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
-    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+    A create in the same command does supply the PR the block demands — that
+    premise is true — but WHETHER it will is not decidable from argv. Two rounds
+    of narrowing proved it: `bool(create_segs)` exempted a create for a different
+    branch, and binding it to head/base/repo then drew four more findings — a
+    glued flag, a `--dry-run` that creates nothing, a create that FAILS and leaves
+    the `&&` push to run anyway, and a configured merge base. Each fix created the
+    surface for the next.
 
-    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys, command=command)
-    assert rc == 0, (command, rc, out, err)
-    assert "NO OPEN PR" not in err, (command, err)
+    So the compound blocks. The rows below include the exact spellings that defeated
+    the previous design, as the regression record: if someone reintroduces an
+    exemption, these are the cases it has to survive, and the simplest way to
+    survive them is not to have one.
 
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git push && gh pr create --head feat/other --title t --body b",
-        "gh pr create --head feat/other --base main --title t --body b && git push",
-        "git push && gh pr create --head feat/x --base develop --title t --body b",
-        "git push && gh pr create --repo owner/other --title t --body b",
-    ],
-)
-def test_a_create_that_does_not_cover_this_branch_still_blocks(
-    monkeypatch, tmp_path, capsys, on_the_public_repo, command: str
-) -> None:
-    """END-TO-END, and the reason this test exists rather than only the unit rows.
-
-    The first cut of the exemption was `bool(create_segs)` — any create at all.
-    A mutation putting that back SURVIVED the whole suite, because the blocking
-    test's command contains no create and the unit rows never reach `main()`. So
-    nothing tied the predicate to the decision, which is exactly the shape the
-    scoping arm was already given an end-to-end test for.
-
-    The branch under test is `feat/x` (see `_run_guard_on_push`), so each command
-    here creates a PR that cannot cover it: another head, a feature base, or
-    another repository."""
+    The cost is close to nothing, which the sibling test measures directly: a FIRST
+    push is not a republish, so the ordinary push-then-create flow never reaches
+    this arm.
+    """
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
@@ -651,6 +540,32 @@ def test_a_create_that_does_not_cover_this_branch_still_blocks(
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys, command=command)
     assert rc == 2, (command, rc, out, err)
     assert "NO OPEN PR" in err, (command, err)
+
+
+def test_the_ordinary_push_then_create_flow_is_UNAFFECTED(
+    monkeypatch, tmp_path, capsys, on_the_public_repo
+) -> None:
+    """The cost measurement for the test above, and the reason dropping the
+    exemption is cheap rather than a regression.
+
+    The arm only runs when `push_allow_reason` is set, i.e. the branch is already
+    on the remote. A FIRST push is not a republish, so the prescribed flow —
+    publish a new branch, then open its PR — never reaches the block at all,
+    whatever the create looks like.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git push -u origin HEAD && gh pr create --title t --body b",
+    )
+    assert rc != 2, (rc, out, err)
+    assert "NO OPEN PR" not in err, err
 
 
 def test_the_block_does_not_fire_off_the_public_repo_end_to_end(
