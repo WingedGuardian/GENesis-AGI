@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import sys
 
 #: Every ask this module can speak about. A key absent from this set is not a
@@ -112,14 +111,73 @@ def _from_seam(raw: str) -> dict[str, object]:
     return parsed
 
 
+def _has_merge_key(yaml, mapping) -> bool:
+    return any(
+        isinstance(k, yaml.ScalarNode) and k.tag == "tag:yaml.org,2002:merge"
+        for k, _ in mapping.value
+    )
+
+
+def _duplicates_on_the_policy_path(yaml, text: str) -> list[str]:
+    """Keys repeated along ``hooks`` -> ``asks`` -> a member of :data:`KEYS`.
+
+    ``yaml.safe_load`` silently keeps the LAST value of a repeated key, so a
+    badly-merged config that visibly says ``push_publish: on`` could turn the
+    prompt off. Refusing to guess is the point; WHERE to look is what the first
+    version got wrong. It scanned lines with a regex, which knows neither
+    quoting nor nesting, and failed in both directions:
+
+    * ``"push_publish": on`` then ``push_publish: off`` — the quoted spelling did
+      not match, one key was counted, the LAST value won, and the prompt was
+      switched OFF against an explicit ``on``. Fail-open.
+    * an ``asks:`` or ``push_publish:`` in an UNRELATED section counted as a
+      duplicate, so a valid ``off`` was discarded. Fail-closed, but wrong.
+
+    Walking the node graph fixes both: a key's identity is its PARSED scalar
+    value (so quoting cannot hide it), and only the mappings on this one path
+    are visited (so an unrelated section cannot be mistaken for it). A syntax
+    error raises, and the caller treats that as no policy.
+
+    A MERGE KEY (``<<``) anywhere on the path is refused outright. safe_load pulls
+    keys in from merges and resolves conflicts by rules a reader cannot see
+    (explicit beats merged in any order; the FIRST entry of a merge list wins), so
+    a merge can carry a hidden duplicate or override the value written last — each
+    MEASURED to switch the prompt off. Checked by TAG, not text: a quoted ``"<<"``
+    is an ordinary key to safe_load too.
+    """
+    node = yaml.compose(text, Loader=yaml.SafeLoader)
+    dupes: list[str] = []
+    for label in ("hooks", "asks"):
+        if not isinstance(node, yaml.MappingNode):
+            return dupes
+        if _has_merge_key(yaml, node):
+            return ["<< (merge key)"]
+        values = [
+            v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == label
+        ]
+        if len(values) > 1:
+            return [label]
+        if not values:
+            return dupes
+        node = values[0]
+    if isinstance(node, yaml.MappingNode):
+        if _has_merge_key(yaml, node):
+            return ["<< (merge key)"]
+        counts: dict[str, int] = {}
+        for k, _ in node.value:
+            if isinstance(k, yaml.ScalarNode) and k.value in KEYS:
+                counts[k.value] = counts.get(k.value, 0) + 1
+        dupes = sorted(k for k, n in counts.items() if n > 1)
+    return dupes
+
+
 def _declared() -> dict[str, object]:
     """The raw ``hooks.asks`` mapping this install declares, or ``{}``.
 
     Every failure returns ``{}`` (= every ask enabled), which is the safe
-    direction. The duplicate-key line scan mirrors the sibling readers in
-    ``git_push_guard``: ``yaml.safe_load`` silently keeps the LAST value for a
-    repeated key, so a badly-merged config could flip a policy with no sign of
-    it. Realistic spellings are line-scanned and refused rather than parsed.
+    direction. A key repeated on the policy path is refused rather than resolved
+    — see :func:`_duplicates_on_the_policy_path` for why that is a node-graph
+    walk and not a line scan.
     """
     raw = os.environ.get(_SEAM)
     if raw is not None:
@@ -129,21 +187,7 @@ def _declared() -> dict[str, object]:
 
         with open(os.path.expanduser(_CONFIG_PATH)) as fh:
             text = fh.read()
-        # Section headers AND leaf keys. Checking only the two headers was the
-        # first cut and it missed the likelier merge accident by far: two
-        # `push_publish:` lines inside ONE `asks:` block. yaml.safe_load keeps
-        # the last silently, so a config that visibly declares the prompt ON
-        # could turn it off — the exact inversion this whole check exists to
-        # refuse, reached by the shape an operator is most likely to produce.
-        dupes = [
-            name
-            for name, pattern in (
-                ("hooks", r"(?m)^hooks\s*:"),
-                ("asks", r"(?m)^\s*asks\s*:"),
-                *((k, rf"(?m)^\s*{re.escape(k)}\s*:") for k in sorted(KEYS)),
-            )
-            if len(re.findall(pattern, text)) > 1
-        ]
+        dupes = _duplicates_on_the_policy_path(yaml, text)
         if dupes:
             _note(
                 f"hooks.asks in {_CONFIG_PATH} declares {', '.join(dupes)} more than "

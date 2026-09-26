@@ -160,6 +160,68 @@ def test_a_duplicate_LEAF_key_refuses_to_guess(config_file, capsys, key: str) ->
     assert key in err, "the NOTE must name which key was discarded"
 
 
+@pytest.mark.parametrize("key", ["push_publish", "secrets_env"])
+def test_a_QUOTED_duplicate_is_still_a_duplicate(config_file, capsys, key: str) -> None:
+    """Devin, the fail-OPEN direction. The first version scanned lines with a
+    regex that did not recognise a quoted key, so it counted ONE `{key}`; YAML
+    kept the last value, and a config reading `on` first turned the prompt OFF.
+    A key's identity is its parsed value, so quoting cannot hide it."""
+    config_file.write_text(f'hooks:\n  asks:\n    "{key}": on\n    {key}: off\n')
+    assert policy.ask_suppressed(key) is False
+    assert key in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hooks:\n  asks:\n    <<: {push_publish: on, push_publish: off}\n",
+        "hooks:\n  asks:\n    push_publish: off\n    <<: {push_publish: on}\n",
+        "hooks:\n  asks:\n    <<: [{push_publish: off}, {push_publish: on}]\n",
+        "hooks:\n  <<: {asks: {push_publish: off}}\n",
+    ],
+)
+def test_a_MERGE_KEY_on_the_path_is_refused(config_file, capsys, text: str) -> None:
+    """Each of these was MEASURED to switch the prompt off: a merge hides a
+    duplicate, or safe_load's merge precedence overrides the value written last.
+    The reader cannot see those rules, so it refuses to guess."""
+    config_file.write_text(text)
+    assert policy.ask_suppressed("push_publish") is False
+    assert "merge" in capsys.readouterr().err
+
+
+def test_duplicate_SECTIONS_in_the_dangerous_order_are_refused(config_file) -> None:
+    """The existing section tests declare off-then-on, so they pass even with no
+    detection at all (the last value already keeps the prompt on). This is the
+    order that matters: on first, off last."""
+    config_file.write_text(
+        "hooks:\n  asks:\n    push_publish: on\nhooks:\n  asks:\n    push_publish: off\n"
+    )
+    assert policy.ask_suppressed("push_publish") is False
+
+
+@pytest.mark.parametrize(
+    "unrelated",
+    [
+        "merge_gate:\n  asks:\n    something: 1\n",
+        "other:\n  push_publish: on\n",
+        "other:\n  nested:\n    secrets_env: on\n",
+    ],
+)
+def test_a_same_named_key_in_an_UNRELATED_section_is_not_a_duplicate(
+    config_file, capsys, unrelated: str
+) -> None:
+    """Devin, the fail-closed direction. The line scan ignored nesting, so an
+    `asks:` or `push_publish:` anywhere else in the file counted as a second
+    declaration and the install's valid `off` was discarded. Only the mappings on
+    hooks -> asks are visited now."""
+    config_file.write_text(
+        unrelated + "hooks:\n  asks:\n    push_publish: off\n    secrets_env: off\n"
+    )
+    assert policy.ask_suppressed("push_publish") is True
+    assert policy.ask_suppressed("secrets_env") is True
+    assert "duplicate" not in capsys.readouterr().err
+
+
 def test_a_non_mapping_asks_section_keeps_the_ask(config_file) -> None:
     config_file.write_text("hooks:\n  asks: off\n")
     assert policy.ask_suppressed("push_publish") is False
