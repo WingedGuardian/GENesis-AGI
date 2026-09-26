@@ -504,13 +504,38 @@ clean_cc_orange() {
     local -a live_excl=()
     zone_a_live_exclusions live_excl "$(live_open_paths)" "$CC_TMP_DIR"
 
-    # Delete claude-skills cache (~35MB, CC re-clones on demand)
-    find "$CC_TMP_DIR" -type d -name "claude-skills" \
-        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
-
-    # Delete tsx cache (~1.2MB, rebuilt automatically)
-    find "$CC_TMP_DIR" -type d -name "tsx-*" \
-        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
+    # Delete the two rebuildable caches (claude-skills ~35MB, CC re-clones on
+    # demand; tsx-* ~1.2MB, rebuilt automatically) — routed through
+    # reap_dir_sparing_sockets rather than `rm -rf`, for the SAME reason RED's
+    # cache sweep already is. The argument is the paragraph directly above this
+    # one, which this tier made about the live-writer exclusions and never
+    # applied to sockets: guarding only RED leaves the incident class open on
+    # the tier that actually runs.
+    #
+    # It was open. REPRODUCED against the `rm -rf` form on the default branch:
+    # a live socket placed inside claude-skills was DESTROYED by this tier.
+    # That is the 2026-09-05 severance shape — sessions left listening on
+    # bound-but-unlinked sockets while inbound connects fail ENOENT — fixed at
+    # RED (90%) and left standing at ORANGE (75%), which is the tier that fires
+    # first and far more often. `rm -rf` has no socket predicate; the primitive
+    # does, and it costs nothing here: sockets are 0 bytes, so sparing them
+    # reclaims exactly as much as deleting them.
+    # NUL-delimited, and that is load-bearing rather than tidy. `find` prints
+    # newline-terminated records, so a directory whose NAME contains a newline
+    # splits into two: the head (not a directory, skipped by the guard below)
+    # and a TAIL that is a RELATIVE path — resolved against the daemon's cwd,
+    # which is the invoking user's home, NOT cc-tmp. MEASURED: a cache named
+    # "tsx-a<LF>b" yields 2 records from -print, the second a bare "b" that a
+    # reap would follow out of the tree entirely; -print0 yields the 1 correct
+    # record. (The NUL caveat recorded for live_open_paths concerns COMMAND
+    # substitution, which drops NUL bytes. This is PROCESS substitution into
+    # `read -d ''`, where they pass through — measured, opposite conclusion.)
+    local cache_dir
+    while IFS= read -r -d '' cache_dir; do
+        [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
+        reap_dir_sparing_sockets "$cache_dir"
+    done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
+        ${live_excl[@]+"${live_excl[@]}"} -print0 2>/dev/null) || true
 
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
@@ -711,8 +736,18 @@ clean_cc_red() {
     # separate sweep below. `|| true` matches the file's find idiom: a
     # transient find error must not abort the daemon mid-RED under
     # set -euo pipefail.
+    # NUL-delimited, and that is load-bearing rather than tidy. `find` prints
+    # newline-terminated records, so a directory whose NAME contains a newline
+    # splits into two: the head (not a directory, skipped by the guard below)
+    # and a TAIL that is a RELATIVE path — resolved against the daemon's cwd,
+    # which is the invoking user's home, NOT cc-tmp. MEASURED: a cache named
+    # "tsx-a<LF>b" yields 2 records from -print, the second a bare "b" that a
+    # reap would follow out of the tree entirely; -print0 yields the 1 correct
+    # record. (The NUL caveat recorded for live_open_paths concerns COMMAND
+    # substitution, which drops NUL bytes. This is PROCESS substitution into
+    # `read -d ''`, where they pass through — measured, opposite conclusion.)
     local dir
-    while IFS= read -r dir; do
+    while IFS= read -r -d '' dir; do
         # Skip if this contains the active session. Deliberately NOT added to
         # any exclusion list: this spares for a DIFFERENT reason than the
         # live-writer branch, and the loose sweep below already carries its own
@@ -733,7 +768,7 @@ clean_cc_red() {
             continue
         fi
         reap_dir_sparing_sockets "$dir"
-    done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null) || true
+    done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null) || true
 
     # The active session's own subtree, spared by both sweeps below — but ONLY
     # when newest_session actually resolved. Spelled unconditionally, an empty
@@ -784,14 +819,24 @@ clean_cc_red() {
     # Sockets are 0 bytes, so keeping them costs no reclaimed space; their
     # ancestor directories stay non-empty and survive with them, which is the
     # same outcome the depth-1 reap already produces.
+    # NUL-delimited, and that is load-bearing rather than tidy. `find` prints
+    # newline-terminated records, so a directory whose NAME contains a newline
+    # splits into two: the head (not a directory, skipped by the guard below)
+    # and a TAIL that is a RELATIVE path — resolved against the daemon's cwd,
+    # which is the invoking user's home, NOT cc-tmp. MEASURED: a cache named
+    # "tsx-a<LF>b" yields 2 records from -print, the second a bare "b" that a
+    # reap would follow out of the tree entirely; -print0 yields the 1 correct
+    # record. (The NUL caveat recorded for live_open_paths concerns COMMAND
+    # substitution, which drops NUL bytes. This is PROCESS substitution into
+    # `read -d ''`, where they pass through — measured, opposite conclusion.)
     local cache_dir
-    while IFS= read -r cache_dir; do
+    while IFS= read -r -d '' cache_dir; do
         [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
         reap_dir_sparing_sockets "$cache_dir"
     done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         ${live_excl[@]+"${live_excl[@]}"} \
         ${session_excl[@]+"${session_excl[@]}"} \
-        2>/dev/null) || true
+        -print0 2>/dev/null) || true
 
     # Report the surviving control plane — counted AFTER every sweep above,
     # so the line is true by construction whatever any sweep did. Sockets
