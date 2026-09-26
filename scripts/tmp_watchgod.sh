@@ -945,22 +945,152 @@ clean_sys_red() {
     log WARN "Zone B RED — aggressive cleanup complete"
 }
 
+sys_unreclaimable_mb() {
+    # Echo "<mb> <uids> <unreadable>" for the depth-1 entries under $1 that this
+    # daemon cannot reclaim by OWNERSHIP:
+    #   mb         — megabytes it could measure (exact: one du over the whole set)
+    #   uids       — the owning uids, comma-separated, or "none"
+    #   unreadable — how many of those trees du could not descend into
+    #
+    # /tmp is mode 1777 — sticky. On a sticky directory only the entry's owner
+    # (or the directory's owner, here root) may unlink it, so a sweep running as
+    # us cannot remove another uid's files no matter how often it runs. Every
+    # Zone B sweep ends `-delete 2>/dev/null || true`, which makes EPERM
+    # indistinguishable from "nothing matched" — the failure is not merely
+    # unfixed, it is invisible.
+    #
+    # `unreadable` is reported SEPARATELY from `mb`, and that is the whole point
+    # of the third field. A foreign tree at mode 700 is the commonest shape here
+    # (13 of 134 depth-1 entries on one measured install) and du returns 0 for
+    # it: it can stat the entry and not descend. Collapsing "0 megabytes" into
+    # "no foreign owner" would make the report state the OPPOSITE of what it
+    # found — an attribution that is wrong sends the reader to the wrong place,
+    # which is worse than none.
+    #
+    # Entries the sweeps spare BY POLICY are skipped, because naming them would
+    # also misattribute: a tmux/pytest/claude tree survives the sweep for a
+    # reason that has nothing to do with who owns it, and "give that writer a
+    # different TMPDIR" is not the fix for it.
+    local root="${1:-/tmp}" me u d rc=0 mb=0 uids="" unreadable=0
+    local -a foreign=()
+    me="$(id -u 2>/dev/null || echo 0)"
+    while IFS= read -r -d '' d; do
+        case "${d##*/}" in
+            tmux-*|pytest-*|claude-*) continue ;;   # spared by policy, not ownership
+        esac
+        u="$(stat -c %u "$d" 2>/dev/null)" || continue
+        [[ "$u" == "$me" ]] && continue
+        foreign+=( "$d" )
+        case ",$uids," in *",$u,"*) ;; *) uids="${uids:+$uids,}$u" ;; esac
+        # Can we actually descend? An unreadable tree holds an unknown amount.
+        if ! du -sm "$d" >/dev/null 2>&1; then
+            unreadable=$(( unreadable + 1 ))
+        fi
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+    # ONE du over the whole set rather than one per entry: -sm rounds EACH
+    # invocation up to a megabyte, so per-entry summing inflates the figure with
+    # the count of small entries (MEASURED: 291MB vs 262MB actual across 134
+    # entries, 11% over). It is also one fork instead of N, on a poll path.
+    if (( ${#foreign[@]} > 0 )); then
+        local total
+        total="$(printf '%s\0' "${foreign[@]}" | du -sm --files0-from=- -c 2>/dev/null | tail -1 | cut -f1)" || rc=1
+        [[ "$total" =~ ^[0-9]+$ ]] && mb="$total"
+    fi
+    printf '%s %s %s' "$mb" "${uids:-none}" "$unreadable"
+}
+
+sys_report_futility() {
+    # Report-only, mirroring Zone A's stuck-tier record: no escalation, no
+    # behaviour change, no page. It exists because a sweep that reclaims
+    # nothing currently looks exactly like a sweep that had nothing to do.
+    # MEASURED on a live install: 1,251 consecutive ORANGE passes over four
+    # days, each reclaiming 0 bytes, because 87% of the used space belonged to
+    # another uid. Nothing in the log said so.
+    local tier="$1" pct_before="$2" threshold="$3" root="${4:-/tmp}"
+    local pct_after
+    pct_after=$(tmp_usage_pct)
+
+    # The dedupe flag is TIER-SCOPED. A single flag would let an ORANGE record
+    # suppress the RED one that follows it as usage climbs — the clear
+    # conditions never fire while things are getting worse, so the SEVERE tier
+    # is the one that goes unrecorded. Zone A documents this exact failure for
+    # its own flag; reproducing it here would be committing a mistake the file
+    # already warns about.
+    local flag="$ALERT_DIR/sys_tmp_stuck.$tier"
+
+    # Progress, or back under the line: clear every tier's dedupe so the NEXT
+    # episode is recorded rather than suppressed by a stale flag.
+    if (( pct_after < pct_before )) || (( pct_after <= threshold )); then
+        rm -f "$ALERT_DIR"/sys_tmp_stuck.* 2>/dev/null || true
+        return 0
+    fi
+
+    mkdir -p "$ALERT_DIR" 2>/dev/null || true
+    [[ -f "$flag" ]] && return 0
+
+    local summary blocked_mb blocked_uids unreadable qualifier
+    summary="$(sys_unreclaimable_mb "$root")"
+    blocked_mb="${summary%% *}"
+    unreadable="${summary##* }"
+    blocked_uids="${summary#* }"
+    blocked_uids="${blocked_uids%% *}"
+
+    if [[ "$blocked_uids" != "none" ]]; then
+        # Size and readability are SEPARATE facts. Saying "0MB" about a tree we
+        # were not allowed to measure is a false precision; saying nothing was
+        # found is a false negative.
+        if (( unreadable > 0 )) && (( blocked_mb == 0 )); then
+            qualifier="an unmeasurable amount (${unreadable} tree(s) this daemon cannot read)"
+        elif (( unreadable > 0 )); then
+            qualifier="at least ${blocked_mb}MB (${unreadable} further tree(s) unreadable)"
+        else
+            qualifier="${blocked_mb}MB"
+        fi
+        log WARN "sys-tmp STUCK ${tier^^} (${pct_after}% > ${threshold}%): the sweep reclaimed nothing, and ${qualifier} under ${root} is owned by uid(s) ${blocked_uids} — this daemon cannot unlink another uid's files in a sticky directory, so re-running will not help. Give that writer a TMPDIR off this filesystem, or reap it as its owner. Log-only."
+    else
+        log WARN "sys-tmp STUCK ${tier^^} (${pct_after}% > ${threshold}%): the sweep reclaimed nothing and no foreign-owned data explains it — the space is held by entries the tier's own exclusions spare (tmux/pytest/claude trees) or by files still in use. Log-only."
+    fi
+    touch "$flag" 2>/dev/null || true
+}
+
 check_sys_tmp() {
     local pct
     pct=$(tmp_usage_pct)
-    local tier="green"
+    local tier="green" threshold=0
 
     if (( pct > 85 )); then
         tier="red"
+        threshold=85
         clean_sys_red
     elif (( pct > 70 )); then
         tier="orange"
+        threshold=70
         clean_sys_orange
     elif (( pct > 50 )); then
         tier="yellow"
+        threshold=50
         clean_sys_yellow
     fi
 
+    # Re-measure AFTER the cleaner, and say so when it changed nothing. The
+    # tier above was chosen from the PRE-cleanup figure, so without this the
+    # daemon re-enters the same tier every poll with no record that its work is
+    # futile — the Zone A runaway, in Zone B.
+    # ORANGE and RED only. YELLOW (>50%) sweeps files untouched for 7+ days, so
+    # a /tmp holding live content above half has nothing for it to delete and
+    # reclaiming nothing there is the HEALTHY steady state — MEASURED: this
+    # install sits at 57% with no problem at all. Reporting futility on YELLOW
+    # would fire a warning on the first poll after deploy, and a check that
+    # cries wolf gets silenced.
+    if [[ "$tier" == "orange" || "$tier" == "red" ]]; then
+        sys_report_futility "$tier" "$pct" "$threshold"
+    elif [[ "$tier" == "green" ]]; then
+        rm -f "$ALERT_DIR"/sys_tmp_stuck.* 2>/dev/null || true
+    fi
+
+    # The tier and the PRE-cleanup pct, unchanged: two tests parse this string
+    # and the dashboard renders it. The post-cleanup figure goes to the log.
     echo "$tier:$pct"
 }
 
