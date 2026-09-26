@@ -30,6 +30,7 @@ async def db():
             last_status TEXT,
             last_result_json TEXT,
             next_run_at TEXT,
+            run_requested_at TEXT,
             failure_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -50,6 +51,15 @@ async def db():
     await conn.commit()
     yield conn
     await conn.close()
+
+
+def _user_jobs(scheduler) -> list:
+    """Only the real user jobs — not the scheduler's own reconcile tick."""
+    return [
+        j
+        for j in scheduler._scheduler.get_jobs()
+        if j.id != "user_job:__reconcile__"
+    ]
 
 
 class TestCRUD:
@@ -209,8 +219,9 @@ class TestUserJobScheduler:
         await scheduler.start()
 
         assert scheduler.is_running
-        # The APScheduler should have 1 job registered
-        jobs = scheduler._scheduler.get_jobs()
+        # The APScheduler should have 1 user job registered (the
+        # scheduler's own reconcile tick also exists but is not a job).
+        jobs = _user_jobs(scheduler)
         assert len(jobs) == 1
         assert jobs[0].id.startswith("user_job:")
 
@@ -234,14 +245,14 @@ class TestUserJobScheduler:
         assert ok
         job = await crud.get_job(db, job_id)
         assert job["status"] == "paused"
-        assert len(scheduler._scheduler.get_jobs()) == 0
+        assert len(_user_jobs(scheduler)) == 0
 
         # Resume
         ok = await scheduler.resume_job(job_id)
         assert ok
         job = await crud.get_job(db, job_id)
         assert job["status"] == "active"
-        assert len(scheduler._scheduler.get_jobs()) == 1
+        assert len(_user_jobs(scheduler)) == 1
 
         await scheduler.stop()
 
@@ -251,7 +262,7 @@ class TestUserJobScheduler:
 
         scheduler = UserJobScheduler(db=db)
         await scheduler.start()
-        assert len(scheduler._scheduler.get_jobs()) == 0
+        assert len(_user_jobs(scheduler)) == 0
 
         # Add a job
         job_id = await crud.create_job(
@@ -260,12 +271,12 @@ class TestUserJobScheduler:
         )
         ok = await scheduler.add_job(job_id)
         assert ok
-        assert len(scheduler._scheduler.get_jobs()) == 1
+        assert len(_user_jobs(scheduler)) == 1
 
         # Remove it
         ok = await scheduler.remove_job(job_id)
         assert ok
-        assert len(scheduler._scheduler.get_jobs()) == 0
+        assert len(_user_jobs(scheduler)) == 0
 
         # Job should be deleted from DB
         job = await crud.get_job(db, job_id)
@@ -287,6 +298,60 @@ class TestUserJobScheduler:
         await scheduler.start()
 
         # The invalid job should not be registered
-        assert len(scheduler._scheduler.get_jobs()) == 0
+        assert len(_user_jobs(scheduler)) == 0
+
+        await scheduler.stop()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_registers_a_db_created_job(self, db) -> None:
+        """A job written by a scheduler-less process must be picked up."""
+        from genesis.scheduler.user_jobs import UserJobScheduler
+
+        scheduler = UserJobScheduler(db=db)
+        await scheduler.start()
+        assert len(_user_jobs(scheduler)) == 0
+
+        # Written straight to the DB — what the standalone MCP server does.
+        job_id = await crud.create_job(
+            db, title="External", cron_expression="0 3 * * *",
+            dispatch_prompt="run",
+        )
+        await scheduler._reconcile()
+        assert [j.id for j in _user_jobs(scheduler)] == [f"user_job:{job_id}"]
+
+        # A pause written from the other side removes it again.
+        await crud.update_job(db, job_id, status="paused")
+        await scheduler._reconcile()
+        assert len(_user_jobs(scheduler)) == 0
+
+        await scheduler.stop()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_dispatches_a_requested_run(self, db, monkeypatch) -> None:
+        """run_now written via the DB channel is consumed and cleared."""
+        from genesis.scheduler.user_jobs import UserJobScheduler
+
+        job_id = await crud.create_job(
+            db, title="Manual", cron_expression="0 3 * * *",
+            dispatch_prompt="run",
+        )
+        ok = await crud.request_run(db, job_id)
+        assert ok
+
+        scheduler = UserJobScheduler(db=db)
+        await scheduler.start()
+
+        dispatched: list[str] = []
+
+        async def _fake_dispatch(jid):
+            dispatched.append(jid)
+            return "fake-session"
+
+        monkeypatch.setattr(scheduler, "_dispatch_job", _fake_dispatch)
+        await scheduler._reconcile()
+
+        assert dispatched == [job_id]
+        job = await crud.get_job(db, job_id)
+        assert job["run_requested_at"] is None
 
         await scheduler.stop()

@@ -23,6 +23,20 @@ _LOCAL_MODULES_DIR = Path.home() / ".genesis" / "config" / "modules"
 # Cache of loaded configs + IPC adapters (lazy, per-process lifetime)
 _adapters: dict | None = None
 
+# Module-level DB handle, wired by init_module_ops() in the standalone
+# server lifespan. When set, adapter enabled/config state is applied
+# from the module_config table on every call — the same states the
+# runtime applies at init (genesis.runtime.init.modules). Without it the
+# standalone process loads YAML defaults and silently re-enables modules
+# the operator disabled from the dashboard.
+_db = None
+
+
+def init_module_ops(*, db=None) -> None:
+    """Wire the module_ops tools at runtime."""
+    global _db
+    _db = db
+
 
 def _reset_adapter_cache() -> None:
     """Clear the cached external-module adapter dict.
@@ -41,13 +55,45 @@ def _reset_adapter_cache() -> None:
     _adapters = None
 
 
+async def _get_adapters_with_state() -> dict:
+    """Adapters from YAML, with persisted module_config state applied.
+
+    The runtime applies module_config rows to modules at init; the
+    standalone MCP process loads adapters lazily and never passes
+    through that code, so without this a module disabled in the
+    dashboard would read enabled here.
+    """
+    adapters = _get_adapters()
+    if _db is None:
+        return adapters
+    from genesis.modules.persistence import load_all_module_states
+
+    states = await load_all_module_states(_db)
+    for name, state in states.items():
+        adapter = adapters.get(name)
+        if adapter is None:
+            continue
+        adapter.enabled = bool(state.get("enabled", adapter.enabled))
+        config = state.get("config") or {}
+        if config and hasattr(adapter, "update_config"):
+            try:
+                adapter.update_config(config)
+            except Exception:
+                logger.warning(
+                    "Failed to restore persisted config for module %s",
+                    name,
+                    exc_info=True,
+                )
+    return adapters
+
+
 def _get_adapters() -> dict:
     """Lazily load external module configs and create adapters."""
     global _adapters
     if _adapters is not None:
         return _adapters
 
-    from genesis.modules.external.adapter import ExternalProgramAdapter
+    from genesis.modules.external.adapters import build_adapter
     from genesis.modules.external.config import ProgramConfig
 
     _adapters = {}
@@ -66,7 +112,12 @@ def _get_adapters() -> dict:
             if not data or data.get("type") != "external":
                 continue
             config = ProgramConfig.from_dict(data)
-            adapter = ExternalProgramAdapter(config)
+            # Same selection the runtime loader makes. Skipping these instead
+            # would omit an endpoint module from module_list entirely, which
+            # reads as "not configured" rather than "not available here".
+            adapter = build_adapter(data, yaml_path.name, config)
+            if adapter is None:
+                continue
             _adapters[config.name] = adapter
         except Exception:
             logger.warning("Failed to load module config from %s", yaml_path.name, exc_info=True)
@@ -94,7 +145,7 @@ async def _impl_module_call(
     params: dict | None = None,
 ) -> dict:
     """Execute an operation on an external module."""
-    adapters = _get_adapters()
+    adapters = await _get_adapters_with_state()
 
     if not module_name or not module_name.strip():
         return {"error": "module_name is required"}
@@ -124,7 +175,7 @@ async def _impl_module_call(
 
 async def _impl_module_list() -> dict:
     """List available external modules and their operations."""
-    adapters = _get_adapters()
+    adapters = await _get_adapters_with_state()
     result = {}
     for name, adapter in adapters.items():
         ops = adapter.list_operations()

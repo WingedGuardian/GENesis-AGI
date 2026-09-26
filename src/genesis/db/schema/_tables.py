@@ -1607,6 +1607,7 @@ TABLES = {
             last_status       TEXT CHECK (last_status IN ('passed', 'failed', 'running', NULL)),
             last_result_json  TEXT,
             next_run_at       TEXT,
+            run_requested_at  TEXT,
             failure_count     INTEGER NOT NULL DEFAULT 0,
             created_at        TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
