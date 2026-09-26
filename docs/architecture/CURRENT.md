@@ -1427,8 +1427,12 @@ verified: 33b49a10 2026-09-26
   diagnosis relief runs about hourly, not every 30s. The tiers above only
   alert, and a thin pool once filled to 100% under six-hourly CRITICALs.
   - It keeps a bounded `pool_history.jsonl` (7d).
-  - It derives the measured runway: the worse of the 6h and 24h slopes, plus a
-    burst reserve.
+  - It derives the measured runway: the worst SUSTAINED slope over 2h/6h/24h
+    (growth must show in both halves of a window, so one-off steps never count).
+    Data and metadata each get a burst reserve, where a burst includes a rise
+    across a delayed tick.
+  - Relief acts only after config validation, with the throttle stamp persisted
+    first and the pool re-read unchanged.
   - It frees ONE guardian-owned thing per tick in two stages:
     - early (<48h): extend the LVM pool, then pre-recovery snapshots, then a
       lifeline older than 48h;

@@ -107,7 +107,8 @@ storage_pool:
   early_horizon_hours: 48    # extend (LVM opt-in), pre-recovery + >48h lifeline
   urgent_horizon_hours: 24   # any guardian snapshot, lifeline last
   burst_multiplier: 2.0
-  min_reserve_pct: 3.0
+  min_reserve_pct: 3.0         # data reserve floor, % of the pool
+  min_meta_reserve_pct: 10.0   # metadata reserve floor, % of the metadata LV
   history_sample_interval_s: 300
   history_max_samples: 2016
   extend_keep_free_mib: 512

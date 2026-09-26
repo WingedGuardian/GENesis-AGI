@@ -94,7 +94,10 @@ class SnapshotManager:
         self._prefix = config.snapshots.prefix
         self._retention = config.snapshots.retention
         # The names take() generates: <prefix><YYYYmmdd>-<HHMMSS>[-<label>].
-        self._owned_re = re.compile(re.escape(self._prefix) + r"\d{8}-\d{6}(?:-[A-Za-z0-9-]+)?")
+        self._owned_re = re.compile(
+            re.escape(self._prefix if isinstance(self._prefix, str) else "")
+            + r"\d{8}-\d{6}(?:-[A-Za-z0-9-]+)?"
+        )
         # Why the last take() returned None (REFUSED_*), or None after success.
         self.last_refusal: str | None = None
         # What mark_healthy() had to do beyond a plain rotation, for alerting.
@@ -398,6 +401,10 @@ class SnapshotManager:
 
         Missing ``created_at`` falls back to the name's timestamp.
         """
+        if not isinstance(self._prefix, str) or not self._prefix.strip():
+            # An empty prefix would make every timestamp-shaped snapshot "ours".
+            logger.warning("snapshots.prefix is empty — refusing to claim ownership")
+            return None
         rc, stdout, stderr = await _run_subprocess(
             "incus", "snapshot", "list", self._container, "--format", "json",
             timeout=30.0,

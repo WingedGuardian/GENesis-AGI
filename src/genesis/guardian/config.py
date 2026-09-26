@@ -218,6 +218,11 @@ class StoragePoolConfig:
     # (and so the relief) high for a week.
     burst_multiplier: float = 2.0
     min_reserve_pct: float = 3.0
+    # Metadata's own reserve floor, as a percent of the metadata LV. Higher
+    # than data's: metadata is small (tens of MiB), a thin snapshot steps it up
+    # several points at once, and a full metadata LV needs an offline repair.
+    # LVM's autoextend (threshold 80%) grows metadata first when it can.
+    min_meta_reserve_pct: float = 10.0
     # History: one sample per interval, bounded (2016 x 300s = 7 days).
     history_sample_interval_s: int = 300
     history_max_samples: int = 2016

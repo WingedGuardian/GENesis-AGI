@@ -61,6 +61,14 @@ def _series(points: list[tuple[float, float]], size: int, step_min: int = 5):
     return out
 
 
+def _meta_series(data: float, m0: float, m1: float, hours: int, size: int):
+    """Hourly samples with metadata rising linearly m0 -> m1, data flat."""
+    return [
+        PoolSample(T0 + timedelta(hours=h), data, m0 + (m1 - m0) * h / hours, size)
+        for h in range(hours + 1)
+    ]
+
+
 # --- sample_from_status -----------------------------------------------------
 
 
@@ -186,6 +194,7 @@ class TestRunway:
         hist = [
             PoolSample(T0, 0.90, 0.4, 100 * _GB),
             PoolSample(T0 + timedelta(hours=3), 0.75, 0.4, 120 * _GB),  # +20G extend
+            PoolSample(T0 + timedelta(hours=6), 0.75, 0.4, 120 * _GB),
         ]
         rw = compute_runway(hist, hist[-1], _cfg())
         assert rw.rate_bytes_per_h == pytest.approx(0.0, abs=1)
@@ -209,22 +218,19 @@ class TestRunway:
 
     def test_relief_when_runway_short(self) -> None:
         size = 100 * _GB
-        hist = _series([(0, 80.0), (24, 90.0)], size)  # 10 GB/day, 10 GB free
+        hist = _series([(0, 80.0), (30, 90.0)], size)  # 8 GB/day, 10 GB free
         cfg = _cfg()
         rw = compute_runway(hist, hist[-1], cfg)
-        assert rw.hours_to_full == pytest.approx(24, rel=0.1)
-        assert assess_pressure(rw, cfg)[0] == LEVEL_EARLY  # 24h: inside 48, not < 24
+        assert rw.hours_to_full == pytest.approx(30, rel=0.1)
+        assert assess_pressure(rw, cfg)[0] == LEVEL_EARLY  # 30h: inside 48, not < 24
         tight = _cfg(early_horizon_hours=12, urgent_horizon_hours=6)
         assert assess_pressure(rw, tight)[0] == LEVEL_NONE
-        loose = _cfg(urgent_horizon_hours=30)
+        loose = _cfg(urgent_horizon_hours=36, early_horizon_hours=48)
         assert assess_pressure(rw, loose)[0] == LEVEL_URGENT
 
     def test_metadata_runway_counts(self) -> None:
         size = 100 * _GB
-        hist = [
-            PoolSample(T0, 0.5, 0.70, size),
-            PoolSample(T0 + timedelta(hours=24), 0.5, 0.90, size),
-        ]
+        hist = _meta_series(0.5, 0.70, 0.90, 24, size)
         rw = compute_runway(hist, hist[-1], _cfg())
         assert rw.meta_hours_to_full == pytest.approx(12, rel=0.05)
         assert rw.hours_to_full == pytest.approx(12, rel=0.05)
@@ -439,10 +445,7 @@ def test_kill_switch_forces_alert_only(monkeypatch) -> None:
 
 def test_metadata_only_pressure_is_not_data_pressure() -> None:
     size = 100 * _GB
-    hist = [
-        PoolSample(T0, 0.85, 0.70, size),
-        PoolSample(T0 + timedelta(hours=24), 0.85, 0.90, size),
-    ]
+    hist = _meta_series(0.85, 0.70, 0.90, 24, size)
     cfg = _cfg()
     rw = compute_runway(hist, hist[-1], cfg)
     assert assess_pressure(rw, cfg)[0] == LEVEL_URGENT
@@ -491,7 +494,9 @@ async def test_relief_settles_between_deletes(tmp_path) -> None:
     cfg = _pass_cfg(tmp_path)
     old = T0 - timedelta(days=3)
     snaps = _Snaps({"guardian-a-pre-recovery": old, "guardian-b-pre-recovery": old})
-    full = StoragePoolStatus(detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB)
+    full = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
     out1, _ = await _run_pass(cfg, snaps, full, T0)
     out2, _ = await _run_pass(cfg, snaps, full, T0 + timedelta(seconds=30))
     out3, _ = await _run_pass(cfg, snaps, full, T0 + timedelta(seconds=330))
@@ -522,7 +527,9 @@ async def test_off_mode_never_measures_or_acts(tmp_path) -> None:
     cfg = _pass_cfg(tmp_path)
     cfg.storage_pool.relief_mode = False  # what `relief_mode: off` loads as
     snaps = _Snaps({"guardian-a-pre-recovery": T0 - timedelta(days=3)})
-    full = StoragePoolStatus(detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB)
+    full = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
     out, d = await _run_pass(cfg, snaps, full, T0)
     assert out == "off"
     assert snaps.deleted == []
@@ -537,6 +544,7 @@ async def _two_pass_extend_probe(tmp_path, samples):
     cfg = _pass_cfg(tmp_path)
     snaps = _Snaps({"guardian-a-pre-recovery": T0 - timedelta(days=3)})
     base = dict(
+        pool_name="default",
         detected=True,
         vg_free_bytes=4 * _GB,
         pool_size_bytes=65 * _GB,
@@ -552,7 +560,7 @@ async def _two_pass_extend_probe(tmp_path, samples):
         return 0, "IncusThinPool\n", ""
 
     run = AsyncMock(side_effect=run)
-    out = ""
+    outs: list[str] = []
     for hours, data, meta in samples:
         st = StoragePoolStatus(data_pct=data, metadata_pct=meta, **base)
 
@@ -570,27 +578,28 @@ async def _two_pass_extend_probe(tmp_path, samples):
                 now=T0 + timedelta(hours=hours),
                 run=run,
             )
+            outs.append(out)
     extended = any("lvextend" in c.args for c in run.await_args_list)
-    return out, extended
+    return outs, extended
 
 
 @pytest.mark.asyncio
 async def test_data_pressure_does_extend(tmp_path) -> None:
     """Positive arm: proves the probe below CAN see an extend."""
-    out, extended = await _two_pass_extend_probe(
+    outs, extended = await _two_pass_extend_probe(
         tmp_path,
-        [(0, 85.0, 40.0), (10, 95.0, 40.0)],
+        [(h, 85.0 + h, 40.0) for h in range(11)],  # hourly, +1 point/h
     )
-    assert out == "extended" and extended
+    assert "extended" in outs and extended, outs
 
 
 @pytest.mark.asyncio
 async def test_metadata_only_pressure_never_extends_the_data_lv(tmp_path) -> None:
-    out, extended = await _two_pass_extend_probe(
+    outs, extended = await _two_pass_extend_probe(
         tmp_path,
-        [(0, 85.0, 70.0), (24, 85.0, 90.0)],
+        [(h, 85.0, 70.0 + 20.0 * h / 24) for h in range(25)],  # metadata only
     )
-    assert out.startswith("deleted:"), out
+    assert any(o.startswith("deleted:") for o in outs), outs  # pressure really acted
     assert not extended
 
 
@@ -703,3 +712,372 @@ def test_pool_key_round_trips_through_history(tmp_path) -> None:
         max_samples=10,
     )
     assert load_history(p)[0].pool == "default|vg0|IncusThinPool"
+
+
+# --- review round 1 (Codex / Devin at 9c24658) --------------------------------
+
+
+def test_high_baseline_snapshot_step_is_not_a_rate() -> None:
+    """Devin: at 92% metadata a fresh snapshot steps it to 96%, then flat. The
+    step must not become a phantom RATE at hour 20 or 24. (At 96% the pool is
+    genuinely short of metadata, so the RESERVE rule does fire — by design.)"""
+    size = 70 * _GB
+    hist = [PoolSample(T0, 0.70, 0.92, size)]
+    hist += [PoolSample(T0 + timedelta(minutes=m), 0.70, 0.96, size) for m in range(6, 25 * 60, 5)]
+    cfg = _cfg()
+    for hours in (20, 24):
+        cur = [s for s in hist if s.ts <= T0 + timedelta(hours=hours)]
+        rw = compute_runway(cur, cur[-1], cfg)
+        assert rw.meta_hours_to_full is None, (hours, rw.describe())
+        level, reason = assess_pressure(rw, cfg)
+        assert level == LEVEL_URGENT and "reserve" in reason
+
+
+def test_sub_day_metadata_fill_is_caught() -> None:
+    """Codex: metadata 80% -> 95% over ten hours must be seen well before full."""
+    size = 70 * _GB
+    hist = _meta_series(0.70, 0.80, 0.95, 10, size)
+    cfg = _cfg()
+    rw = compute_runway(hist, hist[-1], cfg)
+    assert rw.meta_hours_to_full == pytest.approx(3.3, rel=0.1)
+    assert assess_pressure(rw, cfg)[0] == LEVEL_URGENT
+
+
+def test_fresh_pool_metadata_fill_is_caught_early() -> None:
+    """Devin: a fresh pool at 70% metadata heading to 98% in ten hours is
+    caught by the rate within the first hours, not only at the reserve."""
+    size = 70 * _GB
+    hist = _meta_series(0.70, 0.70, 0.98, 10, size)
+    cfg = _cfg()
+    fired_at = None
+    for h in range(2, 11):
+        rw = compute_runway(hist[: h + 1], hist[h], cfg)
+        if assess_pressure(rw, cfg)[0] != LEVEL_NONE:
+            fired_at = h
+            break
+    assert fired_at is not None and fired_at <= 3, fired_at
+
+
+def test_fill_across_a_delayed_tick_is_a_burst() -> None:
+    """Codex: ticks an hour apart (an outage's diagnosis). 100 GiB rising from
+    80% to 96% in one hour must read as pressure, not be discarded."""
+    size = 100 * _GB
+    hist = [
+        PoolSample(T0, 0.80, 0.4, size),
+        PoolSample(T0 + timedelta(hours=1), 0.96, 0.4, size),
+    ]
+    cfg = _cfg()
+    rw = compute_runway(hist, hist[-1], cfg)
+    assert rw.burst_bytes == pytest.approx(16 * _GB, rel=0.01)
+    assert assess_pressure(rw, cfg)[0] == LEVEL_URGENT
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("storage_pool", "min_reserve_pct", 300),
+        ("storage_pool", "min_reserve_pct", "3%"),
+        ("storage_pool", "burst_multiplier", 0),
+        ("storage_pool", "early_horizon_hours", "48h"),
+        ("storage_pool", "urgent_horizon_hours", 100),  # > early
+        ("snapshots", "prefix", ""),
+        ("snapshots", "prefix", "   "),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_config_never_acts(tmp_path, section, key, value) -> None:
+    """Codex: config values steer automatic deletes; invalid ones must degrade
+    to alert-only, never to acting on a guess."""
+    cfg = _pass_cfg(tmp_path)
+    setattr(getattr(cfg, section), key, value)
+    snaps = _Snaps({"guardian-20260101-000000-pre-recovery": T0 - timedelta(days=3)})
+    full = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
+    out, d = await _run_pass(cfg, snaps, full, T0)
+    assert out == "invalid_config"
+    assert snaps.deleted == []
+    assert "not live" in d.send.await_args.args[0].title
+
+
+@pytest.mark.asyncio
+async def test_unwritable_state_stops_the_delete(tmp_path) -> None:
+    """Codex: if the settle stamp cannot persist, the delete must not happen —
+    the next tick would otherwise delete again at once."""
+    from unittest.mock import patch
+
+    cfg = _pass_cfg(tmp_path)
+    snaps = _Snaps({"guardian-20260101-000000-pre-recovery": T0 - timedelta(days=3)})
+    full = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
+    with patch("genesis.guardian.pool_pressure._save_state", return_value=False):
+        out, _ = await _run_pass(cfg, snaps, full, T0)
+    assert out == "state_unwritable"
+    assert snaps.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_pool_change_before_the_act_stops_it(tmp_path) -> None:
+    """Codex: the pool is re-read right before mutating; a different pool
+    than the one measured means no action."""
+    from unittest.mock import AsyncMock, patch
+
+    cfg = _pass_cfg(tmp_path)
+    snaps = _Snaps({"guardian-20260101-000000-pre-recovery": T0 - timedelta(days=3)})
+    first = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
+    moved = StoragePoolStatus(
+        detected=True, pool_used_pct=50.0, pool_size_bytes=100 * _GB, pool_name="other"
+    )
+    measure = AsyncMock(side_effect=[first, moved])
+    with patch("genesis.guardian.pool.measure_storage_pool", measure):
+        out = await check_pool_pressure(cfg, AsyncMock(), snaps, now=T0, run=AsyncMock())
+    assert out == "pool_changed"
+    assert snaps.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_extend_probe_failure_does_not_burn_the_daily_cooldown(tmp_path) -> None:
+    """Codex: a failed extent-size read happens BEFORE any mutation; it must
+    not stamp the 24h extend cooldown."""
+    import json as _json
+    from unittest.mock import AsyncMock, patch
+
+    cfg = _pass_cfg(tmp_path)
+    snaps = _Snaps({})
+    st = StoragePoolStatus(
+        detected=True,
+        data_pct=98.0,
+        metadata_pct=40.0,
+        vg_free_bytes=4 * _GB,
+        pool_size_bytes=65 * _GB,
+        metadata_size_bytes=84 * 1024**2,
+        vg_name="vg0",
+        thinpool_lv="IncusThinPool",
+        thinpool_profile="genesis-thinpool",
+        pool_name="default",
+    )
+
+    async def run(*argv, **kw):
+        if "vg_extent_size" in argv:
+            return 5, "", "vgs: transient failure"
+        return 0, "IncusThinPool\n", ""
+
+    with (
+        patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=st)),
+        patch("genesis.guardian.pool._detect_pool_name", AsyncMock(return_value="default")),
+    ):
+        runner = AsyncMock(side_effect=run)
+        await check_pool_pressure(cfg, AsyncMock(), snaps, now=T0, run=runner)
+    # guard-the-guard: the extend path really was reached and probed
+    assert any("vg_extent_size" in c.args for c in runner.await_args_list)
+    state_file = tmp_path / "pool_relief_state.json"
+    state = _json.loads(state_file.read_text()) if state_file.exists() else {}
+    assert "extend" not in state
+
+
+@pytest.mark.asyncio
+async def test_strict_list_refuses_an_empty_prefix(tmp_path) -> None:
+    import json as _json
+    from unittest.mock import patch
+
+    from genesis.guardian.snapshots import SnapshotManager
+
+    cfg = _pass_cfg(tmp_path)
+    cfg.snapshots.prefix = ""
+    rows = [{"name": "20260101-000000-mine"}, {"name": "20260102-000000"}]
+
+    async def listing(*a, **k):  # a listing that WOULD match an empty prefix
+        return 0, _json.dumps(rows), ""
+
+    with patch("genesis.guardian.snapshots._run_subprocess", listing):
+        assert await SnapshotManager(cfg).list_snapshot_meta_strict() is None
+
+
+# --- internal review of the round-1 delta ------------------------------------
+
+
+def test_daily_recurring_step_reads_as_its_average() -> None:
+    """A job writing 5 GB once a day is the commonest real fill; each step
+    lands in one half of every <=24h window, so only the 72h window sees it.
+    It must read as a rate (not 0), so the EARLY stage can act in time."""
+    size = 100 * _GB
+    used = 40.0
+    hist = []
+    for h in range(0, 24 * 7):
+        if h % 24 == 2 and h > 0:
+            used += 5.0
+        for m in (0, 30):
+            hist.append(PoolSample(T0 + timedelta(hours=h, minutes=m), used / 100, 0.4, size))
+    cfg = _cfg()
+    rw = compute_runway(hist, hist[-1], cfg)
+    assert rw.rate_bytes_per_h == pytest.approx(5 * _GB / 24, rel=0.35), rw.describe()
+
+
+def test_long_sample_gap_does_not_inflate_the_reserve() -> None:
+    """Steady growth across a 20h gap is not a burst (the rate covers it)."""
+    size = 100 * _GB
+    hist = [
+        PoolSample(T0, 0.50, 0.4, size),
+        PoolSample(T0 + timedelta(minutes=5), 0.50, 0.4, size),
+        PoolSample(T0 + timedelta(hours=20), 0.60, 0.4, size),
+    ]
+    rw = compute_runway(hist, hist[-1], _cfg())
+    assert rw.burst_bytes == pytest.approx(0.0, abs=1)
+    assert rw.reserve_bytes == int(0.03 * size)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("snapshots", "lifeline_max_age_hours", float("nan")),
+        ("snapshots", "lifeline_max_age_hours", float("inf")),
+        ("storage_pool", "history_max_samples", 100.5),
+        ("storage_pool", "history_sample_interval_s", 300.0),
+    ],
+)
+def test_validation_rejects_non_finite_and_non_integer(tmp_path, section, key, value) -> None:
+    from genesis.guardian.pool_pressure import validate_relief_config
+
+    cfg = _pass_cfg(tmp_path)
+    setattr(getattr(cfg, section), key, value)
+    assert validate_relief_config(cfg) is not None
+    assert validate_relief_config(_pass_cfg(tmp_path)) is None  # control: defaults valid
+
+
+def _extend_eligible(pool_name="default"):
+    return StoragePoolStatus(
+        detected=True,
+        data_pct=98.0,
+        metadata_pct=40.0,
+        vg_free_bytes=4 * _GB,
+        pool_size_bytes=65 * _GB,
+        metadata_size_bytes=84 * 1024**2,
+        vg_name="vg0",
+        thinpool_lv="IncusThinPool",
+        thinpool_profile="genesis-thinpool",
+        pool_name=pool_name,
+    )
+
+
+async def _extend_run(*argv, **kw):
+    if "vg_extent_size" in argv:
+        return 0, "4194304\n", ""
+    return 0, "IncusThinPool\n", ""
+
+
+@pytest.mark.asyncio
+async def test_lvextend_never_runs_without_a_persisted_stamp(tmp_path) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    cfg = _pass_cfg(tmp_path)
+    runner = AsyncMock(side_effect=_extend_run)
+    d = AsyncMock()
+    with (
+        patch(
+            "genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=_extend_eligible())
+        ),
+        patch("genesis.guardian.pool._detect_pool_name", AsyncMock(return_value="default")),
+        patch("genesis.guardian.pool_pressure._save_state", return_value=False),
+    ):
+        outs = [
+            await check_pool_pressure(
+                cfg,
+                d,
+                _Snaps({}),
+                now=T0 + timedelta(seconds=30 * i),
+                run=runner,
+            )
+            for i in range(5)
+        ]
+    assert any("vg_extent_size" in c.args for c in runner.await_args_list)  # reached
+    assert not any("lvextend" in c.args for c in runner.await_args_list)
+    assert set(outs) == {"extend_stopped"}
+    d.send.assert_not_called()  # no per-tick alert storm when state is unwritable
+
+
+@pytest.mark.asyncio
+async def test_lvextend_never_runs_on_a_pool_that_changed(tmp_path) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    cfg = _pass_cfg(tmp_path)
+    runner = AsyncMock(side_effect=_extend_run)
+    measure = AsyncMock(side_effect=[_extend_eligible(), _extend_eligible("other")])
+    with (
+        patch("genesis.guardian.pool.measure_storage_pool", measure),
+        patch("genesis.guardian.pool._detect_pool_name", AsyncMock(return_value="default")),
+    ):
+        out = await check_pool_pressure(cfg, AsyncMock(), _Snaps({}), now=T0, run=runner)
+    assert out == "extend_stopped"
+    assert not any("lvextend" in c.args for c in runner.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_lvextend_positive_control(tmp_path) -> None:
+    """Proves the two tests above can SEE an lvextend when nothing stops it."""
+    from unittest.mock import AsyncMock, patch
+
+    cfg = _pass_cfg(tmp_path)
+    runner = AsyncMock(side_effect=_extend_run)
+    with (
+        patch(
+            "genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=_extend_eligible())
+        ),
+        patch("genesis.guardian.pool._detect_pool_name", AsyncMock(return_value="default")),
+    ):
+        out = await check_pool_pressure(cfg, AsyncMock(), _Snaps({}), now=T0, run=runner)
+    assert out == "extended"
+    assert any("lvextend" in c.args for c in runner.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_delete_first_waits_out_relief_settle(tmp_path) -> None:
+    """Relief acted this tick: delete-first must not stack a second delete."""
+    import json as _json
+    from datetime import datetime as _dt
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.guardian.pool_pressure import current_pressure
+
+    cfg = _pass_cfg(tmp_path)
+    st = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
+    with patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=st)):
+        assert await current_pressure(cfg) == LEVEL_URGENT  # control
+        (tmp_path / "pool_relief_state.json").write_text(
+            _json.dumps({"last_action": _dt.now(UTC).isoformat()})
+        )
+        assert await current_pressure(cfg) == LEVEL_NONE
+
+
+@pytest.mark.asyncio
+async def test_unwritable_state_never_storms_alerts(tmp_path) -> None:
+    """Urgent pressure with nothing left to free alerts once per realert window
+    — and not at all when its throttle stamp cannot persist (else every 30s)."""
+    from contextlib import ExitStack
+    from unittest.mock import AsyncMock, patch
+
+    cfg = _pass_cfg(tmp_path)
+    full = StoragePoolStatus(
+        detected=True, pool_used_pct=99.0, pool_size_bytes=100 * _GB, pool_name="default"
+    )
+    for writable, expected in ((True, 1), (False, 0)):
+        d = AsyncMock()
+        (tmp_path / "pool_relief_state.json").unlink(missing_ok=True)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=full))
+            )
+            if not writable:
+                stack.enter_context(
+                    patch("genesis.guardian.pool_pressure._save_state", return_value=False)
+                )
+            for i in range(5):
+                out = await check_pool_pressure(
+                    cfg, d, _Snaps({}), now=T0 + timedelta(seconds=30 * i), run=AsyncMock()
+                )
+                assert out == "no_target:urgent"
+        assert d.send.await_count == expected, (writable, d.send.await_count)

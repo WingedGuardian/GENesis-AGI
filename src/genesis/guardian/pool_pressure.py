@@ -15,11 +15,14 @@ says nothing about whether the pool fills in an hour or a month:
 
 * a bounded history (``pool_history.jsonl`` in the guardian state dir, one
   sample per ``history_sample_interval_s``, at most ``history_max_samples``);
-* the growth RATE — the worse of the last six hours and the last day, in used
-  bytes, so a pool extend (which lowers data% without freeing anything) never
-  reads as shrinkage;
-* the worst BURST — the largest rise over any ten-minute window — which sizes
-  the reserve kept free for writes faster than the tick can react to;
+* the growth RATE — the worst SUSTAINED growth over 2h / 6h / 24h, in used
+  bytes (so a pool extend, which lowers data% without freeing anything, never
+  reads as shrinkage), plus a 72h window so a step that RECURS daily reads as
+  its average. Sustained means it shows in BOTH halves of the window, so a
+  one-off step (a backup, a fresh snapshot's metadata jump) is not a rate;
+* the worst BURST — the largest rise over any ten-minute window or between two
+  consecutive samples up to three hours apart — which sizes the data and metadata
+  reserves kept free for writes faster than the tick can react to;
 * the RUNWAY — hours until the data or metadata space is full at that rate.
 
 Two stages (``assess_pressure``):
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -63,24 +67,34 @@ logger = logging.getLogger(__name__)
 
 HISTORY_FILE = "pool_history.jsonl"
 
-# Rate windows. The short one catches a change of regime within hours, the
-# long one a steady climb. Not one hour: a routine backup writes ~2 GB in well
-# under an hour, and a 1h slope reads that as ~48 GB/day — relief would then
-# delete the rollback snapshot on every backup. Sub-hour spikes are what the
-# burst RESERVE is for, not the rate.
-_SHORT_WINDOW = timedelta(hours=6)
-_LONG_WINDOW = timedelta(hours=24)
-# A slope over less than this is not a rate. Two hours, not less: taking a
-# thin snapshot steps METADATA up at once (measured on a live pool: 32.7% →
-# 37.1% within ~30 minutes of a fresh snapshot, then ~0.3%/h). A 30-minute
-# slope reads that step as "metadata full in ~7h" and would delete the brand
-# new lifeline on a freshly deployed guardian with no older history. Faster
-# fills than the rate can see in 2h are what the burst RESERVE covers.
+# Rate windows (the worst of them wins). A RATE is growth that is SUSTAINED:
+# it must show in BOTH halves of a window (see _sustained_slope). One-off
+# STEPS are not rates — a routine backup writes ~2 GB in minutes, and creating
+# a thin snapshot steps METADATA up once (measured on a live pool: 32.7% →
+# 37.1% within ~30 minutes of a fresh snapshot, then ~0.3%/h). An endpoint
+# slope spreads such a step over its window and reads it as growth, which
+# would delete the rollback snapshot on every backup or right after a fresh
+# snapshot. Steps are what the burst RESERVE is for.
+# The 72h window exists for RECURRING steps: a job that writes a chunk once a
+# day lands in one half of every window up to 24h and would never read as a
+# rate, yet it is the commonest real way a pool fills. Over 72h the halves
+# each hold a step, so it reads as its true daily average.
+_RATE_WINDOWS = (
+    timedelta(hours=2),
+    timedelta(hours=6),
+    timedelta(hours=24),
+    timedelta(hours=72),
+)
+# A window must span at least this much history before it yields a rate.
 _MIN_RATE_SPAN = timedelta(hours=2)
-# Metadata rates need most of a day of history (see compute_runway).
-_META_MIN_SPAN = timedelta(hours=20)
-# Burst window: the fastest rise the tick-sampled history can show.
+# Burst window: the fastest rise the tick-sampled history can show. A rise
+# between CONSECUTIVE samples also counts when they are up to _BURST_MAX_GAP
+# apart — ticks can be an hour or so apart during an outage's diagnosis (cc
+# timeout 1h plus approval waits), and a fill across that gap is exactly the
+# burst that matters. Longer gaps are not bursts: steady growth across a 20h
+# gap would otherwise inflate the reserve for a day; the rate covers them.
 _BURST_WINDOW = timedelta(minutes=10)
+_BURST_MAX_GAP = timedelta(hours=3)
 # Bursts older than this no longer size the reserve (see min_reserve_pct).
 _BURST_LOOKBACK = timedelta(hours=24)
 
@@ -117,6 +131,8 @@ class Runway:
     reserve_bytes: int | None
     data_hours_to_full: float | None
     meta_hours_to_full: float | None
+    meta_free_frac: float | None = None
+    meta_reserve_frac: float | None = None
 
     @property
     def hours_to_full(self) -> float | None:
@@ -139,6 +155,8 @@ class Runway:
             parts.append(f"data full in {self.data_hours_to_full:.0f}h")
         if self.meta_hours_to_full is not None:
             parts.append(f"metadata full in {self.meta_hours_to_full:.0f}h")
+        if self.meta_free_frac is not None:
+            parts.append(f"metadata free {self.meta_free_frac * 100:.1f}%")
         return ", ".join(parts)
 
 
@@ -265,43 +283,59 @@ def record_sample(
     return True
 
 
-def _slope_per_h(
+def _endpoint_slope(points: list[tuple[datetime, float]]) -> float | None:
+    if len(points) < 2:
+        return None
+    (t0, v0), (t1, v1) = points[0], points[-1]
+    hours = (t1 - t0).total_seconds() / 3600.0
+    if hours <= 0:
+        return None
+    return (v1 - v0) / hours
+
+
+def _sustained_slope(
     points: list[tuple[datetime, float]],
     now: datetime,
     window: timedelta,
-    *,
-    min_span: timedelta = _MIN_RATE_SPAN,
-):
-    """Rise per hour from the oldest point inside ``window`` to the newest."""
-    inside = [(t, v) for t, v in points if now - t <= window]
-    if len(inside) < 2:
+) -> float | None:
+    """Growth per hour that shows in BOTH halves of ``window``, or None.
+
+    The slower half's slope: a one-off step lands in one half only (the other
+    half is flat), so it contributes nothing; steady growth shows in both.
+    None when the window spans less than _MIN_RATE_SPAN or a half has fewer
+    than two samples.
+    """
+    inside = [(t, v) for t, v in points if timedelta(0) <= now - t <= window]
+    if len(inside) < 3:
         return None
-    (t0, v0), (t1, v1) = inside[0], inside[-1]
-    span = t1 - t0
-    if span < min_span:
+    t0, t1 = inside[0][0], inside[-1][0]
+    if t1 - t0 < _MIN_RATE_SPAN:
         return None
-    return (v1 - v0) / (span.total_seconds() / 3600.0)
+    mid = t0 + (t1 - t0) / 2
+    first = [(t, v) for t, v in inside if t <= mid]
+    second = [(t, v) for t, v in inside if t >= mid]
+    s1, s2 = _endpoint_slope(first), _endpoint_slope(second)
+    if s1 is None or s2 is None:
+        return None
+    return min(s1, s2)
 
 
 def _rate(points: list[tuple[datetime, float]], now: datetime) -> float | None:
-    slopes = [
-        s
-        for s in (
-            _slope_per_h(points, now, _SHORT_WINDOW),
-            _slope_per_h(points, now, _LONG_WINDOW),
-        )
-        if s is not None
-    ]
+    """Worst sustained growth per hour across the rate windows (>= 0), or None."""
+    slopes = [s for s in (_sustained_slope(points, now, w) for w in _RATE_WINDOWS) if s is not None]
     if not slopes:
         return None
     return max(0.0, max(slopes))
 
 
 def _burst(points: list[tuple[datetime, float]]) -> float:
-    """Largest rise between two points at most ``_BURST_WINDOW`` apart."""
+    """Largest rise between two points at most ``_BURST_WINDOW`` apart, or
+    between CONSECUTIVE points however far apart (a delayed tick's rise)."""
     worst = 0.0
     start = 0
     for j, (tj, vj) in enumerate(points):
+        if j > 0 and tj - points[j - 1][0] <= _BURST_MAX_GAP:
+            worst = max(worst, vj - points[j - 1][1])
         while tj - points[start][0] > _BURST_WINDOW:
             start += 1
         for i in range(start, j):
@@ -340,19 +374,22 @@ def compute_runway(
         if rate:
             data_h = free / rate
 
+    # Metadata: the same sustained-rate and burst-reserve model as data, in
+    # fractions of the metadata LV (its size can change under autoextend).
+    # Metadata exhaustion is the worse outage (offline thin_check/repair), so
+    # it gets its own reserve rather than riding on data's.
     meta_h: float | None = None
+    meta_free: float | None = None
+    meta_reserve: float | None = None
     meta_pts = [(s.ts, s.meta_frac) for s in samples if s.meta_frac is not None]
     if current.meta_frac is not None and meta_pts:
-        # Metadata: the full-day slope only, over at least _META_MIN_SPAN.
-        # Creating a thin snapshot steps metadata up ONCE (measured ~4 points
-        # within ~30 minutes of a fresh snapshot, flat afterwards); any window
-        # shorter than a day turns that one-off step into a sustained "rate"
-        # and would delete the brand-new lifeline. Data keeps the 6h window.
-        meta_rate = _slope_per_h(meta_pts, now, _LONG_WINDOW, min_span=_META_MIN_SPAN)
-        if meta_rate is not None:
-            meta_rate = max(0.0, meta_rate)
+        meta_free = max(0.0, 1.0 - current.meta_frac)
+        meta_recent = [(t, v) for t, v in meta_pts if now - t <= _BURST_LOOKBACK]
+        meta_burst = _burst(meta_recent) if meta_recent else 0.0
+        meta_reserve = max(meta_burst * cfg.burst_multiplier, cfg.min_meta_reserve_pct / 100.0)
+        meta_rate = _rate(meta_pts, now)
         if meta_rate:
-            meta_h = max(0.0, 1.0 - current.meta_frac) / meta_rate
+            meta_h = meta_free / meta_rate
 
     return Runway(
         free_bytes=free,
@@ -361,6 +398,8 @@ def compute_runway(
         reserve_bytes=reserve,
         data_hours_to_full=data_h,
         meta_hours_to_full=meta_h,
+        meta_free_frac=meta_free,
+        meta_reserve_frac=meta_reserve,
     )
 
 
@@ -385,6 +424,12 @@ def assess_pressure(runway: Runway, cfg: StoragePoolConfig) -> tuple[str, str]:
         and runway.free_bytes < runway.reserve_bytes
     ):
         return LEVEL_URGENT, "free space is below the burst reserve"
+    if (
+        runway.meta_free_frac is not None
+        and runway.meta_reserve_frac is not None
+        and runway.meta_free_frac < runway.meta_reserve_frac
+    ):
+        return LEVEL_URGENT, "free metadata space is below its reserve"
     for level, horizon in (
         (LEVEL_URGENT, cfg.urgent_horizon_hours),
         (LEVEL_EARLY, cfg.early_horizon_hours),
@@ -519,13 +564,99 @@ def _load_state(path: Path) -> dict:
         return {}
 
 
-def _save_state(path: Path, state: dict) -> None:
+def _save_state(path: Path, state: dict) -> bool:
+    """Persist relief state. False when it could not be written — callers about
+    to MUTATE must treat that as a stop (see _commit_action)."""
     try:
         # mkstemp-based: 0600 (it gates destructive actions via the settle and
         # extend throttles), and the temp never outlives a failed write.
         atomic_write_text(path, json.dumps(state))
     except OSError:
         logger.warning("could not persist pool relief state %s", path, exc_info=True)
+        return False
+    return True
+
+
+def _commit_action(path: Path, state: dict, now: datetime, *keys: str) -> bool:
+    """Stamp ``last_action`` (and ``keys``) and persist it BEFORE mutating.
+
+    The settle and extend throttles live only in this file; a mutation whose
+    stamp did not persist would let the next tick (30s later) act again and
+    walk through the rollback lifeline. So: no persisted stamp, no mutation.
+    """
+    stamped = dict(state)
+    for key in ("last_action", *keys):
+        stamped[key] = now.isoformat()
+    if not _save_state(path, stamped):
+        return False
+    state.update(stamped)
+    return True
+
+
+def _throttled(path: Path, state: dict, key: str, now: datetime, hours: float) -> bool:
+    """True when an alert keyed ``key`` is due AND its stamp persisted.
+
+    Every relief alert is throttled by a stamp in the state file. If the state
+    dir is unwritable the stamp cannot stick, and an unconditional send would
+    page on every 30s tick; so an alert whose stamp did not persist is not
+    sent (the tier alerts still report the pool).
+    """
+    if not _due(state, key, now, hours):
+        return False
+    stamped = dict(state)
+    stamped[key] = now.isoformat()
+    if not _save_state(path, stamped):
+        return False
+    state.update(stamped)
+    return True
+
+
+def validate_relief_config(config) -> str | None:
+    """Why the relief configuration cannot be trusted to ACT, or None.
+
+    ``_build_sub`` copies YAML values without coercing or bounding them, and
+    these values steer automatic deletes: ``min_reserve_pct: 300`` would make
+    every pool "urgent", an empty ``snapshots.prefix`` would make every
+    timestamp-shaped snapshot "ours". Anything invalid degrades relief to
+    alert-only (never to acting on a guess).
+    """
+    cfg = config.storage_pool
+
+    def num(name: str, lo: float, hi: float, *, integer: bool = False) -> str | None:
+        v = getattr(cfg, name)
+        kinds = (int,) if integer else (int, float)
+        if isinstance(v, bool) or not isinstance(v, kinds) or not lo <= v <= hi:
+            what = "an integer" if integer else "a number"
+            return f"storage_pool.{name}={v!r} (expected {what} in [{lo}, {hi}])"
+        return None
+
+    for problem in (
+        num("early_horizon_hours", 1, 24 * 30),
+        num("urgent_horizon_hours", 0, 24 * 30),
+        num("burst_multiplier", 1, 100),
+        num("min_reserve_pct", 0, 50),
+        num("min_meta_reserve_pct", 0, 50),
+        num("history_sample_interval_s", 30, 86400, integer=True),
+        num("history_max_samples", 12, 100000, integer=True),
+        num("extend_keep_free_mib", 0, 1024 * 1024),
+        num("realert_hours", 0.1, 24 * 30),
+    ):
+        if problem:
+            return problem
+    if cfg.urgent_horizon_hours > cfg.early_horizon_hours:
+        return "storage_pool.urgent_horizon_hours is larger than early_horizon_hours"
+    life = config.snapshots.lifeline_max_age_hours
+    if (
+        isinstance(life, bool)
+        or not isinstance(life, (int, float))
+        or not math.isfinite(life)
+        or life > 24 * 365
+    ):
+        return f"snapshots.lifeline_max_age_hours={life!r} (expected a finite number of hours)"
+    prefix = config.snapshots.prefix
+    if not isinstance(prefix, str) or not prefix.strip():
+        return f"snapshots.prefix={prefix!r} (must be a non-empty namespace)"
+    return None
 
 
 def _due(state: dict, key: str, now: datetime, hours: float) -> bool:
@@ -548,10 +679,14 @@ async def _send(dispatcher, severity, title: str, body: str) -> None:
         logger.warning("pool relief alert dispatch failed", exc_info=True)
 
 
+_GUARD_STOP = "stopped before the mutation (pool changed or state unwritable)"
+
+
 async def _extend_thinpool(
     status: StoragePoolStatus,
     grow_bytes: int,
     run,
+    before_mutation=None,
 ) -> tuple[bool, bool, str]:
     """``lvextend -L +<bytes>b vg/thinpool``, rounded DOWN to whole extents.
 
@@ -589,10 +724,27 @@ async def _extend_thinpool(
         return False, False, "grow rounds down to zero extents"
     argv = ("sudo", "-n", "lvextend", "-L", f"+{grow}b", f"{vg}/{lv}")
     _assert_no_full_extend(argv)
+    if before_mutation is not None and not await before_mutation():
+        return False, False, _GUARD_STOP
     rc, out, err = await run(*argv, timeout=60.0)
     if rc != 0:
         return False, True, f"lvextend failed: {(err or out)[:200]}"
     return True, True, f"grew {vg}/{lv} by {grow / 1024**3:.1f}G"
+
+
+async def _same_pool_now(config, status: StoragePoolStatus) -> bool:
+    """Re-measure immediately before a mutation: the pool must still be the
+    one the decision was made on (the container can move pools between the
+    measurement and the act, and two pools can share an LV name)."""
+    from genesis.guardian.pool import measure_storage_pool
+
+    try:
+        again = await measure_storage_pool(config)
+    except Exception:
+        logger.warning("pre-mutation pool re-check failed", exc_info=True)
+        return False
+    key = pool_key(status)
+    return key is not None and pool_key(again) == key and not _ambiguous_pool(again)
 
 
 async def _named_thinpool_matches(config, status: StoragePoolStatus, run) -> bool:
@@ -630,7 +782,26 @@ async def check_pool_pressure(
     state_path = config.state_path / STATE_FILE
     state = _load_state(state_path)
 
-    if cfg.relief_mode not in RELIEF_MODES and _due(state, "invalid_mode", now, 24):
+    problem = validate_relief_config(config)
+    if problem is not None:
+        if _throttled(state_path, state, "invalid_config", now, 24):
+            await _send(
+                dispatcher,
+                AlertSeverity.WARNING,
+                "Pool relief not live",
+                f"Invalid relief configuration: {problem}. The guardian will NOT free "
+                "pool space on its own until it is fixed; the storage tier alerts "
+                "still run.",
+            )
+        return "invalid_config"
+
+    if cfg.relief_mode not in RELIEF_MODES and _throttled(
+        state_path,
+        state,
+        "invalid_mode",
+        now,
+        24,
+    ):
         await _send(
             dispatcher,
             AlertSeverity.WARNING,
@@ -639,8 +810,6 @@ async def check_pool_pressure(
             f"{', '.join(RELIEF_MODES)} — running alert_only (guardian will NOT free "
             "pool space on its own).",
         )
-        state["invalid_mode"] = now.isoformat()
-        _save_state(state_path, state)
 
     status = await measure_storage_pool(config)
     sample = sample_from_status(status, now)
@@ -664,7 +833,7 @@ async def check_pool_pressure(
     severity = AlertSeverity.CRITICAL if level == LEVEL_URGENT else AlertSeverity.WARNING
 
     if mode == "alert_only":
-        if _due(state, f"would_{level}", now, cfg.realert_hours):
+        if _throttled(state_path, state, f"would_{level}", now, cfg.realert_hours):
             await _send(
                 dispatcher,
                 severity,
@@ -672,8 +841,6 @@ async def check_pool_pressure(
                 f"{reason}. {numbers}. Relief would free guardian-owned space now, but "
                 "storage_pool.relief_mode / GUARDIAN_POOL_RELIEF_DISABLED keeps it off.",
             )
-            state[f"would_{level}"] = now.isoformat()
-            _save_state(state_path, state)
         return f"alert_only:{level}"
 
     # Settle: after freeing something, wait one history interval before
@@ -692,8 +859,19 @@ async def check_pool_pressure(
         and _due(state, "extend", now, 24)
         and await _named_thinpool_matches(config, status, run)
     ):
-        ok, attempted, detail = await _extend_thinpool(status, grow, run)
-        state["extend"] = now.isoformat()
+
+        async def _before_extend() -> bool:
+            # Same pool still, and the once-a-day extend stamp persisted,
+            # BEFORE the irreversible lvextend. A probe that fails earlier
+            # (e.g. reading the extent size) stamps nothing and retries.
+            return await _same_pool_now(config, status) and _commit_action(
+                state_path,
+                state,
+                now,
+                "extend",
+            )
+
+        ok, attempted, detail = await _extend_thinpool(status, grow, run, _before_extend)
         if attempted:
             ProvisioningLedger(config.state_dir).record_action(
                 "pool_extend",
@@ -702,8 +880,6 @@ async def check_pool_pressure(
                 ok,
             )
         if ok:
-            state["last_action"] = now.isoformat()
-            _save_state(state_path, state)
             await _send(
                 dispatcher,
                 AlertSeverity.WARNING,
@@ -713,18 +889,23 @@ async def check_pool_pressure(
                 "cannot shrink; grow the VM disk to restore autoextend headroom.",
             )
             return "extended"
-        _save_state(state_path, state)
-        await _send(
-            dispatcher,
-            AlertSeverity.WARNING,
-            "Guardian could not extend the thin pool",
-            f"{reason}. {numbers}. {detail}. Falling back to deleting guardian snapshots.",
-        )
+        if detail == _GUARD_STOP:
+            # The pre-mutation guard stopped it (pool changed, or the stamp
+            # could not persist). Those same guards stop the delete path too,
+            # so do not claim a fallback, and do not act this tick.
+            return "extend_stopped"
+        if _throttled(state_path, state, "extend_failed_alert", now, cfg.realert_hours):
+            await _send(
+                dispatcher,
+                AlertSeverity.WARNING,
+                "Guardian could not extend the thin pool",
+                f"{reason}. {numbers}. {detail}. Falling back to deleting guardian snapshots.",
+            )
 
     # 2. Delete ONE guardian-owned snapshot; later ticks re-measure.
     meta = await snapshots.list_snapshot_meta_strict()
     if meta is None:
-        if _due(state, "list_failed", now, cfg.realert_hours):
+        if _throttled(state_path, state, "list_failed", now, cfg.realert_hours):
             await _send(
                 dispatcher,
                 severity,
@@ -732,13 +913,17 @@ async def check_pool_pressure(
                 f"{reason}. {numbers}. `incus snapshot list` failed, so the guardian "
                 "cannot tell what it could free. Check incus on the host.",
             )
-            state["list_failed"] = now.isoformat()
-            _save_state(state_path, state)
         return "list_failed"
     infos = [SnapshotInfo(n, c, n.endswith(HEALTHY_SUFFIX)) for n, c in meta]
     target = plan_delete(infos, level, now, config.snapshots.lifeline_max_age_hours)
     if target is None:
-        if level == LEVEL_URGENT and _due(state, "no_target", now, cfg.realert_hours):
+        if level == LEVEL_URGENT and _throttled(
+            state_path,
+            state,
+            "no_target",
+            now,
+            cfg.realert_hours,
+        ):
             held = ", ".join(n for n, _ in meta) or "none"
             await _send(
                 dispatcher,
@@ -749,10 +934,14 @@ async def check_pool_pressure(
                 "deletes what it does not own. Grow the pool or free space by hand "
                 "(docs/reference/thin-pool-recovery.md).",
             )
-            state["no_target"] = now.isoformat()
-            _save_state(state_path, state)
         return f"no_target:{level}"
 
+    if not await _same_pool_now(config, status):
+        return "pool_changed"
+    if not _commit_action(state_path, state, now):
+        # The settle stamp could not persist: deleting now would let the next
+        # tick delete again at once. Stop; the tier alerts still report.
+        return "state_unwritable"
     ok = await snapshots.delete(target)
     lifeline_note = (
         " This was the rollback lifeline: SNAPSHOT_ROLLBACK has no target until the "
@@ -761,8 +950,6 @@ async def check_pool_pressure(
         else ""
     )
     if ok:
-        state["last_action"] = now.isoformat()
-        _save_state(state_path, state)
         await _send(
             dispatcher,
             severity,
@@ -770,15 +957,14 @@ async def check_pool_pressure(
             f"{reason}. {numbers}. Deleted guardian snapshot {target}.{lifeline_note}",
         )
         return f"deleted:{target}"
-    if _due(state, "delete_failed", now, 1):
+    if _throttled(state_path, state, "delete_failed", now, 1):
         await _send(
             dispatcher,
             severity,
             "Guardian could not free pool space",
-            f"{reason}. {numbers}. Deleting guardian snapshot {target} failed; retrying next tick.",
+            f"{reason}. {numbers}. Deleting guardian snapshot {target} failed; "
+            "retrying after the settle interval.",
         )
-        state["delete_failed"] = now.isoformat()
-        _save_state(state_path, state)
     return f"delete_failed:{target}"
 
 
@@ -798,6 +984,15 @@ async def current_pressure(config) -> str:
     try:
         cfg = config.storage_pool
         if not cfg.enabled or effective_relief_mode(cfg) != "live":
+            return LEVEL_NONE
+        if validate_relief_config(config) is not None:
+            return LEVEL_NONE
+        # Relief just acted (or is settling): its effect is not measured yet,
+        # so delete-first must not stack a second delete on the same tick.
+        relief_state = _load_state(config.state_path / STATE_FILE)
+        if not _due(
+            relief_state, "last_action", datetime.now(UTC), cfg.history_sample_interval_s / 3600.0
+        ):
             return LEVEL_NONE
         status = await measure_storage_pool(config)
         sample = sample_from_status(status, datetime.now(UTC))

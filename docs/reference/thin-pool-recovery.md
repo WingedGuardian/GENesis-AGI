@@ -42,10 +42,18 @@ once an hour. That is ample against horizons of a day or two, but it is not
 1. **Measures and remembers.** It keeps a bounded history of data% and
    metadata%, converted to bytes, in `pool_history.jsonl` in the Guardian state
    directory: one sample per 5 minutes, 7 days.
-2. **Derives the runway.** It computes:
-   - the growth rate, the worse of the last 6 hours and the last 24 hours;
-   - the worst 10-minute burst in the last day, which sets a free-space reserve
-     (at least 3% of the pool);
+2. **Derives the runway.** It computes, for data and for metadata alike:
+   - the growth rate: the worst SUSTAINED growth over the last 2, 6, 24 and 72
+     hours. The 72-hour window is what lets a job that writes a chunk once a
+     day read as its daily average.
+     Growth counts only when it shows in both halves of a window, so a one-off
+     step never reads as a rate. That rules out a backup writing 2 GB in
+     minutes, or the several-point metadata jump a new thin snapshot causes;
+   - the worst burst in the last day: any 10-minute rise, or any rise between
+     two consecutive readings up to 3 hours apart (ticks can be an hour apart
+     during an outage). Longer gaps are left to the rate. The burst sets a
+     free-space reserve of at least 3% of the pool for data and 10% of the
+     metadata LV for metadata;
    - the hours until data or metadata is full.
 3. **Relieves in two stages.** It frees at most one thing per check. After
    freeing something it waits one history interval (5 minutes) before freeing
@@ -118,13 +126,25 @@ with no overlay.
 | `storage_pool.relief_mode` | `live` | `live` acts. `alert_only` only alerts: no relief action and no delete-first rotation. `off` also stops recording history. An invalid value becomes `alert_only`, with a warning. A bare `off` in YAML is read as a boolean and still means off. |
 | `storage_pool.early_horizon_hours` | 48 | runway below which the early stage acts |
 | `storage_pool.urgent_horizon_hours` | 24 | runway below which any Guardian snapshot may go |
-| `storage_pool.burst_multiplier` | 2.0 | reserve = worst 10-minute burst in the last day × this |
-| `storage_pool.min_reserve_pct` | 3.0 | reserve floor while history is short |
+| `storage_pool.burst_multiplier` | 2.0 | reserve = worst burst in the last day (10-minute rise, or a rise across a gap of up to 3h) × this |
+| `storage_pool.min_reserve_pct` | 3.0 | data reserve floor (% of the pool) |
+| `storage_pool.min_meta_reserve_pct` | 10.0 | metadata reserve floor (% of the metadata LV) |
 | `storage_pool.extend_keep_free_mib` | 512 | volume-group space the extend never uses |
 | `snapshots.lifeline_max_age_hours` | 48 | age at which the early stage may take the lifeline (≤ 0: never early) |
 
 Environment kill switch: `GUARDIAN_POOL_RELIEF_DISABLED=1` forces `alert_only`,
 which stops every automatic delete and extend this page describes.
+
+Every value above is validated before relief may act (type, a finite range,
+whole numbers where a count is expected). A bad value makes relief refuse to
+act: for example `min_reserve_pct: 300`, `early_horizon_hours: "48h"`, or an
+empty `snapshots.prefix`. It sends one warning a day, and the tier alerts keep
+running. That daily warning, and every other relief alert, is sent only if its
+"already alerted" stamp could be saved. An unwritable state dir therefore
+produces no alert storm, just the tier alerts. Relief also stamps its settle and extend throttles
+to disk BEFORE each change, and re-reads the pool right before acting. If the
+stamp can't be written, or the pool is no longer the one it measured, it acts
+on nothing.
 
 ## Reading the state on the host
 
