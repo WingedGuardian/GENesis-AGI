@@ -9375,11 +9375,13 @@ def _push_targets_current_branch(
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
-         • ``git push <remote> <cur>`` (no ``src:dst`` colon) → an explicit refspec
-           overrides ``remote.push`` / ``push.default`` / ``pushRemote`` → True;
+         • ``git push <remote> <cur>`` → an explicit refspec overrides
+           ``remote.push`` / ``push.default`` / ``pushRemote`` → True;
+         • ``git push <remote> <src>:<dst>`` → True only when BOTH halves name
+           the current branch (see ``_colon_refspec_updates_current_branch``);
          • bare ``git push`` / ``git push <remote>`` → True only if
            ``_push_config_is_simple(remote)`` (no redirecting/broadening repo config);
-         • a colon refspec, a differently-named branch, or ≥2 refspecs → False.
+         • a differently-named branch or ≥2 refspecs → False.
     Conservative by construction: any unrecognized form re-prompts. argv-based
     (quote-stripped).
     """
@@ -9397,10 +9399,71 @@ def _push_targets_current_branch(
         # PROVIDED the ref names the current branch. Three spellings do:
         # `<cur>`, `HEAD`, and `refs/heads/<cur>`. Anything else — another
         # branch, a tag, `refs/heads/main` from a feature branch — is not.
-        return ":" not in refspec and _ref_names_current_branch(refspec, cur)
+        if ":" in refspec:
+            return _colon_refspec_updates_current_branch(refspec, cur)
+        return _ref_names_current_branch(refspec, cur)
     # Bare `git push` or `git push <remote>` → the ref set depends on repo config,
     # keyed on the remote git will ACTUALLY push to (resolved by the caller).
     return _push_config_is_simple(remote, cwd=cwd)
+
+
+def _colon_refspec_updates_current_branch(refspec: str, cur: str | None) -> bool:
+    """Whether a ``src:dst`` refspec plainly updates the current branch.
+
+    The THIRD spelling of a routine publish to reach this function, after
+    ``HEAD`` and ``refs/heads/<cur>``. ``git push origin HEAD:refs/heads/<cur>``
+    is how a session republishes a branch whose remote it believes is missing,
+    and the predicate used to reject every colon outright — which sent it to
+    main()'s catch-all, the arm that is ``ask_class = None`` WHOLESALE. So the
+    one form that is unambiguously routine prompted unsuppressibly, every time.
+
+    Established POSITIVELY, both halves, because a colon refspec is where the
+    genuinely dangerous forms live and they must all stay False:
+
+        ``HEAD:refs/heads/main``      publishing a feature branch ONTO main
+        ``:refs/heads/<branch>``      an empty source DELETES the remote branch
+        ``main:refs/heads/<cur>``     another branch's tip under this name
+        ``HEAD:refs/tags/v1``         a tag, not a branch publish
+        ``HEAD:<cur>``                unqualified — git may resolve it into
+                                      ``refs/tags/``, so it is not this branch
+        ``HEAD:a:b`` / ``HEAD:``      refused by the destination equality below,
+                                      not by a clause of their own — an earlier
+                                      revision claimed a dedicated multi-colon
+                                      guard and a mutation sweep showed no test
+                                      could kill it, because there was nothing
+                                      there to kill
+
+    On splitting: git splits a refspec on the LAST colon, this uses the first.
+    Unreachable as a false TRUE — ``git check-ref-format --branch 'a:b'`` is
+    fatal, so ``cur`` can never contain a colon, so any True verdict implies a
+    colon-free destination and the two splits coincide.
+
+    A leading ``+`` (git's force shorthand) cannot reach here: ``_push_is_force``
+    returns True on it and ``_push_ref_positionals`` returns None, so the seg
+    never gets this far. Both layers were verified before this was written,
+    because suppressing the prompt on a force push is the one outcome that would
+    make this change worse than the problem it solves.
+    """
+    if not cur:
+        return False
+    src, sep, dst = refspec.partition(":")
+    if not sep:
+        return False  # no colon — the caller routes those elsewhere
+    if not src or not dst:
+        return False  # `:dst` is a DELETE; `src:` is not a plain update
+    if not _ref_names_current_branch(src, cur):
+        return False  # the source must resolve to the current branch
+    # FULLY QUALIFIED ONLY. A bare `<cur>` destination is NOT equivalent:
+    # git-push(1) says "If <dst> unambiguously refers to a ref on the
+    # <repository> remote, then push to that ref", and MEASURED against a remote
+    # holding `refs/tags/<cur>` and no `refs/heads/<cur>`, git resolved
+    # `HEAD:<cur>` into refs/tags/ and rejected it; with both present it errors
+    # with "dst refspec matches more than one". Every such outcome is a git
+    # refusal, so nothing publishes either way — but claiming "a plain update of
+    # the current branch" for a command that is not one is how a predicate
+    # starts drifting. This also kills a `dst.endswith(cur)` mutant that the
+    # first test set could not.
+    return dst == f"refs/heads/{cur}"
 
 
 def _ref_names_current_branch(ref: str, cur: str | None) -> bool:

@@ -514,16 +514,138 @@ def test_which_refspecs_name_the_current_branch(ref, cur, names_it: bool, why: s
 
 
 @pytest.mark.parametrize(
+    ("refspec", "updates_cur", "why"),
+    [
+        ("HEAD:refs/heads/feat/x", True, "THE spelling that kept prompting unsuppressibly"),
+        ("feat/x:refs/heads/feat/x", True, "bare source naming the current branch"),
+        ("refs/heads/feat/x:refs/heads/feat/x", True, "both halves fully qualified"),
+        # NOT True: git-push(1) resolves an unqualified destination against the
+        # remote's refs, and MEASURED against a remote holding `refs/tags/feat/x`
+        # it picked the TAG and rejected the push. This row asserted the opposite
+        # for one revision, which would have made the correct narrowing look like
+        # a regression to the next reviewer.
+        ("HEAD:feat/x", False, "unqualified dst may resolve into refs/tags/"),
+        ("HEAD:refs/heads/sub/feat/x", False, "a PREFIX extension, not this branch"),
+        # Every row below is a form that MUST keep prompting. A colon refspec is
+        # where the dangerous shapes live, which is why both halves are checked.
+        ("HEAD:refs/heads/main", False, "publishing a feature branch ONTO main"),
+        (":refs/heads/feat/x", False, "empty source DELETES the remote branch"),
+        ("HEAD:", False, "empty destination is not a plain update"),
+        ("main:refs/heads/feat/x", False, "another branch's tip under this name"),
+        ("refs/heads/main:refs/heads/feat/x", False, "same, fully qualified"),
+        ("HEAD:refs/tags/v1.0", False, "a tag is not a branch publish"),
+        ("HEAD:refs/heads/feat/y", False, "a differently-named branch"),
+        ("HEAD:a:b", False, "two colons is not a refspec this understands"),
+        ("HEAD:refs/heads/feat/xy", False, "prefix of the current branch is not it"),
+    ],
+)
+def test_which_colon_refspecs_update_the_current_branch(
+    refspec: str, updates_cur: bool, why: str
+) -> None:
+    """The third spelling, driven directly.
+
+    MEASURED against the live hook before this change: `git push origin
+    HEAD:refs/heads/<cur>` returned `ask` with "git push needs your approval
+    before publishing externally" — the catch-all arm, which is
+    `ask_class = None` WHOLESALE and therefore cannot be suppressed by the
+    install-local knob. That is a routine republish of the current branch, and
+    it is the form a session reaches for when it believes a remote branch is
+    missing.
+
+    The False rows outnumber the True ones on purpose. This function exists
+    because a colon refspec is exactly where the destructive forms live — a
+    delete, a push onto main, a tag — and establishing the safe case positively
+    is the only way to admit it without admitting them.
+    """
+    assert gpg._colon_refspec_updates_current_branch(refspec, "feat/x") is updates_cur, why
+
+
+@pytest.mark.parametrize(
+    ("refspec", "cur", "why"),
+    [
+        (":refs/heads/feat/x", "feat/x", "an empty source DELETES the remote branch"),
+        ("HEAD:a:b", "feat/x", "two colons is not a refspec this understands"),
+        # The falsy-cur rows are the ONLY place `if not cur` is observable: the
+        # detached-HEAD test it was written for passes with that clause deleted,
+        # because `_ref_names_current_branch` refuses a falsy cur one frame down.
+        # Neutering that function is what exposes the clause.
+        ("HEAD:refs/heads/feat/x", None, "detached HEAD names no branch"),
+        ("HEAD:refs/heads/feat/x", "", "same, empty spelling"),
+        # The row that actually binds `if not cur`. With the destination check
+        # tightened to `dst == f"refs/heads/{cur}"`, an EMPTY cur makes the
+        # expected destination the bare prefix `refs/heads/` — so this refspec
+        # passes the destination check, and the precondition is the only clause
+        # between it and True. The two rows above do not bind it: the destination
+        # check already refuses them on its own, which a mutation sweep showed.
+        ("HEAD:refs/heads/", "", "empty cur makes the bare prefix a match"),
+    ],
+)
+def test_the_structural_guards_hold_even_if_the_ref_rule_goes_permissive(
+    refspec: str, cur: str | None, why: str, monkeypatch
+) -> None:
+    """The guards are REDUNDANT today and that is exactly why they need this.
+
+    A mutation sweep showed that deleting the empty-source check, the
+    multi-colon check or the detached-HEAD check changes nothing observable:
+    every one of those inputs already returns False through the SOURCE check,
+    because `_ref_names_current_branch("")` is False and `"a:b"` names no
+    branch. A clause whose removal no test can detect is not defended, it is
+    merely present — and the moment `_ref_names_current_branch` is made more
+    permissive, the empty source stops being caught and `:refs/heads/<cur>`
+    becomes an ALLOWED remote-branch DELETE.
+
+    So neuter that function instead of deleting a token: force it permissive and
+    assert the structural guards still refuse. This is the difference between a
+    negative control and a token edit.
+    """
+    monkeypatch.setattr(gpg, "_ref_names_current_branch", lambda ref, cur: True)
+
+    # Control: with the rule permissive, a WELL-FORMED refspec must now pass —
+    # otherwise the monkeypatch did not take and the assertions below are vacuous.
+    assert gpg._colon_refspec_updates_current_branch("anything:refs/heads/feat/x", "feat/x") is True
+
+    assert gpg._colon_refspec_updates_current_branch(refspec, cur) is False, why
+
+
+def test_a_colon_refspec_never_updates_a_detached_head() -> None:
+    """No current branch means no refspec can name it."""
+    assert gpg._colon_refspec_updates_current_branch("HEAD:refs/heads/feat/x", None) is False
+    assert gpg._colon_refspec_updates_current_branch("HEAD:refs/heads/feat/x", "") is False
+
+
+def test_a_force_shorthand_refspec_never_reaches_the_colon_rule() -> None:
+    """CONTROL, and the one that matters most.
+
+    `+<refspec>` is git's force shorthand — a force push with no `--force` flag.
+    If it reached the colon rule it would be classified as a routine publish and
+    the knob could suppress the prompt on a FORCE push, which is strictly worse
+    than the problem this change solves. Two independent layers stop it, and
+    this test binds both rather than trusting either.
+    """
+    seg = _parsed_push_seg("git push origin +HEAD:refs/heads/feat/x")
+    argv = getattr(seg, "argv", None) or []
+    assert gpg._push_is_force(argv) is True, "the + shorthand must read as force"
+    assert gpg._push_ref_positionals(argv) is None, (
+        "the positional parser must refuse a + refspec outright"
+    )
+    assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is False
+
+
+@pytest.mark.parametrize(
     ("command", "targets_cur"),
     [
         ("git push -u origin HEAD", True),
         ("git push origin HEAD", True),
         ("git push origin feat/x", True),
         ("git push origin refs/heads/feat/x", True),
+        # The colon spelling, through the REAL parse rather than the helper — a
+        # rule defined and never consulted has to fail somewhere.
+        ("git push origin HEAD:refs/heads/feat/x", True),
         ("git push origin refs/heads/main", False),
         ("git push origin refs/tags/v1.0", False),
         ("git push origin main", False),
         ("git push origin HEAD:refs/heads/main", False),
+        ("git push origin :refs/heads/feat/x", False),
         ("git push --all origin", False),
         ("git push --delete origin feat/x", False),
     ],
