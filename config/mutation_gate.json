@@ -1,0 +1,45 @@
+{
+  "_README": [
+    "The pinned verify-RED set. Each case BREAKS one guard's decision and names",
+    "the test that must notice. CI fails if any case SURVIVES -- that test no",
+    "longer pins the property it is named for -- or ABORTS, because a case that",
+    "could not run has established nothing.",
+    "",
+    "Deliberately SMALL. This is not coverage tooling; it is a handful of",
+    "load-bearing decisions whose tests must never rot silently.",
+    "",
+    "EVERY PAIRING HERE WAS VERIFIED TO DISCRIMINATE, not assumed. The first",
+    "draft of this file had two cases that SURVIVED, and neither was a weak",
+    "test: one mutated `main()` while the test calls `_rm_violations` directly,",
+    "and the other was behaviourally null -- `rm -rf /` has zero path segments,",
+    "so `len(parts) < 4` and `< 1` are both true. A third candidate was masked",
+    "by a sibling layer: `_ALWAYS_BLOCK` refuses `/`, `.`, `~` regardless of",
+    "depth, so every test using those inputs is structurally blind to the depth",
+    "rule. Choose the input that discriminates, then confirm it does.",
+    "",
+    "AN ANCHOR THAT STOPS MATCHING IS A FEATURE. If someone edits a guard and",
+    "this gate aborts with 'anchor matched 0x', the case must be updated in the",
+    "same change -- exactly the moment to ask whether the test still pins the",
+    "new shape."
+  ],
+  "cases": [
+    {
+      "label": "rm-guard depth floor weakened from 4 to 1",
+      "path": "scripts/hooks/destructive_command_guard.py",
+      "anchor": "    if len(parts) < 4:",
+      "replacement": "    if len(parts) < 1:",
+      "validator": "python",
+      "test": "tests/test_hooks/test_destructive_command_guard.py::TestLineContinuationFoldsAsTheShellFolds::test_positive_control_the_joined_form_is_refused",
+      "why": "the depth threshold IS the guard's judgement. A weakened floor still refuses something, so a test asserting only 'blocks at all' would miss it -- this case uses a depth-3 target (~/genesis) precisely because `/` is refused by _ALWAYS_BLOCK regardless of depth and would mask the mutation"
+    },
+    {
+      "label": "protected-paths guard stops blocking entirely",
+      "path": "scripts/hooks/protected_paths_guard.py",
+      "anchor": "    return 2",
+      "replacement": "    return 0",
+      "validator": "python",
+      "test": "tests/test_hooks/test_protected_paths_guard.py::TestProtectedDirBlocks::test_dir_itself",
+      "why": "deleting a protected directory must be refused, and this is the single decision point that refuses it"
+    }
+  ]
+}
