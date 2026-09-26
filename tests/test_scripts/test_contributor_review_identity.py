@@ -224,6 +224,34 @@ _PERMITTED_JOB_KEYS = frozenset(
 #: lint-recommended edit is a guard that gets silenced.
 _PERMITTED_WORKFLOW_KEYS = frozenset({"name", "on", "permissions", "concurrency", "jobs"})
 
+#: The post step's ENTIRE environment, keys and values, as exact literals.
+#:
+#: Allowlisting only the credential left the rest of the block free, and an `env`
+#: on this step is a process-startup channel, not just a data channel:
+#: `NODE_OPTIONS: ${{ github.event.pull_request.body }}` lets an outside
+#: contributor put `--import=data:text/javascript,...` in their PR body and have
+#: node execute it BEFORE the pinned action runs, with MAINTAINER_TOKEN already in
+#: the environment. Reproduced by the reviewer on Node 24.15.0. No amount of
+#: checking the script body finds that, because the payload never enters the
+#: script.
+#:
+#: So the environment is pinned whole. A new variable here is a deliberate edit
+#: with a reviewer attached, which for the one step that holds the credential is
+#: the correct amount of friction.
+_PERMITTED_POST_ENV = {
+    "MAINTAINER_TOKEN": "${{ secrets.REVIEW_REQUEST_TOKEN }}",
+    "TARGET_PR": "${{ steps.eligible.outputs.pr }}",
+    "TARGET_ISSUE": "${{ steps.eligible.outputs.issue }}",
+}
+
+#: Step keys are an allowlist for the same reason job keys are. `continue-on-error`
+#: is the one that made it necessary: on the credential-bearing step it tells
+#: GitHub to tolerate a non-zero outcome, so both `core.setFailed` paths -- an
+#: unreadable comment list, and a revoked or under-scoped PAT -- stop turning the
+#: job red. That deletes the signal this change relies on to tell a broken
+#: credential apart from a successful request, and it deletes it silently.
+_PERMITTED_STEP_KEYS = frozenset({"name", "id", "if", "uses", "with", "env"})
+
 #: The ONE runner this workflow may use, as a literal. `runs-on` passed the key
 #: allowlist while its VALUE stayed unbounded, and the value decides which machine
 #: decrypts MAINTAINER_TOKEN: `runs-on: [self-hosted, attacker-pool]` relocates
@@ -464,8 +492,19 @@ def _violations(doc: dict) -> list[str]:
             out.append(f"interpolation-in-script:{label}")
 
         token = str(with_.get("github-token", ""))
+        for step_key in step:
+            if step_key not in _PERMITTED_STEP_KEYS:
+                out.append(f"unpermitted-step-key:{label}:{step_key}")
+
         if step.get("name") == _POST_STEP:
             saw_post = True
+            # The WHOLE environment, keys and values. See _PERMITTED_POST_ENV:
+            # an env var on this step can reach node's startup, not just the
+            # script's data.
+            if (step.get("env") or {}) != _PERMITTED_POST_ENV:
+                out.append(
+                    f"post-step-env-is-not-the-permitted-set:{sorted(step.get('env') or {})}"
+                )
             # Each of the three slots is compared to its permitted LITERAL.
             # See the constants: every previous form of these checks reasoned
             # about the secret NAME inside the expression, and each one was
@@ -481,12 +520,20 @@ def _violations(doc: dict) -> list[str]:
                 out.append("post-step-maintainer-env-is-not-the-permitted-expression")
             if str(step.get("if") or "").strip() != _PERMITTED_GUARD:
                 out.append("post-step-guard-is-not-the-permitted-expression")
-        elif token:
-            # A secret on a non-post step is caught by location above, whatever
-            # channel carries it. This catches the remaining case: a credential
-            # that is not a secret reference at all, such as `${{ github.token
-            # }}`, handed to a step that applies author-influenced predicates.
-            out.append(f"non-post-step-holds-a-token:{label}")
+        else:
+            if token:
+                # A secret on a non-post step is caught by location above,
+                # whatever channel carries it. This catches the remaining case: a
+                # credential that is not a secret reference at all, such as
+                # `${{ github.token }}`, handed to a step that applies
+                # author-influenced predicates.
+                out.append(f"non-post-step-holds-a-token:{label}")
+            if step.get("env"):
+                # No step but the poster needs an environment, and `env` is a
+                # process-startup channel: NODE_OPTIONS reaches node before the
+                # action does. Nothing here needs one, so nothing here may have
+                # one.
+                out.append(f"non-post-step-has-an-env:{label}")
 
     if not saw_post:
         out.append("post-step-missing")
@@ -687,6 +734,29 @@ def _bracket_secret_on_the_eligibility_step(doc):
 
 def _bracket_secret_in_workflow_env(doc):
     doc["env"] = {"MAINTAINER_TOKEN": "${{ secrets['REVIEW_REQUEST_TOKEN'] }}"}
+
+
+def _node_options_from_the_pr_body(doc):
+    """Author-controlled process startup, before the pinned action even loads.
+
+    `--import=data:text/javascript,...` in a PR body executes in the node process
+    that runs github-script, with MAINTAINER_TOKEN already present. The script
+    body is never involved, so scanning it finds nothing.
+    """
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["env"]["NODE_OPTIONS"] = "${{ github.event.pull_request.body }}"
+
+
+def _continue_on_error_on_the_post_step(doc):
+    """Tells GitHub to tolerate the failure this change relies on to be loud."""
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["continue-on-error"] = True
+
+
+def _env_on_the_eligibility_step(doc):
+    _first_job(doc)["steps"][0]["env"] = {"NODE_OPTIONS": "--import=data:x"}
 
 
 def _uppercase_secrets_context(doc):
@@ -953,6 +1023,9 @@ def _drop_the_post_step(doc):
         (_whole_context_secret_export, "secret-outside-the-post-step:"),
         (_secret_after_a_nested_brace, "secret-outside-the-post-step:"),
         (_secret_after_an_injected_double_brace, "secret-outside-the-post-step:"),
+        (_node_options_from_the_pr_body, "post-step-env-is-not-the-permitted-set:"),
+        (_continue_on_error_on_the_post_step, "unpermitted-step-key:"),
+        (_env_on_the_eligibility_step, "non-post-step-has-an-env:"),
         (_uppercase_secrets_context, "secret-outside-the-post-step:"),
         (_uppercase_whole_context_export, "secret-outside-the-post-step:"),
         (_uppercase_write_permission, "default-token-write-scope:"),
