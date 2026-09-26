@@ -11641,7 +11641,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             label = "ok (freshness label unverified — re-read failed)"
         elif _reviewed != _head_l:
             _report_delta = _classify_post_review_delta(_reviewed, _head_l, repo)
-            if _report_delta == "trivial":
+            if _report_delta == "inline":
                 label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
             else:
                 label = "ok (freshness label unverified — accepted evidence could not be re-read)"
