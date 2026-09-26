@@ -29,8 +29,20 @@ column serves both states, disambiguated by ``status``:
   * ``status='open'`` + ``verdict`` non-NULL -> the last non-closing attempt
   * ``status='open'`` + ``verdict`` NULL     -> never attempted
 
-The invariant the CRUD enforces and the tests pin: a PASS verdict exists if and
-only if the row is closed.
+The invariant the CRUD enforces and the tests pin is DIRECTIONAL, and saying so
+precisely matters because the obvious biconditional is FALSE:
+
+    verdict IN (pass-mechanical, pass-with-measured-gaps)  =>  status = 'closed'
+    verdict NOT NULL AND NOT a PASS                        =>  status = 'open'
+
+The converse does NOT hold. A closed row may carry a NULL verdict, and on a live
+install most of them do: the docs-only path exemption is born closed by
+``open_verification`` with no verdict, because a deterministic path rule is not a
+validator's conclusion. So ``status='closed'`` means "obligation discharged", not
+"a validator passed it" — the two are different facts and only ``verdict``
+separates them. (An earlier draft of this docstring claimed the biconditional; an
+adversarial review MEASURED the counterexample by adding one docs-exempt row to
+the test that asserted it.)
 
 NO CHECK CONSTRAINT, deliberately. SQLite cannot ALTER a CHECK, so widening the
 vocabulary later costs the full 12-step table rebuild — and this repo has the

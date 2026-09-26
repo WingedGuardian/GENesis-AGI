@@ -103,6 +103,17 @@ def _print_verification_backlog(db_path: str | None) -> None:
             f"OPEN  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
             f"merged {str(row['merged_at'])[:10]}  {title[:80]}"
         )
+        # A PARKED row: a validator attempted it and could not discharge it. Shown
+        # inline because the alternative is a validator re-deriving a conclusion
+        # someone already reached — which is the whole reason the note is stored.
+        # `verdict` is only ever set on an OPEN row by a non-closing attempt (a
+        # pass closes the row), so its presence IS the parked signal.
+        if row.get("verdict"):
+            note = (row.get("last_attempt_note") or "").strip()
+            tries = row.get("attempt_count") or 0
+            print(
+                f"      ATTEMPTED {tries}x  {row['verdict']}{'  — ' + note[:120] if note else ''}"
+            )
     # `list_open` has its own row cap, so the lines above can be a SUBSET while
     # the histogram below reports the true total — printing both without saying
     # so lets the two numbers disagree in silence, and a reader who counts the
@@ -116,6 +127,96 @@ def _print_verification_backlog(db_path: str | None) -> None:
             f"pr_verifications directly for the full set>"
         )
     print(f"pr_verifications: {open_total} open, {histogram.get('closed', 0)} closed ({resolved})")
+    print(
+        "  close one: python3 scripts/pr_verification.py close --pr <N> --verdict "
+        "<pass-mechanical|pass-with-measured-gaps|fail-intent|cannot-verify> "
+        "--evidence-file <doc.json>   (see --verification-log for what was decided)"
+    )
+
+
+#: Rows one `--verification-log` run will show. Named rather than inline so the
+#: truncation disclosure below cannot drift from the value it describes.
+_LOG_LIMIT = 500
+
+
+def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
+    """The closed-obligation reader: what a validator DECIDED, and on what evidence.
+
+    The counterpart to the backlog. Without it the evidence column is write-only —
+    MEASURED before this shipped: nothing in ``src/`` or ``scripts/`` ever SELECTed
+    it, while the daily retention timer deletes closed rows at 45 days. A record
+    nothing can read is not a record.
+
+    Read-only, no worker run, no debounce — same contract and same guards as the
+    backlog reader above, including the built-not-interpolated ``mode=ro`` URI.
+    """
+    import asyncio as _asyncio
+
+    from genesis.db.crud import pr_verifications as verif_crud
+    from genesis.env import genesis_db_path
+
+    resolved = db_path or str(genesis_db_path())
+    if not Path(resolved).exists():
+        print(f"pr_verifications: no database at {resolved}")
+        return
+    try:
+        from genesis.db.admission import database_is_fenced
+
+        fenced = database_is_fenced(resolved)
+    except Exception:
+        fenced = True
+    if fenced:
+        print("pr_verifications: database quarantined — skipped")
+        return
+
+    async def _read() -> list[dict]:
+        import aiosqlite
+
+        uri = f"{Path(resolved).absolute().as_uri()}?mode=ro"
+        async with aiosqlite.connect(uri, uri=True, timeout=10) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+            # The filter goes to SQL, never to a Python pass over a capped page:
+            # paging 500 and filtering after it reported "no closed rows for PR #N"
+            # about a row that WAS closed, and blamed an empty table for it.
+            return await verif_crud.list_closed(db, limit=_LOG_LIMIT, pr_number=pr_number)
+
+    rows = _asyncio.run(_read())
+    if not rows:
+        scope = f" for PR #{pr_number}" if pr_number is not None else ""
+        print(
+            f"pr_verifications: no closed rows{scope} — the table is empty, "
+            f"pre-migration, or nothing matching has been discharged"
+        )
+        return
+
+    for row in rows:
+        # A NULL verdict is stated, never blanked: it means the row was closed
+        # before verdicts existed, or by the deterministic docs-path exemption —
+        # not that a validator reached no conclusion.
+        verdict = row.get("verdict") or "<no verdict — auto-exempt by path, or pre-verdict>"
+        print(
+            f"CLOSED  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
+            f"{str(row.get('closed_at') or '')[:19]}  {verdict}"
+        )
+        reason = (row.get("closed_reason") or "").strip()
+        if reason:
+            print(f"        reason  : {reason[:160]}")
+        evidence = row.get("evidence")
+        if evidence:
+            print(f"        evidence: {len(evidence)} bytes")
+        else:
+            print("        evidence: none recorded")
+    # A listing whose length EQUALS its cap is a truncated read, and printing the
+    # count alone lets a reader take it for a total — the same omission the backlog
+    # reader states with both numbers. Say so rather than letting the two disagree
+    # in silence.
+    if len(rows) >= _LOG_LIMIT:
+        print(
+            f"  <listed the {_LOG_LIMIT} most recently closed; this is a CAPPED read, "
+            f"not a total — narrow with --pr, or query pr_verifications directly>"
+        )
+    print(f"pr_verifications: {len(rows)} closed row(s) shown ({resolved})")
 
 
 def main() -> None:
@@ -141,13 +242,30 @@ def main() -> None:
     parser.add_argument(
         "--verification-backlog",
         action="store_true",
-        help="list OPEN post-merge verification obligations (oldest merge "
-        "first) and exit — no worker run, no debounce, read-only",
+        help="list OPEN post-merge verification obligations (never-attempted "
+        "first, oldest merge first within each group) and exit — no worker run, "
+        "no debounce, read-only",
+    )
+    parser.add_argument(
+        "--verification-log",
+        action="store_true",
+        help="list CLOSED obligations with the verdict and evidence a validator "
+        "recorded, and exit — read-only. Pair with --pr to scope to one PR",
+    )
+    parser.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help="scope --verification-log to a single PR number",
     )
     args = parser.parse_args()
 
     if args.verification_backlog:
         _print_verification_backlog(args.db_path)
+        return
+
+    if args.verification_log:
+        _print_verification_log(args.db_path, args.pr)
         return
 
     from genesis.session_awareness.repo_pulse_worker import run_pulse_worker

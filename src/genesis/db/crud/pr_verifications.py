@@ -314,7 +314,9 @@ async def open_repos_for_pr(db: aiosqlite.Connection, *, pr_number: int) -> list
     return [row[0] for row in await cursor.fetchall()]
 
 
-async def list_closed(db: aiosqlite.Connection, *, limit: int = 200) -> list[dict]:
+async def list_closed(
+    db: aiosqlite.Connection, *, limit: int = 200, pr_number: int | None = None
+) -> list[dict]:
     """Closed obligations, most recently closed FIRST. Empty pre-migration.
 
     A separate function rather than a flag on :func:`list_open` because the
@@ -322,16 +324,32 @@ async def list_closed(db: aiosqlite.Connection, *, limit: int = 200) -> list[dic
     point is what waited longest" is meaningless once a row is discharged: what
     a reader wants from closed rows is what was decided most recently.
 
+    ``pr_number`` filters IN SQL, and that is the point of the parameter rather
+    than a convenience. A caller that pages the most recent N and then filters in
+    Python reports a confident FALSE ABSENCE the moment the target sits past the
+    page — MEASURED on an earlier draft of the CLI reader: with 511 closed rows it
+    printed "no closed rows for PR #1" about a row that was closed
+    ``pass-mechanical``, and attributed it to an empty or pre-migration table. The
+    sibling :func:`open_repos_for_pr` docstring forbids exactly this shape; the
+    reader broke the rule a hundred lines from where it is written down.
+
     Assumes a Row factory.
     """
     if not await _tables_available(db):
         return []
     lim = max(1, min(int(limit), 2000))
-    cursor = await db.execute(
-        "SELECT * FROM pr_verifications WHERE status = 'closed' "
-        "ORDER BY closed_at DESC, pr_number DESC LIMIT ?",
-        (lim,),
-    )
+    if pr_number is not None:
+        cursor = await db.execute(
+            "SELECT * FROM pr_verifications WHERE status = 'closed' AND pr_number = ? "
+            "ORDER BY closed_at DESC, repo DESC LIMIT ?",
+            (int(pr_number), lim),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM pr_verifications WHERE status = 'closed' "
+            "ORDER BY closed_at DESC, pr_number DESC LIMIT ?",
+            (lim,),
+        )
     return [dict(r) for r in await cursor.fetchall()]
 
 

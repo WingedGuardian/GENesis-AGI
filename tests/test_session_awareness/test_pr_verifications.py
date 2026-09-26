@@ -297,8 +297,9 @@ async def test_the_pass_iff_closed_invariant_holds_across_both_writers(db):
     two writers that can set a verdict — because an adversarial review showed a
     cross-column invariant cannot be held by writers that ignore each other.
 
-    Drive every verdict through its own writer, then assert the biconditional
-    over the whole table rather than per row.
+    Drive every verdict through its own writer, then assert the DIRECTIONAL rule
+    over the whole table. Directional, not a biconditional: a closed row may carry
+    a NULL verdict, and on a live install most closed rows do.
     """
     await _open(db, 60)
     await verif_crud.close_verification(
@@ -323,15 +324,49 @@ async def test_the_pass_iff_closed_invariant_holds_across_both_writers(db):
         db, repo=REPO, pr_number=63, verdict="cannot-verify", note="no box", now=NOW
     )
     await _open(db, 64)  # never attempted
+    # THE CLASS THAT FALSIFIES THE BICONDITIONAL, and the reason this fixture
+    # carries it: a docs-only exemption is born CLOSED with no verdict, and a live
+    # install's closed rows are mostly this. An adversarial review added exactly
+    # this row to an earlier version of this test and it failed immediately —
+    # the test was green only because its fixture omitted the class.
+    await verif_crud.open_verification(
+        db,
+        repo=REPO,
+        pr_number=65,
+        pr_title="docs: x",
+        merged_at="2026-09-06T10:00:00Z",
+        now=NOW,
+        closed_reason="docs-only by path rule — deterministic exemption",
+    )
 
     cur = await db.execute("SELECT pr_number, status, verdict FROM pr_verifications")
-    for row in await cur.fetchall():
-        is_pass = row["verdict"] in verif_crud.PASS_VERDICTS
-        is_closed = row["status"] == "closed"
-        assert is_pass == is_closed, (
-            f"PR {row['pr_number']}: verdict={row['verdict']!r} status={row['status']!r} "
-            f"violates 'a PASS verdict exists iff the row is closed'"
-        )
+    rows = [dict(r) for r in await cur.fetchall()]
+    for row in rows:
+        verdict, status = row["verdict"], row["status"]
+        if verdict in verif_crud.PASS_VERDICTS:
+            assert status == "closed", (
+                f"PR {row['pr_number']}: verdict={verdict!r} but status={status!r} — "
+                f"a PASS verdict must mean the obligation was discharged"
+            )
+        elif verdict is not None:
+            assert status == "open", (
+                f"PR {row['pr_number']}: verdict={verdict!r} but status={status!r} — "
+                f"a non-closing verdict must leave the obligation open"
+            )
+        # verdict IS NULL says nothing about status: open means never attempted,
+        # closed means discharged without a validator verdict (the docs-path
+        # exemption, or a row predating verdicts). The CONVERSE of the invariant
+        # does not hold and asserting it would be false.
+
+    # Guard-the-guard: the fixture must actually contain the falsifying class, or
+    # the loop above is asserting the directional rule over a population that
+    # could not distinguish it from the biconditional.
+    assert any(r["status"] == "closed" and r["verdict"] is None for r in rows), (
+        "fixture must include a closed row with no verdict"
+    )
+    assert any(r["status"] == "open" and r["verdict"] is not None for r in rows), (
+        "fixture must include a parked row"
+    )
 
 
 # ── readers ──────────────────────────────────────────────────────────────
