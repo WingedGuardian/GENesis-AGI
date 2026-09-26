@@ -330,8 +330,55 @@ zone_a_live_exclusions() {
     # the reap loop, logged as spared, and then deleted by the cache sweep
     # twenty lines later.
     local -n _wg_out="$1"
-    local snapshot="$2" root="$3"
+    local snapshot="$2" root="$3" floor="${4:-0}"
     _wg_out=()
+
+    # THE SNAPSHOT CANNOT REPRESENT A NEWLINE, so no exclusion built from it
+    # can protect a path containing one: live_open_paths renders /proc targets
+    # one per LINE, and a held `dir-a<LF>b/part.whl` arrives as two records,
+    # the first truncated at the newline. Every consumer of this array —
+    # YELLOW's two sweeps, ORANGE's, RED's file sweep and both cache loops —
+    # would otherwise walk straight into such a tree with no valid liveness
+    # exclusion and unlink work in flight. Skipping only the directory-level
+    # reaper, as the first version of this guard did, left those file sweeps
+    # traversing the same tree.
+    #
+    # MEASURED 2026-09-26: find's -path glob DOES match a newline through `*`,
+    # so one predicate covers the node and its whole subtree; a control arm
+    # with plain-named siblings confirmed they are still swept.
+    #
+    # Added BEFORE the loop deliberately, so the 512-entry truncation below
+    # cannot drop it.
+    #
+    # BELOW THE OXYGEN FLOOR IT DOES NOT APPLY, and that is not an oversight.
+    # The floor bypasses every liveness guard by design — only zero-byte
+    # sockets survive — so a newline-named, directory-heavy tree left immortal
+    # there would hold the volume at ENOSPC while the daemon kept killing
+    # sessions to no effect. An unverifiable writer loses to a certain outage.
+    #
+    # THE ROOT IS TESTED FIRST, and skipping that test is a total, silent
+    # failure. `-path`'s leading `*` matches `/`, so `*<LF>*` is satisfied by
+    # the SEARCH ROOT's own path whenever the root itself contains a newline —
+    # every candidate then matches the exclusion and Zone A stops reclaiming
+    # ANYTHING. VERIFIED with a control: under a newline-named root the aged
+    # temp sweep reclaimed nothing, while the identical tree under a plain
+    # root reclaimed normally. This file already names the class at the C3
+    # floor; the check was missing here.
+    #
+    # Anchoring the pattern to the root would also avoid the everything-match,
+    # but it would then sweep such a tree BLIND and say nothing, because under
+    # a newline root no pattern can separate the representable paths from the
+    # unrepresentable ones — there are none of the former. So the root case is
+    # handled explicitly instead: warn_paths_defeating_liveness_guard reports
+    # it once and the sweep proceeds. That is the degrade-OPEN-and-LOUD stance
+    # the in-flight guard already takes, and for the same reason — refusing to
+    # reap lets cc-tmp fill, and a full cc-tmp is what kills the sessions this
+    # service exists to protect. With the root cleared, the pattern needs no
+    # anchor: every candidate is under the root by construction.
+    if (( ! floor )) && ! root_defeats_liveness_guard "$root"; then
+        _wg_out+=(-not -path "*${_WG_NL}*")
+    fi
+
     local line tag d esc count=0
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
@@ -423,6 +470,78 @@ cc_tmp_headroom_mb() {
     echo "$(( capacity - used ))"
 }
 
+# A newline in a path DEFEATS THE LIVENESS GUARD, so a candidate carrying one
+# is spared rather than reaped. This is not fastidiousness — it is the direct
+# consequence of NUL-delimiting the reap loops.
+#
+# MEASURED: `live_open_paths` renders /proc/*/fd targets one per LINE, so a
+# descriptor held on `<cc-tmp>/pip-a<LF>b/part.whl` appears in the snapshot as
+# two records, the first truncated to `<cc-tmp>/pip-a`. `dir_has_live_writer`
+# then searches those records for the directory prefix and cannot match — it
+# reports NO live writer for a directory that demonstrably has one, while
+# reporting correctly for its plain-named sibling.
+#
+# Before the loops were NUL-delimited, `read -r` split such a name and the
+# candidate was never reached, so it survived BY ACCIDENT. Reaching it without
+# fixing the snapshot would convert that accident into a deletion with the
+# guard silently answering the wrong question. Bash cannot hold a NUL in a
+# variable, so a NUL-safe snapshot is a larger change to a different function;
+# until then this sparing is the honest position, and it is LOUD rather than
+# implicit.
+_WG_NL=$'\n'
+
+root_defeats_liveness_guard() {
+    # True when the SWEEP ROOT itself contains a newline. Then every path
+    # beneath it is unrepresentable in the liveness snapshot, so there is no
+    # exclusion to build — only a report to make.
+    [[ "$1" == *"$_WG_NL"* ]]
+}
+
+path_defeats_liveness_guard() {
+    # True when live_open_paths cannot represent this path, so no exclusion
+    # built from that snapshot can protect it. See the builder for why.
+    [[ "$1" == *"$_WG_NL"* ]]
+}
+
+warn_paths_defeating_liveness_guard() {
+    # Say OUT LOUD which paths the liveness guard structurally cannot see, so
+    # the limitation is visible in the log rather than implicit in a sweep
+    # that quietly walked around them. Sparing silently would just be the old
+    # accident with extra steps.
+    #
+    # This is a DEDICATED pass rather than a branch inside a reap loop, and
+    # that is the round-2 correction: a loop only ever logs the candidates it
+    # enumerates, so the file sweeps — which have no loop — could never report
+    # what they had skipped. One pass covers every consumer.
+    #
+    # Called once per cleaner invocation: from clean_cc_yellow (which
+    # clean_cc_orange runs first, so ORANGE inherits it) and from clean_cc_red
+    # above the oxygen floor. Below the floor nothing is spared, so there is
+    # nothing to report.
+    local root="$1" p count=0
+    if root_defeats_liveness_guard "$root"; then
+        # The whole tree is unrepresentable. Say so once and sweep anyway.
+        log WARN "Zone A — the sweep root itself contains a newline, which live_open_paths cannot represent, so the in-flight guard is DEGRADED for the ENTIRE tree; sweeping anyway, because refusing would let cc-tmp fill and a full cc-tmp is what kills sessions"
+        return 0
+    fi
+    while IFS= read -r -d '' p; do
+        # Bound the log, not the sparing: the exclusion is a single find
+        # predicate and covers every such path regardless of how many there
+        # are. Only the per-path reporting is capped.
+        if (( ++count > 8 )); then
+            log WARN "Zone A — more than 8 paths contain a newline; the rest are spared too but not listed individually"
+            break
+        fi
+        local _wg_q
+        printf -v _wg_q '%q' "$p"
+        log WARN "Zone A — sparing ${_wg_q}: its name contains a newline, which live_open_paths cannot represent, so this daemon cannot establish whether a process is writing into it"
+        # -prune, so the cap counts offending NAMES rather than descendants.
+        # Every child of a newline-named directory also contains the newline,
+        # so one bad name floods the report: MEASURED, one directory holding
+        # 20 files produced 21 records without -prune and 1 with it.
+    done < <(find "$root" -path "*${_WG_NL}*" -prune -print0 2>/dev/null) || true
+}
+
 reap_dir_sparing_sockets() {
     # Object-level deletion that NEVER removes unix sockets. CC binds one
     # socket per live session under cc-tmp (cross-session messaging); they are
@@ -475,6 +594,7 @@ clean_cc_yellow() {
     local -a _yellow_excl=()
     zone_a_live_exclusions _yellow_excl "$(live_open_paths)" "$CC_TMP_DIR"
     log INFO "Zone A YELLOW — cleaning stale session dirs and temp files"
+    warn_paths_defeating_liveness_guard "$CC_TMP_DIR"
 
     # Clean session dirs with mtime > 7 days
     find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*/???*" \
@@ -504,13 +624,38 @@ clean_cc_orange() {
     local -a live_excl=()
     zone_a_live_exclusions live_excl "$(live_open_paths)" "$CC_TMP_DIR"
 
-    # Delete claude-skills cache (~35MB, CC re-clones on demand)
-    find "$CC_TMP_DIR" -type d -name "claude-skills" \
-        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
-
-    # Delete tsx cache (~1.2MB, rebuilt automatically)
-    find "$CC_TMP_DIR" -type d -name "tsx-*" \
-        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
+    # Delete the two rebuildable caches (claude-skills ~35MB, CC re-clones on
+    # demand; tsx-* ~1.2MB, rebuilt automatically) — routed through
+    # reap_dir_sparing_sockets rather than `rm -rf`, for the SAME reason RED's
+    # cache sweep already is. The argument is the paragraph directly above this
+    # one, which this tier made about the live-writer exclusions and never
+    # applied to sockets: guarding only RED leaves the incident class open on
+    # the tier that actually runs.
+    #
+    # It was open. REPRODUCED against the `rm -rf` form on the default branch:
+    # a live socket placed inside claude-skills was DESTROYED by this tier.
+    # That is the 2026-09-05 severance shape — sessions left listening on
+    # bound-but-unlinked sockets while inbound connects fail ENOENT — fixed at
+    # RED (90%) and left standing at ORANGE (75%), which is the tier that fires
+    # first and far more often. `rm -rf` has no socket predicate; the primitive
+    # does, and it costs nothing here: sockets are 0 bytes, so sparing them
+    # reclaims exactly as much as deleting them.
+    # NUL-delimited, and that is load-bearing rather than tidy. `find` prints
+    # newline-terminated records, so a directory whose NAME contains a newline
+    # splits into two: the head (not a directory, skipped by the guard below)
+    # and a TAIL that is a RELATIVE path — resolved against the daemon's cwd,
+    # which is the invoking user's home, NOT cc-tmp. MEASURED: a cache named
+    # "tsx-a<LF>b" yields 2 records from -print, the second a bare "b" that a
+    # reap would follow out of the tree entirely; -print0 yields the 1 correct
+    # record. (The NUL caveat recorded for live_open_paths concerns COMMAND
+    # substitution, which drops NUL bytes. This is PROCESS substitution into
+    # `read -d ''`, where they pass through — measured, opposite conclusion.)
+    local cache_dir
+    while IFS= read -r -d '' cache_dir; do
+        [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
+        reap_dir_sparing_sockets "$cache_dir"
+    done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
+        ${live_excl[@]+"${live_excl[@]}"} -print0 2>/dev/null) || true
 
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
@@ -711,7 +856,8 @@ clean_cc_red() {
 
     # One exclusion set, built once, consumed by every deletion below.
     local -a live_excl=()
-    zone_a_live_exclusions live_excl "$live_paths" "$CC_TMP_DIR"
+    zone_a_live_exclusions live_excl "$live_paths" "$CC_TMP_DIR" "$floor"
+    (( floor )) || warn_paths_defeating_liveness_guard "$CC_TMP_DIR"
 
     # Reap every depth-1 dir except the newest session's ancestor and any
     # directory a live process is writing into — object-level and
@@ -719,8 +865,18 @@ clean_cc_red() {
     # separate sweep below. `|| true` matches the file's find idiom: a
     # transient find error must not abort the daemon mid-RED under
     # set -euo pipefail.
+    # NUL-delimited, and that is load-bearing rather than tidy. `find` prints
+    # newline-terminated records, so a directory whose NAME contains a newline
+    # splits into two: the head (not a directory, skipped by the guard below)
+    # and a TAIL that is a RELATIVE path — resolved against the daemon's cwd,
+    # which is the invoking user's home, NOT cc-tmp. MEASURED: a cache named
+    # "tsx-a<LF>b" yields 2 records from -print, the second a bare "b" that a
+    # reap would follow out of the tree entirely; -print0 yields the 1 correct
+    # record. (The NUL caveat recorded for live_open_paths concerns COMMAND
+    # substitution, which drops NUL bytes. This is PROCESS substitution into
+    # `read -d ''`, where they pass through — measured, opposite conclusion.)
     local dir
-    while IFS= read -r dir; do
+    while IFS= read -r -d '' dir; do
         # Skip if this contains the active session. Deliberately NOT added to
         # any exclusion list: this spares for a DIFFERENT reason than the
         # live-writer branch, and the loose sweep below already carries its own
@@ -730,6 +886,18 @@ clean_cc_red() {
         # Below the oxygen floor even this sparing goes: the active session's
         # tree is as reclaimable as anything else when the alternative is
         # ENOSPC for every session including that one.
+        # This loop is the ONE Zone A deletion site whose enumeration is not
+        # filtered by live_excl — it walks every depth-1 directory and defers
+        # to dir_has_live_writer per candidate — so the builder's newline
+        # exclusion cannot reach it and the skip has to be here. The two cache
+        # loops take live_excl on their own find, which already drops these
+        # ABOVE THE FLOOR; below it nothing is dropped, by design.
+        # Silent by design: warn_paths_defeating_liveness_guard above has
+        # already named every such path once, and repeating it per loop would
+        # report the same limitation three times per RED pass.
+        if (( ! floor )) && path_defeats_liveness_guard "$dir"; then
+            continue
+        fi
         if (( ! floor )) && [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
             continue
         fi
@@ -741,7 +909,7 @@ clean_cc_red() {
             continue
         fi
         reap_dir_sparing_sockets "$dir"
-    done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null) || true
+    done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null) || true
 
     # The active session's own subtree, spared by both sweeps below — but ONLY
     # when newest_session actually resolved. Spelled unconditionally, an empty
@@ -792,14 +960,24 @@ clean_cc_red() {
     # Sockets are 0 bytes, so keeping them costs no reclaimed space; their
     # ancestor directories stay non-empty and survive with them, which is the
     # same outcome the depth-1 reap already produces.
+    # NUL-delimited, and that is load-bearing rather than tidy. `find` prints
+    # newline-terminated records, so a directory whose NAME contains a newline
+    # splits into two: the head (not a directory, skipped by the guard below)
+    # and a TAIL that is a RELATIVE path — resolved against the daemon's cwd,
+    # which is the invoking user's home, NOT cc-tmp. MEASURED: a cache named
+    # "tsx-a<LF>b" yields 2 records from -print, the second a bare "b" that a
+    # reap would follow out of the tree entirely; -print0 yields the 1 correct
+    # record. (The NUL caveat recorded for live_open_paths concerns COMMAND
+    # substitution, which drops NUL bytes. This is PROCESS substitution into
+    # `read -d ''`, where they pass through — measured, opposite conclusion.)
     local cache_dir
-    while IFS= read -r cache_dir; do
+    while IFS= read -r -d '' cache_dir; do
         [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
         reap_dir_sparing_sockets "$cache_dir"
     done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         ${live_excl[@]+"${live_excl[@]}"} \
         ${session_excl[@]+"${session_excl[@]}"} \
-        2>/dev/null) || true
+        -print0 2>/dev/null) || true
 
     # Report the surviving control plane — counted AFTER every sweep above,
     # so the line is true by construction whatever any sweep did. Sockets
