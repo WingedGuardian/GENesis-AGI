@@ -42,44 +42,63 @@ CC_MCP_DESCRIPTION_LIMIT="${CC_MCP_DESCRIPTION_LIMIT:-8192}"
 # reads the key as `env.X ?? <default>` — `??` falls back only on null/undefined,
 # so a garbage string would reach a numeric comparison. Reject it here.
 # Zero and leading-zero spellings are refused too: 0 is not a usable cap, and a
-# leading zero is ambiguous to any reader that parses it as octal. Said out loud,
-# never silently replaced.
+# leading zero is ambiguous to any reader that parses it as octal. So is anything
+# BELOW 2,048, CC's own default: setting the key lower cuts every description
+# shorter than CC would with no key at all, Genesis's own tools included, and a
+# typo (204) would do that silently on every session. Said out loud, never
+# silently replaced.
 case "$CC_MCP_DESCRIPTION_LIMIT" in
     ''|*[!0-9]*|0*)
         echo "  cc_version: CC_MCP_DESCRIPTION_LIMIT='${CC_MCP_DESCRIPTION_LIMIT}' is not a" \
              "positive integer — using 8192" >&2
         CC_MCP_DESCRIPTION_LIMIT=8192
         ;;
+    *)
+        # ${#} first: a value too long for shell arithmetic is certainly >= 2048.
+        if [ "${#CC_MCP_DESCRIPTION_LIMIT}" -le 4 ] && [ "$CC_MCP_DESCRIPTION_LIMIT" -lt 2048 ]; then
+            echo "  cc_version: CC_MCP_DESCRIPTION_LIMIT=${CC_MCP_DESCRIPTION_LIMIT} is below" \
+                 "Claude Code's own 2048 default — using 8192" >&2
+            CC_MCP_DESCRIPTION_LIMIT=8192
+        fi
+        ;;
 esac
 
 # The CONTAINER-side user-settings defaults, all SET IF ABSENT (an operator value
-# is never overwritten). ONE list, passed by every container path that reconciles
+# is never overwritten). Every container path that reconciles
 # ~/.claude/settings.json — install.sh (first run), cc_ensure_local (install.sh /
-# bootstrap.sh / update.sh) and cc_settings_align.sh (the daily timer) — so a
-# default added here reaches EXISTING installs on their next deploy or tick, not
-# only fresh clones (it used to be install.sh alone, which is the first-run
-# installer, not the deploy path). A first write of new defaults reports the
-# `defaults` state, never `repaired`.
-# host-setup.sh deliberately does NOT pass it: the host's recovery `claude -p` is
+# bootstrap.sh / update.sh) and cc_settings_align.sh (the daily timer) — goes
+# through ONE function, cc_reconcile_container_settings, so a default added here
+# reaches EXISTING installs on their next deploy or tick, not only fresh clones
+# (it used to be install.sh alone, which is the first-run installer, not the
+# deploy path). A first write of new defaults reports the `defaults` state, never
+# `repaired`.
+# host-setup.sh deliberately does NOT use it: the host's recovery `claude -p` is
 # single-brain (never nests), runs no Genesis MCP server, and is not where a
 # claude.ai account's skills would be used.
 #   CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2 — CC 2.1.217+ made nesting opt-in;
 #       Genesis allows ONE level (session -> subagent -> subagent).
 #   CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH — see CC_MCP_DESCRIPTION_LIMIT above.
-#   syncClaudeAiSkills / syncClaudeAiPlugins=false — top-level booleans (CC
-#       2.1.275+). NOTE CC's own semantics: turning skill sync off moves skills
-#       ALREADY synced to ~/.claude/skills/.trash at the next launch (deleted after
-#       cleanupPeriodDays; re-downloaded, not restored, if re-enabled). Because this
-#       list reaches EXISTING installs, an install that was syncing loses its synced
-#       skills on its next deploy or settings tick. To keep the sync, set either key
-#       to `true` explicitly — an existing value is never touched.
-# To opt out of ANY default here, set that key to your own value; this list only
-# fills keys that are ABSENT (so deleting a key is not an opt-out — it is refilled).
+# To opt out of ANY default, set that key to your own value; only ABSENT keys are
+# filled (so deleting a key is not an opt-out — it is refilled).
 CC_CONTAINER_SETTINGS_DEFAULTS=(
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"
     "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=${CC_MCP_DESCRIPTION_LIMIT}"
-    "top:syncClaudeAiSkills=false"
-    "top:syncClaudeAiPlugins=false"
+)
+
+# The claude.ai sync opt-outs — `syncClaudeAiSkills` / `syncClaudeAiPlugins` =
+# false, top-level JSON booleans (CC 2.1.275+) — are NOT in the list above,
+# because turning one off is not free on an install that is already syncing. CC's
+# own description, 2.1.280: previously synced skills (~/.claude/skills/synced) or
+# plugins (~/.claude/plugins/synced) "are hidden from every session started
+# afterwards, and are moved to ~/.claude/<kind>/.trash at the next launch"; if sync
+# is re-enabled they are re-downloaded, not restored. So each opt-out is added only
+# where that kind has NOTHING synced yet — which covers every fresh install — and
+# withheld where something is, with a notice the operator can act on
+# (cc_reconcile_container_settings). `kind:key` pairs; the directory is
+# <claude dir>/<kind>/synced.
+CC_CLAUDE_AI_SYNC_OPTOUTS=(
+    "skills:syncClaudeAiSkills"
+    "plugins:syncClaudeAiPlugins"
 )
 
 # Known CC install prefixes (bin dirs), probed when `command -v claude` fails —
@@ -114,9 +133,10 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # Never clobbers a settings file it cannot parse — a corrupt/foreign file is
 # reported, not overwritten (destroying user settings is worse than the drift).
 # Both suppressions below are cross-file blindness, not dead code: the linter only
-# sees THIS file, where the call is arg-less and the state variable is never read.
-# In reality host-setup.sh passes the host operator's settings path, and update.sh
-# consumes CC_SUPPRESSION_STATE (folding it into HOST_CC_DEGRADED).
+# sees THIS file, where the state variable is never read. In reality host-setup.sh
+# passes the host operator's settings path, cc_reconcile_container_settings passes
+# the container defaults, and update.sh consumes CC_SUPPRESSION_STATE (folding it
+# into HOST_CC_DEGRADED).
 # shellcheck disable=SC2120,SC2034
 # Durable breadcrumb for the suppression outcome, so it survives a SUBPROCESS
 # boundary. During a real update, update.sh runs bootstrap.sh first; bootstrap
@@ -125,7 +145,8 @@ CC_PROBE_DIRS="${CC_PROBE_DIRS:-/usr/local/bin:/usr/bin:$HOME/.npm-global/bin}"
 # file, reports `ok`, and the repair reaches neither update_history nor the
 # visible deploy output. This file is that missing channel.
 #
-# `ok` is deliberately NOT written: absence means "nothing to report", so a
+# `ok` and `defaults` are deliberately NOT written (cc_suppression_clean):
+# absence means "nothing to report", so a
 # stale breadcrumb can never manufacture a degradation. The reader (update.sh)
 # CLEARS this file before the subprocess runs, so existence afterwards means
 # "written during this deploy" by construction — the epoch inside is display
@@ -217,7 +238,7 @@ cc_ensure_updater_suppressed() {
     # "$@" MUST be forwarded: the inner function takes an optional settings
     # path ($1) and optional extra defaults ("$@"). Dropping it silently
     # discards both for any caller that uses them.
-    # shellcheck disable=SC2120  # optional args by design (settings path + CC_CONTAINER_SETTINGS_DEFAULTS)
+    # shellcheck disable=SC2120  # optional args by design (settings path + container defaults)
     # shellcheck disable=SC2034  # cross-file: update.sh folds this into HOST_CC_DEGRADED
     CC_SUPPRESSION_BREADCRUMB_LOST=0
     _cc_ensure_updater_suppressed_inner "$@" || _rc=$?
@@ -235,13 +256,103 @@ cc_ensure_updater_suppressed() {
     return "$_rc"
 }
 
+# _cc_synced_entries <dir> — print how many entries <dir> holds: 0 if it is
+# missing or empty, a count otherwise, or `unreadable` if it exists but cannot be
+# listed. Bash builtins only (a subshell glob), because the reconcile runs where
+# only a minimal PATH is guaranteed. An unreadable directory counts as NOT empty:
+# the cost of guessing "empty" is retiring someone's synced skills.
+_cc_synced_entries() {
+    local d="$1"
+    if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+        echo 0
+        return 0
+    fi
+    if [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then
+        echo unreadable
+        return 0
+    fi
+    ( shopt -s nullglob dotglob; _e=("$d"/*); echo "${#_e[@]}" )
+}
+
+# cc_resolve_container_defaults [claude_dir] — the set-if-absent defaults THIS
+# install should receive: CC_CONTAINER_SETTINGS_DEFAULTS always, plus each
+# claude.ai sync opt-out whose <kind>/synced directory is empty or missing. Sets
+# CC_CONTAINER_DEFAULTS_EFFECTIVE (array) and CC_SYNC_OPTOUT_WITHHELD (array of
+# `kind:key:count` for each opt-out held back). claude_dir defaults to ~/.claude.
+cc_resolve_container_defaults() {
+    local claude_dir="${1:-$HOME/.claude}" pair kind key n
+    CC_CONTAINER_DEFAULTS_EFFECTIVE=("${CC_CONTAINER_SETTINGS_DEFAULTS[@]}")
+    CC_SYNC_OPTOUT_WITHHELD=()
+    for pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
+        kind="${pair%%:*}"
+        key="${pair#*:}"
+        n="$(_cc_synced_entries "$claude_dir/$kind/synced")"
+        if [ "$n" = "0" ]; then
+            CC_CONTAINER_DEFAULTS_EFFECTIVE+=("top:${key}=false")
+        else
+            CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:${n}")
+        fi
+    done
+}
+
+# cc_reconcile_container_settings [settings_file] — THE container-side settings
+# reconcile: suppression keys enforced, container defaults set if absent, via
+# cc_ensure_updater_suppressed (one atomic write), then a notice for each claude.ai
+# sync opt-out held back because something is already synced. Every container path
+# calls this rather than the reconciler directly, so none can forget the defaults
+# or the sync check (tests/test_scripts/test_cc_updater_suppression.py locks that).
+# Returns the reconciler's rc and leaves CC_SUPPRESSION_STATE exactly as it set it.
+# shellcheck disable=SC2120  # cross-file: install.sh passes the settings path
+cc_reconcile_container_settings() {
+    local sf="${1:-}"
+    local path="${sf:-$HOME/.claude/settings.json}"
+    local rc=0
+    cc_resolve_container_defaults "${path%/*}"
+    # "" for $sf selects the default path, exactly as a bare call does.
+    cc_ensure_updater_suppressed "$sf" "${CC_CONTAINER_DEFAULTS_EFFECTIVE[@]}" || rc=$?
+    _cc_sync_optout_notice "$path"
+    return "$rc"
+}
+
+# _cc_sync_optout_notice <settings_file> — one stderr NOTE per withheld sync
+# opt-out, printed on EVERY reconcile while the key is still absent (a decision
+# the operator has not made yet should stay visible), and silent once they set it
+# either way. update.sh reaches this through its own cc_ensure_local call, whose
+# output is not trimmed. Key presence is read with python3; without it, or with a
+# settings file it cannot parse, the note is printed (a spare line beats silence).
+_cc_sync_optout_notice() {
+    local sf="$1" entry kind key n rest
+    for entry in "${CC_SYNC_OPTOUT_WITHHELD[@]}"; do
+        kind="${entry%%:*}"
+        rest="${entry#*:}"
+        key="${rest%%:*}"
+        n="${rest#*:}"
+        if command -v python3 >/dev/null 2>&1 && python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and sys.argv[2] in d else 1)
+' "$sf" "$key" 2>/dev/null; then
+            continue
+        fi
+        if [ "$n" = "unreadable" ]; then n="an unreadable set of"; fi
+        echo "  NOTE: claude.ai ${kind} sync is left ON here: ${n} ${kind} already" \
+             "synced in ${sf%/*}/${kind}/synced. Turning it off makes Claude Code hide" \
+             "them and move them to ${sf%/*}/${kind}/.trash at its next launch" \
+             "(re-downloaded, not restored, if re-enabled). To turn it off anyway, set" \
+             "\"${key}\": false in ${sf}; to keep it and silence this note, set it to true." >&2
+    done
+}
+
 # shellcheck disable=SC2120  # optional args by design (settings path + extra defaults)
 _cc_ensure_updater_suppressed_inner() {
     local settings_file="${1:-$HOME/.claude/settings.json}"
     shift || true
     # Any remaining args are **set-if-absent** defaults applied in the SAME atomic
-    # write: `KEY=VALUE` for the env block (install.sh passes the subagent-nesting
-    # default), or `top:KEY=<json>` for a TOP-LEVEL key with a JSON-typed value
+    # write: `KEY=VALUE` for the env block (cc_reconcile_container_settings passes
+    # the container defaults), or `top:KEY=<json>` for a TOP-LEVEL key with a JSON-typed value
     # (e.g. `top:syncClaudeAiSkills=false`); the python block documents both. Two
     # policies, one read-modify-write: the suppression keys are ENFORCED to an
     # exact value, the defaults are only filled in when the key is missing, so a
@@ -845,8 +956,8 @@ PYEOF
         #   defaults — both suppression keys were already correct; only
         #              set-if-absent defaults were added. Nothing was wrong. This
         #              is what EVERY existing install reports once, the first time
-        #              a new default reaches it (CC_CONTAINER_SETTINGS_DEFAULTS is
-        #              passed on every container reconcile path) — so it must never
+        #              a new default reaches it (cc_reconcile_container_settings runs
+        #              on every container reconcile path) — so it must never
         #              read as a degraded deploy. It repeats only if something
         #              DELETES the key (the timer re-adds an absent default daily);
         #              an operator opts out with an explicit value, never by
@@ -901,9 +1012,9 @@ cc_ensure_local() {
     # deliberately ahead of the pin/npm checks — the common path is "already at
     # pin", which returns early, and that steady state is exactly when settings
     # drift would otherwise go unnoticed. Non-fatal: a failure here must never
-    # stop the version align.
-    # "" selects the default settings path, exactly as a bare call does.
-    cc_ensure_updater_suppressed "" "${CC_CONTAINER_SETTINGS_DEFAULTS[@]}" || true
+    # stop the version align. No argument selects the default settings path.
+    # shellcheck disable=SC2119  # deliberately arg-less: the default path
+    cc_reconcile_container_settings || true
 
     local pin="${CC_VERSION:-}"
     if [ -z "$pin" ]; then

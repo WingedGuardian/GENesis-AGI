@@ -1604,8 +1604,9 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
 fi
 
 # Seed user-level ~/.claude/settings.json with CC defaults: (1) suppress the
-# auto-updater, (2) Genesis's subagent-nesting depth, and (3) the claude.ai
-# skills/plugins sync opt-out (both keys). CC 2.1.217+ made nested
+# auto-updater, (2) Genesis's subagent-nesting depth and MCP description cap, and
+# (3) the claude.ai skills/plugins sync opt-out, each only where nothing of that
+# kind is synced yet (see cc_reconcile_container_settings). CC 2.1.217+ made nested
 # subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
 # (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
 # Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
@@ -1619,12 +1620,13 @@ _settings_file="$HOME/.claude/settings.json"
 #     scripts/lib/cc_version.sh — the SAME function the align path and the
 #     genesis-cc-settings-align timer re-run, so setup and steady state cannot
 #     drift apart);
-#   * the container defaults in CC_CONTAINER_SETTINGS_DEFAULTS (subagent nesting,
-#     the MCP description cap, the claude.ai skills/plugins sync opt-out) are SET
-#     IF ABSENT, so a deliberate operator value is preserved. That list — and its
-#     rationale, including CC's trash-on-disable behaviour for synced skills —
-#     lives in scripts/lib/cc_version.sh, because every container reconcile path
-#     passes the same list; this call is one of them, not the only one.
+#   * the container defaults (subagent nesting, the MCP description cap, and the
+#     claude.ai skills/plugins sync opt-outs where nothing is synced yet) are SET
+#     IF ABSENT, so a deliberate operator value is preserved. The list — and its
+#     rationale, including CC's trash-on-disable behaviour for synced skills and
+#     plugins — lives in scripts/lib/cc_version.sh (cc_reconcile_container_settings),
+#     because every container reconcile path runs the same function; this call is
+#     one of them, not the only one.
 # One call so BOTH policies share a single write contract (mode/xattr carry-over,
 # compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
 # it. Note what this does NOT claim: on a fresh install the file is still touched
@@ -1635,7 +1637,7 @@ _settings_file="$HOME/.claude/settings.json"
 # rewrites settings.json), not this ordering.
 # (The host VM's recovery `claude -p` is single-brain and never nests, so
 # host-setup.sh deliberately passes no nesting default.)
-if cc_ensure_updater_suppressed "$_settings_file" "${CC_CONTAINER_SETTINGS_DEFAULTS[@]}"; then
+if cc_reconcile_container_settings "$_settings_file"; then
     # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
     # "verified" is finally true here. The nesting default is deliberately not
     # claimed on this line: on the python3-less create path it is NOT applied

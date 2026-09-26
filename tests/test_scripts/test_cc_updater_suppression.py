@@ -900,7 +900,9 @@ class TestCallerWiring:
     def test_the_shared_container_defaults_resolve_to_every_key(self) -> None:
         """CC_CONTAINER_SETTINGS_DEFAULTS is EXECUTED, not grepped: sourcing the
         library and printing the array is the only reading that says what callers
-        actually receive (a grep passes on an array defined but later emptied)."""
+        actually receive (a grep passes on an array defined but later emptied).
+        The claude.ai sync opt-outs are deliberately NOT in it — they are decided
+        per install (TestClaudeAiSyncOptOut)."""
         out = subprocess.run(
             ["bash", "-c", f'set -u; source "{_LIB}"; printf "%s\\n" "${{CC_CONTAINER_SETTINGS_DEFAULTS[@]}}"'],
             capture_output=True, text=True, check=True, timeout=60,
@@ -908,39 +910,61 @@ class TestCallerWiring:
         assert out == [
             "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2",
             "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192",
-            # The sync keys MUST use the `top:` form: as env KEY=VALUE they land as
-            # the string "false" inside `env`, where CC never reads them.
-            "top:syncClaudeAiSkills=false",
-            "top:syncClaudeAiPlugins=false",
         ], out
 
-    @pytest.mark.parametrize("override", ["abc", "8192x", "", "-1"])
-    def test_a_non_numeric_description_limit_override_falls_back(self, override: str) -> None:
-        out = subprocess.run(
+    @staticmethod
+    def _limit(override: str) -> tuple[str, str]:
+        r = subprocess.run(
             ["bash", "-c", f'source "{_LIB}"; echo "$CC_MCP_DESCRIPTION_LIMIT"'],
             capture_output=True, text=True, check=True, timeout=60,
             env={"PATH": "/usr/bin:/bin", "CC_MCP_DESCRIPTION_LIMIT": override},
-        ).stdout.strip()
-        assert out == "8192", (override, out)
+        )
+        return r.stdout.strip(), r.stderr
 
-    def test_every_container_reconcile_path_passes_the_shared_defaults(self) -> None:
+    @pytest.mark.parametrize("override", ["abc", "8192x", "", "-1", "0", "08", "00"])
+    def test_a_non_numeric_description_limit_override_falls_back(self, override: str) -> None:
+        out, err = self._limit(override)
+        assert out == "8192", (override, out)
+        if override:
+            assert "CC_MCP_DESCRIPTION_LIMIT" in err, "a fallback is announced, never silent"
+
+    @pytest.mark.parametrize("override", ["1", "204", "2047"])
+    def test_a_limit_below_claude_codes_own_default_falls_back(self, override: str) -> None:
+        """Below 2,048 the key would cut descriptions SHORTER than CC does with no
+        key at all — Genesis's own tools included."""
+        out, err = self._limit(override)
+        assert out == "8192", (override, out)
+        assert "below" in err and "2048" in err, err
+
+    @pytest.mark.parametrize("override", ["2048", "8192", "16384", "123456789012345678901234"])
+    def test_a_valid_description_limit_override_is_kept(self, override: str) -> None:
+        """The other half of the validation: a legitimate override must survive.
+        (A mutation that always forced 8192 would pass every fallback test.)"""
+        out, err = self._limit(override)
+        assert out == override, (override, out, err)
+        # Nothing at all on stderr: a value too long for shell arithmetic must not
+        # reach `[ -lt ]`, which would print "integer expression expected".
+        assert err.strip() == "", err
+
+    def test_every_container_reconcile_path_goes_through_the_one_chokepoint(self) -> None:
         """The defaults reach EXISTING installs, not only fresh clones.
 
         They used to ride install.sh alone — the first-run installer, not the
-        deploy path. Every CONTAINER caller of the reconciler now passes the one
-        shared list; the host deliberately passes none. Asserted on the property,
-        not a literal argument list, so adding a default never fails this test.
+        deploy path. Every CONTAINER path now calls cc_reconcile_container_settings,
+        which resolves the defaults (including the per-install claude.ai sync check)
+        and calls the reconciler; no container path calls the reconciler itself, so
+        none can forget the defaults or the sync check. The host deliberately uses
+        neither.
         """
-        shared = '"${CC_CONTAINER_SETTINGS_DEFAULTS[@]}"'
-
-        def calls(path: Path) -> list[str]:
+        def calls(path: Path, name: str) -> list[str]:
             folded = path.read_text().replace("\\\n", " ")
             return [
                 ln.strip() for ln in folded.splitlines()
-                if "cc_ensure_updater_suppressed " in ln
-                and not ln.lstrip().startswith("#")
-                and "()" not in ln  # the definition
+                if f"{name} " in ln or ln.strip().startswith(f"{name}")
+                if not ln.lstrip().startswith("#")
+                and f"{name}()" not in ln  # the definition
                 and "declare -F" not in ln
+                and "for _fn in" not in ln
                 and not ln.lstrip().startswith("echo")
             ]
 
@@ -950,19 +974,27 @@ class TestCallerWiring:
             "cc_version.sh (cc_ensure_local)": _LIB,
         }
         for label, path in container.items():
-            found = calls(path)
-            assert found, f"{label}: no cc_ensure_updater_suppressed call found"
-            for call in found:
-                assert shared in call, (
-                    f"{label} calls the reconciler without the shared defaults — "
-                    f"an install that runs this path never receives them: {call}"
-                )
-        host_calls = calls(_REPO_ROOT / "scripts" / "host-setup.sh")
+            assert calls(path, "cc_reconcile_container_settings"), (
+                f"{label}: does not reconcile through cc_reconcile_container_settings — "
+                "an install that runs this path never receives the defaults"
+            )
+        for label in ("install.sh", "cc_settings_align.sh"):
+            direct = calls(container[label], "cc_ensure_updater_suppressed")
+            assert not direct, f"{label} calls the reconciler directly, skipping the chokepoint: {direct}"
+        # In the library, the ONLY direct call is the chokepoint's own.
+        lib_direct = calls(_LIB, "cc_ensure_updater_suppressed")
+        assert lib_direct == [
+            'cc_ensure_updater_suppressed "$sf" "${CC_CONTAINER_DEFAULTS_EFFECTIVE[@]}" || rc=$?'
+        ], lib_direct
+        host_calls = calls(_REPO_ROOT / "scripts" / "host-setup.sh", "cc_ensure_updater_suppressed")
         assert host_calls, "host-setup.sh: no reconciler call found (test would pass vacuously)"
         for call in host_calls:
             assert "CC_CONTAINER_SETTINGS_DEFAULTS" not in call, (
                 f"host-setup.sh must NOT pass container defaults: {call}"
             )
+        assert not calls(_REPO_ROOT / "scripts" / "host-setup.sh", "cc_reconcile_container_settings"), (
+            "host-setup.sh must NOT run the container reconcile"
+        )
         # install.sh must not open its OWN read-modify-write of the settings file.
         assert 'python3 - "$_settings_file"' not in (
             _REPO_ROOT / "scripts" / "install.sh"
@@ -2443,3 +2475,111 @@ class TestConsumersReadTheChannel:
             "this channel explicitly refuse"
         )
 
+
+
+class TestClaudeAiSyncOptOut:
+    """The claude.ai sync opt-outs are decided PER INSTALL (owner ruling
+    2026-09-25). Turning sync off on an install that is already syncing makes CC
+    hide the synced skills/plugins and move them to <kind>/.trash at the next
+    launch, and the only opt-out would be acting BEFORE the update — so an opt-out
+    is written only where that kind has nothing synced, and otherwise withheld
+    with a notice. Driven through cc_ensure_local, the real deploy-path caller."""
+
+    _CALL = 'cc_ensure_local || true; echo "STATE=${CC_SUPPRESSION_STATE:-unset}"'
+
+    @staticmethod
+    def _seed(tmp_path: Path, extra: dict | None = None) -> Path:
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps(
+            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, **(extra or {})}
+        ))
+        return s
+
+    @staticmethod
+    def _synced(tmp_path: Path, kind: str, n: int = 1) -> Path:
+        d = tmp_path / "home" / ".claude" / kind / "synced"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (d / f"item{i}").mkdir()
+        return d
+
+    def test_nothing_synced_gets_both_opt_outs(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] is False and data["syncClaudeAiPlugins"] is False, data
+        assert "NOTE: claude.ai" not in r.stderr, r.stderr
+
+    def test_an_empty_synced_dir_counts_as_nothing_synced(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills", n=0)
+        _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is False
+
+    def test_synced_skills_withhold_only_the_skills_opt_out(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills", n=2)
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data, "an install already syncing skills keeps syncing"
+        assert data["syncClaudeAiPlugins"] is False, "the other kind is decided on its own"
+        assert data["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "2", "env defaults still land"
+        assert "NOTE: claude.ai skills sync is left ON" in r.stderr, r.stderr
+        assert "2 skills already synced" in r.stderr, r.stderr
+        assert '"syncClaudeAiSkills": false' in r.stderr, "the notice names the opt-out"
+        assert "plugins sync" not in r.stderr, r.stderr
+
+    def test_synced_plugins_withhold_only_the_plugins_opt_out(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "plugins")
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiPlugins" not in data
+        assert data["syncClaudeAiSkills"] is False
+        assert "NOTE: claude.ai plugins sync is left ON" in r.stderr, r.stderr
+
+    def test_the_notice_repeats_until_the_operator_decides(self, tmp_path: Path) -> None:
+        self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        assert "skills sync is left ON" in _run(tmp_path, self._CALL).stderr
+        assert "skills sync is left ON" in _run(tmp_path, self._CALL).stderr, "still undecided"
+
+    @pytest.mark.parametrize("choice", [True, False])
+    def test_an_explicit_operator_choice_silences_the_notice(self, tmp_path: Path, choice: bool) -> None:
+        s = self._seed(tmp_path, {"syncClaudeAiSkills": choice})
+        self._synced(tmp_path, "skills")
+        r = _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is choice, "never overwritten"
+        assert "skills sync is left ON" not in r.stderr, r.stderr
+
+    def test_an_unreadable_synced_dir_is_treated_as_holding_skills(self, tmp_path: Path) -> None:
+        """Guessing "empty" for a directory it cannot list would retire whatever is
+        in it; the safe reading is "something is synced"."""
+        if os.geteuid() == 0:
+            pytest.skip("root reads any directory; the unreadable case cannot be built")
+        s = self._seed(tmp_path)
+        d = self._synced(tmp_path, "skills")
+        d.chmod(0)
+        try:
+            r = _run(tmp_path, self._CALL)
+        finally:
+            d.chmod(0o755)
+        assert "syncClaudeAiSkills" not in json.loads(s.read_text())
+        assert "an unreadable set of skills" in r.stderr, r.stderr
+
+    def test_a_withheld_opt_out_still_reports_defaults_not_degraded(self, tmp_path: Path) -> None:
+        """Holding one key back is not a failure: the deploy reads `defaults`."""
+        self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        r = _run(tmp_path, self._CALL)
+        assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
+
+    def test_the_settings_timer_applies_the_same_rule(self, tmp_path: Path) -> None:
+        """cc_settings_align.sh reconciles through the same chokepoint."""
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "plugins")
+        r = _run(tmp_path, 'cc_reconcile_container_settings || true; echo "STATE=$CC_SUPPRESSION_STATE"')
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiPlugins" not in data and data["syncClaudeAiSkills"] is False
+        assert "plugins sync is left ON" in r.stderr
