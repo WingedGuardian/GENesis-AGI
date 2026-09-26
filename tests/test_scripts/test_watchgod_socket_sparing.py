@@ -25,6 +25,7 @@ sessions.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -318,9 +319,21 @@ def test_RED_spares_a_newline_named_dir_holding_a_LIVE_writer(tmp_path):
     (junk / "blob").write_bytes(b"j" * 4096)
     (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
 
+    # ABOVE THE OXYGEN FLOOR, pinned explicitly.
+    #
+    # CORRECTION, MEASURED: an earlier draft of this comment said the 4MB
+    # sandbox budget put the arm BELOW the floor. It does not. The floor reads
+    # cc_tmp_headroom_mb = min(fs_total, CC_TMP_CAPACITY_MB default 2048) -
+    # used, which is ~2048MB here; CC_TMP_BUDGET_MB feeds the TIER thresholds,
+    # not the floor. Measured in this sandbox: capacity 2048, used 0, headroom
+    # 2048, floor 150 — and clean_cc_red with no override logs no OXYGEN FLOOR
+    # line. The override is kept for a different and real reason: a runner
+    # whose tmp filesystem is smaller than 150MB would silently flip this arm
+    # onto the emergency branch, where sparing is bypassed by design, and the
+    # arm would then pass while testing the opposite contract.
     # A real held descriptor, exactly as the writer would have.
     with held.open("rb"):
-        proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+        proc = _run(home, bind, _PRELUDE + "SACRED_GROUND_MB=1; clean_cc_red")
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
 
     assert held.exists(), (
@@ -330,4 +343,202 @@ def test_RED_spares_a_newline_named_dir_holding_a_LIVE_writer(tmp_path):
     assert not junk.exists(), (
         "the plain-named directory survived too — the sweep did nothing, so "
         "the assertion above proves nothing"
+    )
+
+
+def _age(path: Path, seconds: int) -> None:
+    """Backdate mtime/atime so a freshness predicate treats the file as stale."""
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
+# --------------------------------------------------------------------------
+# Sparing the directory-level reaper is NOT enough: the FILE sweeps walk the
+# same tree. Review round 1 (Devin severe) named both — YELLOW's aged temp-file
+# sweep and RED's loose-file sweep — and they carry no valid liveness exclusion
+# for a newline-named path either, because they draw it from the same snapshot.
+# The exclusion therefore lives in zone_a_live_exclusions, the one builder every
+# Zone A deletion site consumes.
+#
+# The same round (Codex P2) named the other direction: below the oxygen floor
+# the sparing must NOT apply, or a newline-named directory tree stays immortal
+# while the volume sits at ENOSPC. Both arms are below.
+# --------------------------------------------------------------------------
+
+
+def test_YELLOW_temp_sweep_spares_an_aged_file_in_a_newline_named_dir(tmp_path):
+    """A held `.tmp` ages past the 60-minute window while its writer still has
+    it open. The freshness predicate stops protecting it, and the liveness
+    exclusion never could — so without a newline exclusion this sweep unlinks
+    in-flight work."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    nl_dir = cctmp / "tsx-a\nb"
+    nl_dir.mkdir()
+    spared = nl_dir / "download.tmp"
+    spared.write_bytes(b"w" * 2048)
+    _age(spared, 7200)
+
+    plain = cctmp / "tsx-plain"
+    plain.mkdir()
+    reaped = plain / "download.tmp"
+    reaped.write_bytes(b"j" * 2048)
+    _age(reaped, 7200)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_yellow")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert spared.exists(), (
+        "YELLOW's temp sweep deleted a file inside a newline-named directory, "
+        "which no liveness exclusion built from the snapshot can protect"
+    )
+    assert not reaped.exists(), (
+        "the plain-named sibling survived too — the sweep did not run, so the "
+        "assertion above proves nothing"
+    )
+
+
+def test_RED_loose_file_sweep_spares_a_file_in_a_newline_named_dir(tmp_path):
+    """Above the floor, RED's whole-tree loose-file sweep must respect the same
+    limitation the directory reaper does."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    nl_dir = cctmp / "pip-a\nb"
+    nl_dir.mkdir()
+    spared = nl_dir / "part.whl"
+    spared.write_bytes(b"w" * 4096)
+    _age(spared, 600)
+
+    plain = cctmp / "pip-plain"
+    plain.mkdir()
+    reaped = plain / "part.whl"
+    reaped.write_bytes(b"j" * 4096)
+    _age(reaped, 600)
+    spared_file = cctmp / "spill-a\nb.log"
+    spared_file.write_bytes(b"w" * 4096)
+    _age(spared_file, 600)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    # ABOVE THE OXYGEN FLOOR, pinned explicitly.
+    #
+    # CORRECTION, MEASURED: an earlier draft of this comment said the 4MB
+    # sandbox budget put the arm BELOW the floor. It does not. The floor reads
+    # cc_tmp_headroom_mb = min(fs_total, CC_TMP_CAPACITY_MB default 2048) -
+    # used, which is ~2048MB here; CC_TMP_BUDGET_MB feeds the TIER thresholds,
+    # not the floor. Measured in this sandbox: capacity 2048, used 0, headroom
+    # 2048, floor 150 — and clean_cc_red with no override logs no OXYGEN FLOOR
+    # line. The override is kept for a different and real reason: a runner
+    # whose tmp filesystem is smaller than 150MB would silently flip this arm
+    # onto the emergency branch, where sparing is bypassed by design, and the
+    # arm would then pass while testing the opposite contract.
+    proc = _run(home, bind, _PRELUDE + "SACRED_GROUND_MB=1; clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert "OXYGEN FLOOR" not in _log(home), "the arm's premise: RED is above the floor"
+    assert spared.exists(), "RED's loose-file sweep entered a newline-named dir"
+    assert spared_file.exists(), (
+        "RED's loose-file sweep deleted a newline-named file at depth 1 — the "
+        "directory reaper never sees it, so only the builder's exclusion can "
+        "protect it"
+    )
+    assert not reaped.exists(), (
+        "the plain-named sibling survived too — the sweep did not run"
+    )
+
+
+def test_below_the_oxygen_floor_a_newline_named_tree_is_still_reclaimed(tmp_path):
+    """The other direction, and the one that keeps the guard from becoming an
+    immortality bug. Below the floor every discretionary exclusion is bypassed
+    by design — an unverifiable writer loses to a certain ENOSPC — so the
+    newline sparing must go with them."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    nl_dir = cctmp / "pip-a\nb"
+    nl_dir.mkdir()
+    doomed = nl_dir / "part.whl"
+    doomed.write_bytes(b"w" * 4096)
+    # A newline-named FILE at depth 1, which the directory reaper cannot take
+    # (it enumerates -type d) — so this one is reclaimable ONLY by the loose
+    # sweep, and therefore ONLY if the builder actually drops its exclusion
+    # below the floor. Without it this arm passes on the reaper alone and says
+    # nothing about the gate it exists to pin.
+    doomed_file = cctmp / "spill-a\nb.log"
+    doomed_file.write_bytes(b"w" * 4096)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    # SACRED_GROUND_MB is set after sourcing, so load_config's clamp does not
+    # apply; a floor above any real headroom forces the emergency branch.
+    proc = _run(home, bind, _PRELUDE + "SACRED_GROUND_MB=99999999; clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert "OXYGEN FLOOR" in _log(home), (
+        "the arm's premise failed: RED did not take the floor branch\n" + _log(home)
+    )
+    assert not doomed.exists(), (
+        "below the floor a newline-named tree was left immortal — it can hold "
+        "the volume at ENOSPC while the daemon keeps killing sessions"
+    )
+    assert not doomed_file.exists(), (
+        "below the floor the loose sweep still skipped a newline-named file; "
+        "only the directory reaper reclaimed anything, so the exclusion is "
+        "still installed in the emergency branch"
+    )
+
+
+def test_a_newline_in_the_ROOT_does_not_neuter_the_whole_sweep(tmp_path):
+    """Audit finding, round 2. `-path`'s leading `*` matches `/`, so an
+    unanchored `*<LF>*` exclusion is satisfied by the SEARCH ROOT's own path:
+    with a newline anywhere in the root, every candidate matches the exclusion
+    and Zone A stops reclaiming anything at all, silently. The same class bit
+    an earlier PR in this arc one level up.
+
+    Under such a root the liveness guard is degraded for the ENTIRE tree — no
+    anchored pattern can separate representable paths from unrepresentable
+    ones. The file's stance for a degraded in-flight guard is to proceed and
+    say so, because refusing to reap lets cc-tmp fill, and a full cc-tmp is
+    what kills sessions. So: the sweep still runs, and it is loud.
+    """
+    home = tmp_path / "home"
+    (home / ".genesis" / "logs").mkdir(parents=True)
+    (home / ".genesis" / "alerts").mkdir(parents=True)
+    root = home / ".genesis" / "cc-tmp-a\nb"
+    root.mkdir(parents=True)
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    _make_exec(bind / "tmux", _TMUX_STUB)
+
+    aged = root / "stale.tmp"
+    aged.write_bytes(b"j" * 2048)
+    _age(aged, 7200)
+
+    proc = _run(home, bind, _PRELUDE + f"CC_TMP_DIR={shlex.quote(str(root))}; clean_cc_yellow")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert not aged.exists(), (
+        "a newline in the ROOT matched the exclusion and neutered the entire "
+        "sweep — cc-tmp would fill while the daemon reported a clean pass"
+    )
+    assert "DEGRADED for the ENTIRE tree" in _log(home), (
+        "the sweep ran with no usable liveness guard and said nothing:\n"
+        + _log(home)
+    )
+
+
+def test_the_spared_path_report_counts_names_not_descendants(tmp_path):
+    """The 8-path cap is meant to bound the LOG. Without -prune every
+    descendant of a newline-named directory also contains the newline, so a
+    single bad name fills the cap and the operator is told that "more than 8
+    paths" are affected when there is one."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    nl_dir = cctmp / "tsx-a\nb"
+    nl_dir.mkdir()
+    for i in range(20):
+        (nl_dir / f"f{i}").write_bytes(b"x")
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_yellow")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    log = _log(home)
+    assert log.count("its name contains a newline") == 1, (
+        "the report listed descendants instead of offending names:\n" + log
+    )
+    assert "more than 8 paths" not in log, (
+        "one bad name tripped the cap meant for eight of them:\n" + log
     )
