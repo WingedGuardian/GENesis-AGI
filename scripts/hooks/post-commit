@@ -85,8 +85,9 @@ if [[ -n "$_REPO_ROOT" ]]; then
     _CONTRIB_CFG_DIR="$_MAIN_ROOT/config"
     _CONTRIB_DISABLED=""
     # Overlay resolution mirrors _config_overlay._resolve_overlay_path: the user
-    # overlay (where settings_update writes) wins, else the repo sibling.
-    _CONTRIB_LOCAL="$GENESIS_HOME/config/contribution.local.yaml"
+    # overlay (where settings_update writes, always ~/.genesis/config, independent
+    # of GENESIS_HOME) wins, else the repo sibling.
+    _CONTRIB_LOCAL="$HOME/.genesis/config/contribution.local.yaml"
     [[ -f "$_CONTRIB_LOCAL" ]] || _CONTRIB_LOCAL="$_CONTRIB_CFG_DIR/contribution.local.yaml"
     # Local override takes precedence (if the key is present in it)
     if [[ -f "$_CONTRIB_LOCAL" ]] \

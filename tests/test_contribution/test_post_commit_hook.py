@@ -93,12 +93,17 @@ def test_fix_local_opt_out_no_marker(fix_repo):
     assert not pending.exists() or not list(pending.glob("*.json"))
 
 
-def test_user_overlay_disables_offer(fix_repo):
-    """settings_update writes ~/.genesis/config/contribution.local.yaml; the
-    hook must honour it, not just the repo-local sibling."""
+def test_user_overlay_disables_offer(fix_repo, monkeypatch, tmp_path):
+    """settings_update writes ~/.genesis/config/contribution.local.yaml (always
+    under the real home, whatever GENESIS_HOME says); the hook must honour it,
+    not just the repo-local sibling."""
     repo, home, git = fix_repo["repo"], fix_repo["home"], fix_repo["git"]
-    (home / "config").mkdir(parents=True)
-    (home / "config" / "contribution.local.yaml").write_text("offer_enabled: false\n")
+    user_home = tmp_path / "user_home"
+    (user_home / ".genesis" / "config").mkdir(parents=True)
+    (user_home / ".genesis" / "config" / "contribution.local.yaml").write_text(
+        "offer_enabled: false\n"
+    )
+    monkeypatch.setenv("HOME", str(user_home))
     (repo / "a").write_text("x\n")
     git("add", "a")
     git("commit", "-m", "fix: should be suppressed")
