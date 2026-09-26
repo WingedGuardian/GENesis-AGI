@@ -742,3 +742,36 @@ def test_the_archived_registration_is_locked_and_survives_a_prune(
     assert _git(repo, "cat-file", "-e", sha).returncode == 0, (
         "the archived commit was collected — the anchor did not hold"
     )
+
+
+def test_an_archived_branch_survives_gc_after_its_branch_and_reflog_are_gone(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The lock keeps the registration, not the commit: delete the branch and
+    expire the reflog and only a real ref keeps the archived commit alive."""
+    wt = tmp_path / "wt-branch"
+    _git(repo, "worktree", "add", "--quiet", "-b", "feature/x", str(wt))
+    (wt / "w.txt").write_text("unique\n")
+    _git(wt, "add", "w.txt")
+    _git(wt, "commit", "--quiet", "-m", "unique work")
+    sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
+    entry = {"path": str(wt), "branch": "feature/x", "head": sha, "detached": False}
+    assert wl._trash_worktree(entry, repo) is True
+
+    _git(repo, "update-ref", "-d", "refs/heads/feature/x")
+    _git(repo, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now",
+         "gc", "--prune=now")
+    assert _git(repo, "cat-file", "-e", sha).returncode == 0, (
+        "the archived commit was collected after its branch was deleted"
+    )
+
+
+def test_archive_ref_names_are_valid_for_awkward_entry_names() -> None:
+    for name in ["a b~c^d", "x..y", "-lead", ".dot", "end.lock", "a:b?c*d[e"]:
+        ref = wl._archive_ref(name)
+        rc = subprocess.run(["git", "check-ref-format", ref], capture_output=True).returncode
+        assert rc == 0, (name, ref)

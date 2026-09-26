@@ -60,6 +60,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -850,6 +851,14 @@ def classify_all(
 ARCHIVE_SUFFIX = ".tar.gz"
 
 
+def _archive_ref(entry_name: str) -> str:
+    """Ref name that pins an archive's commits: ``refs/archived/<entry>``."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", entry_name).replace("..", "._").strip(".")
+    if safe.endswith(".lock"):
+        safe = safe[:-5] + "_lock"
+    return f"refs/archived/{safe or 'entry'}"
+
+
 def _archive_path(trash_path: Path) -> Path:
     """Sibling archive for a trash entry. Built by APPENDING, not by replacing a
     suffix — entry names embed a date and can contain dots, and
@@ -1503,6 +1512,21 @@ def _trash_worktree(
         with contextlib.suppress(OSError):
             final_meta.write_text(json.dumps(meta, indent=2))
             os.chmod(final_meta, _PRIVATE_FILE_MODE)
+
+        # The worktree lock keeps the REGISTRATION, not the commit: once the
+        # branch is deleted the worktree's HEAD reflog is the only reference
+        # left and it expires (gc.reflogExpireUnreachable, 30 days). A real ref
+        # per archive keeps the commits reachable for as long as the ref exists.
+        # Ceiling: nothing deletes archives today (recovering a tarball keeps it;
+        # recovering an uncompressed entry consumes it and leaves its ref behind),
+        # so nothing deletes these refs; whatever removes an archive must also
+        # `git update-ref -d` its ref.
+        anchor_sha = str(meta.get("commit") or "").strip()
+        if anchor_sha:
+            anchor_ref = _archive_ref(trash_path.name)
+            if _run_git(repo_root, ["update-ref", anchor_ref, anchor_sha], timeout=15) is None:
+                _log(f"  WARN could not create {anchor_ref} — the archived commits "
+                     "are anchored only by the worktree's reflog")
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
 
