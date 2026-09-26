@@ -2468,12 +2468,16 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   locally-run non-Anthropic reviewer (the install's configured secondary) counts. The
   cap is enforced by three
   mechanics, not by vibes:
-  1. **Visible round counter.** From the first EXTERNAL round, the plan file (or task
-     list) carries `Cross-model rounds: N (cap 3)`, updated every external cycle. Rounds
-     are a tracked artifact — "it's the same class, it doesn't really count" is exactly
+  1. **Visible streak counter.** From the first EXTERNAL round, the plan file (or task
+     list) carries `Cross-model streak: N (cap 3)`, updated every external cycle. It
+     counts consecutive defect-bearing external rounds for this cap — a STREAK
+     POSITION, never a round NUMBER. Round numbers come only from
+     `review_budget.py`'s reviewed-head count, and the two differ (a locally run
+     secondary advances the streak without adding a reviewed head). The streak is a tracked artifact — "it's the same class, it doesn't really count" is exactly
      the rationalization the counter exists to kill (for a repeat EXTERNAL round).
   2. **The block point is BEFORE dispatching the next review.** The check is
-     "am I about to trigger round 4+?" — evaluated at the mechanical moment
+     "am I about to trigger a 4th consecutive defect-bearing external round
+     (streak at the cap)?" — evaluated at the mechanical moment
      (the `@codex review` comment, the reviewer dispatch — NOT the push itself,
      which triggers nothing TODAY — an owner-tunable
      setting, so verify at the PR rather than trusting this clause), never after

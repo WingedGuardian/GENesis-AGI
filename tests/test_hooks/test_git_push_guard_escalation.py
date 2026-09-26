@@ -79,8 +79,8 @@ def test_round_six_and_later_are_strongly_discouraged(monkeypatch):
 
 
 @pytest.mark.parametrize("heads", [4, 5])
-def test_the_prompt_states_the_terminal_rule_at_and_past_four_heads(monkeypatch, heads):
-    """The prompt the OWNER reads at the decision must say round 4 is terminal.
+def test_the_prompt_names_the_terminal_decision_at_and_past_four_heads(monkeypatch, heads):
+    """The prompt the OWNER reads at the decision must frame round 4 as terminal.
 
     This exists because the two assertions above could not see it. They pin
     "strongly discouraged" and "narrow or redesign", both of which live only in the
@@ -91,16 +91,26 @@ def test_the_prompt_states_the_terminal_rule_at_and_past_four_heads(monkeypatch,
     "Approve this single round-5 request" as though a fifth round were ordinary.
 
     Both values are checked because `strongly_discouraged` is `count >= 5`: 4 takes
-    the fall-through branch and 5 the discouraged one, and the rule has to hold in
-    each. Asserting only one would let a future edit drop it from the other.
+    the fall-through branch and 5 the discouraged one. The RULE ("there is no
+    ordinary round 5") belongs only at exactly four heads — at five it is false —
+    while the DECISION (merge or send back) must be named at both.
     """
     _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:heads]])
     decision, reason = _decision()
     assert decision == "ask"
-    assert "ROUND 4 IS TERMINAL" in reason, (
-        f"at {heads} reviewed heads the prompt must state the terminal rule; "
-        "without it the owner is asked to approve round 5 as if it were ordinary"
-    )
+    if heads == 4:
+        assert "ROUND 4 IS TERMINAL" in reason, (
+            "at the four-head boundary the prompt must state the terminal rule; "
+            "without it the owner is asked to approve round 5 as if it were ordinary"
+        )
+    else:
+        # Past the boundary the rule's own sentence is FALSE: "there is no
+        # ordinary round 5" told to someone already holding five reviewed heads
+        # (Devin, #2382). The decision is named instead, as at the commit gate.
+        assert "no ordinary round" not in reason, (
+            "a five-head prompt must not deny that a fifth round happened"
+        )
+        assert "past the terminal boundary" in reason
     # The decision it names, not merely the label — a caller has to be told what
     # the two choices ARE, which is the half the old wording omitted entirely.
     assert "MERGE" in reason and "SEND IT BACK" in reason
@@ -242,6 +252,35 @@ def test_gate_surface_allows_one_exact_head_confirmation(monkeypatch):
     )
 
 
+def test_terminal_notice_is_only_reachable_at_exactly_four_heads():
+    """The four-head NOTICE is rendered by the fall-through, which is reached only
+    while the count sits between the standing limit and the discouraged threshold.
+    That is exactly four heads only because the two constants are adjacent; widen
+    the gap and the NOTICE's "no ordinary round 5" is rendered at five heads again."""
+    rb = _mod._review_budget
+    assert rb.STRONGLY_DISCOURAGED_REVIEWED_HEADS == rb.STANDING_REVIEWED_HEAD_LIMIT + 1
+
+
+def test_gate_prompt_at_exactly_the_limit_does_not_say_past_it(monkeypatch):
+    """At exactly GATE_DISCOVERY_ROUND_LIMIT heads with the exemption spent, the
+    budget is at its end, not past it — "past its 2 discovery rounds" at 2 heads is
+    the off-by-one this prompt exists to remove (adversarial audit, #2382)."""
+    marker = _mod._review_budget.confirmation_marker(HEADS[2])
+    _evidence(
+        monkeypatch,
+        [(HEADS[0], "COMMENTED"), (HEADS[1], "COMMENTED")],
+        head=HEADS[2],
+        files=("scripts/review_budget.py",),
+        comments=(("owner", "User", marker),),
+    )
+    decision, reason = _decision(
+        f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'"
+    )
+    assert decision == "ask"
+    assert "past its" not in reason
+    assert "at the end of its" in reason
+
+
 def test_gate_confirmation_marker_prevents_a_repeat_exemption(monkeypatch):
     marker = _mod._review_budget.confirmation_marker(HEADS[2])
     _evidence(
@@ -289,9 +328,7 @@ def test_shell_expanded_body_cannot_claim_confirmation_exemption(monkeypatch):
         files=("scripts/review_budget.py",),
     )
     marker = _mod._review_budget.confirmation_marker(HEADS[2])
-    decision, _ = _decision(
-        f'gh pr comment 1372 --repo owner/repo --body "$BODY {marker}"'
-    )
+    decision, _ = _decision(f'gh pr comment 1372 --repo owner/repo --body "$BODY {marker}"')
     assert decision == "ask"
 
 

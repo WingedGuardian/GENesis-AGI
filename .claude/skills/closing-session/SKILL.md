@@ -383,8 +383,10 @@ Two caveats a closing session needs, because both are live today. The MECHANISM
 still permits round 5+ under per-request approval — aligning it is tracked work,
 so until then this paragraph and the approval prompts are what carry the rule.
 And a SECOND, local non-convergence streak (cap 3) exists alongside the
-reviewed-head budget; where the two disagree, the reviewed heads are
-authoritative.
+reviewed-head budget. They are independent gates: the streak's cap-3 hard
+stop blocks commits whatever the reviewed-head count, and the reviewed-head
+budget gates review requests and fix commits whatever the streak. Neither
+overrides the other; only the reviewed heads are numbered as rounds.
 
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.

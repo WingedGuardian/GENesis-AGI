@@ -4737,9 +4737,13 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
                 "post the marked confirmation, approving is correct; otherwise post "
                 "it rather than spending a further discovery round."
             )
+        # Reachable at EXACTLY the limit (the exemption is off once the head
+        # is reviewed or a confirmation was already requested), where "past"
+        # would be the same off-by-one this prompt exists to remove.
+        where = "past" if count > limit else "at the end of"
         return (
             f"PR #{pr_num} changes the review-gate surface and already has {count} "
-            f"distinct reviewed heads, past its {limit} discovery rounds. "
+            f"distinct reviewed heads, {where} its {limit} discovery rounds. "
             f"{_review_budget.TERMINAL_DECISION} Approve only after deciding that "
             "another gate-design round is worth the risk; earlier approval never "
             "carries forward."
@@ -4756,15 +4760,21 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     #
     # Read from the evaluator rather than spelled here: the commit gate states the
     # same rule at its own approval, and two copies drift. See
-    # `review_budget.ORDINARY_TERMINAL_NOTICE` for why no local fallback is owed.
+    # `review_budget.TERMINAL_DECISION` for why no local fallback is owed.
     terminal = _review_budget.ORDINARY_TERMINAL_NOTICE
     if result.get("strongly_discouraged"):
+        # TERMINAL_DECISION, never the NOTICE: this branch fires at
+        # STRONGLY_DISCOURAGED_REVIEWED_HEADS, so the notice's "there is no
+        # ordinary round 5" would be rendered to someone already holding five
+        # heads — the same rule the commit gate's matching branch follows.
         return (
             f"PR #{pr_num} already has {count} distinct reviewed heads — past the "
             f"terminal boundary, so round {next_round} is strongly discouraged: "
             "stop, narrow or redesign the change, accept documented residue, or "
-            f"abandon it. {terminal} Every later round is terminal in the same way "
-            "and needs its own approval; earlier approval never carries forward."
+            f"abandon it. {_review_budget.TERMINAL_DECISION} Approve only to "
+            "authorize this one further round anyway; every later round is terminal "
+            "in the same way and needs its own approval, and earlier approval never "
+            "carries forward."
         )
     return (
         f"PR #{pr_num} already has {count} distinct reviewed heads; standing "
