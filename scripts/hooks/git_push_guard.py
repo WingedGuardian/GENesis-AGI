@@ -5130,7 +5130,7 @@ def _latest_codex_completed_summary(
             result = subprocess.run(
                 [
                     "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
-                    "--paginate", "--jq", ".[] | {login: .user.login, type: .user.type, body: .body}",
+                    "--paginate", "--jq", ".[] | {created_at: .created_at, login: .user.login, type: .user.type, body: .body}",
                 ],
                 capture_output=True, text=True, timeout=_gh_timeout(8),
             )
@@ -5139,7 +5139,7 @@ def _latest_codex_completed_summary(
             raw = result.stdout
         except Exception:
             return None
-    latest = None
+    comments = []
     for line in (raw or "").splitlines():
         try:
             obj = json.loads(line.strip())
@@ -5147,6 +5147,11 @@ def _latest_codex_completed_summary(
             continue
         if not isinstance(obj, dict):
             continue
+        created_at = obj.get("created_at")
+        comments.append((created_at if isinstance(created_at, str) else "", obj))
+
+    latest = None
+    for _, obj in sorted(comments, key=lambda item: item[0]):
         if (obj.get("login") or "") != _CODEX_REVIEW_BOT or (obj.get("type") or "") != "Bot":
             continue
         body = obj.get("body") or ""
