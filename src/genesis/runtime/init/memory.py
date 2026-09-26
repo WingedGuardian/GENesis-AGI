@@ -75,21 +75,42 @@ async def init(rt: GenesisRuntime) -> None:
         # URLs, IPs) that belong alongside episodic memories.
         await _migrate_reference_vectors(qdrant, rt._db)
 
-        # Split embedding chains: storage (Ollama first) vs recall (cloud first).
+        # Both chains are cloud-first; they differ only in the rate tier.
         # Both share the same L2 diskcache — cache keys are text-based, not
-        # provider-dependent, so a write cached via Ollama is instantly
-        # available for a read via cloud.
+        # provider-dependent, so a write cached via one backend is instantly
+        # available for a read via the other.
+        #
+        # STORAGE used to run Ollama-first, on the reasoning that a background
+        # write has no deadline so the slower local backend costs nothing. What
+        # that reasoning left out is the CPU: local embedding is inference, and
+        # this install has no GPU, so every write burned cores that the rest of
+        # the system was contending for. MEASURED 2026-09-26 through this very
+        # chain, 20 calls each on representative memory-length texts:
+        #
+        #     ollama_embedding      p50 2395.8ms   p95 2952.9ms
+        #     deepinfra_embedding   p50  207.8ms   p95  399.0ms
+        #
+        # 11.5x at p50. Ollama stays as the second rung, so a cloud outage
+        # degrades to local writes rather than losing them.
         #
         # Only RECALL asks for the paid priority tier, and only because it is
         # deadline-bound: the proactive route cancels at 4.5s, while DeepInfra's
         # default tier queues under load (MEASURED 2026-09-04: 8.6-13.3s default
-        # vs ~650ms priority, which cost a 100% recall failure rate). Storage is
-        # a background write with no deadline, so it stays on the normal rate —
-        # paying the 1.5x premium there would buy nothing.
+        # vs ~650ms priority, which cost a 100% recall failure rate). Storage
+        # stays on the normal rate because it has no deadline to miss, NOT
+        # because it has headroom: the 207.8ms p50 above was measured off-peak,
+        # and the 8.6-13.3s figure on this very line describes the same tier
+        # under load. A queued request returns a clean 200, just late, so the
+        # exception-only fallback below cannot see it and Ollama is never
+        # reached — meaning storage can be slower than the local path it
+        # replaced, silently, exactly when the system is busiest. Live local
+        # average for comparison: 6516ms over 2276 calls in 24h. Giving the
+        # chain a per-rung latency budget is tracked separately; until then this
+        # is a known unguarded edge rather than an unnoticed one.
         from genesis.env import embed_priority_tier
 
         priority = embed_priority_tier()
-        storage_backends = EmbeddingProvider.build_chain(ollama_first=True)
+        storage_backends = EmbeddingProvider.build_chain(ollama_first=False)
         recall_backends = EmbeddingProvider.build_chain(ollama_first=False, priority_tier=priority)
         logger.info(
             "Embedding chains: storage=%s, recall=%s (recall priority_tier=%s)",

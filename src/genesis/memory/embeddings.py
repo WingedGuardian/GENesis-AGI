@@ -1,8 +1,10 @@
 """Embedding provider with configurable backend chains.
 
-Two chain configurations for split read/write paths:
-  Storage (writes): Ollama → DeepInfra → DashScope (cost-optimized, local first)
-  Recall (reads):   DeepInfra → DashScope → Ollama (latency-optimized, cloud first)
+Two chain configurations for split read/write paths. Both lead with the
+cloud backend; they differ only in the rate tier:
+  Storage (writes): DeepInfra → DashScope → Ollama (ordinary tier)
+  Recall (reads):   DeepInfra → DashScope → Ollama (priority tier — deadline-bound)
+Ollama is the fallback rung in both, so a cloud outage degrades rather than fails.
 
 All backends use qwen3-embedding at 1024 dimensions for vector space
 compatibility. Cache keys are text-based (SHA256 of "qwen3-embedding:{text}"),
@@ -388,13 +390,32 @@ class EmbeddingProvider:
 
     @staticmethod
     def build_chain(
-        *, ollama_first: bool = True, priority_tier: bool = False
+        *, ollama_first: bool = False, priority_tier: bool = False
     ) -> list[EmbeddingBackend]:
         """Build backend chain with configurable priority order.
 
         Args:
-            ollama_first: If True, Ollama leads (storage/write path).
-                         If False, cloud leads (recall/read path).
+            ollama_first: If True, Ollama leads. If False (the DEFAULT),
+                         cloud leads and Ollama is the fallback rung.
+                         The default used to be True, on the reasoning that a
+                         write has no deadline so the slower local backend is
+                         free. It is not free: local embedding is inference, and
+                         on a GPU-less host every write burns cores the rest of
+                         the system is contending for. MEASURED 2026-09-26
+                         through this chain, 20 calls each: Ollama p50 2395.8ms
+                         / p95 2952.9ms, DeepInfra p50 207.8ms / p95 399.0ms —
+                         11.5x at p50. FIFTEEN callers construct an
+                         EmbeddingProvider with no explicit chain and so inherit
+                         this value — six in ``src/`` and nine in ``scripts/``,
+                         the highest-traffic being
+                         ``scripts/genesis_mcp_server.py``, which is the
+                         provider behind ``memory_store`` / ``reference_store``
+                         / ``knowledge_ingest`` for every session. They are all
+                         write paths, which is why the DEFAULT is what had to
+                         move rather than one call site. An earlier revision of
+                         this docstring said six: that count enumerated ``src/``
+                         only, and was repeated into the changelog and a test
+                         before an audit enumerated the rest.
             priority_tier: If True, the DeepInfra backend requests the paid
                          priority scheduling tier (1.5x rate). Defaults to
                          False so no caller is billed the premium implicitly —
@@ -450,8 +471,8 @@ class EmbeddingProvider:
 
     @staticmethod
     def _build_default_chain() -> list[EmbeddingBackend]:
-        """Build default backend chain (Ollama first — storage/write path)."""
-        return EmbeddingProvider.build_chain(ollama_first=True)
+        """Build the default backend chain (cloud first, Ollama as fallback)."""
+        return EmbeddingProvider.build_chain(ollama_first=False)
 
     @property
     def tracker(self) -> ProviderActivityTracker | None:

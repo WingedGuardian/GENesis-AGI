@@ -407,6 +407,78 @@ class TestBuildChainPriorityTier:
         assert backend is not None
         assert backend._service_tier is None
 
+    def test_the_builder_DEFAULT_is_cloud_first(self, monkeypatch) -> None:
+        """The default is the change; an explicit-argument test cannot bind it.
+
+        FIFTEEN callers construct `EmbeddingProvider()` with no chain and
+        inherit whatever this default is — six in the package (trace,
+        stale-embedding repair, procedural embedding and its promoter, the
+        procedural MCP, the session-awareness worker) and nine in `scripts/`,
+        the busiest being `genesis_mcp_server.py`, the provider behind
+        `memory_store` / `reference_store` / `knowledge_ingest` for every
+        session. They are all WRITE paths. Flipping only
+        `runtime/init/memory.py` would have left every one of them on local
+        inference and made the change cosmetic.
+
+        This docstring said "six" until an audit enumerated `scripts/` too — the
+        original count swept `src/` only and was repeated into the changelog and
+        the builder docstring before anyone checked it.
+
+        MEASURED 2026-09-26 through this chain, 20 calls each: Ollama p50
+        2395.8ms, DeepInfra p50 207.8ms.
+        """
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+
+        chain = EmbeddingProvider.build_chain()
+        names = [b.name for b in chain]
+
+        assert "deepinfra_embedding" in names and "ollama_embedding" in names, (
+            f"both backends must be present for this test to mean anything: {names}"
+        )
+        assert names.index("deepinfra_embedding") < names.index("ollama_embedding"), (
+            f"the DEFAULT chain must lead with the cloud backend, got {names}"
+        )
+
+    def test_a_bare_EmbeddingProvider_is_cloud_first(self, monkeypatch) -> None:
+        """The path the six bare callers actually take, end to end.
+
+        `build_chain()` and `_build_default_chain()` are separate lines; binding
+        only the former leaves the second free to disagree, which is exactly how
+        the two could drift apart unnoticed.
+        """
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+
+        # cache_dir=None: every other test in this file does the same. The
+        # default opens ~/.genesis/embedding_cache, which is shared live with
+        # the running MCP servers and sits at its 100 MB eviction ceiling. This
+        # test asserts on _backends, so the cache is pure side effect.
+        provider = EmbeddingProvider(cache_dir=None)
+        names = [b.name for b in provider._backends]
+
+        assert "deepinfra_embedding" in names and "ollama_embedding" in names, names
+        assert names.index("deepinfra_embedding") < names.index("ollama_embedding"), (
+            f"a provider built with no explicit chain must be cloud-first, got {names}"
+        )
+
+    def test_ollama_first_is_still_reachable_when_asked_for(self, monkeypatch) -> None:
+        """CONTROL — the flip must change the default, not remove the capability.
+
+        Ollama-first remains the right order for anything that must not leave the
+        host. If this goes red the parameter has stopped working rather than the
+        default having moved.
+        """
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+
+        chain = EmbeddingProvider.build_chain(ollama_first=True)
+        names = [b.name for b in chain]
+
+        assert names.index("ollama_embedding") < names.index("deepinfra_embedding"), (
+            f"ollama_first=True must still lead with Ollama, got {names}"
+        )
+
     def test_priority_defaults_off_at_the_builder(self, monkeypatch) -> None:
         """build_chain must not opt anyone in silently; the CALLER decides."""
         monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
@@ -454,6 +526,24 @@ class TestRecallChainWiring:
         storage_call = storage_call.split(")")[0]
         assert "priority_tier" not in storage_call, (
             "storage is a background write with no deadline — it must not pay 1.5x"
+        )
+
+    def test_the_storage_chain_is_cloud_first(self) -> None:
+        """The one line the flip exists for, and it was unlocked.
+
+        MEASURED: reverting `storage_backends` to `ollama_first=True` left all
+        59 tests in this file green — including the three added with the flip,
+        because those bind the BUILDER default and this binds the CALLER. The
+        purpose-built harness for exactly this was sitting twenty lines above
+        and went unused.
+        """
+        src = self._init_source()
+        assert "storage_backends = EmbeddingProvider.build_chain(" in src
+        storage_call = src.split("storage_backends = EmbeddingProvider.build_chain(")[1]
+        storage_call = storage_call.split(")")[0]
+        assert "ollama_first=False" in storage_call, (
+            "storage must lead with the cloud backend — without this line the "
+            "flip is inert for the runtime, whatever the builder default says"
         )
 
     def test_the_tier_decision_reads_the_config_lever(self) -> None:
