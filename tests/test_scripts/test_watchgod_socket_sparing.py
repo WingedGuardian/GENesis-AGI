@@ -25,6 +25,7 @@ sessions.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -42,8 +43,7 @@ exit 0
 # post-cleanup re-measure; keep it tiny. Stub queue_alert so the
 # RED path's emergency alert becomes a log line instead of a real queue write.
 _PRELUDE = (
-    'CC_TMP_BUDGET_MB=4; '
-    'queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
+    'CC_TMP_BUDGET_MB=4; queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
 )
 
 
@@ -81,6 +81,12 @@ def _mksock(path: Path) -> None:
     unprivileged on Linux, and exactly what `find -type s` matches."""
     path.parent.mkdir(parents=True, exist_ok=True)
     os.mknod(path, stat.S_IFSOCK | 0o600)
+
+
+def _age(path: Path, seconds: int) -> None:
+    """Backdate mtime/atime so a freshness predicate treats the file as stale."""
+    old = time.time() - seconds
+    os.utime(path, (old, old))
 
 
 def _log(home: Path) -> str:
@@ -167,3 +173,380 @@ def test_orange_never_touches_old_socket_pin(tmp_path):
         "yellow/orange sweep deleted a socket"
     )
     assert not (cctmp / "claude-skills").exists(), "orange should evict the cache"
+
+
+# ── Control-plane TREES, not just the socket inodes ──────────────────────
+#
+# `-not -type s` protects a socket FILE. It cannot protect the DIRECTORY that
+# holds it, because a directory is not a socket — a sockets dir survives the
+# sweep only while something inside keeps it non-empty, i.e. by accident.
+# REPRODUCED against the unfixed predicate at both sites: an empty sockets
+# directory and an empty daemon root were deleted, and only a socket-holding
+# sibling survived.
+#
+# The exclusions are EXACT PATHS, not name globs. Two separate reasons, both
+# load-bearing and both pinned below:
+#   * a `-path '*/cc-socks*/*'` glob makes an unbounded subtree immortal
+#     (-path's `*` matches `/`), so any cc-socks-prefixed directory would pin
+#     everything beneath it against the watchdog forever;
+#   * `cc-daemon-*` is ALSO a CC mkdtemp prefix — cc-daemon-<random> holding a
+#     single stderr.log — so a name glob would empty each husk and then spare
+#     it permanently, making the empty-directory reaper leak inodes.
+
+
+def _uid() -> int:
+    return os.getuid()
+
+
+def _control_plane_tree(root: Path) -> None:
+    """The Zone A shapes the guard must keep. Only `cc-socks` is a real CC path
+    under the temp dir; the /tmp-only names are exercised by the Zone B arms."""
+    (root / "cc-socks").mkdir()  # bare: the empty-sockets-dir defect itself
+    (root / "cc-socks" / "nested").mkdir()  # subtree sparing
+    _mksock(root / "cc-socks-live" / "a.sock")  # the accidental-protection case
+
+
+def test_red_spares_an_empty_control_plane_tree(tmp_path):
+    """THE ACCEPTANCE BAR. The sockets directory survives RED with no socket
+    inside to keep it non-empty, and so does a directory beneath it."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _control_plane_tree(cctmp)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (cctmp / "cc-socks").is_dir(), "RED deleted the empty sockets directory"
+    assert (cctmp / "cc-socks" / "nested").is_dir(), "RED deleted a dir inside the tree"
+    assert (cctmp / "cc-socks-live" / "a.sock").exists()
+
+
+def test_red_still_reaps_lookalikes_and_unrelated_dirs(tmp_path):
+    """The negative control, and it is what makes the guard EXACT rather than a
+    prefix match. Without it a guard that spared everything — or one that used
+    a `cc-socks*` glob — would pass every arm above.
+
+    `cc-socks-backup` is the concrete cost of the glob form: under it, that
+    directory and its whole subtree become permanently unreapable."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _control_plane_tree(cctmp)
+    (cctmp / "unrelated-empty").mkdir()
+    (cctmp / "cc-socks-backup" / "junk").mkdir(parents=True)
+    (cctmp / "cc-socksomething").mkdir()
+    # CC's own mkdtemp husk: cc-daemon-<random> holding one stderr.log. Under a
+    # `cc-daemon-*` name glob this is emptied and then spared forever.
+    (cctmp / "cc-daemon-Ab3xY9").mkdir()
+    (cctmp / "cc-daemon-Ab3xY9" / "stderr.log").write_bytes(b"e" * 512)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    for gone in ("unrelated-empty", "cc-socks-backup", "cc-socksomething", "cc-daemon-Ab3xY9"):
+        assert not (cctmp / gone).exists(), (
+            f"{gone} survived — the guard is a prefix match, not an exact path"
+        )
+    assert (cctmp / "cc-socks").is_dir(), "…and the acceptance bar was not vacuous"
+
+
+def test_red_spares_the_directory_but_not_a_file_inside_it(tmp_path):
+    """Sparing is DIRECTORY-scoped on purpose. A regular file inside the tree is
+    still reclaimed — the object-level contract
+    `test_red_reclaims_files_inside_socket_dir` pins with a socket present; this
+    arm pins it with no socket, where only the new guard keeps the parent."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _control_plane_tree(cctmp)
+    stale = cctmp / "cc-socks" / "stale.log"
+    stale.write_bytes(b"j" * 4096)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert not stale.exists(), "a regular file inside the tree should be reclaimed"
+    assert (cctmp / "cc-socks").is_dir(), "…but its directory must survive"
+
+
+# ── The resolver itself, and the trap inside it ──────────────────────────
+
+
+def _resolve_paths(home: Path, bind: Path, cctmp: Path, extra_env=None) -> list[str]:
+    env_prefix = ""
+    if extra_env:
+        env_prefix = "".join(f"export {k}={v}; " for k, v in extra_env.items())
+    proc = _run(home, bind, _PRELUDE + env_prefix + "cc_control_plane_paths")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def test_control_plane_paths_cover_every_location_cc_can_bind(tmp_path):
+    """All four concrete paths, enumerated rather than computed from one
+    expression. CC picks between them from ITS environment, which is not this
+    daemon's."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    paths = _resolve_paths(home, bind, cctmp)
+    assert f"{cctmp}/cc-socks" in paths, paths
+    assert "/tmp/cc-socks" in paths, paths
+    assert f"/tmp/cc-socks-{_uid()}" in paths, paths
+    assert f"/tmp/cc-daemon-{_uid()}" in paths, paths
+
+
+def test_XDG_RUNTIME_DIR_does_not_displace_the_in_budget_sockets_dir(tmp_path):
+    """THE REGRESSION THIS ARM EXISTS FOR, and it is the reason the resolver is
+    a list rather than a `${XDG_RUNTIME_DIR:-$CC_TMP_DIR}/cc-socks` expression.
+
+    MEASURED on a live install: this daemon runs as a systemd user unit WITH
+    XDG_RUNTIME_DIR=/run/user/<uid>, while a CC session under tmux has it unset
+    and falls back to its TMPDIR — and both `<cc-tmp>/cc-socks` and
+    `/run/user/<uid>/cc-socks` existed at the same time. A default-expansion
+    evaluated in THIS process resolves to the runtime dir and silently stops
+    sparing the cc-tmp one, which is the only one inside the budget we sweep.
+    The simplification is tempting and this arm is what refuses it."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    paths = _resolve_paths(home, bind, cctmp, {"XDG_RUNTIME_DIR": str(runtime)})
+    assert f"{cctmp}/cc-socks" in paths, (
+        "XDG_RUNTIME_DIR displaced the in-budget sockets directory:\n" + "\n".join(paths)
+    )
+
+
+# ── Zone B: the same defect, reached through the /tmp sweeps ─────────────
+#
+# `clean_sys_yellow` hardcodes `/tmp`, so a behavioural arm would have to let
+# the function loose on live machine state. The repo's precedent for that case
+# is a structural arm. These go further: the exclusion argv is taken from the
+# script's OWN resolver at runtime and replayed against a sandbox, so a change
+# to the resolver changes what these arms do rather than leaving a hand-copied
+# duplicate behind.
+
+
+def _sweep_argv(home: Path, bind: Path) -> list[str]:
+    """`clean_sys_yellow`'s empty-directory sweep, with the script's own
+    control-plane exclusions expanded by the script itself."""
+    body = _WATCHGOD.read_text()
+    start = body.index("clean_sys_yellow() {")
+    fn = body[start : body.index("\n}\n", start)]
+    joined = fn.replace("\\\n", " ")
+    line = next(
+        (
+            s
+            for s in (ln.strip() for ln in joined.splitlines())
+            if s.startswith("find /tmp") and "-type d" in s and "-empty" in s
+        ),
+        None,
+    )
+    assert line is not None, f"no empty-directory sweep in clean_sys_yellow:\n{fn}"
+    assert "_cp_excl" in line, "the sweep no longer carries the control-plane exclusions"
+    # Let the SCRIPT expand its own exclusion array, rather than re-deriving it.
+    proc = _run(
+        home,
+        bind,
+        _PRELUDE + 'declare -a _e=(); cc_control_plane_excl _e; printf "%s\\n" "${_e[@]}"',
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    excl = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert excl, "the resolver produced no exclusions"
+    static = shlex.split(line.split("${_cp_excl")[0])
+    # Drop the shell tail if shlex swept one up; `find` would treat a
+    # redirection as a path operand, delete nothing, and make every assertion
+    # below a tautology.
+    return static + excl + ["-delete"]
+
+
+def test_zone_b_sweep_spares_the_control_plane_and_reaps_the_rest(tmp_path):
+    """/tmp is where CC's long-path sockets fallback lives, and where its
+    background daemon ALWAYS lives."""
+    root = tmp_path / "faketmp"
+    root.mkdir()
+    for name in ("cc-socks", f"cc-socks-{_uid()}", f"cc-daemon-{_uid()}"):
+        (root / name).mkdir()
+    (root / f"cc-daemon-{_uid()}" / "deadbeef").mkdir()
+    (root / "unrelated-empty").mkdir()
+    (root / "cc-daemon-Ab3xY9").mkdir()  # CC's mkdtemp husk — must still go
+
+    home, cctmp, bind = _sandbox(tmp_path)
+    argv = _sweep_argv(home, bind)
+    assert argv[1] == "/tmp", f"the sweep root is no longer /tmp: {argv[1]}"
+    # Rewrite BOTH the root and the absolute exclusion paths onto the sandbox.
+    # A relative root is used because `-path`'s `*` matches `/`, and pytest's
+    # basetemp is `.../pytest-of-<user>/...`, so `-not -path "*/pytest-*"` would
+    # otherwise be satisfied by the root's own path and exclude everything —
+    # deleting nothing and making every assertion here vacuous. (Production is
+    # unaffected: its root is literally /tmp.)
+    # The rewrite must produce RELATIVE exclusion paths, because `-path`
+    # compares against the path find builds from its starting point — and the
+    # starting point here is relative. An absolute exclusion silently matches
+    # nothing, and the sweep then deletes the very directories this arm is
+    # asserting it spares. (Caught by that assertion, which is the point of
+    # keeping the spare-list and the reap-list in one arm.)
+    argv = [root.name if a == "/tmp" else a.replace("/tmp/", f"{root.name}/", 1) for a in argv]
+    subprocess.run(argv, capture_output=True, cwd=root.parent)
+
+    for kept in (
+        "cc-socks",
+        f"cc-socks-{_uid()}",
+        f"cc-daemon-{_uid()}",
+        f"cc-daemon-{_uid()}/deadbeef",
+    ):
+        assert (root / kept).is_dir(), f"the Zone B sweep deleted {kept}"
+    for gone in ("unrelated-empty", "cc-daemon-Ab3xY9"):
+        assert not (root / gone).exists(), (
+            f"{gone} survived — the sweep deleted nothing, or the guard is a prefix match"
+        )
+
+
+def test_zone_b_sweep_still_calls_the_shared_resolver(tmp_path):
+    """Structural companion. The replay arm would keep passing if the
+    exclusions were dropped AND the sweep stopped deleting anything; this one
+    names the call, so the two fail for different reasons."""
+    body = _WATCHGOD.read_text()
+    start = body.index("clean_sys_yellow() {")
+    fn = body[start : body.index("\n}\n", start)]
+    assert "cc_control_plane_excl" in fn, (
+        "clean_sys_yellow no longer builds the control-plane exclusions"
+    )
+    # Strip comments first: this function's rationale block NAMES the glob
+    # forms it rejects, and a naive substring scan reads its own explanation as
+    # a regression.
+    code = "\n".join(ln for ln in fn.splitlines() if not ln.lstrip().startswith("#"))
+    assert "cc-socks*" not in code and "cc-daemon-*" not in code, (
+        "a name GLOB is back in the Zone B sweep; it makes an unbounded subtree "
+        "immortal and spares CC's mkdtemp husks forever"
+    )
+
+
+# --------------------------------------------------------------------------
+# The path CC_TMP_DIR takes is CONFIG-SETTABLE, and find(1)'s -path takes a
+# GLOB. Both arms below were REPRODUCED against the unfixed code (2026-09-26,
+# review round 1): the empty sockets directory was DELETED in each, while a
+# plain-path control arm spared it. Each arm carries its own negative control
+# — an unrelated empty `junk/` that must still be reaped — so a guard that
+# simply stopped deleting anything cannot pass them.
+# --------------------------------------------------------------------------
+
+
+def test_red_spares_the_sockets_dir_under_a_glob_character_path(tmp_path):
+    """A bracket in CC_TMP_DIR must not turn the exclusion into a pattern that
+    fails to match its own directory. This is the same fail-OPEN `glob_escape`
+    already guards for live-writer paths, one level up."""
+    home, _cctmp, bind = _sandbox(tmp_path)
+    root = home / ".genesis" / "cc-tmp[x]"
+    (root / "cc-socks").mkdir(parents=True)
+    (root / "junk").mkdir()
+
+    proc = _run(
+        home, bind, _PRELUDE + f"CC_TMP_DIR={shlex.quote(str(root))}; clean_cc_red"
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (root / "cc-socks").is_dir(), "RED deleted the sockets dir under a glob path"
+    assert not (root / "junk").exists(), "negative control: unrelated junk survived"
+
+
+def test_red_spares_the_sockets_dir_when_CC_TMP_DIR_has_a_trailing_slash(tmp_path):
+    """`dir/` builds the exclusion `dir//cc-socks` while find, rooted at `dir/`,
+    emits `dir/cc-socks` — so the exclusion matches nothing."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir()
+    (cctmp / "junk").mkdir()
+
+    proc = _run(
+        home, bind, _PRELUDE + f"CC_TMP_DIR={shlex.quote(str(cctmp) + '/')}; clean_cc_red"
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (cctmp / "cc-socks").is_dir(), "RED deleted the sockets dir on a trailing slash"
+    assert not (cctmp / "junk").exists(), "negative control: unrelated junk survived"
+
+
+def test_red_counts_only_control_plane_dirs_under_the_root_it_swept(tmp_path):
+    """The enumeration also carries /tmp roots, which Zone A never walks. If
+    those are counted, an unrelated one reports a preserved directory and masks
+    the absence of the in-budget sockets dir — the single case this log line
+    exists to make visible.
+
+    The resolver is stubbed so the arm does not depend on whether this machine
+    happens to have a /tmp control-plane root: one path inside the swept root,
+    one outside it, both present on disk. The fixed code must count ONE.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir()
+    outside = home / "outside-the-swept-root"
+    outside.mkdir()
+
+    stub = (
+        "cc_control_plane_paths() { printf '%s\\n' "
+        f'"$CC_TMP_DIR/cc-socks" {shlex.quote(str(outside))}; }}; '
+    )
+    proc = _run(home, bind, _PRELUDE + stub + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert outside.is_dir(), "the arm's premise: the outside path is still on disk"
+    assert " and 1 control-plane dir(s)" in _log(home), (
+        "RED counted a control-plane dir it never swept:\n" + _log(home)
+    )
+
+
+def test_red_reclaims_an_unrelated_cc_socks_husk_elsewhere_in_the_tree(tmp_path):
+    """The arm that pins the MECHANISM, not just the outcome.
+
+    Audit finding, round 2: the three arms above are all satisfied by a
+    BASENAME exclusion (`-not -name 'cc-socks'`), which this file spends
+    thirteen comment lines rejecting — under it, an unrelated `cc-socks`
+    directory anywhere in the tree becomes immortal and leaks its inode
+    forever. The exclusions are EXACT PATHS, and only an arm that reaps a
+    same-named directory at a different path can tell the two apart.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    (cctmp / "cc-socks").mkdir()
+    husk = cctmp / "junkproj" / "cc-socks"
+    husk.mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (cctmp / "cc-socks").is_dir(), "the real control-plane dir was reaped"
+    assert not husk.exists(), (
+        "an unrelated cc-socks husk survived — the exclusion is matching by "
+        "NAME, not by exact path, and every such husk is now immortal"
+    )
+
+
+def test_red_spares_the_active_sessions_files_under_a_bracketed_project(tmp_path):
+    """`-path` takes a glob at the ACTIVE-SESSION exclusion too, and that one
+    needs no config change to reach: CC derives the project directory name from
+    the repository path, so a bracket in the repo name is enough.
+
+    REPRODUCED against the unfixed predicate with a plain-named control:
+    control KEPT, `genesis[wt]` DELETED, `home-u-repo[1]` DELETED.
+    """
+    home, cctmp, bind = _sandbox(tmp_path)
+    sess = cctmp / "claude-1000" / "genesis[wt]" / "session-uuid"
+    sess.mkdir(parents=True)
+    live = sess / "working.txt"
+    live.write_bytes(b"w" * 2048)
+    _age(live, 600)
+
+    other = cctmp / "claude-1000" / "plainproj" / "old-session"
+    other.mkdir(parents=True)
+    stale = other / "working.txt"
+    stale.write_bytes(b"j" * 2048)
+    _age(stale, 600)
+    # newest_session is the depth-2 PROJECT dir chosen by mtime, so make the
+    # bracketed one unambiguously the active workspace. Without this the arm
+    # would be about whichever project happened to be created last.
+    _age(other, 3600)
+    _age(cctmp / "claude-1000" / "plainproj", 3600)
+
+    proc = _run(home, bind, _PRELUDE + "SACRED_GROUND_MB=1; clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "OXYGEN FLOOR" not in _log(home), "the arm's premise: RED is above the floor"
+
+    assert live.exists(), (
+        "RED deleted the ACTIVE session's working file because a bracket in "
+        "the project name turned its exclusion into a non-matching glob"
+    )
+    assert not stale.exists(), (
+        "the older session's file survived too — the sweep did not run"
+    )
