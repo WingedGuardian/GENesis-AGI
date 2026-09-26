@@ -35,7 +35,10 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   that is what clears the commit gate's depth check; code-reviewer inline for a
   small focused fix (the Adaptive Review Protocol below is authoritative, and
   dispatching a full adversarial pass on a one-line change is not the bar) —
-  and then it is DONE with that item. It does not wait for Codex, and it
+  and then it is DONE with that item. Where its effect can be observed here, a
+  wrong run can be undone, and it is not on the never-run list, it is seen
+  working BEFORE the PR opens ("Verify BEFORE the PR" below). It does not wait
+  for Codex, and it
   carries no review loop — the obligations under "When to DRIVE a Merge" below
   pass to the closing session along with the PR; they do not lapse.
 - **A closing session owns the open-PR queue**, whichever session built each
@@ -322,6 +325,99 @@ next session reads a confident sentence as a measured one. Those surfaces are
 ENUMERABLE, which makes the check mechanical rather than a mood.
 `references/high-stakes-verification.md` §11 carries the canonical surface list
 and the walk; do not keep a second copy of that list here.
+
+### Verify BEFORE the PR, when this install can show it (standing user rule, 2026-09-24)
+
+A cloud agent has to ship straight to a PR, so review is its first real test.
+You do not. You build on a long-lived install, so **when the change's effect can
+be observed here AND a wrong run can be undone, see it work before you open the
+PR.** Review then looks at a change that works, not at its first attempt to run.
+Put what you ran and what you saw under the PR's `## Testing` section. The `E2E:`
+line keeps its meaning: the check to run AFTER the merge. For a hook that is still
+needed, because a pre-PR run tests the worktree copy, not the merged copy the
+harness fires.
+
+**Which copy actually ran is the whole question. Check it; never assume it.**
+- A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
+  payload on stdin, runs the branch's copy of that file. The harness, and the
+  worktree's own `.claude/hooks/genesis-hook`, run MAIN's copy by default (see
+  "The Gate Machinery" below). `GENESIS_HOOK_DEV_LOCAL=1` on that ONE launcher
+  call switches it, and stderr announces the switch. Never set it session-wide or
+  in `settings.json`: your own commits and pushes would then run under the gate
+  you are still editing.
+- Which `genesis` package a Python file imports depends on the file. MEASURED
+  2026-09-25: from the worktree root, `import genesis` resolves to the MAIN tree
+  through the editable install. But more than twenty scripts and hooks put their
+  own tree's `src` on `sys.path`; run from a worktree they load the BRANCH's
+  package, whose database path then resolves inside the worktree, where no
+  database exists, while Qdrant is still the live one. Read the file's imports
+  before running it, and print `genesis.__file__` when in doubt.
+- So runtime code (`src/genesis/**`) is verified by tests, or by the minimal
+  harness `references/worktrees.md` describes, never by a live run, until there
+  is a supported way to run a branch in the live runtime. Pointing `PYTHONPATH`
+  at a worktree is for pytest only (same reference).
+- Say in the PR which copy ran and what it touched.
+
+**Only a run you can undo qualifies.** MEASURED: 74 of the 161 PRs merged
+2026-09-10..24 (46%) touched only scripts and hooks. That is the pool this step
+draws from, not a count of what passes it. A script that deletes, prunes,
+restores, deploys to the host, pushes, posts or sends a message, or writes to any
+live store (the database, Qdrant, the graph engine) does NOT run before it
+merges. A `--dry-run` flag is not an exception by itself: `restore.sh --dry-run`
+still takes the live update and backup-restore locks, runs `git pull --rebase` on
+the backup repository, and overwrites `~/.genesis/restore_status.json` on exit.
+Run a dry-run only after reading that mode's code and finding that it writes
+nothing. Do not improvise isolation: `GENESIS_HOME` moves neither
+the database nor Qdrant, and many files hard-code `~/.genesis`. Tests are how such
+a script is verified.
+
+**Never run on the live install before it merges:** a branch's migration, privacy,
+egress or credential handling, anything that loosens a gate other sessions rely
+on, and anything whose verification needs days or a machine the owner does not
+control. Test a migration in a pytest fixture, and patch EVERY store it touches on
+the migration MODULE itself. The suite-wide fixture patches
+`genesis.env.genesis_db_path`, but data migrations import that name directly
+(`from genesis.env import genesis_db_path`), so the patch never reaches them and
+the migration still opens the live database. A migration can also reach live
+Qdrant and write under `~/.genesis`. `d0008_reconcile_memory_cross_store`, for
+example, deletes the Qdrant points it judges to be ghosts. Its test patches the
+module's `genesis_db_path`, `get_client` and `_export_path`:
+`tests/test_db/test_d0008_reconcile_memory_cross_store.py` is the pattern to copy. NEW behaviour on a risky surface (memory, graph, database) ships behind a
+shadow flag, and the session never flips it: the owner does, after verifying.
+Entity adjudication is the house example. `config/entity_adjudication.yaml` ships
+it in `propose_only`, so a merge is recorded as a proposal. The owner reviews and
+approves proposals and applies the approved ones (`entity_adjudication_approve`,
+then `entity_adjudication_apply`) without changing the mode. Switching to `live`
+is a separate decision: it applies only approved backlog rows, but from then on
+it merges each NEW pair automatically with no approval step.
+
+**Iterate with the owner.** When acceptance needs the owner's hands (a device, a
+chat channel, another machine they use, or something only they can see), do not
+open the PR on a guess. Tell them exactly what to try and what they should see,
+ask through `AskUserQuestion`, fix what they report, and re-ask while it blocks.
+Open the PR once they confirm it works. Waiting on the owner here is the design,
+not a stall: no review round could have caught what they are about to see.
+- **Do not dispatch work whose acceptance needs the owner's hands.** No
+  dispatched path checked so far (the autonomy executor and
+  `direct_session_run`) can hold a change for the owner's test today.
+  - The autonomy executor pushes every code task's branch and opens a draft PR
+    for a build-lane task that passes its scope gate. It then deletes the
+    worktree and the local branch, so there is nothing left to test locally
+    (#2421).
+  - The executor's code steps have no MCP write except `observation_write`, so
+    they cannot create a follow-up row (#2422).
+  - A `direct_session_run` session has no Bash or Edit tool, so it cannot
+    commit code at all.
+  If a dispatched session finds an owner test is owed anyway, it states what to
+  try and what they should see in its final output. For an executor task that
+  output is read through `task_detail`, and it reaches no notification. A
+  follow-up row that a dispatched session creates (on a profile that allows it)
+  lands on the hidden tabled lane, so its `reason` must say it awaits the owner's
+  test in a foreground session.
+- **The owner says they cannot test it this session, or the session ends
+  before they confirm:** a `follow_up_create` row naming the owner test still
+  owed and where the code is (branch, worktree path, head SHA). Never write the
+  change up as verified.
 
 ### Acceptance Bar + Measured Rate — the primary methodology
 
