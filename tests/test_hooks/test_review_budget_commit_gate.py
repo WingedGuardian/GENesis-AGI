@@ -18,6 +18,35 @@ STATE = ROOT / "scripts" / "review_state.py"
 CODEX = "chatgpt-codex-connector[bot]"
 HEADS = tuple(f"{i:x}" * 40 for i in range(1, 7))
 
+# The hook imports `review_deadline` and `review_scope` at MODULE scope, resolving
+# them from its own `scripts/` when run as a subprocess (sys.path[0] is the script's
+# directory). Loading it by spec instead gives it pytest's sys.path, where neither
+# resolves — so without this insert the module raises ModuleNotFoundError AT
+# COLLECTION. It collected anyway in a whole-directory run only because 32-33 sibling
+# modules do the same insert at import time (AST-resolved count; a grep for the
+# literal idiom undercounts, since most go through a variable) and most sort earlier.
+# That meant the file could NOT be run TARGETED — `pytest tests/test_hooks/test_x.py`,
+# the form this project tells every session to use — which is how a suite silently
+# stops running. Explicit here, like its siblings, so importability does not depend
+# on collection order.
+#
+# `scripts/` only, deliberately: the hook self-inserts its own `hooks/` dir at module
+# scope (review_enforcement_commit.py:26), which runs during exec_module below, so a
+# `hooks` insert here would be dead. MEASURED — with `scripts/` alone and the hooks
+# dir asserted absent, the module imports and `review_deadline` resolves from THIS
+# worktree. Keep it ROOT-relative: hardcoding an absolute main-checkout path makes
+# replay_guard_corpus.py raise SystemExit over a cross-tree bare-name import, in a
+# different test directory, with an error naming neither file.
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import review_budget  # noqa: E402 — needs the insert above.
+
+#: Derived, never spelled. The gate messages interpolate these, so hardcoding "four"
+#: or "two" in an assertion would relocate into the tests exactly the prose-vs-constant
+#: drift this change removes from the code.
+_HEAD_LIMIT = review_budget.STANDING_REVIEWED_HEAD_LIMIT
+_GATE_LIMIT = review_budget.GATE_DISCOVERY_ROUND_LIMIT
+
 _spec = importlib.util.spec_from_file_location("commit_budget_guard", HOOK)
 _guard = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
@@ -190,7 +219,7 @@ def test_ordinary_four_heads_asks_for_each_commit(monkeypatch, repo, home):
     first = _run('git commit -m "fix"', repo, home)
     second = _run('git commit -m "fix"', repo, home)
     assert _decision(first) == _decision(second) == "ask"
-    assert "standing authorization ended after four" in first.stdout
+    assert f"standing authorization ended after {_HEAD_LIMIT}" in first.stdout
 
 
 def test_legacy_final_sigil_does_not_replace_native_approval(monkeypatch, repo, home):
@@ -213,7 +242,7 @@ def test_autonomous_commit_is_denied(monkeypatch, repo, home):
     _mark(repo, home)
     result = _run('git commit -m "fix"', repo, home, dispatched=True)
     assert _decision(result) == "deny"
-    assert "standing authorization ended after four" in result.stderr
+    assert f"standing authorization ended after {_HEAD_LIMIT}" in result.stderr
 
 
 def test_hard_checks_precede_pending_approval(monkeypatch, repo, home):
@@ -270,7 +299,68 @@ def test_gate_round_two_fix_is_allowed_but_post_confirmation_fix_asks(monkeypatc
     _evidence(monkeypatch, 3, gate=True, head=HEADS[2])
     after = _run('git commit -m "post confirmation fix"', repo, home)
     assert _decision(after) == "ask"
-    assert "two discovery rounds plus confirmation are spent" in after.stdout
+    assert f"Its {_GATE_LIMIT} discovery rounds plus confirmation are spent" in after.stdout
+
+
+@pytest.mark.parametrize(
+    ("reviewed", "gate", "head", "boundary_claim"),
+    [
+        # Only the branch where the count IS the ordinary limit may assert the
+        # four-head boundary. At five heads that sentence is false, and at the gate
+        # limit it is about a different lane entirely.
+        pytest.param(4, False, HEADS[4], True, id="ordinary-at-the-terminal-boundary"),
+        pytest.param(5, False, HEADS[5], False, id="ordinary-past-it-discouraged"),
+        pytest.param(3, True, HEADS[2], False, id="gate-lane-budget-spent"),
+    ],
+)
+def test_every_fix_commit_approval_states_the_terminal_decision(
+    monkeypatch, repo, home, reviewed, gate, head, boundary_claim
+):
+    """A fix commit is protected like a review request, so it owes the same rule.
+
+    All three branches of `_commit_budget_reason` shipped with NO terminal framing
+    while the push guard's equivalent had it — the owner reading this prompt was
+    told only to "approve this single fix commit", which frames continued round-5
+    work as routine at the surface where the decision is actually made. Caught by
+    external review on PR #2382, not by that PR's own audit.
+
+    Parametrized across all three branches deliberately. The existing tests above
+    pin the SURROUNDING sentences ("standing authorization ended after <limit>",
+    "strongly discouraged", "two discovery rounds plus confirmation are spent"),
+    every one of which survives if only the terminal framing is deleted — so
+    without this test that mutation leaves the file GREEN.
+
+    The NEGATIVE assertions carry as much weight as the positive one, and each was
+    a real defect in the first version of this fix:
+
+    * This gate authorizes a fix COMMIT, so no branch may tell the reader their
+      approval buys "one further round" — the shared notice's round clause was
+      pasted here and contradicted the very next sentence.
+    * The four-head boundary claim belongs ONLY in the branch where the count is
+      four. The discouraged branch fires at five, where "there is no ordinary round
+      5" is simply false, and the gate lane is a different ladder.
+    """
+    _evidence(monkeypatch, reviewed, gate=gate, head=head)
+    _mark(repo, home)
+    result = _run('git commit -m "fix"', repo, home)
+    assert _decision(result) == "ask"
+    assert "MERGE with the outstanding issues accepted and filed" in result.stdout
+    assert "SEND IT BACK for rework" in result.stdout
+    # A commit gate never authorizes a round, in ANY branch.
+    assert "one further round" not in result.stdout, (
+        "this approval covers a fix commit, not a review round"
+    )
+    if boundary_claim:
+        assert "ROUND 4 IS TERMINAL" in result.stdout
+        assert "there is no ordinary round 5" in result.stdout
+    else:
+        assert "there is no ordinary round 5" not in result.stdout, (
+            "the four-head boundary claim is false in this branch"
+        )
+        if gate:
+            assert "review-gate surface" in result.stdout
+        else:
+            assert "past the terminal boundary" in result.stdout
 
 
 def test_proven_no_open_pr_does_not_invent_a_cloud_round(monkeypatch, repo, home):

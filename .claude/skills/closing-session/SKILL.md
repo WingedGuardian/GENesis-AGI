@@ -364,11 +364,29 @@ sibling you did not look for.
 unanswered finding blocks the gate even when the code is already fixed —
 observed on PR #1541. A reasoned rejection is a valid resolution; silence is not.
 
-**The 3-round escalation cap is evaluated BEFORE dispatching the next review**,
-never after reading its findings. It counts CROSS-MODEL rounds only; internal
-subagent reviews never advance it. The cap CONSUMES standing approval — a prior
-"keep going until it's green" is void once it fires. Post the round ledger and
-get a fresh decision.
+**The round budget is evaluated BEFORE dispatching the next review**, never
+after reading its findings. A ROUND is one of GitHub's distinct reviewed heads
+on the PR — that word is reserved for it. Your own internal subagent audits are
+AUDIT PASSES: they advance nothing, and no counter sees them, so never report a
+round number you did not get from `scripts/review_budget.py`. Reaching the
+budget CONSUMES standing approval — a prior "keep going until it's green" is
+void once it fires. Post the round ledger and get a fresh decision.
+
+**ROUND 4 IS TERMINAL** (owner ruling, 2026-09-25). There is no ordinary round
+5. At four reviewed heads the decision is not "another round": it is to MERGE
+with the outstanding issues accepted and filed, or to SEND IT BACK for rework. A
+fifth round exists only by explicit user approval, re-asked every round, and
+each of those is terminal in the same way. On the gate-surface lane the same
+ladder is compressed to two rounds, each carrying two ordinary rounds' work.
+
+Two caveats a closing session needs, because both are live today. The MECHANISM
+still permits round 5+ under per-request approval — aligning it is tracked work,
+so until then this paragraph and the approval prompts are what carry the rule.
+And a SECOND, local non-convergence streak (cap 3) exists alongside the
+reviewed-head budget. They are independent gates: the streak's cap-3 hard
+stop blocks commits whatever the reviewed-head count, and the reviewed-head
+budget gates review requests and fix commits whatever the streak. Neither
+overrides the other; only the reviewed heads are numbered as rounds.
 
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.
