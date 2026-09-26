@@ -4,7 +4,6 @@
 Used by:
 - review_enforcement_prompt.py (UserPromptSubmit hook)
 - review_enforcement_commit.py (PreToolUse hook)
-- genesis_stop_hook.py (Stop hook)
 - Claude (after /review + code-reviewer agent complete)
 
 The marker file records a hash of ``git diff --cached --raw --no-abbrev -z`` (staged
