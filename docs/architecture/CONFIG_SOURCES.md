@@ -30,7 +30,7 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 | `genesis-server` (systemd) | `EnvironmentFile=<repo>/secrets.env` in `scripts/systemd/genesis-server.service.template` **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
 | `agent-zero` unit | `EnvironmentFile=` in its template | file (systemd) |
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
-| MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers |
+| MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
 | CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) | `load_dotenv(<main checkout>/secrets.env)`, default `override=False`; path hardcoded, ignores `SECRETS_PATH` | **inherited env wins** |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
@@ -146,11 +146,18 @@ the domain's `needs_restart` flag is the stated contract.
 - **Takes effect:** per the domain's `needs_restart` flag. Restart-required today:
   `resilience`, `inbox_monitor`, `autonomy`, `guardian`, `content_sanitization`,
   `surplus`, `ego`, `channels`, `observability`. The rest are flagged no-restart.
+  Two writable domains never take effect through this path: `contribution` (the
+  post-commit hook reads only the repo's `config/contribution[.local].yaml`) and
+  `observability` (`span_config.py` reads only the tracked `config/observability.yaml`).
+  A save to either is reported as applied and never read (#2436).
 - **Kill switches:** env-only `GENESIS_<DOMAIN>_DISABLED` / `_OFF` (39 distinct names),
   which override the yaml (example: `src/genesis/memory/integrity_config.py`, truthy
   tokens `1`/`true`/`yes` — check each module's own token set). **None is in
-  `secrets.env.example`**, so none is settable from the dashboard — put it in
-  `secrets.env` and restart, or set it in the process env.
+  `secrets.env.example`**, so none is settable from the dashboard. A switch read by the
+  server takes effect from `secrets.env` after a restart. A switch read by a Claude Code
+  hook (for example `GENESIS_PR_WATCH_DISABLED` in `scripts/surface_pr_updates.py`) does
+  not: the hook launcher does not load `secrets.env`, so set it in the environment Claude
+  Code is started from.
 
 **B. Model routing** — `src/genesis/routing/config.py::load_config` reads only the
 **repo sibling** `config/model_routing.local.yaml` (never `~/.genesis/config/`). Dashboard
@@ -179,8 +186,11 @@ overlay key.
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
 - **`env.example`** — a template of deployment/topology env vars. Its header suggests
-  "`.env` at the repo root", but nothing in `src/` or `scripts/` loads a repo-root `.env`;
-  put these in `secrets.env` or the unit environment.
+  "`.env` at the repo root", but nothing in `src/` or `scripts/` loads a repo-root `.env`.
+  Runtime entries belong in `secrets.env` or the unit environment. Install-time entries
+  (`VENV_PATH`, `AZ_ROOT`) are read from the shell running `install.sh` / `bootstrap.sh`
+  while service templates are rendered, and neither script reads `secrets.env` first, so
+  export them before running the installer.
 - **Identity** — `src/genesis/identity/*.md`. Tracked prompts, plus gitignored per-install
   files: `USER.md` (user-edited, seeded from `USER.md.example`) and runtime-generated
   `USER_KNOWLEDGE.md` and `TRIAGE_CALIBRATION.md`. `IdentityLoader` caches
@@ -217,10 +227,11 @@ overlay key.
    for `model_routing` and `outreach` is not necessarily what the runtime loads.
 5. **`GENESIS_HOME` does not move config.** `genesis.yaml`, the overlay user dir, and the
    settings writer all use `Path.home()/.genesis/config`.
-6. **MCP children get the whole file.** The `_MCP_VARS` allowlist in
-   `scripts/genesis_mcp_server.py` is superseded by the standalone router's full
-   `override=True` load, so a value the parent put in a child's env is overwritten by any
-   same-named key in `secrets.env`.
+6. **The health, memory, outreach and recon MCP children get the whole file.** Their
+   `_MCP_VARS` allowlist in `scripts/genesis_mcp_server.py` is superseded by the
+   standalone router's full `override=True` load, so a value the parent put in the
+   child's env is overwritten by any same-named key in `secrets.env`. The discord-bot
+   child never builds that router and keeps the allowlist.
 7. **`EnvironmentFile=` beats `Environment=`** regardless of order (measured note in
    `scripts/systemd/genesis-disk-hygiene.service.template`): a `PATH` or `TMPDIR` in
    `secrets.env` replaces the server unit's pinned value.
