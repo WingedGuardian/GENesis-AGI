@@ -45,6 +45,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 _WATCHGOD = Path(__file__).resolve().parents[2] / "scripts" / "tmp_watchgod.sh"
 
 _TMUX_STUB = "#!/usr/bin/env bash\nexit 0\n"
@@ -170,6 +172,18 @@ def test_the_unanchored_glob_no_longer_matches_a_cache_sibling(tmp_path):
 # ── fail-closed ─────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason=(
+        "root (and anything holding CAP_DAC_OVERRIDE) ignores mode bits, so "
+        "chmod(000) cannot make the session unreadable: find descends, sees the "
+        "payload, and this arm silently exercises the spared-LIVE path instead "
+        "of the blind one. CI runs as root, where it fails deterministically. "
+        "The mode-independent arm below covers the same contract everywhere; "
+        "this one is kept because it exercises the REAL kernel refusal rather "
+        "than a stubbed one."
+    ),
+)
 def test_an_unreadable_session_is_spared_and_says_so(tmp_path):
     """FAIL CLOSED. `find` returning nothing and `find` failing are the same
     string; only the exit status separates them. An unreadable session must be
@@ -414,3 +428,218 @@ def test_a_claude_digit_component_in_the_ROOT_path_does_not_widen_the_sweep(tmp_
             f"{rel} was reaped — the glob is satisfied by the ROOT's own path, "
             "so the session filter is not discriminating at all"
         )
+
+
+# ── round 2: the predicate is built from runtime strings ─────────────────
+#
+# Four findings, one class: a `find` pattern assembled from a runtime path and
+# then trusted as if it were a literal. Reviewers reproduced all four; each arm
+# below reproduces one, and each carries its own negative control so an arm
+# cannot pass against a reaper that simply stopped working.
+
+
+def test_a_bracket_in_the_root_does_not_silently_disable_the_reap(tmp_path):
+    """`-path` interprets its whole argument as a GLOB even though the
+    expansion is quoted, so a bracket anywhere in $HOME turns every predicate
+    here into a non-matching pattern. The failure is silent in both directions:
+    zero matches AND exit status 0, so the enumeration warning never fires
+    either. A home directory may legally contain a bracket."""
+    home = tmp_path / "home"
+    root = home / ".genesis" / "cc-tmp[r]"
+    root.mkdir(parents=True)
+    (home / ".genesis" / "logs").mkdir(parents=True)
+    (home / ".genesis" / "alerts").mkdir(parents=True)
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    _make_exec(bind / "tmux", _TMUX_STUB)
+
+    stale = _session(root, "proj", "sess-stale")
+    _age(stale / "payload.jsonl", 30)
+    _age(stale, 30)
+    fresh = _session(root, "proj", "sess-fresh")
+
+    r = _reap(home, root, bind)
+    assert r.returncode == 0, r.stderr
+
+    assert not stale.exists(), (
+        "the stale session survived under a bracketed root — the pattern "
+        "matched nothing and said so to nobody"
+    )
+    assert fresh.exists(), "the fresh session was reaped — the control failed"
+
+
+def test_a_trailing_slash_on_the_root_does_not_disable_the_reap(tmp_path):
+    """Same class, second spelling: an unnormalised root produces a doubled
+    separator in the pattern, which matches nothing."""
+    home, root, bind = _sandbox(tmp_path)
+    stale = _session(root, "proj", "sess-stale")
+    _age(stale / "payload.jsonl", 30)
+    _age(stale, 30)
+
+    r = _run(home, bind, f'reap_stale_session_dirs "{root}/" 7')
+    assert r.returncode == 0, r.stderr
+    assert not stale.exists(), "a trailing slash on the root disabled the reap"
+
+
+def test_a_claude_dash_digit_cache_is_not_a_session_container(tmp_path):
+    """`[0-9]*` in a find GLOB is ONE digit followed by anything, not an
+    all-numeric suffix — fnmatch cannot express the latter at all. So
+    `claude-1cache` matched, and its contents were eligible for deletion: the
+    sibling-cache data loss this function exists to prevent, re-created by the
+    predicate meant to prevent it."""
+    home, root, bind = _sandbox(tmp_path)
+    cache = root / "claude-1cache" / "proj" / "item"
+    cache.mkdir(parents=True)
+    (cache / "blob").write_text("cached")
+    _age(cache / "blob", 30)
+    _age(cache, 30)
+    _age(root / "claude-1cache" / "proj", 30)
+
+    stale = _session(root, "proj", "sess-stale")
+    _age(stale / "payload.jsonl", 30)
+    _age(stale, 30)
+
+    r = _reap(home, root, bind)
+    assert r.returncode == 0, r.stderr
+
+    assert (cache / "blob").exists(), (
+        "a claude-<digit><letters> cache was reaped as a session container"
+    )
+    assert not stale.exists(), (
+        "the real stale session survived too — the reaper did not run, so the "
+        "assertion above proves nothing"
+    )
+
+
+def test_a_failing_enumeration_is_reported_even_when_a_prior_walk_succeeded(tmp_path):
+    """The enumeration's status used to come from a SEPARATE no-output walk.
+    That is a proxy: when the walk succeeded and the enumeration that actually
+    feeds the loop then failed — permissions or the tree changing in between —
+    sessions were left unexamined while the counter stayed 0 and the warning
+    never fired.
+
+    The stub makes exactly that split: the first `find` invocation succeeds,
+    the second fails. A single-invocation design reads the real status.
+    """
+    home, root, bind = _sandbox(tmp_path)
+    stale = _session(root, "proj", "sess-stale")
+    _age(stale / "payload.jsonl", 30)
+    _age(stale, 30)
+
+    # The stub must fail EXACTLY the enumeration that feeds this loop, and it
+    # took two corrections to get there — each one a wrong fix that passed.
+    #   keyed on `-print0` alone: both walks use it, so a status taken from
+    #     the depth-2 empty-project walk also passed;
+    #   keyed on `3` alone: the retired `-printf ''` proxy is also a depth-3
+    #     walk, so restoring the proxy also passed.
+    # Requiring BOTH the depth and the output flag identifies one invocation:
+    # the depth-3 `-print0` enumeration. The proxy would still succeed, so the
+    # retired design stays silent and its mutant dies.
+    _make_exec(
+        bind / "find",
+        "#!/usr/bin/env bash\n"
+        "d3=0; p0=0\n"
+        'for a in "$@"; do [[ "$a" == 3 ]] && d3=1; [[ "$a" == -print0 ]] && p0=1; done\n'
+        "(( d3 && p0 )) && exit 1\n"
+        'exec /usr/bin/find "$@"\n',
+    )
+
+    r = _reap(home, root, bind)
+    assert r.returncode == 0, r.stderr
+    log = _log(home)
+    assert "never examined this sweep" in log, (
+        "a failing enumeration was reported as a clean sweep:\n" + log
+    )
+    assert stale.exists(), (
+        "the arm's premise: nothing was enumerated, so nothing was reaped"
+    )
+
+
+def test_a_probe_that_cannot_look_is_spared_whatever_the_process_privileges(tmp_path):
+    """The mode-independent twin of the unreadable-session arm.
+
+    `chmod(000)` is not a portable way to make a directory unreadable: root and
+    anything with CAP_DAC_OVERRIDE walks straight through it, and CI runs as
+    root — so that arm is skipped there and the fail-closed contract would go
+    unverified on the only machine whose verdict gates the merge. This arm
+    drives the same branch through the probe's EXIT STATUS, which is what the
+    code actually reads, so it holds at every privilege level.
+    """
+    home, root, bind = _sandbox(tmp_path)
+    stale = _session(root, "proj", "sess-stale")
+    _age(stale / "payload.jsonl", 30)
+    _age(stale, 30)
+
+    # Fail only the per-session freshness probe (`-quit`), leaving the
+    # enumeration intact — otherwise nothing reaches the probe at all and the
+    # arm would pass without ever entering the branch.
+    _make_exec(
+        bind / "find",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do [[ "$a" == -quit ]] && exit 1; done\n'
+        'exec /usr/bin/find "$@"\n',
+    )
+
+    r = _reap(home, root, bind)
+    assert r.returncode == 0, r.stderr
+    log = _log(home)
+
+    assert stale.exists(), "a session whose freshness could not be read was DELETED — fail-OPEN"
+    assert "could not be determined" in log, f"the spare was silent:\n{log}"
+    assert "SPARED 1 session dir(s)" in log, (
+        f"spared for the wrong reason — the probe did not fail:\n{log}"
+    )
+
+
+def test_an_empty_non_numeric_claude_sibling_is_not_collected(tmp_path):
+    """The digit rule has TWO applications and they are not symmetrically
+    covered. Every other arm gives its non-numeric sibling CONTENTS, so
+    `-empty` never fires and the depth-2 project pass never sees one — the
+    audit deleted that second call and all 21 arms still passed.
+
+    An empty aged slot under `claude-skills` is the shape that reaches it.
+    """
+    home, root, bind = _sandbox(tmp_path)
+    cache = root / "claude-skills" / "skill-cache"
+    cache.mkdir(parents=True)
+    _age(cache, 30)
+    shell = root / "claude-1000" / "proj-shell"
+    shell.mkdir(parents=True)
+    _age(shell, 30)
+
+    r = _reap(home, root, bind)
+    assert r.returncode == 0, r.stderr
+
+    assert cache.exists(), (
+        "an empty cache slot under claude-skills was collected by the "
+        "empty-PROJECT pass — the digit rule is not applied there"
+    )
+    assert not shell.exists(), (
+        "the real empty project shell survived too — the pass did not run, so "
+        "the assertion above proves nothing"
+    )
+
+
+def test_a_failing_empty_project_walk_is_reported_too(tmp_path):
+    """The enumeration-status lesson applies to BOTH walks. Taking it for the
+    session enumeration alone would leave the very defect the warning claims
+    to have closed — an unreadable project yielding an entirely empty log —
+    alive one loop over.
+
+    The stub fails only the depth-2 walk, so the session enumeration succeeds
+    and the warning can only come from the second one.
+    """
+    home, root, bind = _sandbox(tmp_path)
+    _session(root, "proj", "sess-fresh")
+    _make_exec(
+        bind / "find",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do [[ "$a" == 2 ]] && exit 1; done\n'
+        'exec /usr/bin/find "$@"\n',
+    )
+
+    r = _reap(home, root, bind)
+    assert r.returncode == 0, r.stderr
+    assert "never examined this sweep" in _log(home), (
+        "a failing empty-project walk was reported as a clean sweep:\n" + _log(home)
+    )
