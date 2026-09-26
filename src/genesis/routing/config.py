@@ -144,6 +144,32 @@ def _current_provider_name(name: str) -> str:
     return name
 
 
+def _resolve_provider_alias(name: str, known: set[str] | dict) -> str:
+    """The name to USE for ``name`` against a provider set, aliasing only when it helps.
+
+    ONE rule, and every boundary that accepts a provider name from outside the
+    config needs it:
+
+      * ``name`` present in ``known`` -> return it unchanged. An exact key is a
+        live provider, never a retired one, whatever the alias map says. A
+        non-shipped config is free to define a key the shipped one renamed.
+      * otherwise, if the resolved current name is present -> return that. This
+        is the upgrade path the alias map exists for.
+      * otherwise -> return ``name`` unchanged, and let the caller's own
+        unknown-provider handling report it. Substituting a name that is ALSO
+        absent just changes which name appears in the error.
+
+    Applying the alias unconditionally is what two reviewers found independently:
+    it renames a working override onto a key the base does not have, the entry is
+    then dropped as unknown, and the operator's customization is silently
+    replaced by the base default with only a warning to show for it.
+    """
+    if name in known:
+        return name
+    current = _current_provider_name(name)
+    return current if current in known else name
+
+
 def _migrate_renamed_providers(result: dict, base_providers: set[str]) -> None:
     """Rewrite legacy provider keys in an overlay's ``providers`` section, in place.
 
@@ -172,6 +198,21 @@ def _migrate_renamed_providers(result: dict, base_providers: set[str]) -> None:
 
     for legacy in sorted(_RENAMED_PROVIDERS, key=_rename_depth):
         if legacy not in local_providers:
+            continue
+        # THE ALIAS ONLY APPLIES TO A KEY THE BASE HAS ACTUALLY RETIRED.
+        # `load_config` accepts a caller-supplied path, so the base need not be
+        # the shipped file — and a base that still DEFINES this key means the
+        # operator's override is for a live provider, not a stale one. Migrating
+        # it then renames a working override onto a key the base does not have,
+        # and the check below drops it: the load succeeds, a warning is logged,
+        # and the customization is silently replaced by the base default.
+        #
+        # MEASURED before this guard (base defines `glm51`, overlay sets
+        # `glm51.rpm_limit: 99`): loaded with rpm_limit 5, the base value. The
+        # override was gone. Same shape at the chain boundary, where an overlay
+        # rung was dropped from the chain entirely — worse, because that changes
+        # what gets routed rather than one limit.
+        if legacy in base_providers:
             continue
         current = _current_provider_name(legacy)
         entry = local_providers.pop(legacy)
@@ -253,8 +294,14 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
         # make failover retry one provider twice against the same breaker and
         # daily-budget ledger. Pre-fix the legacy entry was filtered as stale, so
         # this duplicate is only reachable once translation exists.
+        # Same rule as the provider keys, via the shared resolver: a rung the
+        # base still defines is left alone. Translating it unconditionally sent
+        # a live rung to a name the base lacked, and the stale filter two lines
+        # down then removed it from the chain — changing what gets ROUTED, not
+        # just a limit. MEASURED: an overlay chain `[glm51, groq-free]` against
+        # a base that defines `glm51` loaded as `['groq-free']`.
         original_chain = list(
-            dict.fromkeys(_current_provider_name(p) for p in cs["chain"])
+            dict.fromkeys(_resolve_provider_alias(p, base_providers) for p in cs["chain"])
         )
         filtered = [p for p in original_chain if p in base_providers]
         stale = set(original_chain) - set(filtered)

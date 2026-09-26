@@ -49,13 +49,13 @@ class ModelEvalExecutor:
         try:
             from pathlib import Path
 
-            from genesis.routing.config import _current_provider_name, load_config
+            from genesis.routing.config import _resolve_provider_alias, load_config
 
             cfg_path = Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
             config = load_config(cfg_path)
             # The name comes off a stored surplus task, which can be older than
             # the rename that retired it.
-            provider_name = _current_provider_name(provider_name)
+            provider_name = _resolve_provider_alias(provider_name, config.providers)
             if provider_name not in config.providers:
                 logger.debug(
                     "MODEL_EVAL skipped: provider '%s' not in router config",

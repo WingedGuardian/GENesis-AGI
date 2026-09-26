@@ -434,22 +434,162 @@ def test_a_legacy_name_still_resolves_at_a_lookup_boundary(legacy, current):
     )
 
 
-def test_the_eval_boundaries_resolve_aliases():
-    """The three sites that accept an external name all call the resolver.
+def test_the_external_name_boundaries_resolve_aliases():
+    """Every site that accepts a provider name from OUTSIDE the config calls the
+    CONDITIONAL resolver.
 
-    Asserted on the SOURCE rather than by driving each CLI, because the failure
-    being guarded is a site that forgets the call — which a behavioural test of
-    the other two would not reveal. The enumeration is stated rather than implied:
-    these are the boundaries that take a provider name as an argument or a flag.
+    Asserted on the SOURCE rather than by driving each entry point, because the
+    failure being guarded is a site that forgets the call — which a behavioural
+    test of the others would not reveal. The enumeration is stated rather than
+    implied, and it GREW: `standalone_router` was recorded as not needing this on
+    the grounds that it "looks up a name it just read FROM the config". That was
+    wrong — `_resolve` takes a caller's name, and two reviewers found it
+    independently. A claim about which sites are in the class is only as good as
+    the reading behind it.
+
+    It requires `_resolve_provider_alias`, NOT the bare `_current_provider_name`:
+    the unconditional form is itself the defect, because it rewrites a name a
+    caller-supplied config still defines and thereby makes a live provider
+    unreachable.
     """
     import re
     from pathlib import Path
 
-    src = Path(__file__).resolve().parents[2] / "src" / "genesis" / "eval"
-    for name in ("runner.py", "cli.py", "surplus_executor.py"):
-        text = (src / name).read_text()
-        assert re.search(r"_current_provider_name\s*\(", text), (
-            f"eval/{name} looks up a provider by a name it was given but does not "
-            "resolve legacy aliases — a rename breaks it while the same name keeps "
-            "working inside a local overlay"
+    src = Path(__file__).resolve().parents[2] / "src" / "genesis"
+    boundaries = (
+        "eval/runner.py",
+        "eval/cli.py",
+        "eval/surplus_executor.py",
+        "experimentation/standalone_router.py",
+    )
+    for rel in boundaries:
+        text = (src / rel).read_text()
+        assert re.search(r"_resolve_provider_alias\s*\(", text), (
+            f"{rel} looks up a provider by a name it was GIVEN but does not resolve "
+            "legacy aliases conditionally — a rename breaks it while the same name "
+            "keeps working inside a local overlay"
         )
+        assert not re.search(r"(?<!_resolve_provider_alias)\b_current_provider_name\s*\(", text), (
+            f"{rel} still calls _current_provider_name UNCONDITIONALLY — that "
+            "rewrites a name a caller-supplied config legitimately defines, making "
+            "a live provider unreachable (Devin severe, 2026-09-25)"
+        )
+
+
+def test_a_caller_supplied_config_keeps_its_own_legacy_key():
+    """The behavioural arm the source grep cannot give: a config that still
+    DEFINES a renamed key must keep working through it.
+
+    `run_eval` accepts a caller-supplied `RoutingConfig`, which need not be the
+    shipped file and may legitimately define a key the shipped one retired. The
+    unconditional rewrite asked for the NEW name, did not find it, and raised —
+    so a provider present under its own key became unreachable.
+    """
+    from genesis.routing.config import _resolve_provider_alias
+
+    legacy, current = next(iter(sorted(_RENAMED_PROVIDERS.items())))
+
+    # Config defines the LEGACY key only: it is live, so leave it alone.
+    assert _resolve_provider_alias(legacy, {legacy, "groq-free"}) == legacy
+    # Config defines the CURRENT key only: this is the upgrade the map exists for.
+    assert _resolve_provider_alias(legacy, {current, "groq-free"}) == current
+    # Config defines BOTH: the exact key wins — it cannot be the stale one.
+    assert _resolve_provider_alias(legacy, {legacy, current}) == legacy
+    # Config defines NEITHER: unchanged, so the caller's own error names what the
+    # caller actually asked for rather than a substitution it never mentioned.
+    assert _resolve_provider_alias(legacy, {"groq-free"}) == legacy
+    # A name with no alias at all is never touched.
+    assert _resolve_provider_alias("groq-free", {"groq-free"}) == "groq-free"
+
+
+# ── RC1: the alias applies only to a key the BASE has retired ────────────────
+
+
+_BASE_LIVE = """
+providers:
+  glm51:
+    type: openrouter
+    model: z-ai/glm-5.1
+    rpm_limit: 5
+  groq-free:
+    type: groq
+    model: llama-3.3-70b
+retry_profiles:
+  default:
+    max_attempts: 2
+call_sites:
+  triage:
+    chain: [groq-free]
+"""
+
+_BASE_RETIRED = _BASE_LIVE.replace("  glm51:", "  glm:").replace(
+    "z-ai/glm-5.1", "z-ai/glm-5.3"
+)
+
+
+def _load_with_overlay(tmp_path, base_text: str, overlay_text: str):
+    base = tmp_path / "model_routing.yaml"
+    base.write_text(base_text)
+    (tmp_path / "model_routing.local.yaml").write_text(overlay_text)
+    return load_config(base, check_api_keys=False)
+
+
+def test_an_override_on_a_key_the_base_still_defines_SURVIVES(tmp_path):
+    """The defect, from the operator's side.
+
+    `load_config` takes a caller-supplied path, so the base need not be the
+    shipped file and may legitimately define a key the shipped one renamed. The
+    migration used to fire regardless: it popped the override, retargeted it at
+    the new name, found the base lacked that name, and dropped it. The load
+    SUCCEEDED, so nothing failed — the customization was just replaced by the
+    base default with a warning to show for it.
+
+    MEASURED before the guard: rpm_limit came back 5 (the base value) instead of
+    the declared 99.
+    """
+    cfg = _load_with_overlay(
+        tmp_path, _BASE_LIVE, "providers:\n  glm51:\n    rpm_limit: 99\n"
+    )
+    assert "glm51" in cfg.providers, "the live key was renamed out from under the base"
+    assert cfg.providers["glm51"].rpm_limit == 99, "the operator's override was dropped"
+
+
+def test_a_chain_rung_naming_a_live_key_SURVIVES(tmp_path):
+    """The same defect one layer over, and the worse half of it.
+
+    A chain entry was translated unconditionally, so a rung naming a key the base
+    still defines was retargeted, failed the stale filter on the next line, and
+    was removed from the chain — changing what gets ROUTED rather than one limit.
+
+    MEASURED before the guard: `[glm51, groq-free]` loaded as `['groq-free']`.
+    """
+    cfg = _load_with_overlay(
+        tmp_path,
+        _BASE_LIVE,
+        "call_sites:\n  triage:\n    chain: [glm51, groq-free]\n",
+    )
+    assert cfg.call_sites["triage"].chain == ["glm51", "groq-free"]
+
+
+def test_a_retired_key_STILL_MIGRATES(tmp_path):
+    """The control, and the reason the guard is a narrowing rather than a repeal.
+
+    When the base HAS retired the key, migrating is the whole point of the alias
+    map. Without this arm, a fix that simply stopped migrating would pass the two
+    tests above and silently break every real upgrade.
+    """
+    cfg = _load_with_overlay(
+        tmp_path, _BASE_RETIRED, "providers:\n  glm51:\n    rpm_limit: 99\n"
+    )
+    assert "glm51" not in cfg.providers
+    assert cfg.providers["glm"].rpm_limit == 99, "the upgrade path stopped working"
+
+
+def test_a_retired_chain_rung_STILL_MIGRATES(tmp_path):
+    """The chain half of the same control."""
+    cfg = _load_with_overlay(
+        tmp_path,
+        _BASE_RETIRED,
+        "call_sites:\n  triage:\n    chain: [glm51, groq-free]\n",
+    )
+    assert cfg.call_sites["triage"].chain == ["glm", "groq-free"]

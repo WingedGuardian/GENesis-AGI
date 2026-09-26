@@ -22,7 +22,7 @@ from genesis.eval.types import (
     ScoredOutput,
     TaskCategory,
 )
-from genesis.routing.config import _current_provider_name, load_config
+from genesis.routing.config import _resolve_provider_alias, load_config
 from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.rate_gate import ProviderRateGate
 from genesis.routing.types import RoutingConfig
@@ -95,7 +95,7 @@ async def run_eval(
     # overlay sanitizer migrates names inside `model_routing.local.yaml`; nothing
     # migrated them here, which made every rename a breaking change at the public
     # inputs while the same legacy name kept working in an overlay.
-    provider_name = _current_provider_name(provider_name)
+    provider_name = _resolve_provider_alias(provider_name, config.providers)
 
     if provider_name not in config.providers:
         raise ValueError(
