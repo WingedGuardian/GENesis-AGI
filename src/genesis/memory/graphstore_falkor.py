@@ -137,10 +137,15 @@ _PROJECT_BATCH = 10_000
 # is latent -- but the seam's promise is that which store answers cannot change
 # WHICH memories the model sees, and an incremental projector that MERGEs a node
 # without the full property set is the ordinary way that stops being latent.
-_VALID = (
-    "(x.invalid_epoch IS NULL OR x.invalid_epoch > $now) "
-    "AND (x.deprecated IS NULL OR x.deprecated = 0)"
-)
+#
+# Split into the two limbs because they have DIFFERENT widths at traversal time:
+# expiry is unconditional, deprecation is the caller's choice. See
+# `graphstore._HIDDEN_FOR_TRAVERSAL_PREDICATE` for why (it mirrors
+# `search_ranked`, which also applies `invalid_at` always and gates only
+# `deprecated`). `_VALID` keeps both, for any site wanting the full predicate.
+_NOT_EXPIRED = "(x.invalid_epoch IS NULL OR x.invalid_epoch > $now)"
+_NOT_DEPRECATED = "(x.deprecated IS NULL OR x.deprecated = 0)"
+_VALID = f"{_NOT_EXPIRED} AND {_NOT_DEPRECATED}"
 
 # Best-parent-wins, resolved in the engine. The ORDER BY runs BEFORE the
 # aggregation, so `head(collect(...))` picks the first row per node under that
@@ -154,10 +159,23 @@ _VALID = (
 # `max(strength)` and the type separately would pair a strength with another
 # edge's label -- and that label is emitted straight to the model at
 # mcp/memory/core.py:465 and :738.
+# `$include_deprecated` carries the caller's visibility choice into the engine
+# (issue #1896). ONE query constant rather than two, deliberately: a second
+# near-identical Cypher string is a drift hazard, and every future edit to the
+# traversal would have to be made twice or silently diverge between the two
+# visibility modes. MEASURED against the live engine before this shape was
+# chosen -- FalkorDB accepts a boolean parameter in that position, and on a
+# hidden root carrying 24 out-edges >= 0.3 it returns 0 rows with the flag off
+# and 36 with it on, which is the defect and the fix in one probe.
+#
+# `$now` is referenced UNCONDITIONALLY — the expiry limb sits outside the flag,
+# so no arrangement of `$include_deprecated` can un-hide an expired memory, and
+# the params dict never becomes conditional on the flag.
 _TRAVERSE = f"""
 MATCH p=(a:Memory {{id: $root}})-[:LINK*1..{{depth}}]->(b:Memory)
 WHERE ALL(x IN relationships(p) WHERE x.strength >= $min_strength)
-  AND ALL(x IN nodes(p) WHERE {_VALID})
+  AND ALL(x IN nodes(p) WHERE {_NOT_EXPIRED}
+                          AND ($include_deprecated OR {_NOT_DEPRECATED}))
 WITH b.id AS id, length(p) AS d, relationships(p)[-1] AS e
 ORDER BY d ASC, e.strength DESC, e.link_type DESC
 WITH id, head(collect(d)) AS depth, head(collect(e)) AS best
@@ -556,8 +574,17 @@ class FalkorGraphStore:
         *,
         max_depth: int,
         min_strength: float,
+        include_deprecated: bool = False,
     ) -> list[GraphNode]:
         """Neighbours of ``root_id``, ordered ``(depth, -strength)``.
+
+        ``include_deprecated=True`` suppresses the DEPRECATION limb of the
+        validity predicate for this call (issue #1896) — root and every hop
+        alike, since the predicate is applied per-path-node. The EXPIRY limb is
+        outside the flag and always applies, matching ``search_ranked``. It is
+        resolved in the ENGINE via a query parameter rather than by
+        post-filtering here, so a deprecated root's subtree costs the same
+        single round trip a visible one does.
 
         ``db`` is unused: unlike the NetworkX store, the validity predicate is
         answered from properties already in the projection rather than from a
@@ -619,6 +646,7 @@ class FalkorGraphStore:
                 # (`db/timeutil.py`), so the precision is real data, not a
                 # theoretical tail.
                 "now": time.time(),
+                "include_deprecated": bool(include_deprecated),
             },
         )
         nodes = [

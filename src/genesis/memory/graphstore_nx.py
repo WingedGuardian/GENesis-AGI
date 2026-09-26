@@ -27,6 +27,7 @@ import time
 from typing import TYPE_CHECKING
 
 from genesis.memory.graphstore import (
+    GraphModeUnsupported,
     GraphNode,
     GraphUnavailableError,
     invalid_memory_ids,
@@ -101,6 +102,11 @@ def _bfs_with_strength(
 
     NetworkX's bfs_edges doesn't filter by edge attributes, so we roll
     a simple BFS that respects min_strength and optional link_type.
+
+    Carries NO visibility predicate, and #1896 did not change that: this store
+    answers only the VISIBLE question, and its projection has no hidden edges
+    in it. A hidden traversal is served by the recursive-CTE tier instead — see
+    ``NetworkxGraphStore.traverse``.
     """
     if root_id not in G:
         return []
@@ -407,7 +413,6 @@ class NetworkxGraphStore:
                 G.number_of_edges(),
             )
 
-        self._graph = G
         # DO NOT introduce an `await` between the fetch above and this line.
         # Clearing _dirty is safe only because the two staleness signals cover
         # complementary cases (MEASURED 2026-09-07):
@@ -421,6 +426,7 @@ class NetworkxGraphStore:
         # same-connection writer could then commit AFTER the fetch, set _dirty,
         # and have it cleared on the next line with nothing else left to notice.
         # Locked by test_a_same_connection_write_is_seen_by_the_load_that_races_it.
+        self._graph = G
         self._dirty = False
         self._built_conn = _connection_identity(db)
         self._built_data_version = pre_load_version
@@ -433,8 +439,51 @@ class NetworkxGraphStore:
         *,
         max_depth: int,
         min_strength: float,
+        include_deprecated: bool = False,
     ) -> list[GraphNode]:
-        """Neighbours of ``root_id``, ordered (depth, -strength)."""
+        """Neighbours of ``root_id``, ordered (depth, -strength).
+
+        This store answers the VISIBLE question ONLY, and declines
+        ``include_deprecated=True`` rather than serving it (issue #1896). The
+        projection is filtered at BUILD time, so a hidden traversal would need a
+        second, unfiltered graph — and that was built, measured, and withdrawn:
+
+          * ~148 MiB held for the process lifetime, never freed on invalidation;
+          * 4.2s to build, and NEVER WARM in practice — the `data_version`
+            staleness token moves on ordinary memory writes, so a second hidden
+            call moments later paid another full rebuild (MEASURED 4.8s);
+          * that build is billed into `mcp/memory/core.py`'s shared 500ms graph
+            budget, so it enriched 1 of 7 results and silently dropped 6 —
+            reproducing the very defect #1896 is about.
+
+        The facade routes the declined call to the recursive-CTE tier, which
+        answers the same question from SQL in ~1ms per root with nothing
+        resident (MEASURED: 59ms for the same 7 roots, 0 dropped, +0.0 MiB), and
+        returns byte-identical rows — 70/70 field-for-field agreement with this
+        walk across every backend on the live graph.
+
+        Declining is the seam's own idiom, not an escape hatch: FalkorDB raises
+        for `centrality` because it has no betweenness, and the contract in
+        `graphstore.py` names exactly this case. The type is narrow
+        (`GraphModeUnsupported`) so the facade can route quietly instead of
+        logging a dead-engine warning on a healthy path.
+        """
+        # The MODE check comes FIRST, before the importability check, and the
+        # order is deliberate: this store cannot serve `include_deprecated` whether or
+        # not NetworkX imports, so the honest verdict is "unsupported mode" rather
+        # than "unavailable backend". Checking importability first was measured to
+        # send an install without NetworkX down the facade's LOUD degrade path for
+        # this mode — a dead-engine warning with a traceback, once per traversal
+        # and so up to five per `memory_recall` — which is exactly the noise the
+        # narrow type exists to remove.
+        #
+        # Also before any graph work: declining must be cheap, and must not warm
+        # or build a projection the caller will never read.
+        if include_deprecated:
+            raise GraphModeUnsupported(
+                "the NetworkX projection is filtered at build time, so it cannot "
+                "serve include_deprecated=True — the SQL fallback answers this mode"
+            )
         if not _NX_AVAILABLE:
             raise GraphUnavailableError(
                 "NetworkX is not importable — the in-process graph cannot be built"
