@@ -17,6 +17,14 @@ asking.
 
 **Dispatched sessions are DENIED, loudly** — see ``needs_user``.
 
+**An install may turn the prompt off** with ``hooks.asks.secrets_env: off`` in
+``~/.genesis/config/genesis.yaml``. That is a decision about approval fatigue on
+one box, not a change to the public default (which stays ``ask``) and not a
+change to the dispatched deny, which ``needs_user.decide`` reaches before the
+policy is consulted. The allow that replaces the prompt names the setting, so the
+transcript still shows the credentials were touched — "stop asking me" rather
+than "stop telling me". See ``hook_ask_policy``.
+
 **Matching is by RESOLVED PATH, not by command text.** The first version matched
 the literal string ``secrets.env`` in a Bash command and was broken in seconds by
 ``cat ~/genesis/secrets.*``, ``cat s*.env`` and friends — and it never saw
@@ -140,7 +148,31 @@ def main() -> int:
         "LLM call, it belongs in a routing call site instead."
     )
 
-    print(json.dumps(decide("access secrets.env", reason, detail=subject, payload=payload)))
+    # ``ask_key`` lets THIS install silence the prompt (hooks.asks.secrets_env:
+    # off in ~/.genesis/config/genesis.yaml) without changing the public default
+    # or reaching the dispatched-session deny — see needs_user.decide, which
+    # checks the dispatched branch first.
+    # REVERSE version skew, and the fail direction is the point. This guard has
+    # no run_guard wrapper and no try/except around main(): its documented
+    # posture is that a crash exits non-zero, which Claude Code treats as
+    # NON-blocking — so an uncaught TypeError here would let the credentials
+    # access through with no prompt, no block and no record. That is the one
+    # outcome this file exists to prevent, and it would be reachable purely by
+    # deploying this file next to an older needs_user.py that has no `ask_key`
+    # parameter. Retry without it: the prompt is exactly what this guard did
+    # before the knob existed, so the degraded path is the old behaviour rather
+    # than a new one.
+    try:
+        decision = decide(
+            "access secrets.env",
+            reason,
+            detail=subject,
+            payload=payload,
+            ask_key="secrets_env",
+        )
+    except TypeError:
+        decision = decide("access secrets.env", reason, detail=subject, payload=payload)
+    print(json.dumps(decision))
     return 0
 
 

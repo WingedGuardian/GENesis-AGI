@@ -47,6 +47,23 @@ REQUIRED workflow — ``merge_gate.required_ci_workflows`` in genesis.yaml, defa
 genuinely needs several appends several (one trailing comment may carry multiple
 sigils).
 
+The routine PUBLISH prompt is install-tunable (the blocks are not)
+----------------------------------------------------------------
+``hooks.asks.push_publish: off`` in ``~/.genesis/config/genesis.yaml`` turns the
+first-push-of-a-branch approval — and the ``gh pr create`` that would push an
+unpushed branch — into an allow that names the setting. Nothing else moves:
+every hard block is untouched, the force-push ask is untouched (it is
+destructive), and so are the two PR-hygiene asks (no-open-PR, close-then-push),
+which report a state this repo's standing publish rule forbids.
+
+The reasoning is the one that made the prompt worth having in the first place. A
+gate is worth its friction when the answer is a decision; on an install where
+every branch goes to the same public repo and the operator approves each push by
+reflex, the routine prompt has become furniture, and approval fatigue makes the
+prompts that DO matter harder to see. Classification is by ``ask_class`` at each
+arm, defaulting to None (unsuppressible), so an arm added later is safe without
+its author knowing this paragraph exists. See ``hook_ask_policy``.
+
 Hook-surface merge teeth (2026-08-23): a PR whose diff touches the
 ENFORCEMENT-HOOK surface (``_HOOK_SURFACE_PREFIXES``/``_HOOK_SURFACE_FILES`` —
 the code these gates themselves run on) gets stricter freshness handling: its
@@ -200,6 +217,21 @@ try:
     import audit_jsonl  # noqa: E402
 except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
     audit_jsonl = None
+
+# SOFT dependency, and the fallback direction is the one that matters: this
+# module can only ever turn an ask INTO an allow, so a version-skewed or absent
+# copy must leave the ask standing. Stubbing it to "nothing is suppressed" makes
+# a half-deployed hook tree behave exactly like a clone with no local config —
+# one extra prompt, never one fewer.
+try:
+    from hook_ask_policy import ask_suppressed, suppressed_reason  # noqa: E402
+except Exception:  # noqa: BLE001 — absent policy == public default == ask.
+
+    def ask_suppressed(key: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def suppressed_reason(key: str, detail: str = "") -> str:  # type: ignore[misc]
+        return ""
 
 # DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
 # import failing. It mirrors `_GATED_MENTION` below (same verbs and flags, same
@@ -9425,12 +9457,48 @@ def _push_targets_current_branch(
         return False  # multiple refspecs → not a single plain current-branch update
     if len(positionals) == 2:
         refspec = positionals[1]
-        # Explicit `<remote> <cur>` — an explicit refspec overrides remote.push /
-        # push.default / pushRemote, so it is a plain current-branch update.
-        return ":" not in refspec and refspec == cur
+        # Explicit `<remote> <ref>` — an explicit refspec overrides remote.push /
+        # push.default / pushRemote, so it is a plain current-branch update
+        # PROVIDED the ref names the current branch. Three spellings do:
+        # `<cur>`, `HEAD`, and `refs/heads/<cur>`. Anything else — another
+        # branch, a tag, `refs/heads/main` from a feature branch — is not.
+        return ":" not in refspec and _ref_names_current_branch(refspec, cur)
     # Bare `git push` or `git push <remote>` → the ref set depends on repo config,
     # keyed on the remote git will ACTUALLY push to (resolved by the caller).
     return _push_config_is_simple(remote, cwd=cwd)
+
+
+def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
+    """Whether a push refspec names the CURRENT branch ``cur``.
+
+    Three spellings do, and git treats them identically on a push: the bare
+    branch name, ``HEAD`` (which resolves to the checked-out branch), and the
+    fully-qualified ``refs/heads/<cur>``.
+
+    The missing spelling was ``HEAD``, and its absence was not cosmetic.
+    MEASURED on a pristine ``origin/main`` copy before this change:
+
+        git push                      -> True
+        git push origin <cur>         -> True
+        git push -u origin HEAD       -> False   <-- the form the workflow prescribes
+        git push origin refs/heads/<cur> -> False
+
+    A False sends the push down ``main()``'s catch-all arm, which means
+    ``_push_is_republish``, the no-open-PR hygiene check and the close-then-push
+    check NEVER RAN for ``git push -u origin HEAD`` — the command this repo's own
+    development skill tells every session to use, and the one both of today's PRs
+    were published with. The PR-adjacency mechanism had a hole exactly where it
+    was most used, and it predates the change that surfaced it.
+
+    Everything else stays False, which is what keeps this a narrowing rather than
+    a loosening: another branch's name, a tag, and ``refs/heads/main`` pushed
+    from a feature branch are all still unrecognised, so they keep prompting. A
+    falsy ``cur`` (detached HEAD) is never a match — there is no current branch
+    for a ref to name.
+    """
+    if not cur:
+        return False
+    return ref in (cur, "HEAD", f"refs/heads/{cur}")
 
 
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
@@ -10202,6 +10270,20 @@ def _run_merge_and_push_gates() -> int:
         ask_reason: str | None = (
             esc_msg if esc_decision == "ask" and round_autonomous_deny is None else None
         )
+        # The hook_ask_policy key naming the ask currently held in `ask_reason`,
+        # or None when this ask is not one an install may switch off. DEFAULTING
+        # TO None IS THE WHOLE SAFETY PROPERTY: an ask arm added later, by
+        # someone who has never read this module, is unsuppressible until it is
+        # deliberately classified — so forgetting fails toward the prompt, never
+        # toward silence. Only the routine PUBLISH approvals are classified
+        # (first push of a branch; a `gh pr create` that would push one). The
+        # force-push ask, the no-open-PR ask and the close-then-push ask stay
+        # None on purpose: the first is destructive and the other two report a
+        # state this repo's standing rule forbids, so they earn their friction.
+        # Reassignments of `ask_reason` below carry a matching `ask_class` line
+        # because a later arm OVERWRITES an earlier one — the pair has to move
+        # together or a suppressible class could outlive its reason.
+        ask_class: str | None = None
         # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
         # reason): emitting `_allow` inline would short-circuit the whole Bash
         # invocation before the hard-blocks run, so `git push <republish> && git
@@ -10260,6 +10342,7 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                ask_class = None  # destructive: never suppressible
                 ask_reason = (
                     f"FORCE push detected — this REWRITES remote history on "
                     f"'{remote}' (a non-origin remote). Approve only if you "
@@ -10338,6 +10421,7 @@ def _run_merge_and_push_gates() -> int:
                             f"its first push); only the first push of a branch/PR prompts."
                         )
                     else:
+                        ask_class = "push_publish"
                         ask_reason = (
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
@@ -10365,6 +10449,7 @@ def _run_merge_and_push_gates() -> int:
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
+                        ask_class = None  # hygiene arm: never suppressible
                         ask_reason = (
                             f"re-push to '{cur}': an earlier step in this command "
                             f"CLOSES a pull request, so the push that follows may "
@@ -10384,6 +10469,7 @@ def _run_merge_and_push_gates() -> int:
                         and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
                     ):
                         push_allow_reason = None
+                        ask_class = None  # hygiene arm: never suppressible
                         ask_reason = (
                             f"re-push to '{cur}': this branch is PUBLIC but has "
                             f"NO OPEN PR, so CI and the leak scan never run on "
@@ -10391,6 +10477,44 @@ def _run_merge_and_push_gates() -> int:
                             f"(gh pr create) — or close the branch out."
                         )
                 else:
+                    # NOT suppressible, and this arm is the reason the default
+                    # has to be None. It reads like "the ordinary push ask", but
+                    # it is the CATCH-ALL for everything the branch above could
+                    # not establish as a first push of your own feature branch:
+                    # `cur` IS main/master, an ambiguous cwd, a detached HEAD, or
+                    # a push whose destination ref is not the current branch.
+                    #
+                    # The main/master case is the one that makes this a hard
+                    # rule. MEASURED on this tree: a `git push` from main, and
+                    # `git push origin main`, reach exactly here and exit 0 with
+                    # an ASK — there is no hard block standing in front of them
+                    # the way `_walk_merge_into_main` blocks a merge. Classifying
+                    # this arm as routine publish would let an install turn a
+                    # direct push to the default branch into a silent allow,
+                    # which is the one thing this whole guard is named for.
+                    #
+                    # It stays None WHOLESALE, and the reason is the fix above
+                    # rather than an enumeration here. An earlier draft tried to
+                    # pick the routine publishes back out of this arm with a
+                    # predicate, because `git push -u origin HEAD` landed here
+                    # too and that is the form the knob exists for. Review found
+                    # `git push origin refs/heads/main` walking straight through
+                    # that predicate's literal `main`/`master` check, and tags
+                    # with it — a second BLOCKER-class finding in the same place,
+                    # one round after the first.
+                    #
+                    # The predicate was the wrong shape: this arm is defined by
+                    # NEGATION — everything `_push_targets_current_branch` could
+                    # not establish — and classifying a negation means enumerating
+                    # a space with no edge. Teaching that function the two
+                    # spellings it was missing (`HEAD`, `refs/heads/<cur>`) moves
+                    # the routine publishes OUT of here and into the arm that
+                    # already establishes them positively, leaving this one
+                    # genuinely exceptional: on main/master, an ambiguous cwd, a
+                    # detached HEAD, another branch's ref, a tag. Every one of
+                    # those should keep prompting, so no classification is needed
+                    # and none can be got wrong.
+                    ask_class = None
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
@@ -10431,6 +10555,7 @@ def _run_merge_and_push_gates() -> int:
                 )
                 return 2
             if ask_reason is None:
+                ask_class = "push_publish"
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
                 )
@@ -11083,6 +11208,13 @@ def _run_merge_and_push_gates() -> int:
             print(round_autonomous_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
+            # Consumed HERE, after every hard block has had its chance to return
+            # 2, so a local policy can never shorten the command's judgement — it
+            # only decides what happens to a prompt this guard was otherwise
+            # about to raise. An unclassified ask (ask_class is None) is never
+            # reached by the policy at all.
+            if ask_class is not None and ask_suppressed(ask_class):
+                return _allow(suppressed_reason(ask_class, ask_reason))
             return _ask(ask_reason)
 
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
