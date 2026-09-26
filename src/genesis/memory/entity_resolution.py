@@ -136,6 +136,140 @@ def normalize_content(content: str, aliases: dict[str, str] | None = None) -> st
     return content
 
 
+def surface_variants(
+    content: str,
+    aliases: dict[str, str] | None = None,
+    *,
+    limit: int = 16,
+) -> list[str]:
+    r"""Return the raw spellings *content* could have been stored under.
+
+    The inverse of :func:`normalize_content`: for each alias whose canonical
+    form appears in *content* (same whole-word, case-insensitive matching),
+    produce the spelling with the alias substituted back in. A row written
+    before an alias existed — or while normalization was failing — holds the
+    raw surface form, and the shipped seed maps BOTH ``"CC"`` and
+    ``"claude-code"`` to ``"Claude Code"``, so the current write's own raw
+    spelling is not the only one a legacy row can carry.
+
+    Each canonical occurrence is a SLOT, enumerated independently — a legacy
+    row can mix spellings (``"CC reviews claude-code"``). A slot's candidate
+    spellings are the aliases that forward-normalize to that canonical, which
+    is what makes chained mappings (``foo -> bar``, ``bar -> baz``) and
+    dictionary-order sensitivity come out right: ``normalize_content``
+    decides, so no spelling is offered that the write path could not itself
+    produce. Boundaries are ``(?<!\w)``/``(?!\w)`` lookarounds, not ``\b``, so
+    a canonical starting or ending with punctuation (``"C++"``) still matches.
+
+    Homogeneous forms (every slot carrying the same alias) are emitted FIRST,
+    before the mixed enumeration, so the common legacy shape cannot be priced
+    out of *limit* by intermediate combinations. Every candidate is verified
+    by re-running ``normalize_content`` on it — the enumeration is only ever
+    as precise as the inverse, and the check keeps it honest. The check
+    compares casefolded, because normalization preserves the casing it found:
+    a lowercase canonical in *content* must still accept the alias spellings.
+    Capped at *limit*; best-effort like ``normalize_content`` — ``[]`` on any
+    failure.
+    """
+    if aliases is None:
+        aliases = load_aliases()
+    if not aliases:
+        return []
+
+    import re
+    from itertools import islice, product
+
+    def _bounded(term: str) -> re.Pattern:
+        return re.compile(
+            r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.IGNORECASE
+        )
+
+    # Positions and per-slot spellings for each canonical present in content.
+    spellings: dict[str, list[str]] = {}
+    positions: list[tuple[int, int, str]] = []
+    for canonical in dict.fromkeys(aliases.values()):
+        matches = list(_bounded(canonical).finditer(content))
+        if not matches:
+            continue
+        spellings[canonical] = [
+            alias
+            for alias in dict.fromkeys(aliases)
+            if alias != canonical
+            and normalize_content(alias, aliases) == canonical
+        ]
+        positions.extend((m.start(), m.end(), canonical) for m in matches)
+    positions.sort(key=lambda p: (p[0], -p[1]))
+
+    results: list[str] = []
+    seen = {content}
+
+    def _emit(text: str) -> None:
+        if len(results) >= limit or text in seen:
+            return
+        if normalize_content(text, aliases).casefold() != content.casefold():
+            return  # not a spelling this normalization could have produced
+        seen.add(text)
+        results.append(text)
+
+    for canonical, names in spellings.items():
+        if not names:
+            continue
+        pattern = _bounded(canonical)
+        for alias in names:
+            _emit(pattern.sub(alias, content))
+
+    _CANDIDATE_BUDGET = 512
+    _SET_BUDGET = 64
+
+    def _enumerate(slot_list: list[tuple[int, int, str]]) -> None:
+        """Product over one mutually-disjoint slot set; every slot takes an
+        alias (an unset slot is a subset that doesn't contain it)."""
+        choice_lists = [spellings[c] for (_, _, c) in slot_list]
+        for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
+            out: list[str] = []
+            cursor = 0
+            for (start, end, _c), pick in zip(slot_list, picks, strict=True):
+                out.append(content[cursor:start])
+                out.append(pick)
+                cursor = end
+            out.append(content[cursor:])
+            _emit("".join(out))
+            if len(results) >= limit:
+                return
+
+    # Overlapping canonicals ({"X": "Claude", "CC": "Claude Code"}, or
+    # {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}) cannot be
+    # reduced to one kept set: a legacy row can substitute disjoint dropped
+    # spans together ("A Beta G") or a shorter span inside a longer one
+    # ("X Code"). Enumerate every mutually-disjoint subset of matching spans
+    # by include/exclude backtracking — bounded by _SET_BUDGET, correctness
+    # by _emit's normalize_content check.
+    span_slots = [p for p in positions if spellings.get(p[2])]
+    span_slots.sort(key=lambda p: (p[0], p[1]))
+    sets_enumerated = 0
+
+    # Iterative DFS — a memory can carry ~1000 canonical occurrences, past
+    # Python's recursion limit. Stack entries are (index, covered_end,
+    # chosen-spans); include is pushed first so the exclude branch is popped
+    # and fully explored before it, matching exclude-before-include order.
+    stack: list[tuple[int, int, tuple[tuple[int, int, str], ...]]] = [(0, -1, ())]
+    while (
+        stack and sets_enumerated < _SET_BUDGET and len(results) < limit
+    ):
+        i, covered_end, chosen = stack.pop()
+        if i == len(span_slots):
+            if chosen:
+                sets_enumerated += 1
+                _enumerate(list(chosen))
+            continue
+        start, end, canonical = span_slots[i]
+        if start >= covered_end:
+            stack.append((i + 1, end, chosen + ((start, end, canonical),)))
+        stack.append((i + 1, covered_end, chosen))
+
+    return results
+
+
 # ── Dedup Candidate Discovery ────────────────────────────────────────────
 
 

@@ -16,6 +16,7 @@ from genesis.memory.entity_resolution import (
     log_resolution,
     normalize_content,
     pick_duplicate_survivor,
+    surface_variants,
 )
 
 # --- normalize_content ---
@@ -44,6 +45,130 @@ def test_normalize_word_boundary():
 def test_normalize_no_aliases():
     result = normalize_content("hello world", {})
     assert result == "hello world"
+
+
+# --- surface_variants ---
+
+
+def test_surface_variants_recovers_each_alias_spelling():
+    """Both seeded spellings of "Claude Code" come back from canonical text."""
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    variants = surface_variants("Claude Code owns the gate", aliases)
+    assert "CC owns the gate" in variants
+    assert "claude-code owns the gate" in variants
+    assert "Claude Code owns the gate" not in variants  # input is never a variant
+
+
+def test_surface_variants_combines_distinct_canonicals():
+    aliases = {"CC": "Claude Code", "LLM": "large language model"}
+    variants = surface_variants(
+        "Claude Code uses an large language model", aliases
+    )
+    assert "CC uses an large language model" in variants
+    assert "Claude Code uses an LLM" in variants
+    assert "CC uses an LLM" in variants
+
+
+def test_surface_variants_recovers_mixed_spellings_per_occurrence():
+    """A legacy row can use a different alias at EACH occurrence."""
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    variants = surface_variants(
+        "Claude Code reviews Claude Code", aliases
+    )
+    assert "CC reviews claude-code" in variants
+    assert "claude-code reviews CC" in variants
+    assert "CC reviews CC" in variants
+
+
+def test_surface_variants_matches_punctuated_canonicals():
+    """Canonicals ending in punctuation have no word boundary — lookarounds."""
+    aliases = {"cpp": "C++", "cplusplus": "C++"}
+    variants = surface_variants("C++ guide", aliases)
+    assert "cpp guide" in variants
+    assert "cplusplus guide" in variants
+
+
+def test_surface_variants_follows_alias_chains_to_fixpoint():
+    """foo -> bar -> baz: normalized 'baz' must reach the 'foo' spelling."""
+    aliases = {"foo": "bar", "bar": "baz"}
+    variants = surface_variants("baz item", aliases)
+    assert "foo item" in variants
+    assert "bar item" in variants
+
+
+def test_surface_variants_respects_mapping_order_on_chains():
+    """Only spellings that forward-normalize to the input are variants.
+
+    With ``{"bar": "baz", "foo": "bar"}`` (baz-rule first), ``normalize("foo")
+    == "bar"`` — the foo spelling must NOT be offered for "baz item", or a
+    stored "foo item" row (which persists as "bar item") would suppress a
+    different write. For "bar item" it must be offered.
+    """
+    aliases = {"bar": "baz", "foo": "bar"}
+    assert "foo item" not in surface_variants("baz item", aliases)
+    assert "foo item" in surface_variants("bar item", aliases)
+
+
+def test_surface_variants_repeated_canonicals_keep_homogeneous_forms():
+    """Three occurrences x two aliases exceeds a naive budget; the all-alias
+    forms are emitted before mixed enumeration so they are never priced out.
+    """
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    variants = surface_variants(
+        "Claude Code / Claude Code / Claude Code", aliases
+    )
+    assert "CC / CC / CC" in variants
+    assert "claude-code / claude-code / claude-code" in variants
+    assert "CC / Claude Code / claude-code" in variants
+
+
+def test_surface_variants_accepts_canonical_case_differences():
+    """Matching is case-insensitive, so a lowercase canonical in content still
+    yields its alias spellings — normalization only differs in the canonical's
+    own casing, which the verification must tolerate."""
+    aliases = {"CC": "Claude Code"}
+    assert "CC owns the gate" in surface_variants(
+        "claude code owns the gate", aliases
+    )
+
+
+def test_surface_variants_prefers_longest_nested_canonical():
+    """With {"X": "Claude", "CC": "Claude Code"}, "Claude" inside "Claude
+    Code" must not swallow the longer slot: "CC and X" is reachable, and the
+    dropped shorter span still gets its own substitution ("X Code and Claude").
+    """
+    aliases = {"X": "Claude", "CC": "Claude Code"}
+    variants = surface_variants("Claude Code and Claude", aliases)
+    assert "CC and X" in variants
+    assert "X Code and Claude" in variants
+
+
+def test_surface_variants_combines_dropped_slot_with_disjoint_slots():
+    """An overlap-dropped span still combines with non-overlapping slots:
+    "New YC and F" needs the dropped "York City" plus the kept "Foo"."""
+    aliases = {"NY": "New York", "YC": "York City", "F": "Foo"}
+    variants = surface_variants("New York City and Foo", aliases)
+    assert "New YC and F" in variants
+
+
+def test_surface_variants_combines_disjoint_dropped_spans():
+    """Two spans dropped under one covering canonical still combine:
+    "A Beta G" needs the dropped "Alpha" and "Gamma" slots together."""
+    aliases = {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}
+    assert "A Beta G" in surface_variants("Alpha Beta Gamma", aliases)
+
+
+def test_surface_variants_deep_span_count_does_not_recurse():
+    """~1200 canonical occurrences exceed Python's recursion limit; the
+    iterative subset walk must still return the homogeneous form."""
+    aliases = {"CC": "Claude Code"}
+    content = " ".join(["Claude Code"] * 1200)
+    variants = surface_variants(content, aliases)
+    assert " ".join(["CC"] * 1200) in variants
+
+
+def test_surface_variants_no_match_returns_empty():
+    assert surface_variants("nothing aliased here", {"CC": "Claude Code"}) == []
 
 
 def test_normalize_none_aliases():
