@@ -30,16 +30,36 @@ gated by the existing `POST_MERGE` guard:
 # (new, immediately before the "Pre-update DB snapshot" block ~547)
 if [[ "$POST_MERGE" == "false" ]]; then
     echo "--- Fetching latest ---"
-    if ! git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main; then
-        echo "  Fetch failed (network?) — server NOT stopped, nothing changed."
+    if ! _fetch_deploy_refs; then
+        echo "  Fetch failed (network/timeout?) — server NOT stopped, nothing changed."
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        _clear_deploy_state
         exit 1
     fi
 fi
 ```
 
 The old fetch line at 797 is removed (its `--- Fetching latest ---` echo moves
-with it). The merge (836) still consumes `$UPDATE_REMOTE/main` — now already
-fetched.
+with it). The merge now consumes the immutable `DEPLOY_HEAD` read from the
+private fetched ref. The remote-tracking ref is refreshed by a SEPARATE,
+best-effort fetch afterwards (`_refresh_deploy_tracking_ref`), because a stale
+ancestor blocking its own descendant after a branch rename says nothing about
+whether the deploy head arrived. The cost of that split: when the refresh fails,
+deploy health's `HEAD..@{upstream}` distance can be stale while `FETCH_HEAD`'s age
+reads fresh. That pairing is tracked with the rest of the cross-reader work below. The
+script resolves the deploy branch from the persisted `github.deploy_branch` override,
+then the live remote's advertised HEAD (with cached remote-tracking HEAD and `main`
+as fallbacks) and verifies that commit is
+an ancestor before restart or success reporting.
+
+`update.sh` is the only reader of `github.deploy_branch` today. The dashboard's
+update check and the version collector compare against a hard-coded `main`
+(the dashboard hard-codes the `origin` remote as well), and deploy health counts
+`HEAD..@{upstream}`, following whatever the checkout tracks. Giving those readers
+one resolver is tracked separately in #2419 — it is not part of what #2303, #2145
+or #1634 ask for, and
+bundling it here is what made the first two attempts at this change too large to
+converge.
 
 **Why an explicit `if ! … exit 1` and NOT the ERR trap:** the ERR trap arms at
 790, *after* the stop. Before the stop there is deliberately no trap — a failure

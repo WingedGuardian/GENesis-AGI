@@ -8,9 +8,9 @@ shipped bash function against a throwaway git repo + sqlite update_history.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -28,6 +28,16 @@ def _extract_function() -> str:
     # Drop the rest of the BEGIN marker line itself (it carries a prose suffix).
     after_marker = text.split(_BEGIN, 1)[1].split("\n", 1)[1]
     return after_marker.split(_END, 1)[0]
+
+
+def _extract_named_function(name: str) -> str:
+    text = UPDATE_SH.read_text()
+    start = text.index(f"{name}() {{")
+    next_function = re.search(
+        r"\n[A-Za-z_][A-Za-z0-9_]*\(\) \{", text[start + 1 :]
+    )
+    assert next_function, f"missing function boundary after {name}"
+    return text[start : start + 1 + next_function.start()]
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -50,7 +60,7 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.fixture
 def genesis_root(tmp_path):
-    """Throwaway GENESIS_ROOT: git repo + data/genesis.db + fake venv python."""
+    """Throwaway GENESIS_ROOT: git repo + data/genesis.db, no usable venv."""
     root = tmp_path / "root"
     (root / "data").mkdir(parents=True)
     (root / "scripts").mkdir()
@@ -60,9 +70,7 @@ def genesis_root(tmp_path):
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "c1")
 
-    venv = tmp_path / "venv"
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to(sys.executable)
+    venv = tmp_path / "missing-venv"
 
     db = sqlite3.connect(root / "data" / "genesis.db")
     db.execute(
@@ -90,7 +98,11 @@ def _run_check(root: Path, venv: Path) -> int:
     harness = (
         "set -u\n"
         f'GENESIS_ROOT="{root}"\n'
-        f'VENV_DIR="{venv}"\n' + _extract_function() + "\n_tier2_pending_since_baseline\n"
+        f'VENV_DIR="{venv}"\n'
+        + _extract_named_function("_resolve_commit_object")
+        + "\n"
+        + _extract_function()
+        + "\n_tier2_pending_since_baseline\n"
     )
     result = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=60)
     assert result.stderr == "", result.stderr
