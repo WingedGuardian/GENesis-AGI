@@ -394,8 +394,45 @@ class CircuitBreakerRegistry:
         self._breakers: dict[str, CircuitBreaker] = {}
         self.load_state()
 
+    def _alias_target(self, name: str, known) -> str | None:
+        """The key in ``known`` that ``name``'s persisted/held state belongs to, or None.
+
+        Lazy import: ``routing.config`` is the owner of the alias map, and
+        importing it at module scope would tie the breaker to the config loader
+        for a lookup that only matters on two paths.
+        """
+        try:
+            from genesis.routing.config import _resolve_provider_alias
+        except Exception:  # noqa: BLE001 — no alias map available is no migration.
+            return name if name in known else None
+        resolved = _resolve_provider_alias(name, known)
+        return resolved if resolved in known else None
+
     def update_providers(self, providers: dict[str, ProviderConfig]) -> None:
-        """Merge new provider configs into the registry (for hot-reload)."""
+        """Merge new provider configs into the registry (for hot-reload).
+
+        A RENAME across a hot reload would otherwise strand the live breaker.
+        Note this method MERGES rather than replaces, so after a rename
+        ``self._providers`` holds BOTH generations while ``self._breakers`` holds
+        the hold under the OLD key — and ``Router.reload_config``'s subsequent
+        ``get(new_name)`` creates a fresh CLOSED breaker beside it. An OPEN or
+        HALF_OPEN provider would resume taking traffic mid-run, with the operator
+        given no sign, which is the same loss as the restart path below and
+        reachable without one.
+
+        So any breaker whose key is absent from the INCOMING config but whose
+        alias resolves into it is moved onto the new key, unless that key already
+        has a breaker — an existing one is live state and is never overwritten.
+        """
+        for old in [k for k in self._breakers if k not in providers]:
+            target = self._alias_target(old, providers)
+            if target and target != old and target not in self._breakers:
+                self._breakers[target] = self._breakers.pop(old)
+                logger.info(
+                    "Circuit breaker for '%s' moved to '%s' across a hot reload "
+                    "(provider renamed upstream) — its state and trip count are kept",
+                    old, target,
+                )
         self._providers.update(providers)
 
     def get(self, provider: str) -> CircuitBreaker:
@@ -440,133 +477,175 @@ class CircuitBreakerRegistry:
             return
         try:
             data = json.loads(self._state_file.read_text())
-            for name, info in data.items():
+            # A RENAME retires the key this state was persisted under, and the
+            # match below is exact — so an unmatched row was silently dropped and
+            # the renamed provider got a fresh CLOSED breaker. An install with an
+            # actively failing provider therefore resumed sending it traffic on
+            # the first restart after the upgrade, until enough NEW failures
+            # tripped it again, reintroducing exactly the latency and paid-fallback
+            # churn that persisting this state exists to prevent. Confirmed on a
+            # live install: 26 persisted rows, 7 under names a rename retired, one
+            # of them `half_open`.
+            #
+            # TWO PASSES, because both generations can be present and the CURRENT
+            # name's row has to win. Pass 1 takes every row whose key is a live
+            # provider; pass 2 takes a legacy row ONLY if its target was not
+            # already restored. One pass in dict order would let whichever row
+            # came first decide, which is the same order-dependence bug the
+            # overlay migration was fixed for.
+            rows = list(data.items())
+            restored: set[str] = set()
+            ordered: list[tuple[str, dict, str]] = []
+            for name, info in rows:
                 if name in self._providers:
-                    cb = self.get(name)
-                    saved_state = info.get("state", "CLOSED")
-                    # BOTH non-closed states restore. Restoring only OPEN made
-                    # the guarantee below expire at the next restart, by an
-                    # entirely ordinary route: `.state` assigns HALF_OPEN when
-                    # merely READ (it mutates and does NOT notify), and
-                    # `save_state` serialises EVERY breaker's raw `_state`, so
-                    # any other breaker's change persists this one as
-                    # "half_open". A restart then read it as CLOSED — a dead
-                    # provider reporting healthy and probe-healable again, which
-                    # is the original defect returning on a timer.
-                    # `_opened_at` is reset for OPEN only: for HALF_OPEN it is
-                    # not consulted (the window has already elapsed), and the
-                    # breaker is routable, so the next real call decides it.
-                    restored_live = saved_state in (
-                        ProviderState.OPEN.value,
-                        ProviderState.HALF_OPEN.value,
+                    ordered.append((name, info, name))
+            for name, info in rows:
+                if name in self._providers:
+                    continue
+                target = self._alias_target(name, self._providers)
+                if target:
+                    ordered.append((name, info, target))
+
+            for name, info, target in ordered:
+                if target in restored:
+                    logger.info(
+                        "Persisted breaker state for '%s' skipped — '%s' was already "
+                        "restored from its current name, which wins",
+                        name, target,
                     )
-                    if saved_state == ProviderState.OPEN.value:
-                        cb._state = ProviderState.OPEN
-                        cb._opened_at = cb._clock()
-                    elif saved_state == ProviderState.HALF_OPEN.value:
-                        cb._state = ProviderState.HALF_OPEN
-                        cb._consecutive_successes = 0
-                    cb._consecutive_failures = info.get("consecutive_failures", 0)
-                    cb._trip_count = info.get("trip_count", 0)
-                    # Cap backoff on restart — escalating backoff is for consecutive
-                    # failures within a session, not across restarts spanning weeks.
-                    # Cap=3 → max backoff = min(120*2^2, 1800) = 480s (8 min).
-                    if saved_state == ProviderState.OPEN.value:
-                        cb._trip_count = min(cb._trip_count, 3)
-                    # The category QUALIFIES a failing breaker, so it must be
-                    # restored under the same condition as the state it
-                    # describes.
-                    #
-                    # KNOWN, ACCEPTED side effect on the OTHER reader of this
-                    # field: `_effective_open_duration()` consults it to pick
-                    # the 4h quota cap. A QUOTA_EXHAUSTED provider persisted as
-                    # half_open therefore restarts on the 30-minute cap until it
-                    # re-fails and re-classifies — a shorter retry interval, not
-                    # a longer one, so it errs toward re-trying a provider that
-                    # may have recovered. Restoring the category unconditionally
-                    # to preserve the cap is NOT the fix: `_trip_count` is also
-                    # restored unconditionally, so that would hand the heal
-                    # guard a tripped-looking breaker and strand it. Restoring it unconditionally onto a breaker that
-                    # comes back CLOSED (anything not saved as OPEN) leaves a
-                    # dead fact from a previous process — and once
-                    # `record_probe_success` began consulting it, that stale
-                    # value permanently disabled probe healing for a provider
-                    # that is not failing at all: stuck HALF_OPEN after any probe
-                    # blip, with no traffic to rescue it. Reachable in normal
-                    # operation because `.state` mutates OPEN -> HALF_OPEN when
-                    # merely READ, and `save_state` serialises every breaker.
-                    # Restored under the SAME condition as the category, and
-                    # for the same reason: it qualifies a breaker that is NOT
-                    # closed (OPEN or HALF_OPEN — `restored_live`). A saved-
-                    # CLOSED row restores with neither, where "a call opened
-                    # this" is not a fact about anything — carrying it would be
-                    # the poison pill in a new field.
-                    # MIGRATION, and it decides the first post-deploy cycle:
-                    # a file written before this field existed has no key at
-                    # all, and `.get()` would read that absence as "a probe
-                    # opened it" -- the one origin a legacy OPEN row CANNOT
-                    # have. In every version that wrote a keyless file,
-                    # `probe_suspect()` produced HALF_OPEN and nothing else,
-                    # and load_state THEN restored non-OPEN as CLOSED, so a
-                    # persisted OPEN can only have come from a real call trip
-                    # or an operator disable. Both must read True. (The restore
-                    # has since widened to HALF_OPEN; a keyless half_open row
-                    # defaults to probe-origin below, because that state is
-                    # reachable both ways.) MEASURED against this
-                    # deploy's own live state file: the provider in the
-                    # motivating outage is persisted OPEN with no key, so
-                    # defaulting to False would have left it probe-healable for
-                    # one more cycle -- the fix failing its own acceptance bar.
-                    # An explicit False in a NEW-format file is preserved.
-                    # `null` is treated as ABSENT, not as False: `save_state`
-                    # only ever writes a bool, so a null reaching here came
-                    # from a hand-edit or a torn write, and reading it as False
-                    # would hand back exactly the probe-healable value this
-                    # migration exists to prevent.
-                    # The keyless MIGRATION default is True for OPEN only, and
-                    # that scope is load-bearing. A legacy OPEN row can only have
-                    # come from a call trip or an operator disable (see above),
-                    # so True is the sole possible origin. A legacy HALF_OPEN row
-                    # is genuinely AMBIGUOUS — `probe_suspect()` reaches it
-                    # directly, and so does a call trip whose window elapsed —
-                    # so it defaults to False, the conservative direction: a
-                    # probe may heal it, which merely restores pre-fix behaviour
-                    # and self-corrects on the next real failure. Defaulting it
-                    # True instead would strand a healthy probe-suspected
-                    # provider with no traffic to rescue it, which is the harm
-                    # the poison-pill work removed. Files written by THIS build
-                    # always carry the key, so the ambiguity is legacy-only.
-                    saved_origin = info.get("opened_by_call")
-                    if not restored_live:
-                        cb._opened_by_call = False
-                    elif saved_origin is None:
-                        cb._opened_by_call = saved_state == ProviderState.OPEN.value
-                    else:
-                        cb._opened_by_call = bool(saved_origin)
-                    saved_cat = info.get("last_failure_category")
-                    try:
-                        cb._last_failure_category = (
-                            ErrorCategory(saved_cat)
-                            if saved_cat and restored_live
-                            else None
-                        )
-                    except ValueError:
-                        # A category this build does not know -- a file written
-                        # by a NEWER build, i.e. the rollback path. Scoped to
-                        # this ONE breaker on purpose: the enclosing try wraps
-                        # the whole loop, so an unscoped raise here would drop
-                        # every LATER provider's restored state to CLOSED with
-                        # no origin, which is "forget the outage" -- exactly
-                        # what this branch exists to prevent, triggered by a
-                        # rollback. `ErrorCategory` has gained members before
-                        # (TIMEOUT, RATE_LIMITED, BAD_REQUEST), so this is a
-                        # shape that has actually occurred.
-                        logger.warning(
-                            "Unknown failure category %r for provider %s; "
-                            "restoring state without it",
-                            saved_cat, name,
-                        )
-                        cb._last_failure_category = None
+                    continue
+                restored.add(target)
+                if target != name:
+                    logger.info(
+                        "Restoring persisted breaker state from '%s' onto '%s' "
+                        "(provider renamed upstream)",
+                        name, target,
+                    )
+                cb = self.get(target)
+                saved_state = info.get("state", "CLOSED")
+                # BOTH non-closed states restore. Restoring only OPEN made
+                # the guarantee below expire at the next restart, by an
+                # entirely ordinary route: `.state` assigns HALF_OPEN when
+                # merely READ (it mutates and does NOT notify), and
+                # `save_state` serialises EVERY breaker's raw `_state`, so
+                # any other breaker's change persists this one as
+                # "half_open". A restart then read it as CLOSED — a dead
+                # provider reporting healthy and probe-healable again, which
+                # is the original defect returning on a timer.
+                # `_opened_at` is reset for OPEN only: for HALF_OPEN it is
+                # not consulted (the window has already elapsed), and the
+                # breaker is routable, so the next real call decides it.
+                restored_live = saved_state in (
+                    ProviderState.OPEN.value,
+                    ProviderState.HALF_OPEN.value,
+                )
+                if saved_state == ProviderState.OPEN.value:
+                    cb._state = ProviderState.OPEN
+                    cb._opened_at = cb._clock()
+                elif saved_state == ProviderState.HALF_OPEN.value:
+                    cb._state = ProviderState.HALF_OPEN
+                    cb._consecutive_successes = 0
+                cb._consecutive_failures = info.get("consecutive_failures", 0)
+                cb._trip_count = info.get("trip_count", 0)
+                # Cap backoff on restart — escalating backoff is for consecutive
+                # failures within a session, not across restarts spanning weeks.
+                # Cap=3 → max backoff = min(120*2^2, 1800) = 480s (8 min).
+                if saved_state == ProviderState.OPEN.value:
+                    cb._trip_count = min(cb._trip_count, 3)
+                # The category QUALIFIES a failing breaker, so it must be
+                # restored under the same condition as the state it
+                # describes.
+                #
+                # KNOWN, ACCEPTED side effect on the OTHER reader of this
+                # field: `_effective_open_duration()` consults it to pick
+                # the 4h quota cap. A QUOTA_EXHAUSTED provider persisted as
+                # half_open therefore restarts on the 30-minute cap until it
+                # re-fails and re-classifies — a shorter retry interval, not
+                # a longer one, so it errs toward re-trying a provider that
+                # may have recovered. Restoring the category unconditionally
+                # to preserve the cap is NOT the fix: `_trip_count` is also
+                # restored unconditionally, so that would hand the heal
+                # guard a tripped-looking breaker and strand it. Restoring it unconditionally onto a breaker that
+                # comes back CLOSED (anything not saved as OPEN) leaves a
+                # dead fact from a previous process — and once
+                # `record_probe_success` began consulting it, that stale
+                # value permanently disabled probe healing for a provider
+                # that is not failing at all: stuck HALF_OPEN after any probe
+                # blip, with no traffic to rescue it. Reachable in normal
+                # operation because `.state` mutates OPEN -> HALF_OPEN when
+                # merely READ, and `save_state` serialises every breaker.
+                # Restored under the SAME condition as the category, and
+                # for the same reason: it qualifies a breaker that is NOT
+                # closed (OPEN or HALF_OPEN — `restored_live`). A saved-
+                # CLOSED row restores with neither, where "a call opened
+                # this" is not a fact about anything — carrying it would be
+                # the poison pill in a new field.
+                # MIGRATION, and it decides the first post-deploy cycle:
+                # a file written before this field existed has no key at
+                # all, and `.get()` would read that absence as "a probe
+                # opened it" -- the one origin a legacy OPEN row CANNOT
+                # have. In every version that wrote a keyless file,
+                # `probe_suspect()` produced HALF_OPEN and nothing else,
+                # and load_state THEN restored non-OPEN as CLOSED, so a
+                # persisted OPEN can only have come from a real call trip
+                # or an operator disable. Both must read True. (The restore
+                # has since widened to HALF_OPEN; a keyless half_open row
+                # defaults to probe-origin below, because that state is
+                # reachable both ways.) MEASURED against this
+                # deploy's own live state file: the provider in the
+                # motivating outage is persisted OPEN with no key, so
+                # defaulting to False would have left it probe-healable for
+                # one more cycle -- the fix failing its own acceptance bar.
+                # An explicit False in a NEW-format file is preserved.
+                # `null` is treated as ABSENT, not as False: `save_state`
+                # only ever writes a bool, so a null reaching here came
+                # from a hand-edit or a torn write, and reading it as False
+                # would hand back exactly the probe-healable value this
+                # migration exists to prevent.
+                # The keyless MIGRATION default is True for OPEN only, and
+                # that scope is load-bearing. A legacy OPEN row can only have
+                # come from a call trip or an operator disable (see above),
+                # so True is the sole possible origin. A legacy HALF_OPEN row
+                # is genuinely AMBIGUOUS — `probe_suspect()` reaches it
+                # directly, and so does a call trip whose window elapsed —
+                # so it defaults to False, the conservative direction: a
+                # probe may heal it, which merely restores pre-fix behaviour
+                # and self-corrects on the next real failure. Defaulting it
+                # True instead would strand a healthy probe-suspected
+                # provider with no traffic to rescue it, which is the harm
+                # the poison-pill work removed. Files written by THIS build
+                # always carry the key, so the ambiguity is legacy-only.
+                saved_origin = info.get("opened_by_call")
+                if not restored_live:
+                    cb._opened_by_call = False
+                elif saved_origin is None:
+                    cb._opened_by_call = saved_state == ProviderState.OPEN.value
+                else:
+                    cb._opened_by_call = bool(saved_origin)
+                saved_cat = info.get("last_failure_category")
+                try:
+                    cb._last_failure_category = (
+                        ErrorCategory(saved_cat)
+                        if saved_cat and restored_live
+                        else None
+                    )
+                except ValueError:
+                    # A category this build does not know -- a file written
+                    # by a NEWER build, i.e. the rollback path. Scoped to
+                    # this ONE breaker on purpose: the enclosing try wraps
+                    # the whole loop, so an unscoped raise here would drop
+                    # every LATER provider's restored state to CLOSED with
+                    # no origin, which is "forget the outage" -- exactly
+                    # what this branch exists to prevent, triggered by a
+                    # rollback. `ErrorCategory` has gained members before
+                    # (TIMEOUT, RATE_LIMITED, BAD_REQUEST), so this is a
+                    # shape that has actually occurred.
+                    logger.warning(
+                        "Unknown failure category %r for provider %s; "
+                        "restoring state without it",
+                        saved_cat, name,
+                    )
+                    cb._last_failure_category = None
             logger.info("Circuit breaker state restored from %s", self._state_file)
         except Exception:
             logger.warning("Failed to load circuit breaker state", exc_info=True)
