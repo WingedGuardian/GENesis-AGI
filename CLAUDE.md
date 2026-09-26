@@ -20,6 +20,7 @@ Use `codebase_navigate` MCP to explore.
   by `scripts/setup-local-config.sh`). Dashboard proxied host:5000 → container:5000.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: configured in `~/.genesis/config/genesis.yaml` (`github.user` / `github.public_repo`)
+- **Config sources**: where a setting is read from and what wins (secrets.env, genesis.yaml, `config/` overlays, env) → `docs/architecture/CONFIG_SOURCES.md`
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)
 - **Backups**: encrypted, every 6h via `genesis-backup.timer` (systemd user
   unit; enable deliberately after configuring) running `scripts/backup.sh` → your private
