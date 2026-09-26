@@ -1783,6 +1783,7 @@ class InboxMonitor:
             # (it forwards session_origin_from_env), so a delta forged here is
             # stamped external and barred by the user-model consumer gate.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
+            caller_tag="inbox.eval",
         )
 
     async def _set_drop_status(
@@ -2255,8 +2256,10 @@ class InboxMonitor:
                 )
 
             # Capability-build lane (non-fatal, no-op unless enabled + wired):
-            # consumes `build` verdicts into greenlight cards. Independent of
-            # follow-up creation — BUILD verdicts never become follow-ups.
+            # consumes `build` verdicts into greenlight cards. While it is live,
+            # BUILD verdicts never become follow-ups; when it is unwired or
+            # disabled, _create_follow_ups_from_eval surfaces them as follow-ups
+            # instead (see _BUILD_FALLBACK_MAPPING).
             if self._build_lane is not None:
                 try:
                     await self._build_lane.handle_eval(
@@ -2671,6 +2674,24 @@ class InboxMonitor:
         "bookmark": ("ego_judgment", "low", False, "tabled"),
     }
 
+    # BUILD (capability-build items) is deliberately ABSENT from _ACTION_MAP and
+    # stays in recommendation._SKIP_ACTIONS: while the build lane is live it owns
+    # the verdict's lifecycle (greenlight card -> task executor), and a follow-up
+    # as well would be a duplicate. But the lane is optional — unwired, or wired
+    # with ``enabled=False`` (its handle_eval then returns 0 without looking) — and
+    # in that state a BUILD verdict used to reach NO consumer at all: skipped here
+    # by is_actionable, ignored there by the disabled lane. So when the lane is not
+    # live, the verdict is surfaced as a pinned user-owned follow-up instead
+    # (_BUILD_FALLBACK_MAPPING), never silently dropped.
+    _BUILD_FALLBACK_MAPPING: tuple[str, str, bool, str] = (
+        "user_input_needed", "medium", True, "follow_up",
+    )
+
+    def _build_lane_live(self) -> bool:
+        """True only when a build lane is wired AND enabled (it will consume)."""
+        lane = self._build_lane
+        return lane is not None and bool(getattr(lane, "enabled", False))
+
     async def _create_follow_ups_from_eval(
         self,
         evaluation_text: str,
@@ -2692,12 +2713,18 @@ class InboxMonitor:
         created = 0
         source_name = ", ".join(Path(f).name for f in source_files)
 
+        build_lane_live = self._build_lane_live()
+
         for rec in recs:
-            if not rec.is_actionable:
+            action_key = rec.action.lower().replace("_", " ").strip()
+            build_fallback = action_key == "build" and not build_lane_live
+            if not rec.is_actionable and not build_fallback:
                 continue
 
-            action_key = rec.action.lower().replace("_", " ").strip()
-            mapping = self._ACTION_MAP.get(action_key)
+            if build_fallback:
+                mapping = self._BUILD_FALLBACK_MAPPING
+            else:
+                mapping = self._ACTION_MAP.get(action_key)
             if mapping is None:
                 logger.debug(
                     "Unmapped action '%s' — skipping follow-up",
@@ -2713,6 +2740,19 @@ class InboxMonitor:
                 f"Inbox evaluation {batch_id[:8]}: {source_name}. "
                 f"Confidence: {rec.confidence}. Effort: {rec.effort}."
             )
+            if build_fallback:
+                reason += (
+                    " Build lane not live — capability-build verdict surfaced "
+                    f"as a follow-up. Verdict: {rec.verdict or 'none'}."
+                )
+                if rec.verdict_reason:
+                    reason += f" Verdict reason: {rec.verdict_reason}"
+                logger.info(
+                    "Build lane not live — BUILD verdict for %r (verdict=%s) "
+                    "routed to a follow-up",
+                    title,
+                    rec.verdict,
+                )
 
             # Dedup: skip if an identical recommendation already exists so that
             # re-evaluating the same URL (or overlapping drops) never piles up

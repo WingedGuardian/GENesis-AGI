@@ -351,6 +351,7 @@ class EgoSession:
             working_dir=background_session_dir(),
             mcp_config=self._mcp_config_path,
             disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS),
+            caller_tag="ego.cycle",
         )
 
         # Autonomous dispatch check
@@ -1404,6 +1405,7 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=f"ego.gate.{label.lower()}",
             )
             output = await self._invoker.run(invocation)
             if output.is_error:
@@ -1991,6 +1993,7 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag="ego.realist",
             )
             output = await self._invoker.run(invocation)
             # Track realist cost for cycle accounting

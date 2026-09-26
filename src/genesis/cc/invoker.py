@@ -31,6 +31,7 @@ from genesis.cc.exceptions import (
     CCTimeoutError,
 )
 from genesis.cc.types import (
+    PROBE_CALLER_TAG,
     CCInvocation,
     CCModel,
     CCOutput,
@@ -705,6 +706,96 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
         )
     except Exception:
         logger.debug("cc.bg_truncated event emit failed", exc_info=True)
+
+
+# ``cc.invocation_failed`` coalescing. A burst of identical failures (a rate
+# limit hitting every caller of one lane, a network outage parking every
+# dispatch) would otherwise emit one event per call. One event per
+# (error_class, caller_tag) per window keeps the signal while bounding the
+# volume; the count swallowed in between rides on the NEXT emitted event
+# (``coalesced``), so the omission is declared, never silent.
+# 60s: short enough that a recurring failure re-surfaces within a minute, long
+# enough to collapse one incident's fan-out burst into one row.
+_FAILURE_EVENT_COALESCE_S = 60.0
+# (error_class, caller_tag) -> [monotonic time of last emit, suppressed since].
+# Keyed on a small closed set (exception classes x call-site tags) — bounded.
+_failure_event_state: dict[tuple[str, str | None], list[float]] = {}
+
+
+def _runtime_event_bus():
+    """The runtime singleton's event bus, or None (tests, early startup)."""
+    from genesis.runtime import GenesisRuntime
+
+    return getattr(GenesisRuntime.instance(), "_event_bus", None)
+
+
+def _reset_failure_event_state() -> None:
+    """Clear the coalescing window (tests)."""
+    _failure_event_state.clear()
+
+
+async def _emit_invocation_failed_event(
+    exc: CCError,
+    invocation: CCInvocation,
+    *,
+    streaming: bool,
+) -> None:
+    """Fire a ``cc.invocation_failed`` observability event for a raised CCError.
+
+    Called from ``CCInvoker.run`` / ``run_streaming`` on the way out of a failed
+    invocation, immediately before the error is re-raised — so every CC call
+    site gets one central failure signal without each caller emitting its own.
+    Rate-limit / quota errors are WARNING (expected, self-recovering); every
+    other CCError is ERROR. Skipped for liveness probes (``caller_tag ==
+    "probe"``). Same bus resolution as ``_emit_bg_truncation_event``: no-ops
+    when the runtime/bus is absent and never raises — observability must not
+    mask the real error the caller is about to receive.
+    """
+    try:
+        if invocation.caller_tag == PROBE_CALLER_TAG:
+            return
+        bus = _runtime_event_bus()
+        if bus is None:
+            return
+        error_class = type(exc).__name__
+        key = (error_class, invocation.caller_tag)
+        now = time.monotonic()
+        state = _failure_event_state.get(key)
+        if state is not None and now - state[0] < _FAILURE_EVENT_COALESCE_S:
+            state[1] += 1
+            return
+        coalesced = int(state[1]) if state is not None else 0
+        _failure_event_state[key] = [now, 0]
+
+        from genesis.observability.session_context import get_session_id
+        from genesis.observability.types import Severity, Subsystem
+
+        severity = (
+            Severity.WARNING
+            if isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+            else Severity.ERROR
+        )
+        # The exception TEXT is deliberately not carried: CC errors are built
+        # from raw CLI stderr/stdout (see _classify_error), which is unbounded
+        # and can echo arbitrary tool output, and this event is persisted to
+        # the events table. Metadata only; the length marks the omission, and
+        # the caller receives the full error via the re-raise.
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            severity,
+            "cc.invocation_failed",
+            f"CC invocation failed ({error_class}) for "
+            f"{invocation.caller_tag or 'untagged caller'}",
+            error_class=error_class,
+            error_text_omitted_chars=len(str(exc)),
+            streaming=streaming,
+            model=str(invocation.model),
+            session_id=get_session_id(),
+            caller_tag=invocation.caller_tag,
+            coalesced=coalesced,
+        )
+    except Exception:
+        logger.debug("cc.invocation_failed event emit failed", exc_info=True)
 
 
 def cc_span_settings_path() -> str | None:
@@ -1711,6 +1802,20 @@ class CCInvoker:
             logger.debug("network preflight check errored — proceeding", exc_info=True)
 
     async def run(self, invocation: CCInvocation) -> CCOutput:
+        """Run a dispatched CC session (traced; see ``_run_traced``).
+
+        Any ``CCError`` — the pre-spawn network preflight's included — emits a
+        ``cc.invocation_failed`` event and is then re-raised unchanged.
+        ``CancelledError`` is a BaseException, not a CCError, so it propagates
+        untouched and emits nothing.
+        """
+        try:
+            return await self._run_traced(invocation)
+        except CCError as exc:
+            await _emit_invocation_failed_event(exc, invocation, streaming=False)
+            raise
+
+    async def _run_traced(self, invocation: CCInvocation) -> CCOutput:
         """Run a dispatched CC session (traced).
 
         Opens a ``cc.session`` span spanning the whole subprocess lifetime so
@@ -1949,7 +2054,19 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
-        """Run CC with stream-json output (traced — see run() for span rationale)."""
+        """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
+        try:
+            return await self._run_streaming_traced(invocation, on_event)
+        except CCError as exc:
+            await _emit_invocation_failed_event(exc, invocation, streaming=True)
+            raise
+
+    async def _run_streaming_traced(
+        self,
+        invocation: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+    ) -> CCOutput:
+        """Run CC with stream-json output (traced — see _run_traced for span rationale)."""
         invocation, roster_model = roster.apply_active(invocation)
         await self._network_preflight(invocation)
         with start_span(

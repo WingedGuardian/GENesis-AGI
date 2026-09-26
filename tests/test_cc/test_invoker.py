@@ -4787,3 +4787,206 @@ def test_seal_rewrites_are_serialised_against_a_concurrent_writer(monkeypatch, t
             "hosts.yml": "github.com:\n  oauth_token: x\n",
         },
     )
+
+
+# ── cc.invocation_failed: one central failure event per CCError, then re-raise ──
+
+
+class _FakeBus:
+    def __init__(self):
+        self.emit = AsyncMock()
+
+    @property
+    def events(self) -> list[tuple]:
+        return [c.args + (c.kwargs,) for c in self.emit.await_args_list]
+
+
+@pytest.fixture
+def fail_bus(monkeypatch):
+    """Route the invoker's runtime-bus lookup to a fake; reset the coalescer."""
+    import genesis.cc.invoker as inv_mod
+
+    bus = _FakeBus()
+    monkeypatch.setattr(inv_mod, "_runtime_event_bus", lambda: bus)
+    inv_mod._reset_failure_event_state()
+    yield bus
+    inv_mod._reset_failure_event_state()
+
+
+def _failing_invoker(monkeypatch, exc: BaseException | None, *, preflight_exc=None):
+    """A CCInvoker whose inner run raises ``exc`` (or succeeds when None)."""
+    from genesis.cc.types import CCOutput
+
+    invoker = CCInvoker(claude_path="/usr/bin/claude")
+
+    async def _preflight(_inv):
+        if preflight_exc is not None:
+            raise preflight_exc
+
+    async def _inner(*_a, **_k):
+        if exc is not None:
+            raise exc
+        return CCOutput(
+            session_id="s",
+            text="ok",
+            model_used="sonnet",
+            cost_usd=0.0,
+            input_tokens=0,
+            output_tokens=0,
+            duration_ms=1,
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(invoker, "_network_preflight", _preflight)
+    monkeypatch.setattr(invoker, "_run_inner", _inner)
+    monkeypatch.setattr(invoker, "_run_streaming_inner", _inner)
+    return invoker
+
+
+async def _call(invoker, entry: str, inv: CCInvocation):
+    if entry == "run":
+        return await invoker.run(inv)
+    return await invoker.run_streaming(inv)
+
+
+def _error_cases():
+    from genesis.cc.exceptions import (
+        CCMCPError,
+        CCNetworkOfflineError,
+        CCParsingError,
+        CCQuotaExhaustedError,
+        CCRateLimitError,
+        CCSessionError,
+    )
+
+    return [
+        (CCRateLimitError("limit"), "warning"),
+        (CCQuotaExhaustedError("quota"), "warning"),
+        (CCTimeoutError("slow"), "error"),
+        (CCProcessError("exit 1"), "error"),
+        (CCStreamTruncatedError("dropped"), "error"),
+        (CCParsingError("bad json"), "error"),
+        (CCSessionError("expired"), "error"),
+        (CCMCPError("mcp down"), "error"),
+        (CCNetworkOfflineError("offline"), "error"),
+    ]
+
+
+def _case_id(value):
+    return type(value).__name__ if isinstance(value, Exception) else str(value)
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+@pytest.mark.parametrize(("exc", "severity"), _error_cases(), ids=_case_id)
+async def test_invocation_failed_event_per_error_class(
+    monkeypatch,
+    fail_bus,
+    entry,
+    exc,
+    severity,
+):
+    invoker = _failing_invoker(monkeypatch, exc)
+    inv = CCInvocation(prompt="x", caller_tag="unit.test")
+    with pytest.raises(type(exc)) as raised:
+        await _call(invoker, entry, inv)
+    assert raised.value is exc, "the original error must be re-raised unchanged"
+    assert len(fail_bus.events) == 1
+    subsystem, sev, event_type, _msg, payload = fail_bus.events[0]
+    assert event_type == "cc.invocation_failed"
+    assert str(subsystem) == "providers"
+    assert str(sev) == severity
+    assert payload["error_class"] == type(exc).__name__
+    assert payload["streaming"] is (entry == "run_streaming")
+    assert payload["caller_tag"] == "unit.test"
+    assert payload["model"] == str(inv.model)
+    assert "session_id" in payload
+    assert payload["coalesced"] == 0
+    # Raw error text (CLI stderr/stdout) is never persisted — only its length.
+    assert str(exc) not in _msg
+    assert str(exc) not in {str(v) for v in payload.values()}
+    assert payload["error_text_omitted_chars"] == len(str(exc))
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_event_covers_network_preflight(monkeypatch, fail_bus, entry):
+    from genesis.cc.exceptions import CCNetworkOfflineError
+
+    pre = CCNetworkOfflineError("offline")
+    invoker = _failing_invoker(monkeypatch, None, preflight_exc=pre)
+    with pytest.raises(CCNetworkOfflineError):
+        await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert [e[2] for e in fail_bus.events] == ["cc.invocation_failed"]
+    assert fail_bus.events[0][4]["error_class"] == "CCNetworkOfflineError"
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_event_on_success(monkeypatch, fail_bus, entry):
+    invoker = _failing_invoker(monkeypatch, None)
+    out = await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert out.text == "ok"
+    assert fail_bus.events == []
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_event_on_cancel(monkeypatch, fail_bus, entry):
+    invoker = _failing_invoker(monkeypatch, asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert fail_bus.events == []
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_event_for_probe(monkeypatch, fail_bus, entry):
+    from genesis.cc.exceptions import CCRateLimitError
+    from genesis.cc.types import PROBE_CALLER_TAG
+
+    invoker = _failing_invoker(monkeypatch, CCRateLimitError("limit"))
+    with pytest.raises(CCRateLimitError):
+        await _call(invoker, entry, CCInvocation(prompt="x", caller_tag=PROBE_CALLER_TAG))
+    assert fail_bus.events == []
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_bus_still_reraises(monkeypatch, entry):
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_runtime_event_bus", lambda: None)
+    inv_mod._reset_failure_event_state()
+    exc = CCTimeoutError("slow")
+    invoker = _failing_invoker(monkeypatch, exc)
+    with pytest.raises(CCTimeoutError) as raised:
+        await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert raised.value is exc
+
+
+async def test_invocation_failed_emit_error_does_not_mask_original(monkeypatch, fail_bus):
+    fail_bus.emit.side_effect = RuntimeError("bus broke")
+    exc = CCProcessError("exit 1")
+    invoker = _failing_invoker(monkeypatch, exc)
+    with pytest.raises(CCProcessError) as raised:
+        await invoker.run(CCInvocation(prompt="x"))
+    assert raised.value is exc
+
+
+async def test_invocation_failed_coalesces_per_class_and_tag(monkeypatch, fail_bus):
+    import genesis.cc.invoker as inv_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+
+    for _ in range(3):  # same (class, tag) inside the window -> one event
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert len(fail_bus.events) == 1
+
+    with pytest.raises(CCTimeoutError):  # different tag -> its own event
+        await invoker.run(CCInvocation(prompt="x", caller_tag="b"))
+    assert len(fail_bus.events) == 2
+
+    clock["t"] += 61.0  # window elapsed -> emits again, declaring the 2 swallowed
+    with pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert len(fail_bus.events) == 3
+    assert fail_bus.events[-1][4]["caller_tag"] == "a"
+    assert fail_bus.events[-1][4]["coalesced"] == 2

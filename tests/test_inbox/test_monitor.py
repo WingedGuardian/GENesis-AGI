@@ -3528,3 +3528,60 @@ async def test_baseline_guard_delta_only_new_items(
     assert "article-3" in delta
     assert "article-1" not in delta
     assert "article-2" not in delta
+
+
+# ── BUILD verdict fallback: never silently dropped when the lane is not live ──
+
+_BUILD_EVAL = (
+    "# Inbox Evaluation\n\n"
+    "## 1. Widget Skill\n\n"
+    "### Recommendation\n\n"
+    "```yaml\n"
+    "action: BUILD\n"
+    'next_step: "Build the widget skill"\n'
+    "effort: Small\n"
+    "scope: V4\n"
+    "confidence: high\n"
+    "architecture_impact: extends\n"
+    "verdict: build\n"
+    'verdict_reason: "User pre-declared the need"\n'
+    "```\n"
+)
+
+
+async def _build_follow_ups(db) -> list[dict]:
+    cur = await db.execute(
+        "SELECT content, reason, strategy, priority, pinned, kind "
+        "FROM follow_ups WHERE source = 'inbox_evaluation'"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lane", "expected"),
+    [
+        pytest.param(None, 1, id="lane-unwired"),
+        pytest.param(SimpleNamespace(enabled=False), 1, id="lane-disabled"),
+        pytest.param(SimpleNamespace(enabled=True), 0, id="lane-live"),
+    ],
+)
+async def test_build_verdict_follow_up_only_when_lane_not_live(monitor, db, lane, expected):
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_BUILD_EVAL,
+        batch_id="batch-build-1",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == expected
+    assert len(rows) == expected
+    if expected:
+        row = rows[0]
+        assert row["content"].startswith("[BUILD] Widget Skill")
+        assert row["strategy"] == "user_input_needed"
+        assert row["priority"] == "medium"
+        assert row["pinned"] == 1
+        assert row["kind"] == "follow_up"
+        assert "User pre-declared the need" in row["reason"]

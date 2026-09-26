@@ -312,6 +312,11 @@ def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
 VALID_MODEL_NAMES: frozenset[str] = frozenset(m.value for m in CCModel)
 VALID_EFFORT_NAMES: frozenset[str] = frozenset(e.value for e in EffortLevel)
 
+#: ``CCInvocation.caller_tag`` value marking a liveness probe. Its failures are
+#: the expected "not back yet" answer, not an incident, so the invoker emits no
+#: ``cc.invocation_failed`` event for it.
+PROBE_CALLER_TAG = "probe"
+
 
 @dataclass(frozen=True)
 class CCInvocation:
@@ -410,6 +415,13 @@ class CCInvocation:
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
     session_key: str | None = None
+    # Observability label naming the call site that dispatched this invocation
+    # (e.g. "ego.cycle", "inbox.eval", "direct_session.<profile>"). Carried on the
+    # ``cc.invocation_failed`` event so a failure is attributable to its caller,
+    # and used as half of that event's coalescing key. The value "probe" marks a
+    # liveness probe whose failures are expected and are NOT emitted. None →
+    # untagged (still emitted). Never changes control flow.
+    caller_tag: str | None = None
     # WS-3 session-level provenance. When set, CCInvoker._build_env stamps
     # GENESIS_SESSION_ORIGIN so the session's memory MCP writes carry this
     # origin_class (memory.provenance.session_origin_from_env). Set it ONLY at

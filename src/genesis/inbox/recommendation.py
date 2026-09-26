@@ -8,7 +8,7 @@ programmatically.
 Two vocabularies:
 - Genesis-relevant: ADOPT | ADAPT | WATCH | IGNORE
   (+ BUILD, emitted only for capability-build notepad items — consumed by the
-  build lane, never by follow-up creation)
+  build lane; follow-up creation takes it only while that lane is not live)
 - User-relevant:    adopt | explore | bookmark | potential_skip
 
 Capability-build extension: items evaluated under a capability-build bracket
@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 
 # Actions that should NOT produce follow-ups.
 # BUILD is skipped by design: capability-build verdicts are consumed by the
-# build lane (greenlight card -> task executor), never queued as follow-ups.
+# build lane (greenlight card -> task executor). The one exception lives in the
+# consumer, not here: when the build lane is unwired or disabled,
+# InboxMonitor._create_follow_ups_from_eval surfaces BUILD as a follow-up so
+# the verdict is never silently dropped.
 _SKIP_ACTIONS: frozenset[str] = frozenset({
     "ignore",
     "potential_skip",

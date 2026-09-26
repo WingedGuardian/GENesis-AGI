@@ -85,7 +85,12 @@ class CCFallbackProbeWorker:
             return  # only probe while degraded — zero cost in the normal state
 
         from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
-        from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+        from genesis.cc.types import (
+            PROBE_CALLER_TAG,
+            CCInvocation,
+            CCModel,
+            EffortLevel,
+        )
 
         home = state.original or roster.CLAUDE
         try:
@@ -108,6 +113,9 @@ class CCFallbackProbeWorker:
             # block the fallback scheduler. 300s (not 60s) leaves headroom for
             # cross-machine latency while still bounding a hung probe.
             timeout_s=300,
+            # Its failures are the expected "not back yet" answer, not an
+            # incident: the invoker skips cc.invocation_failed for this tag.
+            caller_tag=PROBE_CALLER_TAG,
             **overrides,
         )
         try:
