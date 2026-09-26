@@ -464,7 +464,7 @@ EOF
 # Tiers (% of budget):
 #   Green  : < 50%  — no action
 #   Yellow : > 50%  — clean stale session dirs + old temp files
-#   Orange : > 75%  — yellow + delete caches + kill idle sessions + alert
+#   Orange : > 75%  — yellow + delete caches + record a stuck tier (NO kill) + alert
 #   Red    : > 90% OR fs free < sacred — nuclear cleanup + emergency alert
 
 clean_cc_yellow() {
@@ -489,7 +489,7 @@ clean_cc_yellow() {
 
 clean_cc_orange() {
     clean_cc_yellow
-    log WARN "Zone A ORANGE — deleting caches, then re-measuring before any session kill"
+    log WARN "Zone A ORANGE — deleting caches, then re-measuring to see if the tier resolved"
 
     # Same in-flight exclusions RED uses, for the same two names. ORANGE fires
     # at 75% of budget — MORE often than RED — so guarding only RED would leave
@@ -515,62 +515,70 @@ clean_cc_orange() {
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
 
-    # LOOP-BREAK: re-measure AFTER the cleanup above and kill idle sessions ONLY
-    # if we're still over the ORANGE line. This closes the runaway that killed no
-    # session but churned for ~4.5h on 2026-08-19: the tier that dispatched us
-    # here was measured BEFORE cleanup, so without a re-measure the daemon would
-    # re-enter ORANGE every poll and re-run the kill loop forever while the real
-    # filler (a pytest tree the cache-evict never touches) sat untouched. Killing
-    # an idle session cannot reduce cc-tmp anyway (sessions aren't the filler), so
-    # a kill here is at best useless and at worst reaps an innocent bystander.
+    # LOOP-BREAK: re-measure AFTER the cleanup above, and record the stuck
+    # state ONLY if we are still over the ORANGE line. This closes the runaway
+    # of 2026-08-19: the tier that dispatched us here was measured BEFORE
+    # cleanup, so without a re-measure the daemon re-enters ORANGE every poll
+    # and re-runs this tail forever while the real filler (a pytest tree the
+    # cache-evict never touches) sits untouched.
     # Use dir_usage_mb (du) — it drops immediately after rm; df can lag on
     # held-open deleted fds.
     local used_after threshold_orange
     used_after=$(dir_usage_mb "$CC_TMP_DIR")
     threshold_orange=$(( CC_TMP_BUDGET_MB * 75 / 100 ))
     if (( used_after <= threshold_orange )); then
-        log INFO "ORANGE resolved by cache cleanup (used=${used_after}MB <= ${threshold_orange}MB) — no session kills"
+        log INFO "ORANGE resolved by cache cleanup (used=${used_after}MB <= ${threshold_orange}MB)"
         rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
         return 0
     fi
 
-    log WARN "ORANGE persists after cleanup (used=${used_after}MB > ${threshold_orange}MB) — evaluating idle sessions"
-    # Kill idle CC tmux sessions (unattached, idle > 2h)
-    local killed_any=0
-    while IFS= read -r session; do
-        [[ -z "$session" ]] && continue
-        local sname
-        sname=$(echo "$session" | cut -d: -f1)
-        if [[ "$sname" =~ ^cc- ]]; then
-            local last_activity
-            last_activity=$(tmux display-message -t "$sname" -p '#{session_activity}' 2>/dev/null || echo 0)
-            local now
-            now=$(date +%s)
-            local idle_s=$(( now - last_activity ))
-            if (( idle_s > 7200 )); then
-                log WARN "Killing idle CC session: $sname (idle ${idle_s}s)"
-                # Count a reap only when tmux actually killed it — if the session
-                # vanished between listing and killing (or the kill fails), we
-                # reclaimed nothing, so killed_any must stay 0 and the stuck
-                # marker must still be recorded rather than silently skipped.
-                if tmux kill-session -t "$sname" 2>/dev/null; then
-                    killed_any=1
-                fi
-            fi
-        fi
-    done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null | grep ':0$' || true)
+    log WARN "ORANGE persists after cleanup (used=${used_after}MB > ${threshold_orange}MB) — nothing further this tier can safely reclaim"
 
-    # Stuck-ORANGE: cleanup didn't resolve it AND nothing was killable → the
-    # daemon has nothing safe left to do. Per design D2 (ORANGE is dashboard/log
-    # only — only RED pages) this does NOT page; it records the stuck state ONCE
-    # (dedupe flag) in the log instead of silently re-polling forever, so the
-    # condition is discoverable. If cc-tmp keeps filling it escalates to RED,
-    # which DOES page. The flag is cleared (main loop) whenever cc-tmp LEAVES
-    # ORANGE (green/yellow/red) — never on a kill: reaping an idle session does
-    # not reduce cc-tmp, so a kill that leaves us ORANGE keeps cc_tier==orange and
-    # must not re-arm and re-log the same episode.
-    if (( killed_any == 0 )) && [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
-        log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): reclaim freed nothing and no idle (>2h) session is killable — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
+    # NO SESSION KILL AT THIS TIER — removed deliberately, 2026-09.
+    #
+    # ORANGE used to reap unattached CC tmux sessions idle >2h at this point.
+    # The loop never fired, and could not have helped if it had. MEASURED over
+    # two independent log windows (2026-08-19 → 09-07, and 2026-09-22 →
+    # 09-25): 1,385 ORANGE polls, ZERO kills. The re-measure comment above
+    # already carried the reason — sessions are not the filler. One episode is
+    # the demonstration: a live install sat ORANGE for 2h45m on 263MB of a
+    # third-party tool's index cache plus 160MB of live session trees, and
+    # every byte of that would have survived a tmux kill untouched.
+    #
+    # RESIDUAL, stated rather than hidden: a kill was not strictly a no-op for
+    # space. Killing a process closes its descriptors, which releases any
+    # unlinked-but-held blocks it was pinning — precisely the space a du-based
+    # reclaim figure cannot see (MEASURED: 64MB of unlinked-but-held blocks
+    # reads as 0MB to `du -sm`).
+    #
+    # But that reclaim was never reachable from THIS tier, for a reason the
+    # deleted predicate hid. It judged idleness with tmux's
+    # `#{session_activity}`, which does not track a process at all — MEASURED
+    # 2026-09-25: a session writing 8MB/s to disk advanced it by 0 seconds over
+    # a 6-second window. So "idle >2h" never meant "not writing"; it meant "not
+    # printing", and a session running a long silent job — a build, a clone, a
+    # redirected test run — was a KILL CANDIDATE while actively writing into
+    # cc-tmp. The loop's best case was releasing blocks the tier could not see,
+    # and its worst case was reaping a working session. Note also that age does
+    # not bound size: a process that unlinked a 300MB temp three hours ago pins
+    # 300MB right now.
+    #
+    # RED (90%) still kills every unattached cc- session and is UNCHANGED. Be
+    # precise about what that escape hatch covers: RED's triggers are du-derived
+    # except the `free_mb < SACRED_GROUND_MB` statvfs arm, and on a shared-pool
+    # backend that arm reports the whole pool (see the backend note above), so
+    # descriptor-pinned space may not escalate there either. The hatch is real
+    # and narrower than "RED will catch it".
+
+    # Stuck-ORANGE: cleanup did not resolve it, and this tier has nothing safe
+    # left to do. Per design D2 (ORANGE is dashboard/log only — only RED pages)
+    # this does NOT page; it records the stuck state ONCE (dedupe flag) in the
+    # log instead of silently re-polling forever, so the condition is
+    # discoverable. If cc-tmp keeps filling it escalates to RED, which DOES
+    # page. The flag is cleared (main loop) whenever cc-tmp LEAVES ORANGE
+    # (green/yellow/red), so one episode is logged exactly once.
+    if [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
+        log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): cache eviction freed nothing and this tier has nothing else it can safely delete — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
         touch "$ALERT_DIR/tmp_orange_stuck"
     fi
 }
