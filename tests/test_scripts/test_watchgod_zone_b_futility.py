@@ -27,6 +27,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _WATCHGOD = Path(__file__).resolve().parents[2] / "scripts" / "tmp_watchgod.sh"
 
 # A PASS-THROUGH stat stub: any path whose basename begins with "foreign" is
@@ -37,7 +39,7 @@ _STAT_STUB = r"""#!/usr/bin/env bash
 if [[ "$1" == "-c" && "$2" == "%u" ]]; then
   base="$(basename "$3")"
   case "$base" in
-    foreign*) echo 9999; exit 0 ;;
+    foreign*|locked*) echo 9999; exit 0 ;;
     alien*)   echo 8888; exit 0 ;;
     # The policy-spared names are reported FOREIGN on purpose: otherwise the
     # own-uid check spares them first and the policy arm passes for the wrong
@@ -47,6 +49,24 @@ if [[ "$1" == "-c" && "$2" == "%u" ]]; then
   esac
 fi
 exec /usr/bin/stat "$@"
+"""
+
+
+# A PASS-THROUGH du stub: it fails for any path named on ARGV whose basename
+# begins with "locked", and defers to the real du otherwise.
+#
+# This models an unreadable tree WITHOUT depending on permission bits, and that
+# distinction is load-bearing: CI runs as root, root ignores DAC entirely, and
+# `chmod 000` therefore does nothing there. Two arms written with chmod passed
+# locally as an ordinary uid and FAILED on CI with "du should not have been able
+# to measure it: 1" — the environment, not the logic. The helper detects
+# unreadability by du's EXIT STATUS, so failing the status is exactly what a
+# real permission denial does to it.
+_DU_STUB = r"""#!/usr/bin/env bash
+for a in "$@"; do
+  case "$(basename -- "$a")" in locked*) exit 1 ;; esac
+done
+exec /usr/bin/du "$@"
 """
 
 
@@ -63,6 +83,7 @@ def _sandbox(tmp_path: Path) -> tuple[Path, Path]:
     bind = tmp_path / "bin"
     bind.mkdir()
     _make_exec(bind / "stat", _STAT_STUB)
+    _make_exec(bind / "du", _DU_STUB)
     return home, bind
 
 
@@ -148,17 +169,12 @@ def test_an_UNREADABLE_foreign_tree_is_reported_separately_from_its_size(tmp_pat
     the OPPOSITE of what it found. Size and readability are two facts."""
     home, bind = _sandbox(tmp_path)
     root = tmp_path / "faketmp"
-    blocked = root / "foreign-locked"
-    _mb(blocked / "blob", 4)
-    blocked.chmod(0o000)
-    try:
-        mb, uids, unreadable = _helper(home, bind, root)
-    finally:
-        blocked.chmod(0o755)  # so pytest can clean the tmp tree up
+    (root / "locked-tree").mkdir(parents=True)  # du stub refuses to size it
 
+    mb, uids, unreadable = _helper(home, bind, root)
     assert uids == "9999", "the owner was lost along with the size"
     assert unreadable == 1, f"the unreadable tree was not counted: {unreadable}"
-    assert mb == 0, f"du should not have been able to measure it: {mb}"
+    assert mb == 0, f"nothing measurable should have been reported: {mb}"
 
 
 def test_policy_spared_trees_are_not_attributed_to_ownership(tmp_path):
@@ -338,15 +354,11 @@ def test_an_unreadable_owner_is_named_not_denied(tmp_path):
     the helper returned."""
     home, bind = _sandbox(tmp_path)
     root = tmp_path / "faketmp"
-    blocked = root / "foreign-locked"
-    _mb(blocked / "blob", 4)
-    blocked.chmod(0o000)
-    try:
-        proc = _run(
-            home, bind, _STUB_TIERS + _pct_at(74) + f'sys_report_futility orange 74 70 "{root}"'
-        )
-    finally:
-        blocked.chmod(0o755)
+    (root / "locked-tree").mkdir(parents=True)  # du stub refuses to size it
+
+    proc = _run(
+        home, bind, _STUB_TIERS + _pct_at(74) + f'sys_report_futility orange 74 70 "{root}"'
+    )
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
 
     text = _log(home)
@@ -434,3 +446,31 @@ def test_green_clears_every_stale_tier_flag(tmp_path):
     assert proc.stdout.strip() == "green:10"
     for tier in ("orange", "red"):
         assert not _flag(home, tier).exists(), f"green must clear the {tier} flag"
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root ignores permission bits, so chmod 000 cannot make a tree "
+    "unreadable — the stubbed arms above cover the logic in every environment",
+)
+def test_a_REAL_permission_denial_produces_the_same_reading(tmp_path):
+    """Fidelity check for the stubbed arms: prove that an actual permission
+    denial drives the same branch the du stub models. Skipped under root, where
+    the premise cannot hold — which is exactly how the stubbed versions came to
+    exist (CI runs as root and the chmod arms failed there while passing
+    locally)."""
+    home, bind = _sandbox(tmp_path)
+    root = tmp_path / "faketmp"
+    blocked = root / "foreign-real"
+    _mb(blocked / "blob", 4)
+    blocked.chmod(0o000)
+    try:
+        # The du stub only refuses "locked*", so this path reaches the real du
+        # and is denied by the filesystem rather than by the harness.
+        mb, uids, unreadable = _helper(home, bind, root)
+    finally:
+        blocked.chmod(0o755)
+
+    assert uids == "9999", uids
+    assert unreadable == 1, f"a real EPERM was not counted as unreadable: {unreadable}"
+    assert mb == 0, f"du reported a size for a tree it could not read: {mb}"
