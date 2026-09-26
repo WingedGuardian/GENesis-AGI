@@ -1396,6 +1396,14 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         timer_name=$(basename "$template" .template)
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step
+            # External review dispatch is OPT-IN for the same reason backups are, and
+            # it must be excluded in EVERY enable path or the exclusion means nothing:
+            # it needs a separately-installed orchestrator a fresh install does not
+            # have, it spends an agent-subscription window shared with every
+            # foreground session, and turning on an AUTONOMOUS capability is the
+            # operator's decision rather than the installer's.
+            #   systemctl --user enable --now genesis-external-review.timer
+            genesis-external-review.timer) continue ;;
         esac
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
