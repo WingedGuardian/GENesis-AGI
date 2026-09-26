@@ -161,6 +161,47 @@ def _push_remote(cmd: str) -> str | None:
     return None
 
 
+#: A git command pointed at a repository by something other than cwd / ``-C``.
+#: Mirrors ``git_push_guard._seg_redirects_repo`` — duplicated rather than
+#: imported because hooks stay stdlib-only and import-light, and that module is
+#: the heaviest in the directory. Keep the two in step.
+_GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+_GIT_REPO_ASSIGN_RE = re.compile(r"^(?:" + "|".join(_GIT_REPO_VARS) + r")(?:\+?=|$)")
+_GIT_REPO_FLAGS = ("--git-dir", "--work-tree")
+
+
+def _repo_redirected(cmd: str) -> bool:
+    """Whether the push publishes from a repository this hook cannot locate.
+
+    ``_effective_cwd`` models ``cd`` and ``git -C``. It already knew
+    ``--git-dir`` and ``--work-tree`` existed — but only as options to SKIP, so
+    it discarded their value and fell back to the payload cwd, and the leading
+    env-assignment loop stripped ``GIT_DIR=`` the same way. On such a push this
+    hook diffed the checkout the command ran IN while git published the one it
+    was pointed AT: the leak scan read the wrong repository and reported clean.
+
+    Detected, not resolved: reproducing git's repository discovery for these
+    forms is how a half-model like the one above comes about.
+    """
+    # Env: any segment up to and including the push may set the variable, but
+    # only as a WORD bash assigns — a commit message that merely mentions
+    # `GIT_DIR=` is one word starting with its own text and does not match.
+    # Flags: only on the PUSH segment. Reading them anywhere suppressed real
+    # findings on ordinary pushes (`git --work-tree=x status && git push`).
+    for seg in re.split(r"\|\||&&|[;|&]", cmd):
+        try:
+            toks = shlex.split(seg, comments=True)
+        except ValueError:
+            return True  # unparseable: say so rather than guess
+        if any(_GIT_REPO_ASSIGN_RE.match(t) for t in toks):
+            return True
+        if "git" in toks and "push" in toks:
+            if any(t == f or t.startswith(f + "=") for t in toks for f in _GIT_REPO_FLAGS):
+                return True
+            break  # nothing after the push segment affects it
+    return False
+
+
 def _effective_cwd(cmd: str, payload_cwd: str | None) -> str | None:
     """The directory the ``git push`` actually runs in.
 
@@ -277,6 +318,29 @@ def main() -> None:
         global _deadline
         _deadline = time.monotonic() + _GIT_BUDGET_S
         payload_cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        if _repo_redirected(cmd):
+            # Say so rather than scan the wrong repository. An advisory cannot
+            # fail closed by blocking, so the honest failure is a loud one: the
+            # session is told the scan did not run, instead of being handed a
+            # clean result for commits it never looked at.
+            json.dump(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": (
+                            "[Pre-push privacy review] ⚠️ NOT SCANNED. This push is "
+                            "pointed at a repository by --git-dir / --work-tree or "
+                            "a GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR assignment, "
+                            "so this hook cannot tell which repository's commits it "
+                            "publishes. Check that repository's outgoing diff for "
+                            "private data yourself, or push from inside it (cd, or "
+                            "git -C) so the scan can run."
+                        ),
+                    }
+                },
+                sys.stdout,
+            )
+            return
         # Resolve the repo the push ACTUALLY runs in — honoring `git -C <dir>`
         # and a preceding `cd <dir>` — so we scan the branch being pushed, not
         # the payload cwd (Codex P2 on #1267).

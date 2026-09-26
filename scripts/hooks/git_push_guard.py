@@ -421,6 +421,87 @@ def _seg_dash_C(argv) -> str | None:
     return None
 
 
+#: Environment variables that choose git's repository or work tree. Matched as
+#: shell WORDS after quote removal — see :func:`_raw_sets_repo_env` for why a raw
+#: substring was the wrong grain.
+_GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+#: A word that assigns one of them (``NAME=``, ``NAME+=``) or names one bare, as
+#: ``export NAME``, ``read NAME`` and ``printf -v NAME`` do.
+_GIT_REPO_ASSIGN_RE = re.compile(r"^(?:" + "|".join(_GIT_REPO_VARS) + r")(?:\+?=|$)")
+
+#: git GLOBAL options that choose the repository or work tree. Each accepts both
+#: ``--opt=value`` and ``--opt value``, so the prefix match covers the glued form.
+_GIT_REPO_FLAGS = ("--git-dir", "--work-tree")
+
+
+def _raw_sets_repo_env(raw: str | None) -> bool:
+    """Whether a raw segment assigns (or names) a git repository variable.
+
+    Matched on shell WORDS after quote removal, never on a raw substring. MEASURED
+    against real bash, the raw-substring form got both directions wrong:
+
+    * it MISSED spellings bash accepts — ``export "GIT_DIR"=…``, ``GIT_D\\IR=…``,
+      ``read GIT_DIR``, ``printf -v GIT_DIR …``, ``GIT_DIR+=…`` — each of which
+      made git act on the other repository;
+    * it FIRED on text that is not an assignment at all, such as
+      ``git commit -m "fix GIT_DIR= parsing"`` — which then blocked an ordinary
+      merge and suppressed real findings in the privacy advisory.
+
+    After quote removal the first group all become a word matching
+    :data:`_GIT_REPO_ASSIGN_RE`, while a commit message stays one word that
+    starts with its own text. An unparseable segment fails closed.
+    """
+    if not raw:
+        return False
+    try:
+        words = shlex.split(raw, comments=True)
+    except ValueError:
+        return True
+    return any(_GIT_REPO_ASSIGN_RE.match(w) for w in words)
+
+
+def _seg_redirects_repo(argv, raw: str | None) -> bool:
+    """Whether a git segment is pointed at a repository by anything but cwd / ``-C``.
+
+    (``--work-tree`` / ``GIT_WORK_TREE`` on their own do NOT change which
+    repository git uses — MEASURED, ``HEAD`` is unchanged — so they are flagged
+    here as a conservative over-approximation, not because they redirect.)
+
+    ``_effective_cwd`` models where a command RUNS: the payload cwd, the last
+    ``cd``, a ``git -C``. git also lets a command act on a DIFFERENT repository
+    than the one it runs in — ``--git-dir`` / ``--work-tree``, or ``GIT_DIR`` /
+    ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` in the environment — and none of those
+    were modelled. So the guard resolved the branch, the push remote and the push
+    config from the checkout the command ran IN, while git published from the
+    one it was pointed AT.
+
+    MEASURED before this change, same target repository on ``main``, command run
+    from a checkout on a feature branch:
+
+        git -C <repo-on-main> push                      ask   (modelled)
+        git --git-dir=<repo-on-main>/.git … push        allow
+        GIT_DIR=<repo-on-main>/.git … git push          allow
+
+    This does not try to RESOLVE the redirected repository. Getting that right
+    means reimplementing git's discovery rules (``GIT_DIR`` relative to what,
+    ``core.worktree``, a gitfile, ``--work-tree`` without ``--git-dir``), and a
+    guard that half-models them is how this hole happened. The caller treats a
+    True here as an ambiguous working directory, which every consumer already
+    fails CLOSED on: a force push hard-blocks, a routine publish loses the
+    first-push relaxation and asks, a merge onto main blocks. These spellings are
+    rare in ordinary work, so the cost of refusing to classify them is small.
+
+    Scanning the whole argv rather than only the part before the subcommand is
+    deliberate: ``push`` and ``merge`` accept neither flag, so a later match
+    cannot be a legitimate option, and a position-aware scan would be one more
+    parser to get wrong.
+    """
+    for tok in argv or []:
+        if any(tok == f or tok.startswith(f + "=") for f in _GIT_REPO_FLAGS):
+            return True
+    return _raw_sets_repo_env(raw)
+
+
 def _cd_target(raw: str):
     """Classify a top-level command segment as a ``cd``.
 
@@ -495,12 +576,19 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         for raw in split_segments(cmd):
             if raw == target_raw:
                 break
+            # STICKY: an `export GIT_DIR=…` earlier in the command stays in force
+            # for everything after it, including after an absolute `cd` that would
+            # otherwise recover a known cwd. So it returns rather than setting cur.
+            if _raw_sets_repo_env(raw):
+                return _CWD_UNKNOWN
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
             elif cd is not None:
                 cur = _resolve_against(cur, cd)
     if seg is not None:
+        if _seg_redirects_repo(getattr(seg, "argv", None), getattr(seg, "raw", None)):
+            return _CWD_UNKNOWN
         dash_c = _seg_dash_C(getattr(seg, "argv", None))
         if dash_c is not None:
             return _resolve_against(cur, dash_c)
@@ -540,6 +628,7 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
+    repo_env_redirected = False  # sticky, for the same reason as in _effective_cwd
     for raw in split_segments(cmd):
         top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
         merge_here = next(
@@ -547,6 +636,12 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             None,
         )
         if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
+            # This walk resolves the repo itself rather than through
+            # `_effective_cwd`, so it carried the same hole: a merge pointed at a
+            # repository on main by --git-dir / GIT_DIR was checked against the
+            # checkout it ran in. Fail closed exactly as an unresolvable cwd does.
+            if repo_env_redirected or _seg_redirects_repo(merge_here.argv, raw):
+                return True
             dash_c = _seg_dash_C(merge_here.argv)
             mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
             if mcwd is _CWD_UNKNOWN:
@@ -554,6 +649,8 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
             if branch is None or branch in ("main", "master"):
                 return True  # None branch (error/unresolved) fails closed
+        if _raw_sets_repo_env(raw):
+            repo_env_redirected = True
         cd = _cd_target(raw)
         if cd is _CWD_UNKNOWN:
             cur = _CWD_UNKNOWN
