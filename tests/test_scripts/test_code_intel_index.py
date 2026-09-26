@@ -759,8 +759,26 @@ def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):
         },
     )
     assert res.returncode == 0, res.stderr
-    assert "MemoryMax=8G" in slog.read_text()
+    gn_calls = [line for line in slog.read_text().splitlines() if "MemoryMax=8G" in line]
+    assert len(gn_calls) == 2  # probe and workload
+    assert all("--slice-inherit" not in line for line in gn_calls)
     assert "gitnexus ARGS:analyze" in log.read_text()
+
+
+def test_both_tools_keep_distinct_slice_placement(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stdout + res.stderr
+    calls = slog.read_text().splitlines()
+    cbm = [line for line in calls if "MemoryMax=4G" in line]
+    gn = [line for line in calls if "MemoryMax=8G" in line]
+    assert len(cbm) == len(gn) == 2  # each leg's probe and workload
+    assert all("--slice-inherit" in line for line in cbm)
+    assert all("--slice-inherit" not in line for line in gn)
 
 
 def test_env_overrides_reach_scope(tmp_path):

@@ -618,25 +618,29 @@ fi
 _GN_SCOPE_OK=0
 _CBM_SCOPE_OK=0
 _probe_scope() {
-    /usr/bin/systemd-run --user --scope --slice-inherit --quiet \
+    local -a slice_args=()
+    [ "$2" = "cbm" ] && slice_args=(--slice-inherit)
+    /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
         -p "MemoryMax=$1" -p "MemorySwapMax=0" \
         -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
         -- /bin/true 2>/dev/null
 }
 if [ -x /usr/bin/systemd-run ]; then
     if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
-        _probe_scope "$GITNEXUS_MEM_MAX" && _GN_SCOPE_OK=1
+        _probe_scope "$GITNEXUS_MEM_MAX" gitnexus && _GN_SCOPE_OK=1
     fi
     if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-        _probe_scope "$CBM_MEM_MAX" && _CBM_SCOPE_OK=1
+        _probe_scope "$CBM_MEM_MAX" cbm && _CBM_SCOPE_OK=1
     fi
 fi
 
 _run_capped() {
     if [ "$_SCOPE_OK" = "1" ]; then
+        local -a slice_args=()
+        [ "${_CI_SCOPE_INHERIT:-0}" = "1" ] && slice_args=(--slice-inherit)
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a
         # deterministic name so the watchdog can freeze/thaw/stop it by unit.
-        /usr/bin/systemd-run --user --scope --slice-inherit --quiet \
+        /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
             ${_CI_SCOPE_UNIT:+--unit="$_CI_SCOPE_UNIT"} \
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
@@ -736,10 +740,12 @@ _watchdog() {
 _run_with_watchdog() {
     local label="$1"; shift
     local _SCOPE_OK="$_GN_SCOPE_OK"
+    local scope_inherit=0
     [ "$label" = "cbm" ] && _SCOPE_OK="$_CBM_SCOPE_OK"
+    [ "$label" = "cbm" ] && scope_inherit=1
     if [ "$_SCOPE_OK" = "1" ]; then
         local unit; unit="code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-12)-${label}-$$"
-        _CI_SCOPE_UNIT="$unit" _run_capped "$@" &
+        _CI_SCOPE_UNIT="$unit" _CI_SCOPE_INHERIT="$scope_inherit" _run_capped "$@" &
         local job_pid=$!
         _watchdog scope "$unit" "$job_pid"
         wait "$job_pid"; return $?
