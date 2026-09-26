@@ -67,8 +67,17 @@ def _eval_disallowed_tools() -> list[str]:
 
     ``Bash`` is deliberately RETAINED: the prompt shells out to ``yt-dlp`` /
     ``curl`` to fetch YouTube (and SSL-failing) inbox URLs. Relocating that fetch
-    into Python so ``Bash`` can also be denied is the remaining residual of
-    follow-up 727a3724 (the inbox judge's injection→RCE surface). Deriving from
+    into Python so ``Bash`` can also be denied is the remaining residual, tracked
+    as follow-up ``d83569bf`` — which REPLACES a citation of ``727a3724``, a row
+    that MEASURED zero rows in ``follow_ups`` on 2026-09-25. A comment asserting
+    that something is tracked, pointing at a record that no longer exists, is
+    worse than an untracked TODO: it stops the next reader from filing one.
+    Note what is NOT closed: ``invoker.py`` pins ``GH_TOKEN`` empty for every
+    dispatch, which removes the inherited-env route only. MEASURED: gh then falls
+    back to ``hosts.yml`` on disk, so this session still reaches the operator's
+    GitHub credential. An env pin cannot fix that while ``Bash`` is unrestricted
+    — the file is readable either way — which is why the remedy named above is
+    the remedy, and not a smaller one. Deriving from
     ``build_reflection_disallowed`` (live per call) means a genesis MCP write
     added in a future PR is auto-denied here with no code change.
 

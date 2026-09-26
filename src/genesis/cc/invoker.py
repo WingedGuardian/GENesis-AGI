@@ -304,11 +304,28 @@ def _sealed_gh_config_dir() -> str | None:
     even before that. MEASURED: auth still resolves, ordinary ``gh`` commands
     including live API calls still work, and both write paths return non-zero.
 
-    ``hosts.yml`` IS copied, because it is where the credential lives and gh
-    has no other way to find it. The copy is 0400 inside a 0500 directory owned
-    by this user — the same reachability as the original, which is 0600 in the
-    user's own home — so this moves a secret, it does not widen who can read
-    one. Say that plainly rather than leaving it implied.
+    NO CREDENTIAL IS COPIED, and that is deliberate. The seal is synthesised
+    end to end, so a session launched under it is UNAUTHENTICATED by
+    construction — MEASURED: ``gh auth status`` against this seal reports "not
+    logged into any GitHub hosts", against a control that authenticates.
+
+    Until 2026-09-25 this copied ``hosts.yml``, because that is where gh finds
+    the token. The argument was that the copy moves a secret rather than widening
+    who can read it, which is true and was the wrong question: it handed a
+    session that can be talked into running one ``gh`` command a credential with
+    MEASURED scopes ``delete_repo``, ``gist``, ``read:org``, ``repo``,
+    ``workflow`` ON THE INSTALL WHERE THAT WAS MEASURED — the scope list is a
+    property of one operator's ``gh auth login``, not of this code; what is
+    general is that whatever the operator holds, the session held too. A profile
+    whose whole point is that it reads EXTERNAL pull requests should not hold a
+    token that can delete repositories.
+
+    THERE IS NO ARMING PATH YET, and this comment deliberately does not pretend
+    otherwise. Removing the credential removes a capability the ``steward``
+    profile's own prompt still asks for (comment / reopen / close), which is
+    survivable only because that profile has never run — MEASURED: 0 rows in
+    ``cc_sessions`` for it. A deliberate operator grant is the follow-up work,
+    not something this change quietly provides.
 
     Returns the directory, or ``None`` when it cannot be prepared. The caller
     REFUSES TO LAUNCH on that; it is not a degraded mode, because the fallback
@@ -326,27 +343,17 @@ def _sealed_gh_config_dir() -> str | None:
     """
     target = _SEALED_GH_CONFIG_DIR
     try:
-        # gh's OWN precedence, from `gh help environment`: GH_CONFIG_DIR, then
-        # $XDG_CONFIG_HOME/gh, then ~/.config/gh. Implementing only the first
-        # and last builds a valid-LOOKING seal with no credential in it on any
-        # install that sets XDG_CONFIG_HOME — the session then launches
-        # unauthenticated and every gh call fails, which reads as a broken
-        # steward rather than as a missed config path.
-        _xdg = os.environ.get("XDG_CONFIG_HOME")
-        source = Path(
-            os.environ.get("GH_CONFIG_DIR")
-            or (Path(_xdg) / "gh" if _xdg else Path.home() / ".config" / "gh")
-        )
-        hosts = source / "hosts.yml"
-        desired = {
-            "config.yml": _SEALED_GH_CONFIG_YML,
-            # Absent when gh was never authenticated. Seal anyway: an
-            # unauthenticated session is no reason to leave the alias route
-            # open. Read INSIDE the try — an unreadable or non-UTF-8 hosts.yml
-            # would otherwise raise straight out of _build_env, past the
-            # fallback this function documents.
-            **({"hosts.yml": hosts.read_text(encoding="utf-8")} if hosts.is_file() else {}),
-        }
+        # ONE synthesised file, and nothing read from the operator's own gh
+        # config. There is therefore no source directory to resolve: the
+        # GH_CONFIG_DIR / $XDG_CONFIG_HOME/gh / ~/.config/gh precedence chain
+        # that used to live here existed only to locate `hosts.yml`, and went
+        # with the copy.
+        #
+        # EXISTING INSTALLS SELF-HEAL WITH NO MIGRATION STEP. `hosts.yml` is no
+        # longer in `desired`, so `_seal_matches` reports a mismatch on a seal
+        # that still holds one, and the stale sweep below unlinks the copied
+        # token on the next allowlisted launch.
+        desired = {"config.yml": _SEALED_GH_CONFIG_YML}
         if _seal_matches(target, desired):
             return str(target)
         # REWRITES ARE SERIALISED. The seal is one shared directory, and the
@@ -462,6 +469,17 @@ def _gh_hardening() -> dict[str, str] | None:
     — but gh executes them from INHERITED environment, so they are pinned
     rather than argued about.
 
+    ``GH_TOKEN`` IS PINNED EMPTY, and the reason is precedence rather than
+    tidiness. ``_build_env`` starts from an unfiltered ``dict(os.environ)``, and
+    gh resolves ``GH_TOKEN`` AHEAD of ``hosts.yml`` — MEASURED: a bogus
+    ``GH_TOKEN`` returns 401 against a perfectly good ``hosts.yml``. So an
+    operator who exports ``GH_TOKEN`` in their own shell would have it inherited
+    by the child and beat the credential-free seal entirely. MEASURED: gh reads
+    an EMPTY ``GH_TOKEN`` as UNSET, so pinning ``""`` neutralises an inherited
+    value without inventing one. It is pinned HERE as well as in ``_build_env``
+    so ``_assert_hardening_present`` enforces it fail-closed; a pin that only
+    lives in the builder is silently overridable by ``env_overrides``.
+
     MEASURED inert, and therefore deliberately NOT pinned: ``GH_PATH``. It
     tells gh where its own binary is, for extension callbacks. With a planted
     value an ordinary read still ran the real gh, and with extensions
@@ -489,6 +507,8 @@ def _gh_hardening() -> dict[str, str] | None:
         "EDITOR": "true",
         "GH_BROWSER": "true",
         "BROWSER": "true",
+        # Outranks the seal's (now absent) hosts.yml if inherited. See above.
+        "GH_TOKEN": "",
     }
 
 
@@ -1217,6 +1237,52 @@ class CCInvoker:
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        # NO DISPATCHED SESSION INHERITS A GITHUB CREDENTIAL FROM OUR OWN
+        # ENVIRONMENT. Pinned for EVERY invocation, not only gh-allowlisted
+        # ones: `bash_allowlist=` is set at exactly one call site in the tree,
+        # so every other dispatch takes the `()` default and skips the whole
+        # hardening block below — while `dict(os.environ)` above copies
+        # everything this process holds. MEASURED: gh reads an empty GH_TOKEN as
+        # UNSET, so this neutralises an inherited token without inventing one.
+        # `_gh_hardening` pins the same key for the allowlisted path, where
+        # `_assert_hardening_present` then enforces it fail-closed. The two agree
+        # on `""`, which is the ONLY value that launches today: that assertion
+        # recomputes the hardening and refuses on any difference, so an
+        # `env_overrides` GH_TOKEN is a REFUSAL, not an override. Any future
+        # arming therefore has to teach `_gh_hardening` the value — not slip one
+        # past it — and until that exists there is no arming path at all.
+        env["GH_TOKEN"] = ""
+        #
+        # AND THE PIN ABOVE CLOSES THE ENV ROUTE ONLY — read this before adding a
+        # stronger claim on top of it. MEASURED: with no GH_CONFIG_DIR pin, a
+        # session with `GH_TOKEN=""` is STILL FULLY AUTHENTICATED, because gh
+        # falls back to `hosts.yml` on disk. The deciding variable for
+        # de-authenticating a session is GH_CONFIG_DIR, and this function does
+        # NOT pin it outside the allowlisted path.
+        #
+        # That was deliberately NOT done here, and the reasons are worth keeping
+        # so the next attempt starts further along. Keying it on
+        # `origin == external_untrusted` looks tight and is not: MEASURED, that
+        # origin is produced for SIX dispatch profiles via `_PROFILE_ORIGIN`
+        # (campaign, community-responder, interact, mail, research, steward) and
+        # for every non-owner-attended CONVERSATION channel via
+        # `session_origin_for_channel` — dashboard, web, WhatsApp, voice, agent,
+        # OpenClaw, mail, and any unknown channel, which fails closed to it. A
+        # pin there would also have pointed `XDG_DATA_HOME`, a process-global
+        # base directory, at a read-only tree for ordinary dashboard sessions.
+        #
+        # And pinning the SEAL specifically is a fail-OPEN on exactly the
+        # installs that need it. REPRODUCED: with a pre-heal seal still holding
+        # a copied `hosts.yml`, a rewrite that fails before the stale sweep
+        # (unwritable parent, so the lock file cannot be opened) returns None —
+        # and a fallback that pins the seal path anyway points the session AT
+        # the credential rather than away from it.
+        #
+        # So the remaining exposure is the ON-DISK route for sessions that have
+        # Bash and no allowlist, and the honest fix is denying Bash on the one
+        # path that processes external content, not an env pin: unrestricted
+        # Bash can read the operator's config file whatever GH_CONFIG_DIR says,
+        # so a pin would remove AMBIENT authentication and never confinement.
         # Signal to SessionStart hooks that this is a Genesis-dispatched session.
         # The genesis_session_context.py hook skips identity injection when set,
         # preventing double injection (identity is in the system prompt arg).
