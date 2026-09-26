@@ -5061,6 +5061,81 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
     return latest
 
 
+_CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+_CODEX_SUMMARY_COMPLETED_RE = re.compile(
+    r"\|\s*✅\s*Completed\s*\|\s*\x60?([0-9a-fA-F]{7,40})\x60?\s*\|", re.IGNORECASE
+)
+
+
+def _codex_has_clean_reaction(pr_num: str, repo: str | None = None) -> bool:
+    """Whether Codex left its clean-review thumbs-up reaction on the PR."""
+    raw = os.environ.get("_TEST_GH_CODEX_REACTIONS")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/reactions",
+                    "--paginate", "--jq", ".[] | {login: .user.login, type: .user.type, content: .content}",
+                ],
+                capture_output=True, text=True, timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return False
+            raw = result.stdout
+        except Exception:
+            return False
+    for line in (raw or "").splitlines():
+        try:
+            obj = json.loads(line.strip())
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if (
+            (obj.get("login") or "") == _CODEX_REVIEW_BOT
+            and (obj.get("type") or "") == "Bot"
+            and (obj.get("content") or "") == "+1"
+        ):
+            return True
+    return False
+
+
+def _latest_codex_completed_summary_sha(pr_num: str, repo: str | None = None) -> str | None:
+    """Return the commit prefix from the latest completed Codex PR-open summary."""
+    raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
+                    "--paginate", "--jq", ".[] | {login: .user.login, type: .user.type, body: .body}",
+                ],
+                capture_output=True, text=True, timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
+        except Exception:
+            return None
+    latest = None
+    for line in (raw or "").splitlines():
+        try:
+            obj = json.loads(line.strip())
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if (obj.get("login") or "") != _CODEX_REVIEW_BOT or (obj.get("type") or "") != "Bot":
+            continue
+        body = obj.get("body") or ""
+        if _CODEX_SUMMARY_MARKER not in body:
+            continue
+        match = _CODEX_SUMMARY_COMPLETED_RE.search(body)
+        if match:
+            latest = match.group(1).lower()
+    return latest
+
+
 # ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
 # The ENFORCEMENT-HOOK surface is the code the merge/push/commit gates themselves
 # run on: an unreviewed change here disarms every other gate, so it gets stricter
@@ -6371,6 +6446,9 @@ def _check_codex_reviewed_head_core(
     # grinding surface (fixed head, bot-verified author); see the helper's docstring.
     clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
     if clean_short and head.startswith(clean_short):
+        return False, "", head
+    summary_short = _latest_codex_completed_summary_sha(pr_num, repo=repo)
+    if summary_short and head.startswith(summary_short) and _codex_has_clean_reaction(pr_num, repo=repo):
         return False, "", head
     if not reviewed:
         return (
@@ -11523,6 +11601,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             # Freshness satisfied by a clean Codex ISSUE-COMMENT at head (the review
             # object is absent or stale) — the allow path added in follow-up 7ff0fdc6.
             label = "ok (clean comment at head)"
+        elif (
+            _head_l is not None
+            and (_summary := _latest_codex_completed_summary_sha(pr_num, repo=repo))
+            and _head_l.startswith(_summary)
+            and _codex_has_clean_reaction(pr_num, repo=repo)
+        ):
+            label = "ok (completed PR-open summary at head)"
         elif _reviewed is None or _head is None:
             # A transiently-failed re-read must NOT read as "current" (Codex P2
             # #1373): the enforcement gate already passed, but the report must not

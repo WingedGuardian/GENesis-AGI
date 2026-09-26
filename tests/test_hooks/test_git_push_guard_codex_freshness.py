@@ -2972,3 +2972,49 @@ class TestEveryStatementIsCountedAndEveryUnscopedRowShown:
         msg = self._msg(monkeypatch, rows)
         assert "more)" not in msg, msg
         assert all(f"kind='bogus{i}'" in msg for i in range(8)), msg
+
+class TestPrOpenSummaryFreshness:
+    @staticmethod
+    def _summary(sha, *, login="chatgpt-codex-connector[bot]", user_type="Bot"):
+        tick = chr(96)
+        return json.dumps({
+            "login": login,
+            "type": user_type,
+            "body": "<!-- codex-pull-request-review-summary -->\n| Status | Commit | Trigger |\n| --- | --- | --- |\n| ✅ Completed | " + tick + sha + tick + " | PR opened |",
+        })
+
+    @staticmethod
+    def _thumb(*, login="chatgpt-codex-connector[bot]", user_type="Bot"):
+        return json.dumps({"login": login, "type": user_type, "content": "+1"})
+
+    def test_completed_summary_and_clean_reaction_at_head_allow(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(HEAD[:10]))
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
+        block, msg, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and msg == "" and head == HEAD
+
+    def test_summary_for_stale_head_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(STALE[:10]))
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+
+    def test_summary_without_clean_reaction_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(HEAD[:10]))
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", "")
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+
+    def test_spoofed_summary_author_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(HEAD[:10], login="attacker", user_type="User"))
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
+        block, _, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
