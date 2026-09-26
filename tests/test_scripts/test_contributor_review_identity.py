@@ -53,6 +53,19 @@ learned from a checker that lacked it:
   UNIQUENESS the post step and the eligibility producer are each required to
              be the only one of their kind, because both are identified by a
              string and the post step consumes the producer's output.
+  PLACEMENT  exactly two jobs. The token lives in a GitHub Environment that only
+             the post job names, so every other job resolves it as EMPTY -- a
+             boundary the PLATFORM enforces. `environment`, `needs` and `outputs`
+             are each permitted on one job with one exact value, and the post job
+             holds the post step alone and publishes nothing back.
+
+The first five levels were built against a MALICIOUS editor of this file. A
+premise review pointed out that `pull_request_target` runs the BASE ref's copy,
+so no outside author can edit what runs, and the enforceable hazard is a
+CARELESS maintainer edit -- which the checker, as then written, actively
+forbade the fix for: it listed "move the post step to its own job" as a breach.
+PLACEMENT reverses that. The allowlists stay as the reviewable statement of the
+intended shape; the environment is what now holds it when nobody reads them.
 
 Four rounds went into that list, and every round's finding was the SAME mistake
 in a new place: a set was enumerated instead of bounded. The reviewer supplied
@@ -69,7 +82,7 @@ be clean, and a deliberately broken copy must be caught. An assertion group
 that only ever sees a clean fixture passes just as well when it checks nothing.
 And where an assertion could be satisfied by a string that does not actually
 BIND the behaviour, it compares the whole value: `if: always()` fails a
-presence test, but `if: always() || steps.eligible.outputs.pr != ''` passes
+presence test, but `if: always() || needs.request-review.outputs.pr != ''` passes
 one while gating nothing, and only equality rejects both.
 
 What this file does NOT establish is in `_secret_locations` -- a lexical scan
@@ -129,7 +142,7 @@ _POST_STEP = "Post the review request under a maintainer identity"
 #:       github-actions[bot] -- silently recreating the defect this whole file
 #:       exists to prevent. A fallback is harmless in the token slot, where the
 #:       guard returns first, and guard-defeating in the env slot.
-#:   if: always() || steps.eligible.outputs.pr != ''
+#:   if: always() || needs.request-review.outputs.pr != ''
 #:       contains the gating token and gates nothing.
 #:
 #: An allowlist over VALUES has no expression surface left to attack. The cost
@@ -138,7 +151,43 @@ _POST_STEP = "Post the review request under a maintainer identity"
 #: checkpoint we want rather than a maintenance burden.
 _PERMITTED_TOKEN = "${{ secrets.REVIEW_REQUEST_TOKEN || github.token }}"
 _PERMITTED_MAINTAINER_ENV = "${{ secrets.REVIEW_REQUEST_TOKEN }}"
-_PERMITTED_GUARD = "steps.eligible.outputs.pr != ''"
+
+#: The two jobs, by name, and nothing else. The eligibility job decides; the post
+#: job holds the credential. Splitting them is what lets the PLATFORM keep the
+#: token out of the eligibility job — it lives in a GitHub Environment, and only a
+#: job that names that environment can resolve it at all.
+#:
+#: This check used to assert the opposite: a mutation that split the post step
+#: into its own job was listed as a BREACH. A premise review found that the
+#: checker therefore forbade its own best fix — it modelled a malicious editor of
+#: this file, when `pull_request_target` runs the BASE ref's copy and the
+#: enforceable adversary is a CARELESS one, whom an environment stops without
+#: anyone having to read the file correctly.
+_ELIGIBILITY_JOB = "request-review"
+_POST_JOB = "post-request"
+_PERMITTED_JOBS = frozenset({_ELIGIBILITY_JOB, _POST_JOB})
+
+#: The post JOB's gate, as a literal. It moved from the step to the job with the
+#: split: a step-level `if` inside the post job could only narrow a job that has
+#: already started, and `always() || …` would pass a presence test while gating
+#: nothing — so the post step may carry no `if` at all (see `_violations`).
+_PERMITTED_GUARD = "needs.request-review.outputs.pr != ''"
+
+#: The environment binding, whole. `deployment: false` is part of the literal: a
+#: job naming an environment otherwise creates a deployment record, which shows
+#: up in the contributor's PR timeline on every run. Branch policies still bind
+#: in that mode (GitHub docs, "Using environments without deployments").
+_PERMITTED_ENVIRONMENT = {"name": "review-request", "deployment": False}
+_PERMITTED_NEEDS = _ELIGIBILITY_JOB
+
+#: What crosses from the eligibility job to the post job: two integers, exactly.
+#: Job outputs are the ONLY dataflow channel between jobs, so bounding this
+#: mapping bounds everything the credential-bearing job can be handed — and the
+#: post job may declare no outputs at all, so nothing flows back out.
+_PERMITTED_OUTPUTS = {
+    "pr": "${{ steps.eligible.outputs.pr }}",
+    "issue": "${{ steps.eligible.outputs.issue }}",
+}
 
 #: The only step that may carry an `id`. A later step can read an earlier one's
 #: output, which is runtime dataflow and therefore invisible to any lexical
@@ -207,7 +256,21 @@ _SECRET_NAME = re.compile(
 #: `strategy`, `defaults`, `environment` and `outputs` were never considered at
 #: all. Anything not named here fails, so the next key GitHub adds fails too.
 _PERMITTED_JOB_KEYS = frozenset(
-    {"name", "runs-on", "if", "permissions", "steps", "timeout-minutes", "concurrency"}
+    {
+        "name",
+        "runs-on",
+        "if",
+        "permissions",
+        "steps",
+        "timeout-minutes",
+        "concurrency",
+        # Admitted for the environment split ONLY, and each is bounded below by
+        # WHICH job may carry it and by its exact VALUE — a key allowlist without
+        # a value bound is half a bound, as `runs-on` already showed.
+        "environment",
+        "needs",
+        "outputs",
+    }
 )
 
 #: Same reasoning one level up. The workflow level can also carry `env`,
@@ -240,8 +303,8 @@ _PERMITTED_WORKFLOW_KEYS = frozenset({"name", "on", "permissions", "concurrency"
 #: the correct amount of friction.
 _PERMITTED_POST_ENV = {
     "MAINTAINER_TOKEN": "${{ secrets.REVIEW_REQUEST_TOKEN }}",
-    "TARGET_PR": "${{ steps.eligible.outputs.pr }}",
-    "TARGET_ISSUE": "${{ steps.eligible.outputs.issue }}",
+    "TARGET_PR": "${{ needs.request-review.outputs.pr }}",
+    "TARGET_ISSUE": "${{ needs.request-review.outputs.issue }}",
 }
 
 #: Step keys are an allowlist for the same reason job keys are. `continue-on-error`
@@ -401,13 +464,66 @@ def _violations(doc: dict) -> list[str]:
         if not job.get("steps"):
             out.append(f"job-without-steps:{name}")
 
-    # The post step reads `steps.eligible.outputs.pr`, which only resolves
-    # WITHIN the job that declares that step. Split across jobs the expression
-    # is empty, the step never runs, and nothing is posted -- silently.
-    elig_jobs = {j for j, st in _all_steps(doc) if st.get("id") == "eligible"}
-    post_jobs = {j for j, st in _all_steps(doc) if st.get("name") == _POST_STEP}
-    if elig_jobs and post_jobs and not (elig_jobs & post_jobs):
-        out.append("post-step-in-a-different-job-than-eligibility")
+    # The JOB SET, as an allowlist: exactly the eligibility job and the post job.
+    jobs = _jobs(doc)
+    for name in jobs:
+        if name not in _PERMITTED_JOBS:
+            out.append(f"unpermitted-job:{name}")
+    for name in sorted(_PERMITTED_JOBS - set(jobs)):
+        out.append(f"job-missing:{name}")
+
+    # PLACEMENT and VALUE of the three split keys. Each is permitted on exactly
+    # one job, with exactly one value. `environment` is the credential boundary,
+    # so it is the one that must never appear on the eligibility job; `outputs`
+    # is the only inter-job dataflow channel, so the post job may not have one.
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if "environment" in job:
+            if name != _POST_JOB:
+                out.append(f"environment-on-a-non-post-job:{name}")
+            elif job["environment"] != _PERMITTED_ENVIRONMENT:
+                out.append(
+                    f"post-job-environment-is-not-the-permitted-value:{job['environment']!r}"
+                )
+        elif name == _POST_JOB:
+            out.append(f"post-job-environment-is-not-the-permitted-value:{None!r}")
+        if "needs" in job:
+            if name != _POST_JOB:
+                out.append(f"needs-on-a-non-post-job:{name}")
+            elif job["needs"] != _PERMITTED_NEEDS:
+                out.append(f"post-job-needs-is-not-the-permitted-value:{job['needs']!r}")
+        elif name == _POST_JOB:
+            out.append(f"post-job-needs-is-not-the-permitted-value:{None!r}")
+        if "outputs" in job:
+            if name != _ELIGIBILITY_JOB:
+                out.append(f"outputs-on-a-non-eligibility-job:{name}")
+            elif job["outputs"] != _PERMITTED_OUTPUTS:
+                out.append(
+                    f"eligibility-outputs-are-not-the-permitted-set:{sorted(job['outputs'] or {})}"
+                )
+        elif name == _ELIGIBILITY_JOB:
+            out.append("eligibility-outputs-are-not-the-permitted-set:[]")
+
+    # The gate lives on the post JOB, compared as a whole literal.
+    post_job = jobs.get(_POST_JOB)
+    if isinstance(post_job, dict) and str(post_job.get("if") or "").strip() != _PERMITTED_GUARD:
+        out.append("post-job-guard-is-not-the-permitted-expression")
+
+    # Each step in its own job, and the post job holds nothing but the post step.
+    for job_name, step in _all_steps(doc):
+        if step.get("id") == "eligible" and job_name != _ELIGIBILITY_JOB:
+            out.append(f"eligibility-step-not-in-the-eligibility-job:{job_name}")
+        if step.get("name") == _POST_STEP and job_name != _POST_JOB:
+            out.append(f"post-step-not-in-the-post-job:{job_name}")
+    if isinstance(post_job, dict):
+        others = [
+            s.get("name") or "<unnamed>"
+            for s in post_job.get("steps") or []
+            if not (isinstance(s, dict) and s.get("name") == _POST_STEP)
+        ]
+        if others:
+            out.append(f"post-job-has-other-steps:{others}")
 
     # The post step is identified BY NAME, so it has to be unique: a second
     # step wearing the same name would have its credential slots blessed by the
@@ -417,11 +533,11 @@ def _violations(doc: dict) -> list[str]:
         out.append(f"post-step-is-not-unique:{len(posts)}")
 
     # The eligibility PRODUCER must be unique too, and for the same reason the
-    # post step must be. `steps.eligible.outputs.pr` resolves against whichever
-    # step carries that id IN THE POST STEP'S OWN JOB, so a second job holding
-    # its own `id: eligible` beside a second pinned github-script satisfies the
-    # same-job check while the post step consumes an output the real predicate
-    # never produced.
+    # post step must be. The post job reads whatever job its `needs` names, so a
+    # second job holding its own `id: eligible` beside a second pinned
+    # github-script, re-pointed by `needs`, would hand the post step an output
+    # the real predicate never produced. (The `needs` value bound catches that
+    # re-pointing as well; this check names which producer was duplicated.)
     producers = [st for _j, st in _all_steps(doc) if st.get("id") == "eligible"]
     if len(producers) != 1:
         out.append(f"eligibility-step-is-not-unique:{len(producers)}")
@@ -518,8 +634,11 @@ def _violations(doc: dict) -> list[str]:
             env = env if isinstance(env, dict) else {}
             if str(env.get("MAINTAINER_TOKEN", "")).strip() != _PERMITTED_MAINTAINER_ENV:
                 out.append("post-step-maintainer-env-is-not-the-permitted-expression")
-            if str(step.get("if") or "").strip() != _PERMITTED_GUARD:
-                out.append("post-step-guard-is-not-the-permitted-expression")
+            if "if" in step:
+                # The gate is the post JOB's `if`. A step-level one can only
+                # narrow a job that already started, and `always() || …` would
+                # look like a gate while gating nothing — so none is permitted.
+                out.append("post-step-carries-its-own-if")
         else:
             if token:
                 # A secret on a non-post step is caught by location above,
@@ -679,16 +798,12 @@ def _token_is_the_default_token(doc):
 
 
 def _drop_the_eligibility_guard(doc):
-    for _j, step in _all_steps(doc):
-        if step.get("name") == _POST_STEP:
-            step.pop("if", None)
+    doc["jobs"][_POST_JOB].pop("if")
 
 
 def _neuter_the_guard_with_always(doc):
     """Non-empty, and the opposite of a gate -- the presence-test blind spot."""
-    for _j, step in _all_steps(doc):
-        if step.get("name") == _POST_STEP:
-            step["if"] = "always()"
+    doc["jobs"][_POST_JOB]["if"] = "always()"
 
 
 def _put_the_secret_in_the_eligibility_env(doc):
@@ -839,13 +954,16 @@ def _mutable_suffix_on_the_pinned_sha(doc):
 
 
 def _second_eligibility_producer_in_another_job(doc):
-    """The post step then consumes an output the real predicate never produced."""
-    original = _first_job(doc)["steps"]
-    post = [s for s in original if s.get("name") == _POST_STEP]
-    _first_job(doc)["steps"] = [s for s in original if s.get("name") != _POST_STEP]
-    fake = copy.deepcopy(original[0])
+    """The post job then consumes an output the real predicate never produced."""
+    fake = copy.deepcopy(doc["jobs"][_ELIGIBILITY_JOB]["steps"][0])
     fake["with"] = {"script": "core.setOutput('pr', '1'); core.setOutput('issue', '1')"}
-    doc["jobs"]["shadow"] = {"runs-on": "ubuntu-latest", "steps": [fake, *post]}
+    doc["jobs"]["shadow"] = {
+        "runs-on": "ubuntu-latest",
+        "outputs": dict(_PERMITTED_OUTPUTS),
+        "steps": [fake],
+    }
+    doc["jobs"][_POST_JOB]["needs"] = "shadow"
+    doc["jobs"][_POST_JOB]["if"] = "needs.shadow.outputs.pr != ''"
 
 
 def _bracket_secret_by_computed_name(doc):
@@ -898,7 +1016,7 @@ def _shared_with_mapping_via_anchor(doc):
 
 def _launder_the_token_through_a_step_output(doc):
     """No `secrets` reference anywhere on the receiving step."""
-    job = _first_job(doc)
+    job = doc["jobs"][_POST_JOB]
     for step in job["steps"]:
         if step.get("name") == _POST_STEP:
             step["id"] = "poster"
@@ -917,7 +1035,7 @@ def _launder_the_token_through_a_step_output(doc):
 
 def _duplicate_post_step_name(doc):
     """A second step wearing the post step name gets its slots blessed."""
-    job = _first_job(doc)
+    job = doc["jobs"][_POST_JOB]
     twin = copy.deepcopy(job["steps"][-1])
     twin["with"] = dict(twin["with"])
     twin["with"]["script"] = "core.info(process.env.BODY)"
@@ -928,9 +1046,7 @@ def _duplicate_post_step_name(doc):
 
 def _neuter_the_guard_with_always_or(doc):
     """Contains the gating token, short-circuits past it, gates nothing."""
-    for _j, step in _all_steps(doc):
-        if step.get("name") == _POST_STEP:
-            step["if"] = "always() || steps.eligible.outputs.pr != ''"
+    doc["jobs"][_POST_JOB]["if"] = f"always() || {_PERMITTED_GUARD}"
 
 
 def _repoint_the_guarded_secret(doc):
@@ -952,10 +1068,87 @@ def _job_level_container(doc):
     _first_job(doc)["container"] = {"image": "evil/image:latest"}
 
 
-def _split_post_into_another_job(doc):
-    post = [s for s in _first_job(doc)["steps"] if s.get("name") == _POST_STEP]
-    _first_job(doc)["steps"] = [s for s in _first_job(doc)["steps"] if s.get("name") != _POST_STEP]
-    doc["jobs"]["poster"] = {"runs-on": "ubuntu-latest", "steps": post}
+def _post_step_back_in_the_eligibility_job(doc):
+    """The PRE-rework shape: one job holding both the predicate and the token."""
+    post = doc["jobs"].pop(_POST_JOB)["steps"]
+    doc["jobs"][_ELIGIBILITY_JOB]["steps"].extend(post)
+
+
+def _environment_on_the_eligibility_job(doc):
+    """The credential boundary moved onto the job that runs author predicates."""
+    doc["jobs"][_ELIGIBILITY_JOB]["environment"] = dict(_PERMITTED_ENVIRONMENT)
+
+
+def _drop_the_environment(doc):
+    """With the repo-level secret gone this posts nothing; with it present, unscoped."""
+    doc["jobs"][_POST_JOB].pop("environment")
+
+
+def _environment_as_a_bare_name(doc):
+    """Valid Actions, and creates a deployment record on every contributor PR."""
+    doc["jobs"][_POST_JOB]["environment"] = "review-request"
+
+
+def _environment_that_creates_deployments(doc):
+    doc["jobs"][_POST_JOB]["environment"]["deployment"] = True
+
+
+def _another_environment(doc):
+    doc["jobs"][_POST_JOB]["environment"]["name"] = "production"
+
+
+def _outputs_from_the_post_job(doc):
+    """Dataflow OUT of the credential-bearing job."""
+    doc["jobs"][_POST_JOB]["outputs"] = {"t": "${{ steps.leak.outputs.t }}"}
+
+
+def _extra_eligibility_output(doc):
+    """A third value handed to the job that holds the token."""
+    doc["jobs"][_ELIGIBILITY_JOB]["outputs"]["body"] = "${{ github.event.pull_request.body }}"
+
+
+def _drop_the_eligibility_outputs(doc):
+    doc["jobs"][_ELIGIBILITY_JOB].pop("outputs")
+
+
+def _needs_on_the_eligibility_job(doc):
+    doc["jobs"][_ELIGIBILITY_JOB]["needs"] = _POST_JOB
+
+
+def _post_job_needs_nothing(doc):
+    doc["jobs"][_POST_JOB].pop("needs")
+
+
+def _step_level_if_on_the_post_step(doc):
+    for _j, step in _all_steps(doc):
+        if step.get("name") == _POST_STEP:
+            step["if"] = "always()"
+
+
+def _second_step_in_the_post_job(doc):
+    """A step beside the credential, reading nothing lexical — still forbidden."""
+    doc["jobs"][_POST_JOB]["steps"].insert(
+        0,
+        {
+            "name": "helper",
+            "uses": doc["jobs"][_POST_JOB]["steps"][0]["uses"],
+            "with": {"script": "core.info('hi')"},
+        },
+    )
+
+
+def _a_third_job(doc):
+    """Clean by every other rule: pinned action, no secret, no env. Still a job."""
+    doc["jobs"]["notify"] = {
+        "runs-on": "ubuntu-latest",
+        "steps": [
+            {
+                "name": "note",
+                "uses": doc["jobs"][_ELIGIBILITY_JOB]["steps"][0]["uses"],
+                "with": {"script": "core.info('hi')"},
+            }
+        ],
+    }
 
 
 def _widen_default_token(doc):
@@ -985,14 +1178,14 @@ def _drop_the_post_step(doc):
         (_post_as_bot, "post-step-uses-default-token"),
         (_token_not_from_secrets, "post-step-token-is-not-the-permitted-expression"),
         (_token_is_the_default_token, "post-step-token-is-not-the-permitted-expression"),
-        (_drop_the_eligibility_guard, "post-step-guard-is-not-the-permitted-expression"),
+        (_drop_the_eligibility_guard, "post-job-guard-is-not-the-permitted-expression"),
         (
             _neuter_the_guard_with_always,
-            "post-step-guard-is-not-the-permitted-expression",
+            "post-job-guard-is-not-the-permitted-expression",
         ),
         (
             _neuter_the_guard_with_always_or,
-            "post-step-guard-is-not-the-permitted-expression",
+            "post-job-guard-is-not-the-permitted-expression",
         ),
         (_widen_default_token, "default-token-write-scope:workflow:"),
         (_arm_the_eligibility_step, "non-post-step-holds-a-token:"),
@@ -1051,7 +1244,28 @@ def _drop_the_post_step(doc):
         (_reusable_workflow_job, "job-forwards-secrets:"),
         (_reusable_workflow_job, "job-without-steps:"),
         (_job_level_container, "job-declares-a-container:"),
-        (_split_post_into_another_job, "post-step-in-a-different-job-than-eligibility"),
+        (_post_step_back_in_the_eligibility_job, "post-step-not-in-the-post-job:"),
+        (_post_step_back_in_the_eligibility_job, "job-missing:post-request"),
+        (_environment_on_the_eligibility_job, "environment-on-a-non-post-job:"),
+        (_drop_the_environment, "post-job-environment-is-not-the-permitted-value:"),
+        (_environment_as_a_bare_name, "post-job-environment-is-not-the-permitted-value:"),
+        (
+            _environment_that_creates_deployments,
+            "post-job-environment-is-not-the-permitted-value:",
+        ),
+        (_another_environment, "post-job-environment-is-not-the-permitted-value:"),
+        (_outputs_from_the_post_job, "outputs-on-a-non-eligibility-job:"),
+        (_extra_eligibility_output, "eligibility-outputs-are-not-the-permitted-set:"),
+        (_drop_the_eligibility_outputs, "eligibility-outputs-are-not-the-permitted-set:"),
+        (_needs_on_the_eligibility_job, "needs-on-a-non-post-job:"),
+        (_post_job_needs_nothing, "post-job-needs-is-not-the-permitted-value:"),
+        (_step_level_if_on_the_post_step, "post-step-carries-its-own-if"),
+        (_second_step_in_the_post_job, "post-job-has-other-steps:"),
+        (_a_third_job, "unpermitted-job:notify"),
+        (
+            _second_eligibility_producer_in_another_job,
+            "post-job-needs-is-not-the-permitted-value:",
+        ),
     ],
 )
 def test_checker_catches_each_breach(mutate, expected_prefix):

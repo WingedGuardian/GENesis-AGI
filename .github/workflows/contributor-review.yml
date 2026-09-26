@@ -60,6 +60,24 @@ name: Contributor review trigger
 # value beyond an integer PR number. The eligibility step below runs on the
 # default `GITHUB_TOKEN`, which is now read-only.
 #
+# WHERE THE TOKEN LIVES IS ENFORCED BY THE PLATFORM, not by this file being read
+# carefully. It is stored ONLY as a secret of the `review-request` GitHub
+# Environment, and only the `post-request` job names that environment — so the
+# eligibility job, and any job added to this file later, resolves it as EMPTY
+# however it is spelled. The environment also admits only the `main` branch, so a
+# workflow edited on some other branch cannot claim it either. That matters
+# because `pull_request_target` runs the BASE ref's copy of this file: an outside
+# author cannot edit what runs, so the realistic hazard is a maintainer's own
+# careless edit, and a platform boundary stops that without anyone noticing it.
+# The test's allowlists remain as the reviewable description of the intended
+# shape; they are no longer the only thing holding it.
+#
+# ONE CONDITION KEEPS THAT TRUE: there must be NO repository-level (or
+# organization-level) secret named REVIEW_REQUEST_TOKEN. A job that names no
+# environment falls back to a secret of the same name at those levels, so
+# re-creating one there — say, while debugging — silently re-arms every job in
+# this file. Set or rotate the token ONLY in the `review-request` environment.
+#
 # The one-review-per-issue budget further down is a courtesy bound, not part of
 # this boundary: it reads author-mutable state and must never be relied on as a
 # control. Assignment is what holds.
@@ -140,6 +158,13 @@ jobs:
       github.event_name == 'label' ||
       (github.event.pull_request.head.repo.full_name != github.repository &&
        github.event.pull_request.draft == false)
+    # The decision leaves this job as two integers and nothing else. This job
+    # declares NO environment, so the environment-scoped maintainer token does not
+    # resolve here at all — `secrets.REVIEW_REQUEST_TOKEN` is empty in this job by
+    # construction, not by convention.
+    outputs:
+      pr: ${{ steps.eligible.outputs.pr }}
+      issue: ${{ steps.eligible.outputs.issue }}
     steps:
       - name: Decide whether this PR has earned an automatic review
         id: eligible
@@ -481,9 +506,38 @@ jobs:
             }
             core.info('No claimable PR/issue pair — no review requested.');
 
+  # The credential lives in its OWN job, bound to the `review-request` GitHub
+  # Environment, and that environment is the ONLY place the maintainer token is
+  # stored. Three properties follow from the platform rather than from anything
+  # this file has to be read carefully to see:
+  #
+  #   - Every OTHER job, including the eligibility job above, cannot resolve the
+  #     secret at all. It reads empty there however it is spelled.
+  #   - The environment admits the `main` branch only (a deployment-branch
+  #     policy on the environment). A workflow edited on any other branch that
+  #     names `review-request` is refused the secret. `pull_request_target` and
+  #     `issues` runs execute with the default branch as their ref, so the
+  #     legitimate path is unaffected.
+  #   - `deployment: false` borrows the environment's secrets without creating a
+  #     deployment record, so nothing appears in a contributor's PR timeline.
+  #     Branch policies still apply in that mode (GitHub docs, "Using
+  #     environments without deployments"); it is incompatible only with
+  #     App-based custom protection rules, which this environment does not use.
+  #
+  # The job receives the eligibility decision as two job outputs and nothing
+  # else, and publishes nothing back: it declares no `outputs`, so no value can
+  # leave the credential-bearing job by dataflow.
+  post-request:
+    runs-on: ubuntu-latest
+    needs: request-review
+    if: needs.request-review.outputs.pr != ''
+    environment:
+      name: review-request
+      deployment: false
+    steps:
       # The ONLY step that holds the maintainer token, and the only one that
       # writes. It decides NO eligibility: it posts a fixed string to an integer
-      # PR number the previous step already validated. Keep it that way — every
+      # PR number the eligibility job already validated. Keep it that way — every
       # line added here is a line running next to a privileged credential in a
       # `pull_request_target` context.
       #
@@ -508,7 +562,6 @@ jobs:
       #     read is an externally-influenced job failure. The comparison is a
       #     literal string match -- no eval, no interpolation, no shell.
       - name: Post the review request under a maintainer identity
-        if: steps.eligible.outputs.pr != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           # EVERYTHING the script reads arrives through env, never through a
@@ -523,8 +576,8 @@ jobs:
           # below octokit is constructed either way, and posting under the WRONG
           # identity is the exact defect this workflow exists to fix.
           MAINTAINER_TOKEN: ${{ secrets.REVIEW_REQUEST_TOKEN }}
-          TARGET_PR: ${{ steps.eligible.outputs.pr }}
-          TARGET_ISSUE: ${{ steps.eligible.outputs.issue }}
+          TARGET_PR: ${{ needs.request-review.outputs.pr }}
+          TARGET_ISSUE: ${{ needs.request-review.outputs.issue }}
         with:
           # The fallback keeps the step from failing to initialise when the secret
           # is unset. It is never used to post: the guard below returns first.
