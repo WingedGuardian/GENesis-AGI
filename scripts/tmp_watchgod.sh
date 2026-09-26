@@ -423,6 +423,56 @@ cc_tmp_headroom_mb() {
     echo "$(( capacity - used ))"
 }
 
+cc_control_plane_paths() {
+    # The CONCRETE directories CC binds its cross-session control plane under,
+    # one per line. ENUMERATED, never glob-matched — see below for why the glob
+    # this replaced was both too wide and, in one case, aimed at the wrong
+    # thing. READ from the shipped CC binary:
+    #
+    #   sockets : ${XDG_RUNTIME_DIR:-<os.tmpdir()>}/cc-socks/<pid>.sock, and
+    #             /tmp/cc-socks-<uid>/<pid>.sock when the first would exceed
+    #             the ~103-byte sockaddr_un limit;
+    #   daemon  : /tmp/cc-daemon-<uid>/<8-hex-of-cwd> — ALWAYS /tmp, never the
+    #             temp dir, so a cc-tmp-side cc-daemon rule protects nothing.
+    #
+    # THE FALLBACK CANNOT BE RESOLVED WITH ${XDG_RUNTIME_DIR:-...} HERE, and
+    # that is the trap this function exists to avoid. MEASURED on a live
+    # install: this daemon runs as a systemd user unit with
+    # XDG_RUNTIME_DIR=/run/user/<uid>, while a CC session under tmux has it
+    # UNSET and falls back to its TMPDIR — so both .../cc-tmp/cc-socks and
+    # /run/user/<uid>/cc-socks existed at once. Evaluating the default-expansion
+    # in THIS process resolves to the runtime dir and silently stops sparing the
+    # cc-tmp one, which is the only one inside the budget we sweep. Enumerate
+    # every candidate instead of computing one.
+    #
+    # /run/user/<uid> is deliberately absent: it is under neither sweep root, so
+    # no exclusion can matter there.
+    local uid
+    uid="$(id -u 2>/dev/null || echo 0)"
+    printf '%s\n' \
+        "$CC_TMP_DIR/cc-socks" \
+        "/tmp/cc-socks" \
+        "/tmp/cc-socks-${uid}" \
+        "/tmp/cc-daemon-${uid}"
+}
+
+cc_control_plane_excl() {
+    # Populate the array named by $1 with find(1) predicates sparing each
+    # control-plane directory AND its subtree.
+    local -n _cp_out="$1"
+    _cp_out=()
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        # The subtree clause is -type d SCOPED. Without it the exclusion also
+        # spares regular FILES inside the tree, which breaks the object-level
+        # contract test_red_reclaims_files_inside_socket_dir has pinned since
+        # the 2026-09-05 fix: a log file beside a socket is garbage, only the
+        # DIRECTORY is control plane. Sockets are already spared by -not -type s.
+        _cp_out+=( -not -path "$p" -not \( -type d -path "$p/*" \) )
+    done < <(cc_control_plane_paths)
+}
+
 reap_dir_sparing_sockets() {
     # Object-level deletion that NEVER removes unix sockets. CC binds one
     # socket per live session under cc-tmp (cross-session messaging); they are
@@ -433,7 +483,44 @@ reap_dir_sparing_sockets() {
     # stay non-empty so they survive; a dir holding no sockets is removed
     # entirely, exactly like rm -rf. -delete failures on non-empty dirs are
     # expected and suppressed; GNU find continues past them.
-    find "$1" -depth -not -type s -delete 2>/dev/null || true
+    #
+    # The socket predicate alone is not enough, because it only protects a
+    # directory that HAPPENS to hold a socket right now. An EMPTY sockets
+    # directory has nothing inside to keep it non-empty, so it is deleted —
+    # REPRODUCED: cc-socks and the daemon root both went, and only a
+    # socket-holding sibling survived.
+    #
+    # The exclusion is by EXACT PATH (cc_control_plane_paths), not by name
+    # glob, and both halves of that matter:
+    #
+    #   * `-name 'cc-socks*'` plus `-path '*/cc-socks*/*'` makes an UNBOUNDED
+    #     subtree immortal, because -path's `*` matches `/`. A directory called
+    #     cc-socks-backup or cc-socksomething would pin everything beneath it
+    #     against this sweep forever.
+    #   * `-name 'cc-daemon-*'` is worse than wide, it is WRONG: CC also calls
+    #     mkdtemp(os.tmpdir() + "cc-daemon-"), giving cc-daemon-<random> dirs
+    #     holding a single stderr.log. We still reclaim regular files, so the
+    #     glob would empty each one and then spare the husk permanently —
+    #     turning the empty-directory reaper into an empty-directory LEAKER,
+    #     one inode per daemon spawn.
+    #
+    # Sparing is DIRECTORY-scoped: a regular file inside the tree is still
+    # reclaimed, which is the object-level behaviour
+    # test_red_reclaims_files_inside_socket_dir pins. A log file beside a
+    # socket is garbage; a missing directory is a failed bind.
+    #
+    # Severity, stated precisely because it is easy to overstate: CC RECREATES
+    # a missing sockets directory on demand (mkdir 0700, ancestors included),
+    # so this is not a permanent outage. What it costs is a lost race — CC vets
+    # the path, then creates it, and a sweep landing between the two raises its
+    # "sockets base directory vanished while being set up" error, after which
+    # that session refuses to bind and runs with cross-session messaging off
+    # for its lifetime. It does not retry.
+    local -a _cp_excl=()
+    cc_control_plane_excl _cp_excl
+    find "$1" -depth -not -type s \
+        ${_cp_excl[@]+"${_cp_excl[@]}"} \
+        -delete 2>/dev/null || true
 }
 
 write_state() {
@@ -798,10 +885,19 @@ clean_cc_red() {
     # are 0 bytes: deleting them reclaims nothing and silently severs
     # cross-session messaging (measured, 2026-09-05 incident — this line's
     # absence is what made that invisible).
-    local sock_count
+    local sock_count cp_count
     sock_count=$(find "$CC_TMP_DIR" -type s 2>/dev/null | wc -l) || sock_count=0
-    if (( sock_count > 0 )); then
-        log INFO "RED preserved ${sock_count} unix socket(s) under cc-tmp — control plane, 0 bytes reclaimable"
+    # Count the control-plane DIRECTORIES too. The dangerous case this guard
+    # exists for is an EMPTY sockets directory — zero sockets — so a line
+    # conditioned on sock_count alone goes silent in exactly the situation it
+    # is meant to make visible, which is the same invisibility the comment
+    # above blames for the 2026-09-05 incident going unnoticed.
+    cp_count=0
+    while IFS= read -r _cp_dir; do
+        [[ -d "$_cp_dir" ]] && cp_count=$(( cp_count + 1 ))
+    done < <(cc_control_plane_paths)
+    if (( sock_count > 0 || cp_count > 0 )); then
+        log INFO "RED preserved ${sock_count} unix socket(s) and ${cp_count} control-plane dir(s) — 0 bytes reclaimable"
     fi
 
     # Kill ALL idle CC sessions (log each — so it's clear which terminals were reaped)
@@ -905,7 +1001,18 @@ clean_sys_yellow() {
     log INFO "Zone B YELLOW — cleaning /tmp files not accessed in 7+ days"
     find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +7 -delete 2>/dev/null || true
+    # /tmp is not a hypothetical home for CC's control plane: it is where the
+    # sockets path falls back when the primary would exceed the ~103-byte
+    # sockaddr_un limit, and it is where the background daemon ALWAYS lives
+    # (/tmp/cc-daemon-<uid>/...). An empty one is deleted by this sweep — the
+    # same defect as the Zone A reap, by a different route. Exclusions are
+    # exact paths for the reasons cc_control_plane_paths sets out; in
+    # particular a cc-daemon-* NAME glob would spare CC's mkdtemp scratch dirs
+    # forever and make this very sweep leak the inodes it exists to reclaim.
+    local -a _cp_excl=()
+    cc_control_plane_excl _cp_excl
     find /tmp -mindepth 1 -type d -empty -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" \
+        ${_cp_excl[@]+"${_cp_excl[@]}"} \
         -delete 2>/dev/null || true
 }
 

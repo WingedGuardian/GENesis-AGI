@@ -25,6 +25,7 @@ sessions.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -42,8 +43,7 @@ exit 0
 # post-cleanup re-measure; keep it tiny. Stub queue_alert so the
 # RED path's emergency alert becomes a log line instead of a real queue write.
 _PRELUDE = (
-    'CC_TMP_BUDGET_MB=4; '
-    'queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
+    'CC_TMP_BUDGET_MB=4; queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
 )
 
 
@@ -167,3 +167,244 @@ def test_orange_never_touches_old_socket_pin(tmp_path):
         "yellow/orange sweep deleted a socket"
     )
     assert not (cctmp / "claude-skills").exists(), "orange should evict the cache"
+
+
+# ── Control-plane TREES, not just the socket inodes ──────────────────────
+#
+# `-not -type s` protects a socket FILE. It cannot protect the DIRECTORY that
+# holds it, because a directory is not a socket — a sockets dir survives the
+# sweep only while something inside keeps it non-empty, i.e. by accident.
+# REPRODUCED against the unfixed predicate at both sites: an empty sockets
+# directory and an empty daemon root were deleted, and only a socket-holding
+# sibling survived.
+#
+# The exclusions are EXACT PATHS, not name globs. Two separate reasons, both
+# load-bearing and both pinned below:
+#   * a `-path '*/cc-socks*/*'` glob makes an unbounded subtree immortal
+#     (-path's `*` matches `/`), so any cc-socks-prefixed directory would pin
+#     everything beneath it against the watchdog forever;
+#   * `cc-daemon-*` is ALSO a CC mkdtemp prefix — cc-daemon-<random> holding a
+#     single stderr.log — so a name glob would empty each husk and then spare
+#     it permanently, making the empty-directory reaper leak inodes.
+
+
+def _uid() -> int:
+    return os.getuid()
+
+
+def _control_plane_tree(root: Path) -> None:
+    """The Zone A shapes the guard must keep. Only `cc-socks` is a real CC path
+    under the temp dir; the /tmp-only names are exercised by the Zone B arms."""
+    (root / "cc-socks").mkdir()  # bare: the empty-sockets-dir defect itself
+    (root / "cc-socks" / "nested").mkdir()  # subtree sparing
+    _mksock(root / "cc-socks-live" / "a.sock")  # the accidental-protection case
+
+
+def test_red_spares_an_empty_control_plane_tree(tmp_path):
+    """THE ACCEPTANCE BAR. The sockets directory survives RED with no socket
+    inside to keep it non-empty, and so does a directory beneath it."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _control_plane_tree(cctmp)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert (cctmp / "cc-socks").is_dir(), "RED deleted the empty sockets directory"
+    assert (cctmp / "cc-socks" / "nested").is_dir(), "RED deleted a dir inside the tree"
+    assert (cctmp / "cc-socks-live" / "a.sock").exists()
+
+
+def test_red_still_reaps_lookalikes_and_unrelated_dirs(tmp_path):
+    """The negative control, and it is what makes the guard EXACT rather than a
+    prefix match. Without it a guard that spared everything — or one that used
+    a `cc-socks*` glob — would pass every arm above.
+
+    `cc-socks-backup` is the concrete cost of the glob form: under it, that
+    directory and its whole subtree become permanently unreapable."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _control_plane_tree(cctmp)
+    (cctmp / "unrelated-empty").mkdir()
+    (cctmp / "cc-socks-backup" / "junk").mkdir(parents=True)
+    (cctmp / "cc-socksomething").mkdir()
+    # CC's own mkdtemp husk: cc-daemon-<random> holding one stderr.log. Under a
+    # `cc-daemon-*` name glob this is emptied and then spared forever.
+    (cctmp / "cc-daemon-Ab3xY9").mkdir()
+    (cctmp / "cc-daemon-Ab3xY9" / "stderr.log").write_bytes(b"e" * 512)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    for gone in ("unrelated-empty", "cc-socks-backup", "cc-socksomething", "cc-daemon-Ab3xY9"):
+        assert not (cctmp / gone).exists(), (
+            f"{gone} survived — the guard is a prefix match, not an exact path"
+        )
+    assert (cctmp / "cc-socks").is_dir(), "…and the acceptance bar was not vacuous"
+
+
+def test_red_spares_the_directory_but_not_a_file_inside_it(tmp_path):
+    """Sparing is DIRECTORY-scoped on purpose. A regular file inside the tree is
+    still reclaimed — the object-level contract
+    `test_red_reclaims_files_inside_socket_dir` pins with a socket present; this
+    arm pins it with no socket, where only the new guard keeps the parent."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    _control_plane_tree(cctmp)
+    stale = cctmp / "cc-socks" / "stale.log"
+    stale.write_bytes(b"j" * 4096)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert not stale.exists(), "a regular file inside the tree should be reclaimed"
+    assert (cctmp / "cc-socks").is_dir(), "…but its directory must survive"
+
+
+# ── The resolver itself, and the trap inside it ──────────────────────────
+
+
+def _resolve_paths(home: Path, bind: Path, cctmp: Path, extra_env=None) -> list[str]:
+    env_prefix = ""
+    if extra_env:
+        env_prefix = "".join(f"export {k}={v}; " for k, v in extra_env.items())
+    proc = _run(home, bind, _PRELUDE + env_prefix + "cc_control_plane_paths")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def test_control_plane_paths_cover_every_location_cc_can_bind(tmp_path):
+    """All four concrete paths, enumerated rather than computed from one
+    expression. CC picks between them from ITS environment, which is not this
+    daemon's."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    paths = _resolve_paths(home, bind, cctmp)
+    assert f"{cctmp}/cc-socks" in paths, paths
+    assert "/tmp/cc-socks" in paths, paths
+    assert f"/tmp/cc-socks-{_uid()}" in paths, paths
+    assert f"/tmp/cc-daemon-{_uid()}" in paths, paths
+
+
+def test_XDG_RUNTIME_DIR_does_not_displace_the_in_budget_sockets_dir(tmp_path):
+    """THE REGRESSION THIS ARM EXISTS FOR, and it is the reason the resolver is
+    a list rather than a `${XDG_RUNTIME_DIR:-$CC_TMP_DIR}/cc-socks` expression.
+
+    MEASURED on a live install: this daemon runs as a systemd user unit WITH
+    XDG_RUNTIME_DIR=/run/user/<uid>, while a CC session under tmux has it unset
+    and falls back to its TMPDIR — and both `<cc-tmp>/cc-socks` and
+    `/run/user/<uid>/cc-socks` existed at the same time. A default-expansion
+    evaluated in THIS process resolves to the runtime dir and silently stops
+    sparing the cc-tmp one, which is the only one inside the budget we sweep.
+    The simplification is tempting and this arm is what refuses it."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    paths = _resolve_paths(home, bind, cctmp, {"XDG_RUNTIME_DIR": str(runtime)})
+    assert f"{cctmp}/cc-socks" in paths, (
+        "XDG_RUNTIME_DIR displaced the in-budget sockets directory:\n" + "\n".join(paths)
+    )
+
+
+# ── Zone B: the same defect, reached through the /tmp sweeps ─────────────
+#
+# `clean_sys_yellow` hardcodes `/tmp`, so a behavioural arm would have to let
+# the function loose on live machine state. The repo's precedent for that case
+# is a structural arm. These go further: the exclusion argv is taken from the
+# script's OWN resolver at runtime and replayed against a sandbox, so a change
+# to the resolver changes what these arms do rather than leaving a hand-copied
+# duplicate behind.
+
+
+def _sweep_argv(home: Path, bind: Path) -> list[str]:
+    """`clean_sys_yellow`'s empty-directory sweep, with the script's own
+    control-plane exclusions expanded by the script itself."""
+    body = _WATCHGOD.read_text()
+    start = body.index("clean_sys_yellow() {")
+    fn = body[start : body.index("\n}\n", start)]
+    joined = fn.replace("\\\n", " ")
+    line = next(
+        (
+            s
+            for s in (ln.strip() for ln in joined.splitlines())
+            if s.startswith("find /tmp") and "-type d" in s and "-empty" in s
+        ),
+        None,
+    )
+    assert line is not None, f"no empty-directory sweep in clean_sys_yellow:\n{fn}"
+    assert "_cp_excl" in line, "the sweep no longer carries the control-plane exclusions"
+    # Let the SCRIPT expand its own exclusion array, rather than re-deriving it.
+    proc = _run(
+        home,
+        bind,
+        _PRELUDE + 'declare -a _e=(); cc_control_plane_excl _e; printf "%s\\n" "${_e[@]}"',
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    excl = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert excl, "the resolver produced no exclusions"
+    static = shlex.split(line.split("${_cp_excl")[0])
+    # Drop the shell tail if shlex swept one up; `find` would treat a
+    # redirection as a path operand, delete nothing, and make every assertion
+    # below a tautology.
+    return static + excl + ["-delete"]
+
+
+def test_zone_b_sweep_spares_the_control_plane_and_reaps_the_rest(tmp_path):
+    """/tmp is where CC's long-path sockets fallback lives, and where its
+    background daemon ALWAYS lives."""
+    root = tmp_path / "faketmp"
+    root.mkdir()
+    for name in ("cc-socks", f"cc-socks-{_uid()}", f"cc-daemon-{_uid()}"):
+        (root / name).mkdir()
+    (root / f"cc-daemon-{_uid()}" / "deadbeef").mkdir()
+    (root / "unrelated-empty").mkdir()
+    (root / "cc-daemon-Ab3xY9").mkdir()  # CC's mkdtemp husk — must still go
+
+    home, cctmp, bind = _sandbox(tmp_path)
+    argv = _sweep_argv(home, bind)
+    assert argv[1] == "/tmp", f"the sweep root is no longer /tmp: {argv[1]}"
+    # Rewrite BOTH the root and the absolute exclusion paths onto the sandbox.
+    # A relative root is used because `-path`'s `*` matches `/`, and pytest's
+    # basetemp is `.../pytest-of-<user>/...`, so `-not -path "*/pytest-*"` would
+    # otherwise be satisfied by the root's own path and exclude everything —
+    # deleting nothing and making every assertion here vacuous. (Production is
+    # unaffected: its root is literally /tmp.)
+    # The rewrite must produce RELATIVE exclusion paths, because `-path`
+    # compares against the path find builds from its starting point — and the
+    # starting point here is relative. An absolute exclusion silently matches
+    # nothing, and the sweep then deletes the very directories this arm is
+    # asserting it spares. (Caught by that assertion, which is the point of
+    # keeping the spare-list and the reap-list in one arm.)
+    argv = [root.name if a == "/tmp" else a.replace("/tmp/", f"{root.name}/", 1) for a in argv]
+    subprocess.run(argv, capture_output=True, cwd=root.parent)
+
+    for kept in (
+        "cc-socks",
+        f"cc-socks-{_uid()}",
+        f"cc-daemon-{_uid()}",
+        f"cc-daemon-{_uid()}/deadbeef",
+    ):
+        assert (root / kept).is_dir(), f"the Zone B sweep deleted {kept}"
+    for gone in ("unrelated-empty", "cc-daemon-Ab3xY9"):
+        assert not (root / gone).exists(), (
+            f"{gone} survived — the sweep deleted nothing, or the guard is a prefix match"
+        )
+
+
+def test_zone_b_sweep_still_calls_the_shared_resolver(tmp_path):
+    """Structural companion. The replay arm would keep passing if the
+    exclusions were dropped AND the sweep stopped deleting anything; this one
+    names the call, so the two fail for different reasons."""
+    body = _WATCHGOD.read_text()
+    start = body.index("clean_sys_yellow() {")
+    fn = body[start : body.index("\n}\n", start)]
+    assert "cc_control_plane_excl" in fn, (
+        "clean_sys_yellow no longer builds the control-plane exclusions"
+    )
+    # Strip comments first: this function's rationale block NAMES the glob
+    # forms it rejects, and a naive substring scan reads its own explanation as
+    # a regression.
+    code = "\n".join(ln for ln in fn.splitlines() if not ln.lstrip().startswith("#"))
+    assert "cc-socks*" not in code and "cc-daemon-*" not in code, (
+        "a name GLOB is back in the Zone B sweep; it makes an unbounded subtree "
+        "immortal and spares CC's mkdtemp husks forever"
+    )
