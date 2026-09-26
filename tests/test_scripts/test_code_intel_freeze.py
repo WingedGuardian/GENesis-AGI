@@ -147,18 +147,19 @@ def test_armed_freeze_holds_runner_self_lock(tmp_path):
         fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def test_entrypoint_proceeds_after_disarm(tmp_path):
-    """Once the freeze is stopped, the entrypoint indexes normally (rc=0)."""
+def test_entrypoint_reaches_scope_admission_after_disarm(tmp_path):
+    """Disarming releases the lock; missing containment then refuses Codebase."""
     repo = _make_repo(tmp_path)
     logfile = tmp_path / "freeze.log"
-    # Fake cbm so a real index "runs" without systemd or the real binary.
+    # A fake binary proves the post-lock path reached Codebase admission.
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     toollog = tmp_path / "tool.log"
     _write_exec(
         fakebin / "codebase-memory-mcp", f'#!/usr/bin/env bash\necho "ran:$*" >> "{toollog}"\n'
     )
-    # Minimal PATH (no systemd-run) → rlimit fallback path actually invokes the tool.
+    # Minimal PATH omits optional utilities; Codebase must still refuse when
+    # the real bounded systemd scope is unavailable, never use rlimit fallback.
     minbin = tmp_path / "minbin"
     minbin.mkdir()
     for tool in (
@@ -181,7 +182,7 @@ def test_entrypoint_proceeds_after_disarm(tmp_path):
     path = f"{fakebin}:{minbin}"
 
     proc = _arm_freeze(tmp_path, repo, logfile)
-    _disarm(proc)  # disarm immediately, then the entrypoint should proceed
+    _disarm(proc)  # disarm immediately, then the entrypoint should reach admission
 
     env = {
         "PATH": path,
@@ -200,8 +201,10 @@ def test_entrypoint_proceeds_after_disarm(tmp_path):
         text=True,
         timeout=30,
     )
-    assert res.returncode == 0, f"{res.returncode}: {res.stdout}{res.stderr}"
-    assert "ran:" in toollog.read_text(), "fake cbm did not run after disarm"
+    assert res.returncode == 3, f"{res.returncode}: {res.stdout}{res.stderr}"
+    assert "cannot establish a bounded systemd user scope" in res.stdout
+    assert "lock held" not in res.stdout, "freeze lock remained held after disarm"
+    assert not toollog.exists(), "uncontained fake Codebase index ran after disarm"
 
 
 # ── template sanity ────────────────────────────────────────────────────────

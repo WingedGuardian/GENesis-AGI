@@ -414,6 +414,8 @@ async def _impl_web_search(
     query: str,
     backend: str = "auto",
     max_results: int = 10,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     """Search the web and return structured results."""
     if not query or not query.strip():
@@ -529,10 +531,18 @@ async def _impl_web_search(
             from genesis.providers.exa_adapter import ExaAdapter
 
             adapter = ExaAdapter()
-            result = await adapter.invoke({
+            exa_request: dict = {
                 "query": query,
                 "num_results": max_results,
-            })
+            }
+            # Only forward a domain filter when the caller actually set one —
+            # the adapter branches on truthiness, so passing an empty list here
+            # would be indistinguishable from omitting it and just adds noise.
+            if include_domains:
+                exa_request["include_domains"] = include_domains
+            if exclude_domains:
+                exa_request["exclude_domains"] = exclude_domains
+            result = await adapter.invoke(exa_request)
             latency = (time.monotonic() - start) * 1000
 
             if not result.success:
@@ -628,6 +638,8 @@ async def web_search(
     query: str,
     backend: str = "auto",
     max_results: int = 10,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
 ) -> dict:
     """Search the web and return structured results.
 
@@ -652,8 +664,19 @@ async def web_search(
     Use CC WebSearch for quick general lookups in foreground sessions.
     Use "perplexity" backend when you need a synthesized multi-source answer.
     Use "exa" backend for conceptual/semantic discovery.
+
+    include_domains / exclude_domains: restrict results to (or away from) the
+    given hosts, e.g. include_domains=["github.com"] to search GitHub
+    semantically when you cannot name the code pattern to grep for.
+    EXA ONLY — every other backend ignores them silently. That is a limit of
+    OUR adapters, not of the services: Tavily's API, for one, supports domain
+    filtering and `TavilyAdapter` simply does not surface it. So passing these
+    with backend="auto" does nothing; set backend="exa" explicitly when you
+    need the filter to bind, and do not read the silence as "unsupported".
     """
-    return await _impl_web_search(query, backend, max_results)
+    return await _impl_web_search(
+        query, backend, max_results, include_domains, exclude_domains
+    )
 
 
 @mcp.tool()

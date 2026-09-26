@@ -1130,6 +1130,12 @@ if command -v claude &>/dev/null; then
     fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+    # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
+    # repos. Registered under a Genesis-owned name, not the generic `grep`, so
+    # an operator's own grep server is never touched.
+    # No API key and no local binary, so nothing to gate on `command -v`: it is
+    # a remote endpoint. User scope so worktree sessions get it too.
+    _register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 fi
 
 # Queue initial code intelligence indexing — write an index-request marker for
@@ -1618,8 +1624,9 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
     echo "    + Suppressed CC native installer prompt (npm-only)"
 fi
 
-# Seed user-level ~/.claude/settings.json with two CC defaults: (1) suppress the
-# auto-updater, and (2) Genesis's subagent-nesting depth. CC 2.1.217+ made nested
+# Seed user-level ~/.claude/settings.json with CC defaults: (1) suppress the
+# auto-updater, (2) Genesis's subagent-nesting depth, and (3) the claude.ai
+# skills/plugins sync opt-out (both keys). CC 2.1.217+ made nested
 # subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
 # (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
 # Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
@@ -1634,7 +1641,17 @@ _settings_file="$HOME/.claude/settings.json"
 #     genesis-cc-settings-align timer re-run, so setup and steady state cannot
 #     drift apart);
 #   * the container-only subagent-nesting default is SET IF ABSENT, so a
-#     deliberate operator override (0 to disable, or higher) is preserved.
+#     deliberate operator override (0 to disable, or higher) is preserved;
+#   * syncClaudeAiSkills / syncClaudeAiPlugins are SET IF ABSENT to false (CC
+#     2.1.275+ top-level booleans, hence the `top:` form): claude.ai account
+#     skills and plugins would otherwise sync into EVERY Claude Code session on
+#     this machine (user-level settings), outside the repo's review and
+#     skill-catalog paths. Note CC's own semantics for turning it off: skills
+#     ALREADY synced are moved to ~/.claude/skills/.trash at the next launch
+#     (deleted after cleanupPeriodDays; re-downloaded, not restored, on re-enable)
+#     — so on a machine that had synced them, this default retires them. An
+#     operator who wants the sync sets either key to true and this never touches
+#     it again.
 # One call so BOTH policies share a single write contract (mode/xattr carry-over,
 # compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
 # it. Note what this does NOT claim: on a fresh install the file is still touched
@@ -1645,7 +1662,8 @@ _settings_file="$HOME/.claude/settings.json"
 # rewrites settings.json), not this ordering.
 # (The host VM's recovery `claude -p` is single-brain and never nests, so
 # host-setup.sh deliberately passes no nesting default.)
-if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
+if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2" \
+        "top:syncClaudeAiSkills=false" "top:syncClaudeAiPlugins=false"; then
     # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
     # "verified" is finally true here. The nesting default is deliberately not
     # claimed on this line: on the python3-less create path it is NOT applied
@@ -1655,7 +1673,8 @@ if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAW
 else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
-    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"},"
+    echo "                   \"syncClaudeAiSkills\": false, \"syncClaudeAiPlugins\": false}"
     setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 

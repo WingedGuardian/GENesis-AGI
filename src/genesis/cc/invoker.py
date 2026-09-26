@@ -8,6 +8,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -46,6 +47,44 @@ from genesis.util.proc_kill import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# From CC 2.1.277 a headless resume RESTORES the CC session's saved totals — its
+# changelog: a resume no longer starts "the session's cost and usage totals at
+# zero; headless sessions now save their totals at exit". So a resumed `-p` call
+# reports `total_cost_usd` (and `modelUsage`) as running totals for the whole CC
+# session, while `usage` tokens stay per call. MEASURED on 2.1.280 across a
+# resumed haiku -> haiku -> sonnet session: totals 0.0383 -> 0.0421 -> 0.1475,
+# the earlier model's entry carried over, the session id unchanged. Nothing in the
+# result itself marks the change: `num_turns` is 1 every call, there is no version
+# field, and the switched-to model's own entry starts at this call's tokens — so
+# the VERSION, which is what defines the behaviour, is the signal.
+_CC_CUMULATIVE_COST_SINCE = (2, 1, 277)
+_CC_VERSION_RE = re.compile(r"\s*(\d+)\.(\d+)\.(\d+)")
+# After a failed `claude --version` read, how long before the same binary is
+# asked again. The read sits on the turn path (CCInvoker._cc_version), so a CLI
+# that HANGS on --version would otherwise hold every reply for the full 15 s
+# timeout; with this, at most one reply per 10 minutes pays it. A transient
+# failure recovers within the same window, and a replaced binary is a new key
+# and is read at once.
+_CC_VERSION_RETRY_S = 600.0
+
+
+def parse_cc_version(text: str) -> tuple[int, int, int] | None:
+    """Parse the leading ``X.Y.Z`` of ``claude --version`` output, else None."""
+    m = _CC_VERSION_RE.match(text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def cost_is_cumulative_for(version: tuple[int, int, int] | None) -> bool:
+    """Whether a CC of this version reports a resumed session's running totals.
+
+    True on a FRESH session too, which is harmless: its first running total is
+    its own cost, and ``cc_sessions.record_turn_cost`` keys its cursor by CC
+    session, so a new session is never diffed against an old one. An unknown
+    version reads as False — the additive reading CC used before 2.1.277.
+    """
+    return version is not None and version >= _CC_CUMULATIVE_COST_SINCE
 
 
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
@@ -831,6 +870,13 @@ class CCInvoker:
         self._last_was_error = False
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
+        # `claude --version` per binary FILE identity — see _cc_version. Per
+        # instance, never module-global: a module cache would let one invoker's
+        # answer (or a test's) stand in for another's binary.
+        self._cc_versions: dict[tuple[str, int, int], tuple[int, int, int]] = {}
+        self._cc_version_failed_at: dict[tuple[str, int, int], float] = {}
+        self._cc_version_warned: set[tuple[str, int, int] | str] = set()
+        self._clock: Callable[[], float] = time.monotonic  # injectable for tests
 
         # Advisory check — warn early if the CLI binary is not findable.
         resolved = shutil.which(claude_path)
@@ -843,6 +889,78 @@ class CCInvoker:
                 "~/.npm-global/bin is on PATH.",
                 claude_path,
             )
+
+    async def _cc_version(self) -> tuple[int, int, int] | None:
+        """The version of the CC binary this invoker runs, or None if unreadable.
+
+        Keyed by the resolved file's (path, inode, mtime), so an update that
+        replaces the binary under a running server is read afresh, and read once
+        per file otherwise. A failed read is not cached for good — one bad moment
+        must not pin a long-lived server to the additive path — but it is not
+        retried for ``_CC_VERSION_RETRY_S`` either, and it warns once per file.
+
+        Runs via ``subprocess.run`` in a thread rather than the asyncio spawner,
+        which tests patch to impersonate a CC run. The 15 s bound: this runs on
+        the turn path after the answer is in hand, so a CLI that hangs on
+        ``--version`` holds that reply until the bound (``claude --version``
+        measured 25 ms on 2.1.280). The retry cooldown limits that to one reply
+        per window; the answer itself is never lost, only its cost reading
+        degrades to additive.
+        """
+        resolved = shutil.which(self._claude_path)
+        if not resolved:
+            self._warn_version_once(self._claude_path, "binary not found")
+            return None
+        real = os.path.realpath(resolved)
+        try:
+            st = os.stat(real)
+        except OSError as exc:
+            self._warn_version_once(real, f"stat failed: {exc}")
+            return None
+        key = (real, st.st_ino, st.st_mtime_ns)
+        cached = self._cc_versions.get(key)
+        if cached is not None:
+            return cached
+        failed_at = self._cc_version_failed_at.get(key)
+        if failed_at is not None and self._clock() - failed_at < _CC_VERSION_RETRY_S:
+            return None
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [resolved, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._cc_version_failed_at[key] = self._clock()
+            self._warn_version_once(key, f"{type(exc).__name__}: {exc}")
+            return None
+        version = parse_cc_version(proc.stdout) if proc.returncode == 0 else None
+        if version is None:
+            self._cc_version_failed_at[key] = self._clock()
+            self._warn_version_once(
+                key, f"exit {proc.returncode}, stdout {proc.stdout.strip()[:80]!r}"
+            )
+            return None
+        self._cc_versions[key] = version
+        return version
+
+    def _warn_version_once(self, key: tuple[str, int, int] | str, why: str) -> None:
+        if key in self._cc_version_warned:
+            return
+        self._cc_version_warned.add(key)
+        logger.warning(
+            "Could not read the CC version (%s) — recording resumed-turn cost "
+            "ADDITIVELY, which over-counts on CC 2.1.277+ (cost is display-only)",
+            why,
+        )
+
+    async def _with_cost_semantics(self, output: CCOutput) -> CCOutput:
+        """Stamp whether ``output.cost_usd`` is a running total (see
+        ``cost_is_cumulative_for``). The one place the flag is set."""
+        return replace(output, cost_is_cumulative=cost_is_cumulative_for(await self._cc_version()))
 
     @property
     def working_dir(self) -> str | None:
@@ -1801,6 +1919,7 @@ class CCInvoker:
             raise err
 
         output = self._parse_output(stdout.decode(errors="replace"), invocation, elapsed)
+        output = await self._with_cost_semantics(output)
         if _stderr_bg_truncated(stderr.decode(errors="replace")):
             output = replace(output, bg_truncated=True)
             logger.warning(
@@ -2292,6 +2411,7 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            output = await self._with_cost_semantics(output)
             # () is a real report ("the runtime watched and saw no tool_use"),
             # distinct from None ("nothing watched"). A `if tools_seen:` guard
             # here would silently downgrade the former to the latter on every
@@ -2523,12 +2643,18 @@ class CCInvoker:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
-        # modelUsage lists EVERY model the session touched, including CC's
-        # auxiliary haiku calls (title/topic generation) — and dict order is
+        # modelUsage lists EVERY model the session touched, and dict order is
         # not tier order. Taking the first key false-positived downgrade
-        # detection whenever an auxiliary call was listed before the main
-        # model (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session).
-        # The MAIN conversation model is the highest tier present.
+        # detection whenever another model was listed before the main one
+        # (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session, where the
+        # haiku row was CC's auxiliary title/topic call). CC 2.1.277 dropped
+        # that auxiliary row from `-p` output (measured 2026-09-22), but the
+        # dict still carries SUBAGENT models — a sonnet session that spawns a
+        # haiku subagent lists both. Taking the highest tier is right for a
+        # FRESH call. It is NOT right for a RESUMED one on 2.1.277+: resume
+        # restores every earlier model's entry (measured 2026-09-26 across a
+        # haiku -> sonnet switch), so a higher tier used earlier in the session
+        # wins over this call's own model — issue #2391.
         model_name = (
             max(
                 model_usage,
@@ -2540,6 +2666,9 @@ class CCInvoker:
             if model_usage
             else str(inv.model)
         )
+        # `cost_is_cumulative` is NOT decided here: the result carries no signal
+        # for it (see _CC_CUMULATIVE_COST_SINCE), so the run paths stamp it from
+        # the CC version via _with_cost_semantics.
         downgraded = self._detect_downgrade(inv.model, model_name)
         if downgraded:
             logger.warning(

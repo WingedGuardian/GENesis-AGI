@@ -316,6 +316,16 @@ returned 0 in-server and **three** features shipped green but inert since
 July; the module's docstring claim "same-uid reads succeed" was a shell-tested
 falsehood. The fix routed around the ptrace-gated read entirely.)
 
+**And when the work is done, audit the CLAIMS as well as the outcome.**
+Everything above distrusts a VERIFICATION; the companion failure is the
+SENTENCES you wrote about the work — a number in a commit message, a docstring's
+assertion, an in-thread reply saying a finding is fixed. A green suite says
+nothing about any of them, and permanent record has no tone of voice, so the
+next session reads a confident sentence as a measured one. Those surfaces are
+ENUMERABLE, which makes the check mechanical rather than a mood.
+`references/high-stakes-verification.md` §11 carries the canonical surface list
+and the walk; do not keep a second copy of that list here.
+
 ### Verify BEFORE the PR, when this install can show it (standing user rule, 2026-09-24)
 
 A cloud agent has to ship straight to a PR, so review is its first real test.
@@ -2520,16 +2530,32 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   same-model reviews (genesis-architect / genesis-security / any subagent) are NOT
   rounds — they never move the machine counter (see "THE COUNTER IS CROSS-MODEL ONLY"
   below) and must not be counted in the visible tally either, or a session re-creates the
-  very false-stop this is meant to remove. A cloud-bot (Codex) re-review round counts; a
+  very false-stop this is meant to remove.
+
+  ⚠ **CALL AN INTERNAL AUDIT A "PASS", NEVER A ROUND — including in your own
+  evidence file and your own prose.** The word is reserved for the counted thing,
+  and nothing enforces that, so it is on you. MEASURED 2026-09-25: a session ran
+  three internal architect audits, headed them `ROUND 1` / `ROUND 2` / `ROUND 3` in
+  its evidence file, and then told the owner its PR was "at round 4 with four
+  reviewed heads". `scripts/review_budget.py --repo <r> --pr <n>` said `count=1,
+  next_round=2`. It had been counting its own passes — the very thing this
+  definition excludes — and built a process question on the wrong number. **Never
+  state a round number you have not just read out of `review_budget.py`**; your own
+  tally is not a source, and `review_state.py mark` prints "internal review —
+  cross-model streak unchanged" precisely so you cannot mistake one for the other. A cloud-bot (Codex) re-review round counts; a
   locally-run non-Anthropic reviewer (the install's configured secondary) counts. The
   cap is enforced by three
   mechanics, not by vibes:
-  1. **Visible round counter.** From the first EXTERNAL round, the plan file (or task
-     list) carries `Cross-model rounds: N (cap 3)`, updated every external cycle. Rounds
-     are a tracked artifact — "it's the same class, it doesn't really count" is exactly
+  1. **Visible streak counter.** From the first EXTERNAL round, the plan file (or task
+     list) carries `Cross-model streak: N (cap 3)`, updated every external cycle. It
+     counts consecutive defect-bearing external rounds for this cap — a STREAK
+     POSITION, never a round NUMBER. Round numbers come only from
+     `review_budget.py`'s reviewed-head count, and the two differ (a locally run
+     secondary advances the streak without adding a reviewed head). The streak is a tracked artifact — "it's the same class, it doesn't really count" is exactly
      the rationalization the counter exists to kill (for a repeat EXTERNAL round).
   2. **The block point is BEFORE dispatching the next review.** The check is
-     "am I about to trigger round 4+?" — evaluated at the mechanical moment
+     "am I about to trigger a 4th consecutive defect-bearing external round
+     (streak at the cap)?" — evaluated at the mechanical moment
      (the `@codex review` comment, the reviewer dispatch — NOT the push itself,
      which triggers nothing TODAY — an owner-tunable
      setting, so verify at the PR rather than trusting this clause), never after
@@ -2597,9 +2623,17 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   Codex clean-review comments, and the configured external review identity all collapse
   to one round when they name the same commit. Ordinary PRs carry standing authorization
   through four reviewed heads. Starting with the fifth review request or the fix commit
-  after four reviewed heads, every action needs its own native user approval. At five
-  completed reviewed heads, round 6 and later are strongly discouraged: stop, narrow or
-  redesign, accept documented residue, or abandon before asking to continue.
+  after four reviewed heads, every action needs its own native user approval.
+
+  **ROUND 4 IS TERMINAL (owner ruling, 2026-09-25).** There is no ordinary round 5.
+  At four reviewed heads the decision is not "another round" — it is MERGE, with the
+  outstanding issues accepted and FILED, or SEND IT BACK for rework. A fifth round
+  exists only where the owner explicitly authorizes one, and that authorization is
+  re-asked EVERY subsequent round, each of which is equally terminal and faces the
+  same decision. Earlier text here read "round 6 and later are strongly discouraged",
+  which invited a session to treat round 5 as ordinary; the discouragement was never
+  meant as a softer tier but as the mechanism that stops an authorized fifth round
+  coasting into a sixth unasked.
 
   This approval is never a shell sigil and is never persisted. `# escalation-ack` still
   serves the local round-3 intervention; `# final-round-accept` is legacy syntax and
@@ -2642,8 +2676,13 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `review_state.py` still keeps the local `round` streak and legacy lifetime
   fields for stale-worktree compatibility. Current authorization uses
   `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot
-  only for the round-2/round-3 interventions. `FINAL_ROUND_CAP = 7` and the old lifetime
-  APIs remain import-compatible but current gates do not consult them.
+  only for the round-2/round-3 interventions. The old lifetime APIs remain
+  import-compatible but current gates do not consult them. `FINAL_ROUND_CAP` is
+  **DELETED** (2026-09-25) — it was consulted by no gate, in zero conditionals, while
+  its value had been picked to avoid colliding with the four-head boundary, so a
+  retired tier was still shaping the live one and reading as though a seventh round
+  were real. The `final-round-accept` SIGIL is still parsed and loudly refused, so a
+  stale worktree is still told it is dead.
 
   **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
   non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
@@ -4149,6 +4188,7 @@ references on every trigger.
 | Writing or revising a multi-session plan document | `references/plan-docs.md` |
 | Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Choosing a command/value/procedure by reasoning about an external tool | same, section 9 |
+| Auditing the CLAIMS a session wrote (wrap-up, or before any permanent record) | same, section 11 |
 | Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,

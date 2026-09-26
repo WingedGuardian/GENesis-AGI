@@ -101,7 +101,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import field, read_payload, session_id, session_path, tool_input  # noqa: E402
 from hook_output import DEFAULT_BUDGET, emit_cost, print_json_bounded  # noqa: E402
-from shell_parse import BlindSpot, analyze_checked  # noqa: E402
+from shell_parse import BlindSpot, analyze_checked, gh_command  # noqa: E402
 
 
 def _envelope(context: str) -> dict:
@@ -150,11 +150,6 @@ _GH_DEFAULT_LIMITS: dict[tuple[str, str], int] = {
     ("search", "code"): 30,
     ("search", "commits"): 30,
 }
-
-#: gh global/value flags whose VALUE must not be mistaken for a subcommand.
-#: Same hazard gh_pr_subcommand documents: the separated ``-R o/r`` form once
-#: let a value be read as the verb and every downstream gate skipped the segment.
-_VALUE_FLAGS = {"-R", "--repo", "--hostname", "--template", "--jq", "-q"}
 
 #: The GitHub Search API's hard result ceiling, which gh enforces CLIENT-SIDE.
 #: MEASURED on gh 2.98.0: ``gh search prs --limit 1500`` is REFUSED outright with
@@ -261,25 +256,10 @@ def _listing_target(argv: list[str]) -> tuple[str, str] | None:
     Skips flags and the values of value-taking flags, so
     ``gh --repo o/r pr list`` and ``gh pr -R o/r list`` both resolve.
     """
-    if not argv or os.path.basename(argv[0]) != "gh":
+    inv = gh_command(argv)
+    if inv is None or inv.subcommand is None:
         return None
-    words: list[str] = []
-    skip_next = False
-    for tok in argv[1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if tok in _VALUE_FLAGS:
-            skip_next = True
-            continue
-        if tok.startswith("-"):
-            continue
-        words.append(tok)
-        if len(words) == 2:
-            break
-    if len(words) < 2:
-        return None
-    group, leaf = words[0], words[1]
+    group, leaf = inv.group, inv.subcommand
     # gh ships `ls` as a BUILT-IN alias of `list` for every non-search list family
     # in the table, and those invocations carry the identical default cap. Without
     # this the walker resolves ("pr", "ls"), finds no row, and `gh pr ls` -- a

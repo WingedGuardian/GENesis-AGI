@@ -222,6 +222,91 @@ class TestWebSearch:
         assert "Unknown backend" in result["error"]
 
 
+class TestExaDomainFilter:
+    """The domain filter must actually REACH the adapter.
+
+    `ExaAdapter` has supported include_domains/exclude_domains all along, but
+    the MCP tool built its request from {query, num_results} only — so
+    `web-tools-guide.md`'s documented `include_domains: ["github.com"]` recipe
+    silently searched the whole web. These assert the request payload, not just
+    that the call succeeded, because a call that ignores the filter succeeds
+    identically.
+    """
+
+    @staticmethod
+    def _mock_adapter(MockAdapter):
+        from genesis.providers.types import ProviderResult
+
+        mock_instance = MockAdapter.return_value
+        mock_instance.invoke = AsyncMock(return_value=ProviderResult(
+            success=True,
+            data={"results": [{"title": "T", "url": "U", "text": "C"}]},
+            provider_name="exa",
+        ))
+        return mock_instance
+
+    @pytest.mark.asyncio
+    async def test_include_domains_reaches_adapter(self):
+        with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
+            mock_instance = self._mock_adapter(MockAdapter)
+            await _impl_web_search(
+                "agent review loop", "exa", 5, include_domains=["github.com"]
+            )
+
+        request = mock_instance.invoke.call_args[0][0]
+        assert request["include_domains"] == ["github.com"]
+
+    @pytest.mark.asyncio
+    async def test_exclude_domains_reaches_adapter(self):
+        with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
+            mock_instance = self._mock_adapter(MockAdapter)
+            await _impl_web_search(
+                "agent review loop", "exa", 5, exclude_domains=["spam.example"]
+            )
+
+        request = mock_instance.invoke.call_args[0][0]
+        assert request["exclude_domains"] == ["spam.example"]
+
+    @pytest.mark.asyncio
+    async def test_tool_wrapper_forwards_filters_to_impl(self):
+        """Bind the MCP TOOL surface, not just the impl — that is where the bug was.
+
+        The original defect was `web_search` building its call without the
+        filters, so a test that drives `_impl_web_search` directly cannot see
+        it: MEASURED — deleting the wrapper's forwarding leaves every other
+        test in this file green. `web_search` is a FunctionTool, so `.fn` is
+        the undecorated coroutine the server actually calls.
+        """
+        from genesis.mcp.health import web_tools
+
+        with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
+            mock_instance = self._mock_adapter(MockAdapter)
+            await web_tools.web_search.fn(
+                "agent review loop",
+                "exa",
+                5,
+                include_domains=["github.com"],
+                exclude_domains=["spam.example"],
+            )
+
+        request = mock_instance.invoke.call_args[0][0]
+        assert request["include_domains"] == ["github.com"]
+        assert request["exclude_domains"] == ["spam.example"]
+
+    @pytest.mark.asyncio
+    async def test_omitted_filters_are_not_sent(self):
+        """Absent means absent — the adapter branches on truthiness, so an
+        empty list must not be forwarded as though the caller had asked for a
+        filter matching nothing."""
+        with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
+            mock_instance = self._mock_adapter(MockAdapter)
+            await _impl_web_search("agent review loop", "exa", 5, include_domains=[])
+
+        request = mock_instance.invoke.call_args[0][0]
+        assert "include_domains" not in request
+        assert "exclude_domains" not in request
+
+
 class TestFirecrawlBackend:
     """Firecrawl = PAID explicit-only escalation backend (never in auto)."""
 
