@@ -2650,8 +2650,11 @@ class CCInvoker:
         # haiku row was CC's auxiliary title/topic call). CC 2.1.277 dropped
         # that auxiliary row from `-p` output (measured 2026-09-22), but the
         # dict still carries SUBAGENT models — a sonnet session that spawns a
-        # haiku subagent lists both — so the reasoning stands for a different
-        # reason. The MAIN conversation model is the highest tier present.
+        # haiku subagent lists both. Taking the highest tier is right for a
+        # FRESH call. It is NOT right for a RESUMED one on 2.1.277+: resume
+        # restores every earlier model's entry (measured 2026-09-26 across a
+        # haiku -> sonnet switch), so a higher tier used earlier in the session
+        # wins over this call's own model — issue #2391.
         model_name = (
             max(
                 model_usage,
