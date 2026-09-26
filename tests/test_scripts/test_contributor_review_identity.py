@@ -68,7 +68,12 @@ and step order are there instead.
 from __future__ import annotations
 
 import copy
+import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -738,3 +743,227 @@ def test_second_job_with_a_checkout_is_caught_as_an_action_too():
     """The second-job escape hatch must trip the ALLOWLIST, not only run steps."""
     found = _violations(_mutated(_second_job_with_head_checkout))
     assert any(v.startswith("unpermitted-action:sneaky/") for v in found), found
+
+
+# ------------------------------------------------- the spent-budget predicate
+# The budget is a courtesy bound, not a security control -- assignment is what
+# authorises. But it is the thing that stops an ordinary repeat request, and
+# both halves below were defects found by review rather than theory.
+
+
+def _eligibility_script() -> str:
+    return _eligibility_step(_load())["with"]["script"]
+
+
+def _post_script() -> str:
+    return _post_steps(_load())[0]["with"]["script"]
+
+
+#: The shared predicate, from its first declaration to the end of the arrow
+#: function. Extraction is fail-loud by construction: a renamed parameter breaks
+#: `\(body\)`, a moved declaration breaks the name check below, and a braced
+#: body truncates to invalid JavaScript that node refuses to parse.
+_PREDICATE_RE = re.compile(
+    r"const REQUEST = [\s\S]*?const alreadyRequested = \(body\) =>[\s\S]*?;\n"
+)
+
+
+def _node_or_skip() -> str:
+    """Node, or a skip that can never be silent in CI.
+
+    GitHub Actions sets `CI` platform-wide and `ci.yml` installs no node step --
+    node comes from the runner image. So a missing node must turn this file RED
+    on CI rather than green-but-blind, which is exactly what a bare skip would
+    do, and what a green check that did not look looks like.
+    """
+    node = shutil.which("node")
+    if node is None:
+        assert not os.environ.get("CI"), "node is required in CI to run this test"
+        pytest.skip("node is not installed on this machine")
+    return node
+
+
+def _run_predicate_in_node(node: str, source: str, driver: str, payload) -> list:
+    """Execute the SHIPPED predicate. A Python re-implementation would test itself.
+
+    JavaScript and `re` differ on flags, on `\\b` at the edges, and on what `^`
+    does after a lone carriage return -- and which bodies match is the entire
+    substance of this change.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = Path(tmp) / "harness.js"
+        harness.write_text(source + "\n" + driver)
+        done = subprocess.run(
+            [node, str(harness), json.dumps(payload)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    return json.loads(done.stdout)
+
+
+def _predicate_source(script: str) -> str:
+    found = _PREDICATE_RE.search(script)
+    assert found, "could not locate the shared predicate -- extraction must fail loudly"
+    source = found.group(0)
+    for name in (
+        "REQUEST_MARKER",
+        "OUR_REQUEST",
+        "REQUEST_STARTS_LINE",
+        "REQUEST_ENDS_LINE",
+        "alreadyRequested",
+    ):
+        assert name in source, f"extraction lost {name}"
+    return source
+
+
+def test_both_steps_share_one_byte_identical_predicate():
+    """Drift here is silent: the budget stops recognising its own requests.
+
+    One step writes the request; the other decides whether one was already made.
+    They are separate scripts in separate steps, so nothing but this test couples
+    them -- and an earlier version of this change had the post step re-derive a
+    WEAKER marker-only check, which meant a human who typed the request between
+    the two steps was invisible and got a duplicate on top of their own.
+    """
+    eligibility = _predicate_source(_eligibility_script())
+    post = _predicate_source(_post_script())
+    assert eligibility == post, (
+        "the two copies of the spent-request predicate have drifted:\n"
+        f"--- eligibility ---\n{eligibility}\n--- post ---\n{post}"
+    )
+    assert "<!--" in eligibility, (
+        "the marker must be an HTML comment so it does not render for readers"
+    )
+
+
+def test_the_posted_body_carries_the_marker_and_the_request():
+    script = _post_script()
+    assert "'@codex review'" in script, "the reviewer matches on this literal"
+    assert "`${REQUEST}\\n\\n${REQUEST_MARKER}`" in script, (
+        "the posted body must carry BOTH the request the reviewer matches and "
+        "the marker the budget recognises"
+    )
+
+
+def test_the_post_step_rechecks_for_a_request_before_writing():
+    """An idempotence check, and it must fail CLOSED and precede the write.
+
+    These are position assertions, and position assertions are weak: an audit
+    deleted the ENTIRE duplicate-suppression block and every test still passed,
+    because nothing here read what the block DECIDES. The behavioural half is
+    `test_the_recheck_actually_declines_a_duplicate` below; this one only pins
+    the ordering and the fail-closed arm that a behavioural test cannot see.
+    """
+    script = _post_script()
+    read = script.index("listComments")
+    write = script.index("createComment")
+    assert read < write, "the re-check must happen before the post, not after"
+    between = script[read:write]
+    assert "core.setFailed" in between, (
+        "an unreadable comment list must fail closed -- 'could not read' is not "
+        "'nothing found', and a duplicate request cannot be refunded"
+    )
+    assert "paginate" in script[:read], (
+        "a capped read of a long thread looks exactly like 'no request exists'"
+    )
+
+
+def test_the_recheck_actually_declines_a_duplicate():
+    """The re-check must DECIDE, not merely be present.
+
+    Deleting the suppression block, or repointing it at a different string, both
+    survived every other test in this file. So the decision is exercised here:
+    the shipped predicate is run against a comment list that carries our own
+    request and one that does not, and the two must disagree.
+    """
+    node = _node_or_skip()
+    source = _predicate_source(_post_script())
+    suppression = _post_script()
+    assert "posted.some(c => alreadyRequested(c.body))" in suppression, (
+        "the re-check must consult the SHARED predicate; a marker-only variant "
+        "cannot see a human who typed the request in the meantime"
+    )
+
+    ours = "@codex review\n\n<!-- genesis-auto-review-request -->"
+    lists = [
+        [{"body": ours}],  # our own request already there -> decline
+        [{"body": "looks good to me"}],  # unrelated chatter -> proceed
+        [],  # nothing at all -> proceed
+        [{"body": "please @codex review"}],  # a human already asked -> decline
+    ]
+    got = _run_predicate_in_node(
+        node,
+        source,
+        "const lists = JSON.parse(process.argv[2]);\n"
+        "console.log(JSON.stringify("
+        "lists.map(l => l.some(c => alreadyRequested(c.body)))));\n",
+        lists,
+    )
+    assert got == [True, False, False, True], got
+
+
+_OUR_BODY = "@codex review\n\n<!-- genesis-auto-review-request -->"
+
+_ALREADY_REQUESTED_CASES = [
+    # (comment body, is this already a request?)
+    # --- our own request, and real human ones ---------------------------------
+    (_OUR_BODY, True),
+    (_OUR_BODY.replace("\n", "\r\n"), True),  # CRLF round trip
+    ("@codex review", True),
+    ("  @codex review", True),
+    ("@codex review\n\nplease look at the parser", True),
+    ("Some context first.\n@codex review", True),
+    ("Some context first.\r\n@codex review", True),
+    ("please @codex review", True),  # end-anchored: 0 measured, precaution
+    ("cc @codex review", True),
+    ("> @codex review", True),  # a quote is evidence a request happened
+    # --- prose that merely NAMES the request ---------------------------------
+    # With no retry behind the budget, one of these silently spends an issue's
+    # only automatic review.
+    ("we should check whether @codex review fires for forks", False),
+    ("I think @codex review is the wrong trigger here", False),
+    ("nothing relevant to see", False),
+    ("", False),
+    # The REVIEWER'S OWN footer. MEASURED: 95 of the 1000 most recent comments
+    # on this repository carry this line, it arrives before any human asks, and
+    # under the old predicate it sealed the issue by itself.
+    ('- Comment "@codex review" or "@codex security review".', False),
+    # The marker QUOTED inside prose. Its literal is published in this file, in
+    # the workflow and in the changelog, so a maintainer explaining the
+    # mechanism must not spend the budget. This is why the marker arm is exact
+    # equality and not containment.
+    ("the workflow posts <!-- genesis-auto-review-request --> as a marker", False),
+    ("```yaml\nbody: <!-- genesis-auto-review-request -->\n```", False),
+    # A bare marker with no request is not a request either.
+    ("<!-- genesis-auto-review-request -->", False),
+    # `\b` must not admit these.
+    ("@codex reviewing the parser now", False),
+    ("foo@codex review", False),
+]
+
+
+def test_already_requested_matches_real_requests_and_not_prose():
+    """Run the SHIPPED predicate in node, not a Python re-implementation.
+
+    Translating a JavaScript regex into `re` and asserting on that would test
+    the translation. The flags differ, `\\b` differs at the edges, and the whole
+    point of the change is which bodies match.
+    """
+    got = _run_predicate_in_node(
+        _node_or_skip(),
+        _predicate_source(_eligibility_script()),
+        "const cases = JSON.parse(process.argv[2]);\n"
+        "console.log(JSON.stringify(cases.map(alreadyRequested)));\n",
+        [body for body, _ in _ALREADY_REQUESTED_CASES],
+    )
+    expected = [want for _, want in _ALREADY_REQUESTED_CASES]
+    mismatches = [
+        (body, want, actual)
+        for (body, want), actual in zip(_ALREADY_REQUESTED_CASES, got, strict=True)
+        if want != actual
+    ]
+    assert not mismatches, f"predicate disagrees on: {mismatches}"
+    # Both polarities must be exercised, or this passes against a predicate
+    # that simply returns a constant.
+    assert any(expected) and not all(expected)

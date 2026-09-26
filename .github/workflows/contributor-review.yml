@@ -218,7 +218,51 @@ jobs:
             // made the workflow post a SECOND trigger after a human had already
             // asked. This repo's own escalation guard lowercases for the same
             // reason (scripts/hooks/git_push_guard.py).
-            const REQUESTED = /@codex\s+review/i;
+            // ── What counts as "the review was already requested" ────────────
+            // TWO DIFFERENT QUESTIONS, and conflating them is the bug this
+            // replaces. The block below is BYTE-IDENTICAL in the post step, and
+            // a test asserts that, because two copies of a predicate that drift
+            // is how the budget stops recognising its own requests.
+            //
+            // 1. DID WE POST ONE? Exact equality against the body this workflow
+            //    writes, never containment. The marker literal is published in
+            //    this file, in the test, and in the changelog, so a maintainer
+            //    pasting any of those onto a PR to explain the mechanism would
+            //    otherwise spend that issue's only automatic review -- the exact
+            //    false-seal this change removes, reintroduced by its own fix.
+            //    Quoting a body inside prose cannot equal it.
+            //
+            // 2. DID A HUMAN ASK? Deliberately counted: if a maintainer already
+            //    typed the request, asking again just spends a second review.
+            //    This one cannot be exact, so it is a judgement about SHAPE.
+            //
+            //    MEASURED over the 1000 most recent comments on this repository
+            //    (2026-09-25): 373 bodies contain the request string, and 95 of
+            //    them are the REVIEWER'S OWN footer, which reads `Comment
+            //    "@codex review" or ...`. That footer lands on a PR BEFORE any
+            //    human asks, so matching the string anywhere meant the reviewer
+            //    sealed the issue's only review by introducing itself. This
+            //    feature had a second reason it never worked.
+            //
+            //    The discriminator: a mention with text on BOTH sides of it on
+            //    one line is prose ("I think @codex review is the wrong
+            //    trigger", and that footer). A mention that BEGINS a line or
+            //    ENDS one is a request. Anchoring to the start alone loses none
+            //    of the 373 (measured), and the end anchor adds 0 more on this
+            //    corpus -- it is there for `please @codex review`, a shape with
+            //    no measured instances, so call it precaution, not a fix.
+            //    A quoted line counts: a quote is evidence a request happened,
+            //    and withholding a review is the safe side of that guess.
+            const REQUEST = '@codex review';
+            const REQUEST_MARKER = '<!-- genesis-auto-review-request -->';
+            const OUR_REQUEST = `${REQUEST}\n\n${REQUEST_MARKER}`;
+            const REQUEST_STARTS_LINE = /^[ \t>]*@codex\s+review\b/im;
+            const REQUEST_ENDS_LINE = /(?:^|[\s>])@codex\s+review[ \t]*$/im;
+            const alreadyRequested = (body) =>
+              !!body &&
+              (body.trim() === OUR_REQUEST ||
+                REQUEST_STARTS_LINE.test(body) ||
+                REQUEST_ENDS_LINE.test(body));
 
             const linkQ = `
               query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
@@ -329,7 +373,7 @@ jobs:
                   );
                   return false;
                 }
-                if ((n.comments.nodes || []).some(c => c.body && REQUESTED.test(c.body))) {
+                if ((n.comments.nodes || []).some(c => alreadyRequested(c.body))) {
                   core.info(
                     `Issue #${issueNumber} already spent its automatic review on ` +
                     `PR #${n.number} — not requesting another.`
@@ -438,10 +482,31 @@ jobs:
             core.info('No claimable PR/issue pair — no review requested.');
 
       # The ONLY step that holds the maintainer token, and the only one that
-      # writes. It contains no eligibility logic: it posts a fixed string to an
-      # integer PR number the previous step already validated. Keep it that way —
-      # every line added here is a line running next to a privileged credential
-      # in a `pull_request_target` context.
+      # writes. It decides NO eligibility: it posts a fixed string to an integer
+      # PR number the previous step already validated. Keep it that way — every
+      # line added here is a line running next to a privileged credential in a
+      # `pull_request_target` context.
+      #
+      # It does perform ONE read, and the distinction matters because an earlier
+      # version of this comment claimed there was no logic here at all. Before
+      # writing, it re-reads this PR's own comments and declines if a request is
+      # already present. It exists because the concurrency group is keyed on the
+      # event name and cannot serialise a `pull_request` run against an `issues`
+      # run naming the same PR.
+      #
+      # Two nouns, kept apart, because a review pointed out that conflating them
+      # is how this comment would become another false reassurance:
+      #   AUTHORITY is unchanged. The check can only ever stop a post, never
+      #     authorise one -- `createComment` is the single mutation and is
+      #     reached only when the check passes, so no path leads from the read to
+      #     a post that would not have happened anyway.
+      #   ATTACK SURFACE is wider, and that is the honest cost. The step now
+      #     branches on third-party-controlled text while holding the
+      #     credential. Two consequences: any commenter can VETO the request by
+      #     writing a body the predicate recognises (which is a request, so the
+      #     veto is indistinguishable from the thing it suppresses), and a failed
+      #     read is an externally-influenced job failure. The comparison is a
+      #     literal string match -- no eval, no interpolation, no shell.
       - name: Post the review request under a maintainer identity
         if: steps.eligible.outputs.pr != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
@@ -479,12 +544,91 @@ jobs:
               );
               return;
             }
+            // BYTE-IDENTICAL to the block in the eligibility step above, which
+            // carries the rationale and the measurements. A test asserts the two
+            // copies match: an earlier version of this step re-derived a WEAKER
+            // marker-only check, so a human who typed the request during the
+            // window between the two steps was invisible here and got a
+            // duplicate request on top of their own.
+            const REQUEST = '@codex review';
+            const REQUEST_MARKER = '<!-- genesis-auto-review-request -->';
+            const OUR_REQUEST = `${REQUEST}\n\n${REQUEST_MARKER}`;
+            const REQUEST_STARTS_LINE = /^[ \t>]*@codex\s+review\b/im;
+            const REQUEST_ENDS_LINE = /(?:^|[\s>])@codex\s+review[ \t]*$/im;
+            const alreadyRequested = (body) =>
+              !!body &&
+              (body.trim() === OUR_REQUEST ||
+                REQUEST_STARTS_LINE.test(body) ||
+                REQUEST_ENDS_LINE.test(body));
+
+            // Re-read THIS PR's comments immediately before writing. The
+            // eligibility step decided seconds ago, and the concurrency group is
+            // keyed on the EVENT NAME, so a `pull_request` run and an `issues`
+            // run naming this same PR sit in different groups and can arrive
+            // here together.
+            //
+            // This does NOT close that race — two runs can both read clean
+            // before either writes. It narrows it from the seconds between two
+            // steps to the milliseconds between this read and the write, which
+            // is what stops the realistic case: a maintainer assigning the issue
+            // while the author edits the PR body.
+            //
+            // It is the only logic in this step, and it reads comment bodies,
+            // which are author-influenced. They are compared against a literal
+            // and never executed, interpolated, or handed to a shell — the same
+            // treatment the eligibility step gives them. Paginated rather than
+            // capped: a truncated read of a long thread would look exactly like
+            // "no request exists".
+            let posted;
+            try {
+              posted = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              });
+            } catch (err) {
+              // Fail CLOSED for every error `paginate` propagates: unable to
+              // read is not the same as nothing found, and a duplicate request
+              // spends a review that cannot be refunded.
+              //
+              // ONE source-verified hole, stated rather than papered over:
+              // octokit's plugin-paginate-rest swallows a 409 in its iterator
+              // and yields a synthesized empty page, so a 409 would read as "no
+              // request exists". 409 is not a documented status for this
+              // endpoint, and engineering around it is not worth the code.
+              //
+              // Accepted cost of being loud: `@actions/github` composes Octokit
+              // with no retry or throttling plugin, so a transient 5xx on this
+              // read turns an outside contributor's first PR check red. That is
+              // the failure this file elsewhere works to avoid -- taken
+              // deliberately, because this feature's entire history is being
+              // silently broken, and a quiet warning nobody reads is how it
+              // stayed that way.
+              core.setFailed(
+                `Could not read PR #${prNumber} comments to confirm no request ` +
+                `exists, so no request was posted: ${err.message}`
+              );
+              return;
+            }
+            if (posted.some(c => alreadyRequested(c.body))) {
+              core.info(
+                `PR #${prNumber} already carries an automatic review request — ` +
+                `a concurrent run posted it. Not posting a second one.`
+              );
+              return;
+            }
+
             try {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: prNumber,
-                body: '@codex review',
+                // The marker goes in the body so the budget recognises this
+                // request exactly, rather than by matching its prose. An HTML
+                // comment does not render, and the reviewer already answers a
+                // request carrying extra text around it.
+                body: `${REQUEST}\n\n${REQUEST_MARKER}`,
               });
             } catch (err) {
               // An EXPIRED or revoked token throws here. Unhandled, that is a red
