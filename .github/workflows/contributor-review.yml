@@ -15,26 +15,65 @@ name: Contributor review trigger
 #
 # ── SECURITY: why this is `pull_request_target`, and what that obliges ───────
 # A `pull_request` run for a fork gets a READ-ONLY token, so it cannot comment.
-# `pull_request_target` gets a writable token — but it runs in the BASE repo's
-# context with that token available, so if it ever executed head-ref code, an
+# `pull_request_target` gets a writable token AND access to repository secrets —
+# but it runs in the BASE repo's context, so if it ever executed head-ref code an
 # outside contributor would be running arbitrary code with repository write
-# access. That is the single well-known footgun of this trigger.
+# access and could read those secrets. That is the well-known footgun.
 #
-# The mitigation here is structural rather than careful: this workflow NEVER
-# obtains the head code. There is no `actions/checkout`, no build, no install, no
-# test, and no `run:` step that consumes PR-authored content. It reads metadata
-# through the API and posts one comment. Nothing an author writes is executed,
-# and the one author-influenced input — WHICH issue is linked — decides nothing
-# on its own: the issue must be in this repository, must carry a label only a
-# maintainer can set, and must be ASSIGNED BY A MAINTAINER to this PR's author.
-# No author-supplied string is interpolated into a shell, a template, or a query.
+# THIS WORKFLOW CARRIES A PRIVILEGED CREDENTIAL. The review request is posted
+# under a MAINTAINER identity via `secrets.REVIEW_REQUEST_TOKEN`, because the
+# reviewer resolves the requester from the comment AUTHOR and rejects
+# `github-actions[bot]` outright — it has no reviewer seat, so a request posted
+# by the default token is refused in seconds without the diff ever being read.
+# MEASURED: three of three such requests were rejected that way.
+#
+# So the "never obtains the head code" property below is NOT belt-and-braces any
+# more. It is the ONLY thing standing between an outside author and a
+# maintainer-scoped token, and it must be preserved exactly:
+#   - no `actions/checkout`
+#   - no build, no install, no test
+#   - no `run:` step, and nothing that consumes PR-authored content
+#   - every `uses:` PINNED TO A COMMIT SHA. `@v9` is a mutable tag: whoever can
+#     re-point it chooses the code that runs next to the token. (A tag OBJECT
+#     sha is equally immutable, being content-addressed; the commit form is
+#     pinned because it is the documented and tool-recognised one, not because
+#     the other is forgeable.)
+# The workflow reads metadata through the API and posts one comment. Nothing an
+# author writes is executed, and the one author-influenced input — WHICH issue is
+# linked — decides nothing on its own: the issue must be in this repository, must
+# carry a label only a maintainer can set, and must be ASSIGNED BY A MAINTAINER
+# to this PR's author. No author-supplied string is interpolated into a shell, a
+# template, or a query.
+#
+# WHICH ACCOUNT OWNS THE TOKEN IS THE LOAD-BEARING PROPERTY, not its scope. The
+# reviewer accepts a request because the AUTHOR holds a reviewer seat. A token
+# owned by a seatless collaborator satisfies every permission requirement here
+# and still reproduces the exact defect this split was made to fix, silently.
+#
+# Scope it as narrowly as the platform allows: fine-grained, `Pull requests:
+# write` and nothing else, ideally this repository only. (Posting a comment on a
+# PR is an Issues-API call, which `Pull requests: write` satisfies.) What matters
+# for containment is what it CANNOT do: push, merge, or reach a private
+# repository. Read access to public repositories is not a meaningful escalation,
+# since that content is public already. It is handed ONLY to the
+# final post step, which contains no eligibility logic and no author-derived
+# value beyond an integer PR number. The eligibility step below runs on the
+# default `GITHUB_TOKEN`, which is now read-only.
 #
 # The one-review-per-issue budget further down is a courtesy bound, not part of
 # this boundary: it reads author-mutable state and must never be relied on as a
 # control. Assignment is what holds.
 #
+# One side effect worth stating, because it is invisible until it matters: a
+# comment posted by a PAT DOES start other workflow runs, where one posted by
+# GITHUB_TOKEN does not. Every request here therefore also fires the
+# `issue_comment` triggers elsewhere in this repository. Checked: none of them
+# comment back, so nothing loops. Re-check that before adding one that does.
+#
 # Keep it that way. If this workflow ever needs to inspect the diff, that work
 # belongs in a separate `pull_request` job with the default read-only token.
+# A SECOND JOB IS NOT AN ESCAPE HATCH: the test enumerates every job in this
+# file, so a checkout added anywhere here fails, not just one added above.
 
 on:
   # ELIGIBILITY IS A FUNCTION OF TWO OBJECTS — the pull request AND the issue —
@@ -69,12 +108,13 @@ on:
     # maintainer-only, same as the issues actions above.
     types: [edited]
 
-# Least privilege. `pull-requests: write` is the ONLY elevated scope, and it
-# exists solely to post the trigger comment.
+# Least privilege. The default token now holds NO elevated scope: the only write
+# this workflow performs is the trigger comment, and that is posted by the
+# separate maintainer-token step, not by `GITHUB_TOKEN`.
 permissions:
   contents: read
   issues: read
-  pull-requests: write
+  pull-requests: read
 
 concurrency:
   # Serialises repeat events for the SAME subject — a draft opened then marked
@@ -101,8 +141,9 @@ jobs:
       (github.event.pull_request.head.repo.full_name != github.repository &&
        github.event.pull_request.draft == false)
     steps:
-      - name: Trigger a review when the PR answers a labelled issue
-        uses: actions/github-script@v9
+      - name: Decide whether this PR has earned an automatic review
+        id: eligible
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             // ─────────────────────────────────────────────────────────────
@@ -177,7 +218,51 @@ jobs:
             // made the workflow post a SECOND trigger after a human had already
             // asked. This repo's own escalation guard lowercases for the same
             // reason (scripts/hooks/git_push_guard.py).
-            const REQUESTED = /@codex\s+review/i;
+            // ── What counts as "the review was already requested" ────────────
+            // TWO DIFFERENT QUESTIONS, and conflating them is the bug this
+            // replaces. The block below is BYTE-IDENTICAL in the post step, and
+            // a test asserts that, because two copies of a predicate that drift
+            // is how the budget stops recognising its own requests.
+            //
+            // 1. DID WE POST ONE? Exact equality against the body this workflow
+            //    writes, never containment. The marker literal is published in
+            //    this file, in the test, and in the changelog, so a maintainer
+            //    pasting any of those onto a PR to explain the mechanism would
+            //    otherwise spend that issue's only automatic review -- the exact
+            //    false-seal this change removes, reintroduced by its own fix.
+            //    Quoting a body inside prose cannot equal it.
+            //
+            // 2. DID A HUMAN ASK? Deliberately counted: if a maintainer already
+            //    typed the request, asking again just spends a second review.
+            //    This one cannot be exact, so it is a judgement about SHAPE.
+            //
+            //    MEASURED over the 1000 most recent comments on this repository
+            //    (2026-09-25): 373 bodies contain the request string, and 95 of
+            //    them are the REVIEWER'S OWN footer, which reads `Comment
+            //    "@codex review" or ...`. That footer lands on a PR BEFORE any
+            //    human asks, so matching the string anywhere meant the reviewer
+            //    sealed the issue's only review by introducing itself. This
+            //    feature had a second reason it never worked.
+            //
+            //    The discriminator: a mention with text on BOTH sides of it on
+            //    one line is prose ("I think @codex review is the wrong
+            //    trigger", and that footer). A mention that BEGINS a line or
+            //    ENDS one is a request. Anchoring to the start alone loses none
+            //    of the 373 (measured), and the end anchor adds 0 more on this
+            //    corpus -- it is there for `please @codex review`, a shape with
+            //    no measured instances, so call it precaution, not a fix.
+            //    A quoted line counts: a quote is evidence a request happened,
+            //    and withholding a review is the safe side of that guess.
+            const REQUEST = '@codex review';
+            const REQUEST_MARKER = '<!-- genesis-auto-review-request -->';
+            const OUR_REQUEST = `${REQUEST}\n\n${REQUEST_MARKER}`;
+            const REQUEST_STARTS_LINE = /^[ \t>]*@codex\s+review\b/im;
+            const REQUEST_ENDS_LINE = /(?:^|[\s>])@codex\s+review[ \t]*$/im;
+            const alreadyRequested = (body) =>
+              !!body &&
+              (body.trim() === OUR_REQUEST ||
+                REQUEST_STARTS_LINE.test(body) ||
+                REQUEST_ENDS_LINE.test(body));
 
             const linkQ = `
               query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
@@ -288,7 +373,7 @@ jobs:
                   );
                   return false;
                 }
-                if ((n.comments.nodes || []).some(c => c.body && REQUESTED.test(c.body))) {
+                if ((n.comments.nodes || []).some(c => alreadyRequested(c.body))) {
                   core.info(
                     `Issue #${issueNumber} already spent its automatic review on ` +
                     `PR #${n.number} — not requesting another.`
@@ -379,11 +464,15 @@ jobs:
             for (const prNumber of candidates) {
               for (const issueNumber of await issuesClosedBy(prNumber)) {
                 if (!(await mayClaim(prNumber, issueNumber))) continue;
-                await github.rest.issues.createComment({
-                  ...R, issue_number: prNumber, body: '@codex review',
-                });
+                // The REQUEST ITSELF is posted by the next step, under a
+                // maintainer identity. It cannot be posted here: this step runs
+                // on GITHUB_TOKEN, and a request authored by github-actions[bot]
+                // is rejected by the reviewer on identity alone, before the diff
+                // is ever read. Hand the decision on; do not widen this token.
+                core.setOutput('pr', String(prNumber));
+                core.setOutput('issue', String(issueNumber));
                 core.info(
-                  `Requested a review on PR #${prNumber} — it closes invited issue ` +
+                  `PR #${prNumber} has earned a review — it closes invited issue ` +
                   `#${issueNumber}, which is assigned to its author, and that issue's ` +
                   `automatic review had not been requested.`
                 );
@@ -391,3 +480,167 @@ jobs:
               }
             }
             core.info('No claimable PR/issue pair — no review requested.');
+
+      # The ONLY step that holds the maintainer token, and the only one that
+      # writes. It decides NO eligibility: it posts a fixed string to an integer
+      # PR number the previous step already validated. Keep it that way — every
+      # line added here is a line running next to a privileged credential in a
+      # `pull_request_target` context.
+      #
+      # It does perform ONE read, and the distinction matters because an earlier
+      # version of this comment claimed there was no logic here at all. Before
+      # writing, it re-reads this PR's own comments and declines if a request is
+      # already present. It exists because the concurrency group is keyed on the
+      # event name and cannot serialise a `pull_request` run against an `issues`
+      # run naming the same PR.
+      #
+      # Two nouns, kept apart, because a review pointed out that conflating them
+      # is how this comment would become another false reassurance:
+      #   AUTHORITY is unchanged. The check can only ever stop a post, never
+      #     authorise one -- `createComment` is the single mutation and is
+      #     reached only when the check passes, so no path leads from the read to
+      #     a post that would not have happened anyway.
+      #   ATTACK SURFACE is wider, and that is the honest cost. The step now
+      #     branches on third-party-controlled text while holding the
+      #     credential. Two consequences: any commenter can VETO the request by
+      #     writing a body the predicate recognises (which is a request, so the
+      #     veto is indistinguishable from the thing it suppresses), and a failed
+      #     read is an externally-influenced job failure. The comparison is a
+      #     literal string match -- no eval, no interpolation, no shell.
+      - name: Post the review request under a maintainer identity
+        if: steps.eligible.outputs.pr != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          # EVERYTHING the script reads arrives through env, never through a
+          # `${{ }}` interpolation into the script body. Actions substitutes those
+          # BEFORE node parses the file, so an interpolated value is code, not
+          # data — the standard `actions/github-script` injection shape. These two
+          # values are integers from the API and not author text, but the rule is
+          # kept mechanical rather than argued case by case.
+          #
+          # MAINTAINER_TOKEN is read separately from `github-token` so the script
+          # can tell "secret absent" from "secret present": with the fallback
+          # below octokit is constructed either way, and posting under the WRONG
+          # identity is the exact defect this workflow exists to fix.
+          MAINTAINER_TOKEN: ${{ secrets.REVIEW_REQUEST_TOKEN }}
+          TARGET_PR: ${{ steps.eligible.outputs.pr }}
+          TARGET_ISSUE: ${{ steps.eligible.outputs.issue }}
+        with:
+          # The fallback keeps the step from failing to initialise when the secret
+          # is unset. It is never used to post: the guard below returns first.
+          github-token: ${{ secrets.REVIEW_REQUEST_TOKEN || github.token }}
+          script: |
+            const prNumber = Number(process.env.TARGET_PR);
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('Refusing to comment: bad PR number from the eligibility step.');
+              return;
+            }
+            if (!process.env.MAINTAINER_TOKEN) {
+              core.warning(
+                `REVIEW_REQUEST_TOKEN is not configured, so no review was requested for PR ` +
+                `#${prNumber}. Posting under the default token is not a fallback: the ` +
+                `reviewer rejects a bot-authored request on identity alone. Set a ` +
+                `fine-grained token (this repository, Pull requests: write) to enable this.`
+              );
+              return;
+            }
+            // BYTE-IDENTICAL to the block in the eligibility step above, which
+            // carries the rationale and the measurements. A test asserts the two
+            // copies match: an earlier version of this step re-derived a WEAKER
+            // marker-only check, so a human who typed the request during the
+            // window between the two steps was invisible here and got a
+            // duplicate request on top of their own.
+            const REQUEST = '@codex review';
+            const REQUEST_MARKER = '<!-- genesis-auto-review-request -->';
+            const OUR_REQUEST = `${REQUEST}\n\n${REQUEST_MARKER}`;
+            const REQUEST_STARTS_LINE = /^[ \t>]*@codex\s+review\b/im;
+            const REQUEST_ENDS_LINE = /(?:^|[\s>])@codex\s+review[ \t]*$/im;
+            const alreadyRequested = (body) =>
+              !!body &&
+              (body.trim() === OUR_REQUEST ||
+                REQUEST_STARTS_LINE.test(body) ||
+                REQUEST_ENDS_LINE.test(body));
+
+            // Re-read THIS PR's comments immediately before writing. The
+            // eligibility step decided seconds ago, and the concurrency group is
+            // keyed on the EVENT NAME, so a `pull_request` run and an `issues`
+            // run naming this same PR sit in different groups and can arrive
+            // here together.
+            //
+            // This does NOT close that race — two runs can both read clean
+            // before either writes. It narrows it from the seconds between two
+            // steps to the milliseconds between this read and the write, which
+            // is what stops the realistic case: a maintainer assigning the issue
+            // while the author edits the PR body.
+            //
+            // It is the only logic in this step, and it reads comment bodies,
+            // which are author-influenced. They are compared against a literal
+            // and never executed, interpolated, or handed to a shell — the same
+            // treatment the eligibility step gives them. Paginated rather than
+            // capped: a truncated read of a long thread would look exactly like
+            // "no request exists".
+            let posted;
+            try {
+              posted = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              });
+            } catch (err) {
+              // Fail CLOSED for every error `paginate` propagates: unable to
+              // read is not the same as nothing found, and a duplicate request
+              // spends a review that cannot be refunded.
+              //
+              // ONE source-verified hole, stated rather than papered over:
+              // octokit's plugin-paginate-rest swallows a 409 in its iterator
+              // and yields a synthesized empty page, so a 409 would read as "no
+              // request exists". 409 is not a documented status for this
+              // endpoint, and engineering around it is not worth the code.
+              //
+              // Accepted cost of being loud: `@actions/github` composes Octokit
+              // with no retry or throttling plugin, so a transient 5xx on this
+              // read turns an outside contributor's first PR check red. That is
+              // the failure this file elsewhere works to avoid -- taken
+              // deliberately, because this feature's entire history is being
+              // silently broken, and a quiet warning nobody reads is how it
+              // stayed that way.
+              core.setFailed(
+                `Could not read PR #${prNumber} comments to confirm no request ` +
+                `exists, so no request was posted: ${err.message}`
+              );
+              return;
+            }
+            if (posted.some(c => alreadyRequested(c.body))) {
+              core.info(
+                `PR #${prNumber} already carries an automatic review request — ` +
+                `a concurrent run posted it. Not posting a second one.`
+              );
+              return;
+            }
+
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                // The marker goes in the body so the budget recognises this
+                // request exactly, rather than by matching its prose. An HTML
+                // comment does not render, and the reviewer already answers a
+                // request carrying extra text around it.
+                body: `${REQUEST}\n\n${REQUEST_MARKER}`,
+              });
+            } catch (err) {
+              // An EXPIRED or revoked token throws here. Unhandled, that is a red
+              // job on an outside contributor first PR with nothing saying why.
+              core.setFailed(
+                `Could not post the review request on PR #${prNumber}: ${err.message}. ` +
+                `If this is a 401 or 403 the REVIEW_REQUEST_TOKEN has expired or lost ` +
+                `its Pull requests: write permission.`
+              );
+              return;
+            }
+            core.info(
+              `Requested a review on PR #${prNumber} (closes invited issue ` +
+              `#${process.env.TARGET_ISSUE}) under a maintainer identity.`
+            );
