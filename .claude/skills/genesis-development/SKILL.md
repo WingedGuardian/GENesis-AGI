@@ -1166,6 +1166,24 @@ specific, credible, MEASURED reason — the risk is that severe, or that frequen
 *"For safety"* and *"defense in depth"* are not reasons. Neither is having just
 been bitten once: an n=1 incident earns a COUNTER, not a gate.
 
+**Persisted state inside a guard needs its own justification, separate from
+the decision to refuse.** Before a guard or gate grows a marker, cache or
+counter that one invocation writes and a later one reads (a telemetry counter
+no guard decision reads is observability, not guard state), show why the answer
+cannot be derived at the moment it is needed from state that already exists,
+and enumerate the lifecycle the state adds — write, read, retire, validate,
+scope — because each stage is a defect site. Where a derivation exists, a second
+should-fix-or-worse finding in machinery the change adds means delete it, not
+harden it; where none exists, narrow the lifecycle. Approval records are out of
+scope for deletion. MEASURED on the gate-menu feature at comparable size: the
+persisted-marker layer drew roughly 15 should-fix-or-worse findings against
+roughly 3 in the half it served (179 vs 155 non-comment lines, per #2027's PR
+body); the marker designs were closed (#1863, #1999) and the counter-based one
+merged (#2027). This prices the cost of STATE, not the case for gating; the
+New-Store Gate below asks the neighbouring question (why a NEW store rather than
+an existing one), and the `genesis-architect` agent's Step 0.7 asks this one at
+review time.
+
 **Fail-open is not an automatic defect — but say WHICH question you are
 answering, because there are two and they get opposite defaults.** (1) The
 VERDICT question: when a guard evaluates successfully, should its design be an
