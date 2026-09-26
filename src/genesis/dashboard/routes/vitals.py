@@ -338,8 +338,13 @@ async def _build_embedding_section(rt) -> dict:
     if dashscope_api_key():
         cloud_names.append("dashscope")
 
-    storage_chain = ollama_names + cloud_names  # writes: Ollama first
-    recall_chain = cloud_names + ollama_names    # reads: cloud first
+    # Both chains lead with the cloud backend; they differ only in the rate
+    # tier, which this panel does not surface. This list is hand-mirrored from
+    # EmbeddingProvider.build_chain and WILL desync again — it already reported
+    # `["ollama", "deepinfra"]` for a storage chain that had been flipped. A
+    # follow-up should derive both from the builder rather than re-deriving.
+    storage_chain = cloud_names + ollama_names  # writes: cloud first
+    recall_chain = cloud_names + ollama_names   # reads: cloud first
 
     section["storage_chain"] = storage_chain if storage_chain else ["none configured"]
     section["recall_chain"] = recall_chain if recall_chain else ["none configured"]
