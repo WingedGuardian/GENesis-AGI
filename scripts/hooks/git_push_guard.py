@@ -161,14 +161,17 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
 # A module-load exception exits 1 BEFORE run_guard's fail-closed wrapper can
 # convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
 # gate in this file (force-push, merge, sqlite) would silently vanish.
-try:
-    from review_state import ESCALATION_ROUND_CAP, FINAL_ROUND_CAP  # noqa: E402
-except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
-    # read error, top-level runtime error in review_state) must degrade to the
-    # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
-    # and silently disables every fail-closed gate in this file (round-6 P1).
-    ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
-    FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
+# `ESCALATION_ROUND_CAP` is deliberately NOT imported here. AST-verified 2026-09-25:
+# it had ZERO Load references in this file — an ImportFrom and an except-branch Store
+# and nothing else — so no gate here ever consulted it, and the six-line rationale
+# about "every fail-closed gate in this file" protected a name none of them read. Its
+# real consumers import it from `review_state` directly, each behind its own degrade
+# (`review_enforcement_commit.py`, `ask_gate_menu.py`, `genesis_statusline.py`).
+#
+# That is the same criterion this change applied to the retired `FINAL_ROUND_CAP`,
+# and applying it to one name in a two-name import while leaving its sibling is how
+# the next audit re-finds this. Note grep alone reports the name as live here — it
+# counts a docstring mention and the Store — so the check has to be AST.
 
 try:
     from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
@@ -4705,17 +4708,33 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
             f"this is another discovery request (round {next_round}). Approve only "
             "after deciding that another gate-design round is worth the risk."
         )
+    # ROUND 4 IS TERMINAL (owner ruling, 2026-09-25), and this is the surface the
+    # owner reads AT the decision — so it must not frame round 5 as an ordinary
+    # next round. `strongly_discouraged` is `count >= 5`, one tier LATE for that
+    # purpose, so the terminal framing goes in BOTH branches; the discouraged one
+    # adds that every further round is equally terminal. The MECHANISM still
+    # permits round 5+ under this per-request approval (review_budget.py keeps
+    # STANDING_REVIEWED_HEAD_LIMIT=4 / STRONGLY_DISCOURAGED_REVIEWED_HEADS=5);
+    # aligning it is later work, and until then this prompt is what carries the
+    # rule to the person deciding.
+    terminal = (
+        "ROUND 4 IS TERMINAL: there is no ordinary round 5. The decision here is "
+        "to MERGE with the outstanding issues accepted and filed, or to SEND IT "
+        "BACK for rework. Approve only to authorize one further round anyway, and "
+        "only if that is genuinely the least costly option."
+    )
     if result.get("strongly_discouraged"):
         return (
-            f"PR #{pr_num} already has {count} distinct reviewed heads. Round "
-            f"{next_round} is strongly discouraged: stop, narrow or redesign the "
-            "change, accept documented residue, or abandon it. Approve only this "
-            "single request if continuing is still the least costly option."
+            f"PR #{pr_num} already has {count} distinct reviewed heads — past the "
+            f"terminal boundary, so round {next_round} is strongly discouraged: "
+            "stop, narrow or redesign the change, accept documented residue, or "
+            f"abandon it. {terminal} Every later round is terminal in the same way "
+            "and needs its own approval; earlier approval never carries forward."
         )
     return (
         f"PR #{pr_num} already has {count} distinct reviewed heads; standing "
-        f"authorization ended after four. Approve this single round-{next_round} "
-        "request. Earlier approval does not carry forward to another request."
+        f"authorization ended after four. {terminal} This approval covers exactly "
+        f"this one round-{next_round} request and does not carry forward."
     )
 
 

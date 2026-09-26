@@ -73,6 +73,35 @@ def test_round_six_and_later_are_strongly_discouraged(monkeypatch):
     assert "narrow or redesign" in reason
 
 
+@pytest.mark.parametrize("heads", [4, 5])
+def test_the_prompt_states_the_terminal_rule_at_and_past_four_heads(monkeypatch, heads):
+    """The prompt the OWNER reads at the decision must say round 4 is terminal.
+
+    This exists because the two assertions above could not see it. They pin
+    "strongly discouraged" and "narrow or redesign", both of which live only in the
+    `count >= 5` branch and both of which survived the rewrite that added the
+    terminal framing — so stripping that framing left this file GREEN (MEASURED
+    2026-09-25 by mutation). The four-head case, which IS the terminal boundary, had
+    no assertion on its text at all, and it is the branch that used to read
+    "Approve this single round-5 request" as though a fifth round were ordinary.
+
+    Both values are checked because `strongly_discouraged` is `count >= 5`: 4 takes
+    the fall-through branch and 5 the discouraged one, and the rule has to hold in
+    each. Asserting only one would let a future edit drop it from the other.
+    """
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:heads]])
+    decision, reason = _decision()
+    assert decision == "ask"
+    assert "ROUND 4 IS TERMINAL" in reason, (
+        f"at {heads} reviewed heads the prompt must state the terminal rule; "
+        "without it the owner is asked to approve round 5 as if it were ordinary"
+    )
+    # The decision it names, not merely the label — a caller has to be told what
+    # the two choices ARE, which is the half the old wording omitted entirely.
+    assert "MERGE" in reason and "SEND IT BACK" in reason
+    assert "does not carry forward" in reason or "never carries forward" in reason
+
+
 def test_dismissed_reviews_count_but_duplicate_heads_count_once(monkeypatch):
     reviewed = [
         (HEADS[0], "DISMISSED"),

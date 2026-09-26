@@ -229,8 +229,10 @@ def test_a_small_manifest_is_not_degraded() -> None:
 
 def test_a_reminder_in_the_window_between_the_two_constants_is_rejected() -> None:
     """THE case that distinguishes the two constants, which the real reminder
-    cannot: at 6,436 it sits far below both, so asserting against the looser one
-    passed identically and the mutation was behaviourally null.
+    cannot: at ~6,950 (MEASURED 2026-09-25; this figure drifts with every prose
+    edit and read 6,436 while the literal was already 6,771) it sits far below
+    both, so asserting against the looser one passed identically and the mutation
+    was behaviourally null.
 
     The window is non-empty by this suite's own construction
     (DEFAULT_BUDGET < HOOK_STDOUT_CAP), and a base reminder inside it is the
