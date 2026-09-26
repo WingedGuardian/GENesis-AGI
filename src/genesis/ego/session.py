@@ -2387,7 +2387,7 @@ class EgoSession:
             logger.warning("No DirectSessionRunner — cannot dispatch execution briefs")
             return
 
-        from genesis.cc.direct_session import VALID_PROFILES, DirectSessionRequest
+        from genesis.cc.direct_session import DirectSessionRequest
         from genesis.cc.types import CCModel, EffortLevel
 
         for brief in briefs:
@@ -2436,16 +2436,7 @@ class EgoSession:
             # catches information that slips through the ego's own judgment.
             prompt = f"{prompt}\n\n{_CONTENT_FIREWALL_RULES}"
 
-            # Map profile from brief, falling back to action_type inference.
-            # The ego may omit profile from the brief; defaulting to
-            # "observe" silently killed code-change dispatches (6 instances).
-            brief_profile = brief.get("profile", "")
-            if brief_profile in VALID_PROFILES:
-                profile = brief_profile
-            else:
-                # Infer from proposal action_type if available
-                brief_action = brief.get("action_type", "")
-                profile = _infer_profile(brief_action)
+            profile = _select_dispatch_profile(brief)
             # Resolve straight from the enum so any valid tier (incl. fable) is
             # honored; an unknown value logs and falls back to sonnet rather than
             # silently downgrading a real tier.
@@ -4094,6 +4085,38 @@ _RESEARCH_TYPES = frozenset({
     "investigate", "research", "analyze",
     "diagnose", "monitor",
 })
+
+
+def _select_dispatch_profile(brief: dict) -> str:
+    """The profile an execution brief gets dispatched under.
+
+    Extracted from the dispatch loop so the DECISION can be driven directly. A
+    source-level check that this consults the refusal predicate survived a
+    mutation removing the guard but leaving the import, which is assert-existence
+    rather than assert-binding; a named function is testable.
+
+    Two rules, in order:
+
+    1. The brief's own ``profile`` is honoured when it names a REGISTERED profile
+       that is not currently refused. Both halves matter. Defaulting to
+       ``observe`` when the brief omitted one silently killed six code-change
+       dispatches, which is why the brief is trusted at all.
+    2. Otherwise infer from ``action_type``.
+
+    WHY A REFUSED PROFILE IS NOT MERELY A FAILED DISPATCH. The gh-capable profile
+    is off by default and its refusal is PERMANENT until an operator edits config.
+    A failed dispatch calls ``revert_failed_dispatch``, which returns the proposal
+    to ``approved`` with no attempt counter — so honouring a refused name would
+    re-dispatch and re-fail once per sweep, indefinitely, on a path nobody
+    watches. The brief is model-authored, so the name can arrive from a
+    proposal's own text.
+    """
+    from genesis.cc.direct_session import VALID_PROFILES, profile_dispatch_refusal
+
+    brief_profile = brief.get("profile", "")
+    if brief_profile in VALID_PROFILES and not profile_dispatch_refusal(brief_profile):
+        return brief_profile
+    return _infer_profile(brief.get("action_type", ""))
 
 
 def _infer_profile(action_type: str) -> str:
