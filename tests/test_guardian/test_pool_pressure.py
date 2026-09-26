@@ -222,12 +222,12 @@ class TestRunway:
     def test_metadata_runway_counts(self) -> None:
         size = 100 * _GB
         hist = [
-            PoolSample(T0, 0.5, 0.80, size),
-            PoolSample(T0 + timedelta(hours=10), 0.5, 0.90, size),
+            PoolSample(T0, 0.5, 0.70, size),
+            PoolSample(T0 + timedelta(hours=24), 0.5, 0.90, size),
         ]
         rw = compute_runway(hist, hist[-1], _cfg())
-        assert rw.meta_hours_to_full == pytest.approx(10, rel=0.05)
-        assert rw.hours_to_full == pytest.approx(10, rel=0.05)
+        assert rw.meta_hours_to_full == pytest.approx(12, rel=0.05)
+        assert rw.hours_to_full == pytest.approx(12, rel=0.05)
         assert "metadata" in (relief_reason(rw, _cfg()) or "")
 
     def test_no_size_means_no_byte_maths(self) -> None:
@@ -440,8 +440,8 @@ def test_kill_switch_forces_alert_only(monkeypatch) -> None:
 def test_metadata_only_pressure_is_not_data_pressure() -> None:
     size = 100 * _GB
     hist = [
-        PoolSample(T0, 0.85, 0.80, size),
-        PoolSample(T0 + timedelta(hours=10), 0.85, 0.90, size),
+        PoolSample(T0, 0.85, 0.70, size),
+        PoolSample(T0 + timedelta(hours=24), 0.85, 0.90, size),
     ]
     cfg = _cfg()
     rw = compute_runway(hist, hist[-1], cfg)
@@ -588,7 +588,7 @@ async def test_data_pressure_does_extend(tmp_path) -> None:
 async def test_metadata_only_pressure_never_extends_the_data_lv(tmp_path) -> None:
     out, extended = await _two_pass_extend_probe(
         tmp_path,
-        [(0, 85.0, 80.0), (10, 85.0, 90.0)],
+        [(0, 85.0, 70.0), (24, 85.0, 90.0)],
     )
     assert out.startswith("deleted:"), out
     assert not extended
@@ -654,3 +654,52 @@ async def test_current_pressure_refuses_an_ambiguous_pool(tmp_path) -> None:
     )
     with patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=st)):
         assert await current_pressure(cfg) == LEVEL_NONE
+
+
+@pytest.mark.parametrize("baseline", [0.60, 0.80])
+def test_fresh_snapshot_metadata_step_never_reads_as_growth(baseline) -> None:
+    """Devin's example: history starts, a fresh snapshot steps metadata ~4.4
+    points within minutes, then it stays flat. At 2h, 6h and 20h the step must
+    not become a rate — at a warning AND a critical metadata baseline."""
+    size = 70 * _GB
+    hist = [PoolSample(T0, 0.70, baseline, size)]
+    for minutes in range(6, 21 * 60, 5):
+        hist.append(PoolSample(T0 + timedelta(minutes=minutes), 0.70, baseline + 0.044, size))
+    cfg = _cfg()
+    for hours in (2, 6, 20):
+        cur = [s for s in hist if s.ts <= T0 + timedelta(hours=hours)]
+        rw = compute_runway(cur, cur[-1], cfg)
+        assert assess_pressure(rw, cfg)[0] == LEVEL_NONE, (hours, rw.describe())
+
+
+def test_pool_migration_does_not_compare_two_pools() -> None:
+    """Devin's example: history from a 50 GiB pool using 25 GiB, then the
+    container moves to a 100 GiB pool steadily using 90 GiB. The old pool's
+    samples must not read as a 65 GiB burst."""
+    old = [
+        PoolSample(T0 + timedelta(minutes=5 * i), 0.50, 0.3, 50 * _GB, "a|vg0|tp")
+        for i in range(80)
+    ]
+    t = old[-1].ts
+    new = [
+        PoolSample(t + timedelta(minutes=5 * i), 0.90, 0.3, 100 * _GB, "b|vg1|tp")
+        for i in range(1, 4)
+    ]
+    cfg = _cfg()
+    rw = compute_runway(old + new, new[-1], cfg)
+    assert assess_pressure(rw, cfg)[0] == LEVEL_NONE, rw.describe()
+    # control arm: without pool identity the same history DOES read as urgent
+    anon = [PoolSample(s.ts, s.data_frac, s.meta_frac, s.size_bytes) for s in old + new]
+    rw2 = compute_runway(anon, anon[-1], cfg)
+    assert assess_pressure(rw2, cfg)[0] == LEVEL_URGENT
+
+
+def test_pool_key_round_trips_through_history(tmp_path) -> None:
+    p = tmp_path / "h.jsonl"
+    record_sample(
+        p,
+        PoolSample(T0, 0.5, None, _GB, "default|vg0|IncusThinPool"),
+        min_interval_s=300,
+        max_samples=10,
+    )
+    assert load_history(p)[0].pool == "default|vg0|IncusThinPool"

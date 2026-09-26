@@ -77,6 +77,8 @@ _LONG_WINDOW = timedelta(hours=24)
 # new lifeline on a freshly deployed guardian with no older history. Faster
 # fills than the rate can see in 2h are what the burst RESERVE covers.
 _MIN_RATE_SPAN = timedelta(hours=2)
+# Metadata rates need most of a day of history (see compute_runway).
+_META_MIN_SPAN = timedelta(hours=20)
 # Burst window: the fastest rise the tick-sampled history can show.
 _BURST_WINDOW = timedelta(minutes=10)
 # Bursts older than this no longer size the reserve (see min_reserve_pct).
@@ -93,6 +95,10 @@ class PoolSample:
     data_frac: float | None
     meta_frac: float | None
     size_bytes: int | None
+    # Which pool this sample measured (incus pool + backing VG/LV). Runway
+    # maths only compares samples of the SAME pool: after the container moves
+    # to another pool, the old pool's history would read as a huge burst.
+    pool: str | None = None
 
     @property
     def used_bytes(self) -> float | None:
@@ -169,7 +175,14 @@ def sample_from_status(status: StoragePoolStatus, now: datetime) -> PoolSample |
     else:
         return None
     meta = status.metadata_pct / 100.0 if status.metadata_pct is not None else None
-    return PoolSample(now, data, meta, status.pool_size_bytes)
+    return PoolSample(now, data, meta, status.pool_size_bytes, pool_key(status))
+
+
+def pool_key(status: StoragePoolStatus) -> str | None:
+    """Stable identity of the measured pool, or None when unknown."""
+    if not status.pool_name:
+        return None
+    return f"{status.pool_name}|{status.vg_name or ''}|{status.thinpool_lv or ''}"
 
 
 def _parse_line(line: str) -> PoolSample | None:
@@ -181,11 +194,13 @@ def _parse_line(line: str) -> PoolSample | None:
         data = raw.get("data")
         meta = raw.get("meta")
         size = raw.get("size")
+        pool = raw.get("pool")
         return PoolSample(
             ts,
             float(data) if data is not None else None,
             float(meta) if meta is not None else None,
             int(size) if size is not None else None,
+            str(pool) if pool is not None else None,
         )
     except (ValueError, TypeError, KeyError):
         return None
@@ -209,6 +224,7 @@ def _dump(sample: PoolSample) -> str:
             "data": sample.data_frac,
             "meta": sample.meta_frac,
             "size": sample.size_bytes,
+            "pool": sample.pool,
         }
     )
 
@@ -249,14 +265,20 @@ def record_sample(
     return True
 
 
-def _slope_per_h(points: list[tuple[datetime, float]], now: datetime, window: timedelta):
+def _slope_per_h(
+    points: list[tuple[datetime, float]],
+    now: datetime,
+    window: timedelta,
+    *,
+    min_span: timedelta = _MIN_RATE_SPAN,
+):
     """Rise per hour from the oldest point inside ``window`` to the newest."""
     inside = [(t, v) for t, v in points if now - t <= window]
     if len(inside) < 2:
         return None
     (t0, v0), (t1, v1) = inside[0], inside[-1]
     span = t1 - t0
-    if span < _MIN_RATE_SPAN:
+    if span < min_span:
         return None
     return (v1 - v0) / (span.total_seconds() / 3600.0)
 
@@ -296,6 +318,9 @@ def compute_runway(
 ) -> Runway:
     """Rate, burst, reserve and hours-to-full for ``current`` given ``history``."""
     samples = [s for s in history if s.ts <= current.ts]
+    if current.pool is not None:
+        # Only this pool's own history (see PoolSample.pool).
+        samples = [s for s in samples if s.pool == current.pool]
     if not samples or samples[-1].ts != current.ts:
         samples.append(current)
     now = current.ts
@@ -318,7 +343,14 @@ def compute_runway(
     meta_h: float | None = None
     meta_pts = [(s.ts, s.meta_frac) for s in samples if s.meta_frac is not None]
     if current.meta_frac is not None and meta_pts:
-        meta_rate = _rate(meta_pts, now)
+        # Metadata: the full-day slope only, over at least _META_MIN_SPAN.
+        # Creating a thin snapshot steps metadata up ONCE (measured ~4 points
+        # within ~30 minutes of a fresh snapshot, flat afterwards); any window
+        # shorter than a day turns that one-off step into a sustained "rate"
+        # and would delete the brand-new lifeline. Data keeps the 6h window.
+        meta_rate = _slope_per_h(meta_pts, now, _LONG_WINDOW, min_span=_META_MIN_SPAN)
+        if meta_rate is not None:
+            meta_rate = max(0.0, meta_rate)
         if meta_rate:
             meta_h = max(0.0, 1.0 - current.meta_frac) / meta_rate
 

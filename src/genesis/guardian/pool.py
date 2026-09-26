@@ -51,6 +51,8 @@ class StoragePoolStatus:
     # growth RATE in bytes; None when unreadable (relief then does no byte maths).
     pool_size_bytes: int | None = None
     metadata_size_bytes: int | None = None
+    # The incus storage pool behind the container's root disk.
+    pool_name: str | None = None
     # LVM-thin only: the backing thin-pool LV and its metadata profile. The
     # profile is the install's opt-in to growing the pool into VG free space.
     vg_name: str | None = None
@@ -302,6 +304,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
             detected=df_used is not None,
             pool_used_pct=df_used[0] if df_used else None,
             pool_size_bytes=df_used[1] if df_used else None,
+            pool_name=pool_name,
             detail=f"non-lvm pool {pool_name}",
         )
 
@@ -353,6 +356,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
         detail=f"lvm {vg} data={data_pct} meta={metadata_pct}",
         pool_size_bytes=ident.size_bytes,
         metadata_size_bytes=ident.metadata_size_bytes,
+        pool_name=pool_name,
         vg_name=vg_name,
         thinpool_lv=ident.lv_name,
         thinpool_profile=ident.profile,

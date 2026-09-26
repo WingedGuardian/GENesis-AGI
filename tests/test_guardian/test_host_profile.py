@@ -274,6 +274,7 @@ class TestGatherHostProfile:
             # and the identity fields add nothing drift should hash on today).
             "pool_size_bytes",
             "metadata_size_bytes",
+            "pool_name",
             "vg_name",
             "thinpool_lv",
             "thinpool_profile",
