@@ -535,12 +535,12 @@ class CCOutput:
     # "reported zero", which turned an absence of evidence into a claim.
     tools_used: tuple[str, ...] | None = None
     # True when `cost_usd` is a SESSION-CUMULATIVE total rather than this call's
-    # cost. From CC 2.1.277 a resumed `-p` session's totals no longer restart at
-    # zero, so `total_cost_usd` (and `modelUsage`) are running totals while
-    # `usage` tokens stay per call. Detected from the output itself, not a
-    # version check — see `CCInvoker._parse_result_dict`. A caller that SUMS
-    # `cost_usd` across turns must record the difference, via
-    # `cc_sessions.record_turn_cost`.
+    # cost. From CC 2.1.277 a resumed `-p` session restores its saved totals, so
+    # `total_cost_usd` (and `modelUsage`) are running totals while `usage` tokens
+    # stay per call. Set from the CC VERSION by the invoker's run paths
+    # (`CCInvoker._with_cost_semantics`) — the result itself carries no signal
+    # that survives a model switch. A caller that SUMS `cost_usd` across turns
+    # must record the difference, via `cc_sessions.record_turn_cost`.
     cost_is_cumulative: bool = False
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
