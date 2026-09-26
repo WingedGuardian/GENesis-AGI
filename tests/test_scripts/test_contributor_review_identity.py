@@ -31,26 +31,38 @@ never obtains the head code, so nothing an author writes is executed. That
 property used to be belt-and-braces; once a maintainer token is present it is
 the only thing standing between an outside author and that credential.
 
-Polarity is ALLOWLIST throughout, at three levels, and every one of them was
+Polarity is ALLOWLIST throughout, at five levels, and every one of them was
 learned from a checker that lacked it:
 
-  ACTIONS    only a SHA-pinned `actions/github-script` may run, so an action
-             nobody anticipated fails rather than passes.
-  LOCATIONS  every `secrets` read in the document is a violation except in the
-             two KEYS the post step may hold one in, so a channel nobody
-             anticipated fails. A single-job walk would miss a SECOND job that
-             checks out head code beside the same secret, so every job is
-             enumerated.
+  ACTIONS    only a SHA-pinned `actions/github-script` may run, anchored at
+             BOTH ends, so an action nobody anticipated fails rather than
+             passes -- and so does a valid git ref component bolted onto the
+             sha, which resolves as a mutable tag.
+  KEYS       workflow-level and job-level keys are allowlisted. The denylist
+             form shipped three times and missed a different code-running key
+             each round: `uses`, then `container`, then `services`, which
+             starts an arbitrary image with host mounts before any step here
+             runs. `strategy`, `defaults` and `outputs` were never considered.
+  LOCATIONS  every mention of the `secrets` CONTEXT is a violation except in
+             the two KEYS the post step may hold one in, so a channel nobody
+             anticipated fails. Every job is enumerated, because a single-job
+             walk misses a SECOND job holding head code beside the same secret.
   VALUES     the post step's token, its MAINTAINER_TOKEN env and its `if`
              guard are compared to exact literals, so an EXPRESSION nobody
              anticipated fails.
+  UNIQUENESS the post step and the eligibility producer are each required to
+             be the only one of their kind, because both are identified by a
+             string and the post step consumes the producer's output.
 
-The third level is the newest and the most expensive to have learned. Each
-earlier form reasoned about the secret NAME inside an expression, and an
-adversarial pass defeated every one of them with an expression carrying the
-right name and resolving to something else -- including one that reinstates
-this file's original defect in a single line. A name is not what a slot
-resolves to; only the literal is.
+Four rounds went into that list, and every round's finding was the SAME mistake
+in a new place: a set was enumerated instead of bounded. The reviewer supplied
+`secrets['NAME']` after the dot form, `toJSON(secrets)` after both, and
+`services` after `uses` and `container`. So nothing here enumerates the ways a
+thing can be spelled any more; the checks name what is PERMITTED and everything
+else fails by construction. A name is also not what a slot resolves to --
+`${{ secrets.EXPECTED || github.token }}` names only the expected secret and
+resolves, unset, to the default token -- which is why the value level compares
+literals rather than reasoning about names at all.
 
 Every invariant below is exercised in BOTH directions -- the shipped file must
 be clean, and a deliberately broken copy must be caught. An assertion group
@@ -87,7 +99,14 @@ _WORKFLOW = _REPO / ".github/workflows/contributor-review.yml"
 #: what code runs next to a maintainer token. Note this pattern ACCEPTS the
 #: pinned form specifically -- an earlier version of this allowlist matched the
 #: literal "@v9" and so would have rejected the very hardening it needed.
-_PERMITTED_USES = re.compile(r"^actions/github-script@[0-9a-f]{40}\b")
+#: Anchored at BOTH ends. A trailing `\b` let `actions/github-script@<40-hex>-x`
+#: and `actions/github-script@<40-hex>/x` through, and both are valid git ref
+#: components that resolve as a mutable tag rather than as the pinned commit.
+#: The `# v9` that follows this in the YAML is a comment and is not part of the
+#: parsed value, so anchoring the end is safe -- verified against the parse.
+#: `\Z` and not `$`, because Python's `$` also matches before one trailing
+#: newline, and a `uses:` written as a YAML literal block scalar parses with one.
+_PERMITTED_USES = re.compile(r"^actions/github-script@[0-9a-f]{40}\Z")
 
 _POST_STEP = "Post the review request under a maintainer identity"
 
@@ -129,14 +148,93 @@ _PERMITTED_GUARD = "steps.eligible.outputs.pr != ''"
 #: to detect it.
 _PERMITTED_STEP_IDS = {"eligible"}
 
-#: Any read of the `secrets` context, in EITHER documented spelling. GitHub
-#: documents both `secrets.NAME` and `secrets['NAME']`; a pattern matching only
-#: the first is a denylist one spelling wide, which is how the maintainer
-#: credential reached the eligibility step with the suite fully green. A
-#: bracket read whose name cannot be resolved statically is reported as
-#: `<unresolved>` -- named, not skipped, because failing closed on something
-#: unreadable is the only safe direction for a credential.
-_SECRET_REF = re.compile(r"secrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[)")
+#: ANY mention of the `secrets` context inside an Actions expression -- not any
+#: particular way of reading one.
+#:
+#: This is the fourth polarity fix on this one check, and the pattern in the
+#: three before it was always the same: enumerate the ways a credential can be
+#: named, ship, and have the next review supply the way that was missed.
+#: `secrets.NAME`, then `secrets['NAME']`, then `${{ toJSON(secrets) }}` --
+#: which serialises the WHOLE context, including this workflow's PAT, and names
+#: no individual secret at all, so every name-extracting pattern is blind to it.
+#:
+#: There is no list here any more, and there is no parsing either. The RAW value
+#: is searched for the word `secrets`; `_secret_locations` reports WHERE, and the
+#: two blessed keys are removed before the walk.
+#:
+#: An earlier version of THIS fix carved `${{ ... }}` bodies out first and
+#: searched inside them. That was a fail-open, and an adversarial run produced
+#: it: the non-greedy carve stops at the first `}}`, including one inside the
+#: expression's own string literal, so
+#:     ${{ fromJSON('{"a":{"b":1}}').c || secrets.REVIEW_REQUEST_TOKEN }}
+#: dropped everything after the nested brace and reported CLEAN -- a case the
+#: cruder pattern it replaced had caught. Nested JSON in `fromJSON` is where a
+#: `}}` appears inside a literal, so the shape is ordinary, not exotic.
+#:
+#: The lesson, for the fourth time in this file: tokenizing input you do not
+#: have to tokenize buys a way to be wrong. A false POSITIVE here costs a
+#: reworded string; a false negative costs the credential. So the check does not
+#: care whether the mention is in an expression, a comment inside a script body,
+#: or text nobody meant as code -- it fires, and the shipped-file test is the
+#: proof that the real workflow stays clean under that breadth.
+#: CASE-INSENSITIVE, and that is not a nicety. GitHub resolves context names with
+#: `StringComparer.OrdinalIgnoreCase` (READ: actions/runner
+#: src/Sdk/DTExpressions2/Expressions2/ExpressionParser.cs, the
+#: `ExtensionNamedValues` dictionary), so `${{ SECRETS.X }}` and
+#: `${{ ToJson(SECRETS) }}` both resolve. A case-SENSITIVE pattern here restored
+#: this file's original defect with a one-character edit, suite fully green.
+#:
+#: The general rule, because case is just another enumerated spelling: at this
+#: gate, every comparison must err toward FLAGGING. Those that do are left
+#: case-sensitive on purpose -- an oddly-cased `uses`, post-step name, step id,
+#: schema key or permitted literal all fail, which is the safe direction. The two
+#: that erred toward PASSING are this one and the write-scope check below.
+_SECRETS_CONTEXT = re.compile(r"\bsecrets\b", re.I)
+#: Only to LABEL a reference once `_SECRETS_CONTEXT` has already decided it is
+#: one. Never used to decide whether something IS a reference. Both dereference
+#: spellings are read, so a bracket form is not mislabelled as a whole-context
+#: export -- a wrong label sends the next reader hunting for a `toJSON` that is
+#: not there, and a diagnostic that lies is its own small defect.
+_SECRET_NAME = re.compile(
+    r"""\bsecrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"]([^'"]+)['"]\s*\]|(\[))""",
+    re.I,
+)
+
+#: Job keys are an ALLOWLIST, because the denylist form shipped three times and
+#: missed a different code-running key each time: `uses` (a reusable workflow),
+#: `container`, and `services` -- which starts an arbitrary Docker image, with
+#: docker options and host volume mounts, BEFORE any step in this file runs.
+#: `strategy`, `defaults`, `environment` and `outputs` were never considered at
+#: all. Anything not named here fails, so the next key GitHub adds fails too.
+_PERMITTED_JOB_KEYS = frozenset(
+    {"name", "runs-on", "if", "permissions", "steps", "timeout-minutes", "concurrency"}
+)
+
+#: Same reasoning one level up. The workflow level can also carry `env`,
+#: `defaults` and `run-name`, and an inherited scope is exactly how a credential
+#: reached every step without naming one.
+#:
+#: Read with `_normalised_key`, not with a `True` member. Under YAML 1.1, which
+#: PyYAML implements, a bare `on` is a BOOLEAN, so the trigger block parses as the
+#: key `True` -- and `doc["on"]` is a KeyError, silently, because the key is not
+#: where it was looked for. Putting `True` in the allowlist instead was wrong in
+#: BOTH directions: `1 == True` in Python, so a workflow key `1:` was admitted,
+#: while the QUOTED `"on":` spelling -- the one yamllint's `truthy` rule pushes
+#: authors toward -- was rejected as unpermitted. A guard that fires on a
+#: lint-recommended edit is a guard that gets silenced.
+_PERMITTED_WORKFLOW_KEYS = frozenset({"name", "on", "permissions", "concurrency", "jobs"})
+
+#: The ONE runner this workflow may use, as a literal. `runs-on` passed the key
+#: allowlist while its VALUE stayed unbounded, and the value decides which machine
+#: decrypts MAINTAINER_TOKEN: `runs-on: [self-hosted, attacker-pool]` relocates
+#: the maintainer PAT onto a host outside GitHub's control with the checker
+#: reporting clean. Bounding the key and leaving the value free is half a bound.
+_PERMITTED_RUNS_ON = "ubuntu-latest"
+
+
+def _normalised_key(key):
+    """YAML 1.1 turns a bare `on` into `True`; both spellings mean the trigger."""
+    return "on" if key is True else key
 
 
 def _load() -> dict:
@@ -192,7 +290,23 @@ def _secret_locations(node, path: str = "") -> list[str]:
             for index, value in enumerate(node)
             for loc in _secret_locations(value, f"{path}[{index}]")
         ]
-    return [f"{path}:{m.group(1) or '<unresolved>'}" for m in _SECRET_REF.finditer(str(node))]
+    raw = str(node)
+    if not _SECRETS_CONTEXT.search(raw):
+        return []
+    # One violation per VALUE, not per dereference. The labels below are
+    # diagnostic only -- every one of them is a violation when it sits outside
+    # the two blessed keys:
+    #   a NAME            a readable dot or quoted-bracket dereference
+    #   <unresolved>      a bracket index no static reader can resolve
+    #   <whole-context>   the word appears but nothing is dereferenced, i.e.
+    #                     `toJSON(secrets)` -- every secret the workflow can
+    #                     see, naming none of them
+    named = _SECRET_NAME.search(raw)
+    if named is None:
+        label = "<whole-context>"
+    else:
+        label = named.group(1) or named.group(2) or "<unresolved>"
+    return [f"{path}:{label}"]
 
 
 def _eligibility_step(doc: dict):
@@ -221,7 +335,10 @@ def _violations(doc: dict) -> list[str]:
             out.append(f"permissions-not-a-mapping:{where}")
             continue
         for scope, level in perms.items():
-            if level == "write":
+            # Case-folded for the same reason as `_SECRETS_CONTEXT`: this is the
+            # other comparison at this gate whose case-sensitivity erred toward
+            # PASSING, so `contents: WRITE` read as read-only.
+            if str(level).strip().lower() == "write":
                 out.append(f"default-token-write-scope:{where}:{scope}")
 
     # A job need not have steps at all. A reusable-workflow call (`uses:` at JOB
@@ -229,10 +346,24 @@ def _violations(doc: dict) -> list[str]:
     # every secret this repository holds -- strictly more privilege than the
     # checkout this file already forbids, and invisible to any walk that only
     # iterates `job["steps"]`. `container:` is the same shape.
+    for key in doc:
+        if _normalised_key(key) not in _PERMITTED_WORKFLOW_KEYS:
+            out.append(f"unpermitted-workflow-key:{key}")
+
     for name, job in _jobs(doc).items():
         if not isinstance(job, dict):
             out.append(f"job-not-a-mapping:{name}")
             continue
+        # The allowlist is the MECHANISM. The three named checks below it stay
+        # only because they say WHICH escape hatch was opened, which a generic
+        # "unpermitted key" never will; they are diagnostics, not the bound.
+        for key in job:
+            if _normalised_key(key) not in _PERMITTED_JOB_KEYS:
+                out.append(f"unpermitted-job-key:{name}:{key}")
+        # The key is allowlisted; so is its VALUE, because the value is what
+        # decides which machine decrypts the credential.
+        if job.get("runs-on") != _PERMITTED_RUNS_ON:
+            out.append(f"unpermitted-runner:{name}:{job.get('runs-on')!r}")
         if "uses" in job:
             out.append(f"job-calls-a-reusable-workflow:{name}")
         if "secrets" in job:
@@ -256,6 +387,16 @@ def _violations(doc: dict) -> list[str]:
     posts = _post_steps(doc)
     if len(posts) != 1:
         out.append(f"post-step-is-not-unique:{len(posts)}")
+
+    # The eligibility PRODUCER must be unique too, and for the same reason the
+    # post step must be. `steps.eligible.outputs.pr` resolves against whichever
+    # step carries that id IN THE POST STEP'S OWN JOB, so a second job holding
+    # its own `id: eligible` beside a second pinned github-script satisfies the
+    # same-job check while the post step consumes an output the real predicate
+    # never produced.
+    producers = [st for _j, st in _all_steps(doc) if st.get("id") == "eligible"]
+    if len(producers) != 1:
+        out.append(f"eligibility-step-is-not-unique:{len(producers)}")
 
     # Nothing may follow the post step, and no other step may carry an `id`.
     # See `_PERMITTED_STEP_IDS`: a step output is runtime dataflow and a
@@ -548,6 +689,95 @@ def _bracket_secret_in_workflow_env(doc):
     doc["env"] = {"MAINTAINER_TOKEN": "${{ secrets['REVIEW_REQUEST_TOKEN'] }}"}
 
 
+def _uppercase_secrets_context(doc):
+    """Actions resolves context names case-insensitively; a one-char bypass."""
+    _first_job(doc)["steps"][0]["env"] = {"T": "${{ SECRETS.REVIEW_REQUEST_TOKEN }}"}
+
+
+def _uppercase_whole_context_export(doc):
+    _first_job(doc)["steps"][0]["env"] = {"T": "${{ ToJson(SECRETS) }}"}
+
+
+def _uppercase_write_permission(doc):
+    doc["permissions"]["pull-requests"] = "WRITE"
+
+
+def _self_hosted_runner(doc):
+    """Relocates the machine that decrypts the PAT."""
+    _first_job(doc)["runs-on"] = ["self-hosted", "attacker-pool"]
+
+
+def _numeric_workflow_key(doc):
+    """A non-string key must not be admitted.
+
+    NOT `doc[1]`, which cannot express the case: `1 == True` and dict lookup is
+    by equality, so assigning key 1 REPLACES the `True` that `on:` parsed to
+    rather than adding a key. The two cannot coexist after parsing, which is
+    also why an allowlist containing the bare `True` admitted a numeric key --
+    `_normalised_key` maps only the `True` singleton, by identity.
+    """
+    doc[2] = "anything"
+
+
+def _quoted_on_key(doc):
+    """The spelling yamllint's truthy rule pushes toward must NOT false-positive."""
+    doc["on"] = doc.pop(True)
+
+
+def _secret_after_a_nested_brace(doc):
+    """A `}}` inside a string literal used to hide everything after it.
+
+    Nested JSON in `fromJSON` is where a literal `}}` naturally appears, so this
+    is an ordinary expression rather than a contrived one -- and an earlier
+    version of THIS check carved `${{ ... }}` bodies out with a non-greedy match
+    and reported clean on it.
+    """
+    _first_job(doc)["steps"][0]["env"] = {
+        "X": '${{ fromJSON(\'{"a":{"b":1}}\').c || secrets.REVIEW_REQUEST_TOKEN }}'
+    }
+
+
+def _secret_after_an_injected_double_brace(doc):
+    _first_job(doc)["steps"][0]["env"] = {
+        "X": "${{ format('{0}{1}', '}}', secrets.REVIEW_REQUEST_TOKEN) }}"
+    }
+
+
+def _whole_context_secret_export(doc):
+    """`toJSON(secrets)` serialises EVERY secret and names none of them."""
+    _first_job(doc)["steps"][0]["env"] = {"ALL": "${{ toJSON(secrets) }}"}
+
+
+def _whole_context_secret_export_at_workflow_level(doc):
+    doc["env"] = {"ALL": "${{ toJSON(secrets) }}"}
+
+
+def _job_service_container(doc):
+    """A service starts an arbitrary image, with host mounts, before any step."""
+    _first_job(doc)["services"] = {"evil": {"image": "evil/image:latest", "options": "-v /:/host"}}
+
+
+def _job_matrix_strategy(doc):
+    """Not a code-running key in itself -- the point is that it is UNLISTED."""
+    _first_job(doc)["strategy"] = {"matrix": {"n": [1, 2]}}
+
+
+def _mutable_suffix_on_the_pinned_sha(doc):
+    """A valid git ref component after the sha, so it resolves as a TAG."""
+    step = _first_job(doc)["steps"][0]
+    step["uses"] = f"{step['uses']}-mutable"
+
+
+def _second_eligibility_producer_in_another_job(doc):
+    """The post step then consumes an output the real predicate never produced."""
+    original = _first_job(doc)["steps"]
+    post = [s for s in original if s.get("name") == _POST_STEP]
+    _first_job(doc)["steps"] = [s for s in original if s.get("name") != _POST_STEP]
+    fake = copy.deepcopy(original[0])
+    fake["with"] = {"script": "core.setOutput('pr', '1'); core.setOutput('issue', '1')"}
+    doc["jobs"]["shadow"] = {"runs-on": "ubuntu-latest", "steps": [fake, *post]}
+
+
 def _bracket_secret_by_computed_name(doc):
     """A name no static reader can resolve. Must fail CLOSED, not be skipped."""
     _first_job(doc)["steps"][0]["env"] = {
@@ -720,6 +950,25 @@ def _drop_the_post_step(doc):
         (_bracket_secret_on_the_eligibility_step, "secret-outside-the-post-step:"),
         (_bracket_secret_in_workflow_env, "secret-outside-the-post-step:env."),
         (_bracket_secret_by_computed_name, "secret-outside-the-post-step:"),
+        (_whole_context_secret_export, "secret-outside-the-post-step:"),
+        (_secret_after_a_nested_brace, "secret-outside-the-post-step:"),
+        (_secret_after_an_injected_double_brace, "secret-outside-the-post-step:"),
+        (_uppercase_secrets_context, "secret-outside-the-post-step:"),
+        (_uppercase_whole_context_export, "secret-outside-the-post-step:"),
+        (_uppercase_write_permission, "default-token-write-scope:"),
+        (_self_hosted_runner, "unpermitted-runner:"),
+        (_numeric_workflow_key, "unpermitted-workflow-key:"),
+        (
+            _whole_context_secret_export_at_workflow_level,
+            "unpermitted-workflow-key:env",
+        ),
+        (_job_service_container, "unpermitted-job-key:"),
+        (_job_matrix_strategy, "unpermitted-job-key:"),
+        (_mutable_suffix_on_the_pinned_sha, "unpermitted-action:"),
+        (
+            _second_eligibility_producer_in_another_job,
+            "eligibility-step-is-not-unique:",
+        ),
         (_extra_secret_beside_the_permitted_one, "secret-outside-the-post-step:"),
         (_shared_with_mapping_via_anchor, "secret-outside-the-post-step:"),
         (_duplicate_post_step_name, "post-step-is-not-unique:"),
@@ -737,6 +986,33 @@ def test_checker_catches_each_breach(mutate, expected_prefix):
     assert any(v.startswith(expected_prefix) for v in found), (
         f"expected a {expected_prefix!r} violation, got {found!r}"
     )
+
+
+def test_the_quoted_on_key_is_not_a_false_positive():
+    """A guard that fires on a lint-recommended edit is a guard that gets silenced.
+
+    YAML 1.1 parses a bare `on:` as the boolean `True`, and yamllint's `truthy`
+    rule pushes authors to quote it. Both spellings mean the trigger block, so
+    both must pass -- an earlier version of the key allowlist accepted only the
+    boolean and rejected the quoted form.
+    """
+    assert _violations(_mutated(_quoted_on_key)) == []
+
+
+def test_the_secret_walk_does_not_fire_on_an_ordinary_expression():
+    """The breadth has a limit, and an absence-assertion group needs its sibling.
+
+    The walk searches the RAW value for the word `secrets` rather than parsing
+    expressions, which is deliberate breadth. That only means something if it
+    still distinguishes: an expression with no secret in it must not trip, or
+    every "caught" above would be vacuous.
+    """
+    doc = _mutated(
+        lambda d: _first_job(d)["steps"][0].__setitem__(
+            "env", {"N": "${{ github.event.pull_request.number }}"}
+        )
+    )
+    assert not [v for v in _violations(doc) if v.startswith("secret-outside")]
 
 
 def test_second_job_with_a_checkout_is_caught_as_an_action_too():
