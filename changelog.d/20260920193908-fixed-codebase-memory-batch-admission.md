@@ -1,0 +1,1 @@
+- Request a 4 GiB Codebase batch scope by default. Probe each tool's scope independently and check the Codebase scope's actual cgroup placement, zero-swap limit, effective page-aligned cap, host memory and shared-ancestor headroom before starting the indexer; defer when the full effective cap cannot be accommodated.

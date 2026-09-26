@@ -17,11 +17,10 @@
 #      covers worktree sessions without any index.
 #   2. SINGLE-FLIGHT — a non-blocking flock per repo path: if an index for
 #      this repo is already running, exit 0 immediately (never queue).
-#   3. RESOURCE CAPS — both tools run inside a systemd user scope with
-#      MemoryMax / MemorySwapMax=0 / IOWeight / CPUQuota, so even a single
-#      index cannot starve the container. Where no systemd user manager is
-#      reachable (CI, containers without a user bus), falls back to
-#      nice/ionice + a soft address-space rlimit.
+#   3. RESOURCE CAPS — both tools use a systemd user scope with MemoryMax /
+#      MemorySwapMax=0 / IOWeight / CPUQuota. Codebase refuses when that scope
+#      is unavailable; GitNexus retains its legacy nice/ionice + address-space
+#      rlimit fallback.
 #
 # The script runs the requested tools SEQUENTIALLY in the foreground and
 # exits when done — but it is NOT meant to be called on every commit anymore.
@@ -43,7 +42,7 @@
 #
 # Env overrides:
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
-#   CODE_INTEL_CBM_MEMORY_MAX     default 2G     (CBM batch scope)
+#   CODE_INTEL_CBM_MEMORY_MAX     default 4G     (requested CBM batch ceiling)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
@@ -72,6 +71,23 @@ if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
         printf '%s\n' \
             "code-intel: CODE_INTEL_INDEX_OOM_SCORE_ADJ requires 1000; refusing unsafe batch workload" >&2
         exit 125
+    fi
+    if [ -n "${CODE_INTEL_CHILD_CAP_BYTES:-}" ]; then
+        if [ ! -x /usr/bin/python3 ] \
+            || ! /usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/code_intel_cbm_admission.py" \
+                "$CODE_INTEL_CHILD_CAP_BYTES" \
+                "${CODE_INTEL_CHILD_RESERVE_BYTES:-}" \
+                "${CODE_INTEL_CHILD_SCOPE_UNIT:-}" \
+                "${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-2147483648}"; then
+            # The parent owns this unique marker. It distinguishes an
+            # admission refusal from a raw indexer exit status, so the queue
+            # keeps the request without charging a failed indexing attempt.
+            if [ -n "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ]; then
+                printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER" 2>/dev/null || true
+            fi
+            printf '%s\n' "code-intel: refusing Codebase batch without proven scope admission" >&2
+            exit 125
+        fi
     fi
 
     # One-way failure injection: this can only make a test/refusal stricter. It
@@ -125,7 +141,9 @@ TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
 
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
-CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-2G}}"
+# Four GiB is the provisional batch ceiling. The bounded child checks actual
+# destination-scope headroom for the entire requested cap before indexing.
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-4G}}"
 # Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
 # (4.54 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
 # cap killed it on the way up. Keep headroom for repository growth; admission
@@ -151,6 +169,28 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
     # integer-only, so the multiply goes through awk. A bare number must be an
     # integer byte count — a unitless "5.5" is malformed, not 5.5 bytes.
     [[ "$v" =~ ^([0-9]+(\.[0-9]+)?)([GgMmKk])$ || "$v" =~ ^[0-9]+$ ]] || return 1
+    # Bound the MANTISSA before the multiply, per unit. Bounding the RESULT is
+    # not equivalent: the integer branches below multiply in Bash, so by the
+    # time a result bound runs, the product has already wrapped and the bound
+    # is inspecting a plausible-looking small number. MEASURED on the first
+    # version of this fix: "18014398514243865K" wrapped to 4876166144 and was
+    # accepted as a legitimate 4.87 GB cap, above the gitnexus minimum.
+    # Per-unit limits keep mantissa x scale under the byte bound:
+    #   G: 10^18 / 2^30 = 9.3e8  -> 9 digits
+    #   M: 10^18 / 2^20 = 9.5e11 -> 11 digits
+    #   K: 10^18 / 2^10 = 9.8e14 -> 14 digits
+    local _mb_mant _mb_lim
+    case "$v" in
+        *[Gg]) _mb_mant="${v%[Gg]}"; _mb_lim=9 ;;
+        *[Mm]) _mb_mant="${v%[Mm]}"; _mb_lim=11 ;;
+        *[Kk]) _mb_mant="${v%[Kk]}"; _mb_lim=14 ;;
+        *)     _mb_mant="$v";        _mb_lim="$_GENESIS_MEM_MAX_DIGITS" ;;
+    esac
+    # Integer part only: a fractional mantissa goes through awk (double), and
+    # the result bound below catches anything awk produces that is too large.
+    _genesis_uint_bounded "${_mb_mant%%.*}" "$_mb_lim" || return 1
+    local _mb_out
+    _mb_out="$(
     case "$v" in
         # `%.0f`, not `%d`: mawk implements %d through a signed 32-bit int and
         # clamps 8 GiB to 2147483647, which reads as "below the working set"
@@ -166,7 +206,48 @@ _genesis_mem_bytes() {  # "8G"/"512M"/"1024K"/"5.5G"/bytes -> bytes on stdout, o
                 || printf '%s' "$(( ${v%[Kk]} * 1024 ))" ;;
         *) printf '%s' "$v" ;;
     esac
+    )"
+    # A parseable value can still be too large to compute with ("99999999999G").
+    # Emitting nothing routes it to the caller's existing "not a parseable
+    # memory value" refusal rather than into a wrapped cap.
+    _genesis_uint_bounded "$_mb_out" || return 1
+    printf '%s' "$_mb_out"
 }
+
+# Bash arithmetic is signed 64-bit and wraps SILENTLY. A wrapped product can
+# re-cross zero on the very next subtraction and present as enormous headroom:
+# MEASURED, MemAvailable=9007199254740992 kB makes (avail*1024)-reserve come out
+# at +9223372034707292160, which clears the minimum-headroom check with no
+# headroom at all. So every externally-sourced number is bounded BEFORE it
+# reaches arithmetic, not after.
+#
+# The bound is a DIGIT COUNT rather than a numeric limit, because comparing an
+# out-of-range value numerically is the same trap one layer down: `[ huge -gt x ]`
+# exits 2, and an `&&` list continues straight past it. Counting digits cannot
+# overflow and cannot error. Any value of at most 18 digits is below 10^18, so
+# two of them sum and difference well inside int64. The kB bound is 14 rather
+# than 15 so that a legal kB value stays legal AFTER the x1024 every caller
+# applies: 15 digits x 1024 is a 19-digit byte value, which the byte bound
+# would then reject — the two limits have to compose, not merely each hold.
+# Both ceilings sit astronomically above real hardware (10^18 B is 888 PiB).
+# This generalises the length guard the v1 cgroup branch above already uses.
+_GENESIS_MEM_MAX_DIGITS=18
+_GENESIS_MEM_MAX_KB_DIGITS=14
+
+# A nonnegative decimal integer small enough that the admission arithmetic
+# cannot wrap. Leading zeros are stripped so "0000000008" is judged as one
+# digit, not ten.
+_genesis_uint_bounded() {
+    local v="${1:-}" limit="${2:-$_GENESIS_MEM_MAX_DIGITS}"
+    # No leading zeros: $(( )) reads those as OCTAL while `[` reads them as
+    # decimal, so "0100" would mean 100 to one and 64 to the other, and "08"
+    # aborts the script under `set -u` with a raw bash error rather than a
+    # structured refusal. Rejecting the spelling is cheaper than teaching every
+    # arithmetic site to write 10#.
+    [[ "$v" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    [ "${#v}" -le "$limit" ]
+}
+
 
 # The container's own ceiling. cgroup v2 first (what an LXC/Docker limit shows
 # up as), then v1, then MemTotal. "max" means unlimited, so it is not a ceiling.
@@ -178,6 +259,7 @@ _genesis_mem_ceiling() {
     # install. It doubles as the operator override when a container limit is
     # not discoverable.
     if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ]; then
+        _genesis_uint_bounded "$CODE_INTEL_MEM_CEILING_BYTES" || return 1
         printf '%s' "$CODE_INTEL_MEM_CEILING_BYTES"
         return
     fi
@@ -186,11 +268,13 @@ _genesis_mem_ceiling() {
     elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
         raw="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
     fi
-    if [ -n "$raw" ] && [ "$raw" != "max" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+    if [ -n "$raw" ] && [ "$raw" != "max" ] && _genesis_uint_bounded "$raw" \
+        && [ "$raw" -gt 0 ] 2>/dev/null; then
         # A v1 "unlimited" is a huge sentinel rather than a word; anything at or
         # above MemTotal is not a container limit worth honouring.
         local total_kb total_b
         total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+        _genesis_uint_bounded "${total_kb:-0}" "$_GENESIS_MEM_MAX_KB_DIGITS" || total_kb=0
         total_b=$(( ${total_kb:-0} * 1024 ))
         if [ "$total_b" -gt 0 ] && [ "$raw" -lt "$total_b" ]; then
             printf '%s' "$raw"
@@ -200,10 +284,13 @@ _genesis_mem_ceiling() {
         printf '%s' "$raw"
         return
     fi
-    local total_kb
-    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
-    [ -n "$total_kb" ] && printf '%s' "$(( total_kb * 1024 ))"
+    local total_kb meminfo
+    meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
+    total_kb="$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null)"
+    _genesis_uint_bounded "$total_kb" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && printf '%s' "$(( total_kb * 1024 ))"
 }
+
 
 # Convert a cgroup's total charge into a conservative working-set estimate.
 # memory.current includes clean filesystem cache, which the kernel can reclaim
@@ -216,7 +303,12 @@ _genesis_mem_ceiling() {
 # closed to the raw charge.
 _genesis_mem_working_set_from() {
     local current="${1:-}" stat_path="${2:-}"
-    [[ "$current" =~ ^[0-9]+$ ]] || return 1
+    # Bounded in place rather than through _genesis_uint_bounded: the test suite
+    # extracts THIS FUNCTION ALONE and sources it in isolation, so it cannot
+    # reach the shared validator. Both call sites bound `current` before calling,
+    # making this the local belt to their braces.
+    [[ "$current" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    [ "${#current}" -le "${_GENESIS_MEM_MAX_DIGITS:-18}" ] || return 1
     [ -r "$stat_path" ] || { printf '%s' "$current"; return; }
 
     local fields inactive active dirty writeback v1_inactive v1_active v1_dirty v1_writeback reserve reclaimable discount
@@ -244,11 +336,16 @@ _genesis_mem_working_set_from() {
         return
     fi
     for fields in "$inactive" "$active" "$dirty" "$writeback"; do
-        [[ "$fields" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+        [[ "$fields" =~ ^(0|[1-9][0-9]*)$ ]] \
+            && [ "${#fields}" -le "${_GENESIS_MEM_MAX_DIGITS:-18}" ] \
+            || { printf '%s' "$current"; return; }
     done
 
     reserve="${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-$(( 2 * 1024 * 1024 * 1024 ))}"
-    [[ "$reserve" =~ ^[0-9]+$ ]] || { printf '%s' "$current"; return; }
+    [[ "$reserve" =~ ^(0|[1-9][0-9]*)$ ]] \
+        || { printf '%s' "$current"; return; }
+    [ "${#reserve}" -le "${_GENESIS_MEM_MAX_DIGITS:-18}" ] \
+        || { printf '%s' "$current"; return; }
     reclaimable=$(( inactive + active ))
     [ "$(( dirty + writeback ))" -lt "$reclaimable" ] \
         || { printf '%s' "$current"; return; }
@@ -267,6 +364,7 @@ _genesis_mem_working_set_from() {
 # MemTotal-MemAvailable. Unreadable means the caller falls back to the floor.
 _genesis_mem_current() {
     if [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ]; then
+        _genesis_uint_bounded "$CODE_INTEL_MEM_CURRENT_BYTES" || return 1
         printf '%s' "$CODE_INTEL_MEM_CURRENT_BYTES"
         return
     fi
@@ -281,14 +379,17 @@ _genesis_mem_current() {
         raw="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
         stat_path="${CODE_INTEL_MEM_STAT_PATH:-/sys/fs/cgroup/memory/memory.stat}"
     fi
-    if [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null; then
+    if [ -n "$raw" ] && _genesis_uint_bounded "$raw" && [ "$raw" -gt 0 ] 2>/dev/null; then
         _genesis_mem_working_set_from "$raw" "$stat_path"
         return
     fi
-    local total_kb avail_kb
-    total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
-    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)"
-    [ -n "$total_kb" ] && [ -n "$avail_kb" ] && [ "$total_kb" -gt "$avail_kb" ] \
+    local total_kb avail_kb meminfo
+    meminfo="${CODE_INTEL_MEMINFO:-/proc/meminfo}"
+    total_kb="$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null)"
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' "$meminfo" 2>/dev/null)"
+    _genesis_uint_bounded "$total_kb" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && _genesis_uint_bounded "$avail_kb" "$_GENESIS_MEM_MAX_KB_DIGITS" \
+        && [ "$total_kb" -gt "$avail_kb" ] \
         && printf '%s' "$(( (total_kb - avail_kb) * 1024 ))"
 }
 
@@ -299,11 +400,75 @@ CODE_INTEL_SIBLING_RESERVE_BYTES="${CODE_INTEL_SIBLING_RESERVE_BYTES:-$(( 2 * 10
 #: (4.54 GiB). A cap below the working set does not protect anything, it just
 #: relocates the kill, so refuse instead of pretending.
 CODE_INTEL_GITNEXUS_MIN_BYTES="${CODE_INTEL_GITNEXUS_MIN_BYTES:-$(( 4874166272 ))}"
+# MEASURED 2026-09-09: Codebase Memory's clean fast index peaked at roughly
+# 2,836 MiB RSS. MemoryMax also charges file cache, kernel memory, and the
+# supervising shell, so the safe floor adds a non-RSS allowance to the measured
+# workload instead of treating the RSS peak as a sufficient cgroup ceiling.
+CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES="${CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES:-$(( 128 * 1024 * 1024 ))}"
+# Validated HERE rather than in the chain below, because this value is an
+# OPERAND of the very next line's sum: a bound applied afterwards inspects a
+# result that has already wrapped. MEASURED during review of the first version
+# of this fix, which did exactly that — a crafted charge drove the admission
+# floor to 98,305 bytes instead of 2.9 GiB with no refusal raised, re-opening
+# the wrap-into-admission hole this change exists to close. The value is reset
+# to the default so the sum below stays computable; the refusal is carried in
+# a separate variable and raised by the chain.
+_GENESIS_CHARGE_REFUSE=""
+if ! _genesis_uint_bounded "$CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES"; then
+    _GENESIS_CHARGE_REFUSE="CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES is not a nonnegative integer below 10^$_GENESIS_MEM_MAX_DIGITS"
+    CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES=$(( 128 * 1024 * 1024 ))
+fi
+CODE_INTEL_CBM_MIN_BYTES="${CODE_INTEL_CBM_MIN_BYTES:-$(( 2836 * 1024 * 1024 + CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES ))}"
 
+# THREE refusal scopes, not one. A refusal must reach exactly the legs whose
+# arithmetic the bad value feeds. An earlier revision of this change put every
+# constant in the shared string, which meant a malformed CBM-only constant
+# refused GitNexus (and vice versa) — a leg with a valid cap and real headroom
+# was skipped because of a variable it never reads.
+#
+# SHARED holds only what BOTH legs consume: the ceiling override, live usage,
+# and the sibling reserve.
+_genesis_bad_uint() {  # name -> refusal message, or nothing
+    printf '%s is not a nonnegative integer below 10^%s' "$1" "$_GENESIS_MEM_MAX_DIGITS"
+}
+
+GENESIS_MEM_ENV_REFUSE=""
+if [ -n "${CODE_INTEL_MEM_CEILING_BYTES:-}" ] \
+    && ! _genesis_uint_bounded "$CODE_INTEL_MEM_CEILING_BYTES"; then
+    # The ceiling override belongs in the SHARED chain: refusing it only on the
+    # cbm leg left the gitnexus leg unable to tell "refused" from "no ceiling
+    # discoverable" — both are an empty string there — so it skipped admission
+    # entirely, a refusal path failing open on one of two legs.
+    GENESIS_MEM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_MEM_CEILING_BYTES)"
+elif [ -n "${CODE_INTEL_MEM_CURRENT_BYTES:-}" ] \
+    && ! _genesis_uint_bounded "$CODE_INTEL_MEM_CURRENT_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_MEM_CURRENT_BYTES)"
+elif ! _genesis_uint_bounded "$CODE_INTEL_SIBLING_RESERVE_BYTES"; then
+    GENESIS_MEM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_SIBLING_RESERVE_BYTES)"
+fi
+
+# CBM-only. The workload charge is an operand of the minimum-bytes sum above,
+# so its refusal was captured before that sum was computed.
+GENESIS_CBM_ENV_REFUSE=""
+if [ -n "$_GENESIS_CHARGE_REFUSE" ]; then
+    GENESIS_CBM_ENV_REFUSE="$_GENESIS_CHARGE_REFUSE"
+elif ! _genesis_uint_bounded "$CODE_INTEL_CBM_MIN_BYTES"; then
+    GENESIS_CBM_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_CBM_MIN_BYTES)"
+fi
+
+# GitNexus-only.
+GENESIS_GITNEXUS_ENV_REFUSE=""
+if ! _genesis_uint_bounded "$CODE_INTEL_GITNEXUS_MIN_BYTES"; then
+    GENESIS_GITNEXUS_ENV_REFUSE="$(_genesis_bad_uint CODE_INTEL_GITNEXUS_MIN_BYTES)"
+fi
 _genesis_ceiling_b="$(_genesis_mem_ceiling)"
 _genesis_want_b="$(_genesis_mem_bytes "$GITNEXUS_MEM_MAX")"
 GITNEXUS_MEM_REFUSE=""
-if [ -z "$_genesis_want_b" ]; then
+if [ -n "$GENESIS_MEM_ENV_REFUSE" ]; then
+    GITNEXUS_MEM_REFUSE="$GENESIS_MEM_ENV_REFUSE"
+elif [ -n "$GENESIS_GITNEXUS_ENV_REFUSE" ]; then
+    GITNEXUS_MEM_REFUSE="$GENESIS_GITNEXUS_ENV_REFUSE"
+elif [ -z "$_genesis_want_b" ]; then
     # Fail closed: an unparseable cap must not reach MemoryMax, and skipping the
     # admission check silently would run the job unbounded.
     GITNEXUS_MEM_REFUSE="CODE_INTEL_GITNEXUS_MEMORY_MAX='${GITNEXUS_MEM_MAX}' is not a parseable memory value — refusing rather than running unbounded"
@@ -331,9 +496,6 @@ elif [ -n "$_genesis_ceiling_b" ]; then
         GITNEXUS_MEM_MAX="$_genesis_spare_b"
     fi
 fi
-# Probe with the larger supported value; each tool overrides this dynamically
-# when its real scope/rlimit is created below.
-MEM_MAX="$GITNEXUS_MEM_MAX"
 IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
@@ -453,26 +615,42 @@ fi
 # Probe systemd-run exactly like .claude/mcp/run-codebase-memory does: the
 # probe must create a real scope, because CC-spawned / hook-spawned contexts
 # sometimes cannot reach the user manager even when systemd-run exists.
-_SCOPE_OK=0
-if command -v systemd-run >/dev/null 2>&1; then
-    if systemd-run --user --scope --quiet \
-        -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
+_GN_SCOPE_OK=0
+_CBM_SCOPE_OK=0
+_probe_scope() {
+    local -a slice_args=()
+    [ "$2" = "cbm" ] && slice_args=(--slice-inherit)
+    /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
+        -p "MemoryMax=$1" -p "MemorySwapMax=0" \
         -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
-        -- /bin/true 2>/dev/null; then
-        _SCOPE_OK=1
+        -- /bin/true 2>/dev/null
+}
+if [ -x /usr/bin/systemd-run ]; then
+    if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
+        _probe_scope "$GITNEXUS_MEM_MAX" gitnexus && _GN_SCOPE_OK=1
+    fi
+    if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
+        _probe_scope "$CBM_MEM_MAX" cbm && _CBM_SCOPE_OK=1
     fi
 fi
 
 _run_capped() {
     if [ "$_SCOPE_OK" = "1" ]; then
+        local -a slice_args=()
+        [ "${_CI_SCOPE_INHERIT:-0}" = "1" ] && slice_args=(--slice-inherit)
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a
         # deterministic name so the watchdog can freeze/thaw/stop it by unit.
-        systemd-run --user --scope --quiet \
+        /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
             ${_CI_SCOPE_UNIT:+--unit="$_CI_SCOPE_UNIT"} \
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
             --description "code-intel index: $REPO_PATH" \
-            -- /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
+            -- /usr/bin/env \
+                "CODE_INTEL_CHILD_CAP_BYTES=${CODE_INTEL_CHILD_ADMIT_CAP_BYTES:-}" \
+                "CODE_INTEL_CHILD_RESERVE_BYTES=$CODE_INTEL_SIBLING_RESERVE_BYTES" \
+                "CODE_INTEL_CHILD_SCOPE_UNIT=${_CI_SCOPE_UNIT:-}" \
+                "CODE_INTEL_CHILD_REFUSAL_MARKER=${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" \
+                /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
     else
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
@@ -561,9 +739,13 @@ _watchdog() {
 # _run_with_watchdog <tool_label> <command...>: run one tool under the watchdog.
 _run_with_watchdog() {
     local label="$1"; shift
+    local _SCOPE_OK="$_GN_SCOPE_OK"
+    local scope_inherit=0
+    [ "$label" = "cbm" ] && _SCOPE_OK="$_CBM_SCOPE_OK"
+    [ "$label" = "cbm" ] && scope_inherit=1
     if [ "$_SCOPE_OK" = "1" ]; then
         local unit; unit="code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-12)-${label}-$$"
-        _CI_SCOPE_UNIT="$unit" _run_capped "$@" &
+        _CI_SCOPE_UNIT="$unit" _CI_SCOPE_INHERIT="$scope_inherit" _run_capped "$@" &
         local job_pid=$!
         _watchdog scope "$unit" "$job_pid"
         wait "$job_pid"; return $?
@@ -614,14 +796,52 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
         MISSING="${MISSING}cbm "
     elif command -v codebase-memory-mcp >/dev/null 2>&1; then
-        _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
-        # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
-        # fast — no similarity/semantic edges); --persistence writes the shareable
-        # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
-        # instead of a full 0->100 re-index.
-        MEM_MAX="$CBM_MEM_MAX" _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
-            --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE" \
-            && CBM_RAN=1 || _leg_failed
+        CBM_MEM_REFUSE=""
+        _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
+        if [ -n "$GENESIS_CBM_ENV_REFUSE" ]; then
+            CBM_MEM_REFUSE="$GENESIS_CBM_ENV_REFUSE"
+        elif [ -z "$_cbm_want_b" ]; then
+            CBM_MEM_REFUSE="CODE_INTEL_CBM_MEMORY_MAX='${CBM_MEM_MAX}' is not a parseable memory value"
+        elif [ "$_cbm_want_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
+            CBM_MEM_REFUSE="configured cap ${CBM_MEM_MAX} is below the measured $(( CODE_INTEL_CBM_MIN_BYTES / 1024 / 1024 ))M Codebase Memory workload"
+        fi
+
+        if [ -z "$CBM_MEM_REFUSE" ] && [ "$_CBM_SCOPE_OK" != "1" ]; then
+            CBM_MEM_REFUSE="cannot establish a bounded systemd user scope"
+        fi
+        if [ -n "$CBM_MEM_REFUSE" ]; then
+            _log "SKIP cbm: $CBM_MEM_REFUSE"
+            _log "      verify the requested cap, systemd scope and available headroom"
+            MISSING="${MISSING:+$MISSING }cbm"
+        else
+            _log "indexing (codebase-memory-mcp, mode=$MODE): $REPO_PATH"
+            # Flag form (cbm >=0.9): --mode selects the pipeline depth (default here is
+            # fast — no similarity/semantic edges); --persistence writes the shareable
+            # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
+            # instead of a full 0->100 re-index.
+            _cbm_refusal_marker="$(mktemp "$LOCK_DIR/cbm-admission.XXXXXXXX" 2>/dev/null)"
+            if [ -z "$_cbm_refusal_marker" ]; then
+                _log "SKIP cbm: cannot create admission outcome marker"
+                MISSING="${MISSING:+$MISSING }cbm"
+            else
+                if MEM_MAX="$CBM_MEM_MAX" CODE_INTEL_CHILD_ADMIT_CAP_BYTES="$_cbm_want_b" \
+                    CODE_INTEL_CHILD_REFUSAL_MARKER="$_cbm_refusal_marker" \
+                    _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
+                    --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE"; then
+                    CBM_RAN=1
+                else
+                    _cbm_run_rc=$?
+                    if [ -s "$_cbm_refusal_marker" ]; then
+                        _log "SKIP cbm: scope admission refused before indexing"
+                        MISSING="${MISSING:+$MISSING }cbm"
+                    else
+                        RC=$_cbm_run_rc
+                        case "$RC" in 3|4|5|75) RC=111 ;; esac
+                    fi
+                fi
+                rm -f -- "$_cbm_refusal_marker"
+            fi
+        fi
     else
         _log "codebase-memory-mcp not on PATH — skipped"
         MISSING="${MISSING}cbm "
