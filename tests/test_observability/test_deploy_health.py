@@ -20,6 +20,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from genesis import env
 from genesis.observability.snapshots.deploy_health import (
     GUARDIAN_HOST_PATHS,
     collect_git_facts,
@@ -78,6 +79,21 @@ def test_git_facts_counts_behind_and_fetch_age(repo_with_upstream):
     assert facts["commits_behind_upstream"] == 2
     assert facts["fetch_age_hours"] is not None
     assert facts["fetch_age_hours"] < 1
+
+
+def test_git_facts_measures_the_resolved_deploy_tracking_ref(repo_with_upstream, monkeypatch):
+    monkeypatch.setattr(env, "github_public_repo", lambda: "GENesis-AGI")
+    monkeypatch.setattr(env, "deploy_branch_override", lambda: "")
+    repo = repo_with_upstream
+    upstream_main = _git(repo, "rev-parse", "origin/main")
+    _git(repo, "remote", "add", "upstream", "https://example.test/WingedGuardian/GENesis-AGI.git")
+    _git(repo, "update-ref", "refs/remotes/upstream/release", upstream_main)
+    _git(repo, "symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/release")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    facts = collect_git_facts(repo)
+
+    assert facts["commits_behind_upstream"] == 2
 
 
 def test_git_facts_degrade_on_non_repo(tmp_path):

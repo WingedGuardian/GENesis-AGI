@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -826,6 +828,114 @@ def github_public_repo() -> str:
     if local_val:
         return str(local_val).strip()
     return "GENesis-AGI"
+
+
+def deploy_branch_override() -> str:
+    """Persisted deploy-branch override shared by every Genesis process."""
+    value = _local_section("github").get("deploy_branch")
+    return str(value).strip() if value else ""
+
+
+def deploy_target(repo: Path | str, *, probe_remote_head: bool = True) -> tuple[str, str]:
+    """Resolve the remote and branch ``update.sh`` will deploy for ``repo``.
+
+    The same contract feeds update checks, background observations, and deploy
+    health: public-repo remote, then ``github.deploy_branch``, then that
+    remote's ``HEAD``, then ``main``. ``probe_remote_head=False`` keeps the
+    resolution local for collectors that must never touch the network.
+    """
+    remote = "origin"
+    public_repo = github_public_repo()
+    try:
+        remote_lines = subprocess.run(
+            ["git", "-C", str(repo), "remote", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if remote_lines.returncode == 0:
+            for line in remote_lines.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 3 and fields[2] == "(fetch)":
+                    repo_name = fields[1].rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+                    if repo_name == public_repo:
+                        remote = fields[0]
+                        break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    branch = deploy_branch_override()
+    if not branch and probe_remote_head:
+        with suppress(OSError, subprocess.TimeoutExpired):
+            remote_head = subprocess.run(
+                ["git", "-C", str(repo), "ls-remote", "--symref", remote, "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if remote_head.returncode == 0:
+                for line in remote_head.stdout.splitlines():
+                    fields = line.split()
+                    if (
+                        len(fields) >= 3
+                        and fields[0] == "ref:"
+                        and fields[1].startswith("refs/heads/")
+                        and fields[2] == "HEAD"
+                    ):
+                        branch = fields[1].removeprefix("refs/heads/")
+                        break
+            if branch:
+                branch_check = subprocess.run(
+                    ["git", "-C", str(repo), "check-ref-format", "--branch", branch],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if branch_check.returncode == 0:
+                    subprocess.run(
+                        [
+                            "git", "-C", str(repo),
+                            "symbolic-ref",
+                            f"refs/remotes/{remote}/HEAD",
+                            f"refs/remotes/{remote}/{branch}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                else:
+                    branch = ""
+    if not branch:
+        try:
+            remote_head = subprocess.run(
+                [
+                    "git", "-C", str(repo),
+                    "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if remote_head.returncode == 0:
+                remote_head = remote_head.stdout.strip()
+                if remote_head.startswith(f"{remote}/"):
+                    branch = remote_head[len(remote) + 1 :]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    branch = branch or "main"
+
+    try:
+        branch_check = subprocess.run(
+            ["git", "-C", str(repo), "check-ref-format", "--branch", branch],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"could not validate Genesis deploy branch {branch!r}") from exc
+    if branch_check.returncode != 0:
+        raise ValueError(f"invalid Genesis deploy branch: {branch}")
+    return remote, branch
 
 
 def deepinfra_api_key() -> str | None:

@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 from genesis.db.connection import connect_sqlite_rw
-from genesis.env import update_in_progress
+from genesis.env import deploy_target, update_in_progress
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ def _git_result(*args: str, timeout: int = 10) -> tuple[str | None, str]:
     except OSError as exc:
         return None, str(exc)
 
+
+_UPDATE_CHECK_REF = "refs/genesis-update-check"
+
+
+def _deploy_target() -> tuple[str, str]:
+    """Resolve the remote and branch update.sh will deploy."""
+    return deploy_target(_GENESIS_ROOT)
 
 
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
@@ -187,41 +195,72 @@ def update_status():
 
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
-    """Force an upstream check (git fetch + tag comparison)."""
-    # Fetch branch first (must succeed), then force-update tags separately
-    # (tag conflicts from history rewrites should not block the check).
-    branch_out, branch_err = _git_result("fetch", "origin", "main", timeout=30)
+    """Force an upstream check against the immutable fetched deploy head."""
+    try:
+        remote, deploy_branch = _deploy_target()
+    except ValueError as exc:
+        logger.error("invalid deploy target: %s", exc)
+        return jsonify({"error": "invalid deploy target"}), 400
+
+    # Fetch into a per-request ref, resolve the immutable SHA, then remove the
+    # ref. A shared ref can be overwritten between fetch and measurement by the
+    # collector or by a second overlapping Check call.
+    check_ref = f"{_UPDATE_CHECK_REF}/dashboard/{uuid.uuid4().hex}"
+    tracking_ref = f"refs/remotes/{remote}/{deploy_branch}"
+    branch_out, branch_err = _git_result(
+        "fetch",
+        remote,
+        f"+refs/heads/{deploy_branch}:{check_ref}",
+        timeout=30,
+    )
     if branch_out is None:
         logger.error("git fetch failed: %s", branch_err)
         return jsonify({"error": "git fetch failed"}), 502
 
+    # The remote-tracking ref is refreshed SEPARATELY and non-fatally, for the
+    # same reason the tag sync below is: it fails for causes that say nothing
+    # about whether the deploy head was fetched. After a default-branch
+    # hierarchy change an existing refs/remotes/<remote>/release blocks
+    # refs/remotes/<remote>/release/v2, and bundled into the fetch above that
+    # turned a successful measurement into a 502 until someone pruned by hand.
+    # Test the STATUS, not stderr. `_git_result` signals failure with a None
+    # stdout; git writes its "From ..." line and ref-update progress to stderr on
+    # SUCCESS, so keying the warning off stderr told the operator to run
+    # `git remote prune` every time the ref refreshed correctly.
+    tracking_out, tracking_err = _git_result(
+        "fetch", remote, f"+refs/heads/{deploy_branch}:{tracking_ref}", timeout=30
+    )
+    if tracking_out is None:
+        logger.warning(
+            "Could not refresh %s (non-fatal, deploy head unaffected): %s. "
+            "If this persists: git remote prune %s",
+            tracking_ref,
+            tracking_err,
+            remote,
+        )
+    target_commit = _git("rev-parse", "--verify", f"{check_ref}^{{commit}}")
+    _git_result("update-ref", "-d", check_ref)
+    if target_commit is None:
+        logger.error("git fetch did not leave a measurable deploy head")
+        return jsonify({"error": "could not resolve deploy head"}), 502
+
     # Best-effort tag sync — force to handle rewritten history
-    if _git("fetch", "origin", "--tags", "--force", timeout=15) is None:
+    if _git("fetch", remote, "--tags", "--force", timeout=15) is None:
         logger.warning("Tag fetch failed (non-fatal): tags may be stale")
 
     # Compare release tags (robust against squash-merge divergence)
     local_tag = _git("describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD")
-    origin_tag = _git(
-        "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main"
+    target_tag = _git(
+        "describe", "--tags", "--match", "v*", "--abbrev=0", target_commit
     )
 
-    if local_tag and origin_tag and local_tag == origin_tag:
-        # Same release tag — up to date
-        return jsonify({
-            "commits_behind": 0,
-            "local_tag": local_tag,
-            "target_tag": None,
-            "summary": None,
-        })
-
-    # Different tags or no tags — count from the DEPLOYED COMMIT, never between
-    # the release tags. The second copy of the same defect: this endpoint feeds a
-    # dashboard card reading "N commit(s) behind", and counting tag-to-tag made
-    # that number describe the release span rather than the reader. See the note
-    # in learning/signals/genesis_version.py for the measurement; the correct
-    # shape is observability/snapshots/deploy_health.py's
-    # `commits_behind_upstream`.
-    behind_str = _git("rev-list", "--count", "HEAD..origin/main")
+    # Always count from the DEPLOYED COMMIT, never between the release tags.
+    # Matching nearest tags only prove a shared release ancestor; the fetched
+    # deploy head can still contain commits after that tag. The endpoint feeds a
+    # dashboard card reading "N commit(s) behind", so the count must describe
+    # the reader's own distance, matching deploy_health.commits_behind_upstream.
+    distance = f"HEAD..{target_commit}"
+    behind_str = _git("rev-list", "--count", distance)
     if behind_str is None or not behind_str.isdigit():
         # A failed measurement is not a distance, and every number we could
         # invent here is a lie in one direction or the other: 0 renders as "up
@@ -231,11 +270,11 @@ def update_check():
         # through the same 502 the fetch failure above already uses, which the
         # dashboard surfaces as "Check failed" and which cannot overwrite a
         # previously detected update.
-        logger.error("git rev-list HEAD..origin/main failed; distance unknown")
-        return jsonify({"error": "could not measure distance from origin/main"}), 502
+        logger.error("git rev-list %s failed; distance unknown", distance)
+        return jsonify({"error": "could not measure distance from deploy head"}), 502
     commits_behind = int(behind_str)
     summary = (
-        _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
+        _git("log", "--oneline", "--no-merges", distance)
         if commits_behind > 0
         else None
     )
@@ -243,7 +282,7 @@ def update_check():
     return jsonify({
         "commits_behind": commits_behind,
         "local_tag": local_tag or "untagged",
-        "target_tag": origin_tag if local_tag != origin_tag else None,
+        "target_tag": target_tag if local_tag != target_tag else None,
         "summary": summary,
     })
 
@@ -386,26 +425,29 @@ IMPORTANT: The main working tree is CLEAN — the merge was aborted so the
 system stays operational. You must resolve conflicts in a temporary branch.
 
 If MERGE CONFLICTS:
-1. Create a temporary branch: git checkout -b update-merge-resolution
-2. Redo the merge: git merge origin/main --no-edit
+1. Resolve deploy_branch and deploy_head from {conflict_file}; older
+   records may have only target_commit. If no branch is recorded, use the
+   checkout's deploy branch.
+2. Create a temporary branch: git checkout -b update-merge-resolution
+3. Redo the merge: git merge <resolved-fetched-head> --no-edit
    (This will reproduce the same conflicts)
-3. For each conflicted file, read BOTH sides of every conflict marker
-4. Evaluate: are the changes compatible? (same intent, just different history)
-5. If ALL conflicts in a file are trivially compatible — resolve them:
+4. For each conflicted file, read BOTH sides of every conflict marker
+5. Evaluate: are the changes compatible? (same intent, just different history)
+6. If ALL conflicts in a file are trivially compatible — resolve them:
    - git checkout --theirs for upstream-only changes
    - git checkout --ours for user-only changes
    - Manual merge where both sides add different things
-6. After resolving each file: git add <file>
-7. If ANY conflict is ambiguous or involves genuinely different intents:
+7. After resolving each file: git add <file>
+8. If ANY conflict is ambiguous or involves genuinely different intents:
    - git merge --abort to clean up
-   - git checkout main
+   - git checkout <resolved-deploy-branch>
    - git branch -D update-merge-resolution
    - Write to {escalation_file}: "tier3_needed"
    - Include: which files, what the incompatibility is, your assessment
    - Done.
-8. If all conflicts resolved:
+9. If all conflicts resolved:
    - git commit --no-edit
-   - git checkout main
+   - git checkout <resolved-deploy-branch>
    - git merge update-merge-resolution --ff-only
    - git branch -d update-merge-resolution
    - Run: bash {update_script} --post-merge 2>&1
@@ -429,20 +471,23 @@ Read {escalation_file} for Sonnet's analysis of what couldn't be resolved.
 
 IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 
-1. git checkout -b update-merge-resolution-opus
-2. git merge origin/main --no-edit (reproduces conflicts)
-3. For each conflict, understand the intent of BOTH sides:
+1. Resolve deploy_branch and deploy_head from {conflict_file}; older
+   records may have only target_commit. If no branch is recorded, use the
+   checkout's deploy branch.
+2. git checkout -b update-merge-resolution-opus
+3. git merge <resolved-fetched-head> --no-edit (reproduces conflicts)
+4. For each conflict, understand the intent of BOTH sides:
    - LOCAL (ours): user customizations, additions, local config
    - REMOTE (theirs): upstream bug fixes, features, improvements
-4. Find the resolution that preserves both intents
-5. Where intents genuinely conflict:
+5. Find the resolution that preserves both intents
+6. Where intents genuinely conflict:
    - Bug fixes and security patches: upstream wins
    - User identity, config, customizations: user wins
    - Feature additions: merge both, adapting as needed
-6. After resolving: git add, git commit --no-edit
-7. git checkout main && git merge update-merge-resolution-opus --ff-only
-8. git branch -d update-merge-resolution-opus
-9. Run: bash {update_script} --post-merge 2>&1
+7. After resolving: git add, git commit --no-edit
+8. git checkout <resolved-deploy-branch> && git merge update-merge-resolution-opus --ff-only
+9. git branch -d update-merge-resolution-opus
+10. Run: bash {update_script} --post-merge 2>&1
 
 Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\
@@ -725,6 +770,7 @@ def update_resolve():
     tier3_prompt = _TIER3_PROMPT.format(
         escalation_file=_ESCALATION_FILE,
         summary_file=_SUMMARY_FILE,
+        conflict_file=_CONFLICT_FILE,
         update_script=_UPDATE_SCRIPT,
     )
 
@@ -812,7 +858,7 @@ def update_progress():
 
         # Clean up stale state file — no process is running and the file
         # is just noise at this point (its purpose is crash recovery).
-        if stale:
+        if stale and not _CONFLICT_FILE.is_file():
             with contextlib.suppress(OSError):
                 _STATE_FILE.unlink()
 
