@@ -423,6 +423,30 @@ cc_tmp_headroom_mb() {
     echo "$(( capacity - used ))"
 }
 
+# A newline in a path DEFEATS THE LIVENESS GUARD, so a candidate carrying one
+# is spared rather than reaped. This is not fastidiousness — it is the direct
+# consequence of NUL-delimiting the reap loops.
+#
+# MEASURED: `live_open_paths` renders /proc/*/fd targets one per LINE, so a
+# descriptor held on `<cc-tmp>/pip-a<LF>b/part.whl` appears in the snapshot as
+# two records, the first truncated to `<cc-tmp>/pip-a`. `dir_has_live_writer`
+# then searches those records for the directory prefix and cannot match — it
+# reports NO live writer for a directory that demonstrably has one, while
+# reporting correctly for its plain-named sibling.
+#
+# Before the loops were NUL-delimited, `read -r` split such a name and the
+# candidate was never reached, so it survived BY ACCIDENT. Reaching it without
+# fixing the snapshot would convert that accident into a deletion with the
+# guard silently answering the wrong question. Bash cannot hold a NUL in a
+# variable, so a NUL-safe snapshot is a larger change to a different function;
+# until then this sparing is the honest position, and it is LOUD rather than
+# implicit.
+_WG_NL=$'\n'
+
+path_defeats_liveness_guard() {
+    [[ "$1" == *"$_WG_NL"* ]]
+}
+
 reap_dir_sparing_sockets() {
     # Object-level deletion that NEVER removes unix sockets. CC binds one
     # socket per live session under cc-tmp (cross-session messaging); they are
@@ -533,6 +557,12 @@ clean_cc_orange() {
     local cache_dir
     while IFS= read -r -d '' cache_dir; do
         [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
+        if path_defeats_liveness_guard "$cache_dir"; then
+            local _wg_q
+            printf -v _wg_q '%q' "$cache_dir"
+            log WARN "Zone A — sparing ${_wg_q}: its name contains a newline, which live_open_paths cannot represent, so this daemon cannot establish whether a process is writing into it"
+            continue
+        fi
         reap_dir_sparing_sockets "$cache_dir"
     done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         ${live_excl[@]+"${live_excl[@]}"} -print0 2>/dev/null) || true
@@ -757,6 +787,12 @@ clean_cc_red() {
         # Below the oxygen floor even this sparing goes: the active session's
         # tree is as reclaimable as anything else when the alternative is
         # ENOSPC for every session including that one.
+        if path_defeats_liveness_guard "$dir"; then
+            local _wg_q
+            printf -v _wg_q '%q' "$dir"
+            log WARN "Zone A — sparing ${_wg_q}: its name contains a newline, which live_open_paths cannot represent, so this daemon cannot establish whether a process is writing into it"
+            continue
+        fi
         if (( ! floor )) && [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
             continue
         fi
@@ -832,6 +868,12 @@ clean_cc_red() {
     local cache_dir
     while IFS= read -r -d '' cache_dir; do
         [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
+        if path_defeats_liveness_guard "$cache_dir"; then
+            local _wg_q
+            printf -v _wg_q '%q' "$cache_dir"
+            log WARN "Zone A — sparing ${_wg_q}: its name contains a newline, which live_open_paths cannot represent, so this daemon cannot establish whether a process is writing into it"
+            continue
+        fi
         reap_dir_sparing_sockets "$cache_dir"
     done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
         ${live_excl[@]+"${live_excl[@]}"} \

@@ -250,9 +250,10 @@ def test_a_newline_in_a_cache_name_cannot_reap_outside_the_tree(tmp_path):
     cwd. Two failures in one: the cache is NOT reclaimed, and something outside
     the tree IS.
 
-    Both halves are asserted here. The reclaim half alone would pass against a
-    loop that deleted the right thing by luck; the escape half alone would pass
-    against a loop that deleted nothing at all."""
+    Both halves are asserted: nothing outside the tree is touched, AND the
+    newline-named directory itself is spared rather than reaped, because the
+    liveness snapshot cannot represent it. The escape assertion alone would
+    pass against a loop that deleted nothing at all."""
     home, cctmp, bind = _sandbox(tmp_path)
 
     # A directory beside the daemon's cwd, with the same basename as the tail
@@ -273,7 +274,60 @@ def test_a_newline_in_a_cache_name_cannot_reap_outside_the_tree(tmp_path):
         "the sweep followed a split record out of cc-tmp and deleted a "
         "directory beside the daemon's cwd"
     )
-    assert not cache.exists(), (
-        "the newline-named cache was not reclaimed — the split record was "
-        "skipped by the directory guard and the real directory survived"
+    # The cache SURVIVES, and deliberately so. NUL-delimiting makes the loop
+    # REACH this directory, but `live_open_paths` renders /proc targets one per
+    # line, so a descriptor held inside a newline-named directory appears
+    # truncated and `dir_has_live_writer` reports no writer for a directory
+    # that has one (MEASURED). Reaping it would mean deleting with the guard
+    # silently answering the wrong question — worse than the accidental
+    # survival the split record used to produce. So it is spared, and LOUDLY.
+    assert cache.exists(), (
+        "a newline-named directory was reaped even though the liveness guard "
+        "cannot see writers inside it"
+    )
+    log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "cannot represent" in log, (
+        "the directory was spared SILENTLY — the limitation has to be visible "
+        f"or the next reader will call it a bug:\n{log}"
+    )
+
+
+def test_RED_spares_a_newline_named_dir_holding_a_LIVE_writer(tmp_path):
+    """The shape the reviewer's example names, and the reason the sparing guard
+    exists rather than just the NUL delimiter.
+
+    MEASURED: `live_open_paths` renders /proc/*/fd targets one per LINE, so a
+    descriptor held on `<cc-tmp>/pip-a<LF>b/part.whl` reaches the snapshot as
+    two records, the first truncated to `<cc-tmp>/pip-a`. `dir_has_live_writer`
+    searches those records for the directory prefix and finds nothing — it
+    reports NO live writer for a directory that provably has one, while
+    reporting correctly for a plain-named sibling.
+
+    Before the loops were NUL-delimited this directory was unreachable and
+    survived by accident. Reaching it without a snapshot that can represent it
+    would have converted that accident into a deletion of a writer's work. The
+    negative control is the plain-named sibling: it must still be reaped, or
+    this arm would also pass against a sweep that stopped working."""
+    home, cctmp, bind = _sandbox(tmp_path)
+    nl_dir = cctmp / "pip-a\nb"
+    nl_dir.mkdir()
+    held = nl_dir / "part.whl"
+    held.write_bytes(b"w" * 4096)
+    junk = cctmp / "pip-plain"
+    junk.mkdir()
+    (junk / "blob").write_bytes(b"j" * 4096)
+    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
+
+    # A real held descriptor, exactly as the writer would have.
+    with held.open("rb"):
+        proc = _run(home, bind, _PRELUDE + "clean_cc_red")
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    assert held.exists(), (
+        "RED deleted a file a process was holding open, because the liveness "
+        "snapshot could not represent its newline-named parent"
+    )
+    assert not junk.exists(), (
+        "the plain-named directory survived too — the sweep did nothing, so "
+        "the assertion above proves nothing"
     )
