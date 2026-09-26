@@ -109,6 +109,45 @@ isolation is still load-bearing for you — it is:
   health probes and dashboard polling keep working. Anything readable through
   the API is readable by anyone who can reach the port.
 - It is **inert when no dashboard password is set**, which is the default.
+
+  A narrow exception to that last point. A few routes decide not *whether* to
+  answer but *how much* to include, and those read `has_verified_credential()`
+  instead — which, unlike `is_authenticated()`, is never true when no password
+  is configured, because nothing can be proved without a credential to present.
+  Today that covers the provider-key **values** (`/api/genesis/secrets`) and
+  the backup target (`/api/genesis/backup/status`) and the filesystem paths
+  and NAS username (`/api/genesis/backup/config`). Those are withheld from an unauthenticated
+  caller on every install, including a passwordless one. The routes still
+  answer and the response shape is unchanged; only the sensitive values are
+  absent.
+
+  **This is not the whole class, and it should not be read as one.** The
+  carve-out is a list of FIELDS — not a property of a route, a helper, or the
+  shape of a response. Three shorter rules were tried here and all three were
+  false, so the list is given explicitly:
+
+  - the `value` of **every** key in the secrets registry (`_KEY_REGISTRY`,
+    parsed from `secrets.env.example`), which is the whole file rather than a
+    sensitive subset;
+  - the backup tier-2 target;
+  - the backup local path, share and username.
+
+  Two properties of that list are easy to get wrong. It **nests rather than
+  partitions**: the backup path, share and username are themselves registry
+  keys, so they appear in the first set as well, reached by a second route. And
+  the same underlying value can be treated **differently by each route that
+  serves it** — the backup config route strips credentials out of the
+  repository URL before returning it, while the secrets registry returns that
+  key's raw value, so a URL with an embedded token is disclosed there and not
+  here. Read the route, not the field name.
+
+  For every field not in that list, assume the default posture above: reads are
+  open, `is_authenticated()` opens up when no password is configured, and
+  network isolation is the control. Do not infer that a route is covered
+  because its response resembles one that is — a route elsewhere can mask
+  values behind an explicit reveal step and still sit outside this entirely,
+  and a route whose entire product IS the stored value has no middle state to
+  offer, so gating it would remove the function rather than narrow it.
 - It exempts everything under the `/api/genesis/auth/` prefix — a prefix match,
   not a fixed list, so any route added there in future is exempt by default.
   Today that prefix holds login, logout and an auth-status probe. None of them
@@ -142,8 +181,10 @@ gateway in front of them.
 - Treat the built-in web terminal and the noVNC console as **unauthenticated
   administrative access**: anyone who can reach those ports can drive Genesis.
   For the dashboard API, assume the same for reads and for any install with no
-  dashboard password set. Network isolation remains the primary control; the
-  mutation gate above is a second layer, not a replacement for it.
+  dashboard password set — with the credential-gated field values noted above
+  as the one carve-out, which is a narrow one and does not change the posture.
+  Network isolation remains the primary control; the mutation gate above is a
+  second layer, not a replacement for it.
 
 Security audits should verify this network restriction (firewall / overlay)
 rather than re-flagging the `0.0.0.0` bind, which is intentional for the
@@ -308,7 +349,12 @@ If you suspect a security issue:
 2. Review logs for unauthorized actions or unexpected tool calls.
 3. Check for unexpected file modifications in the Genesis directory.
 4. Rotate all credentials.
-5. Report the incident to project maintainers.
+5. Delete `~/.genesis/flask_secret_key` and restart `genesis-server`. This is
+   what invalidates existing dashboard sessions — changing `DASHBOARD_PASSWORD`
+   alone does **not**. Sessions are signed with that key rather than with the
+   password, so a stolen cookie survives a password change and keeps whatever
+   the session reaches, including the web terminal.
+6. Report the incident to project maintainers.
 
 ## License
 

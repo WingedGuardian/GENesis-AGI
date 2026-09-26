@@ -158,10 +158,79 @@ def check_bearer_token(surface: str) -> tuple[str, int] | None:
 
 
 def is_authenticated() -> bool:
-    """Check if current request has a valid session."""
+    """Check if current request has a valid session.
+
+    Returns ``True`` when no password is configured — "auth disabled". That is
+    correct for a GATE (``if not is_authenticated(): 401``): an install that
+    chose not to set a password is not refused its own dashboard.
+
+    It is WRONG for a disclosure decision. See ``has_verified_credential``.
+    """
     if not get_dashboard_password():
         return True  # Auth disabled
     return session.get("authenticated") is True
+
+
+def has_verified_credential() -> bool:
+    """Did this request PROVE who it is? Never true without a password set.
+
+    The distinction from ``is_authenticated`` is the whole point, and the two
+    are not interchangeable:
+
+    * ``is_authenticated`` answers *"may this request proceed?"* and opens up
+      when no password is configured, so an unconfigured install keeps working.
+    * ``has_verified_credential`` answers *"has this caller demonstrated it is
+      the operator?"* — and with no password configured, nothing can, because
+      there is no credential to present.
+
+    Use this for any decision that REVEALS something rather than admitting
+    someone. Gating disclosure on ``is_authenticated`` inverts it: the flag
+    that chooses redact-vs-reveal flips to REVEAL on exactly the installs that
+    have no credential, so a passwordless box serves its secrets to whoever can
+    reach it. That was live on three sites — the provider-key values and two
+    backup-config routes — and is what this predicate exists to prevent.
+
+    Deliberately session-only: it does NOT accept the internal bearer token.
+    All three current callers are the dashboard's own browser front-end, so no
+    machine caller needs it, and a process holding that 0600 token can already
+    read the same values straight out of the environment — accepting it here
+    would widen the surface while buying nothing.
+
+    NO ROTATION-EVICTION, and the reason is worth keeping because two reviewers
+    asked for it and an earlier revision of this file shipped it. The idea was
+    to bind the session to a keyed tag of the password it was issued against, so
+    rotating the password evicted stale cookies from the disclosure path. It was
+    removed because it is DOMINATED, not because it was expensive: a session
+    carrying a stale tag still satisfies ``is_authenticated``, which is what
+    gates ``routes/terminal.py`` (a bash PTY, so ``cat secrets.env``) and
+    ``routes/references.py`` ``/reveal`` (plaintext credentials, per its own
+    docstring). Rotation would therefore have evicted the holder from ONE
+    credential surface while leaving a shell and a reveal route open — a
+    defence whose absence is not the exposure it appears to be.
+
+    The sharpest leg is not either of those, though, and it is worth stating
+    because it settles the question without depending on the terminal or the
+    reveal route existing at all: with a password configured this predicate and
+    ``is_authenticated`` are the SAME expression, so a stale-tag cookie also
+    satisfied the API mutation gate. Same-origin is decided from a request
+    header a non-browser client sets for itself, so the holder could simply
+    write a NEW dashboard password through the secrets route and then log in
+    cleanly. Rotation-eviction of the READ path was defeated by the WRITE path
+    in one request — not merely dominated, circumventable.
+
+    The harvested-session hazard it was aimed at is addressed at the login route
+    below, which mints nothing when no password is configured — but that guard is
+    PROSPECTIVE, and the distinction matters enough to state rather than imply. A
+    cookie issued by an older revision, on an install that then set a password,
+    still satisfies this predicate. It is not chased here because it is dominated
+    by the same reasoning: that cookie already owns the terminal PTY and the
+    reveal route, so evicting it from value disclosure alone buys nothing. The
+    defence that would actually close it is a session epoch — rotating the Flask
+    signing key, or versioning sessions when the password changes — which evicts
+    every surface at once rather than one. That is a separate change and is not
+    made here.
+    """
+    return bool(get_dashboard_password()) and session.get("authenticated") is True
 
 
 def check_password(input_password: str) -> bool:
@@ -382,6 +451,18 @@ def auth_login():
     if not password:
         return jsonify({"error": "Password required"}), 400
 
+    # Mint NOTHING when there is no credential to check against. ``check_password``
+    # returns True in that state ("auth disabled"), so without this guard any POST
+    # to this route received a permanent 30-day session on a passwordless install —
+    # and that cookie outlived the configuration change, so an operator who later
+    # set a password inherited a session an attacker had already harvested. That
+    # defeats the exact remediation this file recommends, which is why the check
+    # is here and not only at the disclosure sites.
+    pw = get_dashboard_password()
+    if not pw:
+        logger.info("Dashboard login attempted from %s while auth is disabled", ip)
+        return jsonify({"status": "auth_disabled"})
+
     if check_password(password):
         session.permanent = True
         session["authenticated"] = True
@@ -496,11 +577,19 @@ _LOGIN_HTML = """<!DOCTYPE html>
           credentials: 'same-origin',
           body: JSON.stringify({password: pw}),
         });
-        if (resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        if (resp.ok && body.status === 'auth_disabled') {
+          // 200, but NOTHING was minted: there is no password to check
+          // against. Redirecting here told the operator they were logged in
+          // while the session that gates the protected views did not exist,
+          // so values stayed hidden with no explanation.
+          err.textContent = 'No dashboard password is configured, so there is '
+            + 'nothing to log in to. Set one in Secrets to enable the '
+            + 'protected views.';
+        } else if (resp.ok) {
           window.location.href = '/genesis';
         } else {
-          const d = await resp.json().catch(() => ({}));
-          err.textContent = d.error || 'Login failed';
+          err.textContent = body.error || 'Login failed';
           document.getElementById('pw').select();
         }
       } catch (ex) {

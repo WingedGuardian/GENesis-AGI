@@ -422,7 +422,7 @@ def test_get_config_strips_creds_and_gates_nas(client):
                 "interval": "6h",
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=False),
+        patch(f"{_BK}.has_verified_credential", return_value=False),
     ):
         resp = client.get("/api/genesis/backup/config")
     data = resp.get_json()
@@ -431,6 +431,11 @@ def test_get_config_strips_creds_and_gates_nas(client):
     assert data["passphrase_set"] is True and data["nas_pass_set"] is True
     # Infra paths/shares are auth-gated — absent for unauthenticated callers.
     assert "nas" not in data and "nas_user" not in data and "local_path" not in data
+    assert "values_withheld" not in data, (
+        "no withheld signal on this route: backup_config_set skips empty values and "
+        "the form sends only non-empty fields, so the clearing hazard it would "
+        "guard cannot occur here"
+    )
     assert data["schedule_interval"] == "6h" and data["schedule_enabled"] is True
 
 
@@ -453,7 +458,7 @@ def test_get_config_returns_nas_when_authenticated(client):
                 "interval": None,
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=True),
+        patch(f"{_BK}.has_verified_credential", return_value=True),
     ):
         resp = client.get("/api/genesis/backup/config")
     data = resp.get_json()
@@ -485,7 +490,7 @@ def _status_env(tmp_path, status: dict, authed=True):
                 "interval": "6h",
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=authed),
+        patch(f"{_BK}.has_verified_credential", return_value=authed),
     )
 
 
@@ -685,9 +690,11 @@ def test_get_config_backend_backward_compat(client):
                 "interval": "6h",
             },
         ),
-        patch(f"{_BK}.is_authenticated", return_value=True),
     ):
         resp = client.get("/api/genesis/backup/config")
+    # No auth patch: this asserts on ``tier2_backend``, which is returned
+    # unconditionally. Patching a predicate the assertion does not depend on
+    # reads as though the result were auth-conditioned, and it is not.
     assert resp.get_json()["tier2_backend"] == "smb"
 
 
