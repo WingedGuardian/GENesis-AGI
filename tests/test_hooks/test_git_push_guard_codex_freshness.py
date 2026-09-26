@@ -2975,46 +2975,54 @@ class TestEveryStatementIsCountedAndEveryUnscopedRowShown:
 
 class TestPrOpenSummaryFreshness:
     @staticmethod
-    def _summary(sha, *, login="chatgpt-codex-connector[bot]", user_type="Bot"):
+    def _summary(sha, *, status="Completed", login="chatgpt-codex-connector[bot]", user_type="Bot"):
         tick = chr(96)
-        return json.dumps({
-            "login": login,
-            "type": user_type,
-            "body": "<!-- codex-pull-request-review-summary -->\n| Status | Commit | Trigger |\n| --- | --- | --- |\n| ✅ Completed | " + tick + sha + tick + " | PR opened |",
-        })
+        icon = "✅" if status == "Completed" else "👀"
+        body = (
+            "<!-- codex-pull-request-review-summary -->\n"
+            "| Review | Status | Commit | Review trigger |\n"
+            "| --- | --- | --- | --- |\n"
+            f"| 📝 **Code Review** | {icon} **{status}** "
+            '<relative-time datetime="2026-09-26T18:00:00.500000Z">time</relative-time> | '
+            + tick + sha + tick + " | PR opened |"
+        )
+        return json.dumps({"login": login, "type": user_type, "body": body})
 
     @staticmethod
-    def _thumb(*, login="chatgpt-codex-connector[bot]", user_type="Bot"):
-        return json.dumps({"login": login, "type": user_type, "content": "+1"})
+    def _thumb(created_at="2026-09-26T18:00:01Z"):
+        return json.dumps({
+            "login": "chatgpt-codex-connector[bot]", "type": "Bot",
+            "content": "+1", "created_at": created_at,
+        })
 
-    def test_completed_summary_and_clean_reaction_at_head_allow(self, monkeypatch):
+    def _base(self, monkeypatch, summary):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
-        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(HEAD[:10]))
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", summary)
+
+    def test_completed_summary_and_fresh_clean_reaction_at_head_allow(self, monkeypatch):
+        self._base(monkeypatch, self._summary(HEAD[:10]))
         monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
         block, msg, head = _mod._check_codex_reviewed_head("1")
         assert block is False and msg == "" and head == HEAD
 
-    def test_summary_for_stale_head_still_blocks(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
-        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
-        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(STALE[:10]))
-        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
-        block, _, _ = _mod._check_codex_reviewed_head("1")
-        assert block is True
+    def test_old_reaction_cannot_certify_new_summary(self, monkeypatch):
+        self._base(monkeypatch, self._summary(HEAD[:10]))
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb("2026-09-26T17:59:59Z"))
+        assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_summary_without_clean_reaction_still_blocks(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
-        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
-        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(HEAD[:10]))
-        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", "")
-        block, _, _ = _mod._check_codex_reviewed_head("1")
-        assert block is True
+    def test_latest_pending_summary_invalidates_older_completion(self, monkeypatch):
+        summaries = self._summary(HEAD[:10]) + "\n" + self._summary(HEAD[:10], status="Running")
+        self._base(monkeypatch, summaries)
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
+        assert _mod._check_codex_reviewed_head("1")[0] is True
+
+    def test_summary_for_stale_head_still_blocks(self, monkeypatch):
+        self._base(monkeypatch, self._summary(STALE[:10]))
+        monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
+        assert _mod._check_codex_reviewed_head("1")[0] is True
 
     def test_spoofed_summary_author_is_ignored(self, monkeypatch):
-        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
-        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
-        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", self._summary(HEAD[:10], login="attacker", user_type="User"))
+        self._base(monkeypatch, self._summary(HEAD[:10], login="attacker", user_type="User"))
         monkeypatch.setenv("_TEST_GH_CODEX_REACTIONS", self._thumb())
-        block, _, _ = _mod._check_codex_reviewed_head("1")
-        assert block is True
+        assert _mod._check_codex_reviewed_head("1")[0] is True

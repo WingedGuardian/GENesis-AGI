@@ -5063,19 +5063,36 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
 
 _CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 _CODEX_SUMMARY_COMPLETED_RE = re.compile(
-    r"\|\s*✅\s*Completed\s*\|\s*\x60?([0-9a-fA-F]{7,40})\x60?\s*\|", re.IGNORECASE
+    r"\|\s*[^|]*Code Review[^|]*\|\s*✅\s*\*\*Completed\*\*\s*"
+    r"<relative-time datetime=\"([^\"]+)\">[^<]*</relative-time>\s*\|\s*"
+    r"\x60?([0-9a-fA-F]{7,40})\x60?\s*\|",
+    re.IGNORECASE,
 )
 
 
-def _codex_has_clean_reaction(pr_num: str, repo: str | None = None) -> bool:
-    """Whether Codex left its clean-review thumbs-up reaction on the PR."""
+def _parse_github_time(value: str):
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _codex_has_clean_reaction_after(
+    pr_num: str, completed_at: str, repo: str | None = None
+) -> bool:
+    """Whether Codex left a clean thumbs-up no earlier than this review run."""
+    completed = _parse_github_time(completed_at)
+    if completed is None:
+        return False
     raw = os.environ.get("_TEST_GH_CODEX_REACTIONS")
     if raw is None:
         try:
             result = subprocess.run(
                 [
                     "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/reactions",
-                    "--paginate", "--jq", ".[] | {login: .user.login, type: .user.type, content: .content}",
+                    "--paginate", "--jq",
+                    ".[] | {login: .user.login, type: .user.type, content: .content, created_at: .created_at}",
                 ],
                 capture_output=True, text=True, timeout=_gh_timeout(8),
             )
@@ -5091,17 +5108,22 @@ def _codex_has_clean_reaction(pr_num: str, repo: str | None = None) -> bool:
             continue
         if not isinstance(obj, dict):
             continue
+        created = _parse_github_time(obj.get("created_at") or "")
         if (
             (obj.get("login") or "") == _CODEX_REVIEW_BOT
             and (obj.get("type") or "") == "Bot"
             and (obj.get("content") or "") == "+1"
+            and created is not None
+            and created >= completed
         ):
             return True
     return False
 
 
-def _latest_codex_completed_summary_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """Return the commit prefix from the latest completed Codex PR-open summary."""
+def _latest_codex_completed_summary(
+    pr_num: str, repo: str | None = None
+) -> tuple[str, str] | None:
+    """Return (commit prefix, completion time) only for the latest Codex summary."""
     raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
     if raw is None:
         try:
@@ -5130,9 +5152,10 @@ def _latest_codex_completed_summary_sha(pr_num: str, repo: str | None = None) ->
         body = obj.get("body") or ""
         if _CODEX_SUMMARY_MARKER not in body:
             continue
+        latest = None
         match = _CODEX_SUMMARY_COMPLETED_RE.search(body)
         if match:
-            latest = match.group(1).lower()
+            latest = (match.group(2).lower(), match.group(1))
     return latest
 
 
@@ -6447,8 +6470,12 @@ def _check_codex_reviewed_head_core(
     clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
     if clean_short and head.startswith(clean_short):
         return False, "", head
-    summary_short = _latest_codex_completed_summary_sha(pr_num, repo=repo)
-    if summary_short and head.startswith(summary_short) and _codex_has_clean_reaction(pr_num, repo=repo):
+    summary = _latest_codex_completed_summary(pr_num, repo=repo)
+    if (
+        summary
+        and head.startswith(summary[0])
+        and _codex_has_clean_reaction_after(pr_num, summary[1], repo=repo)
+    ):
         return False, "", head
     if not reviewed:
         return (
@@ -11601,20 +11628,23 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             # Freshness satisfied by a clean Codex ISSUE-COMMENT at head (the review
             # object is absent or stale) — the allow path added in follow-up 7ff0fdc6.
             label = "ok (clean comment at head)"
-        elif (
-            _head_l is not None
-            and (_summary := _latest_codex_completed_summary_sha(pr_num, repo=repo))
-            and _head_l.startswith(_summary)
-            and _codex_has_clean_reaction(pr_num, repo=repo)
+        elif _head_l is not None and (
+            (_summary := _latest_codex_completed_summary(pr_num, repo=repo))
+            and _head_l.startswith(_summary[0])
+            and _codex_has_clean_reaction_after(pr_num, _summary[1], repo=repo)
         ):
-            label = "ok (completed PR-open summary at head)"
+            label = "ok (completed clean PR-open summary at head)"
         elif _reviewed is None or _head is None:
             # A transiently-failed re-read must NOT read as "current" (Codex P2
             # #1373): the enforcement gate already passed, but the report must not
             # ASSERT the head was reviewed when it could not confirm it.
             label = "ok (freshness label unverified — re-read failed)"
         elif _reviewed != _head_l:
-            label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
+            _report_delta = _classify_post_review_delta(_reviewed, _head_l, repo)
+            if _report_delta == "trivial":
+                label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
+            else:
+                label = "ok (freshness label unverified — accepted evidence could not be re-read)"
         else:
             label = "ok (current)"
     print(f"codex-at-head  : {label}")
