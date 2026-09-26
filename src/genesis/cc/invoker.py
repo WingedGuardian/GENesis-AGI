@@ -2643,12 +2643,18 @@ class CCInvoker:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
-        # modelUsage lists EVERY model the session touched, including CC's
-        # auxiliary haiku calls (title/topic generation) — and dict order is
+        # modelUsage lists EVERY model the session touched, and dict order is
         # not tier order. Taking the first key false-positived downgrade
-        # detection whenever an auxiliary call was listed before the main
-        # model (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session).
-        # The MAIN conversation model is the highest tier present.
+        # detection whenever another model was listed before the main one
+        # (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session, where the
+        # haiku row was CC's auxiliary title/topic call). CC 2.1.277 dropped
+        # that auxiliary row from `-p` output (measured 2026-09-22), but the
+        # dict still carries SUBAGENT models — a sonnet session that spawns a
+        # haiku subagent lists both. Taking the highest tier is right for a
+        # FRESH call. It is NOT right for a RESUMED one on 2.1.277+: resume
+        # restores every earlier model's entry (measured 2026-09-26 across a
+        # haiku -> sonnet switch), so a higher tier used earlier in the session
+        # wins over this call's own model — issue #2391.
         model_name = (
             max(
                 model_usage,
