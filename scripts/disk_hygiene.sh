@@ -41,6 +41,10 @@
 #  14. Retention prune of ~/.genesis/output/guard-corpus.jsonl (>45d)
 #      (the guard replay corpus and any temp an interrupted rebuild left; it is
 #      regenerable, and it holds verbatim command lines — see prune_guard_corpus)
+#  15. Retention prune of ~/.genesis/logs/fleet_entry_*.log (>45d)
+#      (fleet pane-mode guard: what it found and cleared at each SSH entry, one
+#      dated file per UTC day — a whole-file age prune, which is why the writer
+#      dates them rather than rolling one log; see prune_fleet_entry_logs)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -126,6 +130,25 @@ prune_guard_corpus() {
         \( -name 'guard-corpus.jsonl' -o -name 'guard-corpus.jsonl.*.tmp' \) \
         -mtime +45 -delete 2>/dev/null \
         || echo "guard-corpus prune exited $?"
+}
+
+prune_fleet_entry_logs() {
+    # scripts/fleet_entry_guard.sh appends what it found on the fleet on every
+    # connection through either door, one file per UTC day. Each record is a few
+    # lines and a busy day is a handful of connections, so this is small — but it
+    # is append-forever, and an append-forever store on someone else's smaller
+    # disk is a slow leak whatever its rate.
+    #
+    # Dated filenames mean the timer bounds it by deleting WHOLE old files, which
+    # is why that shape was chosen over one rolling log. 45d matches the other
+    # diagnostic stores here; the logs exist to be read after an operator reports
+    # a "frozen session with the yellow line", and a report that old has lost its
+    # context anyway.
+    local log_dir="${1:-$HOME/.genesis/logs}"
+    [ -d "$log_dir" ] || return 0
+    find "$log_dir" -maxdepth 1 -type f -name 'fleet_entry_*.log' \
+        -mtime +45 -delete 2>/dev/null \
+        || echo "fleet-entry prune exited $?"
 }
 
 main() {
@@ -318,6 +341,9 @@ main() {
 
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
+
+    echo "--- fleet entry-guard log retention prune (>45d) ---"
+    prune_fleet_entry_logs "$HOME/.genesis/logs"
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
