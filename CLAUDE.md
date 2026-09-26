@@ -697,7 +697,19 @@ behind the writer, and 7 were a guard since removed.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
-  discretionary fan-out. An instruction conflicting with an enforced project rule
+  discretionary fan-out. **An INTERRUPTED STREAM is not discretionary either:**
+  when the user throws a new topic at you mid-stream, do NOT silently set aside
+  what you were doing to chase it. Ask whether a subagent can carry it forward —
+  scoped, safe, needing no user decision — and if so dispatch one with a
+  SELF-CONTAINED prompt (it cannot see the conversation), say so in one line,
+  then engage the new topic. If it cannot be handed off — it needs an approval,
+  or you are mid-edit in a shared file — put a ledger row on it FIRST, or on a
+  client with no ledger name it in your reply per the zero-drop fallback below.
+  Either way the stream has an owner before your attention moves — zero-drop
+  catches a drop, this prevents one. (User, 2026-09-08: *"I'm able to distract
+  you… you'll just put it down, walk away, and we'll go down our tangent and
+  never come back to it."*)
+  An instruction conflicting with an enforced project rule
   gets named out loud rather than silently obeyed — then the user decides; this
   file does not outrank the user. That does NOT extend to the standing approval
   gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
