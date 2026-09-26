@@ -100,20 +100,20 @@ async def memory_recall(
         expand_query_terms: If True (default), broaden the FTS5 query via tag
             co-occurrence.
         mode: "auto" (default) = standard + drift fallback; "standard" =
-            hybrid only; "drift" = 3-phase drift retrieval directly, which
-            ignores wing/room filters (an invalid wing is still refused).
+            hybrid only; "drift" = drift retrieval directly, which ignores
+            wing/room filters.
         time_range: Date range as "YYYY-MM-DD/YYYY-MM-DD"; boosts temporally
-            matching memories. Temporal language in the query is also
-            detected automatically.
-        include_subsystem: False (default) excludes automated-subsystem writes
-            (ego corrections, triage signals, reflection observations); True
-            returns everything; a list (e.g. ["ego"]) adds the named
+            matching memories. Temporal language is also auto-detected.
+        include_subsystem: False (default) excludes automated-subsystem writes;
+            True returns everything; a list (e.g. ["ego"]) adds the named
             subsystems to user content. Mutually exclusive with only_subsystem.
         only_subsystem: Return ONLY rows tagged with the named subsystem(s);
             user content excluded.
         rerank: If True (default), apply cross-encoder reranking (~300ms).
         include_deprecated: If True, include superseded memories (audit /
-            history queries). Default False.
+            history queries) and traverse them for ``graph_neighbors``. A
+            superseded neighbour carries ``"hidden": true``; no such key means
+            visible. Expired memories stay hidden either way. Default False.
     """
     import time as _time
 
@@ -260,7 +260,11 @@ async def memory_recall(
             except Exception:
                 logger.warning("drift_recall fallback failed", exc_info=True)
 
-    # Boost event-calendar matches from explicit time_range
+    # Boost event-calendar matches from explicit time_range.
+    #
+    # Ids this loop actually appended, for the enrichment visibility decision far
+    # below. Declared outside the `if` so the predicate can read it unconditionally.
+    boosted_ids: set[str] = set()
     if event_boost_ids:
         from genesis.db.crud import memory as memory_crud
         from genesis.memory.types import RetrievalResult
@@ -271,6 +275,15 @@ async def memory_recall(
             try:
                 row = await memory_crud.get_by_id(memory_mod._db, mid)
                 if row:
+                    # Recorded at the PRODUCER, by identity. Enrichment below needs
+                    # to know which rows came from this unfiltered read, and the
+                    # obvious alternative — reading `source_pipeline == "event_calendar"`
+                    # off the row later — keys a visibility decision on a PERSISTABLE
+                    # string: `retrieval.py` reads that field straight out of the
+                    # Qdrant payload, and "event_calendar" is already a blessed
+                    # member of `provenance._FIRST_PARTY_PIPELINES`, so a future
+                    # writer could store it on a row this loop never produced.
+                    boosted_ids.add(mid)
                     results.append(
                         RetrievalResult(
                             memory_id=mid,
@@ -425,6 +438,56 @@ async def memory_recall(
             for r in results
         ]
 
+    # Which visibility the ENRICHMENT may use, as opposed to which the caller
+    # asked for. The two differ on the drift pipelines, and the rule this whole
+    # change serves is that enrichment must agree with the search that actually
+    # produced these results — not with the search the standard path would have
+    # run. `drift_recall` takes no `include_deprecated` at all and hides
+    # deprecated memories in BOTH its lanes (`search_ranked` filters in SQL;
+    # `qdrant.search` defaults the flag False and adds `must_not deprecated`),
+    # so honouring the caller here would put a deprecated id in
+    # `graph_neighbors` that this recall's own `results` could never contain.
+    # Same defect as the expired-memory one above, one pipeline over.
+    #
+    # `pipeline_used` is the RESOLVED pipeline, not the requested `mode`: the
+    # auto path can silently swap sparse standard results for drift ones
+    # (`pipeline_used = "auto_drift"`), and that swap has to move this flag with
+    # it. Keying on `mode` would miss exactly that case.
+    #
+    # Teaching drift the flag instead would be the wider fix and a real
+    # capability gain for audit recalls — filed separately rather than expanding
+    # this change into another subsystem.
+    #
+    # PER RESULT, not per pipeline, because `pipeline_used` does not describe
+    # every row in `results`. The event-calendar boost above appends rows through
+    # `memory_crud.get_by_id`, whose query is `WHERE f.memory_id = ?` with NO
+    # visibility clause at all — so those rows were produced by a read that
+    # filtered NOTHING, and the rule this change serves ("enrichment agrees with
+    # the search that actually produced this result") therefore says to honour the
+    # caller for them even in drift mode. A pipeline-wide flag stripped their
+    # neighbours instead, which is the same defect as the drift leak it fixed,
+    # pointing the other way: over-hiding rather than over-showing.
+    #
+    # THE TWO RULES, RECONCILED, because stated loosely they contradict each other
+    # and give opposite answers here. "Enrichment must not surface what the search
+    # beside it hides" is the PR's rule and it is about the SEARCH THAT PRODUCED THE
+    # ROW, never about the call's nominal pipeline. Read that way both cases fall
+    # out of one principle rather than needing a precedence order:
+    #   * a drift row was produced by a search that filters deprecated, so its
+    #     neighbours stay hidden even when the caller asked otherwise;
+    #   * a boosted row was produced by a read that filters NOTHING, so there is no
+    #     hiding for enrichment to contradict and the caller's choice governs.
+    # The drift comment above is the first clause of this, not a competing rule.
+    #
+    # Keyed on IDENTITY (`boosted_ids`, recorded at the producer) rather than on the
+    # row's `source_pipeline`, which is persistable — see the note at the boost.
+    def _traversal_allows_deprecated(result) -> bool:
+        if not include_deprecated:
+            return False
+        if pipeline_used == "standard":
+            return True
+        return result.memory_id in boosted_ids
+
     enriched = []
     graph_budget_ms = 500.0
     graph_elapsed_ms = 0.0
@@ -437,6 +500,32 @@ async def memory_recall(
                     r.memory_id,
                     max_depth=2,
                     min_strength=0.3,
+                    # The caller's choice, honoured rather than overridden
+                    # (issue #1896). Without this the search above returns the
+                    # deprecated memory the caller explicitly asked for and the
+                    # enrichment here silently drops all of its neighbours,
+                    # because every backend re-applies the predicate the caller
+                    # just opted out of. DEPRECATION ONLY: an expired memory is
+                    # not reached AS A NEIGHBOUR at any value of this flag — the
+                    # traversal predicate keeps its expiry limb unconditional.
+                    # That is narrower than "results never contain an expired
+                    # memory", which is FALSE today and is not this change's to
+                    # fix: the event-calendar boost above hydrates ids through two
+                    # reads that filter neither limb, so a `time_range` recall can
+                    # hand back an expired ROOT whose neighbours are then traversed
+                    # from here. Issue #2392, which also has to decide whether that
+                    # exemption is intended before it can be closed.
+                    # `search_ranked`
+                    # applies its `invalid_at` clause unconditionally
+                    # (db/crud/memory.py:207) and gates only the `deprecated`
+                    # one (:212), so widening here would hand the model a
+                    # neighbour id its own results array could never contain.
+                    # An earlier version of this code did exactly that.
+                    #
+                    # Not the raw parameter — see `_traversal_allows_deprecated`
+                    # above, which withholds it on the drift pipelines except for
+                    # rows the calendar boost produced through an unfiltered read.
+                    include_deprecated=_traversal_allows_deprecated(r),
                 )
                 graph_elapsed_ms += traversal.query_ms
                 if traversal.nodes:
@@ -446,6 +535,10 @@ async def memory_recall(
                             "link_type": n.link_type,
                             "depth": n.depth,
                             "strength": n.strength,
+                            # A `hidden` key may be added below, after the loop —
+                            # see `_label_hidden_neighbours`. Labelling is one
+                            # scoped query over the ids actually collected, so it
+                            # cannot be done from inside this comprehension.
                         }
                         for n in traversal.nodes[:5]
                     ]
@@ -456,6 +549,15 @@ async def memory_recall(
                     exc_info=True,
                 )
         enriched.append(d)
+
+    # Label the hidden neighbours in ONE scoped pass, after the loop. A False
+    # return means visibility could not be determined, so the "no `hidden` key
+    # means visible" contract does not hold for this response and the caller is
+    # told rather than left to assume the safe-sounding reading.
+    if not await _label_hidden_neighbours(
+        memory_mod._db, enriched, include_deprecated=include_deprecated
+    ):
+        _mark_visibility_unknown(enriched)
 
     # Selective corrective retrieval (CRAG) — high-stakes explicit recall path.
     # Default ON; gated + fail-fast so a confident/healthy recall is untouched.
@@ -535,6 +637,89 @@ async def memory_recall(
     return enriched
 
 
+async def _label_hidden_neighbours(db, results: list[dict], *, include_deprecated: bool) -> bool:
+    """Mark neighbours that normal recall hides. Returns whether it could check.
+
+    Annotates in place: a neighbour the predicate hides gains ``"hidden": True``,
+    and the key is ABSENT on a visible one — so its absence is information, which
+    is why the return value matters. ``False`` means the check could not run, and
+    the caller must not let absence be read as "visible" for that response.
+
+    Exists because un-hiding neighbours without LABELLING them hands a caller
+    superseded ids indistinguishable from live ones, and the documented next step
+    is to expand them. MEASURED on the live graph at these tools' parameters:
+    11,032 of 73,823 visible memories with out-edges (14.9%) gain at least one
+    hidden neighbour at depth 1 ALONE — a common case, not an edge one.
+
+    SCOPED to the ids actually present, and run ONCE after the results are built
+    rather than per neighbour or per call. MEASURED on a live install: the
+    unscoped predicate is a full `SCAN memory_metadata` over 97,971 rows at
+    33.8ms, while the scoped `IN (…)` uses the autoindex at 0.100ms — 338x
+    cheaper for the same answer. Running it after the loop also means a call that
+    returns no results performs no query at all, which matters because
+    ``memory_expand`` defaults this flag ON and would otherwise pay a full scan
+    on every id that resolves to nothing.
+
+    No query when ``include_deprecated`` is False: the traversal applied the
+    predicate, so no hidden neighbour can be present. Skipping is correctness as
+    well as thrift — the query would be guaranteed-empty on the hot path.
+
+    The predicate here stays the WIDE one (``invalid_memory_ids_among``, both
+    hiding reasons) even though traversal now only ever surfaces a DEPRECATED
+    neighbour. Deliberate: the two reads are not in one transaction, so a
+    neighbour can expire between the traversal and this label, and marking that
+    one hidden is right. A narrow label predicate would instead report it as
+    visible — the one direction a fail must not go.
+
+    FAIL-OPEN, but LOUDLY. A label is an enrichment and must not cost the caller
+    their neighbours; returning "nothing is hidden" on a call that could not look
+    would instead assert the opposite of the truth, which on this install would
+    mislabel 4,276 ids as live in a payload whose next step is to trust them.
+    """
+    if not include_deprecated:
+        return True
+    candidates = {
+        n["memory_id"]
+        for r in results
+        for n in r.get("graph_neighbors") or ()
+        if n.get("memory_id")
+    }
+    if not candidates:
+        return True
+    try:
+        from genesis.memory.graphstore import invalid_memory_ids_among
+
+        hidden = await invalid_memory_ids_among(db, candidates)
+    except Exception:
+        # WARNING, not debug: the caller explicitly asked to see hidden
+        # memories, so failing to tell them apart is a failure of the thing they
+        # asked for — not a background detail, and not something to hide behind
+        # a log level that is off in production.
+        logger.warning(
+            "hidden-neighbour labelling failed — neighbours are returned "
+            "UNLABELLED and their visibility is unknown",
+            exc_info=True,
+        )
+        return False
+    for r in results:
+        for n in r.get("graph_neighbors") or ():
+            if n.get("memory_id") in hidden:
+                n["hidden"] = True
+    return True
+
+
+def _mark_visibility_unknown(results: list[dict]) -> None:
+    """Withdraw the absence-means-visible contract for this response.
+
+    Only reached when labelling could not run. Without it the caller cannot
+    distinguish "these neighbours are all live" from "nobody checked", and the
+    first reading is the dangerous one.
+    """
+    for d in results:
+        if d.get("graph_neighbors"):
+            d["graph_neighbors_visibility"] = "unknown"
+
+
 _UUID_LEN = 36
 # Hex (with optional dashes) 4–35 chars — a partial memory UUID. Anything
 # else (full UUIDs, non-hex ids) bypasses prefix resolution untouched.
@@ -582,6 +767,7 @@ async def _resolve_id_prefixes(
 @mcp.tool()
 async def memory_expand(
     memory_ids: list[str],
+    include_deprecated: bool = True,
 ) -> list[dict]:
     """Fetch full content + graph neighbors for specific memory IDs.
 
@@ -591,7 +777,36 @@ async def memory_expand(
     enrichment for each ID found; unresolved or ambiguous handles are reported
     in a trailing ``{"not_found": [...], "ambiguous": [...]}`` entry instead
     of being silently dropped.
+
+    Args:
+        memory_ids: Full UUIDs or short ``id:`` handles to expand.
+        include_deprecated: Include graph neighbours that normal recall hides as
+            SUPERSEDED. Defaults to **True** here, unlike ``memory_recall``,
+            because this tool already returns the named memory whatever its
+            state. Each such neighbour is flagged ``"hidden": true``; the key is
+            absent on visible ones. Expired memories stay hidden either way, so
+            an expired id expands with no ``graph_neighbors``.
     """
+    # WHY the default differs from `memory_recall` (issue #1896, owner decision
+    # 2026-09-24) — kept as a COMMENT, not in the docstring: FastMCP publishes a
+    # tool's docstring as its model-facing description, billed on every session's
+    # handshake, so reviewer-facing rationale there is a permanent token cost.
+    #
+    # This function retrieves by id straight from Qdrant and applies no
+    # visibility predicate to the memory ITSELF, so it already returns a
+    # deprecated memory when one is named. Defaulting the neighbours to hidden
+    # made the tool asymmetric with itself — handing back the memory while
+    # suppressing its edges is the #1896 symptom left in place as a default.
+    #
+    # Who it bites decided it: the proactive hook emits `[→ related: id:xxx]`
+    # handles and this tool is the documented expansion path, so a caller
+    # following that hint has no signal the handle is deprecated, no reason to
+    # set a flag, and no way to tell "hidden neighbours" from "no neighbours".
+    #
+    # The flag is per-CALL, not per-root, so it also un-hides neighbours of
+    # VISIBLE memories — MEASURED: 11,032 of 73,823 visible memories with
+    # out-edges (14.9%) gain one at depth 1 alone. That is why each hidden
+    # neighbour carries a `hidden` label rather than arriving unmarked.
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
@@ -711,6 +926,7 @@ async def memory_expand(
                 mid,
                 max_depth=2,
                 min_strength=0.3,
+                include_deprecated=include_deprecated,
             )
             if traversal.nodes:
                 d["graph_neighbors"] = [
@@ -719,6 +935,10 @@ async def memory_expand(
                         "link_type": n.link_type,
                         "depth": n.depth,
                         "strength": n.strength,
+                        # A `hidden` key may be added after the loop — see
+                        # `_label_hidden_neighbours`. This tool defaults the flag
+                        # ON, so the label is the ordinary case here rather than
+                        # the exception.
                     }
                     for n in traversal.nodes[:5]
                 ]
@@ -726,6 +946,15 @@ async def memory_expand(
             logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
 
         results.append(d)
+
+    # After the loop AND strictly after the not-found early return above, so an
+    # expand whose ids resolve to nothing performs no visibility query at all.
+    # This tool defaults the flag ON, so the previous hoisted placement paid a
+    # full table scan on every miss.
+    if not await _label_hidden_neighbours(
+        memory_mod._db, results, include_deprecated=include_deprecated
+    ):
+        _mark_visibility_unknown(results)
 
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # expand prompt (observe-only). memory_mod._db is asserted non-None above.

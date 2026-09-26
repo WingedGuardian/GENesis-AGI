@@ -43,6 +43,50 @@ STANDING_REVIEWED_HEAD_LIMIT = 4
 GATE_DISCOVERY_ROUND_LIMIT = 2
 STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
 
+#: The two real choices at a terminal round, in the words the owner reads AT the
+#: approval dialog. SINGLE-SOURCED here because BOTH gates state it — the push
+#: guard's review-request ask and the commit gate's fix-commit ask — and a copy
+#: in each is precisely how the two drift apart. That is not hypothetical: the
+#: change that introduced this framing put it in 2 of the 6 approval branches
+#: across those two gates and external review found the other 4 (PR #2382).
+#:
+#: Safe to read as a module attribute from either gate with no local fallback,
+#: for two independent reasons: each gate inserts its own ``scripts/`` at
+#: ``sys.path[0]`` so gate and evaluator are always co-tree, and both reach the
+#: branches that use these only after ``evaluate_pr`` returned ``status=ok``,
+#: which cannot happen unless this module loaded.
+TERMINAL_DECISION = (
+    "The decision here is to MERGE with the outstanding issues accepted and "
+    "filed, or to SEND IT BACK for rework."
+)
+
+#: The ordinary lane's terminal RULE, stating the boundary and the decision and
+#: nothing about what a given approval authorizes. Interpolates the limit rather
+#: than spelling "four", so a future change to STANDING_REVIEWED_HEAD_LIMIT cannot
+#: leave the prose asserting the old boundary — the exact failure this PR removed,
+#: where a retired cap of 7 still shaped the live four-head tier.
+#:
+#: ACTION-NEUTRAL on purpose, and the split below is not cosmetic. The two gates
+#: authorize DIFFERENT things — the push guard a review round, the commit gate a
+#: single fix commit — so a shared sentence that says "approve one further ROUND"
+#: is simply false at the commit gate, and pasting it there contradicts its own
+#: next sentence. Use this constant wherever the action is not a round.
+#:
+#: It also asserts a FOUR-head boundary, so it belongs only where the count is
+#: actually four: rendering "there is no ordinary round 5" to someone already
+#: holding five heads tells them something false. Past the boundary, use
+#: TERMINAL_DECISION with a lead that says so.
+ORDINARY_TERMINAL_RULE = (
+    f"ROUND {STANDING_REVIEWED_HEAD_LIMIT} IS TERMINAL: there is no ordinary "
+    f"round {STANDING_REVIEWED_HEAD_LIMIT + 1}. {TERMINAL_DECISION}"
+)
+
+#: The rule plus the clause for a gate whose approval authorizes a further ROUND.
+ORDINARY_TERMINAL_NOTICE = (
+    f"{ORDINARY_TERMINAL_RULE} Approve only to authorize one further round anyway, "
+    "and only if that is genuinely the least costly option."
+)
+
 CONFIRMATION_MARKER_TEMPLATE = "<!-- genesis-review-request head={head} kind=confirmation -->"
 
 HOOK_SURFACE_PREFIXES = (
