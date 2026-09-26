@@ -66,7 +66,7 @@ import sys
 import tarfile
 import time
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Two lanes, by whether the work is already in main (owner ruling 2026-09-10).
 # MERGED work is a duplicate of main, so it drains fast. UNMERGED work may be the
@@ -1537,7 +1537,138 @@ def _trash_worktree(
 # ---------------------------------------------------------------------------
 
 
-def _recover(name: str, repo_root: Path) -> bool:
+def _describe_recovery(stored: Path, repo_root: Path) -> bool:
+    """Dry-run preview for a resolved trash entry: what recovery WOULD do.
+
+    Read-only. Reads the entry's ``.trash_meta.json`` — from the directory, or
+    from inside the archive in memory, without extracting anything to disk —
+    and prints the same facts a real recovery reports, in the conditional
+    tense: a dry-run that printed completed-actions prose would leave a reader
+    who missed the flag with no second signal that nothing happened (#2188).
+
+    The pre-flight refusals (missing metadata, incomplete metadata, an occupied
+    destination) are reported exactly as a real run would report them, so the
+    preview cannot promise a recovery the real run would refuse.
+    """
+    candidates: list[str] = []
+    if stored.is_dir():
+        meta_path = stored / ".trash_meta.json"
+        if not meta_path.exists():
+            print(f"No .trash_meta.json in {stored}", file=sys.stderr)
+            return False
+        meta = json.loads(meta_path.read_text())
+        # Same walk `_restore_from_dir` uses: symlinks and files only, `.git`
+        # and every `.trash_meta.json` basename excluded.
+        for item in stored.rglob("*"):
+            rel = item.relative_to(stored)
+            if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                continue
+            if item.is_symlink() or item.is_file():
+                candidates.append(rel.as_posix())
+        consume_note = (
+            "WOULD CONSUME the trash entry "
+            "(directory form; recovery moves its contents back)"
+        )
+    else:
+        try:
+            with tarfile.open(stored, "r:gz") as tf:
+                members = tf.getmembers()
+                # The entry's OWN metadata sits at depth two: `<name>/.trash_meta.json`.
+                # A worktree may legitimately contain a deeper file of the same
+                # name, so a bare endswith() search can bind the nested copy and
+                # report — or refuse — the wrong entry. Prefer the root member;
+                # fall back to the first match for archives laid out differently.
+                meta_member = next(
+                    (m for m in members
+                     if m.isfile()
+                     and len(PurePosixPath(m.name).parts) == 2
+                     and m.name.endswith(".trash_meta.json")),
+                    None,
+                )
+                if meta_member is None:
+                    meta_member = next(
+                        (m for m in members
+                         if m.isfile() and m.name.endswith(".trash_meta.json")),
+                        None,
+                    )
+                if meta_member is None:
+                    print(f"No .trash_meta.json in {stored}", file=sys.stderr)
+                    return False
+                meta = json.loads(tf.extractfile(meta_member).read())
+                for m in members:
+                    parts = PurePosixPath(m.name).parts
+                    if len(parts) < 2:
+                        continue  # the root dir member itself
+                    rel = PurePosixPath(*parts[1:])
+                    if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                        continue
+                    if m.isfile() or m.issym() or m.islnk():
+                        candidates.append(rel.as_posix())
+        except (OSError, tarfile.TarError, EOFError, json.JSONDecodeError) as e:
+            print(f"Failed to read {stored}: {e}", file=sys.stderr)
+            return False
+        consume_note = (
+            f"Archive would be KEPT at {stored} "
+            "(recovery copies; it does not consume)"
+        )
+
+    original_path = meta.get("original_path", "")
+    branch = meta.get("branch", "")
+    commit = meta.get("commit", "")
+    detached = meta.get("detached", False)
+    if not original_path or (not branch and not commit):
+        print(f"Incomplete metadata in {stored}", file=sys.stderr)
+        return False
+    if Path(original_path).exists():
+        print(f"Original path already exists: {original_path}", file=sys.stderr)
+        return False
+
+    # A stored branch name does not mean the branch still EXISTS — the reaper's
+    # callers routinely `git branch -D` right after archiving, and a real run
+    # then retries DETACHED at the recorded commit. Preview what recovery would
+    # actually do, not what the metadata last recorded.
+    branch_exists = bool(branch) and _run_git(
+        repo_root,
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        timeout=10,
+    ) is not None
+    if branch and not detached and branch_exists:
+        ref_note = f"branch: {branch}"
+        checkout_ref = branch
+    elif branch and not detached:
+        ref_note = (
+            f"detached at {commit[:8]} — branch {branch!r} no longer exists"
+        )
+        checkout_ref = commit
+    else:
+        ref_note = f"detached at {commit[:8]}"
+        checkout_ref = commit
+
+    # `git worktree add` recreates TRACKED files; the restore step then fills in
+    # only what the checkout left missing (copy-only-missing). Count the files
+    # recovery would actually write — everything stored that is not tracked at
+    # the recovery ref — rather than everything stored, which labels tracked
+    # checkout files and `.git` as "untracked" and overstates the count by the
+    # size of the tree.
+    tracked: set[str] | None = None
+    if checkout_ref:
+        out = _run_git(
+            repo_root, ["ls-tree", "-r", "--name-only", checkout_ref], timeout=30
+        )
+        if out is not None:
+            tracked = set(out.splitlines())
+
+    _log(f"WOULD RECOVER {original_path} ({ref_note})")
+    if tracked is None:
+        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+    else:
+        restorable = sum(1 for c in candidates if c not in tracked)
+        _log(f"WOULD RESTORE {restorable} untracked file(s) from {stored}")
+    _log(consume_note)
+    return True
+
+
+def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
     """Resolve a trash entry by name prefix and restore it.
 
     A stored entry is either a directory or a ``.tar.gz``. Archives are extracted
@@ -1550,6 +1681,10 @@ def _recover(name: str, repo_root: Path) -> bool:
     consumed instead: `_restore_from_dir` moves its contents back and removes the
     entry, because for those the trash directory IS the only copy and leaving a
     duplicate would double the disk for no benefit.
+
+    Under ``dry_run`` the entry is only resolved and described (see
+    `_describe_recovery`): no extraction, no ``git worktree add``, no moves —
+    the same "show, don't do" contract the reap path honours (#2188).
     """
     if not TRASH_DIR.exists():
         print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
@@ -1580,6 +1715,11 @@ def _recover(name: str, repo_root: Path) -> bool:
         return False
 
     stored = matches[0]
+    if dry_run:
+        # Resolution and ambiguity checks above are read-only, so running them
+        # in dry-run keeps the preview's error messages identical to a real
+        # run's. Everything below this line writes.
+        return _describe_recovery(stored, repo_root)
     if stored.is_dir():
         return _restore_from_dir(stored, repo_root)
 
@@ -2001,7 +2141,11 @@ def main() -> int:
     repo_root = _repo_root()
 
     if args.recover:
-        return 0 if _recover(args.recover, repo_root) else 1
+        # --dry-run must reach the recover path too (#2188): the flag's contract
+        # ("Show what would happen without doing it") is taught by the reap path
+        # ("WOULD TRASH ..."), so silently dropping it here would perform a full
+        # real recovery — thousands of files — under a no-op flag.
+        return 0 if _recover(args.recover, repo_root, dry_run=args.dry_run) else 1
 
     if args.report_json:
         try:
