@@ -30,12 +30,17 @@ HOOK_PATH = _find_hook_path()
 
 @pytest.fixture
 def fix_repo(tmp_path, monkeypatch):
-    """A throwaway git repo with the post-commit hook installed and
-    GENESIS_HOME isolated to tmp_path/genesis_home."""
+    """A throwaway git repo with the post-commit hook installed, GENESIS_HOME
+    isolated to tmp_path/genesis_home and HOME to tmp_path/user_home (the hook
+    reads the user overlay from $HOME/.genesis/config, so a real HOME would make
+    these tests depend on the machine they run on)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     home = tmp_path / "genesis_home"
+    user_home = tmp_path / "user_home"
+    user_home.mkdir()
     monkeypatch.setenv("GENESIS_HOME", str(home))
+    monkeypatch.setenv("HOME", str(user_home))
 
     def git(*args, check=True):
         return subprocess.run(
@@ -55,7 +60,7 @@ def fix_repo(tmp_path, monkeypatch):
     dst.write_text(HOOK_PATH.read_text())
     dst.chmod(0o755)
 
-    return {"repo": repo, "home": home, "git": git}
+    return {"repo": repo, "home": home, "user_home": user_home, "git": git}
 
 
 def _read_latest_marker(home: Path) -> dict:

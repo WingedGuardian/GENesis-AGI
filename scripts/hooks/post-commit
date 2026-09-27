@@ -66,7 +66,8 @@ if [[ "$COMMIT_SUBJECT" =~ ^Genesis[[:space:]]+v[0-9]+.*public[[:space:]]release
 fi
 
 # ─── Contribution offer gate (config-driven) ────────────────────────────────
-# Check config/contribution.local.yaml first (user override), then base config.
+# Check the user overlay (~/.genesis/config/contribution.local.yaml, where settings_update
+# writes) first, then the repo's config/contribution.local.yaml, then base config.
 # Default: enabled (if neither file exists or key is absent).
 # Mirrors the Python settings layer's deep-merge: local overrides base per-key.
 # IMPORTANT: resolve config from the MAIN repo root, not the worktree.
@@ -89,7 +90,9 @@ if [[ -n "$_REPO_ROOT" ]]; then
     # of GENESIS_HOME) wins, else the repo sibling.
     _CONTRIB_LOCAL="$HOME/.genesis/config/contribution.local.yaml"
     [[ -f "$_CONTRIB_LOCAL" ]] || _CONTRIB_LOCAL="$_CONTRIB_CFG_DIR/contribution.local.yaml"
-    # Local override takes precedence (if the key is present in it)
+    # Local override takes precedence (if the key is present in it). An unreadable
+    # overlay makes grep fail and falls through to the base value: deliberate, same
+    # as the settings writer's handling of an unreadable file.
     if [[ -f "$_CONTRIB_LOCAL" ]] \
        && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_LOCAL" 2>/dev/null; then
         _CONTRIB_DISABLED="local"
