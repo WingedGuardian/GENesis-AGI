@@ -679,6 +679,10 @@ def test_routing_config_reload_endpoint(client):
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True, "dlq_orphans_expired": 0}
     load_config.assert_called_once()
+    # An operator-initiated reload of a broken overlay must be REFUSED, keeping
+    # the running config, not quietly swapped for the base config the boot path
+    # falls back to.
+    assert load_config.call_args.kwargs.get("strict_overlay") is True
     mock_router.reload_config.assert_called_once_with(fake_config)
     mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
 

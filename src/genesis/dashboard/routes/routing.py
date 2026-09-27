@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import yaml
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
@@ -62,17 +61,11 @@ def routing_config_read():
     config_path = Path(__file__).parent.parent.parent.parent.parent / "config" / "model_routing.yaml"
     if config_path.exists():
         try:
-            raw = yaml.safe_load(config_path.read_text()) or {}
-            # Merge local overlay if present (with stale-provider sanitization)
-            from genesis.routing.config import (
-                _deep_merge,
-                _load_local_overlay,
-                _sanitize_local_overlay,
-            )
-            local_raw = _load_local_overlay(config_path)
-            if local_raw:
-                local_raw = _sanitize_local_overlay(raw, local_raw)
-                raw = _deep_merge(raw, local_raw)
+            # The same overlay-or-base choice the loader made, so a rejected
+            # overlay's CC fields are not displayed as if they were in effect.
+            from genesis.routing.config import _load_effective
+
+            _, raw = _load_effective(config_path, check_api_keys=False)
             for cs_name, cs_raw in (raw.get("call_sites") or {}).items():
                 if isinstance(cs_raw, dict) and (cs_raw.get("dispatch") or cs_raw.get("cc_model")):
                     yaml_cc[cs_name] = cs_raw
@@ -207,7 +200,9 @@ async def routing_config_reload():
         return jsonify({"error": "model_routing.yaml not found"}), 404
 
     try:
-        new_config = load_config(config_path)
+        # Strict: an operator-initiated reload of a broken overlay is refused
+        # and the running config kept, rather than silently dropping the overlay.
+        new_config = load_config(config_path, strict_overlay=True)
     except Exception as e:
         logger.error("Config parse failed: %s", e, exc_info=True)
         return jsonify({"error": "Config parse failed"}), 400
