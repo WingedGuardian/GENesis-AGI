@@ -214,22 +214,20 @@ def test_resolve_honors_the_persisted_deploy_branch(tmp_path: Path) -> None:
     assert result.stdout.strip() == "release/test"
 
 
-def test_local_github_value_declines_rather_than_guessing_without_pyyaml(
+def test_local_github_value_refuses_an_existing_config_it_cannot_read(
     tmp_path: Path,
 ) -> None:
-    """With no yaml, resolve NOTHING — do not hand-parse a branch name.
+    """A config that EXISTS but cannot be read exits non-zero — never "no override".
 
-    This asserted the opposite until 2026-09-26: a 55-line fallback parser read
-    the config by hand and returned a branch — a guess emitted by the very path
-    whose premise is that the config is unreadable, handed to the one caller that
-    acts on it by mutating a checkout. Three review rounds fixed three defects in
-    it (a lossy quoted scalar, ignored YAML hierarchy, and being reached on any
-    `safe_load` failure rather than a missing module) before anyone asked whether
-    it should exist.
-
-    Declining is correct on its own terms: the caller falls through to the
-    remote's advertised HEAD, and `genesis_assert_deploy_checkout` refuses the
-    deploy if that disagrees with the branch actually checked out.
+    This is the third version of this contract. Until 2026-09-26 a 55-line
+    fallback parser read the file by hand and RETURNED a branch: a guess emitted
+    by the very path whose premise is that the config is unreadable. That was
+    replaced by DECLINING (print nothing, exit 0), and review showed declining is
+    still a permissive default: with an override the reader could not see, the
+    resolver fell through to the remote's advertised HEAD, and when the checkout
+    was on that branch too, validation passed and the update deployed a target
+    the operator had configured away from. So an existing-but-unreadable config
+    now REFUSES, and the caller must not swallow it.
     """
     home = tmp_path / "home"
     (home / ".genesis" / "config").mkdir(parents=True)
@@ -254,10 +252,64 @@ def test_local_github_value_declines_rather_than_guessing_without_pyyaml(
         VENV_DIR="",
     )
 
-    assert result.returncode == 0
-    assert result.stdout.strip() == "", (
-        "an unreadable config must resolve to nothing, not to a hand-parsed guess"
-    )
+    assert result.returncode != 0, "an unreadable config must refuse, not read as empty"
+    assert result.stdout.strip() == "", "and it must never emit a guessed value"
+
+
+def test_local_github_value_absent_and_malformed_configs_are_distinguished(
+    tmp_path: Path,
+) -> None:
+    """Absent file or key -> empty and OK; present but malformed -> refused.
+
+    The distinction is the whole contract, so both sides are pinned: a helper
+    that refused on EVERY missing value would pass the malformed case and break
+    every install that has no override set.
+    """
+    home = tmp_path / "home"
+    config_dir = home / ".genesis" / "config"
+    config_dir.mkdir(parents=True)
+    read = "genesis_local_github_value deploy_branch"
+
+    no_file = _run_helper(read, HOME=str(home), VENV_DIR="")
+    assert no_file.returncode == 0 and no_file.stdout.strip() == "", no_file.stderr
+
+    (config_dir / "genesis.yaml").write_text("github:\n  public_repo: GENesis-AGI\n")
+    no_key = _run_helper(read, HOME=str(home), VENV_DIR="")
+    assert no_key.returncode == 0 and no_key.stdout.strip() == "", no_key.stderr
+
+    for body in ("github: [unclosed\n", "- just\n- a list\n", "github: a-string\n"):
+        (config_dir / "genesis.yaml").write_text(body)
+        malformed = _run_helper(read, HOME=str(home), VENV_DIR="")
+        assert malformed.returncode != 0, f"{body!r} must refuse"
+        assert malformed.stdout.strip() == ""
+
+
+def test_resolve_refuses_rather_than_guessing_when_the_config_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's scenario, end to end, with its control.
+
+    The remote advertises `main` and the checkout is on `main`, so without the
+    config every check agrees and the deploy would proceed. With a malformed
+    config that might have held a different override, the resolver must refuse.
+    """
+    remote = tmp_path / "remote"
+    repo = _repo(tmp_path)
+    _git(tmp_path, "init", "--bare", "-b", "main", str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "origin", "main")
+    home = tmp_path / "home"
+    (home / ".genesis" / "config").mkdir(parents=True)
+    resolve = f'genesis_resolve_deploy_branch "{repo}" origin'
+
+    control = _run_helper(resolve, HOME=str(home), VENV_DIR="")
+    assert control.returncode == 0 and control.stdout.strip() == "main", control.stderr
+
+    (home / ".genesis" / "config" / "genesis.yaml").write_text("github: [unclosed\n")
+    refused = _run_helper(resolve, HOME=str(home), VENV_DIR="")
+    assert refused.returncode != 0
+    assert "refusing rather than guessing a deploy target" in refused.stderr
+    assert refused.stdout.strip() == ""
 
 
 def test_local_github_value_prefers_the_venv_over_a_bare_python_without_yaml(

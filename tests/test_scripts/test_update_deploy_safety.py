@@ -318,10 +318,6 @@ def test_only_the_private_deploy_ref_is_a_fatal_fetch() -> None:
     assert "_refresh_deploy_tracking_ref || " not in text, (
         "the call must not be chained to anything that could make it fatal"
     )
-    assert (
-        'public_repo="${GENESIS_GITHUB_PUBLIC_REPO:-$(genesis_local_github_value public_repo || true)}"'
-        in text
-    )
 
 
 def test_detect_update_remote_matches_the_repo_basename(tmp_path: Path) -> None:
@@ -348,6 +344,71 @@ def test_detect_update_remote_matches_the_repo_basename(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "upstream"
+
+
+def _run_detect_update_remote(
+    repo: Path, home: Path, **env: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the real `_detect_update_remote` with the real config helper sourced."""
+    text = UPDATE.read_text()
+    function = text[
+        text.index("_detect_update_remote() {") : text.index(
+            'UPDATE_REMOTE="$(_detect_update_remote)"'
+        )
+    ]
+    lib = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
+    return subprocess.run(
+        ["bash", "-c", f'. "{lib}"\nGENESIS_ROOT="{repo}"\n{function}\n_detect_update_remote'],
+        capture_output=True,
+        text=True,
+        env=_clean_env(HOME=str(home), VENV_DIR="", **env),
+    )
+
+
+def test_detect_update_remote_recognises_a_url_containing_whitespace(tmp_path: Path) -> None:
+    """A legal local-path remote with a space must still be recognised.
+
+    The previous parse split `git remote -v` on whitespace, so `/x/a b/GENesis-AGI.git`
+    became `/x/a` plus a stray field, matched nothing, and fell through to `origin` —
+    deploying from the wrong remote with no error. Enumerating remotes by name and
+    asking git for each URL has no field boundary to get wrong.
+    """
+    repo = tmp_path / "repo"
+    _git(tmp_path, "init", "-q", str(repo))
+    _git(repo, "remote", "add", "origin", "https://example.test/GENesis-AGI-backup.git")
+    _git(repo, "remote", "add", "public", str(tmp_path / "a b" / "GENesis-AGI.git"))
+
+    result = _run_detect_update_remote(
+        repo, tmp_path / "home", GENESIS_GITHUB_PUBLIC_REPO="GENesis-AGI"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "public"
+
+
+def test_detect_update_remote_refuses_an_unreadable_config(tmp_path: Path) -> None:
+    """A config that exists but cannot be parsed REFUSES; an absent one does not.
+
+    Guessing the default repo name when the configured one cannot be read selects
+    a fetch remote the operator did not choose. Positive control first: with NO
+    config file the default applies and detection succeeds, so the refusal below
+    is caused by the malformed file and not by the harness.
+    """
+    repo = tmp_path / "repo"
+    _git(tmp_path, "init", "-q", str(repo))
+    _git(repo, "remote", "add", "origin", "https://example.test/GENesis-AGI.git")
+    home = tmp_path / "home"
+    (home / ".genesis" / "config").mkdir(parents=True)
+
+    absent = _run_detect_update_remote(repo, home)
+    assert absent.returncode == 0, absent.stderr
+    assert absent.stdout.strip() == "origin"
+
+    (home / ".genesis" / "config" / "genesis.yaml").write_text("github: [unclosed\n")
+    malformed = _run_detect_update_remote(repo, home)
+    assert malformed.returncode != 0
+    assert "refusing rather than guessing" in malformed.stderr
+    assert malformed.stdout.strip() == ""
 
 
 def test_private_fetch_ref_and_tracking_ref_survive_narrow_refspec(tmp_path: Path) -> None:
@@ -641,22 +702,122 @@ def test_every_success_record_uses_marker_capable_variable() -> None:
         markers.append(parts[2].strip('"'))
     assert markers == ["$_nd_degraded", "$_nd_degraded", "$_p6_degraded"], markers
 
-    # 3. Every boolean fed to the helper is derived from WERE_RUNNING MEMBERSHIP.
-    #    `_OPERATOR_STOP` is specifically disallowed: it answers "was the array
-    #    empty?", which is a different question from "was the server restarted?".
+    # 3. Each boolean fed to the helper answers "was genesis-server left
+    #    un-restarted?" — and the two sites answer it DIFFERENTLY on purpose:
+    #    - P6 verifies health and ROLLS BACK on failure, so reaching its success
+    #      write already proves a restart worked; membership in WERE_RUNNING (was
+    #      it meant to be restarted?) is the whole question there.
+    #    - The no-delta path has NO health check, and its restart is
+    #      `_start_genesis_server || true`, which reports success even when the
+    #      unit never came back. So membership alone is not enough: the unit's
+    #      state AFTER the attempt must be read too.
+    #    `_OPERATOR_STOP` is disallowed at both: it answers "was the array
+    #    empty?", a different question.
     feeders = re.findall(r'_success_degraded_subsystems[ \t]*\\?\s*"[^"]*"[ \t]+"([^"]+)"', text)
     assert len(feeders) == 2, f"expected 2 helper call sites, got: {feeders}"
-    for feeder in feeders:
-        var = feeder.lstrip("$").strip("{}")
-        assert "_OPERATOR_STOP" not in feeder, (
-            f"{feeder} is true only for an ENTIRELY empty WERE_RUNNING, so it "
-            "cannot answer whether genesis-server was left un-restarted"
+    assert all("_OPERATOR_STOP" not in f for f in feeders), (
+        f"{feeders}: `_OPERATOR_STOP` is true only for an ENTIRELY empty "
+        "WERE_RUNNING, so it cannot answer whether genesis-server was left un-restarted"
+    )
+    assert sorted(f.lstrip("$").strip("{}") for f in feeders) == [
+        "_nd_server_not_restarted",
+        "_p6_server_not_restarted",
+    ], feeders
+
+    membership = r'\[\[ " \$\{WERE_RUNNING\[\*\]\} " == \*" genesis-server "\* \]\]'
+    assert re.search(membership + r"[\s\\]*\|\|[ \t]*_p6_server_not_restarted=true", text), (
+        "P6 must derive its boolean from WERE_RUNNING membership"
+    )
+    # No-delta: DEFAULT true, cleared only when the server was meant to be up AND
+    # the unit is actually up after the restart attempt. A default of `false`
+    # would re-open the failed-restart case.
+    assert "_nd_server_not_restarted=true\n" in text
+    assert re.search(
+        r"if " + membership + r" && _server_unit_is_up; then\s*\n\s*_nd_server_not_restarted=false",
+        text,
+    ), "no-delta must clear the marker only after reading the unit's actual state"
+
+
+def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> None:
+    """With the server down, a latest `failed`/`rolled_back` row must stay latest.
+
+    P6's recovery detection reads only the NEWEST update_history status, and when
+    last_update_failure.json was never written that row is the only signal it has.
+    #2145 asked whether this branch should inherit the "a still-down server may be
+    an unresolved failure whose artifact must survive" condition; writing a newer
+    success row over it is exactly what that condition forbids.
+    """
+    text = UPDATE.read_text()
+    start = text.index('elif [ -n "$_nd_base_degraded" ]')
+    branch = text[start : text.index("Nothing to do.", start)]
+    assert '_nd_last_status="$(_latest_update_status)"' in branch
+    guard = branch[branch.index('case "$_nd_last_status" in') :]
+    failed_arm = guard[guard.index("failed | rolled_back)") : guard.index(";;")]
+    assert "_record_update_history" not in failed_arm, (
+        "the failed/rolled_back arm must not write any update_history row"
+    )
+    # P6 reads the SAME status through the SAME reader, so the two cannot drift:
+    # exactly two call sites (P6 and this branch), and the query exists once.
+    assert re.findall(r"(\w+)=\"\$\(_latest_update_status\)\"", text) == [
+        "_nd_last_status",
+        "_last_status",
+    ]
+    assert text.count("SELECT status FROM update_history ORDER BY started_at DESC") == 1
+
+
+def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
+    """The two probes, driven for real rather than grepped.
+
+    `_server_unit_is_up` is fed each state `systemctl is-active` can print through
+    a PATH shim; an EMPTY answer (a D-Bus hiccup) must read as not-up, so the error
+    lands on the side that reports a problem. `_latest_update_status` reads a real
+    SQLite fixture, and an absent database reads as "" rather than failing.
+    """
+    block = _block(UPDATE.read_text(), "deploy-outcome-probes")
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+
+    def unit_up(state: str) -> bool:
+        (shim_dir / "systemctl").write_text(f"#!/bin/sh\nprintf '%s' '{state}'\nexit 3\n")
+        (shim_dir / "systemctl").chmod(0o755)
+        result = subprocess.run(
+            ["bash", "-c", block + "\n_server_unit_is_up"],
+            capture_output=True,
+            text=True,
+            env=_clean_env(PATH=f"{shim_dir}:{os.environ['PATH']}"),
         )
-        assert re.search(
-            r'\[\[ " \$\{WERE_RUNNING\[\*\]\} " == \*" genesis-server "\* \]\][\s\\]*\|\|'
-            r"[ \t]*" + re.escape(var) + r"=true",
-            text,
-        ), f"{var} is not derived from WERE_RUNNING membership"
+        return result.returncode == 0
+
+    assert unit_up("active") and unit_up("activating") and unit_up("reloading")
+    for state in ("inactive", "failed", "deactivating", ""):
+        assert not unit_up(state), f"state {state!r} must not read as up"
+
+    home = tmp_path / "home"
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "bin" / "python").chmod(0o755)
+
+    def latest() -> str:
+        result = subprocess.run(
+            ["bash", "-c", f'VENV_DIR="{venv}"\n' + block + "\n_latest_update_status"],
+            capture_output=True,
+            text=True,
+            env=_clean_env(HOME=str(home)),
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    assert latest() == "", "no database must read as empty, not fail"
+    db = home / "genesis" / "data" / "genesis.db"
+    db.parent.mkdir(parents=True)
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE update_history (status TEXT, started_at TEXT)")
+    con.execute("INSERT INTO update_history VALUES ('success', '2026-01-01T00:00:00')")
+    con.execute("INSERT INTO update_history VALUES ('rolled_back', '2026-01-02T00:00:00')")
+    con.commit()
+    con.close()
+    assert latest() == "rolled_back", "the NEWEST row, by started_at, must win"
 
 
 def test_success_degraded_helper_marks_server_not_restarted() -> None:
@@ -793,7 +954,41 @@ def test_post_merge_rejects_saved_rollback_tag_on_incoming_side(
     )
 
     assert result.returncode != 0
-    assert "not on the pre-merge side of HEAD" in result.stderr
+    assert "does not point at this merge's pre-merge parent" in result.stderr
+
+
+def test_post_merge_rejects_a_rollback_tag_at_an_older_ancestor(tmp_path: Path) -> None:
+    """A tag on the pre-merge side but OLDER than the merge's first parent is refused.
+
+    Ancestry admitted it: `--is-ancestor` asks "is the first an ancestor of the
+    other?", so a tag at A passed for a history A -> B -> merge, and rolling back
+    to it would discard B. The `old_commit` equality check cannot catch this
+    because it is skipped when the saved state has no `old_commit` — which is
+    exactly this fixture's state.
+    """
+    repo, base, _incoming = _merged_repo(tmp_path)
+    home = tmp_path / "home"
+    older = _git(repo, "rev-list", "--max-parents=0", "HEAD")
+    assert older == base, "fixture: base is the root commit"
+    # Make the tagged commit strictly OLDER than HEAD^1: rebuild so HEAD^1 is a
+    # descendant of the tagged commit rather than the commit itself.
+    _git(repo, "reset", "--hard", base)
+    (repo / "later.txt").write_text("later\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-m", "later work on main")
+    _git(repo, "merge", "--no-ff", "incoming", "-m", "merge incoming")
+    assert _git(repo, "rev-parse", "HEAD^1") != base
+    _git(repo, "tag", "pre-update-saved", base)
+
+    result = _run_post_merge_block(
+        repo,
+        home,
+        state={"rollback_tag": "pre-update-saved"},
+        conflict=None,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "does not point at this merge's pre-merge parent" in result.stderr
 
 
 def test_post_merge_rejects_wrong_head_before_creating_rollback_tag(

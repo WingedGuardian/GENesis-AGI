@@ -9,50 +9,57 @@ genesis_local_github_value() {
     # Venv FIRST, bare python3 only as a fallback. PyYAML is a hard dependency of
     # the venv (pyproject.toml), not of the system interpreter — and before this
     # helper existed, update.sh read `public_repo` through "$VENV_DIR/bin/python"
-    # for exactly that reason. Reading it with bare python3 would silently lose
-    # the key on any host whose system Python has no PyYAML.
+    # for exactly that reason. On a host whose system Python has no PyYAML, bare
+    # python3 cannot read the file at all — which now REFUSES (see below) rather
+    # than reading as "no override", so the venv-first order is what keeps an
+    # ordinary install working, not merely what keeps it correct.
     if [ -n "${VENV_DIR:-}" ] && [ -x "$VENV_DIR/bin/python" ]; then
         py="$VENV_DIR/bin/python"
     else
         py="$(command -v python3 2>/dev/null)" || return 1
     fi
-    GH_KEY="$key" "$py" - <<'PY' 2>/dev/null
+    # THREE outcomes, and the distinction between the last two is the point:
+    #   exit 0, a value   the key is set
+    #   exit 0, empty     no config file, or the key is not set — ordinary
+    #   exit 3, empty     the config EXISTS but cannot be read or parsed
+    #
+    # The third used to read as the second. That "declined" rather than guessed,
+    # which was better than the hand-written parser it replaced (that one
+    # RETURNED a branch from a file it could not parse). But declining is still a
+    # permissive default: with a persisted override the reader could not see,
+    # the resolver fell through to the remote's advertised HEAD, and when the
+    # checkout happened to be on that branch too, validation passed and the
+    # update deployed a target the operator had configured away from. A config
+    # that is present but unreadable now REFUSES; callers must not swallow it.
+    GH_KEY="$key" "$py" - <<'PY'
 import os
+import sys
 from pathlib import Path
 
 key = os.environ["GH_KEY"]
 config = Path.home() / ".genesis" / "config" / "genesis.yaml"
 
+if not config.exists():
+    print("")
+    sys.exit(0)
+
 try:
     import yaml
 
-    github = (yaml.safe_load(config.read_text(encoding="utf-8")) or {}).get("github") or {}
-    value = github.get(key) if isinstance(github, dict) else None
-    print(str(value).strip() if value is not None else "")
-except Exception:
-    # DECLINE. There used to be a 55-line hand parser here for a python3 without
-    # PyYAML.
-    #
-    # Returning nothing is correct on its own terms: the caller falls through to
-    # the remote's advertised HEAD, and `genesis_assert_deploy_checkout` then
-    # refuses the deploy outright if that disagrees with the branch actually
-    # checked out. The hand parser instead RETURNED A BRANCH -- a guess, produced
-    # by a path whose entire premise is that the config could not be read, and
-    # handed to the one caller that acts on it by mutating a checkout.
-    #
-    # It was also unnecessary on the path that matters. `pyyaml` is a hard
-    # dependency of the venv (pyproject.toml), this helper prefers the venv
-    # interpreter, and every other YAML read in update.sh already runs on
-    # "$VENV_DIR/bin/python". The bare-python3 fallback exists only for a
-    # checkout with no venv yet — and there, declining is the safe answer.
-    #
-    # And the parser's own docstring had the right answer all along: returning
-    # nothing lets the caller fall through to the remote HEAD and be refused by
-    # the checkout validation if that disagrees. Three review rounds fixed three
-    # defects in it -- a lossy quoted scalar, ignored YAML hierarchy, and being
-    # reached on ANY safe_load failure rather than just a missing module -- each
-    # fix creating the surface for the next. Deleting it closes all three.
-    print("")
+    doc = yaml.safe_load(config.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"cannot read {config}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    sys.exit(3)
+
+if doc is None:
+    doc = {}
+github = doc.get("github") if isinstance(doc, dict) else None
+if not isinstance(doc, dict) or not isinstance(github, (dict, type(None))):
+    print(f"cannot read {config}: the `github` section is not a mapping", file=sys.stderr)
+    sys.exit(3)
+
+value = (github or {}).get(key)
+print(str(value).strip() if value is not None else "")
 PY
 }
 
@@ -72,7 +79,11 @@ genesis_resolve_deploy_branch() {
     local branch
     local remote_head
 
-    branch="$(genesis_local_github_value deploy_branch || true)"
+    if ! branch="$(genesis_local_github_value deploy_branch)"; then
+        echo "ERROR: cannot read github.deploy_branch from ~/.genesis/config/genesis.yaml;" >&2
+        echo "       refusing rather than guessing a deploy target. Fix or remove the file." >&2
+        return 1
+    fi
 
     if [ -z "$branch" ]; then
         # Ask the remote for its advertised HEAD without depending on a local

@@ -161,23 +161,35 @@ _read_json_field() {
 # definition to the next, so a statement placed between definitions leaks into
 # those slices and runs without its library.
 _detect_update_remote() {
-    local public_repo
-    public_repo="${GENESIS_GITHUB_PUBLIC_REPO:-$(genesis_local_github_value public_repo || true)}"
+    local public_repo="${GENESIS_GITHUB_PUBLIC_REPO:-}"
+    if [ -z "$public_repo" ]; then
+        # A config that EXISTS but cannot be read refuses here rather than
+        # falling back to the default repo name: guessing selects a fetch remote
+        # the operator did not configure. (An absent file or key is ordinary and
+        # reads as empty.)
+        if ! public_repo="$(genesis_local_github_value public_repo)"; then
+            echo "ERROR: cannot read github.public_repo from ~/.genesis/config/genesis.yaml;" >&2
+            echo "       refusing rather than guessing which remote to deploy from." >&2
+            return 1
+        fi
+    fi
     public_repo="${public_repo:-GENesis-AGI}"
-    local remote
-    remote=$(git -C "$GENESIS_ROOT" remote -v 2>/dev/null \
-        | awk -v repo="$public_repo" '
-            $3 == "(fetch)" {
-                url = $2
-                sub(/\/+$/, "", url)
-                sub(/\.git$/, "", url)
-                n = split(url, parts, "/")
-                if (parts[n] == repo) { print $1; exit }
-            }
-        ')
+    # Enumerate remotes BY NAME and ask git for each fetch URL. Splitting
+    # `git remote -v` on whitespace misread any URL containing a space (a legal
+    # local path), matched nothing, and fell through to `origin`.
+    local remote="" name url
+    while IFS= read -r name; do
+        url="$(git -C "$GENESIS_ROOT" remote get-url "$name" 2>/dev/null || true)"
+        while [[ "$url" == */ ]]; do url="${url%/}"; done
+        url="${url%.git}"
+        if [ -n "$url" ] && [ "${url##*/}" = "$public_repo" ]; then
+            remote="$name"
+            break
+        fi
+    done < <(git -C "$GENESIS_ROOT" remote 2>/dev/null || true)
     echo "${remote:-origin}"
 }
-UPDATE_REMOTE="$(_detect_update_remote)"
+UPDATE_REMOTE="$(_detect_update_remote)" || exit 1
 genesis_assert_primary_checkout "$GENESIS_ROOT" || exit 1
 _saved_prevalidate_deploy_branch=""
 if [[ "$POST_MERGE" == "true" ]]; then
@@ -908,8 +920,14 @@ if [[ "$POST_MERGE" == "true" ]]; then
     if [ -n "$_saved_rt" ] && [[ "$_saved_rt" == pre-update-* ]] \
         && git -C "$GENESIS_ROOT" show-ref --verify --quiet "refs/tags/$_saved_rt"; then
         _saved_rt_commit="$(git -C "$GENESIS_ROOT" rev-parse "refs/tags/$_saved_rt^{commit}")"
-        if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$_saved_rt_commit" 'HEAD^1'; then
-            echo "ERROR: saved rollback tag $_saved_rt is not on the pre-merge side of HEAD." >&2
+        # EQUALITY with the merge's first parent, not ancestry. `--is-ancestor`
+        # also admits an OLDER commit on that side, and rolling back to it would
+        # discard every commit between it and the real pre-merge state — e.g. when
+        # the branch advanced after the conflicted run, or stale conflict state is
+        # resumed. The old_commit comparison below cannot cover this: it is
+        # skipped when the saved state carries no old_commit.
+        if [ "$_saved_rt_commit" != "$(git -C "$GENESIS_ROOT" rev-parse 'HEAD^1^{commit}' 2>/dev/null)" ]; then
+            echo "ERROR: saved rollback tag $_saved_rt does not point at this merge's pre-merge parent." >&2
             exit 1
         fi
         if [ -n "$_saved_old_commit_rev" ] \
@@ -1395,6 +1413,44 @@ _success_degraded_subsystems() {
 }
 # END success-degraded-subsystems
 
+# BEGIN deploy-outcome-probes (extracted by tests/test_scripts/test_update_deploy_safety.py)
+# Status of the most recent update_history row, or "" when it cannot be read.
+# ONE reader for the two places that must agree on it: P6's recovery detection,
+# and the no-delta path, which must not write a newer success row over an
+# unresolved `failed`/`rolled_back` one — when last_update_failure.json was
+# never written, that row is the only signal recovery has.
+_latest_update_status() {
+    "$VENV_DIR/bin/python" - <<'PYEOF' 2>/dev/null || true
+import os
+import sqlite3
+
+try:
+    con = sqlite3.connect(os.path.expanduser("~/genesis/data/genesis.db"), timeout=5)
+    row = con.execute(
+        "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    print(row[0] if row else "")
+except Exception:
+    print("")
+PYEOF
+}
+
+# Whether the genesis-server UNIT is up right now. Used where a restart is
+# attempted without a health check: `_start_genesis_server` returns 0 whenever
+# `systemctl restart` exits cleanly, and its direct-start fallback returns 0
+# unconditionally, so its return code cannot say whether the server came back.
+# An unreadable state (empty) counts as NOT up, so the error lands on the side
+# that reports a problem rather than hiding one.
+_server_unit_is_up() {
+    local state
+    state="$(systemctl --user is-active genesis-server.service 2>/dev/null || true)"
+    case "$state" in
+        active | activating | reloading) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+# END deploy-outcome-probes
+
 # ── Rollback helper function ─────────────────────────────
 _do_rollback() {
     local reason="$1"
@@ -1872,20 +1928,43 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # we must not erase it. This path also exits before the success-path
     # recording, so it doubles as the place to persist any host-side degradation
     # the drift healing just found.
-    _nd_server_not_restarted=false
-    [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] \
-        || _nd_server_not_restarted=true
+    #
+    # "Not restarted" is decided by the unit's state AFTER the restart attempt,
+    # not by whether it was running at entry. This path has no health check, and
+    # `_start_genesis_server || true` above reports success even when the unit
+    # never came back — so entry state alone let a failed restart write a bare
+    # success row. (P6 is different: it verifies health and rolls back on
+    # failure, so entry-state membership is sufficient there.)
+    _nd_server_not_restarted=true
+    if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] && _server_unit_is_up; then
+        _nd_server_not_restarted=false
+    fi
     _nd_base_degraded="${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
     _nd_degraded="$(_success_degraded_subsystems \
         "${HOST_CC_DEGRADED:-}" "$_nd_server_not_restarted")"
     if [ -f "$HOME/.genesis/last_update_failure.json" ] \
-        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        && [ "$_nd_server_not_restarted" = "false" ]; then
         rm -f "$HOME/.genesis/last_update_failure.json"
         _record_update_history "success" "" "$_nd_degraded"
-        echo "  Cleared stale update-failure marker (server healthy, code current)."
+        echo "  Cleared stale update-failure marker (server running, code current)."
     elif [ -n "$_nd_base_degraded" ] || [ "$_nd_server_not_restarted" = "true" ]; then
-        echo "  NOTE: recording degraded subsystem: $_nd_degraded"
-        _record_update_history "success" "" "$_nd_degraded"
+        # With the server down, a still-unresolved failure must stay the LATEST
+        # record: P6's recovery detection reads only the newest status, and when
+        # last_update_failure.json was never written, that row is all it has.
+        _nd_last_status=""
+        if [ "$_nd_server_not_restarted" = "true" ]; then
+            _nd_last_status="$(_latest_update_status)"
+        fi
+        case "$_nd_last_status" in
+            failed | rolled_back)
+                echo "  NOTE: genesis-server is not running and the last update ended" \
+                    "'$_nd_last_status' — not recording over it, so recovery still sees it."
+                ;;
+            *)
+                echo "  NOTE: recording degraded subsystem: $_nd_degraded"
+                _record_update_history "success" "" "$_nd_degraded"
+                ;;
+        esac
     fi
     echo ""
     echo "  Nothing to do."
@@ -2103,20 +2182,7 @@ if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
     if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
         _recovery=true
     else
-        _last_status="$("$VENV_DIR/bin/python" - <<'PYEOF' 2>/dev/null || true
-import os
-import sqlite3
-
-try:
-    con = sqlite3.connect(os.path.expanduser("~/genesis/data/genesis.db"), timeout=5)
-    row = con.execute(
-        "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    print(row[0] if row else "")
-except Exception:
-    print("")
-PYEOF
-)"
+        _last_status="$(_latest_update_status)"
         case "$_last_status" in
             rolled_back | failed) _recovery=true ;;
             *) : ;;
