@@ -89,6 +89,17 @@ def _handled_items_from_storage(stored: object) -> list[str]:
     return [stored] if "\n" not in stored and "\r" not in stored else []
 
 
+def stored_item_texts(stored: object) -> list[str]:
+    """The logical item texts a row's ``batch_items`` holds, where storage can
+    say them unambiguously; ``[]`` for blank, corrupt or ambiguous legacy data.
+
+    Public name for :func:`_handled_items_from_storage`, for callers outside
+    this module that need item boundaries (an alert naming each parked item)
+    rather than the flattened batch text.
+    """
+    return _handled_items_from_storage(stored)
+
+
 async def create(
     db: aiosqlite.Connection,
     *,

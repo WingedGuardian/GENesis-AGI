@@ -1592,7 +1592,7 @@ async def test_opaque_path_segments_are_masked_in_the_alert(
     text = alerts[0]["title"] + alerts[0]["body"]
     assert "a8F3kLm29QzX7pRtW4" not in text and "Xy7_Kp2" not in text
     assert "AbCdEfGhIjKlMnOpQr" not in text
-    assert "files.example.com" in text and "quarterly-report" in text
+    assert "- files.example.com/s/…/quarterly-report (url#" in text, text
     assert "2026-09-26-notes" in text  # a dated slug is readable, not a token
 
 
@@ -1666,7 +1666,7 @@ async def test_ended_approval_is_asked_again_when_a_sibling_holds_the_hash(
     )
 
     async def _run(inv):
-        if "b.example.com" in inv.prompt:
+        if "https://b.example.com/beta" in inv.prompt:
             return _error_output("boom")
         return _success_output(good)
 
@@ -1752,3 +1752,70 @@ async def test_retry_lane_storm_alert_does_not_repeat_every_scan(
         for p, _e in queued:  # the awareness tick drains the queue between scans
             p.unlink()
     assert per_scan == [1, 0, 0], per_scan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "must_show"),
+    [
+        # Two URL-free notes batched together: the flattened text named only
+        # the first note's first line.
+        ("Look into the new retrieval paper\n\nCompare our reranker to theirs\n",
+         ["Look into the new retrieval paper", "Compare our reranker to theirs"]),
+        # Two annotated items sharing one URL: URL extraction deduplicated them.
+        ("https://example.com/shared-post why it matters for memory\n\n"
+         "https://example.com/shared-post the pricing section\n",
+         ["example.com/shared-post", "example.com/shared-post"]),
+    ],
+)
+async def test_every_logical_item_of_a_batch_gets_its_own_line(
+    db, inbox_dir, mock_invoker, mock_session_manager, content, must_show,
+):
+    """Codex (#2447 round 2): labels were derived from the flattened batch text,
+    so a batch of URL-free notes, or of annotated items sharing a URL,
+    reported fewer items than stopped."""
+    from tests.test_inbox.test_monitor import _error_output
+
+    mock_invoker.run.return_value = _error_output("boom")
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       items_per_eval=2)
+    (inbox_dir / "Genesis.md").write_text(content)
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items")).fetchall()
+    assert [(r["status"], r["retry_count"]) for r in rows] == [("failed", 1)], (
+        "fixture: both items must sit in ONE exhausted row"
+    )
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    body = alerts[0]["body"]
+    lines = [ln for ln in body.splitlines() if ln.startswith("- ")]
+    assert len(lines) == 2, body
+    for expected, line in zip(must_show, lines, strict=True):
+        assert expected in line, (expected, line)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_alert_enqueue_logs_what_stopped(
+    db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch, caplog,
+):
+    """#2447 class audit: the park buffer is cleared before the enqueue, and a
+    row at the cap is never re-dispatched, so if the enqueue fails the log line
+    is the only record of what stopped. It must name the items."""
+    import genesis.guardian.alert.queue as alert_queue
+
+    def _boom(*_a, **_k):
+        raise OSError("alert queue unwritable")
+
+    monkeypatch.setattr(alert_queue, "enqueue_alert", _boom)
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/lost-item-7c1\n")
+    with caplog.at_level("ERROR"):
+        await mon.check_once()
+    errors = [r for r in caplog.records if r.levelname == "ERROR"
+              and "parked-alert enqueue failed" in r.getMessage()]
+    assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+    assert "example.com/lost-item-7c1" in errors[0].getMessage()
+    assert "Genesis.md" in errors[0].getMessage()

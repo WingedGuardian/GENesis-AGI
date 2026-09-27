@@ -1551,9 +1551,11 @@ class InboxMonitor:
                         detail=(
                             "Its URLs failed to evaluate repeatedly (the "
                             "retry-storm guard tripped), so its pending URL "
-                            "retries were stopped for at least 48 hours. Any "
+                            "retries were stopped. Nothing retries those URLs "
+                            "automatically; edit the file once those failures "
+                            "are more than 48 hours old to run them again. Any "
                             "other failed item in the file resumes retrying "
-                            "once those URL failures are older than that."
+                            "after that window."
                         ),
                     )
                 continue
@@ -2097,7 +2099,7 @@ class InboxMonitor:
                 item.id, item.file_path, item.content,
                 reason="retries_exhausted",
                 detail=(
-                    "These items failed on every retry and will not be retried. "
+                    "These items reached their retry limit and will not be retried. "
                     "Partial evaluations, where one was written, sit next to the "
                     "file as numbered .genesis.md responses."
                 ),
@@ -2117,16 +2119,29 @@ class InboxMonitor:
         try:
             row = await inbox_items.get_by_id(self._db, row_id)
         except Exception:
-            logger.warning("exhaustion check failed for %s", row_id, exc_info=True)
+            # The row may have just reached its cap; if so nothing alerts for it
+            # later. Log at ERROR with the file so the stall is findable.
+            logger.error(
+                "Inbox exhaustion check failed for row %s in %s — a parked item "
+                "may not have been announced",
+                row_id, file_path, exc_info=True,
+            )
             return
         if (
             row
             and row.get("status") == "failed"
             and (row.get("retry_count") or 0) >= self._config.max_retries
         ):
+            # One line per LOGICAL item, from the row's stored item boundaries:
+            # the flattened batch text merges URL-free notes into one first
+            # line and collapses annotated items that share a URL (#2447
+            # review). Unreadable storage falls back to the flattened text,
+            # which for a legacy resume row can be the whole file: shown as one
+            # item. Legacy only; v2 rows always carry item boundaries.
+            items = inbox_items.stored_item_texts(row.get("batch_items")) or [content]
             self._alert_parked(
-                file_path, reason=reason, detail=detail,
-                item_id=row_id, labels=self._item_labels(content),
+                file_path, reason=reason, detail=detail, item_id=row_id,
+                labels=[", ".join(self._item_labels(text)) for text in items],
             )
 
     @staticmethod
@@ -2242,8 +2257,8 @@ class InboxMonitor:
                 except ValueError:
                     name = Path(file_path).name
                 items = entry["items"]
-                # One line per URL, not per row: a row holds several items when
-                # items_per_eval > 1, and the title counts what stopped.
+                # One line per LOGICAL item, not per row: a row holds several
+                # items when items_per_eval > 1, and the title counts them.
                 lines = [f"- {lbl}" for lbls in items.values() for lbl in lbls]
                 if lines:
                     # A capped list, never a cut line: the owner's channel has a
@@ -2275,7 +2290,16 @@ class InboxMonitor:
                     dedupe_key=f"inbox:parked:{file_path}:{reason}:{digest}",
                 )
             except Exception:
-                logger.warning("inbox parked-alert enqueue failed", exc_info=True)
+                # The buffer is already cleared and nothing re-derives it, so this
+                # log line IS the only record of what stopped: keep it whole.
+                logger.error(
+                    "Inbox parked-alert enqueue failed for %s (%s): %s",
+                    file_path, reason,
+                    "; ".join(
+                        lbl for lbls in entry.get("items", {}).values() for lbl in lbls
+                    ) or entry.get("detail", ""),
+                    exc_info=True,
+                )
 
     async def _run_one_batch(
         self,

@@ -1014,10 +1014,12 @@ verified: 640c4f2e3 2026-09-18
   shipped shadow and was flipped on measurement — 0 of the first 42 evaluations
   under the `**Source:**` contract would have re-queued. Parking is visible: an
   item that exhausts its retries, or a file the retry-storm guard parks (at all
-  three of its call sites), queues ONE durable owner alert per file per scan
-  naming the file by its path inside the inbox folder and every parked URL as
-  host+path plus its coverage-log `url#` id (query strings dropped, token-like
-  path segments masked). An approval that ends unanswered (`approval_ended:`)
+  three of its call sites), queues ONE durable owner alert per file and reason
+  per scan, naming the file by its path inside the inbox folder; an exhausted
+  item's alert also names each parked logical item (URLs as host+path plus the
+  coverage-log `url#` id, query strings dropped, token-like path segments
+  masked), while a storm alert names the file only. The retry-lane storm site
+  abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
   the same row is asked about again; with `resilience.parking_mode:
   live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
