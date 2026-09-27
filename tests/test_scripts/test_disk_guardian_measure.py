@@ -390,3 +390,47 @@ def test_the_rate_input_excludes_quota_reservations(tmp_path):
     out = _run(f"dg_measure '{target}'", mi, sy, tmp_path).split()
     assert out[0] == "624"   # headroom counts the reservation
     assert out[6] == "100"   # usage for the rate does not
+
+
+def test_a_roomier_quota_does_not_bind(tmp_path):
+    """Review finding (round 1): a quota with MORE headroom than the pool under
+    it is not the binding limit. The figures, the quota flag and the rate
+    input (7th field) must all come from statvfs, or other subvolumes filling
+    the shared pool would never move the growth rate."""
+    target, mi, sy = _fixture(tmp_path)
+    sv_free, sv_total = _statvfs_mb(target)
+    # 10 MiB referenced under a limit 1 GiB beyond what the pool has free.
+    lim = (sv_free + 1024) * MIB + 10 * MIB
+    q = sy / UUID / "qgroups" / "0_256"
+    _write(q / "max_referenced", lim)
+    _write(q / "referenced", 10 * MIB)
+    _write(q / "limit_flags", 1)
+    out = _run(f"dg_measure '{target}'", mi, sy, tmp_path).split()
+    free, total, quota, used = int(out[0]), int(out[1]), int(out[2]), int(out[6])
+    assert quota == 0, "the pool binds, not the quota"
+    assert total == sv_total
+    assert abs(free - sv_free) <= 2
+    assert abs(used - (sv_total - sv_free)) <= 2, "rate input is the pool's usage, not the qgroup's 10 MiB"
+
+
+def test_a_tighter_quota_supplies_every_figure(tmp_path):
+    """Control for the test above: when the quota IS the closest wall, free,
+    total and the rate input all come from the qgroup."""
+    target, mi, sy = _fixture(tmp_path, quota=(1024 * MIB, 100 * MIB))
+    out = _run(f"dg_measure '{target}'", mi, sy, tmp_path).split()
+    assert (out[0], out[1], out[2], out[6]) == ("924", "1024", "1", "100")
+
+
+def test_each_binding_keeps_its_own_rate_series(tmp_path):
+    """Review finding: near a quota's crossover the closer wall alternates
+    poll to poll. One shared series reset on every flip and never produced a
+    rate; per-binding series each keep tracking a real runaway."""
+    snippet = """
+    dg_rate_update b 1000 1000 fs >/dev/null
+    dg_rate_update b 500 1030 quota >/dev/null
+    dg_rate_update b 1300 1060 fs >/dev/null
+    dg_rate_update b 800 1090 quota >/dev/null
+    dg_rate_update b 1600 1120 fs
+    """
+    rate = int(_run(snippet, tmp_path, tmp_path, tmp_path))
+    assert rate > 100, f"a steady 300 MB/min fill must register while the binding alternates (got {rate})"

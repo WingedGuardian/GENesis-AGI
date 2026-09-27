@@ -350,10 +350,26 @@ def test_orange_never_freezes(box, downloader):
 # ── poll + state file ────────────────────────────────────────────
 
 
-def _poll(box, measure_lines: dict[str, str], act=1) -> dict:
-    """check_disks + write_state with dg_measure answering per path."""
+def _poll(box, measure_lines: dict[str, str], act=1, raw_sizes: dict[str, int] | None = None) -> dict:
+    """check_disks + write_state with dg_measure answering per path.
+
+    raw_sizes stubs dg_raw_total_mb (the domain identity) per path; unstubbed
+    paths keep the real statvfs size."""
     cases = "\n".join(f"        '{p}') echo '{m}';;" for p, m in measure_lines.items())
-    snippet = f"""
+    raw = "\n".join(f"        '{p}') echo {v}; return;;" for p, v in (raw_sizes or {}).items())
+    raw_fn = (
+        f"""
+    eval "_real_raw() $(declare -f dg_raw_total_mb | tail -n +2)"
+    dg_raw_total_mb() {{
+        case "$1" in
+{raw}
+        esac
+        _real_raw "$1"
+    }}"""
+        if raw_sizes
+        else ""
+    )
+    snippet = f"""{raw_fn}
     dg_measure() {{
         case "$1" in
 {cases}
@@ -392,7 +408,7 @@ def test_compat_cc_tier_is_the_floor_tier_not_the_eta_tier(box):
     cc.mkdir()
     snippet_rate = """
     dev=$(stat -c %d /)
-    echo "$(( $(date +%s) - 30 )) 1000 20000 quota" > "$DG_STATE_DIR/rate_$dev"
+    echo "$(( $(date +%s) - 30 )) 1000 20000 quota" > "$DG_STATE_DIR/rate_${dev}_quota"
     """
     _run(box, snippet_rate)
     snippet = """
@@ -844,9 +860,197 @@ def test_a_process_name_with_a_tab_cannot_split_the_snapshot(box):
     try:
         assert Path(f"/proc/{proc.pid}/comm").read_text() == "dl\tfake\n", "fixture precondition: renamed"
         out = _run(box, "dg_io_snapshot").stdout.splitlines()
-        mine = [l for l in out if l.split(" ")[0] == str(proc.pid)]
+        mine = [ln for ln in out if ln.split(" ")[0] == str(proc.pid)]
         assert mine, "fixture precondition: the renamed process is in the snapshot"
         assert mine[0].split(" ")[3] == "dl_fake" and len(mine[0].split(" ")) == 4
     finally:
         proc.kill()
         proc.wait()
+
+
+# ── round-1 review findings ──────────────────────────────────────
+
+
+def test_a_separately_limited_domain_on_a_shared_device_is_watched(box):
+    """Codex P1 / Devin: a path on the SAME device but under its own limit (an
+    incus dir-pool volume with a project quota reports that quota through
+    statvfs) must be measured and acted on as its own domain, not skipped as a
+    device already seen."""
+    cc = box["home"] / ".genesis" / "cc-tmp"
+    cc.mkdir()
+    assert os.stat(cc).st_dev == os.stat(box["home"]).st_dev, "fixture precondition: one device"
+    # A project quota shows through statvfs: its raw size differs from $HOME's.
+    st = _poll(box, {str(cc): "100 2048 0 - - ext4"}, raw_sizes={str(cc): 2048})
+    assert st["disk"][str(cc)]["tier"] == "red", st["disk"]
+    assert st["cc_tmp"]["tier"] == "red"
+    assert st["cc_tmp"]["used_mb"] == 1948, "cc-tmp owns its limited domain: usage = total - free"
+    red = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")]
+    assert len(red) == 1 and str(cc) in red[0]["title"]
+    # Levers stay with the domain they relieve: the $HOME domain is green, so
+    # no last-resort reclaim and no reserve release on its behalf.
+    assert not any("last-resort" in c for c in _calls(box))
+    assert "released" not in red[0]["body"]
+
+
+def test_cc_usage_on_a_shared_quota_domain_is_measured_not_derived(box):
+    """Devin: a quota on a SHARED root subvolume says nothing about cc-tmp's own
+    usage; total - free there is every other file on the subvolume."""
+    cc = box["home"] / ".genesis" / "cc-tmp"
+    cc.mkdir()
+    (cc / "work").write_bytes(b"x" * (3 * 1024 * 1024))
+    shared = "60000 100000 1 - - btrfs"
+    st = _poll(box, {"/": shared, str(box["home"]): shared, str(cc): shared})
+    assert st["cc_tmp"]["used_mb"] < 100, st["cc_tmp"]
+
+
+def test_no_freeze_without_a_record_it_could_be_thawed_from(box, downloader):
+    """Codex P1: at RED the state directory's filesystem can be the full one.
+    A stop whose record cannot be written could never be found by `thaw all`,
+    so nothing is stopped — and the daemon survives the failed writes."""
+    state = box["state"]
+    state.mkdir(parents=True, exist_ok=True)
+    state.chmod(0o555)
+    try:
+        _handle(box, "red", writers=_writers_for(downloader))  # asserts rc == 0
+    finally:
+        state.chmod(0o755)
+    assert _proc_state(downloader.pid) != "T"
+    assert not (state / "frozen").exists()
+    assert f"NOT freezing pid {downloader.pid}" in _log(box)
+
+
+def test_the_daemon_survives_a_log_it_cannot_write(box):
+    """Same class: the log lives on the guarded filesystem. An append that
+    fails at RED must not take the guardian down under set -e."""
+    logs = box["home"] / ".genesis" / "logs"
+    logf = logs / "tmp_watchgod.log"
+    logf.write_text("")
+    logf.chmod(0o444)
+    logs.chmod(0o555)
+    try:
+        _handle(box, "red")  # asserts rc == 0
+        _poll(box, {})
+    finally:
+        logs.chmod(0o755)
+        logf.chmod(0o644)
+
+
+def test_a_downloader_that_only_reads_from_downloads_is_not_frozen(box):
+    """Codex P2: an allowlisted process holding a READ-only descriptor under
+    downloads (ffmpeg reading its input there, writing elsewhere) relieves
+    nothing by stopping."""
+    fifo = box["dl"] / "input.fifo"
+    os.mkfifo(fifo)
+    out = box["tmp"] / "elsewhere.out"
+    proc = subprocess.Popen(["dd", f"if={fifo}", f"of={out}", "status=none"], stdin=subprocess.DEVNULL)
+    writer = os.open(fifo, os.O_WRONLY)
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            links = [os.readlink(f"/proc/{proc.pid}/fd/{fd}") for fd in os.listdir(f"/proc/{proc.pid}/fd")]
+            if str(fifo) in links:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("fixture precondition: dd never opened its input under downloads")
+        _handle(box, "red", writers=_writers_for(proc))
+        assert _proc_state(proc.pid) != "T"
+        body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
+        assert f"downloader not frozen: pid {proc.pid}" in body and "not writing under" in body
+    finally:
+        os.close(writer)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(proc.pid, 18)
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("tier,title", [("red", "Disk nearly full"), ("orange", "Disk filling")])
+def test_switching_observe_to_act_mid_episode_still_pages(box, tier, title):
+    """Codex P2: an observe-mode poll must not consume the page an acting poll
+    owes. Flipping WATCHGOD_ACT 0 -> 1 while still in trouble pages."""
+    _handle(box, tier, act=0)
+    assert not [p for p in _pages(box) if p["title"].startswith(title)], "observe pages nothing"
+    _handle(box, tier, act=1)
+    assert len([p for p in _pages(box) if p["title"].startswith(title)]) == 1
+    _handle(box, tier, act=1)
+    assert len([p for p in _pages(box) if p["title"].startswith(title)]) == 1, "still once per episode"
+
+
+def test_uninstall_stops_the_watchgod_and_both_pressure_instances():
+    """Codex P2: a pressure run can be deleting ~/tmp for up to its timeout;
+    both uninstall paths (in-container and host-driven) must stop it — and the
+    watchgod that starts it — before files are removed."""
+    # The instance names are built from a variable in uninstall.sh (CI's
+    # email scan reads a literal name@word.service as an address), so match
+    # the instance suffixes next to that variable.
+    text = (_ROOT / "scripts" / "uninstall.sh").read_text()
+    assert text.count("genesis-tmp-watchgod.service") >= 2
+    assert text.count("PRESSURE_UNIT=genesis-disk-hygiene-pressure") == 1
+    assert text.count("P=genesis-disk-hygiene-pressure;") == 1
+    for suffix in ("@standard.service", "@last-resort.service"):
+        assert text.count("${PRESSURE_UNIT}" + suffix) == 1, f"in-container path misses {suffix}"
+        assert text.count("\\${P}" + suffix) == 1, f"host-driven path misses {suffix}"
+
+
+def test_red_on_another_limit_domain_of_the_downloads_device_freezes_nothing(box, downloader):
+    """A RED on a separately limited domain that merely shares the downloads
+    directory's DEVICE (a project-quota cc-tmp) is not relieved by stopping a
+    download into the other domain."""
+    _handle(box, "red", dev=f"{_home_dev(box)}q2048", writers=_writers_for(downloader))
+    assert _proc_state(downloader.pid) != "T"
+    assert not (box["state"] / "frozen").exists()
+
+
+def test_the_domain_key_ignores_which_wall_binds(box):
+    """Review finding: grouping by dg_measure's EFFECTIVE total split / and
+    $HOME into two domains whenever a btrfs quota's crossover put them on
+    different sides between two reads. The key uses the raw statvfs size,
+    which a btrfs qgroup never changes."""
+    assert os.stat("/").st_dev == os.stat(box["home"]).st_dev or pytest.skip("needs one device")
+    st = _poll(box, {"/": "5000 267000 1 - - btrfs", str(box["home"]): "5000 357000 0 - - btrfs"})
+    home_like = [p for p in st["disk"] if p in ("/", str(box["home"]))]
+    assert home_like == ["/"], st["disk"].keys()
+
+
+def test_a_failed_stop_withdraws_its_record(box, downloader):
+    """Review NOTE: the record is written first; if the stop then fails, the
+    record is withdrawn so `status` never shows a running process as frozen."""
+    snippet = (
+        'kill() { [[ "$1" == -STOP ]] && return 1; builtin kill "$@"; }\n'
+        f"ALL_WRITERS='{_writers_for(downloader)}'; "
+        f"handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - \"$ALL_WRITERS\" btrfs"
+    )
+    _run(box, snippet)
+    assert _proc_state(downloader.pid) != "T"
+    f = box["state"] / "frozen"
+    assert not f.exists() or f.read_text() == ""
+    assert "record withdrawn" in _log(box)
+
+
+def test_episode_markers_of_a_vanished_domain_are_dropped(box):
+    """Review NOTE: a marker left by a domain that no longer exists (a quota
+    resized away) must not suppress that domain's page if it comes back."""
+    box["state"].mkdir(parents=True, exist_ok=True)
+    stale = box["state"] / "episode_4242q2048_red"
+    stale.write_text("")
+    _poll(box, {})
+    assert not stale.exists()
+
+
+def test_no_stop_when_the_lock_opens_but_the_record_append_fails(box, downloader):
+    """The ENOSPC shape: the lock file already exists, only the append fails.
+    Nothing may be stopped (a read-only record file stands in for a full disk)."""
+    state = box["state"]
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "frozen.lock").write_text("")
+    rec = state / "frozen"
+    rec.write_text("")
+    rec.chmod(0o444)
+    try:
+        _handle(box, "red", writers=_writers_for(downloader))
+    finally:
+        rec.chmod(0o644)
+    assert _proc_state(downloader.pid) != "T"
+    assert rec.read_text() == ""
+    assert f"NOT freezing pid {downloader.pid}" in _log(box)

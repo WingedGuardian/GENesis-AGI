@@ -10,6 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 _HYGIENE = Path(__file__).resolve().parents[2] / "scripts" / "disk_hygiene.sh"
 
 
@@ -220,3 +222,80 @@ def test_an_old_dir_written_deep_inside_is_kept(tmp_path):
     _age(deep, 10)
     _run_prune(d)
     assert not tree.exists(), "once nothing inside is recent, it goes"
+
+
+def _pressure(tmp_path: Path, lock: Path) -> float:
+    """Run the real pressure_main (disk_reclaim stubbed out, a sandbox HOME)
+    and return how long it took."""
+    home = tmp_path / "home"
+    (home / "tmp").mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, HOME=str(home), RECLAIM_LOCK=str(lock))
+    t0 = time.monotonic()
+    r = subprocess.run(
+        ["bash", "-c", f"source '{_HYGIENE}'\nVENV_PY=/bin/true\npressure_main last-resort"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "PRESSURE done" in r.stdout
+    return time.monotonic() - t0
+
+
+def test_pressure_reclaim_waits_for_a_run_already_holding_the_lock(tmp_path):
+    """Codex P2 / Devin: systemd serializes one unit, not the two pressure
+    instances or the daily groom. A last-resort run arriving while another
+    reclaim holds the shared lock waits for it, then runs (not lost)."""
+    lock = tmp_path / "reclaim.lock"
+    assert _pressure(tmp_path, lock) < 2.5, "control: uncontended, it does not wait"
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "3"])
+    try:
+        deadline = time.time() + 5
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            if time.time() > deadline:
+                pytest.fail("fixture precondition: the holder never took the lock")
+            time.sleep(0.05)
+        assert _pressure(tmp_path, lock) >= 2.0, "it ran while another reclaim held the lock"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_the_daily_groom_takes_the_same_lock_around_its_deleting_steps():
+    """The daily unit deletes the same trees; it must hold the lock across
+    cache reclamation, sandbox reaping and the ~/tmp prune."""
+    text = _HYGIENE.read_text()
+    main = text[text.index("\nmain() {"):]
+    lock_at = main.index("if ! reclaim_lock ")
+    assert lock_at < main.index("disk_reclaim.py") < main.index('prune_tmp "$HOME/tmp"') < main.index("reclaim_unlock")
+
+
+def _pressure_out(tmp_path: Path, lock: Path, tier: str, wait_s: int) -> str:
+    home = tmp_path / "home"
+    (home / "tmp").mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, HOME=str(home), RECLAIM_LOCK=str(lock), RECLAIM_WAIT_S=str(wait_s))
+    r = subprocess.run(
+        ["bash", "-c", f"source '{_HYGIENE}'\nVENV_PY=/bin/true\npressure_main {tier}"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_lock_waits_are_bounded_last_resort_runs_standard_yields(tmp_path):
+    """Review finding: an unbounded wait could outlast the unit's timeout. At
+    RED the last-resort pass runs anyway once its wait expires; a standard
+    pass yields to the reclaim already running."""
+    lock = tmp_path / "reclaim.lock"
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "20"])
+    try:
+        deadline = time.time() + 5
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            if time.time() > deadline:
+                pytest.fail("fixture precondition: the holder never took the lock")
+            time.sleep(0.05)
+        lr = _pressure_out(tmp_path, lock, "last-resort", 1)
+        assert "last-resort runs unserialized" in lr and "cache reclamation" in lr
+        std = _pressure_out(tmp_path, lock, "standard", 1)
+        assert "skipping this standard pass" in std and "cache reclamation" not in std
+    finally:
+        holder.kill()
+        holder.wait()

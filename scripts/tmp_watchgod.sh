@@ -186,9 +186,14 @@ _wg_canon() {
 }
 
 # ── Logging ──────────────────────────────────────────────────
+# Every write to the state/log filesystem is best-effort. That filesystem is
+# usually the one this daemon guards, so at RED an append can fail (ENOSPC,
+# EDQUOT, read-only) — and under `set -e` an unguarded one would take the
+# guardian down at exactly the moment it exists for (review finding: the
+# freeze-record write; the same holds for every write below).
 log() {
     local level="$1"; shift
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$level] $*" >> "$LOG_FILE"
+    { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$level] $*" >> "$LOG_FILE"; } 2>/dev/null || true
 }
 
 declare -A _WG_WARNED=()
@@ -228,7 +233,7 @@ home_dev() { stat -c %d -- "$HOME" 2>/dev/null || echo -; }
 # mid-episode.
 _ep_file() { printf '%s/episode_%s_%s' "$DG_STATE_DIR" "$1" "$2"; }
 episode_seen() { [[ -f "$(_ep_file "$1" "$2")" ]]; }
-episode_mark() { mkdir -p "$DG_STATE_DIR"; : > "$(_ep_file "$1" "$2")"; }
+episode_mark() { { mkdir -p "$DG_STATE_DIR" && : > "$(_ep_file "$1" "$2")"; } 2>/dev/null || true; }
 episode_clear() { rm -f "$DG_STATE_DIR/episode_${1}_"* 2>/dev/null || true; }
 
 # ── Attribution ──────────────────────────────────────────────
@@ -263,9 +268,9 @@ log_attribution() {
     (
         local -a targets=()
         local t
-        if [[ "$dev" == "$(home_dev)" ]]; then
+        if [[ "$dev" == "${HOME_KEY:-$(home_dev)}" ]]; then
             while IFS= read -r t; do
-                [[ "$(stat -c %d -- "$t" 2>/dev/null)" == "$dev" ]] && targets+=("$t")
+                [[ "$(stat -c %d -- "$t" 2>/dev/null)" == "${dev%%q*}" ]] && targets+=("$t")
             done < <(attribution_paths)
         else
             # The WATCHED path's children, not its mount's: an extra watched
@@ -298,7 +303,7 @@ reserve_ensure() {
         _wg_warn_once reserve_obs "OBSERVE: would create a ${size} MB reserve file at ${RESERVE_FILE}"
         return 0
     fi
-    mkdir -p "$DG_STATE_DIR"
+    mkdir -p "$DG_STATE_DIR" 2>/dev/null || true
     if fallocate -l "${size}M" "$RESERVE_FILE" 2>/dev/null; then
         log INFO "reserve file created: ${size} MB at ${RESERVE_FILE} (released at RED)"
     else
@@ -335,7 +340,7 @@ start_pressure_unit() {
         log WARN "OBSERVE: would start ${unit}"
         return 0
     fi
-    mkdir -p "$DG_STATE_DIR"; echo "$now" > "$stamp"
+    { mkdir -p "$DG_STATE_DIR" && echo "$now" > "$stamp"; } 2>/dev/null || true
     if systemctl --user start --no-block "$unit" 2>/dev/null; then
         log WARN "started ${unit}"
     else
@@ -354,6 +359,29 @@ protected_pids() {
         systemctl --user show -p MainPID --value "$u" 2>/dev/null | tr '\n' ' ' || true
     done
     return 0
+}
+
+_wg_freeze_pid() {
+    # Record, THEN stop, pid $1 ($2 starttime $3 comm $4 dev $5 rate), both
+    # under the lock `scripts/watchgod thaw` takes — so a thaw can never run
+    # between the two and leave a stopped process with no record.
+    # Returns 0 frozen; 1 the record could not be written (nothing stopped);
+    # 2 the stop failed (the record is truncated away again — truncating needs
+    # no free space).
+    mkdir -p "$DG_STATE_DIR" 2>/dev/null || return 1
+    (
+        flock 9 || exit 1
+        size="$(stat -c %s -- "$FROZEN_FILE" 2>/dev/null || echo 0)"
+        if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date -u +%FT%TZ)" "$4" "$5" >> "$FROZEN_FILE"; then
+            [[ -e "$FROZEN_FILE" ]] && truncate -s "$size" -- "$FROZEN_FILE"
+            exit 1
+        fi
+        if ! kill -STOP "$1"; then
+            truncate -s "$size" -- "$FROZEN_FILE"
+            exit 2
+        fi
+        exit 0
+    ) 2>/dev/null 9>"$FROZEN_FILE.lock"
 }
 
 freeze_runaways() {
@@ -386,14 +414,22 @@ freeze_runaways() {
                 out+="OBSERVE: would freeze pid ${pid} (${comm}, ${rate} MB/min)"$'\n'
                 continue
             fi
-            if kill -STOP "$pid" 2>/dev/null; then
-                mkdir -p "$DG_STATE_DIR"
-                # Same lock `scripts/watchgod thaw` rewrites the file under, so
-                # a thaw cannot drop a record appended mid-rewrite.
-                (
-                    flock 9
-                    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$st" "$comm" "$(date -u +%FT%TZ)" "$dev" "$rate" >> "$FROZEN_FILE"
-                ) 9>"$FROZEN_FILE.lock"
+            # The record is written BEFORE the stop, and the stop happens only
+            # if the record landed: at RED the state directory's own
+            # filesystem can be the full one, and a process stopped with no
+            # record is one `scripts/watchgod thaw all` can never find (review
+            # finding).
+            local frc=0
+            _wg_freeze_pid "$pid" "$st" "$comm" "$dev" "$rate" || frc=$?
+            if (( frc == 1 )); then
+                log WARN "NOT freezing pid ${pid} (${comm}, ${rate} MB/min): could not write the frozen record to ${FROZEN_FILE} — a stop without a record could never be thawed"
+                out+="NOT frozen: pid ${pid} (${comm}, ${rate} MB/min) — the frozen record could not be written"$'\n'
+                continue
+            elif (( frc != 0 )); then
+                log WARN "could not stop pid ${pid} (${comm}) — gone or not ours; record withdrawn"
+                continue
+            fi
+            if (( frc == 0 )); then
                 log WARN "FROZE pid ${pid} (${comm}) writing ${rate} MB/min into ${DOWNLOADS_DIR}; resume with: scripts/watchgod thaw ${pid}"
                 # Its own page: the episode's RED page can predate the freeze
                 # (a writer is only measurable from the second poll), and the
@@ -556,17 +592,27 @@ maybe_sweep_cc_tmp() {
     [[ -f "$stamp" ]] && last="$(cat "$stamp" 2>/dev/null || echo 0)"
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= every )) || return 0
-    mkdir -p "$DG_STATE_DIR"; echo "$now" > "$stamp"
+    { mkdir -p "$DG_STATE_DIR" && echo "$now" > "$stamp"; } 2>/dev/null || true
     sweep_cc_tmp "$age" "$kind"
 }
 
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {
-    # $1 path $2 dev $3 tier $4 free $5 total $6 eta $7 writers $8 fstype
+    # $1 path $2 limit-domain key (see check_disks: the device number, or
+    # "<dev>q<total_mb>" for a second, separately limited domain on the same
+    # device) $3 tier $4 free $5 total $6 eta $7 writers $8 fstype
     local path="$1" dev="$2" tier="$3" free="$4" total="$5" eta="$6" writers="$7" fstype="$8"
-    local is_home=0 is_cc=0 body frz rel lever
-    [[ "$dev" == "$(home_dev)" ]] && is_home=1
-    [[ "$dev" == "$(stat -c %d -- "$CC_TMP_DIR" 2>/dev/null || echo -)" ]] && is_cc=1
+    local is_home=0 is_cc=0 is_dl=0 body frz rel lever
+    # Levers act only on the domain they relieve. check_disks sets the keys;
+    # a direct call (tests) falls back to device numbers.
+    [[ "$dev" == "${HOME_KEY:-$(home_dev)}" ]] && is_home=1
+    [[ "$dev" == "${CC_KEY:-$(stat -c %d -- "$CC_TMP_DIR" 2>/dev/null || echo -)}" ]] && is_cc=1
+    [[ "$dev" == "${DL_KEY:-$(stat -c %d -- "$DOWNLOADS_DIR" 2>/dev/null || echo -)}" ]] && is_dl=1
+    # Pages dedupe per (domain, tier, episode) — and per MODE: an observe-mode
+    # poll records its would-be page under its own marker, so flipping
+    # WATCHGOD_ACT 0→1 mid-episode still delivers the real page (review finding).
+    local pg=""
+    (( WATCHGOD_ACT )) || pg="_observe"
 
     if [[ "$tier" == green ]]; then
         episode_clear "$dev"
@@ -582,8 +628,8 @@ handle_fs() {
         # The evidence the broad-freeze decision waits on: what the freeze
         # WOULD do on this filesystem, logged at the start of every episode
         # (a dry run — nothing is signalled below RED).
-        local dry
-        dry="$(DG_FREEZE_DRY=1 freeze_runaways "$dev" "$ALL_WRITERS")"
+        local dry=""
+        (( is_dl )) && dry="$(DG_FREEZE_DRY=1 freeze_runaways "${dev%%q*}" "$ALL_WRITERS")"
         if [[ -n "$dry" ]]; then
             while IFS= read -r l; do log WARN "freeze candidate (dry): $l"; done <<< "$dry"
         fi
@@ -592,8 +638,8 @@ handle_fs() {
     if [[ "$tier" == orange || "$tier" == red ]]; then
         (( is_home )) && start_pressure_unit standard
         (( is_cc )) && maybe_sweep_cc_tmp pressure
-        if [[ "$tier" == orange ]] && ! episode_seen "$dev" orange; then
-            episode_mark "$dev" orange
+        if [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg"; then
+            episode_mark "$dev" "orange$pg"
             lever="has no lever on this filesystem"
             (( is_home )) && lever="started (genesis-disk-hygiene-pressure@standard)"
             (( is_cc )) && lever="ran: cc-tmp retention sweep at 2 days"
@@ -612,9 +658,11 @@ handle_fs() {
             rel="$(reserve_release)"
             start_pressure_unit last-resort
         fi
-        frz="$(freeze_runaways "$dev" "$ALL_WRITERS")"
-        if ! episode_seen "$dev" red; then
-            episode_mark "$dev" red
+        frz=""
+        # Freezing a download relieves only the domain the downloads dir is in.
+        (( is_dl )) && frz="$(freeze_runaways "${dev%%q*}" "$ALL_WRITERS")"
+        if ! episode_seen "$dev" "red$pg"; then
+            episode_mark "$dev" "red$pg"
             body="${summary}. Reserve: ${rel}."$'\n'"${frz:-No freeze candidate (only known downloaders writing into ${DOWNLOADS_DIR} on this filesystem are ever frozen).}"$'\n'"Top writers:"$'\n'"${writers:-none measurable}"$'\n'"A frozen download is paused, not killed — but its remote end or parent may time out while it waits."
             if (( WATCHGOD_ACT )); then
                 queue_alert emergency "watchgod:disk" "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red"
@@ -638,7 +686,6 @@ NEXT_POLL=$POLL_INTERVAL
 check_disks() {
     local now io_now writers dt p dev m free total quota unalloc meta fstype
     local used binding rate eta floor etat tier fast=0
-    local -A seen=()
     now="$(date +%s)"
     io_now="$(dg_io_snapshot)"
     dt=$(( now - _IO_PREV_T ))
@@ -651,32 +698,74 @@ check_disks() {
     fi
     _IO_PREV="$io_now"; _IO_PREV_T="$now"
 
-    local cc_dev tmp_dev
-    cc_dev="$(stat -c %d -- "$CC_TMP_DIR" 2>/dev/null || echo -)"
-    tmp_dev="$(stat -c %d -- /tmp 2>/dev/null || echo -)"
     DISK_JSON=""; CC_COMPAT=""; SYS_COMPAT=""
+    HOME_KEY=""; CC_KEY=""; DL_KEY=""
 
+    # Pass 1: measure EVERY watched path, then group paths into LIMIT DOMAINS.
+    # A device number alone is not a domain: an incus dir-pool volume with a
+    # project quota shares its device with the root filesystem, and statvfs
+    # reports the quota for paths inside it (review finding). Paths on one
+    # device that report the same size are one domain, keyed by the device
+    # number; a different size on the same device is a separate domain, keyed
+    # "<dev>q<size_mb>". The size is the RAW statvfs size, never dg_measure's
+    # effective total: that one follows whichever wall binds, and near a btrfs
+    # quota's crossover it would move a path between domains from poll to poll
+    # (review finding). A project quota changes the raw statvfs size; a btrfs
+    # qgroup does not (and btrfs subvolumes already get distinct device numbers
+    # — MEASURED: / is 59 and the cc-tmp volume 60 on a live install). Known
+    # limit: two separate limits of the SAME size on one device merge.
+    local -a order=()
+    local -A dom_total=() key_of=() meas_of=() path_of=()
+    local key used_raw
     while IFS= read -r p; do
         dev="$(stat -c %d -- "$p" 2>/dev/null)" || continue
-        [[ -n "${seen[$dev]:-}" ]] && continue
-        seen[$dev]=1
         if ! m="$(dg_measure "$p")"; then
             _wg_warn_once "measure_$dev" "cannot measure ${p} (statvfs failed) — this filesystem is NOT being watched"
             continue
         fi
-        local used_raw
-        read -r free total quota unalloc meta fstype used_raw <<< "$m"
+        total="$(dg_raw_total_mb "$p")"
+        if [[ -z "${dom_total[$dev]:-}" || "${dom_total[$dev]}" == "$total" ]]; then
+            dom_total[$dev]="$total"; key="$dev"
+        else
+            key="${dev}q${total}"
+        fi
+        key_of[$p]="$key"
+        [[ -n "${meas_of[$key]:-}" ]] && continue
+        meas_of[$key]="$m"; path_of[$key]="$p"; order+=("$key")
+    done < <(watched_paths)
+    HOME_KEY="${key_of[$HOME]:-}"
+    CC_KEY="${key_of[$CC_TMP_DIR]:-}"
+    DL_KEY="${key_of[$DOWNLOADS_DIR]:-}"
+    local tmp_key="${key_of[/tmp]:-}"
+
+    # Episode markers of a key that is no longer a domain (a quota resized
+    # away, a device renumbered at boot) would silently suppress that key's
+    # pages if it ever returned; drop them. Keys hold no "_", so the key is
+    # everything before the first one.
+    local ef ek
+    if (( ${#order[@]} )); then
+        for ef in "$DG_STATE_DIR"/episode_*; do
+            [[ -e "$ef" ]] || continue
+            ek="${ef##*/episode_}"; ek="${ek%%_*}"
+            [[ -n "${meas_of[$ek]:-}" ]] || rm -f -- "$ef" 2>/dev/null || true
+        done
+    fi
+
+    # Pass 2: tier and act, once per domain.
+    for key in "${order[@]}"; do
+        p="${path_of[$key]}"
+        read -r free total quota unalloc meta fstype used_raw <<< "${meas_of[$key]}"
         used=$(( total - free ))
         [[ "$used_raw" =~ ^[0-9]+$ ]] || used_raw=$used
         binding=fs; (( quota )) && binding=quota
-        rate="$(dg_rate_update "$dev" "$used_raw" "$now" "$binding")"
+        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding")"
         eta="$(dg_eta_min "$free" "$rate")"
         floor="$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")"
         etat="$(dg_eta_tier "$eta")"
         tier="$(dg_tier "$floor" "$etat")"
         [[ "$tier" == orange || "$tier" == red || "$etat" != green ]] && fast=1
 
-        handle_fs "$p" "$dev" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
+        handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
 
         [[ -n "$DISK_JSON" ]] && DISK_JSON+=", "
         DISK_JSON+="$(_wg_json_str "$p"): {\"tier\": \"$tier\", \"floor_tier\": \"$floor\", \"free_mb\": $free, \"total_mb\": $total, \"used_pct\": $(( total > 0 ? used * 100 / total : 0 )), \"eta_min\": $([[ "$eta" == - ]] && echo null || echo "$eta"), \"rate_mb_per_min\": $rate, \"quota\": $([[ $quota == 1 ]] && echo true || echo false), \"unalloc_mb\": $([[ "$unalloc" == - ]] && echo null || echo "$unalloc"), \"meta_pct\": $([[ "$meta" == - ]] && echo null || echo "$meta"), \"fstype\": $(_wg_json_str "$fstype")}"
@@ -684,10 +773,23 @@ check_disks() {
         # Compat for readers of the v1 keys. The FLOOR tier, deliberately: the
         # cc_tmp tier drives routing degradation (TmpPressureStatus), and an
         # ETA-driven YELLOW on an ordinary large download must not shed call
-        # sites.
-        if [[ "$dev" == "$cc_dev" ]]; then CC_COMPAT="$floor $free $total $quota"; fi
-        if [[ "$dev" == "$tmp_dev" ]]; then SYS_COMPAT="$floor $free $total $fstype"; fi
-    done < <(watched_paths)
+        # sites. The last field says whether these figures are cc-tmp's OWN
+        # (a separately limited domain, or a mount whose figures are its own —
+        # its quota binds, or it is not btrfs, where a subvolume's statvfs is
+        # the whole pool's): only then is total-free cc-tmp's usage (review
+        # finding — a quota on a SHARED root subvolume would count every other
+        # file as cc-tmp's).
+        if [[ -n "$CC_KEY" && "$key" == "$CC_KEY" ]]; then
+            local own=0
+            if [[ "$key" == *q* ]]; then
+                own=1
+            elif mountpoint -q -- "$CC_TMP_DIR" 2>/dev/null && [[ "$quota" == 1 || "$fstype" != btrfs ]]; then
+                own=1
+            fi
+            CC_COMPAT="$floor $free $total $own"
+        fi
+        if [[ -n "$tmp_key" && "$key" == "$tmp_key" ]]; then SYS_COMPAT="$floor $free $total $fstype"; fi
+    done
 
     NEXT_POLL=$POLL_INTERVAL
     (( fast )) && NEXT_POLL=$FAST_POLL_INTERVAL
@@ -695,11 +797,11 @@ check_disks() {
 }
 
 write_state() {
-    local cc_tier=unknown cc_free=0 cc_total=0 cc_quota=0 cc_used=0
+    local cc_tier=unknown cc_free=0 cc_total=0 cc_own=0 cc_used=0
     local sys_tier=unknown sys_free=0 sys_total=0 sys_fstype=- sys_pct=0 is_tmpfs=false
     if [[ -n "$CC_COMPAT" ]]; then
-        read -r cc_tier cc_free cc_total cc_quota <<< "$CC_COMPAT"
-        if (( cc_quota )); then
+        read -r cc_tier cc_free cc_total cc_own <<< "$CC_COMPAT"
+        if (( cc_own )); then
             cc_used=$(( cc_total - cc_free ))
         else
             # On a shared filesystem total-free is the whole disk, not cc-tmp,
@@ -713,7 +815,7 @@ write_state() {
             else
                 cc_used="$(timeout 20 du -smx -- "$CC_TMP_DIR" 2>/dev/null | cut -f1)" || cc_used=""
                 [[ "$cc_used" =~ ^[0-9]+$ ]] || cc_used=0
-                mkdir -p "$DG_STATE_DIR"; echo "$now_s $cc_used" > "$cache" 2>/dev/null || true
+                { mkdir -p "$DG_STATE_DIR" && echo "$now_s $cc_used" > "$cache"; } 2>/dev/null || true
             fi
         fi
     fi
@@ -723,7 +825,7 @@ write_state() {
         [[ "$sys_fstype" == tmpfs ]] && is_tmpfs=true
     fi
     local tmp="${STATE_FILE}.tmp"
-    cat > "$tmp" <<EOF
+    cat 2>/dev/null > "$tmp" <<EOF || { rm -f "$tmp" 2>/dev/null; return 0; }
 {
   "disk": {${DISK_JSON}},
   "act": ${WATCHGOD_ACT},
@@ -733,7 +835,7 @@ write_state() {
   "poll_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    mv "$tmp" "$STATE_FILE"
+    mv "$tmp" "$STATE_FILE" 2>/dev/null || true
 }
 
 # ── OOM event capture (best-effort, cgroup v2) ───────────────
@@ -1203,7 +1305,7 @@ main() {
         local log_size
         log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
         if (( log_size > 1048576 )); then
-            tail -100 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+            { tail -100 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"; } 2>/dev/null || true
         fi
 
         sleep "$NEXT_POLL"

@@ -147,25 +147,27 @@ dg_measure() {
             for r in rsv_data rsv_meta_pertrans rsv_meta_prealloc; do
                 [[ -n "$qd" ]] && v_r="$(_dg_num "$qd/$r")" && rsv=$(( rsv + v_r ))
             done
+            # Whichever wall is CLOSEST binds, and supplies all three figures
+            # (free, total, used): a quota that is roomier than the pool under
+            # it must not feed its own flat usage into the growth rate while
+            # other subvolumes fill the pool (review finding).
+            local k k_lim k_cur qfree
             if [[ -n "$subvolid" && -n "$qd" && -d "$qd" ]] && flags="$(_dg_num "$qd/limit_flags")"; then
-                if (( flags & 1 )) && lim="$(_dg_num "$qd/max_referenced")" \
-                        && cur="$(_dg_num "$qd/referenced")" && (( lim > 0 )); then
-                    # The growth rate is measured WITHOUT reservations: they
-                    # swing by gigabytes between commits and would read as a
-                    # write burst. The headroom below does include them.
-                    (( used_b < 0 || cur > used_b )) && used_b=$cur
-                    cur=$(( cur + rsv ))
-                    (( lim - cur < free_b )) && free_b=$(( lim > cur ? lim - cur : 0 ))
-                    (( lim < total_b )) && total_b=$lim
-                    quota=1
-                fi
-                if (( flags & 2 )) && lim="$(_dg_num "$qd/max_exclusive")" \
-                        && cur="$(_dg_num "$qd/exclusive")" && (( lim > 0 )); then
-                    cur=$(( cur + rsv ))
-                    (( lim - cur < free_b )) && free_b=$(( lim > cur ? lim - cur : 0 ))
-                    (( lim < total_b )) && total_b=$lim
-                    quota=1
-                fi
+                for k in referenced:1 exclusive:2; do
+                    (( flags & ${k#*:} )) || continue
+                    k_lim="$qd/max_${k%%:*}"; k_cur="$qd/${k%%:*}"
+                    lim="$(_dg_num "$k_lim")" && cur="$(_dg_num "$k_cur")" && (( lim > 0 )) || continue
+                    # Headroom subtracts the reservations; the growth rate
+                    # does not use them (they swing by gigabytes between
+                    # commits and would read as a write burst).
+                    qfree=$(( lim > cur + rsv ? lim - cur - rsv : 0 ))
+                    if (( qfree < free_b )); then
+                        free_b=$qfree
+                        total_b=$(( lim < total_b ? lim : total_b ))
+                        used_b=$cur
+                        quota=1
+                    fi
+                done
             fi
             # Unallocated = raw device bytes − raw bytes already carved into
             # chunks. disk_total is the RAW footprint (a DUP metadata profile
@@ -209,6 +211,17 @@ dg_measure() {
         "$(( used_b / 1048576 ))"
 }
 
+dg_raw_total_mb() {
+    # The RAW statvfs size of the filesystem holding $1, in MB (0 if unknown).
+    # It identifies a limit domain: a project quota changes it, a btrfs qgroup
+    # does not, and — unlike dg_measure's effective total — it never moves with
+    # whichever wall currently binds.
+    local b s
+    read -r b s < <(stat -f -c '%b %S' -- "$1" 2>/dev/null) || { echo 0; return 0; }
+    [[ "$b" =~ ^[0-9]+$ && "$s" =~ ^[0-9]+$ ]] || { echo 0; return 0; }
+    echo $(( b * s / 1048576 ))
+}
+
 # ── Growth rate and time-to-full ─────────────────────────────
 dg_rate_update() {
     # Update and echo the smoothed growth rate (MB/min, integer, may be
@@ -221,11 +234,14 @@ dg_rate_update() {
     # space without anything being deleted, and measuring free would read that
     # as the disk "shrinking". Persisted so a restart does not reset it.
     #
-    # $4 names the BINDING limit (e.g. "quota" or "fs"). When it changes, used
-    # is measured against a different total and the jump is an artefact, not a
-    # write — the history is discarded rather than read as a spike.
+    # $4 names the BINDING limit (e.g. "quota" or "fs"). Each binding keeps
+    # its OWN series: the two measure different usage (qgroup vs pool), so a
+    # sample from one never feeds the other. A single shared series had to be
+    # reset on every change, and near a quota's crossover — where reservations
+    # swing by gigabytes and the closer wall alternates poll to poll — it never
+    # built a rate at all, silencing the time-to-full tiers (review finding).
     local key="$1" used="$2" now="$3" binding="${4:-fs}" f prev_t prev_u prev_r prev_b rate
-    f="$DG_STATE_DIR/rate_${key}"
+    f="$DG_STATE_DIR/rate_${key}_${binding}"
     rate=0
     if read -r prev_t prev_u prev_r prev_b 2>/dev/null < "$f" \
             && [[ "$prev_t" =~ ^[0-9]+$ && "$prev_u" =~ ^[0-9]+$ && "$prev_r" =~ ^-?[0-9]+$ ]] \
@@ -239,8 +255,8 @@ dg_rate_update() {
         fi
     fi
     mkdir -p "$DG_STATE_DIR" 2>/dev/null || true
-    printf '%s %s %s %s\n' "$now" "$used" "$rate" "$binding" > "$f.tmp" 2>/dev/null \
-        && mv -f "$f.tmp" "$f" 2>/dev/null
+    { printf '%s %s %s %s\n' "$now" "$used" "$rate" "$binding" > "$f.tmp" \
+        && mv -f "$f.tmp" "$f"; } 2>/dev/null || true
     printf '%s' "$rate"
 }
 
@@ -382,8 +398,8 @@ DG_FREEZE_ALLOW_COMMS="${DG_FREEZE_ALLOW_COMMS:-curl wget wget2 aria2c yt-dlp ff
 
 dg_freeze_eligible() {
     # 0 when pid $1 (starttime $2, comm $3) may be SIGSTOPped under the v2
-    # narrow rule: its name is on DG_FREEZE_ALLOW_COMMS, it holds an open
-    # descriptor under the downloads directory $4, that directory is ON the
+    # narrow rule: its name is on DG_FREEZE_ALLOW_COMMS, it holds a descriptor
+    # open for writing under the downloads directory $4, that directory is ON the
     # filesystem in trouble (device $6 — freezing a writer elsewhere relieves
     # nothing), it is not one of the protected pids in $5, and its identity
     # (starttime) still matches. Prints the reason on refusal.
@@ -406,10 +422,20 @@ dg_freeze_eligible() {
     if [[ -n "$dev" && "$(stat -c %d -- "$dl" 2>/dev/null)" != "$dev" ]]; then
         echo "downloads is not on the filesystem in trouble"; return 1
     fi
-    if find "$DG_PROC/$pid/fd" -maxdepth 1 -type l -printf '%l\n' 2>/dev/null \
-            | awk -v d="$dl/" 'index($0, d) == 1 && !/ \(deleted\)$/ { f = 1 } END { exit !f }'; then
-        return 0
-    fi
+    # A descriptor OPEN FOR WRITING (fdinfo access mode O_WRONLY or O_RDWR)
+    # under the downloads dir: an ffmpeg that only READS its input from there
+    # while writing elsewhere relieves nothing by stopping (review finding).
+    local fd l flags k v
+    for fd in "$DG_PROC/$pid/fd"/*; do
+        l="$(readlink -- "$fd" 2>/dev/null)" || continue
+        [[ "$l" == "$dl/"* && "$l" != *" (deleted)" ]] || continue
+        flags=""
+        while read -r k v _; do
+            [[ "$k" == flags: ]] && { flags="$v"; break; }
+        done 2>/dev/null < "$DG_PROC/$pid/fdinfo/${fd##*/}" || true
+        [[ "$flags" =~ ^[0-7]+$ ]] || continue
+        (( (8#$flags & 3) != 0 )) && return 0
+    done
     echo "not writing under $dl"
     return 1
 }

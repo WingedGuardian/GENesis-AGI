@@ -117,6 +117,29 @@ prune_tmp() {
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
 }
 
+# reclaim_lock / reclaim_unlock — serialize the steps that DELETE (cache
+# reclamation, sandbox reaping, the ~/tmp prune) across the daily groom and
+# both pressure instances. systemd serializes starts of ONE unit only, so
+# pressure@standard, pressure@last-resort and the daily unit could otherwise
+# traverse and delete the same trees at once (review finding).
+#
+# reclaim_lock WAIT_S waits at most WAIT_S seconds: 0 = held (or the lock file
+# cannot even be opened because the disk is full — then reclaim runs
+# unserialized, since freeing space beats ordering); 1 = another reclaim still
+# holds it. Every wait is bounded so it fits inside the caller's systemd
+# timeout; each caller decides what a timeout means (pressure_main, main).
+RECLAIM_LOCK="${RECLAIM_LOCK:-$HOME/.genesis/disk_hygiene_reclaim.lock}"
+reclaim_lock() {
+    local wait_s="${1:-60}"
+    if ! { exec 8>"$RECLAIM_LOCK"; } 2>/dev/null; then
+        echo "reclaim lock unavailable ($RECLAIM_LOCK) — running unserialized"
+        return 0
+    fi
+    flock -w "$wait_s" 8 && return 0
+    return 1
+}
+reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
+
 # pressure_main [--last-resort] — the reclaim subset the tmp watchgod runs when
 # the disk itself is in trouble (its ORANGE tier; RED adds --last-resort). Only
 # the steps that FREE space, and each one more aggressive than the daily run:
@@ -125,9 +148,10 @@ prune_tmp() {
 # worktrees to a trash bin, which frees nothing until the purge) nor any of the
 # database retention prunes (they free megabytes and take the DB lock).
 #
-# Started as its own systemd unit (genesis-disk-hygiene-pressure.service) so it
-# runs under the same sandbox as the daily groom and systemd guarantees one
-# instance at a time; the watchgod never deletes anything itself.
+# Started as a systemd template unit (genesis-disk-hygiene-pressure@<tier>)
+# so it runs under the same sandbox as the daily groom; reclaim_lock keeps it
+# from overlapping the other instance or the daily run. The watchgod never
+# deletes anything itself.
 pressure_main() {
     local last_resort="${1:-}"
     local -a reclaim=(--apply --if-above 0 --fail-above 101)
@@ -136,6 +160,17 @@ pressure_main() {
         reclaim+=(--last-resort-above 0)
     fi
     echo "=== genesis-disk-hygiene PRESSURE ${last_resort:-} $(date -u +%FT%TZ) ==="
+    # Standard waits up to one watchgod re-trigger interval and then yields —
+    # the reclaim already running is doing this work. Last-resort (RED) waits
+    # briefly and then runs regardless: at RED, freeing space beats ordering.
+    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+        reclaim_lock "${RECLAIM_WAIT_S:-120}" \
+            || echo "reclaim lock still held after ${RECLAIM_WAIT_S:-120}s — last-resort runs unserialized"
+    elif ! reclaim_lock "${RECLAIM_WAIT_S:-600}"; then
+        echo "another reclaim is still running after ${RECLAIM_WAIT_S:-600}s — skipping this standard pass"
+        echo "=== genesis-disk-hygiene PRESSURE done ==="
+        return 0
+    fi
     echo "--- cache reclamation (usage gate off) ---"
     "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" "${reclaim[@]}" \
         || echo "disk_reclaim exited $?"
@@ -146,6 +181,7 @@ pressure_main() {
     fi
     echo "--- ~/tmp age prune (>2d, live writers spared) ---"
     prune_tmp "$HOME/tmp" 2880
+    reclaim_unlock
     echo "=== genesis-disk-hygiene PRESSURE done ==="
 }
 
@@ -227,6 +263,16 @@ main() {
     echo "--- worktree reaping ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
 
+    # The deleting steps take the shared reclaim lock. A pressure run holding
+    # it is already reclaiming, so after a bounded wait (inside this unit's
+    # 1200s timeout) the daily pass skips them rather than time out and lose
+    # every retention prune below.
+    local reclaim_locked=1
+    if ! reclaim_lock "${RECLAIM_WAIT_S:-180}"; then
+        reclaim_locked=0
+        echo "--- reclaim steps SKIPPED: a pressure reclaim still holds the lock ---"
+    fi
+    if [ "$reclaim_locked" -eq 1 ]; then
     echo "--- cache reclamation ---"
     "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 \
         --fail-above 95 || disk_reclaim_rc=$?
@@ -248,6 +294,8 @@ main() {
 
     echo "--- ~/tmp age prune (>7d) ---"
     prune_tmp "$HOME/tmp"
+    reclaim_unlock
+    fi
 
     echo "--- mcp-spawn identity prune (dead-pid slots) ---"
     prune_mcp_spawn "$HOME/.genesis/mcp-spawn"
