@@ -1235,17 +1235,61 @@ class TestWildcardDepth:
             # With globskipdots off, `.?` matches `..`: this climbs to `/*`.
             "/home/u/tmp/job/.?/.?/.?/.?/*",
             "/home/u/tmp/job/.*/x",
+            # An extglob group can match `..` without starting with a dot
+            # (found by cross-model review): each `@(.?|x)` can be `..`.
+            "/home/u/tmp/job/@(..)/*",
+            "/tmp/a/b/c/@(.?|x)/@(.?|x)/@(.?|x)/@(.?|x)/*",
+            "/home/u/tmp/job/!(x)/y",
+            "/home/u/tmp/job/?(..)/y",
         ],
     )
-    def test_a_mid_path_dot_wildcard_that_can_climb_is_refused(self, target):
+    def test_a_mid_path_pattern_that_can_be_dotdot_is_refused(self, target):
+        # An unquoted `|` inside a group splits the tokenized operand, so that
+        # spelling is refused as an unseen group; both reasons are refusals.
         reasons = dg._rm_violations(f"{self.RM} -rf {target}")
-        assert reasons and any("dot-wildcard" in r for r in reasons), reasons
+        assert reasons and any(
+            "can match '..'" in r or "cannot see whole" in r for r in reasons
+        ), reasons
+
+    def test_an_extglob_group_split_by_its_pipe_is_refused_via_bash_c(self):
+        # The reviewer's exact spelling: extglob enabled for a `bash -c` payload.
+        cmd = (
+            "bash -O extglob -c 'shopt -u globskipdots; "
+            f"{self.RM} -rf /tmp/a/b/c/@(.?|x)/@(.?|x)/@(.?|x)/@(.?|x)/*'"
+        )
+        assert _blocks(cmd)
+
+    def test_a_plain_mid_path_wildcard_below_the_floor_is_allowed(self):
+        # `*` never matches a leading dot, so it cannot be `..`.
+        assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/*/cache")
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            # normpath treats a pattern as one level and cancels `<pattern>/..`,
+            # but the shell expands first: `.*` can match `.`/`..`, and globstar
+            # `**` can match zero directories, so these climb above what the
+            # collapsed path shows. (Found by cross-model review of this change.)
+            "/home/u/tmp/job/.*/../../x",
+            "/home/u/tmp/job/**/../../x",
+            "/home/u/tmp/job/*/../x",
+        ],
+    )
+    def test_dotdot_after_a_wildcard_is_refused(self, target):
+        reasons = dg._rm_violations(f"{self.RM} -rf {target}")
+        assert reasons and any("after a wildcard" in r for r in reasons), reasons
+
+    def test_a_literal_dotdot_before_the_wildcard_still_collapses(self):
+        # `job/sub/..` is literal and collapses to `job`, so `job/*` is judged.
+        assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/sub/../*")
 
     def test_a_final_dot_wildcard_stays_allowed(self):
         # rm refuses a final `..` itself, so `<deep dir>/.*` cleanups keep working.
         assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/.*")
 
-    @pytest.mark.parametrize("pattern", ["!(keep)", "+(a|b)", "@(a|b)"])
+    # No `|` alternation here: an unquoted `|` splits the operand at tokenizing,
+    # and that fragment is refused on its own (see the "cannot see whole" test).
+    @pytest.mark.parametrize("pattern", ["!(keep)", "+(ab)", "@(ab)"])
     def test_extglob_patterns_count_as_wildcards(self, pattern):
         # A command can turn extglob on for itself (`shopt -s extglob` on an
         # earlier line), and these openers contain none of * ? [.

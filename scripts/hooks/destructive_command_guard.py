@@ -85,6 +85,16 @@ _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 # operand reaches the depth check.)
 _GLOB_CHARS = re.compile(r"[*?\[]|[+@!]\(")
 
+# An extglob group opener, including `?(` and `*(`.
+_EXTGLOB_GROUP = re.compile(r"[?*+@!]\(")
+
+
+def _can_match_dot_entry(component: str) -> bool:
+    """True if a path component is a pattern that can expand to `.` or `..`."""
+    if not _GLOB_CHARS.search(component):
+        return False
+    return component.startswith(".") or bool(_EXTGLOB_GROUP.search(component))
+
 # Programs that RUN a command string handed to them as one argument. A quoted
 # string is a single shlex token, so the every-token scan below cannot see the
 # `rm` inside it — `eval "rm -rf /a/b"` was allowed while the unquoted spelling
@@ -659,16 +669,44 @@ def _check_target(target: str) -> str | None:
     # named with a wildcard character near the top of a tree, which is the
     # safe direction for a recursive-force removal.
     #
-    # That bound holds only while no pattern can climb ABOVE the prefix. A
-    # dot-leading pattern component (`.?`, `.*`) can match `..` when bash's
-    # globskipdots is off (the default before bash 5.2, and a `shopt` away
-    # after), so `<deep>/.?/.?/.?/.?/*` resolves to `/*`. rm itself refuses a
-    # FINAL `..`, so only a non-final dot-pattern component is refused here;
-    # that keeps `<dir>/.*` cleanups working.
-    if any(p.startswith(".") and _GLOB_CHARS.search(p) for p in parts[:-1]):
+    # That bound holds only while no pattern can climb ABOVE the prefix, and
+    # both checks below read the RAW components, before normpath: normpath
+    # treats a pattern as exactly one level, but the shell expands it first
+    # and a pattern's level count is not fixed. `.*` can match `.` (zero
+    # levels) or `..` (minus one) when globskipdots is off (the default
+    # before bash 5.2, a `shopt` away after), and globstar `**` can match
+    # zero directories. So normpath cancelling `<pattern>/..` hides a climb:
+    # `<deep>/.*/../../x` and `<deep>/**/../../x` reach above what the
+    # collapsed path shows.
+    raw = [p for p in os.path.expanduser(clean).split("/") if p]
+    # An unbalanced extglob group means this operand is only PART of the
+    # pattern the shell will see: an unquoted `@(a|b)` contains `|`, which the
+    # tokenizer reads as a pipe, cutting the operand mid-group. The real
+    # operand is unknowable here, so refuse rather than judge a fragment.
+    if any(_EXTGLOB_GROUP.search(p) and p.count("(") != p.count(")") for p in raw):
         return (
-            f"rm -rf on '{clean}' has a dot-wildcard path component that can "
-            f"match '..' and climb above it — refusing."
+            f"rm -rf on '{clean}' contains an extglob group the parser cannot "
+            f"see whole, so its real target is unknown — refusing."
+        )
+    first_glob = next((i for i, p in enumerate(raw) if _GLOB_CHARS.search(p)), None)
+    if first_glob is not None and ".." in raw[first_glob + 1 :]:
+        return (
+            f"rm -rf on '{clean}' has '..' after a wildcard, so its real depth "
+            f"is unknown — refusing."
+        )
+    # A pattern component can itself BE `..`: `<deep>/.?/.?/*` climbs with no
+    # literal `..` at all. Plain `*`, `?` and `[...]` never match a leading
+    # dot, so the pattern must start with one. An extglob group is refused
+    # whatever its first character, because an alternative inside it can
+    # (`@(..)`, `@(.?|x)`). Proving a group cannot match `..` would mean
+    # parsing its alternatives, and a hand-rolled parser is exactly how guards
+    # here have failed, so any group in a non-final component is refused.
+    # rm refuses a FINAL `..` itself, so the last component is exempt and
+    # `<dir>/.*` cleanups keep working.
+    if any(_can_match_dot_entry(p) for p in raw[:-1]):
+        return (
+            f"rm -rf on '{clean}' has a wildcard path component that can match "
+            f"'..' (dot-leading or an extglob group) and climb above it — refusing."
         )
     literal = next((i for i, p in enumerate(parts) if _GLOB_CHARS.search(p)), len(parts))
     if literal < len(parts) and literal < 4:
