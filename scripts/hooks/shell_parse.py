@@ -928,6 +928,7 @@ _KNOWN_SIGILS = (
     # stale-review-override when both are present.
     "substitute-review",
     "discard-override",
+    "privacy-override",
     # Both were passed to has_trailing_override from the day they shipped but never
     # listed here, so the "kept in sync" claim above was false. The consequence is
     # silent and asymmetric: the sigil queried FOR ITSELF still matches, so nothing
