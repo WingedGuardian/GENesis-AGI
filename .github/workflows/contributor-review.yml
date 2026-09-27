@@ -56,8 +56,9 @@ name: Contributor review trigger
 # for containment is what it CANNOT do: push, merge, or reach a private
 # repository. Read access to public repositories is not a meaningful escalation,
 # since that content is public already. It is handed ONLY to the
-# final post step, which contains no eligibility logic and no author-derived
-# value beyond an integer PR number. The eligibility step below runs on the
+# final post step, which receives no author-derived value beyond two integers
+# and whose only eligibility logic is a byte-identical re-check of the
+# eligibility job's predicate — which can decline a post, never add one. The eligibility step below runs on the
 # default `GITHUB_TOKEN`, which is now read-only.
 #
 # WHERE THE TOKEN LIVES IS ENFORCED BY THE PLATFORM, not by this file being read
@@ -536,10 +537,12 @@ jobs:
       deployment: false
     steps:
       # The ONLY step that holds the maintainer token, and the only one that
-      # writes. It decides NO eligibility: it posts a fixed string to an integer
-      # PR number the eligibility job already validated. Keep it that way — every
-      # line added here is a line running next to a privileged credential in a
-      # `pull_request_target` context.
+      # writes. It posts a fixed string to an integer PR number the eligibility
+      # job already chose. It makes no NEW eligibility decision: it re-applies the
+      # eligibility job's own predicate, byte-for-byte, to freshly read state, and
+      # can only DECLINE a post on it — never widen who gets one. Keep it that
+      # way — every line added here is a line running next to a privileged
+      # credential in a `pull_request_target` context.
       #
       # It does perform ONE read, and the distinction matters because an earlier
       # version of this comment claimed there was no logic here at all. Before
@@ -595,6 +598,67 @@ jobs:
                 `reviewer rejects a bot-authored request on identity alone. Set a ` +
                 `fine-grained token (this repository, Pull requests: write) to enable this.`
               );
+              return;
+            }
+            // ── Re-check eligibility AT POST TIME ────────────────────────────
+            // The eligibility job decided from live state, but this job runs
+            // later, on a separately allocated runner: seconds, sometimes
+            // minutes. A PR closed or returned to draft in that window — or an
+            // issue unassigned or unlabelled — would otherwise still get a
+            // request. So the SAME predicate is re-applied here to freshly read
+            // state. The two lines below are BYTE-IDENTICAL to the eligibility
+            // step's copies, and a test asserts that: a weaker re-check here is
+            // how the two would drift. Any lookup failure refuses to post.
+            const issueNumber = Number(process.env.TARGET_ISSUE);
+            if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+              core.setFailed('Refusing to comment: bad issue number from the eligibility step.');
+              return;
+            }
+            const R = { owner: context.repo.owner, repo: context.repo.repo };
+            const INVITED = ['good first issue', 'first-timers-only'];
+            function isEligible(candidate, issue, why) {
+              const author = (candidate.author || '').toLowerCase();
+              const checks = {
+                'pr is open':        candidate.state === 'OPEN',
+                'pr is not a draft': candidate.isDraft === false,
+                'pr is from a fork': candidate.isCrossRepository === true,
+                'issue is open':     issue.state === 'open',
+                'issue is invited':  (issue.labels || []).some(l =>
+                  INVITED.includes(((typeof l === 'string' ? l : l.name) || '').toLowerCase())),
+                'issue is assigned to the pr author': (issue.assignees || []).some(
+                  a => ((a && a.login) || '').toLowerCase() === author && author !== ''),
+              };
+              const failed = Object.keys(checks).filter(k => !checks[k]);
+              if (failed.length && why) core.info(`  ${why}: ${failed.join('; ')}`);
+              return failed.length === 0;
+            }
+            let candidate;
+            let issue;
+            try {
+              const d = await github.graphql(
+                `query($owner:String!,$repo:String!,$number:Int!){
+                   repository(owner:$owner,name:$repo){
+                     pullRequest(number:$number){
+                       number state isDraft isCrossRepository author { login } } } }`,
+                { ...R, number: prNumber });
+              const node = d.repository.pullRequest;
+              candidate = {
+                number: node.number,
+                author: (node.author && node.author.login) || '',
+                state: node.state,
+                isDraft: node.isDraft,
+                isCrossRepository: node.isCrossRepository,
+              };
+              issue = (await github.rest.issues.get({ ...R, issue_number: issueNumber })).data;
+            } catch (err) {
+              core.setFailed(
+                `Refusing to comment: could not re-read PR #${prNumber} or issue ` +
+                `#${issueNumber} before posting (${err.status || err.message}).`
+              );
+              return;
+            }
+            if (!isEligible(candidate, issue, `PR #${prNumber} vs issue #${issueNumber} at post time`)) {
+              core.info(`PR #${prNumber} is no longer eligible — no review requested.`);
               return;
             }
             // BYTE-IDENTICAL to the block in the eligibility step above, which

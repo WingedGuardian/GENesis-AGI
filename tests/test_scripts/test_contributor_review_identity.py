@@ -1400,6 +1400,51 @@ def test_both_steps_share_one_byte_identical_predicate():
     )
 
 
+def _eligibility_predicate_source(script: str) -> str:
+    """The INVITED list and the whole `isEligible` function, verbatim."""
+    invited = next(line for line in script.splitlines() if "const INVITED = " in line)
+    start = script.index("function isEligible(candidate, issue, why) {")
+    end = script.index("return failed.length === 0;", start)
+    end = script.index("}", end) + 1
+    return invited.strip() + "\n" + script[start:end]
+
+
+def test_post_job_rechecks_the_same_eligibility_predicate_before_writing():
+    """The post job must re-apply the eligibility job's predicate, not a weaker one.
+
+    The two jobs run on separately allocated runners, seconds to minutes apart. A
+    PR closed or returned to draft in that window — or its issue unassigned or
+    unlabelled — would otherwise still receive a request, because the post step's
+    last-minute read looked only at comments. The fix re-reads the PR and issue and
+    re-applies the predicate; the risk it introduces is DRIFT, a second copy that
+    checks less. So the copies are pinned equal, the check is pinned BEFORE the
+    single write, and an ineligible result must return without writing.
+    """
+    eligibility = _eligibility_predicate_source(_eligibility_script())
+    post = _eligibility_predicate_source(_post_script())
+    assert eligibility == post, (
+        "the two copies of the eligibility predicate have drifted:\n"
+        f"--- eligibility ---\n{eligibility}\n--- post ---\n{post}"
+    )
+    script = _post_script()
+    recheck = script.index("if (!isEligible(candidate, issue,")
+    write = script.index("github.rest.issues.createComment(")
+    assert recheck < write, "the re-check must run before the only write"
+    # Bounded by the block's closing line, not the first `}` — the condition
+    # itself contains template-literal braces.
+    declined = script[recheck : script.index("\n}", recheck)]
+    assert "return;" in declined, "an ineligible PR must return without posting"
+    # Fresh state, not the job output: both objects are re-read in this step.
+    assert "pullRequest(number:$number)" in script[:recheck]
+    assert "github.rest.issues.get(" in script[:recheck]
+    lookup = script[
+        script.index("} catch (err) {", script.index("github.rest.issues.get(")) : recheck
+    ]
+    assert "core.setFailed(" in lookup and "return;" in lookup, (
+        "a failed re-read must refuse to post, not fall through to the write"
+    )
+
+
 def test_the_posted_body_carries_the_marker_and_the_request():
     script = _post_script()
     assert "'@codex review'" in script, "the reviewer matches on this literal"
