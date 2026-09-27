@@ -45,7 +45,7 @@ _ARCH_REVIEW = (
 _EXECUTION_PROTOCOL = (
     "EXECUTION PROTOCOL — You MUST follow these steps IN ORDER before "
     "writing any code:\n"
-    "1. CREATE WORKTREE — git worktree add .claude/worktrees/<scope>-<desc> "
+    "1. CREATE WORKTREE — git worktree add --no-track .claude/worktrees/<scope>-<desc> "
     "-b <scope>/<desc> origin/main. Work inside the worktree. NEVER commit to "
     "main.\n"
     # "STATE CONFIDENCE - explicit percentages for each part of the plan" used to

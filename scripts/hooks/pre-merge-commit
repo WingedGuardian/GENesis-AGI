@@ -7,10 +7,21 @@
 # back into local main creates spurious conflicts. The PR branch's job is done
 # once pushed — never merge it back.
 #
-# Installed by scripts/hooks/sync-hooks.sh (HOOKS_TO_SYNC) and version-tracked in
-# .genesis-hook-versions like the other synced hooks. Git runs this hook only for
-# a merge that creates a merge commit: a fast-forward runs no hook, and a merge
-# that stops on a conflict is committed later through pre-commit instead.
+# Installed by scripts/hooks/sync-hooks.sh (HOOKS_TO_SYNC; version-tracked in
+# .genesis-hook-versions) and by the hook loops in install.sh and bootstrap.sh.
+#
+# Git runs this hook only for a merge that creates a merge commit. A merge that
+# stops on a conflict is committed later through pre-commit, which refuses it on
+# `live` too. A FAST-FORWARD runs no hook at all, so this hook cannot stop one:
+# `git merge <branch>` on `live`, where <branch> descends from live's tip (a
+# branch cut from `live`, or any branch while `live` still equals origin/main),
+# moves `live` onto that branch's commits with nothing here noticing. The
+# Claude Code merge guard refuses that command before git runs it; typed in a
+# plain shell it is not refused. The same holds for every other way of moving
+# the `live` ref (a fast-forward pull, reset, branch -f, update-ref, checkout -B,
+# a fetch into it): no git hook refuses them. A check that `live` holds only
+# what a rebuild wrote is planned with the rebuild engine, which is not built
+# yet.
 
 current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
 
@@ -18,7 +29,8 @@ current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
 # the rebuild writes its merge commits with `git commit-tree`, which runs no
 # hooks. So every merge that reaches this hook on `live` came from somewhere
 # else — update.sh merging origin/main in, `git pull --no-rebase`, a hand merge —
-# and each one leaves a commit the next rebuild refuses as unknown. There is
+# and each one leaves a commit the planned rebuild engine (not built yet) will
+# refuse as unknown. There is
 # deliberately no override. Applies only where the manifest exists, so an
 # install's own branch that happens to be named `live` is left alone.
 if [ "$current_branch" = "live" ] && [ -f "$HOME/.genesis/deploy_manifest.json" ]; then

@@ -155,15 +155,19 @@ def test_merge_commit_into_a_feature_branch_is_allowed(setup):
     assert res.returncode == 0, res.stdout + res.stderr
 
 
-def test_fast_forward_into_live_runs_no_hook(setup):
-    """Pins the header claim: a fast-forward creates no commit, so git runs no
-    merge hook. `live` equal to an older main moving to a newer main is the one
-    shape this lets through, and it is harmless (nothing candidate-specific)."""
+def test_fast_forward_into_live_is_not_stopped_by_any_git_hook(setup):
+    """Pins the gap the pre-merge-commit header states: a fast-forward creates no
+    commit, so git runs no hook, and a feature branch's own commit lands on `live`
+    unrefused. Only the Claude Code merge guard refuses this command before git
+    runs it; typed in a plain shell it goes through. If a git-level refusal is
+    ever added, this test must change with the header."""
     repo, env = setup
     _commit_file(repo, env, "b.txt", "b\n")
+    feature_tip = _git(repo, env, "rev-parse", "feature").stdout.strip()
     _git(repo, env, "checkout", "-q", "live")
     res = _git(repo, env, "merge", "--ff-only", "feature", check=False)
     assert res.returncode == 0, res.stdout + res.stderr
+    assert _git(repo, env, "rev-parse", "live").stdout.strip() == feature_tip
 
 
 def test_conflicted_merge_into_live_is_refused_at_commit(setup):
@@ -253,7 +257,8 @@ def test_rebuild_trailer_check_ignores_the_manifest(setup):
 def test_force_push_over_an_unfetched_remote_tip_is_allowed(setup, tmp_path):
     """The remote branch was updated elsewhere and never fetched here, so its
     tip is unknown locally. `$remote_oid..$local_oid` would fail and refuse an
-    ordinary push; the hook must fall back to walking what the remote lacks."""
+    ordinary push; the hook falls back to walking the pushed tip's whole
+    ancestry, which carries no rebuild commit here."""
     repo, env = setup
     _commit_file(repo, env, "b.txt", "b\n")
     _git(repo, env, "push", "-q", "origin", "feature")
@@ -291,6 +296,142 @@ def test_rebuild_commit_already_on_the_remote_is_not_re_flagged(setup):
     _commit_file(repo, env, "b.txt", "b\n")
     res = _git(repo, env, "push", "origin", "feature", check=False)
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_new_branch_past_a_stale_tracking_ref_is_still_checked(setup):
+    """A remote-tracking ref records the last fetch, not what the remote holds
+    now. Here one still points at a rebuild commit the remote no longer has; a
+    new branch built on it must be refused, not excused because some tracking
+    ref already reaches the commit."""
+    repo, env = setup
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    _git(repo, env, "update-ref", "refs/remotes/origin/gone", tip)
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    _commit_file(repo, env, "b.txt", "b\n")
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_trailer_separator_config_cannot_hide_a_rebuild_commit(setup):
+    """With `trailer.separators` set to something without `:`, git would not
+    parse `Deploy-rebuild: m1` as a trailer at all. The hook pins the separator."""
+    repo, env = setup
+    _git(repo, env, "config", "trailer.separators", "#")
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_push_is_refused_when_its_commits_cannot_be_listed(setup):
+    """Fail closed: if git cannot list what the push publishes, refuse rather
+    than publish unchecked. An invalid `log.date` makes `git log` fail while
+    `git push` itself still works (measured on git 2.43), so without the refusal
+    this push would succeed. (A PATH shim cannot stand in: git puts its own
+    exec-path first on a hook's PATH. A missing object cannot either: the push
+    then fails later on its own, and the test would pass with no refusal.)"""
+    repo, env = setup
+    _commit_file(repo, env, "b.txt", "b\n")
+    _git(repo, env, "config", "log.date", "bogusfmt")
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "could not list the commits" in res.stdout + res.stderr
+    assert _git(repo, env, "ls-remote", "origin", "feature").stdout == ""
+
+
+def test_branch_deletion_push_is_allowed_on_a_sha256_repository(tmp_path):
+    """A deletion sends an all-zero object id, 64 characters long under SHA-256.
+    The hook must recognise it by shape; a 40-zero comparison would treat it as
+    a commit, fail to list it, and refuse every deletion."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "gitconfig").write_text("")
+    env = _env(home)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    shutil.copy2(_HOOKS / "pre-push", hooks / "pre-push")
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "--object-format=sha256", "-b", "main", str(origin)],
+        env=env,
+        check=True,
+    )
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", "-b", "main", str(repo)],
+        env=env,
+        check=True,
+    )
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    (repo / "a.txt").write_text("a\n")
+    _git(repo, env, "add", "a.txt")
+    _git(repo, env, "commit", "-q", "-m", "base")
+    _git(repo, env, "config", "core.hooksPath", str(hooks))
+    _git(repo, env, "checkout", "-q", "-b", "feature")
+    _git(repo, env, "push", "-q", "origin", "feature")
+    assert len(_git(repo, env, "rev-parse", "HEAD").stdout.strip()) == 64  # guard
+    res = _git(repo, env, "push", "origin", "--delete", "feature", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert _git(repo, env, "ls-remote", "origin", "feature").stdout == ""
+
+
+def test_signature_display_does_not_pose_as_a_rebuild_commit(setup, tmp_path):
+    """With `log.showSignature` set, git writes gpg's report to stdout beside the
+    format. Those lines must not read as a trailer hit: an ordinary signed branch
+    has to publish."""
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen not available")
+    repo, env = setup
+    key = tmp_path / "signkey"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    allowed = tmp_path / "allowed_signers"
+    allowed.write_text(f"t@example.invalid {(tmp_path / 'signkey.pub').read_text()}")
+    _git(repo, env, "config", "gpg.format", "ssh")
+    _git(repo, env, "config", "user.signingkey", str(key))
+    _git(repo, env, "config", "gpg.ssh.allowedSignersFile", str(allowed))
+    (repo / "b.txt").write_text("b\n")
+    _git(repo, env, "add", "b.txt")
+    _git(repo, env, "commit", "-q", "-S", "-m", "signed work")
+    _git(repo, env, "config", "log.showSignature", "true")
+    shown = _git(repo, env, "log", "-1", "--format=%H").stdout
+    assert "Good" in shown or "signature" in shown.lower()  # guard: the display is on
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_comment_char_config_cannot_hide_a_rebuild_commit(setup):
+    """`core.commentChar` set to the trailer's first letter makes git treat the
+    trailer line as a comment. The hook pins it, so the trailer is still seen."""
+    repo, env = setup
+    _git(repo, env, "config", "core.commentChar", "D")
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_a_rebuild_commit_already_on_main_does_not_block_new_branches(setup, tmp_path):
+    """Commits on origin's main are public already. If one ever carries the
+    trailer (a squash message ending in it), new branches cut from main must
+    still publish; only commits NOT on main are this hook's business."""
+    repo, env = setup
+    tip = _rebuild_commit(repo, env, ("squash with a stray trailer", "Deploy-rebuild: x"))
+    origin = tmp_path / "origin.git"
+    _git(repo, env, "push", "-q", "--no-verify", "origin", f"{tip}:refs/heads/main")
+    _git(repo, env, "fetch", "-q", "origin")
+    _git(repo, env, "checkout", "-q", "-b", "topic", "origin/main")
+    _commit_file(repo, env, "t.txt", "t\n")
+    res = _git(repo, env, "push", "origin", "topic", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert origin.exists()  # guard: the fixture's origin is the one pushed to
 
 
 def test_prose_mentioning_the_trailer_is_not_a_rebuild_commit(setup):
