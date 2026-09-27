@@ -356,6 +356,7 @@ async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():
         rerank_timeout_s=None,
         stats=None,
         defer_side_effects=False,
+        trace=None,
     ):
         captured["extra"] = extra_fts_terms
         captured["rerank"] = rerank
@@ -504,6 +505,7 @@ async def test_proactive_context_requests_noise_filter():
         rerank_timeout_s=None,
         stats=None,
         defer_side_effects=False,
+        trace=None,
     ):
         captured["filter_noise"] = filter_noise
         return []
@@ -533,6 +535,7 @@ async def test_proactive_context_surfaces_engine_stats():
         rerank_timeout_s=None,
         stats=None,
         defer_side_effects=False,
+        trace=None,
     ):
         if stats is not None:
             stats["rerank_executed"] = True
@@ -560,6 +563,7 @@ async def test_proactive_context_surfaces_engine_stats():
         rerank_timeout_s=None,
         stats=None,
         defer_side_effects=False,
+        trace=None,
     ):
         if stats is not None:
             stats["rerank_executed"] = False
@@ -637,7 +641,7 @@ async def _run_impl(candidates, *, capture=None, **kwargs):
         _require_init=lambda: None,
     )
 
-    async def _maybe_expand(db, kept, surface):
+    async def _maybe_expand(db, kept, surface, recall_event_id=None):
         return list(kept)  # no graph neighbors
 
     async def _record(*a, **k):

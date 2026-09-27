@@ -229,6 +229,36 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_recall_traces() -> None:
+        # Per-recall retrieval traces (memory/recall_trace.py) are one ~10 KB
+        # eval_events row per proactive recall — a steady drip. Only that ONE
+        # event type is pruned; the rest of eval_events is long-lived eval history.
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import j9_eval as _j9
+            from genesis.memory import recall_trace as _rt
+
+            removed = await _j9.prune_event_type_older_than(
+                rt._db, event_type=_rt.EVENT_TYPE, days=_rt.RETENTION_DAYS
+            )
+            rt.record_job_success("recall_traces_prune")
+            if removed:
+                logger.info(
+                    "recall_trace prune: removed %d rows (>%dd)", removed, _rt.RETENTION_DAYS
+                )
+        except Exception as exc:
+            rt.record_job_failure("recall_traces_prune", exc=exc)
+            logger.exception("recall_trace prune failed")
+
+    scheduler.add_job(
+        _prune_recall_traces,
+        CronTrigger(hour=5, minute=45, timezone=user_timezone()),
+        id="recall_traces_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
     async def _prune_events() -> None:
         # The observability event bus is the ONLY high-volume table with no
         # retention (45k+ rows / ~108d, growing ~12x month-over-month). Unlike

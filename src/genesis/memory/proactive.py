@@ -124,6 +124,56 @@ def _compact_timings(timings: dict[str, Any]) -> str:
     return " ".join(f"{k}={timings[k]}" for k in _COMPACT_TIMING_KEYS if k in timings)
 
 
+def _trace_enabled() -> bool:
+    """``proactive.trace`` kill switch for the per-recall retrieval trace (live;
+    default on). Anything but an explicit off/false/no keeps it on."""
+    val = _proactive_config().get("trace", True)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() not in {"off", "false", "no"}
+    return True
+
+
+def _degraded_reasons(
+    engine_stats: dict[str, Any],
+    vector: Any,
+    rerank_requested: bool,
+    trace: dict[str, Any] | None = None,
+) -> list[str]:
+    """Why this recall ran below its full pipeline (empty = not degraded)."""
+    reasons: list[str] = []
+    # Prefer recall's own verdict (it embeds independently); fall back to ours.
+    emb = (trace or {}).get("embedding_available")
+    if emb is False or (emb is None and vector is None):
+        reasons.append("no_embedding")  # FTS-only retrieval
+    if engine_stats.get("rerank_timed_out"):
+        reasons.append("rerank_timed_out")
+    if engine_stats.get("rerank_skipped_breaker_open"):
+        reasons.append("rerank_breaker_open")
+    if engine_stats.get("rerank_skipped_ratelimited"):
+        reasons.append("rerank_ratelimited")
+    if rerank_requested and not engine_stats.get("rerank_executed") and not reasons:
+        reasons.append("rerank_not_executed")
+    return reasons
+
+
+def _schedule_trace_write(db: Any, trace: dict[str, Any] | None, session_id: str) -> None:
+    """Hand the trace to a background task — the request never waits on it."""
+    if trace is None or db is None:
+        return
+    from genesis.memory.recall_trace import write_trace
+
+    coro = write_trace(db, trace, session_id=session_id)
+    try:
+        from genesis.util.tasks import tracked_task
+
+        tracked_task(coro, name="proactive_recall_trace")
+    except Exception:
+        coro.close()
+        logger.debug("recall trace scheduling failed", exc_info=True)
+
+
 def _proactive_config() -> dict[str, Any]:
     """The ``proactive`` section of the merged memory_recall config (live)."""
     try:
@@ -694,6 +744,20 @@ async def proactive_context(
     phase_started_at = time.monotonic()
     vector: list[float] | None = None
     engine_stats: dict[str, Any] = {}
+    rerank_live = False
+    # Per-recall retrieval trace (recall_trace.py): a caller-owned sink the
+    # engine drops references into; built + written OFF-path at the end.
+    trace: dict[str, Any] | None = None
+    if _trace_enabled():
+        from genesis.memory.recall_trace import new_trace_id
+
+        trace = {
+            "trace_id": new_trace_id(),
+            "caller": "proactive_endpoint",
+            "profile": profile,
+            "stance": stance,
+            "budget": budget,
+        }
     try:
         # Embed once (cache-shared with recall's internal embed of the same text
         # → a warm hit) — reused for procedure cosine + returned for the ambient
@@ -737,6 +801,7 @@ async def proactive_context(
             # write-backs/emits + the immunity emit off the request path so the
             # 4.5s route budget isn't spent on post-result DB writes (ac27b693).
             defer_side_effects=True,
+            trace=trace,
         )
         timings["recall"] = round((time.monotonic() - t_recall) * 1000, 1)
 
@@ -833,6 +898,17 @@ async def proactive_context(
             default_executor_pending(),
             timings,
         )
+        if trace is not None:
+            trace["outcome"] = f"cancelled:{phase}"
+            trace["timings_ms"] = dict(timings)
+            trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
+            _schedule_trace_write(db, trace, session_id)
+        raise
+    except Exception:
+        if trace is not None:
+            trace["outcome"] = f"error:{phase}"
+            trace["timings_ms"] = dict(timings)
+            _schedule_trace_write(db, trace, session_id)
         raise
 
     shadow = _shadow_projection(dicts, suppress)
@@ -861,6 +937,14 @@ async def proactive_context(
         # together the three lines cover every call exactly once. Volume is one
         # line per prompt (hundreds per day on a busy install).
         logger.info("proactive recall timing: %s", _compact_timings(timings))
+    intent_category = classify_intent(prompt).category
+    if trace is not None:
+        trace["outcome"] = "ok"
+        trace["intent"] = intent_category
+        trace["timings_ms"] = dict(timings)
+        trace["delivered"] = [d.get("memory_id") for d in dicts if d.get("memory_id")]
+        trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
+        _schedule_trace_write(db, trace, session_id)
     return {
         "status": "ok",
         "lines": lines,
@@ -879,7 +963,9 @@ async def proactive_context(
             "rerank_requested": rerank_live,
             "rerank_timed_out": bool(engine_stats.get("rerank_timed_out", False)),
             "graph_expansion": graph_expansion.expansion_mode(),
-            "intent": classify_intent(prompt).category,
+            "intent": intent_category,
             "profile": profile,
+            # Join key for the off-path ``recall_trace`` eval row (None = off).
+            "trace_id": trace["trace_id"] if trace is not None else None,
         },
     }

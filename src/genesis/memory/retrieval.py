@@ -765,8 +765,17 @@ class HybridRetriever:
         rerank_timeout_s: float | None = None,
         stats: dict | None = None,
         defer_side_effects: bool = False,
+        trace: dict | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
+
+        ``trace``: optional caller-owned sink for the per-recall retrieval trace
+        (``genesis.memory.recall_trace``). Only REFERENCES and one dict copy are
+        dropped into it on this path (the ranked lane lists, the pre-rerank fused
+        scores, raw reranker scores, the final results); the per-candidate record
+        is assembled off-path by the caller. ``trace["trace_id"]`` (if set) is
+        stamped onto the ``recall_fired`` event as the join key. ``None`` (every
+        caller but the proactive endpoint) is a byte-for-byte no-op.
 
         ``rerank_timeout_s``: optional wall-clock bound on the cross-encoder
         rerank stage ONLY (latency-budgeted callers, e.g. the per-prompt
@@ -995,6 +1004,20 @@ class HybridRetriever:
         if event_memory_ids:
             ranked_lists.append(event_memory_ids)
         fused = _rrf_fuse(ranked_lists)
+        if trace is not None:
+            # References only (these lists are not mutated below) + ONE copy of
+            # ``fused``, which rerank may replace and graph boost mutates.
+            trace["lanes"] = {
+                "vector": vector_ranked_dedup,
+                "fts": fts_ranked,
+                "event": event_memory_ids,
+                "activation": activation_ranked,
+                "intent": intent_ranked or [],
+            }
+            trace["fused"] = dict(fused)
+            trace["recall_limit"] = limit
+            trace["embedding_available"] = embedding_available
+            trace["fts_query_expanded"] = fts_query != query
 
         # 7.5 Cross-encoder reranking (optional, off by default) — the ONLY
         # post-fusion point where ``fused`` is reassigned rather than mutated.
@@ -1007,6 +1030,7 @@ class HybridRetriever:
             rerank=rerank,
             timeout_s=rerank_timeout_s,
             stats=stats,
+            trace=trace,
         )
 
         # 7b. Graph boost: backlink + adjacency (floor-gated); mutates
@@ -1028,6 +1052,8 @@ class HybridRetriever:
         # ``fused`` in place, and J-9 must log retrieval QUALITY, not the
         # halved dedup artifact. ``fused`` (penalized) still drives ordering.
         raw_fused = dict(fused)
+        if trace is not None:
+            trace["post_rerank"] = raw_fused  # a copy already; read-only below
         candidates = _apply_diversity_penalty(
             candidates,
             fused,
@@ -1097,6 +1123,8 @@ class HybridRetriever:
 
         if stats is not None:
             stats["assembly_ms"] = round((time.monotonic() - _ts_asm) * 1000, 1)
+        if trace is not None:
+            trace["results"] = [(r.memory_id, r.retrieval_score, r.score) for r in results]
 
         # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
         # knowledge_units sync) — each individually swallowed. Runs AFTER
@@ -1168,6 +1196,7 @@ class HybridRetriever:
                 entrenchment_corr=_entrenchment,
                 mean_retrieved_count=_mean_retrieved,
                 mean_age_days=_mean_age_days,
+                trace_id=trace.get("trace_id") if trace is not None else None,
             )
 
             # MEM-003: hand the emitted event id back to an MCP caller so it can
@@ -1588,6 +1617,7 @@ class HybridRetriever:
         rerank: bool,
         timeout_s: float | None = None,
         stats: dict | None = None,
+        trace: dict | None = None,
     ) -> dict[str, float]:
         """Stage 7.5: cross-encoder reranking (optional, off by default).
 
@@ -1680,6 +1710,10 @@ class HybridRetriever:
                         self._rerank_breaker.record_success()
                     if stats is not None:
                         stats["rerank_executed"] = True
+                    if trace is not None:
+                        # The reranker's own relevance scores — the positional
+                        # rewrite below discards them.
+                        trace["rerank"] = {item["id"]: item.get("score") for item in reranked}
                     # Rebuild fused with only reranked candidates, using
                     # positional scores so graph boost floor-gating works.
                     fused = {item["id"]: 1.0 / (1 + rank) for rank, item in enumerate(reranked)}
