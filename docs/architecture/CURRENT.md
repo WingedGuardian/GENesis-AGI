@@ -2322,7 +2322,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 
 ```yaml subsystem-map
 entry: routing-providers
-modules: [routing, providers]
+modules: [routing, providers, decisions]
 verified: ee9ebf85c 2026-09-05
 ```
 
@@ -2483,6 +2483,13 @@ verified: ee9ebf85c 2026-09-05
 - A load-time guard warns if an `openrouter` provider flagged `free: true` points
   at a non-`:free` (paid) slug — the openrouter-free billing blind spot
   (`_detect_mislabeled_free_openrouter`, config-only, visibility not gating).
+- **decisions/**: the decision question registry (`config/decisions.yaml`),
+  the bounded-choice counterpart of the routing call sites. Each site declares
+  a `choice` / `score` / `noul` question and what it `consumes`. Only a
+  `threshold` consumer needs calibration, and it must also declare a
+  `dead_band` and `tie_rule`, so `DecisionSpec.gate()` abstains near the cut
+  instead of taking a branch a retry could reverse. DECLARED ONLY: no runtime
+  caller reads the registry yet.
 
 ## 12. Platform & data
 
