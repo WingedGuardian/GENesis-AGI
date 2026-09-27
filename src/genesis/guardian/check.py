@@ -721,24 +721,29 @@ async def _maintain_snapshots(
             logger.warning("Snapshot prune failed", exc_info=True)
         _touch_marker(prune_marker, now)
 
-    if not (is_healthy and config.snapshots.healthy_enabled and healthy_due):
+    # `is True`: the YAML loader does not coerce, and `healthy_enabled: "false"`
+    # is a truthy string (review).
+    if not (is_healthy and config.snapshots.healthy_enabled is True and healthy_due):
         return
 
     retry_soon = False
     try:
         # Delete-first rotation only while relief is live (the kill switch and
         # alert_only stop every automatic delete) and not settling after its
-        # own delete this tick. Whether the lifeline is actually diverging is
-        # mark_healthy's own, measured, decision.
+        # own delete. Whether the snapshots actually hold space is
+        # mark_healthy's own, LVM-measured, decision.
         from genesis.guardian.pool_relief import delete_first_allowed, record_action
 
+        # The settle runs both ways: relief must not delete again 30s after
+        # rotation freed space, before a fresh measurement shows the effect.
+        # So the settle stamp is persisted BEFORE mark_healthy may delete, and
+        # an unwritable stamp forbids the delete (review: stamping after the
+        # delete left relief free to delete again when the write failed).
         name = await snapshots.mark_healthy(
-            snapshot_size_history, delete_first_allowed=delete_first_allowed(config),
+            snapshot_size_history,
+            delete_first_allowed=delete_first_allowed(config),
+            reserve_settle=lambda: record_action(config),
         )
-        if isinstance(getattr(snapshots, "deleted_first", None), str):
-            # The settle runs both ways: relief must not delete again 30s after
-            # rotation freed space, before a fresh measurement shows the effect.
-            record_action(config)
         note = getattr(snapshots, "last_rotation_note", None)
         if name:
             logger.info("Healthy snapshot refreshed: %s", name)
@@ -933,7 +938,7 @@ async def _check_pool_relief(
         outcome = await check_pool_relief(config, dispatcher, snapshots)
         acted = outcome.split(":", 1)[0] in (
             "deleted", "delete_failed", "list_failed", "no_target", "state_unwritable",
-            "unmeasured", "ambiguous_pool",
+            "unmeasured", "ambiguous_pool", "no_signal", "delete_indeterminate",
         )
         (logger.warning if acted else logger.info)("pool relief: %s", outcome)
     except Exception as exc:

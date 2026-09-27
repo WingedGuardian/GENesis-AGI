@@ -25,7 +25,12 @@ import pytest
 
 from genesis.guardian.check import _maintain_snapshots
 from genesis.guardian.config import GuardianConfig
-from genesis.guardian.pool import LVS_FIELDS
+from genesis.guardian.pool import (
+    LVS_FIELDS,
+    THIN_LV_FIELDS,
+    THIN_LV_SELECT,
+    incus_snapshot_lv_name,
+)
 from genesis.guardian.pool_relief import check_pool_relief
 from genesis.guardian.snapshots import SnapshotManager
 
@@ -43,6 +48,7 @@ class FakeHost:
         churn_per_day: int,
         vg_free: int,
         profile: str | None = "genesis-thinpool",
+        extra_div: int = 0,
     ) -> None:
         self.now = T0
         self.size = size
@@ -50,6 +56,8 @@ class FakeHost:
         self.churn = churn_per_day
         self.vg_free = vg_free
         self.profile = profile
+        # Copy-on-write the snapshots already held before the simulation began.
+        self.extra_div = extra_div
         self.snaps: dict[str, datetime] = {}
         self.max_data_pct = 0.0
         self.creates_refused = 0
@@ -59,7 +67,7 @@ class FakeHost:
         if not self.snaps:
             return self.base_used
         oldest = min(self.snaps.values())
-        div = self.churn * (self.now - oldest).total_seconds() / 86400
+        div = self.churn * (self.now - oldest).total_seconds() / 86400 + self.extra_div
         return min(self.size, self.base_used + div)
 
     def data_pct(self) -> float:
@@ -75,6 +83,22 @@ class FakeHost:
             return 0, "default\n", ""
         if cmd == "incus" and a[1] == "storage" and a[2] == "show":
             return 0, "config:\n  lvm.thinpool_name: IncusThinPool\ndriver: lvm\nsource: vg0\n", ""
+        if cmd == "lvs" and THIN_LV_SELECT in a:
+            # Per-volume view, as a real host prints it: the live container
+            # maps the live data; incus keeps snapshot LVs inactive (blank).
+            assert a[a.index("-o") + 1] == ",".join(THIN_LV_FIELDS)
+            ct = 60 * _GiB
+            rows = [{
+                "lv_name": "IncusThinPool", "pool_lv": "", "segtype": "thin-pool",
+                "data_percent": f"{self.data_pct():.2f}", "lv_size": str(self.size),
+            }, {
+                "lv_name": "containers_genesis", "pool_lv": "IncusThinPool", "segtype": "thin",
+                "data_percent": f"{100 * self.base_used / ct:.2f}", "lv_size": str(ct),
+            }] + [{
+                "lv_name": incus_snapshot_lv_name("genesis", n), "pool_lv": "IncusThinPool",
+                "segtype": "thin", "data_percent": "", "lv_size": str(ct),
+            } for n in self.snaps]
+            return 0, json.dumps({"report": [{"lv": rows}]}), ""
         if cmd == "lvs":
             # The shape measured from a real host's `lvs --reportformat json`.
             assert "--reportformat" in a and a[a.index("-o") + 1] == ",".join(LVS_FIELDS)
@@ -261,22 +285,24 @@ async def test_stable_but_full_pool_keeps_its_lifeline(
     profile,
     diverged,
 ) -> None:
-    """Negative control the review asked for: a pool that is FULL but barely
-    growing refuses every rotation — and must still keep its rollback
-    snapshot, because deleting it frees nothing.
+    """Negative control the review asked for: a pool that is FULL of live data
+    refuses every rotation — and must still keep its rollback snapshot,
+    because the snapshot holds almost nothing and deleting it frees nothing.
 
     ``diverged=True`` is the positive twin that keeps the control honest: the
-    SAME seed with a creation mark showing large growth since it was taken must
-    be deleted first. An earlier fixture passed the negative arm vacuously (its
-    lvs row misparsed, so the mark's pool key never matched); if the twin stops
-    deleting, the negative arm proves nothing again.
+    SAME pool level, but 10 GiB of it held by the snapshot alone (LVM's
+    per-volume view shows it), must delete the lifeline first. An earlier
+    fixture passed the negative arm vacuously (its lvs row misparsed); if the
+    twin stops deleting, the negative arm proves nothing again.
     """
     size = int(64.9 * _GiB) // _EXTENT * _EXTENT
+    held = 10 * _GiB if diverged else 0
     host = _incident_host(
-        base_used=int(size * data_pct / 100),
+        base_used=int(size * data_pct / 100) - held,
         churn_per_day=int(0.05 * _GiB),
         vg_free=0,
         profile=profile,
+        extra_div=held,
     )
     # The lifeline already exists (taken when the pool had room); the pool
     # then sat full. Without this seed the first create is refused and there
@@ -284,23 +310,12 @@ async def test_stable_but_full_pool_keeps_its_lifeline(
     seeded = "guardian-20251231-162600-healthy"
     host.snaps[seeded] = T0 - timedelta(days=2)
     cfg = _config(tmp_path)
-    cfg.state_path.mkdir(parents=True, exist_ok=True)
-    used_then = host.used() - (10 * _GiB if diverged else 0)
-    (cfg.state_path / "lifeline_marks.json").write_text(
-        json.dumps(
-            {
-                "name": seeded,
-                "pool": "default|vg0|IncusThinPool",
-                "used_bytes": used_then,
-            }
-        )
-    )
     dispatcher = await _simulate(host, cfg, days=5, relief=True)
     assert host.creates_refused > 0 or data_pct >= 85  # rotations really were refused
     if diverged:
         assert seeded not in host.snaps, host.snaps
         bodies = [c.args[0].body for c in dispatcher.send.await_args_list]
-        assert any(f"deleted the diverging lifeline {seeded}" in b for b in bodies), bodies
+        assert any(f"the lifeline {seeded} was deleted first" in b for b in bodies), bodies
         return
     assert seeded in host.snaps, host.snaps
     assert _freed(dispatcher) == []

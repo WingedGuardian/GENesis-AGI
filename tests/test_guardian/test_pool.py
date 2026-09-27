@@ -17,8 +17,11 @@ from genesis.guardian.pool import (
     StoragePoolStatus,
     ThinPoolReport,
     decide_alert,
+    incus_container_lv_name,
+    incus_snapshot_lv_name,
     measure_storage_pool,
     parse_lvs_report,
+    snapshot_only_bytes,
     worst_tier,
 )
 
@@ -332,3 +335,80 @@ class TestBackendUnknown:
         status = await measure_storage_pool(object())
         assert status.detected is False
         assert not any(c and c[0] == "df" for c in calls)
+
+
+def _thin(*rows: dict) -> str:
+    return json.dumps({"report": [{"lv": list(rows)}]})
+
+
+def _tlv(name, pct, size, pool="IncusThinPool", segtype="thin"):
+    return {
+        "lv_name": name, "pool_lv": pool, "segtype": segtype,
+        "data_percent": pct, "lv_size": str(size),
+    }
+
+
+def _pool_row(pct, size, name="IncusThinPool"):
+    return _tlv(name, pct, size, pool="", segtype="thin-pool")
+
+
+class TestSnapshotOnlyBytes:
+    """The delete-first evidence: pool used minus what live volumes map, from
+    ONE lvs read, is a LOWER bound on what the snapshots alone hold."""
+
+    SNAP = incus_snapshot_lv_name("genesis", "guardian-20260926-162814-healthy")
+    CT = "containers_genesis"
+    G = 1024**3
+
+    def _held(self, *rows, snaps=None):
+        return snapshot_only_bytes(_thin(*rows), "IncusThinPool", self.CT, snaps or {self.SNAP})
+
+    def test_lv_names_match_the_measured_incus_layout(self):
+        assert self.SNAP == "containers_genesis-guardian--20260926--162814--healthy"
+        assert incus_container_lv_name("my-box") == "containers_my--box"
+
+    def test_measured_host_numbers(self):
+        # One real read: pool 76.04% of 73903636480; container 74.82% of
+        # 70002933760; a 2 GiB custom volume at 17.85%; the snapshot blank.
+        held = self._held(
+            _pool_row("76.04", 73903636480),
+            _tlv(self.CT, "74.82", 70002933760),
+            _tlv(self.SNAP, "", 60003713024),
+            _tlv("custom_default_genesis--cc--tmp", "17.85", 2147483648),
+            _tlv("other_pool_volume", "99.00", 10**12, pool="OtherPool"),
+        )
+        assert held == pytest.approx(0.7604 * 73903636480 - 0.7482 * 70002933760
+                                     - 0.1785 * 2147483648)
+        assert 3.0e9 < held < 3.5e9
+
+    def test_new_live_data_is_not_snapshot_held(self):
+        held = self._held(
+            _pool_row("86.00", 100 * self.G), _tlv(self.CT, "86.00", 100 * self.G),
+            _tlv(self.SNAP, "", 1),
+        )
+        assert held == pytest.approx(0)
+
+    @pytest.mark.parametrize("rows", [
+        (),  # empty report
+        (_pool_row("90.00", 100 * 1024**3),),  # no container row
+        (_pool_row("90.00", 100 * 1024**3), _tlv("containers_genesis", "", 1)),  # blank container
+        (_tlv("containers_genesis", "10.00", 100 * 1024**3),),  # no pool row
+        (_pool_row("", 100 * 1024**3), _tlv("containers_genesis", "10.00", 100 * 1024**3)),
+    ])
+    def test_incomplete_report_is_no_evidence(self, rows):
+        """Internal review: an empty or anchor-less report used to return the
+        WHOLE pool as snapshot-held."""
+        assert self._held(*rows) is None
+
+    def test_unattributable_inactive_volume_is_no_evidence(self):
+        held = self._held(
+            _pool_row("90.00", 100 * self.G),
+            _tlv(self.CT, "50.00", 100 * self.G),
+            _tlv(self.SNAP, "", 1),
+            _tlv("containers_stopped--box", "", 50 * self.G),  # a stopped container
+        )
+        assert held is None
+
+    @pytest.mark.parametrize("out", ["", "{}", "  12.0  x\n", '{"report": [{"lv": ["x"]}]}'])
+    def test_unexpected_shape_is_no_evidence(self, out):
+        assert snapshot_only_bytes(out, "IncusThinPool", self.CT, set()) is None

@@ -49,9 +49,8 @@ class StoragePoolStatus:
     pool_used_pct: float | None = None
     detail: str = ""
     # Byte size of the thing the percentages are OF (the thin-pool data LV, or
-    # the non-LVM pool filesystem). Turns a percentage into bytes for the
-    # delete-first divergence evidence (snapshots.mark_healthy); None when
-    # unreadable, and then there is no such evidence.
+    # the non-LVM pool filesystem); None when unreadable. Relief's numbers and
+    # delete-first's size floor (1% of the pool) read it.
     pool_size_bytes: int | None = None
     # The incus storage pool behind the container's root disk.
     pool_name: str | None = None
@@ -168,6 +167,98 @@ def parse_lvs_report(stdout: str) -> ThinPoolReport:
         size_bytes=int(size) if size is not None and size > 0 else None,
         lv_name=name.strip() if isinstance(name, str) and name.strip() else None,
     )
+
+
+THIN_LV_FIELDS = ("lv_name", "pool_lv", "segtype", "data_percent", "lv_size")
+# One lvs read returns the pool row AND every thin volume, so both terms of the
+# bound come from the same instant (measured on LVM 2.03.16).
+THIN_LV_SELECT = "segtype=thin||segtype=thin-pool"
+
+
+def incus_snapshot_lv_name(container: str, snapshot: str) -> str:
+    """The LV incus's LVM driver backs a container snapshot with.
+
+    ``containers_<container>-<snapshot>``, with every ``-`` inside either name
+    doubled (LVM's own escaping; measured on a live host:
+    ``containers_genesis-guardian--20260926--162814--healthy``).
+    """
+    return f"{incus_container_lv_name(container)}-{snapshot.replace('-', '--')}"
+
+
+def incus_container_lv_name(container: str) -> str:
+    """The LV backing a container's root volume (``containers_<name>``, ``-`` doubled)."""
+    return f"containers_{container.replace('-', '--')}"
+
+
+def _mapped_bytes(row: dict) -> float | None:
+    try:
+        val = float(row.get("data_percent")) / 100.0 * float(row.get("lv_size"))
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) and val >= 0 else None
+
+
+def snapshot_only_bytes(
+    stdout: str, thinpool_lv: str, container_lv: str, snapshot_lvs: set[str],
+) -> float | None:
+    """A LOWER BOUND on the pool blocks only the given snapshots hold, or None.
+
+    Parses ONE ``lvs --reportformat json -S 'segtype=thin||segtype=thin-pool'
+    -o lv_name,pool_lv,segtype,data_percent,lv_size --units b --nosuffix <vg>``
+    read, so the pool's used bytes and each volume's mapping are the same
+    instant (review: two reads let a volume freed in between read as
+    snapshot-held). The pool counts every physical block once; each live thin
+    volume reports the blocks IT maps. So
+
+        pool used − Σ(mapped by every live volume in the pool)
+
+    is at most what the snapshots hold exclusively — shared blocks are counted
+    in the live sum (twice, if two live volumes share them), which can only
+    shrink the result. It is COLLECTIVE: blocks two healthy snapshots share are
+    in it, and deleting only one of them does not free those. New container
+    data grows the pool and the container's own mapping equally, so it never
+    reads as snapshot-held. It measures DATA blocks; freeing them also frees
+    their metadata mappings, but the metadata figure itself is not measured.
+
+    None — no evidence — unless the report is complete enough to trust:
+
+    * the pool's own row is present and readable (the used term);
+    * the container's own LV is present and readable — it is running, so an
+      absent or blank row means the report is not what it claims (review: an
+      empty report used to return the whole pool as snapshot-held);
+    * every other LV in the pool is either readable (live) or one of
+      ``snapshot_lvs`` (incus keeps snapshot LVs inactive; lvs reports them
+      blank). Anything else — an operator's snapshot, a stopped container, an
+      inactive image — cannot be attributed.
+    """
+    try:
+        rows = json.loads(stdout)["report"][0]["lv"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        return None
+    pool_rows = [
+        r for r in rows if r.get("lv_name") == thinpool_lv and r.get("segtype") == "thin-pool"
+    ]
+    if len(pool_rows) != 1:
+        return None
+    used = _mapped_bytes(pool_rows[0])
+    if used is None:
+        return None
+    live = 0.0
+    anchored = False
+    for row in rows:
+        if row.get("pool_lv") != thinpool_lv or row.get("segtype") != "thin":
+            continue
+        mapped = _mapped_bytes(row)
+        if mapped is None:
+            if row.get("lv_name") in snapshot_lvs:
+                continue  # the snapshots under test: what the bound measures
+            return None
+        if row.get("lv_name") == container_lv:
+            anchored = True
+        live += mapped
+    return used - live if anchored else None
 
 
 def decide_alert(

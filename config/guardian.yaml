@@ -59,9 +59,9 @@ snapshots:
   # SNAPSHOT_ROLLBACK lifeline. Rotated create-then-delete, so it stays one
   # day old only while the pool accepts the create. When the POOL refuses it
   # (the storage_pool high tier, or LVM's own autoextend threshold), the
-  # lifeline is over a day old, AND the pool has grown since it was taken
-  # (>= 1 GiB or 1%), rotation deletes the old one FIRST. A full-but-stable
-  # pool keeps its lifeline. A refused refresh retries in ~1h and alerts
+  # lifeline is over a day old, AND (LVM-thin only) the snapshots measurably
+  # hold >= 1 GiB (or 1%) no live volume maps, rotation deletes the old one
+  # FIRST. A pool full of live data keeps its lifeline. A refused refresh retries in ~1h and alerts
   # (throttled by storage_pool.realert_hours). Set false to disable.
   healthy_enabled: true
   max_pool_usage_pct: 80

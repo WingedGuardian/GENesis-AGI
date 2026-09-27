@@ -116,9 +116,9 @@ class SnapshotConfig:
     # exactly one healthy snapshot ONLY while creates succeed: a refused
     # create (the pool gate, or LVM's own threshold) leaves the old one in
     # place, still diverging. mark_healthy therefore rotates delete-first when
-    # a MEASURED pool refusal meets a lifeline that is over a day old AND is
-    # measurably diverging (pool usage grew since it was taken); a full-but-
-    # stable pool keeps it. Set false to stop taking (existing healthy
+    # a MEASURED pool refusal meets a lifeline that is over a day old AND LVM
+    # shows the snapshots hold space no live volume maps (LVM-thin only); a
+    # pool full of live data keeps it. Set false to stop taking (existing healthy
     # snapshots then age out via expiry / pool relief).
     healthy_enabled: bool = True
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable

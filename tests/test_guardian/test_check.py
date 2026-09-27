@@ -1452,22 +1452,30 @@ class TestPoolReliefWiring:
         assert order == ["relief", "cycle"]
 
     @pytest.mark.asyncio
-    async def test_delete_first_starts_relief_settle(self, config: GuardianConfig) -> None:
-        """The settle runs both ways: after rotation deleted a lifeline, relief
-        must not delete again on the next tick, before a fresh measurement."""
+    async def test_delete_first_reserves_relief_settle(self, config: GuardianConfig) -> None:
+        """The settle runs both ways, and is persisted BEFORE mark_healthy may
+        delete: the callback it is handed stamps relief's last_action."""
         from genesis.guardian.pool_relief import delete_first_allowed
 
-        snapshots = self._snapshots(name="guardian-20260101-000000-healthy", note="rotated")
-        snapshots.deleted_first = "guardian-20251230-000000-healthy"
-        assert delete_first_allowed(config)
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
         await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
-        assert not delete_first_allowed(config)  # last_action stamped
+        kwargs = snapshots.mark_healthy.await_args.kwargs
+        assert kwargs["delete_first_allowed"] is True
+        assert delete_first_allowed(config)  # nothing stamped until the callback runs
+        assert kwargs["reserve_settle"]() is True
+        assert not delete_first_allowed(config)  # now relief is settling
 
-        other = self._snapshots(name="guardian-20260101-000000-healthy")
-        other.deleted_first = None
-        config.state_dir = str(config.state_path / "fresh")
-        await _maintain_snapshots(config, other, is_healthy=True, dispatcher=AsyncMock())
-        assert delete_first_allowed(config)  # a plain rotation stamps nothing
+    @pytest.mark.parametrize("value", ["false", "no", 1])
+    @pytest.mark.asyncio
+    async def test_non_bool_healthy_enabled_takes_nothing(
+        self, config: GuardianConfig, value,
+    ) -> None:
+        """The loader does not coerce: `healthy_enabled: "false"` is a truthy
+        string, and must not take (or delete-first) a healthy snapshot."""
+        config.snapshots.healthy_enabled = value
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        snapshots.mark_healthy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_relief_crash_alerts_once_a_day(self, config: GuardianConfig) -> None:

@@ -8,12 +8,14 @@
   filesystem went read-only, while CRITICAL alerts fired every six hours. (An
   earlier entry said this snapshot is "never more than a day old"; that held
   only while the replacement succeeded.) Now:
-  - When the pool refuses the new snapshot on a real measurement, the old one
-    is over a day old, and the pool has grown since it was taken by the larger
-    of 1 GiB and 1% of the pool, the Guardian deletes the old snapshot first, then creates the
-    new one. A pool that is full but not growing keeps its rollback snapshot,
-    since deleting it would free almost nothing. A failed probe never counts as
-    a refusal. A refused refresh retries within about an hour and sends an
+  - On LVM-thin pools, when the pool refuses the new snapshot on a real
+    measurement, the old one is over a day old, and LVM shows the snapshots
+    hold at least the larger of 1 GiB and 1% of the pool that no live volume
+    maps, the Guardian deletes the old snapshot first, then creates the new
+    one. A pool that is full of live container data keeps its rollback
+    snapshot, since deleting it would free almost nothing. A failed probe never
+    counts as a refusal. On btrfs and dir pools this step does not run; the
+    backstop below protects them. A refused refresh retries within about an hour and sends an
     alert, throttled rather than hourly; it used to be only a log line.
   - A backstop runs every tick: when free data space is at or below 3% of the
     pool, or free metadata space at or below 10%, it deletes one Guardian
@@ -21,7 +23,8 @@
     five minutes for a fresh measurement, and alerts on each delete. If no
     Guardian snapshot is left, it alerts that something else is filling the
     pool. No new Guardian snapshot is taken while free space is inside that
-    reserve. If relief cannot measure or identify the pool for an hour, it
+    reserve. A delete whose outcome is unknown (the client timed out) stops
+    the pass instead of moving on to another snapshot. If relief cannot measure or identify the pool for an hour, it
     says so in a daily warning rather than going quiet.
   - Every Guardian path that deletes or restores a snapshot (relief,
     rotation, the daily prune, the rollback target) now matches only the exact

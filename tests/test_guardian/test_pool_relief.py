@@ -53,6 +53,8 @@ class _Snaps:
         self.deleted: list[str] = []
         self.delete_ok = delete_ok
         self.fail = set(fail)
+        self.error = "Error: busy"
+        self.gone_anyway: set[str] = set()
 
     async def list_snapshot_meta_strict(self):
         return sorted(self.names.items(), reverse=True)
@@ -60,7 +62,8 @@ class _Snaps:
     async def delete(self, name):
         self.deleted.append(name)
         ok = self.delete_ok and name not in self.fail
-        if ok:
+        self.last_delete_error = None if ok else self.error
+        if ok or name in self.gone_anyway:
             self.names.pop(name, None)
         return ok
 
@@ -395,3 +398,61 @@ class TestFallThroughAndCannotAct:
         assert record_action(cfg, T0)
         assert not delete_first_allowed(cfg, T0 + timedelta(minutes=1))
         assert delete_first_allowed(cfg, T0 + timedelta(minutes=6))
+
+
+class TestReviewRound1:
+    """External review round 1 on the core PR."""
+
+    @pytest.mark.parametrize("status", [
+        # metadata-only reading from an unnamed pool (several thin pools)
+        _lvm(None, meta=95.0, thinpool_lv=None),
+        _lvm(98.0, thinpool_lv=None),
+    ])
+    @pytest.mark.asyncio
+    async def test_unnamed_pool_never_acts_whatever_figures(self, tmp_path, status) -> None:
+        snaps = _Snaps({"guardian-20260101-000000-healthy": OLD})
+        out, _ = await _pass(_cfg(tmp_path), snaps, status)
+        assert out == "ambiguous_pool" and snaps.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_signal_less_measurement_is_not_ok(self, tmp_path) -> None:
+        cfg = _cfg(tmp_path)
+        blank = _lvm(None, meta=None)
+        snaps = _Snaps({"guardian-20260101-000000-healthy": OLD})
+        out, _ = await _pass(cfg, snaps, blank)
+        assert out == "no_signal"
+        _, d = await _pass(cfg, snaps, blank, now=T0 + timedelta(hours=2))
+        assert d.send.await_args.args[0].title == "Pool relief cannot act"
+
+    @pytest.mark.parametrize("value", ["false", "no", 0, None])
+    @pytest.mark.asyncio
+    async def test_non_bool_enabled_never_acts(self, tmp_path, value) -> None:
+        cfg = _cfg(tmp_path)
+        cfg.storage_pool.enabled = value
+        snaps = _Snaps({"guardian-20260101-000000-healthy": OLD})
+        out, _ = await _pass(cfg, snaps, _lvm(98.0))
+        assert out in ("invalid_config", "disabled") and snaps.deleted == []
+        assert not delete_first_allowed(cfg)
+
+    @pytest.mark.asyncio
+    async def test_delete_timeout_stops_the_pass(self, tmp_path) -> None:
+        """The client timing out says nothing about the daemon: never go on to
+        the next snapshot (possibly the lifeline) in the same pass."""
+        pre = "guardian-20260101-000000-pre-recovery"
+        life = "guardian-20260105-000000-healthy"
+        snaps = _Snaps({pre: OLD, life: T0 - timedelta(days=1)}, fail={pre})
+        snaps.error = "timeout"
+        out, d = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
+        assert out == f"delete_indeterminate:{pre}"
+        assert snaps.deleted == [pre]
+        assert d.send.await_args.args[0].title == "Guardian delete outcome unknown"
+
+    @pytest.mark.asyncio
+    async def test_failed_delete_that_happened_anyway_counts_once(self, tmp_path) -> None:
+        pre = "guardian-20260101-000000-pre-recovery"
+        life = "guardian-20260105-000000-healthy"
+        snaps = _Snaps({pre: OLD, life: T0 - timedelta(days=1)}, fail={pre})
+        snaps.error = "timeout"
+        snaps.gone_anyway = {pre}
+        out, _ = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
+        assert out == f"deleted:{pre}" and snaps.deleted == [pre]

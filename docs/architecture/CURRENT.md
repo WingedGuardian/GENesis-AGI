@@ -1428,18 +1428,22 @@ verified: 84c7259d 2026-08-31
   under six-hourly CRITICALs because the space was held by the guardian's own
   healthy snapshot. Two layers now free guardian-owned space:
   - `snapshots.mark_healthy` rotates **delete-first** when the pool refused
-    the create on a real measurement, the lifeline is ≥23h old, AND the pool
-    grew ≥ max(1 GiB, 1%) since it was taken (`lifeline_marks.json`). A
-    full-but-stable pool keeps its lifeline. A refused refresh retries in ~1h
+    the create on a real measurement of a NAMED pool, the lifeline is ≥23h
+    old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
+    live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
+    lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    The settle is reserved before the delete. Healthy snapshots are never
+    retention-evicted before a create. A refused refresh retries in ~1h
     (own `.last_healthy` marker) and alerts, throttled.
   - relief deletes ONE guardian snapshot per pass when free data ≤
     `min_reserve_pct` (3%) or free metadata ≤ `min_meta_reserve_pct` (10%):
     pre-recovery oldest first, then superseded healthy, the lifeline last;
-    a failed delete falls through to the next; 5-minute settle stamped before
+    a failed delete falls through to the next unless the client timed out
+    (outcome unknown → stop and alert); 5-minute settle stamped before
     the delete (delete-first starts it too); pool identity re-checked first.
     `safe_to_snapshot` refuses inside the reserve, so a fresh snapshot is never
-    relief's next target. Unable to measure/name the pool for 1h → daily
-    WARNING.
+    relief's next target. Unable to measure, read or name the pool for 1h →
+    daily WARNING.
   - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
     `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
     (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an

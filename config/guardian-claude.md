@@ -112,9 +112,10 @@ Before recommending IO_TRIAGE, check the PSI trend:
   metadata space reaches its reserve it deletes ONE `guardian-*` snapshot
   (pre-recovery first, the rollback lifeline last) and alerts. The daily
   healthy snapshot rotates delete-first when the pool refuses its create and
-  the old one is measurably diverging. If you are diagnosing a full pool, read
-  the relief alerts and `pool_relief_state.json` / `lifeline_marks.json` in the
-  guardian state dir first. Only snapshots named exactly
+  LVM shows the snapshots hold space no live volume maps. If you are diagnosing
+  a full pool, read the relief alerts and `pool_relief_state.json` in the
+  guardian state dir first; `sudo lvs -o lv_name,pool_lv,data_percent,lv_size
+  <vg>` shows what each volume maps (snapshots read blank). Only snapshots named exactly
   `guardian-YYYYmmdd-HHMMSS` (optionally `-healthy` / `-pre-recovery`) are the
   guardian's; every other snapshot, including a hand-made `guardian-…` one,
   belongs to the user — never delete it. Runbook:

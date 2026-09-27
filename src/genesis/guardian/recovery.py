@@ -357,11 +357,11 @@ class RecoveryEngine:
 
         ok = await self._snapshots.restore(healthy)
         if not ok:
-            # Names are timestamped and sort newest-first; anything sorting
-            # above the healthy name is newer.
-            newer = [
-                n for n in await self._snapshots.list_snapshots() if n > healthy
-            ]
+            # list_snapshots() is newest-first by incus's created_at (never by
+            # name string), and get_latest_healthy() reads the same order, so
+            # everything listed before the healthy snapshot is newer.
+            names = await self._snapshots.list_snapshots()
+            newer = names[: names.index(healthy)] if healthy in names else []
             if newer:
                 logger.warning(
                     "Restore of %s failed with newer snapshots present — "

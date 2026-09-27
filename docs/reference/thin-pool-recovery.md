@@ -49,15 +49,28 @@ these hold:
   reached threshold". A failed probe (incus, `lvs` or `df` unreachable) never
   counts;
 - the current healthy snapshot is at least 23 hours old;
-- it is measurably **diverging**: when each healthy snapshot is taken, the
-  Guardian records the pool's used bytes (`lifeline_marks.json` in its state
-  directory), and the pool must have grown since by at least 1 GiB, or 1% of
-  the pool if that is larger. A pool that is full but not growing keeps its
-  snapshot, since deleting it would free next to nothing;
-- relief is `live` (below), its configuration is valid, and it has not
-  deleted anything in the last 5 minutes.
+- LVM **measures** that the healthy snapshots hold space nothing live maps:
+  the pool's used bytes, minus what every live thin volume in the pool maps,
+  must be at least 1 GiB (or 1% of the pool, if larger). That difference is a
+  lower bound on what deleting the snapshots frees. A pool that is full of
+  live container data keeps its snapshot, because new data grows the container
+  and the pool alike and so never counts. Both figures come from one `lvs`
+  read, and only a read that includes the running container's own volume
+  counts. If any other volume in the pool cannot be read (an inactive one, or
+  a snapshot you made yourself), there is no measurement and nothing is
+  deleted. If the delete itself times out, it alerts that the rollback
+  snapshot may be gone rather than retrying;
+- relief is `live` (below), its configuration is valid, it has not deleted
+  anything in the last 5 minutes, and its 5-minute settle stamp can be saved
+  BEFORE the delete.
 
-If a failed rotation left two healthy snapshots, the older one goes first. If
+This needs LVM's per-volume view, so it runs on LVM-thin pools only. On btrfs
+and dir pools delete-first never fires; pool relief (below) is the protection
+there, and it covers every backend.
+
+If a failed rotation left two healthy snapshots, the older one goes first.
+Healthy snapshots are never evicted by the ordinary retention step before a
+create, so a refused create cannot cost both of them. If
 the create is still refused after the delete, there is no rollback target
 until the pool recovers. The alert says so.
 
@@ -76,8 +89,11 @@ Guardian snapshot and sends a CRITICAL alert naming it. The order is:
 2. superseded healthy snapshots left behind by a failed rotation;
 3. the current healthy snapshot (the rollback target) last.
 
-If a delete fails (a busy volume, say), it tries the next snapshot in that
-order, still freeing at most one per pass. After deleting, it waits 5 minutes
+If a delete fails (a busy volume, say), it re-lists the snapshots. If the
+snapshot is gone anyway, that was this pass's delete. If the client timed out,
+the daemon may still be finishing a slow delete, so it stops and alerts ("delete
+outcome unknown") rather than deleting another. Otherwise it tries the next
+snapshot in that order, still freeing at most one per pass. After deleting, it waits 5 minutes
 before the next delete, so the effect shows in a fresh measurement first (btrfs
 frees a deleted snapshot's space asynchronously). A delete-first rotation starts
 the same 5-minute wait. And the Guardian never takes a NEW snapshot while free
@@ -102,9 +118,10 @@ so the pool is barely growing.
   Guardian snapshot is gone, it sends a CRITICAL alert saying something else is
   consuming the pool (throttled to `storage_pool.realert_hours`).
 - It never grows a pool. Adding space is an operator action (below).
-- It never acts on a pool it cannot name: an unknown backend, a failed
-  measurement, or a volume group with several thin pools means no action. If
-  that lasts an hour, it sends a WARNING ("Pool relief cannot act"), at most
+- It never acts on a pool it cannot name or read: an unknown backend, a
+  failed measurement, a measurement with no usage figures, or a volume group
+  with several thin pools (whatever figures it shows) means no action. If that
+  lasts an hour, it sends a WARNING ("Pool relief cannot act"), at most
   once a day.
 
 ### Levers
@@ -122,8 +139,9 @@ Environment kill switch: `GUARDIAN_POOL_RELIEF_DISABLED=1` forces `alert_only`,
 which stops every automatic delete this page describes.
 
 Relief refuses to act on a configuration it cannot trust: a reserve outside
-0–50, `realert_hours` outside 0.1–720, a non-number, or an empty
-`snapshots.prefix`. It sends one warning a day instead. Every relief alert is
+0–50, `realert_hours` outside 0.1–720, a non-number, a
+`storage_pool.enabled` that is not a real true/false (a quoted `"false"` is a
+string), or an empty `snapshots.prefix`. It sends one warning a day instead. Every relief alert is
 sent only if its "already alerted" stamp could be saved, so an unwritable state
 directory produces no alert storm. Relief also saves its 5-minute settle stamp
 BEFORE deleting, and re-reads the pool's identity right before deleting. If
@@ -139,7 +157,7 @@ sudo vgs <vg>                                  # VFree = what an extend could us
 incus snapshot list <container>                # guardian-* snapshots and their expiry
 journalctl --user -u genesis-guardian.service --since -1d | grep -iE 'pool|snapshot'
 sudo journalctl -t dmeventd --since -1d        # autoextend attempts ("Insufficient free space")
-cat ~/.local/state/genesis-guardian/lifeline_marks.json      # pool usage when the lifeline was taken
+sudo lvs -o lv_name,pool_lv,origin,data_percent,lv_size <vg>   # per volume: snapshots show a blank Data%
 cat ~/.local/state/genesis-guardian/pool_relief_state.json   # relief's settle / alert stamps
 ```
 

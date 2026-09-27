@@ -11,8 +11,8 @@ allowed to delete. Alerts are not a mechanism. This is.
 Two layers stop that incident, and this module is the second:
 
 1. ``SnapshotManager.mark_healthy`` rotates delete-first when a measured pool
-   refusal meets a lifeline that is measurably diverging. That ends the
-   refused-rotation loop at its first day.
+   refusal meets a lifeline that LVM shows holds space nothing live maps. That
+   ends the refused-rotation loop at its first day (LVM-thin only).
 2. Relief (here) is the backstop for everything else: when free DATA space is
    at or below ``min_reserve_pct`` of the pool, or free METADATA space at or
    below ``min_meta_reserve_pct`` of the metadata LV, it deletes ONE
@@ -106,6 +106,9 @@ def validate_relief_config(config) -> str | None:
             return f"storage_pool.{name}={v!r} (expected a number in [{lo}, {hi}])"
         return None
 
+    if not isinstance(cfg.enabled, bool):
+        # _build_sub does not coerce: `enabled: "false"` is a truthy string.
+        return f"storage_pool.enabled={cfg.enabled!r} (expected true or false)"
     for problem in (
         num("min_reserve_pct", 0, 50),
         num("min_meta_reserve_pct", 0, 50),
@@ -187,10 +190,31 @@ def pool_key(status: StoragePoolStatus) -> str | None:
 
 
 def _ambiguous_pool(status: StoragePoolStatus) -> bool:
-    """More than one thin pool in the VG: the percentages may belong to a
-    different pool than the container's. Relief never acts on a pool it
-    cannot name (the tier alerts still report it)."""
-    return status.data_pct is not None and bool(status.vg_name) and not status.thinpool_lv
+    """An LVM pool whose thin-pool LV is unnamed (several thin pools in the VG):
+    ANY percentage present may belong to a different pool than the
+    container's — a metadata-only reading is exactly as unattributable as a
+    data one (review). Relief never acts on a pool it cannot name."""
+    return bool(status.vg_name) and not status.thinpool_lv
+
+
+def _unactionable(status: StoragePoolStatus) -> tuple[str, str] | None:
+    """(outcome, why) when relief must not act on this measurement, else None.
+
+    The ONE admission rule for both the decision and the pre-delete re-check:
+    measured, carrying at least one usage figure, and naming its pool. A
+    "detected" status with no figures (lvs answered but reported nothing
+    usable) would otherwise read as "no shortfall" forever (review).
+    """
+    if not status.detected:
+        return "unmeasured", f"the storage pool could not be measured ({status.detail or 'no detail'})"
+    if status.data_pct is None and status.metadata_pct is None and status.pool_used_pct is None:
+        return "no_signal", f"the pool measurement carried no usage figures ({status.detail})"
+    if _ambiguous_pool(status) or pool_key(status) is None:
+        return "ambiguous_pool", (
+            "the pool's thin-pool LV could not be identified (e.g. several thin "
+            f"pools in one VG): {status.detail}"
+        )
+    return None
 
 
 def shortfall(status: StoragePoolStatus, cfg) -> str | None:
@@ -244,9 +268,7 @@ async def _same_pool_now(config, status: StoragePoolStatus) -> bool:
         logger.warning("pre-delete pool re-check failed", exc_info=True)
         return False
     key = pool_key(status)
-    return (
-        key is not None and again.detected and pool_key(again) == key and not _ambiguous_pool(again)
-    )
+    return key is not None and _unactionable(again) is None and pool_key(again) == key
 
 
 # --- planning ------------------------------------------------------------------
@@ -399,25 +421,9 @@ async def check_pool_relief(config, dispatcher, snapshots, *, now: datetime | No
         )
 
     status = await measure_storage_pool(config)
-    if not status.detected:
-        return await _cannot_act(
-            state_path,
-            state,
-            now,
-            dispatcher,
-            "unmeasured",
-            f"the storage pool could not be measured ({status.detail or 'no detail'})",
-        )
-    if _ambiguous_pool(status) or pool_key(status) is None:
-        return await _cannot_act(
-            state_path,
-            state,
-            now,
-            dispatcher,
-            "ambiguous_pool",
-            "the pool's thin-pool LV could not be identified (e.g. several thin "
-            f"pools in one VG): {status.detail}",
-        )
+    blocked = _unactionable(status)
+    if blocked is not None:
+        return await _cannot_act(state_path, state, now, dispatcher, *blocked)
     if state.pop("cannot_act_since", None) is not None:
         _save_state(state_path, state)
     reason = shortfall(status, cfg)
@@ -476,10 +482,30 @@ async def check_pool_relief(config, dispatcher, snapshots, *, now: datetime | No
     for target in order:
         # A snapshot whose delete keeps failing (busy LV, an export in flight)
         # must not pin relief to it forever: fall through to the next one, but
-        # still free at most ONE per pass.
+        # still free at most ONE per pass. A failure is only DEFINITE once a
+        # re-list shows the snapshot still there and the client did not time
+        # out: incus's client giving up says nothing about whether the daemon
+        # finished a slow delete (review), so then stop and re-measure.
         if not await snapshots.delete(target):
-            failed.append(target)
-            continue
+            err = getattr(snapshots, "last_delete_error", None)
+            after = await snapshots.list_snapshot_meta_strict()
+            if after is not None and target not in {n for n, _ in after}:
+                pass  # it went after all: count it as this pass's one delete
+            elif after is None or err == "timeout":
+                failed.append(target)
+                if _throttled(state_path, state, "delete_indeterminate", now, 1):
+                    await _send(
+                        dispatcher,
+                        AlertSeverity.CRITICAL,
+                        "Guardian delete outcome unknown",
+                        f"{reason}. {numbers}. Deleting guardian snapshot {target} did not "
+                        "confirm (the client timed out or the snapshot list failed); no "
+                        "further snapshot is deleted until a fresh pass re-measures.",
+                    )
+                return f"delete_indeterminate:{target}"
+            else:
+                failed.append(target)
+                continue
         lifeline_note = (
             " This was the rollback lifeline: SNAPSHOT_ROLLBACK has no target until "
             "the next healthy snapshot."

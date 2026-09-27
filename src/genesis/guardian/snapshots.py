@@ -10,13 +10,20 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
-from genesis.guardian.pool import measure_storage_pool, pool_mount_path
-from genesis.util.atomic import atomic_write_text
+from genesis.guardian.pool import (
+    THIN_LV_FIELDS,
+    THIN_LV_SELECT,
+    incus_container_lv_name,
+    incus_snapshot_lv_name,
+    measure_storage_pool,
+    pool_mount_path,
+    snapshot_only_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,15 +99,16 @@ REFUSED_POOL_SPACE = "pool_space"
 REFUSED_PROBE = "probe_failed"
 REFUSED_OTHER = "create_failed"
 
-# Delete-first needs EVIDENCE that the old lifeline is what fills the pool:
-# pool usage must have grown by at least this much since it was taken (its
-# copy-on-write divergence is bounded above by that growth). Below it the pool
-# is full but stable — deleting the lifeline would free next to nothing and
-# leave no rollback target. The floor is measurement noise, not a policy
-# threshold: 1 GiB, or 1% of the pool on a large one.
-_DIVERGENCE_MIN_BYTES = 1024**3
-_DIVERGENCE_MIN_FRAC = 0.01
-LIFELINE_MARKS_FILE = "lifeline_marks.json"
+# Delete-first needs EVIDENCE that deleting the lifeline frees real space:
+# LVM must show the guardian's healthy snapshots hold at least this much that
+# no live volume maps (pool.snapshot_only_bytes — a measured lower bound, not
+# an inference from pool growth, which new container data also causes). Below
+# it, deleting the lifeline would free next to nothing and leave no rollback
+# target. The floor is measurement noise, not a policy threshold: 1 GiB, or 1%
+# of the pool on a large one. Only LVM-thin can measure this; on other
+# backends delete-first never fires and pool relief's reserve is the guard.
+_SNAPSHOT_ONLY_MIN_BYTES = 1024**3
+_SNAPSHOT_ONLY_MIN_FRAC = 0.01
 
 
 def _sort_newest_first(rows: list[tuple[str, datetime | None]]) -> None:
@@ -138,11 +146,11 @@ class SnapshotManager:
         self.last_gate_measured = False
         # Why the last take() returned None (REFUSED_*), or None after success.
         self.last_refusal: str | None = None
+        # Why the last delete() failed (the runner's "timeout" = outcome
+        # unknown), or None after a success.
+        self.last_delete_error: str | None = None
         # What mark_healthy() had to do beyond a plain rotation, for alerting.
         self.last_rotation_note: str | None = None
-        # The lifeline mark_healthy() deleted first (so the caller can start
-        # pool relief's settle: the two must not delete back to back).
-        self.deleted_first: str | None = None
 
     async def check_pool_space(self) -> float:
         """Check genesis pool disk usage. Returns usage percentage (0-100).
@@ -231,6 +239,12 @@ class SnapshotManager:
             logger.warning("Pool measurement failed — using df fallback", exc_info=True)
             pool_status = None
         pool_measured = pool_status is not None and pool_status.detected
+        # A refusal only counts as the POOL refusing when the pool is named: an
+        # LVM VG with several thin pools reports the FIRST row's figures, which
+        # may be another pool's (review) — refuse, but as a probe refusal.
+        pool_named = pool_measured and (
+            pool_status.thinpool_lv is not None or pool_status.vg_name is None
+        )
         if pool_measured:
             # Never looser than pool relief: a snapshot taken inside relief's
             # reserve would be deleted again within minutes, freeing nothing
@@ -241,7 +255,7 @@ class SnapshotManager:
             reason = shortfall(pool_status, self._config.storage_pool)
             if reason is not None:
                 logger.error("Pool at its relief reserve (%s) — refusing snapshot", reason)
-                self.last_gate_measured = True
+                self.last_gate_measured = pool_named
                 return False
         if pool_measured and (
             pool_status.data_pct is not None or pool_status.metadata_pct is not None
@@ -254,14 +268,14 @@ class SnapshotManager:
                     "Pool data %.1f%% >= %.0f%% high tier — refusing snapshot",
                     data, tiers.data_high_pct,
                 )
-                self.last_gate_measured = True
+                self.last_gate_measured = pool_named
                 return False
             if meta is not None and meta >= tiers.metadata_high_pct:
                 logger.error(
                     "Pool metadata %.1f%% >= %.0f%% high tier — refusing snapshot",
                     meta, tiers.metadata_high_pct,
                 )
-                self.last_gate_measured = True
+                self.last_gate_measured = pool_named
                 return False
             return True
 
@@ -350,17 +364,15 @@ class SnapshotManager:
             return None
 
         # Delete-before-create: remove excess snapshots to stay within
-        # retention — but NEVER evict the latest healthy snapshot (the offline
-        # snapshot-rollback lifeline). prune() has the same exemption; without
-        # it here, a pre-recovery take at retention=1 would delete the healthy
-        # snapshot right before the risky action that might need it. Rotation
-        # of superseded healthy snapshots is mark_healthy()'s job (after a
-        # successful create — no zero-lifeline window).
+        # retention — but NEVER evict a healthy snapshot here. Not the latest
+        # (the offline snapshot-rollback lifeline: a pre-recovery take at
+        # retention=1 would delete it right before the risky action that might
+        # need it), and not a superseded one either: evicting it BEFORE a
+        # create that then fails, with delete-first taking the other, would
+        # leave no rollback target (review). Superseded healthy snapshots are
+        # mark_healthy()'s to rotate, after a successful create.
         existing = await self.list_snapshots()
-        latest_healthy = next(
-            (n for n in existing if n.endswith(_HEALTHY_SUFFIX)), None,
-        )
-        candidates = [n for n in existing if n != latest_healthy]
+        candidates = [n for n in existing if not n.endswith(_HEALTHY_SUFFIX)]
         if candidates and len(candidates) >= self._retention:
             for old_name in candidates[self._retention - 1:]:
                 if await self.delete(old_name):
@@ -420,7 +432,12 @@ class SnapshotManager:
         )
         if rc != 0:
             logger.warning("Failed to delete snapshot %s: %s", name, stderr)
+            # "timeout" (the runner's marker) means the OUTCOME is unknown:
+            # the daemon may still finish the delete. Callers that chain
+            # deletes read this (pool_relief).
+            self.last_delete_error = stderr or "failed"
             return False
+        self.last_delete_error = None
         return True
 
     async def restore(self, name: str) -> bool:
@@ -602,6 +619,7 @@ class SnapshotManager:
         snapshot_size_history: list[int] | None = None,
         *,
         delete_first_allowed: bool = False,
+        reserve_settle: Callable[[], bool] | None = None,
     ) -> str | None:
         """Take a 'healthy' snapshot, then rotate superseded healthy ones.
 
@@ -609,34 +627,33 @@ class SnapshotManager:
         before the old one goes, so an ordinary failed create leaves the
         previous healthy snapshot intact with no zero-lifeline window.
 
-        EXCEPT when all three hold:
+        EXCEPT when all of these hold:
 
         * the POOL refused the create, on a real measurement — the guardian's
-          own tier gate (``REFUSED_POOL_GATE``) or LVM's "free space in thin
-          pool reached threshold" (``REFUSED_POOL_SPACE``); never a probe
-          failure;
+          own gate (``REFUSED_POOL_GATE``) or LVM's "free space in thin pool
+          reached threshold" (``REFUSED_POOL_SPACE``); never a probe failure;
         * the newest lifeline is at least a rotation interval old;
-        * it is measurably DIVERGING — pool usage grew by at least
-          ``_DIVERGENCE_MIN_*`` since it was taken (recorded in
-          ``lifeline_marks.json`` at creation).
+        * LVM MEASURES that the healthy snapshots hold at least
+          ``_SNAPSHOT_ONLY_MIN_*`` no live volume maps, so deleting frees it
+          (``_lifeline_holds_space``; LVM-thin only);
+        * the caller passes ``delete_first_allowed`` — pool relief is live
+          (not ``alert_only``/``off``, not killed by GUARDIAN_POOL_RELIEF_DISABLED,
+          valid config) and is not settling after its own action;
+        * ``reserve_settle`` (when given) succeeds: it persists relief's settle
+          stamp BEFORE the delete, so relief cannot delete again on the next
+          tick if the state file turns out to be unwritable.
 
-        and the caller passes ``delete_first_allowed`` — pool relief is live
-        (not ``alert_only``/``off``, not killed by GUARDIAN_POOL_RELIEF_DISABLED,
-        valid config) and is not settling after its own action this tick.
+        Then create-first cannot succeed while that snapshot keeps filling the
+        pool — retrying it daily is how one snapshot once survived a week and
+        filled the pool to 100% — so the stale lifeline is deleted FIRST. The
+        zero-lifeline window is seconds, or lasts until the pool recovers if the
+        retry is still refused; either is recorded in ``last_rotation_note``.
 
-        Then create-first cannot succeed while that divergence keeps filling
-        the pool — retrying it daily is how one snapshot once survived a week
-        and filled the pool to 100% — so the stale lifeline is deleted FIRST.
-        The zero-lifeline window is seconds, or lasts until the pool recovers
-        if the retry is still refused; either is recorded in
-        ``last_rotation_note`` for the caller to alert on.
-
-        A pool that is merely FULL but stable also refuses the create; there
-        the old snapshot holds almost nothing, so it is kept (no evidence, no
-        delete). Pool relief (pool_relief.py) acts if the pool then runs short.
+        A pool that is FULL of live data also refuses the create; there the old
+        snapshot holds little, so it is kept (no evidence, no delete). Pool
+        relief (pool_relief.py) acts if the pool then runs short.
         """
         self.last_rotation_note = None
-        self.deleted_first = None
         name = await self.take(
             label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
         )
@@ -647,12 +664,29 @@ class SnapshotManager:
         ):
             refusal = self.last_refusal
             stale = await self._stale_lifeline(datetime.now(UTC))
-            if stale is not None and await self._lifeline_diverging() and await self.delete(stale):
+            held = await self._lifeline_holds_space() if stale is not None else None
+            deleted = False
+            if (
+                stale is not None
+                and held is not None
+                and (reserve_settle is None or reserve_settle())
+            ):
+                deleted = await self.delete(stale)
+                if not deleted and self.last_delete_error == "timeout":
+                    # The client gave up; the daemon may still finish the
+                    # delete. Say so rather than retry as if nothing happened.
+                    self.last_rotation_note = (
+                        f"pool refused the create ({refusal}); deleting the lifeline "
+                        f"{stale} did not confirm (the client timed out) — the rollback "
+                        "lifeline may be gone"
+                    )
+                    return None
+            if deleted:
                 logger.warning(
-                    "Pool refused the healthy snapshot (%s): deleted diverging lifeline "
-                    "%s first, retrying the create", refusal, stale,
+                    "Pool refused the healthy snapshot (%s): deleted lifeline %s first "
+                    "(snapshots held >= %.1f GiB no live volume maps), retrying the create",
+                    refusal, stale, held / 1024**3,
                 )
-                self.deleted_first = stale
                 name = await self.take(
                     label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
                 )
@@ -667,76 +701,58 @@ class SnapshotManager:
                         else "NO rollback lifeline until the pool recovers"
                     )
                 self.last_rotation_note = (
-                    f"pool refused the create ({refusal}); deleted the diverging "
-                    f"lifeline {stale} first, then {outcome}"
+                    f"pool refused the create ({refusal}); the healthy snapshots held at "
+                    f"least {held / 1024**3:.1f} GiB no live volume maps, so the lifeline "
+                    f"{stale} was deleted first, then {outcome}"
                 )
         if name is None:
             return None
 
-        await self._record_lifeline_mark(name)
         for old_name in await self.list_snapshots():
             is_superseded = old_name.endswith(_HEALTHY_SUFFIX) and old_name != name
             if is_superseded and await self.delete(old_name):
                 logger.info("Rotated superseded healthy snapshot: %s", old_name)
         return name
 
-    def _marks_path(self) -> Path:
-        return self._config.state_path / LIFELINE_MARKS_FILE
+    async def _lifeline_holds_space(self) -> float | None:
+        """Bytes the healthy snapshots MEASURABLY hold alone, or None.
 
-    @staticmethod
-    def _pool_used(status) -> tuple[str, float, int] | None:
-        """(pool identity, used bytes, size bytes) of a measurement, or None."""
-        if not status.detected or not status.pool_size_bytes or not status.pool_name:
-            return None
-        pct = status.data_pct if status.data_pct is not None else status.pool_used_pct
-        if pct is None:
-            return None
-        key = f"{status.pool_name}|{status.vg_name or ''}|{status.thinpool_lv or ''}"
-        return key, pct / 100.0 * status.pool_size_bytes, status.pool_size_bytes
-
-    async def _record_lifeline_mark(self, name: str) -> None:
-        """Remember the pool usage at the moment lifeline ``name`` was taken."""
-        try:
-            used = self._pool_used(await measure_storage_pool(self._config))
-        except Exception:
-            logger.warning("could not measure the pool for the lifeline mark", exc_info=True)
-            used = None
-        if used is None:
-            return
-        try:
-            atomic_write_text(
-                self._marks_path(),
-                json.dumps({"name": name, "pool": used[0], "used_bytes": used[1]}),
-            )
-        except OSError:
-            logger.warning("could not write %s", self._marks_path(), exc_info=True)
-
-    async def _lifeline_diverging(self) -> bool:
-        """True when the pool grew enough since the newest lifeline was taken.
-
-        No mark (a lifeline older than this code, or an unwritable state dir),
-        a different pool, or no measurement → False: without evidence the
-        lifeline is kept.
+        None — no evidence, keep the lifeline — unless the pool is an LVM thin
+        pool identified by name and the lower bound from
+        :func:`pool.snapshot_only_bytes` reaches the floor. Any other backend,
+        an unidentified pool, a non-guardian snapshot (or any other volume)
+        whose mapping cannot be read, or a failed ``lvs`` → None.
         """
         try:
-            mark = json.loads(self._marks_path().read_text())
-            used_then = float(mark["used_bytes"])
-            key_then = str(mark["pool"])
-            mark_name = str(mark["name"])
-        except (OSError, ValueError, KeyError, TypeError):
-            return False
-        newest = await self.get_latest_healthy()
-        if newest != mark_name:
-            return False
-        try:
-            now = self._pool_used(await measure_storage_pool(self._config))
+            status = await measure_storage_pool(self._config)
         except Exception:
             logger.warning("could not measure the pool for delete-first", exc_info=True)
-            return False
-        if now is None or now[0] != key_then:
-            return False
-        floor = max(_DIVERGENCE_MIN_BYTES, _DIVERGENCE_MIN_FRAC * now[2])
-        return now[1] - used_then >= floor
+            return None
+        if (
+            not status.detected or not status.vg_name or not status.thinpool_lv
+            or not status.pool_size_bytes or status.data_pct is None
+        ):
+            return None
+        meta = await self.list_snapshot_meta_strict()
+        if not meta:
+            return None
+        snapshot_lvs = {
+            incus_snapshot_lv_name(self._container, n)
+            for n, _ in meta if n.endswith(_HEALTHY_SUFFIX)
+        }
+        rc, out, err = await _run_subprocess(
+            "sudo", "-n", "lvs", "--reportformat", "json", "--nosuffix", "--units", "b",
+            "-S", THIN_LV_SELECT, "-o", ",".join(THIN_LV_FIELDS), status.vg_name,
+            timeout=10.0,
+        )
+        if rc != 0:
+            logger.warning("lvs (thin volumes) failed for delete-first: %s", err[:120])
+            return None
+        held = snapshot_only_bytes(
+            out, status.thinpool_lv, incus_container_lv_name(self._container), snapshot_lvs,
+        )
+        floor = max(_SNAPSHOT_ONLY_MIN_BYTES, _SNAPSHOT_ONLY_MIN_FRAC * status.pool_size_bytes)
+        return held if held is not None and held >= floor else None
 
     async def _stale_lifeline(self, now: datetime) -> str | None:
         """The healthy snapshot to delete first, or None.
