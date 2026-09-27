@@ -154,6 +154,34 @@ class TestGenesisBridge:
         assert data["answer"] == "Full LLM answer"
         assert handler.handle.await_count == 2
 
+    async def test_web_search_uses_the_standard_chain(self):
+        # An explicit backend now runs only that backend, so the voice path
+        # must ask for the standard chain rather than a single provider.
+        from unittest.mock import patch
+
+        fake = AsyncMock(return_value={"results": [{"title": "T", "snippet": "S"}]})
+        with patch("genesis.mcp.health.web_tools._impl_web_search", fake):
+            result = await GenesisBridge().handle_tool_call(
+                "web_search", json.dumps({"query": "weather"})
+            )
+        assert fake.await_args.kwargs["backend"] == "auto"
+        assert json.loads(result) == {"results": ["T: S"]}
+
+    async def test_web_search_failure_is_an_error_not_no_results(self):
+        from unittest.mock import patch
+
+        failed = {
+            "results": [],
+            "error": "All search backends failed — brave: API_KEY_BRAVE is not set",
+        }
+        with patch("genesis.mcp.health.web_tools._impl_web_search", AsyncMock(return_value=failed)):
+            result = await GenesisBridge().handle_tool_call(
+                "web_search", json.dumps({"query": "weather"})
+            )
+        data = json.loads(result)
+        assert "results" not in data
+        assert data["error"].startswith("Web search failed: All search backends failed")
+
     async def test_web_search_import_failure(self):
         bridge = GenesisBridge()
         result = await bridge.handle_tool_call(

@@ -347,13 +347,20 @@ class GenesisBridge:
         try:
             from genesis.mcp.health.web_tools import _impl_web_search
 
-            result = await _impl_web_search(query, backend="brave", max_results=3)
+            # "auto" is the standard chain (TinyFish, then SearXNG, then Brave).
+            # This used to pass "brave", which then meant "SearXNG, then Brave";
+            # an explicit backend now runs only that backend.
+            result = await _impl_web_search(query, backend="auto", max_results=3)
             search_results = result.get("results", [])
             if search_results:
                 snippets = [
                     f"{r.get('title', '')}: {r.get('snippet', '')}" for r in search_results[:3]
                 ]
                 return json.dumps({"results": snippets})
+            # A failed search is not "no results": say so, so the voice model
+            # does not tell the user the web has nothing.
+            if result.get("error"):
+                return json.dumps({"error": f"Web search failed: {result['error']}"})
             return json.dumps({"results": [], "note": "No results found"})
         except ImportError:
             logger.warning("Web search provider not available")
