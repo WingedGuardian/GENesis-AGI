@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "scripts" / "lib" / "network_resilience.sh"
@@ -148,6 +151,13 @@ def test_fresh_apply_writes_dropin_units_and_reloads(tmp_path):
     assert "Type=oneshot" in service
     assert f"ExecStart={p['script']}" in service
     assert p["script"].read_text() == WATCHDOG.read_text()
+    # The root watchdog is told where the owning user's alert queue is (it runs
+    # with HOME=/root and could not find it), and the queue dir exists, created
+    # as that user rather than by root.
+    queue = Path(env["NETRES_ETC_ROOT"]) / ".genesis" / "alerts" / "queue"
+    assert f'Environment="NETWD_ALERT_QUEUE={queue}"' in service
+    assert queue.is_dir()
+    assert service.index("Environment=") < service.index("ExecStart=")
 
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
     assert "reload" in calls  # networkctl reload for the drop-in
@@ -409,10 +419,48 @@ def test_update_sh_wires_the_lib_visibly():
 _WD_SYSTEMCTL_STUB = """#!/bin/bash
 case "$1" in
     is-enabled) printf '%s' "${WD_ENABLED-enabled}" ;;
-    is-active)  printf '%s' "${WD_ACTIVE-active}" ;;
-    show)       printf '@%s' "${WD_START_EPOCH-0}" ;;
-    restart)    echo "restart $2" >> "$WD_RESTART_LOG"; exit "${WD_RESTART_RC:-0}" ;;
+    is-active)
+        if [ "$2" = "tailscaled" ]; then printf '%s' "${WD_TS_ACTIVE-active}"
+        else printf '%s' "${WD_ACTIVE-active}"; fi ;;
+    show)
+        if [ "$2" = "tailscaled" ] && [ -n "${WD_TS_START_RAW:-}" ]; then printf '%s' "$WD_TS_START_RAW"
+        elif [ "$2" = "tailscaled" ]; then printf '@%s' "${WD_TS_START_EPOCH-0}"
+        else printf '@%s' "${WD_START_EPOCH-0}"; fi ;;
+    restart)
+        echo "restart $2" >> "$WD_RESTART_LOG"
+        if [ "$2" = "tailscaled" ]; then exit "${WD_TS_RESTART_RC:-0}"; fi
+        exit "${WD_RESTART_RC:-0}" ;;
 esac
+exit 0
+"""
+
+# `tailscale status --json` echoes WD_TS_STATUS; `tailscale ping` logs its argv
+# and answers per kind: a --tsmp ping (through the tunnel) exits WD_TS_TSMP_RC,
+# a plain discovery ping exits WD_TS_DISCO_RC. 0 = pong, 1 = "no reply" — the
+# exit codes measured from the real CLI. WD_TS_RELAY_ONLY=1 models a peer whose
+# discovery pong arrives only over a relay: the real CLI's --until-direct
+# (default true) then exits 1 ("direct connection not established"), so only
+# a ping carrying --until-direct=false succeeds. WD_TS_TSMP_SEQ (e.g. "1 0")
+# overrides WD_TS_TSMP_RC with one exit code per --tsmp call, in order.
+_WD_TAILSCALE_STUB = """#!/bin/bash
+if [ "$1" = "status" ]; then printf '%s' "$WD_TS_STATUS"; exit 0; fi
+if [ "$1" = "ping" ]; then
+    echo "$*" >> "$WD_TS_PING_LOG"
+    case " $* " in
+        *" --tsmp "*)
+            if [ -n "${WD_TS_TSMP_SEQ:-}" ]; then
+                n=$(grep -c -- '--tsmp' "$WD_TS_PING_LOG")
+                set -- $WD_TS_TSMP_SEQ
+                shift $((n - 1))
+                exit "${1:-0}"
+            fi
+            exit "${WD_TS_TSMP_RC:-0}" ;;
+    esac
+    if [ "${WD_TS_RELAY_ONLY:-0}" = "1" ]; then
+        case " $* " in *" --until-direct=false "*) ;; *) exit 1 ;; esac
+    fi
+    exit "${WD_TS_DISCO_RC:-0}"
+fi
 exit 0
 """
 
@@ -434,9 +482,21 @@ def _stage_wd(tmp_path: Path) -> dict:
     (bin_dir / "ip").write_text(_WD_IP_STUB)
     sysctl = bin_dir / "sysctl-stub"
     sysctl.write_text(_WD_SYSTEMCTL_STUB)
+    tailscale = bin_dir / "tailscale-stub"
+    tailscale.write_text(_WD_TAILSCALE_STUB)
     for f in bin_dir.iterdir():
         f.chmod(0o755)
+    queue = tmp_path / "alerts" / "queue"
+    queue.mkdir(parents=True)
     return {
+        # Always the stub, never the real CLI on the test machine's PATH.
+        "NETWD_TAILSCALE_BIN": str(tailscale),
+        "NETWD_TS_STAMP_FILE": str(tmp_path / "ts-stamp"),
+        "NETWD_TS_STATUS_SNAPSHOT": str(tmp_path / "ts-status.json"),
+        "NETWD_ALERT_QUEUE": str(queue),
+        "WD_TS_PING_LOG": str(tmp_path / "ts-ping.log"),
+        # No active peers: the tailscale check has nothing to look at.
+        "WD_TS_STATUS": json.dumps({"Self": {"Relay": "r1"}, "Peer": {}}),
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "NETWD_SYSTEMCTL": str(sysctl),
         "NETWD_STATE_FILE": str(tmp_path / "state.json"),
@@ -579,3 +639,657 @@ def test_watchdog_state_file_is_world_readable(tmp_path):
     _run_wd(env)
     mode = Path(env["NETWD_STATE_FILE"]).stat().st_mode & 0o777
     assert mode & 0o044  # infra collector reads it non-root
+
+
+# ── Tailscale stuck-tunnel check ──────────────────────────────────────────────
+#
+# The replay below is an observed incident's shape, with synthetic names, times
+# and addresses: the peer was Active, its last WireGuard handshake stopped
+# advancing, tunnel pings got no reply, and discovery pings still answered. The watchdog ticks every ~2 min; 300s after the stall is the first
+# tick that should act.
+
+_STALL = datetime(2030, 1, 15, 12, 0, 0, tzinfo=UTC)
+_PEER_IP = "100.64.0.7"
+
+
+def _ts_status(*, handshake: str, active: bool = True) -> str:
+    return json.dumps(
+        {
+            "BackendState": "Running",
+            "Self": {"HostName": "node", "Relay": "r1"},
+            "Peer": {
+                "nodekey:aa": {
+                    "HostName": "peer-a",
+                    "TailscaleIPs": [_PEER_IP, "2001:db8::7"],  # IPv6 doc range
+                    "Active": active,
+                    "Online": True,
+                    "Relay": "r2",
+                    "CurAddr": "198.51.100.7:41641",
+                    "LastHandshake": handshake,
+                    "RxBytes": 15434076,
+                    "TxBytes": 39340372,
+                },
+                "nodekey:bb": {  # idle, never handshaked — never a suspect
+                    "HostName": "idle-peer",
+                    "TailscaleIPs": ["100.64.0.8"],
+                    "Active": False,
+                    "LastHandshake": "0001-01-01T00:00:00Z",
+                },
+            },
+        }
+    )
+
+
+def _stage_incident(tmp_path: Path, *, seconds_after_stall: int = 326) -> dict:
+    env = _stage_wd(tmp_path)
+    # Real-CLI timestamp shape: nanoseconds + a local offset.
+    env["WD_TS_STATUS"] = _ts_status(handshake="2030-01-15T14:00:00.577514622+02:00")
+    env["NETWD_NOW"] = str(int(_STALL.timestamp()) + seconds_after_stall)
+    env["WD_TS_TSMP_RC"] = "1"  # tunnel: no reply
+    env["WD_TS_DISCO_RC"] = "0"  # path: fine
+    return env
+
+
+def _ts_restarted(env: dict) -> bool:
+    log = Path(env["WD_RESTART_LOG"])
+    return log.exists() and "restart tailscaled" in log.read_text()
+
+
+def _pings(env: dict) -> list[str]:
+    log = Path(env["WD_TS_PING_LOG"])
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _alerts(env: dict) -> list[dict]:
+    from genesis.guardian.alert.queue import list_queued
+
+    return [entry for _, entry in list_queued(env["NETWD_ALERT_QUEUE"])]
+
+
+def test_tailscale_incident_replay_heals_and_alerts(tmp_path):
+    env = _stage_incident(tmp_path)
+    result = _run_wd(env)
+    assert result.returncode == 0, result.stderr
+    assert _ts_restarted(env)
+    assert not _restarted(env)  # networkd was healthy — untouched
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "healed"
+    assert ts["heal_count"] == 1
+    assert ts["last_peer"] == f"peer-a ({_PEER_IP})"
+    diag = ts["last_diagnostics"]
+    # The evidence that explained the incident, captured at the moment.
+    assert diag["handshake_age_s"] == 325  # 326s minus the .577s fraction, floored
+    assert diag["self_relay"] == "r1"
+    assert diag["peer_relay"] == "r2"
+    assert diag["peer_curaddr"] == "198.51.100.7:41641"
+    assert diag["tsmp_ping"] == "no-reply" and diag["disco_ping"] == "reply"
+    snapshot = Path(env["NETWD_TS_STATUS_SNAPSHOT"])
+    assert json.loads(snapshot.read_text())["Peer"]["nodekey:aa"]["HostName"] == "peer-a"
+    assert snapshot.stat().st_mode & 0o077 == 0  # names the whole tailnet: root-only
+    # The owner alert parses with the REAL drain-side reader.
+    alerts = _alerts(env)
+    assert len(alerts) == 1
+    assert alerts[0]["source"] == "network-watchdog"
+    assert "restarted tailscaled" in alerts[0]["title"]
+    assert "peer-a" in alerts[0]["title"]
+    assert Path(env["NETWD_TS_STAMP_FILE"]).read_text().strip() == env["NETWD_NOW"]
+
+
+def test_tailscale_stall_younger_than_threshold_is_left_alone(tmp_path):
+    # 226s after the stall: past WireGuard's 180s reject point but inside one
+    # watchdog tick of it — not yet confirmed across two ticks.
+    env = _stage_incident(tmp_path, seconds_after_stall=226)
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _pings(env) == []  # not even a suspect
+    assert _state(env)["tailscale"]["last_action"] == "none"
+
+
+def test_tailscale_tunnel_that_answers_is_not_stuck(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_TS_TSMP_RC"] = "0"
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _alerts(env) == []
+    assert _state(env)["tailscale"]["last_action"] == "none"
+
+
+def test_tailscale_tunnel_revived_by_the_discovery_ping_is_not_restarted(tmp_path):
+    # The discovery ping can refresh a cold path; the tunnel is asked again
+    # before the restart, which drops every session.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_TSMP_SEQ"] = "1 0"  # first tunnel ping silent, second answers
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _alerts(env) == []
+    assert _state(env)["tailscale"]["last_action"] == "none"
+    kinds = ["tsmp" if "--tsmp" in p else "disco" for p in _pings(env)]
+    assert kinds == ["tsmp", "disco", "tsmp"]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("NETWD_TS_RATE_LIMIT_SEC", "abc"),
+        ("NETWD_TS_RATE_LIMIT_SEC", "-5"),
+        ("NETWD_TS_RATE_LIMIT_SEC", "0"),
+        ("NETWD_TS_STALE_SEC", "5m"),
+        ("NETWD_TS_STALE_SEC", "0"),
+        ("NETWD_TS_CALL_TIMEOUT", "0"),
+        ("NETWD_TS_RESTART_TIMEOUT", "0"),
+        ("NETWD_TS_RESTART_TIMEOUT", "08"),
+        ("NETWD_TS_PING_TIMEOUT", "3"),
+        ("NETWD_TS_PING_TIMEOUT", "0s"),
+    ],
+)
+def test_an_invalid_tailscale_knob_falls_back_to_its_default(tmp_path, name, value):
+    # A drop-in typo must not abort the check, disable a bound, or turn
+    # detection off: the incident still heals exactly as with the default.
+    env = _stage_incident(tmp_path)
+    env[name] = value
+    result = _run_wd(env)
+    assert result.returncode == 0, result.stderr
+    assert _ts_restarted(env)
+    assert f"ignoring invalid {name}" in result.stderr
+    assert "--timeout 3s" in _pings(env)[0]
+    alert = _alerts(env)[0]
+    assert "after 60 min" in alert["body"]  # the default hour, not the typo
+
+
+def test_an_invalid_rate_limit_still_holds_the_hour(tmp_path):
+    # A negative value used to remove the hourly bound entirely.
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_RATE_LIMIT_SEC"] = "-5"
+    Path(env["NETWD_TS_STAMP_FILE"]).write_text(str(int(env["NETWD_NOW"]) - 1800))
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "ratelimited"
+
+
+def test_the_snapshot_is_root_only_even_when_it_already_existed(tmp_path):
+    env = _stage_incident(tmp_path)
+    snapshot = Path(env["NETWD_TS_STATUS_SNAPSHOT"])
+    snapshot.write_text("old")
+    snapshot.chmod(0o644)
+    _run_wd(env)
+    assert json.loads(snapshot.read_text())["Peer"]["nodekey:aa"]["HostName"] == "peer-a"
+    assert snapshot.stat().st_mode & 0o077 == 0
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("ts-status")) == [
+        "ts-status.json"
+    ]  # no temp file left behind
+
+
+def test_tailscale_peer_that_went_away_is_not_healed(tmp_path):
+    # Tunnel AND discovery both silent: the peer is gone (powered off).
+    # Restarting our daemon cannot bring it back.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_DISCO_RC"] = "1"
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _alerts(env) == []
+    assert _state(env)["tailscale"]["last_action"] == "suspect-unreachable"
+
+
+def test_tailscale_inactive_peer_with_old_handshake_is_not_pinged(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_TS_STATUS"] = _ts_status(handshake="2030-01-15T14:00:00.577514622+02:00", active=False)
+    _run_wd(env)
+    assert _pings(env) == []
+    assert not _ts_restarted(env)
+
+
+def test_tailscale_only_the_tunnel_ping_decides_order(tmp_path):
+    # The tunnel ping runs first; a discovery ping is only spent on a peer whose
+    # tunnel did not answer, and the tunnel is asked once more before the
+    # stuck verdict (the discovery ping can revive a cold path).
+    env = _stage_incident(tmp_path)
+    _run_wd(env)
+    pings = _pings(env)
+    assert len(pings) == 3
+    assert "--tsmp" in pings[0] and _PEER_IP in pings[0]
+    assert "--tsmp" not in pings[1] and _PEER_IP in pings[1]
+    assert "--tsmp" in pings[2] and _PEER_IP in pings[2]
+    assert _ts_restarted(env)
+
+
+def test_tailscale_rate_limit_is_an_hour(tmp_path):
+    env = _stage_incident(tmp_path)
+    Path(env["NETWD_TS_STAMP_FILE"]).write_text(str(int(env["NETWD_NOW"]) - 1800))
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _alerts(env) == []
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "ratelimited"
+    assert ts["last_diagnostics"]["peer_relay"] == "r2"  # evidence kept anyway
+
+
+def test_tailscale_heals_again_after_the_hour(tmp_path):
+    env = _stage_incident(tmp_path)
+    Path(env["NETWD_TS_STAMP_FILE"]).write_text(str(int(env["NETWD_NOW"]) - 3601))
+    _run_wd(env)
+    assert _ts_restarted(env)
+
+
+def test_tailscale_networkd_rate_limit_does_not_gate_tailscale(tmp_path):
+    env = _stage_incident(tmp_path)
+    Path(env["NETWD_STAMP_FILE"]).write_text(env["NETWD_NOW"])  # networkd just healed
+    _run_wd(env)
+    assert _ts_restarted(env)
+
+
+def test_tailscale_observe_mode_alerts_without_restarting(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_MODE"] = "observe"
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "observed"
+    alerts = _alerts(env)
+    assert len(alerts) == 1 and "not restarted" in alerts[0]["title"]
+    assert Path(env["NETWD_TS_STAMP_FILE"]).exists()  # an hour before the next alert
+
+
+def test_tailscale_unknown_mode_degrades_to_observe_not_live(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_MODE"] = "yes-please"
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "observed"
+
+
+def test_tailscale_off_mode_does_nothing(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_MODE"] = "off"
+    _run_wd(env)
+    assert _pings(env) == []
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "off"
+
+
+def test_tailscale_daemon_not_running_is_unavailable(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_TS_ACTIVE"] = "inactive"
+    _run_wd(env)
+    assert _pings(env) == []
+    assert not _ts_restarted(env)  # never starts a daemon someone stopped
+    assert _state(env)["tailscale"]["last_action"] == "unavailable"
+
+
+def test_tailscale_not_installed_is_unavailable(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["NETWD_TAILSCALE_BIN"] = str(tmp_path / "no-such-tailscale")
+    result = _run_wd(env)
+    assert result.returncode == 0
+    assert _state(env)["tailscale"]["last_action"] == "unavailable"
+
+
+def test_tailscale_failed_restart_alerts_and_spends_the_hour(tmp_path):
+    # A failed restart has still dropped every session, and the next ticks will
+    # see tailscaled down and (by design) not start it. So: no heal claimed, the
+    # owner is told NOW, and the hour is spent so it cannot repeat every tick.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_RESTART_RC"] = "1"
+    result = _run_wd(env)
+    assert result.returncode != 0  # surfaces as a failed oneshot
+    assert _ts_restarted(env)  # attempted
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "restart-failed"
+    assert ts["heal_count"] == 0
+    assert Path(env["NETWD_TS_STAMP_FILE"]).read_text().strip() == env["NETWD_NOW"]
+    alerts = _alerts(env)
+    assert len(alerts) == 1 and "FAILED" in alerts[0]["title"]
+    # Next tick, restart still failing and the unit still up: no second attempt.
+    Path(env["WD_RESTART_LOG"]).write_text("")
+    env["NETWD_NOW"] = str(int(env["NETWD_NOW"]) + 120)
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "ratelimited"
+
+
+def test_tailscale_missing_queue_still_heals(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["NETWD_ALERT_QUEUE"] = str(tmp_path / "absent")
+    result = _run_wd(env)
+    assert result.returncode == 0
+    assert _ts_restarted(env)
+    assert not (tmp_path / "absent").exists()  # root must never create it
+    assert "journal-only" in result.stdout
+
+
+def test_both_checks_run_and_both_heal(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_LINKS_JSON"] = json.dumps(
+        {"Interfaces": [{"Name": "eth0", "AdministrativeState": "failed"}]}
+    )
+    _run_wd(env)
+    assert _restarted(env) and _ts_restarted(env)
+    st = _state(env)
+    assert st["last_trigger"] == "failed-link:eth0"
+    assert st["tailscale"]["last_action"] == "healed"
+
+
+def test_networkd_write_keeps_the_tailscale_record(tmp_path):
+    env = _stage_incident(tmp_path)
+    _run_wd(env)  # heal
+    env["WD_TS_TSMP_RC"] = "0"  # next tick: tunnel is fine again
+    env["NETWD_NOW"] = str(int(env["NETWD_NOW"]) + 120)
+    _run_wd(env)
+    st = _state(env)
+    assert st["tailscale"]["heal_count"] == 1
+    assert st["tailscale"]["last_heal"] == int(env["NETWD_NOW"]) - 120
+    assert st["heal_count"] == 0  # networkd's own counter untouched
+
+
+def test_tailscale_relay_only_peer_is_still_healed(tmp_path):
+    # No direct path to the peer: its discovery pong arrives over a relay. That
+    # peer IS reachable, so a stuck tunnel to it must heal, not be written off
+    # as "unreachable".
+    env = _stage_incident(tmp_path)
+    env["WD_TS_RELAY_ONLY"] = "1"
+    _run_wd(env)
+    assert _ts_restarted(env)
+    disco = [p for p in _pings(env) if "--tsmp" not in p]
+    assert disco and "--until-direct=false" in disco[0]
+
+
+def test_tailscale_unparseable_status_is_not_healthy(tmp_path):
+    for i, bad in enumerate(("not json at all", json.dumps({"Peer": []}))):
+        case_dir = tmp_path / f"case{i}"
+        case_dir.mkdir()
+        env = _stage_incident(case_dir)
+        env["WD_TS_STATUS"] = bad
+        _run_wd(env)
+        assert not _ts_restarted(env)
+        assert _state(env)["tailscale"]["last_action"] == "status-unparseable"
+
+
+def test_garbage_stamps_do_not_abort_either_check(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_LINKS_JSON"] = json.dumps(
+        {"Interfaces": [{"Name": "eth0", "AdministrativeState": "failed"}]}
+    )
+    Path(env["NETWD_STAMP_FILE"]).write_text("abc")
+    Path(env["NETWD_TS_STAMP_FILE"]).write_text("12x")
+    result = _run_wd(env)
+    assert "unbound variable" not in result.stderr
+    assert _restarted(env) and _ts_restarted(env)  # garbage reads as "no recent heal"
+
+
+def test_alert_queue_path_is_escaped_for_systemd(tmp_path):
+    env = _stage(tmp_path)
+    env["NETRES_ALERT_QUEUE"] = '/srv/a%b "q"/queue'
+    _run_apply(env)
+    service = _paths(env)["service"].read_text()
+    assert 'Environment="NETWD_ALERT_QUEUE=/srv/a%%b \\"q\\"/queue"' in service
+
+
+def test_tailscale_hostile_peer_name_cannot_forge_records_or_markup(tmp_path):
+    # HostName is chosen by the peer. A newline would split its record into
+    # forged ones (one carrying a flag-shaped "ip" into `tailscale ping`), and
+    # markup would render in the owner's Telegram alert (HTML parse mode).
+    env = _stage_incident(tmp_path)
+    status = json.loads(env["WD_TS_STATUS"])
+    status["Peer"]["nodekey:aa"]["HostName"] = (
+        'x\n--socks5-server=127.0.0.1:1\t\n<a href="http://evil.example">y</a>'
+    )
+    env["WD_TS_STATUS"] = json.dumps(status)
+    _run_wd(env)
+    pings = _pings(env)
+    assert len(pings) == 3  # tunnel, discovery, tunnel again: no forged record
+    assert all(p.endswith(f"-- {_PEER_IP}") for p in pings)
+    title = _alerts(env)[0]["title"]
+    assert "<" not in title and ">" not in title and "\n" not in title
+    assert _state(env)["tailscale"]["last_peer"].startswith("x--socks5-server127.0.0.11ahref")
+
+
+def test_tailscale_non_ip_target_is_never_pinged(tmp_path):
+    env = _stage_incident(tmp_path)
+    status = json.loads(env["WD_TS_STATUS"])
+    status["Peer"]["nodekey:aa"]["TailscaleIPs"] = ["--help", "not-an-ip"]
+    env["WD_TS_STATUS"] = json.dumps(status)
+    _run_wd(env)
+    assert _pings(env) == []
+    assert not _ts_restarted(env)
+
+
+def test_tailscale_alert_refuses_a_symlinked_queue(tmp_path):
+    env = _stage_incident(tmp_path)
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    link = tmp_path / "linkq"
+    link.symlink_to(real)
+    env["NETWD_ALERT_QUEUE"] = str(link)
+    result = _run_wd(env)
+    assert _ts_restarted(env)  # the heal itself still happens
+    assert list(real.iterdir()) == []  # nothing written through the link
+    assert "alert enqueue failed" in result.stdout
+
+
+def test_tailscale_recent_daemon_start_holds_the_limit(tmp_path):
+    # tailscaled's own start time bounds the rate: a start 10 minutes ago
+    # (a reboot, a manual restart, or our last heal) holds off another restart
+    # even with no stamp at all.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_START_EPOCH"] = str(int(env["NETWD_NOW"]) - 600)
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "ratelimited"
+
+
+def test_tailscale_unwritable_stamp_still_heals_only_once(tmp_path):
+    # The stamp cannot be written. The heal still happens; on the next tick,
+    # tailscaled's new start time (which systemd records) holds the limit.
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_STAMP_FILE"] = str(tmp_path / "no-such-dir" / "stamp")
+    _run_wd(env)
+    assert _ts_restarted(env)
+    Path(env["WD_RESTART_LOG"]).write_text("")
+    env["WD_TS_START_EPOCH"] = env["NETWD_NOW"]  # what the restart did
+    env["NETWD_NOW"] = str(int(env["NETWD_NOW"]) + 120)
+    _run_wd(env)
+    assert not _ts_restarted(env)
+    assert _state(env)["tailscale"]["last_action"] == "ratelimited"
+
+
+def test_tailscale_scan_rotates_to_a_stuck_peer_behind_the_cap(tmp_path):
+    # Three offline peers sort before the stuck one. The start point rotates
+    # each tick, so the stuck peer is reached within a few ticks, not never.
+    env = _stage_incident(tmp_path)
+    status = json.loads(env["WD_TS_STATUS"])
+    template = status["Peer"]["nodekey:aa"]
+    status["Peer"] = {
+        f"nodekey:{i}": {**template, "HostName": f"p{i}", "TailscaleIPs": [f"100.64.1.{i}"]}
+        for i in range(4)
+    }
+    env["WD_TS_STATUS"] = json.dumps(status)
+    # Per-IP stub: 100.64.1.0-2 are gone (both pings fail); 100.64.1.3 is stuck.
+    stub = Path(env["NETWD_TAILSCALE_BIN"])
+    stub.write_text(
+        '#!/bin/bash\nif [ "$1" = "status" ]; then printf \'%s\' "$WD_TS_STATUS"; exit 0; fi\n'
+        'echo "$*" >> "$WD_TS_PING_LOG"\n'
+        'case " $* " in *" --tsmp "*) exit 1 ;; esac\n'
+        'case " $* " in *" 100.64.1.3 "*) exit 0 ;; esac\nexit 1\n'
+    )
+    base = int(env["NETWD_NOW"])
+    healed_at = None
+    for tick in range(4):
+        env["NETWD_NOW"] = str(base + 120 * tick)
+        _run_wd(env)
+        if _ts_restarted(env):
+            healed_at = tick
+            break
+    assert healed_at is not None, _pings(env)
+    assert any("100.64.1.3" in p for p in _pings(env))
+
+
+def test_tailscale_observe_alert_is_one_queued_entry_per_peer(tmp_path):
+    # With the stamp unwritable, observe mode fires every tick; a stable
+    # per-peer key keeps ONE queued entry, as enqueue_alert does.
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_MODE"] = "observe"
+    env["NETWD_TS_STAMP_FILE"] = str(tmp_path / "no-such-dir" / "stamp")
+    for tick in range(3):
+        env["NETWD_NOW"] = str(int(env["NETWD_NOW"]) + 120 * tick)
+        _run_wd(env)
+    alerts = _alerts(env)
+    assert len(alerts) == 1
+    assert alerts[0]["dedupe_key"] == f"network-watchdog:tailscale:observe:{_PEER_IP}"
+
+
+def test_tailscale_bad_scan_knobs_fall_back_to_defaults(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_MAX_PROBES"] = "abc"
+    env["NETWD_TS_SCAN_BUDGET_SEC"] = "3x"
+    result = _run_wd(env)
+    assert "unbound variable" not in result.stderr
+    assert _ts_restarted(env)
+
+
+def test_tailscale_zero_padded_knob_falls_back_too(tmp_path):
+    # "08" is bad octal in bash arithmetic: accepting it would make the cap
+    # comparison fail silently and probe every peer.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_DISCO_RC"] = "1"
+    status = json.loads(env["WD_TS_STATUS"])
+    template = status["Peer"]["nodekey:aa"]
+    status["Peer"] = {
+        f"nodekey:{i}": {**template, "HostName": f"p{i}", "TailscaleIPs": [f"100.64.1.{i}"]}
+        for i in range(5)
+    }
+    env["WD_TS_STATUS"] = json.dumps(status)
+    env["NETWD_TS_MAX_PROBES"] = "08"
+    result = _run_wd(env)
+    assert "value too great" not in result.stderr
+    assert len(_pings(env)) == 3 * 2  # the default cap of 3 applied
+
+
+def test_tailscale_real_systemd_timestamp_format_is_parsed(tmp_path):
+    # systemd prints e.g. "Tue 2030-01-15 12:03:00 UTC", not an @epoch.
+    env = _stage_incident(tmp_path)
+    started = datetime.fromtimestamp(int(env["NETWD_NOW"]) - 300, UTC)
+    env["WD_TS_START_RAW"] = started.strftime("%a %Y-%m-%d %H:%M:%S UTC")
+    _run_wd(env)
+    assert not _ts_restarted(env)  # started 5 min ago: inside the hour
+    assert _state(env)["tailscale"]["last_action"] == "ratelimited"
+
+
+def test_tailscale_hostile_queue_entries_cannot_hang_or_break_the_alert(tmp_path):
+    # The stable-key dedupe scan reads the user-owned queue as root. A symlink
+    # to /dev/zero, a FIFO and a non-object JSON file must not exhaust memory,
+    # block, or stop the alert from being queued.
+    import os
+
+    env = _stage_incident(tmp_path)
+    env["NETWD_TS_MODE"] = "observe"
+    queue = Path(env["NETWD_ALERT_QUEUE"])
+    (queue / "zero.json").symlink_to("/dev/zero")
+    os.mkfifo(queue / "fifo.json")
+    (queue / "list.json").write_text("[]")
+    result = _run_wd(env)  # _run_wd has a 30s timeout: a hang fails here
+    assert result.returncode == 0
+    assert "alert enqueue failed" not in result.stdout
+    keyed = [
+        f
+        for f in queue.glob("*.json")
+        if f.is_file() and not f.is_symlink() and f.name != "list.json"
+    ]
+    assert len(keyed) == 1
+
+
+def test_tailscale_scan_is_capped_per_tick(tmp_path):
+    # Many stale Active peers, all gone (tunnel and discovery both silent):
+    # only TS_MAX_PROBES of them are probed this tick, and the log says so.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_DISCO_RC"] = "1"
+    status = json.loads(env["WD_TS_STATUS"])
+    template = status["Peer"]["nodekey:aa"]
+    status["Peer"] = {
+        f"nodekey:{i}": {**template, "HostName": f"p{i}", "TailscaleIPs": [f"100.64.1.{i}"]}
+        for i in range(5)
+    }
+    env["WD_TS_STATUS"] = json.dumps(status)
+    result = _run_wd(env)
+    assert len(_pings(env)) == 3 * 2  # 3 peers, a tunnel + a discovery ping each
+    assert "probed 3 suspect peer(s); 2 more not probed" in result.stdout
+    assert not _ts_restarted(env)
+
+
+def test_tailscale_scan_budget_stops_new_probes(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_TS_DISCO_RC"] = "1"
+    env["NETWD_TS_SCAN_BUDGET_SEC"] = "0"  # budget already spent at the first check
+    result = _run_wd(env)
+    assert _pings(env) == []
+    assert "1 more not probed" in result.stdout
+
+
+def test_installer_under_sudo_honours_genesis_home(tmp_path):
+    # Run as root via sudo, the queue follows GENESIS_HOME (what the drainer
+    # reads), not the invoking user's default ~/.genesis.
+    env = _stage(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+    (bin_dir / "id").write_text(
+        '#!/bin/bash\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n'
+    )
+    (bin_dir / "getent").write_text(
+        '#!/bin/bash\necho "alice:x:1000:1000::/home/alice:/bin/bash"\n'
+    )
+    # sudo -u USER cmd... -> run cmd (the stub cannot switch users)
+    (bin_dir / "sudo").write_text(
+        '#!/bin/bash\nif [ "$1" = "-n" ] && [ "$2" = "true" ]; then exit 0; fi\n'
+        'if [ "$1" = "-u" ]; then shift 2; fi\nexec "$@"\n'
+    )
+    for f in ("id", "getent", "sudo"):
+        (bin_dir / f).chmod(0o755)
+    custom = tmp_path / "srv-genesis"
+    env["SUDO_USER"] = "alice"
+    env["GENESIS_HOME"] = str(custom)
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    service = _paths(env)["service"].read_text()
+    assert f'Environment="NETWD_ALERT_QUEUE={custom}/alerts/queue"' in service
+    assert (custom / "alerts" / "queue").is_dir()
+
+
+def test_installer_expands_a_tilde_genesis_home_like_the_drainer(tmp_path):
+    # The drainer resolves GENESIS_HOME with Path.expanduser(); shell parameter
+    # expansion leaves a literal `~`, which named a different, relative queue.
+    env = _stage(tmp_path)
+    home = Path(env["NETRES_ETC_ROOT"])
+    env["GENESIS_HOME"] = "~/custom-genesis"
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    service = _paths(env)["service"].read_text()
+    queue = home / "custom-genesis" / "alerts" / "queue"
+    assert f'Environment="NETWD_ALERT_QUEUE={queue}"' in service
+    assert queue.is_dir()
+
+
+def test_installer_drops_the_queue_for_a_relative_genesis_home(tmp_path):
+    # A relative path resolves against each side's own working directory, so
+    # no queue is configured and the watchdog alerts via the journal only.
+    env = _stage(tmp_path)
+    env["GENESIS_HOME"] = "relative/genesis"
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    assert "NETWD_ALERT_QUEUE" not in _paths(env)["service"].read_text()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("~", "/home/me"),
+        ("~/x/y", "/home/me/x/y"),
+        ("~root/x", "/root/x"),
+        ("~no-such-user-zz/x", "~no-such-user-zz/x"),
+        ("/abs/~x", "/abs/~x"),
+        ("rel", "rel"),
+    ],
+)
+def test_expand_tilde_matches_python_expanduser(value, expected):
+    out = subprocess.run(
+        ["/bin/bash", "-c", f'source "{LIB}"; _netres_expand_tilde "$1" /home/me', "_", value],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+    assert out == expected

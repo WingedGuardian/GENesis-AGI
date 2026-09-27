@@ -71,6 +71,90 @@ Graceful degradation: no systemd, no `networkctl`, systemd-networkd not the
 active manager (NetworkManager hosts), or no non-interactive sudo each produce
 a one-line skip note and never a failure.
 
+**Layer 3 — a stuck Tailscale tunnel heals itself.**
+The same watchdog run also checks Tailscale, independently of the networkd
+checks (neither one's failure or rate limit gates the other). The failure it
+targets was observed on a live install. The address and the network path to a
+peer were both fine, but that peer stopped completing WireGuard handshakes: it
+kept sending its replies through a relay (DERP) region this node had already
+moved away from. Its network map did not pick up the move for about five
+minutes, and its log showed `derp-<n> does not know about peer [...]` on every
+reply. Every session over that tunnel timed out, and nothing else on the box
+looked wrong.
+
+The fingerprint, which is also the watchdog's trigger (all three must hold):
+
+- the peer is `Active` in `tailscale status --json` (traffic is wanted) and its
+  `LastHandshake` is non-zero and older than `NETWD_TS_STALE_SEC` (default
+  300s: WireGuard stops using a session after 180s without a new handshake,
+  and 300s spans at least two 2-minute watchdog runs);
+- `tailscale ping --tsmp <peer>` (through the tunnel) gets no reply; and
+- `tailscale ping <peer>` (discovery, no `--tsmp`) does reply, so the peer is
+  reachable. A peer that is simply offline fails both pings and is left alone,
+  because restarting the local daemon cannot bring it back; and
+- a second `tailscale ping --tsmp <peer>`, after the discovery ping, still gets
+  no reply. A discovery ping can refresh a cold path, and a restart must not be
+  spent on a tunnel that probe just revived.
+
+Every numeric `NETWD_TS_*` setting is validated: a value that is not a plain
+integer (or, where 0 would disable a timeout, the rate limit or the stale age,
+not positive) falls back to its default and is logged. The status snapshot is
+written to a fresh 0600 file and renamed into place.
+
+The heal is `systemctl restart tailscaled`. In the observed incident the node
+came back with a new disco key (the node key persists), and the coordination
+server pushed the peer a fresh network map carrying the current relay. The
+cost is that **every Tailscale SSH session on the box drops**, including
+healthy ones from other peers. Sessions inside tmux survive and reattach. So it
+is rate-limited to once per `NETWD_TS_RATE_LIMIT_SEC` (default 3600s), and the
+limit is armed before the attempt, because a restart that fails has still
+dropped every session. A failed restart is not retried: it queues its own alert
+saying tailscaled may be down, because later runs see the daemon stopped and,
+by design, never start a stopped tailscaled. Every tailscale call is bounded
+(`NETWD_TS_CALL_TIMEOUT`, `NETWD_TS_RESTART_TIMEOUT`), so a hung local API
+cannot wedge the oneshot unit and stop the networkd checks with it. Output from
+`tailscale status` that cannot be read as a peer map is recorded as
+`status-unparseable`, never as healthy. The check skips cleanly where Tailscale
+is not installed or not running.
+
+The hourly limit is measured from the LATER of two times. The first is
+tailscaled's own start time (`systemctl show -p ActiveEnterTimestamp`), which
+systemd records as part of every start, so it cannot miss a restart that
+happened. It also counts reboots and manual restarts, so there is no heal in
+the first hour after tailscaled starts. The second is a best-effort stamp in
+`/run`, written before acting. It matters only where systemd's time did not
+move: a restart that failed while the unit stayed up, and observe mode. A
+repeated restart therefore needs the stamp write and the restart to fail
+together. Observe-mode alerts use a stable per-peer key, so the queue holds one
+entry per stuck peer and the outreach pipeline delivers it at most daily. The
+scan is bounded too: at most `NETWD_TS_MAX_PROBES` suspect peers (default 3) are
+probed per run, and no new probe starts after `NETWD_TS_SCAN_BUDGET_SEC`
+(default 60s). The status lists peers in a fixed order, so the starting peer
+rotates each run and every suspect is reached within a few runs. Skipped peers
+are logged.
+
+Before anything changes, each detection records its evidence: the full
+`tailscale status --json` goes to
+`/run/genesis-network-watchdog-tailscale-status.json` (root-only, since it
+names every node on the tailnet), and a summary goes under `tailscale` in the
+telemetry file (peer, handshake age, both relay regions, direct address, ping
+results). It then queues a `warning` alert in the owning user's
+`~/.genesis/alerts/queue`, which the awareness tick delivers to Telegram. The
+watchdog runs as root, so the installer writes that queue's path into the
+service unit (`NETWD_ALERT_QUEUE`), and each entry is chowned to the queue
+directory's owner before it lands. With no configured queue the alert goes to
+the journal only.
+
+Operator lever: `NETWD_TS_MODE` = `live` (default) · `observe` (record + alert,
+never restart) · `off`. An unrecognised value degrades to `observe`, never to
+`live`. Set it with a drop-in:
+`sudo systemctl edit genesis-network-watchdog.service` →
+`[Service]` / `Environment=NETWD_TS_MODE=observe`.
+
+Scope: this rides the networkd watchdog, so it is installed only where
+systemd-networkd manages the network (see the applicability gate below). A
+NetworkManager host running Tailscale does not get it.
+
 ## How the body schema surfaces it
 
 The infrastructure profile (`INFRASTRUCTURE.md`, `infra_profile` package)

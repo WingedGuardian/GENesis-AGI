@@ -2810,8 +2810,11 @@ verified: f24c15e9 2026-09-05
   `networkd_manages_default_route` (the applicability gate — networkctl reports
   the default-route link `AdministrativeState=configured`, so the posture check
   stays silent on NetworkManager installs), plus a volatile `watchdog`
-  heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
-  docs/reference/network-resilience.md).
+  heal-telemetry metric from `/run/genesis-network-watchdog.json`. That metric
+  carries a `tailscale` sub-object: the same watchdog also restarts tailscaled
+  when an Active peer's tunnel is stuck (stale handshake, tunnel ping silent,
+  discovery ping answered), at most once an hour, and queues an owner alert
+  (see docs/reference/network-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
