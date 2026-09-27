@@ -9,10 +9,10 @@
 # individually, in shadow, on measured evidence that it beats its incumbent.
 # Register liberally, promote individually.
 #
-# The question WORDING is the asset, not scaffolding around it. MEASURED
-# 2026-09-23: a hand-written question scored AUC 0.900 on a real Genesis task
-# where the vendor's own pre-tuned preset scored 0.560 on the same model and
-# the same cases.
+# The question WORDING is shared across backends: one spec drives a hosted or a
+# local decision model unchanged. Measure every question on a corpus the author
+# did not write — wording that looks strong on hand-written cases can collapse
+# on real text.
 #
 # `consumes` decides what a site needs and therefore how it degrades:
 #   argmax   — top label only.   Needs accuracy. Works uncalibrated.
@@ -45,13 +45,12 @@ decisions:
     owner: memory.relationship_classifier
 
   # --- egress ------------------------------------------------------------
-  # MEASURED 2026-09-23, english checkpoint, zero-shot, no fine-tuning:
-  # AUC 0.900 separating inferential-PII from clean technical prose, on a
-  # class the incumbent nine-regex scanner scores at chance (0.500).
+  # MEASURED 2026-09-26 on 110 real, length-matched items (AUC): an untrained
+  # local encoder checkpoint 0.559, a hosted decision model 0.871. The
+  # incumbent nine-regex scanner cannot see this class at all.
   #
   # `ordering`, NOT `threshold`, deliberately. The natural consumption here is
-  # pass/review/block, but no calibrated threshold exists: the 0.081 cut that
-  # looked good was fitted on self-authored, unrealistically short cases.
+  # pass/review/block, but no calibrated threshold exists yet.
   # Promote to `threshold` only once a calibration fitted on a corpus this
   # project did not author says what the number should be.
   egress_personal_context:

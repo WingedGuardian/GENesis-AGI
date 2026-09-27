@@ -12,10 +12,10 @@ The registry earns its place by making four otherwise-manual jobs mechanical:
 4. "How many decisions does Genesis make, and which are calibrated?" becomes a
    query rather than an archaeology project.
 
-MEASURED 2026-09-23, and the reason the question text lives here rather than
-inline at call sites: a hand-written question scored AUC 0.900 on a real
-Genesis task where the vendor's own pre-tuned preset scored 0.560. The wording
-is the asset.
+The question wording lives here rather than inline at call sites because it
+is shared across backends: the same spec drives a hosted or a local decision
+model unchanged, and wording materially moves accuracy — the same model scored
+very differently on one egress question depending on how it was phrased.
 """
 
 from __future__ import annotations
