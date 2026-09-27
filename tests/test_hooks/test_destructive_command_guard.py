@@ -1174,3 +1174,119 @@ class TestAResolverThatRAISESKeepsTheFallbackRefusalOn:
         """The degraded import path reports unanalysed for the same reason."""
         cmd = f"eval '{self.RM} -rf /a/b'"
         assert self._main_with(monkeypatch, cmd, None) == 2
+
+
+class TestWildcardDepth:
+    """A pathname wildcard is judged at the depth of the literal prefix before it.
+
+    Removing ``<a>/<b>/<c>/*`` recursively deletes everything removing
+    ``<a>/<b>/<c>`` would, yet the depth floor counted the ``*`` as a fourth
+    component and allowed it while refusing the directory itself. A wildcard
+    component matches any name at its level, so what the command reaches is
+    everything under its literal prefix, and that prefix is what must clear the
+    floor. (Observed: a subagent cleaning up its own scratch dirs removed
+    ``<home>/tmp/tmp*/``, which also matched any other session's ``tmp*``
+    directories in the shared scratch area.)
+
+    Absolute paths only for the ALLOWED rows: ``~`` expands to $HOME, whose
+    depth differs between installs (e.g. /root), which would flip an allow row.
+    """
+
+    RM = "r" + "m"  # keeps this file's own text out of the Bash hooks' scanners
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/home/u/tmp/*",  # the directory's whole contents
+            "/home/u/tmp/tmp*/",  # the observed command's shape
+            "/home/u/tmp/tmp?x",  # ? is a wildcard too
+            "/home/u/tmp/[ab]*",  # so is a bracket expression
+            "/a/*/c/d",  # a mid-path wildcard is as wide as its prefix
+            "~/tmp/*",  # the everyday spelling of the first row
+            "/home/u/tmp/{keep,*}",  # a brace alternative that is a wildcard
+        ],
+    )
+    def test_wildcard_below_the_floor_blocks(self, target):
+        assert _blocks(f"{self.RM} -rf {target}"), target
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/home/u/tmp/job/*",  # literal prefix is 4 deep
+            "/home/u/tmp/job/*.log",
+            "/home/u/tmp/tmpabc123/",  # the literal name the wildcard stood for
+            "/home/u/tmp/job/run-?/",
+        ],
+    )
+    def test_wildcard_with_a_deep_enough_prefix_is_allowed(self, target):
+        assert not _blocks(f"{self.RM} -rf {target}"), target
+
+    def test_the_reason_names_the_wildcard_not_just_a_depth(self):
+        reasons = dg._rm_violations(f"{self.RM} -rf /home/u/tmp/*")
+        assert reasons and any("wildcard" in r for r in reasons), reasons
+
+    def test_non_recursive_wildcard_is_untouched(self):
+        # The floor governs recursive+force removal only.
+        assert not _blocks(f"{self.RM} -f /home/u/tmp/*.log")
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            # With globskipdots off, `.?` matches `..`: this climbs to `/*`.
+            "/home/u/tmp/job/.?/.?/.?/.?/*",
+            "/home/u/tmp/job/.*/x",
+        ],
+    )
+    def test_a_mid_path_dot_wildcard_that_can_climb_is_refused(self, target):
+        reasons = dg._rm_violations(f"{self.RM} -rf {target}")
+        assert reasons and any("dot-wildcard" in r for r in reasons), reasons
+
+    def test_a_final_dot_wildcard_stays_allowed(self):
+        # rm refuses a final `..` itself, so `<deep dir>/.*` cleanups keep working.
+        assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/.*")
+
+    @pytest.mark.parametrize("pattern", ["!(keep)", "+(a|b)", "@(a|b)"])
+    def test_extglob_patterns_count_as_wildcards(self, pattern):
+        # A command can turn extglob on for itself (`shopt -s extglob` on an
+        # earlier line), and these openers contain none of * ? [.
+        assert _blocks(f"{self.RM} -rf /home/u/tmp/{pattern}")
+        assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/{pattern}")
+
+    @pytest.mark.parametrize(
+        ("target", "prefix"),
+        [
+            ("/home/u/tmp/*", "'/home/u/tmp'"),
+            ("a/b/c/*", "'a/b/c'"),
+            ("job*", "'.'"),
+            ("/*/x", "'/'"),
+        ],
+    )
+    def test_the_message_names_the_prefix_with_its_own_anchor(self, target, prefix):
+        # A cwd-relative operand must not be described as under '/'.
+        reasons = dg._rm_violations(f"{self.RM} -rf {target}")
+        assert reasons and any(f"under {prefix}" in r for r in reasons), reasons
+
+    def test_a_wildcard_inside_sh_c_is_refused_at_the_entry_point(self, tmp_path):
+        # The carried-command route (`sh -c '…'`) reaches the same check.
+        import json
+        import os
+        import subprocess
+        import sys as _sys
+
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "hooks"
+            / "destructive_command_guard.py"
+        )
+        cmd = f"sh -c '{self.RM} -rf /home/u/tmp/*'"
+        result = subprocess.run(
+            [_sys.executable, str(script)],
+            input=json.dumps({"tool_input": {"command": cmd}, "tool_name": "Bash"}),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "HOME": str(tmp_path)},
+        )
+        assert result.returncode == 2, result.stderr
+        assert "wildcard" in result.stderr

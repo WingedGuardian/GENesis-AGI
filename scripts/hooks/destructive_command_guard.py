@@ -76,6 +76,15 @@ _RM_RF_PATTERN = re.compile(
 # Dangerous special targets — always block regardless of depth
 _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
 
+# Bash pathname-expansion syntax. A path component containing it is a pattern,
+# not a name, and _check_target judges depth from the literal prefix before
+# it. `* ? [` are the base set; `+( @( !(` are extglob openers (`?( *(` are
+# already covered), which apply when a command turns extglob on for itself,
+# e.g. `shopt -s extglob` on an earlier line. (Braces are not here:
+# brace_expand has already split them into separate operands before any
+# operand reaches the depth check.)
+_GLOB_CHARS = re.compile(r"[*?\[]|[+@!]\(")
+
 # Programs that RUN a command string handed to them as one argument. A quoted
 # string is a single shlex token, so the every-token scan below cannot see the
 # `rm` inside it — `eval "rm -rf /a/b"` was allowed while the unquoted spelling
@@ -637,6 +646,41 @@ def _check_target(target: str) -> str | None:
     # review: this was a live bypass.)
     if ".." in parts:
         return f"rm -rf on '{clean}' traverses upward ('..') — refusing."
+    # A pathname wildcard (* ? [) matches ANY name at its level, so what the
+    # command reaches is everything under the literal prefix before the first
+    # wildcard component — `<a>/<b>/<c>/*` deletes all that `<a>/<b>/<c>` does.
+    # Counting the wildcard as a component made the floor one level shallower
+    # than it reads: the directory was refused while its whole contents were
+    # allowed. The floor therefore applies to the literal prefix.
+    #
+    # Quote syntax is already stripped here, so a quoted literal '*' (which the
+    # shell passes through unexpanded) is indistinguishable from a real
+    # wildcard and is judged the same way. That over-blocks a file literally
+    # named with a wildcard character near the top of a tree, which is the
+    # safe direction for a recursive-force removal.
+    #
+    # That bound holds only while no pattern can climb ABOVE the prefix. A
+    # dot-leading pattern component (`.?`, `.*`) can match `..` when bash's
+    # globskipdots is off (the default before bash 5.2, and a `shopt` away
+    # after), so `<deep>/.?/.?/.?/.?/*` resolves to `/*`. rm itself refuses a
+    # FINAL `..`, so only a non-final dot-pattern component is refused here;
+    # that keeps `<dir>/.*` cleanups working.
+    if any(p.startswith(".") and _GLOB_CHARS.search(p) for p in parts[:-1]):
+        return (
+            f"rm -rf on '{clean}' has a dot-wildcard path component that can "
+            f"match '..' and climb above it — refusing."
+        )
+    literal = next((i for i, p in enumerate(parts) if _GLOB_CHARS.search(p)), len(parts))
+    if literal < len(parts) and literal < 4:
+        # Keep the operand's own anchor: an absolute prefix reads '/a/b', a
+        # relative one 'a/b' (or '.' when the wildcard is the first component),
+        # so the message never claims a cwd-relative path is under '/'.
+        lead = "/" if expanded.startswith("/") else ""
+        prefix = (lead + "/".join(parts[:literal])) or (lead or ".")
+        return (
+            f"rm -rf on '{clean}' uses a wildcard under '{prefix}' (depth {literal}), "
+            f"so it can reach everything there — too broad."
+        )
     if len(parts) < 4:
         return f"rm -rf on '{clean}' (depth {len(parts)}) is too broad."
     return None
@@ -926,7 +970,8 @@ def main() -> int:
             for reason in violations:
                 print(f"BLOCKED: {reason}", file=sys.stderr)
             print(
-                "Recursive+force rm targets must be at least 4 levels deep. "
+                "Recursive+force rm targets must be at least 4 levels deep "
+                "(a wildcard counts only the path before it). "
                 "If intentional, ask the user to confirm.",
                 file=sys.stderr,
             )
