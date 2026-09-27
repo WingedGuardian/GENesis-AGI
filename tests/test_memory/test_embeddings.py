@@ -163,6 +163,7 @@ class TestEmbedProviderChain:
         ollama = OllamaBackend(url="http://fake:11434", client=client)
         deepinfra = AsyncMock()
         deepinfra.name = "deepinfra_embedding"
+        deepinfra.vector_space = CANONICAL_VECTOR_SPACE
 
         p = EmbeddingProvider(backends=[ollama, deepinfra], cache_dir=None)
         result = await p.embed("test")
@@ -191,9 +192,11 @@ class TestEmbedProviderChain:
         """All backends fail → EmbeddingUnavailableError."""
         b1 = AsyncMock()
         b1.name = "b1"
+        b1.vector_space = "test-space"
         b1.embed = AsyncMock(side_effect=Exception("fail"))
         b2 = AsyncMock()
         b2.name = "b2"
+        b2.vector_space = "test-space"
         b2.embed = AsyncMock(side_effect=Exception("fail"))
 
         p = EmbeddingProvider(backends=[b1, b2], cache_dir=None)
@@ -204,6 +207,7 @@ class TestEmbedProviderChain:
     async def test_embed_batch(self) -> None:
         b = AsyncMock()
         b.name = "test"
+        b.vector_space = "test-space"
         b.embed = AsyncMock(return_value=VEC_1024)
         p = EmbeddingProvider(backends=[b], cache_dir=None)
         results = await p.embed_batch(["a", "b", "c"])
@@ -221,9 +225,11 @@ class TestEmbedProviderChain:
         """After 3 consecutive failures, backend errors log at DEBUG not WARNING."""
         b_fail = AsyncMock()
         b_fail.name = "ollama_embedding"
+        b_fail.vector_space = "test-space"
         b_fail.embed = AsyncMock(side_effect=httpx.ReadTimeout("timeout"))
         b_ok = AsyncMock()
         b_ok.name = "deepinfra_embedding"
+        b_ok.vector_space = "test-space"
         b_ok.embed = AsyncMock(return_value=VEC_1024)
         p = EmbeddingProvider(backends=[b_fail, b_ok], cache_dir=None)
 
@@ -248,6 +254,7 @@ class TestEmbedProviderChain:
 
         b = AsyncMock()
         b.name = "flaky"
+        b.vector_space = "test-space"
         b.embed = _flaky_embed
         p = EmbeddingProvider(backends=[b], cache_dir=None)
 
@@ -751,3 +758,143 @@ class TestStandaloneMemoryMcpSplitsRecall:
     def test_the_shared_legacy_argument_is_gone(self) -> None:
         """Control: if the legacy kwarg were still passed, init would reuse it."""
         assert "embedding_provider=embedding," not in self._src()
+
+
+class _SpaceFake:
+    """A minimal backend double that DECLARES its space, as every backend must."""
+
+    def __init__(self, name: str, *, space: object, model: str = "m", fail: bool = False) -> None:
+        self.name = name
+        self.vector_space = space
+        self._model = model
+        self._fail = fail
+        self.calls = 0
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls += 1
+        if self._fail:
+            raise httpx.ConnectError("down")
+        return [0.5] * 4
+
+    async def is_available(self) -> bool:
+        return not self._fail
+
+
+class TestFreshCollectionAnchor:
+    """A caller writing into a brand-new, EMPTY collection has no corpus to match.
+
+    The default anchor is the space of the historical storage leader, because a
+    live collection was written in that space. A fresh collection (the
+    LongMemEval ephemeral store) was not written in any space yet, so anchoring
+    it to the local model threw away the cloud rung the caller asked to lead.
+    """
+
+    _env = staticmethod(TestOneVectorSpacePerChain._env)
+
+    @staticmethod
+    def _names(chain) -> list[str]:
+        return [b.name for b in chain]
+
+    def test_fresh_collection_keeps_the_cloud_leader_beside_a_foreign_local_model(
+        self, monkeypatch,
+    ) -> None:
+        self._env(monkeypatch, ollama="nomic-embed-text", deepinfra=True, dashscope=False)
+        assert self._names(
+            EmbeddingProvider.build_chain(ollama_first=False, fresh_collection=True)
+        ) == ["deepinfra_embedding"]
+
+    def test_the_corpus_anchor_is_still_the_default(self, monkeypatch) -> None:
+        """CONTROL — without the flag a live corpus keeps its local space."""
+        self._env(monkeypatch, ollama="nomic-embed-text", deepinfra=True, dashscope=False)
+        assert self._names(EmbeddingProvider.build_chain(ollama_first=False)) == [
+            "ollama_embedding",
+        ]
+
+    @pytest.mark.parametrize(
+        "ollama", [None, "qwen3-embedding:0.6b-fp16", "nomic-embed-text"],
+    )
+    @pytest.mark.parametrize("deepinfra", [False, True])
+    @pytest.mark.parametrize("dashscope", [False, True])
+    @pytest.mark.parametrize("ollama_first", [False, True])
+    def test_a_fresh_chain_is_one_space_led_by_the_requested_order(
+        self, monkeypatch, ollama, deepinfra, dashscope, ollama_first,
+    ) -> None:
+        self._env(monkeypatch, ollama=ollama, deepinfra=deepinfra, dashscope=dashscope)
+        chain = EmbeddingProvider.build_chain(ollama_first=ollama_first, fresh_collection=True)
+        if not (ollama or deepinfra or dashscope):
+            assert chain == []
+            return
+        assert len({b.vector_space for b in chain}) == 1
+        # The leader is the first backend the caller's ORDER names.
+        clouds = (["deepinfra_embedding"] if deepinfra else []) + (
+            ["dashscope_embedding"] if dashscope else []
+        )
+        local = ["ollama_embedding"] if ollama else []
+        expected_leader = (local + clouds if ollama_first else clouds + local)[0]
+        assert chain[0].name == expected_leader
+
+    @pytest.mark.parametrize(
+        "rel", ["src/genesis/eval/longmemeval/store.py", "src/genesis/eval/longmemeval/runner.py"],
+    )
+    def test_the_ephemeral_eval_stores_request_a_fresh_chain(self, rel) -> None:
+        from pathlib import Path
+
+        src = (Path(__file__).parents[2] / rel).read_text()
+        assert "build_chain(ollama_first=False, fresh_collection=True)" in src
+
+
+class TestSpaceDeclarationIsMandatory:
+    """The one-space rule used to skip any backend that declared no space.
+
+    So an undeclared backend could sit beside a Qwen3 one and write whatever
+    model it is into the same collection, and every undeclared provider shared
+    one cache namespace. A backend now either names its space or is refused.
+    """
+
+    def test_an_undeclared_backend_beside_a_declared_one_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="vector space"):
+            EmbeddingProvider(
+                backends=[
+                    _SpaceFake("custom", space=None),
+                    DeepInfraBackend(api_key="k", client=MagicMock()),
+                ],
+                cache_dir=None,
+            )
+
+    @pytest.mark.parametrize("space", [None, "", MagicMock()])
+    def test_an_undeclared_backend_alone_is_refused(self, space) -> None:
+        with pytest.raises(ValueError, match="vector space"):
+            EmbeddingProvider(backends=[_SpaceFake("custom", space=space)], cache_dir=None)
+
+    def test_declared_same_space_fakes_are_accepted(self) -> None:
+        """CONTROL — declaring the space is all it takes."""
+        p = EmbeddingProvider(
+            backends=[_SpaceFake("a", space="s"), _SpaceFake("b", space="s")], cache_dir=None,
+        )
+        assert p.vector_space == "s"
+
+    def test_an_empty_chain_is_still_constructible(self) -> None:
+        """No backend means nothing can be written, so nothing can mix."""
+        assert EmbeddingProvider(backends=[], cache_dir=None).vector_space is None
+
+
+class TestLastBackendIsObserved:
+    """Which backend wrote a vector is observed, not inferred from chain order."""
+
+    @pytest.mark.asyncio
+    async def test_a_fallback_answer_is_recorded_as_the_last_backend(self) -> None:
+        primary = _SpaceFake("primary", space="s", model="cloud-model", fail=True)
+        fallback = _SpaceFake("fallback", space="s", model="local-model")
+        p = EmbeddingProvider(backends=[primary, fallback], cache_dir=None)
+        assert p.last_backend is None
+        await p.embed("hello")
+        assert p.last_backend is fallback
+
+    @pytest.mark.asyncio
+    async def test_the_primary_is_recorded_when_it_answers(self) -> None:
+        """CONTROL — the field follows the answer, it is not pinned to a rung."""
+        primary = _SpaceFake("primary", space="s", model="cloud-model")
+        fallback = _SpaceFake("fallback", space="s", model="local-model")
+        p = EmbeddingProvider(backends=[primary, fallback], cache_dir=None)
+        await p.embed("hello")
+        assert p.last_backend is primary

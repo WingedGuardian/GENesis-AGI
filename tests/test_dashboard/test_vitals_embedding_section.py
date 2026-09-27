@@ -55,6 +55,58 @@ async def test_local_first_chain_reports_the_local_model():
     assert section["recall_chain"] == ["not initialized"]
 
 
+class _Fake:
+    def __init__(self, name, model, *, fail=False):
+        self.name = name
+        self.vector_space = CANONICAL_VECTOR_SPACE
+        self._model = model
+        self._fail = fail
+
+    async def embed(self, text):
+        if self._fail:
+            raise RuntimeError("down")
+        return [0.1] * 4
+
+    async def is_available(self):
+        return not self._fail
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_write_is_reported_as_the_active_model():
+    """The cloud rung failed and the local one wrote: the panel must say so.
+
+    Before, `active_model` was the first rung's model whatever answered, so a
+    cloud outage showed the cloud model as active while Ollama wrote every vector.
+    """
+    storage = _provider(
+        _Fake("deepinfra_embedding", "Qwen/Qwen3-Embedding-0.6B", fail=True),
+        _Fake("ollama_embedding", "qwen3-embedding:0.6b-fp16"),
+    )
+    await storage.embed("hello")
+    rt = SimpleNamespace(db=None, _storage_embedder=storage, _recall_embedder=None)
+
+    section = await _build_embedding_section(rt)
+
+    assert section["active_model"] == "qwen3-embedding:0.6b-fp16"
+    assert section["active_model_observed"] is True
+    assert section["primary_model"] == "Qwen/Qwen3-Embedding-0.6B"
+
+
+@pytest.mark.asyncio
+async def test_before_any_write_the_configured_primary_is_reported_unobserved():
+    """CONTROL — with no write yet in this process, nothing has been observed."""
+    storage = _provider(
+        _Fake("deepinfra_embedding", "Qwen/Qwen3-Embedding-0.6B"),
+        _Fake("ollama_embedding", "qwen3-embedding:0.6b-fp16"),
+    )
+    rt = SimpleNamespace(db=None, _storage_embedder=storage, _recall_embedder=None)
+
+    section = await _build_embedding_section(rt)
+
+    assert section["active_model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert section["active_model_observed"] is False
+
+
 @pytest.mark.asyncio
 async def test_no_embedders_reports_not_initialized():
     section = await _build_embedding_section(SimpleNamespace(db=None))

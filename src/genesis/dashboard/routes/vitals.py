@@ -339,10 +339,23 @@ async def _build_embedding_section(rt) -> dict:
     recall_chain = _embedder_chain(getattr(rt, "_recall_embedder", None))
     storage_embedder = getattr(rt, "_storage_embedder", None)
     lead = storage_embedder.backends[0] if storage_embedder and storage_embedder.backends else None
-    # The model that writes new memory vectors: the storage chain's first rung.
-    model = getattr(lead, "_model", None) if lead else None
+    # `active_model` is the model that OBSERVABLY wrote the most recent storage
+    # vector in this process: during a cloud outage the fallback rung answers,
+    # and naming the first rung would show the cloud model while the local one
+    # writes. Before any write has happened there is nothing to observe, so it
+    # falls back to the configured primary and says so.
+    def _model_of(backend) -> str | None:
+        # Only a real string counts, so a mocked runtime never leaks a Mock.
+        model = getattr(backend, "_model", None) if backend is not None else None
+        return model if isinstance(model, str) else None
+
+    last = getattr(storage_embedder, "last_backend", None) if storage_embedder else None
+    observed_model = _model_of(last)
+    primary = _model_of(lead)
     space = getattr(storage_embedder, "vector_space", None)
-    section["active_model"] = model if isinstance(model, str) else None
+    section["primary_model"] = primary
+    section["active_model"] = observed_model if observed_model is not None else primary
+    section["active_model_observed"] = observed_model is not None
     section["vector_space"] = space if isinstance(space, str) else None
 
     def _label(embedder, chain: list[str]) -> list[str]:

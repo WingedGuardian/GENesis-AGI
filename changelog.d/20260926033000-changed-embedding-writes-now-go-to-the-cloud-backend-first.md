@@ -31,8 +31,16 @@
   vectors from two different models. DashScope is still used when it is the
   only backend configured. A provider assembled by hand from
   backends in different spaces now refuses to start, and the embedding cache is
-  keyed by vector space (a one-time cold cache after updating). The dashboard's embedding panel now reads the chains the
-  runtime actually built and names the model that is writing.
+  keyed by vector space (a one-time cold cache after updating). Every embedding
+  backend must now declare the vector space it produces; a custom backend that
+  does not is refused rather than silently mixed in. The dashboard's embedding
+  panel now reads the chains the server actually built and names the model that
+  wrote the server process's most recent vector, so a fallback to the local
+  model during a cloud outage is marked as a fallback, with the configured
+  primary beside it. (Writes made by a session's own memory tools run in a
+  separate process and are not reflected there.) The LongMemEval harness,
+  which writes into brand-new throwaway collections, now keeps its cloud-first
+  chain even when the local model is a different one.
 
   **What this changes about where your data goes.** Memory and knowledge content
   is now sent to the cloud embedding provider at WRITE time, not only at recall.
