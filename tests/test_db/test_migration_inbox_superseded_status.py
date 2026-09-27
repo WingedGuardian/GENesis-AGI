@@ -198,6 +198,26 @@ async def test_legacy_table_missing_later_columns_takes_defaults():
 
 
 @pytest.mark.asyncio
+async def test_install_local_trigger_survives_rebuild():
+    """DROP TABLE drops attached triggers; the rebuild must replay them."""
+    db = await _make_legacy_db()
+    await db.execute("CREATE TABLE inbox_audit (id TEXT, status TEXT)")
+    await db.execute(
+        "CREATE TRIGGER trg_inbox_audit AFTER UPDATE OF status ON inbox_items "
+        "BEGIN INSERT INTO inbox_audit VALUES (NEW.id, NEW.status); END"
+    )
+    await M.up(db)
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='inbox_items'"
+    )
+    assert [r[0] for r in await cur.fetchall()] == ["trg_inbox_audit"]
+    # It still fires on the rebuilt table (the backfill ran after the replay).
+    cur = await db.execute("SELECT id FROM inbox_audit WHERE status='superseded' ORDER BY id")
+    assert [r[0] for r in await cur.fetchall()] == ["a", "b", "c"]
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_unknown_live_column_raises_instead_of_dropping_data():
     db = await _make_legacy_db()
     await db.execute("ALTER TABLE inbox_items ADD COLUMN future_col TEXT")

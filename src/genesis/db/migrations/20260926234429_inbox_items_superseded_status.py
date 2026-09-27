@@ -79,14 +79,22 @@ async def _live_ddl(db: aiosqlite.Connection) -> str | None:
 
 
 async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
-    """Rebuild inbox_items with the given status CHECK, preserving rows/rowids/indexes."""
-    # Capture every explicit index on the live table so none is lost to the
-    # DROP (autoindexes have NULL sql and are recreated by the PRIMARY KEY).
+    """Rebuild inbox_items with the given status CHECK, preserving rows/rowids/
+    indexes/triggers."""
+    # Capture every explicit index and trigger on the live table so none is
+    # lost to the DROP (autoindexes have NULL sql and are recreated by the
+    # PRIMARY KEY). The canonical schema defines no inbox_items trigger; this
+    # keeps any an install added.
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' "
         "AND tbl_name='inbox_items' AND sql IS NOT NULL"
     )
     live_indexes = [r[0] for r in await cursor.fetchall()]
+    cursor = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name='inbox_items' AND sql IS NOT NULL"
+    )
+    live_triggers = [r[0] for r in await cursor.fetchall()]
 
     await db.execute("DROP TABLE IF EXISTS inbox_items_new")
     await db.execute(
@@ -116,6 +124,8 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
     for stmt in live_indexes:
         await db.execute(stmt)
     for stmt in _CANONICAL_INDEXES:
+        await db.execute(stmt)
+    for stmt in live_triggers:
         await db.execute(stmt)
 
 
