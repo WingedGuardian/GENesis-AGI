@@ -445,7 +445,7 @@ async def _impl_web_search(
         return {
             "query": response.query,
             "results": results,
-            "backend_used": response.backend_used.value if response.backend_used else "unknown",
+            "backend_used": response.backend_used.value if response.backend_used else None,
             "fallback_used": True,
             "answer": None,
             "error": response.error,
@@ -453,9 +453,15 @@ async def _impl_web_search(
         }
 
     elif backend in ("searxng", "brave"):
-        # Explicit SearXNG/Brave selection
+        # Explicit selection runs ONLY that backend. It used to run the whole
+        # SearXNG-then-Brave chain, so "brave" was answered by SearXNG when it
+        # was up and reported as a SearXNG failure when it was not.
+        from genesis.web.types import SearchBackend
+
         searcher = _get_searcher()
-        response = await searcher.search(query, max_results=max_results)
+        response = await searcher.search(
+            query, max_results=max_results, backends=(SearchBackend(backend),),
+        )
         latency = (time.monotonic() - start) * 1000
 
         results = [
@@ -465,7 +471,7 @@ async def _impl_web_search(
         return {
             "query": response.query,
             "results": results,
-            "backend_used": response.backend_used.value if response.backend_used else "unknown",
+            "backend_used": response.backend_used.value if response.backend_used else None,
             "fallback_used": response.fallback_used,
             "answer": None,
             "error": response.error,
@@ -650,7 +656,10 @@ async def web_search(
         query: Search query string. Supports site: filters with SearXNG.
         backend: "auto" (TinyFish→SearXNG→Brave), "tinyfish", "searxng",
                  "brave", "tavily", "exa", "perplexity", or "firecrawl"
-                 (paid escalation — burns Firecrawl credits).
+                 (paid escalation — burns Firecrawl credits). Any backend
+                 other than "auto" runs ONLY that backend, with no fallback.
+                 When every backend fails, backend_used is null and error
+                 names each backend tried and why (unreachable, or no key).
         max_results: Maximum results (default 10, max 20).
 
     Returns dict with: query, results (list of title/url/snippet/score),

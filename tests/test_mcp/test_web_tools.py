@@ -174,8 +174,18 @@ class TestWebSearch:
         mock_response = SearchResponse(
             query="test query",
             results=[
-                SearchResult(title="Result 1", url="https://r1.com", snippet="Snippet 1", backend=SearchBackend.SEARXNG),
-                SearchResult(title="Result 2", url="https://r2.com", snippet="Snippet 2", backend=SearchBackend.SEARXNG),
+                SearchResult(
+                    title="Result 1",
+                    url="https://r1.com",
+                    snippet="Snippet 1",
+                    backend=SearchBackend.SEARXNG,
+                ),
+                SearchResult(
+                    title="Result 2",
+                    url="https://r2.com",
+                    snippet="Snippet 2",
+                    backend=SearchBackend.SEARXNG,
+                ),
             ],
             backend_used=SearchBackend.SEARXNG,
         )
@@ -188,6 +198,22 @@ class TestWebSearch:
         assert len(result["results"]) == 2
         assert result["results"][0]["title"] == "Result 1"
         assert result["error"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["brave", "searxng"])
+    async def test_explicit_backend_runs_only_that_backend(self, name):
+        failed = SearchResponse(query="q", error=f"All search backends failed — {name}: x")
+        with patch("genesis.mcp.health.web_tools._get_searcher") as mock:
+            mock.return_value.search = AsyncMock(return_value=failed)
+            result = await _impl_web_search("q", name, 5)
+
+        mock.return_value.search.assert_awaited_once_with(
+            "q", max_results=5, backends=(SearchBackend(name),)
+        )
+        # A total failure names no backend: it used to read "searxng" (or
+        # "unknown"), pointing at a service that never answered.
+        assert result["backend_used"] is None
+        assert result["error"].endswith(f"{name}: x")
 
     @pytest.mark.asyncio
     async def test_max_results_capped_at_20(self):
@@ -204,11 +230,16 @@ class TestWebSearch:
             from genesis.providers.types import ProviderResult
 
             mock_instance = MockAdapter.return_value
-            mock_instance.invoke = AsyncMock(return_value=ProviderResult(
-                success=True,
-                data={"results": [{"title": "T", "url": "U", "content": "C", "score": 0.9}], "answer": "The answer"},
-                provider_name="tavily",
-            ))
+            mock_instance.invoke = AsyncMock(
+                return_value=ProviderResult(
+                    success=True,
+                    data={
+                        "results": [{"title": "T", "url": "U", "content": "C", "score": 0.9}],
+                        "answer": "The answer",
+                    },
+                    provider_name="tavily",
+                )
+            )
             result = await _impl_web_search("AI agents", "tavily", 5)
 
         assert result["backend_used"] == "tavily"
@@ -238,20 +269,20 @@ class TestExaDomainFilter:
         from genesis.providers.types import ProviderResult
 
         mock_instance = MockAdapter.return_value
-        mock_instance.invoke = AsyncMock(return_value=ProviderResult(
-            success=True,
-            data={"results": [{"title": "T", "url": "U", "text": "C"}]},
-            provider_name="exa",
-        ))
+        mock_instance.invoke = AsyncMock(
+            return_value=ProviderResult(
+                success=True,
+                data={"results": [{"title": "T", "url": "U", "text": "C"}]},
+                provider_name="exa",
+            )
+        )
         return mock_instance
 
     @pytest.mark.asyncio
     async def test_include_domains_reaches_adapter(self):
         with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
             mock_instance = self._mock_adapter(MockAdapter)
-            await _impl_web_search(
-                "agent review loop", "exa", 5, include_domains=["github.com"]
-            )
+            await _impl_web_search("agent review loop", "exa", 5, include_domains=["github.com"])
 
         request = mock_instance.invoke.call_args[0][0]
         assert request["include_domains"] == ["github.com"]
@@ -260,9 +291,7 @@ class TestExaDomainFilter:
     async def test_exclude_domains_reaches_adapter(self):
         with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
             mock_instance = self._mock_adapter(MockAdapter)
-            await _impl_web_search(
-                "agent review loop", "exa", 5, exclude_domains=["spam.example"]
-            )
+            await _impl_web_search("agent review loop", "exa", 5, exclude_domains=["spam.example"])
 
         request = mock_instance.invoke.call_args[0][0]
         assert request["exclude_domains"] == ["spam.example"]
@@ -351,9 +380,14 @@ class TestFirecrawlBackend:
         monkeypatch.setattr(fc, "scrape", fake_scrape)
         with patch("genesis.mcp.health.web_tools._try_tinyfish_fetch") as tf:
             tf.return_value = {
-                "url": "https://a.com", "title": "t", "content": "c",
-                "backend_used": "tinyfish", "status_code": 200,
-                "truncated": False, "error": None, "latency_ms": 1.0,
+                "url": "https://a.com",
+                "title": "t",
+                "content": "c",
+                "backend_used": "tinyfish",
+                "status_code": 200,
+                "truncated": False,
+                "error": None,
+                "latency_ms": 1.0,
             }
             await _impl_web_fetch("https://a.com", "auto", 50000)
         assert called == [], "auto chain must never burn Firecrawl credits"
@@ -396,8 +430,12 @@ class TestFirecrawlBackend:
                 from types import SimpleNamespace
 
                 return SimpleNamespace(
-                    url=url, title="", text="captcha challenge",
-                    status_code=403, truncated=False, error=None,
+                    url=url,
+                    title="",
+                    text="captcha challenge",
+                    status_code=403,
+                    truncated=False,
+                    error=None,
                 )
 
         with (
@@ -432,8 +470,11 @@ class TestFirecrawlBackend:
                 from types import SimpleNamespace
 
                 return SimpleNamespace(
-                    query=query, results=[], backend_used=None,
-                    fallback_used=True, error="all free backends failed",
+                    query=query,
+                    results=[],
+                    backend_used=None,
+                    fallback_used=True,
+                    error="all free backends failed",
                 )
 
         with (
