@@ -1416,3 +1416,163 @@ class TestHealthySnapshotWiring:
         snapshots.mark_healthy = AsyncMock(side_effect=RuntimeError("incus down"))
         await _maintain_snapshots(config, snapshots, is_healthy=True)
         assert (config.state_path / ".last_prune").exists()
+
+
+class TestPoolReliefWiring:
+    """Relief runs every tick BEFORE the cycle; a refused lifeline refresh is
+    loud (throttled) and retried within the hour on its OWN marker, so the
+    daily prune/expiry stay daily."""
+
+    def _snapshots(self, name=None, refusal="pool_gate", note=None):
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(return_value=name)
+        snapshots.last_refusal = None if name else refusal
+        snapshots.last_rotation_note = note
+        return snapshots
+
+    @pytest.mark.asyncio
+    async def test_relief_runs_before_the_cycle(self, config: GuardianConfig) -> None:
+        order: list[str] = []
+
+        async def relief(*a, **k):
+            order.append("relief")
+
+        async def cycle(*a, **k):
+            order.append("cycle")
+
+        with (
+            patch("genesis.guardian.check._check_pool_relief", relief),
+            patch("genesis.guardian.check._check_cycle", cycle),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+        assert order == ["relief", "cycle"]
+
+    @pytest.mark.asyncio
+    async def test_delete_first_starts_relief_settle(self, config: GuardianConfig) -> None:
+        """The settle runs both ways: after rotation deleted a lifeline, relief
+        must not delete again on the next tick, before a fresh measurement."""
+        from genesis.guardian.pool_relief import delete_first_allowed
+
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy", note="rotated")
+        snapshots.deleted_first = "guardian-20251230-000000-healthy"
+        assert delete_first_allowed(config)
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        assert not delete_first_allowed(config)  # last_action stamped
+
+        other = self._snapshots(name="guardian-20260101-000000-healthy")
+        other.deleted_first = None
+        config.state_dir = str(config.state_path / "fresh")
+        await _maintain_snapshots(config, other, is_healthy=True, dispatcher=AsyncMock())
+        assert delete_first_allowed(config)  # a plain rotation stamps nothing
+
+    @pytest.mark.asyncio
+    async def test_relief_crash_alerts_once_a_day(self, config: GuardianConfig) -> None:
+        from genesis.guardian.check import _check_pool_relief
+
+        dispatcher = AsyncMock()
+        with patch(
+            "genesis.guardian.pool_relief.check_pool_relief",
+            AsyncMock(side_effect=ValueError("bad config")),
+        ):
+            await _check_pool_relief(config, dispatcher, MagicMock())
+            await _check_pool_relief(config, dispatcher, MagicMock())
+        assert dispatcher.send.await_count == 1
+        assert "failing" in dispatcher.send.await_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_relief_crash_alert_needs_a_persisted_throttle(
+        self, config: GuardianConfig,
+    ) -> None:
+        """Unwritable state dir: the daily throttle cannot stick, so the
+        alert must not be sent at all (else every 30s tick)."""
+        from genesis.guardian.check import _check_pool_relief
+
+        dispatcher = AsyncMock()
+        with (
+            patch(
+                "genesis.guardian.pool_relief.check_pool_relief",
+                AsyncMock(side_effect=ValueError("bad config")),
+            ),
+            patch("genesis.guardian.check._touch_marker", return_value=False),
+        ):
+            for _ in range(3):
+                await _check_pool_relief(config, dispatcher, MagicMock())
+        dispatcher.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refused_refresh_alerts_and_retries_in_an_hour(
+        self, config: GuardianConfig,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        snapshots = self._snapshots(refusal="pool_space")
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        dispatcher.send.assert_awaited_once()
+        alert = dispatcher.send.await_args.args[0]
+        assert "NOT refreshed" in alert.title and "pool_space" in alert.body
+        stamp = datetime.fromisoformat((config.state_path / ".last_healthy").read_text())
+        hours_since = (datetime.now(UTC) - stamp).total_seconds() / 3600
+        assert 22.9 < hours_since < 23.1  # the healthy cadence reopens in ~1h
+
+    @pytest.mark.asyncio
+    async def test_hourly_retry_does_not_rerun_the_daily_prune(
+        self, config: GuardianConfig,
+    ) -> None:
+        """Review: sharing one marker re-ran expiry + prune every hour while
+        the pool refused. The retry now reopens only the healthy snapshot."""
+        from datetime import UTC, datetime, timedelta
+
+        snapshots = self._snapshots()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        # an hour later the healthy retry is due again; the prune is not
+        marker = config.state_path / ".last_healthy"
+        marker.write_text((datetime.now(UTC) - timedelta(hours=25)).isoformat())
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        assert snapshots.mark_healthy.await_count == 2
+        assert snapshots.prune.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_refusal_alert_is_throttled_not_hourly(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots()
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        # an hour later: the retry marker (stamped now - 23h) is due again
+        from datetime import UTC, datetime, timedelta
+
+        (config.state_path / ".last_healthy").write_text(
+            (datetime.now(UTC) - timedelta(hours=24, minutes=1)).isoformat()
+        )
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        assert snapshots.mark_healthy.await_count == 2
+        assert dispatcher.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rotation_passes_the_relief_permission(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        with patch(
+            "genesis.guardian.pool_relief.delete_first_allowed", return_value=False,
+        ):
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        assert snapshots.mark_healthy.await_args.kwargs["delete_first_allowed"] is False
+
+    @pytest.mark.asyncio
+    async def test_delete_first_rotation_is_reported(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(
+            name="guardian-20260101-000000-healthy",
+            note="pool refused the create (pool_space); deleted ...",
+        )
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        assert "delete-first" in dispatcher.send.await_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_plain_rotation_is_silent(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        dispatcher.send.assert_not_called()

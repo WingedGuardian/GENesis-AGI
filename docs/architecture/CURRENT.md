@@ -1422,6 +1422,31 @@ verified: 84c7259d 2026-08-31
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
   `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
   the same measurement to the container.
+- **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
+  (during an outage's diagnosis that is about hourly, since the tick is a
+  oneshot). The tiers above only alert, and a thin pool once filled to 100%
+  under six-hourly CRITICALs because the space was held by the guardian's own
+  healthy snapshot. Two layers now free guardian-owned space:
+  - `snapshots.mark_healthy` rotates **delete-first** when the pool refused
+    the create on a real measurement, the lifeline is ≥23h old, AND the pool
+    grew ≥ max(1 GiB, 1%) since it was taken (`lifeline_marks.json`). A
+    full-but-stable pool keeps its lifeline. A refused refresh retries in ~1h
+    (own `.last_healthy` marker) and alerts, throttled.
+  - relief deletes ONE guardian snapshot per pass when free data ≤
+    `min_reserve_pct` (3%) or free metadata ≤ `min_meta_reserve_pct` (10%):
+    pre-recovery oldest first, then superseded healthy, the lifeline last;
+    a failed delete falls through to the next; 5-minute settle stamped before
+    the delete (delete-first starts it too); pool identity re-checked first.
+    `safe_to_snapshot` refuses inside the reserve, so a fresh snapshot is never
+    relief's next target. Unable to measure/name the pool for 1h → daily
+    WARNING.
+  - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
+    `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
+    (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an
+    unmeasured or ambiguous pool (unknown backend, several thin pools).
+  - Levers: `storage_pool.relief_mode` (`live`/`alert_only`/`off`) and
+    `GUARDIAN_POOL_RELIEF_DISABLED=1`. Runbook:
+    `docs/reference/thin-pool-recovery.md`.
 - **Container-swap invariant reconciler** (`swap_watch.py`) runs every tick:
   re-asserts `limits.memory.swap=true` (incus config) and live-activates the
   cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the

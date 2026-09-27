@@ -481,6 +481,16 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # no action and never touches the state machine, so running it first is free.
     await _check_guard_layer_and_alert(config, dispatcher)
 
+    # Pool relief, also BEFORE the cycle and for the same reason: a filling
+    # pool is most likely exactly when the cycle is busy (a container outage →
+    # diagnosis for up to cc.timeout_s), and relief that waits behind it
+    # arrives an hour later in this tick. (The tick is a oneshot, so the NEXT
+    # tick still waits for this one's diagnosis: during an outage relief runs
+    # about hourly — against a pool whose container is down and so barely
+    # writing.) Measures, and frees at most ONE guardian-owned snapshot per
+    # tick when free space is at or below its reserve. Never raises.
+    await _check_pool_relief(config, dispatcher, snapshots)
+
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
@@ -494,6 +504,7 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             snapshots,
             is_healthy=sm.current_state == GuardianState.HEALTHY,
             snapshot_size_history=sm.state.snapshot_size_history,
+            dispatcher=dispatcher,
         )
         # Heartbeat means "Guardian process is alive and watching" —
         # NOT "Genesis container is healthy". Any successful check cycle
@@ -664,6 +675,7 @@ async def _maintain_snapshots(
     snapshots: SnapshotManager,
     is_healthy: bool = False,
     snapshot_size_history: list[int] | None = None,
+    dispatcher: AlertDispatcher | None = None,
 ) -> None:
     """Enforce snapshot expiry, prune, and take the daily healthy snapshot.
 
@@ -677,50 +689,136 @@ async def _maintain_snapshots(
     snapshot a broken container as "healthy") is the offline SNAPSHOT_ROLLBACK
     lifeline: before this wiring, ``mark_healthy`` had no callers, so rollback
     could never find a target. Taken after prune so the pool is at its
-    cleanest; rotation inside ``mark_healthy`` keeps exactly one.
+    cleanest; rotation inside ``mark_healthy`` keeps exactly one. It has its
+    own daily marker (``.last_healthy``): a refused take retries in ~1h and
+    alerts (throttled), without re-running the daily expiry + prune.
     """
     prune_marker = config.state_path / ".last_prune"
-    should_run = True
-    if prune_marker.exists():
-        try:
-            last_prune = datetime.fromisoformat(prune_marker.read_text().strip())
-            hours_since = (datetime.now(UTC) - last_prune).total_seconds() / 3600
-            should_run = hours_since >= 24
-        except (ValueError, OSError):
-            should_run = True
+    # The healthy snapshot has its OWN cadence marker: a refused refresh
+    # retries in ~1h, and sharing the prune marker would re-run the daily
+    # expiry + prune every hour for as long as the pool refuses (review).
+    # Fall back to the prune marker the first time, so a deploy does not force
+    # an immediate extra snapshot.
+    healthy_marker = config.state_path / ".last_healthy"
+    now = datetime.now(UTC)
+    # Decided BEFORE the prune step re-stamps its own marker below.
+    healthy_due = _marker_due(
+        healthy_marker if healthy_marker.exists() else prune_marker, 24,
+    )
 
-    if not should_run:
+    if _marker_due(prune_marker, 24):
+        # Idempotent — keep incus daemon-side expiry in force (guardian-
+        # independent safety net that fires even if the guardian later dies).
+        try:
+            await snapshots.enforce_expiry_policy()
+        except Exception:
+            logger.warning("enforce_expiry_policy failed", exc_info=True)
+        try:
+            pruned = await snapshots.prune()
+            if pruned > 0:
+                logger.info("Pruned %d old snapshots", pruned)
+        except Exception:
+            logger.warning("Snapshot prune failed", exc_info=True)
+        _touch_marker(prune_marker, now)
+
+    if not (is_healthy and config.snapshots.healthy_enabled and healthy_due):
         return
 
-    # Idempotent — keep incus daemon-side expiry in force (guardian-independent
-    # safety net that fires even if the guardian process later dies).
+    retry_soon = False
     try:
-        await snapshots.enforce_expiry_policy()
-    except Exception:
-        logger.warning("enforce_expiry_policy failed", exc_info=True)
+        # Delete-first rotation only while relief is live (the kill switch and
+        # alert_only stop every automatic delete) and not settling after its
+        # own delete this tick. Whether the lifeline is actually diverging is
+        # mark_healthy's own, measured, decision.
+        from genesis.guardian.pool_relief import delete_first_allowed, record_action
 
+        name = await snapshots.mark_healthy(
+            snapshot_size_history, delete_first_allowed=delete_first_allowed(config),
+        )
+        if isinstance(getattr(snapshots, "deleted_first", None), str):
+            # The settle runs both ways: relief must not delete again 30s after
+            # rotation freed space, before a fresh measurement shows the effect.
+            record_action(config)
+        note = getattr(snapshots, "last_rotation_note", None)
+        if name:
+            logger.info("Healthy snapshot refreshed: %s", name)
+        else:
+            retry_soon = True
+            refusal = getattr(snapshots, "last_refusal", None)
+            logger.warning(
+                "Healthy snapshot NOT taken (%s) — offline rollback lifeline "
+                "not refreshed this cycle; retrying in ~1h",
+                refusal if isinstance(refusal, str) else "unknown",
+            )
+        # A refused rotation used to be only the log line above, and a week of
+        # them preceded a thin pool filling to 100%. Say it out loud — but
+        # throttled (the retry is hourly), and only when the throttle stamp
+        # persisted, so an unwritable state dir cannot page every hour.
+        refused_marker = config.state_path / ".healthy_refused_alert"
+        if name:
+            refused_marker.unlink(missing_ok=True)
+        send = isinstance(note, str)
+        if not name and _marker_due(refused_marker, config.storage_pool.realert_hours):
+            send = _touch_marker(refused_marker, now) or send
+        if send:
+            await _alert_healthy_snapshot(
+                dispatcher, name, note if isinstance(note, str) else None,
+                getattr(snapshots, "last_refusal", None),
+            )
+    except Exception:
+        retry_soon = True
+        logger.warning("Healthy snapshot take failed", exc_info=True)
+
+    _touch_marker(healthy_marker, now - timedelta(hours=23) if retry_soon else now)
+
+
+def _marker_due(marker: Path, hours: float) -> bool:
+    """True when ``marker`` (an ISO timestamp file) is absent, unreadable, in
+    the future, or older than ``hours``."""
     try:
-        pruned = await snapshots.prune()
-        if pruned > 0:
-            logger.info("Pruned %d old snapshots", pruned)
+        last = datetime.fromisoformat(marker.read_text().strip())
+    except (OSError, ValueError):
+        return True
+    now = datetime.now(UTC)
+    return last > now or (now - last) >= timedelta(hours=hours)
+
+
+def _touch_marker(marker: Path, when: datetime | None = None) -> bool:
+    """Write an ISO timestamp marker; False when it could not be written."""
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text((when or datetime.now(UTC)).isoformat())
+    except OSError:
+        logger.warning("could not write %s", marker, exc_info=True)
+        return False
+    return True
+
+
+async def _alert_healthy_snapshot(
+    dispatcher: AlertDispatcher | None,
+    name: str | None,
+    note: str | None,
+    refusal: object,
+) -> None:
+    """WARN when the rollback lifeline could not be refreshed normally."""
+    if dispatcher is None:
+        return
+    if name:
+        title = "Healthy snapshot rotated delete-first"
+        body = f"{note}. The pool refused a create-first rotation."
+    else:
+        title = "Healthy snapshot NOT refreshed"
+        why = refusal if isinstance(refusal, str) else "unknown"
+        body = (
+            f"The daily rollback snapshot was not taken ({why}); retrying in ~1h. "
+            + (f"{note}. " if note else "")
+            + "If the pool refused it, pool relief frees guardian snapshots once free "
+            "space reaches its reserve (storage_pool.min_reserve_pct)."
+        )
+    try:
+        await dispatcher.send(Alert(severity=AlertSeverity.WARNING, title=title, body=body))
     except Exception:
-        logger.warning("Snapshot prune failed", exc_info=True)
-
-    if is_healthy and config.snapshots.healthy_enabled:
-        try:
-            name = await snapshots.mark_healthy(snapshot_size_history)
-            if name:
-                logger.info("Healthy snapshot refreshed: %s", name)
-            else:
-                logger.warning(
-                    "Healthy snapshot NOT taken (pool gate or create failure) "
-                    "— offline rollback lifeline not refreshed this cycle",
-                )
-        except Exception:
-            logger.warning("Healthy snapshot take failed", exc_info=True)
-
-    prune_marker.parent.mkdir(parents=True, exist_ok=True)
-    prune_marker.write_text(datetime.now(UTC).isoformat())
+        logger.warning("failed to send healthy-snapshot alert", exc_info=True)
 
 
 _POOL_TIER_SEVERITY = {
@@ -816,6 +914,45 @@ async def _check_memory_and_alert(
         await check_memory_and_alert(config, dispatcher)
     except Exception:
         logger.warning("RAM watch failed", exc_info=True)
+
+
+async def _check_pool_relief(
+    config: GuardianConfig,
+    dispatcher: AlertDispatcher,
+    snapshots: SnapshotManager,
+) -> None:
+    """Pool relief pass (delegates to pool_relief). Never raises.
+
+    A relief pass that crashes every tick would otherwise be a journal line
+    nobody reads — the exact silence this feature exists to end — so a crash
+    also alerts, at most daily, and only when that throttle stamp persisted.
+    """
+    try:
+        from genesis.guardian.pool_relief import check_pool_relief
+
+        outcome = await check_pool_relief(config, dispatcher, snapshots)
+        acted = outcome.split(":", 1)[0] in (
+            "deleted", "delete_failed", "list_failed", "no_target", "state_unwritable",
+            "unmeasured", "ambiguous_pool",
+        )
+        (logger.warning if acted else logger.info)("pool relief: %s", outcome)
+    except Exception as exc:
+        logger.warning("pool relief failed", exc_info=True)
+        marker = config.state_path / ".pool_relief_error"
+        if _marker_due(marker, 24) and _touch_marker(marker):
+            try:
+                await dispatcher.send(Alert(
+                    severity=AlertSeverity.WARNING,
+                    title="Pool relief is failing",
+                    body=(
+                        f"The pool relief pass raised {type(exc).__name__}: "
+                        f"{str(exc)[:300]}. The guardian will NOT free "  # the channel escapes
+                        "pool space until this is fixed; the tier alerts still run. "
+                        "Details in the guardian journal."
+                    ),
+                ))
+            except Exception:
+                logger.warning("failed to send relief-failure alert", exc_info=True)
 
 
 async def _check_storage_pool_and_alert(

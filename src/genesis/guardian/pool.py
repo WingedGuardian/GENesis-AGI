@@ -15,7 +15,9 @@ Design:
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -46,6 +48,18 @@ class StoragePoolStatus:
     vg_free_bytes: int | None = None
     pool_used_pct: float | None = None
     detail: str = ""
+    # Byte size of the thing the percentages are OF (the thin-pool data LV, or
+    # the non-LVM pool filesystem). Turns a percentage into bytes for the
+    # delete-first divergence evidence (snapshots.mark_healthy); None when
+    # unreadable, and then there is no such evidence.
+    pool_size_bytes: int | None = None
+    # The incus storage pool behind the container's root disk.
+    pool_name: str | None = None
+    # LVM-thin only: the VG and the backing thin-pool LV. Together with
+    # pool_name they are the pool's identity; a VG with several thin pools
+    # leaves thinpool_lv None, and relief never acts on a pool it cannot name.
+    vg_name: str | None = None
+    thinpool_lv: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,26 +110,64 @@ def worst_tier(status: StoragePoolStatus, cfg: StoragePoolConfig) -> str:
     return data if _TIER_RANK[data] >= _TIER_RANK[meta] else meta
 
 
-def parse_lvs_data_metadata(stdout: str) -> tuple[float | None, float | None]:
-    """Parse ``lvs --noheadings -o data_percent,metadata_percent``.
+@dataclass(frozen=True)
+class ThinPoolReport:
+    """The thin-pool row of ``lvs``, bound by FIELD NAME (see parse_lvs_report)."""
 
-    Output is one line like ``  75.00  12.34`` (percentages). Returns
-    ``(data_pct, metadata_pct)``; either element is None if absent/unparseable.
+    data_pct: float | None = None
+    metadata_pct: float | None = None
+    size_bytes: int | None = None
+    lv_name: str | None = None
+
+
+LVS_FIELDS = ("data_percent", "metadata_percent", "lv_size", "lv_name")
+
+
+def parse_lvs_report(stdout: str) -> ThinPoolReport:
+    """Parse ``lvs --reportformat json -o data_percent,metadata_percent,lv_size,
+    lv_name --units b --nosuffix`` for the thin-pool LVs of one VG.
+
+    Fields are bound by NAME, never by column position: lvs prints a blank
+    percent for an inactive LV (measured: ``"data_percent":""``), and a
+    whitespace-split positional parse then shifts the byte size into the data%
+    column — a healthy pool reading as a CRITICAL one. Blank or unparseable
+    values are None; output that is not the expected JSON shape yields an
+    all-None report (no signal, never a guess).
+
+    Percentages come from the first row, as before. Identity (size + LV name)
+    only when there is EXACTLY one thin pool: with several, the percentages may
+    belong to a different pool than the container's, and relief must never act
+    on a pool it cannot name.
     """
-    lines = [ln for ln in stdout.strip().splitlines() if ln.strip()]
-    if not lines:
-        return None, None
-    parts = lines[0].split()
+    try:
+        rows = json.loads(stdout)["report"][0]["lv"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ThinPoolReport()
+    if not isinstance(rows, list) or not rows or not all(isinstance(r, dict) for r in rows):
+        return ThinPoolReport()
 
-    def _f(idx: int) -> float | None:
-        if idx >= len(parts):
+    def _num(row: dict, key: str) -> float | None:
+        raw = row.get(key)
+        if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return float(parts[idx])
+            val = float(raw)
         except ValueError:
             return None
+        return val if math.isfinite(val) else None
 
-    return _f(0), _f(1)
+    first = rows[0]
+    data, meta = _num(first, "data_percent"), _num(first, "metadata_percent")
+    if len(rows) != 1:
+        return ThinPoolReport(data_pct=data, metadata_pct=meta)
+    size = _num(first, "lv_size")
+    name = first.get("lv_name")
+    return ThinPoolReport(
+        data_pct=data,
+        metadata_pct=meta,
+        size_bytes=int(size) if size is not None and size > 0 else None,
+        lv_name=name.strip() if isinstance(name, str) and name.strip() else None,
+    )
 
 
 def decide_alert(
@@ -202,8 +254,8 @@ async def _lvm_source(pool_name: str) -> str | None:
     return source
 
 
-async def _pool_used_pct_via_df(mount: str) -> float | None:
-    """Filesystem used% of a pool mount via ``df`` (statvfs).
+async def _pool_used_via_df(mount: str) -> tuple[float, int] | None:
+    """Filesystem (used%, size bytes) of a pool mount via ``df`` (statvfs).
 
     The tiering signal for non-LVM pools, where there is no thin-pool
     data%/metadata%. Returns None on any error (missing mount, unparsable
@@ -223,7 +275,13 @@ async def _pool_used_pct_via_df(mount: str) -> float | None:
         return None
     if size <= 0:
         return None
-    return 100.0 * used / size
+    return 100.0 * used / size, size
+
+
+async def _pool_used_pct_via_df(mount: str) -> float | None:
+    """Used% only — see :func:`_pool_used_via_df`."""
+    got = await _pool_used_via_df(mount)
+    return got[0] if got else None
 
 
 async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
@@ -234,17 +292,28 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
 
     pool_used_pct: float | None = None
 
-    vg = await _lvm_source(pool_name)
+    # Identify the backend ONCE, and treat "could not tell" as undetected. An
+    # `incus storage show` failure used to read as "not LVM" and fall through to
+    # df, which on an LVM pool measures the HOST filesystem, not thin-pool
+    # allocation — a number automatic relief must never act on.
+    driver, source = await _pool_driver_and_source(pool_name)
+    if driver is None:
+        return StoragePoolStatus(detected=False, detail=f"backend of pool {pool_name} undetected")
+    if driver == "lvm" and not source:
+        return StoragePoolStatus(detected=False, detail=f"lvm pool {pool_name} has no source VG")
+    vg = source if driver == "lvm" else None
     if not vg:
         # Non-LVM backend (btrfs/dir): the pool mount's filesystem used% is the
         # only tiering signal (there is no thin-pool data%/metadata%). incus
         # storage info exposes no machine-readable space for an uncapped
         # btrfs-on-LV pool, so read the mount directly — the same source
         # snapshots.py uses for this pool.
-        pool_used_pct = await _pool_used_pct_via_df(pool_mount_path(pool_name))
+        df_used = await _pool_used_via_df(pool_mount_path(pool_name))
         return StoragePoolStatus(
-            detected=pool_used_pct is not None,
-            pool_used_pct=pool_used_pct,
+            detected=df_used is not None,
+            pool_used_pct=df_used[0] if df_used else None,
+            pool_size_bytes=df_used[1] if df_used else None,
+            pool_name=pool_name,
             detail=f"non-lvm pool {pool_name}",
         )
 
@@ -253,10 +322,15 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
     # (regular LVs report blank percents), so we must filter to segtype
     # thin-pool to read the pool's own data%/metadata%.
     vg_name = vg.split("/")[0]
+    # The same row also carries the pool's byte size and LV name (folded into
+    # this call rather than a new subprocess: the measurement's subprocess
+    # count is budgeted, see host_profile._POOL_TIMEOUT). `--units b` changes
+    # only lv_size; the percent columns are unit-free.
     rc, out, err = await _run_subprocess(
-        "sudo", "-n", "lvs", "--noheadings", "--nosuffix",
+        "sudo", "-n", "lvs", "--reportformat", "json", "--nosuffix", "--units", "b",
         "-S", "segtype=thin-pool",
-        "-o", "data_percent,metadata_percent", vg_name,
+        "-o", ",".join(LVS_FIELDS),
+        vg_name,
         timeout=10.0,
     )
     if rc != 0:
@@ -266,7 +340,8 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
             pool_used_pct=pool_used_pct,
             detail=f"lvs failed: {err[:120]}",
         )
-    data_pct, metadata_pct = parse_lvs_data_metadata(out)
+    report = parse_lvs_report(out)
+    data_pct, metadata_pct = report.data_pct, report.metadata_pct
 
     # VG free bytes (headroom for autoextend — 0 free = autoextend can't fire).
     vg_free_bytes: int | None = None
@@ -288,4 +363,8 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
         vg_free_bytes=vg_free_bytes,
         pool_used_pct=pool_used_pct,
         detail=f"lvm {vg} data={data_pct} meta={metadata_pct}",
+        pool_size_bytes=report.size_bytes,
+        pool_name=pool_name,
+        vg_name=vg_name,
+        thinpool_lv=report.lv_name,
     )

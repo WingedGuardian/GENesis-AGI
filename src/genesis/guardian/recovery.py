@@ -25,7 +25,7 @@ from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 from genesis.guardian.health_signals import collect_all_signals
-from genesis.guardian.snapshots import SnapshotManager
+from genesis.guardian.snapshots import PRE_RECOVERY_LABEL, SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class RecoveryEngine:
             and await self._snapshots.safe_to_snapshot(snap_history)
         ):
             snap_name = await self._snapshots.take(
-                label="pre-recovery",
+                label=PRE_RECOVERY_LABEL,
                 snapshot_size_history=snap_history,
             )
             if snap_name:
