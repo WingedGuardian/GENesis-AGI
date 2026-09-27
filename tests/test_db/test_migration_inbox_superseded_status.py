@@ -218,6 +218,95 @@ async def test_install_local_trigger_survives_rebuild():
 
 
 @pytest.mark.asyncio
+async def test_views_on_inbox_items_survive_rebuild():
+    """RENAME reparses the whole schema; a view naming inbox_items (directly or
+    through another view) must not abort the migration, and must work after."""
+    db = await _make_legacy_db()
+    await db.execute("CREATE VIEW v_failed AS SELECT id FROM inbox_items WHERE status='failed'")
+    await db.execute("CREATE VIEW v_failed_count AS SELECT count(*) AS n FROM v_failed")
+    await M.up(db)
+    cur = await db.execute("SELECT n FROM v_failed_count")
+    # _ROWS has 8 failed rows; 3 are backfilled to superseded.
+    assert (await cur.fetchone())[0] == 5
+    await M.down(db)  # the narrowing rebuild too
+    cur = await db.execute("SELECT n FROM v_failed_count")
+    assert (await cur.fetchone())[0] == 8
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fk_child_with_foreign_keys_on_refuses_cleanly():
+    """With foreign_keys=ON the DROP would fail on child rows mid-rebuild; the
+    migration refuses up front, naming the table, and changes nothing."""
+    db = await _make_legacy_db()
+    await db.execute("CREATE TABLE child (id TEXT, item_id TEXT REFERENCES inbox_items(id))")
+    await db.execute("INSERT INTO child VALUES ('c1', 'a')")
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=ON")
+    before = await _snapshot(db)
+    with pytest.raises(RuntimeError, match="child"):
+        await M.up(db)
+    assert await _snapshot(db) == before
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fk_child_with_foreign_keys_off_rebuilds():
+    db = await _make_legacy_db()
+    await db.execute("CREATE TABLE child (id TEXT, item_id TEXT REFERENCES inbox_items(id))")
+    await db.execute("INSERT INTO child VALUES ('c1', 'a')")
+    await M.up(db)
+    assert (await _statuses(db))["a"] == "superseded"
+    await db.execute("PRAGMA foreign_keys=ON")
+    cur = await db.execute("PRAGMA foreign_key_check")
+    assert await cur.fetchall() == []
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_generated_column_raises_instead_of_dropping_it():
+    """PRAGMA table_info hides generated columns; the drift check must still see
+    one, or the rebuild would silently drop it."""
+    db = await _make_legacy_db()
+    await db.execute(
+        "ALTER TABLE inbox_items ADD COLUMN file_name TEXT "
+        "GENERATED ALWAYS AS (file_path || '') VIRTUAL"
+    )
+    with pytest.raises(RuntimeError, match="file_name"):
+        await M.up(db)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_matches_reasons_literally_not_as_like_wildcards():
+    """'_' is a LIKE wildcard; only the exact recognised reasons move."""
+    db = await _make_legacy_db()
+    for rid, err in (
+        ("w1", "approvalXinvalidated:content changed"),
+        ("w2", "approvalXinvalidated:superseded by newer modification"),
+        ("w3", "approval_invalidated:superseded by something unrecognised"),
+    ):
+        await db.execute(
+            "INSERT INTO inbox_items (id, file_path, content_hash, status, "
+            "created_at, error_message) VALUES (?, '/f', 'h', 'failed', 't', ?)",
+            (rid, err),
+        )
+    await M.up(db)
+    statuses = await _statuses(db)
+    assert {k: statuses[k] for k in ("w1", "w2", "w3")} == {
+        "w1": "failed",
+        "w2": "failed",
+        "w3": "failed",
+    }
+    assert {k: statuses[k] for k in ("a", "b", "c")} == {
+        "a": "superseded",
+        "b": "superseded",
+        "c": "superseded",
+    }
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_unknown_live_column_raises_instead_of_dropping_data():
     db = await _make_legacy_db()
     await db.execute("ALTER TABLE inbox_items ADD COLUMN future_col TEXT")

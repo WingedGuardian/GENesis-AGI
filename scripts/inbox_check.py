@@ -28,12 +28,17 @@ async def open_migrated_db(path: str | Path | None = None):
     from genesis.db.migrations.runner import MigrationRunner
 
     db = await (init_db(path) if path is not None else init_db())
-    results = await MigrationRunner(db).run_pending()
-    failed = [r for r in results if not r.success]
-    if failed:
+    try:
+        results = await MigrationRunner(db).run_pending()
+        failed = [r for r in results if not r.success]
+        if failed:
+            details = "; ".join(f"{r.name}: {r.error}" for r in failed)
+            raise RuntimeError(f"{len(failed)} schema migration(s) failed: {details}")
+    except BaseException:
+        # The runner can also RAISE (e.g. duplicate ids at preflight) rather
+        # than report a failed result; close the connection on every path.
         await db.close()
-        details = "; ".join(f"{r.name}: {r.error}" for r in failed)
-        raise RuntimeError(f"{len(failed)} schema migration(s) failed: {details}")
+        raise
     return db
 
 

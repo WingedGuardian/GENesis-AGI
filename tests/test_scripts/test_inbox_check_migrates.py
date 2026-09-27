@@ -56,6 +56,38 @@ async def test_init_db_alone_leaves_legacy_check_narrow(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_open_migrated_db_closes_connection_when_runner_raises(tmp_path, monkeypatch):
+    """A runner that RAISES (e.g. duplicate migration ids at preflight) returns no
+    result list; the connection must still be closed before the error propagates."""
+    from genesis.db.migrations.runner import MigrationRunner
+
+    mod = private_module("inbox_check_under_test", _SCRIPT)
+    path = tmp_path / "legacy.db"
+    await _legacy_db(path)
+    opened = []
+
+    import genesis.db.connection as conn_mod
+
+    real_init_db = conn_mod.init_db
+
+    async def spy_init_db(p):
+        db = await real_init_db(p)
+        opened.append(db)
+        return db
+
+    async def boom(self, dry_run=False):
+        raise RuntimeError("duplicate migration id")
+
+    monkeypatch.setattr(conn_mod, "init_db", spy_init_db)
+    monkeypatch.setattr(MigrationRunner, "run_pending", boom)
+    with pytest.raises(RuntimeError, match="duplicate migration id"):
+        await mod.open_migrated_db(path)
+    assert len(opened) == 1
+    with pytest.raises(Exception):  # noqa: B017 — any "closed" error proves closure
+        await opened[0].execute("SELECT 1")
+
+
+@pytest.mark.asyncio
 async def test_open_migrated_db_widens_legacy_check(tmp_path):
     mod = private_module("inbox_check_under_test", _SCRIPT)
     path = tmp_path / "legacy.db"

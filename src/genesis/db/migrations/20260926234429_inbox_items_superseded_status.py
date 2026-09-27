@@ -63,10 +63,13 @@ _CANONICAL_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_drop ON inbox_items(drop_id)",
 )
 
-# error_message prefixes that mean "replaced by a newer snapshot", not "failed".
-_SUPERSEDED_MARKERS = (
-    "approval_invalidated:superseded%",
-    "approval_invalidated:content changed%",
+# The exact error_message values that mean "replaced by a newer snapshot", not
+# "failed" — every value any writer (current or retired) has produced. Matched
+# with equality, never LIKE: '_' in the prefix is a LIKE wildcard.
+_SUPERSEDED_REASONS = (
+    "approval_invalidated:superseded by newer modification",
+    "approval_invalidated:superseded by new inbox scan",
+    "approval_invalidated:content changed",
 )
 
 
@@ -80,11 +83,45 @@ async def _live_ddl(db: aiosqlite.Connection) -> str | None:
 
 async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
     """Rebuild inbox_items with the given status CHECK, preserving rows/rowids/
-    indexes/triggers."""
+    indexes/triggers/views.
+
+    Follows SQLite's documented generalized ALTER TABLE procedure
+    (lang_altertable.html, "Making Other Kinds Of Table Schema Changes"):
+    create the new table under a temporary name, copy, drop, rename into place,
+    then recreate the indexes, triggers and views the DROP removed or broke.
+    The canonical schema has no view, trigger or foreign key touching
+    inbox_items; every such object handled here is one an install added.
+    """
+    # Foreign keys: the procedure disables them BEFORE the transaction, which a
+    # migration cannot do (the runner owns the transaction, and PRAGMA
+    # foreign_keys is a no-op inside one). With them enabled, DROP TABLE runs an
+    # implicit DELETE that fails on any child row, so refuse up front with a
+    # message naming the referencing table rather than failing mid-rebuild.
+    cursor = await db.execute("PRAGMA foreign_keys")
+    if (await cursor.fetchone())[0]:
+        cursor = await db.execute(
+            "SELECT DISTINCT m.name FROM sqlite_master AS m, "
+            "pragma_foreign_key_list(m.name) AS f "
+            "WHERE m.type = 'table' AND lower(f.\"table\") = 'inbox_items'"
+        )
+        referencing = [r[0] for r in await cursor.fetchall()]
+        if referencing:
+            raise RuntimeError(
+                f"inbox_items rebuild: table(s) {referencing} declare a FOREIGN KEY "
+                "to inbox_items; with foreign_keys=ON the rebuild's DROP TABLE would "
+                "fail. Apply this migration with foreign_keys=OFF."
+            )
+
     # Capture every explicit index and trigger on the live table so none is
     # lost to the DROP (autoindexes have NULL sql and are recreated by the
-    # PRIMARY KEY). The canonical schema defines no inbox_items trigger; this
-    # keeps any an install added.
+    # PRIMARY KEY), and every view: ALTER TABLE ... RENAME reparses the whole
+    # schema, and a view naming inbox_items (directly or through another view)
+    # fails that reparse while the table is absent. Views hold no data, so all
+    # of them are dropped and recreated in their original creation order.
+    cursor = await db.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='view' AND sql IS NOT NULL ORDER BY rowid"
+    )
+    live_views = list(await cursor.fetchall())
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' "
         "AND tbl_name='inbox_items' AND sql IS NOT NULL"
@@ -101,9 +138,13 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
         f"CREATE TABLE inbox_items_new ({_COLUMNS_TEMPLATE.format(status_values=status_values)})"
     )
 
-    cursor = await db.execute("PRAGMA table_info(inbox_items)")
+    # table_xinfo, not table_info: table_info omits generated columns, which
+    # would let an install-added generated column pass the drift check and be
+    # silently dropped. The rebuild target declares none, so any live one
+    # (hidden flag 2/3) is reported as drift below.
+    cursor = await db.execute("PRAGMA table_xinfo(inbox_items)")
     src_cols = [r[1] for r in await cursor.fetchall()]
-    cursor = await db.execute("PRAGMA table_info(inbox_items_new)")
+    cursor = await db.execute("PRAGMA table_xinfo(inbox_items_new)")
     dst_cols = {r[1] for r in await cursor.fetchall()}
     dropped = [c for c in src_cols if c not in dst_cols]
     if dropped:
@@ -119,11 +160,16 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
         f"SELECT rowid, {collist} FROM inbox_items"
     )
 
+    for name, _sql in reversed(live_views):
+        quoted = name.replace('"', '""')
+        await db.execute(f'DROP VIEW "{quoted}"')
     await db.execute("DROP TABLE inbox_items")
     await db.execute("ALTER TABLE inbox_items_new RENAME TO inbox_items")
     for stmt in live_indexes:
         await db.execute(stmt)
     for stmt in _CANONICAL_INDEXES:
+        await db.execute(stmt)
+    for _name, stmt in live_views:
         await db.execute(stmt)
     for stmt in live_triggers:
         await db.execute(stmt)
@@ -137,8 +183,8 @@ async def up(db: aiosqlite.Connection) -> None:
         await _rebuild(db, status_values=_WIDE_STATUSES)
     await db.execute(
         "UPDATE inbox_items SET status = 'superseded' "
-        "WHERE status = 'failed' AND (error_message LIKE ? OR error_message LIKE ?)",
-        _SUPERSEDED_MARKERS,
+        "WHERE status = 'failed' AND error_message IN (?, ?, ?)",
+        _SUPERSEDED_REASONS,
     )
 
 
