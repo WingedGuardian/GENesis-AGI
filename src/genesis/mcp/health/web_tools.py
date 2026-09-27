@@ -224,13 +224,32 @@ async def _tinyfish_search_with_reason(query: str, max_results: int) -> tuple[di
 
 
 
-def _explicit_search_failure(query: str, backend: str, summary: str, detail: str | None) -> dict:
+#: The credential each explicit search backend needs.
+_SEARCH_BACKEND_KEYS = {
+    "tinyfish": "API_KEY_TINYFISH",
+    "firecrawl": "FIRECRAWL_API_KEY",
+    "tavily": "API_KEY_TAVILY",
+    "exa": "API_KEY_EXA",
+    "perplexity": "API_KEY_PERPLEXITY",
+}
+
+
+def _explicit_search_failure(
+    query: str, backend: str, summary: str, detail: str | None = None,
+) -> dict:
     """Failure dict for an explicit search backend.
 
-    Adapters put ``str(exc)`` in their error text, which can carry request URLs or
-    response detail. That goes to the log; the caller gets the summary only.
+    A missing credential is classified from the ENVIRONMENT and named, so the caller
+    can fix configuration. Anything else gets ``summary``: adapters put ``str(exc)``
+    in their error text, which can carry request URLs or response detail, so that
+    goes to the log only.
     """
-    if detail:
+    import os
+
+    key = _SEARCH_BACKEND_KEYS.get(backend)
+    if key and not os.environ.get(key, "").strip():
+        summary = f"{key} is not set"
+    elif detail:
         logger.warning("%s search failed: %s", backend, detail)
     return {"query": query, "error": summary, "backend_used": None, "backend_tried": backend}
 
@@ -512,7 +531,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
             tf_result["latency_ms"] = round(latency, 1)
             return tf_result
-        return {"query": query, "error": "TinyFish search failed or unavailable", "backend_used": None, "backend_tried": "tinyfish"}
+        return _explicit_search_failure(query, "tinyfish", "TinyFish search failed or unavailable")
 
     elif backend == "firecrawl":
         # PAID escalation (burns account credits) — explicit-only, like
@@ -522,12 +541,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
             fc_result["latency_ms"] = round(latency, 1)
             return fc_result
-        return {
-            "query": query,
-            "error": "Firecrawl search failed or unavailable (FIRECRAWL_API_KEY set?)",
-            "backend_used": None,
-            "backend_tried": "firecrawl",
-        }
+        return _explicit_search_failure(query, "firecrawl", "Firecrawl search failed or unavailable")
 
     elif backend == "tavily":
         try:
@@ -559,7 +573,7 @@ async def _impl_web_search(
                 "latency_ms": round(latency, 1),
             }
         except (ImportError, ValueError) as exc:
-            return {"query": query, "error": f"Tavily unavailable: {type(exc).__name__}", "backend_used": None, "backend_tried": "tavily"}
+            return _explicit_search_failure(query, "tavily", f"Tavily unavailable: {type(exc).__name__}")
 
     elif backend == "exa":
         try:
@@ -598,7 +612,7 @@ async def _impl_web_search(
                 "latency_ms": round(latency, 1),
             }
         except (ImportError, ValueError) as exc:
-            return {"query": query, "error": f"Exa unavailable: {type(exc).__name__}", "backend_used": None, "backend_tried": "exa"}
+            return _explicit_search_failure(query, "exa", f"Exa unavailable: {type(exc).__name__}")
 
     elif backend == "perplexity":
         try:
@@ -621,7 +635,7 @@ async def _impl_web_search(
                 "latency_ms": round(latency, 1),
             }
         except (ImportError, ValueError) as exc:
-            return {"query": query, "error": f"Perplexity unavailable: {type(exc).__name__}", "backend_used": None, "backend_tried": "perplexity"}
+            return _explicit_search_failure(query, "perplexity", f"Perplexity unavailable: {type(exc).__name__}")
 
     else:
         return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, searxng, brave, tavily, exa, perplexity, firecrawl (paid escalation)"}

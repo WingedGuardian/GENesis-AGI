@@ -478,12 +478,15 @@ class TestFirecrawlBackend:
                 )
 
         with (
-            patch("genesis.mcp.health.web_tools._try_tinyfish_search") as ts,
+            # The helper the auto chain actually calls. Asserted below, so a
+            # rename cannot silently let a real TinyFish request through.
+            patch("genesis.mcp.health.web_tools._tinyfish_search_with_reason") as ts,
             patch("genesis.mcp.health.web_tools._get_searcher") as gs,
         ):
-            ts.return_value = None
+            ts.return_value = (None, "forced miss")
             gs.return_value = _EmptySearcher()
             result = await _impl_web_search("hard query", "auto", 10)
+        ts.assert_awaited_once()
         assert called == [], "search auto chain must not burn paid credits"
         assert result.get("backend_used") != "firecrawl"
 
