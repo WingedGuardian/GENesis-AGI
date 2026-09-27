@@ -639,11 +639,28 @@ def _is_reaper_archive(wt: dict, trash_dir: Path) -> bool:
         archive = trash_dir / f"{entry}{REAPER_ARCHIVE_SUFFIX}"
         if not archive.is_file():
             return False
-        if os.path.lexists(path):
+        if not _path_absent(path):
             return False
     except (OSError, ValueError):
         return False
     return True
+
+
+def _path_absent(path: str) -> bool:
+    """True ONLY when ``lstat`` says the path does not exist.
+
+    ``os.path.lexists`` answers False for EVERY ``OSError``, so an EACCES or EIO
+    on a present tree would read as "gone" and resolve a finding the sweep must
+    hold. Here any error other than ENOENT/ENOTDIR means "could not tell", which
+    keeps holding.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
 
 
 async def _observe_worktrees(

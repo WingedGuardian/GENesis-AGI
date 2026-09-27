@@ -136,7 +136,7 @@ def _pin_ref(entry: str) -> str:
 @pytest.mark.parametrize(
     ("env", "cli", "expected"),
     [
-        (None, None, 30),
+        (None, None, None),  # retention is OFF by default (#2504)
         (None, 45, 45),
         (None, 0, None),
         ("60", None, 60),
@@ -320,6 +320,55 @@ def test_dry_run_changes_nothing(repo, tmp_path):
     assert not wl.TOMBSTONE_INDEX.exists() or "expiring" not in wl.TOMBSTONE_INDEX.read_text()
 
 
+def test_retention_is_off_by_default_and_the_cli_deletes_nothing(repo, tmp_path, monkeypatch):
+    """The split of #2458: with no window named, `--expire-trash` deletes no
+    archive, releases no anchor, prunes no registration and journals nothing —
+    even for an archive that the metadata predicate would expire."""
+    a = _archive(repo, tmp_path, "offbydefault")
+    _backdate(a["entry"], 400)
+    before = _registered(repo)
+    assert before.get(str(a["path"])), "fixture: the archive must be anchored"
+    monkeypatch.setattr(wl, "_repo_root", lambda: repo)
+    monkeypatch.setattr(sys, "argv", ["worktree_lifecycle.py", "--expire-trash"])
+    assert wl.main() == 0
+    assert a["archive"].exists(), "retention must be off by default"
+    assert _registered(repo) == before
+    assert not wl.TOMBSTONE_INDEX.exists() or "expiring" not in wl.TOMBSTONE_INDEX.read_text()
+    # Guard-the-guard: with an explicit window this very archive DOES expire, so
+    # the assertions above are not vacuously true of an archive nothing touches.
+    monkeypatch.setattr(
+        sys, "argv", ["worktree_lifecycle.py", "--expire-trash", "--retention-days", "30"]
+    )
+    assert wl.main() == 0
+    assert not a["archive"].exists(), "fixture: an explicit window must expire it"
+
+
+def test_an_unreadable_anchor_path_is_never_read_as_absent(repo, tmp_path, monkeypatch):
+    """`os.path.lexists` is False on EACCES/EIO, so an unreadable-but-present
+    tree read as gone and expiry deleted its archive, then released its anchor.
+    Only ENOENT/ENOTDIR is absence; any other lstat error keeps everything."""
+    a = _archive(repo, tmp_path, "eacces")
+    _backdate(a["entry"], 40)
+    before = _registered(repo)
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path) == str(a["path"]):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(wl.os, "lstat", lstat)
+    assert os.path.lexists(a["path"]) is False, "fixture: lexists must be fooled here"
+    counts = wl._expire_trash(repo, days=30)
+    assert a["archive"].exists(), "an unreadable anchor path was read as absent"
+    assert counts["expired"] == 0
+    assert _registered(repo) == before
+    assert wl._path_absent(a["path"]) is False
+    monkeypatch.setattr(wl.os, "lstat", real_lstat)
+    # Control: once the path reads as genuinely absent, the same archive expires.
+    assert wl._expire_trash(repo, days=30)["expired"] == 1
+
+
 def test_the_cli_honours_the_kill_switch(repo, tmp_path, monkeypatch):
     a = _archive(repo, tmp_path, "killed")
     _backdate(a["entry"], 40)
@@ -385,7 +434,9 @@ def test_an_archive_anchor_is_never_released_as_a_claim(repo, tmp_path):
 # ─── wiring ──────────────────────────────────────────────────────────────────
 
 
-def test_disk_hygiene_releases_claims_before_reaping_and_expires_after(tmp_path):
+def test_disk_hygiene_releases_claims_before_reaping_and_never_expires(tmp_path):
+    """Retention is off (#2504): the hygiene run releases stale claims, then
+    reaps, and never schedules `--expire-trash`."""
     log = tmp_path / "argv.log"
     fake_python = tmp_path / "python"
     fake_python.write_text(f'#!/usr/bin/env bash\necho "$*" >> "{log}"\nexit 0\n')
@@ -402,7 +453,6 @@ def test_disk_hygiene_releases_claims_before_reaping_and_expires_after(tmp_path)
     assert [line.split("worktree_lifecycle.py", 1)[1].strip() for line in lifecycle] == [
         "--release-stale-claims",
         "",
-        "--expire-trash",
     ]
 
 

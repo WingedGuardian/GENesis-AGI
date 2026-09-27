@@ -136,6 +136,31 @@ async def test_a_tarball_named_WITH_its_extension_in_the_reason_is_not_matched(r
     )
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads through a mode-000 directory")
+async def test_an_UNREADABLE_path_is_not_read_as_absent(repo, tmp_path):
+    """`os.path.lexists` answers False on EACCES, so a present tree under an
+    unreadable parent read as "gone" and its findings were resolved. Only an
+    lstat that reports ENOENT/ENOTDIR counts as absent; anything else holds."""
+    trash = tmp_path / "trash"
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    wt = parent / "unreadable"
+    _archive_by_hand(repo, wt, trash, "unreadable-20260101")
+    listing = await w.list_worktrees(str(repo))
+    entry = next(x for x in listing["worktrees"] if x["path"] == str(wt))
+    # Positive control: while the path is genuinely absent this IS an archive.
+    assert w._is_reaper_archive(entry, trash) is True
+    wt.mkdir()
+    parent.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            os.lstat(wt)  # guard-the-guard: the fixture really is unreadable
+        assert os.path.lexists(wt) is False, "fixture: lexists must be fooled here"
+        assert w._is_reaper_archive(entry, trash) is False
+    finally:
+        parent.chmod(0o755)
+
+
 async def test_a_present_directory_is_observed_even_under_an_archive_lock(repo, tmp_path):
     """A lock does not make live, readable work disappear."""
     trash = tmp_path / "trash"
