@@ -50,6 +50,7 @@ dependencies = [
                                   # The deeper problem is that the right client depends on the server
                                   # version, which is unknown at dependency-resolution time; a static
                                   # bound is the best instrument available here, not a complete one.
+    "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
     "httpx",
     "diskcache>=5.6",

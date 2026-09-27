@@ -31,7 +31,9 @@
 # it cannot add one, so a decision retired upstream cannot survive in an
 # overlay written before the retirement. The cost is deliberate: once a
 # decision is retired, an overlay that still overrides it fails the load
-# loudly until that entry is removed.
+# loudly until that entry is removed. An overlay may reword and retune a
+# question, but not add options or change its type, `consumes` or criteria:
+# those define what the question IS.
 
 decisions:
 
@@ -181,9 +183,13 @@ decisions:
   # asynchronously. Expiry policy is label + re-verify, never delete: the
   # class decides WHEN a memory is re-checked, not whether it survives.
   #
-  # The outcome signal is unusually clean for this site: whether a memory is
-  # later superseded or deprecated is recorded by the memory store itself, so
-  # the label a class predicted can be graded against what actually happened.
+  # NO USABLE OUTCOME SIGNAL YET. MEASURED 2026-09-27 on a live install:
+  # supersession is recorded on about 0.05% of memories, and it records
+  # CORRECTIONS of claims believed durable, not volatility. A hosted decision
+  # model's volatile-class score separated superseded memories from survivors
+  # at AUC 0.53 (chance). Deprecation is mostly consolidation of near-duplicates,
+  # which is redundancy, not staleness. Until a "still current?" judgment is
+  # recorded somewhere, this site can be declared but not graded or calibrated.
   memory_volatility:
     type: choice
     instructions: >-
@@ -199,7 +205,8 @@ decisions:
     fallback:
       typed: argmax_advisory
       legacy: no_volatility_class
-    outcome_source: memory_supersession
+    # outcome_source deliberately unset: see above. Supersession is not a
+    # volatility label, so declaring it would have extraction mine it.
     owner: memory.store
 
   # --- ego ---------------------------------------------------------------

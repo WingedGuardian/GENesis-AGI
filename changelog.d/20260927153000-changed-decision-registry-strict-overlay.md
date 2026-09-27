@@ -1,15 +1,28 @@
-- **The decision registry rejects shapes it used to silently drop.**
-  - Unknown top-level keys, unknown `fallback` keys and non-string decision or
-    option names are now load errors. YAML reads a bare `1`, `yes` or `no` as
-    a non-string, so these used to collide or be renamed.
+- **The decision registry validates through one strict pydantic model.**
+  `DecisionSpec` and `Fallback` are now pydantic dataclasses with strict field
+  types, so loading a file and constructing a spec in code run the same rules.
+  - Identifiers have a grammar (ASCII snake_case), not just a type.
+  - Text fields must be real strings, and `latency_budget_ms` a real integer.
+  - Score levels must be distinct and ordered, and every threshold/band rule
+    runs on construction.
+  - `pydantic` is now a declared dependency. It was already installed through
+    fastapi, litellm and mcp.
+- **One YAML entry point.** Every parse failure is a `RegistryError`. The
+  loader rejects duplicate keys, aliases, merge keys (`<<`), unhashable keys
+  and non-canonical numbers (YAML 1.1 reads `0200` as 128, `1:30` as 90 and
+  `0:0.5` as 0.5). An unreadable or mis-encoded file is a `RegistryError` too.
+- **Overlays only override.**
   - The `decisions.local.yaml` overlay is found where every other config
     overlay is: `~/.genesis/config/` first, then beside the shipped file.
-  - An overlay may only override shipped decisions, never add one.
-  - A falsy non-mapping overlay is an error, not "no overrides".
-- **Gate verdicts now name their fallback.** Legacy mode returns a new `legacy`
-  verdict that routes to `fallback.legacy`, instead of an abstain that pointed
-  at the typed fallback. A calibrated-mode score with no calibration version
-  abstains, and `DecisionSpec.fallback_for()` resolves a verdict to its
-  declared behaviour.
+  - An overlay may not add a decision or an option, and may not change a
+    question's type, what it consumes, or its criteria.
+  - An overlay may not set any field to null.
+  - Unknown top-level keys and falsy non-mapping overlays are errors.
+- **Gate verdicts name their fallback.** Legacy mode returns a `legacy`
+  verdict that routes to `fallback.legacy` and needs no score. A
+  calibrated-mode score abstains unless it carries a well-formed calibration
+  version. `DecisionSpec.fallback_for()` resolves a verdict to its declared
+  behaviour.
 - **Three ego proposal decisions are registered:** reconcile, scope and
-  realist. The registry header now says coverage is not yet complete.
+  realist, each described as its call site actually behaves. The registry
+  header states that coverage is incomplete.

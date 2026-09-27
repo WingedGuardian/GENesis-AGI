@@ -169,6 +169,12 @@ from genesis.decisions.types import (  # noqa: E402
 
 
 def _bare(consumes) -> DecisionSpec:
+    # A thresholding spec is only constructible with its cut, band and tie rule.
+    band = (
+        {"threshold": 0.6, "dead_band": 0.1, "tie_rule": "inclusive"}
+        if consumes in ("threshold", C.THRESHOLD)
+        else {}
+    )
     return DecisionSpec(
         name="t",
         type=QuestionType.NOUL,
@@ -176,6 +182,7 @@ def _bare(consumes) -> DecisionSpec:
         consumes=consumes,
         fallback=Fallback("a", "b"),
         owner="o",
+        **band,
     )
 
 
@@ -300,7 +307,7 @@ def test_latency_budget_rejects_every_non_positive_integer(bad):
     """bool is an int subclass and float('inf') raises OverflowError — both
     escaped the original int() coercion."""
     body = _VALID.replace("latency_budget_ms: 2000", f"latency_budget_ms: {bad}")
-    with pytest.raises(RegistryError, match="latency_budget_ms"):
+    with pytest.raises(RegistryError, match="latency_budget_ms|plain decimal"):
         _spec(body)
 
 
@@ -603,20 +610,20 @@ def test_edges_hold_for_pairs_where_float_addition_is_inexact(cut, band, edge_hi
     ],
 )
 def test_a_directly_constructed_spec_cannot_skip_band_validation(threshold, band, tie):
-    """The loader used to be the only validator; gate() now runs the same checks."""
-    spec = DecisionSpec(
-        name="t",
-        type=QuestionType.NOUL,
-        instructions="q",
-        consumes=C.THRESHOLD,
-        fallback=Fallback("a", "b"),
-        owner="o",
-        threshold=threshold,
-        dead_band=band,
-        tie_rule=tie,
-    )
+    """The loader used to be the only validator. The spec now validates itself
+    on construction, so a bad band never reaches gate() at all."""
     with pytest.raises(ValueError):
-        spec.gate(0.6, mode="calibrated", calibration_version="cal-v1")
+        DecisionSpec(
+            name="t",
+            type=QuestionType.NOUL,
+            instructions="q",
+            consumes=C.THRESHOLD,
+            fallback=Fallback("a", "b"),
+            owner="o",
+            threshold=threshold,
+            dead_band=band,
+            tie_rule=tie,
+        )
 
 
 @pytest.mark.parametrize(
@@ -645,12 +652,15 @@ def test_tie_rule_is_case_sensitive(tie):
         _gated(tie=tie)
 
 
-def test_tie_rule_surrounding_whitespace_is_stripped():
-    assert _gated(tie="'  inclusive  '").tie_rule == "inclusive"
+def test_tie_rule_with_surrounding_whitespace_is_rejected_not_stripped():
+    """Exact match, like every other closed-set field: quietly repairing input
+    is how a value the author did not write gets loaded."""
+    with pytest.raises(RegistryError, match="tie_rule"):
+        _gated(tie="'  inclusive  '")
 
 
 def test_a_yaml_bool_band_is_rejected_as_a_type_not_a_range():
-    with pytest.raises(RegistryError, match="must be a number"):
+    with pytest.raises(RegistryError, match="plain int or float"):
         _gated(band="true")
 
 
@@ -670,13 +680,15 @@ def test_an_unknown_top_level_key_is_rejected():
 def test_a_non_string_decision_name_is_rejected(key):
     """YAML reads these as int/bool/float/None; str() collided or rewrote them."""
     body = _VALID.replace("  memory_relationship:", f"  {key}:")
-    with pytest.raises(RegistryError, match="not strings"):
+    with pytest.raises(RegistryError, match="valid string|match pattern"):
         _spec(body)
 
 
-def test_quoted_numeric_decision_name_is_accepted():
+def test_a_quoted_numeric_decision_name_is_still_not_an_identifier():
+    """Quoting makes it a string, but identifiers have a grammar, not just a type."""
     body = _VALID.replace("  memory_relationship:", '  "1":')
-    assert "1" in _spec(body)
+    with pytest.raises(RegistryError, match="match pattern"):
+        _spec(body)
 
 
 def test_int_and_string_keys_can_no_longer_collide():
@@ -688,7 +700,7 @@ def test_int_and_string_keys_can_no_longer_collide():
         + spec.replace("  memory_relationship:", "  1:")
         + spec.replace("  memory_relationship:", '  "1":')
     )
-    with pytest.raises(RegistryError, match="not strings"):
+    with pytest.raises(RegistryError, match="valid string|match pattern"):
         _spec(body)
 
 
@@ -696,13 +708,13 @@ def test_int_and_string_keys_can_no_longer_collide():
 def test_a_non_string_option_key_is_rejected(key):
     """Bare `no:` became the label "False"."""
     body = _VALID.replace("      distinct:", f"      {key}:")
-    with pytest.raises(RegistryError, match="not strings"):
+    with pytest.raises(RegistryError, match="valid string|match pattern"):
         _spec(body)
 
 
 def test_an_unknown_fallback_key_is_rejected():
     body = _VALID.replace("      legacy: existing_llm_path", "      legacy: x\n      tyepd: y")
-    with pytest.raises(RegistryError, match="fallback has unknown"):
+    with pytest.raises(RegistryError, match="Unexpected keyword argument"):
         _spec(body)
 
 
@@ -715,7 +727,7 @@ def test_a_misspelled_fallback_key_in_an_overlay_is_not_silently_ignored(tmp_pat
     (tmp_path / "decisions.local.yaml").write_text(
         "decisions:\n  memory_relationship:\n    fallback:\n      tyepd: local_path\n"
     )
-    with pytest.raises(RegistryError, match="fallback has unknown"):
+    with pytest.raises(RegistryError, match="Unexpected keyword argument"):
         load_registry(base)
 
 
@@ -815,7 +827,7 @@ def test_the_shipped_registry_loads():
 def test_a_non_string_text_field_is_rejected_not_stringified(old, new):
     """str() turned `owner: yes` into "True" and `outcome_source: 0` into None."""
     assert old in _VALID
-    with pytest.raises(RegistryError, match="must be a non-empty string"):
+    with pytest.raises(RegistryError, match="valid string|at least 1 character"):
         _spec(_VALID.replace(old, new))
 
 
@@ -840,7 +852,7 @@ decisions:
 
 @pytest.mark.parametrize("crit", ["[yes, no]", '[1, "1"]', "[low, null]"])
 def test_non_string_criteria_are_rejected(crit):
-    with pytest.raises(RegistryError, match="must be a non-empty string"):
+    with pytest.raises(RegistryError, match="valid string|at least 1 character"):
         _spec(_SCORE.replace("CRIT", crit))
 
 
@@ -871,7 +883,7 @@ def test_mixed_type_unknown_fallback_keys_raise_registry_error():
         "      legacy: existing_llm_path",
         "      legacy: existing_llm_path\n      tyepd: q\n      1: z",
     )
-    with pytest.raises(RegistryError, match="fallback has unknown"):
+    with pytest.raises(RegistryError, match="Unexpected keyword argument"):
         _spec(body)
 
 
@@ -884,7 +896,7 @@ def test_an_overlay_cannot_delete_an_option_by_nulling_it(tmp_path):
     (tmp_path / "decisions.local.yaml").write_text(
         "decisions:\n  memory_relationship:\n    options:\n      distinct: null\n"
     )
-    with pytest.raises(RegistryError, match="must be a non-empty string"):
+    with pytest.raises(RegistryError, match="options.distinct is null"):
         load_registry(base)
 
 
@@ -894,7 +906,7 @@ def test_an_overlay_nulling_decisions_says_so(tmp_path):
     base = tmp_path / "decisions.yaml"
     base.write_text(_VALID)
     (tmp_path / "decisions.local.yaml").write_text("decisions: null\n")
-    with pytest.raises(RegistryError, match="set to null"):
+    with pytest.raises(RegistryError, match="decisions is null"):
         load_registry(base)
 
 
@@ -914,3 +926,367 @@ def test_a_blank_or_non_string_calibration_version_does_not_count(version):
     """`not version` let " " and 1 through to ACT."""
     spec = _gated()
     assert spec.gate(0.99, mode="calibrated", calibration_version=version) is Verdict.ABSTAIN
+
+
+# ---------------------------------------------------------------------------
+# Round 2: closed by class, not by spelling.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overlay",
+    [
+        "decisions:\n  memory_relationship:\n    outcome_source: null\n",
+        "decisions:\n  memory_relationship:\n    latency_budget_ms: null\n",
+        "decisions:\n  memory_relationship:\n    cardinality_strategy: null\n",
+        "decisions:\n  memory_relationship:\n    options: null\n",
+        "decisions:\n  memory_relationship:\n    fallback:\n      typed: null\n",
+        "decisions:\n  memory_relationship: null\n",
+        "decisions:\n  memory_relationship:\n    owner: x\n    outcome_source: ~\n",
+    ],
+)
+def test_a_null_anywhere_in_an_overlay_is_rejected(tmp_path, overlay):
+    """Deep-merge applied the null before validation, so it silently deleted a
+    shipped constraint. One tree walk covers every field, present or future."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(overlay)
+    with pytest.raises(RegistryError, match="is null"):
+        load_registry(base)
+
+
+def test_a_null_free_overlay_still_merges(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    latency_budget_ms: 900\n"
+    )
+    spec = load_registry(base)["memory_relationship"]
+    assert spec.latency_budget_ms == 900
+    assert spec.outcome_source == "ledger_predictions"
+
+
+@pytest.mark.parametrize("key", ['""', '" "', '"\\t"'])
+def test_a_blank_decision_name_is_rejected(key):
+    with pytest.raises(RegistryError, match="match pattern"):
+        _spec(_VALID.replace("  memory_relationship:", f"  {key}:"))
+
+
+@pytest.mark.parametrize("key", ['""', '"  "'])
+def test_a_blank_option_label_is_rejected(key):
+    with pytest.raises(RegistryError, match="match pattern"):
+        _spec(_VALID.replace("      distinct:", f"      {key}:"))
+
+
+@pytest.mark.parametrize("tie", ["[inclusive]", "{a: b}", "1", "yes"])
+def test_a_non_string_tie_rule_is_a_registry_error(tie):
+    """A YAML list is unhashable, so `in TIE_RULES` raised TypeError."""
+    with pytest.raises(RegistryError, match="tie_rule"):
+        _gated(tie=tie)
+
+
+@pytest.mark.parametrize(
+    "cut,band",
+    [("0.5000000004", "0.001"), ("0.6", "0.0100000004"), ("0.1234567891", "0.01")],
+)
+def test_a_cut_or_band_finer_than_the_edge_rounding_is_rejected(cut, band):
+    """Rounding the edge to 9 places moved a finer declared boundary: with a
+    0.5000000004 cut, 0.5010000002 returned ACT from inside the true band."""
+    with pytest.raises(RegistryError, match="decimal places"):
+        _gated(cut=cut, band=band)
+
+
+@pytest.mark.parametrize("cut,band", [("0.85", "0.07"), ("0.123456789", "0.001"), ("0.6", "0.1")])
+def test_a_cut_and_band_within_nine_places_are_accepted(cut, band):
+    assert _gated(cut=cut, band=band).threshold == pytest.approx(float(cut))
+
+
+def test_the_registry_module_binds_no_overlay_seam_at_module_level():
+    """A module-level alias holds its own reference that the test-suite's
+    user-config isolation cannot reach (tests/test_config_overlay.py)."""
+    import ast
+    import inspect
+
+    import genesis.decisions.registry as reg
+
+    for node in ast.parse(inspect.getsource(reg)).body:
+        if isinstance(node, ast.ImportFrom) and node.module == "genesis._config_overlay":
+            raise AssertionError("module-level import from genesis._config_overlay")
+
+
+import dataclasses  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Round 3: validation moved into one strict model behind one YAML entry point.
+# Each block below is a CLASS the premise check found, one gap per layer.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "decisions:\n  ? [x]\n  : {}\n",  # unhashable key
+        "decisions:\n  a: &s {owner: x}\n  b: *s\n",  # alias
+        "base: &b {owner: x}\ndecisions:\n  a:\n    <<: *b\n",  # merge key via alias
+        "decisions:\n  a:\n    <<: {owner: x}\n",  # merge key, inline
+        "decisions:\n  a:\n    criteria: &c [x, *c]\n",  # recursive alias
+        "decisions: {}\n---\ndecisions: {}\n",  # two documents
+        "decisions: [unclosed\n",  # syntax error
+    ],
+)
+def test_every_yaml_layer_failure_is_a_registry_error(text):
+    """These raised TypeError, ConstructorError, RecursionError, ComposerError
+    or ParserError, escaping any caller that handles RegistryError."""
+    with pytest.raises(RegistryError):
+        _spec(text)
+
+
+@pytest.mark.parametrize("raw", ["0200", "1:30", "0x10", "1_000", "+0x1"])
+def test_a_non_canonical_yaml_integer_is_rejected(raw):
+    """YAML 1.1 read 0200 as 128 (octal) and 1:30 as 90 (base 60)."""
+    body = _VALID.replace("latency_budget_ms: 2000", f"latency_budget_ms: {raw}")
+    with pytest.raises(RegistryError, match="plain decimal"):
+        _spec(body)
+
+
+@pytest.mark.parametrize(
+    "raw", ['"2000"', '"2_000"', '"٢٠٠٠"', '" 2000 "', "2000.0", "true", "0o17"]
+)
+def test_latency_budget_accepts_only_a_real_integer(raw):
+    """int() turned '٢٠٠٠' (Arabic-Indic digits) and '2_000' into 2000."""
+    body = _VALID.replace("latency_budget_ms: 2000", f"latency_budget_ms: {raw}")
+    with pytest.raises(RegistryError, match="latency_budget_ms"):
+        _spec(body)
+
+
+def test_a_canonical_integer_still_loads():
+    body = _VALID.replace("latency_budget_ms: 2000", "latency_budget_ms: 1500")
+    assert _spec(body)["memory_relationship"].latency_budget_ms == 1500
+
+
+@pytest.mark.parametrize("ident", ['" a"', '"a\\u00a0"', '"\\u200b"', '"\\ufeff"', '"A"', '"a-b"'])
+def test_identifiers_have_a_grammar_not_just_a_type(ident):
+    """A leading space or an invisible character made a key that looked right
+    and could never be looked up."""
+    with pytest.raises(RegistryError, match="match pattern"):
+        _spec(_VALID.replace("  memory_relationship:", f"  {ident}:"))
+    with pytest.raises(RegistryError, match="match pattern"):
+        _spec(_VALID.replace("      distinct:", f"      {ident}:"))
+
+
+@pytest.mark.parametrize("version", ["\u200b", "\ufeff", " cal", "cal v1", "-cal"])
+def test_an_invisible_or_malformed_calibration_version_is_not_provenance(version):
+    assert _gated().gate(0.99, mode="calibrated", calibration_version=version) is Verdict.ABSTAIN
+
+
+@pytest.mark.parametrize("version", ["cal-v1", "2026.09.27", "site:abc+1", "v1_2"])
+def test_a_well_formed_calibration_version_is_provenance(version):
+    assert _gated().gate(0.99, mode="calibrated", calibration_version=version) is Verdict.ACT
+
+
+def _direct(**over):
+    kw = {
+        "name": "t",
+        "type": QuestionType.SCORE,
+        "instructions": "q",
+        "consumes": C.ORDERING,
+        "fallback": Fallback("a", "b"),
+        "owner": "o",
+        "criteria": ("low", "high"),
+    }
+    kw.update(over)
+    return DecisionSpec(**kw)
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"criteria": "abc"},  # became ('a', 'b', 'c')
+        {"criteria": {"x": 1, "y": 2}},  # became ('x', 'y')
+        {"criteria": {"low", "high"}},  # a set has no order
+        {"type": QuestionType.CHOICE, "criteria": (), "options": 5},
+        {"type": QuestionType.CHOICE, "criteria": (), "options": None},
+        {"fallback": None},
+        {"name": None},
+        {"owner": ""},
+        {"type": QuestionType.NOUL, "criteria": (), "cardinality_strategy": "shortlist"},
+    ],
+)
+def test_a_directly_constructed_spec_runs_every_rule(over):
+    """Direct construction validated only the band; now it runs the whole model."""
+    with pytest.raises(ValueError):
+        _direct(**over)
+
+
+@pytest.mark.parametrize("arms", [(None, None), ("", "b"), ("a", 1)])
+def test_a_fallback_arm_must_be_an_identifier(arms):
+    with pytest.raises(ValueError):
+        Fallback(*arms)
+
+
+def test_a_valid_direct_spec_still_constructs_and_is_frozen():
+    spec = _direct()
+    assert spec.criteria == ("low", "high")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.name = "other"  # type: ignore[misc]
+
+
+def test_an_overlay_cannot_add_an_option(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    options:\n      unrelated: extra\n"
+    )
+    with pytest.raises(RegistryError, match="adds option"):
+        load_registry(base)
+
+
+def test_an_overlay_may_reword_an_existing_option(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    options:\n      distinct: reworded\n"
+    )
+    spec = load_registry(base)["memory_relationship"]
+    assert spec.options["distinct"] == "reworded"
+    assert spec.cardinality == 4
+
+
+def test_an_alias_is_rejected_even_when_it_would_resolve_to_a_valid_spec():
+    """Isolates the alias rule: without it this file loads clean."""
+    first = _VALID.replace(
+        "    owner: memory.relationship_classifier", "    owner: &o memory.relationship_classifier"
+    )
+    second = _VALID.split("decisions:\n", 1)[1].replace("memory_relationship", "other_site")
+    second = second.replace("    owner: memory.relationship_classifier", "    owner: *o")
+    with pytest.raises(RegistryError, match="alias"):
+        _spec(first + second)
+
+
+def test_a_merge_key_is_rejected_with_its_own_message():
+    """Isolates the merge-key rule from PyYAML's own constructor error."""
+    body = _VALID.replace(
+        "    fallback:\n      typed: argmax_advisory\n      legacy: existing_llm_path",
+        "    fallback:\n      <<: {typed: argmax_advisory, legacy: existing_llm_path}",
+    )
+    with pytest.raises(RegistryError, match="merge key"):
+        _spec(body)
+
+
+# ---------------------------------------------------------------------------
+# Round-3 audit.
+# ---------------------------------------------------------------------------
+
+_SCORE_BASE = """
+decisions:
+  difficulty:
+    type: score
+    instructions: "How hard is this?"
+    criteria: [low, mid, high]
+    consumes: ordering
+    fallback:
+      typed: rank_advisory
+      legacy: static
+    owner: routing.router
+"""
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "    criteria: [high, mid, low]\n",  # reversed scale, same labels
+        "    criteria: [low, mid, high, extreme]\n",  # extended scale
+        "    type: choice\n",
+        "    consumes: threshold\n    threshold: 0.6\n    dead_band: 0.1\n    tie_rule: inclusive\n",
+    ],
+)
+def test_an_overlay_cannot_change_what_a_question_is(tmp_path, override):
+    """Lists replace wholesale, so an overlay could invert a score's scale or
+    promote an argmax site to threshold under the same name."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_SCORE_BASE)
+    (tmp_path / "decisions.local.yaml").write_text("decisions:\n  difficulty:\n" + override)
+    with pytest.raises(RegistryError, match="what the question IS"):
+        load_registry(base)
+
+
+def test_an_overlay_may_still_retune_a_question(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_SCORE_BASE)
+    (tmp_path / "decisions.local.yaml").write_text(
+        'decisions:\n  difficulty:\n    instructions: "How demanding is this?"\n'
+        "    latency_budget_ms: 700\n"
+    )
+    spec = load_registry(base)["difficulty"]
+    assert spec.instructions == "How demanding is this?"
+    assert spec.criteria == ("low", "mid", "high")
+
+
+@pytest.mark.parametrize("raw", ["0:0.5", "0.0_5", "1_0.5", ".5", "5."])
+def test_a_non_canonical_yaml_float_is_rejected(raw):
+    """YAML 1.1 read 0:0.5 as 0.5 (base 60) and 0.0_5 as 0.05."""
+    with pytest.raises(RegistryError, match="plain decimal|plain int or float|valid"):
+        _gated(band=raw)
+
+
+@pytest.mark.parametrize("raw", ["0.05", "0.1", "1.0e-2"])
+def test_a_canonical_float_still_loads(raw):
+    assert _gated(band=raw).dead_band == pytest.approx(float(raw))
+
+
+@pytest.mark.parametrize("value", [Fraction(1, 2), Decimal("0.5"), True])
+def test_a_direct_threshold_must_be_a_plain_number(value):
+    """Fraction and Decimal were silently converted to float by the union type."""
+    with pytest.raises(ValueError, match="plain int or float"):
+        DecisionSpec(
+            "t",
+            QuestionType.NOUL,
+            "q",
+            C.THRESHOLD,
+            Fallback("a", "b"),
+            "o",
+            threshold=value,
+            dead_band=0.1,
+            tie_rule="inclusive",
+        )
+
+
+def test_an_undecodable_overlay_is_a_registry_error(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(RegistryError, match="cannot be read"):
+        load_registry(base)
+
+
+def test_a_yaml_boolean_error_says_to_quote_it():
+    with pytest.raises(RegistryError, match="quote it"):
+        _spec(_VALID.replace("    owner: memory.relationship_classifier", "    owner: yes"))
+
+
+def test_the_shipped_volatility_site_declares_no_outcome_source():
+    """Supersession is not a volatility label; declaring it would have label
+    extraction mine a signal measured at chance."""
+    from pathlib import Path
+
+    from genesis.decisions.registry import load_registry
+
+    root = Path(__file__).resolve().parents[2]
+    assert (
+        load_registry(root / "config" / "decisions.yaml")["memory_volatility"].outcome_source
+        is None
+    )

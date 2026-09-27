@@ -25,10 +25,23 @@ from __future__ import annotations
 
 import math
 import numbers
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 #: Above this option count a ``CHOICE`` must declare a cardinality strategy.
 #: Options share a fixed token budget in encoder-based decision models, so
@@ -95,6 +108,9 @@ TIE_RULES = frozenset({"inclusive", "exclusive"})
 #: cut and break "a score on the cut is always inside the band".
 MIN_DEAD_BAND = 0.001
 
+#: Precision of a declared cut or band, and of the band edges derived from them.
+MAX_DECIMALS = 9
+
 
 def _band_edges(threshold: float, band: float) -> tuple[float, float]:
     """Upper and lower band edges, rounded so exact two-decimal hits stay exact.
@@ -104,14 +120,16 @@ def _band_edges(threshold: float, band: float) -> tuple[float, float]:
     exclusive tie rule. Across all two-decimal cut/band pairs, 1,499 give a
     wrong edge without this rounding.
     """
-    return round(threshold + band, 9), round(threshold - band, 9)
+    return round(threshold + band, MAX_DECIMALS), round(threshold - band, MAX_DECIMALS)
 
 
 def band_problem(threshold: object, band: object, tie_rule: object) -> str | None:
-    """The one place a band is validated — used by the loader AND by gate().
+    """The one place a band is validated — by the spec's model validator AND by gate().
 
-    Returns a description of what is wrong, or None. Kept independent of the
-    loader so a directly constructed spec cannot skip the rules.
+    Returns a description of what is wrong, or None. The type checks below are
+    unreachable through construction (the model's field types already
+    enforce them); they stay because ``gate()`` re-runs this on a spec whose
+    fields could have been forced with ``object.__setattr__``.
     """
     for label, value in (("threshold", threshold), ("dead_band", band)):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -122,6 +140,12 @@ def band_problem(threshold: object, band: object, tie_rule: object) -> str | Non
             finite = False
         if not finite:
             return f"{label}={value!r} must be finite"
+    for label, value in (("threshold", threshold), ("dead_band", band)):
+        if round(float(value), MAX_DECIMALS) != float(value):
+            # Band edges are rounded to MAX_DECIMALS places so two-decimal
+            # scores land exactly on them. A finer declared value would be
+            # moved by that rounding, deciding scores inside the true band.
+            return f"{label}={value!r} has more than {MAX_DECIMALS} decimal places"
     if not (0.0 < threshold < 1.0):
         return f"threshold={threshold} must lie strictly inside (0, 1)"
     if not (band >= MIN_DEAD_BAND):
@@ -132,12 +156,36 @@ def band_problem(threshold: object, band: object, tie_rule: object) -> str | Non
             f"dead_band={band} around threshold={threshold} leaves (0, 1) — one "
             "side of the cut could never be decided"
         )
-    if tie_rule not in TIE_RULES:
+    if not isinstance(tie_rule, str) or tie_rule not in TIE_RULES:  # a list is unhashable in `in`
         return f"tie_rule={tie_rule!r} is not one of: {sorted(TIE_RULES)}"
     return None
 
 
-@dataclass(frozen=True, slots=True)
+#: A registry identifier: decision names, option labels, fallback behaviours,
+#: outcome sources. ASCII snake_case only. A grammar, not a blank check: a
+#: leading space, a non-breaking space or a zero-width character each made a
+#: key that looked right and could never be looked up.
+Identifier = Annotated[StrictStr, StringConstraints(pattern=r"^[a-z_][a-z0-9_]*$")]
+#: An owner is a dotted path of identifiers (``memory.store``).
+DottedIdentifier = Annotated[
+    StrictStr, StringConstraints(pattern=r"^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$")
+]
+#: Prose: any non-blank string. Never a coerced bool, number or null.
+Text = Annotated[StrictStr, StringConstraints(strip_whitespace=True, min_length=1)]
+
+#: Validation for everything below is pydantic's, in STRICT field types.
+#: Hand-written per-field checks were a denylist: three review rounds each
+#: found another type that ``str()`` or ``int()`` quietly coerced, or another
+#: path (loader, overlay, direct construction) weaker than the others. One
+#: model now holds every rule, and loading and direct construction share it.
+_CONFIG = ConfigDict(extra="forbid")
+
+#: Calibration versions are opaque tokens, but printable ASCII ones: a blank
+#: or zero-width string must not count as provenance.
+_CALIBRATION_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]*")
+
+
+@pydantic_dataclass(frozen=True, config=_CONFIG)
 class Fallback:
     """What a site does when it may not act on a probability. Both arms are mandatory.
 
@@ -145,28 +193,118 @@ class Fallback:
     the dead band gets the same behaviour as a site running uncalibrated.
     """
 
-    typed: str
-    legacy: str
+    typed: Identifier
+    legacy: Identifier
 
 
-@dataclass(frozen=True, slots=True)
+@pydantic_dataclass(frozen=True, config=_CONFIG)
 class DecisionSpec:
-    """One registered question. Immutable once loaded."""
+    """One registered question. Immutable, and validated on construction.
 
-    name: str
+    Loading and direct construction run the same rules; there is no path
+    that skips them, and ``dataclasses.replace`` re-validates.
+
+    Not hashable, picklable or deep-copyable: ``options`` is a read-only
+    ``MappingProxyType``. Key caches on ``spec.name`` instead.
+    """
+
+    name: Identifier
     type: QuestionType
-    instructions: str
+    instructions: Text
     consumes: Consumes
     fallback: Fallback
-    owner: str
-    options: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
-    criteria: tuple[str, ...] = ()
-    threshold: float | None = None
-    dead_band: float | None = None
-    tie_rule: str | None = None
-    latency_budget_ms: int | None = None
-    outcome_source: str | None = None
-    cardinality_strategy: str | None = None
+    owner: DottedIdentifier
+    options: Mapping[Identifier, Text] = field(default_factory=lambda: MappingProxyType({}))
+    criteria: tuple[Text, ...] = ()
+    threshold: float | int | None = None
+    dead_band: float | int | None = None
+    tie_rule: Literal["inclusive", "exclusive"] | None = None
+    latency_budget_ms: Annotated[StrictInt, Field(gt=0)] | None = None
+    outcome_source: Identifier | None = None
+    cardinality_strategy: Literal["shortlist", "hierarchical"] | None = None
+
+    @field_validator("options", mode="after")
+    @classmethod
+    def _freeze_options(cls, value: Mapping[str, str]) -> Mapping[str, str]:
+        # A copy, then a read-only view: wrapping the caller's own dict would
+        # leave them a handle that mutates this frozen instance.
+        return MappingProxyType(dict(value))
+
+    @field_validator("threshold", "dead_band", mode="before")
+    @classmethod
+    def _exact_number(cls, value: Any) -> Any:
+        # Exact types, not "anything pydantic can turn into a float": a
+        # Fraction or Decimal was silently converted, and a bool is an int.
+        if value is not None and type(value) not in (int, float):
+            raise ValueError(f"{value!r} must be a plain int or float")
+        return value
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def _criteria_are_ordered(cls, value: Any) -> Any:
+        # A string is a sequence of characters and a set has no order; both
+        # were silently accepted as "criteria".
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("criteria must be an ordered list of levels")
+        return value
+
+    @model_validator(mode="after")
+    def _cross_field_rules(self) -> DecisionSpec:
+        qtype, consumes = self.type, self.consumes
+        # Each primitive declares its own answer space and nothing else's.
+        if qtype == QuestionType.CHOICE:
+            if self.criteria:
+                raise ValueError("a choice declares options, not criteria")
+            if len(self.options) < 2:
+                raise ValueError("a choice needs an options mapping with at least 2 entries")
+        elif qtype == QuestionType.SCORE:
+            if self.options:
+                raise ValueError("a score declares criteria, not options")
+            if len(self.criteria) < 2:
+                raise ValueError("a score needs an ordered criteria list with at least 2 levels")
+            if len(set(self.criteria)) != len(self.criteria):
+                raise ValueError(f"criteria must be distinct levels; got {list(self.criteria)}")
+        else:
+            if self.options or self.criteria:
+                raise ValueError("a noul is binary and must not declare options or criteria")
+            if self.cardinality_strategy is not None:
+                raise ValueError("a noul is binary; cardinality_strategy does not apply")
+
+        # A thresholding site declares its cut, the band it abstains in, and
+        # its edge tie rule: decisions near a cut flip on an identical retry.
+        band = (self.threshold, self.dead_band, self.tie_rule)
+        if consumes == Consumes.THRESHOLD:
+            missing = [
+                k
+                for k, v in zip(("threshold", "dead_band", "tie_rule"), band, strict=True)
+                if v is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"consumes=threshold requires an explicit {missing[0]} — decisions near "
+                    "a cut flip on an identical retry, so the site must declare its cut, "
+                    "the band it abstains in, and its edge tie rule"
+                )
+            problem = band_problem(*band)
+            if problem is not None:
+                raise ValueError(problem)
+        else:
+            for key, value in zip(("threshold", "dead_band", "tie_rule"), band, strict=True):
+                if value is not None:
+                    raise ValueError(
+                        f"{key}={value!r} is set but consumes={consumes.value} — a stray "
+                        f"{key} means gating was expected but never declared"
+                    )
+
+        # The answer space shares a fixed token budget whatever the primitive.
+        if self.cardinality > CARDINALITY_SOFT_CAP and self.cardinality_strategy is None:
+            raise ValueError(
+                f"cardinality {self.cardinality} exceeds the soft cap of "
+                f"{CARDINALITY_SOFT_CAP}; declare a cardinality_strategy "
+                "(hierarchical | shortlist) — labels stop being distinguishable "
+                "as the answer space grows"
+            )
+        return self
 
     def gate(
         self, p: float | None, *, mode: Mode | str, calibration_version: str | None = None
@@ -190,8 +328,9 @@ class DecisionSpec:
 
         In Legacy mode ``p`` is not examined at all (pass ``None``).
 
-        Only PRESENCE of ``calibration_version`` (a non-blank string) is
-        enforced here, and only here: ``usable_in`` answers whether a mode
+        Only PRESENCE of ``calibration_version`` is enforced here: it must be a
+        well-formed token (printable ASCII, no spaces or invisible characters).
+        That check lives here, and only here: ``usable_in`` answers whether a mode
         permits thresholding at all and does not see provenance, so a site must
         branch through ``gate()``, never on ``usable_in`` alone. Whether it
         is the CURRENT calibration for this site needs the calibration store,
@@ -218,7 +357,9 @@ class DecisionSpec:
             raise ValueError(f"score {p!r} is not a probability") from exc
         if not (0.0 <= p <= 1.0):  # also rejects NaN, which fails every comparison
             raise ValueError(f"score {p!r} is not a probability")
-        provenanced = isinstance(calibration_version, str) and bool(calibration_version.strip())
+        provenanced = isinstance(calibration_version, str) and bool(
+            _CALIBRATION_VERSION.fullmatch(calibration_version)
+        )
         if not self.usable_in(resolved) or not provenanced:
             return Verdict.ABSTAIN
         upper, lower = _band_edges(self.threshold, self.dead_band)
@@ -242,16 +383,6 @@ class DecisionSpec:
         if resolved == Verdict.LEGACY:
             return self.fallback.legacy
         raise ValueError(f"verdict {resolved.value!r} is a decision, not a fallback")
-
-    def __post_init__(self) -> None:
-        """Defensively copy the mappings so "immutable once loaded" is true.
-
-        ``MappingProxyType`` is a *view*: wrapping a caller's live dict leaves
-        them holding a handle that mutates this frozen instance. The loader
-        already builds fresh dicts, but direct construction is a public path.
-        """
-        object.__setattr__(self, "options", MappingProxyType(dict(self.options)))
-        object.__setattr__(self, "criteria", tuple(self.criteria))
 
     @property
     def cardinality(self) -> int:

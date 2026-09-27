@@ -20,22 +20,17 @@ very differently on one egress question depending on how it was phrased.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import dataclasses
+import re
+from collections.abc import Hashable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
-from genesis._config_overlay import _resolve_overlay_path
-from genesis.decisions.types import (
-    CARDINALITY_SOFT_CAP,
-    Consumes,
-    DecisionSpec,
-    Fallback,
-    QuestionType,
-    band_problem,
-)
+from genesis.decisions.types import DecisionSpec
 
 __all__ = ["RegistryError", "load_registry", "load_registry_from_string"]
 
@@ -44,248 +39,42 @@ class RegistryError(ValueError):
     """A spec violates a registry rule. Raised at load, never at call time."""
 
 
-def _fail(name: str, msg: str) -> None:
-    raise RegistryError(f"decision {name!r}: {msg}")
-
-
-def _enum(name: str, field: str, raw: Any, enum_cls: type) -> Any:
-    try:
-        return enum_cls(str(raw))
-    except ValueError:
-        allowed = ", ".join(sorted(m.value for m in enum_cls))
-        _fail(name, f"{field}={raw!r} is not one of: {allowed}")
-
-
-#: Every key a spec may carry. ALLOWLIST, deliberately: a denylist cannot
-#: catch `thrshold: 0.9`, which loads clean and silently disables the gate the
-#: author believed they had declared.
-_ALLOWED_KEYS = frozenset(
-    {
-        "type",
-        "instructions",
-        "consumes",
-        "fallback",
-        "owner",
-        "options",
-        "criteria",
-        "threshold",
-        "dead_band",
-        "tie_rule",
-        "latency_budget_ms",
-        "outcome_source",
-        "cardinality_strategy",
-    }
-)
-
-#: Closed set. An unrecognised strategy satisfied the soft-cap rule while
-#: naming a mechanism nothing implements.
-_STRATEGIES = frozenset({"shortlist", "hierarchical"})
-
-
-def _require_string_keys(owner: str, kind: str, mapping: Mapping[Any, Any]) -> None:
-    """Refuse non-string keys rather than canonicalise them with ``str()``.
-
-    YAML resolves ``1`` to an int and bare ``yes`` / ``no`` to booleans, so
-    ``str()`` both collides distinct keys (``1`` and ``"1"`` become one entry,
-    the later silently replacing the earlier) and rewrites labels (``no``
-    becomes ``"False"``). Quote the key instead.
-    """
-    bad = [k for k in mapping if not isinstance(k, str)]
-    if bad:
-        raise RegistryError(
-            f"{owner}: {kind} key(s) {bad!r} are not strings — quote them; YAML "
-            "reads bare numbers and yes/no as non-strings"
-        )
-
-
-def _text(name: str, field: str, value: Any, *, required: bool = True) -> str | None:
-    """A text field, which must BE text. The sibling of `_require_string_keys`.
-
-    ``str()`` on a value rewrote exactly as it did on keys: ``owner: yes``
-    became ``"True"``, an overlay's ``skip: null`` became the description
-    ``"None"``, and ``outcome_source: 0`` quietly became no source at all.
-    """
-    if value is None and not required:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        _fail(
-            name,
-            f"{field}={value!r} must be a non-empty string — quote it; YAML reads "
-            "bare yes/no/numbers/null as non-strings, and an overlay cannot delete "
-            "a field by setting it to null",
-        )
-    return value.strip()
-
-
-def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
-    if not isinstance(raw, Mapping):
-        _fail(name, "spec must be a mapping")
-
-    unknown = sorted(str(k) for k in set(raw) - _ALLOWED_KEYS)
-    if unknown:
-        _fail(
-            name,
-            f"unknown key(s) {unknown} — a typo here loads clean and silently "
-            f"disables whatever it was meant to declare; allowed: "
-            f"{sorted(_ALLOWED_KEYS)}",
-        )
-
-    qtype = _enum(name, "type", raw.get("type"), QuestionType)
-    consumes = _enum(name, "consumes", raw.get("consumes"), Consumes)
-
-    # The wording IS the capability; the owner is where a finding gets routed.
-    instructions = _text(name, "instructions", raw.get("instructions"))
-    owner = _text(name, "owner", raw.get("owner"))
-
-    fb = raw.get("fallback")
-    if isinstance(fb, Mapping) and set(fb) - {"typed", "legacy"}:
-        # An overlay's misspelled `tyepd:` merges beside the shipped `typed:`,
-        # so without this the intended local fallback silently never applies.
-        extra = sorted(str(k) for k in set(fb) - {"typed", "legacy"})
-        _fail(name, f"fallback has unknown key(s) {extra}")
-    if not isinstance(fb, Mapping) or not fb.get("typed") or not fb.get("legacy"):
-        _fail(
-            name,
-            "fallback.typed and fallback.legacy are both required — a site that "
-            "cannot say what it does without a model is not ready to be a "
-            "decision site",
-        )
-    fallback = Fallback(
-        typed=_text(name, "fallback.typed", fb["typed"]),
-        legacy=_text(name, "fallback.legacy", fb["legacy"]),
-    )
-
-    options: Mapping[str, str] = MappingProxyType({})
-    criteria: tuple[str, ...] = ()
-    # Each arm rejects the OTHER arm's field. Accepting and discarding it
-    # means a spec that reads as configured behaves as if it were not.
-    if qtype is QuestionType.CHOICE:
-        if raw.get("criteria") is not None:
-            _fail(name, "a choice declares options, not criteria")
-        opts = raw.get("options")
-        if not isinstance(opts, Mapping) or len(opts) < 2:
-            _fail(name, "a choice needs an options mapping with at least 2 entries")
-        _require_string_keys(name, "option", opts)
-        options = MappingProxyType({k: _text(name, f"options.{k}", v) for k, v in opts.items()})
-    elif qtype is QuestionType.SCORE:
-        if raw.get("options") is not None:
-            _fail(name, "a score declares criteria, not options")
-        crit = raw.get("criteria")
-        if not isinstance(crit, (list, tuple)) or len(crit) < 2:
-            _fail(name, "a score needs an ordered criteria list with at least 2 levels")
-        criteria = tuple(_text(name, f"criteria[{i}]", x) for i, x in enumerate(crit))
-        if len(set(criteria)) != len(criteria):
-            # Two identical levels make the ordinal answer ambiguous.
-            _fail(name, f"criteria must be distinct levels; got {list(criteria)}")
-    else:  # NOUL
-        if raw.get("options") is not None or raw.get("criteria") is not None:
-            _fail(name, "a noul is binary and must not declare options or criteria")
-
-    # The linter rule. `consumes` exists so this is enforced rather than noticed.
-    # A bare cut is not enough: scores near it are not repeatable on replay, so
-    # a thresholding site also declares the band it abstains in and the rule
-    # for scores landing exactly on a band edge. The checks live in
-    # `band_problem`, shared with `DecisionSpec.gate`, so a directly
-    # constructed spec cannot skip them.
-    threshold = raw.get("threshold", None)
-    dead_band = raw.get("dead_band", None)
-    tie_rule = raw.get("tie_rule", None)
-    if consumes is Consumes.THRESHOLD:
-        for key, value in (
-            ("threshold", threshold),
-            ("dead_band", dead_band),
-            ("tie_rule", tie_rule),
-        ):
-            if value is None:
-                _fail(
-                    name,
-                    f"consumes=threshold requires an explicit {key} — decisions near a "
-                    "cut flip on an identical retry, so the site must declare its cut, "
-                    "the band it abstains in, and its edge tie rule",
-                )
-        if isinstance(tie_rule, str):
-            tie_rule = tie_rule.strip()
-        problem = band_problem(threshold, dead_band, tie_rule)
-        if problem is not None:
-            _fail(name, problem)
-        threshold, dead_band = float(threshold), float(dead_band)
-    else:
-        for key, value in (
-            ("threshold", threshold),
-            ("dead_band", dead_band),
-            ("tie_rule", tie_rule),
-        ):
-            if value is not None:
-                _fail(
-                    name,
-                    f"{key}={value!r} is set but consumes={consumes.value} — a stray "
-                    f"{key} means gating was expected but never declared",
-                )
-
-    strategy = raw.get("cardinality_strategy")
-    if strategy is not None:
-        strategy = str(strategy).strip()
-        if strategy not in _STRATEGIES:
-            _fail(
-                name,
-                f"cardinality_strategy={strategy!r} is not one of: "
-                f"{sorted(_STRATEGIES)} — an unrecognised value satisfied the "
-                "soft-cap rule while naming a mechanism nothing implements",
-            )
-
-    # The token budget is shared by the answer space whatever the primitive,
-    # so a 50-level score hits the same wall a 50-option choice does.
-    answer_space = len(options) if qtype is QuestionType.CHOICE else len(criteria)
-    if answer_space > CARDINALITY_SOFT_CAP and not strategy:
-        _fail(
-            name,
-            f"cardinality {answer_space} exceeds the soft cap of "
-            f"{CARDINALITY_SOFT_CAP}; declare a cardinality_strategy "
-            f"({' | '.join(sorted(_STRATEGIES))}) — the answer space shares a "
-            "fixed token budget, so labels stop being distinguishable as it grows",
-        )
-
-    budget = raw.get("latency_budget_ms")
-    if budget is not None:
-        # bool is an int subclass; float('inf') raises OverflowError rather
-        # than ValueError; and a plain float SILENTLY TRUNCATES (3.9 -> 3).
-        # All three escape a naive int() coercion, and the truncation is the
-        # quiet one — it produces a budget the author never wrote.
-        if isinstance(budget, bool) or not isinstance(budget, (int, str)):
-            _fail(
-                name,
-                f"latency_budget_ms={budget!r} must be an integer — a float is "
-                "rejected rather than truncated, so a budget is never silently "
-                "changed to one nobody declared",
-            )
-        try:
-            budget = int(budget)
-        except (TypeError, ValueError, OverflowError):
-            _fail(name, f"latency_budget_ms={budget!r} is not an integer")
-        if budget <= 0:
-            _fail(name, "latency_budget_ms must be positive")
-
-    return DecisionSpec(
-        name=name,
-        type=qtype,
-        instructions=instructions,
-        consumes=consumes,
-        fallback=fallback,
-        owner=owner,
-        options=options,
-        criteria=criteria,
-        threshold=threshold if consumes is Consumes.THRESHOLD else None,
-        dead_band=dead_band if consumes is Consumes.THRESHOLD else None,
-        tie_rule=tie_rule if consumes is Consumes.THRESHOLD else None,
-        latency_budget_ms=budget,
-        outcome_source=_text(name, "outcome_source", raw.get("outcome_source"), required=False),
-        cardinality_strategy=str(strategy) if strategy else None,
-    )
-
+#: Every key a spec may carry, DERIVED from the model so the two cannot drift.
+#: Checked before construction only to give a typo a readable message; the
+#: model forbids extra fields on its own.
+_ALLOWED_KEYS = frozenset(f.name for f in dataclasses.fields(DecisionSpec)) - {"name"}
 
 #: The only top-level key. A misspelled `decision:` beside the real one would
 #: otherwise load clean while everything under it is dropped.
 _TOP_LEVEL_KEYS = frozenset({"decisions"})
+
+
+def _describe(exc: ValidationError) -> str:
+    """One line per failure: which field, and what was wrong with it."""
+    parts = []
+    for err in exc.errors(include_url=False):
+        loc = ".".join(str(x) for x in err.get("loc", ()))
+        msg = str(err.get("msg", "")).removeprefix("Value error, ")
+        if isinstance(err.get("input"), bool):
+            msg += " (YAML read a bare yes/no/true/false as a boolean; quote it)"
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts)
+
+
+def _parse_one(name: Any, raw: Any) -> DecisionSpec:
+    if not isinstance(raw, Mapping):
+        raise RegistryError(f"decision {name!r}: spec must be a mapping")
+    unknown = sorted(str(k) for k in set(raw) - _ALLOWED_KEYS)
+    if unknown:
+        raise RegistryError(
+            f"decision {name!r}: unknown key(s) {unknown} — a typo here loads clean "
+            f"and silently disables whatever it was meant to declare; allowed: "
+            f"{sorted(_ALLOWED_KEYS)}"
+        )
+    try:
+        return DecisionSpec(name=name, **raw)
+    except ValidationError as exc:
+        raise RegistryError(f"decision {name!r}: {_describe(exc)}") from None
 
 
 def _check_root(raw: Any, where: str) -> Mapping[str, Any]:
@@ -307,42 +96,94 @@ def _parse(raw: Any) -> Mapping[str, DecisionSpec]:
         )
     if not isinstance(decisions, Mapping):
         raise RegistryError("'decisions' must be a mapping of name -> spec")
-    _require_string_keys("registry", "decision", decisions)
-    out: dict[str, DecisionSpec] = {}
-    for name, spec in decisions.items():
-        out[name] = _parse_one(name, spec)
-    return MappingProxyType(out)
+    return MappingProxyType({name: _parse_one(name, spec) for name, spec in decisions.items()})
 
 
 class _StrictLoader(yaml.SafeLoader):
-    """SafeLoader that refuses duplicate mapping keys.
+    """SafeLoader narrowed to the YAML a registry actually needs.
 
-    YAML silently keeps the last of two identical keys, so a duplicated
-    decision id would drop a spec with no diagnostic. An earlier version
-    scanned the raw text for two-space-indented keys; that was a DENYLIST and
-    five valid-YAML spellings walked straight past it (4-space indent, a
-    quoted key, ``decisions :`` with a space before the colon, flow style, a
-    trailing comment on the key line) while the overlay was never scanned at
-    all.
+    Four YAML features let a file load clean while meaning something other
+    than it says, so each is refused at construction time:
 
-    Checking at construction time is closed-set: it sees *resolved* keys after
-    YAML has done its own parsing, so every spelling collapses to the same
-    check. Subclassing ``SafeLoader`` inherits its constructor table, so no
+    - **Duplicate keys.** YAML keeps the last of two identical keys, dropping
+      a spec with no diagnostic. Checked on RESOLVED keys, so every spelling
+      (indent, quoting, flow style) collapses to one check; an earlier text
+      scan was a denylist that five valid spellings walked past.
+    - **Aliases and merge keys** (``*a``, ``<<:``). A registry never needs
+      them, and they build self-referencing structures and hidden duplicates.
+    - **Non-canonical numbers.** YAML 1.1 reads ``0200`` as octal 128,
+      ``1:30`` as 90, ``0x10`` as 16, ``1_000`` as 1000, ``0:0.5`` as 0.5
+      and ``0.0_5`` as 0.05. Integers and floats must be plain decimal.
+    - **Unhashable keys** (``? [x]``), which would otherwise surface as a bare
+      ``TypeError``.
+
+    Subclassing ``SafeLoader`` inherits its constructor table, so no
     arbitrary-object tags are enabled by this.
     """
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.events.AliasEvent):
+            event = self.peek_event()
+            raise RegistryError(
+                f"alias *{event.anchor} at line {event.start_mark.line + 1} — anchors "
+                "and aliases are not supported in the decision registry"
+            )
+        return super().compose_node(parent, index)
+
+
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+_CANONICAL_INT = re.compile(r"[-+]?(0|[1-9][0-9]*)")
+_CANONICAL_FLOAT = re.compile(r"[-+]?(0|[1-9][0-9]*)\.[0-9]+([eE][-+]?[0-9]+)?")
 
 
 def _no_duplicate_keys(loader: _StrictLoader, node: yaml.MappingNode) -> dict[Any, Any]:
     mapping: dict[Any, Any] = {}
     for key_node, value_node in node.value:
+        line = key_node.start_mark.line + 1
+        if key_node.tag == _MERGE_TAG:
+            raise RegistryError(f"merge key '<<' at line {line} is not supported")
         key = loader.construct_object(key_node, deep=False)
+        if not isinstance(key, Hashable):
+            raise RegistryError(f"key {key!r} at line {line} is not a scalar")
         if key in mapping:
-            raise RegistryError(f"duplicate key {key!r} at line {key_node.start_mark.line + 1}")
+            raise RegistryError(f"duplicate key {key!r} at line {line}")
         mapping[key] = loader.construct_object(value_node, deep=False)
     return mapping
 
 
+def _canonical_int(loader: _StrictLoader, node: yaml.ScalarNode) -> int:
+    text = loader.construct_scalar(node)
+    if not _CANONICAL_INT.fullmatch(text):
+        raise RegistryError(
+            f"integer {text!r} at line {node.start_mark.line + 1} is not plain decimal — "
+            "YAML 1.1 reads leading zeros as octal and colons as base 60"
+        )
+    return int(text)
+
+
+def _canonical_float(loader: _StrictLoader, node: yaml.ScalarNode) -> float:
+    text = loader.construct_scalar(node)
+    if not _CANONICAL_FLOAT.fullmatch(text):
+        raise RegistryError(
+            f"number {text!r} at line {node.start_mark.line + 1} is not plain decimal — "
+            "YAML 1.1 reads colons as base 60 and ignores underscores"
+        )
+    return float(text)
+
+
 _StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicate_keys)
+_StrictLoader.add_constructor("tag:yaml.org,2002:float", _canonical_float)
+_StrictLoader.add_constructor("tag:yaml.org,2002:int", _canonical_int)
+
+
+def _load(text: str, where: str) -> Any:
+    """The one YAML entry point: every parse failure becomes a RegistryError."""
+    try:
+        return yaml.load(text, Loader=_StrictLoader)  # noqa: S506 — SafeLoader subclass
+    except RegistryError as exc:
+        raise RegistryError(f"{where}: {exc}") from None
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise RegistryError(f"{where} is not valid registry YAML: {exc}") from None
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -362,9 +203,81 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
     return out
 
 
+def _reject_nulls(node: Any, where: str, trail: str = "") -> None:
+    """Refuse a null ANYWHERE in an overlay.
+
+    Deep-merge applies an overlay's ``null`` before validation, after which it
+    is indistinguishable from a field the shipped spec never set, so a null
+    silently deletes a declared constraint (``outcome_source``,
+    ``latency_budget_ms``, ``cardinality_strategy``, an option). One walk over
+    the whole overlay closes that class instead of guarding fields one by one.
+    An overlay overrides values; it never deletes them.
+    """
+    if node is None:
+        raise RegistryError(
+            f"{where}: {trail or 'root'} is null — an overlay cannot delete a "
+            "shipped field; override it with a value or remove the line"
+        )
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            _reject_nulls(value, where, f"{trail}.{key}" if trail else str(key))
+    elif isinstance(node, (list, tuple)):
+        for i, value in enumerate(node):
+            _reject_nulls(value, where, f"{trail}[{i}]")
+
+
+def _reject_additions(shipped: Any, overlay: Any, where: str) -> None:
+    """An overlay overrides; it never grows the question set or an answer space.
+
+    Adding a decision would let a retired one survive in an old overlay, and
+    adding an option would change what a site can answer without the shipped
+    spec ever saying so.
+    """
+    if not (isinstance(shipped, Mapping) and isinstance(overlay, Mapping)):
+        return
+    extra = sorted(str(k) for k in set(overlay) - set(shipped))
+    if extra:
+        raise RegistryError(
+            f"{where} overrides decision(s) {extra} that the shipped registry does "
+            "not define — an overlay may only override, so a retired decision "
+            "cannot come back through it"
+        )
+    for name, spec in overlay.items():
+        reshaped = sorted(_SHAPE_FIELDS & set(spec)) if isinstance(spec, Mapping) else []
+        if reshaped:
+            raise RegistryError(
+                f"{where}: decision {name!r} overrides {reshaped} — those define what "
+                "the question IS; an overlay may reword or retune it, not change it"
+            )
+        base_opts = shipped[name].get("options") if isinstance(shipped[name], Mapping) else None
+        ov_opts = spec.get("options") if isinstance(spec, Mapping) else None
+        if isinstance(base_opts, Mapping) and isinstance(ov_opts, Mapping):
+            new = sorted(str(k) for k in set(ov_opts) - set(base_opts))
+            if new:
+                raise RegistryError(
+                    f"{where}: decision {name!r} adds option(s) {new} — an overlay may "
+                    "reword an option but not change the answer space"
+                )
+
+
+def _read(path: Path) -> str:
+    """Read a registry file; a bad encoding or an unreadable file is a RegistryError."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RegistryError(f"{path.name} cannot be read: {exc}") from None
+
+
+#: Fields that define WHAT a question is, rather than tune how it is asked.
+#: An overlay may reword and retune; changing one of these would silently turn
+#: a shipped question into a different one (a reversed score scale, an argmax
+#: site promoted to threshold) under the same name.
+_SHAPE_FIELDS = frozenset({"type", "consumes", "criteria"})
+
+
 def load_registry_from_string(text: str) -> Mapping[str, DecisionSpec]:
     """Parse a registry from YAML text. No overlay support."""
-    return _parse(yaml.load(text, Loader=_StrictLoader))  # noqa: S506 — SafeLoader subclass
+    return _parse(_load(text, "registry"))
 
 
 def load_registry(path: str | Path) -> Mapping[str, DecisionSpec]:
@@ -376,28 +289,24 @@ def load_registry(path: str | Path) -> Mapping[str, DecisionSpec]:
     merge, which degrades a bad overlay to a warning: a registry that silently
     drops an override has changed a gate's behaviour without saying so.
 
-    An overlay may override shipped decisions but never add one, so a decision
-    retired upstream cannot be resurrected by an overlay written before it was
-    retired.
+    An overlay may override shipped decisions, reword their options and retune
+    them, but never add a decision or an option, nor change a question's
+    type, what it consumes, or its criteria.
     """
     path = Path(path)
-    base = _check_root(yaml.load(path.read_text(), Loader=_StrictLoader), path.name)  # noqa: S506
+    base = _check_root(_load(_read(path), path.name), path.name)
+
+    # Function-local on purpose: a module-level alias would hold its own
+    # reference that test isolation of the user config dir cannot reach.
+    from genesis._config_overlay import _resolve_overlay_path
 
     overlay_path = _resolve_overlay_path(path)
     if overlay_path.is_file():
-        overlay = yaml.load(overlay_path.read_text(), Loader=_StrictLoader)  # noqa: S506
+        overlay = _load(_read(overlay_path), overlay_path.name)
         if overlay is not None:  # an empty file is "no overrides"; [] / false / 0 are errors
             overlay = _check_root(overlay, overlay_path.name)
-            shipped = base.get("decisions")
-            added = overlay.get("decisions")
-            if isinstance(shipped, Mapping) and isinstance(added, Mapping):
-                extra = sorted(str(k) for k in set(added) - set(shipped))
-                if extra:
-                    raise RegistryError(
-                        f"{overlay_path.name} overrides decision(s) {extra} that the "
-                        "shipped registry does not define — an overlay may only "
-                        "override, so a retired decision cannot come back through it"
-                    )
+            _reject_nulls(overlay, overlay_path.name)
+            _reject_additions(base.get("decisions"), overlay.get("decisions"), overlay_path.name)
             base = _deep_merge(base, overlay)
 
     return _parse(base)
