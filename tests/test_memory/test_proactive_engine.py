@@ -790,3 +790,29 @@ async def test_proactive_context_cancellation_folds_completed_substages(caplog):
     assert "'fts'" in warns[0]
     assert "'activation'" not in warns[0]
     assert "'assembly'" not in warns[0]
+
+
+# --- every-call timing line (true p50/p95 from the journal) -----------------
+
+
+async def test_proactive_context_logs_a_compact_timing_line_for_fast_calls(caplog):
+    """A call under the slow threshold still emits exactly one INFO timing line,
+    so the journal holds every completed call, not only the slow tail."""
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=[])),
+        caplog.at_level(logging.INFO, logger="genesis.memory.proactive"),
+    ):
+        await P.proactive_context(prompt="what did we decide about voice", session_id="s")
+
+    lines = [r.getMessage() for r in caplog.records if r.name == "genesis.memory.proactive"]
+    timing = [m for m in lines if m.startswith("proactive recall timing: ")]
+    slow = [m for m in lines if m.startswith("proactive recall slow: ")]
+    assert len(timing) == 1 and not slow
+    assert timing[0].split(": ", 1)[1].startswith("total=")
+    assert " embed=" in timing[0] and " procedure=" in timing[0]
+
+
+def test_compact_timings_orders_and_omits_absent_stages():
+    out = P._compact_timings({"procedure": 3.0, "total": 9.5, "fts": 1.2, "junk": 7})
+    assert out == "total=9.5 fts=1.2 procedure=3.0"

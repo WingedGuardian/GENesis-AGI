@@ -108,8 +108,10 @@ def _reset_procedure_cache():
     """The TTL cache is module-global — clear it around every case so each fake
     db is actually read rather than served stale."""
     proactive._procedure_cache = None
+    proactive._procedure_refresh_in_flight = False
     yield
     proactive._procedure_cache = None
+    proactive._procedure_refresh_in_flight = False
 
 
 async def test_surface_procedure_matches_reference_randomized() -> None:
@@ -177,3 +179,89 @@ async def test_surface_procedure_rechecks_live_winner() -> None:
     proactive._procedure_cache = None
     got = await proactive._surface_procedure(_FakeDB([row], live_ids=set()), q)
     assert got is None  # excluded since build → suppressed
+
+
+# --------------------------------------------------------------------------- #
+# Stale-while-revalidate: past the TTL the request path SERVES the snapshot and
+# schedules one background rebuild; it never rebuilds inline. (Recall calls on a
+# single-user install arrive minutes apart, so refresh-on-read made almost every
+# call pay the 260–570ms rebuild.)
+# --------------------------------------------------------------------------- #
+
+
+class _CountingDB(_FakeDB):
+    def __init__(self, rows: list[_Row]) -> None:
+        super().__init__(rows)
+        self.bulk_reads = 0
+
+    async def execute_fetchall(self, _sql: str, params: object = None) -> list:
+        if params is None:
+            self.bulk_reads += 1
+        return await super().execute_fetchall(_sql, params)
+
+
+async def test_first_build_is_inline() -> None:
+    rng = np.random.default_rng(3)
+    db = _CountingDB([("a", "t", "p", pack_embedding(_rand_vec(rng)), "CORE")])
+    cache = await proactive._load_procedure_cache(db)
+    assert cache is not None and [m[0] for m in cache.meta] == ["a"]
+    assert db.bulk_reads == 1
+
+
+async def test_expired_cache_is_served_and_refreshed_in_background() -> None:
+    import asyncio
+
+    rng = np.random.default_rng(4)
+    old = await proactive._load_procedure_cache(
+        _FakeDB([("old", "t", "p", pack_embedding(_rand_vec(rng)), "CORE")])
+    )
+    assert old is not None
+    # Age the snapshot past the TTL.
+    proactive._procedure_cache = proactive._ProcedureCache(
+        matrix=old.matrix,
+        meta=old.meta,
+        built_at=old.built_at - proactive._PROCEDURE_CACHE_TTL_S - 1,
+    )
+    db = _CountingDB([("new", "t", "p", pack_embedding(_rand_vec(rng)), "CORE")])
+
+    served = await proactive._load_procedure_cache(db)
+    # The request path got the STALE snapshot, with no inline read.
+    assert [m[0] for m in served.meta] == ["old"]
+    assert db.bulk_reads == 0
+    assert proactive._procedure_refresh_in_flight is True
+    # A second expired read while the refresh is in flight schedules nothing new.
+    await proactive._load_procedure_cache(db)
+
+    for _ in range(50):
+        if not proactive._procedure_refresh_in_flight:
+            break
+        await asyncio.sleep(0.01)
+    assert proactive._procedure_refresh_in_flight is False
+    assert db.bulk_reads == 1  # single-flight
+    assert [m[0] for m in proactive._procedure_cache.meta] == ["new"]
+
+
+async def test_background_refresh_failure_keeps_the_prior_snapshot() -> None:
+    import asyncio
+
+    rng = np.random.default_rng(5)
+    old = await proactive._load_procedure_cache(
+        _FakeDB([("old", "t", "p", pack_embedding(_rand_vec(rng)), "CORE")])
+    )
+    proactive._procedure_cache = proactive._ProcedureCache(
+        matrix=old.matrix,
+        meta=old.meta,
+        built_at=old.built_at - proactive._PROCEDURE_CACHE_TTL_S - 1,
+    )
+
+    class _Broken:
+        async def execute_fetchall(self, *_a, **_k):
+            raise RuntimeError("db down")
+
+    await proactive._load_procedure_cache(_Broken())
+    for _ in range(50):
+        if not proactive._procedure_refresh_in_flight:
+            break
+        await asyncio.sleep(0.01)
+    assert proactive._procedure_refresh_in_flight is False  # flag never wedges
+    assert [m[0] for m in proactive._procedure_cache.meta] == ["old"]

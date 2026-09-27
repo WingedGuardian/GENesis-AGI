@@ -102,6 +102,27 @@ _RERANK_TIMEOUT_S = 1.0
 # — slow calls become diagnosable from the journal without live probing.
 _SLOW_RECALL_LOG_MS = 2000.0
 
+# Stages carried by the compact every-call line, in a fixed order so the line is
+# grep/awk-friendly (``total=… embed=… …``). A stage absent from a call is
+# omitted rather than printed as 0 — absent and zero-cost are different facts.
+_COMPACT_TIMING_KEYS: tuple[str, ...] = (
+    "total",
+    "embed",
+    "recall",
+    "vector",
+    "expand",
+    "fts",
+    "activation",
+    "rerank",
+    "enrich",
+    "procedure",
+)
+
+
+def _compact_timings(timings: dict[str, Any]) -> str:
+    """``total=812.3 embed=120.0 …`` for the per-call INFO line."""
+    return " ".join(f"{k}={timings[k]}" for k in _COMPACT_TIMING_KEYS if k in timings)
+
 
 def _proactive_config() -> dict[str, Any]:
     """The ``proactive`` section of the merged memory_recall config (live)."""
@@ -305,41 +326,20 @@ class _ProcedureCache:
 
 
 _procedure_cache: _ProcedureCache | None = None
+# Single-flight guard for the background refresh (one event loop → a plain flag).
+_procedure_refresh_in_flight = False
 
 
-async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
-    """Return the cached surfaceable-procedure matrix, rebuilding past the TTL.
+def _build_procedure_matrix(rows: list[Any], built_at: float) -> _ProcedureCache:
+    """CPU-bound half of a rebuild (BLOB unpack + row normalisation).
 
-    On a DB/read error the last good cache is served (returns None only when one
-    was never built) — more resilient than the old per-call path, which surfaced
-    nothing on a transient error. Staleness is normally ≤ TTL, but during a
-    *sustained* read outage the last snapshot is served until the DB recovers
-    (acceptable for a soft top-1 advisory; a down DB fails ``recall()`` upstream
-    long before this matters). The cache is process-global and NOT keyed on
-    ``db`` — correct because the runtime passes exactly one process-global
-    connection (``memory_mod._db``) for its whole lifetime.
+    Pure and synchronous so it can run in a worker thread: MEASURED on a
+    1,000-row read of a production-shaped copy, a full rebuild costs 263–573ms,
+    almost all of it here, which is too much to spend on the event loop.
     """
-    global _procedure_cache
-    now = time.monotonic()
-    cache = _procedure_cache
-    if cache is not None and (now - cache.built_at) < _PROCEDURE_CACHE_TTL_S:
-        return cache
+    import numpy as np
 
     from genesis.learning.procedural.embedding import normalize_rows, unpack_embedding
-
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, task_type, principle, principle_embedding, activation_tier "
-            "FROM procedural_memory "
-            "WHERE deprecated = 0 AND quarantined = 0 "
-            "AND principle_embedding IS NOT NULL "
-            "ORDER BY confidence DESC LIMIT 1000"
-        )
-    except Exception:
-        logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
-        return cache  # table absent / DB error — never block the endpoint
-
-    import numpy as np
 
     vectors: list[list[float]] = []
     meta: list[tuple[str, str, str, str]] = []
@@ -356,8 +356,73 @@ async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
         meta.append((row[0], row[1] or "", (row[2] or "")[:200], row[4] or "DORMANT"))
 
     matrix = normalize_rows(np.asarray(vectors, dtype=np.float64)) if vectors else np.empty((0, 0))
-    _procedure_cache = _ProcedureCache(matrix=matrix, meta=meta, built_at=now)
-    return _procedure_cache
+    return _ProcedureCache(matrix=matrix, meta=meta, built_at=built_at)
+
+
+async def _rebuild_procedure_cache(db: Any) -> _ProcedureCache | None:
+    """Read + rebuild the cache; on a DB/read error keep (and return) the prior one."""
+    global _procedure_cache
+    now = time.monotonic()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id, task_type, principle, principle_embedding, activation_tier "
+            "FROM procedural_memory "
+            "WHERE deprecated = 0 AND quarantined = 0 "
+            "AND principle_embedding IS NOT NULL "
+            "ORDER BY confidence DESC LIMIT 1000"
+        )
+        built = await asyncio.to_thread(_build_procedure_matrix, list(rows), now)
+    except Exception:
+        logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
+        return _procedure_cache  # table absent / DB error — never block the endpoint
+    _procedure_cache = built
+    return built
+
+
+async def _background_procedure_refresh(db: Any) -> None:
+    global _procedure_refresh_in_flight
+    try:
+        await _rebuild_procedure_cache(db)
+    finally:
+        _procedure_refresh_in_flight = False
+
+
+async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
+    """Return the cached surfaceable-procedure matrix (stale-while-revalidate).
+
+    The FIRST build runs inline (nothing to serve yet). Past the TTL the current
+    snapshot is served and ONE background rebuild is scheduled, so the per-prompt
+    path never pays for a rebuild. Why: recall calls on a single-user install
+    arrive minutes apart — MEASURED 385 calls in ~41h, a mean gap above the 300s
+    TTL — so under refresh-on-read almost every call found the cache expired and
+    rebuilt inline (59 of 87 journal slow-lines showed ≥200ms in this stage).
+
+    Staleness is bounded by TTL + one rebuild, and the one surfaced winner is
+    still re-verified live in :func:`_surface_procedure`, so a procedure
+    quarantined since the snapshot is never advised. On a DB/read error the last
+    good cache is kept (returns None only when one was never built). The cache
+    is process-global and NOT keyed on ``db`` — correct because the runtime
+    passes exactly one process-global connection (``memory_mod._db``) for its
+    whole lifetime.
+    """
+    global _procedure_refresh_in_flight
+    cache = _procedure_cache
+    if cache is None:
+        return await _rebuild_procedure_cache(db)
+    if (
+        time.monotonic() - cache.built_at
+    ) >= _PROCEDURE_CACHE_TTL_S and not _procedure_refresh_in_flight:
+        _procedure_refresh_in_flight = True
+        from genesis.util.tasks import tracked_task
+
+        refresh = _background_procedure_refresh(db)
+        try:
+            tracked_task(refresh, name="procedure_cache_refresh")
+        except Exception:
+            refresh.close()  # never scheduled — don't leak an un-awaited coroutine
+            _procedure_refresh_in_flight = False
+            logger.debug("procedure cache refresh scheduling failed", exc_info=True)
+    return cache
 
 
 async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
@@ -788,6 +853,14 @@ async def proactive_context(
         # from the journal alone (the 503 path discards timings_ms entirely —
         # this was the observability gap behind the #1169 timeout hunt).
         logger.info("proactive recall slow: %s", timings)
+    else:
+        # Every OTHER completed call gets one compact line too. Logging only the
+        # slow tail made true p50/p95 unmeasurable — the journal held a sample
+        # conditioned on being slow. Slow calls keep their original full line
+        # (existing greps depend on it) and 503s keep the CANCELLED warning, so
+        # together the three lines cover every call exactly once. Volume is one
+        # line per prompt (hundreds per day on a busy install).
+        logger.info("proactive recall timing: %s", _compact_timings(timings))
     return {
         "status": "ok",
         "lines": lines,

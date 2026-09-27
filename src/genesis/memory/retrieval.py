@@ -15,7 +15,7 @@ from qdrant_client import QdrantClient
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
-from genesis.db.crud._fts import fts5_term
+from genesis.db.crud._fts import drop_bm25_inert_terms, fts5_term
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
@@ -1392,6 +1392,16 @@ class HybridRetriever:
                 logger.warning("Query expansion failed, using original", exc_info=True)
         if extra_fts_terms:
             safe_terms = [t for t in (fts5_term(t) for t in extra_fts_terms) if t]
+            # This lane is a TOP-LEVEL disjunction, so terms FTS5's bm25 treats
+            # as inert (in >= half the rows — e.g. ``genesis``/``memory`` from a
+            # src/genesis/memory/... path, which every row carries as a tag) are
+            # dropped: they add only ~0-scored rows but force FTS5 to score the
+            # whole corpus. MEASURED on a 100k-row copy over 150 real recent
+            # queries with a 4-term file lane: FTS stage p50 456→115ms, p95
+            # 1291→614ms, top-48 candidate SET identical on 150/150. See
+            # ``_fts.drop_bm25_inert_terms``.
+            if safe_terms:
+                safe_terms = await self._ro_read(drop_bm25_inert_terms, safe_terms)
             extra = " OR ".join(safe_terms)
             if extra:
                 fts_query = f"({fts_query}) OR ({extra})"
