@@ -72,10 +72,11 @@ def _eval_disallowed_tools() -> list[str]:
     that MEASURED zero rows in ``follow_ups`` on 2026-09-25. A comment asserting
     that something is tracked, pointing at a record that no longer exists, is
     worse than an untracked TODO: it stops the next reader from filing one.
-    Note what is NOT closed: ``invoker.py`` pins ``GH_TOKEN`` empty for every
-    dispatch, which removes the inherited-env route only. MEASURED: gh then falls
-    back to ``hosts.yml`` on disk, so this session still reaches the operator's
-    GitHub credential. An env pin cannot fix that while ``Bash`` is unrestricted
+    Note what is NOT closed: ``invoker.py`` pins all FOUR documented gh
+    credential variables empty for every dispatch and refuses a launch where any
+    of them is set, which removes the inherited-env route only. MEASURED: gh then
+    falls back to ``hosts.yml`` on disk, so this session still reaches the
+    operator's GitHub credential. An env pin cannot fix that while ``Bash`` is unrestricted
     — the file is readable either way — which is why the remedy named above is
     the remedy, and not a smaller one. Deriving from
     ``build_reflection_disallowed`` (live per call) means a genesis MCP write
@@ -95,7 +96,8 @@ def _eval_disallowed_tools() -> list[str]:
     reads). Closing that broader observation-content-surfacing surface (exclude/wrap
     external-origin content at the surfacing points) is tracked — see the
     "external-origin observation content" follow-up. (The ``Bash``/fetch relocation
-    remains the open part of 727a3724, above.)
+    remains the open part, tracked as ``d83569bf`` above — NOT as
+    ``727a3724``, which no longer exists.)
     """
     return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
 

@@ -6,13 +6,15 @@ operator's real home:
 
 * ``cc_span_settings_path`` → ``~/.genesis/cc-span-settings.json``, the settings
   file injected into dispatched sessions.
-* ``_sealed_gh_config_dir`` → ``~/.genesis/gh-sealed``, which COPIES the
-  operator's real ``gh`` credential into it. Anything that builds an env for an
+* ``_sealed_gh_config_dir`` → ``~/.genesis/gh-sealed``. Since 2026-09-25 it
+  copies NO credential — but these tests still BUILD, WRITE and CHMOD that
+  path, so without the redirect a run rewrites the real seal (contents replaced,
+  locked at 0500) under the operator's home. Anything that builds an env for an
   invocation carrying ``bash_allowlist=("gh",)`` reaches it, which is a much
-  wider set of tests than the ones that name the seal — MEASURED: the allowlist
-  launch tests created a real seal holding the real token before this fixture
-  existed. Allowlist polarity on purpose: a test written next year inherits the
-  isolation rather than having to remember it.
+  wider set of tests than the ones that name the seal — MEASURED: before this
+  fixture existed the allowlist launch tests created a real seal, and in the
+  copying era it held the real token. Allowlist polarity on purpose: a test
+  written next year inherits the isolation rather than having to remember it.
 """
 
 from __future__ import annotations

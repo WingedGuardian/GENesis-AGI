@@ -24,7 +24,6 @@ import contextlib
 import json
 import logging
 import shutil
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -311,11 +310,19 @@ _NO_MARKETING_SEND = [
     "mcp__genesis-outreach__marketing_prospects_list",
 ]
 
-# The venv Python interpreter running genesis-server. Exposed to profile
-# overlays (see _load_profile_overlays) so a locally-defined Bash profile can
-# allowlist exactly this path and run `<this> -m <module>`. Using
-# sys.executable keeps it install-agnostic (no hard-coded home path).
-_VENV_PYTHON = sys.executable
+# WITHDRAWN 2026-09-26: `_VENV_PYTHON` / `ProfileOverlayContext.venv_python`.
+# It existed so a locally-defined Bash profile could allowlist the venv
+# interpreter and run `<this> -m <module>`. That route no longer launches:
+# `invoker._required_hardening` refuses any allowlist entry that is in neither
+# `_BINARY_HARDENING` nor `_NEEDS_NO_HARDENING`, and `basename(sys.executable)`
+# is in neither — MEASURED, it raises out of `_build_env` on every dispatch.
+#
+# The refusal is CORRECT and is not the thing to change: an interpreter is an
+# arbitrary-program primitive (`python -c`), so no environment pin confines it.
+# What was wrong was leaving a comment here telling the next author to use a
+# route that raises. Reviving it needs a real `_BINARY_HARDENING` entry
+# (`-E`/`-s` plus `PYTHONSTARTUP`/`PYTHONPATH`/`PYTHONHOME`), each escape
+# MEASURED rather than reasoned about — not a field on this context.
 
 PROFILES: dict[str, list[str]] = {
     "observe": (
@@ -356,21 +363,16 @@ PROFILES: dict[str, list[str]] = {
     # capability. A subcommand-level allowlist is what would make "confined"
     # true, and it does not exist yet.
     #
-    # It no longer acts with the OPERATOR's credentials, as of 2026-09-25: the
-    # sealed gh config carries no `hosts.yml` and `GH_TOKEN` is pinned empty, so
-    # a dispatch is UNAUTHENTICATED (MEASURED). What remains is filesystem write
-    # and unauthenticated network reach — which still matters, because this
-    # profile ingests external, attacker-authored PR content. Read the floor as
-    # "no GitHub identity", never as "cannot reach the network or the disk".
-    #
-    # CONSEQUENCE, STATED RATHER THAN DISCOVERED: the mandate below still asks
-    # for authenticated writes (comment / reopen / re-request review / close) and
-    # NONE of them can succeed now. There is no arming path — `_gh_hardening`
-    # pins GH_TOKEN empty and `_assert_hardening_present` refuses any other
-    # value, so a credential cannot even be injected via `env_overrides`.
-    # Survivable only because this profile has never run: MEASURED 0 rows in
-    # `cc_sessions` for it. Giving it a credential deliberately, and rewriting
-    # the mandate to match, is follow-up work — not a gap to paper over here.
+    # On the CREDENTIAL, the mechanisms and nothing more: the sealed gh config
+    # carries no `hosts.yml`, `_build_env` pins the four documented gh
+    # credential variables empty for every dispatch, and
+    # `_assert_no_gh_credentials` refuses a launch where any of them is set, so
+    # `gh` here carries no GitHub identity. Do NOT read that as an
+    # unauthenticated SESSION: this profile permits `Read`/`Glob`/`Grep`
+    # (MEASURED), the operator's own gh config stays on disk, and the profile
+    # ingests external, attacker-authored PR content — so that content can ask
+    # the session to read the file. `gh` itself also reads caller-chosen paths
+    # (`gh pr comment -F`, `gh api --input`), which no environment pin touches.
     "steward": (
         [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
         + _NO_BROWSER_INTERACTION
@@ -618,7 +620,6 @@ class ProfileOverlayContext:
     no_recon_writes: list[str]
     no_web_tools: list[str]
     no_marketing_send: list[str]
-    venv_python: str
 
     def add_profile(
         self,
@@ -669,7 +670,6 @@ def _load_profile_overlays() -> None:
         no_recon_writes=_NO_RECON_WRITES,
         no_web_tools=_NO_WEB_TOOLS,
         no_marketing_send=_NO_MARKETING_SEND,
-        venv_python=_VENV_PYTHON,
     )
     try:
         profile_overlay.register(ctx)
