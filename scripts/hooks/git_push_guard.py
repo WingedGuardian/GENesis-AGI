@@ -4983,7 +4983,8 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
 # opens "Codex Review: Didn't find any major issues." (the flavour sentence after —
 # "Swish!", "You're on a roll.", "Keep them coming!", … — VARIES, so anchor ONLY on the
 # stable prefix) and carries a "**Reviewed commit:** `<sha>`" line with a 10-char
-# ABBREVIATED sha. Both must be present for the comment to vouch for a commit.
+# ABBREVIATED sha. Both must be present for the comment to be REPORTED; it never vouches
+# for a commit (see ``_latest_codex_clean_comment_sha``).
 _CODEX_CLEAN_COMMENT_RE = re.compile(
     r"Codex Review:\s*Didn'?t find any major issues", re.IGNORECASE
 )
@@ -4995,22 +4996,22 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
 def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
     """The ABBREVIATED commit sha from Codex's most recent CLEAN issue-comment, or None.
 
-    Codex posts a clean RE-review as an ISSUE COMMENT, not a review object, so
-    ``_latest_codex_reviewed_sha`` (which reads the reviews API) never sees it — a clean
-    re-review would then false-block the merge (bit PR #1386 twice). This is the fallback
-    the freshness gate consults when the review-object path would otherwise block: it
-    reads ``issues/N/comments``, and for a comment authored by the Codex bot (login AND
-    ``user.type == "Bot"``) requires BOTH the clean marker AND a parseable
-    ``Reviewed commit: <sha>`` line — a marker alone never vouches (fail-closed to None).
+    DIAGNOSTIC ONLY — this value must never satisfy a gate. Codex posts a clean
+    RE-review as an ISSUE COMMENT, not a review object, and names the commit only by an
+    abbreviated id. An abbreviated id does not identify a commit: the head it is compared
+    against is whatever the branch's author pushed, so "the head starts with this prefix"
+    is not "this head was reviewed". Freshness therefore rests on the reviews API's full
+    ``commit_id`` alone (``_latest_codex_reviewed_sha``), and the freshness gate reads this
+    only to explain its block. An earlier version accepted a prefix match as freshness on
+    the argument that the head was a fixed value; the author controls that value, so the
+    argument did not hold.
 
-    Returns a PREFIX (>=7 hex, lowercased). The caller confirms it against the
-    AUTHORITATIVE head via ``head.startswith(...)``: there is NO prefix-grinding surface
-    because the head is a fixed value read from GitHub and the comment author is verified
-    as the Codex bot (a human cannot post as ``chatgpt-codex-connector[bot]``). The
-    reviews-API path keeps its full-oid identity; only this comment fallback is a prefix,
-    and only against a known head. Comments come oldest-first, so the last match (most
-    recent clean comment) wins. Tests inject via ``_TEST_GH_CODEX_COMMENTS`` (one JSON
-    object per line: ``{login, type, body}``). Fail-safe: None on any API/parse error.
+    Reads ``issues/N/comments``; for a comment authored by the Codex bot (login AND
+    ``user.type == "Bot"``) it requires BOTH the clean marker AND a parseable
+    ``Reviewed commit: <sha>`` line (fail-closed to None). Returns a lowercased prefix
+    (>=7 hex). Comments come oldest-first, so the last match wins. Tests inject via
+    ``_TEST_GH_CODEX_COMMENTS`` (one JSON object per line: ``{login, type, body}``).
+    Fail-safe: None on any API/parse error.
     """
     raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
     if raw is None:
@@ -6363,15 +6364,22 @@ def _check_codex_reviewed_head_core(
     if reviewed == head:
         return False, "", head
     # The review-object path can't vouch for the current head (Codex has no review, or
-    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT (not a review object)
-    # carrying a "Reviewed commit: <sha>" marker — accept it as freshness when it names
-    # THIS head (follow-up 7ff0fdc6). Consulted ONLY on the would-block path, so the common
-    # green case (a review object already at head, above) adds no extra API call. The
-    # comment sha is an abbreviated PREFIX, matched against the AUTHORITATIVE head — no
-    # grinding surface (fixed head, bot-verified author); see the helper's docstring.
+    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT, not a review
+    # object, and it names its commit only by an abbreviated id. That id identifies no
+    # commit — the head is whatever the branch's author pushed — so it NEVER satisfies
+    # this gate. Only a review object whose full ``commit_id`` equals the head vouches
+    # (or, via the caller, an owner-approved substitute at that exact head). The comment
+    # is still read, on this would-block path only, so the block can say it was seen
+    # and name the route that works.
     clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
+    clean_note = ""
     if clean_short and head.startswith(clean_short):
-        return False, "", head
+        clean_note = (
+            f"\nNOTE: Codex posted a clean re-review naming commit {clean_short}. A clean "
+            f"re-review arrives as a comment carrying only an abbreviated commit id, which "
+            f"does not identify the commit, so it is not accepted as a review of head "
+            f"{head[:12]}."
+        )
     if not reviewed:
         return (
             True,
@@ -6389,6 +6397,7 @@ def _check_codex_reviewed_head_core(
                 f"— so treat each surface as independently available until proven otherwise: "
                 f"post '@codex review' and check for a review at head BEFORE concluding "
                 f"Codex is unavailable."
+                f"{clean_note}"
             ),
             None,
         )
@@ -6457,6 +6466,7 @@ def _check_codex_reviewed_head_core(
                 f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
+                f"{clean_note}"
             ),
             None,
         )
@@ -11515,14 +11525,6 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _head_l = _head.strip().lower() if _head else None
         if _head_l is not None and _reviewed == _head_l:
             label = "ok (current)"
-        elif (
-            _head_l is not None
-            and (_clean := _latest_codex_clean_comment_sha(pr_num, repo=repo))
-            and _head_l.startswith(_clean)
-        ):
-            # Freshness satisfied by a clean Codex ISSUE-COMMENT at head (the review
-            # object is absent or stale) — the allow path added in follow-up 7ff0fdc6.
-            label = "ok (clean comment at head)"
         elif _reviewed is None or _head is None:
             # A transiently-failed re-read must NOT read as "current" (Codex P2
             # #1373): the enforcement gate already passed, but the report must not
