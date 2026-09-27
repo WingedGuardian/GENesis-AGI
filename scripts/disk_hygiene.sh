@@ -4,7 +4,11 @@
 # Run by the genesis-disk-hygiene.timer systemd unit (also runnable by hand).
 # Best-effort steps — one failing must not skip the others:
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
-#      (trash-bin with 7-day recovery; frees space when trash purges)
+#      (archives into ~/.genesis/worktree-trash; first releases session-claim
+#      locks whose process is gone, then after reaping expires archives older
+#      than 30d — archive first, then its locked registration anchor.
+#      GENESIS_WORKTREE_TRASH_RETENTION_DAYS=0 / GENESIS_WORKTREE_STALE_CLAIM_RELEASE=0
+#      disable those two steps)
 #   2. Reclaim regenerable caches          → scripts/disk_reclaim.py
 #      (cheap tier always; medium/reindex tier only when disk >= 90%)
 #   3. Reap orphaned background-CC sandboxes (~/tmp/bg-cc-sessions, 24h)
@@ -150,8 +154,22 @@ main() {
     "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
         || echo "zero_drop_worker exited $?"
 
+    # Stale claims BEFORE the reaper, so a worktree whose claiming session died
+    # is judged on its merits tonight rather than pinned for another day. The
+    # claim module decides staleness; a lock it did not write is never touched.
+    echo "--- stale worktree-claim release ---"
+    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
+        || echo "worktree_lifecycle --release-stale-claims exited $?"
+
     echo "--- worktree reaping ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
+
+    # Retention for the reaper's archives (30d default, owner decision). The
+    # script deletes an archive BEFORE unlocking and pruning the registration
+    # that anchored it, so nothing is de-anchored while its archive exists.
+    echo "--- worktree archive retention (>30d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --expire-trash \
+        || echo "worktree_lifecycle --expire-trash exited $?"
 
     echo "--- cache reclamation ---"
     "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 \
