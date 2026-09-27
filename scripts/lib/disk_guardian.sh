@@ -222,6 +222,26 @@ dg_raw_total_mb() {
     echo $(( b * s / 1048576 ))
 }
 
+dg_raw_sizes_mb() {
+    # "<size of $1> <size of $2>" in MB, raw statvfs, from ONE stat call so
+    # both are read microseconds apart: two separate calls let a ZFS commit
+    # land between them and flip a domain's key for a poll (review finding).
+    # 0 for any size that cannot be read.
+    local b1=0 s1=0 b2=0 s2=0
+    { read -r b1 s1 && read -r b2 s2; } < <(stat -f -c '%b %S' -- "$1" "$2" 2>/dev/null) || true
+    [[ "$b1" =~ ^[0-9]+$ && "$s1" =~ ^[0-9]+$ ]] || { b1=0; s1=0; }
+    [[ "$b2" =~ ^[0-9]+$ && "$s2" =~ ^[0-9]+$ ]] || { b2=0; s2=0; }
+    echo "$(( b1 * s1 / 1048576 )) $(( b2 * s2 / 1048576 ))"
+}
+
+dg_same_size() {
+    # 0 when sizes $1 and $2 (MB, both non-zero) are within 1 % of each other.
+    local a="$1" b="$2" d
+    (( a > 0 && b > 0 )) || return 1
+    d=$(( a > b ? a - b : b - a ))
+    (( d * 100 <= (a > b ? a : b) ))
+}
+
 # ── Growth rate and time-to-full ─────────────────────────────
 dg_rate_update() {
     # Update and echo the smoothed growth rate (MB/min, integer, may be
@@ -312,7 +332,7 @@ dg_tier() {
     # The tier that DRIVES actions, from the floor tier $1 and the ETA tier $2.
     # Time-to-full may raise the floor tier by ONE level at most. A burst at
     # high free space (a local copy at 200 MB/s with 140 GB free projects "full
-    # in 12 minutes") therefore logs attribution instead of paging and freezing,
+    # in 12 minutes") therefore logs attribution instead of paging and reclaiming,
     # while the same rate on a nearly full disk escalates straight to RED.
     local f e
     f="$(_dg_rank "$1")"; e="$(_dg_rank "$2")"
@@ -362,8 +382,8 @@ dg_io_snapshot() {
         comm="?"
         read -r comm 2>/dev/null < "$p/comm" || true
         # comm is process-chosen (prctl PR_SET_NAME) and may hold tabs or
-        # newlines; those would split the space-separated snapshot and the
-        # tab-separated frozen record, so every whitespace byte becomes "_".
+        # newlines; those would split the space-separated snapshot, so every
+        # whitespace byte becomes "_".
         comm="${comm//[[:space:]]/_}"
         printf '%s %s %s %s\n' "$pid" "$st" "$wb" "$comm"
     done
@@ -383,59 +403,5 @@ dg_io_top() {
             d = $3 - base[$1 " " $2]
             if (d > 0) printf "%s %s %d %d %s\n", $1, $2, d, d * 60 / dt / 1048576, $4
         }
-    ' <(printf '%s\n' "$prev") <(printf '%s\n' "$cur") | sort -k3,3nr | head -n "$n"
-}
-
-# The ONLY process names the freeze may ever act on: downloaders. ALLOWLIST
-# polarity on purpose. An exemption list has to name every process that must
-# never stop, and the one it forgets is a session: 45+ MCP servers, the model
-# proxy and the shells a session runs through are all own-uid python/bash, and
-# freezing one hangs the operator's tool call for up to its 2 h timeout. A
-# heavy writer that is not on this list is logged as a dry "freeze candidate"
-# at the start of every episode (tmp_watchgod.sh, handle_fs) — the evidence the
-# owner widens the list on, in watchgod.conf.
-DG_FREEZE_ALLOW_COMMS="${DG_FREEZE_ALLOW_COMMS:-curl wget wget2 aria2c yt-dlp ffmpeg rsync scp sftp dd gdown git-lfs}"
-
-dg_freeze_eligible() {
-    # 0 when pid $1 (starttime $2, comm $3) may be SIGSTOPped under the v2
-    # narrow rule: its name is on DG_FREEZE_ALLOW_COMMS, it holds a descriptor
-    # open for writing under the downloads directory $4, that directory is ON the
-    # filesystem in trouble (device $6 — freezing a writer elsewhere relieves
-    # nothing), it is not one of the protected pids in $5, and its identity
-    # (starttime) still matches. Prints the reason on refusal.
-    local pid="$1" st="$2" comm="$3" dl="$4" protected="${5:-}" dev="${6:-}" c q cur rest ok=0
-    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || { echo "invalid pid"; return 1; }
-    for q in $protected; do
-        [[ "$q" == "$pid" ]] && { echo "protected process"; return 1; }
-    done
-    for c in $DG_FREEZE_ALLOW_COMMS; do
-        [[ "$c" == "$comm" ]] && ok=1
-    done
-    (( ok )) || { echo "not a known downloader ($comm)"; return 1; }
-    rest="$(cat "$DG_PROC/$pid/stat" 2>/dev/null)" || { echo "gone"; return 1; }
-    rest="${rest##*) }"
-    read -r -a _dg_f <<< "$rest"
-    cur="${_dg_f[19]:-}"
-    [[ "$cur" == "$st" ]] || { echo "pid reused"; return 1; }
-    [[ -n "$dl" && -d "$dl" ]] || { echo "no downloads directory"; return 1; }
-    dl="$(cd "$dl" 2>/dev/null && pwd -P)" || { echo "downloads unreadable"; return 1; }
-    if [[ -n "$dev" && "$(stat -c %d -- "$dl" 2>/dev/null)" != "$dev" ]]; then
-        echo "downloads is not on the filesystem in trouble"; return 1
-    fi
-    # A descriptor OPEN FOR WRITING (fdinfo access mode O_WRONLY or O_RDWR)
-    # under the downloads dir: an ffmpeg that only READS its input from there
-    # while writing elsewhere relieves nothing by stopping (review finding).
-    local fd l flags k v
-    for fd in "$DG_PROC/$pid/fd"/*; do
-        l="$(readlink -- "$fd" 2>/dev/null)" || continue
-        [[ "$l" == "$dl/"* && "$l" != *" (deleted)" ]] || continue
-        flags=""
-        while read -r k v _; do
-            [[ "$k" == flags: ]] && { flags="$v"; break; }
-        done 2>/dev/null < "$DG_PROC/$pid/fdinfo/${fd##*/}" || true
-        [[ "$flags" =~ ^[0-7]+$ ]] || continue
-        (( (8#$flags & 3) != 0 )) && return 0
-    done
-    echo "not writing under $dl"
-    return 1
+    ' <(printf '%s\n' "$prev") <(printf '%s\n' "$cur") | sort -k3,3nr | awk -v n="$n" 'NR <= n'
 }

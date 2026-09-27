@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
-# watchgod — look at the disk guardian, and resume what it froze.
+# watchgod — look at the disk guardian.
 #
-#   scripts/watchgod status          per-filesystem tier, free space, time to full,
-#                                    and every process currently frozen
-#   scripts/watchgod thaw <pid>      resume one frozen process (SIGCONT)
-#   scripts/watchgod thaw all        resume every frozen process
+#   scripts/watchgod status          per-filesystem tier, free space, time to full
+#                                    and whether a quota binds, as of the last poll
 #
-# The guardian (scripts/tmp_watchgod.sh) only ever freezes a known DOWNLOADER
-# writing into ~/tmp/downloads while its disk is RED, and never a session, so
-# any shell or session can run this. It does not auto-thaw: resuming a runaway
-# just refills the disk. Thaw it once there is room, or kill it yourself.
-#
-# A pid is resumed only if it is still the SAME process that was frozen (its
-# start time matches the record); a recycled pid is never signalled.
+# Reads ~/.genesis/watchgod_state.json, which the guardian
+# (scripts/tmp_watchgod.sh, the genesis-tmp-watchgod service) rewrites every poll.
 set -euo pipefail
 
 if [ -z "${HOME:-}" ]; then
@@ -21,22 +14,10 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 STATE_FILE="${WATCHGOD_STATE_FILE:-$HOME/.genesis/watchgod_state.json}"
-DG_STATE_DIR="${DG_STATE_DIR:-$HOME/.genesis/watchgod}"
-FROZEN_FILE="$DG_STATE_DIR/frozen"
-LOG_FILE="${WATCHGOD_LOG_FILE:-$HOME/.genesis/logs/tmp_watchgod.log}"
-DG_PROC="${DG_PROC:-/proc}"
 
 usage() {
-    sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '4,5p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
-}
-
-_starttime() {
-    local rest
-    read -r rest 2>/dev/null < "$DG_PROC/$1/stat" || return 1
-    rest="${rest##*) }"
-    read -r -a f <<< "$rest"
-    printf '%s' "${f[19]:-}"
 }
 
 cmd_status() {
@@ -53,55 +34,10 @@ PY
     else
         echo "no state file at $STATE_FILE (is genesis-tmp-watchgod running?)"
     fi
-    if [[ -s "$FROZEN_FILE" ]]; then
-        echo "frozen:"
-        local pid st comm ts dev rate state
-        while IFS=$'\t' read -r pid st comm ts dev rate; do
-            state="gone"
-            [[ "$(_starttime "$pid" 2>/dev/null || true)" == "$st" ]] && state="still frozen"
-            echo "  pid ${pid} (${comm}) frozen ${ts} at ${rate} MB/min — ${state}"
-        done < "$FROZEN_FILE"
-    else
-        echo "frozen: none"
-    fi
-}
-
-cmd_thaw() {
-    local want="${1:-}"
-    [[ -n "$want" ]] || usage 2
-    [[ "$want" == all || "$want" =~ ^[0-9]+$ ]] || { echo "watchgod: thaw takes a pid or 'all'" >&2; exit 2; }
-    [[ -s "$FROZEN_FILE" ]] || { echo "nothing is frozen"; return 0; }
-    mkdir -p "$DG_STATE_DIR"
-    exec 9>"$FROZEN_FILE.lock"
-    flock 9
-    local keep="" pid st comm ts dev rate hit=0
-    while IFS=$'\t' read -r pid st comm ts dev rate; do
-        [[ -n "$pid" ]] || continue
-        if [[ "$want" != all && "$want" != "$pid" ]]; then
-            keep+="${pid}"$'\t'"${st}"$'\t'"${comm}"$'\t'"${ts}"$'\t'"${dev}"$'\t'"${rate}"$'\n'
-            continue
-        fi
-        hit=1
-        if [[ "$(_starttime "$pid" 2>/dev/null || true)" != "$st" ]]; then
-            echo "pid ${pid} (${comm}) is no longer running — record dropped"
-            continue
-        fi
-        if kill -CONT "$pid" 2>/dev/null; then
-            echo "resumed pid ${pid} (${comm})"
-            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [INFO] THAWED pid ${pid} (${comm}) by operator" >> "$LOG_FILE" 2>/dev/null || true
-        else
-            echo "could not signal pid ${pid} (${comm}) — record kept" >&2
-            keep+="${pid}"$'\t'"${st}"$'\t'"${comm}"$'\t'"${ts}"$'\t'"${dev}"$'\t'"${rate}"$'\n'
-        fi
-    done < "$FROZEN_FILE"
-    printf '%s' "$keep" > "$FROZEN_FILE.tmp" && mv -f "$FROZEN_FILE.tmp" "$FROZEN_FILE"
-    (( hit )) || echo "pid ${want} is not in the frozen list"
-    return 0
 }
 
 case "${1:-}" in
     status) cmd_status ;;
-    thaw) cmd_thaw "${2:-}" ;;
     -h|--help|help|"") usage 0 ;;
     *) echo "watchgod: unknown command '$1'" >&2; usage 2 ;;
 esac

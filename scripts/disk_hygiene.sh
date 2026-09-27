@@ -94,6 +94,10 @@ prune_tmp() {
         recent_pred=(-mmin "-$age_min")
     fi
     local snap child
+    if ! liveness_visible; then
+        echo "tmp prune SKIPPED: no other process is visible in /proc, so nothing can be proven unused"
+        return 0
+    fi
     snap="$(live_open_paths)"
     while IFS= read -r -d '' child; do
         if [ -d "$child" ] && dir_has_live_writer "$child" "$snap"; then
@@ -115,6 +119,30 @@ prune_tmp() {
         rm -rf -- "$child" 2>/dev/null || echo "tmp prune failed for $child"
     done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
+}
+
+# reap_bg_sandboxes DIR — remove per-session background-CC sandboxes (DIR/<id>)
+# untouched for 24 h. 24 h is well past any live session (the Genesis-controlled
+# max timeout is 2 h), but a surviving child of an ended session can still run
+# in or hold one, so each is spared when a live process holds it or uses it as
+# its cwd — and the whole reap is refused when liveness is blind, like every
+# other deleter here (review finding).
+reap_bg_sandboxes() {
+    local dir="$1" snap d
+    [ -d "$dir" ] || return 0
+    dir="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
+    if ! liveness_visible; then
+        echo "bg-cc sandbox reap SKIPPED: no other process is visible in /proc"
+        return 0
+    fi
+    snap="$(live_open_paths)"
+    while IFS= read -r -d '' d; do
+        if dir_has_live_writer "$d" "$snap"; then
+            echo "bg-cc sandbox reap: sparing $d (held open or in use by a live process)"
+            continue
+        fi
+        rm -rf -- "$d" 2>/dev/null || echo "bg-cc sandbox reap failed for $d"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -print0 2>/dev/null)
 }
 
 # reclaim_lock / reclaim_unlock — serialize the steps that DELETE (cache
@@ -175,10 +203,7 @@ pressure_main() {
     "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" "${reclaim[@]}" \
         || echo "disk_reclaim exited $?"
     echo "--- background CC sandbox reaping ---"
-    if [ -d "$HOME/tmp/bg-cc-sessions" ]; then
-        find "$HOME/tmp/bg-cc-sessions" -mindepth 1 -maxdepth 1 -type d -mmin +1440 \
-            -exec rm -rf {} + 2>/dev/null || echo "bg-cc-sandbox reap exited $?"
-    fi
+    reap_bg_sandboxes "$HOME/tmp/bg-cc-sessions"
     echo "--- ~/tmp age prune (>2d, live writers spared) ---"
     prune_tmp "$HOME/tmp" 2880
     reclaim_unlock
@@ -286,11 +311,7 @@ main() {
     # 24h is well past any live session: the Genesis-controlled max timeout is
     # 7200s/2h (CCInvocation.timeout_s); DirectSessionRequest defaults to 3600s/1h.
     echo "--- background CC sandbox reaping ---"
-    BG_CC_SANDBOX_DIR="$HOME/tmp/bg-cc-sessions"
-    if [ -d "$BG_CC_SANDBOX_DIR" ]; then
-        find "$BG_CC_SANDBOX_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +1440 \
-            -exec rm -rf {} + 2>/dev/null || echo "bg-cc-sandbox reap exited $?"
-    fi
+    reap_bg_sandboxes "$HOME/tmp/bg-cc-sessions"
 
     echo "--- ~/tmp age prune (>7d) ---"
     prune_tmp "$HOME/tmp"

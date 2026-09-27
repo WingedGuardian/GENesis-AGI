@@ -60,7 +60,7 @@ Telegram, only when genesis-server is DOWN; it yields/exits 200 if the server
 lock is held, and must never run alongside the server — dual getUpdates
 pollers split updates and break approval buttons),
 `genesis-tmp-watchgod.service` (whole-disk guardian + cc-tmp retention;
-`scripts/watchgod status` / `scripts/watchgod thaw`), `genesis-watchdog.timer`
+`scripts/watchgod status`), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),

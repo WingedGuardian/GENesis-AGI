@@ -24,9 +24,8 @@
 #           pressure@standard (caches, ~/tmp older than 2 days, live writers
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
 #           WARNING.
-#   RED     release the reserve file, freeze a runaway DOWNLOADER writing into
-#           ~/tmp/downloads (SIGSTOP; `scripts/watchgod thaw` resumes it),
-#           start genesis-disk-hygiene-pressure@last-resort, page EMERGENCY.
+#   RED     release the reserve file, start genesis-disk-hygiene-pressure@
+#           last-resort, page EMERGENCY with attribution.
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
 #
@@ -78,6 +77,7 @@ OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
 # environment-dependent: it reads correct on a host that has the file and
 # inverts every suppression decision on one that does not.
 OOM_EVENTS_LOCAL_FILE="${OOM_EVENTS_LOCAL_FILE:-}"
+# shellcheck disable=SC2034  # read by scripts/lib/watchgod_oom.sh
 OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 
 # Durable alert queue (F.3) — emergency-tier events page Telegram via the
@@ -89,6 +89,7 @@ if [[ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]]; then
     source "$_SCRIPT_DIR/lib/alert_queue.sh"
 else
     queue_alert() { :; }
+    queue_alert_try() { return 1; }
 fi
 
 # Whole-disk guardian: measurement + tiering + attribution primitives.
@@ -111,8 +112,6 @@ WATCH_EXTRA_PATHS=""
 # Reserve file: preallocated space released at RED so the last writes (logs,
 # DB commits, the reclaim itself) have room. min(this, 1 % of the filesystem).
 RESERVE_MAX_MB=2048
-# A candidate below this write rate (MB/min) is not the runaway.
-DG_FREEZE_MIN_RATE="${DG_FREEZE_MIN_RATE:-60}"
 # Re-start the reclaim unit at most this often while a tier persists.
 PRESSURE_RETRIGGER_S=600
 # Where space usually goes on this layout; `du` of each is logged at YELLOW.
@@ -127,7 +126,8 @@ OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp-
 # SETS variables. MEASURED in the E2E: a forced-RED threshold outlived its
 # removal and pinned the disk at RED.
 _WG_TUNABLES="CC_TMP_DIR DOWNLOADS_DIR WATCHGOD_ACT WATCH_EXTRA_PATHS RESERVE_MAX_MB
-    DG_FREEZE_MIN_RATE DG_FREEZE_ALLOW_COMMS PRESSURE_RETRIGGER_S DG_ATTRIBUTION_PATHS
+    POLL_INTERVAL FAST_POLL_INTERVAL
+    PRESSURE_RETRIGGER_S DG_ATTRIBUTION_PATHS
     DG_YELLOW_PCT DG_ORANGE_PCT DG_RED_PCT DG_RED_MIN_MB
     DG_ETA_YELLOW_MIN DG_ETA_ORANGE_MIN DG_ETA_RED_MIN DG_META_RED_PCT DG_UNALLOC_RED_MB
     CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_UNIT_PREFIXES"
@@ -155,28 +155,34 @@ load_config() {
         _wg_warn_once act "watchgod.conf: WATCHGOD_ACT='${WATCHGOD_ACT}' is not 0 or 1 — running in OBSERVE mode"
         WATCHGOD_ACT=0
     fi
-    # Every numeric threshold reaches shell arithmetic, where a hand-edited
-    # "10%" or "abc" is an unset-variable abort under set -u — the daemon would
-    # die over a typo. Reset each bad value to its default, loudly.
-    local kv k d
-    for kv in DG_YELLOW_PCT:15 DG_ORANGE_PCT:8 DG_RED_PCT:3 DG_RED_MIN_MB:3072 \
-              DG_ETA_YELLOW_MIN:360 DG_ETA_ORANGE_MIN:60 \
-              DG_ETA_RED_MIN:10 DG_META_RED_PCT:80 DG_UNALLOC_RED_MB:1024; do
-        k="${kv%%:*}"; d="${kv##*:}"
-        if [[ ! "${!k:-}" =~ ^[0-9]+$ ]]; then
-            _wg_warn_once "bad_$k" "watchgod.conf: ${k}='${!k:-}' is not a whole number — using ${d}"
-            printf -v "$k" '%s' "$d"
-        fi
+    # Every numeric setting reaches shell arithmetic, where a hand-edited "10%"
+    # or "abc" aborts under set -u and a leading zero is OCTAL: "08" is a fatal
+    # "value too great for base" and "0600" silently means 384 (review
+    # finding). Each one is normalised to canonical base 10 here, once, or
+    # reset to its default — loudly. The last field is a floor: a retention age
+    # under a day would reap an idle session's temp while its owner is at
+    # lunch, so it is refused rather than obeyed.
+    local kv k d min
+    for kv in DG_YELLOW_PCT:15:0 DG_ORANGE_PCT:8:0 DG_RED_PCT:3:0 DG_RED_MIN_MB:3072:0 \
+              DG_ETA_YELLOW_MIN:360:0 DG_ETA_ORANGE_MIN:60:0 DG_ETA_RED_MIN:10:0 \
+              DG_META_RED_PCT:80:0 DG_UNALLOC_RED_MB:1024:0 RESERVE_MAX_MB:2048:0 \
+              PRESSURE_RETRIGGER_S:600:0 CC_SWEEP_INTERVAL_S:3600:0 \
+              CC_SWEEP_AGE_MIN:10080:1440 CC_SWEEP_PRESSURE_AGE_MIN:2880:1440 \
+              POLL_INTERVAL:30:1 FAST_POLL_INTERVAL:5:1; do
+        IFS=: read -r k d min <<< "$kv"
+        _wg_uint "$k" "$d" "$min"
     done
-    [[ "$RESERVE_MAX_MB" =~ ^[0-9]+$ ]] || RESERVE_MAX_MB=2048
-    [[ "$DG_FREEZE_MIN_RATE" =~ ^[0-9]+$ ]] || DG_FREEZE_MIN_RATE=60
-    [[ "$PRESSURE_RETRIGGER_S" =~ ^[0-9]+$ ]] || PRESSURE_RETRIGGER_S=600
-    [[ "$CC_SWEEP_INTERVAL_S" =~ ^[0-9]+$ ]] || CC_SWEEP_INTERVAL_S=3600
-    # A retention age under a day would reap an idle session's temp while its
-    # owner is at lunch; refuse it rather than obey it.
-    [[ "$CC_SWEEP_AGE_MIN" =~ ^[0-9]+$ ]] && (( CC_SWEEP_AGE_MIN >= 1440 )) || CC_SWEEP_AGE_MIN=10080
-    [[ "$CC_SWEEP_PRESSURE_AGE_MIN" =~ ^[0-9]+$ ]] && (( CC_SWEEP_PRESSURE_AGE_MIN >= 1440 )) \
-        || CC_SWEEP_PRESSURE_AGE_MIN=2880
+}
+
+_wg_uint() {
+    # Normalise variable $1 to a canonical base-10 integer >= $3, else set $2.
+    local k="$1" d="$2" min="$3" v="${!1:-}"
+    if [[ "$v" =~ ^[0-9]{1,12}$ ]] && (( 10#$v >= min )); then
+        printf -v "$k" '%s' "$(( 10#$v ))"
+    else
+        _wg_warn_once "bad_$k" "watchgod.conf: ${k}='${v}' is not a whole number >= ${min} — using ${d}"
+        printf -v "$k" '%s' "$d"
+    fi
 }
 
 _wg_canon() {
@@ -189,8 +195,8 @@ _wg_canon() {
 # Every write to the state/log filesystem is best-effort. That filesystem is
 # usually the one this daemon guards, so at RED an append can fail (ENOSPC,
 # EDQUOT, read-only) — and under `set -e` an unguarded one would take the
-# guardian down at exactly the moment it exists for (review finding: the
-# freeze-record write; the same holds for every write below).
+# guardian down at exactly the moment it exists for (review finding; the
+# same holds for every write below).
 log() {
     local level="$1"; shift
     { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$level] $*" >> "$LOG_FILE"; } 2>/dev/null || true
@@ -228,9 +234,8 @@ home_dev() { stat -c %d -- "$HOME" 2>/dev/null || echo -; }
 
 # ── Episode bookkeeping ──────────────────────────────────────
 # One episode per filesystem: from leaving GREEN to returning to it. Pages and
-# attribution fire once per (filesystem, tier) per episode; the freeze and the
-# reserve re-evaluate on every RED poll, because a new runaway can start
-# mid-episode.
+# attribution fire once per (filesystem, tier) per episode; the reserve and the
+# reclaim re-evaluate on every RED poll.
 _ep_file() { printf '%s/episode_%s_%s' "$DG_STATE_DIR" "$1" "$2"; }
 episode_seen() { [[ -f "$(_ep_file "$1" "$2")" ]]; }
 episode_mark() { { mkdir -p "$DG_STATE_DIR" && : > "$(_ep_file "$1" "$2")"; } 2>/dev/null || true; }
@@ -270,7 +275,7 @@ log_attribution() {
         local t
         if [[ "$dev" == "${HOME_KEY:-$(home_dev)}" ]]; then
             while IFS= read -r t; do
-                [[ "$(stat -c %d -- "$t" 2>/dev/null)" == "${dev%%q*}" ]] && targets+=("$t")
+                [[ "$(stat -c %d -- "$t" 2>/dev/null)" == "${dev%%[qm]*}" ]] && targets+=("$t")
             done < <(attribution_paths)
         else
             # The WATCHED path's children, not its mount's: an extra watched
@@ -325,142 +330,65 @@ reserve_release() {
     return 0
 }
 
+# ── Action stamps and pages ──────────────────────────────────
+# Two rules every stamp, marker and page in this daemon follows (review
+# findings, two rounds): an ACT-mode record is written only after the action
+# SUCCEEDED — a stamp written before a failed start, or a page marked sent
+# before a failed enqueue, silences the retry for a whole interval or episode
+# — and an OBSERVE-mode poll keeps its own records (_wg_mode_tag), so flipping
+# WATCHGOD_ACT 0→1 mid-episode acts at once instead of inheriting "already done".
+_wg_mode_tag() { (( WATCHGOD_ACT )) && return 0; printf '_observe'; }
+
+_wg_due() {
+    # 0 if the stamp named $1 (mode-scoped) is at least $2 seconds old.
+    local f last=0
+    f="$DG_STATE_DIR/${1}$(_wg_mode_tag)"
+    [[ -f "$f" ]] && last="$(cat "$f" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]{1,12}$ ]] || last=0
+    local now
+    now="$(date +%s)"
+    # A stamp from the future (the clock stepped back) counts as due.
+    (( 10#$last > now || now - 10#$last >= $2 ))
+}
+
+_wg_stamp() {
+    { mkdir -p "$DG_STATE_DIR" && date +%s > "$DG_STATE_DIR/${1}$(_wg_mode_tag)"; } 2>/dev/null || true
+}
+
+_wg_page() {
+    # $1 severity $2 title $3 body $4 dedupe key $5 observe-mode summary.
+    # 0 only when the page was queued (or, observing, logged): the caller marks
+    # the episode on 0, so a failed enqueue is retried on the next poll.
+    if (( WATCHGOD_ACT == 0 )); then
+        log WARN "OBSERVE: would page ${5}"
+        return 0
+    fi
+    if queue_alert_try "$1" "watchgod:disk" "$2" "$3" "$4"; then
+        return 0
+    fi
+    log WARN "could not queue the page '${2}' (alert queue unwritable?) — retrying next poll"
+    return 1
+}
+
 # ── Reclaim (the one deleter lives in disk_hygiene.sh) ───────
 start_pressure_unit() {
     # $1 = standard | last-resort. Rate-limited per instance while a tier
-    # persists; systemd itself refuses a second concurrent run.
-    local inst="$1" stamp now last=0 unit
+    # persists; a repeat start of a running instance is a systemd no-op.
+    local inst="$1" unit
     unit="genesis-disk-hygiene-pressure@${inst}.service"
-    stamp="$DG_STATE_DIR/pressure_${inst}"
-    now="$(date +%s)"
-    [[ -f "$stamp" ]] && last="$(cat "$stamp" 2>/dev/null || echo 0)"
-    [[ "$last" =~ ^[0-9]+$ ]] || last=0
-    (( now - last >= PRESSURE_RETRIGGER_S )) || return 0
+    _wg_due "pressure_${inst}" "$PRESSURE_RETRIGGER_S" || return 0
     if (( WATCHGOD_ACT == 0 )); then
         log WARN "OBSERVE: would start ${unit}"
+        _wg_stamp "pressure_${inst}"
         return 0
     fi
-    { mkdir -p "$DG_STATE_DIR" && echo "$now" > "$stamp"; } 2>/dev/null || true
     if systemctl --user start --no-block "$unit" 2>/dev/null; then
+        _wg_stamp "pressure_${inst}"
         log WARN "started ${unit}"
     else
-        log WARN "could not start ${unit} — is it rendered? (bootstrap renders scripts/systemd/*.template)"
+        log WARN "could not start ${unit} — retrying next poll (is it rendered? bootstrap renders scripts/systemd/*.template)"
     fi
     return 0
-}
-
-# ── Freeze (narrow, reversible) ──────────────────────────────
-FROZEN_FILE="$DG_STATE_DIR/frozen"
-
-protected_pids() {
-    local u
-    printf '%s ' "$$" "$PPID"
-    for u in genesis-server.service genesis-bridge.service; do
-        systemctl --user show -p MainPID --value "$u" 2>/dev/null | tr '\n' ' ' || true
-    done
-    return 0
-}
-
-_wg_freeze_pid() {
-    # Record, THEN stop, pid $1 ($2 starttime $3 comm $4 dev $5 rate), both
-    # under the lock `scripts/watchgod thaw` takes — so a thaw can never run
-    # between the two and leave a stopped process with no record.
-    # Returns 0 frozen; 1 the record could not be written (nothing stopped);
-    # 2 the stop failed (the record is truncated away again — truncating needs
-    # no free space).
-    mkdir -p "$DG_STATE_DIR" 2>/dev/null || return 1
-    (
-        flock 9 || exit 1
-        size="$(stat -c %s -- "$FROZEN_FILE" 2>/dev/null || echo 0)"
-        if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date -u +%FT%TZ)" "$4" "$5" >> "$FROZEN_FILE"; then
-            [[ -e "$FROZEN_FILE" ]] && truncate -s "$size" -- "$FROZEN_FILE"
-            exit 1
-        fi
-        if ! kill -STOP "$1"; then
-            truncate -s "$size" -- "$FROZEN_FILE"
-            exit 2
-        fi
-        exit 0
-    ) 2>/dev/null 9>"$FROZEN_FILE.lock"
-}
-
-freeze_runaways() {
-    # $1 device in trouble, $2 EVERY writer measured this poll ("pid st delta
-    # rate comm"). Candidates are ALL of them, not the attribution top five:
-    # MEASURED in the E2E on a busy box, a 300 MB/min downloader never reached
-    # the top five behind test runs and a database at 400-870 MB/min, so a
-    # top-N filter would never have looked at it. Echoes a summary for the page.
-    local dev="$1" writers="$2" pid st _delta rate comm why prot out="" c known
-    # Nothing to freeze unless the downloads directory is ON this filesystem.
-    [[ -d "$DOWNLOADS_DIR" && "$(stat -c %d -- "$DOWNLOADS_DIR" 2>/dev/null)" == "$dev" ]] || return 0
-    prot="$(protected_pids)"
-    while read -r pid st _delta rate comm; do
-        [[ -n "${pid:-}" ]] || continue
-        (( rate >= DG_FREEZE_MIN_RATE )) || continue
-        # The allowlist first: cheap, and most heavy writers are not downloaders.
-        known=0
-        for c in $DG_FREEZE_ALLOW_COMMS; do [[ "$c" == "$comm" ]] && known=1; done
-        if (( ! known )); then
-            [[ -n "${DG_FREEZE_DRY:-}" ]] && out+="not on the downloader allowlist: pid ${pid} (${comm}, ${rate} MB/min)"$'\n'
-            continue
-        fi
-        if why="$(dg_freeze_eligible "$pid" "$st" "$comm" "$DOWNLOADS_DIR" "$prot" "$dev")"; then
-            if [[ -n "${DG_FREEZE_DRY:-}" ]]; then
-                out+="would freeze pid ${pid} (${comm}, ${rate} MB/min)"$'\n'
-                continue
-            fi
-            if (( WATCHGOD_ACT == 0 )); then
-                _wg_warn_once "wf_${pid}_${st}" "OBSERVE: would freeze pid ${pid} (${comm}, ${rate} MB/min) writing into ${DOWNLOADS_DIR}"
-                out+="OBSERVE: would freeze pid ${pid} (${comm}, ${rate} MB/min)"$'\n'
-                continue
-            fi
-            # The record is written BEFORE the stop, and the stop happens only
-            # if the record landed: at RED the state directory's own
-            # filesystem can be the full one, and a process stopped with no
-            # record is one `scripts/watchgod thaw all` can never find (review
-            # finding).
-            local frc=0
-            _wg_freeze_pid "$pid" "$st" "$comm" "$dev" "$rate" || frc=$?
-            if (( frc == 1 )); then
-                log WARN "NOT freezing pid ${pid} (${comm}, ${rate} MB/min): could not write the frozen record to ${FROZEN_FILE} — a stop without a record could never be thawed"
-                out+="NOT frozen: pid ${pid} (${comm}, ${rate} MB/min) — the frozen record could not be written"$'\n'
-                continue
-            elif (( frc != 0 )); then
-                log WARN "could not stop pid ${pid} (${comm}) — gone or not ours; record withdrawn"
-                continue
-            fi
-            if (( frc == 0 )); then
-                log WARN "FROZE pid ${pid} (${comm}) writing ${rate} MB/min into ${DOWNLOADS_DIR}; resume with: scripts/watchgod thaw ${pid}"
-                # Its own page: the episode's RED page can predate the freeze
-                # (a writer is only measurable from the second poll), and the
-                # operator must learn WHAT stopped and how to resume it.
-                queue_alert emergency "watchgod:disk" "Froze a runaway download (pid ${pid}, ${comm})" \
-                    "The disk is nearly full and ${comm} (pid ${pid}) was writing ${rate} MB/min into ${DOWNLOADS_DIR}. It is PAUSED, not killed. Resume it once there is room: scripts/watchgod thaw ${pid} — or end it: kill ${pid}. Its remote end or parent may time out while it waits." \
-                    "watchgod:disk:${dev}:freeze:${pid}:${st}:$(date +%s)"
-                out+="FROZE pid ${pid} (${comm}, ${rate} MB/min) — resume: scripts/watchgod thaw ${pid}"$'\n'
-            fi
-        else
-            out+="downloader not frozen: pid ${pid} (${comm}, ${rate} MB/min) — ${why}"$'\n'
-        fi
-    done <<< "$writers"
-    printf '%s' "$out"
-}
-
-frozen_count() {
-    # Processes STILL frozen: a record whose pid is gone or now names another
-    # process (start time changed) is history, not a frozen process.
-    local n=0 pid st _rest cur rest
-    [[ -f "$FROZEN_FILE" ]] || { echo 0; return 0; }
-    while IFS=$'\t' read -r pid st _rest; do
-        [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        rest=""
-        read -r rest 2>/dev/null < "$DG_PROC/$pid/stat" || continue
-        rest="${rest##*) }"
-        read -r -a _wg_f <<< "$rest"
-        cur="${_wg_f[19]:-}"
-        [[ "$cur" == "$st" ]] && n=$(( n + 1 ))
-    done < "$FROZEN_FILE"
-    echo "$n"
 }
 
 # ── cc-tmp retention sweep ───────────────────────────────────
@@ -522,11 +450,11 @@ sweep_cc_tmp() {
     # ancestor (e.g. /home -> /var/home) would make every held path miss the
     # prefix and silently empty the held table.
     root="$(cd -P -- "$CC_TMP_DIR" 2>/dev/null && pwd -P)" || return 0
-    snap="$(live_open_paths)"
-    if [[ -z "$snap" ]]; then
-        log WARN "cc-tmp sweep skipped: the liveness snapshot is empty (cannot see /proc), so nothing can be proven unused"
+    if ! liveness_visible; then
+        log WARN "cc-tmp sweep skipped: no process outside this daemon is visible in /proc, so nothing can be proven unused"
         return 0
     fi
+    snap="$(live_open_paths)"
     local -A held=() recent=() socket=()
     # Held: every open path or cwd under cc-tmp, mapped to its unit.
     while IFS= read -r key; do [[ -n "$key" ]] && held[$key]=1; done < <(
@@ -580,39 +508,36 @@ sweep_cc_tmp() {
 }
 
 maybe_sweep_cc_tmp() {
-    # $1 = hourly | pressure. Rate-limited by a stamp per kind.
-    local kind="$1" stamp now last=0 every age
+    # $1 = hourly | pressure. Rate-limited by a mode-scoped stamp per kind, so
+    # an observe-mode sweep never uses up the first acting one. The stamp limits
+    # ATTEMPTS, deliberately, unlike the reclaim start: a sweep that refused to
+    # run (blind liveness) would otherwise retry — and warn — every 5 s poll.
+    local kind="$1" every age
     if [[ "$kind" == pressure ]]; then
         every=$PRESSURE_RETRIGGER_S; age=$CC_SWEEP_PRESSURE_AGE_MIN
     else
         every=$CC_SWEEP_INTERVAL_S; age=$CC_SWEEP_AGE_MIN
     fi
-    stamp="$DG_STATE_DIR/cc_sweep_${kind}"
-    now="$(date +%s)"
-    [[ -f "$stamp" ]] && last="$(cat "$stamp" 2>/dev/null || echo 0)"
-    [[ "$last" =~ ^[0-9]+$ ]] || last=0
-    (( now - last >= every )) || return 0
-    { mkdir -p "$DG_STATE_DIR" && echo "$now" > "$stamp"; } 2>/dev/null || true
+    _wg_due "cc_sweep_${kind}" "$every" || return 0
+    _wg_stamp "cc_sweep_${kind}"
     sweep_cc_tmp "$age" "$kind"
 }
 
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {
-    # $1 path $2 limit-domain key (see check_disks: the device number, or
-    # "<dev>q<total_mb>" for a second, separately limited domain on the same
-    # device) $3 tier $4 free $5 total $6 eta $7 writers $8 fstype
+    # $1 path $2 limit-domain key (see check_disks) $3 tier $4 free $5 total
+    # $6 eta $7 writers $8 fstype
     local path="$1" dev="$2" tier="$3" free="$4" total="$5" eta="$6" writers="$7" fstype="$8"
-    local is_home=0 is_cc=0 is_dl=0 body frz rel lever
+    local is_home=0 is_cc=0 body rel lever
     # Levers act only on the domain they relieve. check_disks sets the keys;
     # a direct call (tests) falls back to device numbers.
     [[ "$dev" == "${HOME_KEY:-$(home_dev)}" ]] && is_home=1
     [[ "$dev" == "${CC_KEY:-$(stat -c %d -- "$CC_TMP_DIR" 2>/dev/null || echo -)}" ]] && is_cc=1
-    [[ "$dev" == "${DL_KEY:-$(stat -c %d -- "$DOWNLOADS_DIR" 2>/dev/null || echo -)}" ]] && is_dl=1
-    # Pages dedupe per (domain, tier, episode) — and per MODE: an observe-mode
-    # poll records its would-be page under its own marker, so flipping
-    # WATCHGOD_ACT 0→1 mid-episode still delivers the real page (review finding).
-    local pg=""
-    (( WATCHGOD_ACT )) || pg="_observe"
+    # Pages dedupe per (domain, tier, episode) — and per MODE (_wg_mode_tag): an
+    # observe-mode poll records its would-be page under its own marker, so
+    # flipping WATCHGOD_ACT 0→1 mid-episode still delivers the real page.
+    local pg
+    pg="$(_wg_mode_tag)"
 
     if [[ "$tier" == green ]]; then
         episode_clear "$dev"
@@ -625,30 +550,18 @@ handle_fs() {
     if ! episode_seen "$dev" yellow; then
         episode_mark "$dev" yellow
         log_attribution "$path" "$dev" "$tier" "$writers"
-        # The evidence the broad-freeze decision waits on: what the freeze
-        # WOULD do on this filesystem, logged at the start of every episode
-        # (a dry run — nothing is signalled below RED).
-        local dry=""
-        (( is_dl )) && dry="$(DG_FREEZE_DRY=1 freeze_runaways "${dev%%q*}" "$ALL_WRITERS")"
-        if [[ -n "$dry" ]]; then
-            while IFS= read -r l; do log WARN "freeze candidate (dry): $l"; done <<< "$dry"
-        fi
     fi
 
     if [[ "$tier" == orange || "$tier" == red ]]; then
         (( is_home )) && start_pressure_unit standard
         (( is_cc )) && maybe_sweep_cc_tmp pressure
         if [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg"; then
-            episode_mark "$dev" "orange$pg"
             lever="has no lever on this filesystem"
             (( is_home )) && lever="started (genesis-disk-hygiene-pressure@standard)"
             (( is_cc )) && lever="ran: cc-tmp retention sweep at 2 days"
             body="${summary}. Reclaim ${lever}. Top writers:"$'\n'"${writers:-none measurable}"
-            if (( WATCHGOD_ACT )); then
-                queue_alert warning "watchgod:disk" "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange"
-            else
-                log WARN "OBSERVE: would page WARNING — ${summary}"
-            fi
+            _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
+                && episode_mark "$dev" "orange$pg"
         fi
     fi
 
@@ -658,17 +571,10 @@ handle_fs() {
             rel="$(reserve_release)"
             start_pressure_unit last-resort
         fi
-        frz=""
-        # Freezing a download relieves only the domain the downloads dir is in.
-        (( is_dl )) && frz="$(freeze_runaways "${dev%%q*}" "$ALL_WRITERS")"
         if ! episode_seen "$dev" "red$pg"; then
-            episode_mark "$dev" "red$pg"
-            body="${summary}. Reserve: ${rel}."$'\n'"${frz:-No freeze candidate (only known downloaders writing into ${DOWNLOADS_DIR} on this filesystem are ever frozen).}"$'\n'"Top writers:"$'\n'"${writers:-none measurable}"$'\n'"A frozen download is paused, not killed — but its remote end or parent may time out while it waits."
-            if (( WATCHGOD_ACT )); then
-                queue_alert emergency "watchgod:disk" "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red"
-            else
-                log WARN "OBSERVE: would page EMERGENCY — ${summary}"
-            fi
+            body="${summary}. Reserve: ${rel}."$'\n'"Top writers:"$'\n'"${writers:-none measurable}"
+            _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
+                && episode_mark "$dev" "red$pg"
         fi
     fi
     return 0
@@ -699,33 +605,40 @@ check_disks() {
     _IO_PREV="$io_now"; _IO_PREV_T="$now"
 
     DISK_JSON=""; CC_COMPAT=""; SYS_COMPAT=""
-    HOME_KEY=""; CC_KEY=""; DL_KEY=""
+    HOME_KEY=""; CC_KEY=""
 
     # Pass 1: measure EVERY watched path, then group paths into LIMIT DOMAINS.
     # A device number alone is not a domain: an incus dir-pool volume with a
     # project quota shares its device with the root filesystem, and statvfs
     # reports the quota for paths inside it (review finding). Paths on one
-    # device that report the same size are one domain, keyed by the device
-    # number; a different size on the same device is a separate domain, keyed
-    # "<dev>q<size_mb>". The size is the RAW statvfs size, never dg_measure's
-    # effective total: that one follows whichever wall binds, and near a btrfs
-    # quota's crossover it would move a path between domains from poll to poll
-    # (review finding). A project quota changes the raw statvfs size; a btrfs
-    # qgroup does not (and btrfs subvolumes already get distinct device numbers
-    # — MEASURED: / is 59 and the cc-tmp volume 60 on a live install). Known
-    # limit: two separate limits of the SAME size on one device merge.
+    # device are one domain, keyed by device + MOUNT POINT ("<dev>m<cksum>"),
+    # which does not depend on poll order. A path whose raw statvfs size
+    # differs from its own mount's by more than 1 % is under a separate limit
+    # (a project quota that is not its own mount) and is keyed
+    # "<dev>q<size_mb>" instead. Sizes alone are not an identity: a ZFS
+    # dataset's reported size moves with its neighbours' usage, and a
+    # size-based key re-keyed the domain every poll — a new page each time
+    # (review finding, round 3). So the two sizes come from ONE stat call
+    # (dg_raw_sizes_mb), are compared with a 1 % tolerance, and a key's files
+    # outlive a one-poll disappearance (the GC below). btrfs subvolumes already
+    # get distinct device numbers (MEASURED: / is 59 and the cc-tmp volume 60
+    # on a live install). Known limits: a non-mount project quota within 1 %
+    # of its mount's size merges with the mount, and two such quotas of the
+    # same size on one device share a key (only the first path is tiered).
     local -a order=()
-    local -A dom_total=() key_of=() meas_of=() path_of=()
-    local key used_raw
+    local -A key_of=() meas_of=() path_of=()
+    local key used_raw mnt mtotal ck
     while IFS= read -r p; do
         dev="$(stat -c %d -- "$p" 2>/dev/null)" || continue
         if ! m="$(dg_measure "$p")"; then
             _wg_warn_once "measure_$dev" "cannot measure ${p} (statvfs failed) — this filesystem is NOT being watched"
             continue
         fi
-        total="$(dg_raw_total_mb "$p")"
-        if [[ -z "${dom_total[$dev]:-}" || "${dom_total[$dev]}" == "$total" ]]; then
-            dom_total[$dev]="$total"; key="$dev"
+        mnt="$(stat -c %m -- "$p" 2>/dev/null)" || mnt=""
+        read -r total mtotal < <(dg_raw_sizes_mb "$p" "${mnt:-$p}")
+        if [[ -n "$mnt" ]] && dg_same_size "$total" "$mtotal"; then
+            read -r ck _ < <(printf '%s' "$mnt" | cksum)
+            key="${dev}m${ck}"
         else
             key="${dev}q${total}"
         fi
@@ -735,19 +648,24 @@ check_disks() {
     done < <(watched_paths)
     HOME_KEY="${key_of[$HOME]:-}"
     CC_KEY="${key_of[$CC_TMP_DIR]:-}"
-    DL_KEY="${key_of[$DOWNLOADS_DIR]:-}"
     local tmp_key="${key_of[/tmp]:-}"
 
     # Episode markers of a key that is no longer a domain (a quota resized
     # away, a device renumbered at boot) would silently suppress that key's
-    # pages if it ever returned; drop them. Keys hold no "_", so the key is
-    # everything before the first one.
+    # pages if it ever returned; rate series would accumulate forever. Both
+    # are dropped — but only once the key has been gone an hour (its rate file,
+    # rewritten every poll while it exists, is that old), so a key that
+    # vanishes for one poll (a path briefly unmeasurable) keeps its episode.
+    # Keys hold no "_", so the key is everything between the first two.
     local ef ek
     if (( ${#order[@]} )); then
-        for ef in "$DG_STATE_DIR"/episode_*; do
+        for ef in "$DG_STATE_DIR"/episode_* "$DG_STATE_DIR"/rate_*; do
             [[ -e "$ef" ]] || continue
-            ek="${ef##*/episode_}"; ek="${ek%%_*}"
-            [[ -n "${meas_of[$ek]:-}" ]] || rm -f -- "$ef" 2>/dev/null || true
+            ek="${ef##*/}"; ek="${ek#*_}"; ek="${ek%%_*}"
+            [[ -n "${meas_of[$ek]:-}" ]] && continue
+            [[ -n "$(find "$DG_STATE_DIR" -maxdepth 1 -name "rate_${ek}_*" -mmin -60 -print -quit 2>/dev/null)" ]] \
+                && continue
+            rm -f -- "$ef" 2>/dev/null || true
         done
     fi
 
@@ -774,15 +692,17 @@ check_disks() {
         # cc_tmp tier drives routing degradation (TmpPressureStatus), and an
         # ETA-driven YELLOW on an ordinary large download must not shed call
         # sites. The last field says whether these figures are cc-tmp's OWN
-        # (a separately limited domain, or a mount whose figures are its own —
+        # (a domain separate from $HOME's on the same device, or a mount whose figures are its own —
         # its quota binds, or it is not btrfs, where a subvolume's statvfs is
         # the whole pool's): only then is total-free cc-tmp's usage (review
         # finding — a quota on a SHARED root subvolume would count every other
         # file as cc-tmp's).
         if [[ -n "$CC_KEY" && "$key" == "$CC_KEY" ]]; then
             local own=0
-            if [[ "$key" == *q* ]]; then
-                own=1
+            if [[ "$key" == "$HOME_KEY" ]]; then
+                own=0   # shares $HOME's domain: total-free is everyone's files
+            elif [[ -n "$HOME_KEY" && "$key" == *q* && "${key%%[qm]*}" == "${HOME_KEY%%[qm]*}" ]]; then
+                own=1   # same device, its own limit (a project quota)
             elif mountpoint -q -- "$CC_TMP_DIR" 2>/dev/null && [[ "$quota" == 1 || "$fstype" != btrfs ]]; then
                 own=1
             fi
@@ -810,10 +730,14 @@ write_state() {
             now_s="$(date +%s)"
             if read -r cached_t cached_v 2>/dev/null < "$cache" \
                     && [[ "$cached_t" =~ ^[0-9]+$ && "$cached_v" =~ ^[0-9]+$ ]] \
-                    && (( now_s - cached_t < 300 )); then
+                    && (( cached_t <= now_s && now_s - cached_t < 300 )); then
                 cc_used=$cached_v
             else
-                cc_used="$(timeout 20 du -smx -- "$CC_TMP_DIR" 2>/dev/null | cut -f1)" || cc_used=""
+                # du exits 1 when ANY entry is unreadable yet still prints the
+                # total; under pipefail an `|| cc_used=""` would throw that total
+                # away and cache 0 (review finding). Keep whatever number came out.
+                cc_used="$(timeout 20 du -smx -- "$CC_TMP_DIR" 2>/dev/null | cut -f1)" || true
+                cc_used="${cc_used%%$'\n'*}"
                 [[ "$cc_used" =~ ^[0-9]+$ ]] || cc_used=0
                 { mkdir -p "$DG_STATE_DIR" && echo "$now_s $cc_used" > "$cache"; } 2>/dev/null || true
             fi
@@ -829,7 +753,6 @@ write_state() {
 {
   "disk": {${DISK_JSON}},
   "act": ${WATCHGOD_ACT},
-  "frozen": $(frozen_count),
   "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $cc_total, "sacred_mb": 0, "fs_free_mb": $cc_free, "fs_total_mb": $cc_total},
   "system_tmp": {"tier": "$sys_tier", "used_pct": $sys_pct, "is_tmpfs": $is_tmpfs},
   "poll_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -838,436 +761,9 @@ EOF
     mv "$tmp" "$STATE_FILE" 2>/dev/null || true
 }
 
-# ── OOM event capture (best-effort, cgroup v2) ───────────────
-# A cgroup OOM kill silently collapses a CC session (tmux `exec claude` → claude
-# is reaped → the last pane dies → the session ends) and leaves no durable trace:
-# the kernel dmesg ring cycles and the kernel journal is usually unreadable from
-# inside the container. This samples the container cgroup's CUMULATIVE oom_kill
-# counter each poll and, on a NEW kill since the daemon started, records a
-# timestamped snapshot (memory + top-RSS processes) and pages once. Read-only —
-# it never kills or reclaims anything. Degrades to a no-op when the cgroup-v2
-# interface file is absent/unreadable (older layouts / non-cgroup2 hosts).
-
-_read_oom_kill() {
-    # Echo the current cumulative oom_kill count; non-zero return if unavailable.
-    [[ -r "$OOM_EVENTS_FILE" ]] || return 1
-    awk '/^oom_kill /{print $2; found=1} END{exit !found}' "$OOM_EVENTS_FILE" 2>/dev/null
-}
-
-_read_oom_local_trigger() {
-    # Echo the container root's LOCAL `oom` count (limit invocations charged to
-    # this cgroup itself, descendants excluded); non-zero return if unavailable.
-    local _local_file="${OOM_EVENTS_LOCAL_FILE:-$(dirname "$OOM_EVENTS_FILE")/memory.events.local}"
-    [[ -r "$_local_file" ]] || return 1
-    awk '/^oom /{print $2; found=1} END{exit !found}' "$_local_file" 2>/dev/null
-}
-
-# Attribution reads the systemd journal because the killer cgroup is usually a
-# TRANSIENT scope, deleted with its job — every surviving cgroup shows the kill
-# only as an inherited aggregate (measured: local=0 at every level) — while the
-# journal names the unit and outlives the scope. The query window is a CURSOR:
-# each successful read advances a durable epoch marker, and the next read asks
-# only for lines SINCE it. That is what keeps attribution honest during a
-# thrashing contained job: without it, a contained kill's line from the
-# PREVIOUS increment still inside a fixed lookback could account for a NEW
-# kill that left no line of its own (a non-main process dying inside a
-# surviving scope writes no unit-failure line) and silence a page. A missing
-# cursor (first run) falls back to a short lookback computed from the LIVE
-# poll interval; a failed query does not advance the cursor. Every failure
-# direction lands on the unattributed PAGE, never on silence.
-_OOM_CURSOR_FILE="$(dirname "$LOG_FILE")/.oom_journal_cursor"
-
-_oom_killed_units() {
-    # Echo unit names the user journal says were oom-killed since the cursor,
-    # one per line.
-    # rc!=0 = journal UNAVAILABLE (no journalctl, or the query failed) — the
-    # caller degrades to the unattributed page. rc=0 with empty output =
-    # journal readable, no oom-kill record (also unattributed).
-    command -v journalctl >/dev/null 2>&1 || return 1
-    # Computed per call, not at load time: load_config re-sources watchgod.conf
-    # every tick and may change POLL_INTERVAL — a frozen window shorter than
-    # one poll gap would miss every contained kill and re-open the false pages.
-    local _fallback_s=$(( POLL_INTERVAL * 2 + 60 ))
-    local _cursor out rc=0
-    _cursor=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || _cursor=""
-    # A REAL journal cursor, not a timestamp. `--since` is a TIMESTAMP filter and
-    # is INCLUSIVE at its boundary, so an entry landing exactly on the stored
-    # second is re-read on the next tick; `--after-cursor` is a POSITION filter
-    # and starts strictly AFTER the named entry, so every record is seen exactly
-    # once. That distinction is load-bearing now that the caller reconciles
-    # RECORD COUNT against kill deltas: a double-counted boundary entry would
-    # inflate the count. `--show-cursor` appends a trailing `-- cursor: s=…`
-    # line, stripped below.
-    #
-    # NOTE (adversarial audit, #1790): journalctl REFUSES to combine
-    # --after-cursor with --since/--cursor ("Please specify only one of" —
-    # verified on systemd 255), and these records' timestamps are PID 1's
-    # EMISSION time, not the kernel kill time — so a time window can neither
-    # compose with the position filter nor bound a late record anyway. The
-    # late/pre-baseline record problem is therefore closed by the caller's
-    # DEFICIT reconciliation (see check_oom_events), not here.
-    if [[ "$_cursor" == s=* ]]; then
-        out=$(journalctl --user --after-cursor "$_cursor" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
-    else
-        # First run, or a cursor file written by an older version (epoch digits):
-        # fall back to the time window. Never trust a malformed value as a cursor.
-        out=$(journalctl --user --since "-${_fallback_s} seconds" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
-    fi
-    [[ $rc -ne 0 ]] && return 1
-    # Advance the cursor only on a SUCCESSFUL read (this function runs in a
-    # command substitution, but file writes escape the subshell). If the read
-    # returned no cursor line (an empty journal window), KEEP the old cursor
-    # rather than clearing it — clearing would re-read the whole window next
-    # tick and double-count.
-    local _newcur
-    _newcur=$(printf '%s\n' "$out" | sed -n 's/^-- cursor: //p' | tail -1)
-    # Through the single verified writer, like every other advance. On failure
-    # the OLD cursor is removed rather than left behind: a stale value is
-    # indistinguishable from a fresh anchor to anything that merely checks the
-    # file exists, and `drain` is cleared on exactly that check.
-    if [[ -n "$_newcur" ]]; then
-        _oom_persist_cursor "$_newcur" || rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
-    fi
-    # `-o cat` renders systemd's line as `<unit>: Failed with result 'oom-kill'.`
-    # A unit name can legally contain ':' (template instances); cut would then
-    # truncate it, and a truncated name cannot match a contained prefix — so a
-    # pathological name mis-classifies toward PAGING, the safe direction.
-    # NOT `sort -u`: the caller compares this list's RECORD COUNT against the
-    # kill delta, and de-duplicating collapses two kills of the same unit name
-    # into one line — which would under-count and suppress a page for a kill
-    # nothing accounted for. Cardinality is the point; the display string
-    # de-duplicates separately. (The `-- cursor:` line carries no oom-kill
-    # phrase, so grep drops it here.)
-    printf '%s
-' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1
-}
-
-_oom_units_all_contained() {
-    # $1 = newline-separated non-empty unit list. rc 0 = EVERY unit matches a
-    # contained prefix; any unmatched unit → rc 1 (one uncontained kill pages).
-    local u p ok
-    while IFS= read -r u; do
-        [[ -z "$u" ]] && continue
-        ok=0
-        for p in $OOM_CONTAINED_UNIT_PREFIXES; do
-            [[ "$u" == "$p"* ]] && { ok=1; break; }
-        done
-        [[ $ok -eq 1 ]] || return 1
-    done <<<"$1"
-    return 0
-}
-
-check_oom_events() {
-    # $1 = the carried baseline spec
-    #   counter:local_oom:deficit:deficit_ts:drain
-    # (a bare counter from an older caller is accepted: local unverified,
-    # deficit 0). Echoes the refreshed spec for the next tick. Never touches
-    # stdout except the final spec echo.
-    #
-    # The spec carries FIVE facts because suppression needs all of them
-    # (#1790 review round):
-    #   counter     — the oom_kill aggregate (was there a kill?)
-    #   local_oom   — the container root's LOCAL oom count (WHOSE limit fired:
-    #                 the journal names the victim unit, and a container-limit
-    #                 kill can victimise a contained child scope)
-    #   deficit     — kills we already paged for whose journal records have not
-    #                 been seen yet. systemd's record of a unit failure can be
-    #                 emitted AFTER the poll that observed the counter
-    #                 increment, and the record's timestamp is PID 1's EMISSION
-    #                 time (measured on the live journal, #1790 audit) — so NO
-    #                 time window can exclude a late record from the next
-    #                 kill's batch. The only sound correlation is
-    #                 reconciliation: records returned by a query first retire
-    #                 the owed deficit, and only the REST may account for the
-    #                 current delta. A late record can therefore never cover a
-    #                 kill it does not belong to (Codex P1 / Devin, #1790).
-    #   deficit_ts  — when the deficit last GREW. A kill that never writes a
-    #                 record (a non-main process dying inside a surviving
-    #                 scope) leaves a deficit nothing can retire; it expires
-    #                 after 20 poll intervals so contained kills are not
-    #                 spuriously paged forever. Residue, accepted: a journald
-    #                 outage LONGER than the TTL, ending with a query whose
-    #                 backlogged records exactly equal deficit+n, can
-    #                 mis-attribute once. systemd's emission lag is
-    #                 milliseconds in every measurement we have; the TTL is
-    #                 generous against it.
-    #   drain       — set when arming could not advance the journal cursor
-    #                 (journalctl absent/failing at startup): the FIRST
-    #                 resolution must page and re-anchor, because the fallback
-    #                 window would return pre-baseline records that could
-    #                 otherwise "account" for a post-startup kill.
-    local prev_spec="$1" prev prev_local prev_deficit prev_deficit_ts prev_drain
-    prev="${prev_spec%%:*}"
-    local _r1="" _r2="" _r3="" _r4=""
-    [[ "$prev_spec" == *:* ]] && _r1="${prev_spec#*:}"
-    prev_local="${_r1%%:*}"
-    [[ "$_r1" == *:* ]] && _r2="${_r1#*:}"
-    prev_deficit="${_r2%%:*}"
-    [[ "$_r2" == *:* ]] && _r3="${_r2#*:}"
-    prev_deficit_ts="${_r3%%:*}"
-    [[ "$_r3" == *:* ]] && _r4="${_r3#*:}"
-    prev_drain="${_r4%%:*}"
-    # Numeric hygiene: a malformed element degrades to "unknown", never to a
-    # bash arithmetic error under set -e (audit NOTE, #1790).
-    [[ "$prev" =~ ^[0-9]+$ ]] || prev=""
-    [[ "$prev_local" =~ ^[0-9]+$ ]] || prev_local=""
-    [[ "$prev_deficit" =~ ^[0-9]+$ ]] || prev_deficit=0
-    [[ "$prev_deficit_ts" =~ ^[0-9]+$ ]] || prev_deficit_ts=0
-    [[ "$prev_drain" == "1" ]] || prev_drain=0
-    local cur loc_oom now_epoch
-    cur=$(_read_oom_kill) || { printf '%s' "$prev_spec"; return 0; }
-    [[ "$cur" =~ ^[0-9]+$ ]] || { printf '%s' "$prev_spec"; return 0; }
-    loc_oom=$(_read_oom_local_trigger) || loc_oom=""
-    [[ "$loc_oom" =~ ^[0-9]+$ ]] || loc_oom=""
-    now_epoch=$(date +%s)
-    # Expire an unretireable deficit (see the spec comment above). Computed
-    # PER CALL, like _oom_killed_units' fallback window: load_config re-sources
-    # watchgod.conf every tick and may change POLL_INTERVAL.
-    local _deficit_ttl=$(( POLL_INTERVAL * 20 ))
-    if (( prev_deficit > 0 && prev_deficit_ts > 0 )) \
-        && (( now_epoch - prev_deficit_ts > _deficit_ttl )); then
-        prev_deficit=0
-    fi
-    # LATE ARM (Codex P1, #1790). `main` calls `_oom_arm_baseline` exactly once,
-    # at startup. If `memory.events` was unreadable at that moment the spec came
-    # back empty -- "monitoring unavailable" -- and the journal cursor was never
-    # anchored, because arming returns before it gets that far. The baseline is
-    # then actually established HERE, on the first tick where the counter reads,
-    # and emitting drain=0 from that path would hand the next kill's query a
-    # fallback time window in which a PRE-BASELINE record can explain it away.
-    # A malformed spec lands here too, and for the same reason: we do not know
-    # what the cursor points at, so we re-anchor or refuse to trust it.
-    if [[ -z "$prev" ]]; then
-        _oom_arm_cursor || prev_drain=1
-        # `main` already told the operator monitoring was off. It is not, from
-        # here on, and a log that never retracts a scary line is how someone
-        # concludes the monitor is dead while it is running.
-        log INFO "OOM event capture armed late (baseline oom_kill=${cur}${prev_drain:+, drain=${prev_drain}})"
-    fi
-    if [[ -n "$prev" ]] && (( cur > prev )); then
-        local n=$(( cur - prev )) stamp
-        stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        {
-            echo "# OOM event ${stamp}: cgroup oom_kill ${prev} -> ${cur} (+${n})"
-            echo "## memory (MB):"; free -m 2>/dev/null | head -2
-            echo "## top RSS:"; ps -eo pid,rss,comm --sort=-rss 2>/dev/null | head -12
-            echo
-        } >> "$OOM_LOG" 2>/dev/null || true
-        log WARN "cgroup OOM kill detected (oom_kill ${prev} -> ${cur}); snapshot → ${OOM_LOG}"
-        # ATTRIBUTE before paging (issue #1775): the root counter aggregates
-        # oom_kill from every descendant cgroup, so a by-design kill inside a
-        # resource-capped child scope reads identically to genuine container
-        # pressure. Ask the journal which unit died; when EVERY killed unit is
-        # a known contained scope, the cap did its job — record it (snapshot +
-        # WARN log stay either way) and do not page. Anything else — a
-        # non-contained unit, no record, or no journal — pages exactly as
-        # before: attribution can only ever DOWNGRADE a known-contained kill,
-        # never silence an unknown one.
-        #
-        # TRIGGER CHECK FIRST (Codex P1, #1790): the journal names the VICTIM,
-        # not the cgroup whose limit fired. When the container root's LOCAL
-        # oom counter moved, the container's own limit triggered the kill —
-        # the victim can still be a contained child, so journal attribution
-        # must never suppress this. LIMIT OF THE MECHANISM, stated honestly:
-        # an ancestor ABOVE the container root (the host/VM slice) firing and
-        # victimising a contained child is indistinguishable from a contained
-        # kill at this layer and can still be suppressed — no container-side
-        # signal names that trigger. Unreadable local counter = unverifiable
-        # trigger = the same fail direction (page).
-        local _container_trigger=0
-        if [[ -n "$loc_oom" && -n "$prev_local" ]] && (( loc_oom > prev_local )); then
-            _container_trigger=1
-        fi
-        local _oom_units="" _oom_who="unattributed" _oom_n=0 _oom_query_ok=0
-        if _oom_units=$(_oom_killed_units); then
-            _oom_query_ok=1
-            if [[ -n "$_oom_units" ]]; then
-                _oom_who=$(printf '%s\n' "$_oom_units" | sort -u | paste -sd, -)
-                _oom_n=$(printf '%s\n' "$_oom_units" | grep -c . || true)
-            fi
-        else
-            _oom_units=""
-        fi
-        # RECONCILE (see the spec comment): the obligations are the owed
-        # deficit PLUS this tick's delta; the records returned retire them.
-        # Suppress only when records FULLY account for every obligation and
-        # every named unit is contained. Anything else pages, and the
-        # unaccounted remainder carries forward as the new deficit — which is
-        # why a LATE record (returned by a later query) can never cover a kill
-        # it does not belong to: by then its own kill is already an
-        # obligation. EVERY observed kill must be accounted for, not merely
-        # SOME of them (the partially attributed batch was the original
-        # fail-open here).
-        local _obligations=$(( prev_deficit + n )) _new_deficit
-        _new_deficit=$(( _obligations - _oom_n ))
-        (( _new_deficit < 0 )) && _new_deficit=0
-        if (( prev_drain == 0 && _container_trigger == 0 )) \
-            && [[ -n "$loc_oom" && -n "$prev_local" && -n "$_oom_units" ]] \
-            && (( _oom_n == _obligations )) \
-            && _oom_units_all_contained "$_oom_units"; then
-            log WARN "OOM kill contained in [${_oom_who}] — its own resource cap fired, not container pressure; not paging (snapshot kept)"
-        else
-            # Emergency tier (pages): an OOM kill is a discrete serious event —
-            # the usual reason a CC session vanishing with no crash message —
-            # not routine tier pressure, so unlike ORANGE it warrants a
-            # proactive page (per the 2026-08-19 decision). Deduped per
-            # distinct oom_kill total.
-            local _why="killed unit(s): ${_oom_who}"
-            if (( prev_drain == 1 )); then
-                _why="journal cursor could not be armed at startup; killed unit(s): ${_oom_who}"
-            elif [[ "$_container_trigger" -eq 1 ]]; then
-                _why="container-level trigger (memory.events.local oom ${prev_local} -> ${loc_oom}); killed unit(s): ${_oom_who}"
-            elif [[ -z "$loc_oom" || -z "$prev_local" ]]; then
-                _why="trigger unverifiable (memory.events.local unreadable); killed unit(s): ${_oom_who}"
-            fi
-            queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
-                "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}; ${_why}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
-                "watchgod:oom:${cur}"
-        fi
-        # The deficit clock only restarts when the deficit GROWS; retirements
-        # keep the original timestamp so a shrinking deficit cannot live
-        # forever by halves.
-        if (( _new_deficit > prev_deficit )); then
-            prev_deficit_ts=$now_epoch
-        fi
-        prev_deficit=$_new_deficit
-        # drain clears ONLY on a successful query: the flag means "the cursor
-        # was never anchored", and a FAILED resolution neither re-anchors it
-        # nor returns records — clearing on failure would let the next tick's
-        # fallback window offer pre-baseline records as attribution (audit
-        # BLOCKER, #1790 round 2).
-        # A SUCCESSFUL QUERY IS NOT AN ANCHORED CURSOR, and conflating them
-        # gave back exactly what drain was added to prevent. MEASURED with the
-        # cursor path unwritable: the arm correctly set drain=1, the next kill
-        # paged and cleared drain, its re-anchor silently failed, and the kill
-        # after that -- a genuine one whose own record was never written -- was
-        # accounted for by the first kill's record, still inside the fallback
-        # window, and suppressed. Two kills, one page. Clear drain only when the
-        # cursor is verifiably on disk.
-        # BOTH DIRECTIONS. `drain` means "the cursor is not anchored", so the
-        # cursor decides it -- clearing it on success while never SETTING it left
-        # the inverse open, and the inverse is reachable from the ordinary
-        # drain=0 state: a re-anchor that cannot persist deletes the cursor
-        # (:549) and leaves drain=0 behind, so the next query falls back to the
-        # relative window and re-reads the record this tick just counted.
-        # MEASURED from `4:0:0:0:0` with the cursor path unwritable: a contained
-        # kill, then a real kill that wrote no record of its own -- TWO kills,
-        # ZERO pages. Setting drain from the cursor closes it in one place
-        # rather than at each site that can fail to write.
-        # Clearing needs BOTH: the query succeeded AND the cursor on disk is
-        # anchored. The anchored check alone is syntax -- a stale file from a
-        # dead epoch passes it -- and on a failed query nothing re-anchored, so
-        # clearing there trusts a position nobody verified. Setting needs only
-        # the anchor to be missing.
-        if ! _oom_cursor_is_anchored; then
-            prev_drain=1
-        elif (( _oom_query_ok == 1 )); then
-            prev_drain=0
-        fi
-        # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
-        # keep the most recent ~1000 lines so a thrashing container can't leak it.
-        local oom_lines
-        oom_lines=$(wc -l < "$OOM_LOG" 2>/dev/null || echo 0)
-        if (( ${oom_lines:-0} > 1000 )); then
-            tail -n 1000 "$OOM_LOG" > "${OOM_LOG}.tmp" 2>/dev/null && mv "${OOM_LOG}.tmp" "$OOM_LOG" 2>/dev/null || true
-        fi
-    fi
-    # A transient unreadable local counter must not DISARM future trigger
-    # verification: carry the last known local baseline forward (the tick
-    # itself still pages — the current value is unknown — and a jump observed
-    # once the file is readable again correctly reads as a container trigger).
-    printf '%s' "${cur}:${loc_oom:-$prev_local}:${prev_deficit}:${prev_deficit_ts}:${prev_drain}"
-}
-
-_oom_persist_cursor() {
-    # $1 = a cursor value (with or without the leading `s=`). rc 0 ONLY when the
-    # cursor file now verifiably holds it.
-    #
-    # THE SINGLE WRITER. Every path that advances the cursor goes through here,
-    # because a cursor that was not persisted is the one state the whole
-    # suppression mechanism cannot survive: queries fall back to a TIME WINDOW,
-    # where a record written before the baseline can account for a kill that
-    # happened after it.
-    #
-    # The write's exit status is not enough on its own -- a full filesystem
-    # reports the failure on close, leaving an empty or truncated file behind --
-    # so the value is read BACK and compared. At the point this matters an
-    # unreadable cursor and an absent one are the same thing, and they get the
-    # same answer.
-    local _want="s=${1#s=}" _back=""
-    [[ "$_want" != "s=" ]] || return 1
-    # The write's own status is checked, and then the value is read back and
-    # compared to what we MEANT to write. The comparison subsumes the status
-    # check -- MEASURED: reverting this `|| return 1` to `|| true` turns no test
-    # red, because a failed write leaves either nothing (read-back fails) or the
-    # OLD value (read-back mismatches). It is kept as the cheap early exit and
-    # because a future refactor that weakened the read-back to a bare `s=*`
-    # prefix test would make it load-bearing again.
-    printf '%s' "$_want" > "$_OOM_CURSOR_FILE" 2>/dev/null || return 1
-    _back=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || return 1
-    [[ "$_back" == "$_want" ]] || return 1
-    return 0
-}
-
-_oom_cursor_is_anchored() {
-    # rc 0 when a usable cursor is on disk. This is the fact `drain` denies, so
-    # nothing may clear drain without it.
-    local _back=""
-    _back=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || return 1
-    [[ "$_back" == s=* ]] || return 1
-    return 0
-}
-
-_oom_arm_cursor() {
-    # Advance the journal cursor to the current tail and PERSIST it.
-    #
-    # rc 0 ONLY when the cursor file now holds that position. rc 1 for every
-    # other outcome -- journalctl absent, the query failing, the write failing,
-    # or a write that reported success and left nothing readable behind. The
-    # caller must carry drain=1 on rc 1, because an unarmed cursor is not a
-    # cosmetic gap: the next query falls back to a TIME WINDOW, where a record
-    # written BEFORE the baseline can account for a kill that happened after it
-    # and suppress a real page.
-    #
-    # `-n 0 --show-cursor` prints the tail cursor with no entries, so this
-    # advances the position without consuming anything.
-    command -v journalctl >/dev/null 2>&1 || return 1
-    local _tail_cursor=""
-    _tail_cursor=$(journalctl --user -n 0 --show-cursor --no-pager -o cat 2>/dev/null \
-        | sed -n 's/^-- cursor: //p' | tail -1) || _tail_cursor=""
-    [[ -n "$_tail_cursor" ]] || return 1
-    _oom_persist_cursor "$_tail_cursor"
-}
-
-_oom_arm_baseline() {
-    # Echo the initial OOM baseline spec
-    # ("counter:local_oom:deficit:deficit_ts:drain"; empty = monitoring
-    # unavailable) and advance the journal cursor to the current tail (Codex
-    # P1, #1790): records of kills that predate the baseline — written before
-    # this (re)start, or left behind the cursor by a kill that landed in the
-    # gap — must never account for a post-startup kill. `-n 0 --show-cursor`
-    # prints the tail cursor with no entries, so this advances the position
-    # without consuming anything. When the cursor cannot be armed (journalctl
-    # absent or failing), the spec carries drain=1: the first resolution then
-    # pages and re-anchors rather than trusting the fallback window's
-    # pre-baseline records.
-    local base="" loc="" drain=0
-    base=$(_read_oom_kill) || base=""
-    [[ -z "$base" ]] && { printf '%s' ""; return 0; }
-    loc=$(_read_oom_local_trigger) || loc=""
-    if ! _oom_arm_cursor; then
-        drain=1
-        # A cursor file from a PREVIOUS daemon epoch must not survive a failed
-        # arm. It passes the anchored check on syntax, but its POSITION predates
-        # this baseline -- a query from it returns pre-baseline records, and one
-        # of those can account for a post-baseline kill. MEASURED: with a stale
-        # file surviving, drain=0 and an expired deficit, one real line-less
-        # kill produced ZERO pages. Absent file -> queries use the bounded
-        # fallback window and drain=1 covers the first resolution.
-        rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
-    fi
-    printf '%s' "${base}:${loc}:0:0:${drain}"
-}
+# OOM event capture lives in its own file (moved verbatim; see its header).
+# shellcheck source=scripts/lib/watchgod_oom.sh
+source "$_SCRIPT_DIR/lib/watchgod_oom.sh"
 
 
 # ── Main loop ────────────────────────────────────────────────
@@ -1279,7 +775,7 @@ main() {
     # a leftover would sit there forever looking like a live alarm.
     rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
     log INFO "Watchgod v2 starting (poll=${POLL_INTERVAL}s, fast=${FAST_POLL_INTERVAL}s, act=${WATCHGOD_ACT}, downloads=${DOWNLOADS_DIR})"
-    (( WATCHGOD_ACT )) || log WARN "OBSERVE mode (WATCHGOD_ACT=0): tiers are measured and logged; nothing is reclaimed, released, frozen or paged"
+    (( WATCHGOD_ACT )) || log WARN "OBSERVE mode (WATCHGOD_ACT=0): tiers are measured and logged; nothing is reclaimed, released or paged"
 
     # Baseline the OOM counter at startup so we only page on NEW kills (never the
     # cumulative-since-boot history). Empty baseline = monitoring unavailable.

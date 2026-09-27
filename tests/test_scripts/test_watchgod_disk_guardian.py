@@ -2,25 +2,20 @@
 
 Drives the REAL daemon functions (sourced; `main` is guarded) with measurement
 functions overridden per test, a stub `systemctl` that records what it was asked
-to start, and the durable alert queue pointed at a tmp dir. The freeze tests use
-REAL processes: a `dd` blocked on a FIFO holds an open descriptor under the
-downloads directory exactly as a live download does, so eligibility is decided
-from /proc, not from a fixture.
+to start, and the durable alert queue pointed at a tmp dir.
 
-What these pin, from the design review:
-  * actions are scoped to the filesystem in trouble — the reserve and the
-    reclaim unit only for the $HOME filesystem, a freeze only when the
-    downloads directory is ON the troubled filesystem;
-  * the freeze is ALLOWLIST-only (a non-downloader is named, never stopped)
-    and reversible through `scripts/watchgod thaw`, which checks identity;
-  * pages dedupe per (filesystem, tier, episode), so a WARNING can never
-    swallow the EMERGENCY that follows it;
+What these pin, from the design review and two review rounds:
+  * actions are scoped to the limit domain in trouble — the reserve and the
+    reclaim unit only for the $HOME domain, the pressure sweep only for
+    cc-tmp's;
+  * pages dedupe per (domain, tier, episode) and per mode, and a page is
+    recorded as sent only once it was actually queued;
+  * every action stamp is written only after the action succeeded;
   * observe mode (WATCHGOD_ACT=0, or any invalid value) changes nothing.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import stat
@@ -32,7 +27,6 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 _WATCHGOD = _ROOT / "scripts" / "tmp_watchgod.sh"
-_CLI = _ROOT / "scripts" / "watchgod"
 
 
 def _stub(path: Path, body: str) -> None:
@@ -113,7 +107,7 @@ def _home_dev(box) -> str:
 def _handle(box, tier, *, dev=None, free=1000, total=100_000, eta="-", writers="", act=1):
     dev = dev or _home_dev(box)
     w = writers.replace("'", "")
-    # The freeze reads every writer (ALL_WRITERS); attribution reads the top five.
+    # ALL_WRITERS is every writer measured this poll; attribution reads the top five.
     return _run(
         box,
         f"ALL_WRITERS='{w}'; handle_fs '{box['home']}' '{dev}' {tier} {free} {total} {eta} '{w}' btrfs",
@@ -233,138 +227,26 @@ def test_pressure_retrigger_is_rate_limited(box):
     assert len([c for c in _calls(box) if "@standard" in c]) == 1
 
 
-# ── freeze ───────────────────────────────────────────────────────
-
-
-def _proc_state(pid: int) -> str:
-    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-
-
-def _starttime(pid: int) -> str:
-    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-
-
-@pytest.fixture
-def downloader(box):
-    """A real `dd` holding an open descriptor under the downloads dir, blocked
-    on a FIFO so it lives until the test ends."""
-    fifo = box["tmp"] / "feed"
-    os.mkfifo(fifo)
-    proc = subprocess.Popen(
-        ["dd", f"if={fifo}", f"of={box['dl']}/big.part", "status=none"], stdin=subprocess.DEVNULL
-    )
-    writer = os.open(fifo, os.O_WRONLY)  # unblocks dd's open of the FIFO
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if any(
-            str(box["dl"]) in os.readlink(f"/proc/{proc.pid}/fd/{fd}")
-            for fd in os.listdir(f"/proc/{proc.pid}/fd")
-        ):
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail("fixture precondition: dd never opened its output under downloads")
-    yield proc
-    os.close(writer)
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(proc.pid, 18)  # SIGCONT so it can die cleanly
-    proc.kill()
-    proc.wait()
-
-
-def _writers_for(proc, comm="dd", rate=500):
-    return f"{proc.pid} {_starttime(proc.pid)} 999999 {rate} {comm}"
-
-
-def test_red_freezes_a_known_downloader_writing_into_downloads(box, downloader):
-    _handle(box, "red", writers=_writers_for(downloader))
-    assert _proc_state(downloader.pid) == "T"
-    rec = (box["state"] / "frozen").read_text().split("\t")
-    assert rec[0] == str(downloader.pid) and rec[2] == "dd"
-    page = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]
-    assert f"FROZE pid {downloader.pid}" in page["body"]
-    assert f"scripts/watchgod thaw {downloader.pid}" in page["body"]
-    own = [p for p in _pages(box) if p["title"].startswith("Froze a runaway download")]
-    assert len(own) == 1, "each freeze pages on its own, with the thaw command"
-    assert f"scripts/watchgod thaw {downloader.pid}" in own[0]["body"]
-    assert "PAUSED, not killed" in own[0]["body"]
-
-
-def test_thaw_resumes_it_and_clears_the_record(box, downloader):
-    _handle(box, "red", writers=_writers_for(downloader))
-    assert _proc_state(downloader.pid) == "T"
-    env = dict(os.environ, HOME=str(box["home"]))
-    out = subprocess.run(
-        [str(_CLI), "thaw", str(downloader.pid)], env=env, capture_output=True, text=True
-    )
-    assert out.returncode == 0, out.stderr
-    assert f"resumed pid {downloader.pid}" in out.stdout
-    assert _proc_state(downloader.pid) != "T"
-    assert (box["state"] / "frozen").read_text() == ""
-    assert "THAWED" in _log(box)
-
-
-def test_thaw_refuses_a_recycled_pid(box, downloader):
-    _handle(box, "red", writers=_writers_for(downloader))
-    f = box["state"] / "frozen"
-    parts = f.read_text().split("\t")
-    parts[1] = "1"  # a different start time: the record no longer names this process
-    f.write_text("\t".join(parts))
-    env = dict(os.environ, HOME=str(box["home"]))
-    out = subprocess.run([str(_CLI), "thaw", "all"], env=env, capture_output=True, text=True)
-    assert "no longer running" in out.stdout
-    assert _proc_state(downloader.pid) == "T", (
-        "a pid whose identity changed must never be signalled"
-    )
-
-
-def test_a_non_downloader_is_named_not_frozen(box, downloader):
-    _handle(box, "red", writers=_writers_for(downloader, comm="python"))
-    assert _proc_state(downloader.pid) != "T"
-    body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
-    assert "No freeze candidate" in body
-
-
-def test_no_freeze_when_downloads_is_on_another_filesystem(box, downloader):
-    _handle(box, "red", dev="999999", writers=_writers_for(downloader))
-    assert _proc_state(downloader.pid) != "T"
-    assert "No freeze candidate" in _pages(box)[0]["body"]
-
-
-def test_a_slow_writer_is_not_the_runaway(box, downloader):
-    _handle(box, "red", writers=_writers_for(downloader, rate=5))
-    assert _proc_state(downloader.pid) != "T"
-
-
-def test_observe_mode_never_freezes(box, downloader):
-    _handle(box, "red", writers=_writers_for(downloader), act=0)
-    assert _proc_state(downloader.pid) != "T"
-    assert not (box["state"] / "frozen").exists()
-
-
-def test_orange_never_freezes(box, downloader):
-    _handle(box, "orange", writers=_writers_for(downloader))
-    assert _proc_state(downloader.pid) != "T"
-
-
 # ── poll + state file ────────────────────────────────────────────
 
 
 def _poll(box, measure_lines: dict[str, str], act=1, raw_sizes: dict[str, int] | None = None) -> dict:
     """check_disks + write_state with dg_measure answering per path.
 
-    raw_sizes stubs dg_raw_total_mb (the domain identity) per path; unstubbed
-    paths keep the real statvfs size."""
+    raw_sizes stubs a path's raw statvfs size in dg_raw_sizes_mb (the domain
+    identity); its mount keeps the real size, and unstubbed paths are real."""
     cases = "\n".join(f"        '{p}') echo '{m}';;" for p, m in measure_lines.items())
-    raw = "\n".join(f"        '{p}') echo {v}; return;;" for p, v in (raw_sizes or {}).items())
+    raw = "\n".join(
+        f"        '{p}') echo \"{v} $(dg_raw_total_mb \"$2\")\"; return;;" for p, v in (raw_sizes or {}).items()
+    )
     raw_fn = (
         f"""
-    eval "_real_raw() $(declare -f dg_raw_total_mb | tail -n +2)"
-    dg_raw_total_mb() {{
+    eval "_real_sizes() $(declare -f dg_raw_sizes_mb | tail -n +2)"
+    dg_raw_sizes_mb() {{
         case "$1" in
 {raw}
         esac
-        _real_raw "$1"
+        _real_sizes "$1" "$2"
     }}"""
         if raw_sizes
         else ""
@@ -408,7 +290,8 @@ def test_compat_cc_tier_is_the_floor_tier_not_the_eta_tier(box):
     cc.mkdir()
     snippet_rate = """
     dev=$(stat -c %d /)
-    echo "$(( $(date +%s) - 30 )) 1000 20000 quota" > "$DG_STATE_DIR/rate_${dev}_quota"
+    read -r ck _ < <(printf / | cksum)
+    echo "$(( $(date +%s) - 30 )) 1000 20000 quota" > "$DG_STATE_DIR/rate_${dev}m${ck}_quota"
     """
     _run(box, snippet_rate)
     snippet = """
@@ -659,7 +542,10 @@ def test_a_blind_liveness_snapshot_skips_the_sweep(box, cctmp):
     s = proj / "dead"
     s.mkdir()
     _age_tree(s, 10)
-    _run(box, "live_open_paths() { :; }; sweep_cc_tmp 10080 test")
+    # A /proc showing no other process (unmounted, hidden): blind, not "idle".
+    blind = box["tmp"] / "noproc"
+    blind.mkdir()
+    _run(box, f"TL_PROC='{blind}'; sweep_cc_tmp 10080 test")
     assert s.exists(), "no deletion without being able to see writers"
     assert "sweep skipped" in _log(box)
 
@@ -713,22 +599,6 @@ def test_a_garbage_threshold_is_reset_not_fatal(box):
     assert "is not a whole number" in _log(box)
 
 
-def test_a_downloader_outside_the_top_five_is_still_frozen(box, downloader):
-    """MEASURED in the E2E on a busy box: a 300 MB/min downloader never reached
-    the global top five behind test runs and a database. Candidates are ALL
-    writers above the rate floor."""
-    busy = "\n".join(f"{90000 + i} 1 99999 {2000 - i} python" for i in range(20))
-    writers = busy + "\n" + _writers_for(downloader, rate=300)
-    _handle(box, "red", writers=writers)
-    assert _proc_state(downloader.pid) == "T"
-
-
-def test_non_downloaders_are_not_listed_as_freeze_refusals(box, downloader):
-    _handle(box, "red", writers="424242 1 99999 900 python\n" + _writers_for(downloader, rate=5))
-    body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
-    assert "424242" not in body.split("Top writers")[0], "a python writer is attribution, not a freeze refusal"
-
-
 def test_removing_a_conf_line_restores_its_default(box):
     """Sourcing a file only SETS variables; without restoring the baseline, a
     deleted threshold kept its value until restart. MEASURED in the E2E: a
@@ -742,14 +612,6 @@ def test_removing_a_conf_line_restores_its_default(box):
     """
     out = _run(box, snippet).stdout.strip().splitlines()
     assert out[-2:] == ["100 0", "3 1"]
-
-
-def test_freeze_refuses_a_recycled_pid(box, downloader):
-    """The writers list was measured a poll ago; if that pid now names a
-    different process (start time changed), it must not be stopped."""
-    _handle(box, "red", writers=f"{downloader.pid} 1 999999 500 dd")
-    assert _proc_state(downloader.pid) != "T"
-    assert "pid reused" in [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
 
 
 # ── end-of-build review fixes ────────────────────────────────────
@@ -815,33 +677,6 @@ def test_the_sweep_sees_writers_through_a_symlinked_ancestor(box, tmp_path):
         holder.wait()
 
 
-def test_the_episode_start_logs_a_dry_freeze_evaluation(box, downloader):
-    """The broad-freeze decision waits on evidence of what the freeze WOULD
-    do; it is logged once, at the start of each episode, and stops nothing."""
-    _handle(box, "yellow", writers=_writers_for(downloader) + "\n424242 1 99999 900 python")
-    assert _proc_state(downloader.pid) != "T"
-    log = _log(box)
-    assert f"freeze candidate (dry): would freeze pid {downloader.pid}" in log
-    assert "freeze candidate (dry): not on the downloader allowlist: pid 424242" in log
-
-
-def test_frozen_count_ignores_records_of_gone_or_recycled_processes(box):
-    live = subprocess.Popen(["sleep", "60"])
-    try:
-        st = _starttime(live.pid)
-        f = box["state"]
-        f.mkdir(parents=True, exist_ok=True)
-        (f / "frozen").write_text(
-            "999999\t1\tdd\tts\t59\t100\n"            # gone
-            f"{live.pid}\t1\tdd\tts\t59\t100\n"        # pid alive, different process
-            f"{live.pid}\t{st}\tsleep\tts\t59\t100\n"  # the same process: counts
-        )
-        assert _run(box, "frozen_count").stdout.strip() == "1"
-    finally:
-        live.kill()
-        live.wait()
-
-
 def test_json_strings_stay_valid_for_any_control_byte(box):
     """Security review LOW: the state file must stay parseable whatever a
     configured path contains."""
@@ -851,7 +686,7 @@ def test_json_strings_stay_valid_for_any_control_byte(box):
 
 def test_a_process_name_with_a_tab_cannot_split_the_snapshot(box):
     """Security review WARNING: comm is process-chosen and may hold a tab; it
-    must not shift the fields of the io snapshot (or the frozen record)."""
+    must not shift the fields of the io snapshot."""
     # `sleep 60 & wait` keeps bash itself alive: a trailing plain `sleep`
     # would be exec'd and the process would be named "sleep" again.
     proc = subprocess.Popen(["bash", "-c", "printf 'dl\\tfake' > /proc/self/comm; echo ready; sleep 60 & wait"],
@@ -903,22 +738,6 @@ def test_cc_usage_on_a_shared_quota_domain_is_measured_not_derived(box):
     assert st["cc_tmp"]["used_mb"] < 100, st["cc_tmp"]
 
 
-def test_no_freeze_without_a_record_it_could_be_thawed_from(box, downloader):
-    """Codex P1: at RED the state directory's filesystem can be the full one.
-    A stop whose record cannot be written could never be found by `thaw all`,
-    so nothing is stopped — and the daemon survives the failed writes."""
-    state = box["state"]
-    state.mkdir(parents=True, exist_ok=True)
-    state.chmod(0o555)
-    try:
-        _handle(box, "red", writers=_writers_for(downloader))  # asserts rc == 0
-    finally:
-        state.chmod(0o755)
-    assert _proc_state(downloader.pid) != "T"
-    assert not (state / "frozen").exists()
-    assert f"NOT freezing pid {downloader.pid}" in _log(box)
-
-
 def test_the_daemon_survives_a_log_it_cannot_write(box):
     """Same class: the log lives on the guarded filesystem. An append that
     fails at RED must not take the guardian down under set -e."""
@@ -933,36 +752,6 @@ def test_the_daemon_survives_a_log_it_cannot_write(box):
     finally:
         logs.chmod(0o755)
         logf.chmod(0o644)
-
-
-def test_a_downloader_that_only_reads_from_downloads_is_not_frozen(box):
-    """Codex P2: an allowlisted process holding a READ-only descriptor under
-    downloads (ffmpeg reading its input there, writing elsewhere) relieves
-    nothing by stopping."""
-    fifo = box["dl"] / "input.fifo"
-    os.mkfifo(fifo)
-    out = box["tmp"] / "elsewhere.out"
-    proc = subprocess.Popen(["dd", f"if={fifo}", f"of={out}", "status=none"], stdin=subprocess.DEVNULL)
-    writer = os.open(fifo, os.O_WRONLY)
-    try:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            links = [os.readlink(f"/proc/{proc.pid}/fd/{fd}") for fd in os.listdir(f"/proc/{proc.pid}/fd")]
-            if str(fifo) in links:
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("fixture precondition: dd never opened its input under downloads")
-        _handle(box, "red", writers=_writers_for(proc))
-        assert _proc_state(proc.pid) != "T"
-        body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
-        assert f"downloader not frozen: pid {proc.pid}" in body and "not writing under" in body
-    finally:
-        os.close(writer)
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(proc.pid, 18)
-        proc.kill()
-        proc.wait()
 
 
 @pytest.mark.parametrize("tier,title", [("red", "Disk nearly full"), ("orange", "Disk filling")])
@@ -993,39 +782,15 @@ def test_uninstall_stops_the_watchgod_and_both_pressure_instances():
         assert text.count("\\${P}" + suffix) == 1, f"host-driven path misses {suffix}"
 
 
-def test_red_on_another_limit_domain_of_the_downloads_device_freezes_nothing(box, downloader):
-    """A RED on a separately limited domain that merely shares the downloads
-    directory's DEVICE (a project-quota cc-tmp) is not relieved by stopping a
-    download into the other domain."""
-    _handle(box, "red", dev=f"{_home_dev(box)}q2048", writers=_writers_for(downloader))
-    assert _proc_state(downloader.pid) != "T"
-    assert not (box["state"] / "frozen").exists()
-
-
 def test_the_domain_key_ignores_which_wall_binds(box):
     """Review finding: grouping by dg_measure's EFFECTIVE total split / and
     $HOME into two domains whenever a btrfs quota's crossover put them on
-    different sides between two reads. The key uses the raw statvfs size,
-    which a btrfs qgroup never changes."""
+    different sides between two reads. The key comes from the mount and the
+    RAW statvfs sizes, which a btrfs qgroup never changes."""
     assert os.stat("/").st_dev == os.stat(box["home"]).st_dev or pytest.skip("needs one device")
     st = _poll(box, {"/": "5000 267000 1 - - btrfs", str(box["home"]): "5000 357000 0 - - btrfs"})
     home_like = [p for p in st["disk"] if p in ("/", str(box["home"]))]
     assert home_like == ["/"], st["disk"].keys()
-
-
-def test_a_failed_stop_withdraws_its_record(box, downloader):
-    """Review NOTE: the record is written first; if the stop then fails, the
-    record is withdrawn so `status` never shows a running process as frozen."""
-    snippet = (
-        'kill() { [[ "$1" == -STOP ]] && return 1; builtin kill "$@"; }\n'
-        f"ALL_WRITERS='{_writers_for(downloader)}'; "
-        f"handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - \"$ALL_WRITERS\" btrfs"
-    )
-    _run(box, snippet)
-    assert _proc_state(downloader.pid) != "T"
-    f = box["state"] / "frozen"
-    assert not f.exists() or f.read_text() == ""
-    assert "record withdrawn" in _log(box)
 
 
 def test_episode_markers_of_a_vanished_domain_are_dropped(box):
@@ -1038,19 +803,202 @@ def test_episode_markers_of_a_vanished_domain_are_dropped(box):
     assert not stale.exists()
 
 
-def test_no_stop_when_the_lock_opens_but_the_record_append_fails(box, downloader):
-    """The ENOSPC shape: the lock file already exists, only the append fails.
-    Nothing may be stopped (a read-only record file stands in for a full disk)."""
+# ── round-2 review findings (classes, not instances) ─────────────
+
+
+def test_a_page_that_could_not_be_queued_is_retried_not_marked_sent(box):
+    """Class B: the episode marker used to be written BEFORE the enqueue, and a
+    failed enqueue was swallowed — at RED the queue lives on the full disk, so
+    the one EMERGENCY page could be lost for the whole episode."""
+    blocker = box["tmp"] / "not-a-dir"
+    blocker.write_text("")
+    _run(box, f"_ALERT_QUEUE_ROOT='{blocker}/queue'; handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - '' btrfs")
+    assert not list(box["state"].glob("episode_*_red")), "an undelivered page must not be marked sent"
+    assert "could not queue the page" in _log(box)
+    assert not _pages(box)
+    _handle(box, "red")
+    assert len([p for p in _pages(box) if p["title"].startswith("Disk nearly full")]) == 1, "retried next poll"
+
+
+def test_a_failed_reclaim_start_is_retried_next_poll(box):
+    """Class B: the rate-limit stamp was written before `systemctl start`, so
+    one transient failure silenced reclaim for PRESSURE_RETRIGGER_S."""
+    out = _run(box, """
+        n=0
+        systemctl() { n=$((n + 1)); return 1; }
+        start_pressure_unit standard
+        start_pressure_unit standard
+        echo "attempts=$n"
+    """)
+    assert "attempts=2" in out.stdout
+    assert not (box["state"] / "pressure_standard").exists()
+
+
+def test_observe_mode_never_uses_up_an_acting_sweep(box):
+    """Class D: the sweep stamp written by an observe-mode poll suppressed the
+    first ACTING pressure sweep for up to 600 s after WATCHGOD_ACT flipped."""
+    out = _run(box, """
+        sweep_cc_tmp() { echo "SWEPT act=$WATCHGOD_ACT"; }
+        WATCHGOD_ACT=0; maybe_sweep_cc_tmp pressure
+        WATCHGOD_ACT=1; maybe_sweep_cc_tmp pressure
+        WATCHGOD_ACT=1; maybe_sweep_cc_tmp pressure
+    """)
+    assert out.stdout.count("SWEPT act=0") == 1
+    assert out.stdout.count("SWEPT act=1") == 1, "one acting sweep, then rate-limited"
+
+
+def test_leading_zero_settings_are_decimal_not_octal_and_never_fatal(box):
+    """Class H: "08" aborted the daemon ("value too great for base") and
+    "0600" silently meant 384."""
+    (box["home"] / ".genesis" / "config" / "watchgod.local.conf").write_text(
+        "DG_ORANGE_PCT=08\nPRESSURE_RETRIGGER_S=0600\nCC_SWEEP_AGE_MIN=09\nDG_RED_MIN_MB=0000000000000000099\n"
+    )
+    out = _run(box, 'load_config; echo "$DG_ORANGE_PCT $PRESSURE_RETRIGGER_S $CC_SWEEP_AGE_MIN $DG_RED_MIN_MB"; dg_floor_tier 50 1000 - -')
+    vals = out.stdout.split("\n")[0].split()
+    assert vals == ["8", "600", "10080", "3072"], vals  # 09 < the 1-day floor; 19 digits is not a number
+
+
+def test_cc_usage_survives_one_unreadable_entry(box):
+    """Class H: du exits 1 on any unreadable entry but still prints the total;
+    under pipefail the total was thrown away and 0 cached for 5 minutes."""
+    _stub(box["bin"] / "du", '#!/usr/bin/env bash\nprintf "123\\t%s\\n" "${@: -1}"\nexit 1\n')
+    (box["home"] / ".genesis" / "cc-tmp").mkdir()
+    out = _run(box, 'CC_COMPAT="green 1000 5000 0"; SYS_COMPAT=""; DISK_JSON=""; write_state; cat "$STATE_FILE"')
+    assert json.loads(out.stdout)["cc_tmp"]["used_mb"] == 123
+
+
+def test_the_domain_key_does_not_depend_on_which_paths_were_seen(box):
+    """Class A: the key used to be the bare device for whichever path came
+    first, so a poll where `/` could not be measured re-keyed $HOME's domain
+    (a new rate series, new episode markers). $HOME's key must be the same
+    whether or not `/` was measured first."""
+    probe = "dg_io_snapshot() { :; }; check_disks; echo \"HOME_KEY=$HOME_KEY\""
+    blind_root = "dg_measure() { [[ \"$1\" == / ]] && return 1; echo '90000 100000 0 - - ext4'; }; "
+    normal = "dg_measure() { echo '90000 100000 0 - - ext4'; }; "
+    k1 = _run(box, blind_root + probe).stdout.strip().rsplit("HOME_KEY=", 1)[1]
+    k2 = _run(box, normal + probe).stdout.strip().rsplit("HOME_KEY=", 1)[1]
+    assert k1 and k1 == k2, (k1, k2)
+
+
+def test_update_restarts_the_watchgod_only_after_a_successful_deploy():
+    """Class F: update.sh restarted only server and bridge; daemon-reload does
+    not make a running bash loop re-read its script, so an update never
+    reached the watchgod. The restart sits after the success disarm, so a
+    rolled-back deploy never leaves it on the new code."""
+    text = (_ROOT / "scripts" / "update.sh").read_text()
+    disarm = text.index("# ── Success: disarm trap")
+    restart = text.index("_restart_tmp_watchgod_if_stale\n", disarm)
+    assert disarm < restart < text.index("_guardian_resume\n", disarm)
+    assert text.count("genesis-tmp-watchgod") >= 1
+
+
+def test_the_daemon_survives_a_state_dir_it_cannot_write(box):
+    """At RED the state directory's filesystem can be the full one: episode
+    markers, stamps and the reserve release must fail soft, never exit the
+    daemon under set -e."""
     state = box["state"]
     state.mkdir(parents=True, exist_ok=True)
-    (state / "frozen.lock").write_text("")
-    rec = state / "frozen"
-    rec.write_text("")
-    rec.chmod(0o444)
+    state.chmod(0o555)
     try:
-        _handle(box, "red", writers=_writers_for(downloader))
+        _handle(box, "red")      # asserts rc == 0
+        _handle(box, "orange")
+        _poll(box, {})
     finally:
-        rec.chmod(0o644)
-    assert _proc_state(downloader.pid) != "T"
-    assert rec.read_text() == ""
-    assert f"NOT freezing pid {downloader.pid}" in _log(box)
+        state.chmod(0o755)
+    assert [p for p in _pages(box) if p["title"].startswith("Disk nearly full")], "the page still went out"
+
+
+def test_the_domain_key_survives_a_moving_size(box):
+    """Round-3 review BLOCKER: a ZFS dataset's reported size moves with its
+    neighbours' usage. A size-based key re-keyed the domain every poll — a new
+    EMERGENCY page each time. Keyed on the mount, a size that moves in step for
+    the path and its mount changes nothing."""
+    probe = "dg_io_snapshot() { :; }; check_disks; echo \"HOME_KEY=$HOME_KEY\""
+    keys = []
+    for size in (100000, 99999, 99998):
+        out = _run(box, f"dg_raw_sizes_mb() {{ echo {size} {size}; }}; " + probe).stdout
+        keys.append(out.strip().rsplit("HOME_KEY=", 1)[1])
+    assert len(set(keys)) == 1, keys
+    red = "dg_measure() { echo '100 100000 0 - - ext4'; }; "
+    for size in (100000, 99999, 99998):
+        _run(box, f"dg_raw_sizes_mb() {{ echo {size} {size}; }}; " + red + probe)
+    assert len([p for p in _pages(box) if p["title"] == "Disk nearly full: / RED"]) == 1
+
+
+def test_poll_intervals_are_normalised_settings(box):
+    """Round-3 review: POLL_INTERVAL=08 aborted the daemon's arithmetic and
+    restart-looped the unit; deleting the line never restored the default."""
+    conf = box["home"] / ".genesis" / "config" / "watchgod.local.conf"
+    conf.write_text("POLL_INTERVAL=08\nFAST_POLL_INTERVAL=abc\n")
+    out = _run(box, 'load_config; echo "$POLL_INTERVAL $FAST_POLL_INTERVAL"; conf_restore=1')
+    assert out.stdout.split()[:2] == ["8", "5"]
+    out = _run(box, f'load_config; echo "$POLL_INTERVAL"; : > "{conf}"; load_config; echo "$POLL_INTERVAL"')
+    assert out.stdout.split()[:2] == ["8", "30"], "removing the line restores the default"
+
+
+def test_rate_series_of_a_vanished_domain_are_dropped(box):
+    box["state"].mkdir(parents=True, exist_ok=True)
+    stale = box["state"] / "rate_4242q2048_fs"
+    stale.write_text("1 1 0 fs\n")
+    _poll(box, {})
+    assert stale.exists(), "a key gone for one poll keeps its series (grace)"
+    old = time.time() - 2 * 3600
+    os.utime(stale, (old, old))
+    _poll(box, {})
+    assert not stale.exists(), "gone for an hour: dropped"
+    assert list(box["state"].glob("rate_*")), "control: current domains keep their series"
+
+
+def test_a_stamp_from_the_future_does_not_silence_a_lever(box):
+    """A clock stepped back must not hold the reclaim start off until it catches up."""
+    out = _run(box, """
+        mkdir -p "$DG_STATE_DIR"; echo $(( $(date +%s) + 100000 )) > "$DG_STATE_DIR/pressure_standard"
+        if _wg_due pressure_standard 600; then echo DUE; else echo HELD; fi
+        date +%s > "$DG_STATE_DIR/pressure_standard"
+        if _wg_due pressure_standard 600; then echo DUE; else echo HELD; fi
+    """)
+    assert out.stdout.split() == ["DUE", "HELD"]
+
+
+def test_update_restarts_a_stale_watchgod_even_with_nothing_to_merge():
+    """Round-3 review: update.sh exited at "Nothing to do" before the restart,
+    so a tree pulled by hand never reached the running daemon."""
+    text = (_ROOT / "scripts" / "update.sh").read_text()
+    nothing = text.index('    echo "  Nothing to do."')
+    call = text.rindex("_restart_tmp_watchgod_if_stale\n", 0, nothing)
+    assert nothing - call < 200, "called just before the no-op exit"
+    assert text.index("_restart_tmp_watchgod_if_stale() {") < call
+
+
+def test_a_one_poll_size_jitter_between_path_and_mount_does_not_rekey(box):
+    """Final review: a ZFS commit between the two size reads made the path
+    look like its own quota for one poll — a new key, a new page. Sizes
+    within 1 % are one mount; a one-poll disappearance keeps the episode."""
+    probe = "dg_io_snapshot() { :; }; check_disks; echo \"HOME_KEY=$HOME_KEY\""
+    red = "dg_measure() { echo '100 100000 0 - - ext4'; }; "
+    keys = []
+    for sizes in ("100000 100000", "100000 99990", "100000 100000"):
+        out = _run(box, f"dg_raw_sizes_mb() {{ echo {sizes}; }}; " + red + probe).stdout
+        keys.append(out.strip().rsplit("HOME_KEY=", 1)[1])
+    assert len(set(keys)) == 1, keys
+    assert len([p for p in _pages(box) if p["title"] == "Disk nearly full: / RED"]) == 1
+
+
+def test_dg_same_size_tolerance(box):
+    out = _run(box, """
+        for pair in "100000 100000" "100000 99001" "100000 98999" "2048 280000" "0 0"; do
+            if dg_same_size $pair; then echo S; else echo D; fi
+        done
+    """).stdout.split()
+    assert out == ["S", "S", "D", "D", "D"], out
+
+
+def test_a_future_dated_usage_cache_is_not_trusted(box):
+    """Final review: after a clock step-back a cached cc-tmp `du` from the
+    future read as fresh forever, pinning used_mb to a stale value."""
+    _stub(box["bin"] / "du", '#!/usr/bin/env bash\nprintf "123\\t%s\\n" "${@: -1}"\n')
+    (box["home"] / ".genesis" / "cc-tmp").mkdir()
+    box["state"].mkdir(parents=True, exist_ok=True)
+    (box["state"] / "cc_used_du").write_text(f"{int(time.time()) + 100000} 7\n")
+    out = _run(box, 'CC_COMPAT="green 1000 5000 0"; SYS_COMPAT=""; DISK_JSON=""; write_state; cat "$STATE_FILE"')
+    assert json.loads(out.stdout)["cc_tmp"]["used_mb"] == 123

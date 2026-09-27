@@ -299,3 +299,76 @@ def test_lock_waits_are_bounded_last_resort_runs_standard_yields(tmp_path):
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_a_blind_liveness_view_refuses_the_prune(tmp_path):
+    """Devin severe / Codex P2: a /proc showing no other process proves nothing
+    about what is in use; the prune must refuse rather than delete old jobs."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    old = d / "old_job"
+    old.mkdir()
+    _age(old, 10)
+    blind = tmp_path / "noproc"
+    blind.mkdir()
+    r = subprocess.run(
+        ["bash", "-c", f"source '{_HYGIENE}'\nTL_PROC='{blind}'\nprune_tmp '{d}'"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+    assert old.exists()
+    assert "prune SKIPPED" in r.stdout
+    _run_prune(d)
+    assert not old.exists(), "control: with a normal /proc the same dir is pruned"
+
+
+def _reap(sandboxes: Path, extra: str = "") -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", f"source '{_HYGIENE}'\n{extra}\nreap_bg_sandboxes '{sandboxes}'"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+
+
+def test_bg_sandbox_reap_spares_one_still_in_use(tmp_path):
+    """Devin: a surviving child of an ended background session can still run
+    in its sandbox; the 24 h reap now spares anything held or used as a cwd."""
+    root = tmp_path / "bg-cc-sessions"
+    live, dead = root / "live", root / "dead"
+    live.mkdir(parents=True)
+    dead.mkdir()
+    holder = subprocess.Popen(["sleep", "60"], cwd=live)
+    try:
+        _age(live, 2)
+        _age(dead, 2)
+        r = _reap(root)
+        assert live.exists(), r.stdout
+        assert not dead.exists()
+        assert "sparing" in r.stdout
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_bg_sandbox_reap_refuses_when_blind(tmp_path):
+    root = tmp_path / "bg-cc-sessions"
+    dead = root / "dead"
+    dead.mkdir(parents=True)
+    _age(dead, 2)
+    blind = tmp_path / "noproc"
+    blind.mkdir()
+    r = _reap(root, f"TL_PROC='{blind}'")
+    assert dead.exists() and "SKIPPED" in r.stdout
+
+
+def test_seeing_only_yourself_in_proc_is_blind(tmp_path):
+    """A /proc that shows only the calling process (the snapshot's own find
+    would still find its own descriptors) proves nothing: blind. Control: one
+    other readable process makes it visible."""
+    fake = tmp_path / "proc"
+    snippet = (
+        f"source '{_HYGIENE}'\nTL_PROC='{fake}'\nmkdir -p \"$TL_PROC/$$/fd\"\n"
+        "if liveness_visible; then echo VISIBLE; else echo BLIND; fi\n"
+        "mkdir -p \"$TL_PROC/4242424/fd\"\n"
+        "if liveness_visible; then echo VISIBLE; else echo BLIND; fi\n"
+    )
+    r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert r.stdout.split() == ["BLIND", "VISIBLE"], r.stdout + r.stderr

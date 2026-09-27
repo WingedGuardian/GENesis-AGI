@@ -98,7 +98,41 @@ def test_watchgod_pages_through_the_queue_with_per_tier_dedupe_keys():
     D2). v2 pages a WARNING at ORANGE by design: ORANGE now means the whole
     disk is filling, not that one directory crossed a budget."""
     text = _WATCHGOD.read_text()
-    assert 'queue_alert warning "watchgod:disk"' in text
-    assert 'queue_alert emergency "watchgod:disk"' in text
+    # _wg_page routes both through queue_alert_try with source watchgod:disk.
+    assert 'queue_alert_try "$1" "watchgod:disk"' in text
+    assert '_wg_page warning "Disk filling' in text
+    assert '_wg_page emergency "Disk nearly full' in text
     assert '"watchgod:disk:${dev}:orange"' in text
     assert '"watchgod:disk:${dev}:red"' in text
+
+
+def test_queue_alert_try_reports_failure_and_queue_alert_still_never_does(tmp_path):
+    """The watchgod marks a page sent only when queue_alert_try returned 0; a
+    queue it cannot write (a file where the directory should be) must say so,
+    while plain queue_alert keeps its never-break-the-caller contract."""
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    env = {"GENESIS_ALERT_QUEUE_ROOT": str(blocker / "queue")}
+    r = _run_bash('if queue_alert_try emergency x t b; then echo OK; else echo FAILED; fi', env)
+    assert r.stdout.strip() == "FAILED"
+    r = _run_bash("queue_alert emergency x t b; echo survived", env)
+    assert r.returncode == 0 and r.stdout.strip() == "survived"
+    good = tmp_path / "q"
+    r = _run_bash('queue_alert_try emergency x t b && echo OK', {"GENESIS_ALERT_QUEUE_ROOT": str(good)})
+    assert r.stdout.strip() == "OK" and len(_entries(good)) == 1
+
+
+def test_queue_alert_try_fails_when_the_write_itself_fails(tmp_path):
+    """The directory exists but cannot take a new file (a full or read-only
+    disk): the Python write fails, the status says so, and no partial temp is
+    left for the drainer."""
+    root = tmp_path / "queue"
+    root.mkdir()
+    root.chmod(0o555)
+    try:
+        r = _run_bash('if queue_alert_try emergency x t b; then echo OK; else echo FAILED; fi',
+                      {"GENESIS_ALERT_QUEUE_ROOT": str(root)})
+    finally:
+        root.chmod(0o755)
+    assert r.stdout.strip() == "FAILED"
+    assert list(root.iterdir()) == []

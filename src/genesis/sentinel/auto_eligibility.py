@@ -73,7 +73,7 @@ _SELF_FATAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 #
 # Only KNOWN-SAFE units, not any unit: a generic pattern would mark e.g.
 # `genesis-tmp-watchgod` (a restart re-arms its OOM baseline, and at its RED
-# tier it can freeze a runaway downloader) as
+# tier it releases the reserve and starts last-resort reclaim) as
 # auto-eligible. Extend from shadow data, not speculation.
 _SAFE_UNITS = r"(?:genesis-watchdog|genesis-bridge|qdrant)(?:\.(?:service|timer))?"
 _ALLOWLIST: tuple[tuple[re.Pattern[str], str], ...] = (

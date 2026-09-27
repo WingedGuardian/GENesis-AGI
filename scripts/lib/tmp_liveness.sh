@@ -8,7 +8,8 @@
 # watchgod's sweeps used, so a long-running download or unpack older than the
 # age cut is never removed while a process still holds it open.
 #
-# Pure functions: no globals read, nothing executed at source time.
+# Pure functions: nothing executed at source time. TL_PROC (default /proc)
+# exists so tests can present a blind /proc.
 
 glob_escape() {
     # Escape the four characters find(1)'s -path GLOB treats specially, so an
@@ -71,10 +72,32 @@ live_open_paths() {
     # (a script started in ~/tmp/<job>) may hold no descriptor inside it at the
     # instant of a sweep, yet deleting the directory out from under it breaks
     # every relative path it uses next.
+    local proc="${TL_PROC:-/proc}"
     {
-        find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n'
-        find /proc/[0-9]*/cwd -maxdepth 0 -type l -printf '%l\n'
+        find "$proc"/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n'
+        find "$proc"/[0-9]*/cwd -maxdepth 0 -type l -printf '%l\n'
     } 2>/dev/null || true
+}
+
+liveness_visible() {
+    # 0 when this process can see the descriptors of at least one OTHER
+    # process — the precondition for reading "nothing holds it" as evidence.
+    # Every deleter that consults live_open_paths checks this FIRST and refuses
+    # when it fails (review finding: a blind scan read as "nothing is held"
+    # would let an age prune remove a live job).
+    #
+    # Why "another process" rather than "the snapshot is non-empty": the
+    # snapshot's own find runs in a subshell whose cwd and descriptors are
+    # visible, so an empty snapshot is essentially impossible even with /proc
+    # hidden. What this cannot see: another uid's processes (hidepid,
+    # ProtectProc=invisible, or plain EACCES). That was always the model —
+    # the swept trees are this user's own, written by this user's processes.
+    local proc="${TL_PROC:-/proc}" p
+    for p in "$proc"/[0-9]*; do
+        [[ "${p##*/}" == "$$" || "${p##*/}" == "$BASHPID" ]] && continue
+        [[ -r "$p/fd" && -x "$p/fd" ]] && return 0
+    done
+    return 1
 }
 
 dir_has_live_writer() {
