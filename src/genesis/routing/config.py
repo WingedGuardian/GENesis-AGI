@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import math
 import os
@@ -192,14 +193,15 @@ def load_config(
     deep-merges it on top of the base config before parsing. Local overlays
     are gitignored and survive upstream updates.
 
-    If the overlay cannot be read, merged, or parsed, the WHOLE overlay is set
-    aside and the base config is loaded on its own. The failure is logged at
-    ERROR and recorded as a health observation. Without this, most malformed
-    overlays raised out of here, and ``runtime/init/router.py`` catches that and
-    leaves the runtime with no router, so every LLM call site went dark behind
-    one log line. The base is validated in CI (``test_config_invariants``), so
-    it is the safe thing to fall back to. A base that fails to parse still
-    raises.
+    If the overlay cannot be read, merged, or parsed, its overrides are set
+    aside and the base config is loaded instead, with the overlay's EXCLUSIONS
+    still applied (see ``_restrict_base``): a typo must not re-enable a provider
+    the operator disabled. The failure is logged at ERROR and recorded as a
+    health observation. Without this, most malformed overlays raised out of
+    here, and ``runtime/init/router.py`` catches that and leaves the runtime
+    with no router, so every LLM call site went dark behind one log line. The
+    base is validated in CI (``test_config_invariants``), so it is the safe
+    thing to fall back to. A base that fails to parse still raises.
 
     ``strict_overlay=True`` re-raises the overlay error instead. It is for
     operator-initiated reloads, where the right answer to a broken file is to
@@ -223,26 +225,205 @@ def _load_effective(
     local_path = _local_path_for(path)
     if not local_path.is_file():
         return _parse(base_raw, check_api_keys=check_api_keys), base_raw
+    local_raw: object = _UNREADABLE
     try:
         local_raw = _load_local_overlay(path)
-        merged = _merge_overlay(base_raw, local_raw) if local_raw else base_raw
+        # Always merged, even when falsy: `[]`, `false`, `0` and `''` are
+        # malformed overlays, not absent ones. An absent or empty file is `{}`.
+        merged = _merge_overlay(base_raw, local_raw)
         return _parse(merged, check_api_keys=check_api_keys), merged
     except Exception as exc:
         if strict_overlay:
             raise
-        config = _parse(base_raw, check_api_keys=check_api_keys)
-        _report_overlay_rejected(local_path, exc)
-        return config, base_raw
+        try:
+            fallback, kept = _restrict_base(base_raw, local_raw)
+        except Exception:  # noqa: BLE001 - a defect here must not take routing dark
+            logger.error(
+                "Could not apply the rejected overlay's exclusions; using the base as is",
+                exc_info=True,
+            )
+            fallback = copy.deepcopy(base_raw)
+            kept = [_EXCLUSIONS_FAILED]
+        config = _parse(fallback, check_api_keys=check_api_keys)
+        _report_overlay_rejected(local_path, exc, kept)
+        return config, fallback
 
 
-#: Last-reported (mtime, cause) per overlay path. ``load_config`` runs on every
-#: dashboard vitals read and in every eval/standalone process, so a broken
-#: overlay is reported once per file version AND cause: an edit, or a different
-#: error at the same mtime (the base changed underneath it), reports again.
-_REPORTED_OVERLAYS: dict[str, tuple[float, str]] = {}
+#: Marks an overlay whose text could not be read or parsed as YAML at all.
+_UNREADABLE = object()
+
+#: The kept-exclusions entry when applying them failed.
+_EXCLUSIONS_FAILED = "__exclusions_failed__"
+
+#: Strings the `enabled` field reads as off. Shared by `_parse` and the fallback
+#: so both read an overlay's `enabled` the same way.
+_OFF_STRINGS = frozenset({"0", "false", "no", "off", ""})
 
 
-def _report_overlay_rejected(local_path: Path, exc: BaseException) -> None:
+def _is_enabled(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in _OFF_STRINGS
+    return bool(value)
+
+
+#: Per-provider limits that bound how much a provider is used. On the fallback
+#: path the lower of the base's and the overlay's value applies.
+_LIMIT_KEYS = ("rpd_limit", "tpd_limit", "rpm_limit")
+
+
+def _limit_value(provider: str, key: str, value: object) -> float | None:
+    """A limit as `_parse` reads it, or None when `_parse` would refuse it.
+
+    Runs the accepted path's own validators rather than a copy of them, so the
+    two paths cannot disagree about which values are valid. The result is a
+    number to compare, where "no limit" is infinity: `rpm_limit: 0` turns the
+    rate gate off (``router.py`` gates only on ``rpm_limit > 0``).
+    """
+    try:
+        if key == "rpm_limit":
+            parsed = _number(provider, key, value, allow_none=True)
+            return math.inf if parsed is None or parsed == 0 else parsed
+        parsed = _parse_daily_limit(provider, key, value)
+        return math.inf if parsed is None else parsed
+    except Exception:  # noqa: BLE001 - any refusal, including OverflowError
+        return None
+
+
+def _restrict_base(base_raw: dict, local_raw: object) -> tuple[dict, list[str]]:
+    """The base config, with the rejected overlay's EXCLUSIONS still applied.
+
+    Setting the whole overlay aside must not undo what the operator explicitly
+    excluded. Falling back to the base alone would re-enable all of it, so a
+    typo anywhere in the file would route to providers, and spend, the operator
+    had turned off.
+
+    The exclusions read are the fields the router consumes to decide WHETHER
+    and HOW MUCH a provider is used, and each can only NARROW the base:
+
+      * provider ``enabled`` off, read by the same rule ``_parse`` uses;
+      * provider ``free`` not true (a ``never_pays`` site then skips it);
+      * provider ``rpd_limit`` / ``tpd_limit`` / ``rpm_limit``: the lower value;
+      * call-site ``never_pays``;
+      * call-site ``dispatch: cli``, which keeps the site off the API chain;
+      * call-site ``chain``: only providers that are in the base chain too,
+        in the overlay's order.
+
+    Nothing here enables a provider, marks one free, raises a limit, clears
+    ``never_pays``, moves a site off ``cli``, or adds a provider to a chain.
+    Where the overlay names a provider or call site but the value there cannot
+    be read, the reading is the restrictive one: an unreadable provider entry
+    or limit disables the provider, and an unreadable call-site entry or chain
+    leaves that site no providers (``_parse`` then drops it unless it dispatches
+    to the CLI). A null ENTRY holds nothing and restricts nothing; a null FIELD
+    is read the way the accepted path reads it.
+
+    Other overrides (a model, params, retry settings) are not exclusions and
+    are set aside with the rest of the file.
+
+    An overlay in which no name can be read at all (not YAML, not a mapping, a
+    section that is not a mapping) has no exclusions to apply, and the base is
+    used as it is. The ERROR log and the health observation say so.
+
+    Returns the restricted copy and a description of each exclusion kept.
+    """
+    fallback = copy.deepcopy(base_raw)
+    kept: list[str] = []
+    if not isinstance(local_raw, dict):
+        return fallback, kept
+
+    base_providers = fallback.get("providers")
+    local_providers = local_raw.get("providers")
+    if isinstance(base_providers, dict) and isinstance(local_providers, dict):
+        for name, entry in local_providers.items():
+            base_entry = base_providers.get(name)
+            if not isinstance(base_entry, dict) or entry is None:
+                continue
+            if not isinstance(entry, dict):
+                base_entry["enabled"] = False
+                kept.append(f"provider {name} disabled (unreadable entry)")
+                continue
+            if "enabled" in entry and not _is_enabled(entry["enabled"]):
+                base_entry["enabled"] = False
+                kept.append(f"provider {name} disabled")
+            if "free" in entry and entry["free"] is not True and base_entry.get("free"):
+                base_entry["free"] = False
+                kept.append(f"provider {name} not free")
+            for key in _LIMIT_KEYS:
+                value = entry.get(key)
+                if value is None:
+                    continue
+                limit = _limit_value(name, key, value)
+                if limit is None:
+                    base_entry["enabled"] = False
+                    kept.append(f"provider {name} disabled (unreadable {key})")
+                    continue
+                # An unreadable BASE value is left alone: `_parse` raises on it,
+                # as it would with no overlay at all.
+                base_limit = _limit_value(name, key, base_entry.get(key))
+                if base_limit is not None and limit < base_limit:
+                    base_entry[key] = value
+                    kept.append(f"provider {name} {key} {value}")
+
+    known_providers = set(base_providers) if isinstance(base_providers, dict) else set()
+    base_sites = fallback.get("call_sites")
+    local_sites = local_raw.get("call_sites")
+    if isinstance(base_sites, dict) and isinstance(local_sites, dict):
+        for name, entry in local_sites.items():
+            base_entry = base_sites.get(name)
+            if not isinstance(base_entry, dict) or entry is None:
+                continue
+            if not isinstance(entry, dict):
+                base_entry["chain"] = []
+                kept.append(f"call site {name} has no providers (unreadable entry)")
+                continue
+            never_pays = entry.get("never_pays")
+            if never_pays is not None and never_pays is not False and base_entry.get("never_pays") is not True:
+                base_entry["never_pays"] = True
+                kept.append(f"call site {name} never_pays")
+            dispatch = entry.get("dispatch")
+            # The overlay value is matched directly, not through
+            # `_normalize_dispatch`: that would log a warning about a value the
+            # fallback is not using.
+            if (
+                isinstance(dispatch, str)
+                and dispatch.strip().lower() in {"cli", "cc"}
+                and _normalize_dispatch(base_entry.get("dispatch"), call_site_name=name) != "cli"
+            ):
+                base_entry["dispatch"] = "cli"
+                kept.append(f"call site {name} dispatch cli")
+            chain = entry.get("chain")
+            if chain is None:
+                continue
+            base_chain = base_entry.get("chain")
+            base_chain = base_chain if isinstance(base_chain, list) else []
+            if isinstance(chain, list):
+                # Mirrors `_sanitize_local_overlay` on the accepted path: names
+                # the base does not define are dropped, and a chain left with
+                # none is no override at all.
+                named = [p for p in chain if isinstance(p, str) and p in known_providers]
+                if not named:
+                    continue
+                in_base = set(base_chain)
+                narrowed = [p for p in dict.fromkeys(named) if p in in_base]
+            else:
+                narrowed = []
+            if narrowed != base_chain:
+                base_entry["chain"] = narrowed
+                kept.append(f"call site {name} chain {narrowed}")
+    return fallback, kept
+
+
+#: Last-reported (mtime, cause, exclusions kept) per overlay path.
+#: ``load_config`` runs on every dashboard vitals read and in every
+#: eval/standalone process, so a broken overlay is reported once per file
+#: version, cause AND kept exclusions: an edit, or a base change underneath it
+#: that changes the error or what the fallback kept, reports again.
+_REPORTED_OVERLAYS: dict[str, tuple[float, str, tuple[str, ...]]] = {}
+
+
+def _report_overlay_rejected(
+    local_path: Path, exc: BaseException, kept: list[str] | None = None
+) -> None:
     """Log at ERROR and record a health observation. Never raises."""
     try:
         mtime = local_path.stat().st_mtime
@@ -250,18 +431,32 @@ def _report_overlay_rejected(local_path: Path, exc: BaseException) -> None:
         mtime = 0.0
     key = str(local_path)
     detail = f"{type(exc).__name__}: {exc}"
-    if _REPORTED_OVERLAYS.get(key) == (mtime, detail):
+    kept = kept or []
+    # The kept exclusions are part of the report's identity: the base can change
+    # under an unchanged overlay and change what the fallback kept.
+    report = (mtime, detail, tuple(kept))
+    if _REPORTED_OVERLAYS.get(key) == report:
         return
-    _REPORTED_OVERLAYS[key] = (mtime, detail)
+    _REPORTED_OVERLAYS[key] = report
+    if kept == [_EXCLUSIONS_FAILED]:
+        still = "Its exclusions could NOT be applied; see the ERROR log."
+    elif kept:
+        still = f"Its exclusions are still applied: {'; '.join(kept)}."
+    else:
+        still = "It carried no exclusions that could be read."
     logger.error(
         "Routing overlay %s rejected; running on the shipped routing config "
-        "without it. Fix or remove the file. Cause: %s",
-        local_path, detail, exc_info=exc,
+        "without its overrides. %s Fix or remove the file. Cause: %s",
+        local_path, still, detail, exc_info=exc,
     )
     try:
         from genesis.db.crud.observations import create_sync
         from genesis.env import genesis_db_path
 
+        # The hash names the file VERSION as well as the cause. create_sync
+        # dedups on it, so hashing the content alone would suppress the report
+        # for an edited file whose error text did not change.
+        version = hashlib.sha256(f"{key}|{report!r}".encode()).hexdigest()
         # create_sync never raises and returns False on a failed or deduped
         # write; the ERROR line above is the record that cannot be lost.
         create_sync(
@@ -271,9 +466,10 @@ def _report_overlay_rejected(local_path: Path, exc: BaseException) -> None:
             category="infrastructure",
             priority="high",
             content=(
-                f"[routing] {local_path.name} was rejected and every override in "
-                f"it is inactive; routing runs on the shipped config. Cause: {detail}"
+                f"[routing] {local_path.name} was rejected and its overrides are "
+                f"inactive; routing runs on the shipped config. {still} Cause: {detail}"
             ),
+            content_hash=version,
         )
     except Exception:  # noqa: BLE001 - an import failure must not break config loading
         logger.warning("Could not record the routing overlay observation", exc_info=True)
@@ -521,13 +717,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     for name, p in (raw.get("providers") or {}).items():
         p = _entry("providers", name, p)
         # Parse enabled field — supports bool, string from env var expansion
-        enabled_raw = p.get("enabled", True)
-        if isinstance(enabled_raw, str):
-            enabled = enabled_raw.strip().lower() not in {"0", "false", "no", "off", ""}
-        else:
-            enabled = bool(enabled_raw)
-
-        if not enabled:
+        if not _is_enabled(p.get("enabled", True)):
             disabled_providers.add(name)
             disabled_provider_types[name] = p.get("type", "unknown")
             logger.info("Provider '%s' disabled via config", name)
@@ -620,7 +810,11 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
 
         # null clears an inherited profile back to the default, the same way
         # `params: null` clears an inherited params map.
-        retry_profile = _optional_str(where, "retry_profile", cs.get("retry_profile")) or "default"
+        # Only null means "default". An empty string is a malformed name and is
+        # refused below like any other unknown profile.
+        retry_profile = _optional_str(where, "retry_profile", cs.get("retry_profile"))
+        if retry_profile is None:
+            retry_profile = "default"
         if retry_profile not in retry_profiles:
             msg = (
                 f"Call site '{name}' references unknown "
@@ -695,7 +889,13 @@ def update_call_site_in_yaml(
         and cc_position is None
         and dispatch is None
     ):
-        return load_config(path)
+        # Strict: the caller reloads the router with what this returns, so a
+        # broken overlay must be refused here, not swapped for the fallback.
+        try:
+            return load_config(path, strict_overlay=True)
+        except Exception as e:
+            msg = f"Local overlay {_local_path_for(path).name} could not be loaded; fix or remove it: {e}"
+            raise ValueError(msg) from e
 
     # Start with existing local overlay for this call site. A file that cannot
     # be read is refused rather than overwritten: writing the new entry over it

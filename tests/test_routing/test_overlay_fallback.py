@@ -9,7 +9,9 @@ The design here is a chokepoint, not a list of shapes:
 
   * `load_config` parses base + overlay. If that fails for ANY reason, the whole
     overlay is set aside, the failure is logged at ERROR and recorded as a health
-    observation, and the base is parsed on its own. The base is validated in CI.
+    observation, and the base is parsed instead. The base is validated in CI.
+    The overlay's EXCLUSIONS (a disabled or not-free provider, `never_pays`, a
+    narrowed chain) still apply to that base, so a typo cannot undo them.
   * `_parse` raises on malformed entries and wrongly typed fields rather than
     skipping them, so the chokepoint sees every error it has to contain.
   * One shape does not raise by itself: a non-mapping SECTION (a bare
@@ -128,6 +130,7 @@ MALFORMED = {
     "call_site_list": f"call_sites:\n  {SITE}: [paid-a]\n",
     "provider_none": "providers:\n  paid-a:\n",
     "provider_new_none": "providers:\n  brand-new:\n",
+    "provider_str": "providers:\n  paid-a: oops\n",
     "retry_none_entry": "retry:\n  background:\n",
     "retry_new_none": "retry:\n  custom:\n",
     "retry_new_str": "retry:\n  custom: oops\n",
@@ -146,6 +149,7 @@ MALFORMED = {
     "open_duration_negative": "providers:\n  paid-a:\n    open_duration_s: -1\n",
     "free_string": "providers:\n  free-b:\n    free: 'false'\n",
     "never_pays_string": f"call_sites:\n  {SITE}:\n    never_pays: 'no'\n",
+    "never_pays_zero": f"call_sites:\n  {SITE}:\n    never_pays: 0\n",
     "params_list": "providers:\n  free-b:\n    params: [a]\n",
     "provider_new_without_type": "providers:\n  brand-new:\n    rpm_limit: 3\n",
     "rpd_limit_zero": "providers:\n  paid-a:\n    rpd_limit: 0\n",
@@ -153,16 +157,59 @@ MALFORMED = {
     "max_total_s_nan": "retry:\n  default:\n    max_total_s: .nan\n",
     "max_total_s_inf": "retry:\n  background:\n    max_total_s: .inf\n",
     "open_duration_nan": "providers:\n  paid-a:\n    open_duration_s: .nan\n",
+    # a falsy value is a malformed overlay, not an absent one
+    "top_level_false": "false\n",
+    "top_level_zero": "0\n",
+    "top_level_empty_list": "[]\n",
+    "top_level_empty_str": "''\n",
+    # only null means the default profile; an empty name is a typo
+    "retry_profile_empty": f"call_sites:\n  {SITE}:\n    retry_profile: ''\n",
 }
 
+#: Shapes that also carry an exclusion the fallback keeps, mapped to the base
+#: edit that expresses it. Where the overlay names a provider or call site but
+#: its value there is unreadable, the fallback reads it restrictively.
+EXCLUDING = {
+    "call_site_str": lambda raw: raw["call_sites"][SITE].update(chain=[]),
+    "call_site_list": lambda raw: raw["call_sites"][SITE].update(chain=[]),
+    "chain_int": lambda raw: raw["call_sites"][SITE].update(chain=[]),
+    "chain_str": lambda raw: raw["call_sites"][SITE].update(chain=[]),
+    "provider_str": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
+    "free_string": lambda raw: raw["providers"]["free-b"].update(free=False),
+    "never_pays_string": lambda raw: raw["call_sites"][SITE].update(never_pays=True),
+    "never_pays_zero": lambda raw: raw["call_sites"][SITE].update(never_pays=True),
+    # an unreadable limit on a named provider disables it
+    "rpm_limit_str": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
+    "rpd_limit_zero": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
+}
+NO_EXCLUSION = [k for k in MALFORMED if k not in EXCLUDING]
 
-@pytest.mark.parametrize("local", list(MALFORMED.values()), ids=list(MALFORMED))
-def test_a_malformed_overlay_falls_back_to_the_base(tmp_path, recorded, local):
+
+def _base_edited(tmp_path: Path, edit):
+    ref = tmp_path / "edited"
+    ref.mkdir()
+    raw = yaml.safe_load(_BASE)
+    edit(raw)
+    return load_config(_write(ref, None, base=yaml.safe_dump(raw)), check_api_keys=False)
+
+
+@pytest.mark.parametrize("shape", NO_EXCLUSION)
+def test_a_malformed_overlay_falls_back_to_the_base(tmp_path, recorded, shape):
     """The whole overlay is set aside and routing runs on the base, intact."""
-    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+    loaded = load_config(_write(tmp_path, MALFORMED[shape]), check_api_keys=False)
 
     assert _snapshot(loaded) == _snapshot(_base_only(tmp_path))
     assert len(recorded) == 1, "the fallback happened without a health observation"
+
+
+@pytest.mark.parametrize("shape", list(EXCLUDING))
+def test_an_unreadable_entry_is_read_restrictively(tmp_path, recorded, shape):
+    """A provider or call site the overlay names, with a value there that cannot
+    be read, is not handed back to the base's permissive settings."""
+    loaded = load_config(_write(tmp_path, MALFORMED[shape]), check_api_keys=False)
+
+    assert _snapshot(loaded) == _snapshot(_base_edited(tmp_path, EXCLUDING[shape]))
+    assert len(recorded) == 1
 
 
 @pytest.mark.parametrize("local", list(MALFORMED.values()), ids=list(MALFORMED))
@@ -199,6 +246,209 @@ def test_the_fallback_is_loud(tmp_path, recorded, caplog):
     assert row["type"] == "init_degradation"
     assert row["priority"] == "high"
     assert "model_routing.local.yaml" in row["content"]
+
+
+# ── The fallback keeps the overlay's exclusions ──────────────────────────────
+
+#: An unrelated error elsewhere in the file: an undefined retry profile entry.
+_UNRELATED_ERROR = "retry:\n  custom:\n"
+
+
+def test_a_rejected_overlay_keeps_its_disabled_providers(tmp_path, recorded):
+    """The reviewer's case: a typo anywhere must not re-enable a provider the
+    operator turned off, and so route (and spend) through it."""
+    local = "providers:\n  paid-a:\n    enabled: false\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert "paid-a" not in loaded.providers
+    assert loaded.call_sites[SITE].chain == ["free-b"]
+    assert "provider paid-a disabled" in recorded[0]["content"]
+
+
+def test_a_rejected_overlay_keeps_never_pays(tmp_path, recorded):
+    local = f"call_sites:\n  {SITE}:\n    never_pays: true\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].never_pays is True
+
+
+def test_a_rejected_overlay_keeps_a_narrowed_chain(tmp_path, recorded):
+    local = f"call_sites:\n  {SITE}:\n    chain: [free-b]\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].chain == ["free-b"]
+
+
+def test_a_rejected_overlay_keeps_a_provider_marked_not_free(tmp_path, recorded):
+    """`free: false` is what makes a `never_pays` site skip a provider."""
+    local = "providers:\n  free-b:\n    free: false\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.providers["free-b"].is_free is False
+
+
+def test_a_rejected_overlay_never_widens_the_base(tmp_path, recorded):
+    """CONTROL. Only exclusions survive the fallback. Nothing the overlay says
+    can enable a provider, mark one free, raise a limit, clear never_pays, move
+    a site off the CLI, or add to a chain."""
+    base = (
+        _BASE.replace("free: false", "free: false\n    enabled: false", 1)
+        .replace("free: true", "free: true\n    rpd_limit: 100", 1)
+        .replace(
+            "    chain: [free-b]\n",
+            "    chain: [free-b]\n    never_pays: true\n    dispatch: cli\n",
+            1,
+        )
+    )
+    local = textwrap.dedent(
+        """
+        providers:
+          paid-a:
+            enabled: true
+            free: true
+          free-b:
+            rpd_limit: 500
+        call_sites:
+          32_other:
+            never_pays: false
+            chain: [paid-a, free-b]
+            dispatch: dual
+        """
+    ) + _UNRELATED_ERROR
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    expected = load_config(_write(ref, None, base=base), check_api_keys=False)
+
+    loaded = load_config(_write(tmp_path, local, base=base), check_api_keys=False)
+
+    assert "paid-a" not in expected.providers, "fixture: the base must disable paid-a"
+    assert expected.call_sites["32_other"].never_pays is True, "fixture: base never_pays"
+    assert expected.call_sites["32_other"].dispatch == "cli", "fixture: base dispatch"
+    assert expected.providers["free-b"].rpd_limit == 100, "fixture: base rpd_limit"
+    assert _snapshot(loaded) == _snapshot(expected)
+    assert "no exclusions" in recorded[0]["content"]
+
+
+def test_a_rejected_overlay_keeps_cli_dispatch(tmp_path, recorded):
+    """`dispatch: cli` keeps a site off the API chain. The dashboard's dispatch
+    selector writes exactly this key, so it is common overlay content."""
+    local = f"call_sites:\n  {SITE}:\n    dispatch: cli\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].dispatch == "cli"
+
+
+def test_a_rejected_overlay_keeps_a_lower_daily_limit(tmp_path, recorded):
+    local = "providers:\n  paid-a:\n    rpd_limit: 5\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.providers["paid-a"].rpd_limit == 5
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [("tpd_limit", "5000", 5000), ("rpm_limit", "0.5", 0.5), ("rpd_limit", "10" * 200, int("10" * 200))],
+    ids=["tpd", "rpm_float", "rpd_huge_int"],
+)
+def test_each_limit_takes_the_lower_value(tmp_path, recorded, field, value, expected):
+    """Every limit the accepted path accepts is read the same way here, including
+    an integer too large for a float (which once raised out of the fallback)."""
+    local = f"providers:\n  paid-a:\n    {field}: {value}\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert getattr(loaded.providers["paid-a"], field) == expected
+
+
+def test_an_rpm_limit_of_zero_is_no_limit_not_an_unreadable_one(tmp_path, recorded):
+    """`rpm_limit: 0` is valid on the accepted path and turns the rate gate off.
+    It must not read as unreadable and disable the provider."""
+    local = "providers:\n  paid-a:\n    rpm_limit: 0\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert "paid-a" in loaded.providers
+    assert loaded.providers["paid-a"].rpm_limit is None
+
+
+def test_a_base_rpm_of_zero_is_narrowed_by_the_overlay(tmp_path, recorded):
+    base = _BASE.replace("free: false", "free: false\n    rpm_limit: 0", 1)
+    local = "providers:\n  paid-a:\n    rpm_limit: 5\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local, base=base), check_api_keys=False)
+
+    assert loaded.providers["paid-a"].rpm_limit == 5
+
+
+def test_a_defect_in_the_exclusions_code_does_not_take_routing_dark(
+    tmp_path, recorded, monkeypatch
+):
+    def broken(*_a, **_k):
+        raise RuntimeError("defect")
+
+    monkeypatch.setattr(C, "_restrict_base", broken)
+    loaded = load_config(_write(tmp_path, _UNRELATED_ERROR), check_api_keys=False)
+
+    assert _snapshot(loaded) == _snapshot(_base_only(tmp_path))
+    assert "could NOT be applied" in recorded[0]["content"]
+
+
+def test_a_rejected_overlay_keeps_the_order_of_a_narrowed_chain(tmp_path, recorded):
+    """Order decides which provider is tried, and paid, first."""
+    local = f"call_sites:\n  {SITE}:\n    chain: [free-b, paid-a]\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].chain == ["free-b", "paid-a"]
+
+
+def test_a_change_in_the_kept_exclusions_is_reported_again(tmp_path, recorded):
+    """The base can change under an unchanged overlay and change what is kept."""
+    local_path = tmp_path / "model_routing.local.yaml"
+    local_path.write_text("retry:\n  custom:\n")
+    C._report_overlay_rejected(local_path, ValueError("same"), ["provider a disabled"])
+    C._report_overlay_rejected(local_path, ValueError("same"), ["provider a disabled"])
+    C._report_overlay_rejected(local_path, ValueError("same"), [])
+
+    assert len(recorded) == 2
+
+
+def test_a_chain_naming_only_unknown_providers_is_no_override(tmp_path, recorded):
+    """Mirrors the accepted path, where `_sanitize_local_overlay` drops a chain
+    left with no provider the base defines."""
+    local = f"call_sites:\n  {SITE}:\n    chain: [gone-provider]\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].chain == ["paid-a", "free-b"]
+
+
+@pytest.mark.parametrize("local", ["", "# only a comment\n"], ids=["empty", "comment"])
+def test_an_empty_overlay_file_is_not_a_fallback(tmp_path, recorded, local):
+    """CONTROL for the falsy shapes: an empty file holds nothing, it is not broken."""
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert _snapshot(loaded) == _snapshot(_base_only(tmp_path))
+    assert recorded == []
+
+
+def test_each_file_version_is_recorded_despite_the_real_dedup(tmp_path, monkeypatch):
+    """Against the real create_sync and table: it dedups unresolved rows on the
+    content hash, so an edited file with the same error text must hash apart."""
+    import sqlite3
+
+    from genesis.db.schema import TABLES
+
+    db = tmp_path / "genesis.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(TABLES["observations"])
+    conn.close()
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
+    cfg = _write(tmp_path, "- a\n")
+    local = tmp_path / "model_routing.local.yaml"
+
+    load_config(cfg, check_api_keys=False)
+    stat = local.stat()
+    os.utime(local, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    load_config(cfg, check_api_keys=False)
+
+    rows = sqlite3.connect(db).execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    assert rows == 2
 
 
 def test_the_fallback_is_reported_once_per_file_version(tmp_path, recorded):
@@ -403,6 +653,17 @@ def test_a_save_never_overwrites_something_it_cannot_read(tmp_path, local):
         update_call_site_in_yaml(cfg, "32_other", default_paid=True)
 
     assert local_path.read_text() == local
+
+
+def test_a_no_op_save_refuses_a_broken_overlay(tmp_path, recorded):
+    """The dashboard reloads the router with what the save returns. A save with
+    nothing to change must not hand back the fallback over a running overlay."""
+    cfg = _write(tmp_path, f"call_sites:\n  {SITE}:\n    chain: 5\n")
+
+    with pytest.raises(ValueError, match="could not be loaded"):
+        update_call_site_in_yaml(cfg, SITE)
+
+
 def test_a_save_is_validated_through_the_same_sanitizer_as_boot(tmp_path):
     """A stale call site left in the overlay is dropped by the sanitizer at boot.
     The save must judge the file the way boot will, so it may not refuse over it.
