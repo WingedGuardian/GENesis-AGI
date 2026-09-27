@@ -18,15 +18,22 @@ from genesis.session_awareness import handoffs as H
 
 
 def _scan_or_exit() -> H.Scan | int:
-    directory = H.configured_dir()
+    try:
+        directory = H.configured_dir()
+    except H.HandoffConfigError as exc:
+        print(f"handoffs: {exc}", file=sys.stderr)
+        return 2
     if directory is None:
         print(
-            "handoffs: no handoff directory configured (set `dir:` in "
-            "~/.genesis/config/handoffs.local.yaml) — the feature is off."
+            "handoffs: no handoff directory configured (set an absolute `dir:` in "
+            "the handoffs overlay under ~/.genesis/config/) — the feature is off."
         )
         return 0
     try:
-        return H.scan(directory)
+        # The recovery path: an operator is present, so neither session-start
+        # bound applies — every entry is read and every file content-hashed,
+        # which is what lets it reach a handoff the hook's capped scan cut off.
+        return H.scan(directory, hash_budget_s=None, max_entries=None)
     except H.HandoffDirError as exc:
         print(f"handoffs: configured directory {directory} is unreadable: {exc}", file=sys.stderr)
         return 2
@@ -37,7 +44,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if isinstance(result, int):
         return result
     try:
-        handled = H.load_handled()
+        handled = H.load_handled(result.directory)
     except H.StateError as exc:
         print(f"handoffs: handled-state file unreadable ({exc}): {H.state_path()}", file=sys.stderr)
         return 2
@@ -45,6 +52,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     pending = H.unhandled(result, handled)
     pending_ids = {h.id for h in pending}
     print(f"{result.directory}: {len(result.handoffs)} handoff(s), {len(pending)} unhandled")
+    if result.unreadable:
+        print(
+            f"  {result.unreadable} handoff file(s) could not be read by this install "
+            "— UNKNOWN, not handled"
+        )
     for h in result.handoffs:
         if h.id in pending_ids:
             status = "UNHANDLED"
@@ -57,8 +69,6 @@ def _cmd_list(args: argparse.Namespace) -> int:
             rec = handled.get(h.id)
             if rec and args.all:
                 print(f"      handled {rec.get('handled_at', '?')}: {rec.get('note', '')}")
-    if result.scan_truncated:
-        print(f"  (scan stopped at {H.MAX_SCAN_ENTRIES} entries — counts are floors)")
     return 0
 
 

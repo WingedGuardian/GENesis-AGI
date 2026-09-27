@@ -20,9 +20,11 @@ before touching the filesystem. ``GENESIS_HANDOFFS_DISABLED=1`` is the kill
 switch. Genesis-dispatched (background) sessions get nothing: nobody is there to
 decide, and the surface is not consumed, so the next foreground session sees it.
 
-Fail-open, loudly: a configured directory that cannot be read, a corrupt state
-file, or an unexpected error prints ONE fixed-shape line, so "no handoffs" is
-never what a failure looks like. It never blocks session start.
+Fail-open, loudly: a misconfigured or unreadable directory, a scan that does not
+finish inside ``handoffs.SCAN_TIMEOUT_S`` (it runs in a worker process, so a hung
+mount cannot hold this one past the hook timeout), a corrupt state file, or an
+unexpected error prints ONE fixed-shape line, so "no handoffs" is never what a
+failure looks like. It never blocks session start.
 
 Output routes through ``scripts/hooks/hook_output.py`` (BoundedStdout); the
 listed entries are additionally clamped in code (``handoffs.MAX_LISTED``).
@@ -54,11 +56,28 @@ def main() -> None:
     try:
         from genesis.session_awareness import handoffs as H
 
-        directory = H.configured_dir()
+        try:
+            directory = H.configured_dir()
+        except H.HandoffConfigError as exc:
+            out.emit(
+                f"[Handoffs] handoff directory is misconfigured ({str(exc)[:160]}) — "
+                "read 'no handoffs' as UNKNOWN this session, not none."
+            )
+            return
         if directory is None:
             return
         try:
-            result = H.scan(directory)
+            # Bounded as ONE unit (listing + stat + open + read) in a worker
+            # process: this process never touches the peer-controlled directory,
+            # so a hung mount cannot outlive the hook's timeout and silence it.
+            result = H.scan_within(directory)
+        except H.ScanTimeout:
+            out.emit(
+                f"[Handoffs] scan of {directory} did not finish within "
+                f"{H.SCAN_TIMEOUT_S:g}s — read 'no handoffs' as UNKNOWN this session, "
+                f"not none. `{H.LIST_COMMAND}` scans it without the session-start bound."
+            )
+            return
         except H.HandoffDirError as exc:
             out.emit(
                 f"[Handoffs] configured handoff directory {directory} could not be read "
@@ -66,7 +85,7 @@ def main() -> None:
             )
             return
         try:
-            handled = H.load_handled()
+            handled = H.load_handled(result.directory)
         except H.StateError as exc:
             out.emit(
                 f"[Handoffs] local handled-state file {H.state_path()} is unreadable "

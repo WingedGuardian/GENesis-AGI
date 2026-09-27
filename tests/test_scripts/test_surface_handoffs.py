@@ -151,3 +151,55 @@ def test_mark_output_never_echoes_an_unsafe_filename(tmp_path):
     assert mark.returncode == 0, mark.stderr
     assert "SYSTEM line" not in mark.stdout
     assert "<nonconforming filename>" in mark.stdout
+
+
+def test_cli_list_scans_past_the_session_start_cap(tmp_path):
+    """The recovery command the hook recommends must see what the hook's cap cut."""
+    from genesis.session_awareness import handoffs as H
+
+    home = tmp_path / "home"
+    d = tmp_path / "shared"
+    d.mkdir()
+    n = H.MAX_SCAN_ENTRIES + 10
+    for i in range(n):
+        (d / f"h{i:04d}.md").write_text(str(i))
+    _configure(home, d)
+    assert "floor, not a total" in _run(home).stdout
+    listed = _cli(home, "list")
+    assert listed.returncode == 0, listed.stderr
+    assert listed.stdout.startswith(f"{d}: {n} handoff(s), {n} unhandled")
+
+
+def test_relative_dir_is_loud_in_the_hook_and_an_error_in_the_cli(tmp_path):
+    home = tmp_path / "home"
+    cfg = home / ".genesis" / "config" / "handoffs.local.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("dir: shared/handoffs\n")
+    out = _run(home).stdout
+    assert "misconfigured" in out and "UNKNOWN" in out
+    listed = _cli(home, "list")
+    assert listed.returncode == 2
+    assert "absolute" in listed.stderr
+
+
+def test_scan_timeout_renders_unknown_not_silence(tmp_path, monkeypatch, capsys):
+    from genesis.session_awareness import handoffs as H
+    from tests.conftest import private_module
+
+    home = tmp_path / "home"
+    d = tmp_path / "shared"
+    _seed(d)
+    monkeypatch.setenv("HOME", str(home))
+    for k in ("GENESIS_HOME", "GENESIS_HANDOFFS_DISABLED", "GENESIS_CC_SESSION"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(H, "configured_dir", lambda cfg=None: d)
+
+    def _hang(*a, **k):
+        raise H.ScanTimeout("boom")  # the branch, not this text, must say it
+
+    monkeypatch.setattr(H, "scan_within", _hang)
+    hook = private_module("surface_handoffs_under_test", _SCRIPT)
+    hook.main()
+    out = capsys.readouterr().out
+    assert "did not finish" in out and "UNKNOWN" in out
+    assert "`one.md`" not in out

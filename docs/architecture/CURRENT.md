@@ -1462,8 +1462,10 @@ verified: 788dd9a9 2026-09-06
   and no `<name>-REPLY.md` sibling at least as new, and tells FOREGROUND sessions they exist — as
   untrusted claims to verify, never with their content, never dispatching work.
   Read-only on the shared directory; handled state is local
-  (`~/.genesis/handoffs/handled.json`, keyed to name + content hash, so a
-  rewritten handoff resurfaces). Marked via `python -m genesis handoffs mark`.
+  (`~/.genesis/handoffs/handled.json`, namespaced by the configured directory and
+  keyed to name + content hash, so a rewritten handoff resurfaces). The hook's scan
+  runs in a forked worker under a hard deadline (`SCAN_TIMEOUT_S`) — a hung mount
+  reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
   `upstream-pr-steward` campaign's own owner notifications — the ones it already

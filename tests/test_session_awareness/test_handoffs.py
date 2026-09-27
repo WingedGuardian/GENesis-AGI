@@ -122,11 +122,11 @@ def test_marked_handoff_is_not_resurfaced(tmp_path, state):
     result = H.scan(d)
     target = H.mark_handled(result, "a.md", "verified: claim held", now=_NOW, path=state)
     assert target.name == "a.md"
-    handled = H.load_handled(state)
+    handled = H.load_handled(d, state)
     assert [h.name for h in H.unhandled(H.scan(d), handled)] == ["b.md"]
     # Idempotent: marking again changes nothing about what surfaces.
     H.mark_handled(H.scan(d), "a.md", "again", now=_NOW, path=state)
-    assert [h.name for h in H.unhandled(H.scan(d), H.load_handled(state))] == ["b.md"]
+    assert [h.name for h in H.unhandled(H.scan(d), H.load_handled(d, state))] == ["b.md"]
 
 
 def test_rewritten_handoff_resurfaces(tmp_path, state):
@@ -134,7 +134,7 @@ def test_rewritten_handoff_resurfaces(tmp_path, state):
     p = _write(d, "a.md", "v1")
     H.mark_handled(H.scan(d), "a.md", "done", now=_NOW, path=state)
     p.write_text("v2 — new claims")
-    assert [h.name for h in H.unhandled(H.scan(d), H.load_handled(state))] == ["a.md"]
+    assert [h.name for h in H.unhandled(H.scan(d), H.load_handled(d, state))] == ["a.md"]
 
 
 def test_state_is_written_locally_never_into_the_shared_dir(tmp_path, state):
@@ -144,7 +144,7 @@ def test_state_is_written_locally_never_into_the_shared_dir(tmp_path, state):
     H.mark_handled(H.scan(d), "a.md", "done", now=_NOW, path=state)
     assert sorted(p.name for p in d.iterdir()) == before
     assert state.exists()
-    rec = json.loads(state.read_text())["handled"]
+    rec = json.loads(state.read_text())["sources"][str(d)]
     assert list(rec.values())[0]["note"] == "done"
 
 
@@ -179,15 +179,15 @@ def test_prune_drops_records_for_vanished_files(tmp_path, state):
     H.mark_handled(H.scan(d), "gone.md", "done", path=state)
     gone.unlink()
     H.mark_handled(H.scan(d), "stay.md", "done", path=state)
-    assert {v["name"] for v in H.load_handled(state).values()} == {"stay.md"}
+    assert {v["name"] for v in H.load_handled(d, state).values()} == {"stay.md"}
 
 
 def test_corrupt_state_raises_rather_than_reading_empty(tmp_path, state):
     state.parent.mkdir(parents=True)
     state.write_text("{not json")
-    with pytest.raises(H.StateError):
-        H.load_handled(state)
     d = tmp_path / "h"
+    with pytest.raises(H.StateError):
+        H.load_handled(d, state)
     _write(d, "a.md")
     with pytest.raises(H.StateError):
         H.mark_handled(H.scan(d), "a.md", "x", path=state)
@@ -253,8 +253,8 @@ def test_truncated_scan_with_nothing_pending_is_not_silent(tmp_path, monkeypatch
     d = tmp_path / "h"
     for i in range(5):
         _write(d, f"n{i}.txt")
-    monkeypatch.setattr(H, "MAX_SCAN_ENTRIES", 3)
-    result = H.scan(d)
+    monkeypatch.setattr(H, "MAX_SCAN_ENTRIES", 3)  # what the rendered text names
+    result = H.scan(d, max_entries=3)
     assert result.scan_truncated and not result.handoffs
     text = H.render_session_block(result, [], datetime.now(UTC))
     assert "stopped at 3" in text and "unknown" in text
@@ -272,9 +272,9 @@ def test_transiently_unreadable_file_keeps_its_handled_record(tmp_path, state):
         H.mark_handled(H.scan(d), "b.md", "note-b", path=state)
     finally:
         os.chmod(a, 0o644)
-    notes = {v["name"]: v["note"] for v in H.load_handled(state).values()}
+    notes = {v["name"]: v["note"] for v in H.load_handled(d, state).values()}
     assert notes == {"a.md": "note-a", "b.md": "note-b"}
-    assert H.unhandled(H.scan(d), H.load_handled(state)) == []
+    assert H.unhandled(H.scan(d), H.load_handled(d, state)) == []
 
 
 def test_handoff_rewritten_after_its_reply_resurfaces(tmp_path):
@@ -310,4 +310,228 @@ def test_one_record_per_filename(tmp_path, state):
     H.mark_handled(H.scan(d), "a.md", "first", path=state)
     p.write_text("v2")
     H.mark_handled(H.scan(d), "a.md", "second", path=state)
-    assert [v["note"] for v in H.load_handled(state).values()] == ["second"]
+    assert [v["note"] for v in H.load_handled(d, state).values()] == ["second"]
+
+
+# ── round 2: reply matching uses validated, exact-case parents ──────────────
+
+
+def test_reply_beside_a_directory_or_symlink_parent_is_still_a_handoff(tmp_path):
+    """A directory or link NAMED like a parent must not swallow an orphan reply."""
+    d = tmp_path / "h"
+    (d / "x.md").mkdir(parents=True)
+    os.symlink(_write(tmp_path / "elsewhere", "t.md"), d / "y.md")
+    _write(d, "x-REPLY.md")
+    _write(d, "y-REPLY.md")
+    result = H.scan(d)
+    assert sorted(h.name for h in H.unhandled(result, {})) == ["x-REPLY.md", "y-REPLY.md"]
+    assert result.replies == 0
+
+
+def test_reply_matches_its_parent_by_exact_case(tmp_path):
+    """Only the -REPLY marker is case-insensitive; A.md and a.md are distinct."""
+    d = tmp_path / "h"
+    upper = _write(d, "A.md", "upper")
+    lower = _write(d, "a.md", "lower")
+    reply = _write(d, "a-reply.md")
+    for p, t in ((upper, 1000), (lower, 1000), (reply, 2000)):
+        os.utime(p, (t, t))
+    assert [h.name for h in H.unhandled(H.scan(d), {})] == ["A.md"]
+
+
+# ── round 2: the scan is bounded as one unit ────────────────────────────────
+
+
+def test_hash_cap_is_enforced_on_the_opened_descriptor_not_the_listing(tmp_path, monkeypatch):
+    """A stale (small) listing size must not license reading past the cap."""
+    p = _write(tmp_path, "grown.md", "x" * 100)
+    monkeypatch.setattr(H, "MAX_HASH_BYTES", 10)
+    _digest, kind = H._identity("grown.md", p, 5, 0, None)
+    assert kind == "oversized"
+
+
+def test_read_loop_stops_at_the_cap_even_if_fstat_lies(tmp_path, monkeypatch):
+    """The read itself is capped: a file growing after fstat is never hashed on."""
+    p = _write(tmp_path, "grows.md", "x" * 100)
+    monkeypatch.setattr(H, "MAX_HASH_BYTES", 10)
+    real_fstat = os.fstat
+
+    class _Small:
+        def __init__(self, st):
+            self.st_mode, self.st_mtime_ns, self.st_size = st.st_mode, st.st_mtime_ns, 5
+
+    monkeypatch.setattr(H.os, "fstat", lambda fd: _Small(real_fstat(fd)))
+    _digest, kind = H._identity("grows.md", p, 5, 0, None)
+    assert kind == "oversized"
+
+
+def test_hash_deadline_is_checked_between_chunks(tmp_path, monkeypatch):
+    """One big or slow file cannot carry the scan past its budget."""
+    p = _write(tmp_path, "big.md", "x" * (H._READ_CHUNK * 4))
+    clock = iter(range(100))
+    monkeypatch.setattr(H.time, "monotonic", lambda: next(clock))
+    # deadline 1.5: the pre-open check reads 0, the first chunk check 1, the
+    # second chunk check 2 -> over budget mid-file.
+    _digest, kind = H._identity("big.md", p, H._READ_CHUNK * 4, 0, 1.5)
+    assert kind == "budget"
+
+
+def test_scan_within_matches_an_in_process_scan(tmp_path):
+    d = tmp_path / "h"
+    _write(d, "a.md", "one")
+    _write(d, "b.md", "two")
+    _write(d, "b-REPLY.md")
+    fd = os.open(os.fsencode(d) + b"/bad-\xff.md", os.O_WRONLY | os.O_CREAT, 0o644)
+    os.close(fd)
+    assert H.scan_within(d) == H.scan(d)
+
+
+def test_scan_within_raises_scantimeout_on_a_hung_scan(tmp_path, monkeypatch):
+    import time as _time
+
+    d = tmp_path / "h"
+    _write(d, "a.md")
+    monkeypatch.setattr(H, "scan", lambda *a, **k: _time.sleep(30))
+    start = _time.monotonic()
+    with pytest.raises(H.ScanTimeout):
+        H.scan_within(d, timeout_s=0.5)
+    assert _time.monotonic() - start < 5
+
+
+def test_hung_worker_does_not_hold_the_callers_stdout_open(tmp_path):
+    """The harness reads the hook's stdout to EOF; the worker must not keep it open.
+
+    A worker stuck in uninterruptible I/O on a hung mount survives SIGKILL until
+    the I/O returns, so it would hold every inherited fd. That state cannot be
+    built in a test, so the proxy is a DESCENDANT the SIGKILL does not reach: it
+    inherits exactly the worker's stdio, and outlives the kill the same way.
+    """
+    import subprocess
+    import sys
+    import time as _time
+
+    code = (
+        "import subprocess, time\n"
+        "from pathlib import Path\n"
+        "from genesis.session_awareness import handoffs as H\n"
+        "H.scan = lambda *a, **k: (subprocess.Popen(['sleep', '15']), time.sleep(30))\n"
+        "try:\n"
+        f"    H.scan_within(Path({str(tmp_path)!r}), timeout_s=0.5)\n"
+        "except H.ScanTimeout:\n"
+        "    print('TIMED-OUT-LOUDLY', flush=True)\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(Path(H.__file__).parents[2]))
+    start = _time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=60
+    )
+    elapsed = _time.monotonic() - start
+    assert "TIMED-OUT-LOUDLY" in proc.stdout, proc.stderr
+    assert elapsed < 10, f"caller's pipes held open for {elapsed:.1f}s by the worker"
+
+
+def test_scan_timeout_leaves_margin_inside_the_hook_timeout():
+    """The hard bound must fire, and the hook print, before the harness kills it."""
+    settings = json.loads(
+        (Path(H.__file__).parents[3] / ".claude" / "settings.json").read_text()
+    )
+    timeouts = [
+        h.get("timeout")
+        for group in settings["hooks"]["SessionStart"]
+        for h in group["hooks"]
+        if "surface_handoffs.py" in h.get("command", "")
+    ]
+    assert timeouts, "surface_handoffs.py is not wired at SessionStart"
+    assert all(t - H.SCAN_TIMEOUT_S >= 3 for t in timeouts), timeouts
+    assert H.HASH_BUDGET_S < H.SCAN_TIMEOUT_S
+
+
+# ── round 2: handled-state identity is canonical ────────────────────────────
+
+
+def test_relative_dir_is_rejected_not_resolved_against_cwd(monkeypatch):
+    monkeypatch.delenv("GENESIS_HANDOFFS_DISABLED", raising=False)
+    with pytest.raises(H.HandoffConfigError):
+        H.configured_dir({"dir": "shared/handoffs"})
+
+
+def test_configured_dir_is_normalized(monkeypatch):
+    monkeypatch.delenv("GENESIS_HANDOFFS_DISABLED", raising=False)
+    assert H.configured_dir({"dir": "/srv/a/../b/"}) == Path("/srv/b")
+
+
+def test_handled_records_are_namespaced_by_directory(tmp_path, state):
+    """A record made against A never suppresses an identical handoff in B."""
+    a, b = tmp_path / "A", tmp_path / "B"
+    _write(a, "note.md", "same body")
+    _write(b, "note.md", "same body")
+    H.mark_handled(H.scan(a), "note.md", "done in A", path=state)
+    assert H.scan(a).handoffs[0].id == H.scan(b).handoffs[0].id  # the hazard is real
+    assert H.unhandled(H.scan(a), H.load_handled(a, state)) == []
+    assert [h.name for h in H.unhandled(H.scan(b), H.load_handled(b, state))] == ["note.md"]
+
+
+def test_marking_in_one_directory_never_prunes_another(tmp_path, state):
+    a, b = tmp_path / "A", tmp_path / "B"
+    _write(a, "only-in-a.md")
+    _write(b, "only-in-b.md")
+    H.mark_handled(H.scan(a), "only-in-a.md", "a", path=state)
+    H.mark_handled(H.scan(b), "only-in-b.md", "b", path=state)
+    assert [v["note"] for v in H.load_handled(a, state).values()] == ["a"]
+    assert [v["note"] for v in H.load_handled(b, state).values()] == ["b"]
+
+
+_HEX = "a" * 64
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"version": 2, "sources": {"/x": {_HEX: {}}}},  # empty record
+        {"version": 2, "sources": {"/x": {_HEX: "done"}}},  # non-dict record
+        {"version": 2, "sources": {"/x": {_HEX: {"name": "a.md", "handled_at": "t"}}}},
+        {"version": 2, "sources": {"/x": {_HEX: {"name": "", "handled_at": "t", "note": "n"}}}},
+        {"version": 2, "sources": {"/x": {"abc": {"name": "a", "handled_at": "t", "note": "n"}}}},
+        {"version": 2, "sources": {"rel": {}}},  # relative source
+        {"version": 2, "sources": {"/x": []}},
+        {"version": 2, "sources": []},
+        {"version": 1, "handled": {}},  # unsupported version
+        [],
+    ],
+)
+def test_malformed_state_raises_and_is_never_overwritten(tmp_path, state, doc):
+    state.parent.mkdir(parents=True)
+    raw = json.dumps(doc)
+    state.write_text(raw)
+    d = tmp_path / "h"
+    _write(d, "a.md")
+    with pytest.raises(H.StateError):
+        H.load_handled(d, state)
+    with pytest.raises(H.StateError):
+        H.mark_handled(H.scan(d), "a.md", "x", path=state)
+    assert state.read_text() == raw
+
+
+def test_a_valid_state_round_trips(tmp_path, state):
+    d = tmp_path / "h"
+    _write(d, "a.md")
+    H.mark_handled(H.scan(d), "a.md", "ok", path=state)
+    doc = json.loads(state.read_text())
+    assert doc["version"] == H.STATE_VERSION
+    assert H._validate_state(doc) == doc["sources"]
+
+
+def test_an_unreadable_handoff_is_loud_not_absent(tmp_path):
+    """A peer file this install cannot open must never render as "no handoffs"."""
+    d = tmp_path / "h"
+    p = _write(d, "secret.md")
+    os.chmod(p, 0)
+    try:
+        if os.access(p, os.R_OK):
+            pytest.skip("running as a user that ignores file modes")
+        result = H.scan(d)
+    finally:
+        os.chmod(p, 0o644)
+    assert result.unreadable == 1 and not result.handoffs
+    text = H.render_session_block(result, [], _NOW)
+    assert "could not be read" in text and "UNKNOWN" in text
