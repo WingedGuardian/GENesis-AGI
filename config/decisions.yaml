@@ -1,4 +1,6 @@
-# Decision question registry — every bounded-choice decision Genesis makes.
+# Decision question registry — the home for every bounded-choice decision
+# Genesis makes. COVERAGE IS NOT YET COMPLETE: sites are added as they are
+# found, so an enumeration of this file is a floor, not the full set.
 #
 # INCLUSION TEST, and it is structural rather than a value judgment: is the
 # answer drawn from a declarable finite set? If yes it belongs here — including
@@ -23,7 +25,13 @@
 #              and `tie_rule` (inclusive | exclusive — is a score exactly on a band
 #              edge decided, or does it abstain?).
 #
-# A local `decisions.local.yaml` overlay (gitignored) is deep-merged on top.
+# A local `decisions.local.yaml` overlay is deep-merged on top, resolved like
+# every other config overlay: `~/.genesis/config/` first, then a gitignored
+# sibling of this file. An overlay may only OVERRIDE decisions shipped here —
+# it cannot add one, so a decision retired upstream cannot survive in an
+# overlay written before the retirement. The cost is deliberate: once a
+# decision is retired, an overlay that still overrides it fails the load
+# loudly until that entry is removed.
 
 decisions:
 
@@ -193,3 +201,77 @@ decisions:
       legacy: no_volatility_class
     outcome_source: memory_supersession
     owner: memory.store
+
+  # --- ego ---------------------------------------------------------------
+  # The ego's proposal pipeline asks an LLM for one label per draft, in a
+  # batched JSON array (ego/session.py: the reconcile and realist stages).
+  # The verdict LABEL is bounded and registered here. Where a verdict also
+  # names a board item (reaffirm / revise / withdraw carry a target_id), that
+  # id is an open-ended pointer, not part of the answer space.
+  # Call-site default a backend must keep: an invalid label becomes `new`.
+  ego_proposal_reconcile:
+    type: choice
+    instructions: >-
+      How does this proposal draft relate to the items already on the board
+      and to work already covered by active jobs or merged changes?
+    options:
+      new: "nothing on the board or in covered work already does this"
+      reaffirm: "a pending board item already covers it as written"
+      revise: "a board item covers it, and this draft sharpens or updates it"
+      withdraw: "an active job or a merged change already covers the work"
+    consumes: argmax
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: ego.session.reconcile
+
+  # Operations (genesis) ego only, emitted by the realist per proposal and by
+  # reconcile on a `revise`. Call-site behaviour, which a backend must keep:
+  # an absent or invalid label leaves the draft unstamped, and an unstamped
+  # genesis-ego draft is DROPPED (fail-closed); a deterministic domain
+  # classifier forces `develop` for self-modification and autonomous builds
+  # whatever the label says. The prompt's own tie-break is "when in doubt,
+  # develop" (it routes to review and never silently ships).
+  ego_proposal_scope:
+    type: choice
+    instructions: >-
+      Does this proposal operate the running system or develop it? The test is
+      the deliverable: a patch or a patch plan is development, even when the
+      work itself is read-only.
+    options:
+      operate: >-
+        diagnose health or reliability, pull a reversible operational lever,
+        or investigate a specific live defect where the deliverable is
+        escalated findings, even if the trail leads into code
+      develop: >-
+        write or refactor code, change a schema, an install script or a
+        configuration value, or dev-artifact work such as reviewing a change
+        or tracing source to scope a fix
+    consumes: argmax
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: ego.session.scope
+
+  # The realist also rejects zombies (re-proposals with no change in
+  # circumstances) and duplicates of pending or approved items, using the
+  # proposal history. Call-site defaults, which a backend must keep: an
+  # invalid label becomes `pass`, and so does every proposal when the reply
+  # does not parse. An `amend` also carries amended content, which is open
+  # text outside the answer space.
+  ego_proposal_realist:
+    type: choice
+    instructions: >-
+      Given the proposal history, should this proposal go forward as written,
+      go forward amended, or be rejected (not actionable, a zombie re-proposed
+      with no change in circumstances, or a duplicate of a pending or approved
+      item)?
+    options:
+      pass: "sound as written"
+      amend: "worth doing, but the content needs changing"
+      reject: "not actionable, a zombie, or a duplicate"
+    consumes: argmax
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: ego.session.realist

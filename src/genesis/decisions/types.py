@@ -76,8 +76,12 @@ class Verdict(StrEnum):
 
     ACT = "act"
     DECLINE = "decline"
-    #: Inside the dead band (or not in Calibrated mode) — take ``fallback.typed``.
+    #: Inside the dead band, uncalibrated, or Typed mode — take ``fallback.typed``.
     ABSTAIN = "abstain"
+    #: Legacy mode: no decision backend at all — take ``fallback.legacy``.
+    #: Distinct from ABSTAIN because the typed fallback may itself need the
+    #: backend that Legacy mode says is absent.
+    LEGACY = "legacy"
 
 
 #: Closed set for ``tie_rule``: whether a score exactly on a band EDGE is decided
@@ -164,8 +168,10 @@ class DecisionSpec:
     outcome_source: str | None = None
     cardinality_strategy: str | None = None
 
-    def gate(self, p: float, *, mode: Mode | str) -> Verdict:
-        """Turn one score into ACT / DECLINE / ABSTAIN for a thresholding site.
+    def gate(
+        self, p: float | None, *, mode: Mode | str, calibration_version: str | None = None
+    ) -> Verdict:
+        """Turn one score into ACT / DECLINE / ABSTAIN / LEGACY for a thresholding site.
 
         A score near its cut is not repeatable: re-sending the identical
         request to a pinned decision model flipped roughly one near-cut
@@ -175,9 +181,21 @@ class DecisionSpec:
         could reverse. A score exactly on the cut is always inside the band.
 
         ABSTAIN means "take ``fallback.typed``" — the site's behaviour when it
-        may not branch on a probability. That is also what every score gets
-        outside Calibrated mode, where no site may threshold, so ``mode`` is
-        required rather than defaulted.
+        may not branch on a probability. That is also what every score gets in
+        Typed mode, where no site may threshold, and in Calibrated mode when
+        the caller cannot name the calibration the score came from: an
+        unprovenanced number must not branch. LEGACY means "take
+        ``fallback.legacy``" — there is no backend at all. ``mode`` is required
+        rather than defaulted. Use :meth:`fallback_for` to resolve either.
+
+        In Legacy mode ``p`` is not examined at all (pass ``None``).
+
+        Only PRESENCE of ``calibration_version`` (a non-blank string) is
+        enforced here, and only here: ``usable_in`` answers whether a mode
+        permits thresholding at all and does not see provenance, so a site must
+        branch through ``gate()``, never on ``usable_in`` alone. Whether it
+        is the CURRENT calibration for this site needs the calibration store,
+        which does not exist yet; that comparison belongs to it.
 
         ``p`` must be the answer's probability, never its ``value``: a bool is
         rejected so a yes/no answer cannot skip the band as 1.0 or 0.0.
@@ -187,12 +205,21 @@ class DecisionSpec:
         problem = band_problem(self.threshold, self.dead_band, self.tie_rule)
         if problem is not None:
             raise ValueError(f"decision {self.name!r}: {problem}")
+        resolved = Mode(str(mode))
+        if resolved == Mode.LEGACY:
+            # Before the score check: with no backend there IS no score, and a
+            # caller must not have to invent one to learn which fallback to take.
+            return Verdict.LEGACY
         if isinstance(p, bool) or not isinstance(p, numbers.Real):
             raise ValueError(f"score {p!r} is not a probability")
-        p = float(p)
+        try:
+            p = float(p)
+        except (OverflowError, ValueError, TypeError) as exc:  # huge int / Fraction
+            raise ValueError(f"score {p!r} is not a probability") from exc
         if not (0.0 <= p <= 1.0):  # also rejects NaN, which fails every comparison
             raise ValueError(f"score {p!r} is not a probability")
-        if not self.usable_in(mode):
+        provenanced = isinstance(calibration_version, str) and bool(calibration_version.strip())
+        if not self.usable_in(resolved) or not provenanced:
             return Verdict.ABSTAIN
         upper, lower = _band_edges(self.threshold, self.dead_band)
         if self.tie_rule == "inclusive":
@@ -206,6 +233,15 @@ class DecisionSpec:
             if p < lower:
                 return Verdict.DECLINE
         return Verdict.ABSTAIN
+
+    def fallback_for(self, verdict: Verdict | str) -> str:
+        """The declared behaviour a non-acting verdict routes to."""
+        resolved = Verdict(str(verdict))
+        if resolved == Verdict.ABSTAIN:
+            return self.fallback.typed
+        if resolved == Verdict.LEGACY:
+            return self.fallback.legacy
+        raise ValueError(f"verdict {resolved.value!r} is a decision, not a fallback")
 
     def __post_init__(self) -> None:
         """Defensively copy the mappings so "immutable once loaded" is true.
@@ -249,6 +285,10 @@ class DecisionSpec:
         raises ``ValueError`` instead of silently taking the permissive
         branch. Callers resolve mode from install state, which means it
         reaches here as a string more often than as a member.
+
+        This answers "may this CLASS of site branch in this mode?" It does not
+        see calibration provenance; a thresholding site branches through
+        :meth:`gate`, which does.
         """
         resolved = Mode(str(mode))
         if resolved == Mode.CALIBRATED:
@@ -263,9 +303,10 @@ class Decision:
     """A returned answer, carrying the provenance a gate needs to trust it.
 
     ``calibration_version`` is not bookkeeping. A stale calibration is worse
-    than none because it still looks valid, so a gate whose threshold was
-    fitted against a different version must degrade to advisory rather than
-    silently branch on a number from a distribution it never saw.
+    than none because it still looks valid. ``DecisionSpec.gate`` enforces the
+    first half today: a Calibrated-mode score with no version abstains. The
+    second half, refusing a version that is not the site's CURRENT one, needs
+    the calibration store and lands with it.
     """
 
     name: str

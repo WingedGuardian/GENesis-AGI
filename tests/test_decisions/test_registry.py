@@ -357,6 +357,16 @@ def test_duplicate_detection_survives_a_space_before_the_colon():
         _spec(body + "  memory_relationship:\n    owner: other\n")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_user_config(tmp_path, monkeypatch):
+    """The overlay resolver checks ~/.genesis/config first. Point it at an empty
+    per-test dir so a real install's overlay can never leak into a test."""
+    user_dir = tmp_path / "user-config"
+    user_dir.mkdir()
+    monkeypatch.setattr("genesis._config_overlay._user_config_dir", lambda: user_dir)
+    return user_dir
+
+
 def test_local_overlay_deep_merges_a_partial_override(tmp_path):
     """A replace-merge made an overlay supplying one field fail validation for
     every field it did not restate."""
@@ -465,27 +475,29 @@ def test_the_tie_rule_is_a_closed_set(tie):
     ],
 )
 def test_gate_abstains_inside_the_band(p, verdict):
-    assert _gated().gate(p, mode="calibrated") is verdict
+    assert _gated().gate(p, mode="calibrated", calibration_version="cal-v1") is verdict
 
 
 def test_the_tie_rule_decides_scores_exactly_on_a_band_edge():
     """Two-decimal probabilities land exactly on edges; the rule is explicit."""
     inclusive, exclusive = _gated("inclusive"), _gated("exclusive")
-    assert inclusive.gate(0.7, mode="calibrated") is Verdict.ACT
-    assert inclusive.gate(0.5, mode="calibrated") is Verdict.DECLINE
-    assert exclusive.gate(0.7, mode="calibrated") is Verdict.ABSTAIN
-    assert exclusive.gate(0.5, mode="calibrated") is Verdict.ABSTAIN
+    assert inclusive.gate(0.7, mode="calibrated", calibration_version="cal-v1") is Verdict.ACT
+    assert inclusive.gate(0.5, mode="calibrated", calibration_version="cal-v1") is Verdict.DECLINE
+    assert exclusive.gate(0.7, mode="calibrated", calibration_version="cal-v1") is Verdict.ABSTAIN
+    assert exclusive.gate(0.5, mode="calibrated", calibration_version="cal-v1") is Verdict.ABSTAIN
 
 
 @pytest.mark.parametrize("bad", [float("nan"), -0.01, 1.01, float("inf")])
 def test_gate_refuses_a_score_that_is_not_a_probability(bad):
     with pytest.raises(ValueError):
-        _gated().gate(bad, mode="calibrated")
+        _gated().gate(bad, mode="calibrated", calibration_version="cal-v1")
 
 
 def test_gate_is_only_for_thresholding_sites():
     with pytest.raises(ValueError):
-        _spec(_VALID)["memory_relationship"].gate(0.9, mode="calibrated")
+        _spec(_VALID)["memory_relationship"].gate(
+            0.9, mode="calibrated", calibration_version="cal-v1"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -504,26 +516,64 @@ def test_gate_rejects_a_bool_or_non_real_score(bad):
     """A yes/no answer's VALUE passed instead of its probability used to skip
     the band entirely as 1.0 or 0.0."""
     with pytest.raises(ValueError):
-        _gated().gate(bad, mode="calibrated")
+        _gated().gate(bad, mode="calibrated", calibration_version="cal-v1")
 
 
 def test_gate_converts_other_reals_to_float_so_verdicts_match():
     """Fraction(7,10) used to ACT under exclusive where the float 0.7 abstains."""
     ex = _gated("exclusive")
-    assert ex.gate(Fraction(7, 10), mode="calibrated") is ex.gate(0.7, mode="calibrated")
+    assert ex.gate(Fraction(7, 10), mode="calibrated", calibration_version="cal-v1") is ex.gate(
+        0.7, mode="calibrated", calibration_version="cal-v1"
+    )
 
 
 @pytest.mark.parametrize("p,verdict", [(0.0, Verdict.DECLINE), (1.0, Verdict.ACT)])
 def test_gate_accepts_the_closed_unit_interval(p, verdict):
     """A model returning exactly 1.00 must not crash the gate."""
-    assert _gated().gate(p, mode="calibrated") is verdict
+    assert _gated().gate(p, mode="calibrated", calibration_version="cal-v1") is verdict
 
 
-@pytest.mark.parametrize("mode", ["typed", "legacy", Mode.TYPED])
+@pytest.mark.parametrize("mode", ["typed", Mode.TYPED])
 def test_gate_abstains_whenever_the_site_may_not_threshold(mode):
     """No site may branch on a probability outside Calibrated mode."""
-    assert _gated().gate(0.99, mode=mode) is Verdict.ABSTAIN
-    assert _gated().gate(0.01, mode=mode) is Verdict.ABSTAIN
+    for version in (None, "cal-v1"):
+        assert _gated().gate(0.99, mode=mode, calibration_version=version) is Verdict.ABSTAIN
+        assert _gated().gate(0.01, mode=mode, calibration_version=version) is Verdict.ABSTAIN
+
+
+@pytest.mark.parametrize("mode", ["legacy", Mode.LEGACY])
+def test_legacy_mode_routes_to_the_legacy_fallback_not_the_typed_one(mode):
+    """ABSTAIN means fallback.typed, which may need the backend Legacy lacks."""
+    spec = _gated()
+    for p in (0.99, 0.6, 0.01):
+        verdict = spec.gate(p, mode=mode, calibration_version="cal-v1")
+        assert verdict is Verdict.LEGACY
+        assert spec.fallback_for(verdict) == spec.fallback.legacy
+    assert spec.fallback_for(Verdict.ABSTAIN) == spec.fallback.typed
+    assert spec.fallback.typed != spec.fallback.legacy, "fixture must tell them apart"
+
+
+@pytest.mark.parametrize("version", [None, ""])
+def test_calibrated_mode_without_a_calibration_version_may_not_branch(version):
+    """A score nobody can trace to a calibration abstains, even far from the cut."""
+    spec = _gated()
+    assert spec.gate(0.99, mode="calibrated", calibration_version=version) is Verdict.ABSTAIN
+    assert spec.gate(0.01, mode="calibrated", calibration_version=version) is Verdict.ABSTAIN
+    assert spec.gate(0.99, mode="calibrated", calibration_version="cal-v1") is Verdict.ACT
+
+
+@pytest.mark.parametrize("verdict", [Verdict.ACT, Verdict.DECLINE])
+def test_fallback_for_refuses_a_deciding_verdict(verdict):
+    with pytest.raises(ValueError, match="decision, not a fallback"):
+        _gated().fallback_for(verdict)
+
+
+@pytest.mark.parametrize("huge", [10**400, Fraction(10**400, 3)])
+def test_an_unconvertible_score_is_a_value_error_not_an_overflow(huge):
+    """float() of a huge int or Fraction raises OverflowError, which would
+    escape a caller handling ValueError as 'invalid probability'."""
+    with pytest.raises(ValueError, match="not a probability"):
+        _gated().gate(huge, mode="calibrated", calibration_version="cal-v1")
 
 
 @pytest.mark.parametrize(
@@ -534,10 +584,10 @@ def test_edges_hold_for_pairs_where_float_addition_is_inexact(cut, band, edge_hi
     """0.85 + 0.07 is 0.9199999999999999 unrounded — an exact 0.92 must still be
     ON the edge, so the tie rule, not float noise, decides it."""
     inc, exc = _gated("inclusive", cut, band), _gated("exclusive", cut, band)
-    assert inc.gate(edge_hi, mode="calibrated") is Verdict.ACT
-    assert inc.gate(edge_lo, mode="calibrated") is Verdict.DECLINE
-    assert exc.gate(edge_hi, mode="calibrated") is Verdict.ABSTAIN
-    assert exc.gate(edge_lo, mode="calibrated") is Verdict.ABSTAIN
+    assert inc.gate(edge_hi, mode="calibrated", calibration_version="cal-v1") is Verdict.ACT
+    assert inc.gate(edge_lo, mode="calibrated", calibration_version="cal-v1") is Verdict.DECLINE
+    assert exc.gate(edge_hi, mode="calibrated", calibration_version="cal-v1") is Verdict.ABSTAIN
+    assert exc.gate(edge_lo, mode="calibrated", calibration_version="cal-v1") is Verdict.ABSTAIN
 
 
 @pytest.mark.parametrize(
@@ -566,7 +616,7 @@ def test_a_directly_constructed_spec_cannot_skip_band_validation(threshold, band
         tie_rule=tie,
     )
     with pytest.raises(ValueError):
-        spec.gate(0.6, mode="calibrated")
+        spec.gate(0.6, mode="calibrated", calibration_version="cal-v1")
 
 
 @pytest.mark.parametrize(
@@ -602,3 +652,265 @@ def test_tie_rule_surrounding_whitespace_is_stripped():
 def test_a_yaml_bool_band_is_rejected_as_a_type_not_a_range():
     with pytest.raises(RegistryError, match="must be a number"):
         _gated(band="true")
+
+
+# ---------------------------------------------------------------------------
+# Loader strictness: every shape below used to load clean while silently
+# dropping or rewriting part of what the author declared.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unknown_top_level_key_is_rejected():
+    """`decision:` beside `decisions:` loaded clean and dropped its contents."""
+    with pytest.raises(RegistryError, match="unknown top-level"):
+        _spec(_VALID + "decision:\n  memory_relationship:\n    owner: lost\n")
+
+
+@pytest.mark.parametrize("key", ["1", "yes", "no", "3.5", "null"])
+def test_a_non_string_decision_name_is_rejected(key):
+    """YAML reads these as int/bool/float/None; str() collided or rewrote them."""
+    body = _VALID.replace("  memory_relationship:", f"  {key}:")
+    with pytest.raises(RegistryError, match="not strings"):
+        _spec(body)
+
+
+def test_quoted_numeric_decision_name_is_accepted():
+    body = _VALID.replace("  memory_relationship:", '  "1":')
+    assert "1" in _spec(body)
+
+
+def test_int_and_string_keys_can_no_longer_collide():
+    """`1` and `"1"` are distinct YAML keys; str() merged them, the later
+    silently replacing the earlier despite the duplicate-key guard."""
+    spec = _VALID.split("decisions:\n", 1)[1]
+    body = (
+        "decisions:\n"
+        + spec.replace("  memory_relationship:", "  1:")
+        + spec.replace("  memory_relationship:", '  "1":')
+    )
+    with pytest.raises(RegistryError, match="not strings"):
+        _spec(body)
+
+
+@pytest.mark.parametrize("key", ["yes", "no", "1", "true"])
+def test_a_non_string_option_key_is_rejected(key):
+    """Bare `no:` became the label "False"."""
+    body = _VALID.replace("      distinct:", f"      {key}:")
+    with pytest.raises(RegistryError, match="not strings"):
+        _spec(body)
+
+
+def test_an_unknown_fallback_key_is_rejected():
+    body = _VALID.replace("      legacy: existing_llm_path", "      legacy: x\n      tyepd: y")
+    with pytest.raises(RegistryError, match="fallback has unknown"):
+        _spec(body)
+
+
+def test_a_misspelled_fallback_key_in_an_overlay_is_not_silently_ignored(tmp_path):
+    """The typo merged beside the shipped `typed:`, so the base value won."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    fallback:\n      tyepd: local_path\n"
+    )
+    with pytest.raises(RegistryError, match="fallback has unknown"):
+        load_registry(base)
+
+
+def test_an_overlay_cannot_add_a_decision_the_base_does_not_ship(tmp_path):
+    """A decision retired upstream must not survive in an old overlay."""
+    from genesis.decisions.registry import load_registry
+
+    retired = _VALID.split("decisions:\n", 1)[1].replace("memory_relationship", "retired_site")
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text("decisions:\n" + retired)
+    with pytest.raises(RegistryError, match="retired_site"):
+        load_registry(base)
+
+
+def test_an_overlay_misspelled_top_level_key_is_rejected(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decision:\n  memory_relationship:\n    owner: lost\n"
+    )
+    with pytest.raises(RegistryError, match="unknown top-level"):
+        load_registry(base)
+
+
+@pytest.mark.parametrize("root", ["[]", "false", "0", '""'])
+def test_a_falsy_non_mapping_overlay_is_an_error_not_no_overrides(tmp_path, root):
+    """`or {}` turned these into "no overrides" without a word."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(root + "\n")
+    with pytest.raises(RegistryError, match="must be a mapping"):
+        load_registry(base)
+
+
+@pytest.mark.parametrize("empty", ["", "# nothing yet\n", "null\n"])
+def test_an_empty_overlay_means_no_overrides(tmp_path, empty):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(empty)
+    assert load_registry(base)["memory_relationship"].owner == "memory.relationship_classifier"
+
+
+def test_the_overlay_is_found_in_the_user_config_dir_first(tmp_path, _isolated_user_config):
+    """Settings writers put overlays in ~/.genesis/config; a sibling-only lookup
+    ignored every override stored there."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    owner: sibling\n"
+    )
+    (_isolated_user_config / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    owner: user_dir\n"
+    )
+    assert load_registry(base)["memory_relationship"].owner == "user_dir"
+
+
+def test_the_shipped_registry_loads():
+    """The real config must satisfy every rule above."""
+    from pathlib import Path
+
+    from genesis.decisions.registry import load_registry
+
+    root = Path(__file__).resolve().parents[2]
+    reg = load_registry(root / "config" / "decisions.yaml")
+    assert {"ego_proposal_reconcile", "ego_proposal_scope", "ego_proposal_realist"} <= set(reg)
+
+
+# ---------------------------------------------------------------------------
+# Round-1 audit: the value-side sibling of the non-string-key bug, plus gate
+# ordering and provenance holes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("    owner: memory.relationship_classifier", "    owner: yes"),
+        ('    instructions: "How does Note B relate to Note A?"', "    instructions: [a]"),
+        ('      distinct: "unrelated, or independently true"', "      distinct: null"),
+        ('      distinct: "unrelated, or independently true"', "      distinct: [1, 2]"),
+        ("      typed: argmax_advisory", "      typed: yes"),
+        ("      legacy: existing_llm_path", "      legacy: 1"),
+        ("    outcome_source: ledger_predictions", "    outcome_source: yes"),
+        ("    outcome_source: ledger_predictions", "    outcome_source: 0"),
+        ("    outcome_source: ledger_predictions", "    outcome_source: false"),
+    ],
+)
+def test_a_non_string_text_field_is_rejected_not_stringified(old, new):
+    """str() turned `owner: yes` into "True" and `outcome_source: 0` into None."""
+    assert old in _VALID
+    with pytest.raises(RegistryError, match="must be a non-empty string"):
+        _spec(_VALID.replace(old, new))
+
+
+def test_an_absent_outcome_source_is_still_allowed():
+    body = _VALID.replace("    outcome_source: ledger_predictions\n", "")
+    assert _spec(body)["memory_relationship"].outcome_source is None
+
+
+_SCORE = """
+decisions:
+  difficulty:
+    type: score
+    instructions: "How hard is this?"
+    criteria: CRIT
+    consumes: ordering
+    fallback:
+      typed: rank_advisory
+      legacy: static
+    owner: routing.router
+"""
+
+
+@pytest.mark.parametrize("crit", ["[yes, no]", '[1, "1"]', "[low, null]"])
+def test_non_string_criteria_are_rejected(crit):
+    with pytest.raises(RegistryError, match="must be a non-empty string"):
+        _spec(_SCORE.replace("CRIT", crit))
+
+
+def test_duplicate_criteria_levels_are_rejected():
+    with pytest.raises(RegistryError, match="distinct levels"):
+        _spec(_SCORE.replace("CRIT", "[low, low, high]"))
+
+
+def test_distinct_string_criteria_are_accepted():
+    assert _spec(_SCORE.replace("CRIT", "[low, high]"))["difficulty"].criteria == ("low", "high")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "    thrshold: 1\n    1: z\n",  # mixed str/int unknown spec keys
+    ],
+)
+def test_mixed_type_unknown_keys_raise_registry_error_not_type_error(extra):
+    """sorted() over {str, int} raised TypeError, escaping RegistryError handlers."""
+    body = _VALID.replace("    consumes: argmax\n", "    consumes: argmax\n" + extra)
+    with pytest.raises(RegistryError, match="unknown key"):
+        _spec(body)
+
+
+def test_mixed_type_unknown_fallback_keys_raise_registry_error():
+    body = _VALID.replace(
+        "      legacy: existing_llm_path",
+        "      legacy: existing_llm_path\n      tyepd: q\n      1: z",
+    )
+    with pytest.raises(RegistryError, match="fallback has unknown"):
+        _spec(body)
+
+
+def test_an_overlay_cannot_delete_an_option_by_nulling_it(tmp_path):
+    """Deep-merge kept the key and str() made its description "None"."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    options:\n      distinct: null\n"
+    )
+    with pytest.raises(RegistryError, match="must be a non-empty string"):
+        load_registry(base)
+
+
+def test_an_overlay_nulling_decisions_says_so(tmp_path):
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(_VALID)
+    (tmp_path / "decisions.local.yaml").write_text("decisions: null\n")
+    with pytest.raises(RegistryError, match="set to null"):
+        load_registry(base)
+
+
+@pytest.mark.parametrize("p", [None, "n/a", float("nan"), 7])
+def test_legacy_mode_needs_no_score(p):
+    """No backend means no score; the caller must not have to invent one."""
+    assert _gated().gate(p, mode="legacy") is Verdict.LEGACY
+
+
+def test_a_bad_score_still_raises_outside_legacy_mode():
+    with pytest.raises(ValueError, match="not a probability"):
+        _gated().gate(None, mode="calibrated", calibration_version="cal-v1")
+
+
+@pytest.mark.parametrize("version", [" ", "\t", 1, 1.0, True, b"cal-v1"])
+def test_a_blank_or_non_string_calibration_version_does_not_count(version):
+    """`not version` let " " and 1 through to ACT."""
+    spec = _gated()
+    assert spec.gate(0.99, mode="calibrated", calibration_version=version) is Verdict.ABSTAIN

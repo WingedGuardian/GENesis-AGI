@@ -27,6 +27,7 @@ from typing import Any
 
 import yaml
 
+from genesis._config_overlay import _resolve_overlay_path
 from genesis.decisions.types import (
     CARDINALITY_SOFT_CAP,
     Consumes,
@@ -81,11 +82,46 @@ _ALLOWED_KEYS = frozenset(
 _STRATEGIES = frozenset({"shortlist", "hierarchical"})
 
 
+def _require_string_keys(owner: str, kind: str, mapping: Mapping[Any, Any]) -> None:
+    """Refuse non-string keys rather than canonicalise them with ``str()``.
+
+    YAML resolves ``1`` to an int and bare ``yes`` / ``no`` to booleans, so
+    ``str()`` both collides distinct keys (``1`` and ``"1"`` become one entry,
+    the later silently replacing the earlier) and rewrites labels (``no``
+    becomes ``"False"``). Quote the key instead.
+    """
+    bad = [k for k in mapping if not isinstance(k, str)]
+    if bad:
+        raise RegistryError(
+            f"{owner}: {kind} key(s) {bad!r} are not strings — quote them; YAML "
+            "reads bare numbers and yes/no as non-strings"
+        )
+
+
+def _text(name: str, field: str, value: Any, *, required: bool = True) -> str | None:
+    """A text field, which must BE text. The sibling of `_require_string_keys`.
+
+    ``str()`` on a value rewrote exactly as it did on keys: ``owner: yes``
+    became ``"True"``, an overlay's ``skip: null`` became the description
+    ``"None"``, and ``outcome_source: 0`` quietly became no source at all.
+    """
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        _fail(
+            name,
+            f"{field}={value!r} must be a non-empty string — quote it; YAML reads "
+            "bare yes/no/numbers/null as non-strings, and an overlay cannot delete "
+            "a field by setting it to null",
+        )
+    return value.strip()
+
+
 def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
     if not isinstance(raw, Mapping):
         _fail(name, "spec must be a mapping")
 
-    unknown = sorted(set(raw) - _ALLOWED_KEYS)
+    unknown = sorted(str(k) for k in set(raw) - _ALLOWED_KEYS)
     if unknown:
         _fail(
             name,
@@ -97,15 +133,16 @@ def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
     qtype = _enum(name, "type", raw.get("type"), QuestionType)
     consumes = _enum(name, "consumes", raw.get("consumes"), Consumes)
 
-    instructions = str(raw.get("instructions") or "").strip()
-    if not instructions:
-        _fail(name, "instructions are required — the wording IS the capability")
-
-    owner = str(raw.get("owner") or "").strip()
-    if not owner:
-        _fail(name, "owner is required so a finding can be routed")
+    # The wording IS the capability; the owner is where a finding gets routed.
+    instructions = _text(name, "instructions", raw.get("instructions"))
+    owner = _text(name, "owner", raw.get("owner"))
 
     fb = raw.get("fallback")
+    if isinstance(fb, Mapping) and set(fb) - {"typed", "legacy"}:
+        # An overlay's misspelled `tyepd:` merges beside the shipped `typed:`,
+        # so without this the intended local fallback silently never applies.
+        extra = sorted(str(k) for k in set(fb) - {"typed", "legacy"})
+        _fail(name, f"fallback has unknown key(s) {extra}")
     if not isinstance(fb, Mapping) or not fb.get("typed") or not fb.get("legacy"):
         _fail(
             name,
@@ -113,7 +150,10 @@ def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
             "cannot say what it does without a model is not ready to be a "
             "decision site",
         )
-    fallback = Fallback(typed=str(fb["typed"]), legacy=str(fb["legacy"]))
+    fallback = Fallback(
+        typed=_text(name, "fallback.typed", fb["typed"]),
+        legacy=_text(name, "fallback.legacy", fb["legacy"]),
+    )
 
     options: Mapping[str, str] = MappingProxyType({})
     criteria: tuple[str, ...] = ()
@@ -125,14 +165,18 @@ def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
         opts = raw.get("options")
         if not isinstance(opts, Mapping) or len(opts) < 2:
             _fail(name, "a choice needs an options mapping with at least 2 entries")
-        options = MappingProxyType({str(k): str(v) for k, v in opts.items()})
+        _require_string_keys(name, "option", opts)
+        options = MappingProxyType({k: _text(name, f"options.{k}", v) for k, v in opts.items()})
     elif qtype is QuestionType.SCORE:
         if raw.get("options") is not None:
             _fail(name, "a score declares criteria, not options")
         crit = raw.get("criteria")
         if not isinstance(crit, (list, tuple)) or len(crit) < 2:
             _fail(name, "a score needs an ordered criteria list with at least 2 levels")
-        criteria = tuple(str(x) for x in crit)
+        criteria = tuple(_text(name, f"criteria[{i}]", x) for i, x in enumerate(crit))
+        if len(set(criteria)) != len(criteria):
+            # Two identical levels make the ordinal answer ambiguous.
+            _fail(name, f"criteria must be distinct levels; got {list(criteria)}")
     else:  # NOUL
         if raw.get("options") is not None or raw.get("criteria") is not None:
             _fail(name, "a noul is binary and must not declare options or criteria")
@@ -234,22 +278,39 @@ def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
         dead_band=dead_band if consumes is Consumes.THRESHOLD else None,
         tie_rule=tie_rule if consumes is Consumes.THRESHOLD else None,
         latency_budget_ms=budget,
-        outcome_source=(str(raw["outcome_source"]) if raw.get("outcome_source") else None),
+        outcome_source=_text(name, "outcome_source", raw.get("outcome_source"), required=False),
         cardinality_strategy=str(strategy) if strategy else None,
     )
 
 
-def _parse(raw: Any) -> Mapping[str, DecisionSpec]:
+#: The only top-level key. A misspelled `decision:` beside the real one would
+#: otherwise load clean while everything under it is dropped.
+_TOP_LEVEL_KEYS = frozenset({"decisions"})
+
+
+def _check_root(raw: Any, where: str) -> Mapping[str, Any]:
     if not isinstance(raw, Mapping):
-        raise RegistryError("registry must be a mapping with a 'decisions' key")
+        raise RegistryError(f"{where} must be a mapping with a 'decisions' key")
+    unknown = sorted(str(k) for k in set(raw) - _TOP_LEVEL_KEYS)
+    if unknown:
+        raise RegistryError(f"{where} has unknown top-level key(s) {unknown}; allowed: decisions")
+    return raw
+
+
+def _parse(raw: Any) -> Mapping[str, DecisionSpec]:
+    raw = _check_root(raw, "registry")
     decisions = raw.get("decisions")
     if decisions is None:
-        raise RegistryError("registry has no 'decisions' key")
+        raise RegistryError(
+            "registry has no 'decisions' mapping (missing, or set to null — an "
+            "overlay cannot clear the shipped decisions)"
+        )
     if not isinstance(decisions, Mapping):
         raise RegistryError("'decisions' must be a mapping of name -> spec")
+    _require_string_keys("registry", "decision", decisions)
     out: dict[str, DecisionSpec] = {}
     for name, spec in decisions.items():
-        out[str(name)] = _parse_one(str(name), spec)
+        out[name] = _parse_one(name, spec)
     return MappingProxyType(out)
 
 
@@ -307,20 +368,36 @@ def load_registry_from_string(text: str) -> Mapping[str, DecisionSpec]:
 
 
 def load_registry(path: str | Path) -> Mapping[str, DecisionSpec]:
-    """Load ``path``, deep-merging a sibling ``{stem}.local.yaml`` if present.
+    """Load ``path``, deep-merging its ``{stem}.local.yaml`` overlay if present.
 
-    The overlay is parsed with the same strict loader as the base, so a
-    duplicate id inside the overlay is caught too — scanning only the base
-    left exactly half the surface unchecked.
+    The overlay is FOUND by the shared resolver, so it lives where every other
+    config overlay does (``~/.genesis/config/`` first, then a repo sibling) and
+    where the settings writers put it. It is PARSED strictly, unlike the shared
+    merge, which degrades a bad overlay to a warning: a registry that silently
+    drops an override has changed a gate's behaviour without saying so.
+
+    An overlay may override shipped decisions but never add one, so a decision
+    retired upstream cannot be resurrected by an overlay written before it was
+    retired.
     """
     path = Path(path)
-    base = yaml.load(path.read_text(), Loader=_StrictLoader) or {}  # noqa: S506
+    base = _check_root(yaml.load(path.read_text(), Loader=_StrictLoader), path.name)  # noqa: S506
 
-    overlay_path = path.with_name(f"{path.stem}.local{path.suffix}")
-    if overlay_path.exists():
-        overlay = yaml.load(overlay_path.read_text(), Loader=_StrictLoader) or {}  # noqa: S506
-        if not isinstance(overlay, Mapping):
-            raise RegistryError(f"{overlay_path.name} must be a mapping")
-        base = _deep_merge(base, overlay)
+    overlay_path = _resolve_overlay_path(path)
+    if overlay_path.is_file():
+        overlay = yaml.load(overlay_path.read_text(), Loader=_StrictLoader)  # noqa: S506
+        if overlay is not None:  # an empty file is "no overrides"; [] / false / 0 are errors
+            overlay = _check_root(overlay, overlay_path.name)
+            shipped = base.get("decisions")
+            added = overlay.get("decisions")
+            if isinstance(shipped, Mapping) and isinstance(added, Mapping):
+                extra = sorted(str(k) for k in set(added) - set(shipped))
+                if extra:
+                    raise RegistryError(
+                        f"{overlay_path.name} overrides decision(s) {extra} that the "
+                        "shipped registry does not define — an overlay may only "
+                        "override, so a retired decision cannot come back through it"
+                    )
+            base = _deep_merge(base, overlay)
 
     return _parse(base)
