@@ -255,6 +255,19 @@ def read_internal_api_token() -> str | None:
         return None
 
 
+def bearer_token(name: str) -> str:
+    """Return an operator-configured bearer token, or ``""`` when unconfigured.
+
+    THE one reader for ``GENESIS_MCP_HTTP_TOKEN`` and ``GENESIS_DESK_TOKEN``.
+    Stripped, so a quoted whitespace-only value in secrets.env counts as
+    unconfigured everywhere. That agreement is the point (#2110): three readers
+    once disagreed, and a whitespace-only value became the literal MCP HTTP
+    secret while the dashboard treated the same value as absent. A test locks
+    every other raw read of these names out of ``src/`` and ``scripts/``.
+    """
+    return os.environ.get(name, "").strip()
+
+
 def memory_writebacks_off() -> bool:
     """True when retrieval write-backs (retrieved_count / last_retrieved_at
     bumps on recall) must be suppressed.

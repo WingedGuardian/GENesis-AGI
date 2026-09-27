@@ -545,6 +545,22 @@ def _fastmcp_version() -> str:
         return "unknown"
 
 
+def _resolve_http_auth_token(cli_token: str | None) -> str:
+    """The HTTP transport's bearer token: ``--auth-token`` if given, else the env.
+
+    Both are stripped, so a whitespace-only value is unconfigured here exactly as
+    it is on the dashboard's /v1 routes (#2110). Before this, a quoted "   " in
+    secrets.env became the literal MCP secret while the dashboard read the same
+    value as absent.
+
+    Reads ONLY ``GENESIS_MCP_HTTP_TOKEN``. The desk-scoped token must never reach
+    this transport, which exposes the full MCP tool surface (#2442).
+    """
+    from genesis.env import bearer_token
+
+    return (cli_token or "").strip() or bearer_token("GENESIS_MCP_HTTP_TOKEN")
+
+
 def _bearer_auth_middleware(expected_token: str):
     """Create a raw ASGI middleware for bearer token auth.
 
@@ -670,7 +686,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # HTTP transport: validate auth token is configured
     if args.transport == "streamable-http":
-        token = args.auth_token or os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
+        token = _resolve_http_auth_token(args.auth_token)
         if not token:
             logger.error(
                 "HTTP transport requires auth token. Set GENESIS_MCP_HTTP_TOKEN "

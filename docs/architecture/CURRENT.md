@@ -1185,7 +1185,13 @@ verified: d0627c854 2026-09-11
   `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
   OpenAI-compatible surface that routes each turn through `ModelRouter` on two
   lanes rather than spawning a CC subprocess, so a desktop client holds no model
-  credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an
+  credential. Bearer-authed with `GENESIS_DESK_TOKEN`, which opens this route
+  and no other `/v1` route or the MCP transport, so the credential a desktop
+  client holds cannot execute tools, write memory or start Claude Code; the
+  broad `GENESIS_MCP_HTTP_TOKEN` is still accepted here during a transition.
+  A client that ALSO calls a `/v1/voice/*` route (e.g. `tool_call` for memory
+  recall) still needs the broad token there; voice has no scoped token yet.
+  All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
 - **browser/**: profile/state layer only (persistent
