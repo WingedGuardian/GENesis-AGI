@@ -429,3 +429,15 @@ def test_the_secrets_panel_keeps_raw_truthiness_for_other_keys(monkeypatch):
 
     monkeypatch.setenv("API_KEY_EXAMPLE_FOR_TEST", "   ")
     assert _key_status("API_KEY_EXAMPLE_FOR_TEST") == "configured"
+
+
+@pytest.mark.parametrize("name", [_BROAD, _DESK])
+def test_a_bearer_token_can_be_revoked_from_the_secrets_editor(name):
+    """Both bearer tokens are optional: unset disables their routes. The editor only
+    lets an operator clear a key the template ships commented, so a leaked desk
+    token must be revocable there, not only by hand-editing secrets.env."""
+    from genesis.dashboard.routes.secrets import _parse_example_file
+
+    by_key = {d.key: d for d in _parse_example_file()}
+    assert by_key[name].is_optional_override is True
+    assert by_key[name].is_sensitive is True
