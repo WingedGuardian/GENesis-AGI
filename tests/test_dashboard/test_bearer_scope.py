@@ -403,3 +403,29 @@ def test_the_lock_allows_the_sanctioned_forms(snippet):
     """Positive control: without it, a lock that flagged everything would pass the
     repo scan only by failing — and would be deleted by the next person it annoys."""
     assert not _token_name_misuses(snippet), snippet
+
+
+# ── the secrets panel reports what the gate will do (#2466) ────────────────────
+
+
+@pytest.mark.parametrize("name", [_BROAD, _DESK])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("   ", "not_set"), ("\t\n", "not_set"), ("", "not_set"), ("tok", "configured"), ("  tok ", "configured")],
+)
+def test_the_secrets_panel_never_calls_a_blank_bearer_token_configured(monkeypatch, name, value, expected):
+    """A whitespace-only bearer token is unset at its reader, so the panel must not show
+    it as configured while the route answers 503."""
+    from genesis.dashboard.routes.secrets import _key_status
+
+    monkeypatch.setenv(name, value)
+    assert _key_status(name) == expected
+
+
+def test_the_secrets_panel_keeps_raw_truthiness_for_other_keys(monkeypatch):
+    """Provider readers do not strip, so a whitespace-only provider key is still live at
+    runtime; the panel must keep calling it configured (and so keep checking its breaker)."""
+    from genesis.dashboard.routes.secrets import _key_status
+
+    monkeypatch.setenv("API_KEY_EXAMPLE_FOR_TEST", "   ")
+    assert _key_status("API_KEY_EXAMPLE_FOR_TEST") == "configured"
