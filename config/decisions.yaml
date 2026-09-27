@@ -137,3 +137,56 @@ decisions:
       typed: argmax_advisory
       legacy: skill_injection_hook
     owner: skills.injection
+
+  # --- memory lifecycle -------------------------------------------------
+  # D3 — does a recalled memory apply to the task at hand? Off the per-prompt
+  # hook path (that hook already runs close to its time budget); used where a
+  # recall is explicit or asynchronous. The REWRITE of a partially-applying
+  # memory stays with an LLM — this gate only decides.
+  #
+  # Training labels exist (LLM-judge relevance grades on past recalls), but
+  # judge labels teach the model to imitate the judge and carry the judge's
+  # miscalibration. They may train the adapter; they must never fit its
+  # calibration. An outcome signal (was the injected memory used, corrected,
+  # or ignored?) is required before this site may threshold.
+  recall_applies:
+    type: choice
+    instructions: >-
+      Given the current task and a memory recalled for it, does the memory
+      apply to this task?
+    options:
+      applies: "directly relevant and correct for this task as written"
+      partially: "relevant, but needs adapting before it holds here"
+      does_not_transfer: "about a different situation; misleading if applied"
+    consumes: argmax
+    latency_budget_ms: 3000
+    fallback:
+      typed: argmax_advisory
+      legacy: inject_unfiltered
+    outcome_source: recall_usage_outcomes
+    owner: memory.recall
+
+  # D5 — how quickly will this memory go stale? Assigned at write time,
+  # asynchronously. Expiry policy is label + re-verify, never delete: the
+  # class decides WHEN a memory is re-checked, not whether it survives.
+  #
+  # The outcome signal is unusually clean for this site: whether a memory is
+  # later superseded or deprecated is recorded by the memory store itself, so
+  # the label a class predicted can be graded against what actually happened.
+  memory_volatility:
+    type: choice
+    instructions: >-
+      How long is this memory likely to stay true without being replaced?
+    options:
+      ephemeral_state: "a transient condition; stale within hours or days"
+      project_status: "the state of ongoing work; changes as the work moves"
+      preference: "a stated taste or choice; stable but can change"
+      decision: "a ruling that holds until explicitly revisited"
+      durable_fact: "true for the foreseeable future"
+    consumes: argmax
+    latency_budget_ms: 5000
+    fallback:
+      typed: argmax_advisory
+      legacy: no_volatility_class
+    outcome_source: memory_supersession
+    owner: memory.store
