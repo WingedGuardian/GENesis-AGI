@@ -1804,12 +1804,26 @@ async function loadSurplusDetail(container) {
             // Provider freshness
             for (const p of providers) {
                 const row = el('div', 'surplus-task-row');
-                row.appendChild(el('span', 'task-type', p.provider));
-                const age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
-                const ageColor = p.stale ? '#ef4444' : p.days_ago > 14 ? '#fbbf24' : '#4ade80';
+                row.appendChild(el('span', 'task-type', p.profile && p.profile !== p.provider ? `${p.provider} / ${p.profile}` : p.provider));
+                // A manual or superseded profile is never expected to re-run, so
+                // its age is informational (grey), not an overdue warning.
+                const notRecurring = p.scheduled === false || p.superseded === true;
+                let age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
+                if (p.superseded) age += ' · superseded';
+                else if (p.scheduled === false) age += ' · manual';
+                const ageColor = p.stale ? '#ef4444' : notRecurring ? '#94a3b8' : p.days_ago > 14 ? '#fbbf24' : '#4ade80';
                 const ageEl = el('span', 'task-time', age);
                 ageEl.style.color = ageColor;
                 row.appendChild(ageEl);
+                // Scored wrong answers over the recent window, kept apart from
+                // the infrastructural share that drives the unreliable badge.
+                const recent = p.recent || {};
+                if (recent.failure_rate != null && (recent.passed || recent.failed)) {
+                    const failEl = el('span', 'task-time', `fail ${Math.round(recent.failure_rate * 100)}%`);
+                    failEl.title = `${recent.failed} wrong / ${recent.passed + recent.failed} scored in the last ${recent.window_days}d of runs; ` +
+                        `infra ${Math.round((recent.infra_rate || 0) * 100)}% (skips + provider errors)`;
+                    row.appendChild(failEl);
+                }
                 if (p.unreliable) {
                     const badge = el('span', 'follow-up-badge failed', 'unreliable');
                     row.appendChild(badge);
