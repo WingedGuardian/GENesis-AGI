@@ -47,6 +47,25 @@ REQUIRED workflow — ``merge_gate.required_ci_workflows`` in genesis.yaml, defa
 genuinely needs several appends several (one trailing comment may carry multiple
 sigils).
 
+The routine PUBLISH prompt is install-tunable (the blocks are not)
+----------------------------------------------------------------
+``hooks.asks.push_publish: off`` in ``~/.genesis/config/genesis.yaml`` removes the
+first-push approval for ONE shape of push: a plain update of the current branch,
+where the whole command is one bare ``git push`` (optionally ``git -C <path>
+push``; ``_command_is_a_bare_push``, a closed character set on the raw text),
+the repository's push config does not remap the ref, and every push url names
+the install's DECLARED public repository (``_push_dest_is_public_repo``). In its
+place the hook emits NO permission decision, only ``additionalContext`` naming the
+setting — it stops objecting, it does not approve. Other hooks and Claude Code's
+own permission settings decide the command as they would have without this
+hook's prompt; nothing is ever approved by a setting that was only about the
+push. Nothing else moves: every hard block, the force-push ask, the two
+PR-hygiene asks (no-open-PR, close-then-push), a push to any other remote, URL or
+path, any compound command, and a ``gh pr create`` that would push on its own
+all keep their verdicts. Classification is by ``ask_class`` at each
+arm, defaulting to None (unsuppressible), so an ask arm added later is safe
+without its author knowing this paragraph exists. See ``hook_ask_policy``.
+
 Hook-surface merge teeth (2026-08-23): a PR whose diff touches the
 ENFORCEMENT-HOOK surface (``_HOOK_SURFACE_PREFIXES``/``_HOOK_SURFACE_FILES`` —
 the code these gates themselves run on) gets stricter freshness handling: its
@@ -200,6 +219,28 @@ try:
     import audit_jsonl  # noqa: E402
 except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-blocking.
     audit_jsonl = None
+
+# SOFT dependency, and the fallback direction is the one that matters: this
+# module can only ever REMOVE an ask, so a version-skewed or absent copy must
+# leave the ask standing. Stubbing it to "nothing is suppressed" makes a
+# half-deployed hook tree behave exactly like a clone with no local config — one
+# extra prompt, never one fewer.
+try:
+    from hook_ask_policy import (  # noqa: E402
+        ask_suppressed,
+        drain_notes,
+        suppressed_reason,
+    )
+except Exception:  # noqa: BLE001 — absent policy == public default == ask.
+
+    def ask_suppressed(key: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def suppressed_reason(key: str, detail: str = "") -> str:  # type: ignore[misc]
+        return ""
+
+    def drain_notes() -> str:  # type: ignore[misc]
+        return ""
 
 # DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
 # import failing. It mirrors `_GATED_MENTION` below (same verbs and flags, same
@@ -9571,6 +9612,115 @@ def _push_dest_urls(dest: str, cwd: str | None = None) -> set[str]:
     return set()
 
 
+def _push_dest_is_public_repo(dest: str | None, cwd: str | None = None) -> bool:
+    """Whether every url a push to ``dest`` reaches is the install's DECLARED
+    public repository.
+
+    True only when ``dest``'s push-URL set is NON-EMPTY and every url in it names
+    ``github.com/<owner>/<repo>`` for the ``owner/repo`` that
+    ``_canonical_public_repo`` reads from ``github.user`` / ``github.public_repo``
+    in the install's genesis.yaml — the same declaration the scheduled-review gate
+    is scoped by. No declaration (a fresh clone) means False, and the prompt stays.
+
+    Anchored to the DECLARATION rather than to "whatever origin is", because
+    origin is repository config a session can change in an earlier, unguarded
+    command (``git remote set-url``, ``git config remote.origin.pushurl``, and
+    innocently ``gh repo fork --remote``). A re-point like that is SEEN here:
+    ``git remote get-url --push`` returns the url after ``pushInsteadOf`` /
+    ``insteadOf`` rewriting (MEASURED, git 2.43), so the rewritten destination
+    no longer names the declared repository and the push asks.
+
+    The url set comes from ``_push_dest_urls``, the helper the force arm uses, so
+    a named non-origin remote, a raw URL or path, an unresolvable name, and a
+    ``remote.pushDefault`` / ``branch.<cur>.pushRemote`` redirect (the caller
+    passes the destination ``_effective_push_remote`` resolved) are all judged by
+    the url git will actually push to.
+    """
+    if not dest:
+        return False
+    canon = _canonical_public_repo()
+    if not canon:
+        return False
+    dest_urls = _push_dest_urls(dest, cwd=cwd)
+    return bool(dest_urls) and all(_url_is_exactly_repo(u, canon) for u in dest_urls)
+
+
+def _url_is_exactly_repo(url: str, canon: str) -> bool:
+    """Whether ``url`` is one of the three plain github.com spellings of ``canon``.
+
+    EXACT FORM, not ``_repo_identity_from_url``. That shared parser is built to
+    make spellings of one remote compare equal, so it is lenient on purpose: it
+    strips userinfo at the first ``@`` and ignores ``#`` / ``?``. MEASURED by
+    adversarial audit: it reads ``https://127.0.0.1:9#@github.com/<owner>/<repo>``
+    as github.com, while git connects to 127.0.0.1 — so a lenient match could
+    suppress the prompt for a push that leaves for somewhere else entirely.
+
+    Accepted, owner/repo compared case-insensitively, optional ``.git``:
+    ``https://github.com/<o>/<r>``, ``git@github.com:<o>/<r>``,
+    ``ssh://git@github.com/<o>/<r>``. Anything else keeps the prompt.
+    Connection-level config (``http.curloptResolve``, ``core.sshCommand``, an
+    ssh ``Host`` alias for github.com) is not read — the same residue
+    ``_push_config_is_simple`` states.
+    """
+    owner_repo = re.escape(canon)
+    pattern = (
+        rf"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+        rf"{owner_repo}(?:\.git)?"
+    )
+    return re.fullmatch(pattern, url, flags=re.IGNORECASE) is not None
+
+
+#: The ONE command shape a suppressed publish may have: ``git push`` with plain
+#: word arguments, optionally ``git -C <path> push``. The character set is
+#: CLOSED — no quote, space-in-word, ``$``, backtick, ``;``, ``&``, ``|``,
+#: ``<``, ``>``, ``(``, ``)``, ``{``, ``}``, ``*``, ``~``, newline or ``#`` can
+#: appear — so no redirect, substitution, compound, pipeline, background job,
+#: assignment prefix, wrapper, git ``-c`` or comment is expressible at all.
+#:
+#: Push arguments are a CLOSED set too: the four ref-set-neutral spellings
+#: ``-u`` / ``--set-upstream`` / ``-v`` / ``--verbose``, or a word that does not
+#: start with ``-`` or ``+``. No bundle, so ``-uo origin fork`` (where git takes
+#: ``origin`` as the push-option VALUE and pushes to ``fork``, MEASURED) cannot
+#: be spelled; no ``+`` force refspec; no ``--repo=``.
+_BARE_PUSH_RE = re.compile(
+    r"git(?:[ \t]+-C[ \t]+(?P<cdir>[A-Za-z0-9._/@+-]+))?[ \t]+push"
+    r"(?:[ \t]+(?:-u|--set-upstream|-v|--verbose|[A-Za-z0-9._/@:=][A-Za-z0-9._/@:=+-]*))*"
+)
+
+
+def _command_is_a_bare_push(cmd: str) -> bool:
+    """Whether the WHOLE command is one plain ``git push`` and nothing else.
+
+    The destination check reads git's configuration BEFORE the command runs, so
+    it can only describe a command that cannot change that configuration first.
+    An earlier shape of this rule allowlisted the command's PARSED segments, and
+    two adversarial audits in a row found it describing a command the shell
+    would run differently: a ``> .git/config`` redirect the parser strips from
+    the segment text, git's own ``--output=``, a ``cd`` inside a background job
+    or pipeline, and a process substitution — each MEASURED to put the branch on
+    a non-origin remote while the read said origin. Every one of those lived in
+    what the parser reports, and a rule built on the parse inherits the parse's
+    blind spots.
+
+    So this is a closed-set claim on the RAW text instead (``_BARE_PUSH_RE``,
+    full match after stripping outer whitespace): if anything but a plain push is
+    present, it does not match, whatever the parser would have made of it. The
+    cost is deliberate — ``git push … && gh pr create …`` keeps its prompt.
+
+    Whitespace is stripped only as ASCII space/tab/newline: Python's bare
+    ``strip()`` also removes ``\\r``, ``\\f``, ``\\v`` and NBSP, which bash keeps
+    inside a word. A ``-C`` path with a ``..`` component is refused: the hook
+    resolves ``-C`` as text while git follows symlinks, and ``L/../work`` through
+    a symlink ``L`` was MEASURED to push from a different repository than the
+    hook read.
+    """
+    m = _BARE_PUSH_RE.fullmatch((cmd or "").strip(" \t\n"))
+    if m is None:
+        return False
+    cdir = m.group("cdir")
+    return not (cdir and ".." in cdir.split("/"))
+
+
 def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str | None:
     """The remote's tip sha for EXACTLY ``refs/heads/<branch>``, or None.
 
@@ -9799,6 +9949,31 @@ def _ask(reason: str) -> int:
     global _ASK_EMITTED
     _ASK_EMITTED = True
     emit_native_ask(reason)
+    return 0
+
+
+def _suppressed_ask(note: str) -> int:
+    """Stand in for an ask this install switched off: NO decision, only a note.
+
+    Prints a PreToolUse payload carrying ``additionalContext`` and no
+    ``permissionDecision``, and returns 0. That is "this hook does not object",
+    not "approved": Claude Code then decides the command from the other hooks and
+    its own permission settings, exactly as if this hook had never raised the
+    prompt. Deliberately NOT ``_allow`` — an allow would approve the whole Bash
+    command, so a compound like ``git push && curl …`` would ride a setting that
+    was only about the push. The note is what keeps the policy visible in the
+    transcript (same context-only shape ``git_discard_guard`` uses).
+    """
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": note,
+                }
+            }
+        )
+    )
     return 0
 
 
@@ -10239,6 +10414,15 @@ def _run_merge_and_push_gates() -> int:
         ask_reason: str | None = (
             esc_msg if esc_decision == "ask" and round_autonomous_deny is None else None
         )
+        # The hook_ask_policy key naming the ask currently held in `ask_reason`,
+        # or None when this ask is not one an install may switch off. DEFAULTING
+        # TO None IS THE SAFETY PROPERTY: an ask arm added later, by someone who
+        # has never read hook_ask_policy, is unsuppressible until it is
+        # deliberately classified — forgetting fails toward the prompt. Every
+        # reassignment of `ask_reason` below carries a matching `ask_class` line,
+        # because a later arm OVERWRITES an earlier one and the pair has to move
+        # together or a suppressible class could outlive its reason.
+        ask_class: str | None = None
         # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
         # reason): emitting `_allow` inline would short-circuit the whole Bash
         # invocation before the hard-blocks run, so `git push <republish> && git
@@ -10297,6 +10481,7 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                ask_class = None  # destructive: never suppressible
                 ask_reason = (
                     f"FORCE push detected — this REWRITES remote history on "
                     f"'{remote}' (a non-origin remote). Approve only if you "
@@ -10375,6 +10560,24 @@ def _run_merge_and_push_gates() -> int:
                             f"its first push); only the first push of a branch/PR prompts."
                         )
                     else:
+                        # The ONE suppressible push ask. Four conjuncts, each
+                        # established positively; failing any keeps the prompt:
+                        #   * the ref axis — already established above (a plain
+                        #     update of the current feature branch);
+                        #   * the whole command is one bare `git push` — a config
+                        #     read can only describe a command that cannot change
+                        #     the config first;
+                        #   * no repo push config remaps the ref (an explicit
+                        #     `<cur>` is remapped by remote.<r>.push and
+                        #     push.default=upstream, MEASURED with git 2.43);
+                        #   * the destination is the DECLARED public repository.
+                        ask_class = (
+                            "push_publish"
+                            if _command_is_a_bare_push(cmd)
+                            and _push_config_is_simple(push_remote, cwd=pcwd)
+                            and _push_dest_is_public_repo(push_remote, cwd=pcwd)
+                            else None
+                        )
                         ask_reason = (
                             f"git push needs your approval before publishing externally "
                             f"(target: {branch or 'default'})."
@@ -10402,6 +10605,7 @@ def _run_merge_and_push_gates() -> int:
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
+                        ask_class = None  # hygiene arm: never suppressible
                         ask_reason = (
                             f"re-push to '{cur}': an earlier step in this command "
                             f"CLOSES a pull request, so the push that follows may "
@@ -10421,6 +10625,7 @@ def _run_merge_and_push_gates() -> int:
                         and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
                     ):
                         push_allow_reason = None
+                        ask_class = None  # hygiene arm: never suppressible
                         ask_reason = (
                             f"re-push to '{cur}': this branch is PUBLIC but has "
                             f"NO OPEN PR, so CI and the leak scan never run on "
@@ -10428,6 +10633,12 @@ def _run_merge_and_push_gates() -> int:
                             f"(gh pr create) — or close the branch out."
                         )
                 else:
+                    # The CATCH-ALL, and never suppressible: everything the arm
+                    # above could not establish as a plain update of the current
+                    # feature branch — a push from main/master, an ambiguous cwd,
+                    # a detached HEAD, another branch's ref, a tag. It is defined
+                    # by NEGATION, so there is nothing positive to classify.
+                    ask_class = None
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
@@ -10459,7 +10670,8 @@ def _run_merge_and_push_gates() -> int:
         # bare create from an UNPUSHED branch makes gh push (and possibly fork) the
         # branch itself — a code-publish that would bypass the push gate — so gate
         # that form like a push: dispatched → deny, interactive → ask.
-        if create_segs and any(_pr_create_would_publish(s.argv) for s in create_segs):
+        publishing_creates = [s for s in create_segs if _pr_create_would_publish(s.argv)]
+        if publishing_creates:
             if _is_dispatched():
                 print(
                     "BLOCKED: this gh pr create would push a not-yet-pushed branch; "
@@ -10468,9 +10680,22 @@ def _run_merge_and_push_gates() -> int:
                 )
                 return 2
             if ask_reason is None:
+                # NEVER suppressible on its own. gh chooses where to push from its
+                # own repository resolution — and may offer to create a fork —
+                # none of which this hook can resolve from argv or git config
+                # the way it resolves a `git push` destination. With no
+                # destination to check, the origin-only rule the push arm applies
+                # has nothing to apply to, so the prompt stays.
+                ask_class = None
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
                 )
+            else:
+                # A publishing create sharing the command with a push ask keeps
+                # that ask whatever its class. Unreachable while suppression
+                # requires the whole command to be one bare push; stated here
+                # so widening that rule cannot quietly let a create ride along.
+                ask_class = None
 
         # ── gh pr merge ────────────────────────────────────────────
         if merge_pr_segs:
@@ -11120,7 +11345,34 @@ def _run_merge_and_push_gates() -> int:
             print(round_autonomous_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
-            return _ask(ask_reason)
+            # Consumed HERE, after every hard block has had its chance to return
+            # 2, so a local policy never shortens the command's judgement — it
+            # only decides whether this guard raises a prompt it was about to
+            # raise. An unclassified ask (ask_class is None) never reaches the
+            # policy at all.
+            #
+            # A routine publish is routine only ALONE. A `gh pr close` anywhere
+            # in the same command can leave exactly the state the hygiene asks
+            # report — a public branch with no open PR, outside CI and the leak
+            # scan — and the hook runs before any of it, so the command's shape
+            # keeps the prompt, in either order. Same predicate as the
+            # close-then-push arm and the same limit: it recognises the PARSED
+            # `gh pr close` form, not a close spelled through `gh api`, a gh
+            # alias or `eval` (tracked in #2469). Today no command carrying a
+            # close can pass `_command_is_a_bare_push` at all, so this carve-out
+            # is the second of two layers; it stays so the close rule does not
+            # depend on the shape rule never being widened.
+            closes_any_pr = any(gh_pr_subcommand(s.argv) == "close" for s in segs)
+            suppressed = (
+                ask_class is not None and not closes_any_pr and ask_suppressed(ask_class)
+            )
+            # A misconfigured policy announces itself HERE, in the payload,
+            # because Claude Code discards an exit-0 hook's stderr.
+            notes = drain_notes()
+            if suppressed:
+                note = suppressed_reason(ask_class, ask_reason)
+                return _suppressed_ask(f"{note}\n\n{notes}" if notes else note)
+            return _ask(f"{ask_reason}\n\n{notes}" if notes else ask_reason)
 
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
         # hard-block has had its chance to return 2, so a compound

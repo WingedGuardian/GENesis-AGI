@@ -3084,6 +3084,7 @@ python3 scripts/review_state.py mark              # INTERNAL genesis-architect a
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
 git push                                          # approve the dialog on a branch's first push
+                                                  #   (unless this install sets hooks.asks.push_publish: off)
 gh pr create ...
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
@@ -3130,6 +3131,20 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 - **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
   heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
   Run gate-adjacent steps as separate calls.
+- **A push that did NOT prompt is not a push that escaped the guard.** An
+  install may set `hooks.asks.push_publish: off` in `~/.genesis/config/genesis.yaml`,
+  which removes the push guard's first-push prompt when the whole command is
+  one bare `git push` (or `git -C <path> push`) of the current branch to the
+  declared public repo: the hook emits no decision, only a
+  context note naming the setting — so read the note rather than concluding
+  the hook is broken or absent. It approves nothing; other hooks and Claude
+  Code's own permissions still decide the command. The knob reaches ONLY that
+  prompt. A compound command, a push to any other remote or URL, a `gh pr create` that would push
+  on its own, blocks, and the force-push, no-open-PR and close-then-push
+  prompts are out of its reach. `hooks.asks.secrets_env` does the same for the
+  credentials prompt. It changes nothing about your obligations: the PR still
+  follows the push immediately, because CI and the leak scan trigger on
+  `pull_request` and a PR-less public branch gets neither.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending

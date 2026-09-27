@@ -6,7 +6,8 @@
 # This file is machine-specific — NEVER commit it to git.
 # All values here can also be set via environment variables (env var wins) —
 # EXCEPT `timezone`, which is file-first (this value wins; USER_TIMEZONE env is
-# only a deprecated fallback). See the `timezone:` note below.
+# only a deprecated fallback), and `hooks.asks`, which is FILE-ONLY (no
+# supported env override). See the notes on each below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 network:
@@ -35,3 +36,35 @@ github:
   # this on first use — you usually don't need to set it manually.
   # Override here only if your fork has a non-default name.
   private_repo: ""
+
+# Approval prompts you have chosen to turn off on THIS install.
+#
+# Two hooks ask before they act: the push guard, before a branch is published,
+# and the credentials guard, before anything touches secrets.env. Both prompts
+# are deliberate — but on an install where every push goes to the same public
+# repo, the routine one stops being a decision, and a prompt answered by reflex
+# makes the prompts worth reading harder to notice. Name one here to silence it.
+#
+# ASKS ONLY. Nothing here can reach a BLOCK (a force push to origin, a merge
+# into main, a failing merge gate), nor the deny a Genesis-dispatched session
+# gets. Silencing a prompt does not APPROVE anything: the hook stops raising
+# it and leaves a note naming this setting, and Claude Code's own permission
+# settings still decide the command (in its default permission mode, add a
+# native allow rule too, or Claude Code will prompt instead). Leaving this
+# section out — the default — keeps every prompt.
+#
+# FILE-ONLY: there is no supported environment-variable override for these
+# keys — the hooks read this file directly, on every invocation. (The module
+# also honours `_TEST_HOOK_ASK_POLICY`; that is a test seam for the suite, not a
+# setting, and an install should not rely on it.)
+#
+#hooks:
+#  asks:
+#    # the first push of the current branch, when the whole command is one
+#    # bare `git push` (or `git -C <path> push`) and every push URL names the
+#    # public repo declared in `github:` above. NOT a push anywhere else, any
+#    # compound command, a `gh pr create` that would push on its own, or the
+#    # force-push, no-open-PR and close-then-push prompts.
+#    push_publish: off
+#    # the secrets.env credentials prompt.
+#    secrets_env: off
