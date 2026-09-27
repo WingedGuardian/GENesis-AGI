@@ -6,7 +6,7 @@
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
 #      (archives into ~/.genesis/worktree-trash; first releases session-claim
 #      locks whose process is gone, then after reaping expires MERGED archives
-#      older than 30d (unmerged archives are kept) — archive first, then its locked registration anchor.
+#      with no uncommitted changes older than 30d (all others are kept) — archive first, then its locked registration anchor.
 #      GENESIS_WORKTREE_TRASH_RETENTION_DAYS=0 / GENESIS_WORKTREE_STALE_CLAIM_RELEASE=0
 #      disable those two steps)
 #   2. Reclaim regenerable caches          → scripts/disk_reclaim.py
@@ -164,11 +164,12 @@ main() {
     echo "--- worktree reaping ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
 
-    # Retention for the reaper's MERGED archives (30d default, owner decision;
-    # unmerged archives are never auto-expired). The
+    # Retention for the reaper's clean MERGED archives (30d default, owner
+    # decision; unmerged archives and merged ones that held uncommitted changes
+    # are never auto-expired). The
     # script deletes an archive BEFORE unlocking and pruning the registration
     # that anchored it, so nothing is de-anchored while its archive exists.
-    echo "--- worktree archive retention (merged, >30d) ---"
+    echo "--- worktree archive retention (clean merged, >30d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --expire-trash \
         || echo "worktree_lifecycle --expire-trash exited $?"
 

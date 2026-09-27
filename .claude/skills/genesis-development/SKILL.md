@@ -3144,7 +3144,7 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   message, which reads like a branch problem and is not: use a literal path.
 - **Worktree removal is not yours to do.** `git worktree remove` is blocked;
   `scripts/worktree_lifecycle.py` owns it: it archives stale worktrees on a
-  daily timer; merged archives expire after 30 days, unmerged ones are kept. Leave a dead worktree alone.
+  daily timer; clean merged archives expire after 30 days, the rest are kept. Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`).
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**

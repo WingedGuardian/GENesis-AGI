@@ -483,7 +483,7 @@ def test_UNMERGED_archives_never_expire_and_MERGED_ones_do(repo, tmp_path):
     counts = wl._expire_trash(repo, days=30)
 
     assert counts["expired"] == 1
-    assert counts["kept_unmerged"] == 2
+    assert counts["kept"] == 2
     assert not merged["archive"].exists()
     assert str(merged["path"]) not in _registered(repo)
     for kept in (unmerged, nolane):
@@ -501,5 +501,47 @@ def test_an_unreadable_meta_is_kept_not_expired(repo, tmp_path):
     old = time.time() - 400 * 86400
     os.utime(a["archive"], (old, old))
     counts = wl._expire_trash(repo, days=30)
-    assert counts["expired"] == 0 and counts["kept_unmerged"] == 1
+    assert counts["expired"] == 0 and counts["kept"] == 1
     assert a["archive"].exists()
+
+
+@pytest.mark.parametrize(
+    ("flag", "expires"),
+    [(False, True), (True, False), ("<absent>", False), ("false", False), (0, False)],
+)
+def test_a_MERGED_archive_that_held_uncommitted_changes_is_kept(repo, tmp_path, flag, expires):
+    """Owner ruling: uncommitted changes exist only in the archive, so a merged
+    archive that recorded any is kept. Only an explicit boolean False expires;
+    absent or non-boolean fails toward keeping."""
+    a = _archive(repo, tmp_path, "dirtymrg", detached_commit=True, lane="merged")
+    _backdate(a["entry"], 400)
+    meta = wl.TRASH_DIR / f"{a['entry']}.meta.json"
+    data = json.loads(meta.read_text())
+    if flag == "<absent>":
+        data.pop("had_uncommitted_changes", None)
+    else:
+        data["had_uncommitted_changes"] = flag
+    meta.write_text(json.dumps(data))
+
+    counts = wl._expire_trash(repo, days=30)
+
+    assert counts["expired"] == (1 if expires else 0)
+    assert a["archive"].exists() is (not expires)
+    assert (str(a["path"]) in _registered(repo)) is (not expires)
+
+
+def test_the_REAL_reaper_records_uncommitted_changes_and_that_archive_is_kept(repo, tmp_path):
+    """The flag comes from the reaper itself, not a hand-written fixture."""
+    wt = tmp_path / "realdirty"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt))
+    (wt / "seed.txt").write_text("edited, never committed\n")
+    rec = next(x for x in wl._list_worktrees(repo) if x["path"] == str(wt))
+    assert wl._trash_worktree(rec, repo, lane="merged") is True
+    entry = next(p for p in wl.TRASH_DIR.glob("realdirty-*.tar.gz"))
+    name = entry.name[: -len(".tar.gz")]
+    assert json.loads((wl.TRASH_DIR / f"{name}.meta.json").read_text())[
+        "had_uncommitted_changes"
+    ] is True
+    _backdate(name, 400)
+    assert wl._expire_trash(repo, days=30)["expired"] == 0
+    assert entry.exists()
