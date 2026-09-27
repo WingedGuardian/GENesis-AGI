@@ -617,7 +617,24 @@ class TestPushTargetsCurrentBranch:
     def _t(self, guard_module, cmd, cur):
         return guard_module._push_targets_current_branch(_push_seg(cmd), cur, "origin")
 
-    # ── explicit `<remote> <cur>` → no config subprocess ──
+    # ── explicit `<remote> <cur>` → gated on the same config check as bare ──
+    # git remaps a colon-free local-branch refspec through remote.<r>.push and
+    # push.default=upstream, so the explicit form is not config-immune. Pinned
+    # simple here so these rows do not depend on the host repo's own config;
+    # the bare/remote-only rows below patch it themselves.
+
+    @pytest.fixture(autouse=True)
+    def _simple_config(self, request, guard_module):
+        name = request.node.name
+        if name.startswith("test_bare_") or "remote_only" in name:
+            yield
+            return
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
+            yield
+
+    def test_explicit_current_branch_needs_simple_config(self, guard_module):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
+            assert self._t(guard_module, "git push origin feat", "feat") is False
 
     def test_explicit_current_branch(self, guard_module):
         assert self._t(guard_module, "git push origin feat", "feat") is True

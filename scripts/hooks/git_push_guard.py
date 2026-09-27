@@ -9445,11 +9445,18 @@ def _push_targets_current_branch(
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
-         • ``git push <remote> <cur>`` (no ``src:dst`` colon) → an explicit refspec
-           overrides ``remote.push`` / ``push.default`` / ``pushRemote`` → True;
+         • ``git push <remote> <ref>`` where ``<ref>`` names the current branch
+           (``_ref_names_current_branch``: ``<cur>``, ``HEAD``, ``@`` or
+           ``refs/heads/<cur>``) → True only if ``_push_config_is_simple(remote)``
+           as well: git REMAPS a colon-free refspec that names a local branch
+           through ``remote.<r>.push`` and ``push.default=upstream`` (MEASURED,
+           git 2.43: with either set, ``git push origin <cur>`` and
+           ``git push origin refs/heads/<cur>`` updated ``main``);
+         • ``git push <remote> <src>:<dst>`` → True only when BOTH halves name the
+           current branch (``_colon_refspec_updates_current_branch``);
          • bare ``git push`` / ``git push <remote>`` → True only if
            ``_push_config_is_simple(remote)`` (no redirecting/broadening repo config);
-         • a colon refspec, a differently-named branch, or ≥2 refspecs → False.
+         • a differently-named branch, a tag, a delete, or ≥2 refspecs → False.
     Conservative by construction: any unrecognized form re-prompts. argv-based
     (quote-stripped).
     """
@@ -9462,12 +9469,99 @@ def _push_targets_current_branch(
         return False  # multiple refspecs → not a single plain current-branch update
     if len(positionals) == 2:
         refspec = positionals[1]
-        # Explicit `<remote> <cur>` — an explicit refspec overrides remote.push /
-        # push.default / pushRemote, so it is a plain current-branch update.
-        return ":" not in refspec and refspec == cur
+        # Explicit `<remote> <src>:<dst>` — the destination is spelled out, so
+        # push config cannot redirect it (MEASURED under remote.<r>.push and
+        # push.default=upstream: HEAD:refs/heads/<cur> still updated <cur>).
+        if ":" in refspec:
+            return _colon_refspec_updates_current_branch(refspec, cur)
+        # Explicit `<remote> <ref>` with no colon is NOT immune to push config:
+        # git maps a ref naming a local branch through remote.<r>.push and, under
+        # push.default=upstream, through the branch's upstream. So it needs the
+        # same config check as the bare form. Applied to HEAD too, rather than
+        # relying on HEAD happening to escape the remap in the configs measured.
+        return _ref_names_current_branch(refspec, cur) and _push_config_is_simple(
+            remote, cwd=cwd
+        )
     # Bare `git push` or `git push <remote>` → the ref set depends on repo config,
     # keyed on the remote git will ACTUALLY push to (resolved by the caller).
     return _push_config_is_simple(remote, cwd=cwd)
+
+
+def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
+    """Whether a push refspec (one side of it) names the CURRENT branch ``cur``.
+
+    Four spellings do, and under default push config git treats them identically
+    on a push: the bare branch name, ``HEAD``, its one-character alias ``@``, and
+    the fully-qualified ``refs/heads/<cur>``. (Under ``remote.<r>.push`` or
+    ``push.default=upstream`` the bare name and ``refs/heads/<cur>`` are REMAPPED;
+    the caller therefore also requires ``_push_config_is_simple``.) MEASURED with git 2.43 against a local bare remote:
+    ``git push origin @`` creates ``refs/heads/<cur>`` exactly as
+    ``git push origin HEAD`` does — and it still did with a local branch
+    literally named ``@`` present at a different commit (git allows creating
+    one): the push sent HEAD to ``refs/heads/<cur>``, not that branch.
+
+    Before this function the predicate accepted only the bare name, so
+    ``git push -u origin HEAD`` — the form this repo's development workflow
+    prescribes for a branch's first publication — fell to the push arm's
+    catch-all. That arm asks unconditionally, so the re-push relaxation, the
+    no-open-PR check and the close-then-push check never ran for it.
+
+    This is a deliberate, bounded LOOSENING: these spellings now reach the
+    re-push relaxation, where an ask becomes an allow only when ``<cur>`` is
+    already on the remote with an open PR. Everything else stays False — another
+    branch's name, a tag, and ``refs/heads/main`` pushed from a feature branch
+    are still unrecognised and keep prompting. A falsy ``cur`` (detached HEAD) never matches — there is no
+    current branch for a ref to name.
+    """
+    if not cur:
+        return False
+    return ref in (cur, "HEAD", "@", f"refs/heads/{cur}")
+
+
+def _colon_refspec_updates_current_branch(refspec: str, cur: str | None) -> bool:
+    """Whether a ``src:dst`` refspec plainly updates the current branch.
+
+    ``git push origin HEAD:refs/heads/<cur>`` is how a session republishes a
+    branch whose upstream it cannot rely on. The predicate used to reject every
+    colon outright, which sent it to the catch-all ask.
+
+    Established POSITIVELY, both halves, because a colon refspec is where the
+    dangerous forms live and they must all stay False:
+
+        ``HEAD:refs/heads/main``      publishing a feature branch ONTO main
+        ``:refs/heads/<branch>``      an empty source DELETES the remote branch
+        ``main:refs/heads/<cur>``     another branch's tip under this name
+        ``HEAD:refs/tags/v1``         a tag, not a branch publish
+        ``HEAD:<cur>``                unqualified — see below
+        ``HEAD:a:b`` / ``HEAD:``      refused by the destination equality
+
+    The destination must be FULLY QUALIFIED. git-push(1): "If <dst>
+    unambiguously refers to a ref on the <repository> remote, then push to that
+    ref" — MEASURED against a remote holding ``refs/tags/<cur>`` and no
+    ``refs/heads/<cur>``, git 2.43 resolved ``HEAD:<cur>`` against the tag and
+    rejected it ("the tag already exists in the remote"). Nothing publishes in
+    that case, but calling it a plain update of the current branch would be
+    false.
+
+    On splitting: git splits a refspec on the LAST colon, this uses the first.
+    That cannot yield a false True: ``git check-ref-format --branch 'a:b'`` is
+    fatal, so ``cur`` never contains a colon, and a True verdict therefore implies
+    a colon-free destination, where both splits coincide.
+
+    A leading ``+`` (git's force shorthand) never reaches here:
+    ``_push_is_force`` returns True on it and ``_push_ref_positionals`` returns
+    None, so the push takes the force arm.
+    """
+    if not cur:
+        return False
+    src, sep, dst = refspec.partition(":")
+    if not sep:
+        return False  # no colon — the caller routes those elsewhere
+    if not src or not dst:
+        return False  # `:dst` is a DELETE; `src:` is not a plain update
+    if not _ref_names_current_branch(src, cur):
+        return False  # the source must resolve to the current branch
+    return dst == f"refs/heads/{cur}"
 
 
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
@@ -10330,8 +10424,9 @@ def _run_merge_and_push_gates() -> int:
                 #   • cur not in (main, master) → a push to the default branch never
                 #     goes silent (it is always on the remote);
                 #   • _push_targets_current_branch → a bare / `<remote>` / `<remote>
-                #     <cur>` push with only ref-neutral flags and (for bare/remote-only)
-                #     a simple repo config — everything else prompts;
+                #     <cur|HEAD|@|refs/heads/cur>` / `<remote> HEAD:refs/heads/<cur>`
+                #     push with only ref-neutral flags and (for bare/remote-only) a
+                #     simple repo config — everything else prompts;
                 #   • _push_is_republish → live ls-remote confirms `cur` is present on
                 #     the remote git will ACTUALLY push to (pushRemote/pushDefault
                 #     resolved by _effective_push_remote, so a triangular fork workflow
