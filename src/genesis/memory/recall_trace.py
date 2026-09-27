@@ -90,8 +90,19 @@ def build_record(trace: dict[str, Any]) -> dict[str, Any]:
     post: dict[str, float] = trace.get("post_rerank") or {}
     results: list[tuple[str, float, float]] = trace.get("results") or []
     drops: dict[str, str] = trace.get("drops") or {}
-    neighbors: list[str] = trace.get("graph_neighbors") or []
+    # (id, graph score) pairs for EVERY computed neighbor — in shadow mode too,
+    # where none is injected. A bare id (older sink shape) carries no score.
+    raw_neighbors = trace.get("graph_neighbors") or []
+    neighbors: list[str] = []
+    graph_score: dict[str, float] = {}
+    for item in raw_neighbors:
+        if isinstance(item, (list, tuple)):
+            neighbors.append(item[0])
+            graph_score[item[0]] = item[1]
+        else:
+            neighbors.append(item)
     delivered: list[str] = trace.get("delivered") or []
+    delivered_rank = {mid: pos for pos, mid in enumerate(delivered, start=1)}
     recall_limit = trace.get("recall_limit")
 
     ranks = _rank_maps(lanes)
@@ -127,11 +138,22 @@ def build_record(trace: dict[str, Any]) -> dict[str, Any]:
         if mid in final_rank:
             rec["final_rank"] = final_rank[mid]
             rec["final_score"] = _r(final_scores[mid][1])
+        if mid in graph_score:
+            # The score expansion ordered neighbors by — the only score a
+            # graph-only candidate has (it never went through recall's fusion).
+            rec["graph_score"] = _r(graph_score[mid])
         rec["injected"] = mid in delivered_set
         if mid in delivered_set:
+            # Position in what was actually handed to the prompt — organic and
+            # graph-injected alike.
+            rec["delivered_rank"] = delivered_rank[mid]
+            # Neighbors exclude the organic seeds (= everything delivered
+            # organically), so a delivered neighbor can only have come via graph.
             rec["outcome"] = "injected_via_graph" if mid in neighbor_set else "injected"
         elif mid in drops:
             rec["outcome"] = f"dropped:{drops[mid]}"
+        elif mid in neighbor_set:
+            rec["outcome"] = "graph_not_injected"  # shadow mode, or no room left
         elif mid in final_rank:
             rec["outcome"] = "not_reached"  # returned by recall, past the budget
         else:
@@ -151,6 +173,12 @@ def build_record(trace: dict[str, Any]) -> dict[str, Any]:
         "recall_limit": recall_limit,
         "embedding_available": trace.get("embedding_available"),
         "fts_query_expanded": trace.get("fts_query_expanded"),
+        "fts_fallback_used": trace.get("fts_fallback_used"),
+        # Pre-expiry hit counts per finder lane; with ``zero_hit`` this tells a
+        # completed no-candidate recall apart from one that never got that far.
+        "lane_hits": trace.get("lane_hits"),
+        "zero_hit": bool(trace.get("zero_hit")),
+        "graph_mode": trace.get("graph_mode"),
         "reranked": bool(rerank),
         "degraded": bool(reasons),
         "degraded_reasons": reasons,

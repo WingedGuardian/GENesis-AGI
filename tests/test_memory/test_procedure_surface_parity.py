@@ -74,10 +74,16 @@ class _FakeDB:
     def __init__(self, rows: list[_Row], live_ids: set[str] | None = None) -> None:
         self._rows = rows
         self._live_ids = {r[0] for r in rows} if live_ids is None else set(live_ids)
+        # id -> (principle, tier) as the table holds it NOW (post-snapshot edits)
+        self._live_overrides: dict[str, tuple[str, str | None]] = {}
 
     async def execute_fetchall(self, _sql: str, params: object = None) -> list:
-        if params is not None:  # winner recheck
-            return [(1,)] if params[0] in self._live_ids else []
+        if params is not None:  # winner recheck -> LIVE (principle, tier)
+            if params[0] not in self._live_ids:
+                return []
+            row = next(r for r in self._rows if r[0] == params[0])
+            live = self._live_overrides.get(params[0], (row[2], row[4]))
+            return [live]
         return self._rows
 
 
@@ -265,3 +271,34 @@ async def test_background_refresh_failure_keeps_the_prior_snapshot() -> None:
         await asyncio.sleep(0.01)
     assert proactive._procedure_refresh_in_flight is False  # flag never wedges
     assert [m[0] for m in proactive._procedure_cache.meta] == ["old"]
+
+
+async def test_surfaces_the_live_principle_and_tier_not_the_snapshot() -> None:
+    """PR #2455 review: under SWR the snapshot can outlive the TTL, so the
+    surfaced text/tier must come from the live winner row, and a winner demoted
+    to DORMANT since the snapshot must clear the stricter DORMANT bar."""
+    rng = np.random.default_rng(21)
+    q = _rand_vec(rng)
+    row = ("w1", "task", "old advice", pack_embedding(q), "CORE")
+    db = _FakeDB([row])
+    await proactive._load_procedure_cache(db)  # snapshot says "old advice"/CORE
+
+    db._live_overrides["w1"] = ("new advice", "CORE")
+    got = await proactive._surface_procedure(db, q)
+    assert got is not None and got["principle"] == "new advice"
+
+    # Demoted since the snapshot, and the match (~0.74) is below DORMANT's 0.78.
+    other = [float(x) for x in rng.standard_normal(EMBEDDING_DIM)]
+    mix = [0.74 * a + (1 - 0.74**2) ** 0.5 * b for a, b in zip(q, _unit(other, q), strict=True)]
+    assert (await proactive._surface_procedure(db, mix)) is not None  # CORE bar 0.70: clears
+    db._live_overrides["w1"] = ("new advice", "DORMANT")
+    assert await proactive._surface_procedure(db, mix) is None
+
+
+def _unit(v: list[float], against: list[float]) -> list[float]:
+    """Unit vector orthogonal to ``against`` (Gram-Schmidt), for a known cosine."""
+    a = np.asarray(against)
+    a = a / np.linalg.norm(a)
+    x = np.asarray(v)
+    x = x - x.dot(a) * a
+    return list(x / np.linalg.norm(x) * np.linalg.norm(np.asarray(against)))

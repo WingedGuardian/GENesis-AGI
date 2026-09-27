@@ -1326,15 +1326,19 @@ async def _proactive_impl(
     # enforce-drop, and blockable+wrap pipeline as organic items — expansion
     # must never be a bypass around the gate-4 pushed-surface defenses. Merged
     # BEFORE the emit below so neighbors are counted. Shadow only emits.
+    _graph_seen: list | None = [] if trace is not None else None
     _expanded = await graph_expansion.maybe_expand(
         memory_mod._db,
         kept,
         surface="proactive",
         # Joins the graph_expansion_* event to this recall's trace row.
         recall_event_id=trace.get("trace_id") if trace is not None else None,
+        # Every COMPUTED neighbor, including shadow mode's (not injected).
+        neighbor_sink=_graph_seen,
     )
     if trace is not None:
-        trace["graph_neighbors"] = [nr.memory_id for nr in _expanded[len(kept) :]]
+        trace["graph_mode"] = graph_expansion.expansion_mode()
+        trace["graph_neighbors"] = [(nr.memory_id, nr.score) for nr in _graph_seen or []]
     for nr in _expanded[len(kept) :]:
         # Neighbor tags come from the FTS row as a STRING — substring check
         # mirrors the organic list-membership filter above.

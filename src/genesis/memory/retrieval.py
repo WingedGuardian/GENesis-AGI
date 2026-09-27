@@ -891,7 +891,7 @@ class HybridRetriever:
         # 2c. Expand query via tag co-occurrence (SWR — stale index rebuilds in
         # the background, never inline on this path; see intent.expand_query)
         _ts = time.monotonic()
-        fts_query = await self._expand_fts_query(
+        fts_query, fts_fallback_query = await self._expand_fts_query(
             query,
             collections,
             expand_query_terms=expand_query_terms,
@@ -902,17 +902,32 @@ class HybridRetriever:
 
         # 3. FTS5 text search (using expanded query)
         _ts = time.monotonic()
+        _fts_info: dict = {}
         fts_results, fts_by_id = await self._gather_fts_candidates(
             query=query,
             fts_query=fts_query,
+            fallback_query=fts_fallback_query,
             collections=collections,
             candidate_limit=candidate_limit,
             exclude_subsystems=exclude_subsystems,
             include_only_subsystems=include_only_subsystems,
             include_deprecated=include_deprecated,
+            info=_fts_info,
         )
         if stats is not None:
             stats["fts_ms"] = round((time.monotonic() - _ts) * 1000, 1)
+        if trace is not None:
+            # Set BEFORE the zero-hit early return below, so a completed recall
+            # with no candidates is distinguishable from a partial trace.
+            trace["recall_limit"] = limit
+            trace["embedding_available"] = embedding_available
+            trace["fts_query_expanded"] = fts_query != query
+            trace["fts_fallback_used"] = bool(_fts_info.get("fallback_used"))
+            trace["lane_hits"] = {
+                "vector": len(qdrant_by_id),
+                "fts": len(fts_by_id),
+                "event": len(event_memory_ids),
+            }
 
         # 4. Union of all candidate memory_ids
         all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
@@ -956,6 +971,8 @@ class HybridRetriever:
                 _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow")
             else:
                 await _zero_hit_shadow
+            if trace is not None:
+                trace["zero_hit"] = True
             return []
 
         now_str = datetime.now(UTC).isoformat()
@@ -1015,9 +1032,6 @@ class HybridRetriever:
                 "intent": intent_ranked or [],
             }
             trace["fused"] = dict(fused)
-            trace["recall_limit"] = limit
-            trace["embedding_available"] = embedding_available
-            trace["fts_query_expanded"] = fts_query != query
 
         # 7.5 Cross-encoder reranking (optional, off by default) — the ONLY
         # post-fusion point where ``fused`` is reassigned rather than mutated.
@@ -1387,7 +1401,7 @@ class HybridRetriever:
         *,
         expand_query_terms: bool,
         extra_fts_terms: list[str] | None = None,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         """Stage 2c: expand the FTS query via tag co-occurrence (degrades to
         the original query on failure).
 
@@ -1419,22 +1433,34 @@ class HybridRetriever:
                 )
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
+        fallback: str | None = None
         if extra_fts_terms:
             safe_terms = [t for t in (fts5_term(t) for t in extra_fts_terms) if t]
             # This lane is a TOP-LEVEL disjunction, so terms FTS5's bm25 treats
             # as inert (in >= half the rows — e.g. ``genesis``/``memory`` from a
             # src/genesis/memory/... path, which every row carries as a tag) are
             # dropped: they add only ~0-scored rows but force FTS5 to score the
-            # whole corpus. MEASURED on a 100k-row copy over 150 real recent
-            # queries with a 4-term file lane: FTS stage p50 456→115ms, p95
-            # 1291→614ms, top-48 candidate SET identical on 150/150. See
-            # ``_fts.drop_bm25_inert_terms``.
-            if safe_terms:
-                safe_terms = await self._ro_read(drop_bm25_inert_terms, safe_terms)
-            extra = " OR ".join(safe_terms)
-            if extra:
-                fts_query = f"({fts_query}) OR ({extra})"
-        return fts_query
+            # whole corpus. That is rank-neutral only while the selective part
+            # FILLS the candidate window — RRF consumes positions, not bm25
+            # magnitude, so in an underfilled window the inert term's rows were
+            # the remaining candidates. So the unpruned expression is returned as
+            # ``fallback`` and ``_gather_fts_candidates`` runs it when the pruned
+            # query comes back short. MEASURED on a 100k-row copy over 150 real
+            # recent queries with a 4-term file lane: FTS stage p50 456→115ms,
+            # p95 1291→614ms; top-48 set identical on 144/150, every difference a
+            # near-tie swap at ranks 44–48. See ``_fts.drop_bm25_inert_terms``.
+            kept = await self._ro_read(drop_bm25_inert_terms, safe_terms) if safe_terms else []
+            base = fts_query
+            if kept:
+                fts_query = f"({base}) OR ({' OR '.join(kept)})"
+            elif safe_terms:
+                # Whole lane inert: keep the base PARENTHESISED so it stays on the
+                # same boolean path the unpruned ``(base) OR (…)`` took, instead of
+                # silently entering the non-boolean AND→OR-retry path.
+                fts_query = f"({base})"
+            if len(kept) != len(safe_terms):
+                fallback = f"({base}) OR ({' OR '.join(safe_terms)})"
+        return fts_query, fallback
 
     async def _gather_fts_candidates(
         self,
@@ -1446,6 +1472,8 @@ class HybridRetriever:
         exclude_subsystems: list[str] | None,
         include_only_subsystems: list[str] | None,
         include_deprecated: bool,
+        fallback_query: str | None = None,
+        info: dict | None = None,
     ) -> tuple[list[dict], dict[str, dict]]:
         """Stage 3: FTS5 text search using the expanded query.
 
@@ -1456,20 +1484,34 @@ class HybridRetriever:
         filter at the SQL level so the candidate set matches Qdrant's
         filtered search and RRF fuses comparable lists.
 
+        ``fallback_query`` (set only when inert file terms were pruned — see
+        ``_expand_fts_query``) is the unpruned expression; it runs only when the
+        pruned query returns fewer than ``candidate_limit`` rows, so the cheap
+        query answers whenever it fills the window and the original behaviour
+        is kept exactly when it does not.
+
         Returns ``(fts_results, fts_by_id)``.
         """
         fts_is_boolean = fts_query != query  # expansion produced boolean syntax
         fts_collection = collections[0] if len(collections) == 1 else None
-        fts_results = await self._ro_read(
-            memory_crud.search_ranked,
-            query=fts_query,
-            collection=fts_collection,
-            limit=candidate_limit,
-            boolean=fts_is_boolean,
-            exclude_subsystems=exclude_subsystems,
-            include_only_subsystems=include_only_subsystems,
-            include_deprecated=include_deprecated,
-        )
+
+        async def _search(q: str, boolean: bool) -> list[dict]:
+            return await self._ro_read(
+                memory_crud.search_ranked,
+                query=q,
+                collection=fts_collection,
+                limit=candidate_limit,
+                boolean=boolean,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
+                include_deprecated=include_deprecated,
+            )
+
+        fts_results = await _search(fts_query, fts_is_boolean)
+        if fallback_query is not None and len(fts_results) < candidate_limit:
+            fts_results = await _search(fallback_query, True)
+            if info is not None:
+                info["fallback_used"] = True
 
         fts_by_id: dict[str, dict] = {}
         for row in fts_results:

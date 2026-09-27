@@ -112,7 +112,7 @@ async def test_file_keyword_append_is_parseable_by_fts5(fts, extra_terms):
     dependency) out of scope, so the method touches no instance state and can run
     unbound; the extras append is the whole point of this cell.
     """
-    composed = await HybridRetriever._expand_fts_query(
+    composed, _fallback = await HybridRetriever._expand_fts_query(
         _PassThroughReads(),  # only _ro_read is reachable with expand_query_terms=False
         query="graph expansion",
         collections=[],

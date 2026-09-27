@@ -641,7 +641,7 @@ async def _run_impl(candidates, *, capture=None, **kwargs):
         _require_init=lambda: None,
     )
 
-    async def _maybe_expand(db, kept, surface, recall_event_id=None):
+    async def _maybe_expand(db, kept, surface, recall_event_id=None, neighbor_sink=None):
         return list(kept)  # no graph neighbors
 
     async def _record(*a, **k):

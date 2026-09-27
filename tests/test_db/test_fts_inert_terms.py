@@ -10,6 +10,8 @@ the rest of the query has enough hits; (3) the fail-open contract.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import aiosqlite
 import pytest
 
@@ -135,22 +137,99 @@ async def test_file_keyword_lane_is_pruned_in_the_real_composer():
             return await fn(db, *args, **kwargs)
 
     try:
-        composed = await HybridRetriever._expand_fts_query(
+        composed, fallback = await HybridRetriever._expand_fts_query(
             _Reads(),
             query="graph expansion",
             collections=[],
             expand_query_terms=False,
             extra_fts_terms=["common", "needle"],
         )
-        all_inert = await HybridRetriever._expand_fts_query(
+        all_inert, all_inert_fallback = await HybridRetriever._expand_fts_query(
             _Reads(),
             query="graph expansion",
             collections=[],
             expand_query_terms=False,
             extra_fts_terms=["common", "halfword"],
         )
+        nothing_pruned, no_fallback = await HybridRetriever._expand_fts_query(
+            _Reads(),
+            query="graph expansion",
+            collections=[],
+            expand_query_terms=False,
+            extra_fts_terms=["needle"],
+        )
     finally:
         await db.close()
     assert composed == "(graph expansion) OR (needle)"
-    # Every file term inert -> the whole lane is dropped, query left untouched.
-    assert all_inert == "graph expansion"
+    # The unpruned expression is kept as the underfill fallback.
+    assert fallback == "(graph expansion) OR (common OR needle)"
+    # Every file term inert -> the lane is dropped but the base stays BOOLEAN
+    # (parenthesised), so the non-boolean AND/OR-retry path is never entered.
+    assert all_inert == "(graph expansion)"
+    assert all_inert_fallback == "(graph expansion) OR (common OR halfword)"
+    assert nothing_pruned == "(graph expansion) OR (needle)"
+    assert no_fallback is None
+
+
+async def _corpus_with_metadata(n: int = 200) -> aiosqlite.Connection:
+    db = await _corpus(n)
+    await db.execute(
+        "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, origin_class TEXT, "
+        "wing TEXT, room TEXT, invalid_at TEXT, deprecated INTEGER, source_subsystem TEXT)"
+    )
+    await db.commit()
+    return db
+
+
+async def _gather(db, fts_query, fallback, limit):
+    from genesis.db.crud import memory as memory_crud
+    from genesis.memory.retrieval import HybridRetriever
+
+    class _Reads:
+        async def _ro_read(self, fn, *args, **kwargs):
+            return await fn(db, *args, **kwargs)
+
+    calls: list[str] = []
+    real = memory_crud.search_ranked
+
+    async def spy(conn, **kw):
+        calls.append(kw["query"])
+        return await real(conn, **kw)
+
+    with patch("genesis.memory.retrieval.memory_crud.search_ranked", new=spy):
+        results, _by_id = await HybridRetriever._gather_fts_candidates(
+            _Reads(),
+            query="needle",
+            fts_query=fts_query,
+            fallback_query=fallback,
+            collections=[],
+            candidate_limit=limit,
+            exclude_subsystems=None,
+            include_only_subsystems=None,
+            include_deprecated=True,
+        )
+    return results, calls
+
+
+async def test_underfilled_pruned_query_falls_back_to_the_unpruned_lane():
+    """PR #2455 review: when the selective part cannot fill the candidate
+    window, the inert term's rows WERE the remaining candidates — and RRF uses
+    positions, not bm25 magnitude — so the original unpruned expression runs."""
+    db = await _corpus_with_metadata()
+    try:
+        # needle matches 4 of 200 rows; a window of 10 is underfilled.
+        results, calls = await _gather(db, "(needle)", "(needle) OR (common)", 10)
+    finally:
+        await db.close()
+    assert calls == ["(needle)", "(needle) OR (common)"]
+    assert len(results) == 10  # the common-term rows fill the window as before
+
+
+async def test_filled_pruned_query_does_not_pay_for_the_fallback():
+    db = await _corpus_with_metadata()
+    try:
+        results, calls = await _gather(db, "(needle)", "(needle) OR (common)", 3)
+    finally:
+        await db.close()
+    assert calls == ["(needle)"]
+    assert len(results) == 3

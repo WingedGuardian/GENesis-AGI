@@ -519,9 +519,16 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
     # path (a minority of prompts). Fail-closed — if it is gone, excluded, or the
     # check errors, surface nothing this turn (self-heals at the next rebuild)
     # rather than advise a procedure the rest of the system now excludes.
+    #
+    # The same lookup also returns the winner's LIVE text and tier, which are
+    # what get surfaced. Under stale-while-revalidate the snapshot can be older
+    # than the TTL (the first call after an idle gap is served the old snapshot),
+    # so surfacing the cached principle could advise text that was since
+    # rewritten; the live tier is re-checked against its own bar for the same
+    # reason (a promotion/demotion changes which threshold applies).
     try:
         live = await db.execute_fetchall(
-            "SELECT 1 FROM procedural_memory "
+            "SELECT principle, activation_tier FROM procedural_memory "
             "WHERE id = ? AND deprecated = 0 AND quarantined = 0 LIMIT 1",
             (proc_id,),
         )
@@ -529,8 +536,20 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
         return None
     if not live:
         return None
+    live_principle = live[0][0] if live[0][0] is not None else principle
+    live_tier = live[0][1] or "DORMANT"
+    live_bar = (
+        _DORMANT_SURFACE_THRESHOLD if live_tier == "DORMANT" else _PROCEDURE_SURFACE_THRESHOLD
+    )
+    if best_sim < live_bar:
+        return None
 
-    return {"id": proc_id, "task_type": task_type, "principle": principle[:200], "tier": tier}
+    return {
+        "id": proc_id,
+        "task_type": task_type,
+        "principle": live_principle[:200],
+        "tier": live_tier,
+    }
 
 
 def _render_procedure_line(proc: dict) -> str:
@@ -714,6 +733,34 @@ async def proactive_context(
         "engine": {},
     }
     if budget <= 0:
+        # A configured zero budget skips retrieval entirely, but the call still
+        # happened: it gets the every-call timing line and (if on) a trace row
+        # saying WHY nothing was injected, so the journal/trace denominators
+        # count every endpoint call.
+        total = round((time.monotonic() - t0) * 1000, 1)
+        empty["timings_ms"] = {"total": total}
+        logger.info("proactive recall timing: total=%s skipped=zero_budget", total)
+        if _trace_enabled():
+            from genesis.memory.recall_trace import new_trace_id
+
+            try:
+                from genesis.mcp.memory import core as _core
+
+                skip_db = _core._memory_mod()._db
+            except Exception:
+                skip_db = None
+            if skip_db is not None:
+                skip_trace = {
+                    "trace_id": new_trace_id(),
+                    "caller": "proactive_endpoint",
+                    "profile": profile,
+                    "stance": stance,
+                    "budget": budget,
+                    "outcome": "skipped:zero_budget",
+                    "timings_ms": {"total": total},
+                }
+                _schedule_trace_write(skip_db, skip_trace, session_id)
+                empty["engine"] = {"trace_id": skip_trace["trace_id"]}
         return empty
 
     from genesis.mcp.memory import core as _core
