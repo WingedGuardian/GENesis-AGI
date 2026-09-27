@@ -1803,10 +1803,16 @@ def _net_subshell_depth(src: str) -> int:
     already lost their quotes: in ``(echo "a)"; git push)`` the quoted ``a)``
     token looks exactly like a closer, cancels the opener, and the push is hidden
     again — MEASURED on the first, token-based version. Here a paren inside single
-    quotes, double quotes, or after a backslash is text, not an operator. A
-    ``$(...)`` substitution opens and closes within itself, so it nets to zero.
+    quotes, double quotes, after a backslash, or inside a ``${...}`` expansion
+    (``${v:-)}``, ``${v//[(]/}``) is text, not an operator. A ``$(...)``
+    substitution opens and closes within itself, so it nets to zero.
+
+    This count only decides how many subshells are CARRIED into later segments.
+    It is not trusted to decide how many ``)`` a segment peels; see
+    _strip_wrappers.
     """
     depth = 0
+    brace = 0  # nesting of ${...}; only `${` nests, as in bash
     in_single = in_double = False
     i, n = 0, len(src)
     while i < n:
@@ -1823,6 +1829,12 @@ def _net_subshell_depth(src: str) -> int:
             in_single = True
         elif c == '"':
             in_double = True
+        elif c == "$" and i + 1 < n and src[i + 1] == "{":
+            brace += 1
+            i += 1
+        elif brace:
+            if c == "}":
+                brace -= 1
         elif c == "#" and (i == 0 or src[i - 1] in " \t\n;&|("):
             # a comment runs to end of line; parens in it are text
             nl = src.find("\n", i)
@@ -1837,9 +1849,43 @@ def _net_subshell_depth(src: str) -> int:
     return depth
 
 
-#: Wrappers that take ``NAME=value`` words as assignments before the command.
-#: MEASURED: only these two; every other wrapper here executes such a word.
-_ASSIGNMENT_WRAPPERS = frozenset({"env", "sudo"})
+def _wrapper_takes_assignment(wrapper: str, word: str, options_done: bool) -> bool:
+    """Whether ``wrapper`` consumes ``word`` as an environment assignment.
+
+    Only ``env`` and ``sudo`` take assignments; every other wrapper here executes
+    a word containing ``=`` as its program (MEASURED in bash).
+
+    MEASURED against GNU env 9.4 and sudo 1.9.15 with a stub per candidate
+    program, reading which one ran:
+
+    * ``env`` takes every word containing ``=`` — ``=x``, ``A.B=1``, even a path
+      such as ``/opt/k=v/git`` — and ``--`` does not end that: ``env -- A=1 cmd``
+      runs cmd.
+    * ``sudo`` takes a word containing ``=`` unless it starts with ``=`` or ``/``:
+      ``sudo /opt/k=v/git push`` RUNS that path and ``sudo =x cmd`` runs ``=x``.
+      After ``--`` it takes none: ``sudo -- A=1 cmd`` runs ``A=1``.
+    """
+    if "=" not in word:
+        return False
+    if wrapper == "env":
+        return True
+    if wrapper == "sudo":
+        # sudo tests the word it RECEIVES, after bash expanded it, and this word
+        # is the one BEFORE expansion: `sudo ~/k=v/git` and `sudo $HOME/k=v/git`
+        # reach sudo as absolute paths and run them, while `sudo $X=1 cmd` with
+        # X=A reaches it as `A=1` and runs cmd (MEASURED). Which one an expansion
+        # produces is not knowable here, so the shape decides: a leading `~`, or
+        # an expansion in front of a `/`, is read as the path it almost always
+        # is; an expansion with no `/` before the `=` as the assignment.
+        if options_done or word[0] in "=/~":
+            return False
+        name = word.split("=", 1)[0]
+        if "$" in name or "`" in name:
+            return "/" not in name
+        return True
+    return False
+
+
 _SUBSCRIPT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]$")
 
 
@@ -1949,7 +1995,16 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
-        after_wrapper = True
+        # A bare `time` at command position is the bash KEYWORD, not a program:
+        # bash keeps parsing a simple command after it, so `time A=1 git push`
+        # (and `time -p …`, `time -- …`, `time time …`) assigns A and runs git —
+        # MEASURED, bash 5.2. Only a `time` reached THROUGH a wrapper (`env time`,
+        # `nohup time`) is the external program, which executes a `=`-word.
+        # A `time` after a prefix assignment is also external in bash; resolving
+        # it as the keyword there over-gates (reveals a command that does not
+        # run), never hides one.
+        if not (tok == "time" and not after_wrapper):
+            after_wrapper = True
         if _basename(tok) == "uvx":
             via_uv_tool = True
         # `uvx` is the one wrapper whose CALLER can recover an unresolved
@@ -1960,14 +2015,21 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
         recoverable = _basename(tok) == "uvx"
         wrapper_at = i
         argflags, positional = spec
+        wrapper_name = _basename(tok)
         i += 1
+        # `--` ends OPTION parsing only. It does not end the wrapper's positional
+        # or assignment operands: `timeout -- 5 git push` still takes `5` as the
+        # duration and `env -- A=1 git push` still assigns A — MEASURED, both run
+        # git. Breaking out at `--` resolved those to `5` and `A=1`, hiding git.
+        options_done = False
         # consume the wrapper's own value-flags and leading positional args
         while i < len(argv):
             t = argv[i]
-            if t == "--":
+            if t == "--" and not options_done:
+                options_done = True
                 i += 1
-                break
-            if t.startswith("-"):
+                continue
+            if t.startswith("-") and not options_done:
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
                 elif recoverable and "=" not in t:
@@ -1986,11 +2048,12 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
                 else:
                     i += 1
                 continue
-            if "=" in t and _basename(argv[wrapper_at]) in _ASSIGNMENT_WRAPPERS:
-                # `env` (and `sudo`) take ANY word containing `=` as an
-                # assignment and run what follows — MEASURED, `env A.B=1 cmd`,
-                # `env 1X=1 cmd` and `env =x cmd` all run cmd, so an identifier
-                # test left `env A.B=1 git push` hidden from every guard.
+            if _wrapper_takes_assignment(wrapper_name, t, options_done):
+                # `env` takes ANY word containing `=` as an assignment and runs
+                # what follows, before or after `--` — MEASURED, `env A.B=1 cmd`,
+                # `env 1X=1 cmd`, `env =x cmd` and `env -- A=1 cmd` all run cmd,
+                # so an identifier test left `env A.B=1 git push` hidden from
+                # every guard. `sudo` is narrower; see _wrapper_takes_assignment.
                 #
                 # ONLY for those wrappers. An earlier revision applied the rule to
                 # every wrapper, claiming the worst case was an over-gate. That was
@@ -2013,6 +2076,14 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
     # push)` splits at `;` into `(export A=1` and `git push)`: this segment opened
     # nothing, so without the carry its `)` stayed glued, the subcommand read as
     # `push)`, and no guard saw a push. MEASURED: no decision.
+    #
+    # The peel is by TOKEN, so a QUOTED trailing `)` inside a still-open subshell
+    # is peeled too: `(echo x; git push origin 'HEAD:main)'; echo done)` pushes
+    # to `main)` and reads as `HEAD:main`. That misreads an argument in the
+    # over-gate direction, and it is kept on purpose. Letting the source text
+    # decide which `)` are quoted was tried and REMOVED: every way that reading
+    # goes wrong (`$'\''`, `${v:-{}`, nested quotes inside `"$(…)"`) left a real
+    # closer glued to the verb and hid the push — MEASURED in real bash.
     open_parens += carried_open
     if open_parens and result:
         # Peel matching trailing `)` closers off the operand(s) carrying the
