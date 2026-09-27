@@ -109,6 +109,22 @@ cannot wedge the oneshot unit and stop the networkd checks with it. Output from
 `status-unparseable`, never as healthy. The check skips cleanly where Tailscale
 is not installed or not running.
 
+The hourly limit is measured from the LATER of two times. The first is
+tailscaled's own start time (`systemctl show -p ActiveEnterTimestamp`), which
+systemd records as part of every start, so it cannot miss a restart that
+happened. It also counts reboots and manual restarts, so there is no heal in
+the first hour after tailscaled starts. The second is a best-effort stamp in
+`/run`, written before acting. It matters only where systemd's time did not
+move: a restart that failed while the unit stayed up, and observe mode. A
+repeated restart therefore needs the stamp write and the restart to fail
+together. Observe-mode alerts use a stable per-peer key, so the queue holds one
+entry per stuck peer and the outreach pipeline delivers it at most daily. The
+scan is bounded too: at most `NETWD_TS_MAX_PROBES` suspect peers (default 3) are
+probed per run, and no new probe starts after `NETWD_TS_SCAN_BUDGET_SEC`
+(default 60s). The status lists peers in a fixed order, so the starting peer
+rotates each run and every suspect is reached within a few runs. Skipped peers
+are logged.
+
 Before anything changes, each detection records its evidence: the full
 `tailscale status --json` goes to
 `/run/genesis-network-watchdog-tailscale-status.json` (root-only, since it

@@ -69,6 +69,18 @@ TS_PING_TIMEOUT="${NETWD_TS_PING_TIMEOUT:-3s}"
 # in well under a second, so 20s is only reached by a hung local API. The
 # restart bound allows systemd's default 90s stop timeout plus the start.
 TS_CALL_TIMEOUT="${NETWD_TS_CALL_TIMEOUT:-20}"
+# Per-tick scan bounds. Normally there are 0 or 1 suspects (an Active peer
+# with a stale handshake); 3 covers a shared outage without letting a large
+# tailnet hold the oneshot for minutes: worst case 3 peers x 2 calls x 20s,
+# and the budget stops starting new probes after 60s.
+TS_MAX_PROBES="${NETWD_TS_MAX_PROBES:-3}"
+TS_SCAN_BUDGET_SEC="${NETWD_TS_SCAN_BUDGET_SEC:-60}"
+# A non-numeric drop-in value would abort the check under `set -u` (or, half
+# numeric, silently disable the cap): fall back to the default instead.
+# No leading zero: bash arithmetic reads "08" as bad octal and the comparison
+# silently fails.
+[[ "$TS_MAX_PROBES" =~ ^(0|[1-9][0-9]*)$ ]] || TS_MAX_PROBES=3
+[[ "$TS_SCAN_BUDGET_SEC" =~ ^(0|[1-9][0-9]*)$ ]] || TS_SCAN_BUDGET_SEC=60
 TS_RESTART_TIMEOUT="${NETWD_TS_RESTART_TIMEOUT:-150}"
 TS_STAMP_FILE="${NETWD_TS_STAMP_FILE:-/run/genesis-network-watchdog-tailscale.last}"
 TS_STATUS_SNAPSHOT="${NETWD_TS_STATUS_SNAPSHOT:-/run/genesis-network-watchdog-tailscale-status.json}"
@@ -363,12 +375,12 @@ print(json.dumps(out))
 # unlink it. A missing or root-owned queue dir means no alert, never a root-
 # owned file in someone's home.
 _ts_alert() {
-    local title="$1" body="$2"
+    local title="$1" body="$2" key="${3:-}"
     [[ -n "$ALERT_QUEUE" && -d "$ALERT_QUEUE" ]] || {
         log "tailscale: no alert queue configured/present — alert is journal-only"
         return 0
     }
-    A_ROOT="$ALERT_QUEUE" A_NOW="$NETWD_NOW" A_TITLE="$title" A_BODY="$body" python3 - <<'PY' 2>/dev/null || log "tailscale: alert enqueue failed"
+    A_ROOT="$ALERT_QUEUE" A_NOW="$NETWD_NOW" A_TITLE="$title" A_BODY="$body" A_KEY="$key" python3 - <<'PY' 2>/dev/null || log "tailscale: alert enqueue failed"
 import json, os, uuid
 root = os.environ["A_ROOT"]
 # The queue must be a real directory (not a symlink to one) owned by a user.
@@ -384,10 +396,38 @@ entry = {
     "source": "network-watchdog",
     "title": os.environ["A_TITLE"],
     "body": os.environ["A_BODY"],
-    # Per-event identity: two heals an hour apart are two alerts, not a repeat.
-    "dedupe_key": "network-watchdog:tailscale:%d" % int(ts),
+    # Per-event identity by default: two heals an hour apart are two alerts,
+    # not a repeat. A caller that may fire every tick passes a stable key.
+    "dedupe_key": os.environ["A_KEY"] or "network-watchdog:tailscale:%d" % int(ts),
     "meta": {},
 }
+# A caller-supplied (stable) key is kept to ONE live entry, as
+# genesis.guardian.alert.queue.enqueue_alert does: while the channel is down
+# a condition that recurs every tick must not fill the queue and evict
+# unrelated alerts.
+# The scan READS files in a user-owned directory as root, so it gets the same
+# care as the write below: never follow a symlink (/dev/zero), never block on
+# a FIFO, regular files only, a bounded read, and only a dict counts. Bounded
+# to 200 entries, mirroring the queue's own dedupe scan limit.
+key = os.environ["A_KEY"]
+if key:
+    import glob
+    import stat as _st
+    for existing in glob.glob(os.path.join(root, "*.json"))[:200]:
+        try:
+            fd = os.open(existing, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            if not _st.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            data = json.loads(os.read(fd, 65536) or b"null")
+        except (OSError, ValueError):
+            continue
+        finally:
+            os.close(fd)
+        if isinstance(data, dict) and data.get("dedupe_key") == key:
+            raise SystemExit(0)
 # Root writing into a user-owned directory: create exclusively, never follow
 # a symlink, and chown the open fd rather than a path that could be swapped.
 tmp = os.path.join(root, ".%s.tmp" % uuid.uuid4().hex)
@@ -399,6 +439,24 @@ finally:
     os.close(fd)
 os.replace(tmp, os.path.join(root, "%.6f-%s.json" % (ts, uuid.uuid4().hex)))
 PY
+}
+
+# When the tailscale rate limit was last spent: the LATER of tailscaled's own
+# ActiveEnterTimestamp (systemd writes it as part of every start, so it cannot
+# fail to record a restart that happened, and it also counts reboots and an
+# operator's manual restart) and our stamp. The stamp is best-effort and only
+# matters where systemd's time did not move: a restart that failed while the
+# unit stayed up, and observe mode, which never restarts. A repeated restart
+# therefore needs the stamp write AND the restart to fail together.
+_ts_last_spent() {
+    local ts started=0 stamp
+    ts="$("$SYSTEMCTL" show tailscaled -p ActiveEnterTimestamp --value 2>/dev/null)"
+    if [[ -n "$ts" ]]; then
+        started="$(date -d "$ts" +%s 2>/dev/null || echo 0)"
+        [[ "$started" =~ ^[0-9]+$ ]] || started=0
+    fi
+    stamp="$(_read_stamp "$TS_STAMP_FILE")"
+    (( stamp > started )) && echo "$stamp" || echo "$started"
 }
 
 _tailscale_check() {
@@ -433,9 +491,32 @@ _tailscale_check() {
         return 0
     fi
 
+    # Bounded scan: each suspect can cost two TS_CALL_TIMEOUTs, and the unit
+    # is a oneshot sharing its timer with the networkd heal. A large tailnet
+    # with many stale peers (or a hung local API) must not hold it for
+    # minutes. Stop after TS_MAX_PROBES peers or TS_SCAN_BUDGET_SEC seconds,
+    # and say so. The status lists peers in a FIXED order, so the start point
+    # rotates each tick: otherwise the same first few (e.g. peers that went
+    # offline) would be probed forever and a stuck peer behind them never.
+    local -a rows=()
+    local line
+    while IFS= read -r line; do
+        local r_ip r_age
+        IFS=$'\t' read -r r_ip _ r_age <<<"$line"
+        [[ -n "$r_ip" && "$r_age" =~ ^[0-9]+$ ]] && rows+=("$line")
+    done <<<"$suspects"
+    local n=${#rows[@]} offset=0
+    (( n > 0 )) && offset=$(( (NETWD_NOW / 120) % n ))
+
     local ip name age stuck_ip="" stuck_name="" stuck_age="" saw_unreachable=""
-    while IFS=$'\t' read -r ip name age; do
-        [[ -n "$ip" && "$age" =~ ^[0-9]+$ ]] || continue
+    local probed=0 skipped=0 scan_start=$SECONDS k
+    for (( k = 0; k < n; k++ )); do
+        IFS=$'\t' read -r ip name age <<<"${rows[$(( (offset + k) % n ))]}"
+        if (( probed >= TS_MAX_PROBES || SECONDS - scan_start >= TS_SCAN_BUDGET_SEC )); then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        probed=$((probed + 1))
         # The tunnel answers → merely idle-ish, not stuck.
         if timeout "$TS_CALL_TIMEOUT" "$TAILSCALE" ping --tsmp -c 1 --timeout "$TS_PING_TIMEOUT" -- "$ip" >/dev/null 2>&1; then
             continue
@@ -451,7 +532,10 @@ _tailscale_check() {
         fi
         stuck_ip="$ip"; stuck_name="$name"; stuck_age="$age"
         break
-    done <<<"$suspects"
+    done
+    if (( skipped > 0 )); then
+        log "tailscale: probed $probed suspect peer(s); $skipped more not probed this tick (cap ${TS_MAX_PROBES} peers / ${TS_SCAN_BUDGET_SEC}s)"
+    fi
 
     if [[ -z "$stuck_ip" ]]; then
         if [[ -n "$saw_unreachable" ]]; then
@@ -470,27 +554,35 @@ _tailscale_check() {
     local peer="$stuck_name ($stuck_ip)"
 
     local last
-    last="$(_read_stamp "$TS_STAMP_FILE")"
+    last="$(_ts_last_spent)"
     if (( last > 0 && NETWD_NOW - last < TS_RATE_LIMIT_SEC )); then
-        log "tailscale: tunnel to $peer stuck (handshake ${stuck_age}s old) but a heal/alert fired <${TS_RATE_LIMIT_SEC}s ago — NOT acting"
+        log "tailscale: tunnel to $peer stuck (handshake ${stuck_age}s old) but tailscaled started, or a heal/alert fired, <${TS_RATE_LIMIT_SEC}s ago — NOT acting"
         _write_ts_state "ratelimited" "$peer" "$diag"
         return 0
     fi
 
     local detail="No WireGuard handshake with $peer for ${stuck_age}s while traffic is wanted; the tunnel ping got no reply but the peer answers discovery pings, so the path is fine and the tunnel is stuck. Evidence: $TS_STATUS_SNAPSHOT (and 'tailscale' in $STATE_FILE)."
+
+    # Best-effort stamp BEFORE acting (see _ts_last_spent for why a failed
+    # write is tolerable: systemd's start time bounds every restart that
+    # actually happened).
+    echo "$NETWD_NOW" >"$TS_STAMP_FILE" 2>/dev/null || true
+
     if [[ "$TS_MODE" == "observe" ]]; then
         log "tailscale: OBSERVE — tunnel to $peer stuck (handshake ${stuck_age}s old); not restarting"
-        echo "$NETWD_NOW" >"$TS_STAMP_FILE" 2>/dev/null || true
         _write_ts_state "observed" "$peer" "$diag"
+        # A STABLE per-peer key: if the stamp cannot hold the hourly limit,
+        # the queue keeps one entry per key and the outreach pipeline delivers
+        # a key once per day, so a stuck peer never pages every 2 minutes.
         _ts_alert "Tailscale tunnel to $stuck_name is stuck (observe mode — not restarted)" \
-            "$detail Restart it with: sudo systemctl restart tailscaled"
+            "$detail Restart it with: sudo systemctl restart tailscaled" \
+            "network-watchdog:tailscale:observe:$stuck_ip"
         return 0
     fi
 
     log "tailscale: HEALING — tunnel to $peer stuck (handshake ${stuck_age}s old); restarting tailscaled"
-    # Arm the rate limit BEFORE the attempt: a restart that fails has still
-    # dropped every session, so it spends the hour exactly as a good one does.
-    echo "$NETWD_NOW" >"$TS_STAMP_FILE" 2>/dev/null || true
+    # The stamp was written above, BEFORE the attempt: a restart that fails
+    # has still dropped every session, so it spends the hour as a good one.
     if timeout "$TS_RESTART_TIMEOUT" "$SYSTEMCTL" restart tailscaled; then
         _write_ts_state "healed" "$peer" "$diag"
         _ts_alert "Tailscale tunnel to $stuck_name was stuck — restarted tailscaled" \

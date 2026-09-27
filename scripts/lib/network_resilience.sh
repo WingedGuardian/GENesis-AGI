@@ -84,7 +84,9 @@ _netres_alert_queue_dir() {
         local home
         home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
         [[ -n "$home" ]] || return 0
-        dir="$home/.genesis/alerts/queue"
+        # GENESIS_HOME, when the operator passed it through sudo, is what the
+        # drainer (genesis.env.alert_queue_root) reads, so it wins here too.
+        dir="${GENESIS_HOME:-$home/.genesis}/alerts/queue"
         sudo -u "$SUDO_USER" mkdir -p "$dir" 2>/dev/null || true
     else
         dir="${GENESIS_HOME:-$HOME/.genesis}/alerts/queue"
