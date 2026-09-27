@@ -66,6 +66,41 @@ def _commit(repo: Path, msg: str, files: dict[str, str] | None = None) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _systemctl_shim(calls: Path, manifest: Path, on_restart: str = "") -> str:
+    """The station's systemctl: logs argv; `is-active` prints $UNIT_STATE. It models
+    a restart the way systemd does: MainPID is the old server's (1111) until a
+    restart, then a NEW pid ($NEW_PID, default 2222; "0" = the new process
+    exited). A restart also stands in for a completed bootstrap by writing a
+    manifest owned by the new pid ($MANIFEST_AFTER, a JSON mapping), unless
+    $NO_BOOTSTRAP is set. `on_restart` is extra shell run at the restart."""
+    return (
+        "#!/bin/bash\n"
+        f'echo "$*" >> "{calls}"\n'
+        # $UNIT_STATE_LATER: the state every is-active call AFTER the first reports
+        # (the first reports $UNIT_STATE) — lets a test hold the unit "active" for
+        # the identity check and still end the health wait at once.
+        'if [[ " $* " == *" is-active "* ]]; then\n'
+        '  s="${UNIT_STATE:-active}"\n'
+        f'  if [ -n "${{UNIT_STATE_LATER:-}}" ] && [ -f "{calls}.isactive" ]; then '
+        's="$UNIT_STATE_LATER"; fi\n'
+        f'  touch "{calls}.isactive"; echo "$s"; [ "$s" = active ]; exit\n'
+        "fi\n"
+        'if [[ " $* " == *" MainPID "* ]]; then\n'
+        f'  if grep -q "restart genesis-server" "{calls}"; then echo "${{NEW_PID:-2222}}"; '
+        "else echo 1111; fi; exit 0\n"
+        "fi\n"
+        'if [[ " $* " == *" restart "* ]]; then\n'
+        f"  {on_restart or ':'}\n"
+        '  if [ -z "${NO_BOOTSTRAP:-}" ]; then\n'
+        '    m="${MANIFEST_AFTER:-}"\n'
+        '    [ -n "$m" ] || m=\'{"db": "ok", "perception": "ok"}\'\n'
+        f'    printf \'{{"pid": %s, "manifest": %s}}\' "${{NEW_PID:-2222}}" "$m" > "{manifest}"\n'
+        "  fi\n"
+        "fi\n"
+        "exit 0\n"
+    )
+
+
 PYPROJECT_OK = '[project]\nname = "fixture"\ndependencies = ["packaging"]\n'
 PYPROJECT_UNMET = '[project]\nname = "fixture"\ndependencies = ["packaging>=9999"]\n'
 
@@ -95,14 +130,15 @@ def station(tmp_path):
     calls = tmp_path / "systemctl.log"
     marker = home / ".genesis" / "update_in_progress.pid"
     # systemctl logs its argv; `is-active` prints the state in $UNIT_STATE.
-    _exec(
-        shims / "systemctl",
-        "#!/bin/bash\n"
-        f'echo "$*" >> "{calls}"\n'
-        'if [[ " $* " == *" is-active "* ]]; then echo "${UNIT_STATE:-active}"; '
-        '[ "${UNIT_STATE:-active}" = active ]; exit; fi\n'
-        "exit 0\n",
-    )
+    # It models a restart the way systemd does: MainPID is the old server's
+    # (1111) until a restart, then a NEW pid ($NEW_PID, default 2222; "0" = the
+    # new process exited). A restart also stands in for a completed bootstrap by
+    # writing a manifest owned by the new pid ($MANIFEST_AFTER, a JSON mapping),
+    # unless $NO_BOOTSTRAP is set.
+    manifest = home / ".genesis" / "bootstrap_manifest.json"
+    _exec(shims / "systemctl", _systemctl_shim(calls, manifest))
+    # The old server's manifest, as a running install has it before a deploy.
+    manifest.write_text('{"pid": 1111, "manifest": {"db": "ok", "perception": "ok"}}')
     # curl answers per $CURL_RC, and records whether the deploy marker was held
     # at the moment the health check ran.
     _exec(
@@ -111,10 +147,41 @@ def station(tmp_path):
         f'[ -f "{marker}" ] && echo held >> "{tmp_path}/marker_seen"\n'
         "exit ${CURL_RC:-0}\n",
     )
+    # ss reports who LISTENS on the health port: the restarted unit's pid by
+    # default ($NEW_PID, or 2222), $LISTEN_PID for another process, and no
+    # listener at all under $SS_NO_LISTENER (the manifest fallback). $SS_PIDLESS
+    # prints the line without its users:(...) part, as ss does for a socket owned
+    # by another uid; $SS_EXTRA_PID adds a SECOND listener. Never the host's real
+    # ss: the live server listens on that port.
+    _exec(
+        shims / "ss",
+        "#!/bin/bash\n"
+        '[ -n "${SS_NO_LISTENER:-}" ] && exit 0\n'
+        'if [ -n "${SS_PIDLESS:-}" ]; then echo "LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*"; exit 0; fi\n'
+        'p="${LISTEN_PID:-${NEW_PID:-2222}}"\n'
+        'echo "LISTEN 0 128 [::]:5000 [::]:* users:((\\"python\\",pid=$p,fd=3))"\n'
+        'if [ -n "${SS_EXTRA_PID:-}" ]; then echo "LISTEN 0 128 0.0.0.0:5000 0.0.0.0:* '
+        'users:((\\"python\\",pid=$SS_EXTRA_PID,fd=4))"; fi\n'
+        'if [ -n "${SS_PIDLESS_EXTRA:-}" ]; then echo "LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*"; fi\n',
+    )
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("GENESIS_", "UNIT_STATE", "CURL_RC"))
+        if not k.startswith(
+            (
+                "GENESIS_",
+                "UNIT_STATE",
+                "CURL_RC",
+                "NEW_PID",
+                "NO_BOOTSTRAP",
+                "MANIFEST_AFTER",
+                "LISTEN_PID",
+                "SS_NO_LISTENER",
+                "SS_PIDLESS",
+                "SS_EXTRA_PID",
+                "SS_PIDLESS_EXTRA",
+            )
+        )
     }
     env.update(
         HOME=str(home),
@@ -132,6 +199,7 @@ def station(tmp_path):
         "tmp": tmp_path,
         "shims": shims,
         "calls": calls,
+        "manifest": manifest,
         "marker": marker,
         "lock": home / ".genesis" / "locks" / "update.lock",
         "queue": home / ".genesis" / "alerts" / "queue",
@@ -398,10 +466,12 @@ def test_a_deploy_excludes_update_sh_while_it_runs(station):
     deploy holds it: probe the lock from inside the restart."""
     _exec(
         station["shims"] / "systemctl",
-        "#!/bin/bash\n"
-        f'if [ "$1 $2" = "--user restart" ]; then flock -n "{station["lock"]}" true; '
-        f'echo "probe=$?" >> "{station["tmp"]}/probe"; fi\n'
-        'if [[ " $* " == *" is-active "* ]]; then echo active; fi\nexit 0\n',
+        _systemctl_shim(
+            station["calls"],
+            station["manifest"],
+            on_restart=f'flock -n "{station["lock"]}" true; '
+            f'echo "probe=$?" >> "{station["tmp"]}/probe"',
+        ),
     )
     r = _run(station)
     assert r.returncode == 0, r.stderr
@@ -423,6 +493,85 @@ def test_an_unhealthy_restart_alerts_and_holds(station):
     assert len(alerts) == 1, alerts
     assert "unhealthy" in alerts[0].read_text()
     assert not station["marker"].exists()
+
+
+@pytest.mark.parametrize(
+    "case, extra",
+    [
+        # The unit reports active, and each case defeats ONE identity check, so
+        # the check under test is what decides (a unit reported failed would be
+        # refused before any of them ran).
+        # The new process exited on the process lock an old server holds.
+        ("new process exited", {"NEW_PID": "0"}),
+        # The restarted unit is up, but ANOTHER process listens on the port (a
+        # bind failure in the unit's Flask thread leaves the process running).
+        ("another process holds the port", {"LISTEN_PID": "3333"}),
+        # A listener ss cannot attribute (another uid's socket prints no pid) is
+        # not proof — it must not fall through to the manifest check.
+        ("a listener with no visible pid", {"SS_PIDLESS": "1"}),
+        # The unit listens, but so does another process.
+        ("a second listener", {"SS_EXTRA_PID": "3333"}),
+        # The unit listens (v6), and an unattributable socket holds v4: the pids
+        # that ARE visible all match, so only counting the lines catches it.
+        ("a second listener with no visible pid", {"SS_PIDLESS_EXTRA": "1"}),
+        # ss cannot see a listener, so the manifest decides: a new pid exists,
+        # but no bootstrap completed under it (the manifest is still pid 1111).
+        ("no bootstrap under the new pid", {"NO_BOOTSTRAP": "1", "SS_NO_LISTENER": "1"}),
+        # The unit still reports the OLD pid, whose manifest it is.
+        ("old pid still reported", {"NEW_PID": "1111"}),
+    ],
+)
+def test_an_answer_from_another_server_is_not_a_healthy_deploy(station, case, extra):
+    """THE REPRO (Codex P1 / Devin severe on #2494): after an earlier nohup
+    fallback, an old server outside systemd keeps answering on the port while
+    the restarted unit is not serving. curl alone said "Healthy"."""
+    tip = _advance_upstream(station)
+    env = dict(station["env"], CURL_RC="0", UNIT_STATE="active", UNIT_STATE_LATER="failed", **extra)
+    r = _run(station, env=env)
+    assert r.returncode == 1, (case, r.stdout, r.stderr)
+    assert "Healthy" not in r.stdout, case
+    assert "not from the restarted genesis-server unit" in r.stderr, (case, r.stderr)
+    alerts = _alerts(station)
+    assert len(alerts) == 1 and "critical" in alerts[0].read_text(), (case, alerts)
+    assert _git(station["root"], "rev-parse", "HEAD") == tip, "never revert the tree"
+
+
+@pytest.mark.parametrize("ss_sees", [True, False])
+def test_a_healthy_restart_reports_the_new_pid_and_no_alert(station, ss_sees):
+    """Both proofs accept the real case: the listener, and (where ss sees no
+    listener) the manifest written by the new pid."""
+    _advance_upstream(station)
+    env = dict(station["env"]) if ss_sees else dict(station["env"], SS_NO_LISTENER="1")
+    r = _run(station, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "genesis-server pid 2222" in r.stdout, r.stdout
+    assert not _alerts(station), "a clean deploy pages nobody"
+
+
+def test_no_baseline_is_reported_but_does_not_page(station):
+    """A restart with no pre-restart manifest to compare (a first deploy, or a
+    stopped unit) reports `check:no-baseline` and queues no alert."""
+    station["manifest"].unlink()
+    _advance_upstream(station)
+    r = _run(station)
+    assert r.returncode == 0, r.stderr
+    assert "check:no-baseline" in r.stdout, r.stdout
+    assert not _alerts(station), "nothing actionable, nobody paged"
+
+
+def test_a_subsystem_regression_across_the_restart_is_surfaced(station):
+    """Codex P2 on #2494: the health endpoint stays 200 when a non-critical
+    subsystem regresses. The shared manifest delta (the check update.sh runs)
+    compares the new pid's manifest with the pre-restart baseline."""
+    _advance_upstream(station)
+    env = dict(station["env"], MANIFEST_AFTER='{"db": "ok", "perception": "degraded"}')
+    r = _run(station, env=env)
+    assert r.returncode == 0, r.stderr  # advisory: the deploy stands
+    assert "subsystems not ok after the restart: perception" in r.stdout, r.stdout
+    alerts = _alerts(station)
+    assert len(alerts) == 1, alerts
+    body = alerts[0].read_text()
+    assert "warning" in body and "perception" in body, body
 
 
 def test_a_failed_restart_after_the_merge_alerts(station):
@@ -470,9 +619,9 @@ def test_the_guardian_is_paused_across_the_restart_and_resumed(station):
     )
     _exec(
         station["shims"] / "systemctl",
-        "#!/bin/bash\n"
-        f'[ "$1 $2" = "--user restart" ] && echo RESTART >> "{log}"\n'
-        'if [[ " $* " == *" is-active "* ]]; then echo active; fi\nexit 0\n',
+        _systemctl_shim(
+            station["calls"], station["manifest"], on_restart=f'echo RESTART >> "{log}"'
+        ),
     )
     _advance_upstream(station)
     r = _run(station)
@@ -617,6 +766,55 @@ def test_no_restart_refuses_a_range_that_changes_runtime_code(station):
     assert "without --no-restart" in r.stderr
 
 
+def test_no_restart_refuses_startup_loaded_config(station):
+    """Codex P2 / Devin on #2494: config/ is read at server start (model routing,
+    profiles), so a config-only range under --no-restart would advance HEAD while
+    the live server keeps the old values. The refusal names the path."""
+    head = _git(station["root"], "rev-parse", "HEAD")
+    (station["seed"] / "config").mkdir()
+    _advance_upstream(station, "routing change", {"config/model_routing.yaml": "a: 1\n"})
+    r = _run(station, "--no-restart")
+    _assert_untouched(station, head, r)
+    assert "config/model_routing.yaml" in r.stderr and "without --no-restart" in r.stderr
+
+
+def test_no_restart_refuses_a_module_moved_out_of_src(station):
+    """Review finding on #2494: with rename detection on (git's default),
+    `diff --name-only` lists a move src/mod.py -> docs/mod.py as docs/mod.py
+    alone, so the runtime module it removes passed as a docs change."""
+    (station["seed"] / "src").mkdir()
+    _advance_upstream(station, "add a module", {"src/mod.py": "x = 1\n" * 20})
+    _git(station["root"], "pull", "-q", "--ff-only")
+    head = _git(station["root"], "rev-parse", "HEAD")
+    (station["seed"] / "docs").mkdir()
+    _git(station["seed"], "mv", "src/mod.py", "docs/mod.py")
+    _git(station["seed"], "commit", "-qm", "move it")
+    _git(station["seed"], "push", "-q", "origin", "main")
+    r = _run(station, "--no-restart")
+    _assert_untouched(station, head, r)
+    assert "src/mod.py" in r.stderr, r.stderr
+
+
+def test_no_restart_accepts_hooks_and_docs(station):
+    """Control for the refusal above: the allowlisted paths do deploy."""
+    for d in ("docs", ".claude", "scripts/hooks"):
+        (station["seed"] / d).mkdir(parents=True, exist_ok=True)
+    tip = _advance_upstream(
+        station,
+        "hooks and docs",
+        {
+            "docs/x.md": "d\n",
+            ".claude/y.md": "c\n",
+            "scripts/hooks/z.py": "h = 1\n",
+            "README.md": "r\n",
+        },
+    )
+    r = _run(station, "--no-restart")
+    assert r.returncode == 0, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+    assert not _restarted(station)
+
+
 def test_a_zero_fetch_timeout_spelled_with_padding_is_refused(station):
     """`timeout 00` runs unbounded, exactly like `timeout 0`."""
     head = _git(station["root"], "rev-parse", "HEAD")
@@ -663,8 +861,7 @@ def test_no_child_outlives_the_script_holding_the_lock(station):
     )
     _exec(
         station["shims"] / "systemctl",
-        f'#!/bin/bash\n[ "$1 $2" = "--user restart" ] && {child}\n'
-        'if [[ " $* " == *" is-active "* ]]; then echo active; fi\nexit 0\n',
+        _systemctl_shim(station["calls"], station["manifest"], on_restart=child),
     )
     _advance_upstream(station)
     try:
@@ -692,6 +889,47 @@ def test_no_child_outlives_the_script_holding_the_lock(station):
         ('[project]\ndependencies = ["nope; python_version < \\"3\\""]\n', 0),
         ("not toml [[[", 2),
         ("[project]\n", 2),
+        # Optional groups (Devin on #2494). "packaging" is installed here, so a
+        # group containing it is one this install uses: a package newly added to
+        # it must be installed too.
+        (
+            "[project]\ndependencies = []\n[project.optional-dependencies]\n"
+            'used = ["packaging", "zz-not-installed-pkg"]\n',
+            1,
+        ),
+        # A group none of whose packages is installed is not in use: silent.
+        (
+            "[project]\ndependencies = []\n[project.optional-dependencies]\n"
+            'unused = ["zz-not-installed-pkg", "zz-also-absent"]\n',
+            0,
+        ),
+        # A used group, fully satisfied.
+        (
+            '[project]\ndependencies = []\n[project.optional-dependencies]\nused = ["packaging"]\n',
+            0,
+        ),
+        ('[project]\ndependencies = []\n[project.optional-dependencies]\nbad = "packaging"\n', 2),
+        # A package the BASE dependencies already install says nothing about the
+        # extra (review finding on #2494: openai arrives through litellm), so it
+        # must not mark the group "in use" — directly shared...
+        (
+            '[project]\ndependencies = ["packaging"]\n[project.optional-dependencies]\n'
+            'shared = ["packaging", "zz-not-installed-pkg"]\n',
+            0,
+        ),
+        # ...or transitively (anyio is a dependency of httpx).
+        (
+            '[project]\ndependencies = ["httpx"]\n[project.optional-dependencies]\n'
+            'shared = ["anyio", "zz-not-installed-pkg"]\n',
+            0,
+        ),
+        # Control for the two above: without the base dependency, the same
+        # installed package IS the group's own, so the group is in use and refuses.
+        (
+            "[project]\ndependencies = []\n[project.optional-dependencies]\n"
+            'own = ["anyio", "zz-not-installed-pkg"]\n',
+            1,
+        ),
     ],
 )
 def test_the_dependency_gate_answers(pyproject, rc):

@@ -27,6 +27,37 @@ _GUARDIAN_HOST=""
 _GUARDIAN_KEY=""
 _GUARDIAN_RENEW_PID=""   # PID of the background lease-renewer (P2 #4), if running
 _GUARDIAN_PARENT_PID=""  # the deploy process the renewer serves
+_GUARDIAN_PARENT_START="" # its start time (/proc stat field 22); with the pid, its identity
+
+# "<state> <starttime>" for a pid, from /proc/<pid>/stat; empty when /proc cannot
+# answer (no such process, or no /proc). Fields are counted AFTER the last ")",
+# because field 2 is the command name in parentheses and may itself hold spaces.
+_guardian_proc_start() {
+    local stat
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    stat="${stat##*) }"
+    # shellcheck disable=SC2086 # word-splitting the numeric fields is the point
+    set -- $stat
+    # Now $1 is field 3 (state) and ${20} is field 22 (starttime).
+    [ -n "${20:-}" ] && printf '%s %s\n' "$1" "${20}"
+}
+
+# Is the deploy that started the renewer still THAT running process? `kill -0`
+# alone says yes for a zombie (a SIGKILLed deploy its parent has not reaped) and
+# for an unrelated process that reused the pid — either way the renewer would keep
+# re-pausing the Guardian over a deploy that is gone. So: same start time, and not
+# a zombie. Where /proc could not answer at pause time, `kill -0` is all there is.
+_guardian_parent_alive() {
+    local now
+    if [ -z "$_GUARDIAN_PARENT_START" ]; then
+        kill -0 "$_GUARDIAN_PARENT_PID" 2>/dev/null
+        return
+    fi
+    now="$(_guardian_proc_start "$_GUARDIAN_PARENT_PID")"
+    [ -n "$now" ] || return 1
+    [ "${now%% *}" != Z ] || return 1
+    [ "${now#* }" = "$_GUARDIAN_PARENT_START" ]
+}
 # Generous TTL: the EXIT-trap resume ends the pause early on success, so this only
 # matters if the deploy is SIGKILLed (the host's expires_at then self-heals after
 # this long). The bound is the server-DOWN window (~3-15 min), not the total pause
@@ -92,6 +123,8 @@ _guardian_pause() {
         # inherited lock fd kept the lock held for up to TTL/2 after EVERY run,
         # clean exit included — up to about an hour after a kill.
         _GUARDIAN_PARENT_PID="$$"
+        _GUARDIAN_PARENT_START="$(_guardian_proc_start "$$" || true)"
+        _GUARDIAN_PARENT_START="${_GUARDIAN_PARENT_START#* }"
         if [ -n "${_UPDATE_LOCK_FD:-}" ]; then
             _guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &
         else
@@ -145,7 +178,7 @@ _guardian_renew_loop() {
     local i=0
     while [ "$i" -lt "$GUARDIAN_PAUSE_RENEW_MAX" ]; do
         sleep "$((GUARDIAN_PAUSE_TTL / 2))"
-        kill -0 "$_GUARDIAN_PARENT_PID" 2>/dev/null || break
+        _guardian_parent_alive || break
         timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
             "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
         i=$((i + 1))

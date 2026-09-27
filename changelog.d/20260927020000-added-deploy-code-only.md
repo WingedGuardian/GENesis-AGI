@@ -13,14 +13,23 @@
     `update.sh` run, a branch other than main, a dirty tracked tree, a live
     foreign deploy marker, a diverged tree, and a pull whose `pyproject.toml` the
     venv does not already satisfy. The dependency check reads the incoming file
-    before the merge and asks the environment, not the diff.
+    before the merge and asks the environment, not the diff — including every
+    optional-dependency group this install uses (one with any of its packages
+    installed).
   - **Across the restart** it holds the deploy marker (the watchdog defers) and
     pauses the host Guardian (no false "Genesis down" alert), then waits for
     health with the same window `update.sh` computes.
+  - **Healthy means the RESTARTED unit is serving:** the unit is active with a
+    new pid and the bootstrap manifest was written by that pid. A server running
+    outside systemd that answers on the port does not count. The subsystems are
+    then compared with the pre-restart manifest (the same check `update.sh` runs,
+    now shared in `scripts/lib/manifest_delta.py`); a regression is reported and
+    alerted, and the deploy stands.
   - **On a failed health check it alerts and holds.** The tree is not reverted.
-  - `--no-restart` is a locked pull only, for hooks and docs, and refuses a range
-    that changes runtime code under `src/`; `--no-pull` restarts the tree as it
-    stands (a locked restart).
+  - `--no-restart` is a locked pull only, for hooks and docs: it refuses a range
+    touching anything outside `.claude/`, `docs/`, `tests/`, `changelog.d/`,
+    `.github/`, `scripts/hooks/` and top-level Markdown — `config/` is read at
+    server start. `--no-pull` restarts the tree as it stands (a locked restart).
   - It says what a code-only deploy does not apply: activation paths (units,
     bootstrap, git hooks, dependencies) and code the host Guardian runs, both
     of which need `update.sh`.
@@ -35,7 +44,10 @@
 - **`update.sh`'s Guardian lease renewer no longer holds the update lock after it
   exits.** The renewer's `sleep` inherited the lock and outlived the deploy, for up
   to 15 minutes after a clean exit and about an hour after a kill. It is now
-  started without the lock, and it stops once the deploy that started it is gone.
+  started without the lock, and it stops once the deploy that started it is gone —
+  judged by the process's identity (pid and start time), so a killed deploy that
+  lingers as an unreaped zombie, or a new process that reuses its pid, does not
+  keep the Guardian paused.
   The pause, resume and renewer moved to `scripts/lib/guardian_pause.sh`, shared
   with the new script; the deploy marker and the list of tracked files a deploy
   may find dirty moved to `scripts/lib/deploy_marker.sh`, shared with

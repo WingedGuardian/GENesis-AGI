@@ -299,9 +299,9 @@ def test_lease_renewer_wired_and_bounded(lib: str) -> None:
     renew = _extract_func(lib, "_guardian_renew_loop")
     assert "GUARDIAN_PAUSE_RENEW_MAX" in renew, "renewer must be bounded (no runaway)"
     assert "pause $GUARDIAN_PAUSE_TTL" in renew, "renewer must re-issue the pause verb"
-    assert renew.index('kill -0 "$_GUARDIAN_PARENT_PID"') < renew.index(
-        "pause $GUARDIAN_PAUSE_TTL"
-    ), "check the parent is alive BEFORE each renew"
+    assert renew.index("_guardian_parent_alive") < renew.index("pause $GUARDIAN_PAUSE_TTL"), (
+        "check the parent is alive BEFORE each renew"
+    )
     pause = _extract_func(lib, "_guardian_pause")
     assert "_guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &" in pause, (
         "pause starts the renewer redirected, with the deploy lock fd closed"
@@ -362,6 +362,89 @@ def test_the_renewer_stops_when_its_deploy_is_killed(text: str, tmp_path: Path) 
     assert sent.count("pause 2") == 1, f"the renewer re-paused after its deploy died: {sent!r}"
     alive = subprocess.run(["kill", "-0", str(renewer)], capture_output=True)
     assert alive.returncode != 0, "the renewer outlived its deploy"
+
+
+def _parent_alive(pid: int, start: str) -> bool:
+    """Drive the REAL _guardian_parent_alive for a (pid, recorded start) pair."""
+    r = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'. "{GUARDIAN_LIB}"\n_GUARDIAN_PARENT_PID={pid}\n'
+            f'_GUARDIAN_PARENT_START="{start}"\n_guardian_parent_alive',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return r.returncode == 0
+
+
+def _start_of(pid: int) -> tuple[str, str]:
+    """(state, starttime) straight from /proc, independent of the helper."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    fields = stat[stat.rindex(")") + 2 :].split()
+    return fields[0], fields[19]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_the_pause_records_the_deploys_start_time(text: str, tmp_path: Path) -> None:
+    """The identity check is only as good as the value the pause records: an
+    empty _GUARDIAN_PARENT_START silently falls back to `kill -0` (review finding
+    on #2494). Compared with /proc read independently of the lib's parser."""
+    run, _ = _harness(text, tmp_path, ssh_rc=0)
+    out = run(
+        "_guardian_pause\n"
+        'echo "RECORDED=[$_GUARDIAN_PARENT_START]"\n'
+        "python3 -c \"import sys; s = open('/proc/%s/stat' % sys.argv[1]).read(); "
+        "print('ACTUAL=[' + s[s.rindex(')') + 2:].split()[19] + ']')\" \"$$\"\n"
+        "_guardian_resume\n"
+    )
+    recorded = re.search(r"RECORDED=\[(\d*)\]", out)
+    actual = re.search(r"ACTUAL=\[(\d+)\]", out)
+    assert recorded and actual, out
+    assert recorded.group(1) == actual.group(1), out
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_the_renewer_parent_check_follows_process_identity(tmp_path: Path) -> None:
+    """Codex P2 on #2494: `kill -0` alone says "alive" for a zombie and for a
+    reused pid. Identity is the pid AND its start time; a zombie is dead."""
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        _, start = _start_of(live.pid)
+        assert _parent_alive(live.pid, start), "a live parent with its own start time"
+        # The same pid with another start time is a DIFFERENT process (a reused pid).
+        assert not _parent_alive(live.pid, str(int(start) + 1)), "a reused pid"
+    finally:
+        live.kill()
+        live.wait()
+    assert not _parent_alive(live.pid, start), "a parent that is gone"
+
+    # A real zombie: the child exits, its parent never reaps it.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys, time\npid = os.fork()\nif pid == 0:\n    os._exit(0)\n"
+            "print(pid, flush=True)\ntime.sleep(30)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        zpid = int(holder.stdout.readline())
+        deadline = time.monotonic() + 10
+        while _start_of(zpid)[0] != "Z" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        state, zstart = _start_of(zpid)
+        assert state == "Z", "guard: the fixture must really be a zombie"
+        # Control: kill -0 still succeeds on it — the defect this closes.
+        assert subprocess.run(["kill", "-0", str(zpid)]).returncode == 0
+        assert not _parent_alive(zpid, zstart), "a zombie is not a live deploy"
+    finally:
+        holder.kill()
+        holder.wait()
 
 
 if sys.platform.startswith("win"):  # pragma: no cover

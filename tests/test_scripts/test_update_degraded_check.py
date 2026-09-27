@@ -121,6 +121,7 @@ def _run(
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 HEALTH_OK=true
+SCRIPT_DIR="{REPO / "scripts"}"
 MANIFEST_BEFORE={json.dumps(before_json)}
 SERVER_PID_BEFORE="{pid_b}"
 _do_rollback() {{ echo "ROLLBACK-CALLED: $*"; exit 9; }}

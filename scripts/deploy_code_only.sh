@@ -30,7 +30,9 @@
 #                 GENESIS_DEPLOY_LOCK_WAIT)
 #   --no-pull     restart the tree as it stands (still dependency-checked)
 #   --no-restart  a locked pull only: for a hooks or docs change, which takes
-#                 effect without a restart. Refuses a range that changes src/.
+#                 effect without a restart. Refuses a range touching anything
+#                 outside .claude/, docs/, tests/, changelog.d/, .github/,
+#                 scripts/hooks/ and top-level *.md (config/ is read at startup).
 # It is long-running (up to the lock wait plus the health window): run it in the
 # background from an agent session, never under a short tool timeout.
 #
@@ -202,13 +204,28 @@ if [ "$DO_PULL" -eq 1 ]; then
         # so a refusal leaves the tree untouched.
         git -C "$GENESIS_ROOT" show "$_upstream:pyproject.toml" | _deps_ok "$_upstream" \
             || exit 1
-        # --no-restart promises a hooks/docs deploy. Advancing runtime code under a
-        # running server without restarting it leaves old code in memory importing
-        # new files lazily, so that combination is refused.
-        if [ "$DO_RESTART" -eq 0 ] && [ -n "$(git -C "$GENESIS_ROOT" diff --name-only "$_head" "$_upstream" -- src/)" ]; then
-            die "this range changes runtime code under src/ — deploy it without --no-restart."
+        # --no-restart promises a hooks/docs deploy, so the range may touch ONLY
+        # paths the running server never reads: an ALLOWLIST, not a src/ denylist.
+        # config/ is read at startup (model routing and profiles, among others), so
+        # a config change under a running server leaves the old values in memory;
+        # runtime code would be imported lazily into a half-old process. Anything
+        # outside the list needs the restart.
+        # --no-renames: with rename detection on (git's default), a file MOVED
+        # out of src/ into docs/ lists only its destination, and the runtime
+        # module it removes would pass as a docs change. And the list is read
+        # BEFORE filtering, so a failed diff refuses instead of reading as empty.
+        if [ "$DO_RESTART" -eq 0 ]; then
+            _changed="$(git -C "$GENESIS_ROOT" diff --no-renames --name-only "$_head" "$_upstream")" \
+                || die "cannot list the files this range changes — nothing changed."
+            _unsafe="$(printf '%s\n' "$_changed" \
+                | grep -vE '^$|^(\.claude/|docs/|tests/|changelog\.d/|\.github/|scripts/hooks/)|^[^/]+\.md$' || true)"
+            if [ -n "$_unsafe" ]; then
+                echo "ERROR: --no-restart only deploys hooks, docs and tests; this range also changes:" >&2
+                echo "$_unsafe" | sed 's/^/         /' >&2
+                die "deploy it without --no-restart."
+            fi
         fi
-        _range_changed() { git -C "$GENESIS_ROOT" diff --name-only "$_head" "$_upstream" -- "$@"; }
+        _range_changed() { git -C "$GENESIS_ROOT" diff --no-renames --name-only "$_head" "$_upstream" -- "$@"; }
         # Excused dirty files that the incoming range ALSO changes. The regenerable
         # ones are cleared, exactly as update.sh does before its merge (they rewrite
         # themselves); otherwise the merge would abort on them every time. The
@@ -281,11 +298,55 @@ if [ "$DO_RESTART" -eq 0 ]; then
 fi
 
 # ── Restart ───────────────────────────────────────────────────────────
+# The pre-restart identity and manifest, read while the old server is ALIVE (a
+# stopped unit reports MainPID 0, and its manifest then belongs to nobody). They
+# are what makes the health check below about the RESTARTED unit rather than
+# about whatever answers on the port, and the baseline for the subsystem delta.
+_SERVER_PID_BEFORE="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
+_MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
 _guardian_pause
 _PHASE="restarting"
 echo "  Restarting genesis-server at $SHA…"
 systemctl --user restart genesis-server {_UPDATE_LOCK_FD}>&-
 _PHASE="restarted"
+
+# Is the RESTARTED unit the one serving? A 200 from the port alone cannot say: a
+# server started outside systemd (update.sh's nohup fallback) can keep answering
+# while the new unit exits on the process lock it holds. The unit must be active,
+# with a NEW, nonzero MainPID, AND that pid must be what serves:
+#   - the process LISTENING on the health port is that pid (`ss`). The runtime
+#     binds only after its bootstrap completes, and Flask runs in a daemon thread,
+#     so a bind failure leaves the process up with its manifest written while
+#     something else answers — only the listener identifies who serves;
+#   - where `ss` shows no listener (not installed, or not permitted to see the
+#     owning process), the bootstrap manifest must carry that pid instead.
+# Prints the pid on success.
+_HEALTH_PORT=5000
+_restarted_unit_serving() {
+    local state pid ss_out lpids doc_pid
+    state="$(systemctl --user is-active genesis-server 2>/dev/null || true)"
+    [ "$state" = active ] || return 1
+    pid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
+    [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
+    # A listener line that names no pid (ss prints none for a socket owned by
+    # another uid) is NOT the unit, and neither is a second listener: every
+    # listener must be this pid. The manifest decides only when there is no
+    # listener line at all (ss missing, or not yet bound).
+    ss_out="$(ss -ltnpH "sport = :$_HEALTH_PORT" 2>/dev/null || true)"
+    if [ -n "$ss_out" ]; then
+        lpids="$(printf '%s\n' "$ss_out" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true)"
+        [ "$(printf '%s\n' "$ss_out" | wc -l)" -eq "$(printf '%s\n' "$ss_out" | grep -c 'pid=' || true)" ] || return 1
+        [ "$lpids" = "$pid" ] || return 1
+    else
+        doc_pid="$(python3 -c 'import json,os,sys
+try:
+    print(json.load(open(os.path.expanduser("~/.genesis/bootstrap_manifest.json"))).get("pid", ""))
+except Exception:
+    sys.exit(1)' 2>/dev/null || true)"
+        [ "$doc_pid" = "$pid" ] || return 1
+    fi
+    printf '%s\n' "$pid"
+}
 
 # Health window: the SAME value update.sh computes from the same inputs (pinned by
 # a parity test). It is bounded by the Guardian's cover, derived from the lib's
@@ -323,28 +384,60 @@ if [ "$_start" -eq 0 ]; then _clock=wall; _start="$(_now)"; fi
 _deadline=$(( _start + HEALTH_WINDOW_SECS ))
 _max_attempts=$(( HEALTH_WINDOW_SECS / _poll + 2 ))
 _healthy=false
+_answered_by_other=false
+_SERVER_PID=""
 _attempt=0
 while [ "$_attempt" -lt "$_max_attempts" ] && [ "$(_now)" -lt "$_deadline" ]; do
     _attempt=$((_attempt + 1))
     sleep "$_poll"
+    _seen="not answering yet"
     if curl -sf --max-time 20 "$HEALTH_URL" >/dev/null 2>&1; then
-        _healthy=true
-        break
+        if _SERVER_PID="$(_restarted_unit_serving)"; then
+            _healthy=true
+            break
+        fi
+        # Something answers, but it is not (yet) the restarted unit: still
+        # bootstrapping, or an old server outside systemd holding the port.
+        _answered_by_other=true
+        _seen="the port answers, but not from the restarted unit"
     fi
     # An empty state (systemd/D-Bus busy) is unreadable, not dead: keep waiting.
     _state="$(systemctl --user is-active genesis-server 2>/dev/null || true)"
     case "$_state" in
-        active|activating|reloading|'') echo "  Attempt $_attempt: not answering yet (unit: ${_state:-unreadable})…" ;;
+        active|activating|reloading|'') echo "  Attempt $_attempt: $_seen (unit: ${_state:-unreadable})…" ;;
         *) echo "  Attempt $_attempt: unit is '$_state' — it will not come up on its own."; break ;;
     esac
 done
 
 if [ "$_healthy" = true ]; then
-    echo "  Healthy — deployed $SHA"
+    # Which subsystems regressed across the restart? The same check update.sh
+    # runs, against the baseline read before the restart. ADVISORY, as there:
+    # an otherwise-good deploy is not failed over one non-critical subsystem, but
+    # the regression is surfaced rather than swallowed.
+    _degraded="$(SERVER_PID="$_SERVER_PID" SERVER_PID_BEFORE="$_SERVER_PID_BEFORE" \
+        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 "$_SELF_DIR/lib/manifest_delta.py" 2>/dev/null)" \
+        || _degraded="check:manifest-interpreter-failed"
+    if [ -n "$_degraded" ]; then
+        echo "  NOTE: subsystems not ok after the restart: $_degraded"
+    fi
+    # Page only for something actionable. A lone `check:no-baseline` means only
+    # that there was no pre-restart manifest to compare with (a first deploy, or
+    # a restart of a stopped unit) — reported above, not alerted.
+    if [ -n "$_degraded" ] && [ "$_degraded" != "check:no-baseline" ]; then
+        queue_alert warning deploy-code-only \
+            "code-only deploy at $SHA: subsystems not ok" \
+            "genesis-server is serving $SHA, but these subsystems regressed or could not be checked across the restart: $_degraded. Check: journalctl --user -u genesis-server -n 100"
+    fi
+    echo "  Healthy — deployed $SHA (genesis-server pid $_SERVER_PID)"
     exit 0
 fi
 _ALERTED=1
+if [ "$_answered_by_other" = true ]; then
+    _why="the health endpoint answered, but not from the restarted genesis-server unit (a server running outside systemd may hold the port)"
+else
+    _why="genesis-server did not pass its health check"
+fi
 queue_alert critical deploy-code-only \
     "code-only deploy unhealthy at $SHA" \
-    "genesis-server did not pass its health check after a code-only deploy to $SHA. The tree was NOT reverted (by design). Check: journalctl --user -u genesis-server -n 50"
-die "genesis-server is not healthy after the restart — tree left at $SHA, alert queued."
+    "After a code-only deploy to $SHA, $_why. The tree was NOT reverted (by design). Check: journalctl --user -u genesis-server -n 50"
+die "after the restart, $_why — tree left at $SHA, alert queued."
