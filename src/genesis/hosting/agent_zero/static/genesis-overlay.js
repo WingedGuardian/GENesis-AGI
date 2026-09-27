@@ -592,7 +592,7 @@ async function openGenesisInboxModal() {
   if (existing) existing.remove();
 
   const items = (await fetchJson("/api/genesis/ui/inbox?limit=50")) || [];
-  const filters = ["all", "pending", "completed", "failed"];
+  const filters = ["all", "pending", "completed", "failed", "superseded"];
 
   const overlay = el("div", "genesis-modal-overlay");
   overlay.id = "genesis-inbox-modal";
