@@ -56,6 +56,7 @@ _spec = importlib.util.spec_from_file_location(
 gpg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gpg)
 
+import git_repo_selection as grs  # noqa: E402
 import pre_push_privacy_review as privacy  # noqa: E402
 from shell_parse import analyze  # noqa: E402
 
@@ -88,20 +89,19 @@ def _git_seg(command: str):
     ],
 )
 def test_which_segments_redirect_the_repository(command: str, redirected: bool) -> None:
-    seg = _git_seg(command)
-    assert gpg._seg_redirects_repo(seg.argv, seg.raw) is redirected
+    assert grs.seg_redirects_repo(_git_seg(command)) is redirected
 
 
-def test_the_env_form_is_invisible_in_argv_which_is_why_raw_is_read() -> None:
+def test_the_env_form_is_invisible_in_argv_which_is_why_the_prefix_is_read() -> None:
     """The mechanism of the hole, pinned: ``shell_parse`` strips env assignments.
 
     If a future refactor moves the check onto ``argv`` alone, the env form goes
-    silent again — this is the test that says why ``raw`` is consulted.
+    silent again — this is the test that says why the stripped prefix is read.
     """
     seg = _git_seg("GIT_DIR=/r/.git git push")
     assert not any("GIT_DIR" in tok for tok in seg.argv), "argv now carries the env assignment"
-    assert gpg._seg_redirects_repo(seg.argv, None) is False
-    assert gpg._seg_redirects_repo(seg.argv, seg.raw) is True
+    assert grs._prefix_words(seg) == ["GIT_DIR=/r/.git"]
+    assert grs.seg_redirects_repo(seg) is True
 
 
 # --- _effective_cwd (push path) ---------------------------------------------
@@ -240,26 +240,80 @@ def test_the_privacy_scan_still_runs_for_an_ordinary_push(monkeypatch) -> None:
     assert scanned == ["/r"]
 
 
-# --- audit round: spellings, false positives, and the duplicated copies -------
+# --- round 2: the redirect is read from the shared parser's segments ----------
+#
+# Every round-1 finding was one cause: the detector matched raw WORDS anywhere in
+# a command and raw FLAGS anywhere in argv, instead of asking what bash and git
+# do with them. It now reads the segments ``shell_parse.analyze`` resolved, and
+# asks three scoped questions (git_repo_selection's docstring).
+
+
+@pytest.mark.parametrize(
+    ("command", "redirected"),
+    [
+        # Option VALUES after the subcommand select nothing (`-o` is a push option).
+        ("git push -o --git-dir=/x origin", False),
+        ("git push --push-option --work-tree=/x origin", False),
+        ("git merge -m --git-dir=/x feat/x", False),
+        ("git push origin -- --git-dir=/x", False),
+        # The GLOBAL region still counts, wherever git sits behind a wrapper.
+        ("git -c a.b=c --git-dir=/x push", True),
+        ("sudo git --git-dir=/x push", True),
+        ("/usr/bin/git --git-dir=/x push", True),
+        ("env GIT_DIR=/x git push", True),
+        ("sudo GIT_DIR=/x git push", True),
+        ("(GIT_DIR=/x git push)", True),
+    ],
+)
+def test_only_the_global_region_and_the_command_prefix_count(
+    command: str, redirected: bool
+) -> None:
+    assert grs.seg_redirects_repo(_git_seg(command)) is redirected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -m GIT_DIR && git push",
+        "echo GIT_DIR && git push",
+        "unset GIT_DIR && git push",
+        # COMMAND-scoped: bash sets it for `git status` only.
+        "GIT_DIR=/o/.git git status && git push",
+        "env GIT_DIR=/o/.git git status && git push",
+        "env -u GIT_DIR git status && git push",
+    ],
+)
+def test_a_mention_or_a_command_scoped_assignment_does_not_leak_forward(command: str) -> None:
+    """Round-1 finding: any word equal to a variable name was read as a
+    persistent assignment, so these ordinary pushes lost their known cwd."""
+    push = [s for s in analyze(command) if s.exe == "git"][-1]
+    assert gpg._effective_cwd(command, {"cwd": "/here"}, seg=push) == "/here"
 
 
 @pytest.mark.parametrize(
     "raw",
     [
+        "export GIT_DIR=/r/.git",
         'export "GIT_DIR"=/r/.git',
         "export GIT_D\\IR=/r/.git",
+        "export GIT_DIR",
+        "command export GIT_DIR=/r/.git",
+        "declare -x GIT_DIR=/r/.git",
         "read GIT_DIR <<< /r/.git",
         "printf -v GIT_DIR %s /r/.git",
-        "GIT_DIR+=/r/.git git push",
-        "export GIT_DIR",
+        "GIT_DIR=/r/.git",
+        "eval 'export GIT_DIR=/r/.git'",
+        "export $(cat vars.env)",
     ],
 )
-def test_spellings_bash_accepts_are_all_seen(raw: str) -> None:
-    """Each of these was MEASURED, in real bash, to make git act on the other
-    repository — and each slipped past the first version, which matched a raw
-    substring. After quote removal every one is a word naming the variable."""
-    assert gpg._raw_sets_repo_env(raw) is True
-    assert privacy._repo_redirected(raw + " && git push") is True
+def test_persistent_spellings_are_all_seen(raw: str) -> None:
+    """Each of these leaves the variable set for the NEXT command (MEASURED in
+    bash for the export / read / printf -v / quoted / escaped forms)."""
+    assert grs.raw_sets_repo_env(raw) is True
+    command = raw + " && git push"
+    push = [s for s in analyze(command) if s.exe == "git"][-1]
+    assert gpg._effective_cwd(command, {"cwd": "/here"}, seg=push) is gpg._CWD_UNKNOWN
+    assert privacy._repo_redirected(command) is True
 
 
 @pytest.mark.parametrize(
@@ -269,30 +323,75 @@ def test_spellings_bash_accepts_are_all_seen(raw: str) -> None:
         "echo 'the GIT_DIR=x spelling'",
         "git push  # GIT_DIR=",
         "MY_GIT_DIR=/r git push",
+        "echo GIT_DIR",
+        "unset GIT_DIR",
+        "GIT_DIR=/r/.git git status",
+        "export PATH=$PATH:/x",
+        "source .venv/bin/activate",
     ],
 )
-def test_text_that_merely_mentions_the_variable_is_not_an_assignment(raw: str) -> None:
-    """The false-positive direction. The substring version fired on all of these;
-    measured consequence: an ordinary feature-branch merge after such a commit was
-    hard-blocked, and real privacy findings were suppressed."""
-    assert gpg._raw_sets_repo_env(raw) is False
+def test_text_that_sets_nothing_for_later_commands(raw: str) -> None:
+    assert grs.raw_sets_repo_env(raw) is False
+
+
+def test_a_command_scoped_assignment_does_not_block_a_later_merge(repos) -> None:
+    """Devin finding: `GIT_DIR=/other git status && git merge main` runs the
+    merge in the ordinary checkout; it must not be refused as redirected."""
+    on_main, on_feature = repos
+    cmd = f"GIT_DIR={on_main}/.git git status && git merge main"
+    assert _merges_onto_main(cmd, on_feature) is False
 
 
 def test_a_commit_message_mentioning_the_variable_does_not_block_a_merge(repos) -> None:
     _, on_feature = repos
+    assert _merges_onto_main("git commit -m GIT_DIR && git merge main", on_feature) is False
     cmd = 'git commit -m "handle GIT_DIR= spelling" && git merge main'
     assert _merges_onto_main(cmd, on_feature) is False
 
 
-def test_the_privacy_scan_still_runs_after_an_unrelated_mention(monkeypatch) -> None:
-    """S1: before the fix, this ordinary push reported NOT SCANNED and dropped
-    the real findings, because the whole command was searched for the text."""
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git branch push && GIT_DIR=/o/.git git push",
+        "git push origin && GIT_DIR=/o/.git git push",
+        "git push origin && git --git-dir=/o/.git push",
+    ],
+)
+def test_the_privacy_check_reads_every_push_not_the_first_apparent_one(command: str) -> None:
+    """Round-1 finding: the walk stopped at the first segment holding the words
+    `git` and `push` — `git branch push` included — and never saw the redirect."""
+    assert privacy._repo_redirected(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env GIT_DIR=/r/.git git push",
+        "sudo git --git-dir=/r/.git push",
+        "/usr/bin/git --git-dir=/r/.git push",
+    ],
+)
+def test_a_wrapped_redirected_push_gets_the_notice(command: str, monkeypatch) -> None:
+    """Round-1 finding: these returned before the redirect check, because the
+    hook's own push parser accepts only a literal `git` word — no scan and no
+    notice. The redirect check now runs first, on the shared parser."""
+    scanned = []
+    monkeypatch.setattr(privacy, "_outgoing_diff", lambda cwd: scanned.append(cwd) or "")
+    text = _advisory(command, "/here", monkeypatch)
+    assert "NOT SCANNED" in text
+    assert scanned == []
+
+
+def test_the_privacy_scan_still_runs_after_unrelated_segments(monkeypatch) -> None:
+    """CONTROL — mentions and command-scoped assignments must not suppress it."""
     scanned = []
     monkeypatch.setattr(privacy, "_targets_public_repo", lambda remote, cwd: True)
     monkeypatch.setattr(privacy, "_outgoing_diff", lambda cwd: scanned.append(cwd) or "")
     for cmd in (
         'git commit -m "handle GIT_DIR= spelling" && git -C /r push',
         "git --work-tree=/x status && git -C /r push",
+        "GIT_DIR=/o/.git git status && git -C /r push",
+        "git -C /r push -o --git-dir=/x",
     ):
         scanned.clear()
         text = _advisory(cmd, "/here", monkeypatch)
@@ -300,10 +399,84 @@ def test_the_privacy_scan_still_runs_after_an_unrelated_mention(monkeypatch) -> 
         assert scanned == ["/r"], cmd
 
 
-def test_the_two_hooks_agree_on_what_counts_as_a_redirect() -> None:
-    """N3: the privacy hook duplicates the matcher on purpose (hooks stay
-    stdlib-only and import-light). Nothing else keeps the copies in step, and
-    they diverged in review once already — this is the binding."""
-    assert gpg._GIT_REPO_ASSIGN_RE.pattern == privacy._GIT_REPO_ASSIGN_RE.pattern
-    assert gpg._GIT_REPO_FLAGS == privacy._GIT_REPO_FLAGS
-    assert gpg._GIT_REPO_VARS == privacy._GIT_REPO_VARS
+def test_both_hooks_use_the_one_shared_detector() -> None:
+    """The matcher used to be duplicated in both hooks and diverged in review.
+    It now has one home; this pins that neither hook grows a private copy."""
+    assert gpg.seg_redirects_repo is grs.seg_redirects_repo
+    assert gpg.raw_sets_repo_env is grs.raw_sets_repo_env
+    for mod in (gpg, privacy):
+        for name in ("_GIT_REPO_ASSIGN_RE", "_GIT_REPO_FLAGS", "_GIT_REPO_VARS"):
+            assert not hasattr(mod, name), f"{mod.__name__} carries a private copy: {name}"
+
+
+_TWO_PUSHES = "git push origin HEAD && GIT_DIR=/o/.git git push " + "--" + "force backup HEAD"
+
+
+def test_a_second_redirected_force_push_cannot_ride_behind_an_ordinary_one(tmp_path) -> None:
+    """Round-1 P1 claimed the force-push check examines only the FIRST push's cwd,
+    so a later redirected force push would be judged in the wrong repository.
+
+    It cannot reach that check: any command with two pushes is refused before
+    it, so the only push the force check ever sees is the one it resolves. This
+    pins that ordering, through the real hook.
+    """
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": _TWO_PUSHES},
+            "cwd": str(tmp_path),
+        }
+    )
+    res = subprocess.run(
+        [sys.executable, str(_HOOKS / "git_push_guard.py")],
+        input=payload,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert res.returncode == 2, res.stderr
+    assert "multiple publish/merge" in res.stderr
+
+
+def test_an_append_assignment_prefix_counts_once_the_parser_resolves_the_command() -> None:
+    """`GIT_DIR+=x git push` runs git with GIT_DIR set. The shared parser does not
+    yet resolve that segment's command (a separate parser fix covers it); once it
+    does, the stripped prefix is read here like any other assignment."""
+    from types import SimpleNamespace
+
+    seg = SimpleNamespace(exe="git", argv=["git", "push"], raw="GIT_DIR+=/r/.git git push")
+    assert grs.seg_redirects_repo(seg) is True
+
+
+# --- pre-push audit: spellings the segment reading must not lose --------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A trailing backslash joins the lines in bash, so the assignment prefixes
+        # the push; the segmenter splits there and reports the first half as
+        # unreadable, which is what catches it. MEASURED in bash: git acts on /r.
+        "GIT_DIR=/r/.git \\\n git push",
+        "GIT_DIR=/r/.git\\\ngit push",
+        # Parameter expansion that assigns in the current shell.
+        ": ${GIT_DIR:=/r/.git} && git push",
+        # A nameref: assigning the reference assigns the variable.
+        "declare -n ref=GIT_DIR && export ref=/r/.git && git push",
+        # Conservative: a repo-var prefix on a POSIX special builtin.
+        "GIT_DIR=/r/.git : && git push",
+    ],
+)
+def test_the_redirect_survives_continuations_and_indirect_assignment(command: str) -> None:
+    push = [s for s in analyze(command) if s.exe == "git"][-1]
+    assert gpg._effective_cwd(command, {"cwd": "/here"}, seg=push) is gpg._CWD_UNKNOWN
+    assert privacy._repo_redirected(command) is True
+
+
+def test_a_continuation_without_a_repository_variable_is_ordinary() -> None:
+    """CONTROL for the continuation rule: it keys on the variable, not on `\\`."""
+    command = "echo x \\\n && git push"
+    push = [s for s in analyze(command) if s.exe == "git"][-1]
+    assert gpg._effective_cwd(command, {"cwd": "/here"}, seg=push) == "/here"

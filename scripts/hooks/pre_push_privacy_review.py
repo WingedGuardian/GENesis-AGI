@@ -161,44 +161,39 @@ def _push_remote(cmd: str) -> str | None:
     return None
 
 
-#: A git command pointed at a repository by something other than cwd / ``-C``.
-#: Mirrors ``git_push_guard._seg_redirects_repo`` — duplicated rather than
-#: imported because hooks stay stdlib-only and import-light, and that module is
-#: the heaviest in the directory. Keep the two in step.
-_GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
-_GIT_REPO_ASSIGN_RE = re.compile(r"^(?:" + "|".join(_GIT_REPO_VARS) + r")(?:\+?=|$)")
-_GIT_REPO_FLAGS = ("--git-dir", "--work-tree")
-
-
 def _repo_redirected(cmd: str) -> bool:
-    """Whether the push publishes from a repository this hook cannot locate.
+    """Whether ANY push in the command publishes from a repository this hook
+    cannot locate — one selected by ``--git-dir`` / ``--work-tree`` or a
+    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` assignment.
 
-    ``_effective_cwd`` models ``cd`` and ``git -C``. It already knew
-    ``--git-dir`` and ``--work-tree`` existed — but only as options to SKIP, so
-    it discarded their value and fell back to the payload cwd, and the leading
-    env-assignment loop stripped ``GIT_DIR=`` the same way. On such a push this
-    hook diffed the checkout the command ran IN while git published the one it
-    was pointed AT: the leak scan read the wrong repository and reported clean.
+    ``_effective_cwd`` below models ``cd`` and ``git -C`` only, so on such a push
+    this hook would diff the checkout the command ran IN while git published the
+    one it was pointed AT, and report clean for commits it never read.
 
-    Detected, not resolved: reproducing git's repository discovery for these
-    forms is how a half-model like the one above comes about.
+    Pushes are found with the shared, wrapper-aware parser — the same resolution
+    the push guard gates on — so ``env GIT_DIR=… git push``, ``sudo git
+    --git-dir=… push`` and ``/usr/bin/git --git-dir=… push`` are all seen, and
+    every push segment is checked rather than the first. The redirect rules
+    themselves live in ``git_repo_selection``, shared with the push guard.
+
+    Imported here rather than at module top: this hook is an advisory whose
+    contract is "any error → silent exit 0", and ``main`` enforces that with one
+    broad handler around this call.
     """
-    # Env: any segment up to and including the push may set the variable, but
-    # only as a WORD bash assigns — a commit message that merely mentions
-    # `GIT_DIR=` is one word starting with its own text and does not match.
-    # Flags: only on the PUSH segment. Reading them anywhere suppressed real
-    # findings on ordinary pushes (`git --work-tree=x status && git push`).
-    for seg in re.split(r"\|\||&&|[;|&]", cmd):
-        try:
-            toks = shlex.split(seg, comments=True)
-        except ValueError:
-            return True  # unparseable: say so rather than guess
-        if any(_GIT_REPO_ASSIGN_RE.match(t) for t in toks):
-            return True
-        if "git" in toks and "push" in toks:
-            if any(t == f or t.startswith(f + "=") for t in toks for f in _GIT_REPO_FLAGS):
+    from git_repo_selection import seg_redirects_repo, seg_sets_repo_env, unreadable_mention
+    from shell_parse import analyze_checked, git_subcommand, split_segments
+
+    persistent = False
+    for raw in split_segments(cmd):
+        if unreadable_mention(raw):
+            return True  # the parser could not read it; say so rather than guess
+        segs, _ = analyze_checked(raw)
+        for seg in segs:
+            is_push = seg.exe == "git" and git_subcommand(seg.argv) == "push"
+            if is_push and (persistent or seg_redirects_repo(seg)):
                 return True
-            break  # nothing after the push segment affects it
+            if seg_sets_repo_env(seg):
+                persistent = True
     return False
 
 
@@ -310,14 +305,10 @@ def main() -> None:
         cmd = field(payload, "command")
         if not cmd:
             return
-        remote = _push_remote(cmd)
-        if remote is None:
-            return  # not a git push
-        # All git calls below share ONE wall-clock budget (see _GIT_BUDGET_S) so
-        # the chain can never approach the hook's CC timeout (a timeout = block).
-        global _deadline
-        _deadline = time.monotonic() + _GIT_BUDGET_S
-        payload_cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        # Checked BEFORE `_push_remote`, whose own parser recognises only a
+        # literal `git` command word: a push behind a wrapper (`env`, `sudo`, a
+        # path to git) would otherwise return early with neither a scan nor this
+        # notice. `_repo_redirected` finds pushes with the shared parser.
         if _repo_redirected(cmd):
             # Say so rather than scan the wrong repository. An advisory cannot
             # fail closed by blocking, so the honest failure is a loud one: the
@@ -341,6 +332,14 @@ def main() -> None:
                 sys.stdout,
             )
             return
+        remote = _push_remote(cmd)
+        if remote is None:
+            return  # not a git push
+        # All git calls below share ONE wall-clock budget (see _GIT_BUDGET_S) so
+        # the chain can never approach the hook's CC timeout (a timeout = block).
+        global _deadline
+        _deadline = time.monotonic() + _GIT_BUDGET_S
+        payload_cwd = payload.get("cwd") if isinstance(payload, dict) else None
         # Resolve the repo the push ACTUALLY runs in — honoring `git -C <dir>`
         # and a preceding `cd <dir>` — so we scan the branch being pushed, not
         # the payload cwd (Codex P2 on #1267).
