@@ -111,6 +111,25 @@ def test_user_overlay_disables_offer(fix_repo, monkeypatch, tmp_path):
     assert not pending.exists() or not list(pending.glob("*.json"))
 
 
+def test_user_overlay_enables_offer_over_disabled_base(fix_repo, monkeypatch, tmp_path):
+    """A user overlay that re-enables offers wins over a base config that
+    disables them, exactly as the repo-local overlay does."""
+    repo, home, git = fix_repo["repo"], fix_repo["home"], fix_repo["git"]
+    (repo / "config").mkdir()
+    (repo / "config" / "contribution.yaml").write_text("offer_enabled: false\n")
+    user_home = tmp_path / "user_home"
+    (user_home / ".genesis" / "config").mkdir(parents=True)
+    (user_home / ".genesis" / "config" / "contribution.local.yaml").write_text(
+        "offer_enabled: true\n"
+    )
+    monkeypatch.setenv("HOME", str(user_home))
+    (repo / "a").write_text("x\n")
+    git("add", "a")
+    git("commit", "-m", "fix: overlay re-enables the offer")
+    marker = _read_latest_marker(home)
+    assert marker["subject"] == "fix: overlay re-enables the offer"
+
+
 def test_subject_with_quotes_produces_valid_json(fix_repo):
     """Regression: subjects containing double-quotes must round-trip."""
     repo, home, git = fix_repo["repo"], fix_repo["home"], fix_repo["git"]
