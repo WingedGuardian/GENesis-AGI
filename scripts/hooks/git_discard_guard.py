@@ -107,6 +107,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -803,6 +804,28 @@ def _submodule_recurse_violation(cmd: str) -> str | None:
         if has_trailing_override(seg.raw, _OVERRIDE_SIGIL):
             continue
         return _SUBMODULE_BLOCK_MSG
+    # A CONTINUED command is read joined, as the shell runs it: its segments split
+    # the program from the verb or the recursion option, so the per-segment check
+    # above never sees them together. Each view of the joined text is split into
+    # argv and put through the same predicates. The override counts only when it
+    # is written on the continued command itself, as for `clean`.
+    for group in continuation_groups(segs):
+        for view in group_text(group).split("\n"):
+            try:
+                argv = shlex.split(view, comments=True)
+            except ValueError:
+                argv = view.split()
+            if not argv or os.path.basename(argv[0]) != "git":
+                continue
+            if not (set(argv[1:]) & _SUBMODULE_RECURSE_VERBS):
+                continue
+            if not _argv_recurses_submodules(argv):
+                continue
+            if not any(s.depth for s in group) and has_trailing_override(
+                group[-1].raw, _OVERRIDE_SIGIL
+            ):
+                break
+            return _SUBMODULE_BLOCK_MSG
     return None
 
 
@@ -1801,7 +1824,7 @@ def main() -> int:
     # documented residual. Cheap `recurse` gate avoids analyze() on ordinary cmds
     # (lowered — the config KEY is case-insensitive, so `Submodule.Recurse` must
     # still pass this gate).
-    if "recurse" in cmd.lower():
+    if "recurse" in view.lower():
         with contextlib.suppress(Exception):
             sub_msg = _submodule_recurse_violation(cmd)
             if sub_msg:

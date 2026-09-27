@@ -789,3 +789,121 @@ def test_the_mention_view_widens_and_never_narrows():
     view = sp.mention_view(raw)
     assert raw in view and "git clean -fdx" in view
     assert sp.mention_view("git status") == "git status"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(rm -rf ~)" + _MID,
+        "$(rm -rf ~)" + _MID,
+        'echo "$(rm -rf ~)"' + _MID,
+        "echo `rm -rf ~`" + _MID,
+        "echo $(r" + _MID + "m -rf ~)",
+    ],
+    ids=["dollar", "bare-dollar", "quoted-dollar", "backtick", "split-verb-inside"],
+)
+def test_a_nested_removal_in_a_continued_command_is_refused(tmp_path, command):
+    """The nested-removal recovery is the only scan that sees a removal inside a
+    substitution; the word scan does not. A continuation anywhere in the command
+    used to switch that recovery off, so these ran where main refused the first
+    four (cross-model review, round 1). The last is the continued verb inside the
+    substitution, recovered from the joined text."""
+    home = tmp_path / "home_nested_rm"
+    home.mkdir()
+    res = _run("hooks/destructive_command_guard.py", command, home, _REPO_ROOT)
+    assert res.returncode == 2, res.stderr[:300]
+
+
+def test_a_nested_safe_removal_in_a_continued_command_is_still_allowed(tmp_path):
+    """CONTROL: the recovered removal is judged by the ordinary operand rules, so
+    a deep scratch path stays allowed with the continuation present."""
+    home = tmp_path / "home_nested_ok"
+    home.mkdir()
+    res = _run(
+        "hooks/destructive_command_guard.py", "echo $(rm -rf /tmp/a/b/c)" + _MID, home, _REPO_ROOT
+    )
+    assert res.returncode == 0, res.stderr[:300]
+
+
+def test_a_heredoc_shift_after_an_escaped_quote_in_code_is_still_seen():
+    """Code and a heredoc body need opposite quoting rules, so one global reading
+    cannot serve both: the escape rule is right in the code and wrong in the body.
+    The heredoc-aware reading takes the body out, so the command after it is seen
+    (cross-model review, round 1)."""
+    command = "echo it\\'s && " + _SHIFTED_PROSE + "git push origin main"
+    heads = [p.argv_src.split()[:2] for p in sp.parse_segments(command)]
+    assert ["git", "push"] in heads, heads
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        _SHIFTED_PROSE + "git push origin main",
+        "echo it\\'s && " + _SHIFTED_PROSE + "git push origin main",
+        "cat <<'EOF'\n# a comment's quote\nEOF\ngit push origin main",
+    ],
+    ids=["comment-shift", "escape-and-comment", "comment-line-in-body"],
+)
+def test_a_heredoc_command_keeps_every_segment_the_older_quoting_finds(command):
+    """CONTRACT: for a command with a heredoc in which the escape or comment rule
+    touched a quote, every segment the older quoting finds is kept. That is what
+    makes such a command never see fewer commands than main did, even where the
+    heredoc reading misreads a delimiter."""
+    older, _, _ = sp._scan_segments(command, escape_quotes=False, comments=False)
+    kept = {(p.raw, p.argv_src) for p in sp.parse_segments(command)}
+    assert {(p.raw, p.argv_src) for p in older} <= kept
+
+
+def test_an_unquoted_heredoc_body_keeps_its_substitutions():
+    """The shell expands `$( )` in an unquoted heredoc body, so taking the body out
+    of the code must not take out the command it runs."""
+    command = "cat <<EOF\nnote: it's $(git push origin main)\nEOF\n"
+    segs, _ = sp.analyze_checked(command)
+    assert any(s.argv[:2] == ["git", "push"] and s.depth for s in segs), segs
+
+
+def test_a_continued_removal_behind_an_earlier_cause_is_refused(tmp_path):
+    """An apostrophe in a trailing comment makes the command untokenizable, a cause
+    reported before the continuation; the refusal reads the recorded continuation,
+    not which cause won (cross-model review, round 1)."""
+    home = tmp_path / "home_rm_cause"
+    home.mkdir()
+    res = _run(
+        "hooks/protected_paths_guard.py",
+        "rm -rf" + _CONT + "$HOME/genesis # don't",
+        home,
+        _REPO_ROOT,
+    )
+    assert _decision(res) == "block", res.stdout[:300] + res.stderr[:300]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git" + _CONT + "checkout --recurse-submodules .",
+        "git checkout --rec" + _MID + "urse-submodules .",
+    ],
+    ids=["before-verb", "inside-option"],
+)
+def test_a_continued_submodule_recursing_checkout_is_refused(tmp_path, command):
+    """The discard guard's second block, not only its `git clean` one, reads a
+    continued command joined (cross-model review, round 1)."""
+    home = tmp_path / "home_submod"
+    home.mkdir()
+    one_line = _run(
+        "hooks/git_discard_guard.py", "git checkout --recurse-submodules .", home, _REPO_ROOT
+    )
+    assert one_line.returncode == 2, one_line.stderr[:300]
+    res = _run("hooks/git_discard_guard.py", command, home, _REPO_ROOT)
+    assert res.returncode == 2, res.stderr[:300]
+
+
+def test_a_quoted_program_name_split_from_its_verb_is_refused(tmp_path):
+    """The shell removes quotes after joining the lines, so the group text is also
+    read with quote characters dropped. The one-line form was already refused."""
+    home = tmp_path / "home_quoted_prog"
+    home.mkdir()
+    res = _run(
+        "hooks/git_push_guard.py", 'gi"t" pu' + _MID + "sh origin main " + _FORCE, home, _REPO_ROOT
+    )
+    assert _decision(res) == "block", res.stdout[:300] + res.stderr[:300]

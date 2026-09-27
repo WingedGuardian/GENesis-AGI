@@ -1148,7 +1148,7 @@ class TestAcceptanceCorpus:
         All three parse signatures are kept because they are why enumerating
         beat spot-checking: a fix keyed on the " \\" TOKEN would have closed the
         first two and left the third open. The predicate reads the scanner's own
-        record instead (a segment ending in an odd backslash run), which is the
+        record instead (the `cont_split` flag set at scan time), which is the
         same for all three.
         """
         cmd = cmd_tpl.format(GIT=GIT, PUSH=PUSH, FORCE=FORCE)

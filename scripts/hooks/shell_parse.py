@@ -706,26 +706,114 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     test's EXPLOITS).
     """
     segs, _open_quote, quote_shift = _scan_segments(command, escape_quotes=True, comments=True)
-    if quote_shift:
-        # TWO READINGS, BOTH KEPT, whenever they can disagree about quoting. Reading an
-        # escaped quote as an escape, and a quote inside a `#` comment as a literal, is
-        # right for shell code, but the scanner cannot tell code from a heredoc BODY,
-        # where the shell reads neither. There, those two rules move where every later
-        # quoted span begins and ends, and a span that begins in the body can swallow
-        # the real commands after it. MEASURED over a real command corpus: a `(#NNN)`
-        # in a commit-message heredoc made an apostrophe literal, the next apostrophe
-        # opened a span, and a `git push` and three `git commit`s after the heredoc
-        # vanished, with no blind spot reported, because `shlex` has no comment rule
-        # and tokenized the command fine. So the reading with neither rule (the older
-        # scanner's quoting) is taken too and its segments ADDED, never swapped in:
-        # neither reading can then hide a command the other shows. The trigger is
-        # that one of the two rules touched a quote character at all, not that the
-        # scan ended inside an open quote: an even number of such quotes leaves the
-        # scan balanced while still moving the spans.
-        alt, _, _ = _scan_segments(command, escape_quotes=False, comments=False)
+    if "<<" in command:
+        # A HEREDOC BODY IS NOT SHELL CODE, and a scanner that reads it as code pairs
+        # its quotes wrongly: a span that opens in the body can swallow the real
+        # commands after the heredoc. MEASURED over a real command corpus: a `(#NNN)`
+        # in a commit-message heredoc made an apostrophe literal under the comment
+        # rule, the next apostrophe opened a span, and a `git push` and three
+        # `git commit`s after the heredoc vanished with no blind spot reported. So
+        # more readings are taken and their segments ADDED, never swapped in, so no
+        # reading can hide a command another one shows:
+        #   * one that takes each heredoc body out of the code (below), which is
+        #     right wherever the delimiter is recognised; and
+        #   * where the escape or comment rule touched a quote character, the older
+        #     scanner's quoting (neither rule), for a body the first one misses.
+        # Mixing code and a body is why one global mode cannot do it: an escaped
+        # quote in the code and a shift in the body each defeat a different mode.
+        # A reading that ends a body too EARLY only turns body text into extra
+        # segments, the refusing direction; the delimiter match is deliberately
+        # looser than the shell's so it never ends a body too late.
+        extra = [_scan_segments(command, escape_quotes=True, comments=True, heredocs=True)[0]]
+        if quote_shift:
+            extra.append(_scan_segments(command, escape_quotes=False, comments=False)[0])
         seen = {(p.raw, p.argv_src) for p in segs}
-        segs = segs + [p for p in alt if (p.raw, p.argv_src) not in seen]
+        for alt in extra:
+            for p in alt:
+                if (p.raw, p.argv_src) not in seen:
+                    seen.add((p.raw, p.argv_src))
+                    segs.append(p)
     return segs
+
+
+def _heredoc_delimiter(command: str, j: int, n: int) -> tuple[str, bool, bool] | None:
+    """``(delimiter, strip_tabs, quoted)`` for a ``<<`` whose operator ends at ``j``.
+
+    ``quoted`` is True when any part of the word is quoted or escaped, which is when
+    the shell expands nothing in the body. None when there is no word.
+    """
+    strip_tabs = j < n and command[j] == "-"
+    if strip_tabs:
+        j += 1
+    while j < n and command[j] in (" ", "\t"):
+        j += 1
+    if j >= n or command[j] in _TARGET_STOP:
+        return None
+    word = command[j:_redirect_target_end(command, j, n)]
+    delim = word.replace("'", "").replace('"', "").replace("\\", "")
+    if not delim:
+        return None
+    return delim, strip_tabs, any(ch in word for ch in ("'", '"', "\\"))
+
+
+def _heredoc_bodies_end(
+    command: str, pos: int, pending: list[tuple[str, bool, bool]],
+) -> tuple[int, list[str]]:
+    """Skip the bodies of ``pending`` heredocs starting at ``pos``, in order.
+
+    Returns the index just past the last terminator line and the text of every
+    UNQUOTED body, whose substitutions the shell does run. A body ends at the first
+    line that, stripped of surrounding whitespace, equals the delimiter: looser than
+    the shell, which only strips leading tabs for ``<<-``, so a body can end early
+    here but never late. Without a terminator the body runs to the end, as in bash.
+    """
+    n = len(command)
+    expanded: list[str] = []
+    for delim, strip_tabs, quoted in pending:
+        body: list[str] = []
+        while pos < n:
+            eol = command.find("\n", pos)
+            end = n if eol == -1 else eol
+            line = command[pos:end]
+            pos = n if eol == -1 else eol + 1
+            if (line.lstrip("\t") if strip_tabs else line).strip() == delim:
+                break
+            body.append(line)
+        if not quoted and body:
+            expanded.extend(_heredoc_substitutions("\n".join(body)))
+    return pos, expanded
+
+
+def _heredoc_substitutions(body: str) -> list[str]:
+    """Each ``$( )`` and backtick substitution in an unquoted heredoc body, whole.
+
+    A quote in a body is a literal character, so the ordinary scan (which reads
+    quotes) would miss a substitution after an apostrophe. Inside a substitution the
+    shell parses code again, so its end is found the quote-aware way. A backslash
+    before ``$``, a backtick or itself is an escape here, as in bash.
+    """
+    out: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\" and i + 1 < n and body[i + 1] in ("$", "`", "\\"):
+            i += 2
+            continue
+        if c == "$" and i + 1 < n and body[i + 1] == "(":
+            end = _command_sub_end(body, i, n)
+            out.append(body[i:end])
+            i = end
+            continue
+        if c == "`":
+            j = i + 1
+            while j < n and body[j] != "`":
+                j += 2 if body[j] == "\\" else 1
+            if j < n:
+                out.append(body[i : j + 1])
+                i = j + 1
+                continue
+        i += 1
+    return out
 
 
 #: A `#` opens a comment only at the start of a word: after whitespace, at the start
@@ -734,12 +822,15 @@ _COMMENT_AFTER = frozenset(" \t\n()")
 
 
 def _scan_segments(
-    command: str, *, escape_quotes: bool, comments: bool,
+    command: str, *, escape_quotes: bool, comments: bool, heredocs: bool = False,
 ) -> tuple[list[_ParsedSegment], bool, bool]:
     """One pass of :func:`parse_segments`: ``(segments, ends_in_open_quote,
     quote_shift)``. ``escape_quotes`` False reads an unquoted backslash before a
     quote as a literal backslash; ``comments`` False reads ``#`` as an ordinary
-    character. Both False is the older scanner's quoting. ``quote_shift`` is True
+    character. Both False is the older scanner's quoting. ``heredocs``
+    True takes each heredoc body out of the code: it is skipped, and an unquoted one is
+    kept as a segment with no argv so the substitutions it runs are still found.
+    ``quote_shift`` is True
     when either rule, where on, met a quote character, which is exactly when the
     two readings can pair quotes differently.
     """
@@ -752,6 +843,17 @@ def _scan_segments(
     quote: str | None = None
     in_comment = False
     quote_shift = False
+    pending: list[tuple[str, bool, bool]] = []
+
+    def _after_line(pos: int) -> int:
+        """Index to resume at after an unquoted newline; skips pending heredoc bodies."""
+        if not pending:
+            return pos
+        end, expanded = _heredoc_bodies_end(command, pos, pending)
+        pending.clear()
+        for text in expanded:
+            pairs.append((text, "", [], False, False))
+        return end
 
     def _flush() -> None:
         nonlocal raw_buf, argv_buf, redirs, cont_split, cont_inner
@@ -774,7 +876,9 @@ def _scan_segments(
             if c == "\n":
                 in_comment = False
                 _flush()
-            elif c in (";", "|", "&"):
+                i = _after_line(i + 1)
+                continue
+            if c in (";", "|", "&"):
                 _flush()
             else:
                 if c in ("'", '"'):
@@ -851,6 +955,10 @@ def _scan_segments(
             continue
         op_len = _redirect_operator_len(command, i)
         if op_len is not None:
+            if heredocs and op_len == 2 and command[i : i + 2] == "<<":
+                found = _heredoc_delimiter(command, i + 2, n)
+                if found is not None:
+                    pending.append(found)
             # Drop a standalone leading fd digit-run from BOTH buffers (the '2' of
             # ` 2>`), but NOT a digit that ends a word (`push2>x` keeps 'push2'). The
             # trailing digits are mirrored in both buffers, so remove the same count.
@@ -894,7 +1002,7 @@ def _scan_segments(
             continue
         if c in (";", "|", "&", "\n"):
             _flush()
-            i += 1
+            i = _after_line(i + 1) if c == "\n" else i + 1
             continue
         raw_buf.append(c)
         argv_buf.append(c)
@@ -1943,13 +2051,19 @@ def group_text(group: list[Segment]) -> str:
     reads correctly only joined directly; a split between words written with no
     space before the backslash (`git<continuation> push`) reads correctly only
     joined with a space — joined directly it is `gitpush`, which names neither.
-    Both are returned, so a guard's search can only find more.
+    A third view drops quote characters, because the shell removes them after the
+    join: `gi"t" pu<continuation>sh` runs `git push`, and only the de-quoted text
+    names both. All views are returned, so a guard's search can only find more.
     """
     direct = fold_continuations("\n".join(seg.raw for seg in group))
     spaced = fold_continuations(
         " ".join(seg.raw[:-1] if seg.cont_split else seg.raw for seg in group)
     )
-    return direct if direct == spaced else direct + "\n" + spaced
+    views = [direct]
+    for view in (spaced, direct.replace('"', "").replace("'", "")):
+        if view not in views:
+            views.append(view)
+    return "\n".join(views)
 
 
 def blind_is_continuation(blind: BlindSpot | None) -> bool:

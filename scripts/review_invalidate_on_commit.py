@@ -57,7 +57,13 @@ from review_state import clear_all_markers, clear_marker  # noqa: E402
 # NOTHING → every marker stays valid for its TTL = the bypass). Detection degrades
 # to a strict regex; resolution degrades to clearing the candidate set.
 try:
-    from shell_parse import analyze_checked, git_subcommand, mention_view  # noqa: E402
+    from shell_parse import (  # noqa: E402
+        analyze_checked,
+        continuation_groups,
+        git_subcommand,
+        group_text,
+        mention_view,
+    )
 
     _PARSE_OK = True
 except Exception:  # pragma: no cover - defensive
@@ -65,6 +71,12 @@ except Exception:  # pragma: no cover - defensive
 
     def mention_view(command: str) -> str:  # degraded: the raw text alone
         return command
+
+    def continuation_groups(segments):  # degraded: no continuation record
+        return []
+
+    def group_text(group) -> str:  # degraded: never called without groups
+        return ""
 
 try:
     from review_enforcement_commit import (  # noqa: E402
@@ -245,6 +257,16 @@ def main() -> None:
     # real, while finding none is not evidence of absence, so that case still falls
     # through to the regex. A bounded parse returns nothing at all, by design.
     has_commit_seg = bool(segs) and any(git_subcommand(s.argv) == "commit" for s in segs)
+    # A continuation can split `commit` from the `git` whose global options precede
+    # it (`git -C <dir> com<continuation>mit`); no segment then parses as a commit,
+    # and the adjacency regex below misses the options. The joined text of the
+    # continued command still names both, and over-clearing is this hook's safe
+    # direction.
+    if not has_commit_seg and segs:
+        has_commit_seg = any(
+            re.search(r"\bgit\b", t) and re.search(r"\bcommit\b", t)
+            for t in (group_text(g) for g in continuation_groups(segs))
+        )
     if bounds_blind:
         segs = None  # nothing was parsed; force the unconditional over-clear below
     elif blind is None and segs is not None:

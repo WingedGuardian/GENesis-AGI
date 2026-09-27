@@ -95,7 +95,6 @@ try:
     from shell_parse import (  # noqa: E402
         _REPARSE_CARRIERS,
         analyze_checked,
-        blind_is_continuation,
         continuation_groups,
         group_text,
         mention_view,
@@ -333,13 +332,17 @@ def main() -> int:
         # an ancestor or a glob, so `rm -rf <continuation>$HOME/genesis` — the
         # PARENT of the production database — would reach neither. Scoped to the
         # continued commands that name rm (`continuation_groups`), so a continuation
-        # elsewhere in the line costs nothing.
-        if blind_is_continuation(blind) and any(
-            _RM_PATTERN.search(group_text(g)) for g in continuation_groups(segs)
-        ):
+        # elsewhere in the line costs nothing. Keyed on the recorded continuation,
+        # NOT on which blind-spot cause was reported: an earlier cause (an
+        # apostrophe in a trailing comment makes the command untokenizable) wins
+        # precedence while the continuation is still there, and keying on the
+        # cause let that removal through.
+        if any(_RM_PATTERN.search(group_text(g)) for g in continuation_groups(segs)):
             return _block(
-                f"an rm command that {blind.cause}, so its real targets cannot be "
-                f"resolved. To proceed: {blind.hint}"
+                "an rm command continues a line with a trailing backslash, which the "
+                "shell joins into one command while this parser keeps the lines apart, "
+                "so its real targets cannot be resolved. To proceed: put the command "
+                "on one line, or split it into separate steps."
             )
         # The substring fallback ADDS to the precise scan below; it does not replace
         # it, and the missing `else` here used to be a fail-open.

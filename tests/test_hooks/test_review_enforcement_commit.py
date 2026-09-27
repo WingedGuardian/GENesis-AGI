@@ -700,6 +700,17 @@ def test_invalidate_clears_for_a_commit_split_inside_the_verb(repo: Path, home: 
     assert _markers(home) == []
 
 
+def test_invalidate_clears_for_a_split_commit_after_a_global_option(
+    repo: Path, home: Path
+) -> None:
+    """With a global option between `git` and the split verb, no segment parses as a
+    commit and the adjacency regex misses the option; the continued command's joined
+    text still names both, and over-clearing is this hook's safe direction."""
+    assert _mark(repo, home).returncode == 0
+    _run_invalidate(f"git -C {repo} com\\\nmit -m done", repo, home)
+    assert _markers(home) == []
+
+
 @pytest.mark.parametrize(
     "form",
     [

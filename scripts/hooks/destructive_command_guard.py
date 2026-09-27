@@ -239,15 +239,16 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
         ), False
     if blind is not None and _blind_is_continuation is not None and _blind_is_continuation(blind):
         # A LINE CONTINUATION IS NOT UNREADABLE TO THIS GUARD. Its own scan folds
-        # continuations with a context-aware model (`_fold_continuations`) and was
-        # measured correct on them before the resolver reported the cause. What the
+        # continuations with a context-aware model (`_fold_continuations`). What the
         # resolver cannot do on a continued command is draw segment boundaries,
-        # which is all the carrier arm below reads — so report "not analysed" and
-        # let the caller keep its token-level carrier refusal ON, the fallback that
-        # exists for exactly this. Refusing here instead refused ordinary continued
-        # commands that merely contained `rm` (`docker run --rm`, `rm -f /tmp/x`,
-        # a `trap` cleanup) — MEASURED over the recorded corpus, with no command
-        # the fallback does not also catch.
+        # which is what the carrier arm below reads, so report "not analysed" and
+        # let the caller keep its token-level carrier refusal ON. Refusing here
+        # instead refused ordinary continued commands that merely contained `rm`
+        # (`docker run --rm`, `rm -f /tmp/x`, a `trap` cleanup), MEASURED over the
+        # recorded corpus. The token scan cannot see a removal glued inside `$( )`
+        # or backticks, so the caller still runs the nested-removal recovery on
+        # this path, over the continuation-folded text; skipping it once let a
+        # continued `echo $(rm -rf ~)` through that main refused.
         return None, False
     if blind is not None:
         # AN UNREADABLE COMMAND THAT NAMES A REMOVAL. Refuse; do not degrade to
@@ -921,13 +922,24 @@ def main() -> int:
 
         violations = _rm_violations(cmd, refuse_carriers=not analysed)
 
-        if analysed and violations is not None:
+        if violations is not None:
             # The resolver RECOVERS a nested shell's payload, so scan what it
             # recovered. Without this the quoted payload of `sh -c "rm -rf X"`
             # is a single token the operand scan cannot see — the reason the
             # previous revision refused shells outright and told the reader
             # their payload "cannot be recovered", which was untrue.
-            for inner in _recovered_removals(cmd):
+            #
+            # Not gated on `analysed`: that flag is False on a continued command
+            # (see `_resolver_carrier_refusal`), and gating on it skipped this scan
+            # there. A resolver that is missing or raised recovers nothing anyway.
+            # The FOLDED text is recovered too, widen-only. On a continued command
+            # the raw recovery returns nothing (the resolver reports the
+            # continuation), so this is what sees a removal nested in `$( )` there,
+            # including one whose verb the continuation splits (`$(r<cont>m -rf ~)`).
+            recovered = _recovered_removals(cmd)
+            if folded != cmd:
+                recovered += [r for r in _recovered_removals(folded) if r not in recovered]
+            for inner in recovered:
                 extra = _rm_violations(inner, refuse_carriers=False)
                 if extra:
                     violations.extend(extra)
