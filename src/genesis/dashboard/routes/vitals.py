@@ -12,8 +12,6 @@ from flask import jsonify
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 from genesis.env import (
-    dashscope_api_key,
-    deepinfra_api_key,
     genesis_db_path,
     ollama_enabled,
     ollama_tags_url,
@@ -318,6 +316,13 @@ async def _build_sqlite_section(rt) -> dict:
     return section
 
 
+def _embedder_chain(embedder) -> list[str]:
+    """Backend names of a built EmbeddingProvider, in chain order."""
+    if embedder is None:
+        return []
+    return [b.name.removesuffix("_embedding") for b in embedder.backends]
+
+
 async def _build_embedding_section(rt) -> dict:
     """Embedding pipeline: per-backend stats, active model, dual chain order."""
     section: dict = {
@@ -326,28 +331,27 @@ async def _build_embedding_section(rt) -> dict:
         "error": None,
     }
 
-    section["active_model"] = os.environ.get(
-        "OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b-fp16",
-    )
+    # Read the chains the runtime ACTUALLY built, rather than re-deriving them
+    # from env. A hand-mirrored list desynced twice: it reported
+    # ["ollama", "deepinfra"] for a storage chain that had been flipped, and
+    # named the Ollama model as "active" while the cloud backend was writing.
+    storage_chain = _embedder_chain(getattr(rt, "_storage_embedder", None))
+    recall_chain = _embedder_chain(getattr(rt, "_recall_embedder", None))
+    storage_embedder = getattr(rt, "_storage_embedder", None)
+    lead = storage_embedder.backends[0] if storage_embedder and storage_embedder.backends else None
+    # The model that writes new memory vectors: the storage chain's first rung.
+    model = getattr(lead, "_model", None) if lead else None
+    space = getattr(storage_embedder, "vector_space", None)
+    section["active_model"] = model if isinstance(model, str) else None
+    section["vector_space"] = space if isinstance(space, str) else None
 
-    # Build both chain orderings from env config (mirrors EmbeddingProvider.build_chain)
-    ollama_names = ["ollama"] if ollama_enabled() else []
-    cloud_names = []
-    if deepinfra_api_key():
-        cloud_names.append("deepinfra")
-    if dashscope_api_key():
-        cloud_names.append("dashscope")
+    def _label(embedder, chain: list[str]) -> list[str]:
+        if embedder is None:
+            return ["not initialized"]
+        return chain if chain else ["none configured"]
 
-    # Both chains lead with the cloud backend; they differ only in the rate
-    # tier, which this panel does not surface. This list is hand-mirrored from
-    # EmbeddingProvider.build_chain and WILL desync again — it already reported
-    # `["ollama", "deepinfra"]` for a storage chain that had been flipped. A
-    # follow-up should derive both from the builder rather than re-deriving.
-    storage_chain = cloud_names + ollama_names  # writes: cloud first
-    recall_chain = cloud_names + ollama_names   # reads: cloud first
-
-    section["storage_chain"] = storage_chain if storage_chain else ["none configured"]
-    section["recall_chain"] = recall_chain if recall_chain else ["none configured"]
+    section["storage_chain"] = _label(storage_embedder, storage_chain)
+    section["recall_chain"] = _label(getattr(rt, "_recall_embedder", None), recall_chain)
     # Backward compat: keep chain_order as the storage chain
     section["chain_order"] = section["storage_chain"]
 

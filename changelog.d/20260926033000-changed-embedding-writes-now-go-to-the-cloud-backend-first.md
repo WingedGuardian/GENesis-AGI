@@ -12,11 +12,27 @@
   (execution traces, stale-embedding repair, procedural embedding and its
   promoter, the procedural MCP tool, the session-awareness worker) and nine
   maintenance scripts, the busiest being the MCP server that backs memory,
-  reference and knowledge writes for every session. All fifteen are write paths,
-  so flipping only the runtime wiring would have left them on local inference.
-  Storage stays on the ordinary rate tier rather than the paid priority tier
-  recall uses. Asking for local-first explicitly still works, and Ollama remains
-  the fallback rung.
+  reference and knowledge writes for every session. Flipping only the runtime
+  wiring would have left them on local inference. Storage stays on the ordinary
+  rate tier rather than the paid priority tier recall uses; the standalone memory
+  MCP server now builds a separate priority-tier provider for recall, as the full
+  runtime already did, so interactive recall does not inherit the ordinary tier's
+  queue. Asking for local-first explicitly still works, and Ollama remains the
+  fallback rung.
+
+  **Every embedding chain now uses exactly one model.** Backends are only
+  interchangeable if they produce vectors in the same space; matching dimension
+  is not enough. DeepInfra and the local Ollama model are the same Qwen3 0.6B
+  model (measured cosine 0.9997-0.9999 on identical text), but the DashScope
+  backend is a different model and is no longer mixed into a Qwen3 chain — before
+  this, an install with DashScope and Ollama but no DeepInfra would have written
+  DashScope vectors into its Qwen3 memory collection. On such an install recall
+  now runs on the local model only, which is slower but no longer compares
+  vectors from two different models. DashScope is still used when it is the
+  only backend configured. A provider assembled by hand from
+  backends in different spaces now refuses to start, and the embedding cache is
+  keyed by vector space (a one-time cold cache after updating). The dashboard's embedding panel now reads the chains the
+  runtime actually built and names the model that is writing.
 
   **What this changes about where your data goes.** Memory and knowledge content
   is now sent to the cloud embedding provider at WRITE time, not only at recall.
