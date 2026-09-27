@@ -366,8 +366,16 @@ class GenesisBridge:
                 return json.dumps({"error": "Web search timed out"})
             search_results = result.get("results", [])
             if search_results:
+                # Snippets arrive already wrapped by every search backend; titles do
+                # not, and they are third-party text reaching a model that can
+                # approve pending actions, so they are wrapped here.
+                from genesis.security import ContentSanitizer, ContentSource
+
+                sanitizer = ContentSanitizer()
                 snippets = [
-                    f"{r.get('title', '')}: {r.get('snippet', '')}" for r in search_results[:3]
+                    f"{sanitizer.wrap_content(r.get('title', ''), ContentSource.WEB_SEARCH)}: "
+                    f"{r.get('snippet', '')}"
+                    for r in search_results[:3]
                 ]
                 return json.dumps({"results": snippets})
             # A failed search is not "no results": say so, so the voice model

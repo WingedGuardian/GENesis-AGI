@@ -86,7 +86,8 @@ async def test_brave_no_api_key(searcher: WebSearcher, monkeypatch):
     assert resp.error is not None
     # The error names every backend and its actual reason — not a generic
     # "unavailable" that hid a missing key behind an unreachable SearXNG.
-    assert "searxng: ConnectError: down" in resp.error
+    assert "searxng: ConnectError" in resp.error
+    assert ": down" not in resp.error  # the message stays in the log
     assert "brave: API_KEY_BRAVE is not set" in resp.error
     assert resp.backend_used is None  # a total failure is not labelled "searxng"
 
@@ -125,7 +126,8 @@ async def test_explicit_searxng_does_not_fall_back_to_brave(searcher: WebSearche
     resp = await searcher.search("test", backends=(SearchBackend.SEARXNG,))
     searcher._client.get.assert_not_called()
     assert resp.backend_used is None
-    assert "searxng: ConnectError: down" in resp.error
+    assert "searxng: ConnectError" in resp.error
+    assert ": down" not in resp.error  # the message stays in the log
     assert "brave" not in resp.error
 
 
