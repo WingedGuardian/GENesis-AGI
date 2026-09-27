@@ -185,7 +185,12 @@ if [ "$DO_PULL" -eq 1 ]; then
     echo "  Fetching (bounded, ${_fetch_timeout}s)…"
     # Every git that can outlive this script (an auto-gc) runs in the foreground
     # and without the lock fd.
-    timeout -k 10 "$_fetch_timeout" git -c gc.autoDetach=false -C "$GENESIS_ROOT" fetch {_UPDATE_LOCK_FD}>&- \
+    # Only main's configured upstream: a bare `git fetch` pulls every branch on the
+    # remote (dozens of PR branches), all of it while the exclusive lock is held.
+    _remote="$(git -C "$GENESIS_ROOT" config --get branch.main.remote || true)"
+    _merge_ref="$(git -C "$GENESIS_ROOT" config --get branch.main.merge || true)"
+    [ -n "$_remote" ] && [ -n "$_merge_ref" ] || die "main has no upstream to pull from."
+    timeout -k 10 "$_fetch_timeout" git -c gc.autoDetach=false -C "$GENESIS_ROOT" fetch -q "$_remote" "$_merge_ref" {_UPDATE_LOCK_FD}>&- \
         || die "fetch failed or timed out — nothing changed."
     _upstream="$(git -C "$GENESIS_ROOT" rev-parse --verify -q '@{u}' || true)"
     [ -n "$_upstream" ] || die "main has no upstream to pull from."
