@@ -16,8 +16,10 @@ import time
 from datetime import UTC
 
 from genesis.mcp.health import mcp
+from genesis.security import ContentSanitizer, ContentSource
 
 logger = logging.getLogger(__name__)
+_SANITIZER = ContentSanitizer()
 
 # Lazy singletons — avoids import-time overhead for Playwright/httpx
 _fetcher = None
@@ -190,7 +192,10 @@ async def _try_tinyfish_search(query: str, max_results: int) -> dict | None:
             {
                 "title": r.get("title", ""),
                 "url": r.get("url", ""),
-                "snippet": r.get("snippet", ""),
+                # Wrapped like the SearXNG/Brave snippets (web/search.py): this is
+                # the first backend of the auto chain, and its text reaches
+                # tool-holding models (e.g. voice, which can approve_pending).
+                "snippet": _SANITIZER.wrap_content(r.get("snippet", ""), ContentSource.WEB_SEARCH),
                 "score": max(0.0, 1.0 - (r.get("position", 1) - 1) * 0.1),
             }
             for r in raw_results

@@ -164,7 +164,16 @@ class TestGenesisBridge:
             result = await GenesisBridge().handle_tool_call(
                 "web_search", json.dumps({"query": "weather"})
             )
-        assert fake.await_args.kwargs["backend"] == "auto"
+        # Bind the call as the function would, so a pin passed positionally is caught too.
+        import inspect
+
+        from genesis.mcp.health import web_tools
+
+        bound = inspect.signature(web_tools._impl_web_search).bind(
+            *fake.await_args.args, **fake.await_args.kwargs,
+        )
+        bound.apply_defaults()
+        assert bound.arguments["backend"] == "auto"
         assert json.loads(result) == {"results": ["T: S"]}
 
     async def test_web_search_failure_is_an_error_not_no_results(self):
@@ -181,6 +190,24 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "results" not in data
         assert data["error"].startswith("Web search failed: All search backends failed")
+
+    async def test_web_search_gives_up_before_the_tool_call_timeout(self, monkeypatch):
+        """The voice route abandons a tool call at 30s. The auto chain can run past
+        that (TinyFish 10s, then SearXNG and Brave at 15s each), so voice search has
+        its own, shorter deadline and says so instead of hanging the turn."""
+        import asyncio
+
+        from genesis.channels.voice import genesis_bridge
+
+        async def slow(*_a, **_k):
+            await asyncio.sleep(5)
+
+        monkeypatch.setattr(genesis_bridge, "_VOICE_SEARCH_DEADLINE_S", 0.05)
+        with patch("genesis.mcp.health.web_tools._impl_web_search", slow):
+            result = await GenesisBridge().handle_tool_call(
+                "web_search", json.dumps({"query": "weather"}),
+            )
+        assert "timed out" in json.loads(result)["error"]
 
     async def test_web_search_import_failure(self):
         bridge = GenesisBridge()

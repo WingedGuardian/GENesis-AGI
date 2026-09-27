@@ -210,3 +210,22 @@ async def test_empty_results(searcher: WebSearcher):
     resp = await searcher.search("test")
     assert resp.results == []
     assert resp.error is None
+
+
+@pytest.mark.asyncio
+async def test_an_http_error_reason_never_carries_the_backend_url(searcher: WebSearcher, monkeypatch):
+    """httpx puts the full request URL in an HTTPStatusError's message. The failure
+    reason reaches MCP callers and the voice model, and SEARXNG_URL can be an
+    internal address, so the reason names the status code only."""
+    monkeypatch.delenv("API_KEY_BRAVE", raising=False)
+    internal = "http://searxng.internal.example:55510/search"
+    request = httpx.Request("POST", internal)
+    response = httpx.Response(500, request=request)
+    searcher._client.post = AsyncMock(
+        side_effect=httpx.HTTPStatusError("Server error '500' for url '" + internal + "'",
+                                          request=request, response=response),
+    )
+
+    resp = await searcher.search("test")
+    assert "searxng: HTTPStatusError: HTTP 500" in resp.error
+    assert "internal.example" not in resp.error

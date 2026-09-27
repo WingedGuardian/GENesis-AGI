@@ -81,10 +81,18 @@ class WebSearcher:
                     fallback_used=i > 0,
                 )
             except (httpx.HTTPError, KeyError, ValueError) as exc:
-                # Some httpx errors (ReadTimeout) carry an empty message; the
+                # The reason reaches MCP callers and the voice model. An
+                # HTTPStatusError's message embeds the request URL, which for
+                # SearXNG can be an internal address, so it contributes only its
+                # status code. Some errors (ReadTimeout) carry no message; the
                 # type name alone is then the whole reason.
+                if isinstance(exc, httpx.HTTPStatusError):
+                    detail_msg = f"HTTP {exc.response.status_code}"
+                else:
+                    detail_msg = str(exc)
                 reasons.append(
-                    f"{backend.value}: {type(exc).__name__}" + (f": {exc}" if str(exc) else "")
+                    f"{backend.value}: {type(exc).__name__}"
+                    + (f": {detail_msg}" if detail_msg else "")
                 )
                 logger.warning("%s search failed (%s)", backend.value, exc)
                 if backend == SearchBackend.SEARXNG and self._event_bus:
