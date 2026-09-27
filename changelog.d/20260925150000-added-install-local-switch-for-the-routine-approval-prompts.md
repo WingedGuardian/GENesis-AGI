@@ -13,8 +13,12 @@
   published — "stop asking me", never "stop telling me". Only the routine publish
   approvals are suppressible: the force-push prompt is destructive, and the
   no-open-PR and close-then-push prompts report a state the publish rule forbids,
-  so all three stay. Every hard block is out of reach by construction, as is the
+  so all three stay — and a publish that shares its command with a
+  `gh pr close` keeps its prompt too, since that pairing can leave a public
+  branch with no open PR. Every hard block is out of reach by construction, as is the
   deny a dispatched session gets, and the vocabulary is a closed set — a config
-  naming a prompt nobody classified does nothing at all. Every way of failing to
-  read the setting (absent file, bad YAML, duplicate key, a value that is not a
-  boolean) lands on the prompt rather than the allow.
+  naming a prompt nobody classified does nothing at all, and says so. Every way
+  of failing to read the setting (absent file, bad YAML, duplicate key, a value
+  that is not a boolean, a key left empty) lands on the prompt rather than the
+  allow, and a setting you wrote that had no effect is announced rather than
+  ignored. The setting is file-only: there is no environment-variable override.

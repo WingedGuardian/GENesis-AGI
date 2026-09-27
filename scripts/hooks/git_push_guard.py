@@ -11211,7 +11211,23 @@ def _run_merge_and_push_gates() -> int:
             # only decides what happens to a prompt this guard was otherwise
             # about to raise. An unclassified ask (ask_class is None) is never
             # reached by the policy at all.
-            if ask_class is not None and ask_suppressed(ask_class):
+            #
+            # A routine publish is only routine ALONE. A `gh pr close` anywhere
+            # in the same command can leave exactly the state the unsuppressible
+            # hygiene asks exist to report — a public branch with no open PR,
+            # outside CI and the leak scan (`gh pr create … && gh pr close
+            # <branch>` publishes, opens and closes in one go). The hook runs
+            # before any of it executes, so it cannot count its way to the
+            # answer; the command's shape keeps the prompt, in either order.
+            # Same predicate as the close-then-push arm above, and the same
+            # limit: it recognises the PARSED `gh pr close` form (through
+            # `-R`, env/command/sudo prefixes, `bash -c`, subshells), not a
+            # close spelled as `gh api … state=closed`, a gh alias, `eval`, or
+            # a variable-named executable. Those keep the silent allow; the
+            # branch's next re-push still meets the unsuppressible no-open-PR
+            # ask.
+            closes_any_pr = any(gh_pr_subcommand(s.argv) == "close" for s in segs)
+            if ask_class is not None and not closes_any_pr and ask_suppressed(ask_class):
                 return _allow(suppressed_reason(ask_class, ask_reason))
             return _ask(ask_reason)
 

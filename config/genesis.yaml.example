@@ -6,7 +6,8 @@
 # This file is machine-specific — NEVER commit it to git.
 # All values here can also be set via environment variables (env var wins) —
 # EXCEPT `timezone`, which is file-first (this value wins; USER_TIMEZONE env is
-# only a deprecated fallback). See the `timezone:` note below.
+# only a deprecated fallback), and `hooks.asks`, which is FILE-ONLY (no
+# supported env override). See the notes on each below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 network:
@@ -49,6 +50,11 @@ github:
 # gets. The allow that replaces a silenced prompt names the setting, so the
 # transcript still records what happened. Leaving this section out — the
 # default — keeps every prompt.
+#
+# FILE-ONLY: there is no supported environment-variable override for these
+# keys — the hooks read this file directly, on every invocation. (The module
+# also honours `_TEST_HOOK_ASK_POLICY`; that is a test seam for the suite, not a
+# setting, and an install should not rely on it.)
 #
 #hooks:
 #  asks:

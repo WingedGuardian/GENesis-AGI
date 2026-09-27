@@ -105,9 +105,10 @@ def config_file(monkeypatch, tmp_path):
     return path
 
 
-def test_a_missing_config_file_is_the_public_default(config_file) -> None:
+def test_a_missing_config_file_is_the_public_default(config_file, capsys) -> None:
     assert not config_file.exists()
     assert policy.ask_suppressed("push_publish") is False
+    assert capsys.readouterr().err == ""  # the public default says nothing
 
 
 def test_a_real_config_file_suppresses(config_file) -> None:
@@ -222,9 +223,11 @@ def test_a_same_named_key_in_an_UNRELATED_section_is_not_a_duplicate(
     assert "duplicate" not in capsys.readouterr().err
 
 
-def test_a_non_mapping_asks_section_keeps_the_ask(config_file) -> None:
-    config_file.write_text("hooks:\n  asks: off\n")
+@pytest.mark.parametrize("body", ["off", "[push_publish]", '"push_publish: off"'])
+def test_a_non_mapping_asks_section_keeps_the_ask_and_says_so(config_file, capsys, body) -> None:
+    config_file.write_text(f"hooks:\n  asks: {body}\n")
     assert policy.ask_suppressed("push_publish") is False
+    assert "not a mapping" in capsys.readouterr().err
 
 
 def test_a_bodiless_asks_key_keeps_the_ask(config_file) -> None:
@@ -232,6 +235,47 @@ def test_a_bodiless_asks_key_keeps_the_ask(config_file) -> None:
     produced one defect class in this repo's routing overlay."""
     config_file.write_text("hooks:\n  asks:\n")
     assert policy.ask_suppressed("push_publish") is False
+
+
+# ─── a declaration that changed nothing must SAY so ─────────────────────────
+# The module's contract is "an unknown key suppresses nothing and says so". The
+# first half held; the second did not — a misspelled key and a bodiless leaf
+# both kept the prompt with no word about why the operator's switch had no
+# effect. Each case below is a declaration the operator wrote down and this
+# module discarded, so each must produce a NOTE naming the key.
+
+
+def test_a_MISSPELLED_key_is_announced_not_silently_ignored(config_file, capsys) -> None:
+    config_file.write_text("hooks:\n  asks:\n    push_publsh: off\n")
+    assert policy.ask_suppressed("push_publish") is False
+    err = capsys.readouterr().err
+    assert "push_publsh" in err and "not a prompt this install can turn off" in err
+
+
+def test_an_unknown_key_through_the_seam_is_announced(monkeypatch, capsys) -> None:
+    """The seam and the file share one validation path, so tests of either
+    exercise the same code the file reader runs."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "force_push=off")
+    assert policy.ask_suppressed("push_publish") is False
+    assert "force_push" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ["push_publish", "secrets_env"])
+def test_a_bodiless_LEAF_is_announced_not_read_as_absent(config_file, capsys, key) -> None:
+    """`push_publish:` with no value loads as None. That is a key the operator
+    DECLARED, so it must not share the silent "absent" branch."""
+    config_file.write_text(f"hooks:\n  asks:\n    {key}:\n")
+    assert policy.ask_suppressed(key) is False
+    err = capsys.readouterr().err
+    assert f"hooks.asks.{key}" in err and "not a boolean" in err
+
+
+def test_an_absent_key_stays_silent(config_file, capsys) -> None:
+    """The negative control for the two above: the public default must not
+    start emitting NOTEs, or every clone's transcript fills with noise."""
+    config_file.write_text("hooks:\n  asks:\n    secrets_env: off\n")
+    assert policy.ask_suppressed("push_publish") is False
+    assert capsys.readouterr().err == ""
 
 
 def test_the_allow_reason_names_the_setting(monkeypatch) -> None:
@@ -439,6 +483,57 @@ def test_the_close_then_push_ask_survives_the_knob(monkeypatch, tmp_path, capsys
     doc = json.loads(out)
     assert _decision(doc) == "ask", (out, err)
     assert "CLOSES a pull request" in doc["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.fixture
+def unpushed_create(monkeypatch, first_push):
+    """A `gh pr create` on a branch that is not yet on the remote, so gh would
+    push it — the second of the two arms `push_publish` classifies."""
+    monkeypatch.setattr(gpg, "_pr_create_would_publish", lambda argv: True)
+
+
+def test_the_publishing_pr_create_ask_is_suppressible(
+    monkeypatch, tmp_path, capsys, unpushed_create
+) -> None:
+    """The positive control for the close-compound tests below: without it, an
+    ask there could be the create arm never having been suppressible at all."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, "gh pr create --title x --body y")
+    assert rc == 0, (rc, out, err)
+    assert _decision(json.loads(out)) == "allow", (out, err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # publish, then close the PR it just opened: public branch, no open PR
+        "gh pr create --title x --body y && gh pr close feat/x",
+        # the same outcome through the push arm
+        "git push -u origin HEAD && gh pr close feat/x",
+        # close first, then a create that publishes: the order must not matter
+        "gh pr close 7 && gh pr create --title x --body y",
+        # spellings the parsed predicate sees through, pinned because the
+        # guard's comment names them as covered
+        "gh pr create --title x --body y && gh -R o/r pr close 1",
+        "gh pr create --title x --body y && env A=1 gh pr close 1",
+        "gh pr create --title x --body y && bash -c 'gh pr close 1'",
+        "gh pr create --title x --body y && (gh pr close 1)",
+    ],
+)
+def test_a_publish_compounded_with_a_pr_close_is_never_suppressed(
+    monkeypatch, tmp_path, capsys, unpushed_create, command: str
+) -> None:
+    """A routine publish is only routine ALONE. Compounded with a `gh pr close`,
+    the command can end with exactly the state the unsuppressible hygiene asks
+    exist to report — a public branch with no open PR, outside CI and the leak
+    scan — and the hook runs before any of it executes, so it cannot count its
+    way to the answer. The command's own shape has to keep the prompt."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command)
+    assert rc == 0, (rc, out, err)
+    doc = json.loads(out)
+    assert _decision(doc) == "ask", (out, err)
+    assert "hooks.asks.push_publish" not in doc["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 def test_an_inline_hard_block_still_blocks_with_the_ask_off(

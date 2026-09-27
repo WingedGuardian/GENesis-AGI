@@ -23,8 +23,9 @@ default is unchanged for every other clone. It is deliberately not a general
   the config suppresses nothing and says so; there is no wildcard, no ``all``,
   and no way for a future config file to reach an ask that no one classified.
 * **Default is ASK, and every failure lands there.** A missing file, an
-  unreadable one, a parse error, a duplicate key, a non-boolean value, an
-  unknown key — all of them mean "ask". There is no value that produces a
+  unreadable one, a parse error, a duplicate key, a non-boolean value (a
+  bodiless key included), an unknown key — all of them mean "ask", and every
+  one of them that the operator actually WROTE is announced with a NOTE. There is no value that produces a
   suppression by accident, which is the property that matters: the safe
   direction has to be the one you get when something goes wrong.
 
@@ -197,6 +198,15 @@ def _declared() -> dict[str, object]:
             return {}
         cfg = yaml.safe_load(text) or {}
         asks = (cfg.get("hooks") or {}).get("asks")
+        if asks is not None and not isinstance(asks, dict):
+            # `asks: off` or `asks: [push_publish]` is a declaration the
+            # operator wrote; dropping it without a word is the silent discard
+            # this module promises not to do. A bodiless `asks:` (None)
+            # declares nothing and stays quiet.
+            _note(
+                f"hooks.asks in {_CONFIG_PATH} is {asks!r}, not a mapping of "
+                f"<prompt>: on/off — every ask stays ENABLED."
+            )
         return asks if isinstance(asks, dict) else {}
     except FileNotFoundError:
         return {}  # the normal install: no local config, no local policy
@@ -218,13 +228,29 @@ def ask_suppressed(key: str) -> bool:
     """
     if key not in KEYS:
         return False
-    value = _declared().get(key)
-    if value is None:
+    declared = _declared()
+    # A declared key outside KEYS is a switch the operator believes they flipped
+    # — most often a misspelling. It suppresses nothing (closed set), and the
+    # module's contract is that it SAYS so: a prompt that keeps appearing with no
+    # word about why is the silent-discard this module exists to avoid.
+    unknown = sorted(str(k) for k in declared if k not in KEYS)
+    if unknown:
+        _note(
+            f"hooks.asks in {_CONFIG_PATH} names {', '.join(unknown)}, which is not "
+            f"a prompt this install can turn off (known: {', '.join(sorted(KEYS))}). "
+            f"Ignored — those prompts stay ENABLED."
+        )
+    # Presence, not truthiness: a bodiless `push_publish:` loads as None, and
+    # that is a declaration the operator wrote, not an absent key. Only a key
+    # that is genuinely not there takes the silent public-default branch.
+    if key not in declared:
         return False  # not declared → the public default → ask
+    value = declared[key]
     if isinstance(value, bool):
         return not value  # `off`/`false` → suppressed; `on`/`true` → ask
+    shown = "empty (a key with no value)" if value is None else repr(value)
     _note(
-        f"hooks.asks.{key} in {_CONFIG_PATH} is {value!r}, which is not a boolean — "
+        f"hooks.asks.{key} in {_CONFIG_PATH} is {shown}, which is not a boolean — "
         f"use `off` to silence this ask or `on` to keep it. Keeping it ENABLED."
     )
     return False
