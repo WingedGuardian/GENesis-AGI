@@ -907,6 +907,7 @@ class InboxMonitor:
                         f"{approval_status or 'missing'}"
                     ),
                     processed_at=now_iso,
+                    retriable_below=self._config.max_retries,
                 )
                 logger.info(
                     "Inbox row %s returned to retry: approval %s ended (%s)",
@@ -2250,7 +2251,7 @@ class InboxMonitor:
                 import hashlib
 
                 from genesis.env import alert_queue_root
-                from genesis.guardian.alert.queue import enqueue_alert
+                from genesis.guardian.alert.queue import enqueue_alert, list_queued
 
                 try:
                     name = Path(file_path).relative_to(self._config.watch_path).as_posix()
@@ -2281,14 +2282,24 @@ class InboxMonitor:
                 digest = hashlib.sha256(
                     "\n".join(sorted(items)).encode()
                 ).hexdigest()[:12]
-                enqueue_alert(
-                    alert_queue_root(),
+                root = alert_queue_root()
+                key = f"inbox:parked:{file_path}:{reason}:{digest}"
+                queued = enqueue_alert(
+                    root,
                     severity="warning",
                     source="inbox",
                     title=title,
                     body=body,
-                    dedupe_key=f"inbox:parked:{file_path}:{reason}:{digest}",
+                    dedupe_key=key,
                 )
+                # enqueue_alert never raises: it returns False both when a live
+                # entry already carries this key (fine: the owner will see that
+                # one) and when the write failed (the alert is lost). Tell them
+                # apart, and route a failed write to the error log below.
+                if not queued and not any(
+                    e.get("dedupe_key") == key for _p, e in list_queued(root)
+                ):
+                    raise OSError("alert queue write failed")
             except Exception:
                 # The buffer is already cleared and nothing re-derives it, so this
                 # log line IS the only record of what stopped: keep it whole.
@@ -2365,8 +2376,12 @@ class InboxMonitor:
             errors.append(err)
             logger.warning(err)
             await self._session_manager.fail(session_id, reason=err)
+            # retriable_below: an approved row resumed from a parked approval
+            # can carry a count from an older, higher cap; an outage must not
+            # land it at the current one (#2447 review).
             await inbox_items.mark_failed_keeping_retries(
                 self._db, item.id, error_message=err, processed_at=now_iso,
+                retriable_below=self._config.max_retries,
             )
             return False
         except Exception as exc:

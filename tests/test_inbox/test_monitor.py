@@ -3645,3 +3645,29 @@ async def test_failed_approval_lookup_leaves_the_row_parked(monitor, inbox_dir, 
     ), dict(row)
     dispatcher.approval_gate.approval_manager.cancel.assert_not_called()
     dispatcher.route.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ended_approval_stays_retriable_after_the_cap_is_lowered(
+    monitor, inbox_dir, db,
+):
+    """Codex (#2447 round 3): a row parked for approval under a higher cap can
+    carry a retry count at or above a LOWERED cap. When its approval ends it
+    must still come back, not land at the cap where nothing retries it."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-new",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        approval_by_id={"req-end": {"id": "req-end", "status": "expired"}},
+    )
+    await _seed_expiring_row(
+        db, inbox_dir, request_id="req-end",
+        retry_count=monitor._config.max_retries + 2,  # counted under an older, higher cap
+    )
+    await monitor.check_once()
+    row = await (await db.execute(
+        "SELECT retry_count, error_message FROM inbox_items WHERE id = 'row-req-end'"
+    )).fetchone()
+    assert row["retry_count"] == monitor._config.max_retries - 1, dict(row)
+    assert row["error_message"] == "awaiting_approval:req-new", dict(row)

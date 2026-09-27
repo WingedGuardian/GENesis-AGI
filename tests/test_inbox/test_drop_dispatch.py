@@ -1805,10 +1805,12 @@ async def test_a_failed_alert_enqueue_logs_what_stopped(
     is the only record of what stopped. It must name the items."""
     import genesis.guardian.alert.queue as alert_queue
 
-    def _boom(*_a, **_k):
-        raise OSError("alert queue unwritable")
+    def _lost(*_a, **_k):
+        # The real contract: enqueue_alert never raises; a failed write
+        # returns False (Codex, #2447 round 3).
+        return False
 
-    monkeypatch.setattr(alert_queue, "enqueue_alert", _boom)
+    monkeypatch.setattr(alert_queue, "enqueue_alert", _lost)
     mock_invoker.run.return_value = _ok(_UNCOVERED)
     mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
     (inbox_dir / "Genesis.md").write_text("https://example.com/lost-item-7c1\n")
@@ -1819,3 +1821,60 @@ async def test_a_failed_alert_enqueue_logs_what_stopped(
     assert len(errors) == 1, [r.getMessage() for r in caplog.records]
     assert "example.com/lost-item-7c1" in errors[0].getMessage()
     assert "Genesis.md" in errors[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_deduplicated_alert_is_not_logged_as_lost(
+    db, inbox_dir, mock_invoker, mock_session_manager, caplog,
+):
+    """Negative control: False also means "already queued under this key", which
+    is not a loss and must not be reported as one."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/dup-item-4d2\n")
+    await mon.check_once()
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+    key = next(a for a in _queued_alerts() if a.get("source") == "inbox")["dedupe_key"]
+    # Re-flush the same parked set: the live entry dedupes it.
+    mon._park_buffer = {}
+    row = (await (await db.execute("SELECT id FROM inbox_items")).fetchone())["id"]
+    mon._alert_parked(
+        str(inbox_dir / "Genesis.md"), reason="retries_exhausted", detail="d",
+        item_id=row, labels=["x"],
+    )
+    with caplog.at_level("ERROR"):
+        mon._flush_park_alerts()
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+    assert not [r for r in caplog.records if "enqueue failed" in r.getMessage()], key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_retries", [1, 3])
+async def test_offline_failure_keeps_a_row_below_a_lowered_cap(
+    db, inbox_dir, mock_invoker, mock_session_manager, max_retries,
+):
+    """#2447 review: a row whose count dates from an older, higher cap must stay
+    retriable when an outage fails it, including at max_retries=1 (count 0)."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+    from genesis.inbox.types import InboxItem
+
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       max_retries=max_retries)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://example.com/old-cap-item\n")
+    await inbox_items.create(
+        db, id="old", file_path=str(f), content_hash="h", status="processing",
+        created_at="2026-09-01T00:00:00+00:00", retry_count=max_retries + 2,
+    )
+    item = InboxItem(
+        id="old", file_path=str(f), content="https://example.com/old-cap-item",
+        content_hash="h", detected_at="2026-09-01T00:00:00+00:00",
+    )
+    await mon._run_one_batch(
+        item, model="sonnet", effort="high", system_prompt="",
+        now_iso="2026-09-01T00:00:00+00:00", errors=[],
+    )
+    row = await inbox_items.get_by_id(db, "old")
+    assert row["status"] == "failed", row
+    assert row["retry_count"] == max_retries - 1, row

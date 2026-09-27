@@ -723,6 +723,7 @@ async def mark_failed_keeping_retries(
     *,
     error_message: str,
     processed_at: str | None = None,
+    retriable_below: int | None = None,
 ) -> bool:
     """Fail a row WITHOUT spending its retry budget, in one UPDATE.
 
@@ -730,13 +731,25 @@ async def mark_failed_keeping_retries(
     caller supplies a value, and supplying one means reading the row first. A
     failure that is not the item's fault (the network was down) must neither
     spend a retry nor depend on that read succeeding.
+
+    ``retriable_below`` (the active ``max_retries``) additionally keeps the row
+    RETRIABLE: its count is lowered to ``retriable_below - 1`` when it already
+    sits at or above that cap. A row whose count predates a LOWERED cap would
+    otherwise land at the cap, where nothing retries it and its never-evaluated
+    content counts as handled (#2447 review).
     """
-    cursor = await db.execute(
-        """UPDATE inbox_items
+    if retriable_below is None:
+        sql = """UPDATE inbox_items
            SET status = 'failed', processed_at = ?, error_message = ?
-           WHERE id = ?""",
-        (processed_at, error_message, id),
-    )
+           WHERE id = ?"""
+        params: tuple = (processed_at, error_message, id)
+    else:
+        sql = """UPDATE inbox_items
+           SET status = 'failed', processed_at = ?, error_message = ?,
+               retry_count = MIN(retry_count, ?)
+           WHERE id = ?"""
+        params = (processed_at, error_message, max(retriable_below - 1, 0), id)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount > 0
 
