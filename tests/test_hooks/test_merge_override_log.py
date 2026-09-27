@@ -406,9 +406,17 @@ class TestWiredIntoTheMergePath:
         # ELSE: four of them blocked on a real PR's review state while their
         # docstrings claimed to exercise "a real merge". Mirrors the seam set in
         # test_merge_gate_characterization.py, which is network-free by design.
-        # ONE JSON OBJECT PER LINE, per `_codex_reviews`' documented seam contract —
-        # which is what makes `rounds` the round COUNT the escalation gate sees, and
-        # so the only way a test here can reach that gate's cap comparisons at all.
+        # ONE JSON OBJECT PER LINE, per `_codex_reviews`' documented seam contract.
+        # ⚠ `rounds` does NOT reach the escalation gate's cap comparisons, though an
+        # earlier version of this comment claimed it was the only way to. MEASURED
+        # 2026-09-25: every record below carries the SAME `commit_id`, and
+        # `evaluate_evidence` dedupes reviewed heads by commit id, so any N yields
+        # count=1; and this helper omits the `_TEST_REVIEW_BUDGET_*` seams entirely,
+        # so `evaluate_pr` returns `status=unknown / reason=evidence_unknown /
+        # count=None` and no budget is computed at all. Tests here therefore exercise
+        # the evidence-unreadable DEGRADE path, not any cap. Issue #2378 repairs it;
+        # `tests/test_hooks/test_git_push_guard_escalation.py` is where the caps are
+        # actually covered (counts 0,2,3,4,5 observed, status ok).
         monkeypatch.setenv(
             "_TEST_GH_CODEX_REVIEWS",
             "\n".join(
@@ -594,12 +602,27 @@ class TestWiredIntoTheMergePath:
         separate decision; this test pins the CURRENT answer (it does not), so a
         future change to it is deliberate rather than accidental.
 
-        Which means the cases below must REACH the honour points, not merely run
-        the scan. With one seeded review `effective == 1`, neither cap comparison
-        is taken and the sigil is never consulted — a `_note_override` added inside
-        either branch would leave such a test green, which is the exact accident
-        this docstring claims to prevent. So the tail of this test drives the round
-        count up to each cap.
+        ⚠ **This test does NOT reach the cap comparisons, and it never did.**
+        MEASURED 2026-09-25 by spying the shipped `evaluate_pr` during this very
+        test: five calls, every one `status=unknown / reason=evidence_unknown /
+        count=None`. `_drive` omits the `_TEST_REVIEW_BUDGET_*` seams the evaluator
+        reads (`review_budget.py:465,513,525`), so the budget is never computed and
+        the `ask` observed here is the evidence-unreadable DEGRADE, not a cap.
+        Its `rounds=` knob is inert twice over: the records it fabricates all carry
+        the same `commit_id`, and `evaluate_evidence` dedupes by head (N=1,3,5,7 all
+        yield `count=1`).
+
+        So what this test actually pins is narrower than an earlier version of this
+        docstring claimed, and worth keeping at that narrower scope: **the override
+        scan writes no row for these sigils**, including on the degraded path.
+        It does NOT pin the cap branches.
+
+        The cap comparisons ARE covered — by
+        `tests/test_hooks/test_git_push_guard_escalation.py`, which drives the real
+        budget with DISTINCT heads; counts 0, 2, 3, 4 and 5 were observed there,
+        with `status: ok`. Look there for a change to the cap tiers, and fix
+        `_drive`'s seams here before trusting this file for anything round-related
+        (issue filed).
         """
         for cmd in (
             'git commit -m "wip"  # escalation-ack',
@@ -611,24 +634,20 @@ class TestWiredIntoTheMergePath:
             self._drive(monkeypatch, cmd)
             assert _rows(log_dir) == [], f"{cmd!r} produced a row"
 
-        # THE HONOUR POINTS. Everything above runs with `effective == 1`, below both
-        # caps, so the sigil is never consulted — those cases pin "the scan writes
-        # nothing", not "the waiver writes nothing". These two put the round count
-        # ON each cap, which is where `acked` / `final_acked` actually decide
-        # something, and are therefore the cases a future `_note_override` inside
-        # either branch would have to survive.
-        for cmd, rounds in (
-            (
-                'gh pr comment 5 --body "@codex review"  # escalation-ack',
-                _mod.ESCALATION_ROUND_CAP,
-            ),
-            (
-                'gh pr comment 5 --body "@codex review"  # final-round-accept',
-                _mod.FINAL_ROUND_CAP,
-            ),
-        ):
-            self._drive(monkeypatch, cmd, rounds=rounds)
-            assert _rows(log_dir) == [], f"{cmd!r} logged at the HONOUR point"
+        # Two trailing `_drive` calls used to sit here, labelled THE HONOUR POINTS on
+        # the belief that `rounds=` put the count ON each cap. Both are DELETED, and
+        # neither deletion costs coverage:
+        #
+        #   * the `escalation-ack` one re-ran the identical command the first loop
+        #     already drives, at a `rounds=` value measured inert — a duplicate
+        #     assertion, and the sole reader of a dead re-export in the guard;
+        #   * the `final-round-accept` one used a retired constant, and its branch
+        #     (the retired-sigil NOTE in `_check_codex_round_escalation`) is keyed on
+        #     the SIGIL rather than on any count, so the first loop covers it too.
+        #
+        # What remains is the honest claim: the scan writes no row for an ack-class
+        # sigil on the review-request path. Repairing `_drive`'s seams so a test here
+        # CAN reach the cap comparisons is issue #2378.
 
     def test_no_sigil_writes_nothing(self, monkeypatch, log_dir):
         """Positive control's twin: an ordinary merge must not log."""
