@@ -332,7 +332,7 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     try:
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain", "-z"],
-            capture_output=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode != 0:
             detail = result.stderr.decode("utf-8", "replace").strip()[:200]
@@ -535,7 +535,7 @@ def _merge_verdict(
     try:
         result = subprocess.run(
             ["git", "merge-base", "--is-ancestor", ref, "main"],
-            capture_output=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             return "ancestor"
@@ -581,7 +581,7 @@ def _merge_verdict(
     try:
         result = subprocess.run(
             ["git", "cherry", "main", ref],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, text=True, cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             # Lines starting with '+' are unique commits not in main
@@ -648,7 +648,9 @@ def _is_locked_now(worktree_path: Path) -> bool:
         dot_git = worktree_path / ".git"
         if dot_git.is_dir():  # the main checkout, never reaped anyway
             return False
-        text = dot_git.read_text(encoding="utf-8", errors="replace")
+        # surrogateescape, not replace: a lossy decode of a non-UTF-8 admin path
+        # names a directory that does not exist, and "no lock file" is fail-open.
+        text = dot_git.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError:
         return True
     for line in text.splitlines():
@@ -678,9 +680,13 @@ def _has_in_progress_op(worktree_path: str) -> bool:
     """
     for marker in _IN_PROGRESS_MARKERS:
         try:
+            # surrogateescape: a linked worktree's marker path runs through its
+            # admin directory, which carries the worktree's own name byte for
+            # byte, and a strict decode of a non-UTF-8 name raised out of here.
             result = subprocess.run(
                 ["git", "rev-parse", "--git-path", marker],
-                capture_output=True, text=True, cwd=worktree_path, timeout=10,
+                capture_output=True, text=True, errors="surrogateescape",
+                cwd=worktree_path, timeout=10, env=_git_env(),
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return True  # fail-closed: can't verify state → protect the worktree
@@ -1137,7 +1143,7 @@ def _unique_commits(ref: str, repo_root: Path, limit: int = 50) -> list[str]:
         result = subprocess.run(
             ["git", "log", "--format=%h %s", f"main..{ref}"],
             capture_output=True, text=True, errors="replace",
-            cwd=str(repo_root), timeout=30,
+            cwd=str(repo_root), timeout=30, env=_git_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
         # errors="replace" makes a UnicodeDecodeError unreachable here, but the
@@ -1794,8 +1800,12 @@ def _restore_from_dir(
               f"{original_path}. Nothing was changed; retry --recover.", file=sys.stderr)
         return False
     owner = None
-    if lock and lock.startswith(_LOCK_PREFIX) and not lock.startswith(
-            f"{_LOCK_PREFIX}{trash_path.name}; "):
+    # Held by THIS archive: only then is the registration's index the one archived.
+    # A successful recovery unlocks it while the archive is kept, so a second
+    # recovery of the same archive finds it unlocked, its index possibly a later
+    # session's (MEASURED: a staged file absent from the tree, reported exact).
+    owned = bool(lock) and lock.startswith(f"{_LOCK_PREFIX}{trash_path.name}; ")
+    if lock and lock.startswith(_LOCK_PREFIX) and not owned:
         owner = lock[len(_LOCK_PREFIX):].split("; ", 1)[0]
     if owner is not None:
         print(f"{original_path} is registered to a NEWER archive, {owner}; recovering "
@@ -1813,9 +1823,18 @@ def _restore_from_dir(
     # `git worktree add --force` instead REPLACES that registration and its index,
     # destroying the one complete copy of the staged state before rebuilding a
     # lossy one. The rebuild below is kept for archives whose registration is gone.
-    admin = _reattach_target(trash_path, original_path, repo_root)
+    state, admin = _reattach_target(trash_path, original_path, repo_root)
+    if state == "unknown":
+        print(f"Could not tell whether {original_path} still has the registration it was "
+              "archived under: its `.git` pointer or the registration's files could not "
+              f"be read, or git did not answer. Nothing was changed; the archive is intact "
+              f"at {where}. If the cause was transient, retry --recover; otherwise check "
+              f"that {trash_path / '.git'} and the registration under the repository's "
+              "`worktrees/` directory are readable.", file=sys.stderr)
+        return False
     if admin is not None:
-        outcome = _reattach(trash_path, meta, repo_root, original_path, admin, report, where)
+        outcome = _reattach(trash_path, meta, repo_root, original_path, admin, report, where,
+                            owned=owned)
         if outcome == "done":
             return True
         if outcome in ("stuck", "abort"):
@@ -1859,51 +1878,48 @@ def _restore_from_dir(
             timeout=15,
         )
 
-    # Recreate the worktree: detached at its commit, or checked out on its branch.
-    if detached or not branch:
-        add_cmd = ["git", "worktree", "add", "--force", "--detach", original_path, commit]
-    else:
-        add_cmd = ["git", "worktree", "add", "--force", original_path, branch]
+    # CREATE DETACHED, THEN LET GIT TAKE THE BRANCH. `--force` (needed to take over
+    # the still-registered path) would also let `worktree add <branch>` make a SECOND
+    # checkout of a branch another worktree holds, and two trees on one branch move
+    # its ref under each other. Whether a branch is held is git's own rule, and it
+    # counts more than `worktree list` shows (a worktree mid-rebase or mid-bisect of
+    # the branch is listed as detached, yet holds it). So never copy that rule:
+    # create the tree detached at its recorded commit, then `git switch` without
+    # `--ignore-other-worktrees`, which refuses exactly when git would. A refused
+    # switch leaves a working tree detached at the right commit and says why. The
+    # same path covers a DELETED branch, which is the ordinary case rather than an
+    # exotic one (`autonomy/executor/worktree_mgr.py` deletes a task worktree's
+    # branch right after reaping it); the commit usually survives it through the
+    # HEAD reflog until that reflog expires.
+    # From the recorded commit while it exists; once gc has collected it, from the
+    # branch, which is what a rebuild did before (a plain directory otherwise).
+    have_commit = bool(commit) and _run_git(
+        repo_root, ["cat-file", "-e", f"{commit}^{{commit}}"], timeout=15) is not None
+    start = commit if have_commit else branch
     result = subprocess.run(
-        add_cmd,
-        capture_output=True, text=True, cwd=str(repo_root), timeout=30, env=_git_env(),
+        ["git", "worktree", "add", "--force", "--detach", original_path, start],
+        capture_output=True, text=True, errors="surrogateescape",
+        cwd=str(repo_root), timeout=30, env=_git_env(),
     )
-
-    if result.returncode != 0 and commit and not (detached or not branch):
-        # THE BRANCH IS GONE, AND THE COMMIT IS NOT. This is the ordinary case
-        # rather than an exotic one: `autonomy/executor/worktree_mgr.py` deletes
-        # a task worktree's branch with `git branch -D` right after reaping it,
-        # so by recovery time the branch named in the metadata routinely does not
-        # exist. Falling straight through to the plain-directory move — as this
-        # did — restored a tree whose `.git` file points at a pruned admin
-        # directory, so `git status` inside it fails while `_recover` has already
-        # reported success. A recovery that returns true and leaves an unusable
-        # checkout is worse than one that fails loudly.
-        #
-        # The commit usually survives the branch: this worktree's HEAD reflog
-        # keeps it reachable until that reflog expires (gc.reflogExpireUnreachable,
-        # 30 days by default). The lock keeps the REGISTRATION, not the commit, so
-        # past that a gc can collect it and this retry fails loudly below. While
-        # it holds, retry DETACHED at the recorded commit, which reconstructs a
-        # real, working worktree; the branch name is recoverable from there by
-        # hand with one `git switch -c`, and that is stated rather than implicit.
-        retry = subprocess.run(
-            ["git", "worktree", "add", "--force", "--detach", original_path, commit],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=30, env=_git_env(),
+    if result.returncode == 0 and branch and not detached:
+        switch = subprocess.run(
+            ["git", "switch", "--quiet", branch],
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=original_path, timeout=30, env=_git_env(),
         )
-        if retry.returncode == 0:
-            print(
-                f"Branch {branch!r} no longer exists; recreated as a DETACHED "
-                f"worktree at {commit[:8]}. To restore the branch name: "
-                f"git -C {original_path} switch -c {branch}",
-                file=sys.stderr,
-            )
-            result = retry
-        else:
-            print(
-                f"git worktree add --detach also failed: {retry.stderr.strip()}",
-                file=sys.stderr,
-            )
+        if switch.returncode != 0:
+            detached = True
+            reason = switch.stderr.strip().splitlines()[-1] if switch.stderr.strip() else "no reason given"
+            # git's reason can name another worktree's path, raw; escape it so this
+            # message prints on any stream (the command lines below are quoted).
+            reason = reason.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+            exists = _run_git(repo_root, ["rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
+                              timeout=15)
+            how = (f"git -C {_shell_word(original_path)} switch {branch}   (once it is free)"
+                   if exists else f"git -C {_shell_word(original_path)} switch -c {branch}")
+            print(f"Recreated {original_path} DETACHED at {(start or '')[:8]}: git would not "
+                  f"check out branch {branch!r} there ({reason}). To take the branch: {how}",
+                  file=sys.stderr)
 
     if result.returncode != 0:
         # Neither the branch nor the commit could produce a worktree — fall back
@@ -2016,7 +2032,8 @@ def _restore_from_dir(
             shutil.copy2(str(item), str(target))
         trash_files.add(str(rel))
 
-    _restore_preserved_meta(Path(original_path), meta)
+    if not _restore_preserved_meta(Path(original_path), meta):
+        report["incomplete"] = True
 
     # Patches that did NOT apply are kept IN the worktree, after the untracked
     # copy so they can never take the name of a file the worktree owned.
@@ -2047,8 +2064,14 @@ def _restore_from_dir(
         shutil.rmtree(str(trash_path))
     if failed or missing or mismatched:
         report["incomplete"] = True
+    now = (_run_git(Path(original_path), ["rev-parse", "HEAD"], timeout=15) or "").strip()
+    if commit and now and now != commit:
+        report["incomplete"] = True
+        print(f"The branch has MOVED since archiving (was {commit[:8]}, now {now[:8]}): "
+              "the recovered tree sits on the new tip, not on the archived commit.",
+              file=sys.stderr)
 
-    ref_label = f"branch: {branch}" if branch else f"detached at {commit[:8]}"
+    ref_label = f"branch: {branch}" if branch and not detached else f"detached at {commit[:8]}"
     print(f"Recovered to {original_path} ({ref_label})")
     if trash_files:
         print(f"Restored {len(trash_files)} untracked file(s) from trash")
@@ -2132,7 +2155,9 @@ def _retry_lines(kept: list[Path], worktree: str, restored: set[str]) -> list[st
     """
     if not kept:
         return []
-    q_wt = shlex.quote(str(worktree))
+    # `_shell_word`, like the file names: a non-UTF-8 worktree path otherwise came
+    # out as a `\\udcXX` escape naming a different directory.
+    q_wt = _shell_word(str(worktree))
     touched: set[str] = set()
     unknown = False
     for dest in kept:
@@ -2144,10 +2169,13 @@ def _retry_lines(kept: list[Path], worktree: str, restored: set[str]) -> list[st
     aside = sorted(touched & restored)
     out = ["  Retry by hand, in this order:"]
     if aside:
-        # `test ! -e` first, so running the block twice can never overwrite a
-        # `.restored` copy — those hold the only final working-tree content.
+        # `test ! -e` AND `test ! -L` first, so running the block twice can never
+        # overwrite a `.restored` copy (those hold the only final working-tree
+        # content), nor replace a user's dangling symlink of that name: `-e` follows
+        # a symlink and reports a dangling one as absent.
         moves = " && ".join(
             f"test ! -e {_shell_word(p + '.restored')} && "
+            f"test ! -L {_shell_word(p + '.restored')} && "
             f"mv -- {_shell_word(p)} {_shell_word(p + '.restored')}"
             for p in aside
         )
@@ -2195,43 +2223,53 @@ _INDEX_PATCH_NAME = ".dirty.index.patch"
 _ALT = ".archived-"
 
 
-def _reattach_target(trash_path: Path, original_path: str, repo_root: Path) -> Path | None:
-    """The preserved registration an archived tree still belongs to, or None.
+def _reattach_target(
+    trash_path: Path, original_path: str, repo_root: Path,
+) -> tuple[str, Path | None]:
+    """Whether the archived tree still has a registration to go back under.
 
-    Every check must hold, or the tree is rebuilt instead: the tree's ``.git`` is
-    a regular FILE naming an admin directory; that directory sits under this
-    repository's own ``worktrees/`` and has a HEAD; and its ``gitdir`` points back
-    at ``original_path``. The last one is what makes the registration THIS tree's
-    rather than one a later ``git worktree add`` reused.
+    Returns ``("ok", admin)`` when every check holds: the tree's ``.git`` is a regular
+    FILE naming an admin directory; that directory sits under this repository's own
+    ``worktrees/`` and has a HEAD; and its ``gitdir`` points back at
+    ``original_path`` (which makes it THIS tree's registration rather than one a later
+    ``git worktree add`` reused). ``("absent", None)`` when a check is answered and
+    fails, so rebuilding is right. ``("unknown", None)`` when a check could not be
+    answered at all: an unreadable file, git not answering, an admin directory with
+    its HEAD or ``gitdir`` missing. The rebuild REPLACES the registration and with it
+    the only complete copy of the staged state, so an unanswered question must never
+    be read as "absent". Files are decoded with surrogateescape: git writes a path
+    byte for byte, and a strict decode of a non-UTF-8 name read as "unreadable".
     """
     dotgit = trash_path / ".git"
     if dotgit.is_symlink() or not dotgit.is_file():
-        return None
+        return "absent", None
     try:
-        text = dotgit.read_text().strip()
-    except (OSError, UnicodeDecodeError):
-        return None
+        text = dotgit.read_text(errors="surrogateescape").strip()
+    except OSError:
+        return "unknown", None
     if not text.startswith("gitdir:"):
-        return None
+        return "absent", None
     raw = text[len("gitdir:"):].strip()
     admin = Path(raw) if os.path.isabs(raw) else Path(original_path) / raw
     common = _run_git(repo_root, ["rev-parse", "--path-format=absolute", "--git-common-dir"],
                       timeout=15)
     if not common or not common.strip():
-        return None
+        return "unknown", None
     admin = Path(os.path.realpath(admin))
     if admin.parent != Path(os.path.realpath(Path(common.strip()) / "worktrees")):
-        return None
+        return "absent", None
+    if not admin.is_dir():
+        return "absent", None
     if not (admin / "HEAD").is_file():
-        return None
+        return "unknown", None
     try:
-        pointed = (admin / "gitdir").read_text().strip()
-    except (OSError, UnicodeDecodeError):
-        return None
+        pointed = (admin / "gitdir").read_text(errors="surrogateescape").strip()
+    except OSError:
+        return "unknown", None
     back = Path(pointed) if os.path.isabs(pointed) else admin / pointed
     if os.path.realpath(back) != os.path.realpath(Path(original_path) / ".git"):
-        return None
-    return admin
+        return "absent", None
+    return "ok", admin
 
 
 def _place_tree(src: Path, dest: Path) -> bool:
@@ -2252,10 +2290,14 @@ def _place_tree(src: Path, dest: Path) -> bool:
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
+    # CREATE THE DESTINATION FIRST, so a directory someone else made after the
+    # caller's existence check raises here, before anything of theirs could be
+    # removed as "our partial copy".
+    os.mkdir(dest)
     try:
-        shutil.copytree(src, dest, symlinks=True)
+        shutil.copytree(src, dest, symlinks=True, dirs_exist_ok=True)
     except BaseException:
-        shutil.rmtree(dest, ignore_errors=True)  # our partial copy; the source is intact
+        shutil.rmtree(dest, ignore_errors=True)  # made by this call; the source is intact
         raise
     return False
 
@@ -2310,12 +2352,12 @@ def _registration_lock(original_path: str, repo_root: Path) -> tuple[bool, str |
     return True, None
 
 
-def _restore_preserved_meta(dest: Path, meta: dict) -> None:
+def _restore_preserved_meta(dest: Path, meta: dict) -> bool:
     """Give the worktree its own ``.trash_meta.json`` back under its real name.
 
     Archiving renames a worktree's own file of that name aside, so the reaper's can
     take the name; this is the reverse. Only the RECORDED aside name is renamed, and
-    only when nothing holds the real name.
+    only when nothing holds the real name. False when the rename failed.
     """
     preserved = meta.get("preserved_meta")
     meta_file = dest / ".trash_meta.json"
@@ -2327,11 +2369,13 @@ def _restore_preserved_meta(dest: Path, meta: dict) -> None:
         except OSError as e:
             print(f"Could not give {dest / preserved} back its name .trash_meta.json ({e}); "
                   "it is the worktree's own file, set aside at archive time.", file=sys.stderr)
+            return False
+    return True
 
 
 def _reattach(
     trash_path: Path, meta: dict, repo_root: Path, original_path: str, admin: Path,
-    report: dict, where: Path,
+    report: dict, where: Path, *, owned: bool,
 ) -> str:
     """Move the archived tree back under its registration.
 
@@ -2348,6 +2392,11 @@ def _reattach(
         dest.parent.mkdir(parents=True, exist_ok=True)
         moved = _place_tree(trash_path, dest)
     except (OSError, shutil.Error) as e:
+        if isinstance(e, OSError) and e.errno in (errno.EEXIST, errno.ENOTEMPTY):
+            print(f"Something else now occupies {dest}, so the archived tree was not "
+                  f"placed. Nothing was changed; the archive is intact at {where}.",
+                  file=sys.stderr)
+            return "abort"
         if os.path.lexists(dest):
             print(f"Could not place the archived tree ({e}), and part of a copy remains at "
                   f"{dest}. The archive is intact at {where}; remove {dest} and retry.",
@@ -2376,7 +2425,7 @@ def _reattach(
         and _run_git(dest, ["update-ref", "--no-deref", "HEAD", commit], timeout=15) is not None
     ):
         note = (f"Branch {branch!r} no longer exists; the worktree is DETACHED at "
-                f"{commit[:8]}. To restore the name: git -C {original_path} switch -c {branch}")
+                f"{commit[:8]}. To restore the name: git -C {_shell_word(original_path)} switch -c {branch}")
 
     # VERIFY THE BINDING, and nothing else. `git status` was the check once: it walks
     # the whole tree, so on a slow disk it timed out and a healthy reattach went to
@@ -2423,16 +2472,18 @@ def _reattach(
             meta_file.unlink()
         except OSError:
             leftovers.append(meta_file)
-    _restore_preserved_meta(dest, meta)
+    if not _restore_preserved_meta(dest, meta):
+        report["incomplete"] = True
     if not moved and trash_path.parent == TRASH_DIR:
         print(f"The trash entry was COPIED, not moved (it is on another filesystem), and "
               f"is kept at {trash_path}. Delete it once you have checked the worktree.",
               file=sys.stderr)
 
     report["mode"] = "reattached"
-    print(f"Reattached {original_path} to its preserved registration: index, "
-          "staged/unstaged split and untracked files are exactly as archived.")
+    print(f"Reattached {original_path} to its preserved registration.")
     if leftovers:
+        # The tree is not as archived while the reaper's own files remain in it.
+        report["incomplete"] = True
         print("Could not remove the reaper's own file(s) from the tree: "
               + ", ".join(str(x) for x in leftovers), file=sys.stderr)
     head = (_run_git(dest, ["rev-parse", "--verify", "-q", "HEAD"], timeout=15) or "").strip()
@@ -2448,7 +2499,7 @@ def _reattach(
                   "remote that still has it before committing here.", file=sys.stderr)
         else:
             print(f"BUT ITS HEAD DOES NOT RESOLVE. The files and the index are back; point "
-                  f"HEAD at the recorded commit with: git -C {original_path} update-ref "
+                  f"HEAD at the recorded commit with: git -C {_shell_word(original_path)} update-ref "
                   f"--no-deref HEAD {commit}", file=sys.stderr)
     elif note:
         print(note, file=sys.stderr)
@@ -2459,11 +2510,36 @@ def _reattach(
               f"difference between {commit[:8]} and {head[:8]} as changes here, and a "
               "commit now would record that difference as this tree's own work, undoing "
               "the branch's move. Rebase or merge the archived work first.", file=sys.stderr)
+    if not owned:
+        report["incomplete"] = True
+        print(f"The registration of {original_path} was not held by this archive (it is "
+              "unlocked, or locked by someone else), so its index may be from a later "
+              "session rather than the archived one. Check `git status` before relying "
+              "on the staged changes.", file=sys.stderr)
     if ("patch_format" not in meta and "patch_file" not in meta
             and meta.get("had_tracked_patch")):
+        # The reaper's patch may still be in the tree under a name nothing recorded,
+        # and a later `git add -A` would commit it: not as archived.
+        report["incomplete"] = True
         print("This archive predates recorded patch names, so any `.dirty.patch*` file "
               "in the tree was left alone: it may be the reaper's saved patch, whose "
-              "edits the tree already holds.", file=sys.stderr)
+              "edits the tree already holds. Delete it by hand once checked.",
+              file=sys.stderr)
+    elif meta.get("patch_format") == 2 and any(
+            meta.get(flag) and meta.get(key) is None
+            for key, flag in (("patch_file", "patch_expected"),
+                              ("index_patch_file", "index_patch_expected"))):
+        # The archive says a patch was written but its name never reached this
+        # copy of the metadata (the final rewrite failed), so it was not removed.
+        report["incomplete"] = True
+        print("The archive saved a patch whose name it did not record, so the reaper's "
+              "`.dirty.patch*` file may still be in the tree. Delete it by hand once "
+              "checked.", file=sys.stderr)
+    # Said LAST, and only when nothing above found a difference: a leftover reaper
+    # file, a worktree file still under its aside name, an unresolvable HEAD or a
+    # moved branch each make it untrue.
+    if not report.get("incomplete"):
+        print("Index, staged/unstaged split and untracked files are exactly as archived.")
     return "done"
 
 
@@ -2626,11 +2702,10 @@ def _saved_patches_in(trash_path: Path, meta: dict) -> tuple[Path | None, Path |
         return found[0], found[1], missing
 
     if "had_tracked_patch" not in meta:
-        # An archive from before patches were recorded at all. A `.dirty.patch` in
-        # it may be ours or the user's, and nothing says which; with none, there is
-        # nothing missing — the archive simply never had one.
-        guess = _regular(trash_path / _PATCH_NAME)
-        return None, guess, False
+        # The flag and the reaper's patch arrived in the same change, so an archive
+        # without the flag never had a patch of ours: a `.dirty.patch` in it is the
+        # user's own file, never to be applied or excluded as ours.
+        return None, None, False
     if meta.get("had_tracked_patch") is False:
         return None, None, False
     numbered = []
@@ -2906,6 +2981,15 @@ def main() -> int:
                              "(gh pr list). Faster, and can only ever under-report "
                              "a branch as unmerged — never the reverse")
     args = parser.parse_args()
+
+    # A worktree path is bytes, and one that is not valid UTF-8 decodes to lone
+    # surrogates. Under a locale whose stdout is strict (any `xx_XX.UTF-8`; only the
+    # C locale gets surrogateescape) printing such a path raised mid-recovery, AFTER
+    # the tree had moved and before the checks that report an incomplete result.
+    # Escape instead of raising; commands meant to be pasted are quoted separately.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="backslashreplace")
 
     if args.list_trash:
         _list_trash()
