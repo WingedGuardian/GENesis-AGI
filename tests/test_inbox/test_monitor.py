@@ -47,6 +47,13 @@ def _success_output(
         "**Source:** https://example.com/first\n"
         "**Source:** https://example.com/second\n"
         "**Source:** https://www.linkedin.com/posts/foo-share-123-1G81/\n"
+        "**Source:** https://example.com\n"
+        "**Source:** https://example.com/one\n"
+        "**Source:** https://example.com/two\n"
+        "**Source:** https://example.com/current\n"
+        "**Source:** https://example.com/item-0\n"
+        "**Source:** https://example.com/item-1\n"
+        "**Source:** https://example.com/item-2\n"
     ),
 ) -> CCOutput:
     return CCOutput(
@@ -196,20 +203,20 @@ async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, d
 
 @pytest.mark.asyncio
 async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, mock_invoker, caplog):
-    """The SHIPPED default, and the contrast with the test above.
+    """Shadow mode, the contrast with the test above: compute, log, act on nothing.
 
-    The coverage gate is NEW — `main` carries no such check — and a replay over
-    the completed-evaluation corpus says enforcing it would flag roughly half of
-    legacy-shaped responses on day one, into a retry path that parks a whole
-    file after max_retries with no user notification. That would trade a
-    silent-loss bug for a silent-stall one. So the gate computes its verdict,
-    says so in the log, and acts on nothing until compliance has been measured.
+    Shadow was the shipped default until compliance was measured (0 of 42
+    evaluations under the **Source:** contract would have re-queued); enforce is
+    the default now. Shadow stays one config line away, so it must keep doing
+    exactly this.
     """
+    import dataclasses
     import logging
 
     from genesis.db.crud import inbox_items
 
-    assert monitor._config.url_coverage_mode == "shadow", "the shipped default must be shadow"
+    assert monitor._config.url_coverage_mode == "enforce", "the shipped default"
+    monitor._config = dataclasses.replace(monitor._config, url_coverage_mode="shadow")
 
     f = inbox_dir / "links.md"
     f.write_text("https://example.com/one-thing?token=shadow-secret")
@@ -291,9 +298,13 @@ async def test_fully_covered_urls_complete_normally(monitor, inbox_dir, db, mock
 
     f = inbox_dir / "links.md"
     f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    # The coverage contract is a **Source:** field per input URL (prose slugs
+    # stopped counting when the gate moved to parsed-identity matching).
     mock_invoker.run.return_value = _success_output(
-        "# Inbox Evaluation\n\n## 1. one-thing\nGood piece.\n\n"
-        "## 2. two-thing\nAlso solid.\n" + "x" * 300
+        "# Inbox Evaluation\n\n## 1. one-thing\n"
+        "**Source:** https://example.com/one-thing\nGood piece.\n\n"
+        "## 2. two-thing\n**Source:** https://other.org/two-thing\n"
+        "Also solid.\n" + "x" * 300
     )
 
     await monitor.check_once()
@@ -1277,6 +1288,7 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
         watch_path=inbox_dir,
         batch_size=5,
         evaluation_cooldown_seconds=0,
+        url_coverage_mode="shadow",
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
@@ -1326,6 +1338,7 @@ async def test_phantom_modified_within_cooldown_advances_hash(
         watch_path=inbox_dir,
         batch_size=5,
         evaluation_cooldown_seconds=3600,
+        url_coverage_mode="shadow",
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
@@ -3413,7 +3426,7 @@ async def test_baseline_guard_survives_file_clear(
     # items_per_eval=3 pins this test's original single-batch scenario (the
     # default is now 1); the guard under test is baseline-vs-file-clear, not
     # batch grouping.
-    config = InboxConfig(watch_path=inbox_dir, batch_size=1, items_per_eval=3)
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1, items_per_eval=3, url_coverage_mode="shadow")
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
         db=db,
@@ -3489,7 +3502,7 @@ async def test_baseline_guard_delta_only_new_items(
     from genesis.inbox.monitor import _compute_new_content
 
     clock = _FakeClock()
-    config = InboxConfig(watch_path=inbox_dir, batch_size=1)
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1, url_coverage_mode="shadow")
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
         db=db,

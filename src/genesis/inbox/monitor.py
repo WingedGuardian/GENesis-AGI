@@ -17,6 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
+from genesis.cc.exceptions import CCNetworkOfflineError
 from genesis.cc.session_config import SessionConfigBuilder
 from genesis.inbox.scanner import (
     Item,
@@ -196,8 +197,15 @@ _COVERAGE_INPUT_URL_RE = re.compile(
     r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>\]]+)",
     re.IGNORECASE,
 )
+# A Source FIELD is a line whose only content before the label is Markdown
+# container syntax: blockquote markers and/or ONE list marker (#2020). A
+# bulleted multi-URL answer is the natural shape for "one Source per URL", and
+# rejecting it read every correctly-cited URL as uncovered. The prefix is
+# bounded to container syntax on purpose: the label mid-sentence is prose, and
+# must not become field evidence.
 _SOURCE_FIELD_RE = re.compile(
-    r"^\s*\*\*Source:\*\*\s*(?P<source>\S(?:.*\S)?)\s*$",
+    r"^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?"
+    r"\*\*Source:\*\*\s*(?P<source>\S(?:.*\S)?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -605,7 +613,11 @@ class InboxMonitor:
         if self._check_lock.locked():
             return CheckResult(errors=["Check already in progress"])
         async with self._check_lock:
-            return await self._check_once_inner()
+            self._park_buffer = {}
+            try:
+                return await self._check_once_inner()
+            finally:
+                self._flush_park_alerts()
 
     async def _check_once_inner(self) -> CheckResult:
         """Core check logic, called under _check_lock.
@@ -1219,6 +1231,15 @@ class InboxMonitor:
                     error_message="retry_storm_parked",
                     retry_count=self._config.max_retries,
                 )
+                self._alert_parked(
+                    str(f),
+                    reason="retry_storm",
+                    detail=(
+                        "Its URLs failed to evaluate repeatedly (the retry-storm "
+                        "guard tripped), so the file was parked at its current "
+                        "content."
+                    ),
+                )
                 continue
             # Segment the (full, for a new file) content into per-batch rows
             # under one drop. Failed batches retry via the delta path next
@@ -1379,6 +1400,15 @@ class InboxMonitor:
                     error_message="retry_storm_parked",
                     retry_count=self._config.max_retries,
                 )
+                self._alert_parked(
+                    str(f),
+                    reason="retry_storm",
+                    detail=(
+                        "Its URLs failed to evaluate repeatedly (the retry-storm "
+                        "guard tripped), so the file was parked at its current "
+                        "content."
+                    ),
+                )
                 continue
             # Genuinely new content -> segment the delta into per-batch rows.
             await self._queue_drop(
@@ -1473,9 +1503,30 @@ class InboxMonitor:
             )
             if url_fail_count >= self._config.max_retries:
                 logger.warning(
-                    "Retry storm: %s has %d URL failures in 48h, skipping retry",
+                    "Retry storm: %s has %d URL failures in 48h, parking its retries",
                     f,
                     url_fail_count,
+                )
+                # #1952: PARK, like the new-file and modified-file sites. This
+                # lane used to log and `continue`, leaving the retriable rows in
+                # place — so the file stayed a retry candidate and was re-checked
+                # and re-skipped on every scan until the 48h window aged out.
+                # Abandoning its retriable rows is the existing mechanism for
+                # "this file is no longer a retry candidate".
+                await inbox_items.mark_file_failures_abandoned(
+                    self._db,
+                    str(f),
+                    max_retries=self._config.max_retries,
+                    reason="retry storm parked",
+                    error_like="partial_url_failure%",
+                )
+                self._alert_parked(
+                    str(f),
+                    reason="retry_storm",
+                    detail=(
+                        "Its URLs failed to evaluate repeatedly (the retry-storm "
+                        "guard tripped), so its pending retries were parked."
+                    ),
                 )
                 continue
             prev_content = await inbox_items.get_evaluated_content(
@@ -1996,6 +2047,148 @@ class InboxMonitor:
         now_iso,
         errors,
     ) -> bool:
+        """Dispatch one batch; if that failure spent its LAST retry, tell the owner.
+
+        Every failure exit below writes a failed row and returns False, so the
+        exhaustion check lives here once rather than at each exit — a future
+        exit is covered by construction. Retry exhaustion used to notify nobody:
+        the row simply stopped being a retry candidate, and under the enforced
+        coverage gate a response that never quoted its URL would park in
+        silence (975ca61b's precondition for the flip).
+        """
+        ok = await self._run_one_batch(
+            item,
+            model=model,
+            effort=effort,
+            system_prompt=system_prompt,
+            now_iso=now_iso,
+            errors=errors,
+        )
+        if not ok:
+            await self._alert_if_exhausted(item)
+        return ok
+
+    async def _alert_if_exhausted(self, item) -> None:
+        from genesis.db.crud import inbox_items
+
+        try:
+            row = await inbox_items.get_by_id(self._db, item.id)
+        except Exception:
+            logger.warning("exhaustion check failed for %s", item.id, exc_info=True)
+            return
+        if (
+            row
+            and row.get("status") == "failed"
+            and (row.get("retry_count") or 0) >= self._config.max_retries
+        ):
+            self._alert_parked(
+                item.file_path,
+                reason="retries_exhausted",
+                label=self._item_label(item.content),
+                detail=(
+                    "These items failed on every retry and will not be retried. "
+                    "Partial evaluations, where one was written, sit next to the "
+                    "file as numbered .genesis.md responses."
+                ),
+            )
+
+    @staticmethod
+    def _item_label(content: str) -> str:
+        """A human handle for an item, safe for the owner's channel.
+
+        The first URL as scheme://host/path — query, fragment and userinfo
+        dropped, because a presigned query token is exactly why the coverage
+        log uses opaque ``url#`` ids. Falls back to the first line of prose.
+        """
+        urls = _extract_urls(content or "")
+        if urls:
+            try:
+                parts = urlsplit(urls[0] if "://" in urls[0] else "//" + urls[0])
+                host = parts.hostname or ""
+                return f"{host}{parts.path}".rstrip("/") or urls[0][:80]
+            except ValueError:
+                return "an unparseable URL"
+        first = (content or "").strip().splitlines()
+        return (first[0][:80] if first else "an empty item")
+
+    def _alert_parked(
+        self, file_path: str, *, reason: str, detail: str, label: str | None = None,
+    ) -> None:
+        """Record that part of a file stopped being evaluated; sent at scan end.
+
+        Buffered per (file, reason) for the whole scan and flushed as ONE alert
+        naming every parked item (review S2/S3): with one item per evaluation a
+        single drop can exhaust many items at once, and a per-file dedupe key
+        both hid items 2..N and gave the owner no way to find the one it named.
+        """
+        buf = getattr(self, "_park_buffer", None)
+        if buf is None:  # called outside check_once (tests, direct calls)
+            self._park_buffer = buf = {}
+        entry = buf.setdefault((file_path, reason), {"detail": detail, "labels": []})
+        if label and label not in entry["labels"]:
+            entry["labels"].append(label)
+
+    def _flush_park_alerts(self) -> None:
+        """Queue one durable owner alert per (file, reason) parked this scan.
+
+        Uses the durable alert queue, which the awareness tick drains to the
+        owner's channel — NOT ``_notify_batch``, whose ``cc_foreground`` target
+        has no reader (the table's only consumer polls ``target="user"``). The
+        dedupe key carries the full path (same-named files in different folders
+        are different files) and a hash of the parked items, so a LATER scan that
+        parks a different item alerts again, while a re-run over the same set
+        does not. Best-effort: never raises into the scan.
+        """
+        buf = getattr(self, "_park_buffer", None) or {}
+        self._park_buffer = {}
+        for (file_path, reason), entry in buf.items():
+            try:
+                import hashlib
+
+                from genesis.env import alert_queue_root
+                from genesis.guardian.alert.queue import enqueue_alert
+
+                name = Path(file_path).name
+                labels = entry["labels"]
+                if labels:
+                    shown = labels[:10]
+                    more = f"\n…and {len(labels) - 10} more" if len(labels) > 10 else ""
+                    title = f"Inbox stopped evaluating {len(labels)} item(s) in {name}"
+                    items = "\n".join(f"- {lbl}" for lbl in shown) + more
+                    body = (
+                        f"{entry['detail']}\n\n{items}\n\nNothing will retry "
+                        f"these automatically. To re-run one, edit its line in {name}."
+                    )
+                else:
+                    title = f"Inbox parked {name}"
+                    body = (
+                        f"{entry['detail']} Nothing will retry it automatically. "
+                        f"Editing the file makes it evaluate again."
+                    )
+                digest = hashlib.sha256(
+                    "\n".join(sorted(labels)).encode()
+                ).hexdigest()[:12]
+                enqueue_alert(
+                    alert_queue_root(),
+                    severity="warning",
+                    source="inbox",
+                    title=title,
+                    body=body,
+                    dedupe_key=f"inbox:parked:{file_path}:{reason}:{digest}",
+                )
+            except Exception:
+                logger.warning("inbox parked-alert enqueue failed", exc_info=True)
+
+    async def _run_one_batch(
+        self,
+        item,
+        *,
+        model,
+        effort,
+        system_prompt,
+        now_iso,
+        errors,
+    ) -> bool:
         """Run one eval-batch as its own CC session and post-process the result.
 
         Approval is already cleared at the drop level, so this dispatches
@@ -2040,6 +2233,26 @@ class InboxMonitor:
 
         try:
             output = await self._invoker.run(invocation)
+        except CCNetworkOfflineError as exc:
+            # #1766 (inbox leg): the network being down is not this item's
+            # failure. Fail the row so the retry lane picks it up once
+            # connectivity returns, but keep its retry budget — the default
+            # failed-path increment turns a ~90-minute outage into permanently
+            # parked items (3 retries x 30-minute scans).
+            err = f"CC invocation deferred, network offline: {exc}"
+            errors.append(err)
+            logger.warning(err)
+            await self._session_manager.fail(session_id, reason=err)
+            row = await inbox_items.get_by_id(self._db, item.id)
+            await inbox_items.update_status(
+                self._db,
+                item.id,
+                status="failed",
+                error_message=err,
+                processed_at=now_iso,
+                retry_count=(row or {}).get("retry_count") or 0,
+            )
+            return False
         except Exception as exc:
             err = f"CC invocation failed: {exc}"
             errors.append(err)
@@ -2192,13 +2405,12 @@ class InboxMonitor:
             if len(uncovered) > 5:
                 shown += f" (+{len(uncovered) - 5} more)"
             if self._config.url_coverage_mode != "enforce":
-                # SHADOW: the verdict is computed and recorded, and nothing acts
-                # on it. The gate is new — `main` has no coverage check at all —
-                # and a replay over the completed-evaluation corpus says it would
-                # flag roughly half of legacy-shaped responses on day one, into a
-                # retry path that parks a whole file after `max_retries` with no
-                # user notification. Enforcing on an unmeasured compliance rate
-                # would turn a silent-loss bug into a silent-stall one.
+                # SHADOW (opt-in): the verdict is computed and recorded, and
+                # nothing acts on it. This was the shipped default until the
+                # **Source:** contract's compliance was measured — 0 of the first
+                # 42 evaluations under it would have re-queued — and until parking
+                # alerted the owner (see _dispatch_one_batch / _alert_parked).
+                # Kept so an install can observe the gate without acting on it.
                 logger.warning(
                     "url-coverage SHADOW: batch %s would have re-queued %d uncovered URL(s): %s",
                     batch_id[:8],

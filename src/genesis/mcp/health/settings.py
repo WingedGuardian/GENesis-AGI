@@ -933,6 +933,11 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
 
     _validate_positive_int(section, "check_interval_seconds", errors)
     _validate_positive_int(section, "timeout_s", errors)
+    # #1953: these two were never bounded here, and 0 is harmful for both —
+    # items_per_eval=0 divides a drop into nothing, max_retries=0 parks on the
+    # first miss. config.py floors them too, for the paths this never sees.
+    _validate_positive_int(section, "items_per_eval", errors)
+    _validate_positive_int(section, "max_retries", errors)
 
     if "batch_size" in section:
         try:

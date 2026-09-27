@@ -741,3 +741,11 @@ class TestSettingsProvenanceAndGateFlip:
                 "AND resolved_at IS NULL",
             )
         assert rows == [], "re-enable must resolve the standing alert"
+
+
+@pytest.mark.parametrize("key", ["items_per_eval", "max_retries"])
+@pytest.mark.parametrize("bad", [0, -1, "x"])
+def test_inbox_validator_bounds_items_and_retries(key, bad):
+    """#1953: these two were never validated on the MCP/dashboard path."""
+    errors = _validate_inbox_monitor({key: bad})
+    assert any(key in e for e in errors), errors

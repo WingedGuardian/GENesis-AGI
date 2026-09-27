@@ -1008,9 +1008,15 @@ verified: 640c4f2e3 2026-09-18
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
   identity remain exact. Coverage
-  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
-  its verdict and logs only stable opaque URL ids, acting on nothing until
-  compliance under the `**Source:**` prompt has been measured. Follow-up and
+  is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
+  `shadow` observes without acting): an uncovered URL re-queues its item
+  through the bounded retry lane, logging only stable opaque URL ids. It
+  shipped shadow and was flipped on measurement — 0 of the first 42 evaluations
+  under the `**Source:**` contract would have re-queued. Parking is visible: an
+  item that exhausts its retries, or a file the retry-storm guard parks (at all
+  three of its call sites), queues ONE durable owner alert per file per scan
+  naming each parked item (query strings redacted); with `resilience.parking_mode:
+  live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
   pre-dispatch `pending` row is atomically returned to the bounded retry lane;

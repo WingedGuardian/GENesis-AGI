@@ -684,9 +684,14 @@ async def get_handled_batch_content(
            WHERE file_path = ?
              AND batch_items IS NOT NULL AND TRIM(batch_items) != ''
              AND (status = 'completed'
-                  OR (status = 'failed' AND retry_count >= ?))
+                  OR (status = 'failed' AND retry_count >= ?
+                      -- An invalidated row was never evaluated: counting it as
+                      -- handled silently subtracted its lines from every
+                      -- future delta (review N1, 2026-09-26).
+                      AND (error_message IS NULL
+                           OR error_message NOT LIKE ? || '%')))
            ORDER BY created_at ASC, rowid ASC""",
-        (file_path, max_retries),
+        (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
     )
     handled: list[str] = []
     for row in await cursor.fetchall():
@@ -697,6 +702,7 @@ async def get_handled_batch_content(
 async def mark_file_failures_abandoned(
     db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
     reason: str = "content removed before retry",
+    error_like: str | None = None,
 ) -> int:
     """Mark a file's retriable failed rows as approval-invalidated (abandoned).
 
@@ -707,16 +713,23 @@ async def mark_file_failures_abandoned(
     forever; flipping them to the ``approval_invalidated:<reason>`` prefix
     excludes them from :func:`get_retriable_failure_files` /
     :func:`get_retriable_failed_rows`. Returns the number of rows updated.
+
+    ``error_like`` (a SQL LIKE pattern) narrows the abandon to one failure
+    class. The retry-storm park passes ``'partial_url_failure%'``: a storm of URL
+    failures is no reason to strand a crashed CC call, a restart requeue or a
+    corruption row in the same file (review, 2026-09-26).
     """
-    cursor = await db.execute(
-        """UPDATE inbox_items
+    sql = """UPDATE inbox_items
            SET error_message = ? || ?
            WHERE file_path = ? AND status = 'failed' AND retry_count < ?
              AND (error_message IS NULL
-                  OR error_message NOT LIKE ? || '%')""",
-        (APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
-         APPROVAL_INVALIDATED_PREFIX),
-    )
+                  OR error_message NOT LIKE ? || '%')"""
+    params: list = [APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
+                    APPROVAL_INVALIDATED_PREFIX]
+    if error_like is not None:
+        sql += " AND error_message LIKE ?"
+        params.append(error_like)
+    cursor = await db.execute(sql, tuple(params))
     await db.commit()
     return cursor.rowcount
 
