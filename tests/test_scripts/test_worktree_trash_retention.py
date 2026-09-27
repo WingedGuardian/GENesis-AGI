@@ -67,9 +67,13 @@ def _backdate(entry_name: str, days: float) -> None:
     meta.write_text(json.dumps(data))
 
 
-def _archive(repo: Path, tmp_path: Path, name: str, *, detached_commit: bool = False) -> dict:
+def _archive(
+    repo: Path, tmp_path: Path, name: str, *, detached_commit: bool = False, lane: str = "merged"
+) -> dict:
     """Archive a worktree through the REAL reaper. With ``detached_commit`` the
-    worktree holds a commit reachable from nothing but its own HEAD."""
+    worktree holds a commit reachable from nothing but its own HEAD. ``lane`` is
+    what the reaper records from its own merged/unmerged verdict; only
+    ``"merged"`` archives are eligible to expire."""
     wt = tmp_path / name
     if detached_commit:
         _git(repo, "worktree", "add", "-q", "--detach", str(wt))
@@ -80,7 +84,7 @@ def _archive(repo: Path, tmp_path: Path, name: str, *, detached_commit: bool = F
         _git(repo, "worktree", "add", "-q", "--detach", str(wt))
     head = _git(wt, "rev-parse", "HEAD").stdout.strip()
     rec = next(x for x in wl._list_worktrees(repo) if x["path"] == str(wt))
-    assert wl._trash_worktree(rec, repo, lane="unmerged") is True
+    assert wl._trash_worktree(rec, repo, lane=lane) is True
     entry = next(p for p in wl.TRASH_DIR.glob(f"{name}-*.tar.gz"))
     return {"path": wt, "head": head, "entry": entry.name[: -len(".tar.gz")], "archive": entry}
 
@@ -217,7 +221,7 @@ def test_expiry_deletes_archive_then_pin_then_unlocks_then_prunes(repo, tmp_path
     for ev in ("expiring", "deleted", "expired"):
         assert (ev, old["entry"]) in events, ev
     expiring = next(r for r in rows if r.get("event") == "expiring" and r["name"] == old["entry"])
-    assert expiring["lane"] == "unmerged"
+    assert expiring["lane"] == "merged"
 
     _gc_now(repo)
     assert not _commit_exists(repo, old["head"]), "an expired archive's commit outlived it"
@@ -460,3 +464,42 @@ def test_the_stale_claim_kill_switch_fails_closed_on_a_typo(monkeypatch, value, 
     if value is not None:
         monkeypatch.setenv(wl.STALE_CLAIM_ENV, value)
     assert wl._env_disabled(wl.STALE_CLAIM_ENV) is disabled
+
+
+def test_UNMERGED_archives_never_expire_and_MERGED_ones_do(repo, tmp_path):
+    """Owner ruling: unmerged archives are kept for ever. The lane is the
+    reaper's own recorded verdict, and anything but an explicit "merged" —
+    unmerged, absent (pre-lane entries), unreadable meta — is kept."""
+    unmerged = _archive(repo, tmp_path, "unm", detached_commit=True, lane="unmerged")
+    merged = _archive(repo, tmp_path, "mrg", detached_commit=True, lane="merged")
+    nolane = _archive(repo, tmp_path, "nolane", detached_commit=True, lane="merged")
+    for a in (unmerged, merged, nolane):
+        _backdate(a["entry"], 400)
+    meta = wl.TRASH_DIR / f"{nolane['entry']}.meta.json"
+    data = json.loads(meta.read_text())
+    del data["lane"]
+    meta.write_text(json.dumps(data))
+
+    counts = wl._expire_trash(repo, days=30)
+
+    assert counts["expired"] == 1
+    assert counts["kept_unmerged"] == 2
+    assert not merged["archive"].exists()
+    assert str(merged["path"]) not in _registered(repo)
+    for kept in (unmerged, nolane):
+        assert kept["archive"].exists(), kept["entry"]
+        assert _registered(repo)[str(kept["path"])], "a kept archive keeps its anchor"
+    _gc_now(repo)
+    assert _commit_exists(repo, unmerged["head"]), "an unmerged archive's commit was collected"
+    assert _commit_exists(repo, nolane["head"])
+
+
+def test_an_unreadable_meta_is_kept_not_expired(repo, tmp_path):
+    a = _archive(repo, tmp_path, "badmeta")
+    meta = wl.TRASH_DIR / f"{a['entry']}.meta.json"
+    meta.write_text("{not json")
+    old = time.time() - 400 * 86400
+    os.utime(a["archive"], (old, old))
+    counts = wl._expire_trash(repo, days=30)
+    assert counts["expired"] == 0 and counts["kept_unmerged"] == 1
+    assert a["archive"].exists()

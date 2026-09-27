@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Worktree lifecycle manager — archives stale worktrees; expires old archives.
+"""Worktree lifecycle manager — archives stale worktrees; expires merged archives.
 
 A worktree is only ever touched when it is unused, unlocked, has no paused Git
 operation, and contains no nested worktree. Past those protections it is
 ARCHIVED into the trash as a gzip tarball, together with a tombstone row. The
-reaper itself never deletes a worktree. Archives are kept for
+reaper itself never deletes a worktree. MERGED archives are kept for
 ``TRASH_RETENTION_DAYS`` (30, owner decision 2026-09-26) and then expired by
 ``--expire-trash`` — archive first, then its registration anchor; see
-``_expire_trash`` for why that order is the safety property.
+``_expire_trash`` for why that order is the safety property. UNMERGED archives
+are never auto-expired.
 
 That is a deliberate reversal of an earlier design that deleted merged
 worktrees outright. The reason is that a worktree can hold the only surviving
@@ -19,13 +20,15 @@ is in a position to make, and the storage does not justify guessing — the 192
 worktrees present that day were ~11 GB raw, ~2.9 GB archived, against 265 GB
 free.
 
-That reasoning still decides what the REAPER does. It no longer means archives
-live for ever: with no retention, every archive also kept a locked registration
-alive indefinitely, and those anchors grew without bound alongside the trash.
-The owner set a 30-day archive retention (2026-09-26); the tombstone index,
-which records each archive's branch and unique commits, is kept.
+That reasoning still decides what the REAPER does, and it still holds for every
+UNMERGED archive, which is never auto-expired. A MERGED archive's committed
+content duplicates main,
+and keeping it for ever also kept its locked registration alive indefinitely, so
+those grew without bound alongside the trash; the owner set a 30-day retention
+for the merged lane (2026-09-26). The tombstone index is kept.
 
-Two lanes remain, and they differ only in WHEN and in the label they carry:
+Two lanes remain. They differ in WHEN, in the label they carry, and in
+retention (only MERGED archives expire):
 
   MERGED (7+ days idle)     content is also in main, so it drains sooner
   UNMERGED (14+ days idle)  may be the only copy, so it is held longer
@@ -50,7 +53,7 @@ Usage:
     worktree_lifecycle.py --no-network       # Skip the one gh call (faster, safe)
     worktree_lifecycle.py --list-trash       # Show archives with age, lane, size
     worktree_lifecycle.py --recover <name>   # Restore an archived worktree
-    worktree_lifecycle.py --expire-trash     # Expire archives past retention
+    worktree_lifecycle.py --expire-trash     # Expire MERGED archives past retention
     worktree_lifecycle.py --release-stale-claims  # Drop claims of dead sessions
 
 Run daily by the genesis-disk-hygiene.timer systemd unit (via
@@ -82,8 +85,8 @@ from pathlib import Path
 
 # Two lanes, by whether the work is already in main (owner ruling 2026-09-10).
 # MERGED work is a duplicate of main, so it drains fast. UNMERGED work may be the
-# only copy, so it is held longer before archiving. Once archived, both lanes
-# share one retention window (`TRASH_RETENTION_DAYS`).
+# only copy, so it is held longer before archiving AND its archive is never
+# auto-expired. Merged archives expire after `TRASH_RETENTION_DAYS`.
 MERGED_STALE_DAYS = 7
 UNMERGED_STALE_DAYS = 14
 STALE_DAYS = UNMERGED_STALE_DAYS  # back-compat alias (the conservative bound)
@@ -1146,9 +1149,9 @@ def _trash_worktree(
     """Move a worktree to the trash directory.
 
     ``lane`` records WHY it was reaped: ``"unmerged"`` content exists nowhere
-    else, while ``"merged"`` content is a duplicate of main. Both lanes expire on
-    the same retention window — the field is provenance for a human reading
-    ``--list-trash`` and for the expiry record, not a retention switch.
+    else, while ``"merged"`` content is a duplicate of main. It IS the retention
+    switch: ``--expire-trash`` expires only ``"merged"`` archives, and keeps
+    every other value (``"unmerged"``, absent, unreadable) indefinitely.
 
     Returns True if trashed (or would be trashed in dry-run).
     """
@@ -1324,13 +1327,14 @@ def _trash_worktree(
         staging_meta.write_text(json.dumps(meta, indent=2))
 
         if meta["secret_files"]:
-            # S9: an archived credential lives as long as the archive does (the
-            # retention window). Say so at reap time rather than discovering it later.
+            # S9: an archived credential lives as long as the archive does (30
+            # days on the merged lane, indefinitely on the unmerged one). Say so
+            # at reap time rather than discovering it later.
             # MEASURED 2026-09-10: 0 real secret files across the 48 worktrees due
             # for archiving (the `secrets.env` entries are symlinks, so the LINK
             # is stored, never the content) — this warns if that ever changes.
             _log(f"  NOTE {trash_path.name} archives secret-shaped file(s): "
-                 f"{', '.join(meta['secret_files'][:5])} — retained until the archive expires")
+                 f"{', '.join(meta['secret_files'][:5])} — retained as long as the archive")
 
         # Move worktree to trash, WITHOUT ever releasing the claimed name.
         # `os.rename` atomically replaces the empty claim directory, so the name
@@ -1977,7 +1981,8 @@ def _list_trash() -> None:
                 meta = json.loads(meta_path.read_text())
                 branch = meta.get("branch", "") or ("detached " + meta.get("commit", "")[:8])
                 original = meta.get("original_path", "")
-                lane = meta.get("lane") or "merged"
+                # No recorded lane reads "?", matching expiry, which keeps it.
+                lane = meta.get("lane") or "?"
                 ts = meta.get("trashed_at", "")
                 if ts:
                     age_days = (now - datetime.fromisoformat(ts).timestamp()) / 86400
@@ -2011,22 +2016,30 @@ def _list_trash() -> None:
               f"{branch:<28} {original}")
 
     print(f"\n{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}, "
-          f"{total_mb:.0f} MB archived. Entries older than {TRASH_RETENTION_DAYS}d "
-          f"are expired by the daily hygiene timer ({RETENTION_ENV}=0 disables).")
+          f"{total_mb:.0f} MB archived. MERGED entries older than {TRASH_RETENTION_DAYS}d "
+          f"are expired by the daily hygiene timer ({RETENTION_ENV}=0 disables); "
+          "unmerged entries are kept.")
 # ---------------------------------------------------------------------------
 # Retention: expiring old archives, and the anchors that pointed at them
 # ---------------------------------------------------------------------------
 
-# Owner decision 2026-09-26: archives are kept for 30 days, then expired by the
-# daily disk-hygiene timer. Before that the trash had NO retention at all, and
-# three things grew without bound: the archives, their locked registrations (one
+# Owner decisions 2026-09-26: MERGED archives are kept for 30 days, then expired
+# by the daily disk-hygiene timer; UNMERGED archives are never auto-expired.
+# Before that the trash had NO retention at all, and three things grew without bound: the archives, their locked registrations (one
 # per archive, each an anchor that `git worktree list` reports for ever), and the
 # stranded-work sweep's held set, which read every anchor as unreadable.
 #
-# Both lanes expire. The tombstone index is NOT pruned: it is kilobytes, it is
-# the greppable record of every reaped worktree, and it now also records each
-# expiry with the lane and the unique-commit list the archive carried.
+# Only the merged lane expires: its COMMITTED content is a duplicate of main.
+# Uncommitted changes it recorded (`had_uncommitted_changes`) are lost at expiry
+# and logged as such. An unmerged
+# archive may be the only copy of its work and is kept, with its anchor. The
+# tombstone index is NOT pruned: it is kilobytes, it is the greppable record of
+# every reaped worktree, and it also records each expiry.
 TRASH_RETENTION_DAYS = 30
+
+# The only lane that expires. Written by `main` from the classification's
+# `merged` flag (`lane="merged" if r["merged"] else "unmerged"`).
+MERGED_LANE = "merged"
 
 # The operator lever. `0`/`off` disables expiry; a value that is not a whole
 # number ALSO disables it — an unreadable lever grants less authority, not more.
@@ -2366,8 +2379,9 @@ def _remove_anchors(repo_root: Path, entry: str, anchors: list[dict]) -> int:
 def _expire_trash(
     repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False
 ) -> dict:
-    """Expire archives older than ``days``: DELETE THE ARCHIVE, then its commit
-    pin, then UNLOCK its anchor, then PRUNE that registration.
+    """Expire MERGED archives older than ``days``: DELETE THE ARCHIVE, then its
+    commit pin, then UNLOCK its anchor, then PRUNE that registration. Unmerged
+    archives, and any whose lane cannot be read, are never expired.
 
     The order IS the safety property. The lock keeps an archive's registration
     — and with it the commits the archive points at — alive; once the archive
@@ -2377,7 +2391,8 @@ def _expire_trash(
     verifiably deleted first, in this run or (retry) in a recorded earlier one.
     """
     now = time.time() if now is None else now
-    counts = {"expired": 0, "anchors_removed": 0, "skipped": 0, "retried": 0}
+    counts = {"expired": 0, "anchors_removed": 0, "skipped": 0, "retried": 0,
+              "kept_unmerged": 0}
     with _lifecycle_lock() as held:
         if not held:
             _log("SKIP expiry: another lifecycle run (expiry or --recover) holds the lock")
@@ -2408,6 +2423,19 @@ def _expire_trash(
             age = _entry_age_days(stored, meta, now)
             if age is None or age <= days:
                 continue
+            if meta.get("lane") != MERGED_LANE:
+                # UNMERGED ARCHIVES ARE KEPT FOR EVER (owner ruling 2026-09-26).
+                # `lane` is the reaper's own merged/unmerged verdict, recorded at
+                # archive time from `_classify`'s `merged` — the same predicate
+                # that picked the lane, not a new one. Anything other than an
+                # explicit "merged" — "unmerged", absent (entries archived before
+                # lanes were recorded), unreadable metadata — is KEPT: an
+                # undecidable status fails toward keeping.
+                counts["kept_unmerged"] += 1
+                continue
+            if meta.get("had_uncommitted_changes"):
+                _log(f"NOTE {name}: merged, but it was archived with uncommitted "
+                     "changes; they expire with it")
             mine = by_entry.get(name, [])
             live = [a["path"] for a in mine if os.path.lexists(a["path"])]
             if live:
@@ -2423,11 +2451,6 @@ def _expire_trash(
                 "unique_commits": len(meta.get("unique_commits") or []),
                 "had_uncommitted_changes": bool(meta.get("had_uncommitted_changes")),
             }
-            if summary["lane"] == "unmerged" and summary["unique_commits"]:
-                # Named separately: this archive's commits may be reachable
-                # from nothing else once its anchor goes.
-                _log(f"NOTE {name}: unmerged, {summary['unique_commits']} unique commit(s) "
-                     f"on {summary['branch'] or 'a detached HEAD'} — expiring")
             if dry_run:
                 _log(f"WOULD EXPIRE {name} ({age:.0f}d, {summary}) and {len(mine)} anchor(s)")
                 continue
@@ -2491,7 +2514,7 @@ def _expire_trash(
     _log(
         f"Expiry: {counts['expired']} archive(s) expired, {counts['anchors_removed']} "
         f"anchor(s) removed, {counts['retried']} earlier expiry finished, "
-        f"{counts['skipped']} skipped"
+        f"{counts['skipped']} skipped, {counts['kept_unmerged']} unmerged/undetermined kept"
     )
     return counts
 
@@ -2584,7 +2607,7 @@ def main() -> int:
                         help="Print the classification of every worktree as JSON "
                              "and exit, changing nothing")
     parser.add_argument("--expire-trash", action="store_true",
-                        help="Expire archives older than the retention window "
+                        help="Expire MERGED archives older than the retention window "
                              f"(default {TRASH_RETENTION_DAYS}d): delete the archive, "
                              "then unlock and prune its registration")
     parser.add_argument("--retention-days", type=int, default=None, metavar="N",
