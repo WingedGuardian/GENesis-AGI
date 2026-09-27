@@ -86,35 +86,19 @@ def test_queue_alert_never_breaks_caller(tmp_path):
     assert "REACHED" in r.stdout
 
 
-def test_watchgod_emergency_transition_only(tmp_path):
-    # Replicate the exact guard tmp_watchgod's red paths use, run it TWICE
-    # (two polls in one red episode) → exactly ONE queued page.
-    root = tmp_path / "queue"
-    alert_dir = tmp_path / "alerts"
-    alert_dir.mkdir()
-    guard = (
-        'mkdir -p "$ALERT_DIR"; '
-        'if [[ ! -f "$ALERT_DIR/tmp_emergency" ]]; then '
-        '  queue_alert emergency watchgod:cc "RED" "body" "watchgod:tmp_emergency"; '
-        "fi; "
-        'touch "$ALERT_DIR/tmp_emergency"'
-    )
-    env = {"GENESIS_ALERT_QUEUE_ROOT": str(root), "ALERT_DIR": str(alert_dir)}
-    assert _run_bash(guard, env).returncode == 0
-    assert _run_bash(guard, env).returncode == 0  # second poll, flag persists
-    assert len(_entries(root)) == 1  # only the transition paged
+def test_watchgod_pages_through_the_queue_with_per_tier_dedupe_keys():
+    """The watchgod's pages go through this queue, one dedupe key per
+    (filesystem, tier): a key shared across tiers would let the ORANGE
+    WARNING swallow the RED EMERGENCY that follows it. Behaviour (once per
+    episode, the EMERGENCY still arriving after a WARNING) is pinned against the
+    real script in test_watchgod_disk_guardian.py; this only checks the script
+    still routes both pages here with distinct keys.
 
-
-def test_watchgod_warning_tier_never_queues():
-    # D2: the warning/orange cleaners must NOT call queue_alert (warnings stay
-    # dashboard-only via watchgod_state.json). Only the red cleaners page.
+    v1 of the watchgod paged RED only and kept ORANGE dashboard-only (design
+    D2). v2 pages a WARNING at ORANGE by design: ORANGE now means the whole
+    disk is filling, not that one directory crossed a budget."""
     text = _WATCHGOD.read_text()
-
-    def _body(fn: str) -> str:
-        start = text.index(f"{fn}()")
-        return text[start : text.index("\n}\n", start)]  # to the closing brace
-
-    for fn in ("clean_cc_orange", "clean_sys_orange", "clean_sys_yellow"):
-        assert "queue_alert" not in _body(fn), f"{fn} must not page a warning"
-    for fn in ("clean_cc_red", "clean_sys_red"):
-        assert "queue_alert emergency" in _body(fn), f"{fn} must page emergency"
+    assert 'queue_alert warning "watchgod:disk"' in text
+    assert 'queue_alert emergency "watchgod:disk"' in text
+    assert '"watchgod:disk:${dev}:orange"' in text
+    assert '"watchgod:disk:${dev}:red"' in text

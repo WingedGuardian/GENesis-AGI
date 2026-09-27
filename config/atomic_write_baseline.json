@@ -21,7 +21,7 @@
     "Evidence the class fires:",
     "~/.genesis/tmp9cis_fly.tmp, 0 bytes, on disk since 2026-05-24, in a directory",
     "no reaper sweeps (disk_hygiene.sh roots every find at a named subdirectory;",
-    "tmp_watchgod.sh covers ~/.genesis/cc-tmp and /tmp).",
+    "tmp_watchgod.sh sweeps only ~/.genesis/cc-tmp).",
     "",
     "AN EARLIER BASELINE OF THIS FILE HAD 49 ROWS AND WAS 67% PRECISE. The detector",
     "then anchored on the verb alone, so move-aside, claim-by-rename, rotate and",

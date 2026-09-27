@@ -123,12 +123,13 @@ SEED_PROCEDURES = [
     {
         "id": _id("tmp_filesystem_limit"),
         "task_type": "tmp_filesystem_limit",
-        "principle": "CC sessions use ~/.genesis/cc-tmp/ via TMPDIR — never override TMPDIR in hooks or scripts. /tmp is monitored by the watchgod service.",
+        "principle": "CC sessions use ~/.genesis/cc-tmp/ via TMPDIR — never override TMPDIR in hooks or scripts. cc-tmp is a quota-capped volume every session shares; large temp goes to ~/tmp.",
         "steps": [
             "Never clone repos or write large files to /tmp/ or ~/.genesis/cc-tmp/",
             "Use ~/tmp/ instead for large temporary files",
             "CC temp is redirected to ~/.genesis/cc-tmp/ via TMPDIR env var",
-            "The genesis-tmp-watchgod systemd service monitors both zones",
+            "genesis-tmp-watchgod guards whole disks and sweeps cc-tmp of what ENDED "
+            "sessions left (untouched 7 days); it never deletes live work or kills a session",
             "Never override TMPDIR in hooks, scripts, or service files",
         ],
         "tools_used": ["Bash"],

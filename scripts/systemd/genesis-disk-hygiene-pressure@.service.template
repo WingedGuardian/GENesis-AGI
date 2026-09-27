@@ -1,0 +1,22 @@
+[Unit]
+Description=Genesis Disk Hygiene (pressure) — reclaim started by the tmp watchgod when the disk is filling
+# NOT enabled and NOT timer-driven: scripts/tmp_watchgod.sh starts
+# genesis-disk-hygiene-pressure@standard.service at its ORANGE tier and
+# genesis-disk-hygiene-pressure@last-resort.service at RED (the instance name is
+# passed through as %i). A oneshot unit gives two things the watchgod should not
+# reimplement:
+# systemd runs at most one instance at a time, and the run is sandboxed exactly
+# like the daily groom rather than inheriting the watchgod's unsandboxed context.
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh --pressure %i
+# Same bound as the daily groom: a multi-GB rmtree can outlast the 90s default.
+TimeoutStartSec=1200
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h

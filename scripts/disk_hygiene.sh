@@ -68,18 +68,85 @@ if [ ! -x "$VENV_PY" ]; then
     VENV_PY="$(command -v python3 || true)"
 fi
 
-# prune_tmp DIR — delete direct children of DIR older than 7d, EXCLUDING
+# shellcheck source=scripts/lib/tmp_liveness.sh
+. "$SCRIPT_DIR/lib/tmp_liveness.sh"
+
+# prune_tmp DIR [AGE_MIN] — delete direct children of DIR not modified for more
+# than AGE_MIN minutes (default: the historical `-mtime +7`), EXCLUDING
 # bg-cc-sessions (reaped at 24h below). Direct-children-only so a fresh file
 # deep inside a kept dir can't be orphaned; whole one-off job dirs go atomically.
 # CLAUDE.md: large one-off jobs legitimately live in ~/tmp, so be conservative —
 # a >7d entry is safely dead (backup.sh's mktemp files self-clean well before).
+#
+# A child some process still holds OPEN is spared whatever its age. Age alone
+# cannot see a download or unpack that started days ago and is still running,
+# and the pressure mode below prunes at 2 days, where that stops being
+# hypothetical. The liveness signal and its limits (same-uid only, and a writer
+# that closes between files is invisible) are documented in tmp_liveness.sh.
 prune_tmp() {
-    local tmp_dir="${1:-$HOME/tmp}"
+    local tmp_dir="${1:-$HOME/tmp}" age_min="${2:-}"
     [ -d "$tmp_dir" ] || return 0
-    find "$tmp_dir" -mindepth 1 -maxdepth 1 \
-        ! -name bg-cc-sessions \
-        -mtime +7 \
-        -exec rm -rf {} + 2>/dev/null || echo "tmp prune exited $?"
+    # CANONICAL: /proc reports resolved paths (see sweep_cc_tmp).
+    tmp_dir="$(cd -P -- "$tmp_dir" 2>/dev/null && pwd -P)" || return 0
+    local -a age_pred=(-mtime +7) recent_pred=(-mtime -8)
+    if [[ "$age_min" =~ ^[0-9]+$ ]]; then
+        age_pred=(-mmin "+$age_min")
+        recent_pred=(-mmin "-$age_min")
+    fi
+    local snap child
+    snap="$(live_open_paths)"
+    while IFS= read -r -d '' child; do
+        if [ -d "$child" ] && dir_has_live_writer "$child" "$snap"; then
+            echo "tmp prune: sparing $child (held open by a live process)"
+            continue
+        fi
+        if [ ! -d "$child" ] && path_is_held "$child" "$snap"; then
+            echo "tmp prune: sparing $child (held open by a live process)"
+            continue
+        fi
+        # A directory's OWN mtime moves only when direct children are added or
+        # removed, so a tree written deep inside (a session scratchpad under
+        # ~/tmp/claude-<uid>/) looks old while it is in daily use. Judge it by
+        # the newest thing anywhere inside it.
+        if [ -d "$child" ] && [ -n "$(find "$child" -mindepth 1 "${recent_pred[@]}" -print -quit 2>/dev/null)" ]; then
+            echo "tmp prune: sparing $child (modified inside the window)"
+            continue
+        fi
+        rm -rf -- "$child" 2>/dev/null || echo "tmp prune failed for $child"
+    done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
+                ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
+}
+
+# pressure_main [--last-resort] — the reclaim subset the tmp watchgod runs when
+# the disk itself is in trouble (its ORANGE tier; RED adds --last-resort). Only
+# the steps that FREE space, and each one more aggressive than the daily run:
+# caches regardless of the usage gate, ~/tmp at 2 days instead of 7, and at RED
+# the code-intel indexes too. Deliberately NOT the worktree reaper (it moves
+# worktrees to a trash bin, which frees nothing until the purge) nor any of the
+# database retention prunes (they free megabytes and take the DB lock).
+#
+# Started as its own systemd unit (genesis-disk-hygiene-pressure.service) so it
+# runs under the same sandbox as the daily groom and systemd guarantees one
+# instance at a time; the watchgod never deletes anything itself.
+pressure_main() {
+    local last_resort="${1:-}"
+    local -a reclaim=(--apply --if-above 0 --fail-above 101)
+    # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
+    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+        reclaim+=(--last-resort-above 0)
+    fi
+    echo "=== genesis-disk-hygiene PRESSURE ${last_resort:-} $(date -u +%FT%TZ) ==="
+    echo "--- cache reclamation (usage gate off) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" "${reclaim[@]}" \
+        || echo "disk_reclaim exited $?"
+    echo "--- background CC sandbox reaping ---"
+    if [ -d "$HOME/tmp/bg-cc-sessions" ]; then
+        find "$HOME/tmp/bg-cc-sessions" -mindepth 1 -maxdepth 1 -type d -mmin +1440 \
+            -exec rm -rf {} + 2>/dev/null || echo "bg-cc-sandbox reap exited $?"
+    fi
+    echo "--- ~/tmp age prune (>2d, live writers spared) ---"
+    prune_tmp "$HOME/tmp" 2880
+    echo "=== genesis-disk-hygiene PRESSURE done ==="
 }
 
 # prune_mcp_spawn DIR — remove ~/.genesis/mcp-spawn/<slot> files whose recorded
@@ -134,6 +201,13 @@ main() {
         echo "disk_hygiene: no python interpreter found" >&2
         exit 1
     fi
+
+    case "${1:-}" in
+        --pressure) pressure_main "${2:-}"; return 0 ;;
+        "") ;;
+        *) echo "disk_hygiene: unknown argument '$1' (usage: disk_hygiene.sh [--pressure [--last-resort]])" >&2
+           return 2 ;;
+    esac
 
     echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
 

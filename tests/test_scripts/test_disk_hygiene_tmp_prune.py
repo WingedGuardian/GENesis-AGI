@@ -73,3 +73,150 @@ def test_bg_cc_sessions_excluded(tmp_path):
 def test_missing_dir_is_noop(tmp_path):
     r = _run_prune(tmp_path / "does_not_exist")
     assert r.returncode == 0
+
+
+# ── liveness: an old child still held open is spared (watchgod v2) ────────
+#
+# The pressure mode prunes at 2 days, where "a download that started days ago
+# is still running" stops being hypothetical. The holder is a real process with
+# a real open descriptor, so the prune reads /proc exactly as it does live.
+
+
+def _hold_open(path: Path) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        ["bash", "-c", f"exec 3>>'{path}'; echo ready; sleep 60"],
+        stdout=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
+    )
+    assert proc.stdout.readline().strip() == "ready"
+    return proc
+
+
+def _run_prune_args(tmp_dir: Path, *args: str) -> subprocess.CompletedProcess:
+    quoted = " ".join(f"'{a}'" for a in args)
+    return subprocess.run(
+        ["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{tmp_dir}' {quoted}"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+
+
+def test_old_dir_with_a_live_writer_is_spared(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    job = d / "long_download"
+    job.mkdir()
+    part = job / "big.part"
+    part.write_text("x")
+    holder = _hold_open(part)
+    try:
+        _age(part, 10)
+        _age(job, 10)
+        dead = d / "dead_job"
+        dead.mkdir()
+        _age(dead, 10)
+        r = _run_prune(d)
+        assert job.exists(), r.stdout + r.stderr
+        assert "sparing" in r.stdout
+        assert not dead.exists(), "the control arm: an unheld old dir is still pruned"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_old_file_with_a_live_writer_is_spared(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    f = d / "capture.bin"
+    f.write_text("x")
+    holder = _hold_open(f)
+    try:
+        _age(f, 10)
+        _run_prune(d)
+        assert f.exists()
+    finally:
+        holder.kill()
+        holder.wait()
+    _run_prune(d)
+    assert not f.exists(), "once the writer is gone the same file is pruned"
+
+
+def test_pressure_age_cut_is_minutes(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    three = d / "three_days"
+    three.write_text("x")
+    _age(three, 3)
+    one = d / "one_day"
+    one.write_text("x")
+    _age(one, 1)
+    _run_prune_args(d, "2880")
+    assert not three.exists()
+    assert one.exists()
+
+
+def test_pressure_age_cut_still_skips_bg_cc_sessions(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    bg = d / "bg-cc-sessions"
+    bg.mkdir()
+    _age(bg, 5)
+    _run_prune_args(d, "2880")
+    assert bg.exists()
+
+
+def test_a_name_with_spaces_and_newline_is_pruned_and_spared_correctly(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    odd = d / "a b\nc"
+    odd.write_text("x")
+    _age(odd, 10)
+    _run_prune(d)
+    assert not odd.exists()
+
+
+def test_unknown_argument_is_refused(tmp_path):
+    r = subprocess.run(
+        ["bash", "-c", f"source '{_HYGIENE}'\nVENV_PY=/bin/true main --bogus"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+    assert r.returncode == 2
+    assert "unknown argument" in r.stderr
+
+
+def test_old_dir_that_is_a_process_cwd_is_spared(tmp_path):
+    """A job running FROM ~/tmp/<job> with no descriptor open inside it."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    job = d / "runner"
+    job.mkdir()
+    proc = subprocess.Popen(["bash", "-c", "echo ready; sleep 60"], cwd=job,
+                            stdout=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+    assert proc.stdout.readline().strip() == "ready"
+    try:
+        _age(job, 10)
+        _run_prune(d)
+        assert job.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+    _run_prune(d)
+    assert not job.exists()
+
+
+def test_an_old_dir_written_deep_inside_is_kept(tmp_path):
+    """A directory's OWN mtime moves only when direct children change; a tree
+    written deep inside (a session scratchpad under ~/tmp/claude-<uid>/) must
+    be judged by its newest content, not its top-level mtime."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    tree = d / "claude-1000"
+    deep = tree / "proj" / "session" / "scratchpad"
+    deep.mkdir(parents=True)
+    (deep / "today.txt").write_text("x")
+    for p in (tree / "proj" / "session", tree / "proj", tree):
+        _age(p, 10)
+    _run_prune(d)
+    assert (deep / "today.txt").exists()
+    _age(deep / "today.txt", 10)
+    _age(deep, 10)
+    _run_prune(d)
+    assert not tree.exists(), "once nothing inside is recent, it goes"
