@@ -6,9 +6,9 @@ whole container in a D-state I/O storm. The entrypoint enforces, in order:
 worktree skip, per-repo single-flight flock, and resource-capped execution
 (systemd scope, with a nice/ionice + rlimit fallback).
 
-These tests are binary- and environment-independent: the indexer binaries and
-``systemd-run`` are faked via PATH injection, so they run in CI runners with
-no systemd user manager and no code-intel tools installed. The guardrail test
+These tests are binary- and environment-independent: the indexer binaries are
+faked via PATH and a private entrypoint copy uses a fake systemd executable,
+so they run in CI without a user manager or code-intel tools. The guardrail test
 at the bottom is the enforcement mechanism: it fails the build on any NEW raw
 index spawn outside the entrypoint.
 """
@@ -19,9 +19,12 @@ import fcntl
 import hashlib
 import os
 import re
+import shlex
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENTRYPOINT = _REPO_ROOT / "scripts" / "lib" / "code_intel_index.sh"
@@ -69,6 +72,9 @@ def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
             f'echo "{name} OOM_ADJ:$(</proc/self/oom_score_adj)" >> "{log}"\n'
             + (f"sleep {sleep}\n" if sleep else ""),
         )
+    # Normal entrypoint tests exercise the contained path. Tests of a missing
+    # manager use _minimal_path or replace this stub with a failing probe.
+    _fake_systemd_run(bindir, log.with_suffix(".systemd.log"))
 
 
 def _inherited_oom_adj() -> str:
@@ -81,24 +87,105 @@ def _inherited_oom_adj() -> str:
     return Path("/proc/self/oom_score_adj").read_text().strip()
 
 
-def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True) -> None:
+def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True,
+                      reject_memory_max: str = "") -> None:
     """Fake systemd-run: logs argv, then execs the command after ``--``."""
     bindir.mkdir(exist_ok=True)
     if probe_ok:
+        cgroup = bindir / "test-cgroup"
+        cgroup.mkdir(exist_ok=True)
+        (cgroup / "memory.max").write_text(f"{64 * 1024**3}\n")
+        (cgroup / "memory.current").write_text(f"{512 * 1024**2}\n")
+        (cgroup / "memory.stat").write_text(
+            "inactive_file 0\nactive_file 0\nfile_dirty 0\nfile_writeback 0\n"
+        )
+        self_cgroup = bindir / "test-self.cgroup"
+        mountinfo = bindir / "test-mountinfo"
+        mountinfo.write_text(f"35 24 0:31 / {cgroup} rw - cgroup2 cgroup rw\n")
+        meminfo = bindir / "test-meminfo"
+        meminfo.write_text(
+            "MemTotal: 67108864 kB\nMemAvailable: 66060288 kB\n"
+        )
         body = (
             "#!/usr/bin/env bash\n"
             f'echo "$*" >> "{log}"\n'
             f'echo "SYSTEMD_RUN_OOM_ADJ:$(cat /proc/self/oom_score_adj)" >> "{log}"\n'
+            'unit=""; cap=""; reserve=""; marker=""; memory_max=""\n'
+            'for arg in "$@"; do\n'
+            '  case "$arg" in --unit=*) unit="${arg#--unit=}" ;; '
+            'MemoryMax=*) memory_max="${arg#MemoryMax=}" ;; '
+            'CODE_INTEL_CHILD_RESERVE_BYTES=*) reserve="${arg#*=}" ;; '
+            'CODE_INTEL_CHILD_REFUSAL_MARKER=*) marker="${arg#*=}" ;; '
+            'CODE_INTEL_CHILD_CAP_BYTES=*) cap="${arg#*=}" ;; esac\n'
+            'done\n'
+            f'[ "$memory_max" = "{reject_memory_max}" ] && exit 1\n'
+            'if [ -n "$unit" ] && [ -n "$cap" ]; then\n'
+            f'  mkdir -p "{cgroup}/$unit.scope"\n'
+            f'  printf "%s\\n" "$cap" > "{cgroup}/$unit.scope/memory.max"\n'
+            f'  printf "0\\n" > "{cgroup}/$unit.scope/memory.swap.max"\n'
+            f'  printf "0\\n" > "{cgroup}/$unit.scope/memory.current"\n'
+            f'  printf "0\\n" > "{cgroup}/$unit.scope/memory.stat"\n'
+            f'  printf "0::/$unit.scope\\n" > "{self_cgroup}"\n'
+            f'  export CODE_INTEL_CGROUP_SELF="{self_cgroup}"\n'
+            f'  export CODE_INTEL_CGROUP_MOUNTINFO="{mountinfo}"\n'
+            f'  export CODE_INTEL_MEMINFO="{meminfo}"\n'
+            f'  if ! "{bindir}/python3" "{_REPO_ROOT}/scripts/lib/code_intel_cbm_admission.py" '
+            '"$cap" "$reserve" "$unit" "${CODE_INTEL_FILE_CACHE_RESERVE_BYTES:-2147483648}"; then\n'
+            '    [ -n "$marker" ] && printf "refused\\n" > "$marker"\n'
+            '    exit 125\n'
+            '  fi\n'
+            'fi\n'
             'while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n'
             "shift\n"
-            'exec "$@"\n'
+            'args=()\n'
+            'for arg in "$@"; do\n'
+            '  case "$arg" in CODE_INTEL_CHILD_CAP_BYTES=*) '
+            'args+=("CODE_INTEL_CHILD_CAP_BYTES=") ;; *) args+=("$arg") ;; esac\n'
+            'done\n'
+            'exec "${args[@]}"\n'
         )
     else:
         body = f'#!/usr/bin/env bash\necho "$*" >> "{log}"\nexit 1\n'
     _write_exec(bindir / "systemd-run", body)
+    if probe_ok:
+        # Production admission always reads kernel-owned /proc paths. The fake
+        # systemd scope cannot create a real cgroup, so intercept only the
+        # helper invocation in this test PATH and call its pure assess() API
+        # with synthetic paths. All other Python invocations use real Python.
+        fixture_code = """
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("cbm_admission_fixture", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module.assess(
+        module.number(sys.argv[2], "cap"), module.number(sys.argv[3], "sibling reserve"),
+        sys.argv[4], cache_reserve=module.number(sys.argv[5], "cache reserve"),
+        self_path=Path(os.environ["CODE_INTEL_CGROUP_SELF"]),
+        mountinfo_path=Path(os.environ["CODE_INTEL_CGROUP_MOUNTINFO"]),
+        meminfo_path=Path(os.environ["CODE_INTEL_MEMINFO"]),
+    )
+except (module.AdmissionRefused, KeyError) as exc:
+    print(f"code-intel: SKIP cbm: {exc}", file=sys.stderr)
+    sys.exit(125)
+"""
+        if (bindir / "python3").is_symlink():
+            (bindir / "python3").unlink()
+        _write_exec(
+            bindir / "python3",
+            "#!/usr/bin/env bash\n"
+            'if [[ "${1:-}" == */code_intel_cbm_admission.py ]]; then\n'
+            f"  exec /usr/bin/python3 -c {shlex.quote(fixture_code)} \"$@\"\n"
+            "fi\nexec /usr/bin/python3 \"$@\"\n",
+        )
 
 
 def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
+    entrypoint = _test_entrypoint(tmp_path, Path(path.split(os.pathsep)[0]))
     env = {
         "PATH": path,
         "HOME": str(tmp_path),
@@ -118,9 +205,28 @@ def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
         **(env_extra or {}),
     }
     return subprocess.run(
-        ["bash", str(_ENTRYPOINT), *[str(a) for a in args]],
+        ["bash", str(entrypoint), *[str(a) for a in args]],
         env=env, capture_output=True, text=True, timeout=60, **popen_kw,
     )
+
+
+def _test_entrypoint(tmp_path: Path, fakebin: Path) -> Path:
+    """Substitute the systemd binary only in a private entrypoint copy.
+
+    Production pins /usr/bin/systemd-run and has no environment override for
+    it. CI's fake manager must therefore be injected into a disposable copy.
+    """
+    script_dir = tmp_path / "test-code-intel-entrypoint"
+    script_dir.mkdir(exist_ok=True)
+    script = script_dir / "code_intel_index.sh"
+    source = _ENTRYPOINT.read_text()
+    assert "/usr/bin/systemd-run" in source
+    script.write_text(source.replace("/usr/bin/systemd-run", str(fakebin / "systemd-run")))
+    for name in ("cbm_disable_file.sh", "gitnexus_version.sh", "proc_pressure.sh"):
+        companion = script_dir / name
+        if not companion.exists():
+            companion.symlink_to(_ENTRYPOINT.parent / name)
+    return script
 
 
 def _minimal_path(tmp_path: Path, *extra_tools: str) -> Path:
@@ -132,7 +238,8 @@ def _minimal_path(tmp_path: Path, *extra_tools: str) -> Path:
     d = tmp_path / "minbin"
     d.mkdir(exist_ok=True)
     for tool in ("bash", "sh", "env", "mkdir", "sha1sum", "cut", "flock",
-                 "nice", *extra_tools):
+                 "nice", "cat", "python3", "dirname", "date", "sleep", "ps",
+                 "tr", "mktemp", "rm", *extra_tools):
         src = Path("/usr/bin") / tool
         if not src.exists():
             src = Path("/bin") / tool
@@ -140,6 +247,8 @@ def _minimal_path(tmp_path: Path, *extra_tools: str) -> Path:
         if not target.exists():
             target.symlink_to(src)
     return d
+
+
 
 
 # ── argument validation ───────────────────────────────────────────────────
@@ -522,11 +631,23 @@ def test_lock_held_skips_without_running(tmp_path):
     _fake_tools(fakebin, log)
     repo = _make_repo(tmp_path)
     lock_file = _lock_file_for(tmp_path, repo)
+    poison = tmp_path / "does-not-exist"
     with open(lock_file, "w") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+        res = _run_entry(
+            tmp_path,
+            repo,
+            "both",
+            path=f"{fakebin}:{_SYSTEM_PATH}",
+            env_extra={
+                "CODE_INTEL_MEM_CEILING_BYTES": "",
+                "CODE_INTEL_CGROUP_SELF": str(poison),
+                "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+            },
+        )
     assert res.returncode == 0, res.stderr
     assert "already running" in res.stdout
+    assert "cgroup" not in res.stdout.lower()
     assert not log.exists()
 
 
@@ -558,9 +679,10 @@ def test_parallel_double_invocation_exactly_one_runs(tmp_path):
            "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
            "CODE_INTEL_FAKE_LOADAVG": "0",
            "CODE_INTEL_FAKE_IOWAIT": "0"}
+    entrypoint = _test_entrypoint(tmp_path, fakebin)
     procs = [
         subprocess.Popen(
-            ["bash", str(_ENTRYPOINT), str(repo), "cbm"],
+            ["bash", str(entrypoint), str(repo), "cbm"],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         for _ in range(2)
@@ -608,11 +730,12 @@ def test_scope_path_passes_all_properties(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=2G" in calls
+    assert "MemoryMax=4G" in calls
     assert "MemorySwapMax=0" in calls
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
     assert "--scope" in calls
+    assert "--slice-inherit" in calls
     assert "codebase-memory-mcp ARGS:" in log.read_text()  # tool actually ran
 
 
@@ -636,8 +759,26 @@ def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):
         },
     )
     assert res.returncode == 0, res.stderr
-    assert "MemoryMax=8G" in slog.read_text()
+    gn_calls = [line for line in slog.read_text().splitlines() if "MemoryMax=8G" in line]
+    assert len(gn_calls) == 2  # probe and workload
+    assert all("--slice-inherit" not in line for line in gn_calls)
     assert "gitnexus ARGS:analyze" in log.read_text()
+
+
+def test_both_tools_keep_distinct_slice_placement(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert res.returncode == 0, res.stdout + res.stderr
+    calls = slog.read_text().splitlines()
+    cbm = [line for line in calls if "MemoryMax=4G" in line]
+    gn = [line for line in calls if "MemoryMax=8G" in line]
+    assert len(cbm) == len(gn) == 2  # each leg's probe and workload
+    assert all("--slice-inherit" in line for line in cbm)
+    assert all("--slice-inherit" not in line for line in gn)
 
 
 def test_env_overrides_reach_scope(tmp_path):
@@ -648,37 +789,53 @@ def test_env_overrides_reach_scope(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-        env_extra={"CODE_INTEL_INDEX_MEMORY_MAX": "512M",
+        env_extra={"CODE_INTEL_INDEX_MEMORY_MAX": "5G",
                    "CODE_INTEL_INDEX_IO_WEIGHT": "5",
                    "CODE_INTEL_INDEX_CPU_QUOTA": "100%"},
     )
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=512M" in calls
+    assert "MemoryMax=5G" in calls
     assert "IOWeight=5" in calls
     assert "CPUQuota=100%" in calls
 
 
-def test_probe_failure_falls_back_to_rlimit(tmp_path):
+def test_cbm_probe_failure_refuses_uncontained_run(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     slog = tmp_path / "systemd-run.log"
     _fake_tools(fakebin, log)
     _fake_systemd_run(fakebin, slog, probe_ok=False)
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
-    assert res.returncode == 0, res.stderr
+    assert res.returncode == 3, res.stdout + res.stderr
     assert slog.read_text().count("\n") == 1  # probe attempted exactly once
-    assert "ULIMIT_V:2097152" in log.read_text()  # 2G in KB
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
 
 
-def test_no_systemd_fallback_applies_rlimit(tmp_path):
+def test_both_tools_probe_each_cap_independently(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, reject_memory_max="invalid")
+    repo = _make_repo(tmp_path)
+    res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}",
+                     env_extra={"CODE_INTEL_GITNEXUS_MEMORY_MAX": "invalid"})
+    assert res.returncode == 4, res.stdout + res.stderr
+    assert "codebase-memory-mcp ARGS:" in log.read_text()
+    assert "gitnexus ARGS:" not in log.read_text()
+    assert "MemoryMax=invalid" in slog.read_text()
+    assert "MemoryMax=4G" in slog.read_text()
+
+
+def test_cbm_without_systemd_refuses_uncontained_run(tmp_path):
     minbin = _minimal_path(tmp_path)
     log = tmp_path / "tools.log"
     _fake_tools(minbin, log)
+    (minbin / "systemd-run").unlink()
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
-    assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in log.read_text()
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
 
 
 # ── 4. pressure watchdog ──────────────────────────────────────────────────
@@ -689,12 +846,15 @@ def test_watchdog_wall_cap_kills_stuck_index(tmp_path):
     can't hold the box hostage (the incident's failure mode)."""
     import time
     fakebin = tmp_path / "fakebin"
-    fakebin.mkdir()
-    _write_exec(fakebin / "codebase-memory-mcp", "#!/usr/bin/env bash\nsleep 60\n")
+    _fake_tools(fakebin, tmp_path / "tools.log")
+    _fake_systemd_run(fakebin, tmp_path / "systemd.log", probe_ok=False)
+    _write_exec(fakebin / "gitnexus", "#!/usr/bin/env bash\n"
+                'if [ "$1" = "--version" ]; then echo 1.6.12; exit 0; fi\n'
+                "sleep 60\n")
     repo = _make_repo(tmp_path)
     t0 = time.time()
     res = _run_entry(
-        tmp_path, repo, "cbm", "fast", path=f"{fakebin}:{_SYSTEM_PATH}",
+        tmp_path, repo, "gitnexus", "fast", path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={"CODE_INTEL_WATCHDOG_WALL_FAST": "2",
                    "CODE_INTEL_WATCHDOG_INTERVAL": "1",
                    "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
@@ -710,11 +870,14 @@ def test_watchdog_pauses_under_pressure(tmp_path):
     """High load pauses the running index (cgroup freeze / SIGSTOP) — the only
     working I/O throttle on this host."""
     fakebin = tmp_path / "fakebin"
-    fakebin.mkdir()
-    _write_exec(fakebin / "codebase-memory-mcp", "#!/usr/bin/env bash\nsleep 20\n")
+    _fake_tools(fakebin, tmp_path / "tools.log")
+    _fake_systemd_run(fakebin, tmp_path / "systemd.log", probe_ok=False)
+    _write_exec(fakebin / "gitnexus", "#!/usr/bin/env bash\n"
+                'if [ "$1" = "--version" ]; then echo 1.6.12; exit 0; fi\n'
+                "sleep 20\n")
     repo = _make_repo(tmp_path)
     res = _run_entry(
-        tmp_path, repo, "cbm", "fast", path=f"{fakebin}:{_SYSTEM_PATH}",
+        tmp_path, repo, "gitnexus", "fast", path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={"CODE_INTEL_WATCHDOG_WALL_FAST": "4",
                    "CODE_INTEL_WATCHDOG_INTERVAL": "1",
                    "CODE_INTEL_WATCHDOG_WARMUP_S": "0",
@@ -727,12 +890,15 @@ def test_watchdog_full_mode_uses_longer_wall_cap(tmp_path):
     """full mode reads the FULL wall cap, not the fast one — a legit full rebuild
     (throttled, duty-cycled) is given time the fast cap wouldn't allow."""
     fakebin = tmp_path / "fakebin"
-    fakebin.mkdir()
-    _write_exec(fakebin / "codebase-memory-mcp", "#!/usr/bin/env bash\nsleep 3\n")
+    _fake_tools(fakebin, tmp_path / "tools.log")
+    _fake_systemd_run(fakebin, tmp_path / "systemd.log", probe_ok=False)
+    _write_exec(fakebin / "gitnexus", "#!/usr/bin/env bash\n"
+                'if [ "$1" = "--version" ]; then echo 1.6.12; exit 0; fi\n'
+                "sleep 3\n")
     repo = _make_repo(tmp_path)
     # A 1s FAST cap would kill a 3s tool; the 30s FULL cap lets it finish.
     res = _run_entry(
-        tmp_path, repo, "cbm", "full", path=f"{fakebin}:{_SYSTEM_PATH}",
+        tmp_path, repo, "gitnexus", "full", path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={"CODE_INTEL_WATCHDOG_WALL_FAST": "1",
                    "CODE_INTEL_WATCHDOG_WALL_FULL": "30",
                    "CODE_INTEL_WATCHDOG_INTERVAL": "1",
@@ -841,6 +1007,116 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "WARNING: could not queue initial code intelligence index" in queue
 
 
+# ── Codebase Memory batch admission ───────────────────────────────────────
+
+
+def test_cbm_default_uses_the_measured_four_gibibyte_target(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    systemd_log = tmp_path / "systemd.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, systemd_log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    runs = [
+        line for line in systemd_log.read_text().splitlines()
+        if "codebase-memory-mcp cli index_repository" in line
+    ]
+    assert len(runs) == 1
+    assert "MemoryMax=4G" in runs[0]
+
+
+def test_explicit_cbm_cap_does_not_bypass_destination_headroom(tmp_path):
+    gib = 1024**3
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    (fakebin / "test-cgroup/memory.max").write_text(f"{7 * gib}\n")
+    (fakebin / "test-cgroup/memory.current").write_text(f"{gib}\n")
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_CBM_MEMORY_MAX": "5G"},
+    )
+
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert "scope admission refused" in res.stdout
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+
+
+def test_cbm_refuses_malformed_sibling_reserve(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_SIBLING_RESERVE_BYTES": "unknown"},
+    )
+
+    assert res.returncode == 3
+    assert "invalid sibling reserve" in res.stderr
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+
+
+def test_cbm_rss_peak_is_not_accepted_as_a_safe_scope_cap(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "cbm",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={"CODE_INTEL_CBM_MEMORY_MAX": "2900M"},
+    )
+
+    assert res.returncode == 3
+    assert "below" in res.stdout and "2964M" in res.stdout
+    assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
+
+
+def test_cbm_no_run_paths_do_not_read_cgroup_metadata(tmp_path):
+    poison = tmp_path / "does-not-exist"
+    env = {
+        "CODE_INTEL_MEM_CEILING_BYTES": "",
+        "CODE_INTEL_CGROUP_SELF": str(poison),
+        "CODE_INTEL_CGROUP_MOUNTINFO": str(poison),
+    }
+    disabled = _run_entry(
+        tmp_path,
+        tmp_path / "missing",
+        "cbm",
+        path=_SYSTEM_PATH,
+        env_extra={**env, "CODE_INTEL_INDEX_DISABLE": "1"},
+    )
+    invalid = _run_entry(
+        tmp_path, tmp_path / "missing", "wat", path=_SYSTEM_PATH, env_extra=env,
+    )
+    worktree_root = tmp_path / "worktree-case"
+    worktree_root.mkdir()
+    worktree = _make_repo(worktree_root, worktree=True)
+    skipped = _run_entry(
+        tmp_path, worktree, "cbm", path=_SYSTEM_PATH, env_extra=env,
+    )
+
+    assert disabled.returncode == 0
+    assert invalid.returncode == 1
+    assert skipped.returncode == 0
+    for result in (disabled, invalid, skipped):
+        assert "cgroup" not in result.stdout.lower()
+
+
 # ── the cap must be bounded by what the INSTALL has, not by a constant ───────
 
 def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G", env_overrides: dict | None = None) -> tuple[str, str]:
@@ -878,7 +1154,7 @@ def _headroom_decision(tmp_path, ceiling_gib: int, want: str = "8G", env_overrid
     return cap, why
 
 
-def _working_set_from_stat(tmp_path, current: int, stat: str, reserve: int) -> int:
+def _working_set_from_stat(tmp_path, current: int, stat: str, reserve: int | str) -> int:
     """Run the shipped cgroup working-set helper against synthetic statistics."""
     src = _ENTRYPOINT.read_text()
     start = src.index("_genesis_mem_working_set_from() {")
@@ -940,6 +1216,28 @@ def test_working_set_keeps_small_cache_and_fails_closed_on_bad_stats(tmp_path):
         f"inactive_file {gib}\nactive_file 0\nfile_dirty {2 * gib}\nfile_writeback 0\n",
         2 * gib,
     ) == current
+
+
+@pytest.mark.parametrize("reserve", ["02147483648", "08", "1" * 19])
+def test_working_set_rejects_noncanonical_or_oversized_cache_reserve(tmp_path, reserve):
+    gib = 1024**3
+    assert _working_set_from_stat(
+        tmp_path,
+        12 * gib,
+        f"inactive_file {6 * gib}\nactive_file 0\nfile_dirty 0\nfile_writeback 0\n",
+        reserve,
+    ) == 12 * gib
+
+
+@pytest.mark.parametrize("bad_field", ["08", "1" * 19])
+def test_working_set_rejects_noncanonical_or_oversized_stat_field(tmp_path, bad_field):
+    gib = 1024**3
+    assert _working_set_from_stat(
+        tmp_path,
+        12 * gib,
+        f"inactive_file {bad_field}\nactive_file {6 * gib}\nfile_dirty 0\nfile_writeback 0\n",
+        2 * gib,
+    ) == 12 * gib
 
 
 def test_working_set_supports_the_complete_cgroup_v1_schema(tmp_path):
@@ -1270,12 +1568,13 @@ def test_oom_adjustment_is_child_only_in_systemd_scope_path(tmp_path):
 
 
 def test_oom_adjustment_reaches_child_in_fallback_path(tmp_path):
-    minbin = _minimal_path(tmp_path)
+    fakebin = tmp_path / "fakebin"
     log = tmp_path / "tools.log"
-    _fake_tools(minbin, log)
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, tmp_path / "systemd.log", probe_ok=False)
     repo = _make_repo(tmp_path)
 
-    res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
+    res = _run_entry(tmp_path, repo, "gitnexus", path=f"{fakebin}:{_SYSTEM_PATH}")
 
     assert res.returncode == 0, res.stderr
     assert "OOM_ADJ:1000" in log.read_text()
@@ -1285,11 +1584,14 @@ def test_fallback_watchdog_kills_the_whole_indexer_process_group(tmp_path):
     """The no-systemd wall cap must not leave an indexer descendant orphaned."""
     import time
 
-    minbin = _minimal_path(tmp_path, "date", "ps", "tr", "sleep")
+    fakebin = tmp_path / "fakebin"
     child_pid_log = tmp_path / "child.pid"
+    _fake_tools(fakebin, tmp_path / "tools.log")
+    _fake_systemd_run(fakebin, tmp_path / "systemd.log", probe_ok=False)
     _write_exec(
-        minbin / "codebase-memory-mcp",
+        fakebin / "gitnexus",
         "#!/usr/bin/env bash\n"
+        'if [ "$1" = "--version" ]; then echo 1.6.12; exit 0; fi\n'
         "/bin/sleep 60 &\n"
         f'echo "$!" > "{child_pid_log}"\n'
         "wait\n",
@@ -1299,9 +1601,9 @@ def test_fallback_watchdog_kills_the_whole_indexer_process_group(tmp_path):
     res = _run_entry(
         tmp_path,
         repo,
-        "cbm",
+        "gitnexus",
         "fast",
-        path=str(minbin),
+        path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={
             "CODE_INTEL_WATCHDOG_WALL_FAST": "2",
             "CODE_INTEL_WATCHDOG_INTERVAL": "1",
@@ -1443,3 +1745,148 @@ def test_noop_worktree_skip_does_not_validate_child_oom_override(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "worktree" in res.stdout
     assert not log.exists()
+
+
+# ── Magnitude bounds: Bash operands must be checked before arithmetic ───────
+_OPERAND_WRAP_CASES = [
+    pytest.param(
+        # Drives `2836*1024*1024 + CHARGE` to wrap: the admission FLOOR became
+        # 98,305 bytes instead of 2.9 GiB, so a box with 100 KB of headroom
+        # was admitted — the same wrap-into-admission this change closes.
+        {"CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES": "18446744070735888385"},
+        id="workload-charge-is-an-operand",
+    ),
+    pytest.param(
+        # The K branch multiplies in Bash. This wrapped to 4876166144 and was
+        # accepted as a legitimate 4.87 GB cap, while the literal string was
+        # still handed to systemd as MemoryMax.
+        {"CODE_INTEL_CBM_MEMORY_MAX": "18014398514243865K"},
+        id="mantissa-multiplies-before-the-result-bound",
+    ),
+]
+
+
+@pytest.mark.parametrize("env_extra", _OPERAND_WRAP_CASES)
+def test_an_operand_that_wraps_is_refused_not_merely_recomputed(tmp_path, env_extra):
+    """A value that wraps its own expression must refuse, not produce a number.
+
+    The failure these guard against is silent by construction: the wrapped
+    result is in range, has the right sign, and passes every downstream check.
+    Nothing but a bound on the operand can see it.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env_extra
+    )
+
+    assert "SKIP cbm" in res.stdout, (
+        f"{env_extra} was not refused — the wrap produced a usable-looking "
+        f"number instead\n{res.stdout}\n{res.stderr}"
+    )
+
+
+def test_the_inlined_isolation_default_tracks_the_real_constant():
+    """`_genesis_mem_working_set_from` hardcodes `:-18` as its fallback bound.
+
+    It has to: the suite extracts that function ALONE and sources it without
+    the rest of the file, so it cannot see `_GENESIS_MEM_MAX_DIGITS`. The cost
+    is a second copy of the number. If the constant ever moves and the inlined
+    default does not, the isolated tests keep asserting the old bound and
+    nothing else notices — so the two are pinned together here.
+    """
+    src = _ENTRYPOINT.read_text()
+    declared = re.search(r"^_GENESIS_MEM_MAX_DIGITS=(\d+)$", src, re.M)
+    assert declared, "_GENESIS_MEM_MAX_DIGITS is no longer declared as a bare constant"
+    inlined = set(re.findall(r"\$\{_GENESIS_MEM_MAX_DIGITS:-(\d+)\}", src))
+    assert inlined, "no inlined fallback found — did the isolated extraction change?"
+    assert inlined == {declared.group(1)}, (
+        f"_GENESIS_MEM_MAX_DIGITS={declared.group(1)} but inlined fallbacks are "
+        f"{sorted(inlined)} — the isolated-extraction copies have drifted"
+    )
+
+
+# -- A refusal must reach only the legs whose arithmetic the value feeds -----
+#
+# An earlier revision of the magnitude bound put every constant into ONE shared
+# refusal string consumed by both legs, so a malformed CBM-only value refused
+# GitNexus and a malformed GitNexus-only value refused CBM. In each case a leg
+# with a valid cap and real headroom was skipped because of a variable it never
+# reads. Cross-contamination is invisible in the logs -- the skipped leg reports
+# a refusal naming the OTHER leg's variable, which reads like a config error.
+_LEG_ISOLATION_CASES = [
+    pytest.param(
+        "gitnexus", {"CODE_INTEL_CBM_MIN_BYTES": "1" + "0" * 30}, id="cbm-value-spares-gitnexus"
+    ),
+    pytest.param(
+        "cbm",
+        {"CODE_INTEL_GITNEXUS_MIN_BYTES": "1" + "0" * 30},
+        id="gitnexus-value-spares-cbm",
+    ),
+    pytest.param(
+        "gitnexus",
+        {"CODE_INTEL_CBM_WORKLOAD_CHARGE_BYTES": "18446744070735888385"},
+        id="cbm-charge-spares-gitnexus",
+    ),
+]
+
+
+@pytest.mark.parametrize("leg,env_extra", _LEG_ISOLATION_CASES)
+def test_a_bad_value_refuses_only_the_leg_that_reads_it(tmp_path, leg, env_extra):
+    """One leg's malformed constant must not refuse the other leg."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, leg, path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env_extra
+    )
+
+    assert f"SKIP {leg}" not in res.stdout, (
+        f"{leg} was refused by a value only the other leg reads "
+        f"({sorted(env_extra)})\n{res.stdout}\n{res.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    "leg,env_extra",
+    [
+        pytest.param("cbm", {"CODE_INTEL_CBM_MIN_BYTES": "1" + "0" * 30}, id="cbm-own-value"),
+        pytest.param(
+            "gitnexus",
+            {"CODE_INTEL_GITNEXUS_MIN_BYTES": "1" + "0" * 30},
+            id="gitnexus-own-value",
+        ),
+        pytest.param(
+            "cbm",
+            {"CODE_INTEL_SIBLING_RESERVE_BYTES": "1" + "0" * 30},
+            id="shared-value-hits-cbm",
+        ),
+        pytest.param(
+            "gitnexus",
+            {"CODE_INTEL_SIBLING_RESERVE_BYTES": "1" + "0" * 30},
+            id="shared-value-hits-gitnexus",
+        ),
+    ],
+)
+def test_a_bad_value_still_refuses_the_leg_that_does_read_it(tmp_path, leg, env_extra):
+    """The paired positive control for the isolation test above.
+
+    Without these, every assertion up there could pass because nothing refuses
+    anything at all -- an absence-assertion group proves nothing until its
+    presence-direction sibling is shown to fire.
+    """
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    repo = _make_repo(tmp_path)
+
+    res = _run_entry(
+        tmp_path, repo, leg, path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env_extra
+    )
+
+    assert f"SKIP {leg}" in res.stdout, (
+        f"{leg} was NOT refused by a value it reads ({sorted(env_extra)})"
+        f"\n{res.stdout}\n{res.stderr}"
+    )

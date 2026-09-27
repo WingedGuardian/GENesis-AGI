@@ -48,7 +48,7 @@ import contextlib
 import os
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -71,6 +71,14 @@ async def test_the_store_satisfies_the_seam():
     for member in ("name", "traverse", "centrality", "invalidate"):
         assert hasattr(store, member), f"GraphStore contract member missing: {member}"
     assert isinstance(store.name, str) and store.name
+    # Shared with the NetworkX store's conformance test — see its docstring for
+    # why member existence is not acceptance. It matters MORE here: this store's
+    # traversal semantics need a live engine, so CI never invokes `traverse` with
+    # the keyword at all, and this signature check is the only thing standing
+    # between a signature drift and a silent empty-neighbours answer in prod.
+    from tests.test_memory.test_graphstore_nx import _assert_accepts_visibility_choice
+
+    _assert_accepts_visibility_choice(store)
 
 
 async def test_an_unreachable_engine_raises_and_never_answers_empty(tmp_path):
@@ -1563,3 +1571,93 @@ async def test_the_facade_reaches_sql_when_both_stores_are_down(monkeypatch):
     with pytest.raises(GraphUnavailableError, match="both failed"):
         await graph_mod.traverse(None, "root", max_depth=2, min_strength=0.3)
     assert calls == ["falkordb", "networkx", "cte"]
+
+
+@pytest.mark.parametrize("asked", [False, True])
+async def test_the_visibility_choice_reaches_the_ENGINE_not_just_the_signature(
+    tmp_path, asked
+):
+    """`include_deprecated` must arrive as a bound query PARAMETER (issue #1896).
+
+    This store's traversal semantics need a live engine, so CI never runs the
+    real Cypher — which left the conformance test's `inspect.signature` check as
+    the only thing standing between a signature drift and a silent
+    empty-neighbours answer in production. A parameter can exist in a signature
+    and never be forwarded; that is the "existence is not binding" shape, and
+    this test replaces it with the real thing by capturing what the engine is
+    handed.
+
+    Asserted here: the flag is present, is a genuine BOOLEAN (not a string or an
+    int, which would make `$include_deprecated OR (...)` evaluate on truthiness rules
+    this code never verified), tracks the caller's argument, and the predicate it
+    gates is actually in the query text. `$now` must remain bound in BOTH modes —
+    the one-query-string design depends on it.
+    """
+    seen: dict = {}
+
+    class _Graph:
+        async def query(self, cypher, params=None, **k):
+            seen["cypher"] = cypher
+            seen["params"] = params or {}
+
+            class _R:
+                result_set: list = []
+
+            return _R()
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, _key):
+            return _Graph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        # An empty result would otherwise trip the projection-exists assertion,
+        # which is a different contract and not what this test is about.
+        patch.object(store, "_assert_projection_exists", AsyncMock(return_value=None)),
+    ):
+        await store.traverse(
+            None, "root", max_depth=2, min_strength=0.3, include_deprecated=asked
+        )
+
+    assert seen, "the engine was never queried — this test proves nothing"
+    params = seen["params"]
+    assert "include_deprecated" in params, (
+        "the caller's visibility choice never reached the engine"
+    )
+    assert params["include_deprecated"] is asked, (
+        f"expected include_deprecated={asked}, engine got {params['include_deprecated']!r}"
+    )
+    assert isinstance(params["include_deprecated"], bool), (
+        "must be a real boolean: Cypher's OR over a non-boolean is not the "
+        "semantics this predicate was measured against"
+    )
+    assert "$include_deprecated" in seen["cypher"], (
+        "the parameter is bound but the query does not gate on it"
+    )
+    # COMPOSITION, not presence. A containment check on `$include_deprecated`
+    # cannot tell the fixed query from the defective one it replaced — MEASURED:
+    # reverting `_TRAVERSE` to `WHERE $include_deprecated OR (_VALID)`, the shape
+    # that let the flag un-hide EXPIRED memories, left 112/112 falkor tests green
+    # (PR #2339 review). These two assertions are what make that revert RED, and
+    # they are the only guard on this backend's half of the fix, because no engine
+    # runs in CI.
+    norm = " ".join(seen["cypher"].split())
+    assert f"WHERE {falkor_mod._NOT_EXPIRED} AND ($include_deprecated" in norm, (
+        "the expiry limb must sit OUTSIDE the flag — underneath it, "
+        "include_deprecated=True un-hides bitemporally expired memories, which "
+        "search_ranked can never return (db/crud/memory.py:207)"
+    )
+    assert f"($include_deprecated OR {falkor_mod._NOT_DEPRECATED})" in norm, (
+        "the flag must gate the DEPRECATION limb and nothing else"
+    )
+    # Params are keyed by BARE name; the `$` sigil appears only in the query
+    # text. Both halves are asserted because the design's claim is that one query
+    # string serves both modes, which requires `now` bound even when the
+    # predicate it feeds is short-circuited by the flag.
+    assert "now" in params, "the single-query-string design requires now bound in BOTH modes"
+    assert "$now" in seen["cypher"]

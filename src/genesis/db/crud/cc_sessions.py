@@ -677,22 +677,92 @@ async def update_rate_limit(
     return cursor.rowcount > 0
 
 
-async def increment_cost(
+# How many CC sessions' running totals one row remembers (record_turn_cost). A
+# row normally spans ONE CC session, and two only after a failed resume
+# reconstruction, so this bounds a pathological fallback loop rather than any
+# real workload: ~60 bytes per entry, rewritten on every turn. An evicted
+# session that later returns has its total added whole, the reading before
+# cursors existed — so the bound costs accuracy only past 16 distinct sessions.
+_COST_CURSOR_LIMIT = 16
+
+
+async def record_turn_cost(
     db: aiosqlite.Connection,
     id: str,
     *,
-    cost_usd: float = 0.0,
+    cc_session_id: str,
+    reported_cost_usd: float,
+    cumulative: bool,
     input_tokens: int = 0,
     output_tokens: int = 0,
 ) -> bool:
-    """Add cost and token counts to an existing session (incremental)."""
+    """Record one conversation turn's cost on a row that SUMS turns.
+
+    From CC 2.1.277 a RESUMED session reports a session-cumulative
+    ``total_cost_usd`` (see ``CCOutput.cost_is_cumulative``). Adding that value
+    re-adds every earlier turn, so this records the DIFFERENCE from the last total
+    reported for the same CC session. Those totals are kept per CC session in
+    ``metadata.cost_cursors`` = ``{cc_session_id: total}``, because one row can
+    span several and return to one: ``_reconstruct_resume`` may degrade to a fresh
+    CC session on the same row, and a later turn may resume the original again.
+
+    Rules, for a report with a non-empty CC session id:
+
+    - per-call (``cumulative`` False): added whole;
+    - cumulative, no cursor for this CC session: added whole — the only reading;
+    - cumulative, at or above its cursor: adds ``reported - cursor``;
+    - cumulative, BELOW its cursor: adds nothing. CC saves a session's totals only
+      when its process EXITS, so a process killed after reporting T(k) leaves the
+      next resume restoring the older T(k-1) and reporting T(k-1) + c. Adding that
+      whole would count the earlier session twice; adding nothing under-counts the
+      one call, c. The smaller error wins.
+
+    Every report with an id moves that session's cursor, including a per-call
+    one: after a CC upgrade under a live row, the first running total is diffed
+    against the last per-call figure, under-counting that turn once rather than
+    re-adding the session. A row active at deploy time has no cursor, so its first
+    cumulative report is added whole once; earlier over-counted rows are not
+    repaired. An empty id never reads or writes a cursor. Tokens are always per
+    call and always added. Corrupt ``metadata`` is treated as ``{}`` (as
+    ``merge_metadata`` does) and rewritten with the cursor. Turns on one row are
+    serialised by the conversation loop's per-session lock, which is what makes
+    this read-modify-write safe.
+    """
+    cursor = await db.execute("SELECT metadata FROM cc_sessions WHERE id = ?", (id,))
+    row = await cursor.fetchone()
+    if row is None:
+        return False
+    meta: dict = {}
+    if row[0]:
+        try:
+            loaded = json.loads(row[0])
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+    reported = float(reported_cost_usd or 0.0)
+    cursors = meta.get("cost_cursors")
+    if not isinstance(cursors, dict):
+        cursors = {}
+    prev = cursors.get(cc_session_id) if cc_session_id else None
+    delta = reported
+    if cumulative and isinstance(prev, (int, float)) and not isinstance(prev, bool):
+        # Below the cursor means restored-older totals (see the docstring): 0.
+        delta = max(reported - float(prev), 0.0)
+    if cc_session_id:
+        cursors.pop(cc_session_id, None)  # re-insert last: dict order = recency
+        cursors[cc_session_id] = reported
+        while len(cursors) > _COST_CURSOR_LIMIT:
+            cursors.pop(next(iter(cursors)))
+        meta["cost_cursors"] = cursors
     cursor = await db.execute(
         """UPDATE cc_sessions
            SET cost_usd = COALESCE(cost_usd, 0) + ?,
                input_tokens = COALESCE(input_tokens, 0) + ?,
-               output_tokens = COALESCE(output_tokens, 0) + ?
+               output_tokens = COALESCE(output_tokens, 0) + ?,
+               metadata = ?
            WHERE id = ?""",
-        (cost_usd, input_tokens, output_tokens, id),
+        (delta, input_tokens, output_tokens, json.dumps(meta), id),
     )
     await db.commit()
     return cursor.rowcount > 0
