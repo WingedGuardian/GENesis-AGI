@@ -159,3 +159,29 @@ def test_non_positive_int_falls_back_to_default(key, bad, caplog):
     )
     assert getattr(cfg, key) == default
     assert key in caplog.text
+
+
+@pytest.mark.parametrize("key", ["items_per_eval", "max_retries"])
+@pytest.mark.parametrize("bad", ["true", "2.7", ".inf", "-.inf", ".nan"])
+def test_non_integer_int_falls_back_to_default(key, bad, caplog):
+    """#2447 round 1 (Devin, CodeRabbit): int() turned YAML `true` into 1 and
+    truncated 2.7 to 2 without a word, and `.inf` raised OverflowError, which
+    crashed config loading instead of degrading to the default."""
+    import dataclasses
+
+    from genesis.inbox.types import InboxConfig
+
+    default = {f.name: f.default for f in dataclasses.fields(InboxConfig)}[key]
+    cfg = load_inbox_config_from_string(
+        f'inbox_monitor:\n  watch_path: "/tmp/x"\n  {key}: {bad}\n'
+    )
+    assert getattr(cfg, key) == default
+    assert key in caplog.text
+
+
+def test_integral_float_is_accepted_as_an_int():
+    """Negative control: 4.0 is an integer written as a float, not an error."""
+    cfg = load_inbox_config_from_string(
+        'inbox_monitor:\n  watch_path: "/tmp/x"\n  max_retries: 4.0\n'
+    )
+    assert cfg.max_retries == 4 and isinstance(cfg.max_retries, int)

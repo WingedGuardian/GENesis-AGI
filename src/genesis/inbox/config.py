@@ -62,12 +62,21 @@ def _parse(raw: dict) -> InboxConfig:
         A bare int() accepted 0 and negatives from a hand-edited YAML or an
         overlay (the MCP validator never sees those paths): items_per_eval=0
         divides a drop into nothing, max_retries=0 parks on the first miss.
+        int() was also too forgiving about TYPE: YAML ``true`` became 1, 2.7
+        was truncated to 2, and ``.inf`` raised OverflowError out of the loader.
+        A bool or a non-integral float is not an integer; an integral float
+        (4.0) is.
         """
         raw_val = section.get(key, defaults[key])
-        try:
-            val = int(raw_val)
-        except (TypeError, ValueError):
+        if isinstance(raw_val, bool) or (
+            isinstance(raw_val, float) and not raw_val.is_integer()
+        ):
             val = minimum - 1
+        else:
+            try:
+                val = int(raw_val)
+            except (TypeError, ValueError, OverflowError):
+                val = minimum - 1
         if val < minimum:
             logger.warning(
                 "inbox_monitor.%s=%r is not an integer >= %d — using default %r",

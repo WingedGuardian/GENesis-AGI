@@ -20,6 +20,13 @@ AWAITING_APPROVAL_PREFIX = "awaiting_approval:"
 # invalidated-failed rows with still-awaiting rows.
 APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
 
+# Prefix marking a row whose approval request ENDED without an answer (expired,
+# cancelled, or no longer known to the approval manager). Deliberately NOT the
+# invalidated prefix: the item was never evaluated and its content is still
+# wanted, so the row stays an ordinary retriable failure the retry lane re-asks
+# about, with its retry budget untouched (#2447 review).
+APPROVAL_ENDED_PREFIX = "approval_ended:"
+
 # Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
 # call is about to run / is running).  The resume pass flips a parked row from
 # ``awaiting_approval:`` to ``dispatching:`` via ``claim_for_dispatch`` BEFORE
@@ -699,6 +706,30 @@ async def get_handled_batch_content(
     return handled
 
 
+async def mark_failed_keeping_retries(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    error_message: str,
+    processed_at: str | None = None,
+) -> bool:
+    """Fail a row WITHOUT spending its retry budget, in one UPDATE.
+
+    :func:`update_status` increments ``retry_count`` on ``failed`` unless the
+    caller supplies a value, and supplying one means reading the row first. A
+    failure that is not the item's fault (the network was down) must neither
+    spend a retry nor depend on that read succeeding.
+    """
+    cursor = await db.execute(
+        """UPDATE inbox_items
+           SET status = 'failed', processed_at = ?, error_message = ?
+           WHERE id = ?""",
+        (processed_at, error_message, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def mark_file_failures_abandoned(
     db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
     reason: str = "content removed before retry",
@@ -716,8 +747,10 @@ async def mark_file_failures_abandoned(
 
     ``error_like`` (a SQL LIKE pattern) narrows the abandon to one failure
     class. The retry-storm park passes ``'partial_url_failure%'``: a storm of URL
-    failures is no reason to strand a crashed CC call, a restart requeue or a
-    corruption row in the same file (review, 2026-09-26).
+    failures is no reason to ABANDON a crashed CC call, a restart requeue or a
+    corruption row in the same file (review, 2026-09-26). Those rows stay
+    retriable, but the file-level storm guard still skips the file until its
+    exhausted URL rows leave the 48-hour window, so they are delayed, not lost.
     """
     sql = """UPDATE inbox_items
            SET error_message = ? || ?

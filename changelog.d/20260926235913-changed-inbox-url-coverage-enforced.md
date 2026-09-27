@@ -5,12 +5,15 @@
   evaluations under the citation rule, every one cited its sources and none would
   have been re-queued. When an item uses up its retries, or a file trips the
   repeated-failure guard, you now get one alert per file naming each item it
-  stopped on. Previously that
+  stopped on (links shown without query strings or token-like path segments).
+  An approval request that ends unanswered no longer uses up one of the item's
+  retries, which could leave it never evaluated again. Previously that
   item simply stopped being evaluated, with no signal. The retry lane of that
   guard now parks the file like the other two paths instead of re-checking it on
   every scan. A `**Source:**` line inside a list item or blockquote now counts as
-  a citation. With network parking live (`resilience.parking_mode: live`),
+  a citation, including nested ones such as `- > **Source:**`. With network parking live (`resilience.parking_mode: live`),
   an outage no longer spends an item's retries. Invalid
   `items_per_eval`, `max_retries`, `timeout_s` and interval values now fall back
-  to their defaults with a warning instead of being accepted. To observe without
+  to their defaults with a warning instead of being accepted, including `true`,
+  fractional and infinite values. To observe without
   acting, set `url_coverage_mode: shadow`.

@@ -3227,9 +3227,13 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
     db,
 ):
     """When the approval row is missing entirely (approval_manager
-    returns None), the inbox row must be invalidated with the
-    APPROVAL_INVALIDATED_PREFIX marker so the next scan re-detects the
-    file as new."""
+    returns None), the item must come back for a fresh approval.
+
+    Until #2447 this was pinned as "the row is invalidated with the
+    APPROVAL_INVALIDATED_PREFIX marker so the next scan re-detects the file".
+    That marker stranded the item whenever a completed sibling held the file's
+    hash, so an ended approval now leaves the row an ordinary retriable
+    failure (``approval_ended:``) and the SAME row is asked about again."""
     from genesis.db.crud import inbox_items
 
     pending_decision = AutonomousDispatchDecision(
@@ -3264,14 +3268,14 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
             ).fetchall()
         )
     ]
-    # At least one row should be failed+invalidated.  The next scan may
-    # also have created a fresh row for the re-detected file.
-    failed = [r for r in rows if r["status"] == "failed"]
-    assert len(failed) >= 1
-    assert any(
-        (r["error_message"] or "").startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
-        for r in failed
-    )
+    # One row, never invalidated, asked about again under a new request.
+    assert len(rows) == 1, rows
+    assert not (rows[0]["error_message"] or "").startswith(
+        inbox_items.APPROVAL_INVALIDATED_PREFIX
+    ), rows[0]
+    assert rows[0]["error_message"] == "awaiting_approval:req-gone-1", rows[0]
+    assert rows[0]["retry_count"] == 0, rows[0]
+    gone_dispatcher.route.assert_awaited_once()
 
 
 def test_passes_coherence_check_valid():
@@ -3541,3 +3545,103 @@ async def test_baseline_guard_delta_only_new_items(
     assert "article-3" in delta
     assert "article-1" not in delta
     assert "article-2" not in delta
+
+
+# ── Review round 1 on #2447: an invalidated approval at the retry cap ────────
+
+
+def _inbox_alerts():
+    from genesis.env import alert_queue_root
+    from genesis.guardian.alert.queue import list_queued
+
+    return [e for _p, e in list_queued(alert_queue_root()) if e.get("source") == "inbox"]
+
+
+async def _seed_expiring_row(db, inbox_dir, *, request_id, retry_count):
+    from genesis.db.crud import inbox_items
+
+    f, _h = await _seed_parked_row(
+        db, inbox_dir, request_id=request_id,
+        content="https://example.com/expiring-item\n",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET retry_count = ?, batch_items = ? WHERE id = ?",
+        (
+            retry_count,
+            inbox_items.serialize_batch_items(["https://example.com/expiring-item"]),
+            f"row-{request_id}",
+        ),
+    )
+    await db.commit()
+    return f
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["expired", "cancelled", None])
+async def test_approval_ending_on_the_last_retry_does_not_strand_the_item(
+    monitor, inbox_dir, db, terminal,
+):
+    """Devin (severe) on #2447: an approval that ended unanswered spent a retry.
+    On the last one the row reached the cap, its hash became the file's known
+    hash, and the unchanged file was never evaluated again. An approval ending
+    is not the item failing: the row keeps its retries, stays retriable, and
+    the same row is asked about again.
+    ``None`` is an approval the manager no longer has."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-new",
+    )
+    approvals = {} if terminal is None else {"req-end": {"id": "req-end", "status": terminal}}
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision, approval_by_id=approvals,
+    )
+    await _seed_expiring_row(
+        db, inbox_dir, request_id="req-end",
+        retry_count=monitor._config.max_retries - 1,
+    )
+    await monitor.check_once()
+
+    rows = {r["id"]: dict(r) for r in await (await db.execute(
+        "SELECT id, status, retry_count, error_message FROM inbox_items"
+    )).fetchall()}
+    # The item is not stranded: the SAME row keeps its retries and carries the
+    # item into a new approval request.
+    assert list(rows) == ["row-req-end"], rows
+    row = rows["row-req-end"]
+    assert row["retry_count"] == monitor._config.max_retries - 1, row
+    assert row["error_message"] == "awaiting_approval:req-new", row
+    monitor._autonomous_dispatcher.route.assert_awaited_once()
+    assert _inbox_alerts() == []
+
+
+@pytest.mark.asyncio
+async def test_failed_approval_lookup_leaves_the_row_parked(monitor, inbox_dir, db):
+    """Internal review of #2447: a lookup that RAISED used to leave the status
+    at None, which reads as "approval missing" — the row was ended while its
+    request was still pending, and the orphan guard then re-sent it."""
+    decision = AutonomousDispatchDecision(mode="blocked", reason="approval requested")
+    # A pending site row lets the orphan guard actually run, so the
+    # cancel assertion below can fail.
+    dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[{
+            "id": "req-live", "status": "pending",
+            "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
+        }],
+    )
+
+    async def _boom(_request_id):
+        raise RuntimeError("approvals table locked")
+
+    dispatcher.approval_gate.approval_manager.get_by_id = _boom
+    monitor._autonomous_dispatcher = dispatcher
+    await _seed_expiring_row(db, inbox_dir, request_id="req-live", retry_count=0)
+    await monitor.check_once()
+
+    row = await (await db.execute(
+        "SELECT status, error_message FROM inbox_items WHERE id = 'row-req-live'"
+    )).fetchone()
+    assert (row["status"], row["error_message"]) == (
+        "processing", "awaiting_approval:req-live",
+    ), dict(row)
+    dispatcher.approval_gate.approval_manager.cancel.assert_not_called()
+    dispatcher.route.assert_not_called()
