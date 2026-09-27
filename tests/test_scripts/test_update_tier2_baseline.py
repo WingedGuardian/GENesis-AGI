@@ -33,9 +33,7 @@ def _extract_function() -> str:
 def _extract_named_function(name: str) -> str:
     text = UPDATE_SH.read_text()
     start = text.index(f"{name}() {{")
-    next_function = re.search(
-        r"\n[A-Za-z_][A-Za-z0-9_]*\(\) \{", text[start + 1 :]
-    )
+    next_function = re.search(r"\n[A-Za-z_][A-Za-z0-9_]*\(\) \{", text[start + 1 :])
     assert next_function, f"missing function boundary after {name}"
     return text[start : start + 1 + next_function.start()]
 
@@ -99,6 +97,8 @@ def _run_check(root: Path, venv: Path) -> int:
         "set -u\n"
         f'GENESIS_ROOT="{root}"\n'
         f'VENV_DIR="{venv}"\n'
+        + _extract_named_function("_metadata_python")
+        + "\n"
         + _extract_named_function("_resolve_commit_object")
         + "\n"
         + _extract_function()
@@ -148,3 +148,54 @@ def test_newest_success_row_wins(genesis_root):
     # A NEWER success row at current HEAD: baseline advanced, nothing pending.
     _record_success(root, _git(root, "rev-parse", "--short", "HEAD"), "2026-02-01T00:00:00+00:00")
     assert _run_check(root, venv) == 1
+
+
+def test_no_history_table_is_not_pending(tmp_path):
+    """No table yet (first update before migrations) is ABSENT: shortcut as before."""
+    root = tmp_path / "root"
+    (root / "data").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    (root / "f").write_text("x\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "c1")
+    sqlite3.connect(root / "data" / "genesis.db").execute("PRAGMA user_version = 1")
+    assert _run_check(root, tmp_path / "missing-venv") == 1
+
+
+def test_unreadable_history_is_pending(genesis_root):
+    """A history that exists but cannot be read is NOT "no baseline".
+
+    The function's contract is to fail toward the full run; reading an
+    unreadable database as absent took the shortcut instead.
+    """
+    root, venv = genesis_root
+    (root / "data" / "genesis.db").write_bytes(b"this is not a sqlite database" * 100)
+    assert _run_check(root, venv) == 0
+
+
+def test_no_interpreter_for_the_reader_is_pending(genesis_root, tmp_path):
+    """No interpreter able to read the history: unknown, so fail toward the full run."""
+    root, venv = genesis_root
+    _record_success(root, _git(root, "rev-parse", "--short", "HEAD"))
+    bin_dir = tmp_path / "git-only-bin"
+    bin_dir.mkdir()
+    (bin_dir / "git").symlink_to("/usr/bin/git")
+    harness = (
+        "set -u\n"
+        f'GENESIS_ROOT="{root}"\n'
+        f'VENV_DIR="{venv}"\n'
+        + _extract_named_function("_metadata_python")
+        + "\n"
+        + _extract_named_function("_resolve_commit_object")
+        + "\n"
+        + _extract_function()
+        + "\n_tier2_pending_since_baseline\n"
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": str(bin_dir), "HOME": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr

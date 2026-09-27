@@ -90,19 +90,6 @@ def _unrelated_merge_repo(tmp_path: Path) -> tuple[Path, str, str, str]:
     return repo, base, feature, incoming
 
 
-def _json_reader_stub() -> str:
-    return """_read_json_field() {
-    python3 - "$1" "$2" <<'PY'
-import json, sys
-try:
-    print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
-except Exception:
-    pass
-PY
-}
-"""
-
-
 def _run_post_merge_block(
     repo: Path,
     home: Path,
@@ -124,9 +111,12 @@ def _run_post_merge_block(
         f'CONFLICT_FILE="{conflict_file}"\n'
         "POST_MERGE=true\nDEPLOY_BRANCH=main\nUPDATE_REMOTE=origin\n"
         "OLD_TAG=old\nOLD_COMMIT=old\n"
-        + _json_reader_stub()
+        # The SHIPPED reader, not a stub: a stub that swallows parse errors would
+        # hide whether a corrupt saved-state file stops the resume.
+        + _function(UPDATE.read_text(), "_read_json_field")
+        + "\n"
         + _block(UPDATE.read_text(), "post-merge-target-recovery")
-        + 'printf \'%s\\n%s\\n\' "$DEPLOY_HEAD" "$ROLLBACK_TAG"\n'
+        + 'printf \'%s\\n%s\\n%s\\n%s\\n\' "$DEPLOY_HEAD" "$ROLLBACK_TAG" "$OLD_COMMIT" "$OLD_TAG"\n'
     )
     return subprocess.run(
         ["bash", "-c", script],
@@ -457,8 +447,11 @@ def test_update_merges_and_verifies_fetched_remote_head() -> None:
     text = UPDATE.read_text()
     assert 'DEPLOY_FETCH_REF="refs/genesis-update-head"' in text
     assert 'DEPLOY_HEAD=$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_FETCH_REF")' in text
-    assert 'merge "$DEPLOY_FETCH_REF" --no-edit' in text
-    verify = text.index('merge-base --is-ancestor "$DEPLOY_FETCH_REF" HEAD')
+    # The merge and the activation check name the SAME pinned sha, not the ref:
+    # the check must prove exactly the commit that was merged.
+    assert 'merge "$DEPLOY_HEAD" --no-edit' in text
+    assert 'merge "$DEPLOY_FETCH_REF"' not in text
+    verify = text.index('merge-base --is-ancestor "$DEPLOY_HEAD" HEAD')
     restart = text.index("--- Restarting services ---")
     success = text.index('_record_update_history "success"', verify)
     assert verify < restart
@@ -553,6 +546,8 @@ def test_tier2_baseline_resolves_abbreviated_commit_objects(tmp_path: Path) -> N
     script = (
         "set -euo pipefail\n"
         f'GENESIS_ROOT="{repo}"\nVENV_DIR="{tmp_path / "missing-venv"}"\n'
+        + _function(UPDATE.read_text(), "_metadata_python")
+        + "\n"
         + _function(UPDATE.read_text(), "_resolve_commit_object")
         + "\n"
         + _block(UPDATE.read_text(), "tier2-baseline-check")
@@ -738,6 +733,41 @@ def test_every_success_record_uses_marker_capable_variable() -> None:
     ), "no-delta must clear the marker only after reading the unit's actual state"
 
 
+def _case_arms(case_text: str) -> dict[str, str]:
+    """Map each `label)` of a bash case statement to its body (labels normalised)."""
+    body = case_text.split(" in", 1)[1]
+    arms: dict[str, str] = {}
+    for chunk in body.split(";;"):
+        match = re.match(r"\s*([^()\n]+)\)(.*)", chunk, re.DOTALL)
+        if match:
+            label = "|".join(part.strip() for part in match.group(1).split("|"))
+            arms[label] = match.group(2)
+    return arms
+
+
+def test_p6_treats_an_unreadable_status_as_a_recovery() -> None:
+    """Unknown is not "nothing failed" (owner decision on #2435, round 3).
+
+    Recovery costs a restart plus a health check with rollback on failure;
+    reading unknown as an operator stop would record success over what may be a
+    live failure. Allowlist: exactly the three statuses recover, nothing else.
+    """
+    text = UPDATE.read_text()
+    # Word boundary: `_nd_last_status=…` (the no-delta site) contains this name.
+    match = re.search(r'(?<![\w])_last_status="\$\(_latest_update_status\)"', text)
+    assert match, "P6 status read not found"
+    case_start = text.index('case "$_last_status" in', match.end())
+    case = text[case_start : text.index("esac", case_start)]
+    arms = _case_arms(case)
+    recovering = sorted(
+        status
+        for label, body in arms.items()
+        if "_recovery=true" in body
+        for status in label.split("|")
+    )
+    assert recovering == ["failed", "rolled_back", "unreadable"]
+
+
 def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> None:
     """With the server down, a latest `failed`/`rolled_back` row must stay latest.
 
@@ -751,11 +781,16 @@ def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> Non
     start = text.index('elif [ -n "$_nd_base_degraded" ]')
     branch = text[start : text.index("Nothing to do.", start)]
     assert '_nd_last_status="$(_latest_update_status)"' in branch
-    guard = branch[branch.index('case "$_nd_last_status" in') :]
-    failed_arm = guard[guard.index("failed | rolled_back)") : guard.index(";;")]
-    assert "_record_update_history" not in failed_arm, (
-        "the failed/rolled_back arm must not write any update_history row"
-    )
+    guard = branch[branch.index('case "$_nd_last_status" in') : branch.index("esac")]
+    arms = _case_arms(guard)
+    # ALLOWLIST: only the catch-all may record. A new arm added later is refused
+    # by default instead of silently writing success over an unknown status.
+    recording = [label for label, body in arms.items() if "_record_update_history" in body]
+    assert recording == ["*"], f"only the catch-all arm may record; recording: {recording}"
+    for status in ("failed", "rolled_back", "unreadable"):
+        assert any(status in label.split("|") for label in arms), (
+            f"status {status!r} needs its own non-recording arm"
+        )
     # P6 reads the SAME status through the SAME reader, so the two cannot drift:
     # exactly two call sites (P6 and this branch), and the query exists once.
     assert re.findall(r"(\w+)=\"\$\(_latest_update_status\)\"", text) == [
@@ -793,24 +828,40 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
         assert not unit_up(state), f"state {state!r} must not read as up"
 
     home = tmp_path / "home"
-    venv = tmp_path / "venv"
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "bin" / "python").chmod(0o755)
+    root = tmp_path / "install"
+    # The venv is MISSING — the state a failed update can leave behind. The
+    # history writer falls back to another 3.12+ interpreter in that state, so
+    # the reader must too, or it cannot see the very row the writer recorded.
+    missing_venv = tmp_path / "missing-venv"
+    metadata_python = _function(UPDATE.read_text(), "_metadata_python")
 
-    def latest() -> str:
+    def latest(path: str | None = None) -> str:
+        env = _clean_env(HOME=str(home))
+        if path is not None:
+            env["PATH"] = path
         result = subprocess.run(
-            ["bash", "-c", f'VENV_DIR="{venv}"\n' + block + "\n_latest_update_status"],
+            [
+                "/bin/bash",
+                "-c",
+                f'GENESIS_ROOT="{root}"\nVENV_DIR="{missing_venv}"\n'
+                + metadata_python
+                + "\n"
+                + block
+                + "\n_latest_update_status",
+            ],
             capture_output=True,
             text=True,
-            env=_clean_env(HOME=str(home)),
+            env=env,
         )
         assert result.returncode == 0, result.stderr
         return result.stdout.strip()
 
     assert latest() == "", "no database must read as empty, not fail"
-    db = home / "genesis" / "data" / "genesis.db"
+    db = root / "data" / "genesis.db"
     db.parent.mkdir(parents=True)
+    sqlite3.connect(db).execute("PRAGMA user_version = 1")
+    assert latest() == "", "a database with no history table yet is ABSENT, not unreadable"
+
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE update_history (status TEXT, started_at TEXT)")
     con.execute("INSERT INTO update_history VALUES ('success', '2026-01-01T00:00:00')")
@@ -818,6 +869,24 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     con.commit()
     con.close()
     assert latest() == "rolled_back", "the NEWEST row, by started_at, must win"
+
+    # The reader follows GENESIS_ROOT, the path the writer uses — never a fixed
+    # home-relative database, which on another install layout is a different file.
+    decoy = home / "genesis" / "data" / "genesis.db"
+    decoy.parent.mkdir(parents=True)
+    con = sqlite3.connect(decoy)
+    con.execute("CREATE TABLE update_history (status TEXT, started_at TEXT)")
+    con.execute("INSERT INTO update_history VALUES ('success', '2027-01-01T00:00:00')")
+    con.commit()
+    con.close()
+    assert latest() == "rolled_back", "must read $GENESIS_ROOT's database, not ~/genesis's"
+
+    # Unknown is not "nothing recorded": both unreadable states say so.
+    no_python = tmp_path / "no-python-bin"
+    no_python.mkdir()
+    assert latest(path=str(no_python)) == "unreadable", "no usable interpreter"
+    db.write_bytes(b"this is not a sqlite database" * 100)
+    assert latest() == "unreadable", "a database that exists but cannot be read"
 
 
 def test_success_degraded_helper_marks_server_not_restarted() -> None:
@@ -851,7 +920,7 @@ def test_post_merge_recovers_target_from_old_state_merge_parent(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
-    deploy_head, rollback_tag = result.stdout.splitlines()[-2:]
+    deploy_head, rollback_tag = result.stdout.splitlines()[-4:-2]
     assert deploy_head == incoming
     assert _git(repo, "rev-parse", f"{rollback_tag}^{{commit}}") == base
 
@@ -870,7 +939,7 @@ def test_post_merge_uses_recorded_fetch_head_without_network(tmp_path: Path) -> 
     )
 
     assert result.returncode == 0, result.stderr
-    deploy_head, _rollback_tag = result.stdout.splitlines()[-2:]
+    deploy_head, _rollback_tag = result.stdout.splitlines()[-4:-2]
     assert deploy_head == incoming
 
 
@@ -888,7 +957,7 @@ def test_post_merge_legacy_fetch_head_recovery_needs_no_network(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
-    deploy_head, _rollback_tag = result.stdout.splitlines()[-2:]
+    deploy_head, _rollback_tag = result.stdout.splitlines()[-4:-2]
     assert deploy_head == incoming
 
 
@@ -903,7 +972,7 @@ def test_post_merge_recovers_target_from_conflict_target_commit(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
-    deploy_head, rollback_tag = result.stdout.splitlines()[-2:]
+    deploy_head, rollback_tag = result.stdout.splitlines()[-4:-2]
     assert deploy_head == incoming
     assert _git(repo, "rev-parse", f"{rollback_tag}^{{commit}}") == base
 
@@ -935,7 +1004,7 @@ def test_saved_old_commit_cannot_be_shadowed_by_a_ref(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    _deploy_head, rollback_tag = result.stdout.splitlines()[-2:]
+    _deploy_head, rollback_tag = result.stdout.splitlines()[-4:-2]
     assert _git(repo, "rev-parse", f"{rollback_tag}^{{commit}}") == base
 
 
@@ -991,6 +1060,123 @@ def test_post_merge_rejects_a_rollback_tag_at_an_older_ancestor(tmp_path: Path) 
     assert "does not point at this merge's pre-merge parent" in result.stderr
 
 
+def _merge_after_later_work(tmp_path: Path) -> tuple[Path, str]:
+    """History base -> later -> merge(incoming): HEAD^1 is `later`, not `base`."""
+    repo, base, _incoming = _merged_repo(tmp_path)
+    _git(repo, "reset", "--hard", base)
+    (repo / "later.txt").write_text("later\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-m", "later work on main")
+    _git(repo, "merge", "--no-ff", "incoming", "-m", "merge incoming")
+    return repo, base
+
+
+def test_post_merge_rejects_rebuilding_a_tag_at_a_stale_old_commit(tmp_path: Path) -> None:
+    """The tag-RECONSTRUCTION arm needs the same equality as the saved-tag arm.
+
+    With no usable saved tag, the tag is rebuilt from the saved old_commit. A
+    stale conflict record can carry an old_commit from an earlier run; rebuilt
+    there, a later rollback would discard every commit after it. Control arm:
+    test_post_merge_recovers_target_from_old_state_merge_parent, where old_commit
+    IS the merge's first parent and the tag is rebuilt.
+    """
+    repo, base = _merge_after_later_work(tmp_path)
+    result = _run_post_merge_block(
+        repo, tmp_path / "home", state={"old_commit": base, "rollback_tag": ""}, conflict=None
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "saved old_commit does not match this merge's pre-merge parent" in result.stderr
+    assert _git(repo, "tag", "--list", "pre-update-*") == ""
+
+
+def test_post_merge_derives_old_commit_from_the_proven_parent(tmp_path: Path) -> None:
+    """OLD_COMMIT/OLD_TAG come from HEAD^1, not HEAD, when the state has no old_commit.
+
+    At startup both are computed from HEAD, which in post-merge mode is the merge
+    itself; they were only replaced when saved values existed, so an absent field
+    left OLD_COMMIT == NEW_COMMIT.
+    """
+    repo, base, _incoming = _merged_repo(tmp_path)
+    _git(repo, "tag", "v1.0.0", base)
+    _git(repo, "tag", "pre-update-saved", base)
+
+    result = _run_post_merge_block(
+        repo, tmp_path / "home", state={"rollback_tag": "pre-update-saved"}, conflict=None
+    )
+
+    assert result.returncode == 0, result.stderr
+    _head, rollback_tag, old_commit, old_tag = result.stdout.splitlines()[-4:]
+    assert rollback_tag == "pre-update-saved"
+    assert old_commit == _git(repo, "rev-parse", "--short", base)
+    assert old_tag == "v1.0.0"
+
+
+def test_post_merge_rejects_a_saved_target_that_head_merely_contains(tmp_path: Path) -> None:
+    """The saved deploy head must BE what this merge merged, not just be in history.
+
+    Ancestry admitted any commit HEAD contains, e.g. a stale conflict target from
+    an earlier run that later history already includes. Control arm:
+    test_post_merge_uses_recorded_fetch_head_without_network (the merged head).
+    """
+    repo, base, _incoming = _merged_repo(tmp_path)
+    assert _git(repo, "merge-base", "--is-ancestor", base, "HEAD") == ""  # contained
+
+    result = _run_post_merge_block(
+        repo,
+        tmp_path / "home",
+        state={"old_commit": base, "rollback_tag": "", "deploy_head": base},
+        conflict=None,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "did not merge the fetched deploy head" in result.stderr
+    assert _git(repo, "tag", "--list", "pre-update-*") == ""
+
+
+def test_post_merge_refuses_when_head_is_not_the_merge(tmp_path: Path) -> None:
+    """A commit on top of the merge means the rollback point cannot be proven."""
+    repo, base, incoming = _merged_repo(tmp_path)
+    _git(repo, "tag", "pre-update-saved", base)
+    (repo / "fix.txt").write_text("fix\n")
+    _git(repo, "add", "fix.txt")
+    _git(repo, "commit", "-m", "fix on top of the merge")
+
+    # A durable deploy_head, so the refusal comes from the merge-shape check and
+    # not from failing to identify the target.
+    result = _run_post_merge_block(
+        repo,
+        tmp_path / "home",
+        state={"rollback_tag": "pre-update-saved", "deploy_head": incoming},
+        conflict=None,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "HEAD is not a merge" in result.stderr
+
+
+def test_post_merge_stops_on_a_corrupt_saved_state_file(tmp_path: Path) -> None:
+    """A state file that exists but cannot be parsed is not "nothing saved".
+
+    Read as absent, the resume fell through to the conflict file's values (which
+    may belong to a different run). Control arm: the same valid content resumes.
+    """
+    repo, base, _incoming = _merged_repo(tmp_path)
+    home = tmp_path / "home"
+    valid = {"old_commit": base, "rollback_tag": ""}
+    for corrupt in ('{"old_commit": ', '["not", "an", "object"]'):
+        state_file = home / ".genesis" / "update_state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(corrupt)
+        result = _run_post_merge_block(repo, home, state=None, conflict=valid)
+        assert result.returncode != 0, (corrupt, result.stdout)
+        assert "update_state.json" in result.stderr, result.stderr
+        assert _git(repo, "tag", "--list", "pre-update-*") == ""
+
+    control = _run_post_merge_block(repo, home, state=valid, conflict=None)
+    assert control.returncode == 0, control.stderr
+
+
 def test_post_merge_rejects_wrong_head_before_creating_rollback_tag(
     tmp_path: Path,
 ) -> None:
@@ -1020,7 +1206,7 @@ def test_post_merge_rejects_wrong_head_before_creating_rollback_tag(
     )
 
     assert result.returncode != 0
-    assert "does not contain the fetched deploy head" in result.stderr
+    assert "did not merge the fetched deploy head" in result.stderr
     assert _git(repo, "tag", "--list", "pre-update-*") == ""
 
 

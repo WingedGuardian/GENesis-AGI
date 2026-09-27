@@ -138,13 +138,35 @@ PY
 }
 
 _read_json_field() {
+    # Print one field of a saved-state JSON file. An ABSENT file or field prints
+    # "" and succeeds — nothing was recorded. A file that EXISTS but cannot be
+    # parsed as a JSON object fails with a message: the saved rollback point and
+    # deploy target live in these files, so a corrupt one must stop the resume
+    # rather than read as "nothing saved" and fall through to another file's
+    # values. (Comment kept inside the body: tests slice functions from one
+    # definition to the next, and a comment above a definition ends the previous
+    # slice without a newline.)
     local file="$1"
     local field="$2"
-    [ -f "$file" ] || return 1
-    GH_STATE_FILE="$file" GH_FIELD="$field" \
-        python3 -c \
-        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get(os.environ['GH_FIELD'],''))" \
-        2>/dev/null
+    [ -f "$file" ] || return 0
+    GH_STATE_FILE="$file" GH_FIELD="$field" python3 - <<'PY'
+import json
+import os
+import sys
+
+path = os.environ["GH_STATE_FILE"]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except Exception as exc:
+    print(f"ERROR: cannot read {path}: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(doc, dict):
+    print(f"ERROR: {path} is not a JSON object", file=sys.stderr)
+    sys.exit(1)
+value = doc.get(os.environ["GH_FIELD"])
+print("" if value is None else value)
+PY
 }
 
 # Detect the remote supplying the deploy branch, prove this is the primary
@@ -193,9 +215,9 @@ UPDATE_REMOTE="$(_detect_update_remote)" || exit 1
 genesis_assert_primary_checkout "$GENESIS_ROOT" || exit 1
 _saved_prevalidate_deploy_branch=""
 if [[ "$POST_MERGE" == "true" ]]; then
-    _saved_prevalidate_deploy_branch="$(_read_json_field "$STATE_FILE" deploy_branch || true)"
+    _saved_prevalidate_deploy_branch="$(_read_json_field "$STATE_FILE" deploy_branch)" || exit 1
     if [ -z "$_saved_prevalidate_deploy_branch" ] && [ -f "$CONFLICT_FILE" ]; then
-        _saved_prevalidate_deploy_branch="$(_read_json_field "$CONFLICT_FILE" deploy_branch || true)"
+        _saved_prevalidate_deploy_branch="$(_read_json_field "$CONFLICT_FILE" deploy_branch)" || exit 1
     fi
     if [ -n "$_saved_prevalidate_deploy_branch" ] \
         && ! git check-ref-format --branch "$_saved_prevalidate_deploy_branch" >/dev/null 2>&1; then
@@ -860,25 +882,22 @@ _candidate_is_current_deploy_head() {
 }
 
 _saved_rt=""
-_saved_old_tag=""
 _saved_old_commit=""
 _saved_old_commit_rev=""
 _saved_deploy_branch=""
 _saved_deploy_head=""
 _saved_target_commit=""
 if [[ "$POST_MERGE" == "true" ]]; then
-    _saved_rt="$(_read_json_field "$STATE_FILE" rollback_tag || true)"
-    _saved_old_tag="$(_read_json_field "$STATE_FILE" old_tag || true)"
-    _saved_old_commit="$(_read_json_field "$STATE_FILE" old_commit || true)"
-    _saved_deploy_branch="$(_read_json_field "$STATE_FILE" deploy_branch || true)"
-    _saved_deploy_head="$(_read_json_field "$STATE_FILE" deploy_head || true)"
+    _saved_rt="$(_read_json_field "$STATE_FILE" rollback_tag)" || exit 1
+    _saved_old_commit="$(_read_json_field "$STATE_FILE" old_commit)" || exit 1
+    _saved_deploy_branch="$(_read_json_field "$STATE_FILE" deploy_branch)" || exit 1
+    _saved_deploy_head="$(_read_json_field "$STATE_FILE" deploy_head)" || exit 1
     if [ -f "$CONFLICT_FILE" ]; then
-        [ -n "$_saved_rt" ] || _saved_rt="$(_read_json_field "$CONFLICT_FILE" rollback_tag || true)"
-        [ -n "$_saved_old_tag" ] || _saved_old_tag="$(_read_json_field "$CONFLICT_FILE" old_tag || true)"
-        [ -n "$_saved_old_commit" ] || _saved_old_commit="$(_read_json_field "$CONFLICT_FILE" old_commit || true)"
-        [ -n "$_saved_deploy_branch" ] || _saved_deploy_branch="$(_read_json_field "$CONFLICT_FILE" deploy_branch || true)"
-        [ -n "$_saved_deploy_head" ] || _saved_deploy_head="$(_read_json_field "$CONFLICT_FILE" deploy_head || true)"
-        _saved_target_commit="$(_read_json_field "$CONFLICT_FILE" target_commit || true)"
+        [ -n "$_saved_rt" ] || _saved_rt="$(_read_json_field "$CONFLICT_FILE" rollback_tag)" || exit 1
+        [ -n "$_saved_old_commit" ] || _saved_old_commit="$(_read_json_field "$CONFLICT_FILE" old_commit)" || exit 1
+        [ -n "$_saved_deploy_branch" ] || _saved_deploy_branch="$(_read_json_field "$CONFLICT_FILE" deploy_branch)" || exit 1
+        [ -n "$_saved_deploy_head" ] || _saved_deploy_head="$(_read_json_field "$CONFLICT_FILE" deploy_head)" || exit 1
+        _saved_target_commit="$(_read_json_field "$CONFLICT_FILE" target_commit)" || exit 1
     fi
     if [ -n "$_saved_old_commit" ]; then
         _saved_old_commit_rev="$(_resolve_commit_object "$_saved_old_commit" || true)"
@@ -911,8 +930,22 @@ if [[ "$POST_MERGE" == "true" ]]; then
         echo "       parent matching the deploy branch's fetched head." >&2
         exit 1
     fi
-    if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD; then
-        echo "ERROR: post-merge HEAD does not contain the fetched deploy head $DEPLOY_HEAD." >&2
+    # Post-merge resumes exactly ONE shape: HEAD is the conflict-resolution merge,
+    # its first parent is the pre-merge deploy-branch commit, its second parent is
+    # the fetched deploy head. Every saved value is checked for EQUALITY against
+    # those parents, never ancestry: ancestry admits an OLDER commit (rolling back
+    # to it discards every commit after it) or a stale target from an earlier run
+    # that later history happens to contain.
+    _pm_base="$(git -C "$GENESIS_ROOT" rev-parse --verify --quiet 'HEAD^1^{commit}' || true)"
+    _pm_merged="$(git -C "$GENESIS_ROOT" rev-parse --verify --quiet 'HEAD^2^{commit}' || true)"
+    if [ -z "$_pm_base" ] || [ -z "$_pm_merged" ]; then
+        echo "ERROR: post-merge mode expects HEAD to be the conflict-resolution merge commit," >&2
+        echo "       but HEAD is not a merge. Commits made on top of that merge are not" >&2
+        echo "       supported here: the rollback point could not be proven." >&2
+        exit 1
+    fi
+    if [ "$DEPLOY_HEAD" != "$_pm_merged" ]; then
+        echo "ERROR: post-merge HEAD did not merge the fetched deploy head $DEPLOY_HEAD." >&2
         exit 1
     fi
 
@@ -920,13 +953,9 @@ if [[ "$POST_MERGE" == "true" ]]; then
     if [ -n "$_saved_rt" ] && [[ "$_saved_rt" == pre-update-* ]] \
         && git -C "$GENESIS_ROOT" show-ref --verify --quiet "refs/tags/$_saved_rt"; then
         _saved_rt_commit="$(git -C "$GENESIS_ROOT" rev-parse "refs/tags/$_saved_rt^{commit}")"
-        # EQUALITY with the merge's first parent, not ancestry. `--is-ancestor`
-        # also admits an OLDER commit on that side, and rolling back to it would
-        # discard every commit between it and the real pre-merge state — e.g. when
-        # the branch advanced after the conflicted run, or stale conflict state is
-        # resumed. The old_commit comparison below cannot cover this: it is
+        # The old_commit comparison below cannot stand in for this one: it is
         # skipped when the saved state carries no old_commit.
-        if [ "$_saved_rt_commit" != "$(git -C "$GENESIS_ROOT" rev-parse 'HEAD^1^{commit}' 2>/dev/null)" ]; then
+        if [ "$_saved_rt_commit" != "$_pm_base" ]; then
             echo "ERROR: saved rollback tag $_saved_rt does not point at this merge's pre-merge parent." >&2
             exit 1
         fi
@@ -938,6 +967,14 @@ if [[ "$POST_MERGE" == "true" ]]; then
         ROLLBACK_TAG="$_saved_rt"
         echo "  Post-merge mode: reusing rollback tag $ROLLBACK_TAG"
     elif [ -n "$_saved_old_commit_rev" ]; then
+        # Same equality as the saved-tag arm: a stale conflict record can carry an
+        # old_commit from an earlier run, and a tag rebuilt there would roll back
+        # past the real pre-merge state.
+        if [ "$_saved_old_commit_rev" != "$_pm_base" ]; then
+            echo "ERROR: saved old_commit does not match this merge's pre-merge parent;" >&2
+            echo "       refusing to rebuild a rollback tag there." >&2
+            exit 1
+        fi
         if git -C "$GENESIS_ROOT" show-ref --verify --quiet "refs/tags/$ROLLBACK_TAG"; then
             if [ "$(git -C "$GENESIS_ROOT" rev-parse "refs/tags/$ROLLBACK_TAG^{commit}")" != "$_saved_old_commit_rev" ]; then
                 echo "ERROR: reconstructed rollback tag $ROLLBACK_TAG already points at a different commit." >&2
@@ -951,8 +988,13 @@ if [[ "$POST_MERGE" == "true" ]]; then
         echo "ERROR: post-merge update cannot identify the pre-merge commit to roll back to." >&2
         exit 1
     fi
-    [ -n "$_saved_old_tag" ] && OLD_TAG="$_saved_old_tag"
-    [ -n "$_saved_old_commit_rev" ] && OLD_COMMIT="$_saved_old_commit_rev"
+    # OLD_TAG/OLD_COMMIT were computed from HEAD at startup, which in this mode is
+    # the merge itself. Derive both from the pre-merge commit every arm above just
+    # proved, rather than from saved fields that may be absent — an absent field
+    # left OLD_COMMIT equal to NEW_COMMIT (empty change log, wrong history row,
+    # guardian drift check comparing a commit with itself).
+    OLD_COMMIT="$(git -C "$GENESIS_ROOT" rev-parse --short "$_pm_base")"
+    OLD_TAG="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$_pm_base" 2>/dev/null || echo "untagged")"
 else
     git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
     echo "  Rollback tag: $ROLLBACK_TAG"
@@ -1414,24 +1456,49 @@ _success_degraded_subsystems() {
 # END success-degraded-subsystems
 
 # BEGIN deploy-outcome-probes (extracted by tests/test_scripts/test_update_deploy_safety.py)
-# Status of the most recent update_history row, or "" when it cannot be read.
-# ONE reader for the two places that must agree on it: P6's recovery detection,
-# and the no-delta path, which must not write a newer success row over an
-# unresolved `failed`/`rolled_back` one — when last_update_failure.json was
-# never written, that row is the only signal recovery has.
+# Status of the most recent update_history row. ONE reader for the two places
+# that must agree on it: P6's recovery detection, and the no-delta path, which
+# must not write a newer success row over an unresolved `failed`/`rolled_back`
+# one — when last_update_failure.json was never written, that row is the only
+# signal recovery has.
+#
+# Prints the status; "" only when nothing is recorded (no database file, no
+# table yet, no rows); and "unreadable" when a row may exist but could not be
+# read. Callers treat "unreadable" as a possible unresolved failure, never as
+# "nothing recorded". It reads the database _record_update_history writes
+# ($GENESIS_ROOT, not a fixed home path) with the same interpreter selection,
+# so anything that writer could record, this reader can read.
 _latest_update_status() {
-    "$VENV_DIR/bin/python" - <<'PYEOF' 2>/dev/null || true
+    local db_path="$GENESIS_ROOT/data/genesis.db"
+    if [ ! -f "$db_path" ]; then
+        echo ""
+        return 0
+    fi
+    local py=""
+    py="$(_metadata_python 12 || true)"
+    if [ -z "$py" ]; then
+        echo "unreadable"
+        return 0
+    fi
+    GH_DB_PATH="$db_path" "$py" - <<'PYEOF' 2>/dev/null || echo "unreadable"
 import os
 import sqlite3
+import sys
 
 try:
-    con = sqlite3.connect(os.path.expanduser("~/genesis/data/genesis.db"), timeout=5)
-    row = con.execute(
-        "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    print(row[0] if row else "")
+    # Read-only: never create or migrate the database from a status probe.
+    con = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute(
+            "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        row = None
+    print((row[0] or "") if row else "")
 except Exception:
-    print("")
+    sys.exit(1)
 PYEOF
 }
 
@@ -1724,7 +1791,9 @@ done
 echo "--- Merging $UPDATE_REMOTE/$DEPLOY_BRANCH ---"
 MERGE_OUTPUT=""
 MERGE_RC=0
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$DEPLOY_FETCH_REF" --no-edit 2>&1) || MERGE_RC=$?
+# Merge the sha pinned right after the fetch, not the ref name: the activation
+# check below proves exactly this commit landed, so the two must name one object.
+MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -1742,8 +1811,8 @@ if [[ $MERGE_RC -ne 0 ]]; then
         # whole conflict context. Filenames with quotes broke the array the same
         # way. Guarded with `if !` (ERR-trap-exempt): a failure to write this
         # advisory supervisor context must NOT trip the armed rollback trap.
-        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'untagged')"
-        _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse "$DEPLOY_FETCH_REF" 2>/dev/null || echo 'unknown')"
+        _uc_target_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo 'untagged')"
+        _uc_target_commit="$DEPLOY_HEAD"
         _uc_py="$(_metadata_python 11 || true)"
         if [ -z "$_uc_py" ]; then
             echo "  WARNING: could not write structured conflict context (no Python 3.11+ interpreter)" >&2
@@ -1820,7 +1889,7 @@ PYEOF
     fi
 fi
 
-if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_FETCH_REF" HEAD; then
+if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD; then
     trap - ERR INT TERM
     _do_rollback "merge completed without activating fetched deploy head $DEPLOY_HEAD"
     exit 1
@@ -1837,27 +1906,42 @@ NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 # recovery, so a no-op pull must still fall through to full activation
 # (bootstrap + migrations + restart + a fresh update_history baseline) when
 # update.sh-only paths changed since the last recorded success. Returns 0
-# (pending) when the diff is non-empty OR errors (fail toward the full run);
-# baseline unknown/unresolvable (pre-first-update install, rewritten history)
-# returns 1 — shortcut as before, the awareness alert still covers it. Keep
-# the path list in LOCKSTEP with TIER2_PATHS in
+# (pending) when the diff is non-empty OR errors (fail toward the full run) —
+# including a history that exists but cannot be read, which is NOT the same as
+# no baseline. A baseline that is genuinely absent or unresolvable
+# (pre-first-update install, no table or success row yet, rewritten history)
+# returns 1 — shortcut as before, the awareness alert still covers it. Reads
+# with the history writer's interpreter selection. Keep the path list in
+# LOCKSTEP with TIER2_PATHS in
 # src/genesis/observability/snapshots/deploy_health.py.
 _tier2_pending_since_baseline() {
     local _baseline=""
     if [ -f "$GENESIS_ROOT/data/genesis.db" ]; then
+        local _py=""
+        _py="$(_metadata_python 12 || true)"
+        [ -n "$_py" ] || return 0
         _baseline=$(GH_DB_PATH="$GENESIS_ROOT/data/genesis.db" \
-            python3 - 2>/dev/null <<'PYEOF' || true
+            "$_py" - 2>/dev/null <<'PYEOF'
 import os
 import sqlite3
+import sys
 
-conn = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True)
-row = conn.execute(
-    "SELECT new_commit FROM update_history WHERE status='success' "
-    "ORDER BY datetime(completed_at) DESC LIMIT 1"
-).fetchone()
-print((row[0] or "").strip() if row else "")
+try:
+    conn = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT new_commit FROM update_history WHERE status='success' "
+            "ORDER BY datetime(completed_at) DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        row = None
+    print((row[0] or "").strip() if row else "")
+except Exception:
+    sys.exit(1)
 PYEOF
-        )
+        ) || return 0
     fi
     [ -n "$_baseline" ] || return 1
     _baseline="$(_resolve_commit_object "$_baseline" || true)"
@@ -1959,6 +2043,10 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
             failed | rolled_back)
                 echo "  NOTE: genesis-server is not running and the last update ended" \
                     "'$_nd_last_status' — not recording over it, so recovery still sees it."
+                ;;
+            unreadable)
+                echo "  NOTE: genesis-server is not running and the last update's status" \
+                    "could not be read — not recording over what may be an unresolved failure."
                 ;;
             *)
                 echo "  NOTE: recording degraded subsystem: $_nd_degraded"
@@ -2173,8 +2261,8 @@ _write_state "health_check"
 # a recovery re-run — the server SHOULD come back and be health-verified; or (b)
 # the operator deliberately stopped it before updating — respect that, don't
 # start what they stopped. Distinguish via failure artifacts: a leftover
-# last_update_failure.json, or a last update_history status of rolled_back/failed,
-# marks a recovery. Without the recovery push, the restart+health block below is
+# last_update_failure.json, or a last update_history status of rolled_back/failed
+# (or one that cannot be read), marks a recovery. Without the recovery push, the restart+health block below is
 # skipped and we'd record "success" with the server down and no health check.
 _OPERATOR_STOP=false
 if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
@@ -2185,6 +2273,13 @@ if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
         _last_status="$(_latest_update_status)"
         case "$_last_status" in
             rolled_back | failed) _recovery=true ;;
+            unreadable)
+                # Unknown is not "nothing failed". Recovering costs a restart and
+                # a health check (with rollback on failure); guessing "operator
+                # stop" would record success over what may be a live failure.
+                echo "  Last update status could not be read — treating this as a recovery run."
+                _recovery=true
+                ;;
             *) : ;;
         esac
     fi

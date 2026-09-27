@@ -120,6 +120,20 @@ is robustness (a hung fetch no longer extends an outage), not a downtime rewrite
   (721/945/1140/1188) are untouched.
 - **`POST_MERGE` gating:** the pre-stop fetch is `POST_MERGE==false`-gated so the
   `--post-merge` CC-conflict re-entry (which must not re-fetch) skips it.
+- **Post-merge resume proves its rollback point by EQUALITY.** HEAD must be the
+  conflict-resolution merge; its second parent must equal the fetched deploy
+  head and its first parent the rollback point (a saved tag, or one rebuilt from
+  a saved `old_commit`). Ancestry would admit an older commit, and rolling back
+  to it discards the commits after it. `OLD_COMMIT`/`OLD_TAG` derive from that
+  proven first parent. A commit made on top of the merge is refused, because the
+  rollback point cannot be proven then. A saved-state file that exists but does
+  not parse stops the resume.
+- **Update-history reads mirror the writer.** `_latest_update_status` and the
+  tier-2 baseline read `$GENESIS_ROOT/data/genesis.db` read-only, using the
+  writer's `_metadata_python 12` selection. They separate ABSENT (no file, no
+  table, no row) from UNREADABLE, and UNREADABLE always takes the side that
+  reports or recovers. The no-change path records nothing over it; P6 treats it
+  as a recovery; the tier-2 check runs the full activation.
 - **Marker race (Move 2):** refresh lands after restart, before `_write_state
   "done"` (1228) — server collector stays gated.
 - **Alternate exits unchanged:** up-to-date (940–977) and merge-conflict (838+)
