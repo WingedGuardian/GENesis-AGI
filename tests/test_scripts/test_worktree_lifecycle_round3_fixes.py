@@ -20,6 +20,7 @@ against code that does nothing.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -822,3 +823,117 @@ def test_a_failed_pin_leaves_the_worktree_in_place(
     assert wl._trash_worktree(entry, repo) is False
     assert (wt / "w.txt").exists(), "a reap that could not pin must not move the worktree"
     assert not any(trash.iterdir()) if trash.exists() else True, "the claimed trash name was left behind"
+
+
+def _archived_refs(repo: Path) -> dict[str, str]:
+    out = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/archived").stdout
+    return dict(line.split(" ") for line in out.splitlines() if line)
+
+
+def _commit_in(wt: Path, name: str) -> str:
+    (wt / name).write_text(name + "\n")
+    _git(wt, "add", name)
+    _git(wt, "commit", "--quiet", "-m", name)
+    return _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+
+def _detached_wt(repo: Path, tmp_path: Path, monkeypatch, name: str):
+    wt = tmp_path / name
+    _git(repo, "worktree", "add", "--quiet", "--detach", str(wt))
+    a = _commit_in(wt, "a.txt")
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
+    return wt, a, {"path": str(wt), "branch": "", "head": a, "detached": True}
+
+
+def _commit_during_rename(monkeypatch, wt: Path) -> list:
+    """A session commits in the worktree right before the move, so the fresh HEAD
+    read after the move is a newer commit than the one pinned before it."""
+    made: list = []
+    real = wl.os.rename
+
+    def rename(src, dst):
+        if not made:
+            made.append(_commit_in(wt, "b.txt"))
+        return real(src, dst)
+
+    monkeypatch.setattr(wl.os, "rename", rename)
+    return made
+
+
+def test_a_head_that_advances_during_the_reap_gets_its_own_pin(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """B (committed after the pre-move pin, before the fresh post-move read) is a
+    child of A, so one ref on B keeps both reachable via the parent chain -- the
+    pin does not need to move to a second ref for this, only the pinned commit
+    needs to be moved from A to B."""
+    wt, a, entry = _detached_wt(repo, tmp_path, monkeypatch, "wt-advance")
+    made = _commit_during_rename(monkeypatch, wt)
+    assert wl._trash_worktree(entry, repo) is True
+    b = made[0]
+    assert list(_archived_refs(repo).values()) == [b], "the pin must move to the new HEAD, not stay on the stale one"
+    last = json.loads((tmp_path / "tomb.jsonl").read_text().splitlines()[-1])
+    assert last["commit"] == b, "recovery must be pointed at the HEAD that was actually archived"
+    _git(repo, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "--prune=now")
+    for sha in (a, b):
+        assert _git(repo, "cat-file", "-e", sha).returncode == 0, f"{sha[:8]} must stay reachable"
+
+
+def test_a_failed_re_pin_is_retried_once(repo: Path, tmp_path: Path, monkeypatch) -> None:
+    wt, a, entry = _detached_wt(repo, tmp_path, monkeypatch, "wt-retry")
+    made = _commit_during_rename(monkeypatch, wt)
+    real, calls = wl._pin_archive, []
+
+    def flaky(repo_root, ref, sha):
+        calls.append(sha)
+        return False if made and calls.count(sha) == 1 and sha == made[0] else real(repo_root, ref, sha)
+
+    monkeypatch.setattr(wl, "_pin_archive", flaky)
+    assert wl._trash_worktree(entry, repo) is True
+    assert list(_archived_refs(repo).values()) == [made[0]]
+    assert _git(repo, "cat-file", "-e", a).returncode == 0, "the stale pin's commit stays reachable through its child"
+
+
+def test_a_re_pin_that_keeps_failing_is_not_reported_as_success(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    wt, a, entry = _detached_wt(repo, tmp_path, monkeypatch, "wt-noremp")
+    made = _commit_during_rename(monkeypatch, wt)
+    real = wl._pin_archive
+    monkeypatch.setattr(wl, "_pin_archive", lambda r, ref, sha: False if made and sha == made[0] else real(r, ref, sha))
+    assert wl._trash_worktree(entry, repo) is False, "an unpinned HEAD must not finalize as a clean archive"
+    assert not (tmp_path / "tomb.jsonl").exists() or not (tmp_path / "tomb.jsonl").read_text().strip()
+    assert not list((tmp_path / "trash").glob("*.tar.gz")), "the entry must stay uncompressed for another attempt"
+
+
+def test_a_failed_post_move_read_never_moves_the_pin_backwards(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    wt, a, entry = _detached_wt(repo, tmp_path, monkeypatch, "wt-noread")
+    b = _commit_in(wt, "b.txt")  # committed after the classification snapshot `a`, before the reap
+    real = wl._run_git
+    trash = str(tmp_path / "trash")
+
+    def run_git(root, args, *, timeout):
+        if args[:1] == ["-C"] and args[1].startswith(trash) and args[2:4] == ["rev-parse", "HEAD"]:
+            return None
+        return real(root, args, timeout=timeout)
+
+    monkeypatch.setattr(wl, "_run_git", run_git)
+    assert wl._trash_worktree(entry, repo) is True
+    assert set(_archived_refs(repo).values()) == {b}, "the pin must stay on the HEAD it was taken at"
+    last = json.loads((tmp_path / "tomb.jsonl").read_text().splitlines()[-1])
+    assert last["commit"] == b, "never record the older classification snapshot when the read fails"
+
+
+def test_a_failed_move_drops_the_pin_it_took(repo: Path, tmp_path: Path, monkeypatch) -> None:
+    wt, a, entry = _detached_wt(repo, tmp_path, monkeypatch, "wt-nomove")
+
+    def rename(src, dst):
+        raise OSError(errno.EACCES, "denied")
+
+    monkeypatch.setattr(wl.os, "rename", rename)
+    assert wl._trash_worktree(entry, repo) is False
+    assert (wt / "a.txt").exists()
+    assert _archived_refs(repo) == {}, "a reap that moved nothing must not leave a pin behind"

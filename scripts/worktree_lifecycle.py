@@ -1358,6 +1358,13 @@ def _trash_worktree(
             os.rename(str(wt_path), str(trash_path))
         except OSError as e:
             if e.errno != errno.EXDEV:
+                # The move never happened, so the worktree is still live at wt_path.
+                # The pin taken above now points at a commit with no archive behind
+                # it; drop it so a de-anchored ref doesn't outlive the reap it was
+                # for. Best-effort: a ref left behind here only keeps a commit
+                # reachable longer than needed, which is the safe direction.
+                with contextlib.suppress(Exception):
+                    _run_git(repo_root, ["update-ref", "-d", pin_ref], timeout=15)
                 raise
             _log(f"  NOTE {trash_path.name}: trash is on another filesystem — "
                  "copying instead; the claimed name is briefly unheld")
@@ -1542,6 +1549,14 @@ def _trash_worktree(
         fresh = _run_git(repo_root, ["-C", str(trash_path), "rev-parse", "HEAD"], timeout=15)
         if fresh and fresh.strip():
             meta["head"] = meta["commit"] = fresh.strip()
+        else:
+            # Could not confirm whether a session committed in the gap between the
+            # pre-move pin and now. meta["commit"] carries the classification
+            # snapshot taken before the archive step, which may be stale -- but
+            # pin_sha is what is ACTUALLY pinned, so record that, never the snapshot;
+            # recording the snapshot here would send a later --recover to a commit
+            # this archive's ref does not protect.
+            meta["head"] = meta["commit"] = pin_sha
         with contextlib.suppress(OSError):
             final_meta.write_text(json.dumps(meta, indent=2))
             os.chmod(final_meta, _PRIVATE_FILE_MODE)
@@ -1554,13 +1569,29 @@ def _trash_worktree(
         # recovering an uncompressed entry consumes it and leaves its ref behind),
         # so nothing deletes these refs; whatever removes an archive must also
         # `git update-ref -d` its ref.
-        # The pin was taken before the move; if a session committed in the gap,
-        # move it to the fresh HEAD the metadata now records. The older commit
-        # stays reachable through its descendant.
+        # The pin was taken before the move; if a session committed in the gap, move
+        # it to the fresh HEAD the metadata now records. The older commit stays
+        # reachable through its descendant, so this can only be skipped, never done
+        # backwards: `fresh` above already decided what meta["commit"] is, and when
+        # that read failed meta["commit"] is pin_sha itself (see above), not the
+        # stale classification snapshot -- so anchor_sha here is trustworthy IF the
+        # read succeeded, and otherwise trivially equals pin_sha and this is a no-op.
         anchor_sha = str(meta.get("commit") or "").strip()
-        if anchor_sha and anchor_sha != pin_sha and not _pin_archive(repo_root, pin_ref, anchor_sha):
-            _log(f"  WARN could not move {pin_ref} to the post-move HEAD {anchor_sha[:8]}; "
-                 f"it still pins {pin_sha[:8]}")
+        if anchor_sha and anchor_sha != pin_sha:
+            repinned = _pin_archive(repo_root, pin_ref, anchor_sha)
+            if not repinned:
+                _log(f"  WARN could not move {pin_ref} to the post-move HEAD {anchor_sha[:8]}; retrying once")
+                repinned = _pin_archive(repo_root, pin_ref, anchor_sha)
+            if not repinned:
+                # A pin that still points at pin_sha does not protect anchor_sha --
+                # reachability runs from descendants to ancestors, not the other way
+                # -- so this cannot be finalized as a clean archive. The entry stays
+                # in the trash directory, uncompressed and without a tombstone, for
+                # a later run to retry; the worktree registration is already gone,
+                # so `--recover` still reaches it as a directory.
+                _log(f"ERROR {wt_path}: could not pin the post-move HEAD {anchor_sha[:8]} under "
+                     f"{pin_ref} after a retry; {trash_path} is left uncompressed for another attempt")
+                return False
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
 
