@@ -3398,7 +3398,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 
 | Change type | Deploy path |
 |---|---|
-| Runtime code | `git pull` + server restart (update.sh does both) |
+| Runtime code | `scripts/deploy_code_only.sh` (a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or unmet dependencies, and stands the Guardian and watchdog down), or `update.sh` for dependency, unit or host changes. Run it in the background: it waits for the lock and for health. Validating against the live server? Hold `flock -s -w 7200 ~/.genesis/locks/update.lock <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery), so also record `systemctl --user show -p MainPID,ActiveEnterTimestamp genesis-server` and `git rev-parse HEAD` at the start and the end: if either differs, the run is invalid |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |

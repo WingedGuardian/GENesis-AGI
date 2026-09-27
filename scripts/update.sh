@@ -34,18 +34,40 @@ fi
 # The update script may update itself during git merge, which would corrupt
 # the running process. Industry standard (Chrome, Homebrew, Windows Update):
 # copy to temp, exec from there, so the original can be safely overwritten.
-if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ]; then
+#
+# "We are the copy" is proven by the copy's own path, not by a flag alone. The
+# flag is inherited: a server started by the nohup fallback below is a child of
+# this script, and a dashboard update launched from that server passes its whole
+# environment on. With the flag alone, that update skipped the copy, ran IN
+# PLACE (the mid-merge hazard this guard exists for), and its EXIT trap then
+# deleted the repository's own scripts/update.sh.
+if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ] \
+    || [ "${GENESIS_UPDATE_SELF_COPY:-}" != "${BASH_SOURCE[0]}" ]; then
     mkdir -p "$HOME/tmp"
     TEMP_COPY=$(mktemp "$HOME/tmp/genesis-update-XXXXXX.sh")
+    # If the copy cannot be completed, remove it. `exec` below replaces this
+    # process, so on success this trap never fires.
+    trap 'rm -f "$TEMP_COPY" 2>/dev/null' EXIT
     cp "$0" "$TEMP_COPY"
     chmod +x "$TEMP_COPY"
     export GENESIS_UPDATE_FROM_TEMP=1
+    export GENESIS_UPDATE_SELF_COPY="$TEMP_COPY"
     # Pass original script dir so GENESIS_ROOT resolves correctly
     export GENESIS_UPDATE_ORIG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
     exec "$TEMP_COPY" "$@"
 fi
-# Running from temp copy — clean up on exit
-trap 'rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
+# Running from temp copy — clean up on exit. Bind the path NOW: bash expands
+# ${BASH_SOURCE[0]} inside a trap when the trap FIRES. If the script exits while
+# inside a function defined in a sourced lib — an explicit `exit`, an unbound
+# variable under `set -u`, or a `set -e` failure before the ERR trap is armed —
+# it names that LIB, deleting the lib and leaking this copy. Every EXIT trap
+# below names "$_SELF_COPY" instead, and it is readonly so no later code can
+# re-point it.
+readonly _SELF_COPY="${BASH_SOURCE[0]}"
+trap 'rm -f "$_SELF_COPY" 2>/dev/null' EXIT
+# The copy handshake is spent. Nothing this run starts (bootstrap, a nohup'd
+# server, a later dashboard update) may inherit it.
+unset GENESIS_UPDATE_FROM_TEMP GENESIS_UPDATE_SELF_COPY
 
 # ── Ensure systemctl --user works ───────────────────────
 # CC sessions lack D-Bus env vars, causing systemctl --user to fail silently
@@ -67,25 +89,17 @@ STATE_FILE="$HOME/.genesis/update_state.json"
 
 # Guardian pause across the deploy's server restart (PR-2). We pause the host
 # Guardian's gateway before the stop and resume on EXIT, so a deploy doesn't trip
-# it to confirmed_dead and fire false down/recovered alerts. Coords are resolved
-# lazily inside _guardian_pause and stashed here for resume (kept SEPARATE from the
-# HOST_IP/SSH_KEY globals _sync_deploy_targets owns).
-_GUARDIAN_PAUSED=""
-_GUARDIAN_HOST=""
-_GUARDIAN_KEY=""
-_GUARDIAN_RENEW_PID=""   # PID of the background lease-renewer (P2 #4), if running
-# Generous TTL: the EXIT-trap resume ends the pause early on success, so this only
-# matters if the deploy is SIGKILLed (the host's expires_at then self-heals after
-# this long). The bound is the server-DOWN window (~3-15 min), not the total pause
-# (the long host-sync runs server-up); capped at the guardian's 3600.
-GUARDIAN_PAUSE_TTL=1800
-# Bounded lease-renew (P2 #4): the stop→restart window has NO upper bound (the
-# bootstrap does unbounded network work — installer downloads, npm), so a fixed
-# TTL can expire mid-deploy and re-fire the very alerts the pause suppresses. A
-# background renewer re-issues `pause` every TTL/2 while the server is down. CAPPED
-# so an orphaned renewer (parent died before cleanup) self-terminates in
-# ~ RENEW_MAX * TTL/2 (here ~1h) instead of pausing the guardian forever.
-GUARDIAN_PAUSE_RENEW_MAX=4
+# it to confirmed_dead and fire false down/recovered alerts. The pause, resume and
+# lease renewer live in scripts/lib/guardian_pause.sh, shared with
+# deploy_code_only.sh, together with GUARDIAN_PAUSE_TTL and
+# GUARDIAN_PAUSE_RENEW_MAX. Sourced HERE, before anything can change the checkout:
+# the functions are defined in memory for the rest of the run.
+# shellcheck source=lib/guardian_pause.sh
+. "$SCRIPT_DIR/lib/guardian_pause.sh"
+# The deploy-in-progress marker helpers and EPHEMERAL_DIRTY_RE (the tracked paths
+# a deploy may find dirty), shared with restore.sh and deploy_code_only.sh.
+# shellcheck source=lib/deploy_marker.sh
+. "$SCRIPT_DIR/lib/deploy_marker.sh"
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
@@ -661,7 +675,8 @@ _sync_deploy_targets() {
 # own comment instructed) go permanently dirty. This release de-tracks it — the
 # real per-install USER.md is now .gitignored and seeded from USER.md.example —
 # and the user-md backup/restore pair carries the filled copy through the rename.)
-EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$| src/genesis/identity/USER\.md$'
+# EPHEMERAL_DIRTY_RE itself is defined ONCE, in scripts/lib/deploy_marker.sh
+# (sourced above), so deploy_code_only.sh excuses exactly the same paths.
 if [[ "$POST_MERGE" == "false" ]]; then
     DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null \
         | grep -v "^??" \
@@ -837,104 +852,8 @@ _start_genesis_server() {
 }
 
 # ── Guardian pause / resume across the server restart (PR-2) ─────────────────
-# Pause the host Guardian's gateway before we stop genesis-server, so the deploy
-# restart doesn't trip it to confirmed_dead / fire false down+recovered alerts.
-# BEST-EFFORT ONLY: at the pause site `set -e` is live and the ERR trap is not yet
-# armed, so a bare SSH failure would ABORT the deploy — every SSH is
-# `timeout … || true` (version-verb style, NOT fetch style, which exit 1s). Host
-# coords are resolved lazily here (no hoisted resolver → nothing enters the
-# phase-order chain) into separate globals. The `pause` verb only stands the
-# Guardian down once PR-1's gateway is on the host; against an old gateway it
-# errors and we proceed unpaused (safe, dark). No-op when no host is configured.
-_guardian_pause() {
-    local cfg="$HOME/.genesis/guardian_remote.yaml"
-    [ -f "$cfg" ] || return 0
-    local hip hus key
-    hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
-    hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
-    # Honor the configured ssh_key (guardian_remote.yaml), expanding a leading ~,
-    # and fall back to the historical default when the field is absent/empty.
-    key=$("$VENV_DIR/bin/python" -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
-    [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
-    [ -n "$hip" ] && [ -f "$key" ] || return 0
-    _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
-    _GUARDIAN_KEY="$key"
-    # Don't clobber a pause we did not create (P2 #1): if the gateway already has an
-    # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
-    # proceed WITHOUT pausing and WITHOUT arming resume, so our EXIT never removes
-    # their pause (a pre-existing pause already covers our restart window). Against
-    # an OLD gateway with no `paused` verb the query errors/returns non-JSON → no
-    # match → we fall through and pause as before (backward-compatible). The pipe is
-    # in an `if` condition, so a failing ssh can't abort the deploy.
-    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" paused 2>/dev/null | grep -q '"paused": true'; then
-        echo "  Guardian already paused (operator/other) — leaving it intact; not arming our resume"
-        return 0
-    fi
-    # Only mark paused (and arm the resume) if the gateway ACCEPTED the verb.
-    # Against an OLD gateway (no `pause <ttl>` grammar — needs PR-1 deployed) or an
-    # unreachable host this fails; we then proceed unpaused with a VISIBLE warning
-    # instead of a misleading "paused" + silence. The `if` is set -e-safe (a failing
-    # condition never aborts), so a denied/unreachable pause can't abort the deploy.
-    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1; then
-        _GUARDIAN_PAUSED=1
-        echo "  Guardian paused across the restart (ttl ${GUARDIAN_PAUSE_TTL}s)"
-        # Resume on ANY exit, COMPOSED with the temp-copy self-delete (never
-        # replace it — a resume-only re-arm would leak the mktemp copy each deploy).
-        trap '_guardian_resume; rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
-        # Start the bounded lease renewer so an over-TTL downtime can't expire the
-        # pause mid-deploy (P2 #4). _guardian_resume (and the EXIT trap) kills it.
-        # Redirect its fds so it (and its `sleep` child) don't hold the deploy's
-        # stdout/stderr — otherwise a lingering sleep would keep the pipe open.
-        _guardian_renew_loop >/dev/null 2>&1 &
-        _GUARDIAN_RENEW_PID=$!
-    else
-        echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
-    fi
-}
-
-_guardian_resume() {
-    [ "${_GUARDIAN_PAUSED:-}" = 1 ] || return 0
-    # Stop the lease renewer FIRST so it cannot re-pause after we resume (P2 #4).
-    # We never `wait` the renewer before this point, so its PID stays held (running,
-    # or a zombie once the bounded loop self-exits) and CANNOT be reused — so kill -0
-    # reliably identifies our own process (no PID-reuse hazard, no fragile identity
-    # check). `wait` reaps the renewer bash, stopping further renewals. RESIDUAL: a
-    # `pause` ssh already in flight when the kill lands (~15s window, only if the
-    # kill hits mid-renew) is orphaned and may complete AFTER the resume below,
-    # re-asserting the pause — bounded + self-healing via the host-side TTL (≤ the
-    # pause TTL, ≤30min). All steps non-aborting under set -e.
-    if [ -n "${_GUARDIAN_RENEW_PID:-}" ]; then
-        if kill -0 "$_GUARDIAN_RENEW_PID" 2>/dev/null; then
-            kill "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
-        fi
-        wait "$_GUARDIAN_RENEW_PID" 2>/dev/null || true
-        _GUARDIAN_RENEW_PID=""
-    fi
-    # Clear the flag ONLY after the gateway accepts `resume`. On a transient SSH
-    # failure the flag stays set so the EXIT-trap retries; if every retry fails the
-    # host-side TTL (expires_at) self-heals. Clearing first would no-op the retry.
-    if timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-        "$_GUARDIAN_HOST" resume >/dev/null 2>&1; then
-        _GUARDIAN_PAUSED=""
-    fi
-    return 0
-}
-
-_guardian_renew_loop() {
-    # Re-issue `pause $TTL` every TTL/2 while the server is down, BOUNDED to
-    # GUARDIAN_PAUSE_RENEW_MAX iterations. Runs in the background (started by
-    # _guardian_pause); _guardian_resume — and thus the EXIT trap — kills it. A
-    # failed renew is swallowed (best-effort, like the pause itself).
-    local i=0
-    while [ "$i" -lt "$GUARDIAN_PAUSE_RENEW_MAX" ]; do
-        sleep "$((GUARDIAN_PAUSE_TTL / 2))"
-        timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-            "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
-        i=$((i + 1))
-    done
-}
+# _guardian_pause / _guardian_resume / _guardian_renew_loop live in
+# scripts/lib/guardian_pause.sh (sourced near the top of this script).
 
 # ── Pre-update DB snapshot ────────────────────────────────
 # Flush the WAL and create a clean backup before stopping services.
@@ -1011,7 +930,12 @@ done
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # Pause the host Guardian BEFORE the stop so it never sees the restart as an
-    # outage. Best-effort; on success it arms the EXIT-trap resume.
+    # outage. Best-effort. The resume rides the EXIT trap, COMPOSED with the
+    # temp-copy self-delete (a resume-only re-arm would leak the mktemp copy every
+    # deploy). It is armed BEFORE the pause, so no signal can land between an
+    # accepted pause and its resume; _guardian_resume no-ops until a pause is
+    # accepted.
+    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null' EXIT
     _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come

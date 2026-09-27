@@ -46,7 +46,9 @@ NEVER use `nohup` or bare `python -m genesis serve` — a bare process holds
 the lock file and blocks the systemd unit.
 
 ```bash
-systemctl --user restart genesis-server          # Restart (NEVER nohup)
+scripts/deploy_code_only.sh                      # Deploy code: locked pull + restart (run in background)
+scripts/deploy_code_only.sh --no-pull            # Restart only, locked (run in background)
+systemctl --user restart genesis-server          # Bare restart: bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server           # Check
 journalctl --user -u genesis-server -n 50        # Logs
 systemctl --user list-units 'genesis-*' --all    # All units
@@ -91,7 +93,8 @@ pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS speci
 python3 scripts/pytest_lock_wait.py                # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
-systemctl --user restart genesis-server           # Restart server (NEVER nohup)
+scripts/deploy_code_only.sh                       # Deploy pulled code (locked; background it)
+systemctl --user restart genesis-server           # Bare restart, bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server            # Verify server running
 ```
 
