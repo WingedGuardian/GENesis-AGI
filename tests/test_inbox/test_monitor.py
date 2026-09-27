@@ -3533,12 +3533,32 @@ async def test_baseline_guard_delta_only_new_items(
 # ── BUILD verdict fallback: never silently dropped when the lane is not live ──
 
 
-def _build_eval(verdict: str | None, next_step: str = "Build the widget skill") -> str:
+_VALID_BUILD_SPEC = (
+    "build_spec:\n"
+    "  requirements: [\"Add widget\"]\n"
+    "  steps: [\"write widget.py\"]\n"
+    "  success_criteria: [\"widget imports\"]\n"
+    "  risks: [\"none material\"]\n"
+    "  intended_paths: [\"src/genesis/skills/widget/\"]\n"
+)
+
+
+def _build_eval(
+    verdict: str | None,
+    next_step: str = "Build the widget skill",
+    *,
+    build_spec: bool | None = None,
+) -> str:
+    """``build_spec`` defaults to present iff the verdict is ``build``."""
     verdict_lines = (
         f'verdict: {verdict}\nverdict_reason: "Stated reason for the verdict"\n'
         if verdict is not None
         else ""
     )
+    if build_spec is None:
+        build_spec = verdict == "build"
+    if build_spec:
+        verdict_lines += _VALID_BUILD_SPEC
     return (
         "# Inbox Evaluation\n\n"
         "## 1. Widget Skill\n\n"
@@ -3688,3 +3708,34 @@ async def test_changed_build_verdict_is_not_deduped_away(monitor, db):
         source_files=["Capabilities.md"],
     )
     assert created == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_build_verdict_without_usable_spec_is_a_discussion(monitor, db, lane):
+    """Parity with BuildLane._handle_build: an unusable build_spec fails closed
+    to needs_discussion, never a pinned build request."""
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build", build_spec=False),
+        batch_id="batch-build-7",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    assert rows[0]["content"].startswith("[BUILD: NEEDS DISCUSSION] Widget Skill")
+    assert "build_spec" in rows[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_rephrased_next_step_does_not_duplicate_build_fallback(monitor, db):
+    """The LLM rephrases next_step across evaluations; the fallback dedups on
+    stable item identity + verdict (as BuildLane.item_key excludes next_step)."""
+    for i, step in enumerate(("Build the widget skill", "Implement a widget skill")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval("build", next_step=step),
+            batch_id=f"batch-build-8{i}",
+            source_files=["Capabilities.md"],
+        )
+    assert len(await _build_follow_ups(db)) == 1

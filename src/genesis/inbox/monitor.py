@@ -2716,6 +2716,7 @@ class InboxMonitor:
         import hashlib
         import sqlite3
 
+        from genesis.autonomy.build_lane import build_spec_usable
         from genesis.db.crud import follow_ups
         from genesis.inbox.recommendation import parse_recommendations
 
@@ -2733,8 +2734,15 @@ class InboxMonitor:
 
             title = rec.item_title or "Untitled"
             label = rec.action.upper()
+            effective_verdict = rec.verdict
+            spec_downgraded = False
             if build_fallback:
-                build_mapping = self._BUILD_FALLBACK_MAP.get(rec.verdict or "")
+                if effective_verdict == "build" and not build_spec_usable(rec.build_spec):
+                    # Parity with BuildLane._handle_build: an unusable
+                    # build_spec fails closed to needs_discussion.
+                    effective_verdict = "needs_discussion"
+                    spec_downgraded = True
+                build_mapping = self._BUILD_FALLBACK_MAP.get(effective_verdict or "")
                 if build_mapping is None:
                     logger.warning(
                         "Build lane not live and BUILD recommendation for %r has "
@@ -2765,13 +2773,18 @@ class InboxMonitor:
                     " Build lane not live — capability-build verdict recorded "
                     f"here instead. Verdict: {rec.verdict}."
                 )
+                if spec_downgraded:
+                    reason += (
+                        " build_spec missing or incomplete — recorded as "
+                        "needs_discussion, as the build lane would."
+                    )
                 if rec.verdict_reason:
                     reason += f" Verdict reason: {rec.verdict_reason}"
                 logger.info(
                     "Build lane not live — BUILD verdict for %r (verdict=%s) "
                     "routed to a %s row",
                     title,
-                    rec.verdict,
+                    effective_verdict,
                     kind,
                 )
 
@@ -2783,12 +2796,16 @@ class InboxMonitor:
             primary = (
                 normalize_url_line(urls_in_title[0]) if urls_in_title else title.strip().lower()
             )
-            dedup_basis = f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}"
             if build_fallback:
-                # A changed verdict on the same item + next_step is a NEW
-                # decision, not a duplicate — without the verdict in the key the
-                # later verdict would be deduped away against the earlier row.
-                dedup_basis += f"|verdict={rec.verdict}"
+                # BUILD fallback keys on stable item identity + verdict, like
+                # BuildLane.item_key: next_step is LLM prose that is rephrased
+                # across evaluations (it would duplicate the decision), while a
+                # changed verdict IS a new decision and must not be deduped away.
+                dedup_basis = f"inbox_build_fallback|{primary}|verdict={effective_verdict}"
+            else:
+                dedup_basis = (
+                    f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}"
+                )
             dedup_key = hashlib.sha256(dedup_basis.encode()).hexdigest()
             if await follow_ups.exists_by_dedup_key(self._db, dedup_key):
                 logger.debug("Skipping duplicate inbox follow-up: %s", title)

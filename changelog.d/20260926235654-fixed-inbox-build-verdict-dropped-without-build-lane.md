@@ -7,6 +7,9 @@
   user-owned follow-up; `needs_discussion` becomes a pinned follow-up labelled
   as a discussion rather than a build task; a `dont_build` veto is kept as a
   tabled record and never becomes actionable work. Each carries the verdict's
-  stated reason. A BUILD block with no valid verdict creates nothing and logs a
-  warning, matching the lane. A changed verdict for the same item is recorded
-  rather than deduplicated away. With the lane live, nothing changes.
+  stated reason. As in the lane, a `build` verdict whose build spec is missing
+  or incomplete is recorded as `needs_discussion`, and a BUILD block with no
+  valid verdict creates nothing and logs a warning. Rows are deduplicated per
+  item and verdict: a re-evaluation that merely rephrases the next step adds
+  nothing, while a changed verdict is recorded. With the lane live, nothing
+  changes.

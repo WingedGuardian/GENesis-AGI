@@ -5041,3 +5041,39 @@ async def test_invocation_failed_coalesces_per_class_and_tag(monkeypatch, fail_b
     assert len(fail_bus.events) == 3
     assert fail_bus.events[-1][4]["caller_tag"] == "a"
     assert fail_bus.events[-1][4]["coalesced"] == 2
+
+
+def test_failure_event_bus_lookup_never_constructs_a_runtime():
+    """Observability must not lazily build a blank runtime singleton."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.runtime import GenesisRuntime
+
+    saved = GenesisRuntime._instance
+    GenesisRuntime._instance = None
+    try:
+        assert inv_mod._runtime_event_bus() is None
+        assert GenesisRuntime._instance is None
+    finally:
+        GenesisRuntime._instance = saved
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_attributes_and_keys_by_routed_model(monkeypatch, fail_bus, entry):
+    """Two sessions with one caller_tag but different roster routes are
+    different outages: neither may be coalesced behind the other, and the
+    event names the routed model, not just the requested tier."""
+    from dataclasses import replace as dc_replace
+
+    import genesis.cc.invoker as inv_mod
+
+    def _apply_active(inv):
+        if inv.prompt == "peer":
+            return dc_replace(inv, model_id_override="peer-model"), "peer-model"
+        return inv, "claude"
+
+    monkeypatch.setattr(inv_mod.roster, "apply_active", _apply_active)
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for prompt in ("native", "peer"):
+        with pytest.raises(CCTimeoutError):
+            await _call(invoker, entry, CCInvocation(prompt=prompt, caller_tag="direct_session.observe"))
+    assert [e[4]["roster_model"] for e in fail_bus.events] == ["claude", "peer-model"]

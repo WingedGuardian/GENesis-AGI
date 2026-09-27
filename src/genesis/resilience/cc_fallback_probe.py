@@ -113,8 +113,9 @@ class CCFallbackProbeWorker:
             # block the fallback scheduler. 300s (not 60s) leaves headroom for
             # cross-machine latency while still bounding a hung probe.
             timeout_s=300,
-            # Its failures are the expected "not back yet" answer, not an
-            # incident: the invoker skips cc.invocation_failed for this tag.
+            # Its rate-limit/quota failures are the expected "not back yet"
+            # answer, so the invoker skips cc.invocation_failed for those; any
+            # other probe failure (timeout, missing binary) is still emitted.
             caller_tag=PROBE_CALLER_TAG,
             **overrides,
         )

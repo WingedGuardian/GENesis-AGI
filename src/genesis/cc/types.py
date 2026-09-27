@@ -312,9 +312,10 @@ def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
 VALID_MODEL_NAMES: frozenset[str] = frozenset(m.value for m in CCModel)
 VALID_EFFORT_NAMES: frozenset[str] = frozenset(e.value for e in EffortLevel)
 
-#: ``CCInvocation.caller_tag`` value marking a liveness probe. Its failures are
-#: the expected "not back yet" answer, not an incident, so the invoker emits no
-#: ``cc.invocation_failed`` event for it.
+#: ``CCInvocation.caller_tag`` value marking a liveness probe. Its rate-limit /
+#: quota failures are the expected "not back yet" answer, so the invoker emits
+#: no ``cc.invocation_failed`` event for THOSE; any other probe failure (a
+#: timeout, a missing binary) is a malfunction and is emitted.
 PROBE_CALLER_TAG = "probe"
 
 
@@ -418,9 +419,10 @@ class CCInvocation:
     # Observability label naming the call site that dispatched this invocation
     # (e.g. "ego.cycle", "inbox.eval", "direct_session.<profile>"). Carried on the
     # ``cc.invocation_failed`` event so a failure is attributable to its caller,
-    # and used as half of that event's coalescing key. The value "probe" marks a
-    # liveness probe whose failures are expected and are NOT emitted. None →
-    # untagged (still emitted). Never changes control flow.
+    # and used as part of that event's coalescing key. PROBE_CALLER_TAG marks a
+    # liveness probe whose expected rate-limit/quota failures are NOT emitted
+    # (other probe failures are). None → untagged: always emitted, never
+    # coalesced. Never changes control flow.
     caller_tag: str | None = None
     # WS-3 session-level provenance. When set, CCInvoker._build_env stamps
     # GENESIS_SESSION_ORIGIN so the session's memory MCP writes carry this
