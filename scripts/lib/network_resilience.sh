@@ -42,16 +42,55 @@ _NETRES_KEEP_CONF=$'[Network]\nKeepConfiguration=true'
 _NETRES_WATCHDOG_TIMER=$'[Unit]\nDescription=Genesis network watchdog — heal a wedged systemd-networkd\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=2min\nAccuracySec=20s\n\n[Install]\nWantedBy=timers.target'
 
 # Service content is built from the install dir so the ExecStart path tracks
-# NETRES_LIBEXEC_DIR (real install and test overrides stay consistent).
+# NETRES_LIBEXEC_DIR (real install and test overrides stay consistent). The
+# optional second arg is the owning user's alert queue: the watchdog runs as
+# root, so it cannot find that user's ~/.genesis on its own.
 _netres_service_content() {
     printf '%s\n' \
         '[Unit]' \
-        'Description=Genesis network watchdog (heal wedged systemd-networkd)' \
+        'Description=Genesis network watchdog (heal wedged systemd-networkd or a stuck Tailscale tunnel)' \
         'After=systemd-networkd.service' \
         '' \
         '[Service]' \
-        'Type=oneshot' \
-        "ExecStart=$1"
+        'Type=oneshot'
+    if [[ -n "${2:-}" && "$2" != *[[:cntrl:]]* ]]; then
+        # (A path carrying a control character — a newline would start a new
+        # unit directive — is dropped: the watchdog then alerts via the journal.)
+        # systemd expands %-specifiers and C escapes inside a quoted
+        # Environment= value: double the %, escape backslash and quote.
+        local q="${2//\\/\\\\}"
+        q="${q//\"/\\\"}"
+        q="${q//%/%%}"
+        printf '%s\n' "Environment=\"NETWD_ALERT_QUEUE=$q\""
+    fi
+    printf '%s\n' "ExecStart=$1"
+}
+
+# The Genesis user's durable alert queue (genesis.env.alert_queue_root:
+# ${GENESIS_HOME:-~/.genesis}/alerts/queue). Normally this runs as that user
+# (bootstrap/update, with sudo per write). Run as root via sudo, it resolves
+# SUDO_USER's home instead of /root. Plain root with no SUDO_USER prints
+# nothing, and the watchdog then alerts via the journal only. Created here as
+# the user, because a directory the root watchdog created would be root-owned
+# and unusable by the drainer.
+_netres_alert_queue_dir() {
+    if [[ -n "${NETRES_ALERT_QUEUE:-}" ]]; then
+        printf '%s' "$NETRES_ALERT_QUEUE"
+        return 0
+    fi
+    local dir
+    if [[ "$(id -u)" -eq 0 ]]; then
+        [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || return 0
+        local home
+        home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+        [[ -n "$home" ]] || return 0
+        dir="$home/.genesis/alerts/queue"
+        sudo -u "$SUDO_USER" mkdir -p "$dir" 2>/dev/null || true
+    else
+        dir="${GENESIS_HOME:-$HOME/.genesis}/alerts/queue"
+        mkdir -p "$dir" 2>/dev/null || true
+    fi
+    printf '%s' "$dir"
 }
 
 # _netres_put_file <path> <content> <mode> — write-if-different via sudo. Bumps
@@ -138,7 +177,7 @@ _netres_install_watchdog() {
     fi
     local before=$_NETRES_WROTE
     _netres_put_file "$dst" "$(cat "$NETRES_WATCHDOG_SRC")" "0755"
-    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst")" "0644"
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst" "$(_netres_alert_queue_dir)")" "0644"
     _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.timer" "$_NETRES_WATCHDOG_TIMER" "0644"
     # Reload only when a unit file actually changed this run.
     if ((_NETRES_WROTE > before)); then
