@@ -775,3 +775,50 @@ def test_archive_ref_names_are_valid_for_awkward_entry_names() -> None:
         ref = wl._archive_ref(name)
         rc = subprocess.run(["git", "check-ref-format", ref], capture_output=True).returncode
         assert rc == 0, (name, ref)
+
+
+def test_archive_ref_stays_distinct_and_short_for_colliding_names() -> None:
+    a, b = wl._archive_ref("a:b-20260926"), wl._archive_ref("a?b-20260926")
+    assert a != b, "names that sanitize identically must not share a ref"
+    assert wl._archive_ref("a:b-20260926") == a, "the ref must be stable for one name"
+    long_ref = wl._archive_ref("x" * 400)
+    assert len(long_ref.rsplit("/", 1)[1]) + len(".lock") <= 255
+    assert subprocess.run(["git", "check-ref-format", long_ref], capture_output=True).returncode == 0
+
+
+def test_two_colliding_archives_both_stay_pinned_through_gc(repo: Path) -> None:
+    home = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    _git(repo, "checkout", "--quiet", "--detach")
+    shas = []
+    for i in range(3):
+        _git(repo, "commit", "--quiet", "--allow-empty", "-m", f"work {i}")
+        shas.append(_git(repo, "rev-parse", "HEAD").stdout.strip())
+    _git(repo, "checkout", "--quiet", home)
+    assert wl._pin_archive(repo, wl._archive_ref("a:b-20260926"), shas[0])
+    assert wl._pin_archive(repo, wl._archive_ref("a?b-20260926"), shas[1])
+    _git(repo, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now",
+         "gc", "--prune=now")
+    assert _git(repo, "cat-file", "-e", shas[0]).returncode == 0
+    assert _git(repo, "cat-file", "-e", shas[1]).returncode == 0
+    assert _git(repo, "cat-file", "-e", shas[2]).returncode != 0, "control: an unpinned commit is collected"
+
+
+def test_a_failed_pin_leaves_the_worktree_in_place(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    wt = tmp_path / "wt-unpinned"
+    _git(repo, "worktree", "add", "--quiet", "--detach", str(wt))
+    (wt / "w.txt").write_text("unique\n")
+    _git(wt, "add", "w.txt")
+    _git(wt, "commit", "--quiet", "-m", "unique work")
+    sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+    trash = tmp_path / "trash"
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
+    monkeypatch.setattr(wl, "_pin_archive", lambda *a, **k: False)
+    entry = {"path": str(wt), "branch": "", "head": sha, "detached": True}
+
+    assert wl._trash_worktree(entry, repo) is False
+    assert (wt / "w.txt").exists(), "a reap that could not pin must not move the worktree"
+    assert not any(trash.iterdir()) if trash.exists() else True, "the claimed trash name was left behind"

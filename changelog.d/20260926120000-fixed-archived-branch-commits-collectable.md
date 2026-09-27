@@ -4,5 +4,7 @@
   the archived branch was deleted, the worktree's HEAD reflog was the only
   reference left, and it expires after 30 days by default, after which `git gc`
   collected the commits and `--recover` restored files with nothing under them.
-  Each archive now also gets its own `refs/archived/<entry>` ref, which keeps the
-  commits reachable regardless of reflog expiry.
+  Each archive now also gets its own `refs/archived/<entry>-<digest>` ref, created
+  and verified before the worktree moves (a reap that cannot pin leaves the
+  worktree in place and retries), which keeps the commits reachable regardless of
+  reflog expiry.

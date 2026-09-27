@@ -852,11 +852,25 @@ ARCHIVE_SUFFIX = ".tar.gz"
 
 
 def _archive_ref(entry_name: str) -> str:
-    """Ref name that pins an archive's commits: ``refs/archived/<entry>``."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", entry_name).replace("..", "._").strip(".")
-    if safe.endswith(".lock"):
-        safe = safe[:-5] + "_lock"
-    return f"refs/archived/{safe or 'entry'}"
+    """Ref name that pins an archive's commits: ``refs/archived/<entry>-<digest>``.
+
+    Sanitizing alone is not injective (``a:b`` and ``a?b`` both become ``a_b``),
+    and a shared ref would let the second archive's ``update-ref`` silently drop
+    the first one's pin. The digest is over the ORIGINAL entry name, so it stays
+    stable and distinct; the readable part is cut short to leave room for git's
+    255-byte component limit and its ``.lock`` file suffix.
+    """
+    digest = hashlib.sha256(entry_name.encode("utf-8", "surrogateescape")).hexdigest()[:10]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", entry_name).replace("..", "._").strip(".")[:120]
+    return f"refs/archived/{safe or 'entry'}-{digest}"
+
+
+def _pin_archive(repo_root: Path, ref: str, sha: str) -> bool:
+    """Point *ref* at *sha* and verify git resolves it back to that commit."""
+    if not sha or _run_git(repo_root, ["update-ref", ref, sha], timeout=15) is None:
+        return False
+    resolved = _run_git(repo_root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], timeout=15)
+    return bool(resolved) and resolved.strip() == sha
 
 
 def _archive_path(trash_path: Path) -> Path:
@@ -1313,6 +1327,25 @@ def _trash_worktree(
             _log(f"  NOTE {trash_path.name} archives secret-shaped file(s): "
                  f"{', '.join(meta['secret_files'][:5])} — retained indefinitely")
 
+        # PIN THE COMMITS BEFORE ANYTHING MOVES. Once the archive exists the
+        # worktree's HEAD reflog is the only other reference, and it expires; a
+        # ref that could not be created must therefore stop the reap, not just
+        # log. Failing here leaves the live worktree untouched and the claim
+        # released, so the next run retries. Verified after the write, not assumed.
+        pin_ref = _archive_ref(trash_path.name)
+        pin_sha = (
+            (_run_git(repo_root, ["-C", str(wt_path), "rev-parse", "HEAD"], timeout=15) or "").strip()
+            or str(wt.get("head") or "").strip()
+        )
+        if not _pin_archive(repo_root, pin_ref, pin_sha):
+            _log(f"ERROR {wt_path}: could not pin its commits under {pin_ref}; "
+                 "leaving the worktree in place, will retry on the next run")
+            with contextlib.suppress(OSError):
+                staging_meta.unlink()
+            with contextlib.suppress(OSError):
+                trash_path.rmdir()
+            return False
+
         # Move worktree to trash, WITHOUT ever releasing the claimed name.
         # `os.rename` atomically replaces the empty claim directory, so the name
         # is never free between the claim and the move. Only EXDEV — a trash root
@@ -1521,12 +1554,13 @@ def _trash_worktree(
         # recovering an uncompressed entry consumes it and leaves its ref behind),
         # so nothing deletes these refs; whatever removes an archive must also
         # `git update-ref -d` its ref.
+        # The pin was taken before the move; if a session committed in the gap,
+        # move it to the fresh HEAD the metadata now records. The older commit
+        # stays reachable through its descendant.
         anchor_sha = str(meta.get("commit") or "").strip()
-        if anchor_sha:
-            anchor_ref = _archive_ref(trash_path.name)
-            if _run_git(repo_root, ["update-ref", anchor_ref, anchor_sha], timeout=15) is None:
-                _log(f"  WARN could not create {anchor_ref} — the archived commits "
-                     "are anchored only by the worktree's reflog")
+        if anchor_sha and anchor_sha != pin_sha and not _pin_archive(repo_root, pin_ref, anchor_sha):
+            _log(f"  WARN could not move {pin_ref} to the post-move HEAD {anchor_sha[:8]}; "
+                 f"it still pins {pin_sha[:8]}")
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
 
