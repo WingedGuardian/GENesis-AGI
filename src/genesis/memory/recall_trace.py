@@ -172,8 +172,8 @@ def build_record(trace: dict[str, Any]) -> dict[str, Any]:
         "budget": trace.get("budget"),
         "recall_limit": recall_limit,
         "embedding_available": trace.get("embedding_available"),
-        "fts_query_expanded": trace.get("fts_query_expanded"),
-        "fts_fallback_used": trace.get("fts_fallback_used"),
+        "fts_query_rewritten": trace.get("fts_query_rewritten"),
+        "file_lane_fallback_used": trace.get("file_lane_fallback_used"),
         # Pre-expiry hit counts per finder lane; with ``zero_hit`` this tells a
         # completed no-candidate recall apart from one that never got that far.
         "lane_hits": trace.get("lane_hits"),

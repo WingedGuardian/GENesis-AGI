@@ -233,3 +233,23 @@ async def test_filled_pruned_query_does_not_pay_for_the_fallback():
         await db.close()
     assert calls == ["(needle)"]
     assert len(results) == 3
+
+
+async def test_df_cache_is_dropped_when_the_corpus_size_moves():
+    """PR #2455 round 2: a bulk delete can turn an inert term selective. The
+    corpus size is re-read live (cheap) and a move of more than 1% drops every
+    cached frequency, so the next call re-measures instead of pruning on stale
+    counts."""
+    db = await _corpus(200)
+    try:
+        assert await drop_bm25_inert_terms(db, ["halfword", "needle"]) == ["needle"]
+        # Delete 150 of the rows that carry "halfword" ... every even row but 50
+        await db.execute(
+            "DELETE FROM memory_fts WHERE rowid IN "
+            "(SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'halfword' LIMIT 90)"
+        )
+        await db.commit()
+        # 10 of 110 rows now carry it -> selective, must be KEPT.
+        assert await drop_bm25_inert_terms(db, ["halfword", "needle"]) == ["halfword", "needle"]
+    finally:
+        await db.close()

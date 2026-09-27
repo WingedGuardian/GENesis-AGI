@@ -75,14 +75,14 @@ class _FakeDB:
         self._rows = rows
         self._live_ids = {r[0] for r in rows} if live_ids is None else set(live_ids)
         # id -> (principle, tier) as the table holds it NOW (post-snapshot edits)
-        self._live_overrides: dict[str, tuple[str, str | None]] = {}
+        self._live_overrides: dict[str, tuple] = {}
 
     async def execute_fetchall(self, _sql: str, params: object = None) -> list:
         if params is not None:  # winner recheck -> LIVE (principle, tier)
             if params[0] not in self._live_ids:
                 return []
             row = next(r for r in self._rows if r[0] == params[0])
-            live = self._live_overrides.get(params[0], (row[2], row[4]))
+            live = self._live_overrides.get(params[0], (row[2], row[4], row[3]))
             return [live]
         return self._rows
 
@@ -283,7 +283,7 @@ async def test_surfaces_the_live_principle_and_tier_not_the_snapshot() -> None:
     db = _FakeDB([row])
     await proactive._load_procedure_cache(db)  # snapshot says "old advice"/CORE
 
-    db._live_overrides["w1"] = ("new advice", "CORE")
+    db._live_overrides["w1"] = ("new advice", "CORE", row[3])
     got = await proactive._surface_procedure(db, q)
     assert got is not None and got["principle"] == "new advice"
 
@@ -291,7 +291,7 @@ async def test_surfaces_the_live_principle_and_tier_not_the_snapshot() -> None:
     other = [float(x) for x in rng.standard_normal(EMBEDDING_DIM)]
     mix = [0.74 * a + (1 - 0.74**2) ** 0.5 * b for a, b in zip(q, _unit(other, q), strict=True)]
     assert (await proactive._surface_procedure(db, mix)) is not None  # CORE bar 0.70: clears
-    db._live_overrides["w1"] = ("new advice", "DORMANT")
+    db._live_overrides["w1"] = ("new advice", "DORMANT", row[3])
     assert await proactive._surface_procedure(db, mix) is None
 
 
@@ -302,3 +302,23 @@ def _unit(v: list[float], against: list[float]) -> list[float]:
     x = np.asarray(v)
     x = x - x.dot(a) * a
     return list(x / np.linalg.norm(x) * np.linalg.norm(np.asarray(against)))
+
+
+async def test_refined_procedure_is_rescored_against_its_live_embedding() -> None:
+    """PR #2455 round 2: a refine updates principle AND embedding together. The
+    winner must be re-scored against the LIVE embedding, so revised advice only
+    surfaces if it clears the bar on its own vector — not on the old one's."""
+    rng = np.random.default_rng(31)
+    q = _rand_vec(rng)
+    row = ("w2", "task", "old advice", pack_embedding(q), "CORE")
+    db = _FakeDB([row])
+    await proactive._load_procedure_cache(db)
+
+    unrelated = _unit([float(x) for x in rng.standard_normal(EMBEDDING_DIM)], q)
+    db._live_overrides["w2"] = ("rewritten advice", "CORE", pack_embedding(unrelated))
+    assert await proactive._surface_procedure(db, q) is None
+
+    # Control: a refine whose new vector still matches surfaces the new text.
+    db._live_overrides["w2"] = ("rewritten advice", "CORE", pack_embedding(q))
+    got = await proactive._surface_procedure(db, q)
+    assert got is not None and got["principle"] == "rewritten advice"

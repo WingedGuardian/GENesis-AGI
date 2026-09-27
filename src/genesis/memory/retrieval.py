@@ -921,8 +921,13 @@ class HybridRetriever:
             # with no candidates is distinguishable from a partial trace.
             trace["recall_limit"] = limit
             trace["embedding_available"] = embedding_available
-            trace["fts_query_expanded"] = fts_query != query
-            trace["fts_fallback_used"] = bool(_fts_info.get("fallback_used"))
+            # True when tag expansion AND/OR the file-keyword lane rewrote the
+            # FTS expression — deliberately not called 'expanded'.
+            trace["fts_query_rewritten"] = fts_query != query
+            # ONLY the inert-file-term fallback (``_gather_fts_candidates``).
+            # search_ranked's own AND->OR retry and bare-term syntax retry are
+            # not surfaced here, so the name says which fallback this is.
+            trace["file_lane_fallback_used"] = bool(_fts_info.get("fallback_used"))
             trace["lane_hits"] = {
                 "vector": len(qdrant_by_id),
                 "fts": len(fts_by_id),

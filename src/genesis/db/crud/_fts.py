@@ -189,20 +189,43 @@ def _reset_df_cache() -> None:
     _total_cache.clear()
 
 
+# A corpus-size move larger than this fraction since the frequencies were
+# cached drops them all (see ``_fts_total_rows``). 1%: at 100k rows that is
+# 1,000 rows — far below the shift needed to move a term across the N/2 line
+# by more than a sliver, and far above day-to-day store churn.
+_DF_INVALIDATE_FRACTION = 0.01
+
+
 async def _fts_total_rows(db: aiosqlite.Connection, table: str, now: float) -> int:
-    hit = _total_cache.get(table)
-    if hit is not None and now - hit[1] < _DF_TTL_S:
-        return hit[0]
-    # ``<table>_docsize`` holds exactly one row per indexed document and counts in
-    # ~1ms where ``count(*)`` on the FTS table itself scans (~90ms at 100k rows).
-    # It is an FTS5 shadow table that only exists with the default
-    # ``columnsize=1``; fall back to the direct count if it is absent.
+    """The CURRENT row count, read live on every call.
+
+    ``<table>_docsize`` holds exactly one row per indexed document and counts in
+    ~1ms where ``count(*)`` on the FTS table itself scans (~90ms at 100k rows).
+    It is an FTS5 shadow table that only exists with the default
+    ``columnsize=1``; fall back to the direct count if it is absent.
+
+    Reading it live is what bounds df-cache staleness: a bulk delete or insert
+    that moves the corpus size by more than ``_DF_INVALIDATE_FRACTION`` since
+    the frequencies were cached drops every cached frequency for the table, so
+    a term that stopped being inert is re-measured on the next call instead of
+    being pruned on counts up to ``_DF_TTL_S`` old. (Balanced delete+insert
+    churn that leaves the size unchanged is still bounded only by the TTL.)
+    """
     try:
         rows = await db.execute_fetchall(f"SELECT count(*) FROM {table}_docsize")  # noqa: S608
     except Exception:
         rows = await db.execute_fetchall(f"SELECT count(*) FROM {table}")  # noqa: S608
     total = int(rows[0][0]) if rows else 0
-    _total_cache[table] = (total, now)
+    hit = _total_cache.get(table)
+    if hit is not None:
+        cached_total = hit[0]
+        moved = abs(total - cached_total) > _DF_INVALIDATE_FRACTION * max(cached_total, 1)
+        if moved or now - hit[1] >= _DF_TTL_S:
+            for key in [k for k in _df_cache if k[0] == table]:
+                del _df_cache[key]
+            _total_cache[table] = (total, now)
+    else:
+        _total_cache[table] = (total, now)
     return total
 
 

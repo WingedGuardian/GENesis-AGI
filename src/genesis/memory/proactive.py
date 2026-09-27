@@ -153,7 +153,14 @@ def _degraded_reasons(
         reasons.append("rerank_breaker_open")
     if engine_stats.get("rerank_skipped_ratelimited"):
         reasons.append("rerank_ratelimited")
-    if rerank_requested and not engine_stats.get("rerank_executed") and not reasons:
+    rerank_specific = any(
+        engine_stats.get(k)
+        for k in ("rerank_timed_out", "rerank_skipped_breaker_open", "rerank_skipped_ratelimited")
+    )
+    # Reranking runs on query TEXT + candidate content, not the vector, so a
+    # missing embedding never explains a rerank that did not run — only a
+    # rerank-specific reason replaces the generic one.
+    if rerank_requested and not engine_stats.get("rerank_executed") and not rerank_specific:
         reasons.append("rerank_not_executed")
     return reasons
 
@@ -526,9 +533,14 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
     # so surfacing the cached principle could advise text that was since
     # rewritten; the live tier is re-checked against its own bar for the same
     # reason (a promotion/demotion changes which threshold applies).
+    #
+    # A refine rewrites principle AND embedding together, so the live text must
+    # also be SCORED on the live embedding — a prompt matching the old advice
+    # must not surface revised advice that does not clear the bar on its own
+    # vector. An unusable live embedding fails closed (surface nothing).
     try:
         live = await db.execute_fetchall(
-            "SELECT principle, activation_tier FROM procedural_memory "
+            "SELECT principle, activation_tier, principle_embedding FROM procedural_memory "
             "WHERE id = ? AND deprecated = 0 AND quarantined = 0 LIMIT 1",
             (proc_id,),
         )
@@ -536,12 +548,18 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
         return None
     if not live:
         return None
+    from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
+
+    live_vec = unpack_embedding(live[0][2])
+    if live_vec is None:
+        return None
+    live_sim = cosine_similarity(live_vec, vector)
     live_principle = live[0][0] if live[0][0] is not None else principle
     live_tier = live[0][1] or "DORMANT"
     live_bar = (
         _DORMANT_SURFACE_THRESHOLD if live_tier == "DORMANT" else _PROCEDURE_SURFACE_THRESHOLD
     )
-    if best_sim < live_bar:
+    if live_sim < live_bar:
         return None
 
     return {
@@ -955,6 +973,7 @@ async def proactive_context(
         if trace is not None:
             trace["outcome"] = f"error:{phase}"
             trace["timings_ms"] = dict(timings)
+            trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
             _schedule_trace_write(db, trace, session_id)
         raise
 

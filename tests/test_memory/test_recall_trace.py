@@ -102,7 +102,7 @@ def test_record_carries_zero_hit_and_lane_hits():
             "trace_id": "x",
             "recall_limit": 4,
             "embedding_available": True,
-            "fts_query_expanded": False,
+            "fts_query_rewritten": False,
             "lane_hits": {"vector": 0, "fts": 0, "event": 0},
             "zero_hit": True,
         }
@@ -550,7 +550,13 @@ async def test_zero_hit_recall_still_fills_the_trace(mock_qdrant, mock_crud, moc
     assert trace["recall_limit"] == 3
     assert trace["embedding_available"] is True
     assert trace["lane_hits"] == {"vector": 0, "fts": 0, "event": 0}
-    assert trace["fts_fallback_used"] is False
+    # Named for what it measures: the inert-file-term fallback only.
+    assert trace["file_lane_fallback_used"] is False
+    # Round-2 class sweep: the FTS expression can be rewritten by the file
+    # lane alone, so the field must not claim tag EXPANSION.
+    assert trace["fts_query_rewritten"] is False
+    assert "fts_query_expanded" not in trace
+    assert "fts_fallback_used" not in trace
     rec = RT.build_record(trace)
     assert rec["zero_hit"] is True and rec["candidates"] == []
 
@@ -580,3 +586,41 @@ async def test_zero_budget_call_logs_timing_and_writes_a_skip_trace(caplog):
     assert any("skipped=zero_budget" in r.getMessage() for r in caplog.records)
     assert written and written[0]["outcome"] == "skipped:zero_budget"
     assert resp["engine"]["trace_id"] == written[0]["trace_id"]
+
+
+def test_rerank_degradation_is_reported_alongside_no_embedding():
+    """PR #2455 round 2: no_embedding must not hide a rerank that was requested
+    and did not run — reranking does not depend on the query vector."""
+    reasons = P._degraded_reasons({}, None, True, {"embedding_available": False})
+    assert reasons == ["no_embedding", "rerank_not_executed"]
+    # A rerank-specific reason still replaces the generic one.
+    reasons = P._degraded_reasons(
+        {"rerank_timed_out": True}, None, True, {"embedding_available": False}
+    )
+    assert reasons == ["no_embedding", "rerank_timed_out"]
+    assert P._degraded_reasons({"rerank_executed": True}, [0.1], True, None) == []
+
+
+async def test_errored_recall_trace_carries_degraded_reasons():
+    """The error path records degraded_reasons like the ok/cancel paths."""
+    written = []
+
+    async def _write(db, trace, *, session_id=None):
+        written.append(trace)
+
+    async def _boom(prompt, **kwargs):
+        raise RuntimeError("engine failure")
+
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_FakeMod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=_boom),
+        patch.object(RT, "write_trace", new=_write),
+        pytest.raises(RuntimeError),
+    ):
+        await P.proactive_context(prompt="what did we decide", session_id="s")
+    for _ in range(50):
+        if written:
+            break
+        await asyncio.sleep(0.01)
+    assert written and written[0]["outcome"] == "error:recall"
+    assert "degraded_reasons" in written[0]
