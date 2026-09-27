@@ -247,6 +247,33 @@ def test_literal_dash_C_still_allows(repo: Path, home: Path) -> None:
     assert res.returncode == 0, res.stdout + res.stderr
 
 
+def test_commit_on_live_integration_branch_is_blocked(repo: Path, home: Path) -> None:
+    # `live` is rebuilt by `git commit-tree` from origin/main plus the manifest's
+    # candidates, so a hand commit there is refused like one on main — even with
+    # a valid review marker, which would otherwise allow it.
+    _git(repo, "checkout", "-q", "-b", "live")
+    (repo / "f.py").write_text("base = 4\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    (home / ".genesis").mkdir(exist_ok=True)
+    (home / ".genesis" / "deploy_manifest.json").write_text("{}\n")
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Commit on 'live'" in res.stderr
+
+
+def test_commit_on_a_live_branch_without_a_manifest_is_ordinary(repo: Path, home: Path) -> None:
+    # No deploy manifest = no integration branch: a branch that merely happens
+    # to be named `live` is an ordinary branch.
+    _git(repo, "checkout", "-q", "-b", "live")
+    (repo / "f.py").write_text("base = 4\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    assert not (home / ".genesis" / "deploy_manifest.json").exists()
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
 def test_genuine_main_commit_still_says_direct_commits_to_main(repo: Path, home: Path) -> None:
     _git(repo, "checkout", "-q", "main")
     (repo / "f.py").write_text("base = 3\n")

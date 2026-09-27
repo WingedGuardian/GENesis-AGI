@@ -196,6 +196,28 @@ class TestMergeIntoMainWorktreeAware:
         assert guard_module.main() == 2
         assert "Merging into main" in capsys.readouterr().err
 
+    def test_merge_on_live_blocked(self, guard_module, monkeypatch, capsys):
+        # `live` is rebuilt by `git commit-tree`, never merged into.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda: True)
+        self._prep(guard_module, monkeypatch, "git merge origin/main", cwd=None)
+        assert guard_module.main() == 2
+        assert "'live'" in capsys.readouterr().err
+
+    def test_merge_on_live_without_a_manifest_is_allowed(self, guard_module, monkeypatch):
+        # No deploy manifest = no integration branch: `live` is just a name.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda: False)
+        self._prep(guard_module, monkeypatch, "git merge origin/main", cwd=None)
+        assert guard_module.main() == 0
+
+    def test_merge_on_a_branch_merely_named_like_live_is_allowed(self, guard_module, monkeypatch):
+        # Exact-name match: `live-fixes` is an ordinary feature branch.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live-fixes")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda: True)
+        self._prep(guard_module, monkeypatch, "git merge origin/main", cwd=None)
+        assert guard_module.main() == 0
+
     def test_merge_on_main_with_override_allowed(self, guard_module, monkeypatch):
         monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "main")
         self._prep(

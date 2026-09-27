@@ -1,16 +1,51 @@
 #!/bin/bash
-# Genesis pre-push hook — block ALL direct pushes to main on origin
-# Private/fork remotes are unrestricted — users own their forks.
-# Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
+# Genesis pre-push hook — block ALL direct pushes to main on origin, and block
+# publishing a `Deploy-rebuild:` commit to ANY remote.
+# Private/fork remotes are otherwise unrestricted — users own their forks.
+# Portable copy: lives in scripts/hooks/, installed by scripts/hooks/sync-hooks.sh
 
 remote="$1"
-
-# Only protect the public repo (origin). Private forks can force push freely.
-if [ "$remote" != "origin" ]; then
-    exit 0
-fi
+zero="0000000000000000000000000000000000000000"
 
 while read local_ref local_oid remote_ref remote_oid; do
+    # A `Deploy-rebuild:` commit exists only on `live`, the local integration
+    # branch (origin/main plus unmerged candidate branches, rebuilt locally).
+    # A branch that contains one was cut from `live`, so it carries other PRs'
+    # unreviewed code; publishing it anywhere, fork included, is never right.
+    # Deletions (local_oid all zeros) push no commits.
+    if [ "$local_oid" != "$zero" ]; then
+        # A new ref, or a remote tip this repo has never fetched (the branch was
+        # updated elsewhere and this is a force-push): walk what no remote-tracking
+        # ref of this remote already has. `$remote_oid..$local_oid` would fail on
+        # an unknown remote tip and refuse an ordinary push.
+        if [ "$remote_oid" = "$zero" ] || ! git cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
+            range_args=("$local_oid" --not --remotes="$remote")
+        else
+            range_args=("$remote_oid..$local_oid")
+        fi
+        # No `valueonly`: git prints the key itself (`Deploy-rebuild: <v>`), so a
+        # trailer with an EMPTY value is still seen.
+        if ! rebuilt=$(git log --format='%H %(trailers:key=Deploy-rebuild,separator=%x2C)' "${range_args[@]}" 2>/dev/null); then
+            echo "BLOCKED: could not list the commits this push publishes to $remote_ref."
+            echo "Refusing rather than risk publishing a Deploy-rebuild commit."
+            exit 1
+        fi
+        hit=$(printf '%s\n' "$rebuilt" | awk 'NF > 1 {print $1; exit}')
+        if [ -n "$hit" ]; then
+            echo "BLOCKED: this push to $remote_ref publishes a Deploy-rebuild commit ($hit)."
+            echo ""
+            echo "Deploy-rebuild commits exist only on 'live', the local integration branch,"
+            echo "so this branch was cut from 'live' and carries other candidates' unmerged"
+            echo "code. Recreate it from origin/main and carry only your own commits over:"
+            echo "  git worktree add .claude/worktrees/<name> -b <scope>/<desc> origin/main"
+            exit 1
+        fi
+    fi
+
+    # Only protect the public repo (origin) for direct pushes to main.
+    if [ "$remote" != "origin" ]; then
+        continue
+    fi
     if echo "$remote_ref" | grep -qE 'refs/heads/(main|master)$'; then
         # Block ALL direct pushes to main — force or fast-forward.
         # The only way to update main is via PR merge (gh pr merge).

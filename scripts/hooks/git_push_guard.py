@@ -507,8 +507,22 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
     return cur
 
 
+def _live_integration_active() -> bool:
+    """Whether this install runs a local integration branch named ``live``.
+
+    The deploy manifest is what declares it; without one, a branch named
+    ``live`` is just an ordinary branch and gets no special treatment."""
+    return os.path.isfile(
+        os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json")
+    )
+
+
 def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool:
-    """True if ANY executed ``git merge`` would run on main/master (fail-closed).
+    """True if ANY executed ``git merge`` would run on main/master (fail-closed),
+    or on ``live`` where the install runs a local integration branch.
+
+    ``live`` is rebuilt by ``git commit-tree`` and therefore never the target of
+    a legitimate ``git merge`` (see ``_live_integration_active``).
 
     Walks the top-level segments in bash order tracking the ABSOLUTE cwd (last
     ``cd`` wins; relative cds/-C resolved against it), and checks EACH ``git
@@ -552,8 +566,14 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             if mcwd is _CWD_UNKNOWN:
                 return True
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
+            # `live` (the local integration branch) never takes a merge: it is
+            # rebuilt with `git commit-tree`, so any `git merge` there is foreign.
+            # Only where the deploy manifest exists: an install's own branch that
+            # happens to be named `live` is left alone.
             if branch is None or branch in ("main", "master"):
                 return True  # None branch (error/unresolved) fails closed
+            if branch == "live" and _live_integration_active():
+                return True
         cd = _cd_target(raw)
         if cd is _CWD_UNKNOWN:
             cur = _CWD_UNKNOWN
@@ -10416,11 +10436,13 @@ def _run_merge_and_push_gates() -> int:
         # _walk_merge_into_main.
         if merge_git_segs and _walk_merge_into_main(cmd, payload, merge_git_segs):
             print(
-                "BLOCKED: Merging into main directly is not allowed.",
+                "BLOCKED: Merging into main directly is not allowed "
+                "(nor into 'live', the local integration branch).",
                 file=sys.stderr,
             )
             print(
-                "Use the PR workflow instead.",
+                "Use the PR workflow instead. 'live' is rebuilt from origin/main "
+                "plus the candidates in ~/.genesis/deploy_manifest.json, never merged.",
                 file=sys.stderr,
             )
             return 2

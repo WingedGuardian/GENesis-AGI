@@ -1233,6 +1233,23 @@ def main() -> None:
                 "Create a branch first: git checkout -b <scope>/<description>"
             )
             return
+        if seg_branch == "live" and (
+            Path.home() / ".genesis" / "deploy_manifest.json"
+        ).is_file():
+            # `live` is the local integration branch: origin/main plus the
+            # candidate branches in ~/.genesis/deploy_manifest.json, rebuilt with
+            # `git commit-tree`. A hand commit here is one the next rebuild
+            # refuses as unknown, so it belongs on a branch cut from origin/main.
+            # Only where the manifest exists: an install's own branch that
+            # happens to be named `live` is left alone.
+            _deny(
+                "BLOCKED: Commit on 'live', the local integration branch. It is "
+                "rebuilt from origin/main plus the candidates in "
+                "~/.genesis/deploy_manifest.json. Commit on a branch cut from "
+                "origin/main (git worktree add .claude/worktrees/<name> -b "
+                "<scope>/<desc> origin/main), then add it as a candidate."
+            )
+            return
     # Commits chained into DIFFERENT dirs share this one gate, but the review
     # marker checked below (Rule 2) belongs to the FIRST commit's worktree only —
     # a second repo's commit would ride an approval that never inspected it.

@@ -737,7 +737,7 @@ else
 fi
 if [[ -n "$HOOKS_DST" ]]; then
     # Phase 6: prefer sync-hooks.sh if available — it handles the
-    # full set (pre-commit, pre-push, post-commit) + helper scripts
+    # full set (HOOKS_TO_SYNC in sync-hooks.sh) + helper scripts
     # (emit_bugfix_audit.py) + version tracking via
     # .genesis-hook-versions. Legacy loop remains as a fallback for
     # very old installs that don't have sync-hooks.sh yet.

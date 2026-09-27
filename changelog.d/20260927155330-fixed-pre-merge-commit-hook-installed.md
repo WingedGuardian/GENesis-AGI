@@ -1,0 +1,1 @@
+- The `pre-merge-commit` git hook is now installed and kept current by `sync-hooks.sh` like the other hooks; previously nothing installed it. Its older check against merging a PR branch back into local `main` never takes effect on current git (the merge head it reads does not exist yet while the hook runs), and it is left inert on purpose; only its new `live` refusal is active.
