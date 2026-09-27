@@ -30,10 +30,11 @@ Sources — each read through the module that owns it, never re-implemented here
 
 - branch: ``review_state.get_current_branch``.
 - streak: ``review_state.get_review_counters`` — the LOCAL cross-model review
-  streak the commit gate's round-2 / round-3 interventions read (branch-scoped,
-  legacy-counter aware). It is NOT the GitHub reviewed-heads budget the merge
-  and review-request gates also enforce; that needs a GitHub read and is not
-  shown here.
+  streak (branch-scoped, legacy-counter aware), ONE of the two inputs to the
+  commit gate's round-2 / round-3 interventions. The other is the GitHub
+  reviewed-heads count, which the commit, merge and review-request gates read;
+  that needs a GitHub read and is not shown here, so a zero streak here does not
+  mean no round intervention is due.
 - ledger: the canonical ``session_ledger`` table, read-only (WAL-aware URI,
   admission fence honoured). Deliberately NOT the ``charter.md`` mirror: writers
   outside the ledger MCP tools change the DB without refreshing it, and a

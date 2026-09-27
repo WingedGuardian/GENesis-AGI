@@ -1254,6 +1254,97 @@ def reset_review_round(cwd: str | None = None, *, deadline: float | None = None)
     )
 
 
+#: The two round-tier acknowledgments the commit gate can record against a
+#: GitHub reviewed-head count. Closed set: anything else is rejected at write
+#: time and ignored at read time.
+REVIEWED_HEAD_ACK_TIERS = ("audit", "escalation")
+
+
+def _head_ack_file(cwd: str | None = None, *, deadline: float | None = None) -> Path:
+    """Per-worktree record of which reviewed-head count each tier was acked at.
+
+    A SIBLING of the round file rather than a field inside it, on purpose. Every
+    writer of the round file (``bump_review_round``'s three branches and
+    ``reset_review_round``) REBUILDS the state dict, so a field it does not name
+    again is dropped — a documented class in this module. An ack stored there
+    would vanish on the next external mark or escalation reset and silently
+    re-arm a round the user already acknowledged. A separate file cannot be
+    rebuilt away by those writers. Same directory, same worktree key.
+    """
+    return _ROUND_DIR / f"{_worktree_key(cwd, deadline=deadline)}.head_acks.json"
+
+
+def get_reviewed_head_acks(
+    cwd: str | None = None,
+    *,
+    repo: str,
+    pr: int,
+    deadline: float | None = None,
+) -> dict[str, int]:
+    """``{tier: reviewed_heads}`` recorded for THIS pull request.
+
+    Scoped to ``(repo, pr)``: a record written for any other pull request — the
+    worktree switched branches, or the file is foreign/corrupt — reads as no
+    acknowledgment at all, which is the direction that re-arms the gate rather
+    than silencing it. Never raises on file content; like every deadline-aware
+    helper here, an expired aggregate ``deadline`` propagates as
+    ``DeadlineExpired`` so the gate fails closed instead of reading "no ack".
+    """
+    return _read_head_acks(_head_ack_file(cwd, deadline=deadline), repo=repo, pr=pr)
+
+
+def _read_head_acks(p: Path, *, repo: str, pr: int) -> dict[str, int]:
+    """Parse one ack file for ``(repo, pr)``; anything unexpected reads as ``{}``."""
+    try:
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text())
+    except (ValueError, OSError):  # ValueError covers JSON and UTF-8 decode errors.
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if str(data.get("repo", "")).lower() != str(repo).lower() or data.get("pr") != pr:
+        return {}
+    acks: dict[str, int] = {}
+    for tier in REVIEWED_HEAD_ACK_TIERS:
+        value = data.get(tier)
+        # bool is an int subclass; a hand-edited `true` must not read as 1.
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            acks[tier] = value
+    return acks
+
+
+def record_reviewed_head_ack(
+    cwd: str | None = None,
+    *,
+    tier: str,
+    repo: str,
+    pr: int,
+    heads: int,
+    deadline: float | None = None,
+) -> None:
+    """Record that ``tier`` was acknowledged at ``heads`` reviewed heads.
+
+    The ack satisfies exactly that count: the commit gate compares the stored
+    value for EQUALITY with the live count, so the next reviewed head re-arms
+    the tier. A record for another pull request is replaced, not merged.
+    Best-effort on I/O — an unwritable store leaves the tier armed, the safe
+    direction — while an expired ``deadline`` propagates as everywhere here.
+    """
+    if tier not in REVIEWED_HEAD_ACK_TIERS or not isinstance(heads, int) or heads < 0:
+        return
+    # Resolve the worktree key ONCE: each resolution is a git subprocess spent
+    # inside the commit hook's small post-lookup time reserve.
+    p = _head_ack_file(cwd, deadline=deadline)
+    try:
+        current = _read_head_acks(p, repo=repo, pr=pr)
+        current[tier] = heads
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"repo": repo, "pr": pr, **current}, indent=2))
+    except OSError:
+        pass
+
+
 def get_current_branch(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Get current git branch name."""
     try:

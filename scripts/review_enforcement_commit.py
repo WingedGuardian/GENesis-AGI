@@ -1034,6 +1034,95 @@ def _commit_budget_reason(result: dict) -> str:
     )
 
 
+def _reviewed_heads_pr(cloud_budget: dict | None) -> tuple[str, int, int] | None:
+    """``(repo, pr, reviewed_heads)`` from an already-fetched budget, else None.
+
+    None — the round tiers then act on the local streak alone, exactly as before
+    this input existed — whenever the evidence is not a clean read: no open PR
+    (``cloud_budget is None``), an ``unknown`` budget, or a malformed field. An
+    unknown budget already routes to the native approval ask on its own
+    (``pending_round_approval``); it is deliberately NOT turned into a second,
+    fail-closed round block here, because no hook drifts into asking and an
+    unreadable GitHub must not strand a background session behind a sigil the
+    evidence never justified.
+    """
+    if not isinstance(cloud_budget, dict) or cloud_budget.get("status") != "ok":
+        return None
+    count, repo, pr = cloud_budget.get("count"), cloud_budget.get("repo"), cloud_budget.get("pr")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        or not isinstance(repo, str)
+        or not repo
+        or not isinstance(pr, int)
+        or isinstance(pr, bool)
+    ):
+        return None
+    return repo, pr, count
+
+
+def _round_evidence(
+    local_round: int,
+    gh_heads: int | None,
+    gh_due: bool,
+    cloud_budget: dict | None,
+    cap: int,
+) -> str:
+    """The clause naming WHICH evidence put this commit in a round tier.
+
+    The local wording is unchanged from before the GitHub input existed. When the
+    reviewed-head count is (also) what fired, it is named with its source, so the
+    reader is not told "N consecutive rounds surfaced NEW defects" about a count
+    that includes clean reviews and was never self-reported.
+    """
+    parts: list[str] = []
+    if local_round >= cap - 1:
+        parts.append(
+            f"{local_round} consecutive EXTERNAL cross-model review rounds each "
+            f"surfaced NEW defects (cap {cap}; internal same-model "
+            "self/subagent audits are not counted)"
+        )
+    if gh_due and gh_heads is not None:
+        pr = (cloud_budget or {}).get("pr")
+        parts.append(
+            f"PR #{pr} has {gh_heads} distinct REVIEWED HEADS on GitHub (the same "
+            "count `scripts/review_budget.py` reports; cap "
+            f"{cap}). This is the round the prescription keys on "
+            "even when no external round was marked locally — the ordinary fix "
+            "workflow marks only an internal audit, which never moves the local streak"
+        )
+    return "; and ".join(parts) or f"round {max(local_round, gh_heads or 0)}"
+
+
+def _ack_scope_note(gh_heads: int | None, sigil: str, gh_due: bool) -> str:
+    """How far an ack reaches, and the honest reading when reviewed heads fired.
+
+    The reviewed-head count includes CLEAN reviews, so when it (not the local
+    streak) put the commit here, the rounds may have converged. Say so, and say
+    what the ack then attests, instead of leaving only the defect-loop framing —
+    a block whose text is false for the case in front of it teaches the reader to
+    type the sigil by reflex.
+    """
+    if gh_heads is None:
+        return ""
+    note = (
+        f"\n\nSCOPE OF THE ACK: `# {sigil}` is recorded against {gh_heads} reviewed "
+        "heads for this PR and satisfies that count only; the next reviewed head "
+        "re-arms the round interventions — one acknowledgment never silences later "
+        "rounds. The record is per worktree, so a fresh worktree on the same PR "
+        "meets the tier again."
+    )
+    if gh_due:
+        note += (
+            " The reviewed-head count includes CLEAN reviews. If the latest review "
+            "found no new BLOCKER/SHOULD-FIX/P1/P2, the rounds converged: the "
+            "premise-vs-polish question still has to be answered for the record, "
+            "but it usually has a one-line answer — decide it honestly, then ack."
+        )
+    return note
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -1119,10 +1208,12 @@ def main() -> None:
             ESCALATION_ROUND_CAP,
             get_current_branch,
             get_review_counters,
+            get_reviewed_head_acks,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
             marker_content_current,
+            record_reviewed_head_ack,
             reset_review_round,
         )
     except Exception:  # noqa: BLE001 — ANY load failure, not just absence.
@@ -1373,18 +1464,56 @@ def main() -> None:
             _native_ask(reason)
         sys.exit(0)
 
-    if round_n >= ESCALATION_ROUND_CAP:
+    # The round the tiers act on is max(local streak, GitHub reviewed heads).
+    # The local streak only moves when a session self-reports an external round
+    # (`mark --source external --defects`); the ordinary fix workflow marks its
+    # INTERNAL audit instead, which by design never moves it, so a PR could reach
+    # five reviewed heads with no round file at all and neither tier ever fired.
+    # The reviewed-head count is the same evidence the standing-authorization ask
+    # already reads (`cloud_budget`, fetched above — no new network call), so
+    # self-reporting can now only ADD to the round, never be its sole source.
+    gh_pr = _reviewed_heads_pr(cloud_budget)
+    gh_heads = gh_pr[2] if gh_pr else None
+    gh_acks = (
+        get_reviewed_head_acks(cwd, repo=gh_pr[0], pr=gh_pr[1], deadline=hook_deadline)
+        if gh_pr
+        else {}
+    )
+    gh_escalation_due = (
+        gh_heads is not None
+        and gh_heads >= ESCALATION_ROUND_CAP
+        and gh_acks.get("escalation") != gh_heads
+    )
+    gh_audit_due = (
+        gh_heads is not None
+        and gh_heads == ESCALATION_ROUND_CAP - 1
+        and gh_acks.get("audit") != gh_heads
+        # An escalation decision taken at this same count covers the lesser tier:
+        # otherwise acking a local HARD STOP (which resets the local streak) would
+        # be followed at once by a mode-switch on the unchanged count.
+        and gh_acks.get("escalation") != gh_heads
+    )
+
+    if round_n >= ESCALATION_ROUND_CAP or gh_escalation_due:
         acked = bool(commit_segs) and all(
             has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
         )
         if not acked:
             _deny(
-                f"BLOCKED: review escalation cap reached — {round_n} consecutive "
-                f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
-                f"{ESCALATION_ROUND_CAP}; internal same-model self/subagent audits are "
-                "not counted). The cross-model review→fix loop has run long — the "
-                "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
-                "the problem statement is likely wrong, not just this fix. STOP and get "
+                "BLOCKED: review escalation cap reached — "
+                + _round_evidence(
+                    round_n, gh_heads, gh_escalation_due, cloud_budget, ESCALATION_ROUND_CAP
+                )
+                + (
+                    ". The cross-model review→fix loop has run long — the round-2 "
+                    "mode-switch audit did NOT converge, which means the DESIGN or the "
+                    "problem statement is likely wrong, not just this fix."
+                    if round_n >= ESCALATION_ROUND_CAP
+                    else ". The PR has now been reviewed this many times; if those "
+                    "rounds kept surfacing NEW defects, the DESIGN or the problem "
+                    "statement is likely wrong, not just this fix."
+                )
+                + " STOP and get "
                 "a FRESH user decision. The options, the one this gate could not "
                 "previously name first:\n"
                 "  (a) HAND IT BACK through the ESTABLISHED disposition — a foreground "
@@ -1414,7 +1543,9 @@ def main() -> None:
                 "streak — landing the work and erasing the evidence that stopped it. "
                 "Hand the branch off with the premise-check writeup instead. The streak "
                 "is per-branch, so whoever picks up the SAME branch inherits it: say so "
-                "in the handoff." + _merge_note(cwd, deadline=hook_deadline)
+                "in the handoff."
+                + _ack_scope_note(gh_heads, "escalation-ack", gh_escalation_due)
+                + _merge_note(cwd, deadline=hook_deadline)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -1423,7 +1554,21 @@ def main() -> None:
         # acknowledgment was made, and erring toward less friction only happens
         # AFTER a conscious ack.
         reset_review_round(cwd=cwd, deadline=hook_deadline)
-    elif round_n == ESCALATION_ROUND_CAP - 1:
+        # GitHub's count cannot be "reset", so the ack is RECORDED against the
+        # count it acknowledged. It satisfies that count only; the next reviewed
+        # head re-arms the stop. Recorded whenever the count is known — also when
+        # only the local streak fired — because the acknowledgment covers the
+        # round as it stands, whichever evidence surfaced it.
+        if gh_pr:
+            record_reviewed_head_ack(
+                cwd,
+                tier="escalation",
+                repo=gh_pr[0],
+                pr=gh_pr[1],
+                heads=gh_pr[2],
+                deadline=hook_deadline,
+            )
+    elif round_n == ESCALATION_ROUND_CAP - 1 or gh_audit_due:
         # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
         # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
         # named instead of the CLASS: round N's narrow patch leaves sibling
@@ -1441,10 +1586,16 @@ def main() -> None:
         )
         if not acked:
             _deny(
-                f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
-                f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
-                "internal self/subagent audits are not counted). Two rounds of NEW "
-                "defects means one of two things, and they have OPPOSITE remedies. "
+                "BLOCKED (mode-switch): "
+                + _round_evidence(
+                    round_n, gh_heads, gh_audit_due, cloud_budget, ESCALATION_ROUND_CAP
+                )
+                + (
+                    ". Two rounds of NEW defects"
+                    if round_n == ESCALATION_ROUND_CAP - 1
+                    else ". IF those reviewed rounds each surfaced NEW defects, that"
+                )
+                + " means one of two things, and they have OPPOSITE remedies. "
                 "Decide WHICH before writing another line of fix-code:\n\n"
                 "  (A) The PREMISE is wrong — the change cannot do what it claims, or "
                 "rests on something untrue. More rounds cannot help: every fix creates "
@@ -1489,9 +1640,22 @@ def main() -> None:
                 "you want to land something is falsifying it. Hand the branch off "
                 "with the evidence instead. (The streak is per-branch, so a builder "
                 "picking up the SAME branch inherits it: say so in the handoff.)"
+                + _ack_scope_note(gh_heads, "audit-ack", gh_audit_due)
                 + _merge_note(cwd, deadline=hook_deadline)
             )
             return
+        # Only a GitHub-derived tier is recorded: the local tier keeps its
+        # per-commit ack (the streak does not move until an external mark), and
+        # an audit ack at count N must not pre-satisfy a local tier either.
+        if gh_audit_due and gh_pr:
+            record_reviewed_head_ack(
+                cwd,
+                tier="audit",
+                repo=gh_pr[0],
+                pr=gh_pr[1],
+                heads=gh_pr[2],
+                deadline=hook_deadline,
+            )
 
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),

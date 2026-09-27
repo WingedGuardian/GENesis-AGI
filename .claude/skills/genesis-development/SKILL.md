@@ -2659,12 +2659,26 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   These disciplines are backstopped by two complementary machine layers.
 
-  The LOCAL defect-bearing streak keeps its established interventions:
+  The round interventions key on the EFFECTIVE round — the larger of the LOCAL
+  defect-bearing streak and the PR's GitHub reviewed-head count (the same count
+  `scripts/review_budget.py` reports, already fetched by the commit gate). The local
+  streak moves only on a self-reported `mark --source external --defects`, and the
+  ordinary fix workflow marks an internal audit instead, so on its own it could sit at
+  zero while a PR accumulated reviewed heads. Self-reporting can now only ADD to the
+  round. With no open PR, or an unreadable budget, the local streak alone decides, as
+  before.
 
-  | Local streak | Gate | Required action |
+  | Effective round | Gate | Required action |
   |---|---|---|
   | 2 | **MODE-SWITCH block** | Decide premise-vs-polish, run the fresh-context class audit, then use `# audit-ack` only if that audit happened. |
-  | 3 | **HARD STOP** | Hand back, redesign, narrow, or shelve. `# escalation-ack` records a fresh decision and resets only this local streak. |
+  | 3+ | **HARD STOP** | Hand back, redesign, narrow, or shelve. `# escalation-ack` records a fresh decision and resets the local streak. |
+
+  **An ack is tied to the reviewed-head count it acknowledged.** GitHub's count cannot
+  be reset, so an ack of a reviewed-head tier is RECORDED against that count
+  (`~/.genesis/review_rounds/<key>.head_acks.json`, scoped to the repo and PR) and
+  satisfies that count only; the next reviewed head re-arms the tier. Both counts
+  include clean reviews, so a PR that converged still meets each tier once per
+  reviewed head — one sigil, not a loop.
 
   Standing authorization is a separate GitHub-backed budget. It counts DISTINCT
   REVIEWED HEADS, not local marks: Codex review objects including dismissed reviews,
@@ -2723,8 +2737,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   `review_state.py` still keeps the local `round` streak and legacy lifetime
   fields for stale-worktree compatibility. Current authorization uses
-  `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot
-  only for the round-2/round-3 interventions. The old lifetime APIs remain
+  `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot,
+  and combines it with the reviewed-head count, only for the round-2/round-3
+  interventions. The old lifetime APIs remain
   import-compatible but current gates do not consult them. `FINAL_ROUND_CAP` is
   **DELETED** (2026-09-25) — it was consulted by no gate, in zero conditionals, while
   its value had been picked to avoid colliding with the four-head boundary, so a
@@ -2956,8 +2971,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   shared `review_budget` path predicate, including rename sources and destinations.
   The second-round fix is permitted, and the exact-head marked confirmation is the one
   exempt request. If that confirmation finds another defect and a further fix is needed,
-  the commit requires fresh native approval. The independent local streak may still
-  demand its round-2 class audit or round-3 stop; those are process interventions rather
+  the commit requires fresh native approval. The round interventions still demand
+  their round-2 class audit (at two reviewed heads, so the second-round fix carries
+  `# audit-ack`) and round-3 stop; those are process interventions rather
   than substitutes for the per-action user decision.
 
   **Queue priority:** gate PRs get reviewed and driven before ordinary ones — read this
@@ -2970,7 +2986,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   commit identity, so a dual round does not spend two rounds.
 
   **A note for anyone reading only CLAUDE.md:** the shared evaluator now gates a third
-  discovery request mechanically. The local round-2 MODE-SWITCH still acts on commits
+  discovery request mechanically. The round-2 MODE-SWITCH still acts on commits
   and remains a separate class-audit intervention.
 
 - **Some PRs are not a review problem — hand them to an architecture session.**

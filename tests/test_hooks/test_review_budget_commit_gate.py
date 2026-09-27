@@ -216,7 +216,10 @@ def test_cloud_lookup_reserves_two_seconds_for_post_lookup_checks(monkeypatch, r
 def test_ordinary_four_heads_asks_for_each_commit(monkeypatch, repo, home):
     _evidence(monkeypatch, 4)
     _mark(repo, home)
-    first = _run('git commit -m "fix"', repo, home)
+    # Four reviewed heads is also past the round-3 HARD STOP, which is now keyed
+    # on reviewed heads; its ack is recorded at 4, so the second commit needs no
+    # sigil — but the native approval is per commit and never carries forward.
+    first = _run('git commit -m "fix"  # escalation-ack', repo, home)
     second = _run('git commit -m "fix"', repo, home)
     assert _decision(first) == _decision(second) == "ask"
     assert f"standing authorization ended after {_HEAD_LIMIT}" in first.stdout
@@ -225,14 +228,14 @@ def test_ordinary_four_heads_asks_for_each_commit(monkeypatch, repo, home):
 def test_legacy_final_sigil_does_not_replace_native_approval(monkeypatch, repo, home):
     _evidence(monkeypatch, 4)
     _mark(repo, home)
-    result = _run('git commit -m "fix"  # final-round-accept', repo, home)
+    result = _run('git commit -m "fix"  # escalation-ack final-round-accept', repo, home)
     assert _decision(result) == "ask"
 
 
 def test_round_six_commit_is_strongly_discouraged(monkeypatch, repo, home):
     _evidence(monkeypatch, 5, head=HEADS[5])
     _mark(repo, home)
-    result = _run('git commit -m "more"', repo, home)
+    result = _run('git commit -m "more"  # escalation-ack', repo, home)
     assert _decision(result) == "ask"
     assert "strongly discouraged" in result.stdout
 
@@ -240,7 +243,7 @@ def test_round_six_commit_is_strongly_discouraged(monkeypatch, repo, home):
 def test_autonomous_commit_is_denied(monkeypatch, repo, home):
     _evidence(monkeypatch, 4)
     _mark(repo, home)
-    result = _run('git commit -m "fix"', repo, home, dispatched=True)
+    result = _run('git commit -m "fix"  # escalation-ack', repo, home, dispatched=True)
     assert _decision(result) == "deny"
     assert f"standing authorization ended after {_HEAD_LIMIT}" in result.stderr
 
@@ -274,7 +277,7 @@ def test_docs_skip_and_review_override_still_pass_through_approval(monkeypatch, 
     _git(repo, "reset", "-q", "HEAD", "--", "f.py")
     (repo / "note.md").write_text("documentation\n")
     _git(repo, "add", "note.md")
-    docs = _run('git commit -m "docs"', repo, home)
+    docs = _run('git commit -m "docs"  # escalation-ack', repo, home)
     assert _decision(docs) == "ask"
 
     _git(repo, "reset", "-q", "HEAD", "--", "note.md")
@@ -294,10 +297,12 @@ def test_unknown_budget_asks_foreground_and_denies_autonomous(monkeypatch, repo,
 def test_gate_round_two_fix_is_allowed_but_post_confirmation_fix_asks(monkeypatch, repo, home):
     _evidence(monkeypatch, 2, gate=True, head=HEADS[1])
     _mark(repo, home)
-    assert _decision(_run('git commit -m "round two fix"', repo, home)) == "allow"
+    # Two reviewed heads is the round-2 MODE-SWITCH tier, now keyed on reviewed
+    # heads; the budget still permits the fix once the class audit is attested.
+    assert _decision(_run('git commit -m "round two fix"  # audit-ack', repo, home)) == "allow"
 
     _evidence(monkeypatch, 3, gate=True, head=HEADS[2])
-    after = _run('git commit -m "post confirmation fix"', repo, home)
+    after = _run('git commit -m "post confirmation fix"  # escalation-ack', repo, home)
     assert _decision(after) == "ask"
     assert f"Its {_GATE_LIMIT} discovery rounds plus confirmation are spent" in after.stdout
 
@@ -342,7 +347,7 @@ def test_every_fix_commit_approval_states_the_terminal_decision(
     """
     _evidence(monkeypatch, reviewed, gate=gate, head=head)
     _mark(repo, home)
-    result = _run('git commit -m "fix"', repo, home)
+    result = _run('git commit -m "fix"  # escalation-ack', repo, home)
     assert _decision(result) == "ask"
     assert "MERGE with the outstanding issues accepted and filed" in result.stdout
     assert "SEND IT BACK for rework" in result.stdout
@@ -367,3 +372,185 @@ def test_proven_no_open_pr_does_not_invent_a_cloud_round(monkeypatch, repo, home
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_PR", "none")
     _mark(repo, home)
     assert _decision(_run('git commit -m "local branch"', repo, home)) == "allow"
+
+
+# ── Round prescription keyed on reviewed heads ──────────────────────────────
+#
+# The round-2 MODE-SWITCH and round-3 HARD STOP used to read ONLY the local
+# defect-bearing streak, which moves solely on a self-reported external mark.
+# The ordinary fix workflow marks an INTERNAL audit, which never moves it, so a
+# PR could accumulate reviewed heads with no round file at all and neither tier
+# ever fired. The effective round is now max(local streak, reviewed heads), with
+# acks recorded against the reviewed-head count they acknowledge.
+
+
+def _cap() -> int:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import review_state  # noqa: PLC0415
+
+    return review_state.ESCALATION_ROUND_CAP
+
+
+def _ack_file(repo: Path, home: Path) -> Path:
+    import hashlib  # noqa: PLC0415
+
+    key = hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
+    return home / ".genesis" / "review_rounds" / f"{key}.head_acks.json"
+
+
+def _round_file(repo: Path, home: Path) -> Path:
+    return _ack_file(repo, home).with_name(_ack_file(repo, home).name.replace(".head_acks", ""))
+
+
+def test_mode_switch_fires_on_reviewed_heads_with_no_local_streak(monkeypatch, repo, home):
+    """(a) Local streak 0 (no round file) + CAP-1 reviewed heads → MODE-SWITCH."""
+    _evidence(monkeypatch, _cap() - 1, head=HEADS[_cap() - 1])
+    _mark(repo, home)
+    assert not _round_file(repo, home).exists(), "fixture must have NO local streak"
+    result = _run('git commit -m "fix"', repo, home)
+    assert _decision(result) == "deny"
+    assert "BLOCKED (mode-switch)" in result.stderr
+    assert f"{_cap() - 1} distinct REVIEWED HEADS" in result.stderr
+    # The local clause is absent: nothing was self-reported, and the message must
+    # not claim defect-bearing rounds it has no evidence for — the reviewed-head
+    # count includes clean reviews, so a converged PR lands here too.
+    assert "consecutive EXTERNAL" not in result.stderr
+    assert "Two rounds of NEW defects" not in result.stderr
+    assert "IF those reviewed rounds each surfaced NEW defects" in result.stderr
+    assert "includes CLEAN reviews" in result.stderr
+
+
+def test_hard_stop_from_reviewed_heads_does_not_claim_a_failed_audit(monkeypatch, repo, home):
+    _evidence(monkeypatch, _cap(), head=HEADS[_cap()])
+    _mark(repo, home)
+    result = _run('git commit -m "fix"', repo, home)
+    assert _decision(result) == "deny"
+    assert "mode-switch audit did NOT converge" not in result.stderr
+    assert "if those rounds kept surfacing NEW defects" in result.stderr
+
+
+def test_escalation_ack_at_a_count_also_covers_the_audit_tier(monkeypatch, repo, home):
+    """An escalation decision at count N must not be followed by a mode-switch at N."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import review_state  # noqa: PLC0415
+
+    cap = _cap()
+    _evidence(monkeypatch, cap - 1, head=HEADS[cap - 1])
+    _mark(repo, home)
+    env_home = os.environ.get("HOME")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(review_state, "_ROUND_DIR", home / ".genesis" / "review_rounds")
+    try:
+        review_state.record_reviewed_head_ack(
+            str(repo), tier="escalation", repo="owner/repo", pr=99, heads=cap - 1
+        )
+    finally:
+        if env_home is not None:
+            monkeypatch.setenv("HOME", env_home)
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "allow"
+
+
+def test_hard_stop_fires_on_reviewed_heads_with_no_local_streak(monkeypatch, repo, home):
+    """(b) CAP reviewed heads, no local streak → HARD STOP, in every session type."""
+    _evidence(monkeypatch, _cap(), head=HEADS[_cap()])
+    _mark(repo, home)
+    for dispatched in (False, True):
+        result = _run('git commit -m "fix"', repo, home, dispatched=dispatched)
+        assert _decision(result) == "deny"
+        assert "review escalation cap reached" in result.stderr
+        assert f"{_cap()} distinct REVIEWED HEADS" in result.stderr
+
+
+def test_audit_ack_satisfies_its_count_and_rearms_at_the_next_head(monkeypatch, repo, home):
+    """(c) An ack is tied to the reviewed-head count it acknowledged."""
+    cap = _cap()
+    _evidence(monkeypatch, cap - 1, head=HEADS[cap - 1])
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "fix"  # audit-ack', repo, home)) == "allow"
+    assert json.loads(_ack_file(repo, home).read_text())["audit"] == cap - 1
+    # Same count, no sigil: the recorded ack satisfies it.
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "allow"
+
+    # Next reviewed head: the audit ack does NOT reach it, and the HARD STOP arms.
+    _evidence(monkeypatch, cap, head=HEADS[cap])
+    stopped = _run('git commit -m "fix"', repo, home)
+    assert _decision(stopped) == "deny"
+    assert "review escalation cap reached" in stopped.stderr
+    # An audit-ack is not an escalation-ack.
+    assert _decision(_run('git commit -m "fix"  # audit-ack', repo, home)) == "deny"
+    assert _decision(_run('git commit -m "fix"  # escalation-ack', repo, home)) == "allow"
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "allow"
+
+    # One more reviewed head re-arms the stop: one ack never silences later rounds.
+    _evidence(monkeypatch, cap + 1, head=HEADS[cap + 1])
+    rearmed = _run('git commit -m "fix"', repo, home)
+    assert _decision(rearmed) == "deny"
+    assert "review escalation cap reached" in rearmed.stderr
+    assert f"recorded against {cap + 1} reviewed heads" in rearmed.stderr
+
+
+def test_ack_for_another_pull_request_does_not_satisfy(monkeypatch, repo, home):
+    cap = _cap()
+    _evidence(monkeypatch, cap, head=HEADS[cap])
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "fix"  # escalation-ack', repo, home)) == "allow"
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_PR", "100")
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "deny"
+
+
+def test_unreadable_budget_keeps_todays_local_only_behaviour(monkeypatch, repo, home):
+    """(d) Unknown evidence never becomes a round block — only the existing ask."""
+    _evidence(monkeypatch, _cap() + 1, head=HEADS[_cap() + 1])
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "bad-json")
+    _mark(repo, home)
+    foreground = _run('git commit -m "fix"', repo, home)
+    assert _decision(foreground) == "ask"
+    assert "could not be read reliably" in foreground.stdout
+    background = _run('git commit -m "fix"', repo, home, dispatched=True)
+    assert _decision(background) == "deny"
+    assert "escalation cap" not in background.stderr
+    assert "mode-switch" not in background.stderr
+    assert not _ack_file(repo, home).exists()
+
+
+def test_no_open_pr_keeps_todays_local_only_behaviour(monkeypatch, repo, home):
+    """(e) No PR → no reviewed-head input; nothing recorded."""
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_PR", "none")
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "allow"
+    assert not _ack_file(repo, home).exists()
+
+
+def test_reviewed_heads_pr_accepts_only_a_clean_read():
+    ok = {"status": "ok", "count": 3, "repo": "o/r", "pr": 7}
+    assert _guard._reviewed_heads_pr(ok) == ("o/r", 7, 3)
+    assert _guard._reviewed_heads_pr(None) is None
+    assert _guard._reviewed_heads_pr({**ok, "status": "unknown"}) is None
+    for bad in ({"count": None}, {"count": True}, {"count": -1}, {"repo": ""}, {"pr": "7"}):
+        assert _guard._reviewed_heads_pr({**ok, **bad}) is None, bad
+
+
+def test_ack_store_is_scoped_and_tolerates_corruption(monkeypatch, tmp_path, repo):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import review_state  # noqa: PLC0415
+
+    monkeypatch.setattr(review_state, "_ROUND_DIR", tmp_path / "rounds")
+    cwd = str(repo)
+    assert review_state.get_reviewed_head_acks(cwd, repo="o/r", pr=1) == {}
+    review_state.record_reviewed_head_ack(cwd, tier="audit", repo="o/r", pr=1, heads=2)
+    review_state.record_reviewed_head_ack(cwd, tier="escalation", repo="o/r", pr=1, heads=3)
+    assert review_state.get_reviewed_head_acks(cwd, repo="O/R", pr=1) == {
+        "audit": 2,
+        "escalation": 3,
+    }
+    assert review_state.get_reviewed_head_acks(cwd, repo="o/r", pr=2) == {}
+    # A record for another PR is replaced, not merged.
+    review_state.record_reviewed_head_ack(cwd, tier="audit", repo="o/r", pr=2, heads=5)
+    assert review_state.get_reviewed_head_acks(cwd, repo="o/r", pr=1) == {}
+    assert review_state.get_reviewed_head_acks(cwd, repo="o/r", pr=2) == {"audit": 5}
+    # Unknown tiers are never written.
+    review_state.record_reviewed_head_ack(cwd, tier="bogus", repo="o/r", pr=2, heads=9)
+    assert "bogus" not in json.loads(review_state._head_ack_file(cwd).read_text())
+    for garbage in ("{", "[]", '{"repo": "o/r", "pr": 2, "audit": true}', "\xff"):
+        review_state._head_ack_file(cwd).write_text(garbage)
+        assert review_state.get_reviewed_head_acks(cwd, repo="o/r", pr=2) == {}

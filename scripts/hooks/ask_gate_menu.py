@@ -186,6 +186,11 @@ def _cap_is_live(cwd: str | None) -> bool:
 
     Every failure path returns False (no menu). Fail-open in the sense that matters --
     a miss costs a menu, never a gate.
+
+    KNOWN GAP: the commit gate's HARD STOP now also fires on the PR's GitHub
+    reviewed-head count, which this hook does not read (it would need the network
+    budget lookup this hook deliberately avoids). When only that count fired, no
+    menu is offered; the commit gate's own denial text still carries the options.
     """
     try:
         from review_state import (
