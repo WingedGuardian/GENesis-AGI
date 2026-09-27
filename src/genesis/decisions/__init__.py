@@ -17,22 +17,30 @@ from genesis.decisions.registry import (
 )
 from genesis.decisions.types import (
     CARDINALITY_SOFT_CAP,
+    MIN_DEAD_BAND,
+    TIE_RULES,
     Consumes,
     Decision,
     DecisionSpec,
     Fallback,
     Mode,
     QuestionType,
+    Verdict,
+    band_problem,
 )
 
 __all__ = [
     "CARDINALITY_SOFT_CAP",
+    "MIN_DEAD_BAND",
+    "TIE_RULES",
     "Consumes",
     "Decision",
     "DecisionSpec",
     "Fallback",
     "Mode",
     "QuestionType",
+    "Verdict",
+    "band_problem",
     "RegistryError",
     "load_registry",
     "load_registry_from_string",

@@ -64,14 +64,21 @@ def test_threshold_consumer_without_a_threshold_is_rejected():
 
 
 def test_threshold_consumer_with_a_threshold_is_accepted():
-    body = _VALID.replace("consumes: argmax", "consumes: threshold\n    threshold: 0.81")
+    body = _VALID.replace(
+        "consumes: argmax",
+        "consumes: threshold\n    threshold: 0.81\n    dead_band: 0.05\n    tie_rule: inclusive",
+    )
     assert _spec(body)["memory_relationship"].threshold == pytest.approx(0.81)
 
 
 @pytest.mark.parametrize("bad", ["0", "1", "1.5", "-0.2"])
 def test_threshold_outside_the_open_unit_interval_is_rejected(bad):
-    body = _VALID.replace("consumes: argmax", f"consumes: threshold\n    threshold: {bad}")
-    with pytest.raises(RegistryError, match="threshold"):
+    """Carries a valid band so the failure is the INTERVAL check, not a missing field."""
+    body = _VALID.replace(
+        "consumes: argmax",
+        f"consumes: threshold\n    threshold: {bad}\n    dead_band: 0.01\n    tie_rule: inclusive",
+    )
+    with pytest.raises(RegistryError, match=r"threshold=.* (inside|must)"):
         _spec(body)
 
 
@@ -382,3 +389,216 @@ def test_strict_loader_still_refuses_arbitrary_python_tags():
     with pytest.raises(Exception) as exc:
         _spec('!!python/object/apply:os.system ["true"]')
     assert "python/object" in str(exc.value) or "constructor" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Dead band. A decision whose score sits near its cut is not repeatable:
+# an identical request re-sent to a pinned decision model flipped 159 of 858
+# near-cut decisions at a 0.50 cut, while the aggregate action rate moved only
+# a point because the flips cancel. So a thresholding site may not branch on a
+# bare cut — it declares a band around it and abstains inside the band.
+# ---------------------------------------------------------------------------
+
+from genesis.decisions.types import Verdict  # noqa: E402
+
+_THRESH = _VALID.replace(
+    "consumes: argmax",
+    "consumes: threshold\n    threshold: 0.6\n    dead_band: 0.1\n    tie_rule: inclusive",
+)
+
+
+def _gated(tie="inclusive", cut=0.6, band=0.1):
+    return _spec(
+        _VALID.replace(
+            "consumes: argmax",
+            f"consumes: threshold\n    threshold: {cut}\n    dead_band: {band}\n"
+            f"    tie_rule: {tie}",
+        )
+    )["memory_relationship"]
+
+
+def test_a_threshold_site_with_band_and_tie_rule_loads():
+    s = _spec(_THRESH)["memory_relationship"]
+    assert s.dead_band == pytest.approx(0.1)
+    assert s.tie_rule == "inclusive"
+
+
+@pytest.mark.parametrize("missing", ["dead_band", "tie_rule"])
+def test_a_threshold_site_must_declare_band_and_tie_rule(missing):
+    body = "\n".join(ln for ln in _THRESH.splitlines() if not ln.strip().startswith(missing))
+    with pytest.raises(RegistryError, match=missing):
+        _spec(body)
+
+
+@pytest.mark.parametrize("key,val", [("dead_band", "0.1"), ("tie_rule", "inclusive")])
+def test_band_fields_on_a_non_threshold_site_are_rejected(key, val):
+    """A stray band means gating was expected but never declared."""
+    with pytest.raises(RegistryError, match=key):
+        _spec(_VALID.replace("consumes: argmax", f"consumes: argmax\n    {key}: {val}"))
+
+
+@pytest.mark.parametrize(
+    "cut,band",
+    [(0.6, 0), (0.6, -0.1), (0.6, 0.4), (0.95, 0.1), (0.05, 0.1), (0.6, "true")],
+)
+def test_the_band_must_be_positive_and_stay_inside_the_unit_interval(cut, band):
+    with pytest.raises(RegistryError, match="dead_band"):
+        _gated(cut=cut, band=band)
+
+
+@pytest.mark.parametrize("tie", ["gt", "maybe", "'  '", "true"])
+def test_the_tie_rule_is_a_closed_set(tie):
+    with pytest.raises(RegistryError, match="tie_rule"):
+        _gated(tie=tie)
+
+
+@pytest.mark.parametrize(
+    "p,verdict",
+    [
+        (0.95, Verdict.ACT),
+        (0.71, Verdict.ACT),
+        (0.69, Verdict.ABSTAIN),  # inside the band, above the cut
+        (0.60, Verdict.ABSTAIN),  # exactly on the cut is always inside the band
+        (0.51, Verdict.ABSTAIN),
+        (0.49, Verdict.DECLINE),
+        (0.02, Verdict.DECLINE),
+    ],
+)
+def test_gate_abstains_inside_the_band(p, verdict):
+    assert _gated().gate(p, mode="calibrated") is verdict
+
+
+def test_the_tie_rule_decides_scores_exactly_on_a_band_edge():
+    """Two-decimal probabilities land exactly on edges; the rule is explicit."""
+    inclusive, exclusive = _gated("inclusive"), _gated("exclusive")
+    assert inclusive.gate(0.7, mode="calibrated") is Verdict.ACT
+    assert inclusive.gate(0.5, mode="calibrated") is Verdict.DECLINE
+    assert exclusive.gate(0.7, mode="calibrated") is Verdict.ABSTAIN
+    assert exclusive.gate(0.5, mode="calibrated") is Verdict.ABSTAIN
+
+
+@pytest.mark.parametrize("bad", [float("nan"), -0.01, 1.01, float("inf")])
+def test_gate_refuses_a_score_that_is_not_a_probability(bad):
+    with pytest.raises(ValueError):
+        _gated().gate(bad, mode="calibrated")
+
+
+def test_gate_is_only_for_thresholding_sites():
+    with pytest.raises(ValueError):
+        _spec(_VALID)["memory_relationship"].gate(0.9, mode="calibrated")
+
+
+# ---------------------------------------------------------------------------
+# Audit round 1 on the dead band: each test below closes a finding or a
+# mutation that survived the original suite.
+# ---------------------------------------------------------------------------
+
+from decimal import Decimal  # noqa: E402
+from fractions import Fraction  # noqa: E402
+
+from genesis.decisions.types import MIN_DEAD_BAND, band_problem  # noqa: E402
+
+
+@pytest.mark.parametrize("bad", [True, False, Decimal("0.7"), "0.7", None])
+def test_gate_rejects_a_bool_or_non_real_score(bad):
+    """A yes/no answer's VALUE passed instead of its probability used to skip
+    the band entirely as 1.0 or 0.0."""
+    with pytest.raises(ValueError):
+        _gated().gate(bad, mode="calibrated")
+
+
+def test_gate_converts_other_reals_to_float_so_verdicts_match():
+    """Fraction(7,10) used to ACT under exclusive where the float 0.7 abstains."""
+    ex = _gated("exclusive")
+    assert ex.gate(Fraction(7, 10), mode="calibrated") is ex.gate(0.7, mode="calibrated")
+
+
+@pytest.mark.parametrize("p,verdict", [(0.0, Verdict.DECLINE), (1.0, Verdict.ACT)])
+def test_gate_accepts_the_closed_unit_interval(p, verdict):
+    """A model returning exactly 1.00 must not crash the gate."""
+    assert _gated().gate(p, mode="calibrated") is verdict
+
+
+@pytest.mark.parametrize("mode", ["typed", "legacy", Mode.TYPED])
+def test_gate_abstains_whenever_the_site_may_not_threshold(mode):
+    """No site may branch on a probability outside Calibrated mode."""
+    assert _gated().gate(0.99, mode=mode) is Verdict.ABSTAIN
+    assert _gated().gate(0.01, mode=mode) is Verdict.ABSTAIN
+
+
+@pytest.mark.parametrize(
+    "cut,band,edge_hi,edge_lo",
+    [(0.85, 0.07, 0.92, 0.78), (0.05, 0.01, 0.06, 0.04), (0.03, 0.01, 0.04, 0.02)],
+)
+def test_edges_hold_for_pairs_where_float_addition_is_inexact(cut, band, edge_hi, edge_lo):
+    """0.85 + 0.07 is 0.9199999999999999 unrounded — an exact 0.92 must still be
+    ON the edge, so the tie rule, not float noise, decides it."""
+    inc, exc = _gated("inclusive", cut, band), _gated("exclusive", cut, band)
+    assert inc.gate(edge_hi, mode="calibrated") is Verdict.ACT
+    assert inc.gate(edge_lo, mode="calibrated") is Verdict.DECLINE
+    assert exc.gate(edge_hi, mode="calibrated") is Verdict.ABSTAIN
+    assert exc.gate(edge_lo, mode="calibrated") is Verdict.ABSTAIN
+
+
+@pytest.mark.parametrize(
+    "threshold,band,tie",
+    [
+        (0.6, -0.1, "inclusive"),
+        (0.6, 0.0, "inclusive"),
+        (0.6, 0.5, "inclusive"),
+        (0.6, float("nan"), "inclusive"),
+        (1.5, 0.1, "inclusive"),
+        (0.6, 0.1, "sideways"),
+        (0.6, None, "inclusive"),
+    ],
+)
+def test_a_directly_constructed_spec_cannot_skip_band_validation(threshold, band, tie):
+    """The loader used to be the only validator; gate() now runs the same checks."""
+    spec = DecisionSpec(
+        name="t",
+        type=QuestionType.NOUL,
+        instructions="q",
+        consumes=C.THRESHOLD,
+        fallback=Fallback("a", "b"),
+        owner="o",
+        threshold=threshold,
+        dead_band=band,
+        tie_rule=tie,
+    )
+    with pytest.raises(ValueError):
+        spec.gate(0.6, mode="calibrated")
+
+
+@pytest.mark.parametrize(
+    "cut,band",
+    [(0.5, MIN_DEAD_BAND / 10), (0.5, 0.4999999999), (0.1, 0.1), (0.9, 0.1)],
+)
+def test_bands_that_collapse_or_empty_a_side_are_rejected(cut, band):
+    """A sub-resolution band collapses onto the cut; a band reaching 0 or 1
+    leaves one side undecidable."""
+    assert band_problem(cut, band, "inclusive") is not None
+    with pytest.raises(RegistryError):
+        _gated(cut=cut, band=band)
+
+
+@pytest.mark.parametrize("bad", ["'0.6'", "true", "999999999999999999999" * 20])
+def test_threshold_is_typed_as_strictly_as_the_band(bad):
+    """A string threshold used to load while a string band was rejected; a
+    huge integer used to raise OverflowError instead of RegistryError."""
+    with pytest.raises(RegistryError):
+        _gated(cut=bad)
+
+
+@pytest.mark.parametrize("tie", ["Inclusive", "INCLUSIVE"])
+def test_tie_rule_is_case_sensitive(tie):
+    with pytest.raises(RegistryError, match="tie_rule"):
+        _gated(tie=tie)
+
+
+def test_tie_rule_surrounding_whitespace_is_stripped():
+    assert _gated(tie="'  inclusive  '").tie_rule == "inclusive"
+
+
+def test_a_yaml_bool_band_is_rejected_as_a_type_not_a_range():
+    with pytest.raises(RegistryError, match="must be a number"):
+        _gated(band="true")

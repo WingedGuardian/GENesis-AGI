@@ -33,6 +33,7 @@ from genesis.decisions.types import (
     DecisionSpec,
     Fallback,
     QuestionType,
+    band_problem,
 )
 
 __all__ = ["RegistryError", "load_registry", "load_registry_from_string"]
@@ -67,6 +68,8 @@ _ALLOWED_KEYS = frozenset(
         "options",
         "criteria",
         "threshold",
+        "dead_band",
+        "tie_rule",
         "latency_budget_ms",
         "outcome_source",
         "cardinality_strategy",
@@ -135,22 +138,45 @@ def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
             _fail(name, "a noul is binary and must not declare options or criteria")
 
     # The linter rule. `consumes` exists so this is enforced rather than noticed.
+    # A bare cut is not enough: scores near it are not repeatable on replay, so
+    # a thresholding site also declares the band it abstains in and the rule
+    # for scores landing exactly on a band edge. The checks live in
+    # `band_problem`, shared with `DecisionSpec.gate`, so a directly
+    # constructed spec cannot skip them.
     threshold = raw.get("threshold", None)
+    dead_band = raw.get("dead_band", None)
+    tie_rule = raw.get("tie_rule", None)
     if consumes is Consumes.THRESHOLD:
-        if threshold is None:
-            _fail(name, "consumes=threshold requires an explicit threshold")
-        try:
-            threshold = float(threshold)
-        except (TypeError, ValueError):
-            _fail(name, f"threshold={threshold!r} is not a number")
-        if not (0.0 < threshold < 1.0):
-            _fail(name, f"threshold={threshold} must lie strictly inside (0, 1)")
-    elif threshold is not None:
-        _fail(
-            name,
-            f"threshold={threshold!r} is set but consumes={consumes.value} — a stray "
-            "threshold means gating was expected but never declared",
-        )
+        for key, value in (
+            ("threshold", threshold),
+            ("dead_band", dead_band),
+            ("tie_rule", tie_rule),
+        ):
+            if value is None:
+                _fail(
+                    name,
+                    f"consumes=threshold requires an explicit {key} — decisions near a "
+                    "cut flip on an identical retry, so the site must declare its cut, "
+                    "the band it abstains in, and its edge tie rule",
+                )
+        if isinstance(tie_rule, str):
+            tie_rule = tie_rule.strip()
+        problem = band_problem(threshold, dead_band, tie_rule)
+        if problem is not None:
+            _fail(name, problem)
+        threshold, dead_band = float(threshold), float(dead_band)
+    else:
+        for key, value in (
+            ("threshold", threshold),
+            ("dead_band", dead_band),
+            ("tie_rule", tie_rule),
+        ):
+            if value is not None:
+                _fail(
+                    name,
+                    f"{key}={value!r} is set but consumes={consumes.value} — a stray "
+                    f"{key} means gating was expected but never declared",
+                )
 
     strategy = raw.get("cardinality_strategy")
     if strategy is not None:
@@ -205,6 +231,8 @@ def _parse_one(name: str, raw: Mapping[str, Any]) -> DecisionSpec:
         options=options,
         criteria=criteria,
         threshold=threshold if consumes is Consumes.THRESHOLD else None,
+        dead_band=dead_band if consumes is Consumes.THRESHOLD else None,
+        tie_rule=tie_rule if consumes is Consumes.THRESHOLD else None,
         latency_budget_ms=budget,
         outcome_source=(str(raw["outcome_source"]) if raw.get("outcome_source") else None),
         cardinality_strategy=str(strategy) if strategy else None,

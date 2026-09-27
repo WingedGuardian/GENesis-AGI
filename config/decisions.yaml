@@ -18,6 +18,10 @@
 #   argmax   — top label only.   Needs accuracy. Works uncalibrated.
 #   ordering — relative order.   Needs ranking.  Works uncalibrated.
 #   threshold— absolute p.       REQUIRES calibration; a threshold is mandatory.
+#              A threshold site also declares `dead_band` (it abstains inside
+#              threshold ± band: decisions near a cut flip on an identical retry)
+#              and `tie_rule` (inclusive | exclusive — is a score exactly on a band
+#              edge decided, or does it abstain?).
 #
 # A local `decisions.local.yaml` overlay (gitignored) is deep-merged on top.
 
