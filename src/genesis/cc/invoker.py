@@ -713,7 +713,8 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
 # dispatch) would otherwise emit one event per call. One event per
 # (error_class, caller_tag) per window keeps the signal while bounding the
 # volume; the count swallowed in between rides on the NEXT emitted event
-# (``coalesced``), so the omission is declared, never silent.
+# (``coalesced``), so the omission is declared, never silent. Untagged calls
+# (caller_tag None) are never coalesced: they share no identity to key on.
 # 60s: short enough that a recurring failure re-surfaces within a minute, long
 # enough to collapse one incident's fan-out burst into one row.
 _FAILURE_EVENT_COALESCE_S = 60.0
@@ -746,46 +747,60 @@ async def _emit_invocation_failed_event(
     invocation, immediately before the error is re-raised — so every CC call
     site gets one central failure signal without each caller emitting its own.
     Rate-limit / quota errors are WARNING (expected, self-recovering); every
-    other CCError is ERROR. Skipped for liveness probes (``caller_tag ==
-    "probe"``). Same bus resolution as ``_emit_bg_truncation_event``: no-ops
-    when the runtime/bus is absent and never raises — observability must not
-    mask the real error the caller is about to receive.
+    other CCError is ERROR. A liveness probe's EXPECTED answer (a rate-limit /
+    quota error while the home model is still limited) is skipped; any other
+    probe failure is a malfunction and is emitted. Coalescing applies only to
+    TAGGED callers — an untagged call has no identity to key on, and pooling
+    unrelated subsystems under ``(class, None)`` would hide one behind another.
+    Same bus resolution as ``_emit_bg_truncation_event``: no-ops when the
+    runtime/bus is absent and never raises — observability must not mask the
+    real error the caller is about to receive.
     """
+    is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+    key: tuple[str, str | None] | None = None
+    prev_state: list[float] | None = None
     try:
-        if invocation.caller_tag == PROBE_CALLER_TAG:
+        if invocation.caller_tag == PROBE_CALLER_TAG and is_limit:
             return
         bus = _runtime_event_bus()
         if bus is None:
             return
         error_class = type(exc).__name__
-        key = (error_class, invocation.caller_tag)
-        now = time.monotonic()
-        state = _failure_event_state.get(key)
-        if state is not None and now - state[0] < _FAILURE_EVENT_COALESCE_S:
-            state[1] += 1
-            return
-        coalesced = int(state[1]) if state is not None else 0
-        _failure_event_state[key] = [now, 0]
+        coalesced = 0
+        if invocation.caller_tag is not None:
+            key = (error_class, invocation.caller_tag)
+            now = time.monotonic()
+            prev_state = _failure_event_state.get(key)
+            if prev_state is not None and now - prev_state[0] < _FAILURE_EVENT_COALESCE_S:
+                prev_state[1] += 1
+                key = None  # suppressed: nothing to roll back
+                return
+            coalesced = int(prev_state[1]) if prev_state is not None else 0
+            # Claimed BEFORE the await so concurrent failures coalesce instead of
+            # racing to emit; rolled back below if the emit itself fails.
+            _failure_event_state[key] = [now, 0]
 
         from genesis.observability.session_context import get_session_id
         from genesis.observability.types import Severity, Subsystem
 
-        severity = (
-            Severity.WARNING
-            if isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
-            else Severity.ERROR
-        )
+        severity = Severity.WARNING if is_limit else Severity.ERROR
         # The exception TEXT is deliberately not carried: CC errors are built
         # from raw CLI stderr/stdout (see _classify_error), which is unbounded
         # and can echo arbitrary tool output, and this event is persisted to
         # the events table. Metadata only; the length marks the omission, and
         # the caller receives the full error via the re-raise.
+        # The coalesced count is ALSO in the message, because health_errors
+        # returns the message but not the details.
+        message = (
+            f"CC invocation failed ({error_class}) for {invocation.caller_tag or 'untagged caller'}"
+        )
+        if coalesced:
+            message += f" (+{coalesced} similar failure(s) coalesced in the prior window)"
         await bus.emit(
             Subsystem.PROVIDERS,
             severity,
             "cc.invocation_failed",
-            f"CC invocation failed ({error_class}) for "
-            f"{invocation.caller_tag or 'untagged caller'}",
+            message,
             error_class=error_class,
             error_text_omitted_chars=len(str(exc)),
             streaming=streaming,
@@ -795,6 +810,14 @@ async def _emit_invocation_failed_event(
             coalesced=coalesced,
         )
     except Exception:
+        # The emit failed: do not leave a window open for an event that never
+        # landed. Restore the prior state (keeping its suppressed count) so the
+        # next failure retries the bus instead of being coalesced away.
+        if key is not None:
+            if prev_state is None:
+                _failure_event_state.pop(key, None)
+            else:
+                _failure_event_state[key] = prev_state
         logger.debug("cc.invocation_failed event emit failed", exc_info=True)
 
 

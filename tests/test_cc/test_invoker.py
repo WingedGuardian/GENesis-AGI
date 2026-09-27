@@ -4947,6 +4947,57 @@ async def test_invocation_failed_no_event_for_probe(monkeypatch, fail_bus, entry
 
 
 @pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_probe_malfunction_still_emits(monkeypatch, fail_bus, entry):
+    """Only the probe's EXPECTED answer (limit/quota) is exempt; a probe that
+    times out or loses its binary is a malfunction and must surface."""
+    from genesis.cc.types import PROBE_CALLER_TAG
+
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    with pytest.raises(CCTimeoutError):
+        await _call(invoker, entry, CCInvocation(prompt="x", caller_tag=PROBE_CALLER_TAG))
+    assert len(fail_bus.events) == 1
+    assert fail_bus.events[0][4]["caller_tag"] == PROBE_CALLER_TAG
+
+
+async def test_invocation_failed_untagged_callers_never_coalesce(monkeypatch, fail_bus):
+    """Untagged calls come from unrelated subsystems; sharing a (class, None)
+    key would suppress one subsystem's failure behind another's."""
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(3):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x"))
+    assert len(fail_bus.events) == 3
+    assert all(e[4]["caller_tag"] is None for e in fail_bus.events)
+
+
+async def test_invocation_failed_emit_failure_does_not_open_a_window(monkeypatch, fail_bus):
+    """A bus fault must not record an emission that never happened."""
+    fail_bus.emit.side_effect = [RuntimeError("bus broke"), None]
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(2):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert fail_bus.emit.await_count == 2, "the retry inside the window was suppressed"
+
+
+async def test_invocation_failed_coalesced_count_is_in_the_message(monkeypatch, fail_bus):
+    """health_errors returns the message, not details — the count must be visible there."""
+    import genesis.cc.invoker as inv_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(3):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    clock["t"] += 61.0
+    with pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert "2 similar failure(s) coalesced" in fail_bus.events[-1][3]
+    assert "coalesced" not in fail_bus.events[0][3]
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
 async def test_invocation_failed_no_bus_still_reraises(monkeypatch, entry):
     import genesis.cc.invoker as inv_mod
 

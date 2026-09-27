@@ -3532,56 +3532,159 @@ async def test_baseline_guard_delta_only_new_items(
 
 # ── BUILD verdict fallback: never silently dropped when the lane is not live ──
 
-_BUILD_EVAL = (
-    "# Inbox Evaluation\n\n"
-    "## 1. Widget Skill\n\n"
-    "### Recommendation\n\n"
-    "```yaml\n"
-    "action: BUILD\n"
-    'next_step: "Build the widget skill"\n'
-    "effort: Small\n"
-    "scope: V4\n"
-    "confidence: high\n"
-    "architecture_impact: extends\n"
-    "verdict: build\n"
-    'verdict_reason: "User pre-declared the need"\n'
-    "```\n"
-)
+
+def _build_eval(verdict: str | None, next_step: str = "Build the widget skill") -> str:
+    verdict_lines = (
+        f'verdict: {verdict}\nverdict_reason: "Stated reason for the verdict"\n'
+        if verdict is not None
+        else ""
+    )
+    return (
+        "# Inbox Evaluation\n\n"
+        "## 1. Widget Skill\n\n"
+        "### Recommendation\n\n"
+        "```yaml\n"
+        "action: BUILD\n"
+        f'next_step: "{next_step}"\n'
+        "effort: Small\n"
+        "scope: V4\n"
+        "confidence: high\n"
+        "architecture_impact: extends\n"
+        f"{verdict_lines}"
+        "```\n"
+    )
 
 
 async def _build_follow_ups(db) -> list[dict]:
     cur = await db.execute(
         "SELECT content, reason, strategy, priority, pinned, kind "
-        "FROM follow_ups WHERE source = 'inbox_evaluation'"
+        "FROM follow_ups WHERE source = 'inbox_evaluation' ORDER BY rowid"
     )
     return [dict(r) for r in await cur.fetchall()]
 
 
+_LANE_CASES = [
+    pytest.param(None, id="lane-unwired"),
+    pytest.param(SimpleNamespace(enabled=False), id="lane-disabled"),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("lane", "expected"),
-    [
-        pytest.param(None, 1, id="lane-unwired"),
-        pytest.param(SimpleNamespace(enabled=False), 1, id="lane-disabled"),
-        pytest.param(SimpleNamespace(enabled=True), 0, id="lane-live"),
-    ],
-)
-async def test_build_verdict_follow_up_only_when_lane_not_live(monitor, db, lane, expected):
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_build_verdict_becomes_pinned_follow_up_when_lane_not_live(monitor, db, lane):
     if lane is not None:
         monitor.set_build_lane(lane)
     created = await monitor._create_follow_ups_from_eval(
-        evaluation_text=_BUILD_EVAL,
+        evaluation_text=_build_eval("build"),
         batch_id="batch-build-1",
         source_files=["Capabilities.md"],
     )
     rows = await _build_follow_ups(db)
-    assert created == expected
-    assert len(rows) == expected
-    if expected:
-        row = rows[0]
-        assert row["content"].startswith("[BUILD] Widget Skill")
-        assert row["strategy"] == "user_input_needed"
-        assert row["priority"] == "medium"
-        assert row["pinned"] == 1
-        assert row["kind"] == "follow_up"
-        assert "User pre-declared the need" in row["reason"]
+    assert created == 1
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD] Widget Skill")
+    assert row["strategy"] == "user_input_needed"
+    assert row["priority"] == "medium"
+    assert row["pinned"] == 1
+    assert row["kind"] == "follow_up"
+    assert "Stated reason for the verdict" in row["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_needs_discussion_verdict_is_a_discussion_not_a_build_task(monitor, db, lane):
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("needs_discussion"),
+        batch_id="batch-build-2",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD: NEEDS DISCUSSION] Widget Skill")
+    assert not row["content"].startswith("[BUILD] ")
+    assert row["strategy"] == "user_input_needed"
+    assert row["pinned"] == 1
+    assert row["kind"] == "follow_up"
+    assert "Stated reason for the verdict" in row["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_dont_build_veto_is_recorded_never_actionable(monitor, db, lane):
+    """A veto must not become pinned build work; it is kept as a tabled record."""
+    from genesis.db.crud import follow_ups
+
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("dont_build", next_step="Use the existing capability"),
+        batch_id="batch-build-3",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD: DONT_BUILD] Widget Skill")
+    assert row["kind"] == "tabled"
+    assert row["pinned"] == 0
+    assert row["strategy"] == "ego_judgment"
+    assert "Stated reason for the verdict" in row["reason"]
+    actionable = " ".join(r["content"] for r in await follow_ups.get_actionable(db))
+    assert "Widget Skill" not in actionable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_missing_build_verdict_creates_nothing(monitor, db, lane, caplog):
+    """A BUILD block with no valid verdict is malformed: the live lane skips it
+    too (build_lane.handle_eval: verdict None -> continue). Loud, not a task."""
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    with caplog.at_level("WARNING", logger="genesis.inbox.monitor"):
+        created = await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(None),
+            batch_id="batch-build-4",
+            source_files=["Capabilities.md"],
+        )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+    assert any("no valid verdict" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["build", "needs_discussion", "dont_build", None])
+async def test_live_build_lane_gets_no_fallback_follow_up(monitor, db, verdict):
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval(verdict),
+        batch_id="batch-build-5",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+
+
+@pytest.mark.asyncio
+async def test_changed_build_verdict_is_not_deduped_away(monitor, db):
+    """Same item + same next_step but a NEW verdict must still surface."""
+    for i, verdict in enumerate(("needs_discussion", "build")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(verdict, next_step="Review Widget Skill"),
+            batch_id=f"batch-build-6{i}",
+            source_files=["Capabilities.md"],
+        )
+    contents = [r["content"] for r in await _build_follow_ups(db)]
+    assert len(contents) == 2
+    assert contents[0].startswith("[BUILD: NEEDS DISCUSSION]")
+    assert contents[1].startswith("[BUILD] ")
+    # Re-evaluating with the SAME verdict still dedups.
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build", next_step="Review Widget Skill"),
+        batch_id="batch-build-6x",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0

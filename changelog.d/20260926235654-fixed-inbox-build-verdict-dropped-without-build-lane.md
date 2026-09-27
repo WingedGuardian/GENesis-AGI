@@ -2,7 +2,11 @@
   build lane is off.** A `BUILD` recommendation is deliberately skipped by
   follow-up creation because the build lane owns it — but the lane is
   optional, and when it is unwired or disabled it ignores the verdict too, so
-  the evaluation reached no consumer at all. Follow-up creation now checks
-  whether the build lane is live: when it is not, the verdict becomes a
-  pinned, user-owned follow-up (medium priority) carrying the verdict and its
-  stated reason; when it is, nothing changes and no duplicate is created.
+  the evaluation reached no consumer at all. With the lane not live, the
+  verdict is now recorded by what it says: `build` becomes a pinned,
+  user-owned follow-up; `needs_discussion` becomes a pinned follow-up labelled
+  as a discussion rather than a build task; a `dont_build` veto is kept as a
+  tabled record and never becomes actionable work. Each carries the verdict's
+  stated reason. A BUILD block with no valid verdict creates nothing and logs a
+  warning, matching the lane. A changed verdict for the same item is recorded
+  rather than deduplicated away. With the lane live, nothing changes.

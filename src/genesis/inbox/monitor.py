@@ -2681,11 +2681,21 @@ class InboxMonitor:
     # with ``enabled=False`` (its handle_eval then returns 0 without looking) — and
     # in that state a BUILD verdict used to reach NO consumer at all: skipped here
     # by is_actionable, ignored there by the disabled lane. So when the lane is not
-    # live, the verdict is surfaced as a pinned user-owned follow-up instead
-    # (_BUILD_FALLBACK_MAPPING), never silently dropped.
-    _BUILD_FALLBACK_MAPPING: tuple[str, str, bool, str] = (
-        "user_input_needed", "medium", True, "follow_up",
-    )
+    # live, the verdict is surfaced here instead — mapped by the VERDICT, never by
+    # the action alone, because ``action: BUILD`` carries all three verdicts:
+    #   build            -> pinned user-owned follow-up (the greenlight decision)
+    #   needs_discussion -> pinned user-owned follow-up, labelled as a discussion
+    #   dont_build       -> tabled record (a veto is kept, never actionable work)
+    # A missing/invalid verdict (parsed as None) is malformed output: the live lane
+    # skips it too (BuildLane.handle_eval), so it creates nothing and logs WARNING.
+    _BUILD_FALLBACK_MAP: dict[str, tuple[str, str, bool, str, str]] = {
+        # verdict -> (strategy, priority, pinned, kind, content label)
+        "build": ("user_input_needed", "medium", True, "follow_up", "BUILD"),
+        "needs_discussion": (
+            "user_input_needed", "medium", True, "follow_up", "BUILD: NEEDS DISCUSSION",
+        ),
+        "dont_build": ("ego_judgment", "low", False, "tabled", "BUILD: DONT_BUILD"),
+    }
 
     def _build_lane_live(self) -> bool:
         """True only when a build lane is wired AND enabled (it will consume)."""
@@ -2721,8 +2731,19 @@ class InboxMonitor:
             if not rec.is_actionable and not build_fallback:
                 continue
 
+            title = rec.item_title or "Untitled"
+            label = rec.action.upper()
             if build_fallback:
-                mapping = self._BUILD_FALLBACK_MAPPING
+                build_mapping = self._BUILD_FALLBACK_MAP.get(rec.verdict or "")
+                if build_mapping is None:
+                    logger.warning(
+                        "Build lane not live and BUILD recommendation for %r has "
+                        "no valid verdict — creating nothing (malformed eval)",
+                        title,
+                    )
+                    continue
+                *mapping_fields, label = build_mapping
+                mapping = tuple(mapping_fields)
             else:
                 mapping = self._ACTION_MAP.get(action_key)
             if mapping is None:
@@ -2734,24 +2755,24 @@ class InboxMonitor:
 
             strategy, priority, pinned, kind = mapping
 
-            title = rec.item_title or "Untitled"
-            content = f"[{rec.action.upper()}] {title}: {rec.next_step}"
+            content = f"[{label}] {title}: {rec.next_step}"
             reason = (
                 f"Inbox evaluation {batch_id[:8]}: {source_name}. "
                 f"Confidence: {rec.confidence}. Effort: {rec.effort}."
             )
             if build_fallback:
                 reason += (
-                    " Build lane not live — capability-build verdict surfaced "
-                    f"as a follow-up. Verdict: {rec.verdict or 'none'}."
+                    " Build lane not live — capability-build verdict recorded "
+                    f"here instead. Verdict: {rec.verdict}."
                 )
                 if rec.verdict_reason:
                     reason += f" Verdict reason: {rec.verdict_reason}"
                 logger.info(
                     "Build lane not live — BUILD verdict for %r (verdict=%s) "
-                    "routed to a follow-up",
+                    "routed to a %s row",
                     title,
                     rec.verdict,
+                    kind,
                 )
 
             # Dedup: skip if an identical recommendation already exists so that
@@ -2762,9 +2783,13 @@ class InboxMonitor:
             primary = (
                 normalize_url_line(urls_in_title[0]) if urls_in_title else title.strip().lower()
             )
-            dedup_key = hashlib.sha256(
-                f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}".encode()
-            ).hexdigest()
+            dedup_basis = f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}"
+            if build_fallback:
+                # A changed verdict on the same item + next_step is a NEW
+                # decision, not a duplicate — without the verdict in the key the
+                # later verdict would be deduped away against the earlier row.
+                dedup_basis += f"|verdict={rec.verdict}"
+            dedup_key = hashlib.sha256(dedup_basis.encode()).hexdigest()
             if await follow_ups.exists_by_dedup_key(self._db, dedup_key):
                 logger.debug("Skipping duplicate inbox follow-up: %s", title)
                 continue
