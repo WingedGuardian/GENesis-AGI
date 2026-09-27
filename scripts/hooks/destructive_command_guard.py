@@ -90,10 +90,12 @@ _EXTGLOB_GROUP = re.compile(r"[?*+@!]\(")
 
 
 def _can_match_dot_entry(component: str) -> bool:
-    """True if a path component is a pattern that can expand to `.` or `..`."""
-    if not _GLOB_CHARS.search(component):
-        return False
-    return component.startswith(".") or bool(_EXTGLOB_GROUP.search(component))
+    """True if a path component is a pattern that can expand to `.` or `..`.
+
+    Extglob groups are refused before this is consulted, so only a
+    dot-leading pattern is left to catch.
+    """
+    return component.startswith(".") and bool(_GLOB_CHARS.search(component))
 
 # Programs that RUN a command string handed to them as one argument. A quoted
 # string is a single shlex token, so the every-token scan below cannot see the
@@ -679,14 +681,20 @@ def _check_target(target: str) -> str | None:
     # `<deep>/.*/../../x` and `<deep>/**/../../x` reach above what the
     # collapsed path shows.
     raw = [p for p in os.path.expanduser(clean).split("/") if p]
-    # An unbalanced extglob group means this operand is only PART of the
-    # pattern the shell will see: an unquoted `@(a|b)` contains `|`, which the
-    # tokenizer reads as a pipe, cutting the operand mid-group. The real
-    # operand is unknowable here, so refuse rather than judge a fragment.
-    if any(_EXTGLOB_GROUP.search(p) and p.count("(") != p.count(")") for p in raw):
+    # ANY extglob group is refused outright, wherever it sits. Its extent is
+    # unknowable from here: an unquoted `|` inside `@(a|b)` is split off as a
+    # pipe before this function runs, and quoting or escaping inside the group
+    # has already been stripped, so no count of the parentheses left can tell a
+    # whole group from a fragment. One alternative can also be `..`. The opener
+    # (`@(`, `!(`, `+(`, `?(`, `*(`) always survives in the FIRST fragment,
+    # because it comes before anything inside the group, so this test needs no
+    # parsing. Cost, measured 2026-09-27 by replaying one install's recorded
+    # agent commands through both versions (method and table in PR #2495):
+    # this refusal changed none of 1,621 verdicts.
+    if _EXTGLOB_GROUP.search(clean):
         return (
-            f"rm -rf on '{clean}' contains an extglob group the parser cannot "
-            f"see whole, so its real target is unknown — refusing."
+            f"rm -rf on '{clean}' contains an extglob group, whose real targets "
+            f"this guard cannot see — refusing."
         )
     first_glob = next((i for i, p in enumerate(raw) if _GLOB_CHARS.search(p)), None)
     if first_glob is not None and ".." in raw[first_glob + 1 :]:
@@ -696,17 +704,13 @@ def _check_target(target: str) -> str | None:
         )
     # A pattern component can itself BE `..`: `<deep>/.?/.?/*` climbs with no
     # literal `..` at all. Plain `*`, `?` and `[...]` never match a leading
-    # dot, so the pattern must start with one. An extglob group is refused
-    # whatever its first character, because an alternative inside it can
-    # (`@(..)`, `@(.?|x)`). Proving a group cannot match `..` would mean
-    # parsing its alternatives, and a hand-rolled parser is exactly how guards
-    # here have failed, so any group in a non-final component is refused.
-    # rm refuses a FINAL `..` itself, so the last component is exempt and
-    # `<dir>/.*` cleanups keep working.
+    # dot, so the pattern must start with one (extglob groups, which could
+    # hide one, were refused above). rm refuses a FINAL `..` itself, so the
+    # last component is exempt and `<dir>/.*` cleanups keep working.
     if any(_can_match_dot_entry(p) for p in raw[:-1]):
         return (
-            f"rm -rf on '{clean}' has a wildcard path component that can match "
-            f"'..' (dot-leading or an extglob group) and climb above it — refusing."
+            f"rm -rf on '{clean}' has a dot-leading wildcard path component that "
+            f"can match '..' and climb above it — refusing."
         )
     literal = next((i for i, p in enumerate(parts) if _GLOB_CHARS.search(p)), len(parts))
     if literal < len(parts) and literal < 4:

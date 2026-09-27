@@ -1235,21 +1235,35 @@ class TestWildcardDepth:
             # With globskipdots off, `.?` matches `..`: this climbs to `/*`.
             "/home/u/tmp/job/.?/.?/.?/.?/*",
             "/home/u/tmp/job/.*/x",
-            # An extglob group can match `..` without starting with a dot
-            # (found by cross-model review): each `@(.?|x)` can be `..`.
+        ],
+    )
+    def test_a_mid_path_pattern_that_can_be_dotdot_is_refused(self, target):
+        reasons = dg._rm_violations(f"{self.RM} -rf {target}")
+        assert reasons and any("can match '..'" in r for r in reasons), reasons
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            # An alternative can be `..` without a leading dot (cross-model
+            # review): each of these climbs when globskipdots is off.
             "/home/u/tmp/job/@(..)/*",
             "/tmp/a/b/c/@(.?|x)/@(.?|x)/@(.?|x)/@(.?|x)/*",
             "/home/u/tmp/job/!(x)/y",
             "/home/u/tmp/job/?(..)/y",
+            # A quoted `)` made a split fragment look balanced to a
+            # parenthesis count (cross-model review, round 2).
+            '/tmp/a/b/c/@(")"|.?)/@(")"|.?)/@(")"|.?)/@(")"|.?)/*',
+            # Brace expansion can assemble an opener.
+            "/home/u/tmp/job/{@,x}(..)/*",
+            # A deep group in the final component: still refused. Its extent is
+            # unknowable, so no group is judged safe (an escaped `\(` included).
+            "/home/u/tmp/job/@(ab)",
+            "/home/u/tmp/job/@(foo\\(bar)",
         ],
     )
-    def test_a_mid_path_pattern_that_can_be_dotdot_is_refused(self, target):
-        # An unquoted `|` inside a group splits the tokenized operand, so that
-        # spelling is refused as an unseen group; both reasons are refusals.
+    def test_any_extglob_group_is_refused(self, target):
         reasons = dg._rm_violations(f"{self.RM} -rf {target}")
-        assert reasons and any(
-            "can match '..'" in r or "cannot see whole" in r for r in reasons
-        ), reasons
+        assert reasons and any("extglob group" in r for r in reasons), reasons
 
     def test_an_extglob_group_split_by_its_pipe_is_refused_via_bash_c(self):
         # The reviewer's exact spelling: extglob enabled for a `bash -c` payload.
@@ -1287,14 +1301,16 @@ class TestWildcardDepth:
         # rm refuses a final `..` itself, so `<deep dir>/.*` cleanups keep working.
         assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/.*")
 
-    # No `|` alternation here: an unquoted `|` splits the operand at tokenizing,
-    # and that fragment is refused on its own (see the "cannot see whole" test).
-    @pytest.mark.parametrize("pattern", ["!(keep)", "+(ab)", "@(ab)"])
-    def test_extglob_patterns_count_as_wildcards(self, pattern):
+    @pytest.mark.parametrize("pattern", ["!(keep)", "+(ab)", "@(ab)", "?(ab)", "*(ab)"])
+    def test_every_extglob_opener_is_recognised(self, pattern):
         # A command can turn extglob on for itself (`shopt -s extglob` on an
-        # earlier line), and these openers contain none of * ? [.
-        assert _blocks(f"{self.RM} -rf /home/u/tmp/{pattern}")
-        assert not _blocks(f"{self.RM} -rf /home/u/tmp/job/{pattern}")
+        # earlier line); `!( +( @(` contain none of * ? [ yet are patterns.
+        reasons = dg._rm_violations(f"{self.RM} -rf /home/u/tmp/job/{pattern}")
+        assert reasons and any("extglob group" in r for r in reasons), reasons
+
+    def test_a_parenthesis_without_an_opener_is_not_extglob(self):
+        # A literal `(` that no opener precedes is an ordinary name character.
+        assert not _blocks(f"{self.RM} -rf '/home/u/tmp/job/build (copy)'")
 
     @pytest.mark.parametrize(
         ("target", "prefix"),
