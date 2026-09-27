@@ -123,7 +123,9 @@ every other placeholder is env → inline `:-default` → left literal.
 
 ## 3. `config/*.yaml` and `.local.yaml` overlays
 
-Base files in `config/` are tracked upstream defaults. Four patterns exist:
+Base files in `config/` are tracked upstream defaults. Four patterns exist. Each
+describes the default path; the exceptions known when this was written are listed
+with it, and the code is the authority where the two disagree.
 
 **A. Standard settings domain** — `genesis._config_overlay.merge_local_overlay`, used by
 43 modules under `src/` plus two hook scripts. Effective value:
@@ -131,21 +133,27 @@ Base files in `config/` are tracked upstream defaults. Four patterns exist:
 **user-dir first**: `~/.genesis/config/<name>.local.yaml` if it exists, else the repo
 sibling `config/<name>.local.yaml` (gitignored). **Only one of the two is read.**
 Deep merge; lists replace. An unparseable or non-mapping overlay is ignored with a
-warning (once per file mtime). A broken BASE file is not uniformly safe: some loaders fall back to `DEFAULTS`, while others (e.g. `src/genesis/resilience/config.py`, `src/genesis/inbox/config.py`) call `yaml.safe_load` unguarded and raise, which stops the initialization path that loads them.
+warning (once per file mtime); an empty file or an explicit `null` is treated as no
+overrides, without a warning. A broken BASE file is not uniformly safe: some loaders fall back to `DEFAULTS`, while others (e.g. `src/genesis/resilience/config.py`, `src/genesis/inbox/config.py`) call `yaml.safe_load` unguarded and raise, which stops the initialization path that loads them.
 Many loaders re-read on every call (e.g. `src/genesis/session_awareness/pr_watch_config.py`);
 the domain's `needs_restart` flag is the stated contract.
 
 - **Writers:** `settings_update` MCP tool and the dashboard Settings tab (same backend,
-  `src/genesis/mcp/health/settings.py`). Per-domain validator → atomic write to
+  `src/genesis/mcp/health/settings.py`). Per-domain validator where one exists →
+  atomic write to
   `~/.genesis/config/<name>.local.yaml` with a `# set-by: <actor> @ <utc>` provenance
   header. The write starts from whichever overlay the resolver found, so the first
   save copies a repo-sibling overlay into the user dir, which then shadows it.
+  `outreach` and `confidence_gates` have no validator, so their values are written
+  unchecked (#2446).
 - **Registry:** 48 domains in `_DOMAIN_REGISTRY`. `readonly` domains refuse writes;
   `recon_*` route to the `recon_config` tool; disabling
   `autonomous_cli_policy.manual_approval_required` needs `confirm_disable_approval_gate`.
 - **Takes effect:** per the domain's `needs_restart` flag. Restart-required today:
   `resilience`, `inbox_monitor`, `autonomy`, `guardian`, `content_sanitization`,
-  `surplus`, `ego`, `channels`, `observability`. The rest are flagged no-restart.
+  `surplus`, `ego`, `channels`, `observability`. The rest are flagged no-restart,
+  but `outreach` is not live either: the running pipeline keeps its policy until a
+  restart unless the change goes through the `outreach_preferences` tool (#2446).
   Two writable domains never take effect through this path: `contribution` (the
   post-commit hook reads only the repo's `config/contribution[.local].yaml`) and
   `observability` (`span_config.py` reads only the tracked `config/observability.yaml`).
@@ -174,7 +182,9 @@ written by `save_outreach_config`); the overlay is merged on top of whichever wo
 **D. Raw file editor** — dashboard `PUT /api/genesis/config-files/<name>`
 (`src/genesis/dashboard/routes/config.py`) writes the **tracked base** `config/<name>.yaml`
 directly (read-only list excepted). The edit dirties the checkout and is shadowed by any
-overlay key.
+overlay key. It also lists and writes any existing repo-sibling `config/*.local.yaml`,
+which is an overlay rather than a base, and the read-only list matches exact file
+names, so an overlay of a read-only file is editable (#2446).
 
 ---
 
@@ -231,7 +241,9 @@ overlay key.
    `_MCP_VARS` allowlist in `scripts/genesis_mcp_server.py` is superseded by the
    standalone router's full `override=True` load, so a value the parent put in the
    child's env is overwritten by any same-named key in `secrets.env`. The discord-bot
-   child never builds that router and keeps the allowlist.
+   child never builds that router and keeps the allowlist, and neither does the
+   health child when its database is missing: that degraded path returns before the
+   router is built, so file-only keys are absent there.
 7. **`EnvironmentFile=` beats `Environment=`** regardless of order (measured note in
    `scripts/systemd/genesis-disk-hygiene.service.template`): a `PATH` or `TMPDIR` in
    `secrets.env` replaces the server unit's pinned value.
