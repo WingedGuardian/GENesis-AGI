@@ -147,22 +147,21 @@ def station(tmp_path):
         f'[ -f "{marker}" ] && echo held >> "{tmp_path}/marker_seen"\n'
         "exit ${CURL_RC:-0}\n",
     )
-    # ss reports who LISTENS on the health port: the restarted unit's pid by
-    # default ($NEW_PID, or 2222), $LISTEN_PID for another process, and no
-    # listener at all under $SS_NO_LISTENER (the manifest fallback). $SS_PIDLESS
-    # prints the line without its users:(...) part, as ss does for a socket owned
-    # by another uid; $SS_EXTRA_PID adds a SECOND listener. Never the host's real
-    # ss: the live server listens on that port.
-    _exec(
-        shims / "ss",
-        "#!/bin/bash\n"
-        '[ -n "${SS_NO_LISTENER:-}" ] && exit 0\n'
-        'if [ -n "${SS_PIDLESS:-}" ]; then echo "LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*"; exit 0; fi\n'
-        'p="${LISTEN_PID:-${NEW_PID:-2222}}"\n'
-        'echo "LISTEN 0 128 [::]:5000 [::]:* users:((\\"python\\",pid=$p,fd=3))"\n'
-        'if [ -n "${SS_EXTRA_PID:-}" ]; then echo "LISTEN 0 128 0.0.0.0:5000 0.0.0.0:* '
-        'users:((\\"python\\",pid=$SS_EXTRA_PID,fd=4))"; fi\n'
-        'if [ -n "${SS_PIDLESS_EXTRA:-}" ]; then echo "LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*"; fi\n',
+    # The port-ownership probe (GENESIS_DEPLOY_PORT_PROBE, standing in for
+    # scripts/lib/port_owned_by.py, which is tested on real sockets in
+    # test_port_owned_by.py). Every listener belongs to $PROBE_OWNER (default:
+    # the restarted unit, $NEW_PID or 2222); $PROBE_NONE = nothing listening;
+    # $PROBE_FOREIGN_TOO = a second listener held by another process. Exit 0
+    # means "every listener on the port is <pid>'s". Never the real probe: the
+    # live server listens on that port.
+    probe = tmp_path / "port_probe.py"
+    probe.write_text(
+        "import os, sys\n"
+        "pid = sys.argv[2]\n"
+        "if os.environ.get('PROBE_NONE') or os.environ.get('PROBE_FOREIGN_TOO'):\n"
+        "    sys.exit(1)\n"
+        "owner = os.environ.get('PROBE_OWNER') or os.environ.get('NEW_PID') or '2222'\n"
+        "sys.exit(0 if owner == pid else 1)\n"
     )
     env = {
         k: v
@@ -175,11 +174,9 @@ def station(tmp_path):
                 "NEW_PID",
                 "NO_BOOTSTRAP",
                 "MANIFEST_AFTER",
-                "LISTEN_PID",
-                "SS_NO_LISTENER",
-                "SS_PIDLESS",
-                "SS_EXTRA_PID",
-                "SS_PIDLESS_EXTRA",
+                "PROBE_OWNER",
+                "PROBE_NONE",
+                "PROBE_FOREIGN_TOO",
             )
         )
     }
@@ -189,6 +186,7 @@ def station(tmp_path):
         GENESIS_DEPLOY_ROOT=str(root),
         GENESIS_DEPLOY_VENV=str(VENV),
         GENESIS_DEPLOY_HEALTH_POLL="1",
+        GENESIS_DEPLOY_PORT_PROBE=str(probe),
         GENESIS_ALERT_QUEUE_ROOT=str(home / ".genesis" / "alerts" / "queue"),
     )
     return {
@@ -505,18 +503,12 @@ def test_an_unhealthy_restart_alerts_and_holds(station):
         ("new process exited", {"NEW_PID": "0"}),
         # The restarted unit is up, but ANOTHER process listens on the port (a
         # bind failure in the unit's Flask thread leaves the process running).
-        ("another process holds the port", {"LISTEN_PID": "3333"}),
-        # A listener ss cannot attribute (another uid's socket prints no pid) is
-        # not proof — it must not fall through to the manifest check.
-        ("a listener with no visible pid", {"SS_PIDLESS": "1"}),
+        ("another process holds the port", {"PROBE_OWNER": "3333"}),
         # The unit listens, but so does another process.
-        ("a second listener", {"SS_EXTRA_PID": "3333"}),
-        # The unit listens (v6), and an unattributable socket holds v4: the pids
-        # that ARE visible all match, so only counting the lines catches it.
-        ("a second listener with no visible pid", {"SS_PIDLESS_EXTRA": "1"}),
-        # ss cannot see a listener, so the manifest decides: a new pid exists,
-        # but no bootstrap completed under it (the manifest is still pid 1111).
-        ("no bootstrap under the new pid", {"NO_BOOTSTRAP": "1", "SS_NO_LISTENER": "1"}),
+        ("a second listener", {"PROBE_FOREIGN_TOO": "1"}),
+        # Nothing listens, or ownership cannot be read: never proven (Codex P1,
+        # round 2 — there is no manifest fallback to fall through to).
+        ("ownership cannot be established", {"PROBE_NONE": "1"}),
         # The unit still reports the OLD pid, whose manifest it is.
         ("old pid still reported", {"NEW_PID": "1111"}),
     ],
@@ -536,13 +528,9 @@ def test_an_answer_from_another_server_is_not_a_healthy_deploy(station, case, ex
     assert _git(station["root"], "rev-parse", "HEAD") == tip, "never revert the tree"
 
 
-@pytest.mark.parametrize("ss_sees", [True, False])
-def test_a_healthy_restart_reports_the_new_pid_and_no_alert(station, ss_sees):
-    """Both proofs accept the real case: the listener, and (where ss sees no
-    listener) the manifest written by the new pid."""
+def test_a_healthy_restart_reports_the_new_pid_and_no_alert(station):
     _advance_upstream(station)
-    env = dict(station["env"]) if ss_sees else dict(station["env"], SS_NO_LISTENER="1")
-    r = _run(station, env=env)
+    r = _run(station)
     assert r.returncode == 0, r.stderr
     assert "genesis-server pid 2222" in r.stdout, r.stdout
     assert not _alerts(station), "a clean deploy pages nobody"

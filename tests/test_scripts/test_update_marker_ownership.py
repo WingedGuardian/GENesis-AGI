@@ -22,6 +22,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
+# update.sh sources this before defining _clear_deploy_state.
+MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
 
 
 @pytest.fixture(scope="module")
@@ -52,7 +54,9 @@ def test_no_unconditional_marker_rm_remains(text: str) -> None:
     )
 
 
-def _run_clear(tmp_path: Path, text: str, marker_pid: str | None) -> tuple[bool, bool]:
+def _run_clear(
+    tmp_path: Path, text: str, marker_pid: str | None, marker_mtime: float | None = None
+) -> tuple[bool, bool]:
     """Run the shipped _clear_deploy_state with a given marker state.
     Returns (marker_still_exists, state_still_exists)."""
     home = tmp_path / "home"
@@ -62,9 +66,12 @@ def _run_clear(tmp_path: Path, text: str, marker_pid: str | None) -> tuple[bool,
     state.write_text("{}")
     if marker_pid is not None:
         marker.write_text(marker_pid)
+        if marker_mtime is not None:
+            os.utime(marker, (marker_mtime, marker_mtime))
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="{state}"
+. "{MARKER_LIB}"
 {_extract_func(text, "_clear_deploy_state")}
 _clear_deploy_state
 """
@@ -90,6 +97,7 @@ def test_deletes_marker_we_own(tmp_path: Path, text: str) -> None:
 set -Eeuo pipefail
 STATE_FILE="{state}"
 echo "$$" > "{marker}"      # marker holds OUR pid → owned
+. "{MARKER_LIB}"
 {_extract_func(text, "_clear_deploy_state")}
 _clear_deploy_state
 """
@@ -122,3 +130,104 @@ def test_deletes_dead_marker(tmp_path: Path, text: str) -> None:
 def test_no_marker_is_safe(tmp_path: Path, text: str) -> None:
     marker_exists, state_exists = _run_clear(tmp_path, text, None)
     assert not marker_exists and not state_exists
+
+
+@pytest.fixture
+def zombie_pid():
+    """The pid of a child that has exited and that its parent never reaps: a
+    zombie, on which `kill -0` still succeeds."""
+    import sys
+    import time
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, time\npid = os.fork()\nif pid == 0:\n    os._exit(0)\n"
+            "print(pid, flush=True)\ntime.sleep(30)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        zpid = int(holder.stdout.readline())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            stat = Path(f"/proc/{zpid}/stat").read_text()
+            if stat[stat.rindex(")") + 2] == "Z":
+                break
+            time.sleep(0.05)
+        assert subprocess.run(["kill", "-0", str(zpid)]).returncode == 0, "control: kill -0 lies"
+        yield zpid
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_deletes_a_zombie_holders_marker(tmp_path: Path, text: str, zombie_pid: int) -> None:
+    """A killed holder its parent never reaped is dead, though `kill -0` still
+    succeeds on it (round-2 review on #2494): the stale marker is cleaned."""
+    marker_exists, _ = _run_clear(tmp_path, text, str(zombie_pid))
+    assert not marker_exists, "a zombie holder's marker must be cleaned"
+
+
+def test_deletes_a_marker_whose_pid_was_reused(tmp_path: Path, text: str) -> None:
+    """The recorded pid is alive, but that process started long AFTER the marker
+    was written, so it cannot be the writer: a reused pid, and a stale marker."""
+    marker_exists, _ = _run_clear(tmp_path, text, str(os.getpid()), marker_mtime=1_000_000_000)
+    assert not marker_exists, "a reused-pid marker must be cleaned"
+
+
+# ── The acquire side: deploy_code_only.sh and restore.sh take the marker through
+# _acquire_deploy_marker, a different call site from update.sh's cleanup above.
+
+
+def _run_acquire(
+    tmp_path: Path, marker_pid: str, marker_mtime: float | None = None
+) -> tuple[int, str]:
+    """Source the shipped lib and acquire over a marker holding `marker_pid`.
+    Returns the exit status and what the marker holds afterwards, with the
+    harness's own pid written as the literal `SELF`."""
+    home = tmp_path / "home"
+    marker = home / ".genesis" / "update_in_progress.pid"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(marker_pid + "\n")
+    if marker_mtime is not None:
+        os.utime(marker, (marker_mtime, marker_mtime))
+    script = tmp_path / "acquire.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"source {MARKER_LIB}\n"
+        "rc=0; _acquire_deploy_marker || rc=$?\n"
+        'held="$(cat "$DEPLOY_MARKER_FILE")"\n'
+        '[ "$held" = "$$" ] && held=SELF\n'
+        'echo "$rc $held"\n'
+    )
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOME"}
+    out = subprocess.run(
+        ["bash", str(script)],
+        env={**env, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.split()
+    return int(out[0]), out[1]
+
+
+def test_acquire_refuses_a_live_holder(tmp_path: Path) -> None:
+    """Control for the two below: a live holder that started before its marker
+    was written (this pytest process) is refused and left in place."""
+    rc, held = _run_acquire(tmp_path, str(os.getpid()))
+    assert (rc, held) == (1, str(os.getpid()))
+
+
+def test_acquire_replaces_a_zombie_holder(tmp_path: Path, zombie_pid: int) -> None:
+    rc, held = _run_acquire(tmp_path, str(zombie_pid))
+    assert (rc, held) == (0, "SELF"), "a zombie holder is stale; the marker is taken"
+
+
+def test_acquire_replaces_a_reused_pid(tmp_path: Path) -> None:
+    """A live pid whose process started long after the marker was written."""
+    rc, held = _run_acquire(tmp_path, str(os.getpid()), marker_mtime=1_000_000_000)
+    assert (rc, held) == (0, "SELF"), "a reused pid is stale; the marker is taken"

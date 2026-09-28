@@ -18,9 +18,45 @@ DEPLOY_MARKER_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid"
 DEPLOY_MARKER_HOLDER=""
 _DEPLOY_MARKER_HELD=false
 
+# Is <pid> a LIVE holder of the marker file <file>? `kill -0` alone says yes for
+# a zombie (a killed deploy its parent has not reaped) and for an unrelated
+# process that has since reused the pid — either way the marker would read as
+# held forever: new deploys refused, and the watchdog kept from reviving a down
+# server. So: running, not a zombie, and started no later than the marker was
+# written (a process that started after the file was written cannot be its
+# writer). 60s of slack absorbs small wall-clock steps between the write and
+# the check. Where /proc cannot answer, `kill -0` is all there is. Mirrored
+# for the Python reader by genesis.env._marker_holder_live.
+#
+# The start time is dated WITHOUT /proc/stat's btime or /proc/uptime: a
+# container's lxcfs virtualizes /proc/uptime (measured 60s off here) and may do
+# the same to btime, which would date every holder in the future and read a live
+# deploy as stale. Instead, a process started NOW (the `cut` below, reading its
+# own /proc/self/stat) gives the tick count for "now" in the same clock the
+# holder's start tick is in, so only the DIFFERENCE is used.
+_deploy_marker_holder_live() {
+    local pid="$1" file="$2" stat hz mtime now_tick now start
+    kill -0 "$pid" 2>/dev/null || return 1
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 0
+    stat="${stat##*) }"
+    # shellcheck disable=SC2086 # word-splitting the numeric fields is the point
+    set -- $stat
+    # $1 is field 3 (state), ${20} field 22 (start time in clock ticks since boot).
+    [ "$1" != Z ] || return 1
+    now_tick="$(cut -d' ' -f22 /proc/self/stat 2>/dev/null || true)"
+    now="$(date +%s)"
+    hz="$(getconf CLK_TCK 2>/dev/null || true)"
+    mtime="$(stat -c %Y "$file" 2>/dev/null || true)"
+    if [[ "${20:-}" =~ ^[0-9]+$ && "$now_tick" =~ ^[0-9]+$ && "$hz" =~ ^[0-9]+$ && "$hz" -gt 0 && "$mtime" =~ ^[0-9]+$ ]]; then
+        start=$(( now - (now_tick - ${20}) / hz ))
+        [ "$start" -le $(( mtime + 60 )) ] || return 1
+    fi
+    return 0
+}
+
 # Returns 0 once the marker holds our pid; 1 when a LIVE foreign process holds it
-# (its pid is left in DEPLOY_MARKER_HOLDER). A dead or garbage pid is a stale marker
-# every reader already ignores, so it is simply replaced.
+# (its pid is left in DEPLOY_MARKER_HOLDER). A dead, zombie, reused or garbage pid
+# is a stale marker, so it is simply replaced.
 _acquire_deploy_marker() {
     DEPLOY_MARKER_HOLDER=""
     mkdir -p "$(dirname "$DEPLOY_MARKER_FILE")"
@@ -28,7 +64,7 @@ _acquire_deploy_marker() {
         local _other
         _other="$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || true)"
         if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && [ "$_other" != "$$" ] \
-            && kill -0 "$_other" 2>/dev/null; then
+            && _deploy_marker_holder_live "$_other" "$DEPLOY_MARKER_FILE"; then
             DEPLOY_MARKER_HOLDER="$_other"
             return 1
         fi

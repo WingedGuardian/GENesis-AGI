@@ -134,7 +134,9 @@ _clear_deploy_state() {
     rm -f "$STATE_FILE" 2>/dev/null || true
     local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
     _pid="$(cat "$_m" 2>/dev/null || true)"
-    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; }; then
+    # "Dead" includes a zombie and a reused pid (_deploy_marker_holder_live, in
+    # deploy_marker.sh): either would otherwise keep a stale marker forever.
+    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! _deploy_marker_holder_live "$_pid" "$_m"; }; then
         rm -f "$_m" 2>/dev/null || true
     fi
 }

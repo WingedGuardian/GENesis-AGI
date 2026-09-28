@@ -20,13 +20,18 @@
     pauses the host Guardian (no false "Genesis down" alert), then waits for
     health with the same window `update.sh` computes.
   - **Healthy means the RESTARTED unit is serving:** the unit is active with a
-    new pid and the bootstrap manifest was written by that pid. A server running
-    outside systemd that answers on the port does not count. The subsystems are
+    new pid, and every socket listening on the health port is one of that pid's
+    own (read from `/proc`, no external tool; when ownership cannot be read the
+    answer is no). A server running outside systemd, or any other process holding
+    the port, does not count. The subsystems are
     then compared with the pre-restart manifest (the same check `update.sh` runs,
     now shared in `scripts/lib/manifest_delta.py`); a regression is reported and
     alerted, and the deploy stands.
   - **On a failed health check it alerts and holds.** The tree is not reverted.
-  - `--no-restart` is a locked pull only, for hooks and docs: it refuses a range
+  - `--no-restart` is a locked pull only, for Claude Code hooks (they run from
+    the tree, so the pull is the deploy) and docs. Git hooks are copies installed
+    by `update.sh`; a range that changes them is named in the activation note
+    below. It refuses a range
     touching anything outside `.claude/`, `docs/`, `tests/`, `changelog.d/`,
     `.github/`, `scripts/hooks/` and top-level Markdown — `config/` is read at
     server start. `--no-pull` restarts the tree as it stands (a locked restart).
@@ -52,3 +57,10 @@
   with the new script; the deploy marker and the list of tracked files a deploy
   may find dirty moved to `scripts/lib/deploy_marker.sh`, shared with
   `restore.sh`.
+- **A stale deploy marker no longer blocks deploys or the watchdog.** A deploy
+  that was killed could leave `~/.genesis/update_in_progress.pid` naming a process
+  that was a zombie, or whose pid had since been reused, and every liveness check
+  read that as a deploy still running: new deploys refused, and the watchdog kept
+  from restarting a down server. The marker's holder now counts only if it is
+  running, not a zombie, and started no later than the marker was written — the
+  same rule in the deploy scripts and the watchdog's reader.

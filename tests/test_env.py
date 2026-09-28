@@ -728,3 +728,67 @@ class TestNestedConfigReadsAreRouted:
             "nested local-config read bypassing _local_section (it will raise on a "
             f"section that is not a mapping): {bad}"
         )
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+class TestSignalHolderIdentity:
+    """A live pid is not enough: the process must be the signal's WRITER. A
+    zombie (a killed deploy its parent never reaped) and a pid reused after the
+    signal was written both pass `os.kill(pid, 0)`, and each kept the watchdog
+    from reviving a down server for as long as it lived (#2494 review)."""
+
+    @staticmethod
+    def _zombie():
+        import subprocess
+        import sys
+        import time
+
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, time\npid = os.fork()\nif pid == 0:\n    os._exit(0)\n"
+                "print(pid, flush=True)\ntime.sleep(30)\n",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        zpid = int(holder.stdout.readline())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            stat = Path(f"/proc/{zpid}/stat").read_text()
+            if stat[stat.rindex(")") + 2] == "Z":
+                break
+            time.sleep(0.05)
+        os.kill(zpid, 0)  # control: the liveness probe alone says "alive"
+        return holder, zpid
+
+    def test_a_zombie_pid_file_holder_is_not_a_deploy(self, home: Path):
+        holder, zpid = self._zombie()
+        try:
+            (home / "update_in_progress.pid").write_text(str(zpid))
+            assert update_in_progress() is False
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_a_zombie_state_file_owner_is_not_a_deploy(self, home: Path):
+        holder, zpid = self._zombie()
+        try:
+            _write_state(home, pid=zpid)
+            assert update_in_progress() is False
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_a_pid_reused_after_the_pid_file_was_written_is_not_a_deploy(self, home: Path):
+        marker = home / "update_in_progress.pid"
+        marker.write_text(str(os.getpid()))
+        os.utime(marker, (1_000_000_000, 1_000_000_000))  # written long before we started
+        assert update_in_progress() is False
+
+    def test_a_pid_reused_after_the_state_file_was_written_is_not_a_deploy(self, home: Path):
+        _write_state(home, pid=os.getpid())
+        state = home / "update_state.json"
+        os.utime(state, (1_000_000_000, 1_000_000_000))
+        assert update_in_progress() is False

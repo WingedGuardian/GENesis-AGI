@@ -312,39 +312,24 @@ _PHASE="restarted"
 
 # Is the RESTARTED unit the one serving? A 200 from the port alone cannot say: a
 # server started outside systemd (update.sh's nohup fallback) can keep answering
-# while the new unit exits on the process lock it holds. The unit must be active,
-# with a NEW, nonzero MainPID, AND that pid must be what serves:
-#   - the process LISTENING on the health port is that pid (`ss`). The runtime
-#     binds only after its bootstrap completes, and Flask runs in a daemon thread,
-#     so a bind failure leaves the process up with its manifest written while
-#     something else answers — only the listener identifies who serves;
-#   - where `ss` shows no listener (not installed, or not permitted to see the
-#     owning process), the bootstrap manifest must carry that pid instead.
-# Prints the pid on success.
+# while the new unit exits on the process lock it holds. And the bootstrap
+# manifest cannot say either: it is written BEFORE the web server binds, and Flask
+# runs in a daemon thread, so a failed bind leaves the process up with its
+# manifest while something else answers. So the proof is the socket itself: the
+# unit is active with a NEW, nonzero MainPID, and every socket listening on the
+# health port is one of that pid's own descriptors (scripts/lib/port_owned_by.py,
+# which reads /proc and answers no whenever it cannot tell). Prints the pid.
+# GENESIS_DEPLOY_PORT_PROBE is a TEST seam, like GENESIS_DEPLOY_ROOT: the fixture
+# substitutes it so no test ever probes the live server's port.
 _HEALTH_PORT=5000
+_PORT_PROBE="${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by.py}"
 _restarted_unit_serving() {
-    local state pid ss_out lpids doc_pid
+    local state pid
     state="$(systemctl --user is-active genesis-server 2>/dev/null || true)"
     [ "$state" = active ] || return 1
     pid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
     [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
-    # A listener line that names no pid (ss prints none for a socket owned by
-    # another uid) is NOT the unit, and neither is a second listener: every
-    # listener must be this pid. The manifest decides only when there is no
-    # listener line at all (ss missing, or not yet bound).
-    ss_out="$(ss -ltnpH "sport = :$_HEALTH_PORT" 2>/dev/null || true)"
-    if [ -n "$ss_out" ]; then
-        lpids="$(printf '%s\n' "$ss_out" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true)"
-        [ "$(printf '%s\n' "$ss_out" | wc -l)" -eq "$(printf '%s\n' "$ss_out" | grep -c 'pid=' || true)" ] || return 1
-        [ "$lpids" = "$pid" ] || return 1
-    else
-        doc_pid="$(python3 -c 'import json,os,sys
-try:
-    print(json.load(open(os.path.expanduser("~/.genesis/bootstrap_manifest.json"))).get("pid", ""))
-except Exception:
-    sys.exit(1)' 2>/dev/null || true)"
-        [ "$doc_pid" = "$pid" ] || return 1
-    fi
+    python3 "$_PORT_PROBE" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
     printf '%s\n' "$pid"
 }
 

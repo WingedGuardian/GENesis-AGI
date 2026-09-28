@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -493,6 +494,41 @@ def _deploy_state_is_recent(state: dict) -> bool:
     return (datetime.now(UTC) - started).total_seconds() < _UPDATE_STALE_AFTER_S
 
 
+def _marker_holder_live(pid: int, written_at: float) -> bool:
+    """Is `pid` a LIVE holder of a deploy signal written at `written_at` (epoch)?
+
+    ``os.kill(pid, 0)`` alone says yes for a zombie (a killed deploy its parent
+    has not reaped) and for an unrelated process that later reused the pid, and
+    either one kept the watchdog from reviving a down server for as long as it
+    lived. So: running, not a zombie, and started no later than the signal was
+    written (a process that started afterwards cannot be its writer), with 60s
+    of slack for small wall-clock steps. Where /proc cannot answer, liveness is
+    all there is. Mirrors ``_deploy_marker_holder_live`` in
+    scripts/lib/deploy_marker.sh.
+
+    The start tick is dated through CLOCK_BOOTTIME (the clock /proc/<pid>/stat
+    counts in), never /proc/stat's btime: a container's lxcfs can virtualize
+    btime, which would date every holder in the future and read a live deploy
+    as stale.
+    """
+    if pid <= 1:  # 0 and -1 address process GROUPS; 1 is init (and AsyncMock().pid)
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if fields[0] == "Z":
+            return False
+        boot = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+        started = boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return True
+    return started <= written_at + 60
+
+
 def update_in_progress() -> bool:
     """True while a Genesis self-update (deploy) is actively running.
 
@@ -514,7 +550,9 @@ def update_in_progress() -> bool:
       before the file is removed) and ``started_at`` is recent.
 
     A signal counts only if its PID is > 1 (an ``AsyncMock().pid`` is 1) AND
-    still alive (``os.kill(pid, 0)``). Any dead / absent / corrupt / ``done`` /
+    that process is a live holder of it (``_marker_holder_live``: running, not a
+    zombie, and not started after the signal was written — a reused pid is not
+    the writer). Any dead / zombie / reused / absent / corrupt / ``done`` /
     expired signal is treated as "no deploy", so a stale file can never
     permanently disable the watchdog. This check is defensive by contract: it
     NEVER raises into the caller (the watchdog restart path).
@@ -527,11 +565,10 @@ def update_in_progress() -> bool:
         if pid_file.exists():
             try:
                 pid = int(pid_file.read_text().strip())
-                if pid > 1:
-                    os.kill(pid, 0)
+                if pid > 1 and _marker_holder_live(pid, pid_file.stat().st_mtime):
                     return True
-            except (ProcessLookupError, ValueError, OSError):
-                pass  # dead / invalid PID — not an active deploy
+            except (ValueError, OSError):
+                pass  # dead / zombie / reused / invalid PID — not an active deploy
 
         # CLI path: update.sh state file with phase + owning PID + start time.
         state_file = home / "update_state.json"
@@ -548,9 +585,9 @@ def update_in_progress() -> bool:
                 pid = state.get("pid")
                 if isinstance(pid, int) and pid > 1:
                     try:
-                        os.kill(pid, 0)
-                        return True
-                    except (ProcessLookupError, OSError):
+                        if _marker_holder_live(pid, state_file.stat().st_mtime):
+                            return True
+                    except OSError:
                         pass  # owning process gone — stale state file
 
         return False
