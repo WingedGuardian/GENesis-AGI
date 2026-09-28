@@ -106,6 +106,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -170,6 +171,7 @@ try:
         analyze_checked,
         git_subcommand_index,
         has_trailing_override,
+        mention_view,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -268,6 +270,15 @@ _TRIGGER_SUBSTRINGS = (
 # EXCLUDED (all-untracked → zero snapshot value — it stays the one BLOCK).
 _SNAPSHOT_VERBS = frozenset(
     {"checkout", "restore", "switch", "reset", "rm", "mv", "checkout-index", "read-tree"}
+)
+# The same verbs as whole words, for the one place a verb is read from TEXT rather
+# than argv: the snapshot fallback for a parse that returned no segments. Two
+# independent searches, never one pattern with `.*` between the words: that shape is
+# quadratic in the command's length, and this runs on the hook path, where MEASURED
+# a 32,000-character command took 4 seconds with it.
+_GIT_WORD = re.compile(r"\bgit\b")
+_SNAPSHOT_VERB_WORD = re.compile(
+    r"\b(?:" + "|".join(re.escape(v) for v in sorted(_SNAPSHOT_VERBS)) + r")\b"
 )
 # The sanctioned escape for the clean block: `git clean -f  # discard-override`.
 _OVERRIDE_SIGIL = "discard-override"
@@ -575,6 +586,22 @@ _CLEAN_PARSE_FAILED_MSG = (
 )
 
 
+def _clean_blind_msg(blind) -> str:
+    """The refusal for a clean-mentioning command the parse could not read in full.
+
+    Built from the blind spot's own ``cause`` and ``hint`` rather than a fixed text,
+    because the causes need different remedies: the crash message above says "deeply
+    nested", which is the right diagnosis for a bound and the wrong one for a line
+    continuation, whose remedy is to put the command on one line."""
+    return (
+        f"[git-discard-guard] BLOCKED: this command {blind.cause}, and it mentions "
+        "`clean`. `git clean` permanently deletes untracked files that no snapshot "
+        "can recover, so a command the parser cannot read in full fails CLOSED. "
+        f"To proceed: {blind.hint}. Dry-run forms are allowed, and "
+        "`# discard-override` is honoured once the command parses."
+    )
+
+
 def _clean_violation(cmd: str) -> str | None:
     """The ONE block this otherwise snapshot-only guard still makes: a
     non-dry-run ``git clean``. Returns a block message if any ``git`` segment
@@ -586,9 +613,11 @@ def _clean_violation(cmd: str) -> str | None:
     pathological ``git checkout clean`` merely over-blocks (override escape) —
     the direction this boundary wants.
 
-    A parse cut short by one of shell_parse's BOUNDS lands on the same fail-closed
-    message as a parser crash, because it is the same situation: this guard cannot
-    prove a clean-mentioning command safe. It matters that the parser says so rather
+    A parse cut short by one of shell_parse's BOUNDS, or a line continuation (the
+    other bounds-type blind spot), fails closed just as a parser crash does,
+    because it is the same situation: this guard cannot prove a clean-mentioning
+    command safe. The message differs: it is built from the blind spot's own cause
+    and remedy (`_clean_blind_msg`). It matters that the parser says so rather
     than raising — a bound does not crash, it silently returns fewer segments, and
     reading that as "no clean here" is a silent allow of the one unrecoverable
     operation this guard blocks. MEASURED before this call was switched: a
@@ -616,10 +645,12 @@ def _clean_violation(cmd: str) -> str | None:
     and the alternative to blocking is permitting. The per-axis severity flag that
     made this mistake possible has since been DELETED outright — see BlindSpot.
 
-    Cost of refusing both: 0 of 45,956 real commands reach either bound."""
+    Cost of refusing both bounds: 0 of 45,956 real commands reach either. A line
+    continuation takes the same branch and is ordinary input; its cost is measured
+    at `shell_parse._BLIND_CONTINUATION`, and its refusal names the one-line remedy."""
     segs, blind = _parse_once(cmd)
     if blind is not None and blind.bounds_induced:
-        return _CLEAN_PARSE_FAILED_MSG
+        return _clean_blind_msg(blind)
     for seg in segs:
         if seg.exe != "git":
             continue
@@ -647,8 +678,8 @@ _SUBMODULE_BLOCK_MSG = (
 
 
 _SUBMODULE_PARSE_FAILED_MSG = (
-    "[git-discard-guard] BLOCKED: this command could not be parsed within the "
-    "parser's bounds AND it mentions submodule recursion, which `git stash create` "
+    "[git-discard-guard] BLOCKED: this command could not be read in full by the "
+    "parser AND it mentions submodule recursion, which `git stash create` "
     "cannot capture — so the guard cannot prove it is recoverable and refuses. "
     "`# discard-override` is NOT honoured here: the override is read per-segment on "
     "the parsed path, which is the path that just failed. Run the git command on its "
@@ -719,7 +750,7 @@ def _submodule_recurse_violation(cmd: str) -> str | None:
         # `# discard-override` to proceed" could not be taken — MEASURED, an
         # over-length command carrying the sigil still returned 2 with that text,
         # leaving no route forward at all. The `clean` twin already got this right.
-        return _SUBMODULE_PARSE_FAILED_MSG
+        return f"{_SUBMODULE_PARSE_FAILED_MSG} (This command {blind.cause}: {blind.hint}.)"
     for seg in segs:
         if seg.exe != "git":
             continue
@@ -1333,6 +1364,7 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     # about what the guard could NOT see, so it can only be written once the loop has
     # finished establishing what it could.
     blind_unrecorded = blind is not None and blind.bounds_induced
+    targets: list[str | None] = []
     for seg in segs:
         if seg.exe != "git":
             continue
@@ -1342,7 +1374,23 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         # under-matching costs a missed snapshot (status quo). Neither can block.
         if not set(seg.argv[1:]) & _SNAPSHOT_VERBS:
             continue
-        cwd = _segment_cwd(seg, payload)
+        targets.append(_segment_cwd(seg, payload))
+    # A BLIND parse returns no segments, so the loop above finds nothing — and a
+    # line continuation is a blind spot that ordinary work produces. A continued
+    # `git reset --hard` is not refused (it is recoverable by design), so the
+    # snapshot is the only thing between it and lost work. MEASURED: before the
+    # continuation became a blind spot, the verb survived the parser's split and the
+    # snapshot fired; after, nothing did. So when the command VISIBLY names a
+    # snapshot verb, fall back to the session's working directory — the repository
+    # such a command most likely touches — and say below that it is ALL we covered.
+    # A word match on the text the shell assembles, not a parse: over-matching costs
+    # one harmless snapshot, under-matching is the status quo, neither can block.
+    fallback_cwd: str | None = None
+    view = mention_view(cmd) if blind_unrecorded else ""
+    if blind_unrecorded and _GIT_WORD.search(view) and _SNAPSHOT_VERB_WORD.search(view):
+        fallback_cwd = payload.get("cwd") or os.getcwd()
+        targets.append(fallback_cwd)
+    for cwd in targets:
         if not cwd or cwd in seen_cwds or not os.path.isdir(cwd):
             continue
         seen_cwds.add(cwd)
@@ -1510,16 +1558,22 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             "repos in this compound were NOT snapshotted. Run a single git "
             "command per repo if you need its recovery point."
         )
-    if blind_unrecorded:
-        # `seen_cwds` is provably EMPTY here, so this says so plainly rather than
-        # hedging. A bounds-induced blind spot means `analyze_checked` returned no
-        # segments at all, and `seen_cwds` is filled only from inside the segment
-        # loop — so "cut short but still snapshotted something" is not a state this
-        # function can be in. An earlier revision branched on `sorted(seen_cwds)` and
-        # spoke of the repositories it "did snapshot"; that branch was unreachable,
-        # and the wording it left on the live path implied repositories that cannot
-        # exist. Defensive phrasing against an impossible state is not caution, it is
-        # a false claim with a conditional in front of it.
+    if blind_unrecorded and fallback_cwd is not None and fallback_cwd in sha_by_cwd:
+        # The fallback above is the ONLY way a blind parse records anything, so a sha
+        # for it means exactly one snapshot, of the session's directory.
+        warnings.append(
+            f"[git-discard-guard] this command {blind.cause}, so the guard could not "
+            f"tell which repositories it touches: it snapshotted only the session's "
+            f"working directory ({fallback_cwd}). Any OTHER repository this command "
+            f"discards work in has no recovery point. To get one: {blind.hint}."
+        )
+    elif blind_unrecorded:
+        # No snapshot was recorded. A bounds-induced blind spot returns no segments,
+        # so the only snapshot this function can take for it is the fallback above,
+        # and that one did not land (no snapshot verb named, not a repository, or a
+        # clean tree). An earlier revision branched on `sorted(seen_cwds)` and spoke
+        # of the repositories it "did snapshot"; that branch was unreachable, and the
+        # wording it left on the live path implied repositories that cannot exist.
         warnings.append(
             f"[git-discard-guard] no recovery snapshot was recorded at all: this "
             f"command {blind.cause}, so the guard could not tell which "
@@ -1683,13 +1737,21 @@ def main() -> int:
             Exception
         ):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
             discarded_write.remember(cmd)
-    if not cmd or "git" not in cmd:
+    if not cmd:
         return 0
-    if not any(s in cmd for s in _TRIGGER_SUBSTRINGS):
+    # The early exits below decide whether the PARSE runs at all, so they read the
+    # text the shell would assemble (`mention_view`), not the raw string: a quote or
+    # a line continuation inside `git` or `clean` hides the word from a raw test and
+    # the parse — which resolves it correctly — never ran. The view only widens what
+    # reaches the parse; every verdict is still made on the parse.
+    view = mention_view(cmd)
+    if "git" not in view:
+        return 0
+    if not any(s in view for s in _TRIGGER_SUBSTRINGS):
         return 0
 
     # Phase 1 — the clean BLOCK (UNRECOVERABLE → fail CLOSED).
-    if "clean" in cmd:
+    if "clean" in view:
         try:
             block_msg = _clean_violation(cmd)
         except Exception:
@@ -1721,7 +1783,7 @@ def main() -> int:
     # documented residual. Cheap `recurse` gate avoids analyze() on ordinary cmds
     # (lowered — the config KEY is case-insensitive, so `Submodule.Recurse` must
     # still pass this gate).
-    if "recurse" in cmd.lower():
+    if "recurse" in view.lower():
         with contextlib.suppress(Exception):
             sub_msg = _submodule_recurse_violation(cmd)
             if sub_msg:

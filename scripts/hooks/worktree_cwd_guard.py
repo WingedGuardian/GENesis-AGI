@@ -78,6 +78,7 @@ try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
         git_subcommand_index,
+        mention_view,
         untokenizable,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -136,6 +137,7 @@ _WORKTREE_REMOVE = re.compile(r"\bworktree\s+remove\b")
 # shapes that branch covers the removal is INSIDE a quoted string and has no
 # segment of its own.
 _GIT_TOKEN = re.compile(r"\bgit\b")
+_NON_SPACE = re.compile(r"\S+")
 _SUBCOMMAND = "worktree"
 _OPERATION = "remove"
 
@@ -211,8 +213,12 @@ def _legacy_targets(cmd: str) -> list[str]:
     """
     targets: list[str] = []
     for match in _WORKTREE_REMOVE.finditer(cmd):
-        for token in cmd[match.end() :].split():
-            token = token.strip("'\"")
+        # Tokens are read lazily from the match, not by splitting the whole rest of
+        # the command at every match: that was quadratic in the command's length on
+        # a hook path (MEASURED 0.41 s at the length cap, and this now also reads
+        # `mention_view`, up to three times longer). Same tokens, same order.
+        for token_match in _NON_SPACE.finditer(cmd, match.end()):
+            token = token_match.group().strip("'\"")
             if not token or token.startswith("-"):
                 continue
             targets.append(token)
@@ -378,8 +384,9 @@ def _handle_bash(data: dict) -> int:
         return 0
 
     # Cheap pre-gate: cost only. Correctness rests on the parser below, never on
-    # this substring.
-    if _SUBCOMMAND not in cmd:
+    # this substring — read through `mention_view`, so a quote or a line
+    # continuation inside the word cannot skip the parse (widen-only).
+    if _SUBCOMMAND not in mention_view(cmd):
         return 0
 
     # A command shlex cannot tokenize gets the PREVIOUS, coarser reading rather
@@ -430,7 +437,15 @@ def _handle_bash(data: dict) -> int:
     # unreliable. The parsed route below has its own carrier fallback for a removal
     # the parser cannot see, so declining to degrade here is not the same as
     # trusting the parse blindly.
-    if untokenizable(cmd) or (blind is not None and blind.bounds_induced):
+    if blind is not None and blind.bounds_induced:
+        # The coarse reader reads TEXT, so give it the text the shell assembles: a
+        # line continuation (a bounds-type blind spot) splits `worktree remove`
+        # across lines, and the raw-text reader found no target (MEASURED, before
+        # this read the view). `mention_view` keeps the
+        # raw text as its first line, so this can only find MORE targets, and every
+        # direct removal is refused anyway: it moves only toward refusing.
+        targets = _legacy_targets(mention_view(cmd))
+    elif untokenizable(cmd):
         targets = _legacy_targets(cmd)
     else:
         targets = _extract_worktree_targets(segs)
@@ -462,11 +477,14 @@ def _handle_bash(data: dict) -> int:
         # than restated for a gate it no longer describes.
         if (
             not targets
-            and _WORKTREE_REMOVE.search(cmd)
-            and _GIT_TOKEN.search(cmd)
+            # The view throughout: a word split by quotes or backslashes inside a
+            # carried payload still names the removal to the shell that runs it,
+            # and the coarse reader must find the target in that same text.
+            and _WORKTREE_REMOVE.search(mention_view(cmd))
+            and _GIT_TOKEN.search(mention_view(cmd))
             and _carries_a_command(cmd, segs)
         ):
-            targets = _legacy_targets(cmd)
+            targets = _legacy_targets(mention_view(cmd))
     if not targets:
         return 0
 

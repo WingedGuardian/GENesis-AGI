@@ -75,7 +75,9 @@ from shell_parse import (  # noqa: E402
     _GH_ALL_VALUE_FLAGS,
     _GH_FLAG_TABLE,
     analyze_checked,
+    fold_continuations,
     gh_command,
+    mention_view,
 )
 
 #: Cheap prefilter, same reasoning as `capped_read_advisory._GH_WORD`: this runs
@@ -337,22 +339,25 @@ def _advisory(reasons: list[str], closes: int) -> str:
 
 def _process(payload: dict) -> None:
     cmd = (tool_input(payload) or {}).get("command") or ""
-    if not cmd or not _GH_WORD.search(cmd):
+    if not cmd or not _GH_WORD.search(mention_view(cmd)):
         return
-    segments, _blind = analyze_checked(cmd)
-    # THE BLIND FLAG IS DELIBERATELY NOT CONSULTED, and an earlier comment here
-    # claimed the opposite -- that a blind parse means silence. It did not, and
-    # the two blind spots are why. The BOUNDS one returns no segments, so
-    # silence is automatic and needs no flag. The UNTOKENIZABLE one still
-    # returns segments, and `gh pr close 'unterminated` is among them -- a
-    # genuine close attempt that a flag check would silence.
-    #
-    # So reading `_blind` would LOSE real closes to buy nothing, since the case
-    # it would catch is already silent. Advising on what DID parse is right for
-    # an advisory: a spurious note costs a sentence, where a fail-closed guard
-    # in the same position must refuse, because for it a spurious ALLOW costs a
-    # bypass. `_LIMIT` already tells the reader that silence is not evidence,
-    # which covers whatever the parser could not reach.
+    segments, blind = analyze_checked(cmd)
+    # THE BLIND FLAG IS NOT A REASON FOR SILENCE. The UNTOKENIZABLE blind spot
+    # still returns segments, and `gh pr close 'unterminated` is among them -- a
+    # genuine close attempt a flag check would silence. A BOUNDS-TYPE one returns
+    # none, which used to be harmless because the bounds are measured at 0 of
+    # 45,956 real commands; a line continuation is also bounds-type and is
+    # ordinary input, so for that case this reads the command with its
+    # continuations folded instead. An advisory may do what a guard's verdict may
+    # not: a wrong reading here costs one spurious sentence. Over-long or
+    # over-nested commands stay bounded when folded, so they stay silent.
+    if blind is not None and blind.bounds_induced:
+        segments, _ = analyze_checked(fold_continuations(cmd))
+    # Advising on what DID parse is right for an advisory: a spurious note costs a
+    # sentence, where a fail-closed guard in the same position must refuse,
+    # because for it a spurious ALLOW costs a bypass. `_LIMIT` already tells the
+    # reader that silence is not evidence, which covers whatever the parser could
+    # not reach.
     reasons: list[str] = []
     closes = 0
     for seg in segments:

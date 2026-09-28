@@ -239,7 +239,9 @@ try:
         gh_pr_subcommand,
         git_subcommand,
         has_trailing_override,
+        mention_view,
         split_segments,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__" or (len(sys.argv) >= 3 and sys.argv[1] == "--check-pr"):
@@ -327,6 +329,13 @@ _CARRIER_GATED_MENTION = re.compile(
 # nothing and would have measured 0 false positives by never firing at all.
 _GH_MENTION = re.compile(r"\bgh\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
+#: The blind branch's view of a REVIEW REQUEST. The round-budget gate finds a
+#: `gh pr comment … @codex review` in the SEGMENTS, so a command whose segments are
+#: withheld (a bounds-type blind spot) reaches GitHub with no budget check unless
+#: the blind branch names it too. Same breadth as `gh` + `create`: an opaque body
+#: (a file, an editor) already counts as a possible request on the parsed path, so
+#: the body is not inspected here either.
+_COMMENT_MENTION = re.compile(r"\bcomment\b")
 
 #: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
 #: whether a segment that resolved to one of them left its operation unreadable —
@@ -10021,6 +10030,11 @@ def _run_merge_and_push_gates() -> int:
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
         hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # A bounds-type blind spot withholds the segments, and this fact with them:
+        # MEASURED, a continuation elsewhere in the command changed this guard's
+        # verdict on an unresolved verb. Recover the fact from the command itself.
+        if blind is not None and blind.bounds_induced and not hidden_gated_verb:
+            hidden_gated_verb = bool(unresolved_verb_programs(cmd) & _GATED_EXES)
         # A LAUNCHER THE RESOLVER REFUSES TO MODEL, carrying a gated operation.
         # `eval git push --no-verify` parses CLEANLY — `blind` is None — and
         # resolves to `exe == "eval"`, so every predicate above sees no push and
@@ -10050,12 +10064,11 @@ def _run_merge_and_push_gates() -> int:
         # scoped — an 83% cut, with every attack spelling this change documents
         # still refused, because each contains the literal `git`.
         #
-        # STATED RESIDUAL: `eval "gi""t push"` escapes this bound, since the
-        # bound is itself text. That is the SAME exposure already accepted one
-        # file over, where a split `r""m` escapes the `\brm\b` prefilter — so
-        # the two guards now fail identically instead of taking opposite sides
-        # of one question. Closing it properly needs the resolver to report a
-        # carrier as a blind-spot cause, which is filed, not built here.
+        # The mention is read through `mention_view`, the text the shell would
+        # assemble, so a word split by quotes or backslashes inside the carrier's
+        # own segment is still seen. The sibling guards read their carrier
+        # segments the same way, so they keep failing identically rather than
+        # taking opposite sides of one question.
         # PER SEGMENT, not per command. A carrier verdict is "a fact about a
         # SPECIFIC segment" — this file says so where it explains why
         # `hidden_gated_verb` must not be suppressed by a different segment
@@ -10079,7 +10092,10 @@ def _run_merge_and_push_gates() -> int:
         # `su ubuntu -c 'git push'`, `eval gh pr create …`.
         carried_gated_op = any(
             s.exe in _REPARSE_CARRIERS
-            and (_mentions_gated_op(s.raw) or bool(_CARRIER_GATED_MENTION.search(s.raw)))
+            and (
+                _mentions_gated_op(mention_view(s.raw))
+                or bool(_CARRIER_GATED_MENTION.search(mention_view(s.raw)))
+            )
             for s in segs
         )
         # The two predicates are NOT suppressed by the same thing, and collapsing
@@ -10102,7 +10118,23 @@ def _run_merge_and_push_gates() -> int:
             hidden_gated_verb
             or (
                 not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-                and _mentions_gated_op(cmd)
+                # The mention is read through `mention_view`: a line continuation
+                # inside the verb (`pu<continuation>sh`) is exactly the blind spot
+                # that returned no segments, and it also hides the word from the
+                # raw text — so the raw test alone let the one command this branch
+                # exists for through.
+                and (
+                    _mentions_gated_op(mention_view(cmd))
+                    # BOUNDS-TYPE ONLY: an untokenizable command still returns
+                    # its segments, so the round-budget gate below sees its
+                    # comment; widening there would refuse every PR comment whose
+                    # body carries an apostrophe.
+                    or (
+                        blind.bounds_induced
+                        and bool(_GH_MENTION.search(mention_view(cmd)))
+                        and bool(_COMMENT_MENTION.search(mention_view(cmd)))
+                    )
+                )
             )
         ):
             # Defer the syntax refusal so specific sqlite/no-verify blocks keep

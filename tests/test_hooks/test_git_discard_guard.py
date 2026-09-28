@@ -547,14 +547,35 @@ def test_reset_hard_is_snapshotted(repo, snap_log):
     assert (repo / "tracked.py").read_text() == "dirty\n"
 
 
-def test_backslash_newline_reset_still_snapshots(repo, snap_log):
-    # `git reset \<newline> --hard` — the tokenizer splits at the escaped
-    # newline, so the SUBSTRING block misses it; the verb-triggered snapshot
-    # still fires (the `reset` verb survives the split) -> loss is recoverable,
-    # not silent. This is why the recovery net de-fangs the parser gaps.
+@pytest.mark.parametrize(
+    "cmd",
+    ["git reset \\\n --hard", "git re\\\nset --hard", "g\\\nit checkout -- ."],
+    ids=["after-verb", "inside-verb", "inside-program"],
+)
+def test_a_continued_discard_still_snapshots_the_session_cwd(repo, snap_log, cmd):
+    """A line continuation is a blind spot: the parse returns NO segments, so the
+    per-segment loop finds no snapshot verb. The recovery net must not go with it —
+    a continued `git reset --hard` is not refused (it is recoverable, by design), so
+    the snapshot is the only thing standing between it and lost work. The fallback
+    snapshots the session's working directory, the repository such a command most
+    likely touches, and the note says that is ALL it covered."""
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is not None and blind.bounds_induced, "fixture must be a blind parse"
     (repo / "tracked.py").write_text("dirty\n")
-    _gd._record_snapshots("git reset \\\n --hard", {"cwd": str(repo)})
-    assert len(_rows(snap_log)) == 1
+    notes = _gd._record_snapshots(cmd, {"cwd": str(repo)})
+    rows = _rows(snap_log)
+    assert len(rows) == 1 and rows[0]["cwd"] == str(repo)
+    joined = "\n".join(notes)
+    assert "snapshotted the worktree" in joined
+    assert "only the session's working directory" in joined, joined
+
+
+def test_a_blind_command_naming_no_discard_verb_takes_no_fallback_snapshot(repo, snap_log):
+    """The fallback is gated on the command visibly naming a snapshot verb, so an
+    ordinary continued git command does not snapshot on every call."""
+    (repo / "tracked.py").write_text("dirty\n")
+    _gd._record_snapshots("git log \\\n --oneline", {"cwd": str(repo)})
+    assert _rows(snap_log) == []
 
 
 # ── snapshot misses degrade to status quo (never block, never lie) ───────────

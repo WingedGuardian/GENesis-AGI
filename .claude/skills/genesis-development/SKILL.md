@@ -1843,6 +1843,18 @@ Four rules follow, each cheap:
   is what lets the trigger stay broad instead of clever. Measured prompt rate
   after widening: 0.43% of ~19k real commands.
 
+  **SUPERSEDED for the git-operation net by owner ruling 2026-09-08 (re-checked
+  against the code 2026-09-27).** That net no longer asks in any session type:
+  the commit gate and the push guard REFUSE an unreadable command that names a
+  gated operation, with a message giving the cause and a rewrite the session can
+  perform — both cite the ruling at their blind branch. The reasoning here still
+  prices the TRIGGER (a broad predicate remains right); what changed is the cost
+  of a false positive, now an agent rewrite rather than a human confirmation. So
+  wherever this passage and the paragraphs below say `ask` for that net, read
+  "refuse with an actionable message". A line continuation joined the same path
+  when the parser began REPORTING it as a blind spot (`_BLIND_CONTINUATION`)
+  instead of modelling the join: refused, never parsed around.
+
   This does NOT loosen the fail-closed mandate above, and the two are easy to
   read as contradicting each other. Rule (b) is scoped to the git-operation
   blind-spot net — a guard whose trigger is deliberately broad and whose false

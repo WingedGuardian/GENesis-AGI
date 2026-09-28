@@ -1,0 +1,487 @@
+"""A line continuation is a blind spot the parser REPORTS, not one it models.
+
+THE DEFECT. The shell deletes an unescaped backslash-newline and runs the two lines
+as one command; the parser splits there instead. A gated verb on the far side of the
+split landed in a segment of its own, the guards found no operation, and "not found"
+was read as "not present". MEASURED on the pre-change tree, each guard driven as a
+subprocess with the one-line form as the control: the discard guard, the
+protected-path guard, the push gate and the commit gate each refused the one-line
+command and allowed the continued one.
+
+THE FIX IS A REFUSAL, NOT A READING. Three review rounds on an earlier attempt that
+modelled the join (continuation groups, joined views, heredoc and quote readings)
+each found new defects in that modelling. So a continuation is now reported by
+``analyze_checked`` as a BOUNDS-type blind spot: the segments cannot be trusted, and
+every consumer already refuses a bounds blind spot when its early exit says the
+command names its operation. No guard gained a new code path for it.
+
+The early exits read ``shell_parse.mention_view`` rather than the raw text, so a
+continuation or a quote INSIDE the verb (which the shell removes) cannot hide the
+verb from the early exit and skip the parse altogether.
+
+Trigger literals are assembled from fragments so this file's own text does not carry
+them, per the convention in the other guard suites.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+_WORKTREE = Path(__file__).resolve().parent.parent.parent
+_HOOKS_DIR = _WORKTREE / "scripts" / "hooks"
+if str(_HOOKS_DIR) not in sys.path:
+    sys.path.insert(0, str(_HOOKS_DIR))
+
+import shell_parse as sp  # noqa: E402
+
+_PY = sys.executable
+
+# ── trigger literals assembled from fragments ──
+GIT = "git"
+CLEAN = "cl" + "ean"
+PUSH = "pu" + "sh"
+COMMIT = "com" + "mit"
+RM = "r" + "m"
+FORCE = "--" + "for" + "ce"
+NV = "--no-" + "ver" + "ify"
+
+CONT = " \\\n  "  # a continuation between two words
+MID = "\\\n"  # a continuation with nothing around it: splits a WORD
+
+# Every guard gets the same ALLOWLIST environment (see test_guard_ansic_fail_closed
+# for the two ambient inputs that once changed verdicts): nothing inherited reaches a
+# guard unless it is named here, and HOME is pinned per test to a sandbox.
+_NEUTRAL_ENV = ("PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
+
+
+def _env(home: Path) -> dict[str, str]:
+    env = {k: os.environ[k] for k in _NEUTRAL_ENV if k in os.environ}
+    env["HOME"] = str(home)
+    env["GENESIS_HOME"] = str(home / ".genesis")
+    return env
+
+
+def _repo(tmp: Path) -> Path:
+    """A throwaway repository on a feature branch, outside any other repository."""
+    repo = tmp / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "feature-x", str(repo)], check=True)
+    return repo
+
+
+@pytest.fixture
+def sandbox():
+    # Not tmp_path: the scratch root must sit outside every repository so a guard
+    # resolving the cwd's repo can only ever find the one built here.
+    with tempfile.TemporaryDirectory(prefix="cont-refusal-") as d:
+        root = Path(d)
+        home = root / "home"
+        (home / "genesis" / "data").mkdir(parents=True)
+        yield home, _repo(root)
+
+
+def _run(script: Path, command: str, home: Path, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [_PY, str(script)],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}),
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+        env=_env(home),
+        timeout=120,
+    )
+
+
+def _refused(res: subprocess.CompletedProcess) -> bool:
+    """Exit 2, or a JSON deny. An ``ask`` is not a refusal and is reported as such."""
+    try:
+        out = json.loads(res.stdout or "{}")
+    except json.JSONDecodeError:
+        out = {}
+    decision = out.get("hookSpecificOutput", {}).get("permissionDecision", "")
+    return res.returncode == 2 or decision == "deny"
+
+
+_DISCARD = _HOOKS_DIR / "git_discard_guard.py"
+_PUSH_GUARD = _HOOKS_DIR / "git_push_guard.py"
+_PROTECTED = _HOOKS_DIR / "protected_paths_guard.py"
+_DESTRUCTIVE = _HOOKS_DIR / "destructive_command_guard.py"
+_COMMIT_GATE = _WORKTREE / "scripts" / "review_enforcement_commit.py"
+
+# (id, guard, one-line gated command). Each one-line form is REFUSED today; that is
+# asserted first in every cell, so a fixture that never reaches its gate fails loudly
+# instead of letting the continued cell pass for the wrong reason.
+_GATED = [
+    ("discard", _DISCARD, f"{GIT} {CLEAN} -fd"),
+    ("push", _PUSH_GUARD, f"{GIT} {PUSH} origin main {FORCE}"),
+    ("protected", _PROTECTED, f"{RM} -rf ~/genesis/data"),
+    ("destructive", _DESTRUCTIVE, f"{RM} -rf ~"),
+    ("commit", _COMMIT_GATE, f"{GIT} {COMMIT} {NV} -m x"),
+]
+
+
+def _variants(one_line: str) -> dict[str, str]:
+    """Every place a continuation can sit: between words, and inside each of the
+    first two words (the program and the verb)."""
+    words = one_line.split(" ")
+    out = {"between-first-words": one_line.replace(" ", CONT, 1)}
+    out["before-last-word"] = " ".join(words[:-1]) + CONT + words[-1]
+    first = words[0]
+    out["inside-program"] = first[:1] + MID + first[1:] + " " + " ".join(words[1:])
+    if len(words) > 1 and len(words[1]) > 1:
+        second = words[1]
+        out["inside-verb"] = " ".join([first, second[:1] + MID + second[1:], *words[2:]])
+    return out
+
+
+_CELLS = [
+    pytest.param(guard, one_line, variant, id=f"{gid}-{name}")
+    for gid, guard, one_line in _GATED
+    for name, variant in _variants(one_line).items()
+]
+
+
+@pytest.mark.parametrize(("guard", "one_line", "continued"), _CELLS)
+def test_a_continued_gated_command_is_refused_like_its_one_line_form(
+    sandbox, guard, one_line, continued
+):
+    """The acceptance bar: the measured bypass, replayed through the real guard."""
+    home, repo = sandbox
+    plain = _run(guard, one_line, home, repo)
+    assert _refused(plain), (
+        f"{guard.name} did not refuse the one-line form, so this fixture never reaches "
+        f"its gate and the continued cell would prove nothing.\n{plain.stderr[:400]}"
+    )
+    cont = _run(guard, continued, home, repo)
+    assert _refused(cont), (
+        f"{guard.name} allowed a continued command it refuses on one line: "
+        f"{continued!r}\n{cont.stderr[:400]}"
+    )
+
+
+# Quotes inside the verb: the shell removes them, so `cl''ean` runs `clean`. The
+# parser already resolves these correctly; the leak was the raw-text early exit that
+# never let the parser see them.
+_QUOTED = [
+    ("discard", _DISCARD, f"{GIT} cl''ean -fd"),
+    ("discard-double", _DISCARD, f'{GIT} c"lea"n -fd'),
+    ("protected", _PROTECTED, "r''m -rf ~/genesis/data"),
+    ("commit", _COMMIT_GATE, f"{GIT} co''mmit {NV} -m x"),
+    ("destructive", _DESTRUCTIVE, "r''m -rf ~"),
+]
+
+
+@pytest.mark.parametrize(
+    ("guard", "command"), [(g, c) for _, g, c in _QUOTED], ids=[i for i, _, _ in _QUOTED]
+)
+def test_a_quote_inside_the_verb_does_not_skip_the_gate(sandbox, guard, command):
+    home, repo = sandbox
+    res = _run(guard, command, home, repo)
+    assert _refused(res), (
+        f"{guard.name} allowed {command!r}; bash runs it with the quotes removed.\n"
+        f"{res.stderr[:400]}"
+    )
+
+
+def test_a_plain_push_split_inside_the_verb_is_refused_not_run_unasked(sandbox):
+    """No force flag, so nothing else in the raw text names a gated operation: the
+    word `push` itself is the only mention, and the continuation splits it. The
+    blind branch must still see it (through `mention_view`), or the command reaches
+    the shell with neither a refusal nor the ordinary push approval."""
+    home, repo = sandbox
+    res = _run(_PUSH_GUARD, f"{GIT} pu{MID}sh origin feature-x", home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+def test_a_continued_review_request_is_refused_not_passed_unbudgeted(sandbox):
+    """The push guard's review-request budget reads the SEGMENTS for a
+    `gh pr comment … @codex review`. A continuation returns none, so without the
+    blind branch naming review requests the command reached GitHub with no budget
+    check at all. MEASURED on the corpus differential: a real multi-line reply loop
+    that ended in `@codex review` went ASK on main -> ALLOW before this cell existed."""
+    home, repo = sandbox
+    cmd = f"gh pr comment 1 {CONT}--body '@codex review'"
+    res = _run(_PUSH_GUARD, cmd, home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+_WORKTREE = _HOOKS_DIR / "worktree_cwd_guard.py"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git worktree" + CONT + "remove {t}",
+        "git worktree re" + MID + "move {t}",
+        "git work" + MID + "tree remove {t}",
+    ],
+    ids=["between-words", "inside-verb", "inside-subcommand"],
+)
+def test_a_continued_worktree_removal_is_refused(sandbox, command):
+    """Every direct worktree removal is refused on one line (the lifecycle manager
+    owns removal). The guard's fallback for an unreadable parse reads the text, and
+    read the RAW text, so a continuation hid the removal and it ran — MEASURED on
+    main and on this branch before the fallback read `mention_view`."""
+    home, repo = sandbox
+    target = repo / "wt"
+    target.mkdir()
+    one_line = _run(_WORKTREE, f"git worktree remove {target}", home, repo)
+    assert one_line.returncode == 2, "control: the one-line removal must be refused"
+    res = _run(_WORKTREE, command.format(t=target), home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+def test_a_continued_removal_inside_a_launcher_is_refused(sandbox):
+    """The destructive guard's token scan folds continuations itself, so a direct
+    `r<continuation>m -rf ~` is refused with or without the resolver. A removal
+    carried inside a launcher is different: the token scan sees only `bash`, and
+    only the resolver can refuse it — and the resolver runs only when its prefilter
+    finds `rm`, which the raw text does not spell."""
+    home, repo = sandbox
+    res = _run(_DESTRUCTIVE, f'bash -c "r{MID}m -rf ~"', home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+def test_a_pytest_split_inside_its_name_is_refused(sandbox):
+    """full_suite_guard refuses a bounds-type blind spot only when the command
+    names pytest; that check read the raw text, where a continuation inside the
+    word hides it."""
+    home, repo = sandbox
+    res = _run(_HOOKS_DIR / "full_suite_guard.py", f"py{MID}test tests/", home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+# ── negative controls: a guard that refused everything would pass every cell above ──
+
+_BENIGN_CONTINUED = [
+    "ls" + CONT + "-la",
+    "echo hello" + CONT + "world",
+    "python3 -c 'print(1)'" + CONT + "&& echo done",
+]
+
+
+@pytest.mark.parametrize("guard", [g for _, g, _ in _GATED], ids=[i for i, _, _ in _GATED])
+@pytest.mark.parametrize("command", _BENIGN_CONTINUED)
+def test_a_continued_command_naming_no_gated_operation_is_allowed(sandbox, guard, command):
+    home, repo = sandbox
+    res = _run(guard, command, home, repo)
+    assert not _refused(res), (
+        f"{guard.name} refused {command!r}, which names nothing it gates. The refusal "
+        f"must stay behind each guard's own mention check.\n{res.stderr[:400]}"
+    )
+
+
+@pytest.mark.parametrize("guard", [g for _, g, _ in _GATED], ids=[i for i, _, _ in _GATED])
+def test_the_one_line_benign_command_is_still_allowed(sandbox, guard):
+    home, repo = sandbox
+    res = _run(guard, "git status", home, repo)
+    assert not _refused(res), f"{guard.name} refused `git status`.\n{res.stderr[:400]}"
+
+
+def test_the_refusal_names_the_continuation_and_the_one_line_remedy(sandbox):
+    """A refusal is only a cost, not a wall, if it says what to do. The message must
+    name the cause a reader can recognise and a remedy they can perform."""
+    home, repo = sandbox
+    res = _run(_DISCARD, f"{GIT}{CONT}{CLEAN} -fd", home, repo)
+    assert res.returncode == 2
+    assert "continu" in res.stderr, res.stderr
+    assert "one line" in res.stderr, res.stderr
+
+
+# ── the parser's report ──
+
+
+def test_a_continuation_is_a_bounds_type_blind_spot_with_no_segments():
+    segs, blind = sp.analyze_checked(f"{GIT}{CONT}{CLEAN} -fd")
+    assert blind is sp._BLIND_CONTINUATION
+    assert blind.bounds_induced is True
+    assert segs == [], "a bounds-type blind spot must return no segments"
+
+
+def test_the_continuation_cause_is_in_the_blind_spot_domain():
+    assert sp._BLIND_CONTINUATION in sp._ALL_BLIND_SPOTS
+
+
+def test_the_one_line_command_has_no_blind_spot():
+    _, blind = sp.analyze_checked(f"{GIT} {CLEAN} -fd")
+    assert blind is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"echo a\n{GIT} status",  # a plain newline
+        "echo 'a\\b'",  # a backslash not before a newline
+    ],
+    ids=["plain-newline", "no-newline"],
+)
+def test_a_newline_or_backslash_on_its_own_is_not_reported(command):
+    assert not sp.has_continuation(command)
+    _, blind = sp.analyze_checked(command)
+    assert blind is not sp._BLIND_CONTINUATION
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo a\\\n b", "echo a\\\\\n b", "echo a\\\\\\\n b"],
+    ids=["one", "two", "three"],
+)
+def test_any_run_of_backslashes_before_a_newline_is_reported(command):
+    """Counting the run is right only for the command as typed. One layer down — a
+    payload handed to another shell, backticks, a heredoc fed to a shell — the
+    outer layer halves the run, so an EVEN run becomes a join there. The detector
+    therefore does not count: any backslash directly before a newline is reported,
+    which over-refuses an even run at the top level and never misses a nested join
+    spelled in the text."""
+    assert sp.has_continuation(command)
+
+
+def test_the_detector_tries_each_backslash_run_once():
+    """The detector runs on the hook path several times per call, so its regex must
+    stay linear in the command's length. Anchoring each attempt at the start of a
+    run is what does that (see `_CONTINUATION_NL`); this pins the anchor, and the
+    count below pins that a long run is still found. A wall-clock bound would be
+    install-dependent, so the bounded ALGORITHM is what is locked."""
+    assert sp._CONTINUATION_NL.pattern.startswith(r"(?<!\\)")
+    assert sp.has_continuation("x" + "\\" * 50_000 + "\n")
+    assert not sp.has_continuation("x" + "\\" * 50_000)
+
+
+# Joins that happen one layer down: the outer shell turns `\\` into `\` before the
+# inner shell reads the line. Each is refused like its one-line form.
+_NESTED = [
+    ("discard-bash-c", _DISCARD, 'bash -c "git cl' + "\\\\\n" + 'ean -fd"'),
+    ("destructive-bash-c", _DESTRUCTIVE, 'bash -c "r' + "\\\\\n" + 'm -rf ~"'),
+    ("protected-bash-c", _PROTECTED, 'bash -c "r' + "\\\\\n" + 'm -rf ~/genesis/data"'),
+]
+
+
+@pytest.mark.parametrize(
+    ("guard", "command"), [(g, c) for _, g, c in _NESTED], ids=[i for i, _, _ in _NESTED]
+)
+def test_a_join_one_layer_down_is_refused(sandbox, guard, command):
+    home, repo = sandbox
+    res = _run(guard, command, home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+# A verb held in a variable: the push guard refuses `git $V …` because the segment's
+# operation is unreadable. A continuation withholds the segments, so that fact has to
+# survive the withholding.
+@pytest.mark.parametrize(
+    "command",
+    [f"{GIT} $V{CONT}origin main", "gh pr $OP 5" + CONT + "--squash", f"{GIT}{CONT}$V origin main"],
+    ids=["git-var-verb", "gh-var-op", "var-verb-after-split"],
+)
+def test_a_continued_command_with_a_variable_verb_is_refused(sandbox, command):
+    home, repo = sandbox
+    res = _run(_PUSH_GUARD, command, home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+def test_a_continued_read_only_api_call_with_a_variable_is_not_refused(sandbox):
+    """The control for the cell above: an expansion in an ARGUMENT is ordinary work
+    (a repository slug in a path). MEASURED, a rule keyed on 'git/gh plus any `$`'
+    would have refused 121 recorded commands like this one."""
+    home, repo = sandbox
+    cmd = 'gh api "repos/$REPO/pulls/1/comments"' + CONT + "--jq ."
+    res = _run(_PUSH_GUARD, cmd, home, repo)
+    assert res.returncode != 2, (res.stdout + res.stderr)[:400]
+
+
+# Quotes inside a verb carried by a launcher: the per-segment check that decides
+# whether a launcher's payload names the operation read the segment's raw text.
+_CARRIED = [
+    ("protected-eval", _PROTECTED, "eval 'r\"\"m -rf ~/genesis/data'"),
+    ("destructive-eval", _DESTRUCTIVE, "eval 'r\"\"m -rf ~'"),
+    ("worktree-eval", _HOOKS_DIR / "worktree_cwd_guard.py", "eval 'git worktree rem\"\"ove {t}'"),
+    ("push-eval", _PUSH_GUARD, f"eval '{GIT} pu\"\"sh origin main'"),
+]
+
+
+@pytest.mark.parametrize(
+    ("guard", "command"), [(g, c) for _, g, c in _CARRIED], ids=[i for i, _, _ in _CARRIED]
+)
+def test_a_quote_split_verb_inside_a_launcher_is_refused(sandbox, guard, command):
+    home, repo = sandbox
+    target = repo / "wt"
+    target.mkdir()
+    res = _run(guard, command.format(t=target), home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+
+
+def test_an_unreadable_removal_is_not_told_its_target_is_protected(sandbox):
+    """The protected-path guard refuses an rm it cannot read without knowing its
+    targets, so its message must not assert what it has not established."""
+    home, repo = sandbox
+    res = _run(_PROTECTED, f"{RM} /tmp/a{CONT}/tmp/b", home, repo)
+    assert res.returncode == 2
+    assert "This target holds irreplaceable data" not in res.stderr, res.stderr
+    assert "cannot tell whether" in res.stderr, res.stderr
+
+
+def test_the_close_advisory_still_speaks_for_a_continued_close(sandbox):
+    """An advisory, so the cost of a wrong note is a sentence — and silence on a
+    genuine close is the failure it exists to prevent."""
+    home, repo = sandbox
+    res = _run(
+        _HOOKS_DIR / "pr_close_advisory.py",
+        "gh pr close 5" + CONT + "--comment superseded",
+        home,
+        repo,
+    )
+    assert res.returncode == 0
+    assert res.stdout.strip(), "the advisory went silent on a continued close"
+
+
+def test_a_bound_still_outranks_a_continuation():
+    """Both are bounds-type, so the verdict is the same either way; the ORDER only
+    decides which remedy is printed, and the bound's is the one that must be acted
+    on first (a continuation fixed on an over-long command is still over-long)."""
+    cmd = "echo " + "x" * (sp.MAX_COMMAND_CHARS + 10) + CONT + "done"
+    _, blind = sp.analyze_checked(cmd)
+    assert blind is sp._BLIND_OVER_LONG
+
+
+def test_a_continuation_outranks_untokenizable():
+    """The discard guard ignores non-bounds causes, so reporting ``untokenizable`` for
+    a continued command that is ALSO untokenizable would hand it the one answer it is
+    documented to ignore — the same precedence rule the bounds already follow."""
+    cmd = f"{GIT}{CONT}{CLEAN} -fd # don" + chr(39) + "t"
+    assert sp.untokenizable(cmd), "fixture must genuinely defeat the tokenizer"
+    _, blind = sp.analyze_checked(cmd)
+    assert blind is sp._BLIND_CONTINUATION
+
+
+# ── the early-exit view ──
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"{GIT} {CLEAN} -fd",
+        f"{GIT} cl{MID}ean -fd",
+        f"{GIT} cl''ean -fd",
+        f'{GIT} c"lea"n -fd',
+        f"{GIT} cl\\ean -fd",
+        "echo 'unrelated'",
+    ],
+)
+def test_the_mention_view_always_contains_the_raw_text(command):
+    """Widen-only: a pattern that matched the raw command still matches the view."""
+    assert command in sp.mention_view(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [f"{GIT} cl{MID}ean -fd", f"{GIT} cl''ean -fd", f'{GIT} c"lea"n -fd', f"{GIT} cl\\ean -fd"],
+)
+def test_the_mention_view_shows_the_word_the_shell_runs(command):
+    assert f"{GIT} {CLEAN} -fd" in sp.mention_view(command)

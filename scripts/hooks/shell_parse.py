@@ -1390,8 +1390,12 @@ class BlindSpot(NamedTuple):
     the three fields below) is a verdict this module has already made, so a guard obeys
     a single boolean instead of re-deriving one from a string:
 
-    ``bounds_induced`` — a BOUND stopped this parse, as opposed to the pre-existing
-    ``untokenizable`` case. "Blind" is not one thing: every guard's behaviour for an
+    ``bounds_induced`` — the SEGMENTS CANNOT BE TRUSTED, so none are returned: a
+    BOUND stopped this parse, or (:data:`_BLIND_CONTINUATION`) the shell joins lines
+    the parser keeps apart. The name predates the second cause; what consumers act on
+    is the property both share — an empty segment list that means "not read", never
+    "not present". As opposed to the pre-existing ``untokenizable`` case, whose
+    segments are complete. "Blind" is not one thing: every guard's behaviour for an
     untokenizable command was already settled before the bounds existed, so a guard
     restoring what a bound took away must act on ``bounds_induced`` only. Widening to
     all three causes is a new over-block wearing the costume of a regression fix, and
@@ -1528,6 +1532,131 @@ _BLIND_UNCLASSIFIED_OPTION = BlindSpot(
     ),
 )
 
+#: A LINE CONTINUATION: an unescaped backslash immediately before a newline. The
+#: shell DELETES the pair and runs the two lines as one command; the parser splits
+#: there instead. So a verb on the far side of the split lands in a segment of its
+#: own, and a guard searching the segments for its operation finds none — while the
+#: shell runs it. MEASURED on the tree before this cause existed: four guards gave a
+#: continued command a different verdict from the same command on one line.
+#:
+#: REPORTED, NOT MODELLED. The obvious fix is to join the lines as the shell does,
+#: and an earlier attempt did: continuation groups, joined views, and readings for
+#: here-doc bodies and shifted quotes. Three review rounds each found new defects in
+#: that modelling, because a continuation's meaning depends on context the parser
+#: does not track (inside single quotes the shell keeps the pair; inside a `#`
+#: comment it ends the line). Refusing costs a rewrite; modelling cost a new defect
+#: per round.
+#:
+#: ``bounds_induced`` is True because the consequence is the one a bound has: the
+#: segments are not what the shell runs, so none are returned, and every consumer's
+#: existing bounds branch refuses when its own early exit says the command names its
+#: operation. That reuses a refusal path each guard already has and tests; it adds
+#: no per-guard logic.
+#:
+#: DETECTED ANYWHERE, quoted or not, and WITHOUT COUNTING the backslashes. Counting
+#: (an odd run joins, an even run is an escaped backslash and a real newline) is right
+#: only for the command as typed. One layer down — a payload handed to another shell,
+#: backticks, a heredoc fed to a shell — the outer layer halves the run first, so an
+#: even run joins there. Any backslash directly before a newline is therefore
+#: reported. That over-refuses a literal backslash inside single quotes and an even
+#: run at the top level; both are answered by the same one-line hint.
+#:
+#: WHAT THIS STILL CANNOT SEE, stated so it is not read as closed: a newline the shell
+#: BUILDS rather than one written in the text, such as an escape inside ANSI-C
+#: quoting. There is no newline character to find, and recognising the construction
+#: is the shell modelling this cause exists to avoid.
+#:
+#: COST, measured over 86,684 recorded commands on one install with both trees run
+#: through the real hooks: counting odd runs only, 375 commands (0.43%) were newly
+#: refused, every one with this hint; not counting adds 42 commands, 33 of which name
+#: a gated operation.
+_BLIND_CONTINUATION = BlindSpot(
+    bounds_induced=True,
+    cause=(
+        "continues a line with a trailing backslash, which the shell joins into one "
+        "command and this parser does not"
+    ),
+    hint=(
+        "put the command on one line, or split it into separate commands. If the "
+        "backslash is inside text you are writing (a message, a script body), write "
+        "that text to a file instead"
+    ),
+)
+
+#: Any run of backslashes directly before a newline — see :data:`_BLIND_CONTINUATION`
+#: for why the run is not counted. The lookbehind anchors each attempt at the START
+#: of a run, and that is load-bearing, not style: without it the engine retries from
+#: every backslash inside a long run, which is quadratic. MEASURED, 40,000 backslashes
+#: with no newline: 1.47 s unanchored, under 1 ms anchored — and this runs several
+#: times per call on a hook path, where a hook killed by its timeout does not refuse.
+_CONTINUATION_NL = re.compile(r"(?<!\\)\\+\n")
+
+
+def has_continuation(command: str) -> bool:
+    """Whether ``command`` contains a possible line continuation anywhere (see
+    :data:`_BLIND_CONTINUATION` for why neither quoting nor the run's length is
+    consulted)."""
+    return _CONTINUATION_NL.search(command) is not None
+
+
+def fold_continuations(text: str) -> str:
+    """``text`` with every backslash run before a newline deleted, and the newline.
+
+    A DECISION VIEW, never a verdict's parse input. It feeds :func:`mention_view`,
+    which only decides whether a guard's early exit may skip the parse, and the two
+    readings below that can only ADD a refusal or an advisory note. Deleting the
+    whole run rather than the shell's exact reduction is deliberate: every reader of
+    this view also strips backslashes, so the difference cannot change a mention.
+    """
+    return _CONTINUATION_NL.sub("", text)
+
+
+def mention_view(command: str) -> str:
+    """The text a guard's early exit must search before deciding to skip the parse.
+
+    A test for a verb in the raw text cannot see a verb the SHELL assembles from
+    pieces — quote removal, backslash removal, and line joining all run before the
+    word exists. When an early exit read the raw text, a command whose verb was
+    assembled that way never reached the parse, although the parse resolves it.
+
+    Returns the raw command plus the forms with continuations folded and with quotes
+    and backslashes removed, joined by newlines. WIDEN-ONLY: the raw text is always
+    the first line, so any pattern that matched before still matches. Over-matching
+    only sends a command on to the parse, which is where the decision is made. Use it
+    for a MENTION test and nothing else; never parse it.
+    """
+    folded = fold_continuations(command)
+    stripped = folded.replace('"', "").replace("'", "").replace("\\", "")
+    views = [command]
+    for view in (folded, stripped):
+        if view not in views:
+            views.append(view)
+    return "\n".join(views)
+
+
+def unresolved_verb_programs(command: str) -> frozenset[str]:
+    """The programs whose operation is named by an expansion, in EITHER reading.
+
+    For a consumer whose segments :func:`analyze_checked` withheld. A bounds-type
+    blind spot returns no segments, and with them the one per-segment fact a
+    consumer refuses on by itself: a dispatcher (``git``, ``gh``) whose verb the
+    shell builds, so the guard cannot tell which operation runs. Withholding it
+    turned a refusal into an allow — see :func:`analyze_checked`.
+
+    Reads the command as written and with its continuations folded, and returns the
+    union. The folded reading is used ONLY to add names here, so an error in it can
+    add a refusal or miss one the as-written reading also misses; it never decides an
+    allow. Bounded exactly like :func:`analyze_checked`: a reading that trips a bound
+    contributes nothing, and the caller's own bounds branch has already refused.
+    """
+    programs: set[str] = set()
+    for text in dict.fromkeys((command, fold_continuations(command))):
+        segments, reason = _analyze_bounded(text)
+        if reason:
+            continue
+        programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
+    return frozenset(programs)
+
 #: THE OTHER HALF OF VERB POSITION IS DELIBERATELY NOT REPORTED, and the reason is
 #: measurement rather than oversight. When the PROGRAM ITSELF is built by the shell
 #: (``$PY x.py``, ``$SSH host …``), nothing about the segment is established — not
@@ -1575,6 +1704,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_OVER_LONG,
     _BLIND_UNRESOLVED_VERB,
     _BLIND_UNCLASSIFIED_OPTION,
+    _BLIND_CONTINUATION,
 )
 
 
@@ -1656,6 +1786,22 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
     2 of 45,956 real commands a reclassification and no change of verdict.
 
+    :data:`_BLIND_CONTINUATION` comes directly after the two bounds, and BEFORE
+    :func:`untokenizable`, for the same reason the bounds do: it is bounds-type, and
+    the discard guard acts on ``bounds_induced`` only, so a continued command that
+    was ALSO untokenizable would otherwise be handed the cause that guard ignores.
+    The bounds keep precedence because both are bounds-type — the verdict is the same —
+    and the bound's remedy is the one that must be acted on first.
+
+    WITHHOLDING SEGMENTS ALSO WITHHOLDS THE FACTS ON THEM, which is how an earlier
+    revision of this docstring came to claim the placement "never removes" a refusal
+    and was wrong. The push guard refused `git $V …` from the unresolved-verb flag on
+    the SEGMENT; a continuation elsewhere in the same command returned no segments,
+    and the refusal went with them. A consumer that acts on a per-segment fact must
+    therefore recover it when the segments are withheld —
+    :func:`unresolved_verb_programs` does that for the only such fact any consumer
+    reads today.
+
     :data:`_BLIND_UNRESOLVED_VERB` is reported LAST, which means it is reported only
     where this function previously returned None. That is a property worth stating
     rather than a rank: every command that already had a blind spot keeps the exact
@@ -1669,6 +1815,8 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_OVER_LONG
     if reason == "depth":
         return [], _BLIND_OVER_NESTED
+    if has_continuation(command):
+        return [], _BLIND_CONTINUATION
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
     hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
