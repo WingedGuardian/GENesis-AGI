@@ -151,13 +151,9 @@ def test_fresh_apply_writes_dropin_units_and_reloads(tmp_path):
     assert "Type=oneshot" in service
     assert f"ExecStart={p['script']}" in service
     assert p["script"].read_text() == WATCHDOG.read_text()
-    # The root watchdog is told where the owning user's alert queue is (it runs
-    # with HOME=/root and could not find it), and the queue dir exists, created
-    # as that user rather than by root.
-    queue = Path(env["NETRES_ETC_ROOT"]) / ".genesis" / "alerts" / "queue"
-    assert f'Environment="NETWD_ALERT_QUEUE={queue}"' in service
-    assert queue.is_dir()
-    assert service.index("Environment=") < service.index("ExecStart=")
+    # The root watchdog writes nothing into a user's home, so the unit carries
+    # no user path: the Genesis runtime reads its /run telemetry instead.
+    assert "Environment=" not in service
 
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
     assert "reload" in calls  # networkctl reload for the drop-in
@@ -420,16 +416,26 @@ _WD_SYSTEMCTL_STUB = """#!/bin/bash
 case "$1" in
     is-enabled) printf '%s' "${WD_ENABLED-enabled}" ;;
     is-active)
-        if [ "$2" = "tailscaled" ]; then printf '%s' "${WD_TS_ACTIVE-active}"
+        if [ "$2" = "tailscaled" ] && { [ -n "${WD_TS_STOP_DURING_SCAN:-}" ] || [ -n "${WD_TS_DIES_AFTER_RESTART:-}" ]; } && [ -f "$WD_RESTART_LOG" ]; then
+            printf 'inactive'
+        elif [ "$2" = "tailscaled" ]; then printf '%s' "${WD_TS_ACTIVE-active}"
         else printf '%s' "${WD_ACTIVE-active}"; fi ;;
     show)
-        if [ "$2" = "tailscaled" ] && [ -n "${WD_TS_START_RAW:-}" ]; then printf '%s' "$WD_TS_START_RAW"
+        if [ "$2" = "tailscaled" ] && [ "$4" = "InvocationID" ]; then
+            # A try-restart that actually ran gives the unit a new invocation.
+            if [ -f "$WD_RESTART_LOG" ] && [ -z "${WD_TS_STOP_DURING_SCAN:-}" ]; then printf 'inv-2'
+            else printf 'inv-1'; fi
+        elif [ "$2" = "tailscaled" ] && [ -n "${WD_TS_START_RAW:-}" ]; then printf '%s' "$WD_TS_START_RAW"
         elif [ "$2" = "tailscaled" ]; then printf '@%s' "${WD_TS_START_EPOCH-0}"
         else printf '@%s' "${WD_START_EPOCH-0}"; fi ;;
     restart)
         echo "restart $2" >> "$WD_RESTART_LOG"
-        if [ "$2" = "tailscaled" ]; then exit "${WD_TS_RESTART_RC:-0}"; fi
         exit "${WD_RESTART_RC:-0}" ;;
+    try-restart)
+        # Real systemd: acts only on a running unit, exits 0 either way.
+        echo "try-restart $2" >> "$WD_RESTART_LOG"
+        if [ "$2" = "tailscaled" ]; then exit "${WD_TS_RESTART_RC:-0}"; fi
+        exit 0 ;;
 esac
 exit 0
 """
@@ -486,14 +492,11 @@ def _stage_wd(tmp_path: Path) -> dict:
     tailscale.write_text(_WD_TAILSCALE_STUB)
     for f in bin_dir.iterdir():
         f.chmod(0o755)
-    queue = tmp_path / "alerts" / "queue"
-    queue.mkdir(parents=True)
     return {
         # Always the stub, never the real CLI on the test machine's PATH.
         "NETWD_TAILSCALE_BIN": str(tailscale),
         "NETWD_TS_STAMP_FILE": str(tmp_path / "ts-stamp"),
         "NETWD_TS_STATUS_SNAPSHOT": str(tmp_path / "ts-status.json"),
-        "NETWD_ALERT_QUEUE": str(queue),
         "WD_TS_PING_LOG": str(tmp_path / "ts-ping.log"),
         # No active peers: the tailscale check has nothing to look at.
         "WD_TS_STATUS": json.dumps({"Self": {"Relay": "r1"}, "Peer": {}}),
@@ -691,8 +694,11 @@ def _stage_incident(tmp_path: Path, *, seconds_after_stall: int = 326) -> dict:
 
 
 def _ts_restarted(env: dict) -> bool:
+    # Only ever try-restart: a plain restart would START a stopped tailscaled.
     log = Path(env["WD_RESTART_LOG"])
-    return log.exists() and "restart tailscaled" in log.read_text()
+    text = log.read_text() if log.exists() else ""
+    assert "\nrestart tailscaled" not in "\n" + text, text
+    return "try-restart tailscaled" in text
 
 
 def _pings(env: dict) -> list[str]:
@@ -700,13 +706,12 @@ def _pings(env: dict) -> list[str]:
     return log.read_text().splitlines() if log.exists() else []
 
 
-def _alerts(env: dict) -> list[dict]:
-    from genesis.guardian.alert.queue import list_queued
+def _event(env: dict) -> dict | None:
+    """The record the Genesis runtime turns into an owner alert."""
+    return _state(env).get("tailscale", {}).get("last_event")
 
-    return [entry for _, entry in list_queued(env["NETWD_ALERT_QUEUE"])]
 
-
-def test_tailscale_incident_replay_heals_and_alerts(tmp_path):
+def test_tailscale_incident_replay_heals_and_records_the_event(tmp_path):
     env = _stage_incident(tmp_path)
     result = _run_wd(env)
     assert result.returncode == 0, result.stderr
@@ -726,12 +731,15 @@ def test_tailscale_incident_replay_heals_and_alerts(tmp_path):
     snapshot = Path(env["NETWD_TS_STATUS_SNAPSHOT"])
     assert json.loads(snapshot.read_text())["Peer"]["nodekey:aa"]["HostName"] == "peer-a"
     assert snapshot.stat().st_mode & 0o077 == 0  # names the whole tailnet: root-only
-    # The owner alert parses with the REAL drain-side reader.
-    alerts = _alerts(env)
-    assert len(alerts) == 1
-    assert alerts[0]["source"] == "network-watchdog"
-    assert "restarted tailscaled" in alerts[0]["title"]
-    assert "peer-a" in alerts[0]["title"]
+    # The event the runtime alerts on, identified by its time.
+    assert _event(env) == {
+        "action": "healed",
+        "at": int(env["NETWD_NOW"]),
+        "peer": f"peer-a ({_PEER_IP})",
+        "handshake_age_s": 325,
+        "rc": None,
+        "rate_limit_s": 3600,
+    }
     assert Path(env["NETWD_TS_STAMP_FILE"]).read_text().strip() == env["NETWD_NOW"]
 
 
@@ -750,7 +758,7 @@ def test_tailscale_tunnel_that_answers_is_not_stuck(tmp_path):
     env["WD_TS_TSMP_RC"] = "0"
     _run_wd(env)
     assert not _ts_restarted(env)
-    assert _alerts(env) == []
+    assert _event(env) is None
     assert _state(env)["tailscale"]["last_action"] == "none"
 
 
@@ -761,7 +769,7 @@ def test_tailscale_tunnel_revived_by_the_discovery_ping_is_not_restarted(tmp_pat
     env["WD_TS_TSMP_SEQ"] = "1 0"  # first tunnel ping silent, second answers
     _run_wd(env)
     assert not _ts_restarted(env)
-    assert _alerts(env) == []
+    assert _event(env) is None
     assert _state(env)["tailscale"]["last_action"] == "none"
     kinds = ["tsmp" if "--tsmp" in p else "disco" for p in _pings(env)]
     assert kinds == ["tsmp", "disco", "tsmp"]
@@ -780,6 +788,12 @@ def test_tailscale_tunnel_revived_by_the_discovery_ping_is_not_restarted(tmp_pat
         ("NETWD_TS_RESTART_TIMEOUT", "08"),
         ("NETWD_TS_PING_TIMEOUT", "3"),
         ("NETWD_TS_PING_TIMEOUT", "0s"),
+        # Beyond bash's signed 64-bit range: 2**64 evaluates as 0 and 2**63 as
+        # negative, either of which removed the hourly bound.
+        ("NETWD_TS_RATE_LIMIT_SEC", "18446744073709551616"),
+        ("NETWD_TS_RATE_LIMIT_SEC", "9223372036854775808"),
+        ("NETWD_TS_RATE_LIMIT_SEC", "1000000000"),
+        ("NETWD_TS_MAX_PROBES", "99999999999999999999"),
     ],
 )
 def test_an_invalid_tailscale_knob_falls_back_to_its_default(tmp_path, name, value):
@@ -792,8 +806,7 @@ def test_an_invalid_tailscale_knob_falls_back_to_its_default(tmp_path, name, val
     assert _ts_restarted(env)
     assert f"ignoring invalid {name}" in result.stderr
     assert "--timeout 3s" in _pings(env)[0]
-    alert = _alerts(env)[0]
-    assert "after 60 min" in alert["body"]  # the default hour, not the typo
+    assert _event(env)["rate_limit_s"] == 3600  # the default hour, not the typo
 
 
 def test_an_invalid_rate_limit_still_holds_the_hour(tmp_path):
@@ -826,7 +839,7 @@ def test_tailscale_peer_that_went_away_is_not_healed(tmp_path):
     env["WD_TS_DISCO_RC"] = "1"
     _run_wd(env)
     assert not _ts_restarted(env)
-    assert _alerts(env) == []
+    assert _event(env) is None
     assert _state(env)["tailscale"]["last_action"] == "suspect-unreachable"
 
 
@@ -857,7 +870,7 @@ def test_tailscale_rate_limit_is_an_hour(tmp_path):
     Path(env["NETWD_TS_STAMP_FILE"]).write_text(str(int(env["NETWD_NOW"]) - 1800))
     _run_wd(env)
     assert not _ts_restarted(env)
-    assert _alerts(env) == []
+    assert _event(env) is None
     ts = _state(env)["tailscale"]
     assert ts["last_action"] == "ratelimited"
     assert ts["last_diagnostics"]["peer_relay"] == "r2"  # evidence kept anyway
@@ -883,9 +896,8 @@ def test_tailscale_observe_mode_alerts_without_restarting(tmp_path):
     _run_wd(env)
     assert not _ts_restarted(env)
     assert _state(env)["tailscale"]["last_action"] == "observed"
-    alerts = _alerts(env)
-    assert len(alerts) == 1 and "not restarted" in alerts[0]["title"]
-    assert Path(env["NETWD_TS_STAMP_FILE"]).exists()  # an hour before the next alert
+    assert _event(env)["action"] == "observed"
+    assert Path(env["NETWD_TS_STAMP_FILE"]).exists()  # an hour before the next one
 
 
 def test_tailscale_unknown_mode_degrades_to_observe_not_live(tmp_path):
@@ -935,24 +947,13 @@ def test_tailscale_failed_restart_alerts_and_spends_the_hour(tmp_path):
     assert ts["last_action"] == "restart-failed"
     assert ts["heal_count"] == 0
     assert Path(env["NETWD_TS_STAMP_FILE"]).read_text().strip() == env["NETWD_NOW"]
-    alerts = _alerts(env)
-    assert len(alerts) == 1 and "FAILED" in alerts[0]["title"]
+    assert _event(env)["action"] == "restart-failed" and _event(env)["rc"] == 1
     # Next tick, restart still failing and the unit still up: no second attempt.
     Path(env["WD_RESTART_LOG"]).write_text("")
     env["NETWD_NOW"] = str(int(env["NETWD_NOW"]) + 120)
     _run_wd(env)
     assert not _ts_restarted(env)
     assert _state(env)["tailscale"]["last_action"] == "ratelimited"
-
-
-def test_tailscale_missing_queue_still_heals(tmp_path):
-    env = _stage_incident(tmp_path)
-    env["NETWD_ALERT_QUEUE"] = str(tmp_path / "absent")
-    result = _run_wd(env)
-    assert result.returncode == 0
-    assert _ts_restarted(env)
-    assert not (tmp_path / "absent").exists()  # root must never create it
-    assert "journal-only" in result.stdout
 
 
 def test_both_checks_run_and_both_heal(tmp_path):
@@ -1014,14 +1015,6 @@ def test_garbage_stamps_do_not_abort_either_check(tmp_path):
     assert _restarted(env) and _ts_restarted(env)  # garbage reads as "no recent heal"
 
 
-def test_alert_queue_path_is_escaped_for_systemd(tmp_path):
-    env = _stage(tmp_path)
-    env["NETRES_ALERT_QUEUE"] = '/srv/a%b "q"/queue'
-    _run_apply(env)
-    service = _paths(env)["service"].read_text()
-    assert 'Environment="NETWD_ALERT_QUEUE=/srv/a%%b \\"q\\"/queue"' in service
-
-
 def test_tailscale_hostile_peer_name_cannot_forge_records_or_markup(tmp_path):
     # HostName is chosen by the peer. A newline would split its record into
     # forged ones (one carrying a flag-shaped "ip" into `tailscale ping`), and
@@ -1036,8 +1029,8 @@ def test_tailscale_hostile_peer_name_cannot_forge_records_or_markup(tmp_path):
     pings = _pings(env)
     assert len(pings) == 3  # tunnel, discovery, tunnel again: no forged record
     assert all(p.endswith(f"-- {_PEER_IP}") for p in pings)
-    title = _alerts(env)[0]["title"]
-    assert "<" not in title and ">" not in title and "\n" not in title
+    peer = _event(env)["peer"]
+    assert "<" not in peer and ">" not in peer and "\n" not in peer
     assert _state(env)["tailscale"]["last_peer"].startswith("x--socks5-server127.0.0.11ahref")
 
 
@@ -1049,19 +1042,6 @@ def test_tailscale_non_ip_target_is_never_pinged(tmp_path):
     _run_wd(env)
     assert _pings(env) == []
     assert not _ts_restarted(env)
-
-
-def test_tailscale_alert_refuses_a_symlinked_queue(tmp_path):
-    env = _stage_incident(tmp_path)
-    real = tmp_path / "elsewhere"
-    real.mkdir()
-    link = tmp_path / "linkq"
-    link.symlink_to(real)
-    env["NETWD_ALERT_QUEUE"] = str(link)
-    result = _run_wd(env)
-    assert _ts_restarted(env)  # the heal itself still happens
-    assert list(real.iterdir()) == []  # nothing written through the link
-    assert "alert enqueue failed" in result.stdout
 
 
 def test_tailscale_recent_daemon_start_holds_the_limit(tmp_path):
@@ -1121,20 +1101,6 @@ def test_tailscale_scan_rotates_to_a_stuck_peer_behind_the_cap(tmp_path):
     assert any("100.64.1.3" in p for p in _pings(env))
 
 
-def test_tailscale_observe_alert_is_one_queued_entry_per_peer(tmp_path):
-    # With the stamp unwritable, observe mode fires every tick; a stable
-    # per-peer key keeps ONE queued entry, as enqueue_alert does.
-    env = _stage_incident(tmp_path)
-    env["NETWD_TS_MODE"] = "observe"
-    env["NETWD_TS_STAMP_FILE"] = str(tmp_path / "no-such-dir" / "stamp")
-    for tick in range(3):
-        env["NETWD_NOW"] = str(int(env["NETWD_NOW"]) + 120 * tick)
-        _run_wd(env)
-    alerts = _alerts(env)
-    assert len(alerts) == 1
-    assert alerts[0]["dedupe_key"] == f"network-watchdog:tailscale:observe:{_PEER_IP}"
-
-
 def test_tailscale_bad_scan_knobs_fall_back_to_defaults(tmp_path):
     env = _stage_incident(tmp_path)
     env["NETWD_TS_MAX_PROBES"] = "abc"
@@ -1172,29 +1138,6 @@ def test_tailscale_real_systemd_timestamp_format_is_parsed(tmp_path):
     assert _state(env)["tailscale"]["last_action"] == "ratelimited"
 
 
-def test_tailscale_hostile_queue_entries_cannot_hang_or_break_the_alert(tmp_path):
-    # The stable-key dedupe scan reads the user-owned queue as root. A symlink
-    # to /dev/zero, a FIFO and a non-object JSON file must not exhaust memory,
-    # block, or stop the alert from being queued.
-    import os
-
-    env = _stage_incident(tmp_path)
-    env["NETWD_TS_MODE"] = "observe"
-    queue = Path(env["NETWD_ALERT_QUEUE"])
-    (queue / "zero.json").symlink_to("/dev/zero")
-    os.mkfifo(queue / "fifo.json")
-    (queue / "list.json").write_text("[]")
-    result = _run_wd(env)  # _run_wd has a 30s timeout: a hang fails here
-    assert result.returncode == 0
-    assert "alert enqueue failed" not in result.stdout
-    keyed = [
-        f
-        for f in queue.glob("*.json")
-        if f.is_file() and not f.is_symlink() and f.name != "list.json"
-    ]
-    assert len(keyed) == 1
-
-
 def test_tailscale_scan_is_capped_per_tick(tmp_path):
     # Many stale Active peers, all gone (tunnel and discovery both silent):
     # only TS_MAX_PROBES of them are probed this tick, and the log says so.
@@ -1211,6 +1154,8 @@ def test_tailscale_scan_is_capped_per_tick(tmp_path):
     assert len(_pings(env)) == 3 * 2  # 3 peers, a tunnel + a discovery ping each
     assert "probed 3 suspect peer(s); 2 more not probed" in result.stdout
     assert not _ts_restarted(env)
+    # Two suspects went unprobed, so this tick proves nothing healthy.
+    assert _state(env)["tailscale"]["last_action"] == "incomplete"
 
 
 def test_tailscale_scan_budget_stops_new_probes(tmp_path):
@@ -1220,76 +1165,87 @@ def test_tailscale_scan_budget_stops_new_probes(tmp_path):
     result = _run_wd(env)
     assert _pings(env) == []
     assert "1 more not probed" in result.stdout
+    assert _state(env)["tailscale"]["last_action"] == "incomplete"
 
 
-def test_installer_under_sudo_honours_genesis_home(tmp_path):
-    # Run as root via sudo, the queue follows GENESIS_HOME (what the drainer
-    # reads), not the invoking user's default ~/.genesis.
-    env = _stage(tmp_path)
-    bin_dir = Path(env["PATH"].split(":")[0])
-    (bin_dir / "id").write_text(
-        '#!/bin/bash\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n'
-    )
-    (bin_dir / "getent").write_text(
-        '#!/bin/bash\necho "alice:x:1000:1000::/home/alice:/bin/bash"\n'
-    )
-    # sudo -u USER cmd... -> run cmd (the stub cannot switch users)
-    (bin_dir / "sudo").write_text(
-        '#!/bin/bash\nif [ "$1" = "-n" ] && [ "$2" = "true" ]; then exit 0; fi\n'
-        'if [ "$1" = "-u" ]; then shift 2; fi\nexec "$@"\n'
-    )
-    for f in ("id", "getent", "sudo"):
-        (bin_dir / f).chmod(0o755)
-    custom = tmp_path / "srv-genesis"
-    env["SUDO_USER"] = "alice"
-    env["GENESIS_HOME"] = str(custom)
-    result = _run_apply(env)
-    assert result.returncode == 0, result.stderr
-    service = _paths(env)["service"].read_text()
-    assert f'Environment="NETWD_ALERT_QUEUE={custom}/alerts/queue"' in service
-    assert (custom / "alerts" / "queue").is_dir()
+def test_tailscale_stopped_during_the_scan_is_left_stopped(tmp_path):
+    # An operator stops tailscaled while the scan runs. try-restart acts only
+    # on a running unit, and the result is re-checked: no heal is claimed.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_STOP_DURING_SCAN"] = "1"
+    result = _run_wd(env)
+    assert result.returncode == 0
+    assert "left stopped" in result.stdout
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "unavailable"
+    assert ts["heal_count"] == 0
+    assert _event(env) is None
 
 
-def test_installer_expands_a_tilde_genesis_home_like_the_drainer(tmp_path):
-    # The drainer resolves GENESIS_HOME with Path.expanduser(); shell parameter
-    # expansion leaves a literal `~`, which named a different, relative queue.
-    env = _stage(tmp_path)
-    home = Path(env["NETRES_ETC_ROOT"])
-    env["GENESIS_HOME"] = "~/custom-genesis"
-    result = _run_apply(env)
-    assert result.returncode == 0, result.stderr
-    service = _paths(env)["service"].read_text()
-    queue = home / "custom-genesis" / "alerts" / "queue"
-    assert f'Environment="NETWD_ALERT_QUEUE={queue}"' in service
-    assert queue.is_dir()
+def test_tailscale_diagnostics_never_come_from_an_older_snapshot(tmp_path):
+    # This tick's snapshot write fails; an older incident's file is still
+    # there. The diagnostics must describe THIS tick's status.
+    env = _stage_incident(tmp_path)
+    snap_dir = tmp_path / "snapdir"
+    snap_dir.mkdir()
+    old = snap_dir / "ts-status.json"
+    old.write_text(json.dumps({"Self": {"Relay": "stale-relay"}, "Peer": {}}))
+    snap_dir.chmod(0o555)  # mktemp beside it fails
+    env["NETWD_TS_STATUS_SNAPSHOT"] = str(old)
+    try:
+        _run_wd(env)
+    finally:
+        snap_dir.chmod(0o755)
+    diag = _state(env)["tailscale"]["last_diagnostics"]
+    assert diag["self_relay"] == "r1"
+    assert diag["peer_relay"] == "r2"
+    assert "stale-relay" not in json.dumps(diag)
 
-
-def test_installer_drops_the_queue_for_a_relative_genesis_home(tmp_path):
-    # A relative path resolves against each side's own working directory, so
-    # no queue is configured and the watchdog alerts via the journal only.
-    env = _stage(tmp_path)
-    env["GENESIS_HOME"] = "relative/genesis"
-    result = _run_apply(env)
-    assert result.returncode == 0, result.stderr
-    assert "NETWD_ALERT_QUEUE" not in _paths(env)["service"].read_text()
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
+    ("mode_env", "title_part"),
     [
-        ("~", "/home/me"),
-        ("~/x/y", "/home/me/x/y"),
-        ("~root/x", "/root/x"),
-        ("~no-such-user-zz/x", "~no-such-user-zz/x"),
-        ("/abs/~x", "/abs/~x"),
-        ("rel", "rel"),
+        ({}, "restarted tailscaled"),
+        ({"NETWD_TS_MODE": "observe"}, "not restarted"),
+        ({"WD_TS_RESTART_RC": "1"}, "restart FAILED"),
     ],
 )
-def test_expand_tilde_matches_python_expanduser(value, expected):
-    out = subprocess.run(
-        ["/bin/bash", "-c", f'source "{LIB}"; _netres_expand_tilde "$1" /home/me', "_", value],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    ).stdout
-    assert out == expected
+def test_the_runtime_reads_the_scripts_event_into_one_alert(tmp_path, mode_env, title_part):
+    # Both halves of the contract, unmodified: the REAL script writes the
+    # telemetry, and the REAL runtime consumer turns it into a queued alert.
+    from genesis.guardian.alert.queue import list_queued
+    from genesis.resilience.network_watchdog_events import enqueue_new_events
+
+    env = _stage_incident(tmp_path)
+    env.update(mode_env)
+    _run_wd(env)
+    queue = tmp_path / "user-alerts" / "queue"
+    seen = tmp_path / "user-alerts" / "seen.json"
+    kwargs = dict(
+        queue_root=queue,
+        seen_file=seen,
+        state_file=Path(env["NETWD_STATE_FILE"]),
+        now=int(env["NETWD_NOW"]) + 300,
+    )
+    assert enqueue_new_events(**kwargs) is True
+    (entry,) = [e for _, e in list_queued(queue)]
+    assert title_part in entry["title"]
+    assert "peer-a" in entry["title"] + entry["body"]
+    # The next tick re-reads the same telemetry: no second alert.
+    assert enqueue_new_events(**kwargs) is False
+
+
+def test_tailscale_that_dies_after_the_restart_is_a_failed_restart(tmp_path):
+    # try-restart ran (a new InvocationID) but the daemon is not running: every
+    # session dropped and Tailscale may be down, so the owner must hear of it.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_DIES_AFTER_RESTART"] = "1"
+    result = _run_wd(env)
+    assert result.returncode != 0
+    assert "not active" in result.stdout
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "restart-failed"
+    assert ts["heal_count"] == 0
+    assert _event(env)["action"] == "restart-failed"
+

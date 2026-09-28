@@ -42,8 +42,11 @@
 #     discovery ping can itself revive a cold path).
 # The heal restarts tailscaled (this drops every Tailscale SSH session on the
 # box, which is why it is rate-limited to once per NETWD_TS_RATE_LIMIT_SEC,
-# default an hour). Each heal records what it saw and queues an owner alert.
-# Operator lever NETWD_TS_MODE: live (default) | observe (record + alert, never
+# default an hour). Each heal, observation or failed restart is recorded as
+# `tailscale.last_event` in the /run telemetry file below. The watchdog writes
+# nothing outside /run: the Genesis runtime, running as the owning user, reads
+# that event and raises the owner alert (genesis.resilience.network_watchdog_events).
+# Operator lever NETWD_TS_MODE: live (default) | observe (record, never
 # restart) | off. Set it with a drop-in:
 # `systemctl edit genesis-network-watchdog.service` →
 # `[Service]` + `Environment=NETWD_TS_MODE=observe`.
@@ -66,12 +69,14 @@ TS_MODE="${NETWD_TS_MODE:-live}"                  # live | observe | off
 # Every numeric tailscale knob goes through _ts_knob. A drop-in typo must fall
 # back to the default, never abort the check under `set -u`, disable a bound,
 # or silently turn detection off. Integers only, no leading zero (bash reads
-# "08" as bad octal). min 1 where 0 would remove a safety rail: `timeout 0`
-# never fires, a 0 rate limit restarts every tick, a 0 stale age suspects every
-# peer. The two scan caps allow 0 (probe nothing this tick).
+# "08" as bad octal), at most 9 digits: bash arithmetic is signed 64-bit, so a
+# longer value can wrap negative or to zero and silently remove the bound it
+# sets (a wrapped rate limit restarts every tick). min 1 where 0 would remove a
+# safety rail: `timeout 0` never fires, a 0 rate limit restarts every tick, a 0
+# stale age suspects every peer. The two scan caps allow 0 (probe nothing).
 _ts_knob() {  # <env name> <default> <min: 0|1>
-    local v="${!1:-$2}" re='^[1-9][0-9]*$'
-    [[ "$3" == 0 ]] && re='^(0|[1-9][0-9]*)$'
+    local v="${!1:-$2}" re='^[1-9][0-9]{0,8}$'
+    [[ "$3" == 0 ]] && re='^(0|[1-9][0-9]{0,8})$'
     if [[ "$v" =~ $re ]]; then
         printf '%s' "$v"
     else
@@ -84,7 +89,7 @@ TS_RATE_LIMIT_SEC="$(_ts_knob NETWD_TS_RATE_LIMIT_SEC 3600 1)"  # min seconds be
 # Passed to `tailscale ping --timeout`, which needs a Go duration with a unit;
 # a bare number fails every ping and would read every peer as unreachable.
 TS_PING_TIMEOUT="${NETWD_TS_PING_TIMEOUT:-3s}"
-if ! [[ "$TS_PING_TIMEOUT" =~ ^[1-9][0-9]*(ms|s)$ ]]; then
+if ! [[ "$TS_PING_TIMEOUT" =~ ^[1-9][0-9]{0,5}(ms|s)$ ]]; then
     printf 'genesis-network-watchdog: ignoring invalid NETWD_TS_PING_TIMEOUT=%q; using 3s\n' "$TS_PING_TIMEOUT" >&2
     TS_PING_TIMEOUT=3s
 fi
@@ -102,9 +107,6 @@ TS_MAX_PROBES="$(_ts_knob NETWD_TS_MAX_PROBES 3 0)"
 TS_SCAN_BUDGET_SEC="$(_ts_knob NETWD_TS_SCAN_BUDGET_SEC 60 0)"
 TS_STAMP_FILE="${NETWD_TS_STAMP_FILE:-/run/genesis-network-watchdog-tailscale.last}"
 TS_STATUS_SNAPSHOT="${NETWD_TS_STATUS_SNAPSHOT:-/run/genesis-network-watchdog-tailscale-status.json}"
-# The owning user's alert queue (~/.genesis/alerts/queue), written into the
-# service unit by network_resilience.sh. Unset → no owner alert (journal only).
-ALERT_QUEUE="${NETWD_ALERT_QUEUE:-}"
 
 log() { printf 'genesis-network-watchdog: %s\n' "$1"; }
 
@@ -254,13 +256,16 @@ _networkd_check() {
 # ── Tailscale stuck-tunnel check ──────────────────────────────────────────────
 
 # Merge the tailscale sub-object into the state file, leaving the networkd keys
-# alone. action ∈ {none, suspect-unreachable, healed, observed, ratelimited,
-# restart-failed, unavailable, status-unparseable, off}. `diag` is the JSON
-# evidence captured at the moment of a heal/observation (or empty).
+# alone. action ∈ {none, incomplete, suspect-unreachable, healed, observed,
+# ratelimited, restart-failed, unavailable, status-unparseable, off}. `diag` is
+# the JSON evidence captured at the moment of a heal/observation (or empty).
+# healed / observed / restart-failed also become `last_event`, the record the
+# Genesis runtime turns into an owner alert; its `at` is the event's identity.
 _write_ts_state() {
-    local action="$1" peer="$2" diag="$3"
+    local action="$1" peer="$2" diag="$3" rc="${4:-}"
     NETWD_STATE_FILE="$STATE_FILE" A_NOW="$NETWD_NOW" A_ACTION="$action" \
-        A_PEER="$peer" A_DIAG="$diag" python3 - <<'PY' 2>/dev/null || true
+        A_PEER="$peer" A_DIAG="$diag" A_RC="$rc" A_RATE="$TS_RATE_LIMIT_SEC" \
+        python3 - <<'PY' 2>/dev/null || true
 import json, os
 path = os.environ["NETWD_STATE_FILE"]
 now = int(os.environ["A_NOW"])
@@ -289,6 +294,15 @@ if peer:
     ts["last_peer"] = peer
 if diag is not None:
     ts["last_diagnostics"] = diag
+if action in ("healed", "observed", "restart-failed"):
+    ts["last_event"] = {
+        "action": action,
+        "at": now,
+        "peer": peer,
+        "handshake_age_s": (diag or {}).get("handshake_age_s"),
+        "rc": int(os.environ["A_RC"]) if os.environ["A_RC"].isdigit() else None,
+        "rate_limit_s": int(os.environ["A_RATE"]),
+    }
 state["tailscale"] = ts
 tmp = f"{path}.tmp"
 with open(tmp, "w") as fh:
@@ -355,16 +369,19 @@ for peer in peers.values():
 ' 2>/dev/null
 }
 
-# Evidence for one stuck peer, pulled from the saved status snapshot: both
-# relay homes, the direct address, handshake, byte counters — the fields that
-# told us what happened on 2026-09-26, captured at the moment rather than after.
+# Evidence for one stuck peer, read from THIS tick's `status --json` on stdin
+# (never the snapshot file, which may be an older incident's if this tick's
+# write failed): both relay homes, the direct address, handshake, byte
+# counters — the fields that told us what happened on 2026-09-26, captured at
+# the moment rather than after.
 _ts_diag() {
     local ip="$1" age="$2"
-    A_SNAP="$TS_STATUS_SNAPSHOT" A_IP="$ip" A_AGE="$age" python3 -c '
-import json, os
+    A_IP="$ip" A_AGE="$age" python3 -c '
+import json, os, sys
 try:
-    with open(os.environ["A_SNAP"]) as fh:
-        status = json.load(fh)
+    status = json.load(sys.stdin)
+    if not isinstance(status, dict):
+        status = {}
 except Exception:
     status = {}
 self_node = status.get("Self") or {}
@@ -384,79 +401,6 @@ for peer in (status.get("Peer") or {}).values():
         break
 print(json.dumps(out))
 ' 2>/dev/null
-}
-
-# Queue an owner alert into the Genesis user's durable alert queue (schema v1,
-# genesis.guardian.alert.queue — the awareness tick drains it to Telegram).
-# Runs as root, so the entry is chowned to the queue directory's owner BEFORE it
-# is renamed into place: the drainer (that user) must be able to read and
-# unlink it. A missing or root-owned queue dir means no alert, never a root-
-# owned file in someone's home.
-_ts_alert() {
-    local title="$1" body="$2" key="${3:-}"
-    [[ -n "$ALERT_QUEUE" && -d "$ALERT_QUEUE" ]] || {
-        log "tailscale: no alert queue configured/present — alert is journal-only"
-        return 0
-    }
-    A_ROOT="$ALERT_QUEUE" A_NOW="$NETWD_NOW" A_TITLE="$title" A_BODY="$body" A_KEY="$key" python3 - <<'PY' 2>/dev/null || log "tailscale: alert enqueue failed"
-import json, os, uuid
-root = os.environ["A_ROOT"]
-# The queue must be a real directory (not a symlink to one) owned by a user.
-st = os.lstat(root)
-import stat as _stat
-if not _stat.S_ISDIR(st.st_mode) or st.st_uid == 0:
-    raise SystemExit(1)  # not a user's queue; refuse to write into it
-ts = float(os.environ["A_NOW"])
-entry = {
-    "schema": 1,
-    "ts": ts,
-    "severity": "warning",
-    "source": "network-watchdog",
-    "title": os.environ["A_TITLE"],
-    "body": os.environ["A_BODY"],
-    # Per-event identity by default: two heals an hour apart are two alerts,
-    # not a repeat. A caller that may fire every tick passes a stable key.
-    "dedupe_key": os.environ["A_KEY"] or "network-watchdog:tailscale:%d" % int(ts),
-    "meta": {},
-}
-# A caller-supplied (stable) key is kept to ONE live entry, as
-# genesis.guardian.alert.queue.enqueue_alert does: while the channel is down
-# a condition that recurs every tick must not fill the queue and evict
-# unrelated alerts.
-# The scan READS files in a user-owned directory as root, so it gets the same
-# care as the write below: never follow a symlink (/dev/zero), never block on
-# a FIFO, regular files only, a bounded read, and only a dict counts. Bounded
-# to 200 entries, mirroring the queue's own dedupe scan limit.
-key = os.environ["A_KEY"]
-if key:
-    import glob
-    import stat as _st
-    for existing in glob.glob(os.path.join(root, "*.json"))[:200]:
-        try:
-            fd = os.open(existing, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError:
-            continue
-        try:
-            if not _st.S_ISREG(os.fstat(fd).st_mode):
-                continue
-            data = json.loads(os.read(fd, 65536) or b"null")
-        except (OSError, ValueError):
-            continue
-        finally:
-            os.close(fd)
-        if isinstance(data, dict) and data.get("dedupe_key") == key:
-            raise SystemExit(0)
-# Root writing into a user-owned directory: create exclusively, never follow
-# a symlink, and chown the open fd rather than a path that could be swapped.
-tmp = os.path.join(root, ".%s.tmp" % uuid.uuid4().hex)
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-try:
-    os.write(fd, json.dumps(entry, ensure_ascii=False).encode("utf-8"))
-    os.fchown(fd, st.st_uid, st.st_gid)
-finally:
-    os.close(fd)
-os.replace(tmp, os.path.join(root, "%.6f-%s.json" % (ts, uuid.uuid4().hex)))
-PY
 }
 
 # When the tailscale rate limit was last spent: the LATER of tailscaled's own
@@ -563,7 +507,11 @@ _tailscale_check() {
     fi
 
     if [[ -z "$stuck_ip" ]]; then
-        if [[ -n "$saw_unreachable" ]]; then
+        # A suspect the cap left unprobed could be the stuck one, so a capped
+        # scan never reads as healthy.
+        if (( skipped > 0 )); then
+            _write_ts_state "incomplete" "" ""
+        elif [[ -n "$saw_unreachable" ]]; then
             _write_ts_state "suspect-unreachable" "" ""
         else
             _write_ts_state "none" "" ""
@@ -582,7 +530,7 @@ _tailscale_check() {
             unlink "$snap_tmp" 2>/dev/null || true
         fi
     fi
-    local diag; diag="$(_ts_diag "$stuck_ip" "$stuck_age")"
+    local diag; diag="$(printf '%s' "$status" | _ts_diag "$stuck_ip" "$stuck_age")"
     local peer="$stuck_name ($stuck_ip)"
 
     local last
@@ -593,8 +541,6 @@ _tailscale_check() {
         return 0
     fi
 
-    local detail="No WireGuard handshake with $peer for ${stuck_age}s while traffic is wanted; the tunnel ping got no reply but the peer answers discovery pings, so the path is fine and the tunnel is stuck. Evidence: $TS_STATUS_SNAPSHOT (and 'tailscale' in $STATE_FILE)."
-
     # Best-effort stamp BEFORE acting (see _ts_last_spent for why a failed
     # write is tolerable: systemd's start time bounds every restart that
     # actually happened).
@@ -603,31 +549,40 @@ _tailscale_check() {
     if [[ "$TS_MODE" == "observe" ]]; then
         log "tailscale: OBSERVE — tunnel to $peer stuck (handshake ${stuck_age}s old); not restarting"
         _write_ts_state "observed" "$peer" "$diag"
-        # A STABLE per-peer key: if the stamp cannot hold the hourly limit,
-        # the queue keeps one entry per key and the outreach pipeline delivers
-        # a key once per day, so a stuck peer never pages every 2 minutes.
-        _ts_alert "Tailscale tunnel to $stuck_name is stuck (observe mode — not restarted)" \
-            "$detail Restart it with: sudo systemctl restart tailscaled" \
-            "network-watchdog:tailscale:observe:$stuck_ip"
         return 0
     fi
 
     log "tailscale: HEALING — tunnel to $peer stuck (handshake ${stuck_age}s old); restarting tailscaled"
     # The stamp was written above, BEFORE the attempt: a restart that fails
     # has still dropped every session, so it spends the hour as a good one.
-    if timeout "$TS_RESTART_TIMEOUT" "$SYSTEMCTL" restart tailscaled; then
-        _write_ts_state "healed" "$peer" "$diag"
-        _ts_alert "Tailscale tunnel to $stuck_name was stuck — restarted tailscaled" \
-            "$detail Restarting tailscaled dropped the Tailscale SSH sessions on this machine; tmux sessions survive, so reconnect. Next automatic restart is allowed after $((TS_RATE_LIMIT_SEC / 60)) min."
-        return 0
+    # try-restart, not restart: `restart` STARTS a stopped unit, and an
+    # operator may have stopped tailscaled while the scan ran. try-restart acts
+    # only on a running unit and exits 0 either way, so the result is read back:
+    # a new InvocationID means a restart really happened.
+    local inv_before inv_after
+    inv_before="$("$SYSTEMCTL" show tailscaled -p InvocationID --value 2>/dev/null)"
+    if timeout "$TS_RESTART_TIMEOUT" "$SYSTEMCTL" try-restart tailscaled; then
+        if [[ "$("$SYSTEMCTL" is-active tailscaled 2>/dev/null || true)" == "active" ]]; then
+            _write_ts_state "healed" "$peer" "$diag"
+            return 0
+        fi
+        inv_after="$("$SYSTEMCTL" show tailscaled -p InvocationID --value 2>/dev/null)"
+        if [[ -n "$inv_before" && "$inv_after" == "$inv_before" ]]; then
+            # Nothing restarted: it was already stopped. Leave it stopped.
+            log "tailscale: tailscaled was stopped during the scan — left stopped"
+            _write_ts_state "unavailable" "" ""
+            return 0
+        fi
+        # It restarted (every session dropped) and is not running now.
+        log "tailscale: restarted tailscaled but it is not active — tailscaled may be DOWN; not retrying"
+        _write_ts_state "restart-failed" "$peer" "$diag"
+        return 1
     else
         local rc=$?
         # Not retried: the next ticks see tailscaled down and, by design, never
-        # start a stopped daemon. So the owner must hear about it now.
-        log "tailscale: restart FAILED (rc=$rc) — tailscaled may be DOWN; not retrying, alert queued"
-        _write_ts_state "restart-failed" "$peer" "$diag"
-        _ts_alert "Tailscale restart FAILED — tailscaled may be down" \
-            "$detail The watchdog tried to restart tailscaled and the restart failed (rc=$rc), so Tailscale may now be down entirely. It will not retry. Check: sudo systemctl status tailscaled; fix with: sudo systemctl restart tailscaled"
+        # start a stopped daemon. The recorded event tells the owner now.
+        log "tailscale: restart FAILED (rc=$rc) — tailscaled may be DOWN; not retrying"
+        _write_ts_state "restart-failed" "$peer" "$diag" "$rc"
         return "$rc"
     fi
 }

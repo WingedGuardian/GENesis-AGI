@@ -2813,8 +2813,10 @@ verified: f24c15e9 2026-09-05
   heal-telemetry metric from `/run/genesis-network-watchdog.json`. That metric
   carries a `tailscale` sub-object: the same watchdog also restarts tailscaled
   when an Active peer's tunnel is stuck (stale handshake, tunnel ping silent,
-  discovery ping answered), at most once an hour, and queues an owner alert
-  (see docs/reference/network-resilience.md).
+  discovery ping answered), at most once an hour, and records the event as
+  `tailscale.last_event`; the awareness tick's alert drain
+  (`resilience/network_watchdog_events.py`) turns a new event into an owner
+  alert (see docs/reference/network-resilience.md).
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

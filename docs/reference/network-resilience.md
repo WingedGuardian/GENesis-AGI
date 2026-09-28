@@ -97,20 +97,26 @@ The fingerprint, which is also the watchdog's trigger (all three must hold):
   spent on a tunnel that probe just revived.
 
 Every numeric `NETWD_TS_*` setting is validated: a value that is not a plain
-integer (or, where 0 would disable a timeout, the rate limit or the stale age,
-not positive) falls back to its default and is logged. The status snapshot is
+integer of at most 9 digits (bash arithmetic is signed 64-bit, so a longer one
+can wrap and remove the bound it sets), or, where 0 would disable a timeout,
+the rate limit or the stale age, not positive, falls back to its default and
+is logged. The status snapshot is
 written to a fresh 0600 file and renamed into place.
 
-The heal is `systemctl restart tailscaled`. In the observed incident the node
+The heal is `systemctl try-restart tailscaled`, which acts only on a running
+unit, so a tailscaled an operator stopped while the scan ran stays stopped
+(recorded as `unavailable`). The unit's InvocationID is compared before and
+after: if it changed but the daemon is not running, the restart happened and
+failed, which is recorded and alerted as `restart-failed`. In the observed incident the node
 came back with a new disco key (the node key persists), and the coordination
 server pushed the peer a fresh network map carrying the current relay. The
 cost is that **every Tailscale SSH session on the box drops**, including
 healthy ones from other peers. Sessions inside tmux survive and reattach. So it
 is rate-limited to once per `NETWD_TS_RATE_LIMIT_SEC` (default 3600s), and the
 limit is armed before the attempt, because a restart that fails has still
-dropped every session. A failed restart is not retried: it queues its own alert
-saying tailscaled may be down, because later runs see the daemon stopped and,
-by design, never start a stopped tailscaled. Every tailscale call is bounded
+dropped every session. A failed restart is not retried: it is recorded as its
+own event, which alerts that tailscaled may be down, because later runs see the
+daemon stopped and, by design, never start a stopped tailscaled. Every tailscale call is bounded
 (`NETWD_TS_CALL_TIMEOUT`, `NETWD_TS_RESTART_TIMEOUT`), so a hung local API
 cannot wedge the oneshot unit and stop the networkd checks with it. Output from
 `tailscale status` that cannot be read as a peer map is recorded as
@@ -125,25 +131,34 @@ the first hour after tailscaled starts. The second is a best-effort stamp in
 `/run`, written before acting. It matters only where systemd's time did not
 move: a restart that failed while the unit stayed up, and observe mode. A
 repeated restart therefore needs the stamp write and the restart to fail
-together. Observe-mode alerts use a stable per-peer key, so the queue holds one
-entry per stuck peer and the outreach pipeline delivers it at most daily. The
-scan is bounded too: at most `NETWD_TS_MAX_PROBES` suspect peers (default 3) are
+together. The scan is bounded too: at most `NETWD_TS_MAX_PROBES` suspect peers (default 3) are
 probed per run, and no new probe starts after `NETWD_TS_SCAN_BUDGET_SEC`
 (default 60s). The status lists peers in a fixed order, so the starting peer
 rotates each run and every suspect is reached within a few runs. Skipped peers
-are logged.
+are logged, and a run that skipped any records `incomplete`, never `none`.
 
 Before anything changes, each detection records its evidence: the full
 `tailscale status --json` goes to
 `/run/genesis-network-watchdog-tailscale-status.json` (root-only, since it
 names every node on the tailnet), and a summary goes under `tailscale` in the
 telemetry file (peer, handshake age, both relay regions, direct address, ping
-results). It then queues a `warning` alert in the owning user's
-`~/.genesis/alerts/queue`, which the awareness tick delivers to Telegram. The
-watchdog runs as root, so the installer writes that queue's path into the
-service unit (`NETWD_ALERT_QUEUE`), and each entry is chowned to the queue
-directory's owner before it lands. With no configured queue the alert goes to
-the journal only.
+results), built from that run's own status output rather than the file.
+
+**Owner alerts are raised on the user side.** A heal, an observation or a
+failed restart is recorded as `tailscale.last_event` (action, time, peer,
+handshake age) in `/run/genesis-network-watchdog.json`. The watchdog writes
+nothing outside `/run`. On every awareness tick (5 minutes by default), the Genesis runtime,
+running as the owning user, reads that file
+(`genesis.resilience.network_watchdog_events`) and turns a NEW event into an
+entry in the user's durable alert queue, which the same tick delivers. An
+event's time is its identity (an observation's alert is keyed by peer instead,
+so a stuck peer in observe mode pages at most once a day even if the hourly
+stamp cannot be written), and the last one alerted is kept in
+`~/.genesis/alerts/network-watchdog-seen.json`, so each event alerts once. On a
+first run with no seen-file, an event more than a day old is recorded without
+alerting. Raising the alert here crosses no privilege boundary: an earlier
+design had root write queue files into the user's home, and each hardening
+round on that write found another way a user-owned directory could redirect it.
 
 Operator lever: `NETWD_TS_MODE` = `live` (default) · `observe` (record + alert,
 never restart) · `off`. An unrecognised value degrades to `observe`, never to

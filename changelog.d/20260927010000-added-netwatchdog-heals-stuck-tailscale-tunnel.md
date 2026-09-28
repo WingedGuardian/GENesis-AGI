@@ -7,6 +7,9 @@
   drops every Tailscale SSH session on the machine (tmux sessions survive), so
   it happens at most once an hour. It never starts a stopped `tailscaled`. Set
   `NETWD_TS_MODE=observe` on `genesis-network-watchdog.service` to get the
-  alert without the restart, or `off` to disable it. Runs wherever the network
-  watchdog is installed (systemd-networkd hosts), and takes effect on the next
-  `update.sh`.
+  alert without the restart, or `off` to disable it. The watchdog runs as root
+  but writes only its own `/run` telemetry; the Genesis runtime reads each new
+  event from there and sends the alert, so nothing root-owned is written into
+  your home directory. Runs wherever the network watchdog is installed
+  (systemd-networkd hosts), and takes effect on the next `update.sh` plus a
+  Genesis server restart.
