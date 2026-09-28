@@ -122,7 +122,7 @@ class ThinPoolReport:
 LVS_FIELDS = ("data_percent", "metadata_percent", "lv_size", "lv_name")
 
 
-def parse_lvs_report(stdout: str) -> ThinPoolReport:
+def parse_lvs_report(stdout: str, thinpool_lv: str | None = None) -> ThinPoolReport:
     """Parse ``lvs --reportformat json -o data_percent,metadata_percent,lv_size,
     lv_name --units b --nosuffix`` for the thin-pool LVs of one VG.
 
@@ -133,10 +133,11 @@ def parse_lvs_report(stdout: str) -> ThinPoolReport:
     values are None; output that is not the expected JSON shape yields an
     all-None report (no signal, never a guess).
 
-    Percentages come from the first row, as before. Identity (size + LV name)
-    only when there is EXACTLY one thin pool: with several, the percentages may
-    belong to a different pool than the container's, and relief must never act
-    on a pool it cannot name.
+    With ``thinpool_lv`` (the LV incus DECLARES backs the pool, from
+    ``lvm.thinpool_name``) the report is that row and only that row; absent, it
+    is empty — never another pool's figures. Without it (no declaration), the
+    old rule: percentages from the first row, identity only when there is
+    EXACTLY one thin pool in the VG.
     """
     try:
         rows = json.loads(stdout)["report"][0]["lv"]
@@ -155,6 +156,10 @@ def parse_lvs_report(stdout: str) -> ThinPoolReport:
             return None
         return val if math.isfinite(val) else None
 
+    if thinpool_lv is not None:
+        rows = [r for r in rows if r.get("lv_name") == thinpool_lv]
+        if len(rows) != 1:
+            return ThinPoolReport()
     first = rows[0]
     data, meta = _num(first, "data_percent"), _num(first, "metadata_percent")
     if len(rows) != 1:
@@ -309,23 +314,76 @@ async def _detect_pool_name(config: GuardianConfig) -> str | None:
     return out.strip() if rc == 0 and out.strip() else None
 
 
-async def _pool_driver_and_source(pool_name: str) -> tuple[str | None, str | None]:
-    """Parse ``incus storage show``: (driver, source), (None, None) on failure."""
+@dataclass(frozen=True)
+class PoolBackend:
+    """What incus DECLARES backs a storage pool (``incus storage show``)."""
+
+    driver: str
+    source: str | None = None
+    vg_name: str | None = None  # LVM: lvm.vg_name, else a bare-VG source
+    thinpool_lv: str | None = None  # LVM: lvm.thinpool_name (incus default IncusThinPool)
+    thin: bool = True  # LVM: lvm.use_thinpool (false = thick LVs, no thin pool)
+
+
+# incus's default name for the thin-pool LV when lvm.thinpool_name is unset.
+INCUS_DEFAULT_THINPOOL = "IncusThinPool"
+
+
+def parse_pool_backend(out: str) -> PoolBackend | None:
+    """Parse ``incus storage show <pool>`` YAML into its declared backend.
+
+    A real YAML parse, not a line scan: ``source`` lives under ``config:``
+    (measured on incus 6.0.0), and a line-prefix match also accepts an indented
+    ``source:`` from a multi-line description. The VG and the thin-pool LV are
+    read from ``lvm.vg_name`` / ``lvm.thinpool_name`` — the pool's declared
+    identity — so nothing downstream has to infer them by counting the thin
+    pools in a VG (review: a VG with several thin pools, or thick LVM beside
+    an unrelated thin pool, measured the wrong pool). None on any parse error.
+    """
+    import yaml
+
+    try:
+        doc = yaml.safe_load(out)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("driver"), str):
+        return None
+    cfg = doc.get("config") if isinstance(doc.get("config"), dict) else {}
+
+    def _s(val) -> str | None:
+        return val.strip() if isinstance(val, str) and val.strip() else None
+
+    driver = doc["driver"].strip()
+    source = _s(cfg.get("source")) or _s(doc.get("source"))
+    if driver != "lvm":
+        return PoolBackend(driver=driver, source=source)
+    vg = _s(cfg.get("lvm.vg_name"))
+    if vg is None and source and "/" not in source:
+        vg = source  # a bare VG name; a path (loop file, device) is not one
+    return PoolBackend(
+        driver=driver,
+        source=source,
+        vg_name=vg,
+        thinpool_lv=_s(cfg.get("lvm.thinpool_name")) or INCUS_DEFAULT_THINPOOL,
+        thin=str(cfg.get("lvm.use_thinpool", "true")).strip().lower() != "false",
+    )
+
+
+async def _pool_backend(pool_name: str) -> PoolBackend | None:
     rc, out, _ = await _run_subprocess(
         "incus", "storage", "show", pool_name, timeout=10.0,
     )
     if rc != 0:
+        return None
+    return parse_pool_backend(out)
+
+
+async def _pool_driver_and_source(pool_name: str) -> tuple[str | None, str | None]:
+    """(driver, source) of an incus pool, (None, None) on failure."""
+    backend = await _pool_backend(pool_name)
+    if backend is None:
         return None, None
-    # incus storage show emits YAML; driver + source identify the backend.
-    driver = None
-    source = None
-    for line in out.splitlines():
-        s = line.strip()
-        if s.startswith("driver:"):
-            driver = s.split(":", 1)[1].strip()
-        elif s.startswith("source:"):
-            source = s.split(":", 1)[1].strip()
-    return driver, source
+    return backend.driver, backend.source
 
 
 async def _detect_pool_driver(pool_name: str) -> str | None:
@@ -346,14 +404,18 @@ async def _lvm_source(pool_name: str) -> str | None:
 
 
 async def _pool_used_via_df(mount: str) -> tuple[float, int] | None:
-    """Filesystem (used%, size bytes) of a pool mount via ``df`` (statvfs).
+    """Filesystem (unavailable%, size bytes) of a pool mount via ``df``.
 
-    The tiering signal for non-LVM pools, where there is no thin-pool
-    data%/metadata%. Returns None on any error (missing mount, unparsable
-    output, zero size) so a probe failure is never a false alarm.
+    The tiering and relief signal for non-LVM pools, where there is no
+    thin-pool data%/metadata%. "Unavailable" is size minus AVAILABLE, not the
+    used column: ext4 reserves blocks that count as neither used nor available
+    to an unprivileged writer, so used/size can read 95% on a filesystem with
+    nothing left to write to (review). Returns None on any error (missing
+    mount, unparsable output, zero size) so a probe failure is never a false
+    alarm.
     """
     rc, out, _ = await _run_subprocess(
-        "df", "-B1", "--output=used,size", mount, timeout=10.0,
+        "df", "-B1", "--output=avail,size", mount, timeout=10.0,
     )
     if rc != 0:
         return None
@@ -361,12 +423,12 @@ async def _pool_used_via_df(mount: str) -> tuple[float, int] | None:
     if len(lines) < 2:  # header + at least one data row
         return None
     try:
-        used, size = (int(x) for x in lines[-1].split()[:2])
+        avail, size = (int(x) for x in lines[-1].split()[:2])
     except (ValueError, IndexError):
         return None
-    if size <= 0:
+    if size <= 0 or avail < 0:
         return None
-    return 100.0 * used / size, size
+    return 100.0 * (size - min(avail, size)) / size, size
 
 
 async def _pool_used_pct_via_df(mount: str) -> float | None:
@@ -387,18 +449,28 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
     # `incus storage show` failure used to read as "not LVM" and fall through to
     # df, which on an LVM pool measures the HOST filesystem, not thin-pool
     # allocation — a number automatic relief must never act on.
-    driver, source = await _pool_driver_and_source(pool_name)
-    if driver is None:
+    backend = await _pool_backend(pool_name)
+    if backend is None:
         return StoragePoolStatus(detected=False, detail=f"backend of pool {pool_name} undetected")
-    if driver == "lvm" and not source:
-        return StoragePoolStatus(detected=False, detail=f"lvm pool {pool_name} has no source VG")
-    vg = source if driver == "lvm" else None
-    if not vg:
-        # Non-LVM backend (btrfs/dir): the pool mount's filesystem used% is the
-        # only tiering signal (there is no thin-pool data%/metadata%). incus
-        # storage info exposes no machine-readable space for an uncapped
-        # btrfs-on-LV pool, so read the mount directly — the same source
-        # snapshots.py uses for this pool.
+    if backend.driver == "lvm":
+        if not backend.thin:
+            return StoragePoolStatus(
+                detected=False, detail=f"lvm pool {pool_name} is thick (lvm.use_thinpool=false)",
+            )
+        if not backend.vg_name:
+            return StoragePoolStatus(detected=False, detail=f"lvm pool {pool_name} has no VG")
+    elif backend.driver not in ("btrfs", "dir"):
+        # zfs, ceph, …: the pool path is NOT a mount of the pool there, so df
+        # would measure the HOST filesystem and relief would delete snapshots
+        # for a full host disk while the real pool fills unseen (review).
+        return StoragePoolStatus(
+            detected=False, detail=f"pool {pool_name}: backend {backend.driver} not measured",
+        )
+    if backend.driver != "lvm":
+        # btrfs/dir: the pool mount's filesystem is the only signal (there is no
+        # thin-pool data%/metadata%). incus storage info exposes no
+        # machine-readable space for an uncapped btrfs-on-LV pool, so read the
+        # mount directly — the same source snapshots.py uses for this pool.
         df_used = await _pool_used_via_df(pool_mount_path(pool_name))
         return StoragePoolStatus(
             detected=df_used is not None,
@@ -412,7 +484,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
     # Select ONLY thin-pool LVs — a bare `lvs <vg>` lists every LV in the VG
     # (regular LVs report blank percents), so we must filter to segtype
     # thin-pool to read the pool's own data%/metadata%.
-    vg_name = vg.split("/")[0]
+    vg_name = backend.vg_name
     # The same row also carries the pool's byte size and LV name (folded into
     # this call rather than a new subprocess: the measurement's subprocess
     # count is budgeted, see host_profile._POOL_TIMEOUT). `--units b` changes
@@ -431,7 +503,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
             pool_used_pct=pool_used_pct,
             detail=f"lvs failed: {err[:120]}",
         )
-    report = parse_lvs_report(out)
+    report = parse_lvs_report(out, backend.thinpool_lv)
     data_pct, metadata_pct = report.data_pct, report.metadata_pct
 
     # VG free bytes (headroom for autoextend — 0 free = autoextend can't fire).
@@ -453,7 +525,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
         metadata_pct=metadata_pct,
         vg_free_bytes=vg_free_bytes,
         pool_used_pct=pool_used_pct,
-        detail=f"lvm {vg} data={data_pct} meta={metadata_pct}",
+        detail=f"lvm {vg_name}/{backend.thinpool_lv} data={data_pct} meta={metadata_pct}",
         pool_size_bytes=report.size_bytes,
         pool_name=pool_name,
         vg_name=vg_name,

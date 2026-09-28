@@ -109,7 +109,7 @@ Before recommending IO_TRIAGE, check the PSI trend:
   threshold); other backends use a headroom check (free > max(5GB, 2x avg
   recent snapshots))
 - Pool relief runs every tick BEFORE the recovery cycle: when free data or
-  metadata space reaches its reserve it deletes ONE `guardian-*` snapshot
+  metadata space reaches its reserve it deletes ONE guardian-generated snapshot
   (pre-recovery first, the rollback lifeline last) and alerts. The daily
   healthy snapshot rotates delete-first when the pool refuses its create and
   LVM shows the snapshots hold space no live volume maps. If you are diagnosing

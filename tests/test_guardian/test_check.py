@@ -1478,6 +1478,79 @@ class TestPoolReliefWiring:
         snapshots.mark_healthy.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_relief_protects_lifeline_unless_healthy(self, config: GuardianConfig) -> None:
+        seen: list = []
+
+        async def relief(*a, protect_lifeline=False, **k):
+            seen.append(protect_lifeline)
+
+        for state, expect in ((GuardianState.HEALTHY, False), (GuardianState.CONFIRMED_DEAD, True)):
+            sm = MagicMock()
+            sm.current_state = state
+            with (
+                patch("genesis.guardian.check._check_pool_relief", relief),
+                patch("genesis.guardian.check._check_cycle", AsyncMock()),
+                patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+                patch("genesis.guardian.check.load_secrets", return_value={}),
+                patch("genesis.guardian.check.ConfirmationStateMachine", return_value=sm),
+                patch("genesis.guardian.check._maintain_snapshots", AsyncMock()),
+            ):
+                await run_check(config)
+            assert seen[-1] is expect, state
+
+    @pytest.mark.asyncio
+    async def test_unwritable_cadence_marker_skips_rotation(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        with patch("genesis.guardian.check._touch_marker", return_value=False):
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        snapshots.mark_healthy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_delete_note_is_throttled(self, config: GuardianConfig) -> None:
+        """A timed-out delete-first (nothing confirmed deleted) says so, but
+        through the refusal throttle — not on every hourly retry."""
+        from datetime import UTC, datetime, timedelta
+
+        dispatcher = AsyncMock()
+        calls = 0
+        for _ in range(3):
+            snapshots = self._snapshots(note="deleting the lifeline did not confirm")
+            snapshots.last_rotation_deleted = False
+            # Make every iteration genuinely due (an absent marker would fall
+            # back to .last_prune, which the first pass stamps).
+            config.state_path.mkdir(parents=True, exist_ok=True)
+            (config.state_path / ".last_healthy").write_text(
+                (datetime.now(UTC) - timedelta(days=2)).isoformat(),
+            )
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+            calls += snapshots.mark_healthy.await_count
+        assert calls == 3  # guard-the-guard: every pass really ran the refresh
+        assert dispatcher.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_lifeline_is_refreshed_early(self, config: GuardianConfig) -> None:
+        """Audit: relief deleted the lifeline; a replacement should not wait for
+        the daily cadence — but a pool that keeps refusing is retried at most
+        hourly, never every tick."""
+        from datetime import UTC, datetime, timedelta
+
+        config.state_path.mkdir(parents=True, exist_ok=True)
+        marker = config.state_path / ".last_healthy"
+        (config.state_path / ".last_prune").write_text(datetime.now(UTC).isoformat())
+        for age_h, has_lifeline, expect in (
+            (2, False, True),    # no lifeline, last try 2h ago -> due now
+            (2, True, False),    # lifeline present -> daily cadence
+            (0.2, False, False), # no lifeline but tried 12 min ago -> wait
+        ):
+            marker.write_text((datetime.now(UTC) - timedelta(hours=age_h)).isoformat())
+            snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+            snapshots.get_latest_healthy = AsyncMock(
+                return_value="guardian-20260101-000000-healthy" if has_lifeline else None,
+            )
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+            assert (snapshots.mark_healthy.await_count == 1) is expect, (age_h, has_lifeline)
+
+    @pytest.mark.asyncio
     async def test_relief_crash_alerts_once_a_day(self, config: GuardianConfig) -> None:
         from genesis.guardian.check import _check_pool_relief
 
@@ -1574,6 +1647,7 @@ class TestPoolReliefWiring:
             name="guardian-20260101-000000-healthy",
             note="pool refused the create (pool_space); deleted ...",
         )
+        snapshots.last_rotation_deleted = True
         dispatcher = AsyncMock()
         await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
         assert "delete-first" in dispatcher.send.await_args.args[0].title

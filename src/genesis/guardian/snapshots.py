@@ -62,16 +62,21 @@ def _parse_created_at(raw: object) -> datetime | None:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
-_NAME_TS_RE = re.compile(r"(\d{8})-(\d{6})")
+_NAME_TS_RE = re.compile(r"(\d{8})-(\d{6})(?:-|$)")
 
 
-def _created_from_name(name: str) -> datetime | None:
+def _created_from_name(name: str, prefix: str) -> datetime | None:
     """Creation time from a guardian snapshot name (``<prefix>YYYYmmdd-HHMMSS…``).
 
     take() stamps the UTC creation time into every name, so this is the
-    fallback when incus omits ``created_at``.
+    fallback when incus omits ``created_at``. Parsed at the exact boundary
+    after ``prefix``, never the first timestamp-shaped text anywhere: a prefix
+    like ``archive-20200101-000000-`` would otherwise date every snapshot 2020
+    (review).
     """
-    m = _NAME_TS_RE.search(name)
+    if not isinstance(prefix, str) or not prefix or not name.startswith(prefix):
+        return None
+    m = _NAME_TS_RE.match(name, len(prefix))
     if not m:
         return None
     try:
@@ -80,12 +85,15 @@ def _created_from_name(name: str) -> datetime | None:
         return None
 
 
-# Substrings of an `incus snapshot create` failure that mean "the pool has no
-# room" rather than some other fault. Measured on an LVM-thin pool whose
+# Substrings of an `incus snapshot create` failure that mean "the THIN POOL has
+# no room" rather than some other fault. Only LVM's thin-pool refusal: generic
+# ENOSPC text ("no space left") can come from the incus daemon, its database or
+# the host filesystem, and a pool refusal is what licenses delete-first
+# (review). Measured on an LVM-thin pool whose
 # autoextend profile threshold was exceeded: "Error creating LVM logical volume
 # snapshot: ... Cannot create new thin volume, free space in thin pool
 # vg0/IncusThinPool reached threshold."
-_POOL_SPACE_ERRORS = ("free space in thin pool", "no space left", "insufficient free space")
+_POOL_SPACE_ERRORS = ("free space in thin pool",)
 
 # Delete-first rotation only replaces a lifeline at least this old. The
 # healthy snapshot is refreshed once per ~24h maintenance pass; one hour of
@@ -111,18 +119,24 @@ _SNAPSHOT_ONLY_MIN_BYTES = 1024**3
 _SNAPSHOT_ONLY_MIN_FRAC = 0.01
 
 
-def _sort_newest_first(rows: list[tuple[str, datetime | None]]) -> None:
+def _sort_newest_first(rows: list[tuple[str, datetime | None]], prefix: str) -> None:
     """Order (name, created) rows newest first by CREATION TIME, in place.
 
-    Never by name: every "latest healthy" decision (prune's exemption, the
-    rollback target, delete-first's staleness) reads this order, and a name is
-    just a string — ``guardian-99999999-999999-healthy`` fits the ownership
-    pattern and would outrank the real lifeline (security review). incus stamps
-    ``created_at`` itself. Undated rows sort oldest (the strict listing first
-    falls back to the name's timestamp); the name breaks exact ties.
+    Never by the name string: every "latest healthy" decision (prune's
+    exemption, the rollback target, delete-first's staleness) reads this order,
+    and ``guardian-99999999-999999-healthy`` fits the ownership pattern and
+    would outrank the real lifeline (security review). incus stamps
+    ``created_at`` itself. Only a row incus left UNDATED is ordered by the
+    timestamp take() wrote into its name (review: sorting it oldest made a
+    fresh, undated lifeline lose to an older dated one); that fallback orders
+    only — prune's age rule still needs a real created_at. Rows with neither
+    sort oldest; the name breaks exact ties.
     """
     floor = datetime.min.replace(tzinfo=UTC)
-    rows.sort(key=lambda t: (t[1] or floor, t[0]), reverse=True)
+    rows.sort(
+        key=lambda t: (t[1] or _created_from_name(t[0], prefix) or floor, t[0]),
+        reverse=True,
+    )
 
 
 class SnapshotManager:
@@ -149,6 +163,8 @@ class SnapshotManager:
         # Why the last delete() failed (the runner's "timeout" = outcome
         # unknown), or None after a success.
         self.last_delete_error: str | None = None
+        # Whether mark_healthy() deleted a lifeline first (alerted at once).
+        self.last_rotation_deleted = False
         # What mark_healthy() had to do beyond a plain rotation, for alerting.
         self.last_rotation_note: str | None = None
 
@@ -239,23 +255,38 @@ class SnapshotManager:
             logger.warning("Pool measurement failed — using df fallback", exc_info=True)
             pool_status = None
         pool_measured = pool_status is not None and pool_status.detected
-        # A refusal only counts as the POOL refusing when the pool is named: an
-        # LVM VG with several thin pools reports the FIRST row's figures, which
-        # may be another pool's (review) — refuse, but as a probe refusal.
-        pool_named = pool_measured and (
-            pool_status.thinpool_lv is not None or pool_status.vg_name is None
-        )
         if pool_measured:
+            # ONE admission rule with pool relief (review, round 2: the gate
+            # still trusted what relief rejects). An LVM measurement that
+            # cannot name its thin-pool LV (several thin pools: the figures may
+            # be another pool's) or carries no figures at all proves nothing
+            # about THIS pool — refuse, as a probe refusal, rather than admit on
+            # another pool's number or fall through to df of the host fs.
+            from genesis.guardian.pool_relief import (
+                shortfall,
+                unactionable,
+                validate_relief_config,
+            )
+
+            blocked = unactionable(pool_status)
+            if blocked is not None:
+                logger.error("Pool measurement unusable (%s) — refusing snapshot", blocked[1])
+                return False
             # Never looser than pool relief: a snapshot taken inside relief's
             # reserve would be deleted again within minutes, freeing nothing
             # and costing the lifeline (review: on a large non-LVM pool the
             # headroom gate below admits creates relief then undoes).
-            from genesis.guardian.pool_relief import shortfall
-
-            reason = shortfall(pool_status, self._config.storage_pool)
+            # Only with a config relief itself trusts: an invalid reserve
+            # (e.g. "3" as a string, or 60) must neither crash the gate — it
+            # runs before a recovery action — nor pose as a pool refusal.
+            reason = (
+                shortfall(pool_status, self._config.storage_pool)
+                if validate_relief_config(self._config) is None
+                else None
+            )
             if reason is not None:
                 logger.error("Pool at its relief reserve (%s) — refusing snapshot", reason)
-                self.last_gate_measured = pool_named
+                self.last_gate_measured = True
                 return False
         if pool_measured and (
             pool_status.data_pct is not None or pool_status.metadata_pct is not None
@@ -268,14 +299,14 @@ class SnapshotManager:
                     "Pool data %.1f%% >= %.0f%% high tier — refusing snapshot",
                     data, tiers.data_high_pct,
                 )
-                self.last_gate_measured = pool_named
+                self.last_gate_measured = True
                 return False
             if meta is not None and meta >= tiers.metadata_high_pct:
                 logger.error(
                     "Pool metadata %.1f%% >= %.0f%% high tier — refusing snapshot",
                     meta, tiers.metadata_high_pct,
                 )
-                self.last_gate_measured = pool_named
+                self.last_gate_measured = True
                 return False
             return True
 
@@ -491,7 +522,7 @@ class SnapshotManager:
             and self._owned_re.fullmatch(s["name"])
         ]
         # Newest first by incus's own created_at (never by the name string).
-        _sort_newest_first(result)
+        _sort_newest_first(result, self._prefix)
         return result
 
     async def list_snapshot_meta_strict(self) -> list[tuple[str, datetime | None]] | None:
@@ -533,9 +564,11 @@ class SnapshotManager:
             name = s.get("name", "")
             if not isinstance(name, str) or not self._owned_re.fullmatch(name):
                 continue
-            created = _parse_created_at(s.get("created_at")) or _created_from_name(name)
+            created = _parse_created_at(s.get("created_at")) or _created_from_name(
+                name, self._prefix,
+            )
             out.append((name, created))
-        _sort_newest_first(out)
+        _sort_newest_first(out, self._prefix)
         return out
 
     async def list_snapshots(self) -> list[str]:
@@ -654,6 +687,7 @@ class SnapshotManager:
         relief (pool_relief.py) acts if the pool then runs short.
         """
         self.last_rotation_note = None
+        self.last_rotation_deleted = False
         name = await self.take(
             label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
         )
@@ -682,6 +716,7 @@ class SnapshotManager:
                     )
                     return None
             if deleted:
+                self.last_rotation_deleted = True
                 logger.warning(
                     "Pool refused the healthy snapshot (%s): deleted lifeline %s first "
                     "(snapshots held >= %.1f GiB no live volume maps), retrying the create",

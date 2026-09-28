@@ -489,7 +489,12 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # about hourly — against a pool whose container is down and so barely
     # writing.) Measures, and frees at most ONE guardian-owned snapshot per
     # tick when free space is at or below its reserve. Never raises.
-    await _check_pool_relief(config, dispatcher, snapshots)
+    # The recovery cycle below may need SNAPSHOT_ROLLBACK when the container is
+    # not healthy, so relief must not take the lifeline out from under it.
+    await _check_pool_relief(
+        config, dispatcher, snapshots,
+        protect_lifeline=sm.current_state != GuardianState.HEALTHY,
+    )
 
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
@@ -723,7 +728,30 @@ async def _maintain_snapshots(
 
     # `is True`: the YAML loader does not coerce, and `healthy_enabled: "false"`
     # is a truthy string (review).
-    if not (is_healthy and config.snapshots.healthy_enabled is True and healthy_due):
+    if not (is_healthy and config.snapshots.healthy_enabled is True):
+        return
+    if not healthy_due and _marker_due(
+        healthy_marker if healthy_marker.exists() else prune_marker, 1,
+    ):
+        # Due early when NO healthy snapshot exists (pool relief deleted the
+        # lifeline, or it never got one) — a rollback target should not wait up
+        # to a day for the daily cadence (review). The 1h floor keeps a pool
+        # that keeps refusing from being retried every 30s tick.
+        try:
+            healthy_due = await snapshots.get_latest_healthy() is None
+        except Exception:
+            logger.warning("could not list healthy snapshots", exc_info=True)
+    if not healthy_due:
+        return
+    # Stamp the cadence BEFORE the work: if the marker cannot persist (a full or
+    # read-only state dir), a successful rotation would be "due" again on every
+    # 30s tick — continuous snapshot create/delete while host storage is already
+    # impaired (review). No durable cadence, no rotation this tick.
+    if not _touch_marker(healthy_marker, now):
+        logger.warning(
+            "cannot persist %s — skipping the healthy snapshot rather than "
+            "re-running it every tick", healthy_marker,
+        )
         return
 
     retry_soon = False
@@ -762,7 +790,11 @@ async def _maintain_snapshots(
         refused_marker = config.state_path / ".healthy_refused_alert"
         if name:
             refused_marker.unlink(missing_ok=True)
-        send = isinstance(note, str)
+        # A delete-first that actually deleted the lifeline alerts at once;
+        # everything else a refused refresh says (including an unconfirmed,
+        # timed-out delete) waits for the throttle (review: those bypassed it
+        # and paged hourly).
+        send = isinstance(note, str) and getattr(snapshots, "last_rotation_deleted", False) is True
         if not name and _marker_due(refused_marker, config.storage_pool.realert_hours):
             send = _touch_marker(refused_marker, now) or send
         if send:
@@ -774,7 +806,8 @@ async def _maintain_snapshots(
         retry_soon = True
         logger.warning("Healthy snapshot take failed", exc_info=True)
 
-    _touch_marker(healthy_marker, now - timedelta(hours=23) if retry_soon else now)
+    if retry_soon:
+        _touch_marker(healthy_marker, now - timedelta(hours=23))
 
 
 def _marker_due(marker: Path, hours: float) -> bool:
@@ -782,10 +815,12 @@ def _marker_due(marker: Path, hours: float) -> bool:
     the future, or older than ``hours``."""
     try:
         last = datetime.fromisoformat(marker.read_text().strip())
-    except (OSError, ValueError):
+        now = datetime.now(UTC)
+        return last > now or (now - last) >= timedelta(hours=hours)
+    except (OSError, ValueError, TypeError):
+        # TypeError: a timezone-less stamp (a hand edit) or a non-numeric
+        # `hours` — due, never an exception that skips the heartbeat.
         return True
-    now = datetime.now(UTC)
-    return last > now or (now - last) >= timedelta(hours=hours)
 
 
 def _touch_marker(marker: Path, when: datetime | None = None) -> bool:
@@ -925,6 +960,8 @@ async def _check_pool_relief(
     config: GuardianConfig,
     dispatcher: AlertDispatcher,
     snapshots: SnapshotManager,
+    *,
+    protect_lifeline: bool = False,
 ) -> None:
     """Pool relief pass (delegates to pool_relief). Never raises.
 
@@ -935,10 +972,13 @@ async def _check_pool_relief(
     try:
         from genesis.guardian.pool_relief import check_pool_relief
 
-        outcome = await check_pool_relief(config, dispatcher, snapshots)
+        outcome = await check_pool_relief(
+            config, dispatcher, snapshots, protect_lifeline=protect_lifeline,
+        )
         acted = outcome.split(":", 1)[0] in (
             "deleted", "delete_failed", "list_failed", "no_target", "state_unwritable",
             "unmeasured", "ambiguous_pool", "no_signal", "delete_indeterminate",
+            "lifeline_protected", "pool_changed",
         )
         (logger.warning if acted else logger.info)("pool relief: %s", outcome)
     except Exception as exc:

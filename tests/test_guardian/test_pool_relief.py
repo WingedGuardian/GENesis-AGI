@@ -336,13 +336,26 @@ class TestFallThroughAndCannotAct:
     @pytest.mark.asyncio
     async def test_failed_delete_falls_through_to_the_next(self, tmp_path) -> None:
         pre = "guardian-20260101-000000-pre-recovery"
+        pre2 = "guardian-20260102-000000-pre-recovery"
+        life = "guardian-20260105-000000-healthy"
+        snaps = _Snaps({pre: OLD, pre2: OLD + timedelta(days=1), life: T0 - timedelta(days=1)},
+                       fail={pre})
+        out, d = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
+        assert out == f"deleted:{pre2}"
+        assert snaps.deleted == [pre, pre2]  # tried in plan order, stopped at one success
+        assert f"deleting {pre} failed first" in d.send.await_args.args[0].body
+
+    @pytest.mark.asyncio
+    async def test_failure_never_falls_through_to_the_lifeline(self, tmp_path) -> None:
+        """Audit: the earlier failure may be the daemon still deleting it (a
+        re-delete while one is in flight fails with a non-timeout error), so the
+        space may already be coming back — never take the lifeline on top."""
+        pre = "guardian-20260101-000000-pre-recovery"
         life = "guardian-20260105-000000-healthy"
         snaps = _Snaps({pre: OLD, life: T0 - timedelta(days=1)}, fail={pre})
-        out, d = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
-        assert out == f"deleted:{life}"
-        assert snaps.deleted == [pre, life]  # tried in plan order, stopped at one success
-        body = d.send.await_args.args[0].body
-        assert f"deleting {pre} failed first" in body and "rollback lifeline" in body
+        out, _ = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
+        assert out == f"delete_failed:{pre}"
+        assert snaps.deleted == [pre] and life in snaps.names
 
     @pytest.mark.asyncio
     async def test_all_deletes_failing_alerts_once_per_hour(self, tmp_path) -> None:
@@ -350,7 +363,8 @@ class TestFallThroughAndCannotAct:
         cfg = _cfg(tmp_path)
         snaps = _Snaps({a: OLD, b: T0 - timedelta(days=1)}, delete_ok=False)
         out, d = await _pass(cfg, snaps, _lvm(98.0))
-        assert out == f"delete_failed:{a},{b}"
+        assert out == f"delete_failed:{a}"  # stops before the lifeline
+        assert b not in snaps.deleted
         assert d.send.await_count == 1
         out2, d2 = await _pass(cfg, snaps, _lvm(98.0), now=T0 + timedelta(minutes=6))
         assert out2.startswith("delete_failed") and d2.send.await_count == 0
@@ -456,3 +470,57 @@ class TestReviewRound1:
         snaps.gone_anyway = {pre}
         out, _ = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
         assert out == f"deleted:{pre}" and snaps.deleted == [pre]
+
+
+
+class TestProtectLifeline:
+    """Review round 2: relief runs BEFORE the recovery cycle; while the
+    container is not healthy it must not take the rollback target away."""
+
+    LIFE = "guardian-20260105-000000-healthy"
+    PRE = "guardian-20260101-000000-pre-recovery"
+
+    @pytest.mark.asyncio
+    async def test_only_lifeline_left_is_kept_and_alerted(self, tmp_path) -> None:
+        snaps = _Snaps({self.LIFE: T0 - timedelta(days=1)})
+        d = AsyncMock()
+        with patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=_lvm(98.0))):
+            out = await check_pool_relief(_cfg(tmp_path), d, snaps, now=T0, protect_lifeline=True)
+        assert out == "lifeline_protected" and snaps.deleted == []
+        assert "kept for recovery" in d.send.await_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_other_snapshots_still_go(self, tmp_path) -> None:
+        snaps = _Snaps({self.PRE: OLD, self.LIFE: T0 - timedelta(days=1)})
+        with patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=_lvm(98.0))):
+            out = await check_pool_relief(
+                _cfg(tmp_path), AsyncMock(), snaps, now=T0, protect_lifeline=True,
+            )
+        assert out == f"deleted:{self.PRE}"
+
+    @pytest.mark.asyncio
+    async def test_healthy_container_does_not_protect(self, tmp_path) -> None:
+        snaps = _Snaps({self.LIFE: T0 - timedelta(days=1)})
+        out, _ = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
+        assert out == f"deleted:{self.LIFE}"
+
+
+
+def test_timezone_less_stamps_are_due_not_a_crash(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg.state_path.mkdir(parents=True, exist_ok=True)
+    (cfg.state_path / "pool_relief_state.json").write_text(
+        json.dumps({"last_action": "2026-01-10T11:59:00", "cannot_act_since": "2026-01-10T10:00:00"})
+    )
+    assert delete_first_allowed(cfg, T0) is True
+
+
+@pytest.mark.asyncio
+async def test_timezone_less_cannot_act_stamp_restarts_the_clock(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg.state_path.mkdir(parents=True, exist_ok=True)
+    (cfg.state_path / "pool_relief_state.json").write_text(
+        json.dumps({"cannot_act_since": "2026-01-10T10:00:00"})
+    )
+    out, d = await _pass(cfg, _Snaps({}), StoragePoolStatus(detected=False))
+    assert out == "unmeasured" and d.send.await_count == 0

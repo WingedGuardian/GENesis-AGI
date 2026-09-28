@@ -14,6 +14,7 @@ from genesis.guardian.pool import (
     TIER_HIGH,
     TIER_OK,
     TIER_WARN,
+    PoolBackend,
     StoragePoolStatus,
     ThinPoolReport,
     decide_alert,
@@ -21,6 +22,7 @@ from genesis.guardian.pool import (
     incus_snapshot_lv_name,
     measure_storage_pool,
     parse_lvs_report,
+    parse_pool_backend,
     snapshot_only_bytes,
     worst_tier,
 )
@@ -132,12 +134,12 @@ class TestMeasureLvmPool:
     VG with two thin pools leaves the LV unnamed (relief then never acts)."""
 
     @staticmethod
-    def _patch(monkeypatch, lvs_out: str, calls: list | None = None):
+    def _patch(monkeypatch, lvs_out: str, calls: list | None = None, thinpool="IncusThinPool"):
         async def _detect(_config):
             return "default"
 
         async def _backend(_name):
-            return "lvm", "vg0"
+            return PoolBackend(driver="lvm", source="vg0", vg_name="vg0", thinpool_lv=thinpool)
 
         async def _run(*a, **k):
             if calls is not None:
@@ -150,7 +152,7 @@ class TestMeasureLvmPool:
             return 1, "", "unexpected"
 
         monkeypatch.setattr(pool_mod, "_detect_pool_name", _detect)
-        monkeypatch.setattr(pool_mod, "_pool_driver_and_source", _backend)
+        monkeypatch.setattr(pool_mod, "_pool_backend", _backend)
         monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
 
     @pytest.mark.asyncio
@@ -170,13 +172,90 @@ class TestMeasureLvmPool:
         assert "--units" in lvs and lvs[lvs.index("--units") + 1] == "b"
 
     @pytest.mark.asyncio
-    async def test_two_thin_pools_leave_lv_unnamed(self, monkeypatch):
+    async def test_declared_thin_pool_is_picked_among_several(self, monkeypatch):
+        """Audit: identity is what incus DECLARES (lvm.thinpool_name), not a
+        count — a VG with several thin pools measures the right one."""
         self._patch(
-            monkeypatch, _lvs_json(_row(name="poolA"), _row("10.00", "5.00", "1", "poolB")),
+            monkeypatch,
+            _lvs_json(_row(name="poolA"), _row("10.00", "5.00", "1073741824", "poolB")),
+            thinpool="poolB",
         )
         status = await measure_storage_pool(object())
-        assert status.detected is True
-        assert status.thinpool_lv is None and status.pool_size_bytes is None
+        assert (status.data_pct, status.metadata_pct) == (10.0, 5.0)
+        assert status.thinpool_lv == "poolB" and status.pool_size_bytes == 1073741824
+
+    @pytest.mark.asyncio
+    async def test_declared_thin_pool_missing_is_no_signal(self, monkeypatch):
+        self._patch(
+            monkeypatch, _lvs_json(_row(name="poolA"), _row("10.00", "5.00", "1", "poolB")),
+            thinpool="IncusThinPool",
+        )
+        status = await measure_storage_pool(object())
+        assert status.thinpool_lv is None and status.data_pct is None and status.metadata_pct is None
+
+
+class TestParsePoolBackend:
+    """`incus storage show` as incus 6.0.0 prints it (measured): source lives
+    under config."""
+
+    SHOW = (
+        "config:\n  lvm.thinpool_name: IncusThinPool\n  lvm.vg.force_reuse: \"true\"\n"
+        "  lvm.vg_name: vg0\n  source: vg0\n  volatile.initial_source: vg0\n"
+        "description: \"\"\nname: default\ndriver: lvm\nused_by:\n- /1.0/instances/genesis\n"
+        "status: Created\nlocations:\n- none\n"
+    )
+
+    def test_measured_host_output(self):
+        b = parse_pool_backend(self.SHOW)
+        assert b == PoolBackend(
+            driver="lvm", source="vg0", vg_name="vg0", thinpool_lv="IncusThinPool", thin=True,
+        )
+
+    def test_thick_lvm(self):
+        b = parse_pool_backend("driver: lvm\nconfig:\n  source: vg0\n  lvm.use_thinpool: \"false\"\n")
+        assert b.thin is False
+
+    def test_loop_file_source_is_not_a_vg(self):
+        b = parse_pool_backend("driver: lvm\nconfig:\n  source: /var/lib/incus/disks/p.img\n")
+        assert b.vg_name is None
+
+    def test_description_cannot_inject_source(self):
+        out = ("driver: lvm\ndescription: |\n  source: evil\nconfig:\n  lvm.vg_name: vg0\n")
+        b = parse_pool_backend(out)
+        assert b.vg_name == "vg0" and b.source is None
+
+    @pytest.mark.parametrize("out", ["", "::", "- a\n- b\n", "config: {}\n"])
+    def test_garbage_is_none(self, out):
+        assert parse_pool_backend(out) is None
+
+
+class TestUnsupportedBackends:
+    @pytest.mark.parametrize("backend", [
+        PoolBackend(driver="zfs", source="tank/incus"),
+        PoolBackend(driver="ceph", source="pool"),
+        PoolBackend(driver="lvm", source="vg0", vg_name="vg0", thin=False),
+        PoolBackend(driver="lvm", source="/x.img", vg_name=None),
+    ])
+    @pytest.mark.asyncio
+    async def test_not_measured_and_never_df(self, monkeypatch, backend):
+        calls: list = []
+
+        async def _detect(_config):
+            return "default"
+
+        async def _backend(_name):
+            return backend
+
+        async def _run(*a, **k):
+            calls.append(a)
+            return 0, "      Avail    1B-blocks\n1 100\n", ""
+
+        monkeypatch.setattr(pool_mod, "_detect_pool_name", _detect)
+        monkeypatch.setattr(pool_mod, "_pool_backend", _backend)
+        monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+        status = await measure_storage_pool(object())
+        assert status.detected is False
+        assert not any(c and c[0] == "df" for c in calls)
 
 
 class TestDecideAlert:
@@ -214,9 +293,10 @@ class TestDecideAlert:
         assert decide_alert(TIER_WARN, TIER_WARN, None, self.now, 6.0).should_alert
 
 
-def _df(used: int, size: int) -> str:
-    # `df -B1 --output=used,size` form: header row + one data row.
-    return f"       Used    1B-blocks\n{used} {size}\n"
+def _df(used: int, size: int, reserved: int = 0) -> str:
+    # `df -B1 --output=avail,size` form: header row + one data row. Reserved
+    # blocks are neither used nor available.
+    return f"      Avail    1B-blocks\n{size - used - reserved} {size}\n"
 
 
 class TestPoolUsedViaDf:
@@ -277,13 +357,13 @@ class TestMeasureNonLvmPool:
             return "genesis-btrfs"
 
         async def _backend(_name):
-            return "btrfs", "/dev/vg/btrfs"  # non-LVM backend
+            return PoolBackend(driver="btrfs", source="/dev/vg/btrfs")  # non-LVM backend
 
         async def _run(*a, **k):
             return 0, _df(48_318_382_080, 322_122_547_200), ""
 
         monkeypatch.setattr(pool_mod, "_detect_pool_name", _detect)
-        monkeypatch.setattr(pool_mod, "_pool_driver_and_source", _backend)
+        monkeypatch.setattr(pool_mod, "_pool_backend", _backend)
         monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
 
         status = await measure_storage_pool(object())
@@ -299,13 +379,13 @@ class TestMeasureNonLvmPool:
             return "genesis-btrfs"
 
         async def _backend(_name):
-            return "btrfs", "/dev/vg/btrfs"
+            return PoolBackend(driver="btrfs", source="/dev/vg/btrfs")
 
         async def _run(*a, **k):
             return 1, "", "df failed"
 
         monkeypatch.setattr(pool_mod, "_detect_pool_name", _detect)
-        monkeypatch.setattr(pool_mod, "_pool_driver_and_source", _backend)
+        monkeypatch.setattr(pool_mod, "_pool_backend", _backend)
         monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
 
         status = await measure_storage_pool(object())
@@ -412,3 +492,16 @@ class TestSnapshotOnlyBytes:
     @pytest.mark.parametrize("out", ["", "{}", "  12.0  x\n", '{"report": [{"lv": ["x"]}]}'])
     def test_unexpected_shape_is_no_evidence(self, out):
         assert snapshot_only_bytes(out, "IncusThinPool", self.CT, set()) is None
+
+
+@pytest.mark.asyncio
+async def test_reserved_blocks_count_as_unavailable(monkeypatch):
+    """Review round 2: ext4 reserved blocks are neither used nor available, so
+    used/size read 95% on a filesystem with nothing left to write to."""
+    async def _run(*a, **k):
+        assert "--output=avail,size" in a
+        return 0, _df(95 * 1024**3, 100 * 1024**3, reserved=5 * 1024**3), ""
+
+    monkeypatch.setattr(pool_mod, "_run_subprocess", _run)
+    pct = await pool_mod._pool_used_pct_via_df("/mnt/pool")
+    assert pct == pytest.approx(100.0)

@@ -23,7 +23,8 @@
     five minutes for a fresh measurement, and alerts on each delete. If no
     Guardian snapshot is left, it alerts that something else is filling the
     pool. No new Guardian snapshot is taken while free space is inside that
-    reserve. A delete whose outcome is unknown (the client timed out) stops
+    reserve. While the container is unhealthy the rollback snapshot itself is
+    kept (recovery may need it) and the backstop alerts instead. A delete whose outcome is unknown (the client timed out) stops
     the pass instead of moving on to another snapshot. If relief cannot measure or identify the pool for an hour, it
     says so in a daily warning rather than going quiet.
   - Every Guardian path that deletes or restores a snapshot (relief,
@@ -33,9 +34,12 @@
     any name starting with `guardian-`, so a hand-made `guardian-…-healthy`
     snapshot could be deleted or chosen as the rollback target. Relief never
     acts on a pool it cannot identify, and nothing here grows the pool.
-  - A pool backend that cannot be determined now reads as "not measured"
-    rather than as a non-LVM pool, which had fallen back to measuring the host
-    filesystem instead of the thin pool.
+  - The pool is identified by what incus declares (`lvm.vg_name`,
+    `lvm.thinpool_name`), not inferred. A backend that cannot be determined,
+    thick LVM, and backends whose pool path is not a mount (zfs, ceph) now read
+    as "not measured" rather than falling back to `df`, which measured the host
+    filesystem instead of the pool. On btrfs and dir pools, free space is what
+    `df` reports as available, so reserved blocks count as used.
   - Levers: `storage_pool.relief_mode` (`live` / `alert_only` / `off`) and the
     two reserves in `guardian.yaml`, plus the `GUARDIAN_POOL_RELIEF_DISABLED=1`
     kill switch, which stops every automatic delete. Recovery runbook:

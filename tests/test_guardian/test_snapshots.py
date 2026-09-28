@@ -466,8 +466,12 @@ class TestGetLatestHealthy:
 
 
 def _pool_status(detected: bool = True, data=None, meta=None):
+    """A NAMED LVM-thin pool measurement (an unnamed one is refused outright)."""
     from genesis.guardian.pool import StoragePoolStatus
-    return StoragePoolStatus(detected=detected, data_pct=data, metadata_pct=meta)
+    return StoragePoolStatus(
+        detected=detected, data_pct=data, metadata_pct=meta, pool_size_bytes=100 * 1024**3,
+        pool_name="default", vg_name="vg0", thinpool_lv="IncusThinPool",
+    )
 
 
 class TestLvmPoolGating:
@@ -722,9 +726,14 @@ def _ago(hours: float) -> str:
 class TestRefusalAndDeleteFirst:
 
     def test_created_from_name(self) -> None:
-        got = _created_from_name("guardian-20260919-162609-healthy")
+        got = _created_from_name("guardian-20260919-162609-healthy", "guardian-")
         assert got == datetime(2026, 9, 19, 16, 26, 9, tzinfo=UTC)
-        assert _created_from_name("guardian-manual") is None
+        assert _created_from_name("guardian-manual", "guardian-") is None
+        # Anchored after the prefix: a timestamp-shaped PREFIX is not the date.
+        pre = "archive-20200101-000000-"
+        assert _created_from_name(pre + "20260919-162609-healthy", pre) == got
+        assert _created_from_name(pre + "healthy", pre) is None
+        assert _created_from_name("other-20260919-162609", "guardian-") is None
 
     @pytest.mark.asyncio
     async def test_take_classifies_lvm_threshold_as_pool_space(self, manager) -> None:
@@ -1301,3 +1310,70 @@ async def test_retention_never_evicts_a_healthy_snapshot(config) -> None:
         assert await manager.take(label="healthy") is None
     assert a not in fake.deleted and b not in fake.deleted
     assert fake.deleted == [pre]  # retention still applies to non-healthy ones
+
+
+
+class TestReviewRound2:
+    """External review round 2 on the core PR."""
+
+    @pytest.mark.parametrize("stderr", [
+        "Error: no space left on device",           # host fs / daemon ENOSPC
+        "Error: insufficient free space for the database",
+    ])
+    @pytest.mark.asyncio
+    async def test_generic_enospc_is_not_a_pool_refusal(self, manager, stderr) -> None:
+        fake = _FakeIncus({}, create_err=stderr)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", fake.run),
+        ):
+            assert await manager.take(label="pre-recovery") is None
+        assert manager.last_refusal == REFUSED_OTHER
+
+    @pytest.mark.parametrize("status_kw", [
+        dict(data_pct=10.0, metadata_pct=5.0, thinpool_lv=None),   # low % of an unnamed pool
+        dict(data_pct=None, metadata_pct=None),                    # no figures at all
+    ])
+    @pytest.mark.asyncio
+    async def test_gate_refuses_unattributable_lvm_as_probe(self, manager, status_kw) -> None:
+        calls: list = []
+
+        async def run(*a, **k):
+            calls.append(a)
+            return 0, "      Avail    1B-blocks\n90000000000 100000000000\n", ""
+
+        with (
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.1, **status_kw)),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is False
+        assert not any(c and c[0] == "df" for c in calls)  # never the host filesystem
+
+    @pytest.mark.asyncio
+    async def test_undated_lifeline_is_ordered_by_its_name(self, manager) -> None:
+        """incus omitted created_at on the NEWEST healthy snapshot: it must not
+        sort behind an older dated one (and so lose the rollback target)."""
+        older, newer = "guardian-20260101-000000-healthy", "guardian-20260105-000000-healthy"
+
+        async def run(*a, **k):
+            return 0, json.dumps([
+                {"name": older, "created_at": "2026-01-01T00:00:00Z"},
+                {"name": newer},
+            ]), ""
+
+        with patch("genesis.guardian.snapshots._run_subprocess", run):
+            assert await manager.get_latest_healthy() == newer
+
+
+
+@pytest.mark.parametrize("bad", ["3", 60, float("nan")])
+@pytest.mark.asyncio
+async def test_gate_ignores_an_invalid_reserve(config, bad) -> None:
+    """Audit: the gate runs before a recovery action; an invalid reserve must
+    neither crash it nor pose as a measured pool refusal."""
+    config.storage_pool.min_reserve_pct = bad
+    manager = SnapshotManager(config)
+    with patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.45)):
+        assert await manager.safe_to_snapshot() is True
+    assert manager.last_gate_measured is False

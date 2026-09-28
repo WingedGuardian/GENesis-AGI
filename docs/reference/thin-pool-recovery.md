@@ -44,10 +44,11 @@ deletes the old snapshot FIRST, then creates the new one, only when all of
 these hold:
 
 - the **pool** refused the create, on a real measurement: the Guardian's own
-  gate on a measured pool (the LVM tiers, the relief reserve below, or the
-  headroom check on a btrfs/dir pool), or LVM's own "free space in thin pool
-  reached threshold". A failed probe (incus, `lvs` or `df` unreachable) never
-  counts;
+  gate on a measured, identified LVM thin pool (its tiers, or the relief
+  reserve below), or LVM's own "free space in thin pool reached threshold". A failed probe (incus, `lvs` or `df`
+  unreachable), a pool the Guardian cannot identify, and a generic
+  "no space left" error (which can come from the host filesystem or the incus
+  daemon) never count;
 - the current healthy snapshot is at least 23 hours old;
 - LVM **measures** that the healthy snapshots hold space nothing live maps:
   the pool's used bytes, minus what every live thin volume in the pool maps,
@@ -87,7 +88,11 @@ Guardian snapshot and sends a CRITICAL alert naming it. The order is:
 
 1. pre-recovery snapshots, oldest first;
 2. superseded healthy snapshots left behind by a failed rotation;
-3. the current healthy snapshot (the rollback target) last.
+3. the current healthy snapshot (the rollback target) last — but only while
+   the container is healthy. While it is not, the recovery cycle that runs
+   right after relief may need that snapshot to roll back, so relief keeps it
+   and sends a CRITICAL alert instead ("rollback lifeline kept for recovery").
+   The container is down then, so the pool is barely growing.
 
 If a delete fails (a busy volume, say), it re-lists the snapshots. If the
 snapshot is gone anyway, that was this pass's delete. If the client timed out,
@@ -96,8 +101,12 @@ outcome unknown") rather than deleting another. Otherwise it tries the next
 snapshot in that order, still freeing at most one per pass. After deleting, it waits 5 minutes
 before the next delete, so the effect shows in a fresh measurement first (btrfs
 frees a deleted snapshot's space asynchronously). A delete-first rotation starts
-the same 5-minute wait. And the Guardian never takes a NEW snapshot while free
-space is inside the reserve, so relief never deletes a snapshot it just took.
+the same 5-minute wait. The Guardian never takes a NEW snapshot while free
+space is already inside the reserve. (A snapshot taken just above the reserve
+can still be relief's target once the pool crosses it; that is the pressure
+relief exists for.) A pass whose earlier delete failed never goes on to the
+rollback snapshot: the failure may be the daemon still finishing a slow
+delete.
 
 Checks run every 30 seconds while the container is fine. During an outage a
 single check can spend up to the diagnosis timeout (an hour by default) in
@@ -205,7 +214,13 @@ Growing the container's root disk first only adds promises the pool cannot keep.
    `df -h /` inside the container before and after. The disk only ever grows;
    it cannot be shrunk.
 
-On btrfs, dir and other backends there is no thin pool to extend; relief works
-the same way (deleting Guardian snapshots), measured from the pool's filesystem.
+On btrfs and dir pools there is no thin pool to extend; relief works the same
+way (deleting Guardian snapshots), measured from the pool's filesystem. Other
+backends (zfs, ceph, …) are not measured: their pool path is not a mount of
+the pool, so reading it would measure the host's own disk. Relief then does
+nothing and says so ("Pool relief cannot act").
+Free space there is what `df` reports as AVAILABLE: blocks a filesystem
+reserves (ext4 keeps some for root) count as used, because the container cannot
+write to them.
 On a cloud VM, growing the disk is a provider-console action, usually a paid
 one, so the Guardian alerts and leaves it to you.

@@ -1441,9 +1441,13 @@ verified: 84c7259d 2026-08-31
     a failed delete falls through to the next unless the client timed out
     (outcome unknown → stop and alert); 5-minute settle stamped before
     the delete (delete-first starts it too); pool identity re-checked first.
-    `safe_to_snapshot` refuses inside the reserve, so a fresh snapshot is never
-    relief's next target. Unable to measure, read or name the pool for 1h →
-    daily WARNING.
+    `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
+    delete never falls through to the lifeline. Pool identity is incus's
+    DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
+    only lvm (thin), btrfs and dir are measured — others are undetected. Unable to measure, read or name the pool for 1h →
+    daily WARNING. While the guardian state is not HEALTHY the newest healthy
+    snapshot is protected (the recovery cycle runs after relief and may need
+    it). The snapshot gate shares relief's admission rule (`unactionable`).
   - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
     `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
     (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an

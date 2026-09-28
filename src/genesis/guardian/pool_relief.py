@@ -150,9 +150,11 @@ def _due(state: dict, key: str, now: datetime, hours: float) -> bool:
         return True
     try:
         last = datetime.fromisoformat(raw)
+        return now - last >= timedelta(hours=hours) or last > now
     except (TypeError, ValueError):
+        # Unparseable, or a timezone-less stamp (a hand edit) that cannot be
+        # compared with an aware now: due, never a crash.
         return True
-    return now - last >= timedelta(hours=hours) or last > now
 
 
 def _stamp(path: Path, state: dict, key: str, now: datetime) -> bool:
@@ -197,7 +199,7 @@ def _ambiguous_pool(status: StoragePoolStatus) -> bool:
     return bool(status.vg_name) and not status.thinpool_lv
 
 
-def _unactionable(status: StoragePoolStatus) -> tuple[str, str] | None:
+def unactionable(status: StoragePoolStatus) -> tuple[str, str] | None:
     """(outcome, why) when relief must not act on this measurement, else None.
 
     The ONE admission rule for both the decision and the pre-delete re-check:
@@ -268,7 +270,7 @@ async def _same_pool_now(config, status: StoragePoolStatus) -> bool:
         logger.warning("pre-delete pool re-check failed", exc_info=True)
         return False
     key = pool_key(status)
-    return key is not None and _unactionable(again) is None and pool_key(again) == key
+    return key is not None and unactionable(again) is None and pool_key(again) == key
 
 
 # --- planning ------------------------------------------------------------------
@@ -353,6 +355,8 @@ async def _cannot_act(
             since = datetime.fromisoformat(raw)
         except (TypeError, ValueError):
             since = None
+    if since is not None and since.tzinfo is None:
+        since = None  # a timezone-less hand edit: restart the clock, never crash
     if since is None or since > now:
         _stamp(state_path, state, "cannot_act_since", now)
         return outcome
@@ -382,8 +386,18 @@ def record_action(config, now: datetime | None = None) -> bool:
     return _stamp(path, _load_state(path), "last_action", now or datetime.now(UTC))
 
 
-async def check_pool_relief(config, dispatcher, snapshots, *, now: datetime | None = None) -> str:
-    """One relief pass. Returns what it did (for logs/tests)."""
+async def check_pool_relief(
+    config, dispatcher, snapshots, *, now: datetime | None = None, protect_lifeline: bool = False,
+) -> str:
+    """One relief pass. Returns what it did (for logs/tests).
+
+    ``protect_lifeline``: the container is not healthy, so this tick's recovery
+    cycle (which runs AFTER relief) may need SNAPSHOT_ROLLBACK. The newest
+    healthy snapshot is then never deleted — everything else still is (review:
+    deleting it here could leave the same tick's rollback with no target). The
+    pool is barely growing while the container is down, and the protection
+    lifts on the first healthy tick.
+    """
     from genesis.guardian.alert.base import AlertSeverity
     from genesis.guardian.pool import measure_storage_pool
 
@@ -421,7 +435,7 @@ async def check_pool_relief(config, dispatcher, snapshots, *, now: datetime | No
         )
 
     status = await measure_storage_pool(config)
-    blocked = _unactionable(status)
+    blocked = unactionable(status)
     if blocked is not None:
         return await _cannot_act(state_path, state, now, dispatcher, *blocked)
     if state.pop("cannot_act_since", None) is not None:
@@ -457,6 +471,22 @@ async def check_pool_relief(config, dispatcher, snapshots, *, now: datetime | No
             )
         return "list_failed"
     order = plan_order([SnapshotInfo(n, c, n.endswith(HEALTHY_SUFFIX)) for n, c in meta])
+    # meta is newest-first, so the first healthy name is the rollback lifeline.
+    lifeline = next((n for n, _ in meta if n.endswith(HEALTHY_SUFFIX)), None)
+    if protect_lifeline and lifeline in order:
+        order = [n for n in order if n != lifeline]
+        if not order:
+            if _throttled(state_path, state, "lifeline_protected", now, cfg.realert_hours):
+                await _send(
+                    dispatcher,
+                    AlertSeverity.CRITICAL,
+                    "Pool short of space — rollback lifeline kept for recovery",
+                    f"{reason}. {numbers}. The only guardian snapshot left is the rollback "
+                    f"lifeline {lifeline}; it is kept while the container is not healthy, "
+                    "because recovery may need it. Grow the pool or free space by hand if "
+                    "this persists (docs/reference/thin-pool-recovery.md).",
+                )
+            return "lifeline_protected"
     if not order:
         if _throttled(state_path, state, "no_target", now, cfg.realert_hours):
             await _send(
@@ -476,10 +506,14 @@ async def check_pool_relief(config, dispatcher, snapshots, *, now: datetime | No
         # The settle stamp could not persist: deleting now would let the next
         # tick delete again at once. Stop; the tier alerts still report.
         return "state_unwritable"
-    # meta is newest-first, so the first healthy name is the rollback lifeline.
-    lifeline = next((n for n, _ in meta if n.endswith(HEALTHY_SUFFIX)), None)
     failed: list[str] = []
     for target in order:
+        if failed and target == lifeline:
+            # Never fall through TO the lifeline: an earlier failure may be the
+            # daemon still deleting another snapshot (a re-delete while one is
+            # in flight can fail with a non-timeout error), so the space may be
+            # coming back already (review).
+            break
         # A snapshot whose delete keeps failing (busy LV, an export in flight)
         # must not pin relief to it forever: fall through to the next one, but
         # still free at most ONE per pass. A failure is only DEFINITE once a
