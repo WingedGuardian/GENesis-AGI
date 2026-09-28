@@ -175,7 +175,9 @@ async def _simulate(host: FakeHost, cfg: GuardianConfig, days: float, *, relief:
         while host.now < end:
             host.now += tick
             if relief:
-                await check_pool_relief(cfg, dispatcher, snapshots, now=host.now)
+                await check_pool_relief(
+                    cfg, dispatcher, snapshots, now=host.now, healthy_confirmed=True,
+                )
             await _maintain_snapshots(cfg, snapshots, is_healthy=True, dispatcher=dispatcher)
             host.max_data_pct = max(host.max_data_pct, host.data_pct())
     return dispatcher

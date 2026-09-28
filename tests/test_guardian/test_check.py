@@ -1449,7 +1449,7 @@ class TestPoolReliefWiring:
             patch("genesis.guardian.check.load_secrets", return_value={}),
         ):
             await run_check(config)
-        assert order == ["relief", "cycle"]
+        assert order == ["relief", "cycle", "relief"]  # pre-probe, cycle, post-probe
 
     @pytest.mark.asyncio
     async def test_delete_first_reserves_relief_settle(self, config: GuardianConfig) -> None:
@@ -1478,25 +1478,43 @@ class TestPoolReliefWiring:
         snapshots.mark_healthy.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_relief_protects_lifeline_unless_healthy(self, config: GuardianConfig) -> None:
-        seen: list = []
-
-        async def relief(*a, protect_lifeline=False, **k):
-            seen.append(protect_lifeline)
-
-        for state, expect in ((GuardianState.HEALTHY, False), (GuardianState.CONFIRMED_DEAD, True)):
+    async def test_relief_frees_rollback_snapshots_only_after_the_probe(
+        self, config: GuardianConfig,
+    ) -> None:
+        """The pre-cycle pass never frees rollback snapshots (the probe has not
+        run); the post-cycle pass may, only when THIS tick's probe said
+        HEALTHY."""
+        for post_state, expect in ((GuardianState.HEALTHY, True), (GuardianState.CONFIRMED_DEAD, False)):
+            seen: list = []
             sm = MagicMock()
-            sm.current_state = state
+            sm.current_state = GuardianState.HEALTHY  # the STALE pre-probe state
+            sm.state.signal_history = []
+
+            async def relief(
+                *a, healthy_confirmed=False, alert_when_deferred=True, _seen=seen, **k,
+            ):
+                _seen.append((healthy_confirmed, alert_when_deferred))
+
+            async def cycle(*a, _sm=sm, _post=post_state, **k):
+                # The probe's verdict, recorded the way process() records it.
+                from datetime import UTC, datetime
+
+                _sm.current_state = _post
+                _sm.state.signal_history = [{
+                    "at": datetime.now(UTC).isoformat(),
+                    "all_alive": _post == GuardianState.HEALTHY,
+                }]
+
             with (
                 patch("genesis.guardian.check._check_pool_relief", relief),
-                patch("genesis.guardian.check._check_cycle", AsyncMock()),
+                patch("genesis.guardian.check._check_cycle", cycle),
                 patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
                 patch("genesis.guardian.check.load_secrets", return_value={}),
                 patch("genesis.guardian.check.ConfirmationStateMachine", return_value=sm),
                 patch("genesis.guardian.check._maintain_snapshots", AsyncMock()),
             ):
                 await run_check(config)
-            assert seen[-1] is expect, state
+            assert seen == [(False, False), (expect, True)], post_state
 
     @pytest.mark.asyncio
     async def test_unwritable_cadence_marker_skips_rotation(self, config: GuardianConfig) -> None:
@@ -1658,3 +1676,69 @@ class TestPoolReliefWiring:
         dispatcher = AsyncMock()
         await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
         dispatcher.send.assert_not_called()
+
+
+class TestProbeConfirmedHealthy:
+    """Internal review, BLOCKER: the state machine reaches HEALTHY with every
+    signal down (auto-reset out of CONFIRMED_DEAD). Rollback snapshots — relief's
+    post-cycle pass and the daily healthy refresh — must follow THIS tick's
+    probe, never the state. Real state machine, real run_check."""
+
+    @staticmethod
+    async def _run(config, snapshot) -> list:
+        calls: list = []
+
+        async def relief(*a, healthy_confirmed=False, **k):
+            calls.append(("relief", healthy_confirmed))
+
+        async def maintain(*a, is_healthy=False, **k):
+            calls.append(("maintain", is_healthy))
+
+        with (
+            patch("genesis.guardian.check.collect_all_signals", AsyncMock(return_value=snapshot)),
+            patch("genesis.guardian.check._build_dispatcher", return_value=MagicMock(send=AsyncMock())),
+            patch("genesis.guardian.check._handle_healthy", AsyncMock()),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch("genesis.guardian.check._check_pool_relief", relief),
+            patch("genesis.guardian.check._maintain_snapshots", maintain),
+        ):
+            await run_check(config)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_auto_reset_while_down_confirms_nothing(self, config: GuardianConfig) -> None:
+        import json
+
+        state_path = _seed_state(
+            config,
+            current_state="confirmed_dead",
+            first_failure_at="2026-01-01T00:00:00+00:00",  # long past → auto-reset
+            auto_reset_count=0,
+        )
+        calls = await self._run(config, _dead_snapshot())
+        # guard-the-guard: the auto-reset really landed on HEALTHY
+        assert json.loads(state_path.read_text())["current_state"] == "healthy"
+        assert calls == [("relief", False), ("relief", False), ("maintain", False)]
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_probe_confirms(self, config: GuardianConfig) -> None:
+        calls = await self._run(config, _healthy_snapshot())
+        assert calls == [("relief", False), ("relief", True), ("maintain", True)]
+
+    def test_a_stale_probe_confirms_nothing(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from genesis.guardian.check import _probe_confirmed_healthy
+
+        now = datetime.now(UTC)
+        sm = MagicMock()
+        sm.current_state = GuardianState.HEALTHY
+        sm.state.signal_history = [{"at": (now - timedelta(minutes=5)).isoformat(), "all_alive": True}]
+        assert _probe_confirmed_healthy(sm, now) is False  # an EARLIER tick's probe
+        sm.state.signal_history = [{"at": now.isoformat(), "all_alive": True}]
+        assert _probe_confirmed_healthy(sm, now) is True
+        sm.state.signal_history = [{"at": now.isoformat(), "all_alive": False}]
+        assert _probe_confirmed_healthy(sm, now) is False
+        sm.state.signal_history = []
+        assert _probe_confirmed_healthy(sm, now) is False

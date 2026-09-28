@@ -415,6 +415,9 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     """
     if config is None:
         config = load_config()
+    # For _probe_confirmed_healthy: a probe recorded before this instant is an
+    # EARLIER tick's, never this tick's verdict.
+    tick_started = datetime.now(UTC)
 
     # A stand-down still writes the heartbeat: the Guardian PROCESS is alive and
     # deliberately not watching, so it must not read as DOWN to the container
@@ -489,15 +492,27 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     # about hourly — against a pool whose container is down and so barely
     # writing.) Measures, and frees at most ONE guardian-owned snapshot per
     # tick when free space is at or below its reserve. Never raises.
-    # The recovery cycle below may need SNAPSHOT_ROLLBACK when the container is
-    # not healthy, so relief must not take the lifeline out from under it.
+    # This pass runs BEFORE this tick's health probe, so it never deletes a
+    # rollback (healthy) snapshot: a container that failed since the last tick
+    # still reads HEALTHY here, and the cycle below may need SNAPSHOT_ROLLBACK
+    # (review, round 3). Rollback snapshots are only freed by the post-cycle
+    # pass, on a tick the probe confirmed HEALTHY.
     await _check_pool_relief(
-        config, dispatcher, snapshots,
-        protect_lifeline=sm.current_state != GuardianState.HEALTHY,
+        config, dispatcher, snapshots, healthy_confirmed=False, alert_when_deferred=False,
     )
 
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
+        # Post-probe relief: rollback snapshots may go only if THIS tick's
+        # probe found the container healthy. Not "the state is HEALTHY": the
+        # state machine also reaches HEALTHY with the container still down
+        # (auto-reset after CONFIRMED_DEAD, unpause, an approval's RECOVERED —
+        # review). The shared settle stamp keeps this pass from deleting again
+        # right after the pre-cycle pass did.
+        probe_healthy = _probe_confirmed_healthy(sm, tick_started)
+        await _check_pool_relief(
+            config, dispatcher, snapshots, healthy_confirmed=probe_healthy,
+        )
         # Snapshot lifecycle maintenance runs regardless of resulting state —
         # a guardian stuck in confirmed_dead/recovering for weeks must still
         # enforce expiry + prune stale snapshots (the incident: prune only ran
@@ -507,7 +522,10 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         await _maintain_snapshots(
             config,
             snapshots,
-            is_healthy=sm.current_state == GuardianState.HEALTHY,
+            # The probe's verdict, not the state (see _probe_confirmed_healthy):
+            # a "healthy" snapshot of a container that is still down would
+            # rotate the real lifeline out (review).
+            is_healthy=probe_healthy,
             snapshot_size_history=sm.state.snapshot_size_history,
             dispatcher=dispatcher,
         )
@@ -771,6 +789,9 @@ async def _maintain_snapshots(
             snapshot_size_history,
             delete_first_allowed=delete_first_allowed(config),
             reserve_settle=lambda: record_action(config),
+            # _maintain_snapshots only gets here when THIS tick's probe said
+            # HEALTHY (is_healthy is the post-cycle state).
+            healthy_confirmed=is_healthy,
         )
         note = getattr(snapshots, "last_rotation_note", None)
         if name:
@@ -808,6 +829,28 @@ async def _maintain_snapshots(
 
     if retry_soon:
         _touch_marker(healthy_marker, now - timedelta(hours=23))
+
+
+def _probe_confirmed_healthy(sm, since: datetime) -> bool:
+    """True only when THIS tick's health probe found the container healthy.
+
+    The state machine's HEALTHY is not that: it is also reached with every
+    signal down (auto-reset out of CONFIRMED_DEAD, unpause, an approval's
+    RECOVERED). ``process()`` records every probe in ``signal_history`` with
+    its time and ``all_alive``, so the verdict is the LAST entry — provided it
+    was recorded during this tick (a tick that never probed must not reuse an
+    older one) and the state is HEALTHY too. Anything unreadable → False.
+    """
+    try:
+        if sm.current_state != GuardianState.HEALTHY:
+            return False
+        hist = sm.state.signal_history
+        if not hist or not isinstance(hist[-1], dict) or hist[-1].get("all_alive") is not True:
+            return False
+        at = datetime.fromisoformat(str(hist[-1].get("at")))
+        return at >= since
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _marker_due(marker: Path, hours: float) -> bool:
@@ -961,7 +1004,8 @@ async def _check_pool_relief(
     dispatcher: AlertDispatcher,
     snapshots: SnapshotManager,
     *,
-    protect_lifeline: bool = False,
+    healthy_confirmed: bool = False,
+    alert_when_deferred: bool = True,
 ) -> None:
     """Pool relief pass (delegates to pool_relief). Never raises.
 
@@ -973,7 +1017,8 @@ async def _check_pool_relief(
         from genesis.guardian.pool_relief import check_pool_relief
 
         outcome = await check_pool_relief(
-            config, dispatcher, snapshots, protect_lifeline=protect_lifeline,
+            config, dispatcher, snapshots,
+            healthy_confirmed=healthy_confirmed, alert_when_deferred=alert_when_deferred,
         )
         acted = outcome.split(":", 1)[0] in (
             "deleted", "delete_failed", "list_failed", "no_target", "state_unwritable",

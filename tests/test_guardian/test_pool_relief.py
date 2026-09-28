@@ -22,6 +22,7 @@ from genesis.guardian.pool_relief import (
     shortfall,
     validate_relief_config,
 )
+from genesis.guardian.snapshots import HEALTHY_SUFFIX
 
 T0 = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
 _GB = 1024**3
@@ -54,12 +55,27 @@ class _Snaps:
         self.delete_ok = delete_ok
         self.fail = set(fail)
         self.error = "Error: busy"
+        self.bypassed: list[str] = []
         self.gone_anyway: set[str] = set()
 
     async def list_snapshot_meta_strict(self):
         return sorted(self.names.items(), reverse=True)
 
+    async def delete_healthy(self, name, *, healthy_confirmed=False, replaced_by=None):
+        assert healthy_confirmed or replaced_by, "relief reached the chokepoint unconfirmed"
+        return await self._delete(name)
+
     async def delete(self, name):
+        # Mirrors SnapshotManager.delete: a rollback snapshot is refused here, so
+        # relief calling the plain path for one is caught (review: the fake used
+        # to accept it and hid exactly that bypass).
+        if name.endswith(HEALTHY_SUFFIX):
+            self.bypassed.append(name)
+            self.last_delete_error = "healthy snapshot: use delete_healthy()"
+            return False
+        return await self._delete(name)
+
+    async def _delete(self, name):
         self.deleted.append(name)
         ok = self.delete_ok and name not in self.fail
         self.last_delete_error = None if ok else self.error
@@ -68,14 +84,14 @@ class _Snaps:
         return ok
 
 
-async def _pass(cfg, snaps, status, now=T0, *, measures=None, extra=()):
+async def _pass(cfg, snaps, status, now=T0, *, measures=None, extra=(), healthy_confirmed=True):
     d = AsyncMock()
     measure = AsyncMock(side_effect=measures) if measures else AsyncMock(return_value=status)
     with ExitStack() as stack:
         stack.enter_context(patch("genesis.guardian.pool.measure_storage_pool", measure))
         for p in extra:
             stack.enter_context(p)
-        out = await check_pool_relief(cfg, d, snaps, now=now)
+        out = await check_pool_relief(cfg, d, snaps, now=now, healthy_confirmed=healthy_confirmed)
     return out, d
 
 
@@ -106,6 +122,8 @@ class TestMode:
 @pytest.mark.parametrize(
     ("section", "key", "value"),
     [
+        ("storage_pool", "data_high_pct", -1),
+        ("storage_pool", "metadata_high_pct", "70"),
         ("storage_pool", "min_reserve_pct", 300),
         ("storage_pool", "min_reserve_pct", "3%"),
         ("storage_pool", "min_reserve_pct", float("nan")),
@@ -473,36 +491,46 @@ class TestReviewRound1:
 
 
 
-class TestProtectLifeline:
-    """Review round 2: relief runs BEFORE the recovery cycle; while the
-    container is not healthy it must not take the rollback target away."""
+class TestHealthyOnlyAfterTheProbe:
+    """Review round 3: relief runs before this tick's health probe too, and a
+    container that failed since the last tick still reads HEALTHY there. So a
+    rollback snapshot is a relief target only on a probe-confirmed HEALTHY
+    tick (the post-cycle pass)."""
 
     LIFE = "guardian-20260105-000000-healthy"
+    OLDH = "guardian-20260103-000000-healthy"
     PRE = "guardian-20260101-000000-pre-recovery"
 
     @pytest.mark.asyncio
-    async def test_only_lifeline_left_is_kept_and_alerted(self, tmp_path) -> None:
-        snaps = _Snaps({self.LIFE: T0 - timedelta(days=1)})
+    async def test_pre_probe_pass_frees_only_non_healthy(self, tmp_path) -> None:
+        snaps = _Snaps({self.PRE: OLD, self.OLDH: OLD, self.LIFE: T0 - timedelta(days=1)})
+        out, _ = await _pass(_cfg(tmp_path), snaps, _lvm(98.0), healthy_confirmed=False)
+        assert out == f"deleted:{self.PRE}"
+
+    @pytest.mark.asyncio
+    async def test_pre_probe_pass_defers_silently_when_only_healthy_left(self, tmp_path) -> None:
+        snaps = _Snaps({self.OLDH: OLD, self.LIFE: T0 - timedelta(days=1)})
         d = AsyncMock()
         with patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=_lvm(98.0))):
-            out = await check_pool_relief(_cfg(tmp_path), d, snaps, now=T0, protect_lifeline=True)
+            out = await check_pool_relief(
+                _cfg(tmp_path), d, snaps, now=T0,
+                healthy_confirmed=False, alert_when_deferred=False,
+            )
+        assert out == "healthy_deferred" and snaps.deleted == [] and d.send.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_post_probe_pass_keeps_them_and_alerts(self, tmp_path) -> None:
+        snaps = _Snaps({self.LIFE: T0 - timedelta(days=1)})
+        out, d = await _pass(_cfg(tmp_path), snaps, _lvm(98.0), healthy_confirmed=False)
         assert out == "lifeline_protected" and snaps.deleted == []
         assert "kept for recovery" in d.send.await_args.args[0].title
 
     @pytest.mark.asyncio
-    async def test_other_snapshots_still_go(self, tmp_path) -> None:
-        snaps = _Snaps({self.PRE: OLD, self.LIFE: T0 - timedelta(days=1)})
-        with patch("genesis.guardian.pool.measure_storage_pool", AsyncMock(return_value=_lvm(98.0))):
-            out = await check_pool_relief(
-                _cfg(tmp_path), AsyncMock(), snaps, now=T0, protect_lifeline=True,
-            )
-        assert out == f"deleted:{self.PRE}"
-
-    @pytest.mark.asyncio
-    async def test_healthy_container_does_not_protect(self, tmp_path) -> None:
-        snaps = _Snaps({self.LIFE: T0 - timedelta(days=1)})
+    async def test_confirmed_healthy_frees_superseded_then_lifeline(self, tmp_path) -> None:
+        snaps = _Snaps({self.OLDH: OLD, self.LIFE: T0 - timedelta(days=1)})
         out, _ = await _pass(_cfg(tmp_path), snaps, _lvm(98.0))
-        assert out == f"deleted:{self.LIFE}"
+        assert out == f"deleted:{self.OLDH}"
+
 
 
 

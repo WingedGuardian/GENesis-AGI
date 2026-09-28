@@ -23,8 +23,10 @@
     five minutes for a fresh measurement, and alerts on each delete. If no
     Guardian snapshot is left, it alerts that something else is filling the
     pool. No new Guardian snapshot is taken while free space is inside that
-    reserve. While the container is unhealthy the rollback snapshot itself is
-    kept (recovery may need it) and the backstop alerts instead. A delete whose outcome is unknown (the client timed out) stops
+    reserve. A rollback snapshot is only ever deleted when a newer one was just
+    created, or when this check's health probe found the container healthy;
+    while it is not, the backstop keeps them and alerts. The daily prune never
+    deletes a rollback snapshot. A delete whose outcome is unknown (the client timed out) stops
     the pass instead of moving on to another snapshot. If relief cannot measure or identify the pool for an hour, it
     says so in a daily warning rather than going quiet.
   - Every Guardian path that deletes or restores a snapshot (relief,

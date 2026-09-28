@@ -110,6 +110,11 @@ def validate_relief_config(config) -> str | None:
         # _build_sub does not coerce: `enabled: "false"` is a truthy string.
         return f"storage_pool.enabled={cfg.enabled!r} (expected true or false)"
     for problem in (
+        # The high tiers gate snapshot creation; a refusal there licenses
+        # delete-first, so a malformed one (e.g. -1: refuse everything) must
+        # not pose as pool pressure (review).
+        num("data_high_pct", 1, 100),
+        num("metadata_high_pct", 1, 100),
         num("min_reserve_pct", 0, 50),
         num("min_meta_reserve_pct", 0, 50),
         num("realert_hours", 0.1, 24 * 30),
@@ -387,16 +392,26 @@ def record_action(config, now: datetime | None = None) -> bool:
 
 
 async def check_pool_relief(
-    config, dispatcher, snapshots, *, now: datetime | None = None, protect_lifeline: bool = False,
+    config,
+    dispatcher,
+    snapshots,
+    *,
+    now: datetime | None = None,
+    healthy_confirmed: bool = False,
+    alert_when_deferred: bool = True,
 ) -> str:
     """One relief pass. Returns what it did (for logs/tests).
 
-    ``protect_lifeline``: the container is not healthy, so this tick's recovery
-    cycle (which runs AFTER relief) may need SNAPSHOT_ROLLBACK. The newest
-    healthy snapshot is then never deleted — everything else still is (review:
-    deleting it here could leave the same tick's rollback with no target). The
-    pool is barely growing while the container is down, and the protection
-    lifts on the first healthy tick.
+    Healthy (rollback) snapshots are candidates only with ``healthy_confirmed``
+    — THIS tick's health probe found the container HEALTHY — and are deleted
+    through ``SnapshotManager.delete_healthy``, the one chokepoint for rollback
+    targets. ``run_check`` runs a pass BEFORE the recovery cycle with it False
+    (the probe has not run yet: a container that failed since the last tick
+    still reads HEALTHY there — review, round 3) and a second pass AFTER the
+    cycle with the probe's verdict. The pre-cycle pass frees only non-healthy
+    snapshots and stays silent when healthy ones are all that is left
+    (``alert_when_deferred`` False); the post-cycle pass alerts if it must keep
+    them because the container is not healthy.
     """
     from genesis.guardian.alert.base import AlertSeverity
     from genesis.guardian.pool import measure_storage_pool
@@ -473,16 +488,18 @@ async def check_pool_relief(
     order = plan_order([SnapshotInfo(n, c, n.endswith(HEALTHY_SUFFIX)) for n, c in meta])
     # meta is newest-first, so the first healthy name is the rollback lifeline.
     lifeline = next((n for n, _ in meta if n.endswith(HEALTHY_SUFFIX)), None)
-    if protect_lifeline and lifeline in order:
-        order = [n for n in order if n != lifeline]
+    if not healthy_confirmed and any(n.endswith(HEALTHY_SUFFIX) for n in order):
+        order = [n for n in order if not n.endswith(HEALTHY_SUFFIX)]
         if not order:
+            if not alert_when_deferred:
+                return "healthy_deferred"
             if _throttled(state_path, state, "lifeline_protected", now, cfg.realert_hours):
                 await _send(
                     dispatcher,
                     AlertSeverity.CRITICAL,
                     "Pool short of space — rollback lifeline kept for recovery",
-                    f"{reason}. {numbers}. The only guardian snapshot left is the rollback "
-                    f"lifeline {lifeline}; it is kept while the container is not healthy, "
+                    f"{reason}. {numbers}. Only rollback snapshots are left (newest: "
+                    f"{lifeline}); they are kept while the container is not healthy, "
                     "because recovery may need it. Grow the pool or free space by hand if "
                     "this persists (docs/reference/thin-pool-recovery.md).",
                 )
@@ -520,7 +537,11 @@ async def check_pool_relief(
         # re-list shows the snapshot still there and the client did not time
         # out: incus's client giving up says nothing about whether the daemon
         # finished a slow delete (review), so then stop and re-measure.
-        if not await snapshots.delete(target):
+        if target.endswith(HEALTHY_SUFFIX):
+            ok = await snapshots.delete_healthy(target, healthy_confirmed=healthy_confirmed)
+        else:
+            ok = await snapshots.delete(target)
+        if not ok:
             err = getattr(snapshots, "last_delete_error", None)
             after = await snapshots.list_snapshot_meta_strict()
             if after is not None and target not in {n for n, _ in after}:

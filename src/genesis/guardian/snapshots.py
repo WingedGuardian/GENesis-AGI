@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -28,8 +29,8 @@ from genesis.guardian.pool import (
 logger = logging.getLogger(__name__)
 
 # Label suffix marking the offline snapshot-rollback lifeline. take(label=
-# _HEALTHY_LABEL) produces names ending in this suffix; prune()/take()
-# eviction exempt the latest one and mark_healthy() rotates the rest.
+# _HEALTHY_LABEL) produces names ending in this suffix; prune() and take()'s
+# eviction never delete one, and every deletion goes through delete_healthy().
 _HEALTHY_LABEL = "healthy"
 _HEALTHY_SUFFIX = f"-{_HEALTHY_LABEL}"
 # Public alias: pool_relief classifies the lifeline by the SAME suffix.
@@ -106,6 +107,7 @@ REFUSED_POOL_GATE = "pool_gate"
 REFUSED_POOL_SPACE = "pool_space"
 REFUSED_PROBE = "probe_failed"
 REFUSED_OTHER = "create_failed"
+REFUSED_CONFIG = "invalid_config"
 
 # Delete-first needs EVIDENCE that deleting the lifeline frees real space:
 # LVM must show the guardian's healthy snapshots hold at least this much that
@@ -163,6 +165,8 @@ class SnapshotManager:
         # Why the last delete() failed (the runner's "timeout" = outcome
         # unknown), or None after a success.
         self.last_delete_error: str | None = None
+        # Whether the last take() evicted a snapshot before its create.
+        self.last_take_evicted = False
         # Whether mark_healthy() deleted a lifeline first (alerted at once).
         self.last_rotation_deleted = False
         # What mark_healthy() had to do beyond a plain rotation, for alerting.
@@ -276,14 +280,11 @@ class SnapshotManager:
             # reserve would be deleted again within minutes, freeing nothing
             # and costing the lifeline (review: on a large non-LVM pool the
             # headroom gate below admits creates relief then undoes).
+            config_trusted = validate_relief_config(self._config) is None
             # Only with a config relief itself trusts: an invalid reserve
             # (e.g. "3" as a string, or 60) must neither crash the gate — it
             # runs before a recovery action — nor pose as a pool refusal.
-            reason = (
-                shortfall(pool_status, self._config.storage_pool)
-                if validate_relief_config(self._config) is None
-                else None
-            )
+            reason = shortfall(pool_status, self._config.storage_pool) if config_trusted else None
             if reason is not None:
                 logger.error("Pool at its relief reserve (%s) — refusing snapshot", reason)
                 self.last_gate_measured = True
@@ -292,6 +293,15 @@ class SnapshotManager:
             pool_status.data_pct is not None or pool_status.metadata_pct is not None
         ):
             tiers = self._config.storage_pool
+            if not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and 1 <= v <= 100
+                for v in (tiers.data_high_pct, tiers.metadata_high_pct)
+            ):
+                # A malformed tier (a string, -1) cannot gate: refuse, but as a
+                # PROBE refusal — it must never license delete-first (review).
+                logger.error("storage_pool high tiers invalid — refusing snapshot")
+                return False
             data = pool_status.data_pct
             meta = pool_status.metadata_pct
             if data is not None and data >= tiers.data_high_pct:
@@ -383,6 +393,14 @@ class SnapshotManager:
             # be pruned, rotated or freed — refuse it at the source.
             raise ValueError(f"unknown snapshot label {label!r}; add it to _GENERATED_LABELS")
         self.last_refusal = None
+        self.last_take_evicted = False
+        if not isinstance(self._prefix, str) or not self._prefix.strip():
+            # No ownership namespace: a snapshot created now could never be
+            # listed back as the guardian's, so it would never be rotated,
+            # pruned or freed (review). Refuse at the source.
+            logger.error("snapshots.prefix is empty or invalid — refusing to create a snapshot")
+            self.last_refusal = REFUSED_CONFIG
+            return None
         if not await self.safe_to_snapshot(snapshot_size_history):
             # Only a refusal on a real pool measurement counts as the POOL
             # refusing (LVM lvs, or df on a positively non-LVM pool). The
@@ -406,8 +424,15 @@ class SnapshotManager:
         candidates = [n for n in existing if not n.endswith(_HEALTHY_SUFFIX)]
         if candidates and len(candidates) >= self._retention:
             for old_name in candidates[self._retention - 1:]:
-                if await self.delete(old_name):
+                ok = await self.delete(old_name)
+                if ok:
                     logger.info("Deleted snapshot before create: %s", old_name)
+                if ok or self.last_delete_error == "timeout":
+                    # Its space may still be coming back (btrfs frees
+                    # asynchronously; a timed-out delete may still be running
+                    # in the daemon): mark_healthy must not delete-first on top
+                    # of it in the same attempt (review).
+                    self.last_take_evicted = True
 
         ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         name = f"{self._prefix}{ts}"
@@ -451,12 +476,50 @@ class SnapshotManager:
         return name
 
     async def delete(self, name: str) -> bool:
-        """Delete a snapshot by name. Returns True on success.
+        """Delete a NON-healthy snapshot by name. Returns True on success.
 
-        120s timeout: deleting a long-lived LVM-thin snapshot with heavy CoW
-        divergence involves real kernel metadata work (the incident snapshots
-        were months old) — 60s can genuinely be exceeded.
+        A healthy snapshot (a rollback target) is refused here: the only way
+        GUARDIAN CODE deletes one is :meth:`delete_healthy`, the single
+        chokepoint that checks a rollback cannot still need it (review, round 3:
+        three paths deleted rollback targets under three different
+        preconditions). Outside the guardian, incus's own ``snapshots.expiry``
+        (asserted by :meth:`enforce_expiry_policy`) can still expire one on
+        Incus versions that apply it to manual snapshots — see #2486.
         """
+        if name.endswith(_HEALTHY_SUFFIX):
+            logger.error("refusing to delete rollback snapshot %s outside delete_healthy()", name)
+            self.last_delete_error = "healthy snapshot: use delete_healthy()"
+            return False
+        return await self._delete_raw(name)
+
+    async def delete_healthy(
+        self, name: str, *, healthy_confirmed: bool = False, replaced_by: str | None = None,
+    ) -> bool:
+        """THE chokepoint for deleting a rollback (healthy) snapshot.
+
+        Allowed only when a rollback cannot need it:
+
+        * ``replaced_by`` — a newer healthy snapshot was just created (plain
+          rotation), so a rollback target still exists; or
+        * ``healthy_confirmed`` — THIS tick's health probe (not a stale
+          persisted state) found the container HEALTHY, so no recovery in this
+          tick will reach for SNAPSHOT_ROLLBACK.
+
+        Everything else — a pre-probe pass, an unhealthy tick — is refused.
+        """
+        if not name.endswith(_HEALTHY_SUFFIX):
+            return await self.delete(name)
+        if replaced_by is None and not healthy_confirmed:
+            logger.warning("refusing to delete rollback snapshot %s: health not confirmed", name)
+            self.last_delete_error = "health not confirmed"
+            return False
+        return await self._delete_raw(name)
+
+    async def _delete_raw(self, name: str) -> bool:
+        """``incus snapshot delete``. 120s timeout: deleting a long-lived
+        LVM-thin snapshot with heavy CoW divergence involves real kernel
+        metadata work (the incident snapshots were months old) — 60s can
+        genuinely be exceeded."""
         rc, _, stderr = await _run_subprocess(
             "incus", "snapshot", "delete", self._container, name,
             timeout=120.0,
@@ -578,40 +641,45 @@ class SnapshotManager:
     async def prune(self) -> int:
         """Prune guardian snapshots. Returns count deleted.
 
-        Two independent rules, unioned:
-        - **Retention**: keep the newest ``retention`` + the most-recent healthy;
+        Only NON-healthy snapshots; two independent rules, unioned:
+        - **Retention**: keep the newest ``retention`` non-healthy snapshots;
           delete the rest.
-        - **Age**: delete anything older than ``max_age_days`` that is NOT the
-          most-recent healthy snapshot — *even if it currently sorts as the
-          "newest"*. This is the incident backstop: a stale
-          ``guardian-pre-recovery`` snapshot sorts newest by name suffix and
-          would otherwise be protected by retention forever, accumulating CoW
-          divergence. The most-recent healthy snapshot is always exempt — it is
-          the offline snapshot-rollback lifeline. (Under pool pressure it is
-          not exempt from delete-first rotation or pool relief.)
+        - **Age**: delete any non-healthy snapshot older than ``max_age_days``
+          — *even if it is the newest*. This is the incident backstop: a stale
+          ``guardian-pre-recovery`` snapshot would otherwise be protected by
+          retention forever, accumulating CoW divergence.
+
+        Healthy (rollback) snapshots are never pruned. The newest is the
+        offline lifeline; an older one is the fallback if the next refresh is
+        refused. They leave only via ``delete_healthy``: rotation after a
+        successful create, pool relief on a probe-confirmed healthy tick, or
+        delete-first. (Consequence, stated: a superseded healthy snapshot whose
+        rotation delete keeps failing is bounded only by the next successful
+        rotation, relief under pressure, and incus's own expiry where it
+        applies.)
         """
         meta = await self._list_snapshots_with_meta()
         if not meta:
             return 0
 
+        # Healthy snapshots are never pruned — not even a superseded one: it is
+        # the fallback if the next refresh is refused and delete-first takes the
+        # newer one (review: prune removed it right before such a refresh).
+        # They are rotated by mark_healthy after a successful create, and freed
+        # by pool relief under pressure, both through delete_healthy().
+        meta = [(n, c) for n, c in meta if not n.endswith(_HEALTHY_SUFFIX)]
         names = [name for name, _ in meta]
-        healthy = [n for n in names if n.endswith(_HEALTHY_SUFFIX)]
-        latest_healthy = healthy[0] if healthy else None
 
-        # Retention rule: keep newest N + latest healthy.
+        # Retention rule: keep the newest N non-healthy snapshots.
         to_keep = set(names[:self._retention])
-        if latest_healthy:
-            to_keep.add(latest_healthy)
         to_delete = {n for n in names if n not in to_keep}
 
-        # Age rule: delete stale snapshots (except the healthy lifeline),
-        # including a stale "newest" non-healthy snapshot that retention keeps.
+        # Age rule: delete stale snapshots, including a stale "newest"
+        # non-healthy snapshot that retention keeps.
         max_age_days = self._config.snapshots.max_age_days
         if max_age_days > 0:
             cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
             for name, created in meta:
-                if name == latest_healthy:
-                    continue  # never delete the rollback lifeline
                 if created is not None and created < cutoff:
                     to_delete.add(name)
 
@@ -653,6 +721,7 @@ class SnapshotManager:
         *,
         delete_first_allowed: bool = False,
         reserve_settle: Callable[[], bool] | None = None,
+        healthy_confirmed: bool = False,
     ) -> str | None:
         """Take a 'healthy' snapshot, then rotate superseded healthy ones.
 
@@ -674,7 +743,11 @@ class SnapshotManager:
           valid config) and is not settling after its own action;
         * ``reserve_settle`` (when given) succeeds: it persists relief's settle
           stamp BEFORE the delete, so relief cannot delete again on the next
-          tick if the state file turns out to be unwritable.
+          tick if the state file turns out to be unwritable;
+        * ``healthy_confirmed``: this tick's probe found the container HEALTHY
+          (the delete goes through the ``delete_healthy`` chokepoint);
+        * the create attempt did not already delete a snapshot (retention
+          eviction) whose space may still be coming back.
 
         Then create-first cannot succeed while that snapshot keeps filling the
         pool — retrying it daily is how one snapshot once survived a week and
@@ -700,12 +773,15 @@ class SnapshotManager:
             stale = await self._stale_lifeline(datetime.now(UTC))
             held = await self._lifeline_holds_space() if stale is not None else None
             deleted = False
-            if (
+            if self.last_take_evicted:
+                logger.info("delete-first deferred: this attempt already deleted a snapshot")
+            elif (
                 stale is not None
                 and held is not None
+                and healthy_confirmed
                 and (reserve_settle is None or reserve_settle())
             ):
-                deleted = await self.delete(stale)
+                deleted = await self.delete_healthy(stale, healthy_confirmed=True)
                 if not deleted and self.last_delete_error == "timeout":
                     # The client gave up; the daemon may still finish the
                     # delete. Say so rather than retry as if nothing happened.
@@ -745,7 +821,7 @@ class SnapshotManager:
 
         for old_name in await self.list_snapshots():
             is_superseded = old_name.endswith(_HEALTHY_SUFFIX) and old_name != name
-            if is_superseded and await self.delete(old_name):
+            if is_superseded and await self.delete_healthy(old_name, replaced_by=name):
                 logger.info("Rotated superseded healthy snapshot: %s", old_name)
         return name
 

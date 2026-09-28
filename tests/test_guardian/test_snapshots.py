@@ -298,7 +298,7 @@ class TestMarkHealthy:
             "genesis.guardian.snapshots._run_subprocess",
             _mock_subprocess_smart(snapshot_rc=0),
         ):
-            name = await manager.mark_healthy(delete_first_allowed=True)
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
         assert name is not None
         assert name.endswith("-healthy")
 
@@ -621,7 +621,7 @@ class TestMarkHealthyRotation:
                 _take_env_mock(existing, deletes, creates),
             ),
         ):
-            name = await manager.mark_healthy(delete_first_allowed=True)
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
         assert name is not None and name.endswith("-healthy")
         assert "guardian-20260701-000000-healthy" in deletes
         assert "guardian-20260702-000000-pre-recovery" not in deletes
@@ -659,7 +659,7 @@ class TestMarkHealthyRotation:
             ),
             patch("genesis.guardian.snapshots._run_subprocess", failing_create),
         ):
-            name = await manager.mark_healthy(delete_first_allowed=True)
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
         assert name is None
         assert deletes == []  # old lifeline untouched
 
@@ -866,7 +866,7 @@ class TestDeleteFirstRotation:
             ),
         ):
             name = await manager.mark_healthy(
-                delete_first_allowed=allowed, reserve_settle=reserve,
+                delete_first_allowed=allowed, reserve_settle=reserve, healthy_confirmed=True,
             )
         return name, fake
 
@@ -894,7 +894,7 @@ class TestDeleteFirstRotation:
             ),
             patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.95)),
         ):
-            assert await manager.mark_healthy(delete_first_allowed=True) is None
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
         assert fake.deleted == []
 
     @pytest.mark.asyncio
@@ -911,7 +911,7 @@ class TestDeleteFirstRotation:
             ),
             patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.95)),
         ):
-            assert await manager.mark_healthy(delete_first_allowed=True) is None
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
         assert fake.deleted == []
 
     @pytest.mark.asyncio
@@ -929,7 +929,7 @@ class TestDeleteFirstRotation:
             patch("genesis.guardian.snapshots._run_subprocess", run),
             patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
         ):
-            assert await manager.mark_healthy(delete_first_allowed=True) is None
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
         assert fake.creates == 1  # no retry create after an unconfirmed delete
         assert "may be gone" in (manager.last_rotation_note or "")
 
@@ -1014,7 +1014,9 @@ class TestDeleteFirstRotation:
             ),
             patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
         ):
-            await manager.mark_healthy(delete_first_allowed=True, reserve_settle=reserve)
+            await manager.mark_healthy(
+                delete_first_allowed=True, reserve_settle=reserve, healthy_confirmed=True,
+            )
         assert order == ["reserve deleted=[]"] and fake.deleted[0] == self.OLD
 
     @pytest.mark.asyncio
@@ -1059,7 +1061,7 @@ class TestDeleteFirstRotation:
             ),
             patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.95)),
         ):
-            assert await manager.mark_healthy(delete_first_allowed=True) is None
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
         assert manager.last_refusal == REFUSED_PROBE
         assert fake.deleted == []
 
@@ -1246,7 +1248,7 @@ async def test_refused_retry_note_names_the_surviving_lifeline(manager) -> None:
         ),
         patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
     ):
-        assert await manager.mark_healthy(delete_first_allowed=True) is None
+        assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
     assert fake.deleted == [older]
     assert f"rollback falls back to {newer}" in manager.last_rotation_note
 
@@ -1377,3 +1379,129 @@ async def test_gate_ignores_an_invalid_reserve(config, bad) -> None:
     with patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.45)):
         assert await manager.safe_to_snapshot() is True
     assert manager.last_gate_measured is False
+
+
+
+class TestRollbackChokepoint:
+    """Review round 3 (owner-chosen shape): ONE chokepoint deletes rollback
+    snapshots; nothing else can."""
+
+    H = "guardian-20260101-000000-healthy"
+
+    @pytest.mark.asyncio
+    async def test_plain_delete_refuses_a_healthy_snapshot(self, manager) -> None:
+        fake = _FakeIncus({self.H: _ago(50)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.delete(self.H) is False
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_chokepoint_needs_confirmation_or_a_replacement(self, manager) -> None:
+        fake = _FakeIncus({self.H: _ago(50)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.delete_healthy(self.H) is False
+            assert fake.deleted == []
+            assert await manager.delete_healthy(self.H, replaced_by="guardian-x-healthy") is True
+        assert fake.deleted == [self.H]
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_health_never_deletes_first(self, manager) -> None:
+        fake = _FakeIncus(
+            {"guardian-20260101-000000-healthy": _ago(30)}, create_err=_LVM_THRESHOLD_ERR,
+        )
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            assert await manager.mark_healthy(delete_first_allowed=True) is None
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_prune_never_deletes_a_superseded_healthy(self, config) -> None:
+        """Devin: prune removed the fallback right before a refused refresh."""
+        config.snapshots.retention = 1
+        config.snapshots.max_age_days = 1
+        manager = SnapshotManager(config)
+        older, newer = "guardian-20260101-000000-healthy", "guardian-20260102-000000-healthy"
+        pre = "guardian-20260103-000000-pre-recovery"
+        fake = _FakeIncus({older: _ago(90), newer: _ago(60), pre: _ago(50)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            await manager.prune()
+        assert older not in fake.deleted and newer not in fake.deleted
+        assert pre in fake.deleted  # non-healthy age rule still applies
+
+    @pytest.mark.asyncio
+    async def test_retention_eviction_defers_delete_first(self, config) -> None:
+        """Devin: take() evicted a snapshot, the create was refused, and
+        delete-first then took the lifeline before the first delete's space
+        came back."""
+        config.snapshots.retention = 1
+        manager = SnapshotManager(config)
+        life = "guardian-20260101-000000-healthy"
+        pre = "guardian-20260102-000000-pre-recovery"
+        fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            assert await manager.mark_healthy(
+                delete_first_allowed=True, healthy_confirmed=True,
+            ) is None
+        assert fake.deleted == [pre]  # the eviction, and nothing on top of it
+        assert life in fake.snaps
+
+    @pytest.mark.parametrize("bad", [-1, "85", 0])
+    @pytest.mark.asyncio
+    async def test_malformed_tier_is_a_probe_refusal(self, config, bad) -> None:
+        config.storage_pool.data_high_pct = bad
+        manager = SnapshotManager(config)
+        with patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.3)):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is False
+
+    @pytest.mark.parametrize("prefix", ["", "   ", None])
+    @pytest.mark.asyncio
+    async def test_no_ownership_prefix_creates_nothing(self, config, prefix) -> None:
+        config.snapshots.prefix = prefix
+        manager = SnapshotManager(config)
+        run = AsyncMock()
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+        ):
+            assert await manager.take(label="healthy") is None
+        run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_eviction_also_defers_delete_first(config) -> None:
+    """Review: a retention delete that TIMED OUT may still be running in the
+    daemon, so it must hold delete-first off exactly like a completed one."""
+    config.snapshots.retention = 1
+    manager = SnapshotManager(config)
+    life = "guardian-20260101-000000-healthy"
+    pre = "guardian-20260102-000000-pre-recovery"
+    fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR)
+    inner = _with_thin_lvs(fake, manager, live_frac=0.80)
+
+    async def run(*args, **kwargs):
+        if args[:3] == ("incus", "snapshot", "delete") and args[4] == pre:
+            return -1, "", "timeout"  # client gave up; the snapshot is still listed
+        return await inner(*args, **kwargs)
+
+    with (
+        patch.object(manager, "safe_to_snapshot", return_value=True),
+        patch("genesis.guardian.snapshots._run_subprocess", run),
+        patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+    ):
+        assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+    assert manager.last_take_evicted is True
+    assert life in fake.snaps and life not in fake.deleted

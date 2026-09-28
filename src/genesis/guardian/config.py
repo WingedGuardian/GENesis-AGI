@@ -123,9 +123,10 @@ class SnapshotConfig:
     healthy_enabled: bool = True
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
     min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
-    # Age-based prune: delete guardian-* snapshots older than this many days,
-    # regardless of retention count — EXCEPT the latest healthy snapshot, which
-    # is instead refreshed by rotation and freed by pool relief under pressure.
+    # Age-based prune: delete non-healthy guardian snapshots older than this
+    # many days, regardless of retention count. Healthy (rollback) snapshots are
+    # never pruned — they are rotated after a successful create and freed by
+    # pool relief under pressure, both via SnapshotManager.delete_healthy.
     # Backstops the incident where
     # stale guardian-pre-recovery snapshots accumulated CoW divergence for months.
     max_age_days: int = 14

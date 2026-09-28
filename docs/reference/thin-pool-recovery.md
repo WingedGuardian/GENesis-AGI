@@ -88,11 +88,22 @@ Guardian snapshot and sends a CRITICAL alert naming it. The order is:
 
 1. pre-recovery snapshots, oldest first;
 2. superseded healthy snapshots left behind by a failed rotation;
-3. the current healthy snapshot (the rollback target) last — but only while
-   the container is healthy. While it is not, the recovery cycle that runs
-   right after relief may need that snapshot to roll back, so relief keeps it
-   and sends a CRITICAL alert instead ("rollback lifeline kept for recovery").
-   The container is down then, so the pool is barely growing.
+3. the current healthy snapshot (the rollback target) last.
+
+Rollback (healthy) snapshots — 2 and 3 — are only ever deleted through one
+check, and only when a rollback cannot need them: either a newer healthy
+snapshot was just created (ordinary rotation), or THIS check's health probe
+found the container healthy. So relief runs twice per check. The pass before
+the health probe frees only pre-recovery snapshots, because a container that
+failed since the last check still looks healthy there. The pass after the probe
+may free rollback snapshots when the container is healthy, and when it is not,
+keeps them and sends a CRITICAL alert ("rollback lifeline kept for recovery")
+— it may be about to need one. "Healthy" here is the health probe's own
+verdict on this check, not the Guardian's state: the state can read healthy
+while the container is still down (after an automatic reset, or on unpause),
+and that is exactly when a rollback may follow. The daily prune
+and the retention step before a new snapshot never delete a rollback snapshot
+at all: an older one is the fallback if the next refresh is refused.
 
 If a delete fails (a busy volume, say), it re-lists the snapshots. If the
 snapshot is gone anyway, that was this pass's delete. If the client timed out,

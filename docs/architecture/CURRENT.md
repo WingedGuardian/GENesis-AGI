@@ -1457,9 +1457,17 @@ verified: 84c7259d 2026-08-31
     delete never falls through to the lifeline. Pool identity is incus's
     DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
     only lvm (thin), btrfs and dir are measured — others are undetected. Unable to measure, read or name the pool for 1h →
-    daily WARNING. While the guardian state is not HEALTHY the newest healthy
-    snapshot is protected (the recovery cycle runs after relief and may need
-    it). The snapshot gate shares relief's admission rule (`unactionable`).
+    daily WARNING. Rollback (healthy) snapshots have ONE deletion chokepoint,
+    `SnapshotManager.delete_healthy` (plain `delete` refuses them): allowed
+    only with a just-created replacement or THIS tick's probe-confirmed
+    HEALTHY (`check._probe_confirmed_healthy`: the last `signal_history`
+    entry is from this tick and `all_alive` — NOT the state, which also
+    reaches HEALTHY with the container down via auto-reset/unpause); the
+    daily healthy refresh uses the same verdict. Relief runs a pre-cycle pass (non-healthy only) and a post-cycle
+    pass (healthy allowed when the probe said HEALTHY); prune and pre-create
+    retention never delete a healthy snapshot; a retention eviction defers
+    delete-first. The snapshot gate shares relief's admission rule
+    (`unactionable`) and trusts only validated tiers/reserves.
   - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
     `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
     (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an
