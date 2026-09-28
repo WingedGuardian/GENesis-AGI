@@ -1387,3 +1387,113 @@ def test_preview_refuses_an_archive_whose_only_metadata_is_nested(tmp_path, caps
         tf.addfile(info, io.BytesIO(body))
     assert wl._describe_recovery(archive, repo) is False
     assert "No .trash_meta.json" in capsys.readouterr().err
+# ─── dry-run preview vs recovery, round 2 (Devin Review on #2206) ─────────────
+
+
+def _preview_repo(tmp_path: Path, setup) -> tuple[Path, Path, str]:
+    """A repo whose committed tree `setup(repo)` builds, plus a directory-form
+    trash entry detached at its commit. Returns (repo, entry, commit)."""
+    import json
+
+    repo = tmp_path / "prev_repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "s@s")
+    _git(repo, "config", "user.name", "s")
+    setup(repo)
+    _git(repo, "commit", "-q", "-m", "tree")
+    commit = _git(repo, "rev-parse", "HEAD").strip()
+    entry = tmp_path / "trash" / "entry-20260101"
+    entry.mkdir(parents=True)
+    (entry / ".trash_meta.json").write_text(
+        json.dumps(
+            {
+                "original_path": str(tmp_path / "gone"),
+                "commit": commit,
+                "detached": True,
+            }
+        )
+    )
+    return repo, entry, commit
+
+
+def _restore_line(capsys) -> str:
+    return next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "WOULD RESTORE" in line
+    )
+
+
+def test_preview_counts_a_file_behind_an_absolute_link_inside(tmp_path, capsys):
+    """An absolute link target that lands back inside `original_path` is not an
+    escape: realpath stays in the worktree, so recovery writes the file."""
+
+    def setup(r: Path) -> None:
+        os.symlink(str(tmp_path / "gone" / "subdir"), r / "alias_in")
+        _git(r, "add", "alias_in")
+
+    repo, entry, _ = _preview_repo(tmp_path, setup)
+    (entry / "alias_in").mkdir()
+    (entry / "alias_in" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 1 untracked" in _restore_line(capsys)
+
+
+def test_preview_excludes_a_file_behind_an_absolute_link_outside(tmp_path, capsys):
+    """Control: an absolute target outside `original_path` still escapes."""
+
+    def setup(r: Path) -> None:
+        os.symlink(str(tmp_path / "elsewhere"), r / "alias_out")
+        _git(r, "add", "alias_out")
+
+    repo, entry, _ = _preview_repo(tmp_path, setup)
+    (entry / "alias_out").mkdir()
+    (entry / "alias_out" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_line(capsys)
+
+
+def test_preview_skips_a_file_the_checkout_provides_through_an_alias(
+    tmp_path, capsys
+):
+    """`alias -> real` with tracked `real/file`: stored `alias/file` resolves
+    onto an existing path, and recovery's `lexists` check writes nothing."""
+
+    def setup(r: Path) -> None:
+        (r / "real").mkdir()
+        (r / "real" / "file").write_text("r")
+        os.symlink("real", r / "alias")
+        _git(r, "add", "real/file", "alias")
+
+    repo, entry, _ = _preview_repo(tmp_path, setup)
+    (entry / "alias").mkdir()
+    (entry / "alias" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_line(capsys)
+
+
+def test_preview_refuses_a_multi_root_archive(tmp_path, capsys):
+    """Real recovery requires exactly one top-level directory after extract;
+    a tarball with a second root is 'Unexpected archive layout', not a preview."""
+    import io
+    import json
+    import tarfile
+
+    def setup(r: Path) -> None:
+        (r / "f").write_text("f")
+        _git(r, "add", "f")
+
+    repo, _, commit = _preview_repo(tmp_path, setup)
+    archive = tmp_path / "trash" / "multi-20260101.tar.gz"
+    body = json.dumps(
+        {"original_path": str(tmp_path / "gone"), "commit": commit}
+    ).encode()
+    with tarfile.open(archive, "w:gz") as tf:
+        info = tarfile.TarInfo("entry/.trash_meta.json")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+        info = tarfile.TarInfo("extra/file.txt")
+        info.size = 1
+        tf.addfile(info, io.BytesIO(b"x"))
+    assert wl._describe_recovery(archive, repo) is False
+    assert "Unexpected archive layout" in capsys.readouterr().err
