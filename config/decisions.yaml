@@ -182,13 +182,20 @@ decisions:
   # asynchronously. Expiry policy is label + re-verify, never delete: the
   # class decides WHEN a memory is re-checked, not whether it survives.
   #
-  # NO USABLE OUTCOME SIGNAL YET. MEASURED 2026-09-27 on a live install:
-  # supersession is recorded on about 0.05% of memories, and it records
-  # CORRECTIONS of claims believed durable, not volatility. A hosted decision
-  # model's volatile-class score separated superseded memories from survivors
-  # at AUC 0.53 (chance). Deprecation is mostly consolidation of near-duplicates,
-  # which is redundancy, not staleness. Until a "still current?" judgment is
-  # recorded somewhere, this site can be declared but not graded or calibrated.
+  # MEASURED 2026-09-27 on a live install, zero-shot on a hosted decision
+  # model:
+  # - Supersession is NOT a usable label. It is recorded on about 0.05% of
+  #   memories and marks corrections of claims believed durable; graded against
+  #   it, this site scored AUC 0.53 (chance).
+  # - Against LATER EVIDENCE it carries a weak but real signal. The label: a
+  #   newer memory on the same topic shows that something this one stated as
+  #   current is no longer true. Over 1,000 fact-like memories, 6.3% went stale
+  #   within 60 days, and the volatile-class score separated them at AUC 0.60
+  #   (95% CI 0.53-0.68). `ephemeral_state` went stale 16% of the time,
+  #   `durable_fact` 3.5%.
+  # So this site RANKS memories for re-verification (`ordering`); it is not
+  # good enough to act on a single answer. Activity-log records describe
+  # events, which do not go stale, and are out of scope for this question.
   memory_volatility:
     type: choice
     instructions: >-
@@ -199,13 +206,13 @@ decisions:
       preference: "a stated taste or choice; stable but can change"
       decision: "a ruling that holds until explicitly revisited"
       durable_fact: "true for the foreseeable future"
-    consumes: argmax
+    consumes: ordering
     latency_budget_ms: 5000
     fallback:
-      typed: argmax_advisory
+      typed: rank_advisory
       legacy: no_volatility_class
-    # outcome_source deliberately unset: see above. Supersession is not a
-    # volatility label, so declaring it would have extraction mine it.
+    # outcome_source unset: the later-evidence label above was a one-off
+    # measurement, not a persisted signal.
     owner: memory.store
 
   # --- ego ---------------------------------------------------------------
