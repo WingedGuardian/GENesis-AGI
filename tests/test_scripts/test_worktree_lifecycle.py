@@ -1276,3 +1276,114 @@ def test_an_untouched_worktree_still_reads_as_idle(reaper_repo, tmp_path):
         f"a clean, aged worktree reported {age_days:.1f} days — consulting git "
         "made an idle worktree look active, so nothing would ever be reclaimed"
     )
+
+
+# ─── dry-run preview agrees with what recovery would do (Devin round on #2206) ─
+
+
+def _preview_fixture(tmp_path: Path, setup) -> tuple[Path, Path, str]:
+    """A repo whose committed tree `setup(repo)` builds, and an empty directory
+    trash entry pointing at that commit. Returns (repo, entry, commit)."""
+    import json
+
+    repo = tmp_path / "prev_repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "s@s")
+    _git(repo, "config", "user.name", "s")
+    setup(repo)
+    _git(repo, "commit", "-q", "-m", "tree")
+    commit = _git(repo, "rev-parse", "HEAD").strip()
+    entry = tmp_path / "trash" / "entry-20260101"
+    entry.mkdir(parents=True)
+    (entry / ".trash_meta.json").write_text(
+        json.dumps({"original_path": str(tmp_path / "gone"), "commit": commit, "detached": True})
+    )
+    return repo, entry, commit
+
+
+def _links(repo: Path, links: dict[str, str]) -> None:
+    for name, target in links.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, repo / name)
+        _git(repo, "add", name)
+
+
+def _restore_count(capsys) -> str:
+    out = capsys.readouterr().out
+    return next(line for line in out.splitlines() if "WOULD RESTORE" in line)
+
+
+def test_preview_carries_the_suffix_through_link_hops(tmp_path, capsys):
+    """`a -> b/sub`, `b -> c`, `c/sub -> <outside>`: realpath of `a` leaves the
+    worktree, so recovery skips `a/file` and the preview must not count it."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo, entry, _ = _preview_fixture(
+        tmp_path,
+        lambda r: _links(r, {"a": "b/sub", "b": "c", "c/sub": str(outside)}),
+    )
+    (entry / "a").mkdir()
+    (entry / "a" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_count(capsys)
+
+
+def test_preview_resolves_the_stored_files_own_path_not_just_the_link(tmp_path, capsys):
+    """`a -> b` stays inside, but `b/x -> <outside>`: stored `a/x/file` resolves
+    through BOTH links. Checking only the tracked ancestor `a` misses `b/x`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo, entry, _ = _preview_fixture(
+        tmp_path, lambda r: _links(r, {"a": "b", "b/x": str(outside)})
+    )
+    (entry / "a" / "x").mkdir(parents=True)
+    (entry / "a" / "x" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_count(capsys)
+
+
+def test_preview_counts_a_file_behind_an_in_tree_link(tmp_path, capsys):
+    """Control for the two above: a link chain that stays inside the worktree
+    does not stop the file being restored."""
+    repo, entry, _ = _preview_fixture(tmp_path, lambda r: _links(r, {"a": "b/sub", "b": "c"}))
+    (entry / "a").mkdir()
+    (entry / "a" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 1 untracked" in _restore_count(capsys)
+
+
+def test_preview_treats_a_submodule_gitlink_as_a_directory(tmp_path, capsys):
+    """A gitlink is checked out as a directory, so a stored file under it is
+    restorable, not a collision with a tracked file."""
+
+    def setup(r: Path) -> None:
+        (r / "f").write_text("f")
+        _git(r, "add", "f")
+        _git(r, "commit", "-q", "-m", "base")
+        sha = _git(r, "rev-parse", "HEAD").strip()
+        _git(r, "update-index", "--add", "--cacheinfo", f"160000,{sha},sub")
+
+    repo, entry, _ = _preview_fixture(tmp_path, setup)
+    (entry / "sub").mkdir()
+    (entry / "sub" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    out = _restore_count(capsys)
+    assert "WOULD RESTORE 1 untracked" in out
+
+
+def test_preview_refuses_an_archive_whose_only_metadata_is_nested(tmp_path, capsys):
+    """Recovery requires `.trash_meta.json` at the archive's inner root; a
+    worktree's own nested file of that name must not stand in for it."""
+    import io
+    import json
+    import tarfile
+
+    repo, _, commit = _preview_fixture(tmp_path, lambda r: _links(r, {"l": "x"}))
+    archive = tmp_path / "trash" / "arch-20260101.tar.gz"
+    body = json.dumps({"original_path": str(tmp_path / "gone"), "commit": commit}).encode()
+    with tarfile.open(archive, "w:gz") as tf:
+        info = tarfile.TarInfo("arch/deep/.trash_meta.json")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    assert wl._describe_recovery(archive, repo) is False
+    assert "No .trash_meta.json" in capsys.readouterr().err

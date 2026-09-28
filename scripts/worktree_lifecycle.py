@@ -1573,11 +1573,11 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         try:
             with tarfile.open(stored, "r:gz") as tf:
                 members = tf.getmembers()
-                # The entry's OWN metadata sits at depth two: `<name>/.trash_meta.json`.
-                # A worktree may legitimately contain a deeper file of the same
-                # name, so a bare endswith() search can bind the nested copy and
-                # report — or refuse — the wrong entry. Prefer the root member;
-                # fall back to the first match for archives laid out differently.
+                # The entry's OWN metadata sits at depth two: `<name>/.trash_meta.json`
+                # — real recovery extracts the archive and requires exactly that
+                # file at the inner root, so the preview must require it too:
+                # accepting a deeper member (a worktree's own nested file of the
+                # same name) would preview a recovery the real run refuses.
                 meta_member = next(
                     (m for m in members
                      if m.isfile()
@@ -1585,13 +1585,6 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                      and PurePosixPath(m.name).name == ".trash_meta.json"),
                     None,
                 )
-                if meta_member is None:
-                    meta_member = next(
-                        (m for m in members
-                         if m.isfile()
-                         and PurePosixPath(m.name).name == ".trash_meta.json"),
-                        None,
-                    )
                 if meta_member is None:
                     print(f"No .trash_meta.json in {stored}", file=sys.stderr)
                     return False
@@ -1709,7 +1702,7 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     # `café.txt` would never equal its archive name and would be counted as a
     # restorable untracked file. surrogateescape decoding matches the
     # filesystem spelling candidates carry.
-    tree: tuple[set[str], set[str]] | None = None
+    tree: tuple[set[str], set[str], set[str]] | None = None
     if checkout_ref:
         try:
             ls = subprocess.run(
@@ -1720,30 +1713,31 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             ls = None
         if ls is not None and ls.returncode == 0:
-            tracked, link_paths = set(), set()
+            tracked, link_paths, gitlinks = set(), set(), set()
             for entry in ls.stdout.split(b"\0"):
                 meta, _, name = entry.partition(b"\t")
                 if not name:
                     continue
                 p = name.decode("utf-8", "surrogateescape")
                 tracked.add(p)
-                if meta.split(b" ", 1)[0] == b"120000":
+                mode = meta.split(b" ", 1)[0]
+                if mode == b"120000":
                     link_paths.add(p)
-            tree = (tracked, link_paths)
+                elif mode == b"160000":
+                    # Submodule gitlink: checkout materializes a DIRECTORY
+                    # there, not a file — descendants do not collide.
+                    gitlinks.add(p)
+            tree = (tracked, link_paths, gitlinks)
 
     link_target_cache: dict[str, str | None] = {}
 
-    def _link_escapes(link_path: str, seen: frozenset[str]) -> bool | None:
-        """Whether a tracked symlink resolves OUTSIDE the worktree. None =
-        cannot say confidently (unreadable target or a link cycle).
+    def _link_target(link_path: str) -> str | None:
+        """The raw target bytes of a tracked link blob, cached. None = the
+        target could not be read — say nothing certain about it.
 
-        Resolves recursively: a target can sit lexically inside the tree while
-        passing through ANOTHER tracked link that escapes (`link -> safe`,
-        `safe -> ../../outside`). `_restore_from_dir` calls `realpath` on the
-        full destination parent, so it catches the chain; the preview must too.
-        """
-        if link_path in seen:
-            return None  # cycle — cannot resolve
+        Verbatim blob content — a symlink target is raw bytes to POSIX:
+        newlines and spaces are legal characters in it, so splitting or
+        stripping changes which path the link actually names."""
         if link_path not in link_target_cache:
             try:
                 out = _run_git(
@@ -1751,28 +1745,46 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 )
             except (UnicodeDecodeError, ValueError):
                 out = None
-            # Verbatim blob content — a symlink target is raw bytes to POSIX:
-            # newlines and spaces are legal characters in it, so splitting or
-            # stripping changes which path the link actually names.
             link_target_cache[link_path] = out
-        target = link_target_cache[link_path]
-        if target is None or not target:
-            return None
-        if os.path.isabs(target):
-            return True
-        resolved = os.path.normpath(
-            os.path.join(os.path.dirname(link_path), target)
-        )
-        if resolved == ".." or resolved.startswith("../"):
-            return True
-        # The resolved path is lexically inside, but may itself traverse a
-        # tracked link — walk its ancestors.
-        parts = resolved.split("/")
-        for i in range(1, len(parts) + 1):
-            prefix = "/".join(parts[:i])
-            if prefix in tree[1]:
-                return _link_escapes(prefix, seen | {link_path})
-        return False
+        return link_target_cache[link_path]
+
+    def _path_escapes(path: str, seen: frozenset[str]) -> bool | None:
+        """Whether `path`, resolved through tracked links, lands OUTSIDE the
+        worktree. None = cannot say confidently (unreadable target or a link
+        cycle).
+
+        Each hop replaces the FIRST link prefix with its target and CARRIES the
+        remaining suffix through — `a -> b/sub` with stored `a/file` must keep
+        `/file` so the next hop can see `b/sub`'s own traversal (`b -> c` safe
+        is not enough; `c/sub` may itself escape). `_restore_from_dir` calls
+        `realpath` on the full destination parent, so the preview must resolve
+        the same way.
+        """
+        while True:
+            parts = path.split("/")
+            hit = None
+            for i in range(1, len(parts) + 1):
+                if "/".join(parts[:i]) in tree[1]:
+                    hit = i
+                    break
+            if hit is None:
+                return False  # fully resolved, lexically inside
+            link_path = "/".join(parts[:hit])
+            if link_path in seen:
+                return None  # cycle — cannot resolve
+            seen = seen | {link_path}
+            target = _link_target(link_path)
+            if not target:
+                return None
+            if os.path.isabs(target):
+                return True
+            resolved = os.path.normpath(
+                os.path.join(os.path.dirname(link_path), target,
+                             *parts[hit:])
+            )
+            if resolved == ".." or resolved.startswith("../"):
+                return True
+            path = resolved
 
     def _classify(c: str) -> str:
         """'restorable' | 'collides' | 'escapes' | 'unknown', from the tree.
@@ -1788,10 +1800,15 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
             if ancestor not in tree[0]:
                 continue
             if ancestor in tree[1]:
-                escapes = _link_escapes(ancestor, frozenset())
+                # Resolve the file's whole PARENT, as recovery's realpath does,
+                # not just this link: the part below it can cross another link
+                # (`a -> b` inside, `b/x -> outside`, stored `a/x/file`).
+                escapes = _path_escapes(c.rsplit("/", 1)[0], frozenset())
                 if escapes is not False:
                     return "escapes" if escapes else "unknown"
                 continue  # in-tree link — the write still lands inside
+            if ancestor in tree[2]:
+                continue  # submodule gitlink — checkout creates a directory
             return "collides"  # tracked regular file in the way
         return "restorable"
 
