@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from genesis.autonomy.executor.engine import CCSessionExecutor
 from genesis.autonomy.executor import worktree_mgr
+from genesis.autonomy.executor.engine import CCSessionExecutor
 from genesis.autonomy.executor.scope_gate import (
     ScopeGateResult,
     evaluate_raw_diff,
