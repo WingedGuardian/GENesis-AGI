@@ -25,6 +25,11 @@
 #              and `tie_rule` (inclusive | exclusive — is a score exactly on a band
 #              edge decided, or does it abstain?).
 #
+# `outcome_source` names a PERSISTED signal that labels a site's answers. It
+# is set only where such a signal exists; declaring an aspirational one made
+# sites look trainable while label extraction would find nothing or the
+# wrong thing. No shipped site has one yet.
+#
 # A local `decisions.local.yaml` overlay is deep-merged on top, resolved like
 # every other config overlay: `~/.genesis/config/` first, then a gitignored
 # sibling of this file. An overlay may only OVERRIDE decisions shipped here —
@@ -51,7 +56,6 @@ decisions:
     fallback:
       typed: argmax_advisory
       legacy: existing_llm_path
-    outcome_source: ledger_predictions
     owner: memory.relationship_classifier
 
   # --- egress ------------------------------------------------------------
@@ -74,7 +78,6 @@ decisions:
     fallback:
       typed: rank_for_human_review
       legacy: regex_scan_only
-    outcome_source: egress_review_outcomes
     owner: security.output_scanner
 
   # Complementary to the regexes, NOT a replacement. MEASURED: this caught an
@@ -91,7 +94,6 @@ decisions:
     fallback:
       typed: rank_for_human_review
       legacy: regex_scan_only
-    outcome_source: egress_review_outcomes
     owner: security.output_scanner
 
   # --- triage ------------------------------------------------------------
@@ -112,7 +114,6 @@ decisions:
     fallback:
       typed: argmax_advisory
       legacy: token_count_heuristic
-    outcome_source: calibration_cells
     owner: learning.triage.prefilter
 
   # --- routing -----------------------------------------------------------
@@ -128,7 +129,6 @@ decisions:
     fallback:
       typed: rank_advisory
       legacy: static_chain_selection
-    outcome_source: calibration_cells
     owner: routing.router
 
   # --- skills ------------------------------------------------------------
@@ -176,7 +176,6 @@ decisions:
     fallback:
       typed: argmax_advisory
       legacy: inject_unfiltered
-    outcome_source: recall_usage_outcomes
     owner: memory.recall
 
   # D5 — how quickly will this memory go stale? Assigned at write time,

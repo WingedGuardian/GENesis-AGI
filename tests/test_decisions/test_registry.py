@@ -1290,3 +1290,74 @@ def test_the_shipped_volatility_site_declares_no_outcome_source():
         load_registry(root / "config" / "decisions.yaml")["memory_volatility"].outcome_source
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-3 review.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shipped",
+    [
+        _VALID.replace(
+            '    options:\n      duplicate: "B restates A with no new information"\n'
+            '      contradicts: "B asserts something incompatible with A"\n'
+            '      succeeded_by: "B updates or replaces A"\n'
+            '      distinct: "unrelated, or independently true"\n',
+            "",
+        ),  # a choice with no options
+        "decisions:\n",  # decisions is null
+        "decisions: []\n",
+    ],
+)
+def test_an_overlay_cannot_mask_an_invalid_shipped_registry(tmp_path, shipped):
+    """The shipped file was only checked after merging, so an overlay could
+    supply what it lacked and it loaded on that one install alone."""
+    from genesis.decisions.registry import load_registry
+
+    base = tmp_path / "decisions.yaml"
+    base.write_text(shipped)
+    # A COMPLETE spec in the overlay: before the fix the merge alone was
+    # validated, so this loaded for all three shipped files. Only a shipped
+    # file validated on its own rejects every one of them.
+    (tmp_path / "decisions.local.yaml").write_text(
+        "decisions:\n  memory_relationship:\n    type: choice\n    instructions: q\n"
+        "    consumes: argmax\n    fallback: {typed: a, legacy: b}\n    owner: o\n"
+        "    options: {a: x, b: y}\n"
+    )
+    with pytest.raises(RegistryError, match="shipped, before any overlay"):
+        load_registry(base)
+
+
+def test_an_integer_beyond_the_digit_limit_is_a_registry_error():
+    """int() of a 5000-digit token raises a bare ValueError (Python's
+    int-string conversion limit), escaping the RegistryError contract."""
+    body = _VALID.replace("latency_budget_ms: 2000", "latency_budget_ms: " + "9" * 5000)
+    with pytest.raises(RegistryError, match="more than 18 digits"):
+        _spec(body)
+
+
+def test_the_integer_bound_does_not_depend_on_the_interpreter_setting():
+    """Python's own digit limit can be switched off; the registry's bound cannot."""
+    import sys
+
+    old = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(0)  # 0 = unlimited
+    try:
+        body = _VALID.replace("latency_budget_ms: 2000", "latency_budget_ms: " + "9" * 19)
+        with pytest.raises(RegistryError, match="more than 18 digits"):
+            _spec(body)
+    finally:
+        sys.set_int_max_str_digits(old)
+
+
+def test_no_shipped_site_declares_an_outcome_source_it_does_not_have():
+    """Declared sources pointed at tables that do not exist or hold other labels."""
+    from pathlib import Path
+
+    from genesis.decisions.registry import load_registry
+
+    root = Path(__file__).resolve().parents[2]
+    reg = load_registry(root / "config" / "decisions.yaml")
+    assert all(spec.outcome_source is None for spec in reg.values())

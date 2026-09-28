@@ -6,8 +6,9 @@ Both are cognitive infrastructure that memory, triage, ego and autonomy call
 into.
 
 Today this package is the **registry only** — the enumerable catalogue of
-every bounded-choice decision Genesis makes, and the validation that keeps
-those declarations honest. Backends and calibration land on top of it.
+Genesis's bounded-choice decisions, and the validation that keeps those
+declarations honest. Coverage is not yet complete: an enumeration is a
+floor, not the full set. Backends and calibration land on top of it.
 """
 
 from genesis.decisions.registry import (

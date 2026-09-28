@@ -1,4 +1,4 @@
-"""Decision question registry — one enumerable home for every bounded choice.
+"""Decision question registry — the enumerable home for bounded-choice decisions.
 
 Mirrors ``routing/config.py``: a shipped YAML plus a gitignored
 ``{stem}.local.yaml`` overlay, deep-merged. That seam is deliberate — the
@@ -6,7 +6,9 @@ question set is capability and ships; anything install-specific stays local.
 
 The registry earns its place by making four otherwise-manual jobs mechanical:
 
-1. **Label extraction** knows what to mine per site (``outcome_source``).
+1. **Label extraction** knows what to mine per site (``outcome_source``),
+   once a site has a persisted signal. None does yet; the field stays unset
+   until one exists.
 2. **Calibration fitting** gets its natural unit — one temperature per site.
 3. **Task-adapter training** learns question *shapes* without seeing content.
 4. "How many decisions does Genesis make, and which are calibrated?" becomes a
@@ -133,6 +135,7 @@ class _StrictLoader(yaml.SafeLoader):
 
 _MERGE_TAG = "tag:yaml.org,2002:merge"
 _CANONICAL_INT = re.compile(r"[-+]?(0|[1-9][0-9]*)")
+_MAX_INT_DIGITS = 18
 _CANONICAL_FLOAT = re.compile(r"[-+]?(0|[1-9][0-9]*)\.[0-9]+([eE][-+]?[0-9]+)?")
 
 
@@ -157,6 +160,13 @@ def _canonical_int(loader: _StrictLoader, node: yaml.ScalarNode) -> int:
         raise RegistryError(
             f"integer {text!r} at line {node.start_mark.line + 1} is not plain decimal — "
             "YAML 1.1 reads leading zeros as octal and colons as base 60"
+        )
+    # An explicit bound, not Python's int-string digit limit, which is an
+    # interpreter setting (PYTHONINTMAXSTRDIGITS=0 disables it). No registry
+    # integer needs more than 18 digits.
+    if len(text.lstrip("+-")) > _MAX_INT_DIGITS:
+        raise RegistryError(
+            f"integer at line {node.start_mark.line + 1} has more than {_MAX_INT_DIGITS} digits"
         )
     return int(text)
 
@@ -295,6 +305,14 @@ def load_registry(path: str | Path) -> Mapping[str, DecisionSpec]:
     """
     path = Path(path)
     base = _check_root(_load(_read(path), path.name), path.name)
+    # The shipped registry must be valid ON ITS OWN. Validating only the
+    # merged result let an overlay supply what the shipped file lacked (a
+    # missing options map, or a whole decisions mapping), so whether the
+    # shipped registry was valid depended on one install's local config.
+    try:
+        _parse(base)
+    except RegistryError as exc:
+        raise RegistryError(f"{path.name} (shipped, before any overlay): {exc}") from None
 
     # Function-local on purpose: a module-level alias would hold its own
     # reference that test isolation of the user config dir cannot reach.
