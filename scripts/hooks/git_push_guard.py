@@ -230,6 +230,10 @@ _DEGRADED_GATED = (
 )
 
 try:
+    from git_repo_selection import (  # noqa: E402
+        raw_sets_repo_env,
+        seg_redirects_repo,
+    )
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
         _REPARSE_CARRIERS,
@@ -430,6 +434,11 @@ def _seg_dash_C(argv) -> str | None:
     return None
 
 
+# Repository selection by --git-dir / --work-tree / GIT_DIR & co. lives in
+# git_repo_selection (imported above, shared with pre_push_privacy_review) so the
+# two hooks cannot disagree about what counts as a redirect.
+
+
 def _cd_target(raw: str):
     """Classify a top-level command segment as a ``cd``.
 
@@ -504,12 +513,21 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         for raw in split_segments(cmd):
             if raw == target_raw:
                 break
+            # PERSISTENT: an `export GIT_DIR=…` earlier in the command stays in
+            # force for everything after it, including after an absolute `cd` that
+            # would otherwise recover a known cwd. So it returns rather than setting
+            # cur. A COMMAND-scoped `GIT_DIR=… git status` does not persist and is
+            # not counted here (git_repo_selection.seg_sets_repo_env).
+            if raw_sets_repo_env(raw):
+                return _CWD_UNKNOWN
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
             elif cd is not None:
                 cur = _resolve_against(cur, cd)
     if seg is not None:
+        if seg_redirects_repo(seg):
+            return _CWD_UNKNOWN
         dash_c = _seg_dash_C(getattr(seg, "argv", None))
         if dash_c is not None:
             return _resolve_against(cur, dash_c)
@@ -549,6 +567,7 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
+    repo_env_redirected = False  # persistent, for the same reason as in _effective_cwd
     for raw in split_segments(cmd):
         top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
         merge_here = next(
@@ -556,6 +575,12 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             None,
         )
         if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
+            # This walk resolves the repo itself rather than through
+            # `_effective_cwd`, so it carried the same hole: a merge pointed at a
+            # repository on main by --git-dir / GIT_DIR was checked against the
+            # checkout it ran in. Fail closed exactly as an unresolvable cwd does.
+            if repo_env_redirected or seg_redirects_repo(merge_here):
+                return True
             dash_c = _seg_dash_C(merge_here.argv)
             mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
             if mcwd is _CWD_UNKNOWN:
@@ -563,6 +588,8 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
             if branch is None or branch in ("main", "master"):
                 return True  # None branch (error/unresolved) fails closed
+        if raw_sets_repo_env(raw):
+            repo_env_redirected = True
         cd = _cd_target(raw)
         if cd is _CWD_UNKNOWN:
             cur = _CWD_UNKNOWN
