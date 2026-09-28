@@ -7,8 +7,9 @@
 #
 # Format: <hook-name>:<sha256>
 #
-# Release discipline: every commit that touches scripts/hooks/{post-commit,
-# pre-commit, pre-push} MUST also append the new hash to this file.
+# Release discipline: every commit that touches a tracked hook (the
+# TRACKED_HOOKS list in scripts/update_hook_versions.sh) MUST also append the
+# new hash to this file.
 # Enforced by scripts/check_hook_versions.sh run from pre-commit.
 #
 # To regenerate entries for the current tree:
@@ -56,3 +57,10 @@ commit-msg:50ff87d2b57eecf16bee245c949caa255212f4ec1d5e75c35b37ad2cc9ab1058
 commit-msg:5a995035b06ad63ab5de4bf953c396827a5c38c4ddc37abe74f8e03a8ee2acc6
 commit-msg:3ea4b1616cd8d53852215572540c497597968eb01edf863fce07e62fdd2537f0
 pre-commit:7947d4ca7e81246e6fbdbb8d8c752a301a97d080ca14f77e2af00211bec6dbc1
+pre-merge-commit:46e242e052f79f1d9258db61d738380b5224d3fbdb5d3b80ee39eb739c3a4a9c
+pre-commit:8cfb203e212c3b27b298d5f4439a7b2d3280152593d0f9d6038eb40ea739ebb2
+pre-push:3d2d4ff677f4338586bd7155d112ece60bce8f330a2e99f25500c17563076a3a
+pre-merge-commit:6219ed452e6eb2819d46662f8c5fe5e27be62f2bcfb89cbe67af6671f545b484
+pre-commit:cbe26018ce0bed261a9a8a644d3d3c38b606c2789787a145d7cfd0a57666b198
+pre-push:d4f121c6c024a81967e8f1f91a799fdc821111269da23ba914f4c6529057705b
+pre-merge-commit:c46b44a73a90383afdfa9245c58f2f30a4e8042cb2e48af36fd586a7cef6cb31

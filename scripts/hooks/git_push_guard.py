@@ -525,8 +525,59 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
     return cur
 
 
-def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool:
-    """True if ANY executed ``git merge`` would run on main/master (fail-closed).
+def _git_common_dir(cwd: str | None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        out = result.stdout.strip()
+        return os.path.realpath(out) if result.returncode == 0 and out else None
+    except Exception:
+        return None
+
+
+def _live_manifest_present() -> bool:
+    """Whether this install declares a local integration branch at all."""
+    return os.path.isfile(
+        os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json")
+    )
+
+
+def _live_integration_active(cwd: str | None) -> bool:
+    """Whether ``cwd``'s repository runs a local integration branch named ``live``.
+
+    Two conditions. The deploy manifest declares that this install runs one;
+    without it, a branch named ``live`` is just an ordinary branch. And the
+    target must be THIS repository (the one this guard ships in, any of its
+    worktrees): a session can run git in unrelated checkouts, whose own `live`
+    branches the manifest says nothing about. When the manifest exists but a
+    repository identity cannot be read, fail closed, as this guard does for an
+    unreadable branch."""
+    if not _live_manifest_present():
+        return False
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
+    there = _git_common_dir(cwd)
+    if here is None or there is None:
+        return True
+    return here == there
+
+
+def _walk_merge_into_main(
+    cmd: str, payload: dict, merge_git_segs: list, *, fired_on: list | None = None
+) -> bool:
+    """True if ANY executed ``git merge`` would run on main/master (fail-closed),
+    or on ``live`` where the install runs a local integration branch.
+
+    ``live`` is rebuilt by ``git commit-tree`` and therefore never the target of
+    a legitimate ``git merge`` (see ``_live_integration_active``). The
+    ``# merge-to-main-override`` sigil does NOT waive it: the git hooks refuse a
+    merge on ``live`` with no override, and this guard is what stops the one merge
+    they cannot see, a fast-forward. With the sigil present the branch is still
+    resolved, and where it cannot be (a redirected repository, an unresolvable
+    directory, a nested merge) on an install that declares a ``live``, the merge
+    is refused. When a caller passes ``fired_on``, "live" or "unresolved" is
+    appended to it for those refusals, so the message can say which.
 
     Walks the top-level segments in bash order tracking the ABSOLUTE cwd (last
     ``cd`` wins; relative cds/-C resolved against it), and checks EACH ``git
@@ -551,10 +602,15 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
     # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
-        if getattr(s, "depth", 0) > 0 and not has_trailing_override(
-            s.raw, "merge-to-main-override"
-        ):
-            return True
+        if getattr(s, "depth", 0) > 0:
+            if not has_trailing_override(s.raw, "merge-to-main-override"):
+                return True
+            # The override covers main only. A nested merge's branch cannot be
+            # resolved here, so where a `live` may exist it is refused.
+            if _live_manifest_present():
+                if fired_on is not None:
+                    fired_on.append("unresolved")
+                return True
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
@@ -565,7 +621,28 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
             None,
         )
-        if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
+        overridden = merge_here is not None and has_trailing_override(
+            raw, "merge-to-main-override"
+        )
+        if overridden:
+            # The override acknowledges a merge into main, never into `live`. So
+            # the branch is still resolved; where it cannot be (a redirected
+            # repository, an unresolvable directory) and a `live` may exist, the
+            # merge is refused rather than waved through on the override.
+            dash_c = _seg_dash_C(merge_here.argv)
+            mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
+            if repo_env_redirected or seg_redirects_repo(merge_here) or mcwd is _CWD_UNKNOWN:
+                if _live_manifest_present():
+                    if fired_on is not None:
+                        fired_on.append("unresolved")
+                    return True
+            else:
+                ocwd = mcwd if isinstance(mcwd, str) else None
+                if _current_branch(cwd=ocwd) == "live" and _live_integration_active(ocwd):
+                    if fired_on is not None:
+                        fired_on.append("live")
+                    return True
+        if merge_here is not None and not overridden:
             # This walk resolves the repo itself rather than through
             # `_effective_cwd`, so it carried the same hole: a merge pointed at a
             # repository on main by --git-dir / GIT_DIR was checked against the
@@ -577,8 +654,18 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
             if mcwd is _CWD_UNKNOWN:
                 return True
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
+            # `live` (the local integration branch) never takes a merge: it is
+            # rebuilt with `git commit-tree`, so any `git merge` there is foreign.
+            # Only where the deploy manifest exists: an install's own branch that
+            # happens to be named `live` is left alone.
             if branch is None or branch in ("main", "master"):
                 return True  # None branch (error/unresolved) fails closed
+            if branch == "live" and _live_integration_active(
+                mcwd if isinstance(mcwd, str) else None
+            ):
+                if fired_on is not None:
+                    fired_on.append("live")
+                return True
         if raw_sets_repo_env(raw):
             repo_env_redirected = True
         cd = _cd_target(raw)
@@ -10441,15 +10528,37 @@ def _run_merge_and_push_gates() -> int:
         # main. A per-segment `# merge-to-main-override` acknowledges an intended
         # on-main merge; an ambiguous cwd fails closed (blocked). See
         # _walk_merge_into_main.
-        if merge_git_segs and _walk_merge_into_main(cmd, payload, merge_git_segs):
-            print(
-                "BLOCKED: Merging into main directly is not allowed.",
-                file=sys.stderr,
-            )
-            print(
-                "Use the PR workflow instead.",
-                file=sys.stderr,
-            )
+        merge_fired_on: list[str] = []
+        if merge_git_segs and _walk_merge_into_main(
+            cmd, payload, merge_git_segs, fired_on=merge_fired_on
+        ):
+            if "unresolved" in merge_fired_on:
+                print(
+                    "BLOCKED: cannot tell which branch this merge lands on, and "
+                    "'# merge-to-main-override' covers main only, never 'live', the "
+                    "local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Re-run it as a top-level command with a literal path "
+                    "(git -C /abs/path merge ...), without GIT_DIR or --git-dir.",
+                    file=sys.stderr,
+                )
+            elif "live" in merge_fired_on:
+                print(
+                    "BLOCKED: Merging into 'live', the local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "'live' is rebuilt from origin/main plus the candidate branches "
+                    "in ~/.genesis/deploy_manifest.json, never merged into, and no "
+                    "override sigil applies. Put the change on a branch cut from "
+                    "origin/main and add that branch as a candidate.",
+                    file=sys.stderr,
+                )
+            else:
+                print("BLOCKED: Merging into main directly is not allowed.", file=sys.stderr)
+                print("Use the PR workflow instead.", file=sys.stderr)
             return 2
 
         # ── gh pr create ────────────────────────────────────────────
