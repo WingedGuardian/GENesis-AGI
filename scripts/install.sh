@@ -801,7 +801,7 @@ else
 fi
 
 if [ -n "$HOOKS_DST" ]; then
-    for hook in pre-commit pre-push; do
+    for hook in pre-commit pre-push pre-merge-commit; do
         if [ -f "$HOOKS_SRC/$hook" ]; then
             cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
             chmod +x "$HOOKS_DST/$hook"

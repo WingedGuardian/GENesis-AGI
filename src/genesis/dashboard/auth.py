@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from flask import jsonify, redirect, request, session
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.env import bearer_token
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +123,37 @@ def get_or_create_internal_api_token() -> str:
 # share so a new ``/v1/*`` surface cannot quietly ship without one.
 
 
-def check_bearer_token(surface: str) -> tuple[str, int] | None:
+def presented_bearer_is(name: str) -> bool:
+    """Whether the request's bearer credential equals the configured ``name`` token.
+
+    For callers that have ALREADY authorized the request with
+    ``check_bearer_token`` and need to know which accepted token it used — the
+    desk route logs a migration notice when a client still sends the broad one.
+    An unconfigured token never matches, including an empty credential.
+    """
+    configured = bearer_token(name)
+    auth_header = request.headers.get("Authorization", "")
+    if not configured or not auth_header.startswith("Bearer "):
+        return False
+    presented = auth_header[7:].encode("utf-8", "surrogateescape")
+    return hmac.compare_digest(presented, configured.encode("utf-8", "surrogateescape"))
+
+
+def check_bearer_token(
+    surface: str, *, accept: tuple[str, ...] = ("GENESIS_MCP_HTTP_TOKEN",),
+) -> tuple[str, int] | None:
     """Validate a machine caller's ``Authorization: Bearer`` header.
 
     Returns ``(error message, http status)`` on refusal, or ``None`` when the
     caller is authorized.
 
-    Fail-closed: with no ``GENESIS_MCP_HTTP_TOKEN`` configured the surface
+    ``accept`` names the token variables this surface honours, and nothing
+    else is ever honoured — that is the scope. The default is the broad token.
+    The desk route passes ``("GENESIS_DESK_TOKEN", "GENESIS_MCP_HTTP_TOKEN")``
+    so a desktop client can hold a credential that opens ONLY the desk route
+    (#2442), while the broad token keeps working there during the transition.
+
+    Fail-closed: with none of the accepted tokens configured the surface
     answers 503 rather than opening. These endpoints reach real authority —
     CC invocation, memory writes, the voice graduation write — so
     open-by-default is not acceptable even on a trusted overlay network.
@@ -136,11 +161,17 @@ def check_bearer_token(surface: str) -> tuple[str, int] | None:
     ``surface`` names the caller in the 503 text only, so an operator who hits
     a disabled endpoint learns which one to configure.
     """
-    # .strip() matches get_dashboard_password() — a quoted "   " in secrets.env
-    # otherwise reads as a configured token that a blank credential satisfies.
-    token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "").strip()
-    if not token:
-        return (f"{surface} disabled: GENESIS_MCP_HTTP_TOKEN not configured", 503)
+    # A bare string is the missing-comma tuple — ("GENESIS_DESK_TOKEN") — and
+    # iterating it reads SINGLE-CHARACTER env names, so any ambient one-letter
+    # variable would authenticate. Refuse it rather than fail open.
+    if isinstance(accept, str) or not accept:
+        raise ValueError("check_bearer_token needs a non-empty tuple of token names")
+    # Only CONFIGURED values are candidates. An unconfigured token reads as "",
+    # and compare_digest(b"", b"") is True — so comparing against every NAME
+    # would let "Bearer " through whenever an accepted token is unset.
+    candidates = [v for v in (bearer_token(name) for name in accept) if v]
+    if not candidates:
+        return (f"{surface} disabled: {' or '.join(accept)} not configured", 503)
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -149,9 +180,13 @@ def check_bearer_token(surface: str) -> tuple[str, int] | None:
     # Compare BYTES: compare_digest refuses non-ASCII str operands, and WSGI
     # decodes headers as latin-1 — so a header carrying any high byte raised
     # TypeError and surfaced as a 500 with a stack trace per request. Still
-    # fail-closed, but a spammable 500 where a 401 belongs.
+    # fail-closed, but a spammable 500 where a 401 belongs. Every candidate is
+    # compared (no short-circuit), so timing does not reveal which one matched.
     presented = auth_header[7:].encode("utf-8", "surrogateescape")
-    if not hmac.compare_digest(presented, token.encode("utf-8", "surrogateescape")):
+    matched = False
+    for token in candidates:
+        matched |= hmac.compare_digest(presented, token.encode("utf-8", "surrogateescape"))
+    if not matched:
         return ("Invalid bearer token", 401)
 
     return None

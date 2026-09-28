@@ -18,7 +18,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 from genesis.dashboard.auth import is_authenticated
-from genesis.env import repo_root, secrets_path
+from genesis.env import bearer_token, repo_root, secrets_path
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +160,24 @@ _OPTIONAL_OVERRIDE_KEYS: frozenset[str] = frozenset(
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+#: Keys whose runtime reader is ``bearer_token`` (stripped).
+_STRIPPED_BEARER_KEYS: frozenset[str] = frozenset(
+    ("GENESIS_MCP_HTTP_TOKEN", "GENESIS_DESK_TOKEN")
+)
+
+
 def _key_status(key_name: str) -> str:
-    """Check if a key is configured in the environment."""
+    """Check if a key is configured in the environment.
+
+    The panel must report what the key's RUNTIME reader will do. The bearer
+    tokens are read through ``genesis.env.bearer_token``, which strips, so a
+    whitespace-only value there is unset and its route answers 503 (#2466).
+    Other keys keep the raw truthiness check because their readers do not
+    strip: a whitespace-only provider key is still registered at runtime, and
+    calling it "not_set" would also skip the panel's breaker-health check.
+    """
+    if key_name in _STRIPPED_BEARER_KEYS:
+        return "configured" if bearer_token(key_name) else "not_set"
     val = os.environ.get(key_name, "")
     if val and val not in ("None", "NA", ""):
         return "configured"

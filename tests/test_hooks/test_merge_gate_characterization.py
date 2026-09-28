@@ -305,7 +305,7 @@ def _run(
     monkeypatch.setenv("_TEST_GH_CI_ROLLUP", _ci() if ci is None else ci)
     monkeypatch.setenv("_TEST_GH_BASE_REF", base)
     monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", default)
-    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")  # no clean-comment fallback unless asked
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")  # clean comments are diagnostic only
     # Default: a valid OWNER-authored scheduled-review marker AT head, so every
     # pre-existing case stays behaviour-identical (mirrors the default codex review
     # above). Scheduled-gate cases pass an explicit ``scheduled=`` to override.
