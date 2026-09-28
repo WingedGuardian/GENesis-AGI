@@ -1008,9 +1008,21 @@ verified: 640c4f2e3 2026-09-18
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
   identity remain exact. Coverage
-  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
-  its verdict and logs only stable opaque URL ids, acting on nothing until
-  compliance under the `**Source:**` prompt has been measured. Follow-up and
+  is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
+  `shadow` observes without acting): an uncovered URL re-queues its item
+  through the bounded retry lane, logging only stable opaque URL ids. It
+  shipped shadow and was flipped on measurement — 0 of the first 42 evaluations
+  under the `**Source:**` contract would have re-queued. Parking is visible: an
+  item that exhausts its retries, or a file the retry-storm guard parks (at all
+  three of its call sites), queues ONE durable owner alert per file and reason
+  per scan, naming the file by its path inside the inbox folder; an exhausted
+  item's alert also names each parked logical item (URLs as host+path plus the
+  coverage-log `url#` id, query strings dropped, token-like path segments
+  masked), while a storm alert names the file only. The retry-lane storm site
+  abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
+  does not spend a retry and leaves the row an ordinary retriable failure, so
+  the same row is asked about again; with `resilience.parking_mode:
+  live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
   pre-dispatch `pending` row is atomically returned to the bounded retry lane;
@@ -1185,7 +1197,13 @@ verified: d0627c854 2026-09-11
   `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
   OpenAI-compatible surface that routes each turn through `ModelRouter` on two
   lanes rather than spawning a CC subprocess, so a desktop client holds no model
-  credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an
+  credential. Bearer-authed with `GENESIS_DESK_TOKEN`, which opens this route
+  and no other `/v1` route or the MCP transport, so the credential a desktop
+  client holds cannot execute tools, write memory or start Claude Code; the
+  broad `GENESIS_MCP_HTTP_TOKEN` is still accepted here during a transition.
+  A client that ALSO calls a `/v1/voice/*` route (e.g. `tool_call` for memory
+  recall) still needs the broad token there; voice has no scoped token yet.
+  All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
 - **browser/**: profile/state layer only (persistent
@@ -2338,7 +2356,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 
 ```yaml subsystem-map
 entry: routing-providers
-modules: [routing, providers]
+modules: [routing, providers, decisions]
 verified: ee9ebf85c 2026-09-05
 ```
 
@@ -2499,6 +2517,13 @@ verified: ee9ebf85c 2026-09-05
 - A load-time guard warns if an `openrouter` provider flagged `free: true` points
   at a non-`:free` (paid) slug — the openrouter-free billing blind spot
   (`_detect_mislabeled_free_openrouter`, config-only, visibility not gating).
+- **decisions/**: the decision question registry (`config/decisions.yaml`),
+  the bounded-choice counterpart of the routing call sites. Each site declares
+  a `choice` / `score` / `noul` question and what it `consumes`. Only a
+  `threshold` consumer needs calibration, and it must also declare a
+  `dead_band` and `tie_rule`, so `DecisionSpec.gate()` abstains near the cut
+  instead of taking a branch a retry could reverse. DECLARED ONLY: no runtime
+  caller reads the registry yet.
 
 ## 12. Platform & data
 

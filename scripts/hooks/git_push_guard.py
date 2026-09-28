@@ -230,6 +230,10 @@ _DEGRADED_GATED = (
 )
 
 try:
+    from git_repo_selection import (  # noqa: E402
+        raw_sets_repo_env,
+        seg_redirects_repo,
+    )
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
         _REPARSE_CARRIERS,
@@ -421,6 +425,11 @@ def _seg_dash_C(argv) -> str | None:
     return None
 
 
+# Repository selection by --git-dir / --work-tree / GIT_DIR & co. lives in
+# git_repo_selection (imported above, shared with pre_push_privacy_review) so the
+# two hooks cannot disagree about what counts as a redirect.
+
+
 def _cd_target(raw: str):
     """Classify a top-level command segment as a ``cd``.
 
@@ -495,20 +504,80 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         for raw in split_segments(cmd):
             if raw == target_raw:
                 break
+            # PERSISTENT: an `export GIT_DIR=…` earlier in the command stays in
+            # force for everything after it, including after an absolute `cd` that
+            # would otherwise recover a known cwd. So it returns rather than setting
+            # cur. A COMMAND-scoped `GIT_DIR=… git status` does not persist and is
+            # not counted here (git_repo_selection.seg_sets_repo_env).
+            if raw_sets_repo_env(raw):
+                return _CWD_UNKNOWN
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
             elif cd is not None:
                 cur = _resolve_against(cur, cd)
     if seg is not None:
+        if seg_redirects_repo(seg):
+            return _CWD_UNKNOWN
         dash_c = _seg_dash_C(getattr(seg, "argv", None))
         if dash_c is not None:
             return _resolve_against(cur, dash_c)
     return cur
 
 
-def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool:
-    """True if ANY executed ``git merge`` would run on main/master (fail-closed).
+def _git_common_dir(cwd: str | None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        out = result.stdout.strip()
+        return os.path.realpath(out) if result.returncode == 0 and out else None
+    except Exception:
+        return None
+
+
+def _live_manifest_present() -> bool:
+    """Whether this install declares a local integration branch at all."""
+    return os.path.isfile(
+        os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json")
+    )
+
+
+def _live_integration_active(cwd: str | None) -> bool:
+    """Whether ``cwd``'s repository runs a local integration branch named ``live``.
+
+    Two conditions. The deploy manifest declares that this install runs one;
+    without it, a branch named ``live`` is just an ordinary branch. And the
+    target must be THIS repository (the one this guard ships in, any of its
+    worktrees): a session can run git in unrelated checkouts, whose own `live`
+    branches the manifest says nothing about. When the manifest exists but a
+    repository identity cannot be read, fail closed, as this guard does for an
+    unreadable branch."""
+    if not _live_manifest_present():
+        return False
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
+    there = _git_common_dir(cwd)
+    if here is None or there is None:
+        return True
+    return here == there
+
+
+def _walk_merge_into_main(
+    cmd: str, payload: dict, merge_git_segs: list, *, fired_on: list | None = None
+) -> bool:
+    """True if ANY executed ``git merge`` would run on main/master (fail-closed),
+    or on ``live`` where the install runs a local integration branch.
+
+    ``live`` is rebuilt by ``git commit-tree`` and therefore never the target of
+    a legitimate ``git merge`` (see ``_live_integration_active``). The
+    ``# merge-to-main-override`` sigil does NOT waive it: the git hooks refuse a
+    merge on ``live`` with no override, and this guard is what stops the one merge
+    they cannot see, a fast-forward. With the sigil present the branch is still
+    resolved, and where it cannot be (a redirected repository, an unresolvable
+    directory, a nested merge) on an install that declares a ``live``, the merge
+    is refused. When a caller passes ``fired_on``, "live" or "unresolved" is
+    appended to it for those refusals, so the message can say which.
 
     Walks the top-level segments in bash order tracking the ABSOLUTE cwd (last
     ``cd`` wins; relative cds/-C resolved against it), and checks EACH ``git
@@ -533,27 +602,72 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
     # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
-        if getattr(s, "depth", 0) > 0 and not has_trailing_override(
-            s.raw, "merge-to-main-override"
-        ):
-            return True
+        if getattr(s, "depth", 0) > 0:
+            if not has_trailing_override(s.raw, "merge-to-main-override"):
+                return True
+            # The override covers main only. A nested merge's branch cannot be
+            # resolved here, so where a `live` may exist it is refused.
+            if _live_manifest_present():
+                if fired_on is not None:
+                    fired_on.append("unresolved")
+                return True
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
+    repo_env_redirected = False  # persistent, for the same reason as in _effective_cwd
     for raw in split_segments(cmd):
         top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
         merge_here = next(
             (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
             None,
         )
-        if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
+        overridden = merge_here is not None and has_trailing_override(
+            raw, "merge-to-main-override"
+        )
+        if overridden:
+            # The override acknowledges a merge into main, never into `live`. So
+            # the branch is still resolved; where it cannot be (a redirected
+            # repository, an unresolvable directory) and a `live` may exist, the
+            # merge is refused rather than waved through on the override.
+            dash_c = _seg_dash_C(merge_here.argv)
+            mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
+            if repo_env_redirected or seg_redirects_repo(merge_here) or mcwd is _CWD_UNKNOWN:
+                if _live_manifest_present():
+                    if fired_on is not None:
+                        fired_on.append("unresolved")
+                    return True
+            else:
+                ocwd = mcwd if isinstance(mcwd, str) else None
+                if _current_branch(cwd=ocwd) == "live" and _live_integration_active(ocwd):
+                    if fired_on is not None:
+                        fired_on.append("live")
+                    return True
+        if merge_here is not None and not overridden:
+            # This walk resolves the repo itself rather than through
+            # `_effective_cwd`, so it carried the same hole: a merge pointed at a
+            # repository on main by --git-dir / GIT_DIR was checked against the
+            # checkout it ran in. Fail closed exactly as an unresolvable cwd does.
+            if repo_env_redirected or seg_redirects_repo(merge_here):
+                return True
             dash_c = _seg_dash_C(merge_here.argv)
             mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
             if mcwd is _CWD_UNKNOWN:
                 return True
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
+            # `live` (the local integration branch) never takes a merge: it is
+            # rebuilt with `git commit-tree`, so any `git merge` there is foreign.
+            # Only where the deploy manifest exists: an install's own branch that
+            # happens to be named `live` is left alone.
             if branch is None or branch in ("main", "master"):
                 return True  # None branch (error/unresolved) fails closed
+            if branch == "live" and _live_integration_active(
+                mcwd if isinstance(mcwd, str) else None
+            ):
+                if fired_on is not None:
+                    fired_on.append("live")
+                return True
+        if raw_sets_repo_env(raw):
+            repo_env_redirected = True
         cd = _cd_target(raw)
         if cd is _CWD_UNKNOWN:
             cur = _CWD_UNKNOWN
@@ -4983,7 +5097,8 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
 # opens "Codex Review: Didn't find any major issues." (the flavour sentence after —
 # "Swish!", "You're on a roll.", "Keep them coming!", … — VARIES, so anchor ONLY on the
 # stable prefix) and carries a "**Reviewed commit:** `<sha>`" line with a 10-char
-# ABBREVIATED sha. Both must be present for the comment to vouch for a commit.
+# ABBREVIATED sha. Both must be present for the comment to be REPORTED; it never vouches
+# for a commit (see ``_latest_codex_clean_comment_sha``).
 _CODEX_CLEAN_COMMENT_RE = re.compile(
     r"Codex Review:\s*Didn'?t find any major issues", re.IGNORECASE
 )
@@ -4995,22 +5110,22 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
 def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
     """The ABBREVIATED commit sha from Codex's most recent CLEAN issue-comment, or None.
 
-    Codex posts a clean RE-review as an ISSUE COMMENT, not a review object, so
-    ``_latest_codex_reviewed_sha`` (which reads the reviews API) never sees it — a clean
-    re-review would then false-block the merge (bit PR #1386 twice). This is the fallback
-    the freshness gate consults when the review-object path would otherwise block: it
-    reads ``issues/N/comments``, and for a comment authored by the Codex bot (login AND
-    ``user.type == "Bot"``) requires BOTH the clean marker AND a parseable
-    ``Reviewed commit: <sha>`` line — a marker alone never vouches (fail-closed to None).
+    DIAGNOSTIC ONLY — this value must never satisfy a gate. Codex posts a clean
+    RE-review as an ISSUE COMMENT, not a review object, and names the commit only by an
+    abbreviated id. An abbreviated id does not identify a commit: the head it is compared
+    against is whatever the branch's author pushed, so "the head starts with this prefix"
+    is not "this head was reviewed". Freshness therefore rests on the reviews API's full
+    ``commit_id`` alone (``_latest_codex_reviewed_sha``), and the freshness gate reads this
+    only to explain its block. An earlier version accepted a prefix match as freshness on
+    the argument that the head was a fixed value; the author controls that value, so the
+    argument did not hold.
 
-    Returns a PREFIX (>=7 hex, lowercased). The caller confirms it against the
-    AUTHORITATIVE head via ``head.startswith(...)``: there is NO prefix-grinding surface
-    because the head is a fixed value read from GitHub and the comment author is verified
-    as the Codex bot (a human cannot post as ``chatgpt-codex-connector[bot]``). The
-    reviews-API path keeps its full-oid identity; only this comment fallback is a prefix,
-    and only against a known head. Comments come oldest-first, so the last match (most
-    recent clean comment) wins. Tests inject via ``_TEST_GH_CODEX_COMMENTS`` (one JSON
-    object per line: ``{login, type, body}``). Fail-safe: None on any API/parse error.
+    Reads ``issues/N/comments``; for a comment authored by the Codex bot (login AND
+    ``user.type == "Bot"``) it requires BOTH the clean marker AND a parseable
+    ``Reviewed commit: <sha>`` line (fail-closed to None). Returns a lowercased prefix
+    (>=7 hex). Comments come oldest-first, so the last match wins. Tests inject via
+    ``_TEST_GH_CODEX_COMMENTS`` (one JSON object per line: ``{login, type, body}``).
+    Fail-safe: None on any API/parse error.
     """
     raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
     if raw is None:
@@ -6363,15 +6478,22 @@ def _check_codex_reviewed_head_core(
     if reviewed == head:
         return False, "", head
     # The review-object path can't vouch for the current head (Codex has no review, or
-    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT (not a review object)
-    # carrying a "Reviewed commit: <sha>" marker — accept it as freshness when it names
-    # THIS head (follow-up 7ff0fdc6). Consulted ONLY on the would-block path, so the common
-    # green case (a review object already at head, above) adds no extra API call. The
-    # comment sha is an abbreviated PREFIX, matched against the AUTHORITATIVE head — no
-    # grinding surface (fixed head, bot-verified author); see the helper's docstring.
+    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT, not a review
+    # object, and it names its commit only by an abbreviated id. That id identifies no
+    # commit — the head is whatever the branch's author pushed — so it NEVER satisfies
+    # this gate. Only a review object whose full ``commit_id`` equals the head vouches
+    # (or, via the caller, an owner-approved substitute at that exact head). The comment
+    # is still read, on this would-block path only, so the block can say it was seen
+    # and name the route that works.
     clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
+    clean_note = ""
     if clean_short and head.startswith(clean_short):
-        return False, "", head
+        clean_note = (
+            f"\nNOTE: Codex posted a clean re-review naming commit {clean_short}. A clean "
+            f"re-review arrives as a comment carrying only an abbreviated commit id, which "
+            f"does not identify the commit, so it is not accepted as a review of head "
+            f"{head[:12]}."
+        )
     if not reviewed:
         return (
             True,
@@ -6389,6 +6511,7 @@ def _check_codex_reviewed_head_core(
                 f"— so treat each surface as independently available until proven otherwise: "
                 f"post '@codex review' and check for a review at head BEFORE concluding "
                 f"Codex is unavailable."
+                f"{clean_note}"
             ),
             None,
         )
@@ -6457,6 +6580,7 @@ def _check_codex_reviewed_head_core(
                 f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
+                f"{clean_note}"
             ),
             None,
         )
@@ -10404,15 +10528,37 @@ def _run_merge_and_push_gates() -> int:
         # main. A per-segment `# merge-to-main-override` acknowledges an intended
         # on-main merge; an ambiguous cwd fails closed (blocked). See
         # _walk_merge_into_main.
-        if merge_git_segs and _walk_merge_into_main(cmd, payload, merge_git_segs):
-            print(
-                "BLOCKED: Merging into main directly is not allowed.",
-                file=sys.stderr,
-            )
-            print(
-                "Use the PR workflow instead.",
-                file=sys.stderr,
-            )
+        merge_fired_on: list[str] = []
+        if merge_git_segs and _walk_merge_into_main(
+            cmd, payload, merge_git_segs, fired_on=merge_fired_on
+        ):
+            if "unresolved" in merge_fired_on:
+                print(
+                    "BLOCKED: cannot tell which branch this merge lands on, and "
+                    "'# merge-to-main-override' covers main only, never 'live', the "
+                    "local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Re-run it as a top-level command with a literal path "
+                    "(git -C /abs/path merge ...), without GIT_DIR or --git-dir.",
+                    file=sys.stderr,
+                )
+            elif "live" in merge_fired_on:
+                print(
+                    "BLOCKED: Merging into 'live', the local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "'live' is rebuilt from origin/main plus the candidate branches "
+                    "in ~/.genesis/deploy_manifest.json, never merged into, and no "
+                    "override sigil applies. Put the change on a branch cut from "
+                    "origin/main and add that branch as a candidate.",
+                    file=sys.stderr,
+                )
+            else:
+                print("BLOCKED: Merging into main directly is not allowed.", file=sys.stderr)
+                print("Use the PR workflow instead.", file=sys.stderr)
             return 2
 
         # ── gh pr create ────────────────────────────────────────────
@@ -11515,14 +11661,6 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _head_l = _head.strip().lower() if _head else None
         if _head_l is not None and _reviewed == _head_l:
             label = "ok (current)"
-        elif (
-            _head_l is not None
-            and (_clean := _latest_codex_clean_comment_sha(pr_num, repo=repo))
-            and _head_l.startswith(_clean)
-        ):
-            # Freshness satisfied by a clean Codex ISSUE-COMMENT at head (the review
-            # object is absent or stale) — the allow path added in follow-up 7ff0fdc6.
-            label = "ok (clean comment at head)"
         elif _reviewed is None or _head is None:
             # A transiently-failed re-read must NOT read as "current" (Codex P2
             # #1373): the enforcement gate already passed, but the report must not

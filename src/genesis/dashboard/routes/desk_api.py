@@ -48,7 +48,7 @@ import uuid
 
 from flask import Blueprint, current_app, jsonify, request
 
-from genesis.dashboard.auth import check_bearer_token
+from genesis.dashboard.auth import check_bearer_token, presented_bearer_is
 
 logger = logging.getLogger("genesis.dashboard.desk_api")
 
@@ -114,6 +114,28 @@ _MAX_MAX_TOKENS = 8192
 # Flask thread on the same app that serves the dashboard and health probes.
 _MAX_CONCURRENT = 4
 _semaphore = threading.Semaphore(_MAX_CONCURRENT)
+
+
+_broad_token_noticed = threading.Event()
+
+
+def _note_broad_token_on_desk() -> None:
+    """Once per process: say so when a desk client authenticated with the BROAD token.
+
+    The broad token is still honoured here so nothing breaks on update, but a
+    transition nothing announces never ends — the client keeps holding a
+    credential that can execute tools, write memory and start Claude Code.
+    Called only after the request is authorized, so it never alters a verdict.
+    """
+    if _broad_token_noticed.is_set() or presented_bearer_is("GENESIS_DESK_TOKEN"):
+        return
+    _broad_token_noticed.set()
+    logger.warning(
+        "A desk client authenticated with GENESIS_MCP_HTTP_TOKEN, which also opens "
+        "tool execution, memory writes and the Claude Code route. Set "
+        "GENESIS_DESK_TOKEN and give the client that instead — it opens only "
+        "/v1/desk/chat/completions."
+    )
 
 
 def _err(message: str, status: int, kind: str = "invalid_request_error"):
@@ -339,10 +361,18 @@ def _route_and_wait(
 @desk_api_bp.route("/v1/desk/chat/completions", methods=["POST"])
 def desk_chat_completions():
     """Route one desktop-assistant turn through Genesis and answer OpenAI-shaped."""
-    denied = check_bearer_token("desk brain API")
+    # The desk-scoped token opens THIS route and nothing else (#2442), so a
+    # desktop client never has to hold the credential for tool execution,
+    # memory writes or the Claude Code route. The broad token is still honoured
+    # here during the transition, so existing clients keep working on update.
+    denied = check_bearer_token(
+        "desk brain API",
+        accept=("GENESIS_DESK_TOKEN", "GENESIS_MCP_HTTP_TOKEN"),
+    )
     if denied:
         message, status = denied
         return _err(message, status)
+    _note_broad_token_on_desk()
 
     # Two checks, and the second is the one that actually bounds memory.
     #

@@ -718,3 +718,53 @@ class TestCountUrlFailures:
 
         count = await inbox_items.count_url_failures(db, "/test/f.md")
         assert count == 0
+
+
+class TestSourceFieldInsideMarkdownContainers:
+    """#2020: a Source field written inside a list item or blockquote is still a
+    dedicated Source field. It used to parse as prose, so under enforce a
+    correctly-cited bulleted answer would re-queue until it parked."""
+
+    @pytest.mark.parametrize(
+        "prefix", ["- ", "* ", "+ ", "1. ", "12) ", "> ", ">> ", "> - ", "  - "],
+    )
+    def test_container_prefixed_source_line_covers(self, prefix):
+        content = "https://lnkd.in/p/eYssnmfd"
+        response = (
+            "# Inbox Evaluation\n## A post\n"
+            f"{prefix}**Source:** https://lnkd.in/p/eYssnmfd\n"
+        )
+        assert _uncovered_urls(response, content) == []
+
+    @pytest.mark.parametrize(
+        "prefix", ["- > ", "- - ", "> - > ", "1. - ", "- 2. ", "  > * "],
+    )
+    def test_nested_container_prefix_covers(self, prefix):
+        """Codex (#2447 round 1): nested containers, in either order, are still
+        container syntax. Only one list marker used to be allowed, and only
+        after the quote markers."""
+        content = "https://lnkd.in/p/eYssnmfd"
+        response = (
+            "# Inbox Evaluation\n## A post\n"
+            f"{prefix}**Source:** https://lnkd.in/p/eYssnmfd\n"
+        )
+        assert _uncovered_urls(response, content) == []
+
+    @pytest.mark.parametrize("prefix", ["- see ", "> per the ", "- - note: "])
+    def test_prose_inside_a_container_is_still_prose(self, prefix):
+        from genesis.inbox.monitor import _SOURCE_FIELD_RE
+
+        line = f"{prefix}**Source:** https://lnkd.in/p/eYssnmfd\n"
+        assert _SOURCE_FIELD_RE.search(line) is None
+
+    def test_prose_mentioning_source_label_mid_line_is_not_a_field(self):
+        """Only a LINE that is a Source field counts — the label appearing in
+        the middle of a sentence is prose, and must not become evidence."""
+        response = (
+            "# Inbox Evaluation\nThe post says **Source:** https://lnkd.in/p/"
+            "eYssnmfd is where it came from, but I did not open it.\n"
+        )
+        # This asserts the FIELD parser specifically does not claim the line.
+        from genesis.inbox.monitor import _SOURCE_FIELD_RE
+
+        assert _SOURCE_FIELD_RE.search(response) is None
