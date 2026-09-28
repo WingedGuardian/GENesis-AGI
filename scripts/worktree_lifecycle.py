@@ -1573,6 +1573,19 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         try:
             with tarfile.open(stored, "r:gz") as tf:
                 members = tf.getmembers()
+                # Real recovery extracts the archive and requires exactly ONE
+                # top-level directory — a stray root file is fine (it extracts
+                # and is ignored), a second root dir is "Unexpected archive
+                # layout". Mirror that before describing anything.
+                root_dirs = {
+                    PurePosixPath(m.name).parts[0]
+                    for m in members
+                    if m.isdir() or len(PurePosixPath(m.name).parts) >= 2
+                }
+                if len(root_dirs) != 1:
+                    print(f"Unexpected archive layout in {stored}: "
+                          f"{sorted(root_dirs)}", file=sys.stderr)
+                    return False
                 # The entry's OWN metadata sits at depth two: `<name>/.trash_meta.json`
                 # — real recovery extracts the archive and requires exactly that
                 # file at the inner root, so the preview must require it too:
@@ -1748,18 +1761,20 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
             link_target_cache[link_path] = out
         return link_target_cache[link_path]
 
-    def _path_escapes(path: str, seen: frozenset[str]) -> bool | None:
-        """Whether `path`, resolved through tracked links, lands OUTSIDE the
-        worktree. None = cannot say confidently (unreadable target or a link
-        cycle).
+    def _resolve_links(path: str, seen: frozenset[str]) -> tuple[str, str | None]:
+        """Resolve `path` through tracked links the way recovery's `realpath`
+        does. Returns ("inside", resolved-path) | ("outside", None) |
+        ("unknown", None — unreadable target or a link cycle).
 
         Each hop replaces the FIRST link prefix with its target and CARRIES the
         remaining suffix through — `a -> b/sub` with stored `a/file` must keep
         `/file` so the next hop can see `b/sub`'s own traversal (`b -> c` safe
-        is not enough; `c/sub` may itself escape). `_restore_from_dir` calls
-        `realpath` on the full destination parent, so the preview must resolve
-        the same way.
+        is not enough; `c/sub` may itself escape). An ABSOLUTE target is not
+        automatically outside: one that lands back inside `original_path` keeps
+        resolving from the worktree root, exactly as `realpath` would report
+        an inside path.
         """
+        root = os.path.normpath(original_path)
         while True:
             parts = path.split("/")
             hit = None
@@ -1768,45 +1783,57 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                     hit = i
                     break
             if hit is None:
-                return False  # fully resolved, lexically inside
+                return "inside", path
             link_path = "/".join(parts[:hit])
             if link_path in seen:
-                return None  # cycle — cannot resolve
+                return "unknown", None  # cycle — cannot resolve
             seen = seen | {link_path}
             target = _link_target(link_path)
             if not target:
-                return None
+                return "unknown", None
             if os.path.isabs(target):
-                return True
+                rel = os.path.relpath(os.path.normpath(target), root)
+                if rel == ".." or rel.startswith("../") or os.path.isabs(rel):
+                    return "outside", None
+                suffix = "/".join(parts[hit:])
+                path = suffix if rel == "." else f"{rel}/{suffix}" if suffix else rel
+                continue  # absolute link that lands back inside the worktree
             resolved = os.path.normpath(
                 os.path.join(os.path.dirname(link_path), target,
                              *parts[hit:])
             )
             if resolved == ".." or resolved.startswith("../"):
-                return True
+                return "outside", None
             path = resolved
 
     def _classify(c: str) -> str:
-        """'restorable' | 'collides' | 'escapes' | 'unknown', from the tree.
+        """'restorable' | 'exists' | 'collides' | 'escapes' | 'unknown'.
 
         'collides': a tracked NON-directory ancestor (`a` is a regular file
-        while the archive holds `a/b`) — recovery does NOT skip it; mkdir on the
-        existing file RAISES and aborts the restore partway, so it is reported
-        separately rather than silently discounted. 'escapes': a tracked
-        symlink ancestor resolves outside the worktree (invariant 2 — skipped).
-        'unknown': an ancestor's escape could not be determined."""
+        while the archive holds `a/b`) — recovery does NOT skip it; mkdir on
+        the existing file RAISES and aborts the restore partway, so it is
+        reported separately rather than silently discounted. 'escapes': the
+        destination's resolved PARENT leaves the worktree (invariant 2 —
+        skipped). 'exists': the candidate resolves through links onto a path
+        the checkout already provides (`alias -> real`, stored `alias/f`,
+        tracked `real/f`) — recovery's `lexists` skip means it writes nothing.
+        'unknown': a link could not be resolved confidently."""
         for i in range(1, c.count("/") + 1):
             ancestor = c.rsplit("/", i)[0]
             if ancestor not in tree[0]:
                 continue
-            if ancestor in tree[1]:
-                escapes = _path_escapes(ancestor, frozenset())
-                if escapes is not False:
-                    return "escapes" if escapes else "unknown"
-                continue  # in-tree link — the write still lands inside
-            if ancestor in tree[2]:
-                continue  # submodule gitlink — checkout creates a directory
+            if ancestor in tree[1] or ancestor in tree[2]:
+                continue  # links resolve below; gitlinks check out as dirs
             return "collides"  # tracked regular file in the way
+        if "/" in c:
+            status, _ = _resolve_links(c.rsplit("/", 1)[0], frozenset())
+            if status != "inside":
+                return "escapes" if status == "outside" else "unknown"
+        status, resolved = _resolve_links(c, frozenset())
+        if status != "inside":
+            return "escapes" if status == "outside" else "unknown"
+        if resolved in tree[0]:
+            return "exists"  # checkout already provides this file via a link
         return "restorable"
 
     _log(f"WOULD RECOVER {original_path} ({ref_note})")
