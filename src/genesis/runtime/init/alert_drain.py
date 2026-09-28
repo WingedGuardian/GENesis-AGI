@@ -153,17 +153,6 @@ def _make_drainer(rt):
         from genesis.env import alert_queue_root
 
         root = alert_queue_root()
-        # The root network watchdog records its Tailscale events in /run and
-        # writes nothing into this user's home; turn a new one into a queue
-        # entry here, as this user, so this same drain delivers it.
-        try:
-            from genesis.resilience.network_watchdog_events import enqueue_new_events
-
-            enqueue_new_events(
-                queue_root=root, seen_file=root.parent / "network-watchdog-seen.json"
-            )
-        except Exception:
-            logger.warning("network watchdog event check skipped", exc_info=True)
         drained = await alert_queue.drain(root, _send)
         if drained:
             logger.info("Delivered %d queued alert(s) via outreach", drained)

@@ -473,6 +473,11 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         "surplus_scheduler",
         "task_executor",
         "wal_health_monitor",
+        # Root network watchdog's Tailscale events, read by the awareness tick
+        # (resilience/network_watchdog_events.py). The observation carries only
+        # Genesis-authored text and a validated IPv4 address; the peer's
+        # hostname (chosen by another tailnet member) is deliberately left out.
+        "network_watchdog_monitor",
         # Follow-up hygiene watchdog (awareness/loop.py _FU_WATCHDOG_SOURCE) — a
         # Genesis-authored infrastructure alert, in-server first-party monitoring.
         # (It embeds a truncated follow-up snippet; that snippet's own hygiene is

@@ -248,8 +248,8 @@ def _isolate_alert_queue(tmp_path):
         "genesis.env.alert_queue_root",
         lambda: tmp_path / "alerts" / "queue",
     )
-    # The drain also reads the root network watchdog's /run telemetry for new
-    # events; a real one on the test machine must not become a queued alert.
+    # The awareness tick also reads the root network watchdog's /run telemetry;
+    # a real event on the test machine must not become an observation.
     mp.setenv("GENESIS_NETWD_STATE_FILE", str(tmp_path / "no-network-watchdog.json"))
     yield
     mp.undo()

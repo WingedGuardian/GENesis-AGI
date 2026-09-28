@@ -138,7 +138,10 @@ try:
         prior = {}
 except Exception:
     prior = {}
-heal_count = int(prior.get("heal_count", 0) or 0)
+try:
+    heal_count = max(0, int(prior.get("heal_count") or 0))
+except (TypeError, ValueError):
+    heal_count = 0  # a corrupt counter must never block the write
 last_heal = prior.get("last_heal")
 last_trigger = prior.get("last_trigger")
 if action == "healed":
@@ -257,15 +260,18 @@ _networkd_check() {
 
 # Merge the tailscale sub-object into the state file, leaving the networkd keys
 # alone. action ∈ {none, incomplete, suspect-unreachable, healed, observed,
-# ratelimited, restart-failed, unavailable, status-unparseable, off}. `diag` is
+# ratelimited, restart-failed, unverified, unavailable, status-unparseable, off}. `diag` is
 # the JSON evidence captured at the moment of a heal/observation (or empty).
 # healed / observed / restart-failed also become `last_event`, the record the
 # Genesis runtime turns into an owner alert; its `at` is the event's identity.
+# A failed write is LOUD, never swallowed: stderr reaches the journal, the
+# function returns 1, and an event caller fails the unit, because a lost event
+# means the owner is never told.
 _write_ts_state() {
     local action="$1" peer="$2" diag="$3" rc="${4:-}"
-    NETWD_STATE_FILE="$STATE_FILE" A_NOW="$NETWD_NOW" A_ACTION="$action" \
+    if ! NETWD_STATE_FILE="$STATE_FILE" A_NOW="$NETWD_NOW" A_ACTION="$action" \
         A_PEER="$peer" A_DIAG="$diag" A_RC="$rc" A_RATE="$TS_RATE_LIMIT_SEC" \
-        python3 - <<'PY' 2>/dev/null || true
+        python3 - <<'PY'
 import json, os
 path = os.environ["NETWD_STATE_FILE"]
 now = int(os.environ["A_NOW"])
@@ -283,7 +289,10 @@ try:
 except Exception:
     state = {}
 ts = state.get("tailscale") if isinstance(state.get("tailscale"), dict) else {}
-heal_count = int(ts.get("heal_count", 0) or 0)
+try:
+    heal_count = max(0, int(ts.get("heal_count") or 0))
+except (TypeError, ValueError):
+    heal_count = 0  # a corrupt counter must never block recording the event
 if action == "healed":
     heal_count += 1
     ts["last_heal"] = now
@@ -313,6 +322,10 @@ try:
 except OSError:
     pass
 PY
+    then
+        log "tailscale: could not record '$action' in $STATE_FILE — the owner will NOT be told of it"
+        return 1
+    fi
 }
 
 # Suspect peers: Active, non-zero handshake older than TS_STALE_SEC. One TSV
@@ -377,14 +390,15 @@ for peer in peers.values():
 _ts_diag() {
     local ip="$1" age="$2"
     A_IP="$ip" A_AGE="$age" python3 -c '
-import json, os, sys
+import json, os, re, sys
 try:
     status = json.load(sys.stdin)
     if not isinstance(status, dict):
         status = {}
 except Exception:
     status = {}
-self_node = status.get("Self") or {}
+self_node = status.get("Self")
+self_node = self_node if isinstance(self_node, dict) else {}
 out = {
     "peer_ip": os.environ["A_IP"],
     "handshake_age_s": int(os.environ["A_AGE"]),
@@ -393,10 +407,16 @@ out = {
     "self_relay": self_node.get("Relay"),
     "backend_state": status.get("BackendState"),
 }
-for peer in (status.get("Peer") or {}).values():
-    if os.environ["A_IP"] in (peer.get("TailscaleIPs") or []):
-        for key in ("HostName", "Relay", "CurAddr", "LastHandshake",
-                    "RxBytes", "TxBytes", "Online"):
+peers = status.get("Peer")
+for peer in (peers.values() if isinstance(peers, dict) else []):
+    if not isinstance(peer, dict):
+        continue
+    ips = peer.get("TailscaleIPs")
+    if isinstance(ips, list) and os.environ["A_IP"] in ips:
+        # HostName is chosen by the peer and this file feeds INFRASTRUCTURE.md
+        # and an LLM prompt: keep only hostname characters, as _ts_suspects does.
+        out["peer_hostname"] = re.sub(r"[^A-Za-z0-9._-]", "", str(peer.get("HostName") or ""))
+        for key in ("Relay", "CurAddr", "LastHandshake", "RxBytes", "TxBytes", "Online"):
             out["peer_" + key.lower()] = peer.get(key)
         break
 print(json.dumps(out))
@@ -548,7 +568,7 @@ _tailscale_check() {
 
     if [[ "$TS_MODE" == "observe" ]]; then
         log "tailscale: OBSERVE — tunnel to $peer stuck (handshake ${stuck_age}s old); not restarting"
-        _write_ts_state "observed" "$peer" "$diag"
+        _write_ts_state "observed" "$peer" "$diag" || return 1
         return 0
     fi
 
@@ -562,15 +582,21 @@ _tailscale_check() {
     local inv_before inv_after
     inv_before="$("$SYSTEMCTL" show tailscaled -p InvocationID --value 2>/dev/null)"
     if timeout "$TS_RESTART_TIMEOUT" "$SYSTEMCTL" try-restart tailscaled; then
-        if [[ "$("$SYSTEMCTL" is-active tailscaled 2>/dev/null || true)" == "active" ]]; then
-            _write_ts_state "healed" "$peer" "$diag"
+        inv_after="$("$SYSTEMCTL" show tailscaled -p InvocationID --value 2>/dev/null)"
+        if [[ -z "$inv_before" || -z "$inv_after" ]]; then
+            log "tailscale: try-restart ran but its InvocationID could not be read — outcome unverified, not recorded as a heal"
+            _write_ts_state "unverified" "$peer" "$diag"
             return 0
         fi
-        inv_after="$("$SYSTEMCTL" show tailscaled -p InvocationID --value 2>/dev/null)"
-        if [[ -n "$inv_before" && "$inv_after" == "$inv_before" ]]; then
-            # Nothing restarted: it was already stopped. Leave it stopped.
-            log "tailscale: tailscaled was stopped during the scan — left stopped"
+        if [[ "$inv_after" == "$inv_before" ]]; then
+            # Nothing restarted: it was stopped when try-restart ran. Whether or
+            # not something else has started it since, this run healed nothing.
+            log "tailscale: tailscaled was stopped during the scan — not restarted"
             _write_ts_state "unavailable" "" ""
+            return 0
+        fi
+        if [[ "$("$SYSTEMCTL" is-active tailscaled 2>/dev/null || true)" == "active" ]]; then
+            _write_ts_state "healed" "$peer" "$diag" || return 1
             return 0
         fi
         # It restarted (every session dropped) and is not running now.

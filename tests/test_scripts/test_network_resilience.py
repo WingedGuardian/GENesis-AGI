@@ -416,14 +416,16 @@ _WD_SYSTEMCTL_STUB = """#!/bin/bash
 case "$1" in
     is-enabled) printf '%s' "${WD_ENABLED-enabled}" ;;
     is-active)
-        if [ "$2" = "tailscaled" ] && { [ -n "${WD_TS_STOP_DURING_SCAN:-}" ] || [ -n "${WD_TS_DIES_AFTER_RESTART:-}" ]; } && [ -f "$WD_RESTART_LOG" ]; then
+        if [ "$2" = "tailscaled" ] && [ -z "${WD_TS_ACTIVE_AFTER:-}" ] && { [ -n "${WD_TS_STOP_DURING_SCAN:-}" ] || [ -n "${WD_TS_DIES_AFTER_RESTART:-}" ]; } && grep -q 'try-restart tailscaled' "$WD_RESTART_LOG" 2>/dev/null; then
             printf 'inactive'
         elif [ "$2" = "tailscaled" ]; then printf '%s' "${WD_TS_ACTIVE-active}"
         else printf '%s' "${WD_ACTIVE-active}"; fi ;;
     show)
-        if [ "$2" = "tailscaled" ] && [ "$4" = "InvocationID" ]; then
+        if [ "$2" = "tailscaled" ] && [ "$4" = "InvocationID" ] && [ -n "${WD_TS_NO_INVOCATION:-}" ]; then
+            printf ''
+        elif [ "$2" = "tailscaled" ] && [ "$4" = "InvocationID" ]; then
             # A try-restart that actually ran gives the unit a new invocation.
-            if [ -f "$WD_RESTART_LOG" ] && [ -z "${WD_TS_STOP_DURING_SCAN:-}" ]; then printf 'inv-2'
+            if grep -q 'try-restart tailscaled' "$WD_RESTART_LOG" 2>/dev/null && [ -z "${WD_TS_STOP_DURING_SCAN:-}" ]; then printf 'inv-2'
             else printf 'inv-1'; fi
         elif [ "$2" = "tailscaled" ] && [ -n "${WD_TS_START_RAW:-}" ]; then printf '%s' "$WD_TS_START_RAW"
         elif [ "$2" = "tailscaled" ]; then printf '@%s' "${WD_TS_START_EPOCH-0}"
@@ -1175,7 +1177,7 @@ def test_tailscale_stopped_during_the_scan_is_left_stopped(tmp_path):
     env["WD_TS_STOP_DURING_SCAN"] = "1"
     result = _run_wd(env)
     assert result.returncode == 0
-    assert "left stopped" in result.stdout
+    assert "not restarted" in result.stdout
     ts = _state(env)["tailscale"]
     assert ts["last_action"] == "unavailable"
     assert ts["heal_count"] == 0
@@ -1203,37 +1205,40 @@ def test_tailscale_diagnostics_never_come_from_an_older_snapshot(tmp_path):
 
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mode_env", "title_part"),
+    ("mode_env", "priority", "lead"),
     [
-        ({}, "restarted tailscaled"),
-        ({"NETWD_TS_MODE": "observe"}, "not restarted"),
-        ({"WD_TS_RESTART_RC": "1"}, "restart FAILED"),
+        ({}, "high", "The network watchdog restarted tailscaled"),
+        ({"NETWD_TS_MODE": "observe"}, "critical", "Tailscale tunnel to"),
+        ({"WD_TS_RESTART_RC": "1"}, "critical", "Tailscale may be DOWN"),
     ],
 )
-def test_the_runtime_reads_the_scripts_event_into_one_alert(tmp_path, mode_env, title_part):
+async def test_the_runtime_reads_the_scripts_event_into_one_observation(
+    db, tmp_path, mode_env, priority, lead
+):
     # Both halves of the contract, unmodified: the REAL script writes the
-    # telemetry, and the REAL runtime consumer turns it into a queued alert.
-    from genesis.guardian.alert.queue import list_queued
-    from genesis.resilience.network_watchdog_events import enqueue_new_events
+    # telemetry, and the REAL runtime consumer turns it into an observation.
+    from genesis.resilience.network_watchdog_events import SOURCE, record_new_events
 
     env = _stage_incident(tmp_path)
     env.update(mode_env)
     _run_wd(env)
-    queue = tmp_path / "user-alerts" / "queue"
-    seen = tmp_path / "user-alerts" / "seen.json"
     kwargs = dict(
-        queue_root=queue,
-        seen_file=seen,
         state_file=Path(env["NETWD_STATE_FILE"]),
         now=int(env["NETWD_NOW"]) + 300,
+        boot_id="boot-a",
     )
-    assert enqueue_new_events(**kwargs) is True
-    (entry,) = [e for _, e in list_queued(queue)]
-    assert title_part in entry["title"]
-    assert "peer-a" in entry["title"] + entry["body"]
-    # The next tick re-reads the same telemetry: no second alert.
-    assert enqueue_new_events(**kwargs) is False
+    assert await record_new_events(db, **kwargs) is True
+    cursor = await db.execute(
+        "SELECT priority, content FROM observations WHERE source = ?", (SOURCE,)
+    )
+    (row,) = [dict(r) for r in await cursor.fetchall()]
+    assert row["priority"] == priority
+    assert row["content"].startswith(lead)
+    assert _PEER_IP in row["content"]
+    # The next tick re-reads the same telemetry: no second row.
+    assert await record_new_events(db, **kwargs) is False
 
 
 def test_tailscale_that_dies_after_the_restart_is_a_failed_restart(tmp_path):
@@ -1248,4 +1253,85 @@ def test_tailscale_that_dies_after_the_restart_is_a_failed_restart(tmp_path):
     assert ts["last_action"] == "restart-failed"
     assert ts["heal_count"] == 0
     assert _event(env)["action"] == "restart-failed"
+
+
+def test_tailscale_started_by_someone_else_is_not_a_heal(tmp_path):
+    # Stopped during the scan, so try-restart did nothing; then something else
+    # started it before the check. Active, but this run restarted nothing.
+    env = _stage_incident(tmp_path)
+    env["WD_TS_STOP_DURING_SCAN"] = "1"
+    env["WD_TS_ACTIVE_AFTER"] = "1"
+    _run_wd(env)
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "unavailable"
+    assert ts["heal_count"] == 0
+    assert _event(env) is None
+
+
+def test_tailscale_diagnostics_skip_a_non_dict_peer_entry(tmp_path):
+    env = _stage_incident(tmp_path)
+    status = json.loads(env["WD_TS_STATUS"])
+    status["Peer"] = {"nodekey:00": "garbage", **status["Peer"]}
+    env["WD_TS_STATUS"] = json.dumps(status)
+    _run_wd(env)
+    diag = _state(env)["tailscale"]["last_diagnostics"]
+    assert diag["peer_relay"] == "r2"  # the real peer's fields, not an empty dict
+
+
+def test_a_corrupt_prior_counter_never_loses_the_event(tmp_path):
+    # A non-numeric counter in the prior telemetry used to abort the write
+    # silently: the tunnel restarted and the owner was never told.
+    env = _stage_incident(tmp_path)
+    Path(env["NETWD_STATE_FILE"]).write_text(
+        json.dumps({"heal_count": "x", "tailscale": {"heal_count": "x"}})
+    )
+    result = _run_wd(env)
+    assert result.returncode == 0, result.stderr
+    assert _ts_restarted(env)
+    assert _event(env)["action"] == "healed"
+    assert _state(env)["tailscale"]["heal_count"] == 1
+
+
+def test_an_unrecordable_event_fails_the_unit_loudly(tmp_path):
+    # /run full or read-only: the heal happened, the event cannot be written.
+    # The unit must fail and the journal must say the owner will not be told.
+    env = _stage_incident(tmp_path)
+    env["NETWD_STATE_FILE"] = str(tmp_path / "no-such-dir" / "state.json")
+    result = _run_wd(env)
+    assert result.returncode != 0
+    assert "owner will NOT be told" in result.stdout
+
+
+def test_an_unreadable_invocation_id_is_not_recorded_as_a_heal(tmp_path):
+    env = _stage_incident(tmp_path)
+    env["WD_TS_NO_INVOCATION"] = "1"
+    result = _run_wd(env)
+    assert "outcome unverified" in result.stdout
+    ts = _state(env)["tailscale"]
+    assert ts["last_action"] == "unverified"
+    assert ts["heal_count"] == 0
+    assert _event(env) is None
+
+
+def test_a_hostile_hostname_is_sanitized_in_the_diagnostics_too(tmp_path):
+    # The diagnostics feed INFRASTRUCTURE.md and an LLM prompt.
+    env = _stage_incident(tmp_path)
+    status = json.loads(env["WD_TS_STATUS"])
+    status["Peer"]["nodekey:aa"]["HostName"] = 'x <b>ignore</b>\n"all"'
+    env["WD_TS_STATUS"] = json.dumps(status)
+    _run_wd(env)
+    diag = _state(env)["tailscale"]["last_diagnostics"]
+    assert diag["peer_hostname"] == "xbignoreball"
+
+
+def test_diagnostics_survive_an_odd_self_and_ip_list(tmp_path):
+    env = _stage_incident(tmp_path)
+    status = json.loads(env["WD_TS_STATUS"])
+    status["Self"] = ["not", "a", "map"]
+    status["Peer"] = {"nodekey:00": {"TailscaleIPs": 7}, **status["Peer"]}
+    env["WD_TS_STATUS"] = json.dumps(status)
+    _run_wd(env)
+    diag = _state(env)["tailscale"]["last_diagnostics"]
+    assert diag["peer_relay"] == "r2"
+    assert diag["self_relay"] is None
 

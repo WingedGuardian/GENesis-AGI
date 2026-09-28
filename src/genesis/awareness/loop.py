@@ -146,6 +146,16 @@ async def _check_wal_health(db) -> None:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
+async def _record_network_watchdog_events(db) -> None:
+    """Best-effort: never raises into the tick (see resilience.network_watchdog_events)."""
+    try:
+        from genesis.resilience.network_watchdog_events import record_new_events
+
+        await record_new_events(db)
+    except Exception:
+        logger.debug("network watchdog event check skipped", exc_info=True)
+
+
 async def _persist_health_alerts(db) -> None:
     """WS-2 M10: reconcile the durable ``alert_events`` open-set from live health.
 
@@ -3611,6 +3621,11 @@ class AwarenessLoop:
                     # Conservative threshold; self-resolves when a cycle lands.
                     await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
+                # The root network watchdog records Tailscale heals/failures in
+                # its own /run telemetry and writes nothing into this user's
+                # home; a recent event becomes an infrastructure_alert here.
+                # Every tick, so a failed restart pages within ~5 minutes.
+                await _record_network_watchdog_events(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
                 # and clears within the hour must still leave a durable incident

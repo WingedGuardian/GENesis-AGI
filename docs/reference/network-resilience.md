@@ -144,21 +144,28 @@ names every node on the tailnet), and a summary goes under `tailscale` in the
 telemetry file (peer, handshake age, both relay regions, direct address, ping
 results), built from that run's own status output rather than the file.
 
-**Owner alerts are raised on the user side.** A heal, an observation or a
-failed restart is recorded as `tailscale.last_event` (action, time, peer,
-handshake age) in `/run/genesis-network-watchdog.json`. The watchdog writes
-nothing outside `/run`. On every awareness tick (5 minutes by default), the Genesis runtime,
-running as the owning user, reads that file
-(`genesis.resilience.network_watchdog_events`) and turns a NEW event into an
-entry in the user's durable alert queue, which the same tick delivers. An
-event's time is its identity (an observation's alert is keyed by peer instead,
-so a stuck peer in observe mode pages at most once a day even if the hourly
-stamp cannot be written), and the last one alerted is kept in
-`~/.genesis/alerts/network-watchdog-seen.json`, so each event alerts once. On a
-first run with no seen-file, an event more than a day old is recorded without
-alerting. Raising the alert here crosses no privilege boundary: an earlier
-design had root write queue files into the user's home, and each hardening
-round on that write found another way a user-owned directory could redirect it.
+**Owner alerts are raised on the user side, as observations.** A heal, an
+observation or a failed restart is recorded as `tailscale.last_event` (action,
+time, peer, handshake age) in `/run/genesis-network-watchdog.json`. The watchdog
+writes nothing outside `/run`. On every awareness tick (5 minutes by default),
+the Genesis runtime, running as the owning user, reads that file
+(`genesis.resilience.network_watchdog_events`) and records an event less than 6
+hours old as an `infrastructure_alert` observation:
+
+- `restart-failed` (Tailscale may be down) and `observed` (observe mode wants a
+  human) are `critical`, so the critical-observations job pages the owner once.
+- `healed` is `high`: the dashboard and the morning report, not a page. The owner
+  already felt the SSH drop, and networkd heals are handled the same way.
+
+Deduplication is the observation store's own atomic insert on a hash of the boot
+ID, the event time and the action (per peer for an observation, so a stuck peer
+in observe mode stays one row even if the hourly stamp cannot be written). A
+database error fails the insert and the next tick retries it; nothing pages
+twice, and a resolved event row is never re-raised. The observation names the peer by its IPv4 address only, because the
+hostname is chosen by another tailnet member and first-party observations carry
+no outside text. Raising the alert here crosses no privilege boundary: an earlier
+design had root write queue files into the user's home, and each hardening round
+on that write found another way a user-owned directory could redirect it.
 
 Operator lever: `NETWD_TS_MODE` = `live` (default) · `observe` (record + alert,
 never restart) · `off`. An unrecognised value degrades to `observe`, never to
