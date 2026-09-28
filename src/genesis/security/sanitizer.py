@@ -20,9 +20,7 @@ logger = logging.getLogger(__name__)
 # any pre-existing boundary markers before (re-)wrapping, so content that was
 # already wrapped at an upstream ingestion point (e.g. WebFetcher) is never
 # double-wrapped into nested tags that blur the data/instruction boundary.
-# Case-insensitive and whitespace-tolerant: a FORGED marker in untrusted text only has
-# to look like a boundary to a model, not match the exact spelling wrap_content emits.
-_BOUNDARY_MARKER_RE = re.compile(r"<\s*/?\s*external-content\b[^>]*>", re.IGNORECASE)
+_BOUNDARY_MARKER_RE = re.compile(r"<external-content[^>]*>|</external-content>")
 
 
 def strip_boundary_markers(text: str) -> str:
@@ -153,20 +151,6 @@ _PERIMETER_SOURCES = frozenset({ContentSource.EMAIL, ContentSource.INBOX})
 _PERIMETER_BLOCK_THRESHOLD = 0.6
 
 
-# Neutralize, don't delete. Deleting a forged marker can REASSEMBLE one from the text
-# around it ("</exter</external-content>nal-content>" becomes a working closer), and
-# deleting to a fixed point instead is quadratic on nested input. Rewriting the "<"
-# of anything marker-like joins nothing, so one linear pass is final. It also needs
-# no closing ">", so an unterminated forged tag is caught. Invisible format characters
-# go first, so they cannot hide a marker inside its own name.
-_INVISIBLE_RE = re.compile("[" + _CF_INVISIBLE + "]")
-_MARKER_OPEN_RE = re.compile(r"<(?=\s*/?\s*external-content)", re.IGNORECASE)
-
-
-def _neutralize_boundary_markers(text: str) -> str:
-    """Make any marker-like text inert. Linear time; cannot create a marker."""
-    return _MARKER_OPEN_RE.sub("&lt;", _INVISIBLE_RE.sub("", text))
-
 class ContentSanitizer:
     """Sanitize third-party content before LLM prompt inclusion.
 
@@ -186,14 +170,8 @@ class ContentSanitizer:
         return list(self._patterns)
 
     def wrap_content(self, content: str, source: ContentSource) -> str:
-        """Wrap content in boundary markers. Use this at ingestion points.
-
-        Any marker-like text already inside ``content`` is NEUTRALIZED first, so
-        untrusted text cannot close its own boundary (a forged closing tag would leave
-        whatever follows it outside). See ``_neutralize_boundary_markers``.
-        """
+        """Wrap content in boundary markers. Use this at ingestion points."""
         risk = _SOURCE_RISK.get(source, 0.5)
-        content = _neutralize_boundary_markers(content)
         return (
             f'<external-content source="{source.value}" risk="{risk:.1f}">\n'
             f"{content}\n"

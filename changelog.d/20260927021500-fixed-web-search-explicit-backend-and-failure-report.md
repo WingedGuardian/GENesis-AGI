@@ -16,8 +16,4 @@
   30-second voice tool-call limit. TinyFish search snippets now carry the same
   untrusted-content markers as SearXNG and Brave snippets. A failed explicit search whose credential is missing now says so (for example
   `API_KEY_TAVILY is not set`); other failures return a short summary, with the detail
-  in the server log. Boundary markers: `wrap_content` now neutralizes any marker-like
-  text inside what it wraps (case-insensitive, unterminated tags and invisible characters
-  included), so untrusted text cannot close its own boundary. It rewrites rather than
-  deletes, because deleting can reassemble a marker from the surrounding text, and it
-  runs in linear time.
+  in the server log.
