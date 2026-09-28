@@ -2147,36 +2147,85 @@ class InboxMonitor:
 
     @staticmethod
     def _mask_opaque_segments(path: str) -> str:
-        """Replace path segments that look like tokens or ids with ``…``.
+        """Replace the PARTS of path segments that look like tokens or ids with ``…``.
 
-        Share links often carry their secret in the PATH, not the query. A
-        segment is opaque when one of its ``-``/``_``-separated parts is at
-        least 12 characters and mixes letters with digits: a token or an id
-        (``a8F3kLm29QzX7pRtW4``, a document id), never a readable slug
-        (``quarterly-report``, ``2026-09-26-release-notes``). URL-safe base64
-        splits into short mixed parts at ``-``/``_`` (``Xy7_Kp2-Qw9_Rt4-Zm1``),
-        so a segment of 16+ characters with ANY mixed part is opaque too — at
-        the cost of masking a long slug with a version token (``v2-…``). A
-        heuristic: letters-only keys are masked when they are 16+ characters in
-        mixed case or any run is 20+; a lowercase letters-only token under 20, a
-        digits-only one, a short one, or one in the host name is shown.
+        Share links often carry their secret in the PATH, not the query. Each
+        segment is split into parts at ``- _ : . @ + ~``, and only the opaque
+        parts are masked, so the readable words of a slug survive
+        (``ai-rag-agents-share-…``). The first version masked whole segments,
+        which hid a readable word on 90 of 498 real inbox URLs (157 had any
+        mask) because one short id inside a slug tripped the rule (MEASURED
+        2026-09-28).
+
+        A part is TOKEN-LIKE when it mixes letters with digits, or is letters in
+        dense mixed case (3+ capitals making up a quarter or more of it, which
+        random base64 is and a word or ``camelHandle`` is not). A part is opaque
+        when it is token-like and 12+ long; when it is a short token-like part
+        in a 16+ segment whose CHARACTERS are mostly token-like (URL-safe base64
+        splits into short parts, ``Xy7_Kp2-Qw9_Rt4``, while a slug has one
+        handle like ``name7`` among words — weighting by characters, not part
+        count, stops a few lowercase parts like ``sk-proj-`` diluting a key into
+        view, MEASURED on 2000 random tokens per shape); when it is a
+        letters-only key of 16+ in mixed case (``ghp_``/``AKIA…`` shapes); or
+        when it is a run of 20+ that is not a lowercase word (hashtag slugs
+        concatenate words: ``enterprisearchitecture``), or any run of 40+.
+        Consecutive masked parts collapse into one ``…``. A heuristic: a
+        lowercase letters-only token under 40, a digits-only one under 20, a
+        short one, or one in the host name is shown.
         """
         def mixed(part: str) -> bool:
             return any(c.isdigit() for c in part) and any(c.isalpha() for c in part)
 
-        def opaque(seg: str) -> bool:
-            parts = re.split(r"[-_]", seg)
-            return any(
-                (mixed(part) and (len(part) >= 12 or len(seg) >= 16))
-                # Letters-only keys (`ghp_`, `sk-proj-`, `AKIA…` shapes): mixed
-                # case at 16+, or any run of 20+, is no English word.
-                or (len(part) >= 16 and part.isalpha() and not part.islower()
-                    and not part.istitle())
-                or len(part) >= 20
-                for part in parts
+        def camel(part: str) -> bool:
+            upper = sum(c.isupper() for c in part)
+            return (part.isalpha() and any(c.islower() for c in part)
+                    and upper >= 3 and upper * 4 >= len(part))
+
+        def tokenish(part: str) -> bool:
+            return mixed(part) or camel(part)
+
+        def dense_signal(part: str) -> bool:
+            # For the whole-segment DENSITY decision only, a looser test: 2+
+            # capitals after the first letter, or an all-caps run of 3+.
+            # Random base64 is full of both (`hqAktkkE`); a name or handle
+            # has at most one internal capital (`BytedTsinghua`). Part-level
+            # masking keeps the strict test, so a camelCase handle in a
+            # readable slug stays visible.
+            return tokenish(part) or (
+                part.isalpha()
+                and (sum(c.isupper() for c in part[1:]) >= 2
+                     or (part.isupper() and len(part) >= 3))
             )
 
-        return "/".join("…" if opaque(seg) else seg for seg in path.split("/"))
+        def opaque(part: str, seg: str, dense: bool) -> bool:
+            lower_word = part.isalpha() and part.islower()
+            return (
+                (tokenish(part) and (len(part) >= 12 or (len(seg) >= 16 and dense)))
+                # Letters-only keys: mixed case at 16+ is no English word.
+                or (len(part) >= 16 and part.isalpha() and not part.islower()
+                    and not part.istitle())
+                or (len(part) >= 20 and not lower_word)
+                or len(part) >= 40
+            )
+
+        def mask_segment(seg: str) -> str:
+            pieces = re.split(r"([-_:.@+~])", seg)  # parts at even indexes
+            parts = [p for p in pieces[::2] if p]
+            total = sum(len(p) for p in parts) or 1
+            dense = sum(len(p) for p in parts if dense_signal(p)) * 2 >= total
+            if dense and len(seg) >= 16:
+                # A token-shaped segment is masked WHOLE: showing its short
+                # letter-only pieces leaks fragments of the secret (random
+                # base64url, JWTs, `sk-proj-` keys), MEASURED on 2000 random
+                # tokens per shape. Only non-token segments keep their words.
+                return "…"
+            out = [
+                "…" if i % 2 == 0 and piece and opaque(piece, seg, dense) else piece
+                for i, piece in enumerate(pieces)
+            ]
+            return re.sub(r"…(?:[-_:.@+~]…)+", "…", "".join(out))
+
+        return "/".join(mask_segment(seg) for seg in path.split("/"))
 
     @classmethod
     def _item_labels(cls, content: str) -> list[str]:

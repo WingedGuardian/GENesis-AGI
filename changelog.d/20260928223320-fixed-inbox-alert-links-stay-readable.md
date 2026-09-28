@@ -1,0 +1,1 @@
+- **Inbox alerts show readable links again.** Masking of token-like parts of a link's path now hides only the token itself instead of the whole path segment, so a stopped post keeps its readable title words (for example `posts/…_ai-rag-agents-share-…`) while share codes and keys stay hidden.

@@ -1878,3 +1878,66 @@ async def test_offline_failure_keeps_a_row_below_a_lowered_cap(
     row = await inbox_items.get_by_id(db, "old")
     assert row["status"] == "failed", row
     assert row["retry_count"] == max_retries - 1, row
+
+
+def _path_parts(out: str) -> list[str]:
+    import re
+
+    return [p for p in re.split(r"[-_:.@+~/]", out) if p]
+
+
+@pytest.mark.parametrize(
+    ("path", "kept", "hidden"),
+    [
+        # A post slug keeps its words and its short random suffix: it is not
+        # token-shaped (MEASURED 2026-09-28: the whole-segment rule hid a
+        # readable word on 90 of 498 real inbox URLs).
+        ("/posts/someuser7_ai-rag-agents-share-7473249679800107008-bpJ9/",
+         ["someuser7", "ai", "rag", "agents", "share", "bpJ9"], []),
+        # Hashtag slugs concatenate words into 20+ lowercase runs.
+        ("/posts/someone_agentengineering-enterprisearchitecture-share-748/",
+         ["agentengineering", "enterprisearchitecture"], []),
+        # A token inside an otherwise readable path is masked on its own.
+        ("/s/a8F3kLm29QzX7pRtW4/quarterly-report", ["quarterly", "report"],
+         ["a8F3kLm29QzX7pRtW4"]),
+        ("/k/ghp_AbCdEfGhIjKlMnOpQr/x", ["x"], ["AbCdEfGhIjKlMnOpQr"]),
+    ],
+)
+def test_masking_hides_tokens_but_keeps_slug_words(path, kept, hidden):
+    out = InboxMonitor._mask_opaque_segments(path)
+    parts = _path_parts(out)
+    for word in kept:
+        assert word in parts, (path, out)
+    for token in hidden:
+        assert token not in out, (path, out)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "Xy7_Kp2-Qw9_Rt4-Zm1_Bn8",  # URL-safe base64: short mixed parts
+        "sk-proj-9swRy5pG9nJ_BUnwGTGawS-KMNJzYanbJdtOgE",  # lowercase prefix parts
+        "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0NTY3ODkw.SflKxwRJSMeKKF2QT4fw",  # JWT
+    ],
+)
+def test_a_token_shaped_segment_is_masked_whole(token):
+    """Internal review (#2447 follow-up): masking only the long parts of a
+    token-shaped segment left its short letter-only pieces visible."""
+    out = InboxMonitor._mask_opaque_segments(f"/s/{token}/view")
+    assert out == "/s/…/view", out
+
+
+def test_random_url_safe_tokens_leak_no_fragment():
+    """Recall arm from a generator, not a hand-picked list: 300 seeded random
+    base64url tokens of 24 and 32 bytes; no 6-character run of any may survive."""
+    import base64
+    import random
+    import re
+
+    rng = random.Random(2447)
+    for n in (24, 32) * 150:
+        token = base64.urlsafe_b64encode(rng.randbytes(n)).decode().rstrip("=")
+        out = InboxMonitor._mask_opaque_segments(f"/s/{token}/view")
+        core = re.sub(r"[^A-Za-z0-9]", "", token)
+        shown = re.sub(r"[^A-Za-z0-9]", "", out)
+        assert not any(core[i:i + 6] in shown for i in range(len(core) - 5)), (token, out)
