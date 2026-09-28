@@ -2188,7 +2188,7 @@ class InboxMonitor:
             # For the whole-segment DENSITY decision only, a looser test: 2+
             # capitals after the first letter, or an all-caps run of 3+.
             # Random base64 is full of both (`hqAktkkE`); a name or handle
-            # has at most one internal capital (`BytedTsinghua`). Part-level
+            # has at most one internal capital (`AcmeResearch`). Part-level
             # masking keeps the strict test, so a camelCase handle in a
             # readable slug stays visible.
             return tokenish(part) or (
