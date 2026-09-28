@@ -30,7 +30,10 @@ def strip_boundary_markers(text: str) -> str:
     before wrapping content that may already carry markers from an upstream
     ingestion point, to avoid nested wrappers that confuse the LLM boundary.
     """
-    return _BOUNDARY_MARKER_RE.sub("", text)
+    # One removal pass can REASSEMBLE a marker from the fragments around the one it
+    # removed ("</exter</external-content>nal-content>"), so whatever remains
+    # marker-like is neutralized. Linear time; nothing live survives.
+    return _neutralize_markers(_BOUNDARY_MARKER_RE.sub("", _normalize_untrusted(text)))
 
 
 # Any maximal run of characters that break — or conceal a break in — a single line
@@ -151,6 +154,25 @@ _PERIMETER_SOURCES = frozenset({ContentSource.EMAIL, ContentSource.INBOX})
 _PERIMETER_BLOCK_THRESHOLD = 0.6
 
 
+# Untrusted text is NORMALIZED once (None -> "", invisible format characters
+# removed) and then NEUTRALIZED: the "<" of anything marker-like is rewritten, not
+# deleted. Deleting can rebuild a marker from the surrounding text, and deleting to
+# a fixed point is quadratic on nested input; rewriting joins nothing, so one
+# linear pass is final, and it needs no closing ">" (unterminated tags included).
+# Plus the Unicode line/paragraph separators, which split a word invisibly too.
+_INVISIBLE_RE = re.compile("[" + _CF_INVISIBLE + "\u2028\u2029]")
+# "<" and its fullwidth form, which a model reads the same way.
+_MARKER_OPEN_RE = re.compile(r"[<\uff1c](?=\s*/?\s*external-content)", re.IGNORECASE)
+
+
+def _normalize_untrusted(text: object) -> str:
+    """None-safe, and without invisible characters that could hide a phrase or a marker."""
+    return _INVISIBLE_RE.sub("", "" if text is None else str(text))
+
+
+def _neutralize_markers(text: str) -> str:
+    return _MARKER_OPEN_RE.sub("&lt;", text)
+
 class ContentSanitizer:
     """Sanitize third-party content before LLM prompt inclusion.
 
@@ -172,6 +194,8 @@ class ContentSanitizer:
     def wrap_content(self, content: str, source: ContentSource) -> str:
         """Wrap content in boundary markers. Use this at ingestion points."""
         risk = _SOURCE_RISK.get(source, 0.5)
+        # Untrusted text must not be able to close its own boundary.
+        content = _neutralize_markers(_normalize_untrusted(content))
         return (
             f'<external-content source="{source.value}" risk="{risk:.1f}">\n'
             f"{content}\n"
@@ -192,8 +216,12 @@ class ContentSanitizer:
         detected: list[str] = []
         max_severity = 0.0
 
+        # Scan the NORMALIZED text too: it is what wrap_content hands on, so an
+        # invisible character inside a phrase must not hide it from the scanner.
+        normalized = _normalize_untrusted(content)
+        original = content if isinstance(content, str) else normalized
         for pattern in self._patterns:
-            if pattern.matches(content):
+            if pattern.matches(original) or pattern.matches(normalized):
                 detected.append(pattern.name)
                 max_severity = max(max_severity, pattern.severity_score)
 
