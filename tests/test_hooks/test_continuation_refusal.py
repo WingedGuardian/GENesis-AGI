@@ -403,6 +403,11 @@ _CARRIED = [
     ("destructive-eval", _DESTRUCTIVE, "eval 'r\"\"m -rf ~'"),
     ("worktree-eval", _HOOKS_DIR / "worktree_cwd_guard.py", "eval 'git worktree rem\"\"ove {t}'"),
     ("push-eval", _PUSH_GUARD, f"eval '{GIT} pu\"\"sh origin main'"),
+    # The push guard's carrier check is two tests joined by OR, and each covers one
+    # operation the other does not: `pr create` only the guard's own mention set,
+    # `commit` only the carrier net. One cell per arm, so each arm is pinned.
+    ("push-eval-create", _PUSH_GUARD, "eval 'gh pr cr\"\"eate --fill'"),
+    ("push-eval-commit", _PUSH_GUARD, f"eval '{GIT} com\"\"mit -n -m x'"),
 ]
 
 
