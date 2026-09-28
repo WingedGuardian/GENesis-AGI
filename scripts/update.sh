@@ -1037,7 +1037,7 @@ echo ""
 
 # Restart the tmp watchgod when its code on disk is newer than the running
 # daemon. A long-running bash loop never re-reads its script, so a tree updated
-# any other way (a hand pull, a deploy that stopped at "Nothing to do") left it
+# any other way (a hand pull, or an update run with nothing to merge) left it
 # on old code until a reboot — MEASURED on a live install, a daemon still
 # running code from before a watchgod fix that merged a day earlier.
 # try-restart never starts a unit that is not running.
