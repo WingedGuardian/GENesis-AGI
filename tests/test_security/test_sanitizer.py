@@ -283,8 +283,9 @@ class TestBoundaryMarkers:
     def test_content_not_modified_inside_markers(self, sanitizer: ContentSanitizer) -> None:
         original = "This <is> some & special \"content\" with 'quotes'"
         wrapped = sanitizer.wrap_content(original, ContentSource.WEB_FETCH)
-        # Content appears verbatim between tags
-        assert original in wrapped
+        # Content appears between the tags verbatim except "<", which is escaped so
+        # that no boundary marker can form inside untrusted text.
+        assert original.replace("<", "&lt;") in wrapped
 
     def test_sanitize_wrapped_matches_wrap(self, sanitizer: ContentSanitizer) -> None:
         """sanitize().wrapped should match wrap_content() output."""
@@ -386,7 +387,8 @@ class TestEdgeCases:
         """Content with existing XML tags doesn't confuse boundary markers."""
         content = '<div class="test">Some <b>HTML</b> content</div>'
         result = sanitizer.sanitize(content, ContentSource.WEB_FETCH)
-        assert content in result.wrapped
+        assert content.replace("<", "&lt;") in result.wrapped
+        assert result.content == content  # the original is kept unmodified
         # Our boundary tags are distinct from the content's tags
         assert result.wrapped.count("<external-content") == 1
         assert result.wrapped.count("</external-content>") == 1

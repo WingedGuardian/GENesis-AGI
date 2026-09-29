@@ -8,8 +8,11 @@ use should_block() to check if high-severity patterns warrant blocking.
 from __future__ import annotations
 
 import enum
+import functools
 import logging
 import re
+import sys
+import unicodedata
 from dataclasses import dataclass
 
 from genesis.security.patterns import InjectionPattern, load_default_patterns
@@ -30,10 +33,9 @@ def strip_boundary_markers(text: str) -> str:
     before wrapping content that may already carry markers from an upstream
     ingestion point, to avoid nested wrappers that confuse the LLM boundary.
     """
-    # One removal pass can REASSEMBLE a marker from the fragments around the one it
-    # removed ("</exter</external-content>nal-content>"), so whatever remains
-    # marker-like is neutralized. Linear time; nothing live survives.
-    return _neutralize_markers(_BOUNDARY_MARKER_RE.sub("", _normalize_untrusted(text)))
+    # Real markers are removed, then every remaining "<"-like character is escaped:
+    # whatever the removal left behind cannot form a marker, however it is spelled.
+    return _escape_markup(_BOUNDARY_MARKER_RE.sub("", _display_untrusted(text)))
 
 
 # Any maximal run of characters that break — or conceal a break in — a single line
@@ -154,24 +156,86 @@ _PERIMETER_SOURCES = frozenset({ContentSource.EMAIL, ContentSource.INBOX})
 _PERIMETER_BLOCK_THRESHOLD = 0.6
 
 
-# Untrusted text is NORMALIZED once (None -> "", invisible format characters
-# removed) and then NEUTRALIZED: the "<" of anything marker-like is rewritten, not
-# deleted. Deleting can rebuild a marker from the surrounding text, and deleting to
-# a fixed point is quadratic on nested input; rewriting joins nothing, so one
-# linear pass is final, and it needs no closing ">" (unterminated tags included).
-# Plus the Unicode line/paragraph separators, which split a word invisibly too.
-_INVISIBLE_RE = re.compile("[" + _CF_INVISIBLE + "\u2028\u2029]")
-# "<" and its fullwidth form, which a model reads the same way.
-_MARKER_OPEN_RE = re.compile(r"[<\uff1c](?=\s*/?\s*external-content)", re.IGNORECASE)
+# Two forms of untrusted text, each for one job.
+#
+# DISPLAY form (what gets wrapped and passed on): None-safe; Unicode line and
+# paragraph separators become newlines (deleting them would join words); every
+# "<"-like character is escaped. No boundary marker can form without "<", so this
+# holds however a forged marker is spelled or split, and it is a plain character
+# translation: linear, no pattern to evade and nothing to backtrack on. Legitimate
+# "<" in wrapped text reads as "&lt;", which models read without trouble.
+#
+# DETECTION forms (what the injection scanner also checks, never passed on):
+# hidden characters, chosen BY UNICODE CATEGORY rather than a hand-kept list, are
+# once deleted and once turned into spaces, so a hidden character can neither
+# split a phrase from inside a word nor glue its words together.
+_SEPARATORS = str.maketrans({" ": "\n", " ": "\n"})
+_LT_LIKE = str.maketrans({"<": "&lt;", "＜": "&lt;", "﹤": "&lt;"})
+_MARKER_NAME = "external-content"
+# The only hidden characters plain ASCII can carry: controls other than tab/newline/return.
+_ASCII_HIDDEN = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
-def _normalize_untrusted(text: object) -> str:
-    """None-safe, and without invisible characters that could hide a phrase or a marker."""
-    return _INVISIBLE_RE.sub("", "" if text is None else str(text))
+@functools.lru_cache(maxsize=1)
+def _unicode_tables() -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Built once, from the Unicode database rather than hand-kept lists.
+
+    - hidden characters (format Cf, control Cc except tab/newline/return, and
+      variation selectors) for the detection forms, mapped to delete / to space;
+    - opening angle-bracket look-alikes (names containing LESS-THAN or a LEFT /
+      LEFT-POINTING ANGLE BRACKET), which a model may read as "<".
+    """
+    delete: dict[int, None] = {}
+    for code in range(sys.maxunicode + 1):
+        ch = chr(code)
+        cat = unicodedata.category(ch)
+        if (cat == "Cf" or (cat == "Cc" and ch not in "\t\n\r")
+                or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF):
+            delete[code] = None
+    delete[0x2028] = None
+    delete[0x2029] = None
+    angles = set()
+    for code in range(0x2000, 0x10000):
+        name = unicodedata.name(chr(code), "")
+        if ("LESS-THAN" in name and "OR" not in name) or (
+            "ANGLE BRACKET" in name and "LEFT" in name
+        ) or "LEFT-POINTING ANGLE" in name:
+            angles.add(chr(code))
+    hidden = re.compile("[" + "".join(re.escape(chr(c)) for c in sorted(delete)) + "]")
+    angle = re.compile("[" + "".join(re.escape(c) for c in sorted(angles - {"＜", "﹤"})) + "]")
+    return hidden, angle
 
 
-def _neutralize_markers(text: str) -> str:
-    return _MARKER_OPEN_RE.sub("&lt;", text)
+def _display_untrusted(text: object) -> str:
+    return ("" if text is None else str(text)).translate(_SEPARATORS)
+
+
+def _escape_markup(text: str) -> str:
+    """Escape every "<" (always), and any opening angle look-alike that is followed,
+    within a short window, by the marker name. Look-alikes elsewhere are ordinary
+    punctuation and are left alone. Bounded work per look-alike, so linear overall."""
+    text = text.translate(_LT_LIKE)
+    if text.isascii():  # every look-alike is non-ASCII
+        return text
+    hidden, angle = _unicode_tables()
+
+    def _maybe(m: re.Match[str]) -> str:
+        window = hidden.sub("", text[m.end() : m.end() + 64]).lower()
+        window = window.lstrip().lstrip("/").lstrip()
+        return "&lt;" if window.startswith(_MARKER_NAME) else m.group()
+
+    return angle.sub(_maybe, text)
+
+
+def _detection_forms(text: object) -> tuple[str, str]:
+    """Two scan-only forms: hidden characters deleted (catches one inside a word)
+    and hidden characters as spaces (catches one standing in for a space)."""
+    raw = "" if text is None else str(text)
+    hidden = _ASCII_HIDDEN if raw.isascii() else _unicode_tables()[0]
+    if hidden.search(raw) is None:  # the common case: nothing to normalize
+        return raw, raw
+    return hidden.sub("", raw), hidden.sub(" ", raw)
+
 
 class ContentSanitizer:
     """Sanitize third-party content before LLM prompt inclusion.
@@ -195,7 +259,7 @@ class ContentSanitizer:
         """Wrap content in boundary markers. Use this at ingestion points."""
         risk = _SOURCE_RISK.get(source, 0.5)
         # Untrusted text must not be able to close its own boundary.
-        content = _neutralize_markers(_normalize_untrusted(content))
+        content = _escape_markup(_display_untrusted(content))
         return (
             f'<external-content source="{source.value}" risk="{risk:.1f}">\n'
             f"{content}\n"
@@ -218,10 +282,13 @@ class ContentSanitizer:
 
         # Scan the NORMALIZED text too: it is what wrap_content hands on, so an
         # invisible character inside a phrase must not hide it from the scanner.
-        normalized = _normalize_untrusted(content)
-        original = content if isinstance(content, str) else normalized
+        joined, spaced = _detection_forms(content)
+        # With no hidden characters all three forms are the same text: scan once.
+        # With some, the spaced form matches everything the original would (a hidden
+        # character never completes a pattern), so the original is not rescanned.
+        forms = (spaced,) if joined is spaced else (joined, spaced)
         for pattern in self._patterns:
-            if pattern.matches(original) or pattern.matches(normalized):
+            if any(pattern.matches(form) for form in forms):
                 detected.append(pattern.name)
                 max_severity = max(max_severity, pattern.severity_score)
 
