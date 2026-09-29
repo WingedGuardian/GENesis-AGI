@@ -1,27 +1,19 @@
-"""tmp_watchgod ORANGE loop-break + durable OOM capture.
+"""tmp_watchgod durable OOM capture.
 
-Regression cover for the 2026-08-19 runaway: cc-tmp went ORANGE (a ~382MB pytest
-tree the cache-evict never touches), and because the tier that dispatched the
-handler was measured BEFORE cleanup, the daemon re-entered ORANGE every poll and
-re-ran this tail every poll for ~4.5h. The loop-break re-measures AFTER cleanup
-and only proceeds if still over the line; when nothing is reclaimable it records
-the stuck state ONCE in the log rather than re-logging it forever. It does not
-page: per design D2 only RED pages, which this file asserts twice.
+On a NEW cgroup oom_kill the watchgod writes a durable snapshot and pages once
+(the death that started all this left no diagnosable trace), attributing the
+kill to a contained unit where the journal and the cgroup's local trigger
+counter both agree.
 
-The idle-session kill this tier used to perform was REMOVED in 2026-09 — it
-never fired and could not have reclaimed cc-tmp if it had. RED's kill is a
-separate site and is unchanged.
+This file used to also cover the v1 cc-tmp ORANGE loop-break and the RED
+session kill. Watchgod v2 (the whole-disk guardian) deleted both code paths,
+and their tests went with them; the guardian's own behaviour is pinned in
+test_watchgod_disk_guardian.py. The OOM section of the script was carried into
+v2 byte-for-byte, which is why every test below is unchanged.
 
-Plus the OOM sampler: on a NEW cgroup oom_kill it writes a durable snapshot and
-pages once (the death that started all this left no diagnosable trace).
-
-tmux is a configurable STUB (never a real session): it reports whatever sessions
-the test injects and records every kill-session call to a file, so we can assert
-no kill happens at ORANGE and that RED's still does. STUB_TMUX_ARGLOG records
-every invocation, which is what separates a DELETED call site from one whose
-predicate merely did not fire. queue_alert is overridden to a call-log so we
-can assert page-once. The script's sourcing guard loads its functions without
-starting the daemon.
+tmux and journalctl are STUBS (never a real session, never the real journal).
+queue_alert is overridden to a call-log so we can assert page-once. The
+script's sourcing guard loads its functions without starting the daemon.
 """
 
 import os
@@ -126,217 +118,8 @@ def _run(home, bind, snippet, extra_env=None):
     )
 
 
-# The snippet prefix: shrink the budget so a few MB crosses ORANGE, and override
-# queue_alert to a call-log. threshold_orange = budget*75/100; budget=4 → 3MB.
-_PRELUDE = (
-    'CC_TMP_BUDGET_MB=4; queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
-)
-
-
-def _mb(path: Path, mb: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"x" * (mb * 1024 * 1024))
-
-
-# ── Fix 3: ORANGE loop-break ─────────────────────────────────────────────
-
-
-def test_orange_resolved_by_cleanup_returns_early(tmp_path):
-    """When cache cleanup drops cc-tmp back under the ORANGE line the handler
-    returns before the stuck-state record and clears any stale flag.
-
-    The kill-log assertion is kept deliberately. This arm predates the removal
-    of the ORANGE kill loop (2026-09) and is retained as a standing guard: if
-    the loop is ever restored, it must go red here too."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    _mb(cctmp / "claude-skills" / "blob", 6)  # >3MB ORANGE; evicted by cleanup
-    stuck = home / ".genesis" / "alerts" / "tmp_orange_stuck"
-    stuck.touch()  # a stale flag from a prior episode
-    killlog = home / "killed.log"
-    env = {"STUB_SESSIONS": "cc-99:0", "STUB_ACTIVITY": "100", "STUB_KILLLOG": str(killlog)}
-    proc = _run(home, bind, _PRELUDE + "clean_cc_orange", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert not killlog.exists(), "no session may be killed at ORANGE"
-    assert not stuck.exists(), "resolving ORANGE must clear the stuck flag"
-    log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
-    assert "resolved by cache cleanup" in log, log
-
-
-def test_orange_persists_logs_stuck_once_and_never_pages(tmp_path):
-    """Non-reclaimable data keeps cc-tmp ORANGE → per design D2 this does NOT
-    page (only RED pages); it records the stuck state once (dedupe flag + a
-    single STUCK log line), not silently every poll."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    _mb(cctmp / "bigdata" / "blob", 6)  # NOT a cache/session dir → cleanup can't evict
-    killlog = home / "killed.log"
-    env = {"STUB_SESSIONS": "", "STUB_KILLLOG": str(killlog)}  # no sessions
-    # Call twice — the second must NOT re-log the stuck state (flag dedupe).
-    proc = _run(home, bind, _PRELUDE + "clean_cc_orange; clean_cc_orange", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert not killlog.exists(), "no session may be killed at ORANGE"
-    stuck = home / ".genesis" / "alerts" / "tmp_orange_stuck"
-    assert stuck.exists(), "stuck-ORANGE dedupe flag not set"
-    # D2: no page — the alert queue is never touched for a stuck ORANGE.
-    assert not (home / ".genesis" / "alerts" / "calls.log").exists(), (
-        "stuck ORANGE must NOT page (D2: only RED pages)"
-    )
-    logtext = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
-    assert logtext.count("STUCK ORANGE") == 1, (
-        f"expected exactly one STUCK log line, got {logtext.count('STUCK ORANGE')}"
-    )
-    # The ORANGE tail's two operator-facing lines are the only place a human
-    # learns what this tier did, and nothing else in this file reads them. Both
-    # made a claim about killing sessions that stopped being true in 2026-09;
-    # pin the absence, or the prose can silently regress while every arm above
-    # stays green.
-    for lie in ("evaluating idle sessions", "session is killable", "before any session kill"):
-        assert lie not in logtext, (
-            f"the ORANGE log still claims {lie!r}, but this tier no longer kills"
-        )
-
-
-def test_orange_with_an_idle_killable_session_kills_nothing(tmp_path):
-    """THE ACCEPTANCE BAR for the 2026-09 removal, and it inverts what this
-    file used to assert.
-
-    Until 2026-09 an unattached CC session idle >2h was reaped at ORANGE, and
-    the stuck state was then suppressed (`killed_any == 1`). Both halves are
-    now inverted: the session survives, and the stuck state IS recorded —
-    because reaping a session was never going to reclaim cc-tmp. MEASURED
-    across two independent log windows (2026-08-19 → 09-07 and 2026-09-22 →
-    09-25): 1,385 ORANGE polls, zero kills."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    _mb(cctmp / "bigdata" / "blob", 6)
-    killlog = home / "killed.log"
-    # STUB_ACTIVITY=100 is epoch 1970 → idle far past the old 2h threshold, so
-    # this session is exactly the one the removed loop would have killed.
-    env = {"STUB_SESSIONS": "cc-77:0", "STUB_ACTIVITY": "100", "STUB_KILLLOG": str(killlog)}
-    proc = _run(home, bind, _PRELUDE + "clean_cc_orange", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert not killlog.exists(), "ORANGE killed an idle session — the removed kill loop is back"
-    stuck = home / ".genesis" / "alerts" / "tmp_orange_stuck"
-    assert stuck.exists(), (
-        "a killable session must no longer suppress the stuck record: there is "
-        "no kill, so there is nothing to suppress it"
-    )
-    # This fixture is the ONE the old loop would have killed under, so it is the
-    # only arm where the old kill log line could ever have appeared. Pin its
-    # absence here rather than in an arm with no sessions, where it is dead.
-    logtext = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
-    assert "Killing idle" not in logtext, "the ORANGE kill log line is back\n" + logtext
-
-
-def test_orange_invokes_tmux_zero_times(tmp_path):
-    """Stronger than 'no kill was logged', and the reason this arm exists.
-
-    A no-kill assertion passes against a loop whose predicate merely failed to
-    fire — MEASURED: three of this file's pre-existing no-kill arms stayed
-    green against the unmodified script. Asserting that tmux is never invoked
-    at all (no list-sessions, no display-message, no kill-session) is what
-    distinguishes a deleted loop from a quiet one."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    _mb(cctmp / "bigdata" / "blob", 6)  # persists ORANGE → reaches the tail
-    arglog = home / "tmux-calls.log"
-    env = {
-        "STUB_SESSIONS": "cc-55:0",
-        "STUB_ACTIVITY": "100",
-        "STUB_KILLLOG": str(home / "killed.log"),
-        "STUB_TMUX_ARGLOG": str(arglog),
-    }
-    proc = _run(home, bind, _PRELUDE + "clean_cc_orange", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    # PROOF OF TAIL. Without this the arm passes when ORANGE resolves early and
-    # never reaches the region the kill loop was in — a fixture whose blob lands
-    # in an EVICTABLE cache dir does exactly that, and the RED control below
-    # cannot tell the two apart.
-    orange_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
-    assert "ORANGE persists after cleanup" in orange_log, (
-        "ORANGE returned before the tail — the zero-tmux assertion is vacuous"
-    )
-    # Negative control: the arglog machinery itself must work, or this arm is
-    # vacuous. RED does invoke tmux, so a second call proves the log records.
-    assert not arglog.exists(), (
-        f"ORANGE invoked tmux: {arglog.read_text() if arglog.exists() else ''}"
-    )
-    proc2 = _run(home, bind, _PRELUDE + "clean_cc_red", env)
-    assert proc2.returncode == 0, f"{proc2.stdout}\n{proc2.stderr}"
-    assert arglog.exists() and "list-sessions" in arglog.read_text(), (
-        "the tmux arglog never records anything — the ORANGE assertion above was vacuous"
-    )
-
-
-def test_a_second_stuck_poll_neither_relogs_nor_pages(tmp_path):
-    """The dedupe survives the removal of the kill.
-
-    This arm used to read: a later poll that reaps a newly-idle session must
-    not clear the flag, else the next still-ORANGE poll re-arms and re-logs the
-    same episode. There is no kill to clear it now, but the invariant it was
-    protecting — one episode, one STUCK line — still has to hold."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    _mb(cctmp / "bigdata" / "blob", 6)  # persists ORANGE
-    stuck = home / ".genesis" / "alerts" / "tmp_orange_stuck"
-    stuck.touch()  # a prior poll already recorded this episode
-    killlog = home / "killed.log"
-    env = {"STUB_SESSIONS": "cc-88:0", "STUB_ACTIVITY": "100", "STUB_KILLLOG": str(killlog)}
-    proc = _run(home, bind, _PRELUDE + "clean_cc_orange", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert not killlog.exists(), "no session may be killed at ORANGE"
-    assert stuck.exists(), "the stuck flag must survive a subsequent poll"
-    logtext = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
-    assert logtext.count("STUCK ORANGE") == 0, (
-        "the flag failed to dedupe: the episode was logged a second time"
-    )
-    assert not (home / ".genesis" / "alerts" / "calls.log").exists(), (
-        "stuck ORANGE must NOT page (D2: only RED pages)"
-    )
-
-
-def test_no_session_is_killed_whatever_its_attach_state(tmp_path):
-    """Attached or unattached, idle or fresh: ORANGE kills nothing.
-
-    Before 2026-09 only the unattached (`:0$`) sessions were candidates and the
-    attach state was load-bearing. It no longer is, and this arm pins the
-    generalisation rather than the old filter shape."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    _mb(cctmp / "bigdata" / "blob", 6)
-    killlog = home / "killed.log"
-    for sessions in ("cc-5:1", "cc-5:0", "cc-5:0\ncc-6:0"):
-        env = {
-            "STUB_SESSIONS": sessions,
-            "STUB_ACTIVITY": "100",
-            "STUB_KILLLOG": str(killlog),
-        }
-        proc = _run(home, bind, _PRELUDE + "clean_cc_orange", env)
-        assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-        assert not killlog.exists(), f"a session was killed at ORANGE ({sessions!r})"
-
-
-def test_RED_still_kills_an_unattached_session(tmp_path):
-    """The control for the deletion — and it had no coverage before this change.
-
-    ORANGE stopped killing; RED did not. Without this arm, removing the ORANGE
-    loop is indistinguishable from removing the tier stack's ability to kill at
-    all, and the residual argument in `clean_cc_orange` (RED is the remaining
-    escape hatch for descriptor-pinned space) would rest on nothing. MEASURED
-    2026-09-25: no watchgod suite asserted on the RED kill site."""
-    home, cctmp, bind = _sandbox(tmp_path)
-    (cctmp / "claude-1000" / "some-session-uuid").mkdir(parents=True)
-    killlog = home / "killed.log"
-    # No STUB_ACTIVITY: RED kills every unattached cc- session outright and
-    # never consults session_activity. The production script has no
-    # display-message call site left at all.
-    env = {"STUB_SESSIONS": "cc-42:0", "STUB_KILLLOG": str(killlog)}
-    proc = _run(home, bind, _PRELUDE + "clean_cc_red", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert killlog.exists() and "cc-42" in killlog.read_text(), (
-        "RED must still kill an unattached CC session"
-    )
-    # Negative control: RED honours the same unattached filter ORANGE used to.
-    killlog.unlink()
-    env["STUB_SESSIONS"] = "cc-43:1"
-    proc = _run(home, bind, _PRELUDE + "clean_cc_red", env)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert not killlog.exists(), "RED must not kill an ATTACHED session"
+# The snippet prefix: override queue_alert to a call-log.
+_PRELUDE = 'queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
 
 
 # ── Fix 4: durable OOM capture ───────────────────────────────────────────

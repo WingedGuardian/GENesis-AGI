@@ -1,14 +1,40 @@
 #!/usr/bin/env bash
-# tmp_watchgod.sh — Dual-zone temp directory protection.
+# tmp_watchgod.sh — whole-disk guardian (v2), plus cgroup OOM event capture.
 #
-# Runs as a standalone systemd user service, independent of Genesis.
-# Monitors two zones:
-#   Zone A: CC temp (~/.genesis/cc-tmp/) — tiered budget enforcement
-#   Zone B: System /tmp — gentle time-based housekeeping
+# Runs as a standalone systemd user service, independent of Genesis: it is the
+# layer that must still work when genesis-server (and every alarm inside it) is
+# the thing that has died.
 #
-# Reads config from ~/.genesis/config/watchgod.conf
-# Writes status to ~/.genesis/watchgod_state.json
-# Logs to ~/.genesis/logs/tmp_watchgod.log
+# WHAT IT GUARDS. Every distinct filesystem Genesis writes to — the root disk,
+# $HOME, /tmp, the cc-tmp volume, ~/tmp/downloads — measured by the tightest of
+# statvfs, the btrfs quota on the subvolume, and btrfs metadata/unallocated
+# space (scripts/lib/disk_guardian.sh explains each). A full disk is the one
+# failure that stops every session and service at once; nothing here exists to
+# keep any single directory under an arbitrary size.
+#
+# RETENTION. Hourly, it sweeps cc-tmp — Claude Code's working temp — of what
+# ENDED sessions left behind: a unit nothing alive holds and nothing has
+# touched for 7 days (sweep_cc_tmp). That is the only thing it deletes.
+#
+# WHAT IT DOES, by tier (per filesystem; free space AND time-to-full, see
+# dg_tier). It never deletes working files and never kills a process:
+#   YELLOW  log attribution once per episode: who is writing, and where the
+#           space went.
+#   ORANGE  reclaim: on the $HOME filesystem start genesis-disk-hygiene-
+#           pressure@standard (caches, ~/tmp older than 2 days, live writers
+#           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
+#           WARNING.
+#   RED     release the reserve file, start genesis-disk-hygiene-pressure@
+#           last-resort, page EMERGENCY with attribution.
+# Reclaim levers only run for the filesystem they can actually relieve; the
+# others page with attribution.
+#
+# v1 of this daemon enforced a 500 MB budget on cc-tmp and swept /tmp by age,
+# deleting live work to stay under numbers nobody had justified. Both are gone.
+#
+# Reads ~/.genesis/config/watchgod.conf, then watchgod.local.conf (install-local
+# overrides that the conf generator never rewrites).
+# Writes ~/.genesis/watchgod_state.json; logs to ~/.genesis/logs/tmp_watchgod.log.
 
 set -euo pipefail
 
@@ -51,6 +77,7 @@ OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
 # environment-dependent: it reads correct on a host that has the file and
 # inverts every suppression decision on one that does not.
 OOM_EVENTS_LOCAL_FILE="${OOM_EVENTS_LOCAL_FILE:-}"
+# shellcheck disable=SC2034  # read by scripts/lib/watchgod_oom.sh
 OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 
 # Durable alert queue (F.3) — emergency-tier events page Telegram via the
@@ -62,1509 +89,693 @@ if [[ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]]; then
     source "$_SCRIPT_DIR/lib/alert_queue.sh"
 else
     queue_alert() { :; }
+    queue_alert_try() { return 1; }
 fi
+
+# Whole-disk guardian: measurement + tiering + attribution primitives.
+# shellcheck source=scripts/lib/disk_guardian.sh
+source "$_SCRIPT_DIR/lib/disk_guardian.sh"
+# Liveness (open fds + cwds) for the cc-tmp retention sweep.
+# shellcheck source=scripts/lib/tmp_liveness.sh
+source "$_SCRIPT_DIR/lib/tmp_liveness.sh"
+
+LOCAL_CONF_FILE="$HOME/.genesis/config/watchgod.local.conf"
+FAST_POLL_INTERVAL=5
 
 # Defaults (overridden by config)
 CC_TMP_DIR="$HOME/.genesis/cc-tmp"
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
-# Units whose OOM kill is CONTAINMENT WORKING, not a container emergency: they
-# run inside their own MemoryMax scope on purpose (issue #1775 — 11 emergency
-# pages for the code-intel indexer dying at its own 2G cap, attributed to "the
-# container" and blamed on CC sessions, while `free` showed 17.8 GB available).
-# Space-separated unit-name prefixes; override in watchgod.conf or the env.
-# cbm-mcp- = the codebase-memory MCP wrapper (.claude/mcp/run-codebase-memory),
-# capped and NAMED for exactly this classification (issue #1792).
+DOWNLOADS_DIR="$HOME/tmp/downloads"
+# 1 = act; 0 = OBSERVE: log what each tier WOULD do, change nothing, page nothing.
+WATCHGOD_ACT=1
+# Extra paths whose filesystems should be watched, space-separated.
+WATCH_EXTRA_PATHS=""
+# Reserve file: preallocated space released at RED so the last writes (logs,
+# DB commits, the reclaim itself) have room. min(this, 1 % of the filesystem).
+RESERVE_MAX_MB=2048
+# Re-start the reclaim unit at most this often while a tier persists.
+PRESSURE_RETRIGGER_S=600
+# Where space usually goes on this layout; `du` of each is logged at YELLOW.
+DG_ATTRIBUTION_PATHS=""
 OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp-}"
 
 # ── Load config ──────────────────────────────────────────────
+# Every tunable a conf file may set. Their STARTUP values (code default, or an
+# environment override) are snapshotted once, and load_config restores them
+# before each re-read — otherwise deleting a line from watchgod.conf would keep
+# its old value until the daemon restarted, because sourcing a file only ever
+# SETS variables. MEASURED in the E2E: a forced-RED threshold outlived its
+# removal and pinned the disk at RED.
+_WG_TUNABLES="CC_TMP_DIR DOWNLOADS_DIR WATCHGOD_ACT WATCH_EXTRA_PATHS RESERVE_MAX_MB
+    POLL_INTERVAL FAST_POLL_INTERVAL
+    PRESSURE_RETRIGGER_S DG_ATTRIBUTION_PATHS
+    DG_YELLOW_PCT DG_ORANGE_PCT DG_RED_PCT DG_RED_MIN_MB
+    DG_ETA_YELLOW_MIN DG_ETA_ORANGE_MIN DG_ETA_RED_MIN DG_META_RED_PCT DG_UNALLOC_RED_MB
+    CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_UNIT_PREFIXES"
+declare -A _WG_BASE=()
+_wg_snapshot_defaults() {
+    local k
+    for k in $_WG_TUNABLES; do _WG_BASE[$k]="${!k-}"; done
+}
+
 load_config() {
-    if [[ -f "$CONF_FILE" ]]; then
-        # shellcheck source=/dev/null
-        source "$CONF_FILE"
+    local f k
+    if (( ${#_WG_BASE[@]} )); then
+        for k in $_WG_TUNABLES; do printf -v "$k" '%s' "${_WG_BASE[$k]-}"; done
     fi
-    # Headroom can never exceed capacity, so a sacred ground at or above the
-    # volume's capacity makes `headroom < SACRED_GROUND_MB` true forever: the
-    # oxygen floor is pinned ON and the in-flight guard is bypassed on every
-    # RED run, silently and permanently. That is the same failure a capacity of
-    # 0 produces, from the other knob — cc_tmp_capacity_mb already rejects
-    # that one, and leaving this side open would be arbitrary. Clamp loudly
-    # rather than fail closed: a wrong sacred ground must not stop the daemon.
-    # Conditioned on the default being a SANE sacred ground for this capacity:
-    # on a volume genuinely smaller than 150MB every value is >= capacity, the
-    # floor being permanently on is the honest answer, and clamping would only
-    # trade a real signal for a warning on every poll.
-    local _cap
-    _cap="$(cc_tmp_capacity_mb)"
-    CC_TMP_DIR="$(canon_dir "$CC_TMP_DIR")"
-    if [[ "${SACRED_GROUND_MB:-}" =~ ^[0-9]+$ ]] && (( _cap > 150 && SACRED_GROUND_MB >= _cap )); then
-        log WARN "watchgod.conf: SACRED_GROUND_MB=${SACRED_GROUND_MB} >= cc-tmp capacity ${_cap}MB — that pins the oxygen floor permanently ON and bypasses the in-flight guard on every RED run; clamping to 150"
-        SACRED_GROUND_MB=150
-    fi
-}
-
-# ── Logging ──────────────────────────────────────────────────
-log() {
-    local level="$1"; shift
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$level] $*" >> "$LOG_FILE"
-}
-
-# ── Helpers ──────────────────────────────────────────────────
-dir_usage_mb() {
-    # Total disk usage of a directory in MB
-    # NOTE: capture first, then default — pipefail + '|| echo 0' appends
-    # a spurious '0' when du exits non-zero but awk already emitted output.
-    local result
-    result=$(du -sm "$1" 2>/dev/null | awk '{print $1}') || true
-    echo "${result:-0}"
-}
-
-tmp_usage_pct() {
-    if df -T /tmp 2>/dev/null | grep -q tmpfs; then
-        # tmpfs: filesystem percentage is meaningful
-        local result
-        result=$(df --output=pcent /tmp 2>/dev/null | tail -1 | tr -d ' %') || true
-        echo "${result:-0}"
-    else
-        # Not tmpfs (/tmp on root disk): use absolute free space thresholds.
-        # Danger is the same regardless of disk size — CC sessions need ~60MB
-        # each, sacred ground is 150MB.  Percentage-based thresholds are
-        # meaningless when measuring the whole root filesystem.
-        local free_mb
-        free_mb=$(df -BM --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' M') || true
-        free_mb="${free_mb:-9999}"
-        if (( free_mb > 2048 )); then echo 0       # >2GB free  → green
-        elif (( free_mb > 1024 )); then echo 60     # 1-2GB free → yellow
-        elif (( free_mb > 500 )); then echo 75      # 500M-1GB  → orange
-        else echo 90                                 # <500MB    → red
+    for f in "$CONF_FILE" "$LOCAL_CONF_FILE"; do
+        if [[ -f "$f" ]]; then
+            # shellcheck source=/dev/null
+            source "$f"
         fi
+    done
+    CC_TMP_DIR="$(_wg_canon "$CC_TMP_DIR")"
+    DOWNLOADS_DIR="$(_wg_canon "$DOWNLOADS_DIR")"
+    # The lever degrades toward LESS authority: anything but 0 or 1 observes.
+    if [[ "$WATCHGOD_ACT" != 0 && "$WATCHGOD_ACT" != 1 ]]; then
+        _wg_warn_once act "watchgod.conf: WATCHGOD_ACT='${WATCHGOD_ACT}' is not 0 or 1 — running in OBSERVE mode"
+        WATCHGOD_ACT=0
+    fi
+    # Every numeric setting reaches shell arithmetic, where a hand-edited "10%"
+    # or "abc" aborts under set -u and a leading zero is OCTAL: "08" is a fatal
+    # "value too great for base" and "0600" silently means 384 (review
+    # finding). Each one is normalised to canonical base 10 here, once, or
+    # reset to its default — loudly. The last field is a floor: a retention age
+    # under a day would reap an idle session's temp while its owner is at
+    # lunch, so it is refused rather than obeyed.
+    local kv k d min
+    for kv in DG_YELLOW_PCT:15:0 DG_ORANGE_PCT:8:0 DG_RED_PCT:3:0 DG_RED_MIN_MB:3072:0 \
+              DG_ETA_YELLOW_MIN:360:0 DG_ETA_ORANGE_MIN:60:0 DG_ETA_RED_MIN:10:0 \
+              DG_META_RED_PCT:80:0 DG_UNALLOC_RED_MB:1024:0 RESERVE_MAX_MB:2048:0 \
+              PRESSURE_RETRIGGER_S:600:0 CC_SWEEP_INTERVAL_S:3600:0 \
+              CC_SWEEP_AGE_MIN:10080:1440 CC_SWEEP_PRESSURE_AGE_MIN:2880:1440 \
+              POLL_INTERVAL:30:1 FAST_POLL_INTERVAL:5:1; do
+        IFS=: read -r k d min <<< "$kv"
+        _wg_uint "$k" "$d" "$min"
+    done
+}
+
+_wg_uint() {
+    # Normalise variable $1 to a canonical base-10 integer >= $3, else set $2.
+    local k="$1" d="$2" min="$3" v="${!1:-}"
+    if [[ "$v" =~ ^[0-9]{1,12}$ ]] && (( 10#$v >= min )); then
+        printf -v "$k" '%s' "$(( 10#$v ))"
+    else
+        _wg_warn_once "bad_$k" "watchgod.conf: ${k}='${v}' is not a whole number >= ${min} — using ${d}"
+        printf -v "$k" '%s' "$d"
     fi
 }
 
-fs_free_mb() {
-    # Free space on the filesystem containing the given path, in MB
-    local result
-    result=$(df -BM --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
-    echo "${result:-999999}"
-}
-
-fs_total_mb() {
-    # Total size of the filesystem containing the given path, in MB. After the
-    # cc-tmp blast-radius split this reports the dedicated volume's size, so the
-    # state file (and dashboard) can show the volume's capacity/headroom, not
-    # the rootfs's.
-    local result
-    result=$(df -BM --output=size "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
-    echo "${result:-0}"
-}
-
-glob_escape() {
-    # Escape the four characters find(1)'s -path GLOB treats specially, so an
-    # exclusion built from a real directory name matches that name literally.
-    # MEASURED 2026-09-23: without this, a directory named `sp[a]re` is NOT
-    # excluded by -not -path ".../sp[a]re/*" and is reaped anyway — a silent
-    # fail-OPEN in the exact direction this guard exists to prevent.
-    printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'
-}
-
-canon_dir() {
-    # Collapse trailing slashes so a configured path and the paths find(1)
-    # emits under it agree. GNU find reproduces its START POINT verbatim,
-    # repeated slashes included — MEASURED: `find "$root//" -maxdepth 1`
-    # emits `$root//child`. Normalising only the EXCLUSION side therefore
-    # relocates the mismatch instead of closing it, which is why this is
-    # applied to the value where it ENTERS rather than at each consumer.
+_wg_canon() {
     local d="$1"
     while [[ "$d" == */ && "$d" != "/" ]]; do d="${d%/}"; done
     printf '%s' "$d"
 }
 
-live_open_paths() {
-    # Every filesystem path a live process currently holds OPEN, one per line.
-    #
-    # This is the signal the reap needs, and mtime is not: a directory being
-    # written RIGHT NOW is indistinguishable by mtime from a cache written a
-    # second ago and already closed, so a recency threshold either destroys
-    # in-flight work or refuses to reclaim fresh junk.
-    #
-    # It is a STRICTLY BETTER signal, not a complete one. A writer that opens,
-    # writes and closes each file in turn — a shell loop calling curl per file,
-    # an extractor that closes each member, a write-then-rename — holds no
-    # descriptor at the instant of the sweep and is reaped exactly as before.
-    # Do not read this as a biconditional.
-    #
-    # NEWLINE-delimited, and that is a CONSTRAINT rather than a choice. A path
-    # containing a newline splits into two records, neither of which matches —
-    # a silent fail-OPEN. The obvious fix is NUL delimiting, and it is not
-    # available here: MEASURED 2026-09-23, bash command substitution STRIPS NUL
-    # bytes outright (it warns "ignored null byte in input"), so a NUL-delimited
-    # snapshot arrives in the variable as one concatenated blob with no
-    # separators at all — strictly worse. awk itself handles RS="\0" fine; the
-    # shell variable is the limit. Accepted: every directory name this sweep
-    # meets in practice comes from mktemp, pip, or a CC session UUID.
-    #
-    # Same-uid processes only: another uid's /proc/<pid>/fd is EACCES and is
-    # skipped. cc-tmp is mode 700, so its writers are normally this user's own
-    # processes — "normally" because a root process writing there would be
-    # invisible here, which is one of the states the caller's self-test exists
-    # to notice.
-    #
-    # One find for the whole sweep rather than one per candidate directory.
-    # MEASURED 2026-09-23 on a live install: ~2,000 descriptors across ~170
-    # processes in a single pass (47-118ms), and identical counts inside a
-    # transient systemd --user unit (the service's own context) as in an
-    # interactive shell — this unit sets no ProtectProc/ProcSubset.
-    find /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null || true
+# ── Logging ──────────────────────────────────────────────────
+# Every write to the state/log filesystem is best-effort. That filesystem is
+# usually the one this daemon guards, so at RED an append can fail (ENOSPC,
+# EDQUOT, read-only) — and under `set -e` an unguarded one would take the
+# guardian down at exactly the moment it exists for (review finding; the
+# same holds for every write below).
+log() {
+    local level="$1"; shift
+    { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$level] $*" >> "$LOG_FILE"; } 2>/dev/null || true
 }
 
-dir_has_live_writer() {
-    # 0 when the snapshot ($2) holds an open path under directory $1. Used for
-    # the depth-1 REAP decision, where the unit is the whole directory: reaping
-    # only the quiet part of a tree being written leaves its writer a
-    # partially-deleted directory.
-    #
-    # The needle goes through the environment rather than `awk -v`, which
-    # expands backslash escapes in the value — MEASURED: a directory named
-    # `ta\tb` silently fails to match under -v, and fail-OPEN follows.
-    # Prefix-matched on "$1/" so a sibling sharing a name prefix
-    # (pip-unpack-a beside pip-unpack-abc) cannot match the wrong directory.
-    local dir="$1" snapshot="$2"
-    [[ -n "$snapshot" ]] || return 1
-    # No early exit on match, deliberately: awk quitting mid-stream leaves
-    # printf writing into a closed pipe, and under pipefail the pipeline then
-    # returns 141 (SIGPIPE) — which the caller reads as "no live writer", so a
-    # FOUND writer produced a reap. MEASURED 2026-09-23 at snapshots >~379KB
-    # (mawk's read buffer; implementation-dependent). Draining the whole
-    # stream costs ~60ms at 800KB and makes the status always awk's own.
-    #
-    # The " (deleted)" skip: an unlinked inode's directory reclaims nothing
-    # and would be spared forever. A real filename ending in that literal
-    # string is indistinguishable (/proc does not escape) and would hide its
-    # writer — accepted: cc-tmp is mode 700 and same-uid, so an actor who can
-    # craft that name can already delete the tree directly.
-    printf '%s\n' "$snapshot" | _wg_needle="$dir/" awk '
-        / \(deleted\)$/ { next }
-        index($0, ENVIRON["_wg_needle"]) == 1 { found = 1 }
-        END { exit !found }
-    '
+declare -A _WG_WARNED=()
+_wg_warn_once() {
+    [[ -n "${_WG_WARNED[$1]:-}" ]] && return 0
+    _WG_WARNED[$1]=1
+    log WARN "$2"
 }
 
-live_writer_units() {
-    # For each live open file under $2, the WORK UNIT its writer owns —
-    # "U <dir>" lines — plus the unit's ancestor NODES up to (never including)
-    # the root — "A <dir>" lines. Deduplicated.
-    #
-    # The unit question is where both review rounds' fixes conflicted, each
-    # correct about its own measured case: excluding the file's DEEPEST
-    # directory misses quiet siblings one level up (a pip unpack with a writer
-    # in a subdir lost already-downloaded files beside that subdir), while
-    # excluding the whole ANCESTOR CHAIN as subtrees turns one live session
-    # under claude-<uid>/ into a verdict about all of it (MEASURED live: 7
-    # project trees, 93 session dirs, 1 with live fds — a disabled reaper).
-    #
-    # Resolution — the unit is what the writer plausibly OWNS:
-    #   * an ordinary depth-1 dir (pip-unpack-*, tmpXXXX, tsx-*): the whole
-    #     depth-1 tree. mktemp-style dirs are single-owner by construction.
-    #   * under the claude-<uid>/ container: the SESSION tree
-    #     (claude-<uid>/<project>/<session>), the same 2-level layout
-    #     newest_session above already encodes. Siblings stay reclaimable.
-    #   * a loose file at the ROOT: no unit at all. CC points TMPDIR here, so
-    #     root-level held temp files are routine (227 measured live) — deriving
-    #     the root itself as a unit excluded EVERYTHING from every sweep.
-    #
-    # Unit subtrees are excluded whole ("U": node + contents); ancestors are
-    # excluded as NODES only ("A": the directory itself survives rm -rf /
-    # -delete, its OTHER children remain sweepable).
-    local snapshot="$1" root="$2"
-    [[ -n "$snapshot" ]] || return 0
-    printf '%s\n' "$snapshot" | _wg_root="$root/" awk '
-        / \(deleted\)$/ { next }
-        index($0, ENVIRON["_wg_root"]) != 1 { next }
-        {
-            rootlen = length(ENVIRON["_wg_root"])
-            rel = substr($0, rootlen + 1)
-            if (rel !~ /\//) {
-                # A loose file at the ROOT gets no directory unit (the C3
-                # floor: deriving the root dir excluded EVERYTHING) — but the
-                # FILE itself is still in-flight work, so protect exactly that
-                # one path, node-only. Bounded: one entry per held root file.
-                if (!(("F" rel) in seen)) { seen["F" rel] = 1; print "F " $0 }
-                next
-            }
-            d = rel
-            sub(/\/[^\/]*$/, "", d)       # dirname, root-relative
-            n = split(d, comp, "/")
-            # The container test is anchored to the NUMERIC-uid form on
-            # purpose: a bare /^claude-/ also matched claude-skills — the
-            # CACHE this same file deletes by name at two tiers — and
-            # reclassified it as a container, narrowing its unit to depth 2
-            # and re-creating for a neighbouring name the exact quiet-sibling
-            # loss the unit model exists to prevent (round-3 finding,
-            # MEASURED).
-            if (comp[1] ~ /^claude-[0-9]+$/) {
-                if (n < 2) {
-                    # A loose file directly under the container would derive
-                    # the container ITSELF as a unit — the C3 disabled-reaper
-                    # one level down (round-3 finding, MEASURED: one held
-                    # lockfile stopped every sibling tree being reclaimed).
-                    # Same remedy as the root floor: protect exactly the file.
-                    if (!(("F" rel) in seen)) { seen["F" rel] = 1; print "F " $0 }
-                    next
-                }
-                depth = (n < 3 ? n : 3)   # session tree, or shallower dirname
-            } else {
-                depth = 1                 # ordinary temp: depth-1 owns it
-            }
-            unit = comp[1]
-            for (i = 2; i <= depth; i++) unit = unit "/" comp[i]
-            if (!(("U" unit) in seen)) {
-                seen["U" unit] = 1
-                print "U " ENVIRON["_wg_root"] unit
-            }
-            anc = ""
-            for (i = 1; i < depth; i++) {
-                anc = (i == 1 ? comp[1] : anc "/" comp[i])
-                if (!(("A" anc) in seen)) {
-                    seen["A" anc] = 1
-                    print "A " ENVIRON["_wg_root"] anc
-                }
-            }
-        }
-    '
+_wg_json_str() {
+    # A JSON string literal for $1 (backslash, quote and control characters).
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"
+    # Any other C0 control byte is invalid inside a JSON string; replace it.
+    s="${s//[$'\x01'-$'\x08'$'\x0b'$'\x0c'$'\x0e'-$'\x1f']/?}"
+    printf '"%s"' "$s"
 }
 
-zone_a_live_exclusions() {
-    # Populate the array named by $1 with find(1) predicates protecting every
-    # live writer's WORK UNIT (see live_writer_units): "U" units as node +
-    # subtree, "A" ancestors as node only.
-    #
-    # ONE builder, consumed by EVERY Zone A deletion site. The alternative —
-    # each site matching in its own way — is what let a directory be spared by
-    # the reap loop, logged as spared, and then deleted by the cache sweep
-    # twenty lines later.
-    local -n _wg_out="$1"
-    local snapshot="$2" root="$3"
-    _wg_out=()
-    local line tag d esc count=0
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        tag="${line:0:1}"
-        d="${line:2}"
-        # N4: an absurdly large exclusion set would push find's argv past
-        # ARG_MAX, and `2>/dev/null || true` would swallow the failure — the
-        # sweep silently never runs, indistinguishable from "nothing to
-        # reclaim". Cap it LOUDLY; ~500 units is far beyond any real state
-        # (baseline: ~2,000 descriptors system-wide, 0 under cc-tmp).
-        if (( ++count > 512 )); then
-            log WARN "Zone A — live-writer exclusion set exceeded 512 entries; truncating (further live writers are NOT protected this sweep)"
-            break
-        fi
-        esc="$(glob_escape "$d")"
-        # "U" unit subtree: node + contents. "A" ancestor and "F" root-level
-        # held file: node only — an "F" exclusion is a single exact path, so
-        # it can never widen into the everything-match the C3 floor prevents.
-        _wg_out+=(-not -path "$esc")
-        if [[ "$tag" == "U" ]]; then
-            _wg_out+=(-not -path "$esc/*")
-        fi
-    done < <(live_writer_units "$snapshot" "$root")
-}
-
-cc_tmp_capacity_mb() {
-    # The cc-tmp volume's TRUE capacity in MB: min(what statfs reports, the
-    # configured cap). Two backends, verified live 2026-09-23 on two installs:
-    # on an LVM pool the volume is a real 2GiB block device and statfs tells
-    # the truth (min picks it); on a btrfs pool the volume is a subvolume
-    # whose 2GiB quota lives in a qgroup statfs CANNOT see — df reports the
-    # whole shared pool (349GB measured), so the configured number is the only
-    # true one (min picks it). A statfs failure (0) falls back to the config.
-    local fs_total conf
-    fs_total="$(fs_total_mb "$CC_TMP_DIR")"
-    conf="${CC_TMP_CAPACITY_MB:-2048}"
-    # A hand-edited conf value like "2G" would kill the daemon at the
-    # arithmetic below under set -e; degrade to the default instead. ZERO is
-    # rejected by the same test on purpose: a capacity of 0 makes every
-    # headroom negative, which pins the oxygen floor permanently ON and so
-    # bypasses the in-flight guard forever — the failure direction this whole
-    # helper exists to avoid.
-    [[ "$conf" =~ ^[1-9][0-9]*$ ]] || conf=2048
-    if (( fs_total > 0 && fs_total < conf )); then
-        echo "$fs_total"
-    else
-        echo "$conf"
-    fi
-}
-
-cc_tmp_headroom_mb() {
-    # Headroom in MB — how much more cc-tmp can grow before it hits its own
-    # configured ceiling. ONE term, deliberately: capacity - used.
-    #
-    # fs_free is DELIBERATELY NOT folded in, and this is the third position on
-    # that question — the first two were wrong and both are recorded here so
-    # the cap does not get re-added a fourth time.
-    #
-    # The floor is a statement about CC-TMP'S OWN ceiling. fs_free answers a
-    # different question — how full is the filesystem cc-tmp happens to sit on
-    # — and on every backend this install supports that filesystem is SHARED:
-    #   * plain directory (unsupported pool, failed create/attach, bare metal)
-    #     -> the host root filesystem;
-    #   * btrfs subvolume (the isolated case) -> the whole pool. MEASURED
-    #     2026-09-24: cc-tmp and / report the SAME device and the SAME 200641MB
-    #     avail, while cc-tmp is genuinely its own mount point. So an
-    #     is-it-its-own-mount test — the obvious discriminator, and the one
-    #     tried second — passes on btrfs and lets the shared number straight
-    #     back in.
-    # Folding it in therefore makes "the host disk is full" indistinguishable
-    # from "cc-tmp is full", and the floor's response (spare nothing, delete
-    # everything) is correct for the second while being destructive AND futile
-    # for the first: it would wipe every in-flight write inside a near-empty
-    # cc-tmp, on every poll, without freeing a byte that moves the host disk.
-    #
-    # The concern that motivated the cap — that capacity minus usage can
-    # overstate what is actually writable — is already answered where it can be
-    # answered honestly: cc_tmp_capacity_mb takes min(fs_total, configured), so
-    # on a backend whose statfs tells the truth the capacity is already the
-    # device's real size. And a genuine host-level disk emergency keeps its own
-    # independent RED trigger in check_cc_tmp; it simply does not license the
-    # bypass.
-    #
-    # $1 is the already-measured usage, because du of cc-tmp is not free and
-    # check_cc_tmp has measured it one line earlier; a direct call measures it.
-    local used="${1:-}" capacity
-    [[ "$used" =~ ^[0-9]+$ ]] || used="$(dir_usage_mb "$CC_TMP_DIR")"
-    capacity="$(cc_tmp_capacity_mb)"
-    echo "$(( capacity - used ))"
-}
-
-cc_control_plane_paths() {
-    # The CONCRETE directories CC binds its cross-session control plane under,
-    # one per line. ENUMERATED, never glob-matched — see below for why the glob
-    # this replaced was both too wide and, in one case, aimed at the wrong
-    # thing. READ from the shipped CC binary:
-    #
-    #   sockets : ${XDG_RUNTIME_DIR:-<os.tmpdir()>}/cc-socks/<pid>.sock, and
-    #             /tmp/cc-socks-<uid>/<pid>.sock when the first would exceed
-    #             the ~103-byte sockaddr_un limit;
-    #   daemon  : /tmp/cc-daemon-<uid>/<8-hex-of-cwd> — ALWAYS /tmp, never the
-    #             temp dir, so a cc-tmp-side cc-daemon rule protects nothing.
-    #
-    # THE FALLBACK CANNOT BE RESOLVED WITH ${XDG_RUNTIME_DIR:-...} HERE, and
-    # that is the trap this function exists to avoid. MEASURED on a live
-    # install: this daemon runs as a systemd user unit with
-    # XDG_RUNTIME_DIR=/run/user/<uid>, while a CC session under tmux has it
-    # UNSET and falls back to its TMPDIR — so both .../cc-tmp/cc-socks and
-    # /run/user/<uid>/cc-socks existed at once. Evaluating the default-expansion
-    # in THIS process resolves to the runtime dir and silently stops sparing the
-    # cc-tmp one, which is the only one inside the budget we sweep. Enumerate
-    # every candidate instead of computing one.
-    #
-    # /run/user/<uid> is deliberately absent: it is under neither sweep root, so
-    # no exclusion can matter there.
-    local uid
-    uid="$(id -u 2>/dev/null || echo 0)"
-    # CANONICALIZE the trailing slash. CC_TMP_DIR is config-settable, and
-    # `dir/` yields the exclusion `dir//cc-socks` while find(1), rooted at
-    # `dir/`, emits `dir/cc-socks` — the exclusion then matches nothing and
-    # the sweep deletes the directory this function exists to spare.
-    # REPRODUCED 2026-09-26: with a trailing slash the empty cc-socks was
-    # DELETED while a plain-path control arm spared it.
-    printf '%s\n' \
-        "$(canon_dir "$CC_TMP_DIR")/cc-socks" \
-        "/tmp/cc-socks" \
-        "/tmp/cc-socks-${uid}" \
-        "/tmp/cc-daemon-${uid}"
-}
-
-cc_control_plane_excl() {
-    # Populate the array named by $1 with find(1) predicates sparing each
-    # control-plane directory AND its subtree.
-    local -n _cp_out="$1"
-    _cp_out=()
+# ── Which filesystems ────────────────────────────────────────
+watched_paths() {
+    # One path per line; the caller deduplicates by device. A path that does
+    # not exist yet (no downloads dir on this install) is simply skipped.
     local p
-    while IFS= read -r p; do
-        [[ -n "$p" ]] || continue
-        # The subtree clause is -type d SCOPED. Without it the exclusion also
-        # spares regular FILES inside the tree, which breaks the object-level
-        # contract test_red_reclaims_files_inside_socket_dir has pinned since
-        # the 2026-09-05 fix: a log file beside a socket is garbage, only the
-        # DIRECTORY is control plane. Sockets are already spared by -not -type s.
-        # -path takes a GLOB, not a literal, so a bracket/star/question mark
-        # in a config-settable CC_TMP_DIR silently stops the exclusion from
-        # matching its own directory. Same fail-OPEN glob_escape already
-        # guards for live-writer paths. REPRODUCED 2026-09-26: with
-        # CC_TMP_DIR=.../home[x] the empty cc-socks was DELETED while the
-        # plain-path control arm spared it.
-        #
-        # The ESCAPED form is only for the predicates. Callers that test the
-        # path on disk or log it keep the literal from cc_control_plane_paths,
-        # which is why the escaping lives here and not there.
-        local esc
-        esc="$(glob_escape "$p")"
-        _cp_out+=( -not -path "$esc" -not \( -type d -path "$esc/*" \) )
-    done < <(cc_control_plane_paths)
+    for p in / "$HOME" /tmp "$CC_TMP_DIR" "$DOWNLOADS_DIR" $WATCH_EXTRA_PATHS; do
+        [[ -e "$p" ]] && printf '%s\n' "$p"
+    done
+    return 0
 }
 
-reap_dir_sparing_sockets() {
-    # Object-level deletion that NEVER removes unix sockets. CC binds one
-    # socket per live session under cc-tmp (cross-session messaging); they are
-    # 0 bytes, so deleting them reclaims nothing and silently severs the local
-    # coordination plane — sessions keep listening on bound-but-unlinked
-    # sockets and inbound connects fail ENOENT (measured, 2026-09-05 RED
-    # incident). Deletes everything else depth-first; a socket's ancestor dirs
-    # stay non-empty so they survive; a dir holding no sockets is removed
-    # entirely, exactly like rm -rf. -delete failures on non-empty dirs are
-    # expected and suppressed; GNU find continues past them.
+home_dev() { stat -c %d -- "$HOME" 2>/dev/null || echo -; }
+
+# ── Episode bookkeeping ──────────────────────────────────────
+# One episode per filesystem: from leaving GREEN to returning to it. Pages and
+# attribution fire once per (filesystem, tier) per episode; the reserve and the
+# reclaim re-evaluate on every RED poll.
+_ep_file() { printf '%s/episode_%s_%s' "$DG_STATE_DIR" "$1" "$2"; }
+episode_seen() { [[ -f "$(_ep_file "$1" "$2")" ]]; }
+episode_mark() { { mkdir -p "$DG_STATE_DIR" && : > "$(_ep_file "$1" "$2")"; } 2>/dev/null || true; }
+episode_clear() { rm -f "$DG_STATE_DIR/episode_${1}_"* 2>/dev/null || true; }
+
+# ── Attribution ──────────────────────────────────────────────
+attribution_paths() {
+    local p
+    if [[ -n "$DG_ATTRIBUTION_PATHS" ]]; then
+        for p in $DG_ATTRIBUTION_PATHS; do printf '%s\n' "$p"; done
+        return 0
+    fi
+    for p in "$HOME/tmp" "$DOWNLOADS_DIR" "$CC_TMP_DIR" "$HOME/genesis/.claude/worktrees" \
+             "$HOME/genesis/data" "$HOME/.genesis" "$HOME/.cache" "$HOME/.npm" \
+             "$HOME/.local/share" "$HOME/.claude"; do
+        [[ -e "$p" ]] && printf '%s\n' "$p"
+    done
+    return 0
+}
+
+log_attribution() {
+    # $1 path, $2 device, $3 tier, $4 top-writers text. The writer list is
+    # computed by the caller (cheap); the du is backgrounded, niced and bounded,
+    # because du across a large tree inside the poll loop would stop the very
+    # measurements that matter while the disk fills.
+    local path="$1" dev="$2" tier="$3" writers="$4"
+    log WARN "disk ${tier^^} [${path}] top writers by bytes written since the last poll (own uid only; blind to tmpfs):"
+    if [[ -n "$writers" ]]; then
+        while IFS= read -r line; do log WARN "  writer: $line"; done <<< "$writers"
+    else
+        log WARN "  writer: (none measurable)"
+    fi
+    # Detached from the daemon's stdio: it logs through log() only, and must
+    # never hold a pipe a caller is waiting on.
+    (
+        local -a targets=()
+        local t
+        if [[ "$dev" == "${HOME_KEY:-$(home_dev)}" ]]; then
+            while IFS= read -r t; do
+                [[ "$(stat -c %d -- "$t" 2>/dev/null)" == "${dev%%[qm]*}" ]] && targets+=("$t")
+            done < <(attribution_paths)
+        else
+            # The WATCHED path's children, not its mount's: an extra watched
+            # path can sit on a mount (even /) far larger than it.
+            while IFS= read -r -d '' t; do targets+=("$t"); done \
+                < <(find "$path" -mindepth 1 -maxdepth 1 -xdev -print0 2>/dev/null)
+        fi
+        (( ${#targets[@]} )) || exit 0
+        timeout 120 nice -n 19 ionice -c3 du -smx -- "${targets[@]}" 2>/dev/null \
+            | sort -rn | head -10 | while IFS= read -r line; do
+                log WARN "  du [${path}]: $line"
+            done
+    ) </dev/null >/dev/null 2>&1 &
+}
+
+# ── Reserve file ─────────────────────────────────────────────
+RESERVE_FILE="$DG_STATE_DIR/reserve"
+
+reserve_ensure() {
+    # Create the reserve on the $HOME filesystem when it is healthy. $1 free
+    # MB, $2 total MB. Never takes the filesystem below its ORANGE floor.
+    local free="$1" total="$2" size orange_floor
+    [[ -f "$RESERVE_FILE" ]] && return 0
+    size=$(( total / 100 ))
+    (( size > RESERVE_MAX_MB )) && size=$RESERVE_MAX_MB
+    (( size >= 64 )) || return 0
+    orange_floor=$(( total * DG_ORANGE_PCT / 100 ))
+    (( free - size > orange_floor )) || return 0
+    if (( WATCHGOD_ACT == 0 )); then
+        _wg_warn_once reserve_obs "OBSERVE: would create a ${size} MB reserve file at ${RESERVE_FILE}"
+        return 0
+    fi
+    mkdir -p "$DG_STATE_DIR" 2>/dev/null || true
+    if fallocate -l "${size}M" "$RESERVE_FILE" 2>/dev/null; then
+        log INFO "reserve file created: ${size} MB at ${RESERVE_FILE} (released at RED)"
+    else
+        rm -f "$RESERVE_FILE" 2>/dev/null || true
+        _wg_warn_once reserve_fail "reserve file could not be preallocated (fallocate unsupported here?) — RED has no reserve to release"
+    fi
+    return 0
+}
+
+reserve_release() {
+    [[ -f "$RESERVE_FILE" ]] || { echo "none held"; return 0; }
+    local sz
+    sz=$(( $(stat -c %s -- "$RESERVE_FILE" 2>/dev/null || echo 0) / 1048576 ))
+    if (( WATCHGOD_ACT == 0 )); then
+        echo "OBSERVE: would release ${sz} MB"
+        return 0
+    fi
+    rm -f -- "$RESERVE_FILE" && echo "released ${sz} MB (a snapshot may still pin its blocks; the next poll measures what was actually freed)"
+    return 0
+}
+
+# ── Action stamps and pages ──────────────────────────────────
+# Two rules every stamp, marker and page in this daemon follows (review
+# findings, two rounds): an ACT-mode record is written only after the action
+# SUCCEEDED — a stamp written before a failed start, or a page marked sent
+# before a failed enqueue, silences the retry for a whole interval or episode
+# — and an OBSERVE-mode poll keeps its own records (_wg_mode_tag), so flipping
+# WATCHGOD_ACT 0→1 mid-episode acts at once instead of inheriting "already done".
+_wg_mode_tag() { (( WATCHGOD_ACT )) && return 0; printf '_observe'; }
+
+_wg_due() {
+    # 0 if the stamp named $1 (mode-scoped) is at least $2 seconds old.
+    local f last=0
+    f="$DG_STATE_DIR/${1}$(_wg_mode_tag)"
+    [[ -f "$f" ]] && last="$(cat "$f" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]{1,12}$ ]] || last=0
+    local now
+    now="$(date +%s)"
+    # A stamp from the future (the clock stepped back) counts as due.
+    (( 10#$last > now || now - 10#$last >= $2 ))
+}
+
+_wg_stamp() {
+    { mkdir -p "$DG_STATE_DIR" && date +%s > "$DG_STATE_DIR/${1}$(_wg_mode_tag)"; } 2>/dev/null || true
+}
+
+_wg_page() {
+    # $1 severity $2 title $3 body $4 dedupe key $5 observe-mode summary.
+    # 0 only when the page was queued (or, observing, logged): the caller marks
+    # the episode on 0, so a failed enqueue is retried on the next poll.
+    if (( WATCHGOD_ACT == 0 )); then
+        log WARN "OBSERVE: would page ${5}"
+        return 0
+    fi
+    if queue_alert_try "$1" "watchgod:disk" "$2" "$3" "$4"; then
+        return 0
+    fi
+    log WARN "could not queue the page '${2}' (alert queue unwritable?) — retrying next poll"
+    return 1
+}
+
+# ── Reclaim (the one deleter lives in disk_hygiene.sh) ───────
+start_pressure_unit() {
+    # $1 = standard | last-resort. Rate-limited per instance while a tier
+    # persists; a repeat start of a running instance is a systemd no-op.
+    local inst="$1" unit
+    unit="genesis-disk-hygiene-pressure@${inst}.service"
+    _wg_due "pressure_${inst}" "$PRESSURE_RETRIGGER_S" || return 0
+    if (( WATCHGOD_ACT == 0 )); then
+        log WARN "OBSERVE: would start ${unit}"
+        _wg_stamp "pressure_${inst}"
+        return 0
+    fi
+    if systemctl --user start --no-block "$unit" 2>/dev/null; then
+        _wg_stamp "pressure_${inst}"
+        log WARN "started ${unit}"
+    else
+        log WARN "could not start ${unit} — retrying next poll (is it rendered? bootstrap renders scripts/systemd/*.template)"
+    fi
+    return 0
+}
+
+# ── cc-tmp retention sweep ───────────────────────────────────
+# cc-tmp is Claude Code's working temp: every session writes there, nothing
+# else removes what an ENDED session leaves behind, and the volume has a hard
+# quota. This sweep is its retention — the file-side counterpart of the session
+# reapers, which clean up database rows and never free a byte.
+#
+# It is NOT v1's budget sweep. v1 deleted to stay under a number and took live
+# work with it. This reaps a unit only when BOTH hold:
+#   * nothing alive is using it — no open descriptor or working directory
+#     inside it (tmp_liveness.sh), and it holds no socket; and
+#   * nothing in it has been modified for the retention age (7 days on the
+#     hourly pass, 2 days while cc-tmp's own filesystem is ORANGE/RED).
+# Units: a loose top-level file; a top-level directory; and a SESSION directory
+# claude-<uid>/<project>/<session> (the container and project levels are never
+# units — one live session must not pin its siblings, and a sibling's age must
+# not take a live session). The control plane (cc-socks*, cc-daemon-*) is
+# never a unit. If the liveness snapshot comes back empty the sweep does not
+# run: deleting without being able to see writers is the failure this avoids.
+CC_SWEEP_INTERVAL_S=3600
+CC_SWEEP_AGE_MIN=10080
+CC_SWEEP_PRESSURE_AGE_MIN=2880
+
+# Unit key of a path RELATIVE to cc-tmp (one per line on stdin): the first
+# component, or claude-<uid>/<project>/<session> inside a container. Container
+# and project levels map to nothing — they are never units.
+_CC_UNIT_KEY_AWK='
+    { n = split($0, c, "/")
+      if (c[1] ~ /^claude-[0-9]+$/) { if (n >= 3) print c[1] "/" c[2] "/" c[3] }
+      else if (c[1] != "") print c[1] }'
+
+_cc_sweep_units() {
+    # NUL-delimited candidate units under $1 (see the header for the model).
+    local root="$1" c name uid
+    uid="$(id -u 2>/dev/null || echo 0)"
+    while IFS= read -r -d '' c; do
+        name="${c##*/}"
+        case "$name" in
+            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid") continue ;;
+        esac
+        if [[ "$name" =~ ^claude-[0-9]+$ && -d "$c" ]]; then
+            find "$c" -mindepth 2 -maxdepth 2 -print0 2>/dev/null
+            continue
+        fi
+        printf '%s\0' "$c"
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    return 0
+}
+
+sweep_cc_tmp() {
+    # $1 retention age in minutes, $2 why ("hourly" / "pressure").
     #
-    # The socket predicate alone is not enough, because it only protects a
-    # directory that HAPPENS to hold a socket right now. An EMPTY sockets
-    # directory has nothing inside to keep it non-empty, so it is deleted —
-    # REPRODUCED: cc-socks and the daemon root both went, and only a
-    # socket-holding sibling survived.
+    # One find pass and three lookup tables, not a find per unit: MEASURED on a
+    # live cc-tmp of ~1,000 units, the per-unit form cost 30 s of CPU and held
+    # the poll loop for all of it.
+    local age="$1" why="${2:-hourly}" root snap u key n=0 kept=0
+    # CANONICAL root: /proc reports fully resolved paths, so a symlinked
+    # ancestor (e.g. /home -> /var/home) would make every held path miss the
+    # prefix and silently empty the held table.
+    root="$(cd -P -- "$CC_TMP_DIR" 2>/dev/null && pwd -P)" || return 0
+    if ! liveness_visible; then
+        log WARN "cc-tmp sweep skipped: no process outside this daemon is visible in /proc, so nothing can be proven unused"
+        return 0
+    fi
+    snap="$(live_open_paths)"
+    local -A held=() recent=() socket=()
+    # Held: every open path or cwd under cc-tmp, mapped to its unit.
+    while IFS= read -r key; do [[ -n "$key" ]] && held[$key]=1; done < <(
+        printf '%s\n' "$snap" | _wg_root="$root/" awk '
+            / \(deleted\)$/ { next }
+            index($0, ENVIRON["_wg_root"]) == 1 { print substr($0, length(ENVIRON["_wg_root"]) + 1) }
+        ' | awk "$_CC_UNIT_KEY_AWK")
+    # Recent (anything modified inside the window, the unit itself included)
+    # and socket-holding units, from ONE walk.
     #
-    # The exclusion is by EXACT PATH (cc_control_plane_paths), not by name
-    # glob, and both halves of that matter:
-    #
-    #   * `-name 'cc-socks*'` plus `-path '*/cc-socks*/*'` makes an UNBOUNDED
-    #     subtree immortal, because -path's `*` matches `/`. A directory called
-    #     cc-socks-backup or cc-socksomething would pin everything beneath it
-    #     against this sweep forever.
-    #   * `-name 'cc-daemon-*'` is worse than wide, it is WRONG: CC also calls
-    #     mkdtemp(os.tmpdir() + "cc-daemon-"), giving cc-daemon-<random> dirs
-    #     holding a single stderr.log. We still reclaim regular files, so the
-    #     glob would empty each one and then spare the husk permanently —
-    #     turning the empty-directory reaper into an empty-directory LEAKER,
-    #     one inode per daemon spawn.
-    #
-    # Sparing is DIRECTORY-scoped: a regular file inside the tree is still
-    # reclaimed, which is the object-level behaviour
-    # test_red_reclaims_files_inside_socket_dir pins. A log file beside a
-    # socket is garbage; a missing directory is a failed bind.
-    #
-    # Severity, stated precisely because it is easy to overstate: CC RECREATES
-    # a missing sockets directory on demand (mkdir 0700, ancestors included),
-    # so this is not a permanent outage. What it costs is a lost race — CC vets
-    # the path, then creates it, and a sweep landing between the two raises its
-    # "sockets base directory vanished while being set up" error, after which
-    # that session refuses to bind and runs with cross-session messaging off
-    # for its lifetime. It does not retry.
-    local -a _cp_excl=()
-    cc_control_plane_excl _cp_excl
-    find "$1" -depth -not -type s \
-        ${_cp_excl[@]+"${_cp_excl[@]}"} \
-        -delete 2>/dev/null || true
+    # Read WITHOUT field splitting: IFS=' ' would trim the key, so a unit named
+    # "trail " was recorded as "trail", its recent file never matched, and it
+    # was reaped (and a unit named " " produced an EMPTY key, which aborts the
+    # daemon under set -e). Found by review, reproduced before fixing.
+    local line kind
+    while IFS= read -r line; do
+        kind="${line%% *}"; key="${line#? }"
+        [[ -n "$key" ]] || continue
+        if [[ "$kind" == s ]]; then socket[$key]=1; else recent[$key]=1; fi
+    done < <(find "$root" -mindepth 1 \( -type s -printf 's %P\n' \) -o \( -mmin "-$age" -printf 'r %P\n' \) 2>/dev/null \
+        | awk '{ kind = substr($0, 1, 1); p = substr($0, 3); n = split(p, c, "/")
+                 if (c[1] ~ /^claude-[0-9]+$/) { if (n >= 3) print kind " " c[1] "/" c[2] "/" c[3] }
+                 else if (c[1] != "") print kind " " c[1] }')
+    while IFS= read -r -d '' u; do
+        key="${u#"$root"/}"
+        # A name with a newline cannot be represented in the line-based tables
+        # above, so it is never provably unused: keep it.
+        if [[ "$key" == *$'\n'* || -n "${held[$key]:-}" || -n "${recent[$key]:-}" || -n "${socket[$key]:-}" || -S "$u" ]]; then
+            kept=$(( kept + 1 ))
+            continue
+        fi
+        if (( WATCHGOD_ACT == 0 )); then
+            log INFO "OBSERVE: cc-tmp sweep would reap ${u}"
+        else
+            rm -rf -- "$u" 2>/dev/null || log WARN "cc-tmp sweep could not remove ${u}"
+        fi
+        n=$(( n + 1 ))
+    done < <(_cc_sweep_units "$root")
+    # Project directories a sweep emptied (never a container, never recent).
+    if (( WATCHGOD_ACT )); then
+        local c
+        for c in "$root"/claude-*; do
+            [[ "${c##*/}" =~ ^claude-[0-9]+$ && -d "$c" ]] || continue
+            find "$c" -mindepth 1 -maxdepth 1 -type d -empty -mmin "+$age" -delete 2>/dev/null || true
+        done
+    fi
+    if (( n > 0 )); then
+        log INFO "cc-tmp sweep (${why}, age>$(( age / 1440 ))d): $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}"
+    fi
+    return 0
+}
+
+maybe_sweep_cc_tmp() {
+    # $1 = hourly | pressure. Rate-limited by a mode-scoped stamp per kind, so
+    # an observe-mode sweep never uses up the first acting one. The stamp limits
+    # ATTEMPTS, deliberately, unlike the reclaim start: a sweep that refused to
+    # run (blind liveness) would otherwise retry — and warn — every 5 s poll.
+    local kind="$1" every age
+    if [[ "$kind" == pressure ]]; then
+        every=$PRESSURE_RETRIGGER_S; age=$CC_SWEEP_PRESSURE_AGE_MIN
+    else
+        every=$CC_SWEEP_INTERVAL_S; age=$CC_SWEEP_AGE_MIN
+    fi
+    _wg_due "cc_sweep_${kind}" "$every" || return 0
+    _wg_stamp "cc_sweep_${kind}"
+    sweep_cc_tmp "$age" "$kind"
+}
+
+# ── Per-filesystem tier handling ─────────────────────────────
+handle_fs() {
+    # $1 path $2 limit-domain key (see check_disks) $3 tier $4 free $5 total
+    # $6 eta $7 writers $8 fstype
+    local path="$1" dev="$2" tier="$3" free="$4" total="$5" eta="$6" writers="$7" fstype="$8"
+    local is_home=0 is_cc=0 body rel lever
+    # Levers act only on the domain they relieve. check_disks sets the keys;
+    # a direct call (tests) falls back to device numbers.
+    [[ "$dev" == "${HOME_KEY:-$(home_dev)}" ]] && is_home=1
+    [[ "$dev" == "${CC_KEY:-$(stat -c %d -- "$CC_TMP_DIR" 2>/dev/null || echo -)}" ]] && is_cc=1
+    # Pages dedupe per (domain, tier, episode) — and per MODE (_wg_mode_tag): an
+    # observe-mode poll records its would-be page under its own marker, so
+    # flipping WATCHGOD_ACT 0→1 mid-episode still delivers the real page.
+    local pg
+    pg="$(_wg_mode_tag)"
+
+    if [[ "$tier" == green ]]; then
+        episode_clear "$dev"
+        (( is_home )) && reserve_ensure "$free" "$total"
+        return 0
+    fi
+
+    local summary="${path}: ${free} MB free of ${total} MB (${fstype}); time to full: ${eta} min"
+
+    if ! episode_seen "$dev" yellow; then
+        episode_mark "$dev" yellow
+        log_attribution "$path" "$dev" "$tier" "$writers"
+    fi
+
+    if [[ "$tier" == orange || "$tier" == red ]]; then
+        (( is_home )) && start_pressure_unit standard
+        (( is_cc )) && maybe_sweep_cc_tmp pressure
+        if [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg"; then
+            lever="has no lever on this filesystem"
+            (( is_home )) && lever="started (genesis-disk-hygiene-pressure@standard)"
+            (( is_cc )) && lever="ran: cc-tmp retention sweep at 2 days"
+            body="${summary}. Reclaim ${lever}. Top writers:"$'\n'"${writers:-none measurable}"
+            _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
+                && episode_mark "$dev" "orange$pg"
+        fi
+    fi
+
+    if [[ "$tier" == red ]]; then
+        rel="not applicable (reserve lives on the \$HOME filesystem)"
+        if (( is_home )); then
+            rel="$(reserve_release)"
+            start_pressure_unit last-resort
+        fi
+        if ! episode_seen "$dev" "red$pg"; then
+            body="${summary}. Reserve: ${rel}."$'\n'"Top writers:"$'\n'"${writers:-none measurable}"
+            _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
+                && episode_mark "$dev" "red$pg"
+        fi
+    fi
+    return 0
+}
+
+# ── One poll ─────────────────────────────────────────────────
+_IO_PREV=""
+_IO_PREV_T=0
+ALL_WRITERS=""
+DISK_JSON=""
+CC_COMPAT=""
+SYS_COMPAT=""
+NEXT_POLL=$POLL_INTERVAL
+
+check_disks() {
+    local now io_now writers dt p dev m free total quota unalloc meta fstype
+    local used binding rate eta floor etat tier fast=0
+    now="$(date +%s)"
+    io_now="$(dg_io_snapshot)"
+    dt=$(( now - _IO_PREV_T ))
+    writers=""; ALL_WRITERS=""
+    if [[ -n "$_IO_PREV" ]]; then
+        ALL_WRITERS="$(dg_io_top "$_IO_PREV" "$io_now" "$dt" 100000)"
+        # awk reads everything: `| head` would SIGPIPE printf on a long list
+        # and, under pipefail, abort the daemon.
+        writers="$(awk 'NR <= 5' <<< "$ALL_WRITERS")"
+    fi
+    _IO_PREV="$io_now"; _IO_PREV_T="$now"
+
+    DISK_JSON=""; CC_COMPAT=""; SYS_COMPAT=""
+    HOME_KEY=""; CC_KEY=""
+
+    # Pass 1: measure EVERY watched path, then group paths into LIMIT DOMAINS.
+    # A device number alone is not a domain: an incus dir-pool volume with a
+    # project quota shares its device with the root filesystem, and statvfs
+    # reports the quota for paths inside it (review finding). Paths on one
+    # device are one domain, keyed by device + MOUNT POINT ("<dev>m<cksum>"),
+    # which does not depend on poll order. A path whose raw statvfs size
+    # differs from its own mount's by more than 1 % is under a separate limit
+    # (a project quota that is not its own mount) and is keyed
+    # "<dev>q<size_mb>" instead. Sizes alone are not an identity: a ZFS
+    # dataset's reported size moves with its neighbours' usage, and a
+    # size-based key re-keyed the domain every poll — a new page each time
+    # (review finding, round 3). So the two sizes come from ONE stat call
+    # (dg_raw_sizes_mb), are compared with a 1 % tolerance, and a key's files
+    # outlive a one-poll disappearance (the GC below). btrfs subvolumes already
+    # get distinct device numbers (MEASURED: / is 59 and the cc-tmp volume 60
+    # on a live install). Known limits: a non-mount project quota within 1 %
+    # of its mount's size merges with the mount, and two such quotas of the
+    # same size on one device share a key (only the first path is tiered).
+    local -a order=()
+    local -A key_of=() meas_of=() path_of=()
+    local key used_raw mnt mtotal ck
+    while IFS= read -r p; do
+        dev="$(stat -c %d -- "$p" 2>/dev/null)" || continue
+        if ! m="$(dg_measure "$p")"; then
+            _wg_warn_once "measure_$dev" "cannot measure ${p} (statvfs failed) — this filesystem is NOT being watched"
+            continue
+        fi
+        mnt="$(stat -c %m -- "$p" 2>/dev/null)" || mnt=""
+        read -r total mtotal < <(dg_raw_sizes_mb "$p" "${mnt:-$p}")
+        if [[ -n "$mnt" ]] && dg_same_size "$total" "$mtotal"; then
+            read -r ck _ < <(printf '%s' "$mnt" | cksum)
+            key="${dev}m${ck}"
+        else
+            key="${dev}q${total}"
+        fi
+        key_of[$p]="$key"
+        [[ -n "${meas_of[$key]:-}" ]] && continue
+        meas_of[$key]="$m"; path_of[$key]="$p"; order+=("$key")
+    done < <(watched_paths)
+    HOME_KEY="${key_of[$HOME]:-}"
+    CC_KEY="${key_of[$CC_TMP_DIR]:-}"
+    local tmp_key="${key_of[/tmp]:-}"
+
+    # Episode markers of a key that is no longer a domain (a quota resized
+    # away, a device renumbered at boot) would silently suppress that key's
+    # pages if it ever returned; rate series would accumulate forever. Both
+    # are dropped — but only once the key has been gone an hour (its rate file,
+    # rewritten every poll while it exists, is that old), so a key that
+    # vanishes for one poll (a path briefly unmeasurable) keeps its episode.
+    # Keys hold no "_", so the key is everything between the first two.
+    local ef ek
+    if (( ${#order[@]} )); then
+        for ef in "$DG_STATE_DIR"/episode_* "$DG_STATE_DIR"/rate_*; do
+            [[ -e "$ef" ]] || continue
+            ek="${ef##*/}"; ek="${ek#*_}"; ek="${ek%%_*}"
+            [[ -n "${meas_of[$ek]:-}" ]] && continue
+            [[ -n "$(find "$DG_STATE_DIR" -maxdepth 1 -name "rate_${ek}_*" -mmin -60 -print -quit 2>/dev/null)" ]] \
+                && continue
+            rm -f -- "$ef" 2>/dev/null || true
+        done
+    fi
+
+    # Pass 2: tier and act, once per domain.
+    for key in "${order[@]}"; do
+        p="${path_of[$key]}"
+        read -r free total quota unalloc meta fstype used_raw <<< "${meas_of[$key]}"
+        used=$(( total - free ))
+        [[ "$used_raw" =~ ^[0-9]+$ ]] || used_raw=$used
+        binding=fs; (( quota )) && binding=quota
+        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding")"
+        eta="$(dg_eta_min "$free" "$rate")"
+        floor="$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")"
+        etat="$(dg_eta_tier "$eta")"
+        tier="$(dg_tier "$floor" "$etat")"
+        [[ "$tier" == orange || "$tier" == red || "$etat" != green ]] && fast=1
+
+        handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
+
+        [[ -n "$DISK_JSON" ]] && DISK_JSON+=", "
+        DISK_JSON+="$(_wg_json_str "$p"): {\"tier\": \"$tier\", \"floor_tier\": \"$floor\", \"free_mb\": $free, \"total_mb\": $total, \"used_pct\": $(( total > 0 ? used * 100 / total : 0 )), \"eta_min\": $([[ "$eta" == - ]] && echo null || echo "$eta"), \"rate_mb_per_min\": $rate, \"quota\": $([[ $quota == 1 ]] && echo true || echo false), \"unalloc_mb\": $([[ "$unalloc" == - ]] && echo null || echo "$unalloc"), \"meta_pct\": $([[ "$meta" == - ]] && echo null || echo "$meta"), \"fstype\": $(_wg_json_str "$fstype")}"
+
+        # Compat for readers of the v1 keys. The FLOOR tier, deliberately: the
+        # cc_tmp tier drives routing degradation (TmpPressureStatus), and an
+        # ETA-driven YELLOW on an ordinary large download must not shed call
+        # sites. The last field says whether these figures are cc-tmp's OWN
+        # (a domain separate from $HOME's on the same device, or a mount whose figures are its own —
+        # its quota binds, or it is not btrfs, where a subvolume's statvfs is
+        # the whole pool's): only then is total-free cc-tmp's usage (review
+        # finding — a quota on a SHARED root subvolume would count every other
+        # file as cc-tmp's).
+        if [[ -n "$CC_KEY" && "$key" == "$CC_KEY" ]]; then
+            local own=0
+            if [[ "$key" == "$HOME_KEY" ]]; then
+                own=0   # shares $HOME's domain: total-free is everyone's files
+            elif [[ -n "$HOME_KEY" && "$key" == *q* && "${key%%[qm]*}" == "${HOME_KEY%%[qm]*}" ]]; then
+                own=1   # same device, its own limit (a project quota)
+            elif mountpoint -q -- "$CC_TMP_DIR" 2>/dev/null && [[ "$quota" == 1 || "$fstype" != btrfs ]]; then
+                own=1
+            fi
+            CC_COMPAT="$floor $free $total $own"
+        fi
+        if [[ -n "$tmp_key" && "$key" == "$tmp_key" ]]; then SYS_COMPAT="$floor $free $total $fstype"; fi
+    done
+
+    NEXT_POLL=$POLL_INTERVAL
+    (( fast )) && NEXT_POLL=$FAST_POLL_INTERVAL
+    return 0
 }
 
 write_state() {
-    local cc_tier="$1" cc_used="$2" sys_tier="$3" sys_pct="$4"
-    local is_tmpfs="false"
-    if df -T /tmp 2>/dev/null | grep -q tmpfs; then
-        is_tmpfs="true"
+    local cc_tier=unknown cc_free=0 cc_total=0 cc_own=0 cc_used=0
+    local sys_tier=unknown sys_free=0 sys_total=0 sys_fstype=- sys_pct=0 is_tmpfs=false
+    if [[ -n "$CC_COMPAT" ]]; then
+        read -r cc_tier cc_free cc_total cc_own <<< "$CC_COMPAT"
+        if (( cc_own )); then
+            cc_used=$(( cc_total - cc_free ))
+        else
+            # On a shared filesystem total-free is the whole disk, not cc-tmp,
+            # so du it — at most every 5 minutes, not every (fast) poll.
+            local now_s cache="$DG_STATE_DIR/cc_used_du" cached_t cached_v
+            now_s="$(date +%s)"
+            if read -r cached_t cached_v 2>/dev/null < "$cache" \
+                    && [[ "$cached_t" =~ ^[0-9]+$ && "$cached_v" =~ ^[0-9]+$ ]] \
+                    && (( cached_t <= now_s && now_s - cached_t < 300 )); then
+                cc_used=$cached_v
+            else
+                # du exits 1 when ANY entry is unreadable yet still prints the
+                # total; under pipefail an `|| cc_used=""` would throw that total
+                # away and cache 0 (review finding). Keep whatever number came out.
+                cc_used="$(timeout 20 du -smx -- "$CC_TMP_DIR" 2>/dev/null | cut -f1)" || true
+                cc_used="${cc_used%%$'\n'*}"
+                [[ "$cc_used" =~ ^[0-9]+$ ]] || cc_used=0
+                { mkdir -p "$DG_STATE_DIR" && echo "$now_s $cc_used" > "$cache"; } 2>/dev/null || true
+            fi
+        fi
     fi
-    # Filesystem headroom for cc-tmp's mount. Post-split these describe the
-    # dedicated volume; pre-split they describe the rootfs. Consumers read them
-    # via .get(..) so an older state file (without these keys) stays valid.
-    local cc_fs_free cc_fs_total
-    cc_fs_free=$(fs_free_mb "$CC_TMP_DIR")
-    cc_fs_total=$(fs_total_mb "$CC_TMP_DIR")
+    if [[ -n "$SYS_COMPAT" ]]; then
+        read -r sys_tier sys_free sys_total sys_fstype <<< "$SYS_COMPAT"
+        (( sys_total > 0 )) && sys_pct=$(( (sys_total - sys_free) * 100 / sys_total ))
+        [[ "$sys_fstype" == tmpfs ]] && is_tmpfs=true
+    fi
     local tmp="${STATE_FILE}.tmp"
-    cat > "$tmp" <<EOF
+    cat 2>/dev/null > "$tmp" <<EOF || { rm -f "$tmp" 2>/dev/null; return 0; }
 {
-  "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $CC_TMP_BUDGET_MB, "sacred_mb": $SACRED_GROUND_MB, "fs_free_mb": $cc_fs_free, "fs_total_mb": $cc_fs_total},
+  "disk": {${DISK_JSON}},
+  "act": ${WATCHGOD_ACT},
+  "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $cc_total, "sacred_mb": 0, "fs_free_mb": $cc_free, "fs_total_mb": $cc_total},
   "system_tmp": {"tier": "$sys_tier", "used_pct": $sys_pct, "is_tmpfs": $is_tmpfs},
   "poll_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    mv "$tmp" "$STATE_FILE"
+    mv "$tmp" "$STATE_FILE" 2>/dev/null || true
 }
 
-# ── Zone A: CC Temp ──────────────────────────────────────────
-#
-# Tiers (% of budget):
-#   Green  : < 50%  — no action
-#   Yellow : > 50%  — clean stale session dirs + old temp files
-#   Orange : > 75%  — yellow + delete caches + record a stuck tier (NO kill) + alert
-#   Red    : > 90% OR fs free < sacred — nuclear cleanup + emergency alert
+# OOM event capture lives in its own file (moved verbatim; see its header).
+# shellcheck source=scripts/lib/watchgod_oom.sh
+source "$_SCRIPT_DIR/lib/watchgod_oom.sh"
 
-clean_cc_yellow() {
-    # Same in-flight exclusions the tiers above use. YELLOW fires at 50% of
-    # budget — more often than either — and deletes *.tmp older than 60min: a
-    # long download's still-open .tmp is in-flight work by RED's own standard.
-    # Snapshot cost ~50-100ms per poll, measured.
-    local -a _yellow_excl=()
-    zone_a_live_exclusions _yellow_excl "$(live_open_paths)" "$CC_TMP_DIR"
-    CC_TMP_DIR="$(canon_dir "$CC_TMP_DIR")"
-    log INFO "Zone A YELLOW — cleaning stale session dirs and temp files"
-
-    # Clean session dirs with mtime > 7 days
-    find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*/???*" \
-        -mtime +7 ${_yellow_excl[@]+"${_yellow_excl[@]}"} \
-        -exec rm -rf {} + 2>/dev/null || true
-
-    # Clean old temp files (*.tmp, *.env, *.yaml) > 1 hour old
-    find "$CC_TMP_DIR" -type f \( -name "*.tmp" -o -name "*.env" -o -name "*.yaml" \) \
-        -mmin +60 ${_yellow_excl[@]+"${_yellow_excl[@]}"} \
-        -delete 2>/dev/null || true
-}
-
-clean_cc_orange() {
-    clean_cc_yellow
-    log WARN "Zone A ORANGE — deleting caches, then re-measuring to see if the tier resolved"
-
-    # Same in-flight exclusions RED uses, for the same two names. ORANGE fires
-    # at 75% of budget — MORE often than RED — so guarding only RED would leave
-    # the incident class open on the tier that actually runs. A tsx-* directory
-    # is written into while its process runs; "rebuilt automatically" is true
-    # of a cache nobody is mid-write on, and says nothing about one that is.
-    #
-    # No probe self-test here, unlike RED: this tier deletes two named caches
-    # rather than reaping arbitrary directories, so a blind guard costs a
-    # rebuildable cache rather than a writer's work, and the scan runs on a
-    # far more frequent tier. RED carries the diagnostic.
-    local -a live_excl=()
-    zone_a_live_exclusions live_excl "$(live_open_paths)" "$CC_TMP_DIR"
-
-    # Delete claude-skills cache (~35MB, CC re-clones on demand)
-    find "$CC_TMP_DIR" -type d -name "claude-skills" \
-        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
-
-    # Delete tsx cache (~1.2MB, rebuilt automatically)
-    find "$CC_TMP_DIR" -type d -name "tsx-*" \
-        ${live_excl[@]+"${live_excl[@]}"} -exec rm -rf {} + 2>/dev/null || true
-
-    mkdir -p "$ALERT_DIR"
-    touch "$ALERT_DIR/tmp_warning"
-
-    # LOOP-BREAK: re-measure AFTER the cleanup above, and record the stuck
-    # state ONLY if we are still over the ORANGE line. This closes the runaway
-    # of 2026-08-19: the tier that dispatched us here was measured BEFORE
-    # cleanup, so without a re-measure the daemon re-enters ORANGE every poll
-    # and re-runs this tail forever while the real filler (a pytest tree the
-    # cache-evict never touches) sits untouched.
-    # Use dir_usage_mb (du) — it drops immediately after rm; df can lag on
-    # held-open deleted fds.
-    local used_after threshold_orange
-    used_after=$(dir_usage_mb "$CC_TMP_DIR")
-    threshold_orange=$(( CC_TMP_BUDGET_MB * 75 / 100 ))
-    if (( used_after <= threshold_orange )); then
-        log INFO "ORANGE resolved by cache cleanup (used=${used_after}MB <= ${threshold_orange}MB)"
-        rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
-        return 0
-    fi
-
-    log WARN "ORANGE persists after cleanup (used=${used_after}MB > ${threshold_orange}MB) — nothing further this tier can safely reclaim"
-
-    # NO SESSION KILL AT THIS TIER — removed deliberately, 2026-09.
-    #
-    # ORANGE used to reap unattached CC tmux sessions idle >2h at this point.
-    # The loop never fired, and could not have helped if it had. MEASURED over
-    # two independent log windows (2026-08-19 → 09-07, and 2026-09-22 →
-    # 09-25): 1,385 ORANGE polls, ZERO kills. The re-measure comment above
-    # already carried the reason — sessions are not the filler. One episode is
-    # the demonstration: a live install sat ORANGE for 2h45m on 263MB of a
-    # third-party tool's index cache plus 160MB of live session trees, and
-    # every byte of that would have survived a tmux kill untouched.
-    #
-    # RESIDUAL, stated rather than hidden: a kill was not strictly a no-op for
-    # space. Killing a process closes its descriptors, which releases any
-    # unlinked-but-held blocks it was pinning — precisely the space a du-based
-    # reclaim figure cannot see (MEASURED: 64MB of unlinked-but-held blocks
-    # reads as 0MB to `du -sm`).
-    #
-    # But that reclaim was never reachable from THIS tier, for a reason the
-    # deleted predicate hid. It judged idleness with tmux's
-    # `#{session_activity}`, which does not track a process at all — MEASURED
-    # 2026-09-25: a session writing 8MB/s to disk advanced it by 0 seconds over
-    # a 6-second window. So "idle >2h" never meant "not writing"; it meant "not
-    # printing", and a session running a long silent job — a build, a clone, a
-    # redirected test run — was a KILL CANDIDATE while actively writing into
-    # cc-tmp. The loop's best case was releasing blocks the tier could not see,
-    # and its worst case was reaping a working session. Note also that age does
-    # not bound size: a process that unlinked a 300MB temp three hours ago pins
-    # 300MB right now.
-    #
-    # RED (90%) still kills every unattached cc- session and is UNCHANGED. Be
-    # precise about what that escape hatch covers: RED's triggers are du-derived
-    # except the `free_mb < SACRED_GROUND_MB` statvfs arm, and on a shared-pool
-    # backend that arm reports the whole pool (see the backend note above), so
-    # descriptor-pinned space may not escalate there either. The hatch is real
-    # and narrower than "RED will catch it".
-
-    # Stuck-ORANGE: cleanup did not resolve it, and this tier has nothing safe
-    # left to do. Per design D2 (ORANGE is dashboard/log only — only RED pages)
-    # this does NOT page; it records the stuck state ONCE (dedupe flag) in the
-    # log instead of silently re-polling forever, so the condition is
-    # discoverable. If cc-tmp keeps filling it escalates to RED, which DOES
-    # page. The flag is cleared (main loop) whenever cc-tmp LEAVES ORANGE
-    # (green/yellow/red), so one episode is logged exactly once.
-    if [[ ! -f "$ALERT_DIR/tmp_orange_stuck" ]]; then
-        log WARN "cc-tmp STUCK ORANGE (used=${used_after}MB, budget=${CC_TMP_BUDGET_MB}MB): cache eviction freed nothing and this tier has nothing else it can safely delete — non-reclaimable data is filling cc-tmp (see cc_tmp_top snapshots). Dashboard/log-only per D2; RED will page if it escalates."
-        touch "$ALERT_DIR/tmp_orange_stuck"
-    fi
-}
-
-clean_cc_red() {
-    CC_TMP_DIR="$(canon_dir "$CC_TMP_DIR")"
-    log WARN "Zone A RED — NUCLEAR cleanup, preserving active session"
-
-    # Find the most recently modified session UUID dir (the active workspace)
-    local newest_session=""
-    newest_session=$(find "$CC_TMP_DIR" -mindepth 2 -maxdepth 2 -type d -path "*/claude-*" \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}') || true
-
-    # ── In-flight guard ──────────────────────────────────────
-    # Degrades OPEN AND LOUD. Reaping without the guard is today's behaviour
-    # and risks one writer's work; refusing to reap would spare everything and
-    # let cc-tmp fill, and a full cc-tmp is what kills CC sessions — the
-    # outcome this whole service exists to prevent. Open is the lesser harm.
-    # Silent is not an option in either direction.
-    #
-    # The check is a POSITIVE SELF-TEST, not an emptiness test. An empty
-    # snapshot is only the TOTAL failure; a partial /proc read, a writer owned
-    # by another uid, or a CC_TMP_DIR spelling the kernel does not use all
-    # yield a NON-empty snapshot with a structurally blind guard. Holding a
-    # descriptor open on a probe inside CC_TMP_DIR and requiring the snapshot
-    # to show it exercises every one of those at once — including the root
-    # spelling, which is the case no amount of reading would have caught.
-    # ── THE OXYGEN FLOOR — the invariant this whole tier exists for ──
-    # When true headroom falls under sacred ground, cc-tmp is about to hit its
-    # real ceiling, and a full cc-tmp is what kills CC sessions. At that point
-    # NOTHING is spared: the in-flight guard is not consulted, no descriptor
-    # and no guard defect can block reclamation. Keyed on cc_tmp_capacity_mb
-    # (not statfs) because on a btrfs backend df cannot see the volume quota —
-    # the deployed sacred-ground check read 190GB free while the real ceiling
-    # was 2GiB away, so it could never have fired before ENOSPC.
-    # check_cc_tmp has already measured usage and headroom to decide this tier;
-    # it passes the number in so the du is not paid twice and the dispatcher and
-    # the cleaner can never disagree about which side of the floor we are on. A
-    # direct call (tests, a manual run) measures it here instead.
-    local headroom="${1:-}"
-    [[ "$headroom" =~ ^-?[0-9]+$ ]] || headroom="$(cc_tmp_headroom_mb)"
-
-    local floor=0
-    local live_paths="" probe="" probe_snapshot=""
-    local probe_fd   # assigned by `exec {probe_fd}>` below, never by hand
-    if (( headroom < SACRED_GROUND_MB )); then
-        floor=1
-        # Log the COMPONENTS, not just the result. An operator seeing only the
-        # difference cannot tell a capacity that is wrong in the config from a
-        # cc-tmp that is genuinely full, and those have opposite remedies. The
-        # extra du costs one call on a path that fires only in an emergency.
-        local _cap _used
-        _cap="$(cc_tmp_capacity_mb)"
-        _used="$(dir_usage_mb "$CC_TMP_DIR")"
-        log WARN "Zone A RED — OXYGEN FLOOR: true headroom ${headroom}MB < sacred ${SACRED_GROUND_MB}MB (capacity ${_cap}MB - used ${_used}MB; filesystem free space is deliberately NOT part of this — it measures a SHARED pool on every supported backend). EVERY discretionary exclusion is bypassed — the in-flight guard, the 60-second freshness window, and the active session's own tree. Unix sockets are the ONLY thing that survives, anywhere in the tree (0 bytes: deleting them reclaims nothing and severs the control plane)."
-    else
-        probe="$(mktemp "$CC_TMP_DIR/.wg-probe.XXXXXX" 2>/dev/null)" || probe=""
-        if [[ -n "$probe" ]]; then
-            # Two hazards in one line, both MEASURED, both silent:
-            #   * a failing `exec {fd}>` EXITS a non-interactive shell under
-            #     set -e even mid-function — an unguarded open would take the
-            #     daemon down at the exact tier where fd pressure makes open()
-            #     likeliest to fail. Hence the `if`.
-            #   * an `exec` with NO COMMAND applies every redirection to the
-            #     shell PERMANENTLY, so a bare `exec {fd}>"$probe" 2>/dev/null`
-            #     sends the daemon's own stderr to /dev/null for the rest of
-            #     its life — the journal silently loses bash errors and set -e
-            #     aborts from then on. The brace group scopes the suppression
-            #     while probe_fd, opened in the current shell, outlives it.
-            # MEASURED 2026-09-24, 4 forms x 2 outcomes with a no-redirect
-            # oracle arm: this form keeps stderr AND still guards.
-            if { exec {probe_fd}>"$probe"; } 2>/dev/null; then
-                probe_snapshot="$(live_open_paths)"
-                exec {probe_fd}>&-
-            fi
-            rm -f "$probe"
-        fi
-        # ONE scan, and it is the scan the self-test validated. An earlier
-        # draft validated the probe snapshot and then took a SECOND snapshot to
-        # protect with — so the checked one was discarded and the one that
-        # actually guarded was unchecked. live_open_paths suppresses find
-        # failures, so a failed or partial second read returns empty, which is
-        # indistinguishable from "nothing is live" and reaps every active
-        # directory while the self-test reports healthy.
-        #
-        # Positive self-test, not an emptiness test: a partial /proc read,
-        # another uid's writer, or a CC_TMP_DIR spelling the kernel does not
-        # use all yield a NON-empty snapshot with a structurally blind guard.
-        # Exact-path match, not a prefix test: a prefix test answers "is
-        # ANYTHING open under cc-tmp", which any other session's descriptor
-        # satisfies (6 measured live at review time) — masking exactly the
-        # partial read this names first (MEASURED: the prefix form passed with
-        # the probe wholly invisible).
-        # Whole-line containment in pure bash — NOT `printf | grep -qxF`.
-        # `grep -q` exits on its first match, which SIGPIPEs the printf still
-        # feeding it, and under `set -o pipefail` the pipeline then reports 141
-        # and the self-test reads as FAILED while the probe was in fact found.
-        # MEASURED 2026-09-24, sweeping snapshot size with the needle first:
-        # 33,901 B -> rc 0, 67,901 B -> rc 141. The boundary is the 64 KiB pipe
-        # buffer, and a live snapshot here is ~118 KB — so the piped form was
-        # failing its own self-test on EVERY real RED run while passing in
-        # small test fixtures. Same class as the awk early-exit above; the pipe
-        # is the hazard, so this form removes the pipe rather than working
-        # around it. Both operands are quoted, which makes the needle a LITERAL
-        # inside the pattern, and the \n fences make it an exact-line test.
-        if [[ -n "$probe" && $'\n'"$probe_snapshot"$'\n' == *$'\n'"$probe"$'\n'* ]]; then
-            # Drop the probe's own record — it is closed and unlinked by now,
-            # so a unit derived from it would exclude a path that cannot exist.
-            # grep -v has no early exit, so it drains its input and cannot
-            # SIGPIPE the printf the way the -q form above did.
-            live_paths="$(printf '%s\n' "$probe_snapshot" | grep -vxF -- "$probe")" || live_paths=""
-        else
-            # Degrade LOUD — but KEEP the snapshot. Discarding it here would
-            # be a policy change riding along with the single-snapshot fix,
-            # and a strictly worse one: a snapshot that failed a POSITIVE
-            # self-test is still better evidence than the empty string. Every
-            # failure mode this test catches (a partial /proc read, a
-            # CC_TMP_DIR spelling the kernel does not use, another uid's
-            # writer) makes the snapshot INCOMPLETE, never fictional — /proc
-            # fd links cannot name a path nobody has open — so using it can
-            # only under-protect, which is the same direction blanking goes,
-            # while blanking additionally throws away the real writers it DID
-            # see. The point is sharp here: the SIGPIPE defect fixed just above
-            # made this very branch fire on every real RED run, and under
-            # blanking that false negative would have deleted every live
-            # writer's tree rather than costing a log line.
-            log WARN "Zone A RED — in-flight guard DEGRADED (self-test failed: this process's own open probe under $CC_TMP_DIR is not visible in the /proc snapshot); proceeding with the unverified snapshot, which may be incomplete — an active writer's directory may be deleted"
-            live_paths="$probe_snapshot"
-        fi
-    fi
-
-    # One exclusion set, built once, consumed by every deletion below.
-    local -a live_excl=()
-    zone_a_live_exclusions live_excl "$live_paths" "$CC_TMP_DIR"
-
-    # Reap every depth-1 dir except the newest session's ancestor and any
-    # directory a live process is writing into — object-level and
-    # socket-sparing (see reap_dir_sparing_sockets); loose files are the
-    # separate sweep below. `|| true` matches the file's find idiom: a
-    # transient find error must not abort the daemon mid-RED under
-    # set -euo pipefail.
-    local dir
-    while IFS= read -r dir; do
-        # Skip if this contains the active session. Deliberately NOT added to
-        # any exclusion list: this spares for a DIFFERENT reason than the
-        # live-writer branch, and the loose sweep below already carries its own
-        # deliberately narrower -not -path "$newest_session/*". Promoting this
-        # to the depth-1 parent would exclude every sibling project tree under
-        # claude-<uid>/ from the sweep (MEASURED: 7 trees, 1 of them live).
-        # Below the oxygen floor even this sparing goes: the active session's
-        # tree is as reclaimable as anything else when the alternative is
-        # ENOSPC for every session including that one.
-        if (( ! floor )) && [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
-            continue
-        fi
-        # The REAP unit is the whole directory: reaping only the quiet part of
-        # a tree being written leaves its writer a partially-deleted directory,
-        # which breaks it just as surely as removing the whole thing.
-        if dir_has_live_writer "$dir" "$live_paths"; then
-            log INFO "Zone A RED — sparing $dir (a live process is writing into it)"
-            continue
-        fi
-        reap_dir_sparing_sockets "$dir"
-    done < <(find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null) || true
-
-    # The active session's own subtree, spared by both sweeps below — but ONLY
-    # when newest_session actually resolved. Spelled unconditionally, an empty
-    # newest_session makes the predicate `-not -path "/*"`, which matches every
-    # absolute path and so deletes NOTHING AT ALL: RED would run, log normally
-    # and reclaim zero bytes on any cc-tmp with no claude-<uid>/<project> dir
-    # at depth 2 (MEASURED: 0 of 2 files swept). Pre-existing on the default
-    # branch; it has to be right here because the floor path depends on these
-    # sweeps actually sweeping.
-    local -a session_excl=()
-    if (( ! floor )) && [[ -n "$newest_session" ]]; then
-        # ESCAPED, for the same reason the control-plane exclusions are, and
-        # this one is reachable without touching any config: newest_session is
-        # derived from a real project directory name, and CC builds that name
-        # from the repository path. REPRODUCED 2026-09-26 with a stock
-        # CC_TMP_DIR — a project named `genesis[wt]` made RED delete the ACTIVE
-        # session's loose working files, while a plain-named control kept them.
-        local _sess_esc
-        _sess_esc="$(glob_escape "$newest_session")"
-        session_excl=(-not -path "$_sess_esc/*")
-    fi
-
-    # Delete all reclaimable loose files except those modified in the last 60s.
-    # This sweep has no -maxdepth, so it walks the WHOLE tree — including the
-    # directories spared above. Without the exclusions it would delete the
-    # quiet files inside a directory the reap loop deliberately kept, which is
-    # the same partial-deletion failure by another route.
-    #
-    # Below the floor the freshness window goes too. It is the one exclusion
-    # that survives an emptied live_paths, and a root-level file being written
-    # fast enough to cause the emergency is precisely the file whose mtime is
-    # always current — it would survive every sweep, all the way to ENOSPC.
-    local -a fresh_excl=()
-    (( floor )) || fresh_excl=(-not -newermt '60 seconds ago')
-    find "$CC_TMP_DIR" -type f ${fresh_excl[@]+"${fresh_excl[@]}"} \
-        ${session_excl[@]+"${session_excl[@]}"} ${live_excl[@]+"${live_excl[@]}"} \
-        -delete 2>/dev/null || true
-
-    # Delete caches — except where a live process is writing, and except
-    # inside the active session's own tree: a tsx-*/claude-skills dir INSIDE
-    # the newest session is that session's in-flight tooling state, and the
-    # descriptor guard alone cannot vouch for it (its writer may be between
-    # opens). Reclaim of DEAD caches is pinned by its own test arm. Without
-    # the live exclusions this sweep deleted a directory the reap loop had
-    # just spared AND logged as spared, which is worse than not sparing it:
-    # the operator is told a directory survived that did not.
-    #
-    # Routed through reap_dir_sparing_sockets rather than `rm -rf`, for the
-    # SAME reason the depth-1 reap is: rm -rf has no socket predicate, so a
-    # socket living inside a cache directory was deleted here twenty lines
-    # after the reap loop deliberately kept its parent BECAUSE it holds a
-    # socket (MEASURED: of four sockets placed across the tree, the two inside
-    # cache directories were destroyed) — the exact spared-then-deleted
-    # failure the paragraph above says this sweep exists to avoid, and the
-    # reason the floor's log line could not honestly say sockets survive.
-    # Sockets are 0 bytes, so keeping them costs no reclaimed space; their
-    # ancestor directories stay non-empty and survive with them, which is the
-    # same outcome the depth-1 reap already produces.
-    local cache_dir
-    while IFS= read -r cache_dir; do
-        [[ -d "$cache_dir" ]] || continue   # an outer match may have taken it
-        reap_dir_sparing_sockets "$cache_dir"
-    done < <(find "$CC_TMP_DIR" -type d \( -name "claude-skills" -o -name "tsx-*" \) \
-        ${live_excl[@]+"${live_excl[@]}"} \
-        ${session_excl[@]+"${session_excl[@]}"} \
-        2>/dev/null) || true
-
-    # Report the surviving control plane — counted AFTER every sweep above,
-    # so the line is true by construction whatever any sweep did. Sockets
-    # are 0 bytes: deleting them reclaims nothing and silently severs
-    # cross-session messaging (measured, 2026-09-05 incident — this line's
-    # absence is what made that invisible).
-    local sock_count cp_count
-    sock_count=$(find "$CC_TMP_DIR" -type s 2>/dev/null | wc -l) || sock_count=0
-    # Count the control-plane DIRECTORIES too. The dangerous case this guard
-    # exists for is an EMPTY sockets directory — zero sockets — so a line
-    # conditioned on sock_count alone goes silent in exactly the situation it
-    # is meant to make visible, which is the same invisibility the comment
-    # above blames for the 2026-09-05 incident going unnoticed.
-    # Count ONLY the control-plane dirs under the root this sweep actually
-    # walked. The enumeration also carries /tmp roots, which Zone A never
-    # touches — counting those would let an unrelated /tmp/cc-daemon-<uid>
-    # report a preserved directory and mask the absence of the in-budget
-    # cc-socks, which is the one case this line exists to make visible.
-    cp_count=0
-    local _cp_root; _cp_root="$(canon_dir "$CC_TMP_DIR")"
-    # A root of "/" canonicalises to "/", and "$_cp_root"/* would then be the
-    # pattern "//*", which matches nothing — the count would read 0 forever.
-    [[ "$_cp_root" == "/" ]] && _cp_root=""
-    while IFS= read -r _cp_dir; do
-        [[ "$_cp_dir" == "$_cp_root"/* ]] || continue
-        [[ -d "$_cp_dir" ]] && cp_count=$(( cp_count + 1 ))
-    done < <(cc_control_plane_paths)
-    if (( sock_count > 0 || cp_count > 0 )); then
-        log INFO "RED preserved ${sock_count} unix socket(s) and ${cp_count} control-plane dir(s) — 0 bytes reclaimable"
-    fi
-
-    # Kill ALL idle CC sessions (log each — so it's clear which terminals were reaped)
-    while IFS= read -r sname; do
-        [[ -z "$sname" ]] && continue
-        if [[ "$sname" =~ ^cc- ]]; then
-            log WARN "RED killing idle CC session: $sname"
-            tmux kill-session -t "$sname" 2>/dev/null || true
-        fi
-    done < <(tmux list-sessions -F '#{session_name}:#{session_attached}' 2>/dev/null \
-             | grep ':0$' | cut -d: -f1 || true)
-
-    # Emergency alert — queue a page ONLY on the transition INTO red (flag not
-    # yet set), so a sustained red episode does not re-page every 30s poll.
-    mkdir -p "$ALERT_DIR"
-    if [[ ! -f "$ALERT_DIR/tmp_emergency" ]]; then
-        queue_alert emergency "watchgod:cc" "CC temp CRITICAL (RED)" \
-            "cc-tmp blew its budget (${CC_TMP_BUDGET_MB}MB) — nuclear cleanup ran to protect active CC sessions. Investigate what filled it." \
-            "watchgod:tmp_emergency"
-    fi
-    touch "$ALERT_DIR/tmp_emergency"
-    log WARN "Zone A RED — nuclear cleanup complete"
-}
-
-# Record cc-tmp pressure + top consumers BEFORE a cleanup runs — so a filled-folder
-# incident is diagnosable afterward (the nuclear cleanup erases the evidence otherwise).
-# The snapshot goes under the log dir (NOT cc-tmp), so it survives the cleanup.
-_log_cc_pressure() {
-    local tier="$1" used="$2" free="$3"
-    local stamp snap top
-    stamp=$(date -u +%Y%m%dT%H%M%SZ)
-    snap="$(dirname "$LOG_FILE")/cc_tmp_top_${stamp}.txt"
-    # `|| true` inside the substitution: an empty cc-tmp (e.g. the sacred-ground RED path,
-    # disk-full but cc-tmp empty) makes the glob literal → du fails → set -e would abort the
-    # whole daemon. Tolerate it; `top` is just empty then.
-    top=$(du -sm "$CC_TMP_DIR"/* 2>/dev/null | sort -rn | head -8 || true)
-    {
-        echo "# cc-tmp pressure ${stamp}  tier=${tier} used=${used}MB free=${free}MB budget=${CC_TMP_BUDGET_MB}MB"
-        echo "$top"
-    } > "$snap" 2>/dev/null || true
-    log WARN "cc-tmp ${tier^^}: used=${used}MB free=${free}MB budget=${CC_TMP_BUDGET_MB}MB — top consumers → ${snap}"
-    # Bound the snapshot count — a sustained ORANGE/RED episode would otherwise accumulate
-    # these unbounded on the very filesystem we're protecting. Keep the 20 most recent.
-    ls -1t "$(dirname "$LOG_FILE")"/cc_tmp_top_*.txt 2>/dev/null | tail -n +21 | xargs -r rm -f 2>/dev/null || true
-}
-
-check_cc_tmp() {
-    mkdir -p "$CC_TMP_DIR"
-    local used_mb
-    used_mb=$(dir_usage_mb "$CC_TMP_DIR")
-    local free_mb
-    free_mb=$(fs_free_mb "$CC_TMP_DIR")
-
-    local threshold_yellow=$(( CC_TMP_BUDGET_MB * 50 / 100 ))
-    local threshold_orange=$(( CC_TMP_BUDGET_MB * 75 / 100 ))
-    local threshold_red=$(( CC_TMP_BUDGET_MB * 90 / 100 ))
-
-    local tier="green"
-
-    # TRUE headroom against the volume's real ceiling, computed HERE rather
-    # than inside clean_cc_red alone. The budget thresholds above are a
-    # configured number and the statfs check below is blind on a btrfs backend,
-    # so a budget set larger than the volume lets both stay green while the
-    # volume runs out: with a 1 GiB volume and CC_TMP_BUDGET_MB=2000, budget-RED
-    # does not start until 1800 MB and df reports the shared pool, so nothing
-    # would ever call the only function that evaluates the real ceiling.
-    local headroom
-    headroom=$(cc_tmp_headroom_mb "$used_mb")
-
-    # After the cc-tmp blast-radius split, free_mb measures the DEDICATED
-    # volume, so this sacred-ground trigger guards that volume (not the rootfs).
-    # On a 2 GiB volume it is a pure backstop behind the 450 MiB budget-red
-    # above; rootfs free-space monitoring lives in Zone B (/tmp) below.
-    if (( used_mb > threshold_red )) || (( free_mb < SACRED_GROUND_MB )) \
-        || (( headroom < SACRED_GROUND_MB )); then
-        tier="red"
-        _log_cc_pressure red "$used_mb" "$free_mb"   # capture BEFORE the nuclear cleanup erases it
-        clean_cc_red "$headroom"
-    elif (( used_mb > threshold_orange )); then
-        tier="orange"
-        _log_cc_pressure orange "$used_mb" "$free_mb"
-        clean_cc_orange
-    elif (( used_mb > threshold_yellow )); then
-        tier="yellow"
-        log INFO "cc-tmp YELLOW: used=${used_mb}MB free=${free_mb}MB budget=${CC_TMP_BUDGET_MB}MB"
-        clean_cc_yellow
-    fi
-
-    echo "$tier:$used_mb"
-}
-
-# ── Zone B: System /tmp ──────────────────────────────────────
-#
-# Tiers (% of filesystem):
-#   Green  : < 50%  — no action
-#   Yellow : 50-70% — clean files not accessed in 7+ days
-#   Orange : 70-85% — clean files not accessed in 3+ days + alert
-#   Red    : > 85%  — aggressive cleanup + emergency alert
-
-clean_sys_yellow() {
-    log INFO "Zone B YELLOW — cleaning /tmp files not accessed in 7+ days"
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
-        -atime +7 -delete 2>/dev/null || true
-    # /tmp is not a hypothetical home for CC's control plane: it is where the
-    # sockets path falls back when the primary would exceed the ~103-byte
-    # sockaddr_un limit, and it is where the background daemon ALWAYS lives
-    # (/tmp/cc-daemon-<uid>/...). An empty one is deleted by this sweep — the
-    # same defect as the Zone A reap, by a different route. Exclusions are
-    # exact paths for the reasons cc_control_plane_paths sets out; in
-    # particular a cc-daemon-* NAME glob would spare CC's mkdtemp scratch dirs
-    # forever and make this very sweep leak the inodes it exists to reclaim.
-    local -a _cp_excl=()
-    cc_control_plane_excl _cp_excl
-    find /tmp -mindepth 1 -type d -empty -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" \
-        ${_cp_excl[@]+"${_cp_excl[@]}"} \
-        -delete 2>/dev/null || true
-}
-
-clean_sys_orange() {
-    clean_sys_yellow
-    log WARN "Zone B ORANGE — cleaning /tmp files not accessed in 3+ days"
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
-        -atime +3 -delete 2>/dev/null || true
-    mkdir -p "$ALERT_DIR"
-    touch "$ALERT_DIR/tmp_warning"
-}
-
-clean_sys_red() {
-    log WARN "Zone B RED — aggressive /tmp cleanup"
-    # Files not accessed in 1+ day
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
-        -atime +1 -delete 2>/dev/null || true
-
-    # If still critical, remove all regular files except last 1h, sockets, tmux, pytest, claude
-    local pct_after
-    pct_after=$(tmp_usage_pct)
-    if (( pct_after > 85 )); then
-        find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
-            -mmin +60 -delete 2>/dev/null || true
-    fi
-
-    # Emergency alert — transition-only (see clean_cc_red). Zones A/B share the
-    # tmp_emergency flag, so a red episode pages once regardless of which zone
-    # tripped first — intentional (one page per episode, not per zone).
-    mkdir -p "$ALERT_DIR"
-    if [[ ! -f "$ALERT_DIR/tmp_emergency" ]]; then
-        queue_alert emergency "watchgod:sys" "System /tmp CRITICAL (RED)" \
-            "/tmp usage exceeded 85% — aggressive cleanup ran. Something is filling /tmp." \
-            "watchgod:tmp_emergency"
-    fi
-    touch "$ALERT_DIR/tmp_emergency"
-    log WARN "Zone B RED — aggressive cleanup complete"
-}
-
-check_sys_tmp() {
-    local pct
-    pct=$(tmp_usage_pct)
-    local tier="green"
-
-    if (( pct > 85 )); then
-        tier="red"
-        clean_sys_red
-    elif (( pct > 70 )); then
-        tier="orange"
-        clean_sys_orange
-    elif (( pct > 50 )); then
-        tier="yellow"
-        clean_sys_yellow
-    fi
-
-    echo "$tier:$pct"
-}
-
-# ── OOM event capture (best-effort, cgroup v2) ───────────────
-# A cgroup OOM kill silently collapses a CC session (tmux `exec claude` → claude
-# is reaped → the last pane dies → the session ends) and leaves no durable trace:
-# the kernel dmesg ring cycles and the kernel journal is usually unreadable from
-# inside the container. This samples the container cgroup's CUMULATIVE oom_kill
-# counter each poll and, on a NEW kill since the daemon started, records a
-# timestamped snapshot (memory + top-RSS processes) and pages once. Read-only —
-# it never kills or reclaims anything. Degrades to a no-op when the cgroup-v2
-# interface file is absent/unreadable (older layouts / non-cgroup2 hosts).
-
-_read_oom_kill() {
-    # Echo the current cumulative oom_kill count; non-zero return if unavailable.
-    [[ -r "$OOM_EVENTS_FILE" ]] || return 1
-    awk '/^oom_kill /{print $2; found=1} END{exit !found}' "$OOM_EVENTS_FILE" 2>/dev/null
-}
-
-_read_oom_local_trigger() {
-    # Echo the container root's LOCAL `oom` count (limit invocations charged to
-    # this cgroup itself, descendants excluded); non-zero return if unavailable.
-    local _local_file="${OOM_EVENTS_LOCAL_FILE:-$(dirname "$OOM_EVENTS_FILE")/memory.events.local}"
-    [[ -r "$_local_file" ]] || return 1
-    awk '/^oom /{print $2; found=1} END{exit !found}' "$_local_file" 2>/dev/null
-}
-
-# Attribution reads the systemd journal because the killer cgroup is usually a
-# TRANSIENT scope, deleted with its job — every surviving cgroup shows the kill
-# only as an inherited aggregate (measured: local=0 at every level) — while the
-# journal names the unit and outlives the scope. The query window is a CURSOR:
-# each successful read advances a durable epoch marker, and the next read asks
-# only for lines SINCE it. That is what keeps attribution honest during a
-# thrashing contained job: without it, a contained kill's line from the
-# PREVIOUS increment still inside a fixed lookback could account for a NEW
-# kill that left no line of its own (a non-main process dying inside a
-# surviving scope writes no unit-failure line) and silence a page. A missing
-# cursor (first run) falls back to a short lookback computed from the LIVE
-# poll interval; a failed query does not advance the cursor. Every failure
-# direction lands on the unattributed PAGE, never on silence.
-_OOM_CURSOR_FILE="$(dirname "$LOG_FILE")/.oom_journal_cursor"
-
-_oom_killed_units() {
-    # Echo unit names the user journal says were oom-killed since the cursor,
-    # one per line.
-    # rc!=0 = journal UNAVAILABLE (no journalctl, or the query failed) — the
-    # caller degrades to the unattributed page. rc=0 with empty output =
-    # journal readable, no oom-kill record (also unattributed).
-    command -v journalctl >/dev/null 2>&1 || return 1
-    # Computed per call, not at load time: load_config re-sources watchgod.conf
-    # every tick and may change POLL_INTERVAL — a frozen window shorter than
-    # one poll gap would miss every contained kill and re-open the false pages.
-    local _fallback_s=$(( POLL_INTERVAL * 2 + 60 ))
-    local _cursor out rc=0
-    _cursor=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || _cursor=""
-    # A REAL journal cursor, not a timestamp. `--since` is a TIMESTAMP filter and
-    # is INCLUSIVE at its boundary, so an entry landing exactly on the stored
-    # second is re-read on the next tick; `--after-cursor` is a POSITION filter
-    # and starts strictly AFTER the named entry, so every record is seen exactly
-    # once. That distinction is load-bearing now that the caller reconciles
-    # RECORD COUNT against kill deltas: a double-counted boundary entry would
-    # inflate the count. `--show-cursor` appends a trailing `-- cursor: s=…`
-    # line, stripped below.
-    #
-    # NOTE (adversarial audit, #1790): journalctl REFUSES to combine
-    # --after-cursor with --since/--cursor ("Please specify only one of" —
-    # verified on systemd 255), and these records' timestamps are PID 1's
-    # EMISSION time, not the kernel kill time — so a time window can neither
-    # compose with the position filter nor bound a late record anyway. The
-    # late/pre-baseline record problem is therefore closed by the caller's
-    # DEFICIT reconciliation (see check_oom_events), not here.
-    if [[ "$_cursor" == s=* ]]; then
-        out=$(journalctl --user --after-cursor "$_cursor" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
-    else
-        # First run, or a cursor file written by an older version (epoch digits):
-        # fall back to the time window. Never trust a malformed value as a cursor.
-        out=$(journalctl --user --since "-${_fallback_s} seconds" --no-pager --show-cursor -o cat 2>/dev/null) || rc=$?
-    fi
-    [[ $rc -ne 0 ]] && return 1
-    # Advance the cursor only on a SUCCESSFUL read (this function runs in a
-    # command substitution, but file writes escape the subshell). If the read
-    # returned no cursor line (an empty journal window), KEEP the old cursor
-    # rather than clearing it — clearing would re-read the whole window next
-    # tick and double-count.
-    local _newcur
-    _newcur=$(printf '%s\n' "$out" | sed -n 's/^-- cursor: //p' | tail -1)
-    # Through the single verified writer, like every other advance. On failure
-    # the OLD cursor is removed rather than left behind: a stale value is
-    # indistinguishable from a fresh anchor to anything that merely checks the
-    # file exists, and `drain` is cleared on exactly that check.
-    if [[ -n "$_newcur" ]]; then
-        _oom_persist_cursor "$_newcur" || rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
-    fi
-    # `-o cat` renders systemd's line as `<unit>: Failed with result 'oom-kill'.`
-    # A unit name can legally contain ':' (template instances); cut would then
-    # truncate it, and a truncated name cannot match a contained prefix — so a
-    # pathological name mis-classifies toward PAGING, the safe direction.
-    # NOT `sort -u`: the caller compares this list's RECORD COUNT against the
-    # kill delta, and de-duplicating collapses two kills of the same unit name
-    # into one line — which would under-count and suppress a page for a kill
-    # nothing accounted for. Cardinality is the point; the display string
-    # de-duplicates separately. (The `-- cursor:` line carries no oom-kill
-    # phrase, so grep drops it here.)
-    printf '%s
-' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1
-}
-
-_oom_units_all_contained() {
-    # $1 = newline-separated non-empty unit list. rc 0 = EVERY unit matches a
-    # contained prefix; any unmatched unit → rc 1 (one uncontained kill pages).
-    local u p ok
-    while IFS= read -r u; do
-        [[ -z "$u" ]] && continue
-        ok=0
-        for p in $OOM_CONTAINED_UNIT_PREFIXES; do
-            [[ "$u" == "$p"* ]] && { ok=1; break; }
-        done
-        [[ $ok -eq 1 ]] || return 1
-    done <<<"$1"
-    return 0
-}
-
-check_oom_events() {
-    # $1 = the carried baseline spec
-    #   counter:local_oom:deficit:deficit_ts:drain
-    # (a bare counter from an older caller is accepted: local unverified,
-    # deficit 0). Echoes the refreshed spec for the next tick. Never touches
-    # stdout except the final spec echo.
-    #
-    # The spec carries FIVE facts because suppression needs all of them
-    # (#1790 review round):
-    #   counter     — the oom_kill aggregate (was there a kill?)
-    #   local_oom   — the container root's LOCAL oom count (WHOSE limit fired:
-    #                 the journal names the victim unit, and a container-limit
-    #                 kill can victimise a contained child scope)
-    #   deficit     — kills we already paged for whose journal records have not
-    #                 been seen yet. systemd's record of a unit failure can be
-    #                 emitted AFTER the poll that observed the counter
-    #                 increment, and the record's timestamp is PID 1's EMISSION
-    #                 time (measured on the live journal, #1790 audit) — so NO
-    #                 time window can exclude a late record from the next
-    #                 kill's batch. The only sound correlation is
-    #                 reconciliation: records returned by a query first retire
-    #                 the owed deficit, and only the REST may account for the
-    #                 current delta. A late record can therefore never cover a
-    #                 kill it does not belong to (Codex P1 / Devin, #1790).
-    #   deficit_ts  — when the deficit last GREW. A kill that never writes a
-    #                 record (a non-main process dying inside a surviving
-    #                 scope) leaves a deficit nothing can retire; it expires
-    #                 after 20 poll intervals so contained kills are not
-    #                 spuriously paged forever. Residue, accepted: a journald
-    #                 outage LONGER than the TTL, ending with a query whose
-    #                 backlogged records exactly equal deficit+n, can
-    #                 mis-attribute once. systemd's emission lag is
-    #                 milliseconds in every measurement we have; the TTL is
-    #                 generous against it.
-    #   drain       — set when arming could not advance the journal cursor
-    #                 (journalctl absent/failing at startup): the FIRST
-    #                 resolution must page and re-anchor, because the fallback
-    #                 window would return pre-baseline records that could
-    #                 otherwise "account" for a post-startup kill.
-    local prev_spec="$1" prev prev_local prev_deficit prev_deficit_ts prev_drain
-    prev="${prev_spec%%:*}"
-    local _r1="" _r2="" _r3="" _r4=""
-    [[ "$prev_spec" == *:* ]] && _r1="${prev_spec#*:}"
-    prev_local="${_r1%%:*}"
-    [[ "$_r1" == *:* ]] && _r2="${_r1#*:}"
-    prev_deficit="${_r2%%:*}"
-    [[ "$_r2" == *:* ]] && _r3="${_r2#*:}"
-    prev_deficit_ts="${_r3%%:*}"
-    [[ "$_r3" == *:* ]] && _r4="${_r3#*:}"
-    prev_drain="${_r4%%:*}"
-    # Numeric hygiene: a malformed element degrades to "unknown", never to a
-    # bash arithmetic error under set -e (audit NOTE, #1790).
-    [[ "$prev" =~ ^[0-9]+$ ]] || prev=""
-    [[ "$prev_local" =~ ^[0-9]+$ ]] || prev_local=""
-    [[ "$prev_deficit" =~ ^[0-9]+$ ]] || prev_deficit=0
-    [[ "$prev_deficit_ts" =~ ^[0-9]+$ ]] || prev_deficit_ts=0
-    [[ "$prev_drain" == "1" ]] || prev_drain=0
-    local cur loc_oom now_epoch
-    cur=$(_read_oom_kill) || { printf '%s' "$prev_spec"; return 0; }
-    [[ "$cur" =~ ^[0-9]+$ ]] || { printf '%s' "$prev_spec"; return 0; }
-    loc_oom=$(_read_oom_local_trigger) || loc_oom=""
-    [[ "$loc_oom" =~ ^[0-9]+$ ]] || loc_oom=""
-    now_epoch=$(date +%s)
-    # Expire an unretireable deficit (see the spec comment above). Computed
-    # PER CALL, like _oom_killed_units' fallback window: load_config re-sources
-    # watchgod.conf every tick and may change POLL_INTERVAL.
-    local _deficit_ttl=$(( POLL_INTERVAL * 20 ))
-    if (( prev_deficit > 0 && prev_deficit_ts > 0 )) \
-        && (( now_epoch - prev_deficit_ts > _deficit_ttl )); then
-        prev_deficit=0
-    fi
-    # LATE ARM (Codex P1, #1790). `main` calls `_oom_arm_baseline` exactly once,
-    # at startup. If `memory.events` was unreadable at that moment the spec came
-    # back empty -- "monitoring unavailable" -- and the journal cursor was never
-    # anchored, because arming returns before it gets that far. The baseline is
-    # then actually established HERE, on the first tick where the counter reads,
-    # and emitting drain=0 from that path would hand the next kill's query a
-    # fallback time window in which a PRE-BASELINE record can explain it away.
-    # A malformed spec lands here too, and for the same reason: we do not know
-    # what the cursor points at, so we re-anchor or refuse to trust it.
-    if [[ -z "$prev" ]]; then
-        _oom_arm_cursor || prev_drain=1
-        # `main` already told the operator monitoring was off. It is not, from
-        # here on, and a log that never retracts a scary line is how someone
-        # concludes the monitor is dead while it is running.
-        log INFO "OOM event capture armed late (baseline oom_kill=${cur}${prev_drain:+, drain=${prev_drain}})"
-    fi
-    if [[ -n "$prev" ]] && (( cur > prev )); then
-        local n=$(( cur - prev )) stamp
-        stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        {
-            echo "# OOM event ${stamp}: cgroup oom_kill ${prev} -> ${cur} (+${n})"
-            echo "## memory (MB):"; free -m 2>/dev/null | head -2
-            echo "## top RSS:"; ps -eo pid,rss,comm --sort=-rss 2>/dev/null | head -12
-            echo
-        } >> "$OOM_LOG" 2>/dev/null || true
-        log WARN "cgroup OOM kill detected (oom_kill ${prev} -> ${cur}); snapshot → ${OOM_LOG}"
-        # ATTRIBUTE before paging (issue #1775): the root counter aggregates
-        # oom_kill from every descendant cgroup, so a by-design kill inside a
-        # resource-capped child scope reads identically to genuine container
-        # pressure. Ask the journal which unit died; when EVERY killed unit is
-        # a known contained scope, the cap did its job — record it (snapshot +
-        # WARN log stay either way) and do not page. Anything else — a
-        # non-contained unit, no record, or no journal — pages exactly as
-        # before: attribution can only ever DOWNGRADE a known-contained kill,
-        # never silence an unknown one.
-        #
-        # TRIGGER CHECK FIRST (Codex P1, #1790): the journal names the VICTIM,
-        # not the cgroup whose limit fired. When the container root's LOCAL
-        # oom counter moved, the container's own limit triggered the kill —
-        # the victim can still be a contained child, so journal attribution
-        # must never suppress this. LIMIT OF THE MECHANISM, stated honestly:
-        # an ancestor ABOVE the container root (the host/VM slice) firing and
-        # victimising a contained child is indistinguishable from a contained
-        # kill at this layer and can still be suppressed — no container-side
-        # signal names that trigger. Unreadable local counter = unverifiable
-        # trigger = the same fail direction (page).
-        local _container_trigger=0
-        if [[ -n "$loc_oom" && -n "$prev_local" ]] && (( loc_oom > prev_local )); then
-            _container_trigger=1
-        fi
-        local _oom_units="" _oom_who="unattributed" _oom_n=0 _oom_query_ok=0
-        if _oom_units=$(_oom_killed_units); then
-            _oom_query_ok=1
-            if [[ -n "$_oom_units" ]]; then
-                _oom_who=$(printf '%s\n' "$_oom_units" | sort -u | paste -sd, -)
-                _oom_n=$(printf '%s\n' "$_oom_units" | grep -c . || true)
-            fi
-        else
-            _oom_units=""
-        fi
-        # RECONCILE (see the spec comment): the obligations are the owed
-        # deficit PLUS this tick's delta; the records returned retire them.
-        # Suppress only when records FULLY account for every obligation and
-        # every named unit is contained. Anything else pages, and the
-        # unaccounted remainder carries forward as the new deficit — which is
-        # why a LATE record (returned by a later query) can never cover a kill
-        # it does not belong to: by then its own kill is already an
-        # obligation. EVERY observed kill must be accounted for, not merely
-        # SOME of them (the partially attributed batch was the original
-        # fail-open here).
-        local _obligations=$(( prev_deficit + n )) _new_deficit
-        _new_deficit=$(( _obligations - _oom_n ))
-        (( _new_deficit < 0 )) && _new_deficit=0
-        if (( prev_drain == 0 && _container_trigger == 0 )) \
-            && [[ -n "$loc_oom" && -n "$prev_local" && -n "$_oom_units" ]] \
-            && (( _oom_n == _obligations )) \
-            && _oom_units_all_contained "$_oom_units"; then
-            log WARN "OOM kill contained in [${_oom_who}] — its own resource cap fired, not container pressure; not paging (snapshot kept)"
-        else
-            # Emergency tier (pages): an OOM kill is a discrete serious event —
-            # the usual reason a CC session vanishing with no crash message —
-            # not routine tier pressure, so unlike ORANGE it warrants a
-            # proactive page (per the 2026-08-19 decision). Deduped per
-            # distinct oom_kill total.
-            local _why="killed unit(s): ${_oom_who}"
-            if (( prev_drain == 1 )); then
-                _why="journal cursor could not be armed at startup; killed unit(s): ${_oom_who}"
-            elif [[ "$_container_trigger" -eq 1 ]]; then
-                _why="container-level trigger (memory.events.local oom ${prev_local} -> ${loc_oom}); killed unit(s): ${_oom_who}"
-            elif [[ -z "$loc_oom" || -z "$prev_local" ]]; then
-                _why="trigger unverifiable (memory.events.local unreadable); killed unit(s): ${_oom_who}"
-            fi
-            queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
-                "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}; ${_why}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
-                "watchgod:oom:${cur}"
-        fi
-        # The deficit clock only restarts when the deficit GROWS; retirements
-        # keep the original timestamp so a shrinking deficit cannot live
-        # forever by halves.
-        if (( _new_deficit > prev_deficit )); then
-            prev_deficit_ts=$now_epoch
-        fi
-        prev_deficit=$_new_deficit
-        # drain clears ONLY on a successful query: the flag means "the cursor
-        # was never anchored", and a FAILED resolution neither re-anchors it
-        # nor returns records — clearing on failure would let the next tick's
-        # fallback window offer pre-baseline records as attribution (audit
-        # BLOCKER, #1790 round 2).
-        # A SUCCESSFUL QUERY IS NOT AN ANCHORED CURSOR, and conflating them
-        # gave back exactly what drain was added to prevent. MEASURED with the
-        # cursor path unwritable: the arm correctly set drain=1, the next kill
-        # paged and cleared drain, its re-anchor silently failed, and the kill
-        # after that -- a genuine one whose own record was never written -- was
-        # accounted for by the first kill's record, still inside the fallback
-        # window, and suppressed. Two kills, one page. Clear drain only when the
-        # cursor is verifiably on disk.
-        # BOTH DIRECTIONS. `drain` means "the cursor is not anchored", so the
-        # cursor decides it -- clearing it on success while never SETTING it left
-        # the inverse open, and the inverse is reachable from the ordinary
-        # drain=0 state: a re-anchor that cannot persist deletes the cursor
-        # (:549) and leaves drain=0 behind, so the next query falls back to the
-        # relative window and re-reads the record this tick just counted.
-        # MEASURED from `4:0:0:0:0` with the cursor path unwritable: a contained
-        # kill, then a real kill that wrote no record of its own -- TWO kills,
-        # ZERO pages. Setting drain from the cursor closes it in one place
-        # rather than at each site that can fail to write.
-        # Clearing needs BOTH: the query succeeded AND the cursor on disk is
-        # anchored. The anchored check alone is syntax -- a stale file from a
-        # dead epoch passes it -- and on a failed query nothing re-anchored, so
-        # clearing there trusts a position nobody verified. Setting needs only
-        # the anchor to be missing.
-        if ! _oom_cursor_is_anchored; then
-            prev_drain=1
-        elif (( _oom_query_ok == 1 )); then
-            prev_drain=0
-        fi
-        # Bound the OOM log (retention discipline — matches cc_exit/log rotation);
-        # keep the most recent ~1000 lines so a thrashing container can't leak it.
-        local oom_lines
-        oom_lines=$(wc -l < "$OOM_LOG" 2>/dev/null || echo 0)
-        if (( ${oom_lines:-0} > 1000 )); then
-            tail -n 1000 "$OOM_LOG" > "${OOM_LOG}.tmp" 2>/dev/null && mv "${OOM_LOG}.tmp" "$OOM_LOG" 2>/dev/null || true
-        fi
-    fi
-    # A transient unreadable local counter must not DISARM future trigger
-    # verification: carry the last known local baseline forward (the tick
-    # itself still pages — the current value is unknown — and a jump observed
-    # once the file is readable again correctly reads as a container trigger).
-    printf '%s' "${cur}:${loc_oom:-$prev_local}:${prev_deficit}:${prev_deficit_ts}:${prev_drain}"
-}
-
-_oom_persist_cursor() {
-    # $1 = a cursor value (with or without the leading `s=`). rc 0 ONLY when the
-    # cursor file now verifiably holds it.
-    #
-    # THE SINGLE WRITER. Every path that advances the cursor goes through here,
-    # because a cursor that was not persisted is the one state the whole
-    # suppression mechanism cannot survive: queries fall back to a TIME WINDOW,
-    # where a record written before the baseline can account for a kill that
-    # happened after it.
-    #
-    # The write's exit status is not enough on its own -- a full filesystem
-    # reports the failure on close, leaving an empty or truncated file behind --
-    # so the value is read BACK and compared. At the point this matters an
-    # unreadable cursor and an absent one are the same thing, and they get the
-    # same answer.
-    local _want="s=${1#s=}" _back=""
-    [[ "$_want" != "s=" ]] || return 1
-    # The write's own status is checked, and then the value is read back and
-    # compared to what we MEANT to write. The comparison subsumes the status
-    # check -- MEASURED: reverting this `|| return 1` to `|| true` turns no test
-    # red, because a failed write leaves either nothing (read-back fails) or the
-    # OLD value (read-back mismatches). It is kept as the cheap early exit and
-    # because a future refactor that weakened the read-back to a bare `s=*`
-    # prefix test would make it load-bearing again.
-    printf '%s' "$_want" > "$_OOM_CURSOR_FILE" 2>/dev/null || return 1
-    _back=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || return 1
-    [[ "$_back" == "$_want" ]] || return 1
-    return 0
-}
-
-_oom_cursor_is_anchored() {
-    # rc 0 when a usable cursor is on disk. This is the fact `drain` denies, so
-    # nothing may clear drain without it.
-    local _back=""
-    _back=$(cat "$_OOM_CURSOR_FILE" 2>/dev/null) || return 1
-    [[ "$_back" == s=* ]] || return 1
-    return 0
-}
-
-_oom_arm_cursor() {
-    # Advance the journal cursor to the current tail and PERSIST it.
-    #
-    # rc 0 ONLY when the cursor file now holds that position. rc 1 for every
-    # other outcome -- journalctl absent, the query failing, the write failing,
-    # or a write that reported success and left nothing readable behind. The
-    # caller must carry drain=1 on rc 1, because an unarmed cursor is not a
-    # cosmetic gap: the next query falls back to a TIME WINDOW, where a record
-    # written BEFORE the baseline can account for a kill that happened after it
-    # and suppress a real page.
-    #
-    # `-n 0 --show-cursor` prints the tail cursor with no entries, so this
-    # advances the position without consuming anything.
-    command -v journalctl >/dev/null 2>&1 || return 1
-    local _tail_cursor=""
-    _tail_cursor=$(journalctl --user -n 0 --show-cursor --no-pager -o cat 2>/dev/null \
-        | sed -n 's/^-- cursor: //p' | tail -1) || _tail_cursor=""
-    [[ -n "$_tail_cursor" ]] || return 1
-    _oom_persist_cursor "$_tail_cursor"
-}
-
-_oom_arm_baseline() {
-    # Echo the initial OOM baseline spec
-    # ("counter:local_oom:deficit:deficit_ts:drain"; empty = monitoring
-    # unavailable) and advance the journal cursor to the current tail (Codex
-    # P1, #1790): records of kills that predate the baseline — written before
-    # this (re)start, or left behind the cursor by a kill that landed in the
-    # gap — must never account for a post-startup kill. `-n 0 --show-cursor`
-    # prints the tail cursor with no entries, so this advances the position
-    # without consuming anything. When the cursor cannot be armed (journalctl
-    # absent or failing), the spec carries drain=1: the first resolution then
-    # pages and re-anchors rather than trusting the fallback window's
-    # pre-baseline records.
-    local base="" loc="" drain=0
-    base=$(_read_oom_kill) || base=""
-    [[ -z "$base" ]] && { printf '%s' ""; return 0; }
-    loc=$(_read_oom_local_trigger) || loc=""
-    if ! _oom_arm_cursor; then
-        drain=1
-        # A cursor file from a PREVIOUS daemon epoch must not survive a failed
-        # arm. It passes the anchored check on syntax, but its POSITION predates
-        # this baseline -- a query from it returns pre-baseline records, and one
-        # of those can account for a post-baseline kill. MEASURED: with a stale
-        # file surviving, drain=0 and an expired deficit, one real line-less
-        # kill produced ZERO pages. Absent file -> queries use the bounded
-        # fallback window and drain=1 covers the first resolution.
-        rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
-    fi
-    printf '%s' "${base}:${loc}:0:0:${drain}"
-}
 
 # ── Main loop ────────────────────────────────────────────────
 main() {
     mkdir -p "$(dirname "$LOG_FILE")" "$ALERT_DIR"
-    log INFO "Watchgod starting (poll=${POLL_INTERVAL}s, budget=${CC_TMP_BUDGET_MB}MB, sacred=${SACRED_GROUND_MB}MB)"
+    load_config
+    mkdir -p "$DG_STATE_DIR"
+    # v1's shared tier flags. Nothing reads them, and v2 never clears them, so
+    # a leftover would sit there forever looking like a live alarm.
+    rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
+    log INFO "Watchgod v2 starting (poll=${POLL_INTERVAL}s, fast=${FAST_POLL_INTERVAL}s, act=${WATCHGOD_ACT}, downloads=${DOWNLOADS_DIR})"
+    (( WATCHGOD_ACT )) || log WARN "OBSERVE mode (WATCHGOD_ACT=0): tiers are measured and logged; nothing is reclaimed, released or paged"
 
     # Baseline the OOM counter at startup so we only page on NEW kills (never the
     # cumulative-since-boot history). Empty baseline = monitoring unavailable.
@@ -1579,46 +790,27 @@ main() {
     while true; do
         load_config
 
-        local cc_result sys_result
-        cc_result=$(check_cc_tmp)
-        sys_result=$(check_sys_tmp)
-
-        local cc_tier="${cc_result%%:*}"
-        local cc_used="${cc_result##*:}"
-        local sys_tier="${sys_result%%:*}"
-        local sys_pct="${sys_result##*:}"
-
-        write_state "$cc_tier" "$cc_used" "$sys_tier" "$sys_pct"
+        check_disks
+        write_state
+        maybe_sweep_cc_tmp hourly
 
         # Durable OOM capture — snapshot + page on any NEW cgroup OOM kill.
         oom_baseline=$(check_oom_events "$oom_baseline")
-
-        # Clear the shared cc+sys alert flags only when BOTH zones are green:
-        # tmp_warning/tmp_emergency are touched by both the cc AND sys handlers
-        # (one dedupe key across zones), so a red episode in either zone must
-        # keep them set.
-        if [[ "$cc_tier" == "green" && "$sys_tier" == "green" ]]; then
-            rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" 2>/dev/null || true
-        fi
-        # tmp_orange_stuck is cc-tmp-SPECIFIC (only clean_cc_orange sets it), so
-        # clear it whenever cc-tmp is no longer ORANGE — independent of the sys
-        # tier. Otherwise a cc episode that falls to YELLOW while /tmp stays
-        # non-green leaves a stale flag that suppresses the once-per-episode STUCK
-        # record of a later, distinct cc-tmp ORANGE episode.
-        if [[ "$cc_tier" != "orange" ]]; then
-            rm -f "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
-        fi
 
         # Log rotation — truncate when > 1MB
         local log_size
         log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
         if (( log_size > 1048576 )); then
-            tail -100 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+            { tail -100 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"; } 2>/dev/null || true
         fi
 
-        sleep "$POLL_INTERVAL"
+        sleep "$NEXT_POLL"
     done
 }
+
+# Every tunable now holds its code default or environment override: that is the
+# baseline load_config restores before each re-read.
+_wg_snapshot_defaults
 
 # Run the poll loop only when executed directly — sourcing (e.g. from tests) loads the
 # functions without starting the daemon.

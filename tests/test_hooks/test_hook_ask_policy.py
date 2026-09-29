@@ -875,15 +875,29 @@ def test_a_dispatched_session_is_still_denied_the_push(
     assert rc == 2, (rc, out, err)
 
 
-def test_the_no_open_pr_ask_survives_the_knob(monkeypatch, tmp_path, capsys) -> None:
-    """Classified unsuppressible on purpose: a public branch with no PR runs
-    neither CI nor the leak scan. Turning off the routine publish prompt must
-    not turn this off."""
+def _no_open_pr_repush(monkeypatch) -> None:
     monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+
+def test_the_no_open_pr_block_survives_the_knob(monkeypatch, tmp_path, capsys) -> None:
+    """A public branch with no PR runs neither CI nor the leak scan. On the
+    declared public repo that re-push is BLOCKED (#2358), and turning off the
+    routine publish prompt must not weaken it."""
+    _no_open_pr_repush(monkeypatch)
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push origin feat/x")
+    assert rc == 2, (rc, out, err)
+    assert "NO OPEN PR" in err, err
+
+
+def test_the_no_open_pr_ask_survives_the_knob(monkeypatch, tmp_path, capsys) -> None:
+    """Off the declared public repo the same state is an ask, and it is
+    classified unsuppressible: the knob must not silence it."""
+    _no_open_pr_repush(monkeypatch)
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
     doc = _assert_asks(*_run(monkeypatch, tmp_path, capsys, "git push origin feat/x"))
     assert "NO OPEN PR" in _hso(doc)["permissionDecisionReason"]
 

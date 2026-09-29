@@ -104,30 +104,10 @@ STATUSEOF
 # already honors (~/.genesis/update_in_progress.pid, a bare live PID) so the
 # watchdog DEFERS its restart until the restore's EXIT trap clears it. We refuse
 # to clobber a marker a real update.sh/dashboard deploy already owns, and remove
-# it only if it is still OUR pid — never another deploy's.
-_UPDATE_PID_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid"
-_WROTE_UPDATE_MARKER=false
-_acquire_deploy_marker() {
-    mkdir -p "$(dirname "$_UPDATE_PID_FILE")"
-    if [ -f "$_UPDATE_PID_FILE" ]; then
-        local _other
-        _other="$(cat "$_UPDATE_PID_FILE" 2>/dev/null || true)"
-        if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && kill -0 "$_other" 2>/dev/null; then
-            log "ERROR: a deploy already holds $_UPDATE_PID_FILE (pid $_other) — refusing concurrent update+restore"
-            return 1
-        fi
-    fi
-    echo "$$" > "$_UPDATE_PID_FILE"
-    _WROTE_UPDATE_MARKER=true
-    log "Holding deploy-in-progress marker (pid $$) so the watchdog won't revive genesis-server mid-restore"
-}
-_release_deploy_marker() {
-    $_WROTE_UPDATE_MARKER || return 0
-    # Remove only if it is still OUR pid (a later deploy may have taken over).
-    if [ -f "$_UPDATE_PID_FILE" ] && [ "$(cat "$_UPDATE_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
-        rm -f "$_UPDATE_PID_FILE"
-    fi
-}
+# it only if it is still OUR pid — never another deploy's. The acquire/release
+# helpers live in a shared lib; this script logs at the call site.
+# shellcheck source=lib/deploy_marker.sh
+source "$_SCRIPT_DIR/lib/deploy_marker.sh"
 # N2: the credential-bearing plaintext SQL dump and decrypted Qdrant snapshot
 # temps are `rm`'d inline, but a mid-section death would leave them in ~/tmp —
 # trap-protect them. (Empty-string default → no-op before they're assigned.)
@@ -213,7 +193,16 @@ _quiesce_genesis_server() {
     # may have crashed. Gating the marker on is-active (as an earlier draft did)
     # would leave that highest-risk case — the multi-minute .read — unprotected.
     # Only the stop ACTION below is gated on liveness.
-    _acquire_deploy_marker || die "another live deploy owns the deploy marker — live database left untouched"
+    local _marker_rc=0
+    _acquire_deploy_marker || _marker_rc=$?
+    if [ "$_marker_rc" -eq 2 ]; then
+        log "ERROR: cannot write the deploy marker $DEPLOY_MARKER_FILE — without it the watchdog could restart genesis-server mid-restore"
+        die "cannot write the deploy marker — live database left untouched"
+    elif [ "$_marker_rc" -ne 0 ]; then
+        log "ERROR: a deploy already holds $DEPLOY_MARKER_FILE (pid $DEPLOY_MARKER_HOLDER) — refusing concurrent update+restore"
+        die "another live deploy owns the deploy marker — live database left untouched"
+    fi
+    log "Holding deploy-in-progress marker (pid $$) so the watchdog won't revive genesis-server mid-restore"
     if systemctl --user is-active --quiet genesis-server 2>/dev/null; then
         log "Stopping genesis-server before SQLite restore (will NOT auto-restart)..."
         # Only record "stopped" if the stop actually succeeded — otherwise the

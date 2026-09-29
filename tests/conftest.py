@@ -252,6 +252,21 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from creating the REAL content-boundary key ───────
+@pytest.fixture(autouse=True)
+def _isolate_boundary_key(tmp_path):
+    """Point the sanitizer's per-install boundary key at tmp and drop the cached
+    key, so no test creates or reads ``~/.genesis/boundary_key`` and each test
+    starts from a known state. Fixture-owned ``MonkeyPatch``, as above."""
+    import genesis.security.sanitizer as sanitizer
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.env.boundary_key_path", lambda: tmp_path / "boundary_key")
+    mp.setattr(sanitizer, "_boundary_key", None)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from writing REAL merge-override audit rows ───────
 @pytest.fixture(autouse=True)
 def _isolate_override_log(tmp_path):
