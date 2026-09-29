@@ -818,7 +818,7 @@ def test_invalidate_clears_for_a_commit_the_raw_text_does_not_spell(
 ) -> None:
     """The invalidator's early exit tests for the word `commit` before parsing, and
     must test the text the shell assembles: otherwise a review marker could stay
-    valid past the commit it was for. It reads the same `mention_view` the checker's
+    valid past the commit it was for. It reads the same `mentions` the checker's
     early exit reads, so the two cannot disagree about which commands are commits."""
     assert _mark(repo, home).returncode == 0
     assert len(_markers(home)) == 1

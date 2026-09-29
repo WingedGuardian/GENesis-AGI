@@ -35,7 +35,7 @@ from hook_input import read_payload, tool_input  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     has_continuation,
-    mention_view,
+    mentions,
     untokenizable,
 )
 
@@ -112,10 +112,8 @@ def _advisory(command: str) -> str | None:
     # continued command whose assembled text names the operation gets the advice as
     # it stands — advisory-only, so the worst case is one unneeded note — rather than
     # a re-parse of the join.
-    if has_continuation(command):
-        view = mention_view(command)
-        if "tmux" in view and "kill-server" in view:
-            return _ADVICE
+    if has_continuation(command) and mentions(command, "tmux", "kill-server"):
+        return _ADVICE
     for seg in analyze(command):
         if seg.exe != "tmux":
             continue

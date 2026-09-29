@@ -109,7 +109,7 @@ from shell_parse import (  # noqa: E402
     analyze_checked,
     gh_command,
     has_continuation,
-    mention_view,
+    mentions,
 )
 
 
@@ -444,21 +444,20 @@ def _omission_line(dropped: int) -> str:
     )
 
 
-#: A gh READ named in the text of a command the parse could not read: a listing, a
-#: search, or a `gh api` call carrying no write flag (a field makes it a POST, and a
-#: method or input flag makes it anything). Only decides whether that command gets a
-#: one-line note. MEASURED over 86,684 recorded commands: matching the bare words
-#: `list|search|api|view` put the note on 123 continued commands, most of them review
-#: replies sent with `gh api -f`; this leaves 49, nearly all real paginated reads.
-_GH_LISTING = re.compile(r"\bgh\s+search\b|\bgh\s+[\w-]+\s+list\b")
-_GH_API = re.compile(r"\bgh\s+api\b")
-_GH_API_WRITE = re.compile(r"\s(?:-f|-F|--field|--raw-field|--input|-X|--method)[\s=]")
+#: The verbs of every gh read that can come back capped: a listing (`list`, or its
+#: alias `ls`), a `search`, and `api`. On a command the parse could not read, a
+#: reading that names `gh` and one of these gets a one-line note. The test ONLY
+#: ADDS a note: it does not look for gh's grammar (options before the group, the
+#: method, which command a flag belongs to), because a text classifier of that
+#: grammar missed real reads in review each time it was narrowed (`gh --repo o/r pr
+#: list`, `gh api -X GET`, a field on a different command). The note is conditional
+#: prose, so on a write it costs one sentence. MEASURED over the 928 continued
+#: commands in 86,684 recorded ones: 115 get the note.
+_GH_READ_VERB = re.compile(r"\b(?:list|ls|search|api)\b")
 
 
-def _names_a_gh_read(view: str) -> bool:
-    return bool(
-        _GH_LISTING.search(view) or (_GH_API.search(view) and not _GH_API_WRITE.search(view))
-    )
+def _names_a_gh_read(command: str) -> bool:
+    return mentions(command, _GH_WORD, _GH_READ_VERB)
 
 
 def _unreadable_listing_note(blind: BlindSpot) -> str:
@@ -578,9 +577,8 @@ def _hits(command: str) -> tuple[list[tuple[str, str, int, bool]], object]:
 def _process(payload: dict) -> None:
     command = field(tool_input(payload), "command")
     # The text the shell assembles, so a `gh` word split by a line continuation or
-    # by quotes still reaches the parse (`mention_view` is widen-only).
-    view = mention_view(command) if command else ""
-    if not command or not _GH_WORD.search(view):
+    # by quotes still reaches the parse (`mentions` is widen-only).
+    if not command or not mentions(command, _GH_WORD):
         return
     sid = session_id(payload)
     found, blind = _hits(command)
@@ -594,7 +592,7 @@ def _process(payload: dict) -> None:
     # review found a new defect in that modelling each round. The real bounds keep the
     # keyed block: they are measured at 0 real commands, so spending it costs nothing.
     if blind is not None and blind.bounds_induced and has_continuation(command):
-        if _names_a_gh_read(view):
+        if _names_a_gh_read(command):
             print_json_bounded(
                 _envelope(_unreadable_listing_note(blind)),
                 text_keys=("hookSpecificOutput.additionalContext",),

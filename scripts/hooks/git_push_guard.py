@@ -243,7 +243,7 @@ try:
         gh_pr_subcommand,
         git_subcommand,
         has_trailing_override,
-        mention_view,
+        mentions,
         split_segments,
         unresolved_verb_programs,
     )
@@ -336,9 +336,13 @@ _CREATE_MENTION = re.compile(r"\bcreate\b")
 #: The blind branch's view of a REVIEW REQUEST. The round-budget gate finds a
 #: `gh pr comment … @codex review` in the SEGMENTS, so a command whose segments are
 #: withheld (a bounds-type blind spot) reaches GitHub with no budget check unless
-#: the blind branch names it too. Same breadth as `gh` + `create`: an opaque body
-#: (a file, an editor) already counts as a possible request on the parsed path, so
-#: the body is not inspected here either.
+#: the blind branch names it too. It names the same shape the parsed check does:
+#: `gh`, `pr` and `comment`, all in one reading. `gh` + `comment` alone refused an
+#: issue comment and every `gh api …/comments -f body=…` review reply, neither of
+#: which the parsed check gates (MEASURED: 33 continued commands -> 21). An opaque
+#: body (a file, an editor) already counts as a possible request on the parsed
+#: path, so the body is not inspected here either.
+_PR_MENTION = re.compile(r"\bpr\b")
 _COMMENT_MENTION = re.compile(r"\bcomment\b")
 
 #: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
@@ -352,12 +356,11 @@ _GATED_EXES = frozenset({"git", "gh"})
 def _mentions_gated_op(command: str) -> bool:
     """Whether the text names any gated operation, on the blind path only.
 
-    Every caller passes `mention_view(...)`, the text the shell would assemble, so
-    a gated word split by quotes or a line continuation is still named here.
+    Searches every reading `shell_parse.mentions` searches, the text the shell would
+    assemble among them, so a gated word split by quotes or a line continuation is
+    still named here. `gh` and `create` must share one reading.
     """
-    if _GATED_MENTION.search(command):
-        return True
-    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+    return mentions(command, _GATED_MENTION) or mentions(command, _GH_MENTION, _CREATE_MENTION)
 
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
@@ -10183,7 +10186,7 @@ def _run_merge_and_push_gates() -> int:
         # scoped — an 83% cut, with every attack spelling this change documents
         # still refused, because each contains the literal `git`.
         #
-        # The mention is read through `mention_view`, the text the shell would
+        # The mention is read through `mentions`, the text the shell would
         # assemble, so a word split by quotes or backslashes inside the carrier's
         # own segment is still seen. The sibling guards read their carrier
         # segments the same way, so they keep failing identically rather than
@@ -10212,8 +10215,8 @@ def _run_merge_and_push_gates() -> int:
         carried_gated_op = any(
             s.exe in _REPARSE_CARRIERS
             and (
-                _mentions_gated_op(mention_view(s.raw))
-                or bool(_CARRIER_GATED_MENTION.search(mention_view(s.raw)))
+                _mentions_gated_op(s.raw)
+                or mentions(s.raw, _CARRIER_GATED_MENTION)
             )
             for s in segs
         )
@@ -10237,12 +10240,12 @@ def _run_merge_and_push_gates() -> int:
             hidden_gated_verb
             or (
                 not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-                # The mention is read through `mention_view`, the text the shell
+                # The mention is read through `mentions`, the text the shell
                 # assembles: a word split by a line continuation is exactly the blind
                 # spot that returned no segments, so the raw text is the wrong place
                 # to look for it.
                 and (
-                    _mentions_gated_op(mention_view(cmd))
+                    _mentions_gated_op(cmd)
                     # BOUNDS-TYPE ONLY, both arms: an untokenizable command still
                     # returns its segments, so the gates below see them.
                     #
@@ -10255,14 +10258,13 @@ def _run_merge_and_push_gates() -> int:
                     # quietly depending on another one.
                     or (
                         blind.bounds_induced
-                        and bool(_CARRIER_GATED_MENTION.search(mention_view(cmd)))
+                        and mentions(cmd, _CARRIER_GATED_MENTION)
                     )
                     # A review request: widening this on an untokenizable command
                     # would refuse every PR comment whose body carries an apostrophe.
                     or (
                         blind.bounds_induced
-                        and bool(_GH_MENTION.search(mention_view(cmd)))
-                        and bool(_COMMENT_MENTION.search(mention_view(cmd)))
+                        and mentions(cmd, _GH_MENTION, _PR_MENTION, _COMMENT_MENTION)
                     )
                 )
             )

@@ -1568,7 +1568,7 @@ _BLIND_UNCLASSIFIED_OPTION = BlindSpot(
 #: separately.
 #:
 #: COST, measured over 86,684 recorded commands on one install, both trees run through
-#: the real hooks against the same base: 429 commands (0.49%) are newly refused, each
+#: the real hooks against the same base: 373 commands (0.43%) are newly refused, each
 #: with this hint, and none moves toward allowing.
 _BLIND_CONTINUATION = BlindSpot(
     bounds_induced=True,
@@ -1602,8 +1602,8 @@ def has_continuation(command: str) -> bool:
 def fold_continuations(text: str) -> str:
     """``text`` with every backslash run before a newline deleted, and the newline.
 
-    A DECISION VIEW, never a verdict's parse input. It feeds :func:`mention_view`,
-    which only decides whether a guard's early exit may skip the parse, and
+    A DECISION VIEW, never a verdict's parse input. It feeds :func:`mention_views`,
+    which only decides whether a command MENTIONS an operation, and
     :func:`unresolved_verb_programs`, which can only ADD a refusal. Deleting the
     whole run rather than the shell's exact reduction is deliberate: every reader of
     this view also strips backslashes, so the difference cannot change a mention.
@@ -1611,35 +1611,41 @@ def fold_continuations(text: str) -> str:
     return _CONTINUATION_NL.sub("", text)
 
 
-def mention_view(command: str) -> str:
-    """The text a guard's early exit must search before deciding to skip the parse.
+def mention_views(command: str) -> tuple[str, ...]:
+    """The readings of ``command`` a guard's MENTION test must search.
 
     A test for a verb in the raw text cannot see a verb the SHELL assembles from
     pieces — quote removal, backslash removal, and line joining all run before the
     word exists. When an early exit read the raw text, a command whose verb was
     assembled that way never reached the parse, although the parse resolves it.
 
-    Returns the raw command plus the forms with continuations folded and with quotes
-    and backslashes removed, joined by newlines. WIDEN-ONLY: the raw text is always
-    the first line, so any pattern that matched before still matches. Over-matching
-    only sends a command on to the parse, which is where the decision is made. Use it
-    for a MENTION test and nothing else; never parse it.
-    """
-    return "\n".join(mention_views(command))
-
-
-def mention_views(command: str) -> tuple[str, ...]:
-    """The separate readings :func:`mention_view` joins, one per element.
-
-    For a reader that extracts TOKENS rather than testing for a mention. The joined
-    view is one string only for convenience; its lines are alternative readings of
-    the same command, not consecutive text, so a token read past the end of one
-    belongs to a different reading. MEASURED: a worktree-target reader given the
-    joined view took a target from the next reading and refused a harmless command.
+    Returns the raw command, then the form with continuations folded, then that form
+    with quotes and backslashes removed (duplicates dropped). WIDEN-ONLY: the raw text
+    is always the first reading, so any pattern that matched before still matches.
+    For a MENTION test or token extraction, and nothing else; never parse it. Test a
+    mention with :func:`mentions`, which searches each reading separately.
     """
     folded = fold_continuations(command)
     stripped = folded.replace('"', "").replace("'", "").replace("\\", "")
     return tuple(dict.fromkeys((command, folded, stripped)))
+
+
+def mentions(command: str, *patterns: re.Pattern[str] | str) -> bool:
+    """Whether ONE reading of ``command`` matches every pattern (see :func:`mention_views`).
+
+    A ``str`` pattern is a substring test; a compiled pattern is searched.
+
+    Each reading is searched on its own, and every pattern must match in the same
+    one. The readings are alternatives, not consecutive text: a pattern spanning two
+    of them, or two patterns satisfied by different ones, describe text the shell
+    never assembles. MEASURED in review: a two-word pattern run over the readings
+    joined into one string matched the last word of one reading and the first word of
+    the next, and refused a command that removes nothing.
+    """
+    return any(
+        all((p in view) if isinstance(p, str) else bool(p.search(view)) for p in patterns)
+        for view in mention_views(command)
+    )
 
 
 def unresolved_verb_programs(command: str) -> frozenset[str]:

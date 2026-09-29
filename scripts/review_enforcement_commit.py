@@ -92,7 +92,7 @@ try:
         gh_pr_subcommand,
         git_subcommand,
         has_trailing_override,
-        mention_view,
+        mentions,
         split_segments,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -1073,12 +1073,12 @@ def main() -> None:
     # consumed by read_payload, so nothing further down can read it again.
     if discarded_write is not None:
         discarded_write.remember(command)
-    # Read through `mention_view`: a word the shell assembles from quotes,
+    # Read through `mentions`: a word the shell assembles from quotes,
     # backslashes or joined lines is not spelled in the raw text, and a raw test
     # would skip the parse that resolves it. Widen-only — the parse below still makes every decision. Keep
     # identical to the invalidator's early-out, or a commit this gate checks can
     # leave that module's marker standing.
-    if not _COMMIT_PATTERN.search(mention_view(command)):
+    if not mentions(command, _COMMIT_PATTERN):
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through

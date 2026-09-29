@@ -14,9 +14,11 @@ a continuation is reported by ``analyze_checked`` as a BOUNDS-type blind spot: t
 segments cannot be trusted, and each consumer refuses when its early exit says the
 command names its operation, or, for an advisory, gives a short note.
 
-The early exits read ``shell_parse.mention_view`` rather than the raw text, so a
+The early exits read ``shell_parse.mentions`` rather than the raw text, so a
 continuation or a quote INSIDE the verb (which the shell removes) cannot hide the
-verb from the early exit and skip the parse altogether.
+verb from the early exit and skip the parse altogether. It searches each reading of
+the command on its own: a match assembled across two readings is text the shell
+never runs.
 
 Trigger literals are assembled from fragments so this file's own text does not carry
 them, per the convention in the other guard suites.
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -192,7 +195,7 @@ def test_a_quote_inside_the_verb_does_not_skip_the_gate(sandbox, guard, command)
 def test_a_plain_push_split_inside_the_verb_is_refused_not_run_unasked(sandbox):
     """No force flag, so nothing else in the raw text names a gated operation: the
     word `push` itself is the only mention, and the continuation splits it. The
-    blind branch must still see it (through `mention_view`), or the command reaches
+    blind branch must still see it (through `mentions`), or the command reaches
     the shell with neither a refusal nor the ordinary push approval."""
     home, repo = sandbox
     res = _run(_PUSH_GUARD, f"{GIT} pu{MID}sh origin feature-x", home, repo)
@@ -630,14 +633,85 @@ def test_a_continuation_outranks_untokenizable():
         "echo 'unrelated'",
     ],
 )
-def test_the_mention_view_always_contains_the_raw_text(command):
-    """Widen-only: a pattern that matched the raw command still matches the view."""
-    assert command in sp.mention_view(command)
+def test_the_first_mention_reading_is_always_the_raw_text(command):
+    """Widen-only: a pattern that matched the raw command still matches a reading."""
+    assert sp.mention_views(command)[0] == command
+    assert sp.mentions(command, command)
 
 
 @pytest.mark.parametrize(
     "command",
     [f"{GIT} cl{MID}ean -fd", f"{GIT} cl''ean -fd", f'{GIT} c"lea"n -fd', f"{GIT} cl\\ean -fd"],
 )
-def test_the_mention_view_shows_the_word_the_shell_runs(command):
-    assert f"{GIT} {CLEAN} -fd" in sp.mention_view(command)
+def test_a_mention_reading_shows_the_word_the_shell_runs(command):
+    assert sp.mentions(command, f"{GIT} {CLEAN} -fd")
+
+
+# ── the readings are alternatives, never consecutive text ──
+
+
+def test_a_pattern_never_matches_across_two_readings():
+    """Joined into one string, the last word of one reading sat next to the first word
+    of the next, so a two-word pattern matched text no reading contains."""
+    command = "alpha" + CONT + "beta omega"
+    assert not sp.mentions(command, re.compile(r"\bomega\s+alpha\b"))
+    assert sp.mentions(command, re.compile(r"\bbeta\s+omega\b")), "control: in one reading"
+
+
+def test_every_pattern_must_match_in_the_same_reading():
+    """`cl''ean` is in the raw reading only, `clean` in the de-quoted one only: no
+    single reading names both, so the conjunction does not hold."""
+    command = f"{GIT} cl''ean -fd"
+    assert not sp.mentions(command, "cl''ean", CLEAN)
+    assert sp.mentions(command, GIT, CLEAN), "control: both in the de-quoted reading"
+
+
+def test_a_continued_command_ending_in_the_subcommand_is_not_a_removal(sandbox):
+    """The removal pattern matched the subcommand ending one reading and the operation
+    starting the next, and refused a command that removes nothing."""
+    home, repo = sandbox
+    res = _run(_WORKTREE_GUARD, "remove" + CONT + "foo git worktree", home, repo)
+    assert res.returncode == 0, (res.stdout + res.stderr)[:400]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh issue comment 1" + CONT + "--body hi",
+        "gh api repos/o/r/pulls/1/comments" + CONT + "-f body=thanks",
+    ],
+    ids=["issue-comment", "review-reply"],
+)
+def test_a_continued_comment_that_is_not_a_pr_comment_is_not_refused(sandbox, command):
+    """The review-request arm names what the parsed check gates, `gh pr comment`; an
+    issue comment or an API review reply is neither, and was refused."""
+    home, repo = sandbox
+    res = _run(_PUSH_GUARD, command, home, repo)
+    assert res.returncode == 0, (res.stdout + res.stderr)[:400]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh --repo o/r pr list" + CONT + "--state open",
+        "gh pr ls" + CONT + "--state open",
+        "gh api -X GET search/issues" + CONT + "-f q=repo:o/r",
+        "gh api repos/o/r/issues" + CONT + "--jq length; gh pr comment 2 -f body=thanks",
+    ],
+    ids=["option-before-group", "ls-alias", "explicit-get", "field-on-another-command"],
+)
+def test_a_continued_gh_read_is_noted_however_it_is_spelled(sandbox, command):
+    """The note used to depend on a text classifier of gh's grammar, and each spelling
+    it did not model got no note. It now needs only `gh` and a read verb."""
+    home, repo = sandbox
+    res = _run(_HOOKS_DIR / "capped_read_advisory.py", command, home, repo)
+    assert res.returncode == 0
+    assert "could not check the gh read" in res.stdout, res.stdout
+
+
+def test_a_continued_gh_command_with_no_read_verb_gets_no_note(sandbox):
+    """Control for the cell above: the note is not given to every continued `gh`."""
+    home, repo = sandbox
+    res = _run(_HOOKS_DIR / "capped_read_advisory.py", "gh pr create" + CONT + "--fill", home, repo)
+    assert res.returncode == 0
+    assert res.stdout.strip() == "", res.stdout

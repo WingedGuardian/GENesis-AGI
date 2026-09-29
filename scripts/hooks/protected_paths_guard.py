@@ -93,7 +93,7 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
 _DEGRADED_GATED = r"\brm\b|\brmdir\b"
 
 try:
-    from shell_parse import _REPARSE_CARRIERS, analyze_checked, mention_view  # noqa: E402
+    from shell_parse import _REPARSE_CARRIERS, analyze_checked, mentions  # noqa: E402
 except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
     if __name__ != "__main__":
         # A test importing a deliberately broken tree must see the real error, not a
@@ -271,10 +271,10 @@ def main() -> int:
         discarded_write.remember(cmd)
 
     # Fast path: no rm/rmdir word anywhere in the command — as the shell would
-    # assemble it. `mention_view` adds the forms with quotes, backslashes and line
+    # assemble it. `mentions` also reads the forms with quotes, backslashes and line
     # continuations removed, so `r''m` or a continuation inside the word cannot skip
     # the parse below, which resolves them correctly. Widen-only.
-    if not _RM_PATTERN.search(mention_view(cmd)):
+    if not mentions(cmd, _RM_PATTERN):
         return 0
 
     dirs = _protected_dirs()
@@ -407,9 +407,9 @@ def main() -> int:
         # segment mentioned rm. `_RM_PATTERN` is the same prefilter used at the
         # module's fast path; `seg.raw` is the carrier's own segment text, not
         # the whole command.
-        # Read through `mention_view`: a word split by quotes or backslashes inside
+        # Read through `mentions`: a word split by quotes or backslashes inside
         # the carrier's own payload still names rm to the shell that runs it.
-        if seg.exe in _REPARSE_CARRIERS and _RM_PATTERN.search(mention_view(seg.raw)):
+        if seg.exe in _REPARSE_CARRIERS and mentions(seg.raw, _RM_PATTERN):
             # A LAUNCHER THAT RUNS A COMMAND THIS RESOLVER CANNOT RECOVER.
             # REFUSE OUTRIGHT, deliberately WITHOUT looking at the payload.
             #

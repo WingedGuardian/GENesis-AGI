@@ -171,7 +171,8 @@ try:
         analyze_checked,
         git_subcommand_index,
         has_trailing_override,
-        mention_view,
+        mention_views,
+        mentions,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -277,6 +278,8 @@ _SNAPSHOT_VERBS = frozenset(
 # quadratic in the command's length, and this runs on the hook path, where MEASURED
 # a 32,000-character command took 4 seconds with it.
 _GIT_WORD = re.compile(r"\bgit\b")
+# The submodule gate's word, case-folded: the config KEY is case-insensitive.
+_RECURSE_WORD = re.compile("recurse", re.IGNORECASE)
 _SNAPSHOT_VERB_WORD = re.compile(
     r"\b(?:" + "|".join(re.escape(v) for v in sorted(_SNAPSHOT_VERBS)) + r")\b"
 )
@@ -1537,7 +1540,7 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     return warnings + notes
 
 
-def _blind_discard_violation(cmd: str, view: str) -> str | None:
+def _blind_discard_violation(cmd: str) -> str | None:
     """Refuse a snapshot verb the parse could not read. None otherwise.
 
     A snapshot verb is let through because the guard snapshots the repository it
@@ -1550,14 +1553,22 @@ def _blind_discard_violation(cmd: str, view: str) -> str | None:
     tree-rewind warning, then the escaped backslashes in a path).
 
     Read from the text the shell assembles, as the other early exits are: a verb
-    split by the continuation still names itself there. The override is not honoured
+    split by the continuation still names itself there. `git` and the verb must
+    appear in the SAME reading (see `shell_parse.mentions`). The override is not honoured
     on this path, for the reason `_clean_blind_msg` gives.
     """
     _segs, blind = _parse_once(cmd)
     if blind is None or not blind.bounds_induced:
         return None
-    verb = _SNAPSHOT_VERB_WORD.search(view)
-    if not (_GIT_WORD.search(view) and verb):
+    verb = next(
+        (
+            found
+            for view in mention_views(cmd)
+            if _GIT_WORD.search(view) and (found := _SNAPSHOT_VERB_WORD.search(view))
+        ),
+        None,
+    )
+    if verb is None:
         return None
     # Says only what is known: the text names git and a word that is a discarding verb
     # when git runs it. It may be prose (a commit message, a `--grep` pattern), and the
@@ -1730,18 +1741,15 @@ def main() -> int:
     if not cmd:
         return 0
     # The early exits below decide whether the PARSE runs at all, so they read the
-    # text the shell would assemble (`mention_view`), not the raw string: a quote or
+    # text the shell would assemble (`mentions`), not the raw string: a quote or
     # a line continuation inside `git` or `clean` hides the word from a raw test and
     # the parse — which resolves it correctly — never ran. The view only widens what
     # reaches the parse; every verdict is still made on the parse.
-    view = mention_view(cmd)
-    if "git" not in view:
-        return 0
-    if not any(s in view for s in _TRIGGER_SUBSTRINGS):
+    if not any(mentions(cmd, "git", s) for s in _TRIGGER_SUBSTRINGS):
         return 0
 
     # Phase 1 — the clean BLOCK (UNRECOVERABLE → fail CLOSED).
-    if "clean" in view:
+    if mentions(cmd, "clean"):
         try:
             block_msg = _clean_violation(cmd)
         except Exception:
@@ -1773,7 +1781,7 @@ def main() -> int:
     # documented residual. Cheap `recurse` gate avoids analyze() on ordinary cmds
     # (lowered — the config KEY is case-insensitive, so `Submodule.Recurse` must
     # still pass this gate).
-    if "recurse" in view.lower():
+    if mentions(cmd, _RECURSE_WORD):
         with contextlib.suppress(Exception):
             sub_msg = _submodule_recurse_violation(cmd)
             if sub_msg:
@@ -1791,7 +1799,7 @@ def main() -> int:
     # promised, and the verb is refused like the two above. Fails OPEN on a parser
     # crash, like 1b: the verb is normally recoverable.
     with contextlib.suppress(Exception):
-        blind_msg = _blind_discard_violation(cmd, view)
+        blind_msg = _blind_discard_violation(cmd)
         if blind_msg:
             with contextlib.suppress(OSError):
                 print(blind_msg, file=sys.stderr)

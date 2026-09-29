@@ -76,7 +76,7 @@ from shell_parse import (  # noqa: E402
     _GH_FLAG_TABLE,
     analyze_checked,
     gh_command,
-    mention_view,
+    mentions,
 )
 
 #: Cheap prefilter, same reasoning as `capped_read_advisory._GH_WORD`: this runs
@@ -394,8 +394,7 @@ def _scan(segments: list) -> tuple[list[str], int]:
 
 def _process(payload: dict) -> None:
     cmd = (tool_input(payload) or {}).get("command") or ""
-    view = mention_view(cmd) if cmd else ""
-    if not cmd or not _GH_WORD.search(view):
+    if not cmd or not mentions(cmd, _GH_WORD):
         return
     segments, blind = analyze_checked(cmd)
     # THE BLIND FLAG IS NOT A REASON FOR SILENCE. The UNTOKENIZABLE blind spot
@@ -410,7 +409,7 @@ def _process(payload: dict) -> None:
     # the text alone, and no count. Over-long or over-nested commands take this
     # branch too; the note names each one's own cause.
     if blind is not None and blind.bounds_induced:
-        if _CLOSE_WORD.search(view):
+        if mentions(cmd, _CLOSE_WORD):
             _emit(_unreadable_note(blind))
         return
     reasons, closes = _scan(segments)

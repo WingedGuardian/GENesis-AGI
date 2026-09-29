@@ -78,8 +78,8 @@ try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
         git_subcommand_index,
-        mention_view,
         mention_views,
+        mentions,
         untokenizable,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -217,7 +217,7 @@ def _legacy_targets(cmd: str) -> list[str]:
         # Tokens are read lazily from the match, not by splitting the whole rest of
         # the command at every match: that was quadratic in the command's length on
         # a hook path (MEASURED 0.41 s at the length cap, and this now also reads
-        # `mention_view`, up to three times longer). Same tokens, same order.
+        # each reading from `mention_views`). Same tokens, same order.
         for token_match in _NON_SPACE.finditer(cmd, match.end()):
             token = token_match.group().strip("'\"")
             if not token or token.startswith("-"):
@@ -230,7 +230,7 @@ def _legacy_targets(cmd: str) -> list[str]:
 def _view_targets(cmd: str) -> list[str]:
     """`_legacy_targets` over each reading in `mention_views`, SEPARATELY.
 
-    The readings are alternatives, not consecutive text. Given the joined view, the
+    The readings are alternatives, not consecutive text. Given them joined, the
     extractor read past the end of one reading and took the first word of the next as
     the target, so a harmless continued command ending in a quoted mention of the
     operation was refused as a direct removal. Reading each view on its own keeps the
@@ -396,9 +396,9 @@ def _handle_bash(data: dict) -> int:
         return 0
 
     # Cheap pre-gate: cost only. Correctness rests on the parser below, never on
-    # this substring — read through `mention_view`, so a quote or a line
+    # this substring — read through `mentions`, so a quote or a line
     # continuation inside the word cannot skip the parse (widen-only).
-    if _SUBCOMMAND not in mention_view(cmd):
+    if not mentions(cmd, _SUBCOMMAND):
         return 0
 
     # A command shlex cannot tokenize gets the PREVIOUS, coarser reading rather
@@ -463,7 +463,7 @@ def _handle_bash(data: dict) -> int:
     # (MEASURED in review), and re-parsing the join is what the blind spot exists to
     # avoid.
     if blind is not None and blind.bounds_induced:
-        if not _WORKTREE_REMOVE.search(mention_view(cmd)):
+        if not mentions(cmd, _WORKTREE_REMOVE):
             return 0
         # Only what is known: the text mentions the operation and cannot be read. The
         # lifecycle-manager redirect is NOT printed here, because the command may be
@@ -512,8 +512,7 @@ def _handle_bash(data: dict) -> int:
             # The view throughout: a word split by quotes or backslashes inside a
             # carried payload still names the removal to the shell that runs it,
             # and the coarse reader must find the target in that same text.
-            and _WORKTREE_REMOVE.search(mention_view(cmd))
-            and _GIT_TOKEN.search(mention_view(cmd))
+            and mentions(cmd, _WORKTREE_REMOVE, _GIT_TOKEN)
             and _carries_a_command(cmd, segs)
         ):
             targets = _view_targets(cmd)
