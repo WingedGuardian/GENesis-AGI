@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -63,22 +65,29 @@ def _status(st, **extra) -> dict:
     out = {}
     for line in r.stdout.splitlines():
         key, sep, value = line.partition(": ")
-        if sep and key in ("serving", "head", "mainpid", "runtime-edits"):
+        if sep and key in _STATUS_FIELDS:
             out[key] = value.strip()
-    assert set(out) == {"serving", "head", "mainpid", "runtime-edits"}, r.stdout
+    assert set(out) == set(_STATUS_FIELDS), r.stdout
     return out
 
 
-def _bracket_valid(start: dict, end: dict) -> bool:
-    """The validation bracket as the script's header states it."""
-    return (
-        start["serving"] == start["head"]
-        and end["serving"] == start["serving"]
-        and end["head"] == start["head"]
-        and end["mainpid"] == start["mainpid"]
-        and start["runtime-edits"] == "none"
-        and end["runtime-edits"] == "none"
-    )
+_STATUS_FIELDS = (
+    "serving",
+    "head",
+    "mainpid",
+    "invocation",
+    "runtime-edits",
+    "runtime-overrides",
+    "bracket",
+)
+
+
+def _verify(st, token: str, **extra) -> bool:
+    """The script's own verdict on a bracket: `status --verify <token>`."""
+    r = _run(st, "status", "--verify", token, env=_env(st, **extra))
+    assert r.returncode in (0, 1), (r.returncode, r.stdout, r.stderr)
+    assert ("bracket: valid" in r.stdout) == (r.returncode == 0), r.stdout
+    return r.returncode == 0
 
 
 _SCRIPT_FILES = (
@@ -86,6 +95,7 @@ _SCRIPT_FILES = (
     "lib/guardian_pause.sh",
     "lib/deploy_marker.sh",
     "lib/alert_queue.sh",
+    "lib/deploy_status.sh",
     "lib/port_owned_by.py",
     "lib/manifest_delta.py",
     "lib/serving_commit.py",
@@ -98,12 +108,16 @@ def _install_the_script(st) -> None:
     the script resolves its paths from where it sits (no GENESIS_DEPLOY_ROOT)."""
     files = {f"scripts/{f}": (SCRIPT.parent / f).read_text() for f in _SCRIPT_FILES}
     _advance_upstream(st, "the deploy script", files)
+    # Real clock, deliberately: a later deploy merges on the real clock too, and a
+    # pull stamped ahead of it reads as the clock stepping back.
     _git(st["root"], "pull", "-q", "--ff-only")
 
 
 def _env_without_the_root_seam(st, **extra) -> dict:
     env = {k: v for k, v in st["env"].items() if k != "GENESIS_DEPLOY_ROOT"}
-    return {**env, **extra}
+    # The shim's unit runs in the seam's directory by default; without the seam,
+    # name the fixture tree the script resolves for itself.
+    return {**env, "UNIT_DIR": str(st["root"]), **extra}
 
 
 # ── the mode interface ──────────────────────────────────────────────────────
@@ -234,7 +248,14 @@ def test_status_reports_and_takes_no_lock(station):
     finally:
         holder.kill()
         holder.wait()
-    assert s == {"serving": head, "head": head, "mainpid": "1111", "runtime-edits": "none"}, s
+    assert s["bracket"].startswith("b1-"), s
+    assert {k: s[k] for k in ("serving", "head", "mainpid", "runtime-edits")} == {
+        "serving": head,
+        "head": head,
+        "mainpid": "1111",
+        "runtime-edits": "none",
+    }, s
+    assert s["invocation"] == "1" * 32 and s["runtime-overrides"] == "none", s
     assert not _restarted(station)
 
 
@@ -256,14 +277,41 @@ def test_a_validation_bracketed_across_a_pull_reads_invalid(station):
     assert start["head"] == end["head"] and start["mainpid"] == end["mainpid"], (
         "HEAD alone says valid"
     )
-    assert not _bracket_valid(start, end)
+    assert start["bracket"].startswith("unknown (HEAD's runtime files differ"), start
+    assert not _verify(station, start["bracket"])
 
 
 def test_a_bracket_reads_valid_over_an_idle_run_and_invalid_across_a_restart(station):
     start = _status(station)
-    assert _bracket_valid(start, _status(station)), "control: nothing happened"
+    assert _verify(station, start["bracket"]), "control: nothing happened"
     assert _run(station, "restart").returncode == 0
-    assert not _bracket_valid(start, _status(station))
+    assert not _verify(station, start["bracket"])
+
+
+def test_a_pull_of_docs_or_hooks_leaves_the_bracket_valid(station):
+    """HEAD moves, but nothing the server loads: the server under test runs what
+    it ran. Commit equality would call this invalid."""
+    start = _status(station)
+    _advance_upstream(station, "docs", {"docs/x.md": "d\n", "scripts/hooks/h.sh": "h\n"})
+    r = _run(station, "pull", env=_env(station, GIT_COMMITTER_DATE=_later(station)))
+    assert r.returncode == 0, r.stderr
+    end = _status(station)
+    assert end["head"] != start["head"] and end["serving"] == start["serving"]
+    assert end["bracket"] == start["bracket"]
+    assert _verify(station, start["bracket"])
+
+
+def test_a_deploy_of_docs_or_hooks_neither_stops_nor_restarts(station):
+    """An outage and ended dispatched sessions buy nothing when the server's
+    files do not change."""
+    tip = _advance_upstream(station, "docs", {"docs/x.md": "d\n"})
+    r = _run(station, env=_env(station, GIT_COMMITTER_DATE=_later(station)))
+    assert r.returncode == 0, r.stderr
+    assert "no stop, no restart" in r.stdout and "Nothing to deploy" in r.stdout, r.stdout
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+    calls = _calls(station)
+    assert not any("stop genesis-server" in c or "restart" in c for c in calls), calls
+    assert not _alerts(station)
 
 
 # ── the dependency gate's remedy ────────────────────────────────────────────
@@ -399,13 +447,18 @@ def test_cdpath_cannot_redirect_the_script_to_another_tree(station):
 def test_the_helpers_this_run_uses_are_the_ones_it_started_with(station):
     """The script merges the tree it runs from. Helpers that run after the merge
     (the boot-commit reader, the manifest delta) are read at startup, so a merge
-    that replaces them does not change this run."""
+    that replaces them does not change this run. The range carries a runtime
+    change too, so the deploy restarts and runs both helpers after the merge."""
     _install_the_script(station)
     broken = "import sys\nsys.exit(7)\n"
     _advance_upstream(
         station,
         "helpers change",
-        {"scripts/lib/serving_commit.py": broken, "scripts/lib/manifest_delta.py": broken},
+        {
+            "scripts/lib/serving_commit.py": broken,
+            "scripts/lib/manifest_delta.py": broken,
+            "src/genesis/m.py": "x = 1\n",
+        },
     )
     r = subprocess.run(
         ["bash", "scripts/deploy_code_only.sh", "--wait", "5"],
@@ -437,7 +490,7 @@ def test_a_bare_pull_during_the_run_reads_invalid(station):
     )
     end = _status(station)
     assert (end["serving"], end["mainpid"]) == (start["serving"], start["mainpid"])
-    assert not _bracket_valid(start, end)
+    assert not _verify(station, start["bracket"])
 
 
 def test_a_merge_git_refuses_pages_nobody(station):
@@ -455,7 +508,12 @@ def test_a_merge_git_refuses_pages_nobody(station):
     assert not station["marker"].exists()
 
 
-def test_an_unreadable_tree_status_refuses(station):
+@pytest.mark.parametrize("mode", ["restart", "pull"])
+def test_an_unreadable_tree_status_refuses(station, mode):
+    """pull has no later status read to fall back on: this check is its only
+    one."""
+    _advance_upstream(station)
+    head = _git(station["root"], "rev-parse", "HEAD")
     real_git = subprocess.run(
         ["bash", "-c", "command -v git"], capture_output=True, text=True, check=True
     ).stdout.strip()
@@ -467,10 +525,11 @@ def test_an_unreadable_tree_status_refuses(station):
         f'exec "{real_git}" "$@"\n',
     )
     (station["root"] / "pyproject.toml").write_text("# a real tracked edit\n")
-    r = _run(station, "restart")
+    r = _run(station, mode)
     assert r.returncode == 1, r.stdout
     assert "cannot read the working tree's status" in r.stderr, r.stderr
     assert not _restarted(station)
+    assert _git(station["root"], "rev-parse", "HEAD") == head
 
 
 def test_status_from_a_linked_worktree_reports_the_main_checkout(station):
@@ -585,24 +644,60 @@ def test_a_merge_refused_after_the_stop_starts_the_server_again(station):
     assert not _alerts(station), "nothing changed and the server is back up"
 
 
-def test_a_checkout_moved_during_the_run_is_refused_and_the_server_started(station):
-    """Another tool moves the tree between the checks and the restart: what would
-    be restarted is not what was checked."""
-    _advance_upstream(station, "runtime change", {"src/genesis/mod.py": "x = 1\n"})
-    _git_shim(
-        station,
-        '"$REAL" "$@" || exit $?\n'
+_RACES = {
+    "moved": (
         '"$REAL" -C "$GENESIS_DEPLOY_ROOT" -c user.email=t@l -c user.name=t '
-        "commit -q --allow-empty -m raced; exit 0",
-    )
+        "commit -q --allow-empty -m raced",
+        "the checkout moved during this run",
+    ),
+    "untracked": (
+        'echo "y = 1" > "$GENESIS_DEPLOY_ROOT/src/genesis/stray.py"',
+        "src/genesis/stray.py",
+    ),
+}
+
+
+@pytest.mark.parametrize("race", sorted(_RACES))
+def test_a_late_refusal_after_the_stop_restarts_health_checked_and_alerts(station, race):
+    """Something outside the lock changes the tree after deploy stopped the
+    server. Refusing would leave it down, and starting it without a check would
+    hide a broken tree: the restart runs with its health check, and the run ends
+    in a critical alert naming the change (owner ruling on #2557)."""
+    _advance_upstream(station, "runtime change", {"src/genesis/mod.py": "x = 1\n"})
+    act, needle = _RACES[race]
+    _git_shim(station, f'"$REAL" "$@" || exit $?\n{act}; exit 0')
     r = _run(station)
     assert r.returncode == 1, r.stdout
-    assert "the checkout moved during this run" in r.stderr, r.stderr
+    assert needle in r.stderr and "did not check" in r.stderr, r.stderr
+    assert "Healthy" in r.stdout, r.stdout
     calls = _calls(station)
-    assert not any("restart genesis-server" in c for c in calls), "restarted unchecked code"
-    assert any(c.endswith("start genesis-server") for c in calls), "left the server down"
+    stop = next(i for i, c in enumerate(calls) if "stop genesis-server" in c)
+    restart = next(i for i, c in enumerate(calls) if "restart genesis-server" in c)
+    assert stop < restart, calls
     alerts = _alerts(station)
-    assert len(alerts) == 1 and "started again" in alerts[0].read_text(), alerts
+    assert len(alerts) == 1, alerts
+    body = alerts[0].read_text()
+    assert "critical" in body and "did not check" in body and needle in body, body
+
+
+def test_a_late_refusal_before_anything_changed_is_only_a_refusal(station):
+    """Control: with the server untouched, the same check refuses and pages
+    nobody. restart mode, the file appearing after the start's checks (the first
+    MainPID read is the baseline, read after them)."""
+    exec_shim = (
+        '#!/bin/bash\nif [[ " $* " == *" MainPID "* ]] && [ -n "${STRAY:-}" ] '
+        '&& [ ! -e "$STRAY" ]; then mkdir -p "$(dirname "$STRAY")"; echo y > "$STRAY"; fi\n'
+    )
+    from tests.test_scripts._deploy_station import exec_file
+
+    real = (station["shims"] / "systemctl").read_text()
+    exec_file(station["shims"] / "systemctl", exec_shim + real.split("\n", 1)[1])
+    stray = station["root"] / "src" / "genesis" / "stray.py"
+    r = _run(station, "restart", env=_env(station, STRAY=str(stray)))
+    assert r.returncode == 1, r.stdout
+    assert "src/genesis/stray.py" in r.stderr and "nothing was restarted" in r.stderr, r.stderr
+    assert not _restarted(station)
+    assert not _alerts(station)
 
 
 @pytest.mark.parametrize("where", ["the-path", "a-parent"])
@@ -642,21 +737,18 @@ def test_a_rename_into_an_excused_path_is_still_a_dirty_tree(station):
 
 
 def test_status_reports_uncommitted_runtime_edits(station):
-    _advance_upstream(station, "module", {"src/genesis/mod.py": "x = 1\n"})
-    _git(
-        station["root"],
-        "pull",
-        "-q",
-        "--ff-only",
-        env=_env(station, GIT_COMMITTER_DATE=_later(station)),
+    start = _status(station)
+    assert start["runtime-edits"] == "none" and start["bracket"].startswith("b1-"), start
+    (station["root"] / "pyproject.toml").write_text(
+        (station["root"] / "pyproject.toml").read_text() + "# edited\n"
     )
-    assert _status(station)["runtime-edits"] == "none"
-    (station["root"] / "src" / "genesis" / "mod.py").write_text("x = 2\n")
+    (station["root"] / "src" / "genesis").mkdir(parents=True)
     (station["root"] / "src" / "genesis" / "new.py").write_text("y = 1\n")
     s = _status(station)
     assert s["runtime-edits"].startswith("2 paths:"), s
-    assert "src/genesis/mod.py" in s["runtime-edits"] and "src/genesis/new.py" in s["runtime-edits"]
-    assert not _bracket_valid(s, s), "an uncommitted runtime edit invalidates the bracket"
+    assert "pyproject.toml" in s["runtime-edits"] and "src/genesis/new.py" in s["runtime-edits"]
+    assert s["bracket"].startswith("unknown (uncommitted runtime edits"), s
+    assert not _verify(station, start["bracket"])
 
 
 def test_the_health_answer_and_the_identity_are_one_process(station):
@@ -669,3 +761,215 @@ def test_the_health_answer_and_the_identity_are_one_process(station):
     assert "Attempt 1: the port answers, but not from the restarted unit" in r.stdout, r.stdout
     args = (station["tmp"] / "curl_args").read_text().splitlines()
     assert args[0].startswith("-q --noproxy * ") and "http://127.0.0.1:5000/" in args[0], args
+
+
+# ── review round 2 on the PR: what runs is what was checked ─────────────────
+def test_a_restart_whose_start_fails_starts_the_server_again(station):
+    """systemctl restart stops the old server, then its start fails: the exit
+    trap must try to start it again, and the alert says what it found."""
+    r = _run(station, "restart", env=_env(station, RESTART_RC="1"))
+    assert r.returncode != 0, r.stdout
+    calls = _calls(station)
+    restart = next(i for i, c in enumerate(calls) if "restart genesis-server" in c)
+    assert any(
+        c.endswith("start genesis-server") and "restart" not in c for c in calls[restart + 1 :]
+    ), calls
+    alerts = _alerts(station)
+    assert len(alerts) == 1 and "restarting" in alerts[0].read_text(), alerts
+
+
+def test_a_checkout_moved_during_a_pulls_hook_sync_is_refused(station):
+    """pull restarts nothing, so only the check after the hook sync stands
+    between a raced tree and a report that it holds the pulled commit."""
+    raced = (
+        "#!/bin/bash\n"
+        'git -C "$GENESIS_DEPLOY_ROOT" -c user.email=t@l -c user.name=t '
+        "commit -q --allow-empty -m raced\n"
+    )
+    _advance_upstream(station, "hooks", {"scripts/hooks/sync-hooks.sh": raced})
+    r = _run(station, "pull")
+    assert r.returncode == 1, r.stdout
+    assert "the checkout moved during this run" in r.stderr, r.stderr
+    assert "Pulled" not in r.stdout
+
+
+def test_deploy_syncs_the_git_hooks_after_the_restart(station):
+    """The sync runs a script from the merged tree; with the server stopped for
+    the fast-forward, running it first would only lengthen the outage."""
+    _advance_upstream(
+        station, "hooks", {"scripts/hooks/sync-hooks.sh": _SYNC_STUB, "src/genesis/m.py": "x\n"}
+    )
+    r = _run(station, env=_env(station, SYNC_LOG=str(station["calls"])))
+    assert r.returncode == 0, r.stderr
+    calls = _calls(station)
+    restart = next(i for i, c in enumerate(calls) if "restart genesis-server" in c)
+    synced = next(i for i, c in enumerate(calls) if c == "ran --quiet")
+    assert restart < synced, calls
+
+
+def test_the_units_own_server_holding_the_lock_refuses_nothing(station, outside_server):
+    """The ordinary case on a live install: the server lock names the unit's own
+    MainPID. That server is the one a restart replaces."""
+    r = _run(station, "restart", env=_env(station, MAIN_PID=str(outside_server)))
+    assert r.returncode == 0, r.stderr
+    assert _restarted(station)
+
+
+@pytest.mark.parametrize("mode", ["deploy", "restart"])
+def test_untracked_runtime_files_refuse_a_restart(station, mode):
+    """The editable install imports a new module under src/ as soon as something
+    asks for it; startup globs YAML under config/."""
+    _advance_upstream(station)
+    head = _git(station["root"], "rev-parse", "HEAD")
+    (station["root"] / "src" / "genesis").mkdir(parents=True)
+    (station["root"] / "src" / "genesis" / "stray.py").write_text("x = 1\n")
+    r = _run(station, mode)
+    assert r.returncode == 1, r.stdout
+    assert "src/genesis/stray.py" in r.stderr and "untracked" in r.stderr, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == head
+    assert not _restarted(station)
+    assert not _alerts(station)
+
+
+def test_untracked_files_elsewhere_and_a_pull_are_not_refused(station):
+    """Control: an untracked file outside what the server loads refuses nothing,
+    and a pull (which restarts nothing) is not refused for one inside it."""
+    (station["root"] / "notes.txt").write_text("mine\n")
+    r = _run(station, "restart")
+    assert r.returncode == 0, r.stderr
+    (station["root"] / "src").mkdir()
+    (station["root"] / "src" / "stray.py").write_text("x = 1\n")
+    _advance_upstream(station)
+    assert _run(station, "pull").returncode == 0
+
+
+@pytest.fixture()
+def outside_server(station):
+    """A live process that looks like a server started outside the unit, named
+    by the server's process lock, as update.sh's fallback leaves one."""
+    p = subprocess.Popen(["bash", "-c", 'exec -a "python -m genesis serve" sleep 120'])
+    cmdline = Path(f"/proc/{p.pid}/cmdline")
+    for _ in range(200):
+        if b"genesis serve" in cmdline.read_bytes():
+            break
+        time.sleep(0.01)
+    (station["home"] / ".genesis" / "genesis-server.lock").write_text(str(p.pid))
+    yield p.pid
+    p.kill()
+    p.wait()
+
+
+@pytest.mark.parametrize("mode", ["deploy", "restart"])
+def test_a_server_outside_the_unit_refuses(station, outside_server, mode):
+    _advance_upstream(station, "runtime change", {"src/genesis/mod.py": "x = 1\n"})
+    head = _git(station["root"], "rev-parse", "HEAD")
+    r = _run(station, mode)
+    assert r.returncode == 1, r.stdout
+    assert f"outside the systemd unit (pid {outside_server})" in r.stderr, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == head
+    assert not any("stop genesis-server" in c or "restart" in c for c in _calls(station))
+
+
+def test_a_server_lock_naming_something_else_refuses_nothing(station):
+    """Control: a stale lock naming a live process that is not a server."""
+    p = subprocess.Popen(["sleep", "120"])
+    try:
+        (station["home"] / ".genesis" / "genesis-server.lock").write_text(str(p.pid))
+        assert _run(station, "restart").returncode == 0
+    finally:
+        p.kill()
+        p.wait()
+
+
+@pytest.mark.parametrize("unit_dir", ["/srv/another-checkout", "-"])
+def test_a_unit_running_in_another_directory_refuses_and_status_says_unknown(station, unit_dir):
+    """Its working directory (and the secrets.env beside it) is fixed in the unit
+    apart from its python: this venv can be run from another tree."""
+    _advance_upstream(station)
+    head = _git(station["root"], "rev-parse", "HEAD")
+    env = _env(station, UNIT_DIR=unit_dir)
+    r = _run(station, env=env)
+    assert r.returncode == 1, r.stdout
+    assert "genesis-server runs in" in r.stderr and "update.sh --post-merge" in r.stderr, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == head
+    assert _status(station, UNIT_DIR=unit_dir)["serving"].startswith("unknown")
+
+
+def test_a_reused_pid_reads_invalid_through_the_invocation(station):
+    """Same MainPID at both ends, but a new activation: the bracket must see it."""
+    start = _status(station)
+    end = _status(station, INVOCATION="33333333333333333333333333333333")
+    assert end["mainpid"] == start["mainpid"]
+    assert _verify(station, start["bracket"])
+    assert not _verify(station, start["bracket"], INVOCATION="3" * 32)
+    unread = _status(station, INVOCATION="-")
+    assert unread["invocation"] == "unknown"
+    assert unread["bracket"].startswith("unknown (the server's invocation id is unreadable"), unread
+    assert not _verify(station, unread["bracket"], INVOCATION="-"), "two unknowns prove nothing"
+
+
+@pytest.mark.parametrize("shape", ["directory-to-file", "file-to-directory"])
+def test_a_tracked_path_the_range_replaces_is_not_a_collision(station, shape):
+    """git replaces a tracked file or directory itself; only what it does not
+    track is at risk."""
+    if shape == "directory-to-file":
+        _advance_upstream(station, "dir", {"thing/child.txt": "c\n"})
+    else:
+        _advance_upstream(station, "file", {"thing": "f\n"})
+    _git(station["root"], "pull", "-q", "--ff-only")
+    _git(station["seed"], "rm", "-rq", "thing")
+    if shape == "directory-to-file":
+        tip = _commit(station["seed"], "now a file", {"thing": "f\n"})
+    else:
+        tip = _commit(station["seed"], "now a dir", {"thing/child.txt": "c\n"})
+    _git(station["seed"], "push", "-q", "origin", "main")
+    r = _run(station)
+    assert r.returncode == 0, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+
+
+def test_an_ignored_file_inside_a_replaced_directory_still_refuses(station):
+    """Control: the tracked directory goes, but an ignored file in it is not
+    git's, and the fast-forward would delete it."""
+    _advance_upstream(station, "dir", {"thing/child.txt": "c\n", ".gitignore": "*.env\n"})
+    _git(station["root"], "pull", "-q", "--ff-only")
+    local = station["root"] / "thing" / "local.env"
+    local.write_text("MY SECRET\n")
+    _git(station["seed"], "rm", "-rq", "thing")
+    _commit(station["seed"], "now a file", {"thing": "f\n"})
+    _git(station["seed"], "push", "-q", "origin", "main")
+    r = _run(station)
+    assert r.returncode == 1, r.stdout
+    assert "already exist here, untracked" in r.stderr, r.stderr
+    assert local.read_text() == "MY SECRET\n"
+
+
+def test_status_fingerprints_ignored_runtime_overrides(station):
+    """git status never lists an ignored config/*.local.yaml; the bracket must
+    still see it change. Files the server rewrites itself are left out."""
+    _advance_upstream(
+        station,
+        "ignore",
+        {".gitignore": "config/*.local.yaml\nconfig/procedure_triggers.json\n"},
+    )
+    _git(
+        station["root"],
+        "pull",
+        "-q",
+        "--ff-only",
+        env=_env(station, GIT_COMMITTER_DATE=_later(station)),
+    )
+    assert _status(station)["runtime-overrides"] == "none"
+    (station["root"] / "config").mkdir()
+    override = station["root"] / "config" / "routing.local.yaml"
+    override.write_text("a: 1\n")
+    start = _status(station)
+    assert start["runtime-overrides"].startswith("1 files, "), start
+    assert start["runtime-edits"] == "none", "ignored: runtime-edits cannot see it"
+    (station["root"] / "config" / "procedure_triggers.json").write_text("{}\n")
+    assert _status(station)["runtime-overrides"] == start["runtime-overrides"]
+    override.write_text("a: 2\n")
+    assert start["bracket"].startswith("b1-"), start
+    end = _status(station)
+    assert end["runtime-overrides"] != start["runtime-overrides"]
+    assert not _verify(station, start["bracket"])

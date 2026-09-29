@@ -6,7 +6,8 @@
 # takes no lock, so it lands in the middle of another session's validation or of
 # update.sh. This script is that path with the discipline update.sh already has.
 #
-# Usage: scripts/deploy_code_only.sh [deploy|pull|restart|status] [--wait N]
+# Usage: scripts/deploy_code_only.sh [deploy|pull|restart] [--wait N]
+#        scripts/deploy_code_only.sh status [--verify <token>]
 #
 #   deploy   (the default) fetch main and run every check, then stop
 #            genesis-server, fast-forward, and start it again (stopped first, so
@@ -17,7 +18,9 @@
 #            change the running server has not loaded, and the next step.
 #   restart  restart genesis-server on the tree as it stands; no fetch.
 #   status   read-only, takes no lock: the commit the server booted from, HEAD,
-#            and the server's MainPID. This is the validation bracket's reading.
+#            the server's MainPID and invocation, and what runs beside the commit
+#            (runtime-edits, runtime-overrides), and the validation bracket's
+#            token; --verify <token> answers whether it still holds (below).
 #            Run from a linked worktree, it reports the main checkout.
 #   --wait N seconds to queue for the lock (default 7200, the same two hours a
 #            validation's hold may run, or GENESIS_DEPLOY_LOCK_WAIT)
@@ -27,14 +30,24 @@
 #     REFUSES while a validation holds the lock shared);
 #   refusals BEFORE anything changes: a linked worktree, an unfinished update.sh
 #     run, a branch other than main, a dirty tree, a unit that runs a different
-#     venv, a live foreign deploy marker, and a venv that does not match the
-#     pyproject.toml being deployed (that one needs update.sh, which reinstalls);
+#     venv or from a different directory, a live foreign deploy marker, and a
+#     venv that does not match the pyproject.toml being deployed (that one needs
+#     update.sh, which reinstalls). deploy and restart also refuse untracked
+#     files under src/, config/ or pyproject.toml, and a server running outside
+#     the unit (update.sh's fallback), which a restart would not replace. Just
+#     before the restart, four of these are checked again (HEAD must be the
+#     exact commit this run checked, on main; no tracked change; no untracked
+#     runtime file; no server outside the unit). If one fails while the server
+#     is untouched, it is a refusal. If deploy has already stopped the server,
+#     it is restarted on the tree as it stands, health-checked, and the run ends
+#     in a critical alert: refusing then would leave it down;
 #   the deploy marker for the whole run (the watchdog defers; a dashboard update
 #     or a restore cannot start underneath).
 # pull and deploy add a bounded fetch and a fast-forward-only merge. deploy and
 # restart add a Guardian pause (no false "Genesis down" alert or paid diagnosis)
-# and a health wait sized the way update.sh sizes its own. deploy skips the
-# restart when nothing merged and the server already booted from HEAD.
+# and a health wait sized the way update.sh sizes its own. deploy skips the stop
+# and the restart when the files the server loads (src/, config/,
+# pyproject.toml) are the ones it booted from, before and after the merge.
 #
 # "The commit the server booted from" is read from HEAD's reflog at the unit's
 # start time (scripts/lib/serving_commit.py), and is "unknown" whenever the reflog
@@ -66,7 +79,9 @@
 #     /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/deploy_code_only.sh deploy > ~/tmp/deploy-code-only-$(date +%Y%m%d-%H%M%S%N).log 2>&1'
 #
 # Exit codes: 0 done (or nothing to do) · 200 lock wait timed out · 1 any
-# refusal or failure (the message says which; refusals change nothing).
+# refusal or failure (the message says which; refusals change nothing) · 130 and
+# 143 interrupted (SIGINT, SIGTERM), after the exit trap ran. status --verify:
+# 0 the token holds, 1 it does not.
 #
 # Validating against the live server? Hold the lock SHARED for your whole run:
 #   flock -s -w 7200 ~/.genesis/locks/update.lock <your command>
@@ -75,13 +90,18 @@
 # holds overlap, a waiting deploy can starve: flock grants a late shared request
 # ahead of a queued exclusive one, so the deploy may run out its --wait.
 # The hold stops locked deploys, not every restarter (the watchdog, the
-# dashboard's service routes, Guardian recovery) and not a bare `git pull`. So run
-# `scripts/deploy_code_only.sh status` at the start and at the end. The run is
-# INVALID if, at the start, the server booted from a commit other than HEAD or
-# from an unknown one (a pull left code unloaded: restart first), if at the end
-# the booted commit, HEAD or the MainPID differs from the start, or if
-# runtime-edits (uncommitted changes under src/, config/, pyproject.toml, which
-# the editable install can import without HEAD moving) is not "none" at both ends.
+# dashboard's service routes, Guardian recovery) and not a bare `git pull`. So
+# bracket the run: take the `bracket:` token `status` prints at the start, and
+# run `status --verify <token>` at the end. The script decides; exit 0 is a
+# valid run. A token exists only when the server is up, its boot commit is known,
+# HEAD's runtime files are the ones it booted from (after a pull of code:
+# restart first), and nothing under src/, config/ or pyproject.toml is edited
+# outside git; otherwise it prints "unknown (<why>)", which no token matches. It
+# covers the boot commit, the MainPID, systemd's invocation id (a pid can be
+# reused, an invocation cannot) and a fingerprint of the ignored runtime files
+# (a config/*.local.yaml, which git status never lists). HEAD may move over docs
+# or hooks without invalidating the run. Not covered: an uncommitted edit present
+# at boot and reverted since, which git keeps no record of.
 
 set -euo pipefail
 
@@ -122,6 +142,8 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$_SELF_DIR/lib/deploy_marker.sh"
 # shellcheck source=lib/alert_queue.sh
 . "$_SELF_DIR/lib/alert_queue.sh"
+# shellcheck source=lib/deploy_status.sh
+. "$_SELF_DIR/lib/deploy_status.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).
@@ -132,6 +154,7 @@ _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
 
 MODE=""
+VERIFY=""
 # Two hours: a validation's documented hold is `flock -s -w 7200`, and a detached
 # deploy that gave up sooner would leave nobody to retry it.
 WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
@@ -141,12 +164,14 @@ while [ $# -gt 0 ]; do
             [ -z "$MODE" ] || die "one mode at a time (got '$MODE' and '$1')."
             MODE="$1"; shift ;;
         --wait) WAIT_S="${2:?--wait needs a value}"; shift 2 ;;
+        --verify) VERIFY="${2:?--verify needs the token status printed}"; shift 2 ;;
         --no-pull) die "--no-pull is now the restart mode: scripts/deploy_code_only.sh restart" ;;
         --no-restart) die "--no-restart is now the pull mode: scripts/deploy_code_only.sh pull" ;;
         *) die "unknown argument: $1 (modes: deploy, pull, restart, status)" ;;
     esac
 done
 MODE="${MODE:-deploy}"
+[ -z "$VERIFY" ] || [ "$MODE" = status ] || die "--verify belongs to status (scripts/deploy_code_only.sh status --verify <token>)."
 case "$WAIT_S" in
     ''|*[!0-9]*) die "the lock wait must be a whole number of seconds (got: $WAIT_S)" ;;
 esac
@@ -170,100 +195,53 @@ if [ -z "$_git_dir" ] || [ -z "$_common_dir" ] || [ "$(unset CDPATH; cd -- "$_gi
     die "deploy_code_only.sh must run against the main checkout, not a worktree ($GENESIS_ROOT)."
 fi
 
-# ── What the server booted from ───────────────────────────────────────
-# Sets SERVING to the commit, or empty with SERVING_WHY saying why it is unknown.
-# ActiveState and the start time come from `systemctl show`, never `is-active`,
-# and no date is parsed (--timestamp=unix).
-_read_serving() {
-    local state boot cutoff out rc=0
-    SERVING=""
-    SERVING_WHY=""
-    state="$(systemctl --user show genesis-server -p ActiveState --value 2>/dev/null || true)"
-    if [ "$state" != active ]; then
-        SERVING_WHY="genesis-server is not running (${state:-state unreadable})"
-        return 0
-    fi
-    boot="$(systemctl --user show genesis-server -p ActiveEnterTimestamp --timestamp=unix --value 2>/dev/null || true)"
-    boot="${boot#@}"
-    case "$boot" in
-        ''|*[!0-9]*)
-            SERVING_WHY="cannot read genesis-server's start time in unix seconds (--timestamp=unix needs systemd 248 or newer)"
-            return 0 ;;
-    esac
-    # Before this cutoff git may have expired unreachable reflog entries (a
-    # detour, as a pair). git resolves the setting itself; unset means its
-    # 30-day default, and a value it cannot read leaves the cutoff empty, which
-    # the reader answers as unknown.
-    cutoff="$(git -C "$GENESIS_ROOT" config --type=expiry-date gc.reflogExpireUnreachable 2>/dev/null)" || {
-        [ "$?" -eq 1 ] && cutoff=$(( $(date +%s) - 30 * 86400 )) || cutoff=""
-    }
-    out="$(python3 -c "$_SERVING_COMMIT_PY" "$_git_dir/logs/HEAD" "$boot" \
-        "$(git -C "$GENESIS_ROOT" rev-parse HEAD)" "$cutoff" 2>/dev/null)" || rc=$?
-    if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
-        SERVING="$out"
-    else
-        SERVING_WHY="${out#unknown: }"
-        [ -n "$SERVING_WHY" ] || SERVING_WHY="the reflog reader failed"
-    fi
+# ── Checks a restart depends on ───────────────────────────────────────
+# A server outside the unit, such as update.sh's nohup fallback after a failed
+# restart, is out of systemctl's reach: stopping the unit leaves it serving (and
+# lazily importing) from a tree the fast-forward is about to change, and a
+# restart would not replace it. The server's process lock names its pid; one
+# that is alive, is a `genesis serve`, and is not the unit's MainPID is outside.
+# Sets _OUTSIDE_PID.
+_server_outside_unit() {
+    local lock="$HOME/.genesis/genesis-server.lock" pid main cmd
+    [ -f "$lock" ] || return 1
+    pid="$(tr -dc '0-9' < "$lock" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmd" == *"genesis serve"* ]] || return 1
+    main="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
+    [ "$pid" != "$main" ] || return 1
+    _OUTSIDE_PID="$pid"
 }
 
-# The server-loaded changes the running server has not loaded: src/, config/
-# (read at startup) and pyproject.toml, between the commit it booted from and
-# HEAD. When that commit is unknown, <fallback-from> (this run's pull range) is
-# used instead, and said so. Addressed to the session that ran the command: it
-# names the next step and pages nobody.
-_report_pending() {
-    local fallback_from="${1:-}" head from changed
-    head="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
-    _read_serving
-    if [ -n "$SERVING" ]; then
-        echo "  The server booted from $SERVING; the tree is at $head."
-        from="$SERVING"
-    else
-        echo "  The commit the server booted from is unknown: $SERVING_WHY."
-        if [ -n "$fallback_from" ] && [ "$fallback_from" != "$head" ]; then
-            echo "  Showing what this pull changed instead ($fallback_from..$head)."
-            from="$fallback_from"
-        else
-            return 0
-        fi
-    fi
-    changed="$(git -C "$GENESIS_ROOT" diff --no-renames --name-only "$from" "$head" -- src config pyproject.toml)" \
-        || { echo "  NOTE: cannot list the changes since $from."; return 0; }
-    if [ -z "$changed" ]; then
-        echo "  Nothing the server loads (src/, config/, pyproject.toml) has changed since then."
-        return 0
-    fi
-    echo "  PENDING: the running server has not loaded these changes. It imports src/ lazily,"
-    echo "  so until it restarts it can run a mix of old and new code:"
-    echo "$changed" | sed 's/^/          /'
-    echo "  Next step, once no validation holds the lock: scripts/deploy_code_only.sh restart"
-    echo "  (launch it detached; the header of this script has the command)."
-}
-
-# Uncommitted edits to what the server loads: the editable install imports src/
-# from disk, so a tracked edit or an untracked module there runs without moving
-# HEAD. Prints "none", the first paths, or "unreadable".
-_runtime_edits() {
+# Untracked files under what the server loads (the editable install imports a
+# new module there; startup globs YAML under config/), less the paths update.sh
+# excuses. Prints them; nothing when there are none. Unreadable dies.
+_untracked_runtime() {
     local st
     st="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames --untracked-files=all \
-        -- src config pyproject.toml 2>/dev/null)" || { echo unreadable; return 0; }
-    if [ -z "$st" ]; then
-        echo none
-    else
-        printf '%s paths: %s\n' "$(printf '%s\n' "$st" | wc -l)" \
-            "$(printf '%s\n' "$st" | cut -c4- | head -n 5 | paste -sd ' ' -)"
-    fi
+        -- src config pyproject.toml)" || die "cannot read the working tree's status — nothing changed."
+    printf '%s\n' "$st" | grep '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" || true
 }
 
+# Does <path> (relative to the checkout) hold anything git does not track: an
+# untracked or IGNORED file, or a directory with one inside? A tracked file or
+# directory there is git's to replace; the fast-forward removes it as the range
+# says. Something present that git lists nothing under at all (an empty
+# directory) counts too. An unreadable listing counts: refusing is the safe side.
+_untracked_node() {
+    [ -e "$GENESIS_ROOT/$1" ] || [ -L "$GENESIS_ROOT/$1" ] || return 1
+    local others tracked
+    others="$(git -C "$GENESIS_ROOT" ls-files -z --others -- "$1" 2>/dev/null)" || return 0
+    [ -z "$others" ] || return 0
+    tracked="$(git -C "$GENESIS_ROOT" ls-files -z -- "$1" 2>/dev/null)" || return 0
+    [ -z "$tracked" ]
+}
+
+
 if [ "$MODE" = status ]; then
-    _read_serving
-    echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
-    echo "head: $(git -C "$GENESIS_ROOT" rev-parse HEAD)"
-    echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
-    echo "runtime-edits: $(_runtime_edits)"
-    _report_pending
-    exit 0
+    _status_main "$VERIFY" && exit 0
+    exit 1
 fi
 
 echo ""
@@ -353,6 +331,22 @@ _unit_python="$(systemctl --user show genesis-server -p ExecStart --value 2>/dev
 [ -n "$_unit_python" ] || die "cannot read which python genesis-server runs (systemctl show ExecStart)."
 [ "$(realpath -m "$(dirname "$_unit_python")")" = "$(realpath -m "$VENV_DIR/bin")" ] \
     || die "genesis-server runs $_unit_python, not $VENV_DIR — run scripts/update.sh --post-merge, whose bootstrap renders the unit for this checkout's venv."
+_unit_dir_is_ours \
+    || die "genesis-server runs in ${_UNIT_DIR:-a working directory systemctl did not report}, not $GENESIS_ROOT — run scripts/update.sh --post-merge, whose bootstrap renders the unit for this checkout."
+# What this run checked, and what a restart must find: HEAD now, or the upstream
+# commit once a fast-forward lands.
+_CHECKED="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+if [ "$MODE" != pull ]; then
+    _extra="$(_untracked_runtime)"
+    if [ -n "$_extra" ]; then
+        echo "ERROR: untracked files under src/, config/ or pyproject.toml would load with the restart. Nothing was deployed:" >&2
+        echo "$_extra" >&2
+        exit 1
+    fi
+    if _server_outside_unit; then
+        die "a genesis server outside the systemd unit (pid $_OUTSIDE_PID) holds the server lock; stopping or restarting the unit would not replace it — stop it, or run scripts/update.sh, which does."
+    fi
+fi
 # The deploy marker is taken NOW, before any pull, in every mode: a live foreign
 # holder (a dashboard update between its tiers, a restore) is refused before the
 # tree moves, and nothing can take the marker between our check and our restart.
@@ -423,6 +417,60 @@ _read_baseline() {
     _read_serving
     echo "  The server booted from ${SERVING:-an unknown commit ($SERVING_WHY)}."
     _BASELINE_READ=1
+}
+
+# The last word before any restart, as close to it as the script can put it: the
+# checkout must still be exactly the commit this run checked (_CHECKED), with no
+# tracked change and no untracked file under what the server loads, and no
+# server may be running outside the unit. The lock serializes deploys, not a
+# bare git command or an editor, so this is checked here, not only at the start.
+# Returns 1 with _BLOCKED saying why; the caller decides what a "no" means (a
+# refusal while the server is untouched, see _restart_or_refuse).
+_checkout_unmoved() {
+    local head br
+    head="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unreadable)"
+    br="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
+    [ "$head" = "$_CHECKED" ] && [ "$br" = "$_branch" ] && return 0
+    _BLOCKED="the checkout moved during this run (now ${br:-a detached HEAD} at $head; this run checked $_CHECKED) — something outside the lock changed it"
+    return 1
+}
+_ready_to_restart() {
+    local st dirty extra
+    _checkout_unmoved || return 1
+    if ! st="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames --untracked-files=all 2>/dev/null)"; then
+        _BLOCKED="cannot read the working tree's status before the restart"
+        return 1
+    fi
+    dirty="$(printf '%s\n' "$st" | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" | grep -v '^$' || true)"
+    if [ -n "$dirty" ]; then
+        _BLOCKED="tracked files changed during this run: $(printf '%s\n' "$dirty" | head -n 5 | cut -c4- | paste -sd ' ' -)"
+        return 1
+    fi
+    extra="$(printf '%s\n' "$st" | grep '^?? ' | cut -c4- | grep -E '^(src/|config/|pyproject\.toml$)' \
+        | sed 's/^/?? /' | grep -vE "$EPHEMERAL_DIRTY_RE" | cut -c4- || true)"
+    if [ -n "$extra" ]; then
+        _BLOCKED="untracked files under src/, config/ or pyproject.toml would load: $(printf '%s\n' "$extra" | head -n 5 | paste -sd ' ' -) — commit or move them aside"
+        return 1
+    fi
+    if _server_outside_unit; then
+        _BLOCKED="a server outside the systemd unit (pid $_OUTSIDE_PID) holds the server lock, and a restart would not replace it — stop it, or run scripts/update.sh, which does"
+        return 1
+    fi
+}
+
+# After a "no" from the checks above: while the server is untouched, a refusal
+# (nothing changed, nobody paged). Once deploy has stopped it, refusing would
+# leave it down, so the restart goes ahead on the tree as it stands, with the
+# health and identity checks, and the run ends in a critical alert naming why
+# the tree was not the one checked (owner ruling on #2557, 2026-09-29).
+_UNVERIFIED=""
+_restart_or_refuse() {
+    [ -n "$_STOPPED" ] || die "$_BLOCKED — nothing was restarted."
+    [ -z "$_UNVERIFIED" ] || return 0
+    _UNVERIFIED="$_BLOCKED"
+    SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unreadable)"
+    echo "  WARNING: $_UNVERIFIED." >&2
+    echo "  The server is stopped, so it is restarted on the tree as it stands ($SHA), health-checked, and alerted." >&2
 }
 
 # deploy's stop before the fast-forward. _STOPPED stays set until the server is
@@ -502,17 +550,20 @@ _pull() {
     # a local secrets or settings file would be lost.
     git -C "$GENESIS_ROOT" diff --no-renames --name-only --diff-filter=A "$_head" "$_upstream" >/dev/null \
         || die "cannot list the files this range adds — nothing changed."
+    # Only what git does NOT track counts: a tracked file or directory in the way
+    # is git's own to replace (the range deletes it as it adds the new path).
     _collisions=""
     while IFS= read -r -d '' _f; do
-        if [ -e "$GENESIS_ROOT/$_f" ] || [ -L "$GENESIS_ROOT/$_f" ]; then
+        if _untracked_node "$_f"; then
             _collisions+="$_f"$'\n'
             continue
         fi
+        [ -e "$GENESIS_ROOT/$_f" ] || [ -L "$GENESIS_ROOT/$_f" ] && continue
         _p="$_f"
         while [ "$_p" != "${_p%/*}" ]; do
             _p="${_p%/*}"
-            [ -d "$GENESIS_ROOT/$_p" ] && break
-            if [ -e "$GENESIS_ROOT/$_p" ] || [ -L "$GENESIS_ROOT/$_p" ]; then
+            [ -d "$GENESIS_ROOT/$_p" ] && [ ! -L "$GENESIS_ROOT/$_p" ] && break
+            if _untracked_node "$_p"; then
                 _collisions+="$_f"$'\n'
                 break
             fi
@@ -561,7 +612,16 @@ _pull() {
     # editable install imports src/ from disk, so a live server would serve
     # requests against a mix of old and new modules until its restart. pull keeps
     # the server running by design, and reports the pending changes instead.
-    [ "$MODE" = deploy ] && _stop_for_deploy
+    # A range that leaves the server's files as it booted them (docs, hooks)
+    # needs neither the stop nor the restart.
+    if [ "$MODE" = deploy ]; then
+        _read_baseline
+        if [ -n "$SERVING" ] && _runtime_same "$SERVING" "$_upstream"; then
+            echo "  Nothing the server loads changes in $_head..$_upstream: no stop, no restart."
+        else
+            _stop_for_deploy
+        fi
+    fi
     _PHASE="merging"
     for _f in AGENTS.md config/procedure_triggers.yaml; do
         if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
@@ -594,13 +654,7 @@ _pull() {
         exit 1
     fi
     _PHASE="merged"
-    # The lock serializes deploys, not a bare git command: if the checkout moved
-    # after this run checked what it would deploy, that is not what was checked.
-    _now_head="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unreadable)"
-    _now_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
-    if [ "$_now_head" != "$_upstream" ] || [ "$_now_branch" != "$branch" ]; then
-        die "the checkout moved during this run (now $_now_branch at $_now_head; this run checked $_upstream) — something outside the lock changed it."
-    fi
+    _CHECKED="$_upstream"
     echo "  Merged $_head..$_upstream"
 }
 
@@ -624,14 +678,21 @@ _sync_git_hooks() {
 case "$MODE" in
     deploy|pull)
         _pull "$_branch"
-        _sync_git_hooks
+        # deploy syncs after its restart: the server may be stopped now, and the
+        # sync runs a script from the merged tree that has no reason to lengthen
+        # the outage.
+        [ "$MODE" = deploy ] || _sync_git_hooks
         ;;
     restart)
         # No fetch, so nothing to merge: update.sh --post-merge is what reinstalls.
         _deps_ok "the working tree" "scripts/update.sh --post-merge" < "$GENESIS_ROOT/pyproject.toml" || exit 1
         ;;
 esac
-SHA="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
+# The lock serializes deploys, not a bare git command: if the checkout moved
+# after this run checked it (during the merge or a pull's hook sync), what it
+# holds is not what was checked. The same check runs again just before a restart.
+SHA="$_CHECKED"
+_checkout_unmoved || _restart_or_refuse
 
 if [ "$MODE" = pull ]; then
     _report_pending "$_PULL_FROM"
@@ -640,14 +701,17 @@ if [ "$MODE" = pull ]; then
 fi
 
 # ── Restart ───────────────────────────────────────────────────────────
-# (deploy with something to merge read the baseline and stopped the server
-# before the fast-forward; every other path reads it here, server still alive.)
+# (deploy with something to merge read the baseline before the fast-forward;
+# every other path reads it here, server still alive.)
 _read_baseline
-# A deploy with nothing to deploy: nothing merged, and the server provably booted
-# from HEAD. A restart would only cost an outage and end in-flight dispatched
-# sessions. The restart mode is there to force one.
-if [ "$MODE" = deploy ] && [ "$_PHASE" != merged ] && [ "$SERVING" = "$SHA" ]; then
-    echo "  Nothing to deploy: the server already booted from $SHA."
+# A deploy with nothing to deploy: the server is running, its boot commit is
+# known, and the files it loads are the same at HEAD (a merge of docs or hooks
+# only, or no merge at all). A restart would only cost an outage and end
+# in-flight dispatched sessions. The restart mode is there to force one.
+if [ "$MODE" = deploy ] && [ -z "$_STOPPED" ] && [ -n "$SERVING" ] && _runtime_same "$SERVING" "$SHA"; then
+    echo "  Nothing to deploy: the files the server loads are the ones it booted from ($SERVING)."
+    _sync_git_hooks
+    echo "  Tree at $SHA; no restart."
     exit 0
 fi
 # The reflog and the unit's start time both count whole seconds, and the boot
@@ -655,11 +719,17 @@ fi
 # of wait puts this boot clear of the merge above.
 sleep 1
 [ -n "$_PAUSED_THIS_RUN" ] || _guardian_pause
+_ready_to_restart || _restart_or_refuse
 _PHASE="restarting"
 echo "  Restarting genesis-server at $SHA…"
+# A restart stops the old process before it starts the new one, and the start
+# can fail after the stop: armed, the exit trap starts the server again, so a
+# failed restart never leaves it down unannounced.
+_STOPPED=1
 systemctl --user restart genesis-server {_UPDATE_LOCK_FD}>&-
 _STOPPED=""
 _PHASE="restarted"
+[ "$MODE" = deploy ] && _sync_git_hooks
 
 # Is the RESTARTED unit the one serving? A 200 from the port alone cannot say: a
 # server started outside systemd (update.sh's nohup fallback) can keep answering
@@ -773,9 +843,17 @@ if [ "$_healthy" = true ]; then
         echo "  NOTE: the reflog does not confirm the restarted server booted from $SHA (${SERVING:-unknown: $SERVING_WHY})."
     fi
     echo "  Healthy — deployed $SHA (genesis-server pid $_SERVER_PID)"
+    if [ -n "$_UNVERIFIED" ]; then
+        _ALERTED=1
+        queue_alert critical deploy-code-only \
+            "code-only deploy restarted on a tree it did not check ($SHA)" \
+            "The code-only deploy had stopped genesis-server when a late check found: $_UNVERIFIED. Refusing would have left the server down, so it was restarted on the tree as it stands ($SHA) and is healthy, but that tree is not the commit this run checked ($_CHECKED). Converge: find what changed the checkout, then scripts/deploy_code_only.sh restart."
+        die "restarted on a tree this run did not check ($SHA): $_UNVERIFIED — alert queued."
+    fi
     exit 0
 fi
 _ALERTED=1
+[ -z "$_UNVERIFIED" ] || _UNVERIFIED=" It was also not the tree this run checked: $_UNVERIFIED."
 if [ "$_answered_by_other" = true ]; then
     _why="the health endpoint answered, but not from the restarted genesis-server unit (a server running outside systemd may hold the port)"
 else
@@ -783,5 +861,5 @@ else
 fi
 queue_alert critical deploy-code-only \
     "code-only deploy unhealthy at $SHA" \
-    "After a code-only deploy to $SHA, $_why. The tree was NOT reverted (by design). Check: journalctl --user -u genesis-server -n 50"
+    "After a code-only deploy to $SHA, $_why.$_UNVERIFIED The tree was NOT reverted (by design). Check: journalctl --user -u genesis-server -n 50"
 die "after the restart, $_why — tree left at $SHA, alert queued."

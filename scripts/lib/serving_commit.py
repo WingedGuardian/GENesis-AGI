@@ -28,13 +28,15 @@ and it is only trusted when every one of these holds:
   * the boot is newer than the unreachable-entry cutoff. Past it, ``git gc`` may
     have expired a detour's entries as a PAIR (A->F and F->A), which removes the
     commit the server booted from and leaves the chain unbroken;
-  * the times do not go backwards across the boot.
+  * no move written before the chosen one is timed after the boot (the clock
+    stepped back across it).
 
 Residuals, stated, where the file cannot show the problem: ``git reflog expire
 --rewrite``, or a manual expire with a shorter cutoff than the configured one; a
 per-ref ``gc.<pattern>.reflogExpireUnreachable`` override; and a move whose
 reflog time was backdated (git records the committer time, so a move made with
-``GIT_COMMITTER_DATE`` in the past reads as having happened then). The complete
+``GIT_COMMITTER_DATE`` in the past reads as having happened then, and so does a
+move made after the clock stepped back behind the boot). The complete
 answer is the server recording its own commit at boot; until then this is the
 best evidence on disk. Stdlib only: this runs under the system python.
 """
@@ -88,7 +90,8 @@ def serving_commit(text: str, boot: int, head: str, cutoff: int) -> str:
     if any(when == boot and old != new for old, new, when in moves[: at + 1]):
         raise _Unknown("HEAD moved in the same second the server booted")
     # A move written before this one but timed after the boot means the clock
-    # stepped back; the ordering the answer relies on is gone.
+    # stepped back; the ordering the answer relies on is gone. (A clock that
+    # steps back AFTER the boot leaves no such trace: see the residuals above.)
     if any(when > boot for _, _, when in moves[:at]):
         raise _Unknown("reflog times go backwards around the boot")
     for i in range(at + 1, len(moves)):

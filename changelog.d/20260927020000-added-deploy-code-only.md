@@ -14,19 +14,22 @@
   - **What the server booted from.** Every mode reports the commit the running
     server started from against the tree, read from HEAD's reflog at the unit's
     start time. It is "unknown" when the reflog does not reach back that far,
-    has a gap left by pruned entries, does not end at HEAD, has times going
-    backwards, has a move in the boot's own second, or when the boot is older
-    than git's expiry for unreachable reflog entries (which can remove a detour
-    as a pair without leaving a gap). The reflog cannot show a manual
-    `git reflog expire --rewrite` or a move whose committer time was backdated;
-    the server recording its own commit at boot is the complete answer.
-  - **`deploy` with nothing to deploy does not restart:** when nothing merged
-    and the server provably booted from HEAD, it says so and stops. `restart`
-    forces one.
+    has a gap left by pruned entries, does not end at HEAD, shows the clock
+    stepping back across the boot, has a move in the boot's own second, or when
+    the boot is older than git's expiry for unreachable reflog entries (which
+    can remove a detour as a pair without leaving a gap). The reflog cannot show
+    a manual `git reflog expire --rewrite`, a move whose committer time was
+    backdated, or one made after the clock stepped back behind the boot; the
+    server recording its own commit at boot is the complete answer.
+  - **`deploy` restarts only for what the server loads:** when the files under
+    `src/`, `config/` and `pyproject.toml` are the ones the server booted from,
+    before and after the merge (a docs or hooks range, or nothing to merge), it
+    neither stops nor restarts the server. `restart` forces one.
   - **It refuses before anything changes:** a linked worktree, an unfinished
     `update.sh` run, a branch other than main, a dirty tracked tree, a unit that
-    runs a different venv, a live foreign deploy marker (or one that cannot be
-    written), a diverged tree, and a venv that does not match the
+    runs a different venv or from a different directory, a live foreign deploy
+    marker (or one that cannot be written), a diverged tree, and a venv that
+    does not match the
     `pyproject.toml` being deployed. That check reads the installed project's own
     metadata: an editable install from this checkout, with requirements (base and
     every optional group, compared parsed) and `requires-python` equal to the
@@ -39,12 +42,20 @@
   - **`deploy` stops the server before the fast-forward**, as `update.sh` does,
     so no request runs against a mix of old and new modules. A merge git refuses
     starts it again on the unchanged tree, and any failure while it is stopped
-    starts it before exiting. If the checkout moves under the run (a bare git
-    command outside the lock), the run refuses to restart onto code it did not
-    check.
+    starts it before exiting, and so does a restart whose start half fails.
+  - **Just before any restart it checks again** that the checkout is the exact
+    commit it checked, with no tracked change and no untracked file under
+    `src/`, `config/` or `pyproject.toml`, and that no server is running outside
+    the unit (such as `update.sh`'s fallback, which a restart would not replace).
+    `deploy` and `restart` also refuse those last two before anything changes.
+    If a late check fails after `deploy` stopped the server, refusing would leave
+    it down, so it is restarted on the tree as it stands with its health check,
+    and the run ends in a critical alert naming what changed. The git hook
+    copies are synced after the restart, not while the server is down.
   - **A range that adds a file already present here, untracked, is refused.** A
     fast-forward overwrites an ignored file without asking, so a local secrets or
-    settings file would be lost.
+    settings file would be lost. A tracked file or directory the range replaces
+    is git's own and does not count.
   - **Across a restart** it holds the deploy marker (the watchdog defers) and
     pauses the host Guardian (no false "Genesis down" alert), then waits for
     health with the same window `update.sh` computes. The health request goes to
@@ -64,7 +75,12 @@
   - Launch `deploy` and `restart` detached, as a transient `systemd-run --user`
     unit named with the time, so a second launch queues on the lock (the command
     is in the script's header): a session's background job dies with the session.
-  - For a validation against the live server, `status` at the start and the end
-    is the bracket: the run is invalid unless the server booted from HEAD at the
-    start, the boot commit, HEAD and MainPID are unchanged at the end, and there
-    are no uncommitted runtime edits at either end.
+  - For a validation against the live server, the script judges the bracket:
+    take the `bracket:` token `status` prints at the start, and run
+    `status --verify <token>` at the end (exit 0 is valid). A token exists only
+    when the boot commit is known, HEAD's runtime files are the ones the server
+    booted from, and nothing under them is edited outside git. It covers a
+    restart (boot commit, MainPID, systemd invocation id, which a reused pid
+    cannot fake) and an edit to an ignored runtime override such as a
+    `config/*.local.yaml`, fingerprinted without the files the server rewrites on
+    its own. HEAD may move over docs or hooks without invalidating the run.

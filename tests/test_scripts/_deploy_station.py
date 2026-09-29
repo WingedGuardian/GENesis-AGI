@@ -82,6 +82,17 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         f'  touch "{calls}.isactive"; echo "$s"; [ "$s" = active ]; exit\n'
         "fi\n"
         'if [[ " $* " == *" ActiveState "* ]]; then echo "${ACTIVE_STATE:-active}"; exit 0; fi\n'
+        # `show -p WorkingDirectory`: $UNIT_DIR, default the checkout under test
+        # ("-" = systemd answers nothing).
+        'if [[ " $* " == *" WorkingDirectory "* ]]; then\n'
+        '  d="${UNIT_DIR:-${GENESIS_DEPLOY_ROOT:-}}"; [ "$d" = - ] || echo "$d"; exit 0\n'
+        "fi\n"
+        # `show -p InvocationID`: one id per activation, a new one after a restart
+        # ($INVOCATION overrides the first; "-" = systemd answers nothing).
+        'if [[ " $* " == *" InvocationID "* ]]; then\n'
+        f'  if [ -f "{calls}.restarted_at" ]; then echo 22222222222222222222222222222222;\n'
+        '  else i="${INVOCATION:-11111111111111111111111111111111}"; [ "$i" = - ] || echo "$i"; fi; exit 0\n'
+        "fi\n"
         'if [[ " $* " == *" ActiveEnterTimestamp "* ]]; then\n'
         f'  if [ -f "{calls}.restarted_at" ]; then echo "@$(cat "{calls}.restarted_at")"; '
         f'else echo "@${{BOOTED_AT:-{booted_at}}}"; fi; exit 0\n'
@@ -98,7 +109,7 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         f'  if grep -q "restart genesis-server" "{calls}"; then\n'
         f'    if [ -n "${{NEW_PID_LATER:-}}" ] && [ -f "{calls}.pidread" ]; then echo "$NEW_PID_LATER";\n'
         f'    else touch "{calls}.pidread"; echo "${{NEW_PID:-2222}}"; fi\n'
-        "  else echo 1111; fi; exit 0\n"
+        '  else echo "${MAIN_PID:-1111}"; fi; exit 0\n'
         "fi\n"
         # A stop records the HEAD it found, so a test can tell whether it came
         # before or after the fast-forward.
@@ -108,6 +119,8 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         'if [[ " $* " == *" restart "* ]]; then\n'
         f'  echo "${{RESTARTED_AT:-$(date +%s)}}" > "{calls}.restarted_at"\n'
         f"  {on_restart or ':'}\n"
+        # $RESTART_RC: the restart stopped the old server, then its start failed.
+        '  [ -z "${RESTART_RC:-}" ] || exit "$RESTART_RC"\n'
         '  if [ -z "${NO_BOOTSTRAP:-}" ]; then\n'
         '    m="${MANIFEST_AFTER:-}"\n'
         '    [ -n "$m" ] || m=\'{"db": "ok", "perception": "ok"}\'\n'
@@ -224,6 +237,10 @@ def station(tmp_path):
                 "PROBE_FOREIGN_TOO",
                 "UNIT_PYTHON",
                 "UNIT_ARGS",
+                "UNIT_DIR",
+                "INVOCATION",
+                "RESTART_RC",
+                "MAIN_PID",
                 "SYNC_RC",
                 "PYTHONPATH",
                 "CDPATH",
@@ -259,9 +276,17 @@ def station(tmp_path):
     }
 
 
+_ADVANCES = [0]
+
+
 def advance_upstream(
     st, msg: str = "upstream advanced", files: dict[str, str] | None = None
 ) -> str:
+    """Push to the fixture's upstream. With no *files* it changes a file the
+    server loads (a deploy restarts only for those); pass files to shape it."""
+    if files is None:
+        _ADVANCES[0] += 1
+        files = {"src/genesis/_upstream.py": f"# {msg} {_ADVANCES[0]}\n"}
     tip = commit(st["seed"], msg, files)
     git(st["seed"], "push", "-q", "origin", "main")
     return tip
