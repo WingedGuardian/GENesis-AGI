@@ -547,6 +547,15 @@ def test_the_tmux_note_survives_a_continuation(sandbox):
     assert "kill-server" in res.stdout, f"the tmux note went silent: {res.stdout!r}"
 
 
+def test_the_push_guard_refuses_a_continued_pr_create_with_a_split_verb(sandbox):
+    """`pr create` is named only by the guard's own mention set (the carrier net has
+    no `create`), so this cell pins that set reading the assembled text on a
+    continued command."""
+    home, repo = sandbox
+    res = _run(_PUSH_GUARD, "gh pr cr''eate --fill" + CONT + "--draft", home, repo)
+    assert _refused(res), (res.stdout + res.stderr)[:400]
+
+
 def test_the_push_guard_refuses_a_continued_hook_skipping_commit(sandbox):
     """On one line the push guard refuses `commit -n` from the segment; a withheld
     parse has no segment, so its blind branch must still name the commit. The commit
