@@ -34,6 +34,13 @@ from genesis.util.tmp import big_tmp_dir
 
 logger = logging.getLogger(__name__)
 
+# One audio transcription at a time per process: each can download up to the
+# length cap of audio and hold it in memory for speech-to-text (#2568 review).
+_AUDIO_SLOTS = asyncio.Semaphore(1)
+# Audio download ceiling per allowed minute of video. 2 MB per minute is well
+# above speech bitrates, so a real track fits and a padded stream cannot.
+_AUDIO_MB_PER_MINUTE = 2
+
 _YOUTUBE_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+"
 )
@@ -254,6 +261,12 @@ class YouTubeProcessor:
         if not is_youtube_video_url(url):
             result.errors.append("not a YouTube video URL")
             return result
+        if url.lower().startswith("http://"):
+            # Never fetch a cleartext YouTube URL: an on-path responder could
+            # answer before the HTTPS redirect, and the result would still
+            # claim verified TLS (#2568 review).
+            url = "https://" + url[len("http://"):]
+            result.url = url
         if importlib.util.find_spec("yt_dlp") is None:
             result.errors.append("yt-dlp is not installed")
             return result
@@ -328,7 +341,8 @@ class YouTubeProcessor:
             )
         if not result.transcript and audio_fallback:
             logger.info("No captions for %s, attempting audio transcription", url)
-            text = await self._transcribe_audio(result, url, max_seconds=cap * 60)
+            async with _AUDIO_SLOTS:
+                text = await self._transcribe_audio(result, url, max_seconds=cap * 60)
             if text:
                 result.transcript = text
                 result.caption = {"key": None, "language": None, "kind": "audio transcription",
@@ -387,6 +401,7 @@ class YouTubeProcessor:
                     # The length check again at download time, by yt-dlp itself,
                     # in case the video changed since the metadata call.
                     ["--match-filters", f"!is_live & duration > 0 & duration <= {max_seconds}",
+                     "--max-filesize", f"{max(1, max_seconds // 60) * _AUDIO_MB_PER_MINUTE}M",
                      "-x", "--audio-format", "mp3", "--audio-quality", "5", "-o", out],
                     url,
                 )
@@ -398,7 +413,13 @@ class YouTubeProcessor:
                     result.errors.append("audio not downloaded (the length check rejected it)")
                 if candidates:
                     from genesis.channels.stt import transcribe
-                    return await transcribe(candidates[0].read_bytes())
+                    text = await transcribe(candidates[0].read_bytes())
+                    if not text:
+                        result.errors.append(
+                            "audio downloaded but speech-to-text returned nothing "
+                            "(provider unavailable, unconfigured or no speech)"
+                        )
+                    return text or None
         except asyncio.CancelledError:
             raise
         except Exception:

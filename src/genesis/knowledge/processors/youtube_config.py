@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import merge_local_overlay
+from genesis._config_overlay import _resolve_overlay_path, merge_local_overlay
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -47,24 +47,52 @@ def _base_path() -> Path:
     return repo_root() / "config" / _CONFIG_NAME
 
 
+def _overlay_damaged(base_path: Path) -> bool:
+    """True when a ``.local.yaml`` overlay exists but cannot be applied.
+
+    ``merge_local_overlay`` ignores such an overlay and returns the base, which
+    would silently drop an operator's ``tls: verify``. This check lets the
+    lever fail toward verification instead (#2568 review).
+    """
+    try:
+        path = _resolve_overlay_path(base_path)
+        if not path.exists():
+            return False
+        loaded = yaml.safe_load(path.read_text())
+    except Exception:
+        return True
+    return loaded is not None and not isinstance(loaded, dict)
+
+
 def load_config() -> dict[str, Any]:
-    """The merged config, read fresh (defaults ← base yaml ← .local.yaml)."""
+    """The merged config, read fresh (defaults ← base yaml ← .local.yaml).
+
+    ``_damaged`` is set when the base file is missing or unreadable, or an
+    overlay exists but cannot be applied; ``tls_mode`` then answers ``verify``.
+    """
     merged = copy.deepcopy(DEFAULTS)
     base_path = _base_path()
     base: dict[str, Any] = {}
+    damaged = False
     try:
-        loaded = yaml.safe_load(base_path.read_text()) or {}
+        loaded = yaml.safe_load(base_path.read_text())
         if isinstance(loaded, dict):
             base = loaded
-    except FileNotFoundError:
-        pass
+        else:
+            damaged = True
     except Exception:
-        logger.warning("youtube_fetch base config unreadable at %s", base_path)
+        damaged = True
+        logger.warning("youtube_fetch base config missing or unreadable at %s", base_path)
+    if _overlay_damaged(base_path):
+        damaged = True
+        logger.warning("youtube_fetch overlay for %s cannot be applied", base_path)
     try:
         base = merge_local_overlay(base, base_path)
     except Exception:
+        damaged = True
         logger.warning("youtube_fetch overlay merge failed", exc_info=True)
     merged.update(base)
+    merged["_damaged"] = damaged
     return merged
 
 
@@ -81,7 +109,12 @@ def audio_max_minutes() -> int:
 
 def tls_mode() -> str:
     """The certificate-verification mode, read live. Invalid → ``verify``."""
-    mode = load_config().get("tls")
+    cfg = load_config()
+    if cfg.get("_damaged"):
+        # Never fall back to the less-safe product default on a damaged
+        # config: the operator's `tls: verify` may be what failed to load.
+        return "verify"
+    mode = cfg.get("tls")
     if mode is False:
         # Hand-edited unquoted `tls: off` parses as YAML-1.1 boolean False.
         return "off"

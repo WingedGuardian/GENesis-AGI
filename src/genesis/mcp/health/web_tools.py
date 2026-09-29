@@ -698,9 +698,12 @@ async def web_fetch(
         # A batch holding a YouTube link: every URL is fetched on its own, all
         # at once, so each result belongs to its URL by construction and one
         # slow video never holds up the rest (#2568 review).
+        # In a batch, a captionless video is not transcribed from its audio:
+        # ten at once would multiply downloads and speech-to-text work from one
+        # external request (#2568 review). Fetching the URL on its own does.
         async def one(u: str) -> dict:
             try:
-                yt, yt_error = await fetch_youtube(u, max_chars)
+                yt, yt_error = await fetch_youtube(u, max_chars, audio_fallback=False)
                 if yt is not None:
                     return yt
                 page = await _impl_web_fetch(u, "auto", max_chars)

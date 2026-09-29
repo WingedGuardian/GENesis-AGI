@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -624,3 +625,125 @@ def test_speech_that_starts_with_language_is_kept():
     vtt = ("WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:02.000\n"
            "Language: Python is the topic\n\n00:00:02.000 --> 00:00:04.000\nKind: of great\n")
     assert YouTubeProcessor._parse_vtt(vtt) == "Language: Python is the topic Kind: of great"
+
+
+# ─── #2568 round 2: cleartext URLs, damaged config, audio limits, STT errors ─
+
+
+async def test_a_cleartext_youtube_url_is_fetched_over_https(monkeypatch, tmp_path):
+    """Codex P1: an http:// URL reached yt-dlp in cleartext yet reported verified TLS."""
+    seen = []
+
+    async def run(argv):
+        seen.append(argv)
+        return 1, b"", b"ERROR: [youtube] x: Video unavailable"
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    result = await YouTubeProcessor().fetch("http://www.youtube.com/watch?v=abc123", audio_fallback=False)
+    assert seen[0][-1] == "https://www.youtube.com/watch?v=abc123"
+    assert result.url.startswith("https://")
+
+
+def test_a_damaged_config_degrades_tls_to_verify(monkeypatch, tmp_path):
+    """Codex P2: a broken base or overlay restored the auto_fallback default."""
+    base = tmp_path / "youtube_fetch.yaml"
+    base.write_text("tls: [not, a, mode")  # unparseable
+    monkeypatch.setattr(youtube_config, "_base_path", lambda: base)
+    monkeypatch.setattr(youtube_config, "_overlay_damaged", lambda p: False)
+    assert youtube_config.tls_mode() == "verify"
+    base.write_text("tls: auto_fallback\n")
+    assert youtube_config.tls_mode() == "auto_fallback"
+    monkeypatch.setattr(youtube_config, "_overlay_damaged", lambda p: True)
+    assert youtube_config.tls_mode() == "verify"
+
+
+def test_an_unparseable_overlay_counts_as_damage(monkeypatch, tmp_path):
+    overlay = tmp_path / "youtube_fetch.local.yaml"
+    monkeypatch.setattr(youtube_config, "_resolve_overlay_path", lambda p: overlay)
+    assert youtube_config._overlay_damaged(tmp_path / "youtube_fetch.yaml") is False  # absent
+    overlay.write_text("tls: verify\n")
+    assert youtube_config._overlay_damaged(tmp_path / "youtube_fetch.yaml") is False
+    overlay.write_text("- a list\n")
+    assert youtube_config._overlay_damaged(tmp_path / "youtube_fetch.yaml") is True
+    overlay.write_text("tls: [broken")
+    assert youtube_config._overlay_damaged(tmp_path / "youtube_fetch.yaml") is True
+
+
+async def test_the_audio_download_is_capped_in_bytes(monkeypatch, tmp_path):
+    """Devin: the duration filter bounds length, not bytes."""
+    seen = []
+
+    async def run(argv):
+        seen.append(argv)
+        return 0, b"", b""
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    await YouTubeProcessor()._transcribe_audio(YouTubeFetch(url="https://youtu.be/a"), "https://youtu.be/a", max_seconds=7200)
+    argv = seen[0]
+    assert argv[argv.index("--max-filesize") + 1] == "240M"
+
+
+async def test_an_empty_speech_to_text_result_is_reported(monkeypatch, tmp_path):
+    """Codex P2: an STT failure left only a generic 'no transcript'."""
+    async def run(argv):
+        out = argv[argv.index("-o") + 1].replace("%%", "%").replace("%(ext)s", "mp3")
+        Path(out).write_bytes(b"audio")
+        return 0, b"", b""
+
+    import genesis.channels.stt as stt
+
+    async def empty(data):
+        return ""
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    monkeypatch.setattr(stt, "transcribe", empty)
+    result = YouTubeFetch(url="https://youtu.be/a")
+    assert await YouTubeProcessor()._transcribe_audio(result, result.url, max_seconds=600) is None
+    assert any("speech-to-text returned nothing" in e for e in result.errors), result.errors
+
+
+async def test_a_batch_never_transcribes_audio(web, monkeypatch):
+    """Codex P1: a 10-link batch of captionless videos started ten audio jobs."""
+    from genesis.mcp.health import youtube_route
+
+    tool, calls, set_fetch = web
+    flags = []
+
+    async def fetch(self, url, *, audio_fallback=True):
+        flags.append(audio_fallback)
+        return YouTubeFetch(url=url, metadata={"title": "V"}, transcript="t",
+                            caption={"key": "en", "language": "en", "kind": "manual",
+                                     "provenance": "original"})
+
+    monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", fetch)
+    await tool(urls=["https://youtu.be/a1", "https://youtu.be/b2"])
+    assert flags == [False, False]
+    flags.clear()
+    await tool(url="https://youtu.be/a1")
+    assert flags == [True]
+
+
+async def test_audio_transcriptions_run_one_at_a_time(monkeypatch, tmp_path):
+    info = {"title": "T", "duration": 60}
+    monkeypatch.setattr(yt, "_exec", _fake_ytdlp(info, None))
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "audio_max_minutes", lambda: 120)
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    active = {"now": 0, "peak": 0}
+
+    async def audio(self, result, url, **kw):
+        active["now"] += 1
+        active["peak"] = max(active["peak"], active["now"])
+        await asyncio.sleep(0.05)
+        active["now"] -= 1
+        return "words"
+
+    monkeypatch.setattr(YouTubeProcessor, "_transcribe_audio", audio)
+    await asyncio.gather(*(YouTubeProcessor().fetch(f"https://youtu.be/v{i}") for i in range(3)))
+    assert active["peak"] == 1

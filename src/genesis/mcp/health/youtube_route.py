@@ -48,7 +48,9 @@ def _format(result) -> str:
     return "\n".join(lines)
 
 
-async def fetch_youtube(url: str, max_chars: int) -> tuple[dict | None, str | None]:
+async def fetch_youtube(
+    url: str, max_chars: int, *, audio_fallback: bool = True
+) -> tuple[dict | None, str | None]:
     """``(result, None)`` on success, ``(None, error)`` when the caller should
     fall back to the ordinary fetch chain; ``(None, None)`` for a non-YouTube URL."""
     url = (url or "").strip()
@@ -58,7 +60,7 @@ async def fetch_youtube(url: str, max_chars: int) -> tuple[dict | None, str | No
         return None, None
     start = time.monotonic()
     try:
-        result = await YouTubeProcessor().fetch(url)
+        result = await YouTubeProcessor().fetch(url, audio_fallback=audio_fallback)
     except Exception as exc:  # never let the route break web_fetch
         logger.warning("YouTube fetch raised for %s", url, exc_info=True)
         return None, f"{type(exc).__name__}: {exc}"
