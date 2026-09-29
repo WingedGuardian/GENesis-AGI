@@ -10,7 +10,9 @@ import math
 import os
 import re
 import shutil
+import time
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -376,9 +378,10 @@ def load_config(
     are gitignored and survive upstream updates.
 
     If the overlay cannot be read, merged, or parsed, its overrides are set
-    aside and the base config is loaded instead, with the overlay's EXCLUSIONS
-    still applied (see ``_restrict_base``): a typo must not re-enable a provider
-    the operator disabled. The failure is logged at ERROR and recorded as a
+    aside and the base config is loaded instead, with every RESTRICTION the
+    overlay makes still applied (see ``_restrict_base`` and ``_FALLBACK_RULES``):
+    a typo must not lift a limit, a provider exclusion, a dispatch mode or a
+    retry cap the operator set. The failure is logged at ERROR and recorded as a
     health observation. Without this, most malformed overlays raised out of
     here, and ``runtime/init/router.py`` catches that and leaves the runtime
     with no router, so every LLM call site went dark behind one log line. The
@@ -421,7 +424,7 @@ def _load_effective(
             fallback, kept = _restrict_base(base_raw, local_raw)
         except Exception:  # noqa: BLE001 - a defect here must not take routing dark
             logger.error(
-                "Could not apply the rejected overlay's exclusions; using the base as is",
+                "Could not apply the rejected overlay's restrictions; using the base as is",
                 exc_info=True,
             )
             fallback = copy.deepcopy(base_raw)
@@ -434,7 +437,7 @@ def _load_effective(
 #: Marks an overlay whose text could not be read or parsed as YAML at all.
 _UNREADABLE = object()
 
-#: The kept-exclusions entry when applying them failed.
+#: The kept-restrictions entry when applying them failed.
 _EXCLUSIONS_FAILED = "__exclusions_failed__"
 
 #: Strings the `enabled` field reads as off. Shared by `_parse` and the fallback
@@ -471,67 +474,277 @@ def _limit_value(provider: str, key: str, value: object) -> float | None:
         return None
 
 
+#: A retry profile's CAPS: the fields that bound how many executions a call
+#: makes (`max_retries`) and for how long (`max_total_s`), with the value
+#: `_parse` uses when the field is absent. None means no cap.
+_RETRY_CAPS: dict[str, object] = {"max_retries": 3, "max_total_s": None}
+
+#: `open_duration_s` when a provider does not set it. One constant, so the
+#: fallback compares against the value `_parse` actually uses.
+_OPEN_DURATION_DEFAULT_S = 120
+
+#: How an unreadable cap is read: the tightest value that still ROUTES.
+#: `max_retries` 0 is one attempt per provider. `max_total_s` has no such
+#: value: the router checks the deadline before the FIRST provider too
+#: (`router.py`, the chain walk), so 0 means no call at all, which is the
+#: outage this fallback exists to prevent. An unreadable deadline therefore
+#: narrows nothing (infinity), and the base's deadline stands.
+_UNREADABLE_CAP: dict[str, float] = {"max_retries": 0, "max_total_s": math.inf}
+
+
+def _cap_value(key: str, value: object) -> float:
+    """A retry cap as `_parse` reads it, as a number to compare. No cap is
+    infinity. A value `_parse` would refuse reads as `_UNREADABLE_CAP`."""
+    try:
+        parsed = _number(
+            "retry", key, value, integer=key == "max_retries", allow_none=key == "max_total_s"
+        )
+    except Exception:  # noqa: BLE001 - any refusal
+        return _UNREADABLE_CAP[key]
+    return math.inf if parsed is None else parsed
+
+
+def _profile_caps(profile: object) -> dict[str, float]:
+    """The caps a raw retry profile sets. An unreadable profile reads as
+    `_UNREADABLE_CAP`."""
+    if not isinstance(profile, dict):
+        return dict(_UNREADABLE_CAP)
+    return {key: _cap_value(key, profile.get(key, default)) for key, default in _RETRY_CAPS.items()}
+
+
+#: The executors each dispatch mode permits. `api` and `cli` each permit a
+#: subset of `dual`, and share nothing with each other.
+_DISPATCH_EXECUTORS: dict[str, frozenset[str]] = {
+    "dual": frozenset({"api", "cli"}),
+    "api": frozenset({"api"}),
+    "cli": frozenset({"cli"}),
+}
+
+
+def _dispatch_mode(raw: object) -> str:
+    """`_normalize_dispatch` without its warning: the fallback reads the value,
+    it does not run on it. An unrecognised value is `dual`, as on the accepted
+    path, so it narrows nothing."""
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        value = "cli" if value == "cc" else value
+        if value in _DISPATCH_EXECUTORS:
+            return value
+    return "dual"
+
+
+class _Rule(NamedTuple):
+    """How a rejected overlay's value for one field still restricts the base.
+
+    ``kind`` names the operation, each of which can only NARROW the base:
+
+      * ``off_wins``    a switch: the value that permits less wins.
+      * ``on_wins``     the same, for a switch whose ON value restricts.
+      * ``lower``       a limit or cap: the lower value wins.
+      * ``higher``      a wait: the longer value wins (fewer probes of that
+        provider; the rest of its chain carries the load meanwhile, never for
+        longer than the overlay itself asked).
+      * ``same_or_excluded``  a value with no order (which model, which
+        endpoint). The only restrictive reading of two different values is
+        neither, so an overlay that changes it excludes the provider.
+      * ``chain``       the providers in both chains, in the overlay's order.
+      * ``dispatch``    the executors both modes permit; with none in common the
+        site is BLOCKED (kept as API-only with no providers, so nothing runs).
+      * ``retry_profile``  the tighter of the two profiles' caps.
+      * ``neutral``     bounds nothing the router does; the base value is used.
+        ``why`` must say why.
+    """
+
+    kind: str
+    why: str
+
+
+#: EVERY field `_parse` reads from an overlay-settable entry, plus the fields
+#: the dashboard writes, with how a rejected overlay's value for it still
+#: applies. `test_every_overlay_settable_field_has_a_restrictiveness_rule` walks
+#: `_parse` and the shipped config and fails on a field missing here, so a field
+#: added later cannot be silently dropped by the fallback.
+_FALLBACK_RULES: dict[str, dict[str, _Rule]] = {
+    "providers": {
+        "enabled": _Rule("off_wins", "a disabled provider is never called"),
+        "free": _Rule("off_wins", "a never_pays site skips a provider that is not free"),
+        "rpd_limit": _Rule("lower", "requests per day"),
+        "tpd_limit": _Rule("lower", "tokens per day"),
+        "rpm_limit": _Rule("lower", "requests per minute; 0 is no limit"),
+        "type": _Rule("same_or_excluded", "which API is called"),
+        "model": _Rule("same_or_excluded", "which model is called, and its price"),
+        "base_url": _Rule("same_or_excluded", "where prompts are sent"),
+        "profile": _Rule("same_or_excluded", "the pricing and capability profile"),
+        "params": _Rule("same_or_excluded", "request parameters, including fallback models"),
+        "open_duration_s": _Rule(
+            "higher", "how long a tripped provider rests before it is probed again"
+        ),
+        "keep_alive": _Rule(
+            "neutral", "how long a local model stays loaded: changes neither the call nor its cost"
+        ),
+    },
+    "call_sites": {
+        "chain": _Rule("chain", "which providers the site may call, and in what order"),
+        "dispatch": _Rule("dispatch", "whether the site may use the API chain, the CLI, or both"),
+        "never_pays": _Rule("on_wins", "keeps the site on free providers"),
+        "retry_profile": _Rule("retry_profile", "how many attempts and how long"),
+        "default_paid": _Rule("neutral", "not read by the router; the dashboard displays it"),
+        "cc_model": _Rule("neutral", "display only; the router does not read it"),
+        "cc_position": _Rule("neutral", "display only; the router does not read it"),
+        "description": _Rule("neutral", "documentation"),
+    },
+    "retry": {
+        "max_retries": _Rule("lower", "attempts per provider"),
+        "max_total_s": _Rule("lower", "the deadline for the whole chain walk; null is none"),
+        "base_delay_ms": _Rule(
+            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
+        ),
+        "max_delay_ms": _Rule(
+            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
+        ),
+        "backoff_multiplier": _Rule(
+            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
+        ),
+        "jitter_pct": _Rule(
+            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
+        ),
+    },
+}
+
+#: Every operation a rule may name. The coverage test checks the table against it.
+_RULE_KINDS = frozenset(
+    {
+        "off_wins",
+        "on_wins",
+        "lower",
+        "higher",
+        "same_or_excluded",
+        "chain",
+        "dispatch",
+        "retry_profile",
+        "neutral",
+    }
+)
+
+#: How `off_wins` / `on_wins` read a value, matching `_parse`: `enabled` through
+#: `_is_enabled`, the other switches through `_flag`, where only `True` is on
+#: and anything else it would refuse reads restrictively.
+_PERMITS: dict[str, object] = {
+    "enabled": _is_enabled,
+    "free": lambda value: value is True,
+}
+_SWITCH_DEFAULTS = {"enabled": True, "free": False}
+_SWITCH_LABELS = {"enabled": "disabled", "free": "not free"}
+
+
 def _restrict_base(base_raw: dict, local_raw: object) -> tuple[dict, list[str]]:
-    """The base config, with the rejected overlay's EXCLUSIONS still applied.
+    """The base config, with everything the rejected overlay restricts still applied.
 
-    Setting the whole overlay aside must not undo what the operator explicitly
-    excluded. Falling back to the base alone would re-enable all of it, so a
-    typo anywhere in the file would route to providers, and spend, the operator
-    had turned off.
+    Setting the whole overlay aside must not undo what the operator restricted.
+    Falling back to the base alone would lift all of it, so a typo anywhere in
+    the file would route to providers, executors and spend the operator had
+    ruled out.
 
-    The exclusions read are the fields the router consumes to decide WHETHER
-    and HOW MUCH a provider is used, and each can only NARROW the base:
+    Every field the overlay can set has a rule in ``_FALLBACK_RULES``, and each
+    rule can only NARROW the base: the result permits no call, no provider, no
+    executor, no attempt and no spend that either the base or the overlay would
+    refuse. See ``_Rule`` for the operations. A field with no order (which model,
+    which endpoint) that the overlay changes excludes its provider, because the
+    base's value is not the one the operator runs.
 
-      * provider ``enabled`` off, read by the same rule ``_parse`` uses;
-      * provider ``free`` not true (a ``never_pays`` site then skips it);
-      * provider ``rpd_limit`` / ``tpd_limit`` / ``rpm_limit``: the lower value;
-      * call-site ``never_pays``;
-      * call-site ``dispatch: cli``, which keeps the site off the API chain;
-      * call-site ``chain``: only providers that are in the base chain too,
-        in the overlay's order.
+    Where the overlay names a provider, call site or retry profile but the value
+    there cannot be read, the reading is the restrictive one: an unreadable
+    provider entry or limit disables the provider, an unreadable call-site
+    entry blocks the site, an unreadable chain leaves the site no providers,
+    and an unreadable `max_retries` is 0 (see ``_UNREADABLE_CAP`` for why an
+    unreadable `max_total_s` narrows nothing). A null ENTRY holds nothing and restricts
+    nothing; a null FIELD is read the way the accepted path reads it.
 
-    Nothing here enables a provider, marks one free, raises a limit, clears
-    ``never_pays``, moves a site off ``cli``, or adds a provider to a chain.
-    Where the overlay names a provider or call site but the value there cannot
-    be read, the reading is the restrictive one: an unreadable provider entry
-    or limit disables the provider, and an unreadable call-site entry or chain
-    leaves that site no providers (``_parse`` then drops it unless it dispatches
-    to the CLI). A null ENTRY holds nothing and restricts nothing; a null FIELD
-    is read the way the accepted path reads it.
-
-    Other overrides (a model, params, retry settings) are not exclusions and
-    are set aside with the rest of the file.
+    Provider names go through the same rename resolution as the accepted path,
+    so an overlay that restricts a provider under its old name still restricts it.
 
     An overlay in which no name can be read at all (not YAML, not a mapping, a
-    section that is not a mapping) has no exclusions to apply, and the base is
-    used as it is. The ERROR log and the health observation say so.
+    section that is not a mapping) has nothing to apply, and the base is used as
+    it is. The ERROR log and the health observation say so.
 
-    Returns the restricted copy and a description of each exclusion kept.
+    Returns the restricted copy and a description of each restriction kept.
     """
     fallback = copy.deepcopy(base_raw)
     kept: list[str] = []
     if not isinstance(local_raw, dict):
         return fallback, kept
 
+    # A base with no `retry` section, or `retry: null`, still has a `default`
+    # profile: `_parse` supplies one. Materialise both so a restriction on
+    # them has somewhere to land. A section of another type makes `_parse`
+    # raise on the base itself, so it is left alone.
+    if fallback.get("retry") is None:
+        fallback["retry"] = {}
+    base_retry = fallback["retry"] if isinstance(fallback["retry"], dict) else {}
+    if base_retry is fallback["retry"] and "default" not in base_retry:
+        base_retry["default"] = {}
+    local_retry = local_raw.get("retry")
+    local_retry = local_retry if isinstance(local_retry, dict) else {}
+    _restrict_retry(base_retry, local_retry, kept)
+
     base_providers = fallback.get("providers")
     local_providers = local_raw.get("providers")
+    known = set(base_providers) if isinstance(base_providers, dict) else set()
     if isinstance(base_providers, dict) and isinstance(local_providers, dict):
-        for name, entry in local_providers.items():
-            base_entry = base_providers.get(name)
-            if not isinstance(base_entry, dict) or entry is None:
+        _restrict_providers(base_providers, local_providers, kept)
+
+    base_sites = fallback.get("call_sites")
+    local_sites = local_raw.get("call_sites")
+    if isinstance(base_sites, dict) and isinstance(local_sites, dict):
+        _restrict_call_sites(base_sites, local_sites, known, fallback, base_raw, local_retry, kept)
+    return fallback, kept
+
+
+def _restrict_retry(base_retry: dict, local_retry: dict, kept: list[str]) -> None:
+    for name, entry in local_retry.items():
+        base_entry = base_retry.get(name)
+        # A profile the base does not define is reachable only through a call
+        # site's retry_profile, where `_restrict_call_sites` reads it.
+        if not isinstance(base_entry, dict) or entry is None:
+            continue
+        if not isinstance(entry, dict):
+            entry = dict.fromkeys(_RETRY_CAPS, "unreadable")
+        for key, value in entry.items():
+            rule = _FALLBACK_RULES["retry"].get(key)
+            if rule is None or rule.kind == "neutral":
                 continue
-            if not isinstance(entry, dict):
-                base_entry["enabled"] = False
-                kept.append(f"provider {name} disabled (unreadable entry)")
+            limit = _cap_value(key, value)
+            base_limit = _cap_value(key, base_entry.get(key, _RETRY_CAPS[key]))
+            if limit < base_limit:
+                # The parsed number, never the raw value: an unreadable value
+                # reads as `_UNREADABLE_CAP`, and writing it back would make
+                # `_parse` refuse the fallback itself. Below the base, so finite.
+                base_entry[key] = limit
+                kept.append(f"retry {name} {key} {base_entry[key]}")
+
+
+def _restrict_providers(base_providers: dict, local_providers: dict, kept: list[str]) -> None:
+    known = set(base_providers)
+    for raw_name, entry in local_providers.items():
+        name = _resolve_provider_alias(raw_name, known)
+        base_entry = base_providers.get(name)
+        if not isinstance(base_entry, dict) or entry is None:
+            continue
+        if not isinstance(entry, dict):
+            base_entry["enabled"] = False
+            kept.append(f"provider {name} disabled (unreadable entry)")
+            continue
+        for key, value in entry.items():
+            rule = _FALLBACK_RULES["providers"].get(key)
+            if rule is None or rule.kind == "neutral":
                 continue
-            if "enabled" in entry and not _is_enabled(entry["enabled"]):
-                base_entry["enabled"] = False
-                kept.append(f"provider {name} disabled")
-            if "free" in entry and entry["free"] is not True and base_entry.get("free"):
-                base_entry["free"] = False
-                kept.append(f"provider {name} not free")
-            for key in _LIMIT_KEYS:
-                value = entry.get(key)
+            if rule.kind == "off_wins":
+                permits = _PERMITS[key]
+                default = _SWITCH_DEFAULTS[key]
+                if not permits(value) and permits(base_entry.get(key, default)):
+                    base_entry[key] = False
+                    kept.append(f"provider {name} {_SWITCH_LABELS[key]}")
+            elif rule.kind == "lower":
                 if value is None:
                     continue
                 limit = _limit_value(name, key, value)
@@ -545,62 +758,202 @@ def _restrict_base(base_raw: dict, local_raw: object) -> tuple[dict, list[str]]:
                 if base_limit is not None and limit < base_limit:
                     base_entry[key] = value
                     kept.append(f"provider {name} {key} {value}")
-
-    known_providers = set(base_providers) if isinstance(base_providers, dict) else set()
-    base_sites = fallback.get("call_sites")
-    local_sites = local_raw.get("call_sites")
-    if isinstance(base_sites, dict) and isinstance(local_sites, dict):
-        for name, entry in local_sites.items():
-            base_entry = base_sites.get(name)
-            if not isinstance(base_entry, dict) or entry is None:
-                continue
-            if not isinstance(entry, dict):
-                base_entry["chain"] = []
-                kept.append(f"call site {name} has no providers (unreadable entry)")
-                continue
-            never_pays = entry.get("never_pays")
-            if never_pays is not None and never_pays is not False and base_entry.get("never_pays") is not True:
-                base_entry["never_pays"] = True
-                kept.append(f"call site {name} never_pays")
-            dispatch = entry.get("dispatch")
-            # The overlay value is matched directly, not through
-            # `_normalize_dispatch`: that would log a warning about a value the
-            # fallback is not using.
-            if (
-                isinstance(dispatch, str)
-                and dispatch.strip().lower() in {"cli", "cc"}
-                and _normalize_dispatch(base_entry.get("dispatch"), call_site_name=name) != "cli"
-            ):
-                base_entry["dispatch"] = "cli"
-                kept.append(f"call site {name} dispatch cli")
-            chain = entry.get("chain")
-            if chain is None:
-                continue
-            base_chain = base_entry.get("chain")
-            base_chain = base_chain if isinstance(base_chain, list) else []
-            if isinstance(chain, list):
-                # Mirrors `_sanitize_local_overlay` on the accepted path: names
-                # the base does not define are dropped, and a chain left with
-                # none is no override at all.
-                named = [p for p in chain if isinstance(p, str) and p in known_providers]
-                if not named:
+            elif rule.kind == "higher":
+                # Only `open_duration_s`, with the default `_parse` supplies.
+                try:
+                    wait = _number(name, key, value)
+                except Exception:  # noqa: BLE001 - any refusal
+                    base_entry["enabled"] = False
+                    kept.append(f"provider {name} disabled (unreadable {key})")
                     continue
-                in_base = set(base_chain)
-                narrowed = [p for p in dict.fromkeys(named) if p in in_base]
-            else:
-                narrowed = []
-            if narrowed != base_chain:
-                base_entry["chain"] = narrowed
-                kept.append(f"call site {name} chain {narrowed}")
-    return fallback, kept
+                try:
+                    base_wait = _number(name, key, base_entry.get(key, _OPEN_DURATION_DEFAULT_S))
+                except Exception:  # noqa: BLE001 - `_parse` raises on the base itself
+                    continue
+                if wait > base_wait:
+                    base_entry[key] = wait
+                    kept.append(f"provider {name} {key} {wait}")
+            elif rule.kind == "same_or_excluded":
+                current = base_entry.get(key)
+                # The value the accepted path would have run: mappings merge.
+                effective = (
+                    _deep_merge(current, value)
+                    if isinstance(current, dict) and isinstance(value, dict)
+                    else value
+                )
+                if effective != current and _is_enabled(base_entry.get("enabled", True)):
+                    base_entry["enabled"] = False
+                    kept.append(f"provider {name} disabled (the overlay changes its {key})")
+            else:  # pragma: no cover - the coverage test pins the kinds per section
+                msg = f"no provider handling for rule kind {rule.kind!r}"
+                raise AssertionError(msg)
 
 
-#: Last-reported (mtime, cause, exclusions kept) per overlay path.
+def _restrict_call_sites(
+    base_sites: dict,
+    local_sites: dict,
+    known: set[str],
+    fallback: dict,
+    base_raw: dict,
+    local_retry: dict,
+    kept: list[str],
+) -> None:
+    excluded: list[str] = []
+    for name, entry in local_sites.items():
+        base_entry = base_sites.get(name)
+        if not isinstance(base_entry, dict) or entry is None:
+            continue
+        if not isinstance(entry, dict):
+            excluded.append(name)
+            kept.append(f"call site {name} blocked (unreadable entry)")
+            continue
+        for key, value in entry.items():
+            rule = _FALLBACK_RULES["call_sites"].get(key)
+            if rule is None or rule.kind == "neutral":
+                continue
+            if rule.kind == "on_wins":
+                # `_flag` reads null as false, and refuses anything but a bool.
+                if value is not None and value is not False and base_entry.get(key) is not True:
+                    base_entry[key] = True
+                    kept.append(f"call site {name} {key}")
+            elif rule.kind == "chain":
+                _restrict_chain(name, base_entry, value, known, kept)
+            elif rule.kind == "dispatch":
+                base_mode = _dispatch_mode(base_entry.get("dispatch"))
+                allowed = (
+                    _DISPATCH_EXECUTORS[base_mode] & _DISPATCH_EXECUTORS[_dispatch_mode(value)]
+                )
+                if not allowed:
+                    excluded.append(name)
+                    kept.append(f"call site {name} blocked (dispatch {value!r} vs {base_mode})")
+                elif allowed != _DISPATCH_EXECUTORS[base_mode]:
+                    mode = next(m for m, ex in _DISPATCH_EXECUTORS.items() if ex == allowed)
+                    base_entry["dispatch"] = mode
+                    kept.append(f"call site {name} dispatch {mode}")
+            elif rule.kind == "retry_profile":
+                _restrict_site_retry(name, base_entry, value, fallback, base_raw, local_retry, kept)
+            else:  # pragma: no cover - the coverage test pins the kinds per section
+                msg = f"no call-site handling for rule kind {rule.kind!r}"
+                raise AssertionError(msg)
+    # BLOCKED, not removed. The autonomous dispatcher reads a call site missing
+    # from the config as `dual`, which can escalate to the CLI; an API-only
+    # site with no providers is refused there instead ("dispatch=api: API chain
+    # exhausted"), and `route_call` finds no provider to call.
+    for name in dict.fromkeys(excluded):
+        base_sites[name]["chain"] = []
+        base_sites[name]["dispatch"] = "api"
+
+
+def _restrict_chain(
+    name: str, base_entry: dict, chain: object, known: set[str], kept: list[str]
+) -> None:
+    if chain is None:
+        return
+    base_chain = base_entry.get("chain")
+    base_chain = base_chain if isinstance(base_chain, list) else []
+    if isinstance(chain, list):
+        # Mirrors `_sanitize_local_overlay` on the accepted path: renamed names
+        # are translated, names the base does not define are dropped, and a
+        # chain left with none is no override at all.
+        named = [_resolve_provider_alias(p, known) for p in chain if isinstance(p, str)]
+        named = [p for p in named if p in known]
+        if not named:
+            return
+        in_base = set(base_chain)
+        narrowed = [p for p in dict.fromkeys(named) if p in in_base]
+    else:
+        narrowed = []
+    if narrowed != base_chain:
+        base_entry["chain"] = narrowed
+        kept.append(f"call site {name} chain {narrowed}")
+
+
+def _restrict_site_retry(
+    name: str,
+    base_entry: dict,
+    value: object,
+    fallback: dict,
+    base_raw: dict,
+    local_retry: dict,
+    kept: list[str],
+) -> None:
+    """Give the site the tighter caps of its base profile and the overlay's.
+
+    The overlay may point the site at another profile, possibly one it defines
+    or edits itself. The fallback keeps the site on its base profile's settings
+    but caps it at the lower `max_retries` and `max_total_s` of the two, in a
+    profile made for the site. An unreadable name or profile reads as
+    ``_UNREADABLE_CAP``.
+    """
+    retry = fallback.setdefault("retry", {})
+    if not isinstance(retry, dict):
+        return
+    base_profile_name = base_entry.get("retry_profile") or "default"
+    base_profile = retry.get(base_profile_name)
+    base_profile = base_profile if isinstance(base_profile, dict) else {}
+
+    if value is None:
+        wanted: object = "default"
+    else:
+        wanted = value if isinstance(value, str) and value else None
+    if wanted is None:
+        overlay_profile: object = None  # unreadable name
+    else:
+        shipped = (
+            (base_raw.get("retry") or {}).get(wanted)
+            if isinstance(base_raw.get("retry"), dict)
+            else None
+        )
+        local = local_retry.get(wanted)
+        if wanted not in local_retry:
+            overlay_profile = (
+                shipped if isinstance(shipped, dict) else ({} if wanted == "default" else None)
+            )
+        elif isinstance(local, dict):
+            overlay_profile = _deep_merge(shipped, local) if isinstance(shipped, dict) else local
+        elif local is None and isinstance(shipped, dict):
+            overlay_profile = shipped
+        else:
+            overlay_profile = None
+
+    base_caps = _profile_caps(base_profile)
+    overlay_caps = _profile_caps(overlay_profile)
+    tighter = {key: min(base_caps[key], overlay_caps[key]) for key in _RETRY_CAPS}
+    if tighter == base_caps:
+        return
+    site_profile = copy.deepcopy(base_profile)
+    for key, cap in tighter.items():
+        site_profile[key] = None if cap == math.inf else cap
+    site_name = f"fallback:{name}"
+    retry[site_name] = site_profile
+    base_entry["retry_profile"] = site_name
+    kept.append(
+        f"call site {name} retry max_retries {site_profile['max_retries']} "
+        f"max_total_s {site_profile['max_total_s']}"
+    )
+
+
+#: Last-LOGGED (mtime, cause, restrictions kept) per overlay path.
 #: ``load_config`` runs on every dashboard vitals read and in every
-#: eval/standalone process, so a broken overlay is reported once per file
-#: version, cause AND kept exclusions: an edit, or a base change underneath it
+#: eval/standalone process, so a broken overlay is logged once per file
+#: version, cause AND kept restrictions: an edit, or a base change underneath it
 #: that changes the error or what the fallback kept, reports again.
 _REPORTED_OVERLAYS: dict[str, tuple[float, str, tuple[str, ...]]] = {}
+
+#: The report whose health observation is RECORDED, per overlay path: written,
+#: or already present as an unresolved row. Kept apart from the log dedup so a
+#: write that failed (a locked or missing database) is retried, not forgotten.
+_RECORDED_OVERLAYS: dict[str, tuple[float, str, tuple[str, ...]]] = {}
+
+#: Monotonic time of the last FAILED observation write, per (path, report).
+_OBSERVATION_FAILED_AT: dict[tuple[str, tuple[float, str, tuple[str, ...]]], float] = {}
+
+#: Seconds between retries of a failed observation write. `load_config` runs on
+#: every dashboard vitals poll and each attempt can wait out create_sync's 1 s
+#: lock timeout, so a database that stays unavailable must cost one attempt per
+#: interval rather than one per poll. A minute keeps that cost negligible while
+#: the observation still lands within a minute of the database coming back.
+_OBSERVATION_RETRY_S = 60.0
 
 
 def _report_overlay_rejected(
@@ -614,34 +967,36 @@ def _report_overlay_rejected(
     key = str(local_path)
     detail = f"{type(exc).__name__}: {exc}"
     kept = kept or []
-    # The kept exclusions are part of the report's identity: the base can change
-    # under an unchanged overlay and change what the fallback kept.
+    # The kept restrictions are part of the report's identity: the base can
+    # change under an unchanged overlay and change what the fallback kept.
     report = (mtime, detail, tuple(kept))
-    if _REPORTED_OVERLAYS.get(key) == report:
-        return
-    _REPORTED_OVERLAYS[key] = report
     if kept == [_EXCLUSIONS_FAILED]:
-        still = "Its exclusions could NOT be applied; see the ERROR log."
+        still = "Its restrictions could NOT be applied; see the ERROR log."
     elif kept:
-        still = f"Its exclusions are still applied: {'; '.join(kept)}."
+        still = f"Its restrictions are still applied: {'; '.join(kept)}."
     else:
-        still = "It carried no exclusions that could be read."
-    logger.error(
-        "Routing overlay %s rejected; running on the shipped routing config "
-        "without its overrides. %s Fix or remove the file. Cause: %s",
-        local_path, still, detail, exc_info=exc,
-    )
+        still = "It carried no restrictions that could be read."
+    if _REPORTED_OVERLAYS.get(key) != report:
+        _REPORTED_OVERLAYS[key] = report
+        logger.error(
+            "Routing overlay %s rejected; running on the shipped routing config "
+            "without its overrides. %s Fix or remove the file. Cause: %s",
+            local_path, still, detail, exc_info=exc,
+        )
+    if _RECORDED_OVERLAYS.get(key) == report:
+        return
+    failed_at = _OBSERVATION_FAILED_AT.get((key, report))
+    if failed_at is not None and time.monotonic() - failed_at < _OBSERVATION_RETRY_S:
+        return
     try:
-        from genesis.db.crud.observations import create_sync
+        from genesis.db.crud.observations import create_sync_status
         from genesis.env import genesis_db_path
 
         # The hash names the file VERSION as well as the cause. create_sync
         # dedups on it, so hashing the content alone would suppress the report
         # for an edited file whose error text did not change.
         version = hashlib.sha256(f"{key}|{report!r}".encode()).hexdigest()
-        # create_sync never raises and returns False on a failed or deduped
-        # write; the ERROR line above is the record that cannot be lost.
-        create_sync(
+        status = create_sync_status(
             str(genesis_db_path()),
             source="routing",
             type="init_degradation",
@@ -655,6 +1010,13 @@ def _report_overlay_rejected(
         )
     except Exception:  # noqa: BLE001 - an import failure must not break config loading
         logger.warning("Could not record the routing overlay observation", exc_info=True)
+        status = "failed"
+    if status == "failed":
+        # The ERROR line above is already written; only the row is retried.
+        _OBSERVATION_FAILED_AT[(key, report)] = time.monotonic()
+        return
+    _OBSERVATION_FAILED_AT.pop((key, report), None)
+    _RECORDED_OVERLAYS[key] = report
 
 
 def load_config_from_string(text: str, *, check_api_keys: bool = True) -> RoutingConfig:
@@ -923,7 +1285,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             tpd_limit=_parse_daily_limit(name, "tpd_limit", p.get("tpd_limit")),
             # A number, not only an integer: 0.5 means one call per two minutes.
             rpm_limit=_number(where, "rpm_limit", p.get("rpm_limit"), allow_none=True),
-            open_duration_s=_number(where, "open_duration_s", p.get("open_duration_s", 120)),
+            open_duration_s=_number(where, "open_duration_s", p.get("open_duration_s", _OPEN_DURATION_DEFAULT_S)),
             base_url=_optional_str(where, "base_url", p.get("base_url")),
             keep_alive=p.get("keep_alive"),
             enabled=True,
@@ -975,15 +1337,25 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
         if not chain:
             # CLI-dispatch call sites don't use the provider chain — they
             # spawn CC sessions directly.  An empty chain is valid for them.
-            if dispatch != "cli":
+            # An API-only site with no providers is KEPT too, as a site that
+            # cannot run: dropped, it would be missing from the config, and the
+            # autonomous dispatcher reads a missing site as `dual`, which can
+            # escalate to the CLI the operator ruled out. Kept, `route_call`
+            # finds no provider and the dispatcher's api-only branch refuses.
+            if dispatch == "dual":
                 logger.warning(
                     "Call site '%s' has empty chain after `enabled: false` filter — dropping",
                     name,
                 )
                 continue
-            logger.info(
-                "Call site '%s' has no API providers but dispatch=cli — keeping", name,
-            )
+            if dispatch == "api":
+                logger.warning(
+                    "Call site '%s' is dispatch=api with no providers — kept as BLOCKED "
+                    "(it cannot run)",
+                    name,
+                )
+            else:
+                logger.info("Call site '%s' has no API providers but dispatch=cli — keeping", name)
         # Validate remaining providers exist
         for provider in chain:
             if provider not in providers:
@@ -1135,9 +1507,11 @@ def update_call_site_in_yaml(
     base_cs = base_raw["call_sites"][call_site_id]
     effective_cs = _deep_merge(base_cs, local_cs)
 
-    # The dispatch this update will leave in effect. Mirrors the loader's
-    # empty-chain exemption (_parse: an empty chain is valid ONLY for cli
-    # sites, which spawn CC directly). Without it the first empty-chain
+    # The dispatch this update will leave in effect. An edit may leave a chain
+    # empty only for a cli site, which spawns CC directly. The loader also
+    # tolerates an empty api chain, keeping the site BLOCKED so the dispatcher
+    # cannot read it as missing, but an edit must not author an unrunnable
+    # site, so the save refuses it. Without the cli exemption the first empty-chain
     # cli site (ambient_arbiter) is un-editable — the dashboard editor
     # round-trips the chain, and [] was rejected unconditionally here.
     intended_dispatch = _normalize_dispatch(

@@ -477,6 +477,7 @@ def test_routing_config_read_includes_call_sites(client):
             default_paid=True,
             never_pays=False,
             retry_profile="background",
+            dispatch="dual",
         ),
     }
     mock_router = MagicMock()
@@ -496,6 +497,50 @@ def test_routing_config_read_includes_call_sites(client):
     assert "autonomous_executor_reasoning" in data["call_sites"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["openrouter-sonnet"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
+
+
+def test_routing_config_read_shows_the_running_dispatch_not_the_file(client):
+    """After a refused reload the router keeps its previous config, while a fresh
+    load of the broken file falls back to the base. The editor must show the
+    dispatch that is actually running, not the one on disk."""
+    mock_cfg = SimpleNamespace(disabled_providers={}, providers={})
+    mock_cfg.call_sites = {
+        "31_site": SimpleNamespace(
+            chain=[], default_paid=False, never_pays=False,
+            retry_profile="default", dispatch="cli",
+        ),
+        "32_site": SimpleNamespace(
+            chain=[], default_paid=False, never_pays=False,
+            retry_profile="default", dispatch="api",
+        ),
+    }
+    mock_router = MagicMock()
+    mock_router._daily_budget = None
+    mock_router.config = mock_cfg
+    mock_router.breakers = {}
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+    on_disk = {
+        "call_sites": {
+            "31_site": {"dispatch": "dual", "cc_model": "Sonnet"},
+            "32_site": {"chain": []},
+        }
+    }
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.routing.config._load_effective", return_value=(None, on_disk)),
+    ):
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/routing/config")
+
+    assert resp.status_code == 200
+    sites = resp.get_json()["call_sites"]
+    assert sites["31_site"]["dispatch"] == "cli"
+    assert sites["31_site"]["cc_model"] == "Sonnet"
+    # Nothing on disk names a dispatch here; the running mode is still shown.
+    assert sites["32_site"]["dispatch"] == "api"
 
 
 def test_routing_config_read_surfaces_daily_budget_counters(client):

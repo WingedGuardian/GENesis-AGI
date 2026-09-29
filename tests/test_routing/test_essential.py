@@ -70,3 +70,23 @@ def test_build_map_empty_when_all_sites_missing_logs_error(caplog):
         "coverage-based degradation is DISABLED" in r.getMessage()
         for r in caplog.records
     )
+def test_build_map_skips_a_blocked_site_loudly(caplog):
+    """A site present with NO providers is blocked by configuration, not
+    uncovered by an outage. It is skipped like a missing site, with a warning."""
+    logger = logging.getLogger("genesis.routing.essential")
+    logger.addHandler(caplog.handler)
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
+    try:
+        m = build_essential_provider_map(
+            _cfg({"4_light_reflection": [], "9_fact_extraction": ["groq-free"]})
+        )
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(old_level)
+    assert "4_light_reflection" not in m
+    assert m["9_fact_extraction"] == ["groq-free"]
+    assert any(
+        "4_light_reflection" in r.getMessage() and "blocked" in r.getMessage()
+        for r in caplog.records
+    )

@@ -83,11 +83,20 @@ def routing_config_read():
         }
         # CC info: YAML overrides meta (YAML is updated by saves)
         yaml_entry = yaml_cc.get(name, {})
-        dispatch = yaml_entry.get("dispatch") or (meta.get("dispatch") if meta else None)
         cc_model = yaml_entry.get("cc_model") or (meta.get("cc_model") if meta else None)
         cc_position = yaml_entry.get("cc_position")
-        if dispatch:
-            site_data["dispatch"] = dispatch
+        # The dispatch shown is the one the RUNNING router uses. The file on disk
+        # can differ from it: an edit not yet reloaded, or a reload that was
+        # refused because the overlay is broken, which keeps the previous config
+        # running while a fresh load of the file falls back to the base.
+        # cc_model and cc_position are display-only and routing never reads
+        # them, so they still come from the file.
+        if (
+            yaml_entry.get("dispatch")
+            or (meta.get("dispatch") if meta else None)
+            or cs.dispatch != "dual"
+        ):
+            site_data["dispatch"] = cs.dispatch
             site_data["cc_model"] = cc_model
         if cc_position is not None:
             site_data["cc_position"] = cc_position

@@ -10,8 +10,9 @@ The design here is a chokepoint, not a list of shapes:
   * `load_config` parses base + overlay. If that fails for ANY reason, the whole
     overlay is set aside, the failure is logged at ERROR and recorded as a health
     observation, and the base is parsed instead. The base is validated in CI.
-    The overlay's EXCLUSIONS (a disabled or not-free provider, `never_pays`, a
-    narrowed chain) still apply to that base, so a typo cannot undo them.
+    Every RESTRICTION the overlay makes still applies to that base, through one
+    rule per overlay-settable field (`_FALLBACK_RULES`), so a typo cannot undo
+    any of them. A test walks `_parse` and fails on a field with no rule.
   * `_parse` raises on malformed entries and wrongly typed fields rather than
     skipping them, so the chokepoint sees every error it has to contain.
   * One shape does not raise by itself: a non-mapping SECTION (a bare
@@ -74,9 +75,11 @@ SITE = "31_outcome_classification"
 
 @pytest.fixture(autouse=True)
 def _fresh_report_state():
-    C._REPORTED_OVERLAYS.clear()
+    for state in (C._REPORTED_OVERLAYS, C._RECORDED_OVERLAYS, C._OBSERVATION_FAILED_AT):
+        state.clear()
     yield
-    C._REPORTED_OVERLAYS.clear()
+    for state in (C._REPORTED_OVERLAYS, C._RECORDED_OVERLAYS, C._OBSERVATION_FAILED_AT):
+        state.clear()
 
 
 @pytest.fixture
@@ -84,11 +87,13 @@ def recorded(monkeypatch):
     """Capture health observations instead of writing to any database."""
     rows: list[dict] = []
 
-    def fake_create_sync(db_path, **kw):
+    def fake_create_sync_status(db_path, **kw):
         rows.append(kw)
-        return True
+        return "written"
 
-    monkeypatch.setattr("genesis.db.crud.observations.create_sync", fake_create_sync)
+    monkeypatch.setattr(
+        "genesis.db.crud.observations.create_sync_status", fake_create_sync_status
+    )
     return rows
 
 
@@ -166,12 +171,31 @@ MALFORMED = {
     "retry_profile_empty": f"call_sites:\n  {SITE}:\n    retry_profile: ''\n",
 }
 
-#: Shapes that also carry an exclusion the fallback keeps, mapped to the base
+
+def _site_capped(max_retries, max_total_s):
+    """The base edit for a site the fallback caps: its own copy of its profile."""
+
+    def edit(raw):
+        profile = dict(raw["retry"]["background"])
+        profile.update(max_retries=max_retries, max_total_s=max_total_s)
+        raw["retry"][f"fallback:{SITE}"] = profile
+        raw["call_sites"][SITE]["retry_profile"] = f"fallback:{SITE}"
+
+    return edit
+
+
+def _profile_capped(name, **caps):
+    return lambda raw: raw["retry"][name].update(**caps)
+
+
+#: Shapes that also carry a restriction the fallback keeps, mapped to the base
 #: edit that expresses it. Where the overlay names a provider or call site but
 #: its value there is unreadable, the fallback reads it restrictively.
 EXCLUDING = {
-    "call_site_str": lambda raw: raw["call_sites"][SITE].update(chain=[]),
-    "call_site_list": lambda raw: raw["call_sites"][SITE].update(chain=[]),
+    # an unreadable call-site entry BLOCKS the site: its dispatch is unknown,
+    # so it is kept API-only with no providers and nothing runs
+    "call_site_str": lambda raw: raw["call_sites"][SITE].update(chain=[], dispatch="api"),
+    "call_site_list": lambda raw: raw["call_sites"][SITE].update(chain=[], dispatch="api"),
     "chain_int": lambda raw: raw["call_sites"][SITE].update(chain=[]),
     "chain_str": lambda raw: raw["call_sites"][SITE].update(chain=[]),
     "provider_str": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
@@ -181,6 +205,18 @@ EXCLUDING = {
     # an unreadable limit on a named provider disables it
     "rpm_limit_str": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
     "rpd_limit_zero": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
+    # a value with no order that the overlay changes excludes the provider
+    "params_list": lambda raw: raw["providers"]["free-b"].update(enabled=False),
+    "open_duration_negative": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
+    "open_duration_nan": lambda raw: raw["providers"]["paid-a"].update(enabled=False),
+    # an unreadable max_retries is 0, one attempt per provider. An unreadable
+    # max_total_s narrows nothing: 0 would stop the site calling anything.
+    "max_retries_float": _profile_capped("background", max_retries=0),
+    "max_retries_bool": _profile_capped("background", max_retries=0),
+    # an unreadable profile NAME: 0 retries, the base profile's deadline
+    "retry_profile_typo": _site_capped(0, 600),
+    "retry_profile_mapping": _site_capped(0, 600),
+    "retry_profile_empty": _site_capped(0, 600),
 }
 NO_EXCLUSION = [k for k in MALFORMED if k not in EXCLUDING]
 
@@ -326,7 +362,7 @@ def test_a_rejected_overlay_never_widens_the_base(tmp_path, recorded):
     assert expected.call_sites["32_other"].dispatch == "cli", "fixture: base dispatch"
     assert expected.providers["free-b"].rpd_limit == 100, "fixture: base rpd_limit"
     assert _snapshot(loaded) == _snapshot(expected)
-    assert "no exclusions" in recorded[0]["content"]
+    assert "no restrictions" in recorded[0]["content"]
 
 
 def test_a_rejected_overlay_keeps_cli_dispatch(tmp_path, recorded):
@@ -581,7 +617,8 @@ def test_deep_merge_still_applies_non_mapping_values_at_field_depth():
 )
 def test_a_malformed_default_profile_inherits_the_bases_bound(tmp_path, recorded, local):
     """#2215's per-shape guard substituted an unbounded `RetryPolicy()` here.
-    The fallback inherits the base's default instead."""
+    The fallback keeps the base's bound. An unreadable deadline does not
+    lower it to 0, which would stop every site on the profile calling anything."""
     loaded = load_config(_write(tmp_path, local), check_api_keys=False)
 
     assert loaded.retry_profiles["default"].max_total_s == 300
@@ -743,3 +780,538 @@ def test_a_mapping_retry_profile_fails_with_a_sentence(tmp_path):
 
     with pytest.raises(ValueError, match="retry_profile must be a string or null"):
         load_config(_write(tmp_path, local), check_api_keys=False, strict_overlay=True)
+# ── Every overlay-settable field has a restrictiveness rule ─────────────────
+#
+# Rounds 2 and 3 of review each found a restriction the fallback dropped
+# (first `enabled`/`never_pays`/chains, then `dispatch: api` and retry caps),
+# because the fallback listed the fields it kept. It now keeps a rule for EVERY
+# field, and this test fails when a field is read without one.
+
+#: How `_parse` names each section's entry.
+_PARSE_ENTRY_VARS = {"p": "providers", "cs": "call_sites", "rp": "retry"}
+
+
+def _fields_parse_reads() -> dict[str, set[str]]:
+    """The field names `_parse` reads from each section's entries, by AST."""
+    import ast
+    import inspect
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(C._parse)))
+    # `for required in ("type", "model"): p.get(required)` names fields too.
+    loop_names: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.iter, ast.Tuple)
+            and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str) for e in node.iter.elts
+            )
+        ):
+            loop_names[node.target.id] = [e.value for e in node.iter.elts]
+
+    def names(arg: ast.AST) -> list[str]:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return [arg.value]
+        if isinstance(arg, ast.Name):
+            return loop_names.get(arg.id, [])
+        return []
+
+    # Every OTHER use of an entry variable fails the walk rather than being
+    # skipped: `"k" in p`, `p.items()`, `**p`, passing `p` to a helper. Each
+    # could read a field this walker cannot name. Allowed: `.get`, a subscript,
+    # the `_entry(section, name, p)` check, and a comprehension that rebinds the
+    # name to something else (`[p for p in chain ...]`).
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def inside(node: ast.AST, ancestor: ast.AST) -> bool:
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = parents.get(node)
+        return False
+
+    def rebound_by_comprehension(name: ast.Name) -> bool:
+        node = parents.get(name)
+        while node is not None:
+            comprehension = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            if (
+                isinstance(node, comprehension)
+                and any(
+                    isinstance(gen.target, ast.Name) and gen.target.id == name.id
+                    for gen in node.generators
+                )
+                # The FIRST generator's iterable runs in the enclosing scope,
+                # where the name is still the entry: `[p for p in p.items()]`.
+                and not inside(name, node.generators[0].iter)
+            ):
+                return True
+            node = parents.get(node)
+        return False
+
+    unrecognised = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Name)
+            and node.id in _PARSE_ENTRY_VARS
+            and isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        parent = parents[node]
+        if rebound_by_comprehension(node):
+            continue
+        if isinstance(parent, ast.Attribute) and parent.attr == "get":
+            call = parents.get(parent)
+            if isinstance(call, ast.Call) and call.args and names(call.args[0]):
+                continue
+        elif isinstance(parent, ast.Subscript) and parent.value is node and names(parent.slice) or (
+            isinstance(parent, ast.Call)
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id == "_entry"
+        ):
+            continue
+        unrecognised.append(f"line {node.lineno}: {ast.unparse(parent)}")
+    assert not unrecognised, (
+        "`_parse` uses an entry in a way this walker cannot read field names from; "
+        f"teach it the new form, or read the field with .get: {unrecognised}"
+    )
+
+    found: dict[str, set[str]] = {section: set() for section in _PARSE_ENTRY_VARS.values()}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in _PARSE_ENTRY_VARS
+            and node.args
+        ):
+            found[_PARSE_ENTRY_VARS[node.func.value.id]].update(names(node.args[0]))
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in _PARSE_ENTRY_VARS
+        ):
+            found[_PARSE_ENTRY_VARS[node.value.id]].update(names(node.slice))
+    return found
+
+
+def _fields_the_shipped_config_sets() -> dict[str, set[str]]:
+    shipped_path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
+    shipped = yaml.safe_load(shipped_path.read_text())
+    return {
+        section: {key for entry in shipped[section].values() for key in entry}
+        for section in ("providers", "call_sites", "retry")
+    }
+
+
+def _fields_the_dashboard_writes() -> set[str]:
+    import inspect
+
+    params = inspect.signature(update_call_site_in_yaml).parameters.values()
+    return {p.name for p in params if p.kind is p.KEYWORD_ONLY}
+
+
+def test_every_overlay_settable_field_has_a_restrictiveness_rule():
+    """ALLOWLIST polarity: a field `_parse` reads, the shipped config sets, or
+    the dashboard writes, with no rule in `_FALLBACK_RULES`, fails here. Adding
+    a field to the schema without deciding how a rejected overlay still
+    restricts it is the defect this blocks."""
+    parse = _fields_parse_reads()
+    # Guard the guard: the walker must see the fields it exists to find, or an
+    # empty walk would pass vacuously.
+    assert {"enabled", "rpd_limit", "type", "model"} <= parse["providers"]
+    assert {"chain", "dispatch", "never_pays", "retry_profile"} <= parse["call_sites"]
+    assert {"max_retries", "max_total_s", "jitter_pct"} <= parse["retry"]
+
+    shipped = _fields_the_shipped_config_sets()
+    dashboard = _fields_the_dashboard_writes()
+    assert "dispatch" in dashboard, "fixture: the save path's keyword fields"
+
+    missing = {
+        section: sorted(
+            (parse[section] | shipped[section] | (dashboard if section == "call_sites" else set()))
+            - set(C._FALLBACK_RULES[section])
+        )
+        for section in ("providers", "call_sites", "retry")
+    }
+    assert missing == {"providers": [], "call_sites": [], "retry": []}
+
+
+def test_every_rule_names_a_known_operation_and_says_why():
+    applicable = {
+        "providers": {"off_wins", "lower", "higher", "same_or_excluded", "neutral"},
+        "call_sites": {"on_wins", "chain", "dispatch", "retry_profile", "neutral"},
+        "retry": {"lower", "neutral"},
+    }
+    for section, rules in C._FALLBACK_RULES.items():
+        for field, rule in rules.items():
+            assert rule.kind in C._RULE_KINDS, (section, field)
+            assert rule.kind in applicable[section], (section, field, rule.kind)
+            assert rule.why.strip(), (section, field)
+    # Every switch has a reader, and every retry cap a default.
+    switches = {f for f, r in C._FALLBACK_RULES["providers"].items() if r.kind == "off_wins"}
+    assert switches == set(C._PERMITS) == set(C._SWITCH_DEFAULTS) == set(C._SWITCH_LABELS)
+    caps = {f for f, r in C._FALLBACK_RULES["retry"].items() if r.kind == "lower"}
+    assert caps == set(C._RETRY_CAPS)
+
+
+# ── The rules the round-3 review found missing ──────────────────────────────
+
+
+def test_a_rejected_overlay_keeps_api_only_dispatch(tmp_path, recorded):
+    """The reviewer's case: `dispatch: api` keeps a `dual` site from escalating
+    to the CLI when its chain is exhausted."""
+    local = f"call_sites:\n  {SITE}:\n    dispatch: api\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].dispatch == "api"
+    assert f"call site {SITE} dispatch api" in recorded[0]["content"]
+
+
+def _dispatcher_mode(config, site: str) -> str:
+    """The mode the autonomous dispatcher resolves for a site, on this config."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from genesis.autonomy.dispatch_router import AutonomousDispatchRouter
+
+    dispatcher = AutonomousDispatchRouter(
+        router=SimpleNamespace(config=config), approval_gate=MagicMock()
+    )
+    return dispatcher._resolve_dispatch_mode(
+        SimpleNamespace(dispatch_mode=None, api_call_site_id=site)
+    )
+
+
+def test_dispatch_modes_with_no_executor_in_common_block_the_site(tmp_path, recorded):
+    """A base `cli` site the overlay moves to `api`: no executor is allowed by
+    both. The site must stay in the config as API-only with no providers. A
+    site MISSING from the config is read as `dual` by the dispatcher, which
+    would reach the CLI both files ruled out for it."""
+    base = _BASE.replace("    chain: [free-b]\n", "    chain: [free-b]\n    dispatch: cli\n", 1)
+    local = "call_sites:\n  32_other:\n    dispatch: api\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local, base=base), check_api_keys=False)
+
+    assert loaded.call_sites["32_other"].chain == []
+    assert _dispatcher_mode(loaded, "32_other") == "api"
+
+
+def test_an_api_site_whose_chain_empties_is_blocked_not_dropped(tmp_path, recorded):
+    """`dispatch: api` plus a chain naming no provider of the base chain leaves
+    no providers. Dropped, the dispatcher would read the site as `dual`."""
+    local = (
+        f"call_sites:\n  {SITE}:\n    dispatch: api\n    chain: [free-b]\n"
+        + _UNRELATED_ERROR
+    )
+    base = _BASE.replace("chain: [paid-a, free-b]", "chain: [paid-a]", 1)
+    loaded = load_config(_write(tmp_path, local, base=base), check_api_keys=False)
+
+    assert loaded.call_sites[SITE].chain == []
+    assert _dispatcher_mode(loaded, SITE) == "api"
+
+
+def test_an_unreadable_deadline_still_lets_the_site_call(tmp_path, recorded):
+    """EFFECT, not value: the router checks the deadline before the first
+    provider too, so a deadline of 0 means no call at all."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+    from genesis.routing.degradation import DegradationTracker
+    from genesis.routing.router import Router
+    from genesis.routing.types import BudgetStatus
+
+    from .conftest import MockDelegate
+
+    local = "retry:\n  background:\n    max_total_s: 5m\n  custom:\n"
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+    cost_tracker = MagicMock(db=None)
+    cost_tracker.check_budget = AsyncMock(return_value=BudgetStatus.UNDER_LIMIT)
+    cost_tracker.record = AsyncMock()
+    delegate = MockDelegate()
+    router = Router(
+        config=loaded,
+        breakers=CircuitBreakerRegistry(loaded.providers),
+        cost_tracker=cost_tracker,
+        degradation=DegradationTracker(),
+        delegate=delegate,
+    )
+
+    result = asyncio.run(router.route_call(SITE, [{"role": "user", "content": "hi"}]))
+
+    assert loaded.retry_profiles["background"].max_total_s == 600
+    assert result.success, result.error
+    assert len(delegate.calls) == 1
+
+
+def test_a_rejected_overlay_keeps_lower_retry_caps(tmp_path, recorded):
+    # The unrelated error sits inside `retry:`: a second top-level `retry:` key
+    # would replace this section, since YAML keeps the last duplicate.
+    local = "retry:\n  background:\n    max_retries: 1\n    max_total_s: 30\n  custom:\n"
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.retry_profiles["background"].max_retries == 1
+    assert loaded.retry_profiles["background"].max_total_s == 30
+
+
+def test_a_higher_or_absent_retry_cap_is_not_applied(tmp_path, recorded):
+    """null is no deadline, which is looser than the base's, so it is not kept."""
+    local = "retry:\n  background:\n    max_retries: 9\n    max_total_s: null\n  custom:\n"
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.retry_profiles["background"].max_retries == 5
+    assert loaded.retry_profiles["background"].max_total_s == 600
+
+
+def test_moving_a_site_to_a_tighter_profile_is_kept(tmp_path, recorded):
+    """The site keeps its base profile's pacing, capped at the tighter caps."""
+    local = f"call_sites:\n  {SITE}:\n    retry_profile: default\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    policy = loaded.retry_profiles[loaded.call_sites[SITE].retry_profile]
+    assert (policy.max_retries, policy.max_total_s) == (3, 300)
+    assert loaded.retry_profiles["background"].max_retries == 5, "the shared profile is untouched"
+
+
+def test_moving_a_site_to_a_profile_the_overlay_defines_is_kept(tmp_path, recorded):
+    local = (
+        f"call_sites:\n  {SITE}:\n    retry_profile: quick\n"
+        "retry:\n  quick:\n    max_retries: 0\n    max_total_s: 5\n  custom:\n"
+    )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    policy = loaded.retry_profiles[loaded.call_sites[SITE].retry_profile]
+    assert (policy.max_retries, policy.max_total_s) == (0, 5)
+
+
+def test_moving_a_site_to_a_looser_profile_changes_nothing(tmp_path, recorded):
+    local = "call_sites:\n  32_other:\n    retry_profile: background\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.call_sites["32_other"].retry_profile == "default"
+
+
+def test_an_overlay_that_changes_a_model_excludes_the_provider(tmp_path, recorded):
+    """The operator runs a different model there. The base's model is not one
+    they chose, so the fallback does not call it."""
+    local = "providers:\n  paid-a:\n    model: vendor/other\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert "paid-a" not in loaded.providers
+
+
+def test_an_overlay_that_restates_a_value_excludes_nothing(tmp_path, recorded):
+    """CONTROL for `same_or_excluded`: the same model, and params that merge to
+    the same map, are no change."""
+    local = (
+        "providers:\n  paid-a:\n    model: vendor/model-a\n"
+        "  free-b:\n    params:\n      reasoning_effort: disable\n" + _UNRELATED_ERROR
+    )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert _snapshot(loaded) == _snapshot(_base_only(tmp_path))
+
+
+def test_a_longer_breaker_rest_is_kept_and_a_shorter_one_is_not(tmp_path, recorded):
+    """A provider that rests longer after tripping is probed less often."""
+    local = (
+        "providers:\n  paid-a:\n    open_duration_s: 900\n  free-b:\n    open_duration_s: 1\n"
+        + _UNRELATED_ERROR
+    )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert loaded.providers["paid-a"].open_duration_s == 900
+    assert loaded.providers["free-b"].open_duration_s == 120
+
+
+def test_a_neutral_field_is_set_aside(tmp_path, recorded):
+    local = "providers:\n  paid-a:\n    keep_alive: 5m\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert _snapshot(loaded) == _snapshot(_base_only(tmp_path))
+
+
+def test_a_restriction_under_a_renamed_provider_name_still_applies(tmp_path, recorded, monkeypatch):
+    """An upgrading install's overlay can still use a provider's old name. The
+    accepted path migrates it; the fallback must read it the same way."""
+    monkeypatch.setitem(C._RENAMED_PROVIDERS, "paid-a-old", "paid-a")
+    local = (
+        "providers:\n  paid-a-old:\n    rpd_limit: 7\n"
+        "call_sites:\n  32_other:\n    chain: [paid-a-old]\n" + _UNRELATED_ERROR
+    )
+    base = _BASE.replace("    chain: [free-b]\n", "    chain: [free-b, paid-a]\n", 1)
+    loaded = load_config(_write(tmp_path, local, base=base), check_api_keys=False)
+
+    assert loaded.providers["paid-a"].rpd_limit == 7
+    assert loaded.call_sites["32_other"].chain == ["paid-a"]
+
+
+# ── The health observation survives a failed write ──────────────────────────
+
+
+def test_a_failed_observation_write_is_retried(tmp_path, monkeypatch):
+    """A locked database at the first report must not lose the observation."""
+    statuses = iter(["failed", "written"])
+    calls: list[dict] = []
+
+    def status(db_path, **kw):
+        calls.append(kw)
+        return next(statuses)
+
+    monkeypatch.setattr("genesis.db.crud.observations.create_sync_status", status)
+    clock = [1000.0]
+    monkeypatch.setattr(C.time, "monotonic", lambda: clock[0])
+    cfg = _write(tmp_path, _UNRELATED_ERROR)
+
+    load_config(cfg, check_api_keys=False)
+    load_config(cfg, check_api_keys=False)
+    assert len(calls) == 1, "a retry within the interval would cost a write per poll"
+
+    clock[0] += C._OBSERVATION_RETRY_S
+    load_config(cfg, check_api_keys=False)
+    load_config(cfg, check_api_keys=False)
+    assert len(calls) == 2, "the failed write was not retried, or was retried after success"
+
+
+def test_a_deduplicated_observation_is_not_retried(tmp_path, monkeypatch):
+    """A duplicate means the row is already recorded: retrying would repeat
+    the write forever."""
+    calls: list[dict] = []
+
+    def status(db_path, **kw):
+        calls.append(kw)
+        return "duplicate"
+
+    monkeypatch.setattr("genesis.db.crud.observations.create_sync_status", status)
+    clock = [1000.0]
+    monkeypatch.setattr(C.time, "monotonic", lambda: clock[0])
+    cfg = _write(tmp_path, _UNRELATED_ERROR)
+
+    load_config(cfg, check_api_keys=False)
+    clock[0] += 10 * C._OBSERVATION_RETRY_S
+    load_config(cfg, check_api_keys=False)
+
+    assert len(calls) == 1
+
+
+def test_create_sync_status_tells_a_duplicate_from_a_failure(tmp_path):
+    import sqlite3
+
+    from genesis.db.crud.observations import create_sync, create_sync_status
+    from genesis.db.schema import TABLES
+
+    db = tmp_path / "genesis.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(TABLES["observations"])
+    conn.close()
+    kw = {
+        "source": "routing",
+        "type": "init_degradation",
+        "priority": "high",
+        "content": "x",
+        "content_hash": "h",
+    }
+
+    assert create_sync_status(str(db), **kw) == "written"
+    assert create_sync_status(str(db), **kw) == "duplicate"
+    assert create_sync_status(str(tmp_path / "missing" / "no.db"), **kw) == "failed"
+    # The boolean API is unchanged: True only for a written row.
+    assert create_sync(str(db), **{**kw, "content_hash": "h2"}) is True
+    assert create_sync(str(db), **{**kw, "content_hash": "h2"}) is False
+
+
+# ── The save path after the merge with the rename migration ─────────────────
+
+
+def test_a_save_can_replace_a_malformed_chain_on_the_site_it_edits(tmp_path):
+    """The chain this save replaces is never read, so it must not block the
+    save that repairs it."""
+    cfg = _write(tmp_path, f"call_sites:\n  {SITE}:\n    chain: paid-a\n")
+
+    update_call_site_in_yaml(cfg, SITE, chain=["free-b"])
+
+    written = yaml.safe_load((tmp_path / "model_routing.local.yaml").read_text())
+    assert written["call_sites"][SITE]["chain"] == ["free-b"]
+
+
+def test_a_save_that_leaves_a_malformed_chain_in_place_is_refused(tmp_path):
+    cfg = _write(tmp_path, f"call_sites:\n  {SITE}:\n    chain: paid-a\n")
+
+    with pytest.raises(ValueError, match="chain must be a list"):
+        update_call_site_in_yaml(cfg, SITE, never_pays=True)
+
+
+def test_an_unhashable_chain_rung_is_a_value_error_not_a_crash(tmp_path):
+    """The dashboard maps only ValueError to 400; anything else is a 500."""
+    cfg = _write(tmp_path, "call_sites:\n  32_other:\n    chain: [[free-b]]\n")
+
+    with pytest.raises(ValueError, match="could not be read"):
+        update_call_site_in_yaml(cfg, SITE, never_pays=True)
+
+
+def test_an_api_site_whose_providers_are_all_disabled_is_kept_blocked(
+    tmp_path, recorded, caplog
+):
+    """ACCEPTED path too: an API-only site left with no providers stays in the
+    config. Dropped, the dispatcher would read it as `dual` and could reach the
+    CLI. A `dual` site with no providers is still dropped: it permits the CLI."""
+    base = _BASE.replace(
+        "    chain: [free-b]\n", "    chain: [free-b]\n    dispatch: api\n", 1
+    ).replace("free: true", "free: true\n    enabled: false", 1)
+    with caplog.at_level(logging.WARNING, logger="genesis.routing.config"):
+        loaded = load_config(_write(tmp_path, None, base=base), check_api_keys=False)
+
+    assert loaded.call_sites["32_other"].chain == []
+    assert _dispatcher_mode(loaded, "32_other") == "api"
+    assert loaded.call_sites[SITE].chain == ["paid-a"], "fixture: a dual site keeps paid-a"
+    # A site that cannot run is a WARNING, as a dropped one was.
+    assert any(
+        r.levelno == logging.WARNING and "32_other" in r.getMessage() and "BLOCKED" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    "retry_section",
+    ["retry:\n  background:\n    max_retries: 5\n", "retry:\n", ""],
+    ids=["no_default", "null_section", "no_section"],
+)
+def test_a_default_cap_applies_when_the_base_leaves_default_implicit(
+    tmp_path, recorded, retry_section
+):
+    """`_parse` supplies a `default` profile the base does not spell out. A
+    lower cap on it must still land there."""
+    base_head = _BASE.split("retry:\n", 1)[0].replace("    retry_profile: background\n", "")
+    base = base_head + retry_section
+    local = "retry:\n  default:\n    max_retries: 1\n  custom:\n"
+    loaded = load_config(_write(tmp_path, local, base=base.rstrip()), check_api_keys=False)
+
+    assert loaded.retry_profiles["default"].max_retries == 1
+def test_a_blocked_essential_site_does_not_raise_system_degradation(tmp_path, recorded):
+    """A blocked site is a configuration state, not a provider outage. On the
+    shipped config, one unreadable overlay entry for an essential site must not
+    count it as uncovered: that would raise ESSENTIAL degradation, and the
+    router would then shed nearly every other routed call site."""
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+    from genesis.routing.essential import ESSENTIAL_CLOUD_SITES, build_essential_provider_map
+    from genesis.routing.types import DegradationLevel
+
+    shipped = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
+    site = "4_light_reflection"
+    assert site in ESSENTIAL_CLOUD_SITES, "fixture: the site must be essential"
+    local = f"call_sites:\n  {site}: oops\n"
+    loaded = load_config(
+        _write(tmp_path, local, base=shipped.read_text().rstrip()), check_api_keys=False
+    )
+    assert loaded.call_sites[site].chain == [], "fixture: the site must be blocked"
+
+    registry = CircuitBreakerRegistry(
+        loaded.providers,
+        state_file=tmp_path / "breakers.json",
+        persist=False,
+        essential_sites=build_essential_provider_map(loaded),
+    )
+
+    assert registry.uncovered_essential_sites() == []
+    assert registry.compute_degradation_level() == DegradationLevel.NORMAL

@@ -458,6 +458,43 @@ def create_sync(
     Returns True when a row was written, False when it was deduped away or the
     write failed. Callers that need the block to hold regardless MUST NOT treat
     False as a reason to stop — recording is observability, never authorization.
+    A caller that must tell a dedup from a failure uses ``create_sync_status``.
+    """
+    return (
+        create_sync_status(
+            db_path,
+            source=source,
+            type=type,
+            content=content,
+            priority=priority,
+            category=category,
+            content_hash=content_hash,
+            origin_class=origin_class,
+            skip_if_duplicate=skip_if_duplicate,
+            timeout=timeout,
+        )
+        == "written"
+    )
+
+
+def create_sync_status(
+    db_path: str,
+    *,
+    source: str,
+    type: str,
+    content: str,
+    priority: str,
+    category: str | None = None,
+    content_hash: str | None = None,
+    origin_class: str | None = None,
+    skip_if_duplicate: bool = True,
+    timeout: float = 1.0,
+) -> str:
+    """``create_sync``, returning ``"written"``, ``"duplicate"`` or ``"failed"``.
+
+    For a caller that retries only a write that FAILED: a duplicate means an
+    unresolved row with this hash is already recorded, and retrying it would
+    repeat the write attempt forever. Never raises.
     """
     try:
         from genesis.db.connection import connect_sqlite_rw
@@ -512,11 +549,11 @@ def create_sync(
                     params,
                 )
             conn.commit()
-            return cur.rowcount > 0
+            return "written" if cur.rowcount > 0 else "duplicate"
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 - observability must never break its caller
-        return False
+        return "failed"
 
 
 async def upsert(

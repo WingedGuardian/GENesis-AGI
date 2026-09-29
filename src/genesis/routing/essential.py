@@ -51,11 +51,16 @@ def build_essential_provider_map(config: RoutingConfig) -> dict[str, list[str]]:
     call_sites = getattr(config, "call_sites", {}) or {}
     for site in ESSENTIAL_CLOUD_SITES:
         cs = call_sites.get(site)
-        if cs is None:
+        # A site with NO providers is BLOCKED by configuration (an API-only
+        # site whose providers are all disabled, or one a rejected overlay
+        # blocked), not uncovered by an outage. Counting it as uncovered would
+        # raise system-wide ESSENTIAL degradation and shed every other routed
+        # site over one config line, so it is skipped the way a missing site is.
+        if cs is None or not cs.chain:
             logger.warning(
-                "Essential cloud site %r not found in routing config — "
-                "degradation coverage check will skip it",
+                "Essential cloud site %r %s — degradation coverage check will skip it",
                 site,
+                "not found in routing config" if cs is None else "has no providers (blocked)",
             )
             continue
         result[site] = list(cs.chain)
