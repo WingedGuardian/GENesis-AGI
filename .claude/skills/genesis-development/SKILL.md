@@ -3155,8 +3155,8 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   git command. `cd "$VAR" && git commit` fails closed with a *branch-verification*
   message, which reads like a branch problem and is not: use a literal path.
 - **Worktree removal is not yours to do.** `git worktree remove` is blocked;
-  `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
-  unchanged worktrees on a daily timer. Leave a dead worktree alone.
+  `scripts/worktree_lifecycle.py` owns it: it archives stale worktrees on a
+  daily timer and never deletes them (archive retention is off, #2504). Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`).
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**

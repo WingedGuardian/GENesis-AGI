@@ -367,3 +367,414 @@ def test_proven_no_open_pr_does_not_invent_a_cloud_round(monkeypatch, repo, home
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_PR", "none")
     _mark(repo, home)
     assert _decision(_run('git commit -m "local branch"', repo, home)) == "allow"
+
+
+# ---------------------------------------------------------------------------
+# Scope: the budget belongs to the configured PUBLIC repo's open PR, nothing else.
+#
+# A commit in a scratch repo (no remote, or only a local-path remote) or on a
+# branch whose open PR lives in some OTHER repository has no review budget to
+# exhaust. Before this scope existed, a failed `gh pr status` in such a repo was
+# read as "unreadable history" and the commit ASKED (DENIED when dispatched).
+# The fail direction for the public repo itself is unchanged, and is pinned
+# below by negative controls.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _pin_scope_inputs(monkeypatch):
+    """Pin every ambient input the scope decision reads, so no test depends on
+    this install's config or the runner's environment. Empty = undeterminable,
+    the pre-existing (engage) behaviour; scope tests set their own value."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
+    monkeypatch.delenv("GH_REPO", raising=False)
+
+
+def _failing_gh(tmp_path: Path) -> str:
+    """A PATH whose `gh` fails the way `gh pr status` does in a repository gh
+    cannot resolve: a message on stderr and exit 1."""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    gh = bindir / "gh"
+    gh.write_text("#!/bin/sh\necho 'no git remotes found' >&2\nexit 1\n")
+    gh.chmod(0o755)
+    return f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def _unseamed(monkeypatch, tmp_path: Path) -> None:
+    """Drive the REAL lookup path: no PR seam, and a gh that cannot read anything."""
+    monkeypatch.delenv("_TEST_REVIEW_BUDGET_PR", raising=False)
+    monkeypatch.setenv("PATH", _failing_gh(tmp_path))
+
+
+def test_repo_with_no_remote_has_no_budget_to_consult(monkeypatch, repo, home, tmp_path):
+    """The reported false positive: a throwaway repo with no remote. gh cannot
+    resolve any repository, so no open PR can exist for the branch. Allow, in
+    the foreground AND in a dispatched session."""
+    _unseamed(monkeypatch, tmp_path)
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "lab"', repo, home)) == "allow"
+    assert _decision(_run('git commit -m "lab"', repo, home, dispatched=True)) == "allow"
+
+
+def test_dash_C_commit_into_remote_less_repo_is_scoped_to_that_repo(
+    monkeypatch, repo, home, tmp_path
+):
+    """`git -C <lab> commit` from a session sitting elsewhere: the scope is the
+    repo the commit TARGETS, not the session cwd."""
+    _unseamed(monkeypatch, tmp_path)
+    _mark(repo, home)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": str(elsewhere),
+            "tool_input": {"command": f'git -C {repo} -c user.name=t commit -q -m "lab"'},
+        }
+    )
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("GENESIS_CC_SESSION", None)
+    result = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=payload,
+        cwd=elsewhere,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert _decision(result) == "allow", result.stdout + result.stderr
+
+
+def test_local_path_remote_is_not_a_github_remote(monkeypatch, repo, home, tmp_path):
+    """A lab clone of a local checkout has only a filesystem remote, which gh
+    can never resolve to a pull request."""
+    _unseamed(monkeypatch, tmp_path)
+    _git(repo, "remote", "add", "origin", str(tmp_path / "upstream-checkout"))
+    _git(repo, "remote", "add", "file", "file://" + str(tmp_path / "other"))
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "lab"', repo, home, dispatched=True)) == "allow"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/owner/repo.git",
+        "git@github.com:owner/repo.git",
+        # Not provably local: gh might resolve it, so it must not be read as "no remote".
+        "relative/dir",
+        # Look like paths, but gh parses a HOST out of both (measured, gh 2.100).
+        "//github.com/owner/repo",
+        "file://github.com/owner/repo",
+    ],
+)
+def test_non_local_remote_with_unreadable_lookup_keeps_todays_behaviour(
+    monkeypatch, repo, home, tmp_path, url
+):
+    """NEGATIVE CONTROL. A branch of the public repo whose PR lookup fails is
+    still unknown evidence: ask in the foreground, deny when dispatched."""
+    _unseamed(monkeypatch, tmp_path)
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    _git(repo, "remote", "add", "origin", url)
+    _mark(repo, home)
+    fg = _run('git commit -m "fix"', repo, home)
+    assert _decision(fg) == "ask"
+    assert "could not be read reliably" in fg.stdout
+    assert _decision(_run('git commit -m "fix"', repo, home, dispatched=True)) == "deny"
+
+
+def test_gh_repo_env_keeps_an_unreadable_lookup_unknown(monkeypatch, repo, home, tmp_path):
+    """GH_REPO points gh at a repository regardless of remotes, so a missing
+    remote proves nothing there."""
+    _unseamed(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_REPO", "owner/repo")
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "ask"
+    assert _decision(_run('git commit -m "fix"', repo, home, dispatched=True)) == "deny"
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "git --git-dir={pub}/.git --work-tree={pub} commit -m fix",
+        "git --git-dir {pub}/.git commit -m fix",
+        "GIT_DIR={pub}/.git GIT_WORK_TREE={pub} git commit -m fix",
+        "export GIT_DIR={pub}/.git; git commit -m fix",
+    ],
+)
+def test_git_dir_redirect_from_a_remote_less_cwd_keeps_unknown(
+    monkeypatch, repo, home, tmp_path, form
+):
+    """NEGATIVE CONTROL. The remote probe reads the commit's cwd, but these
+    forms point git at a DIFFERENT repository. That repository may be the public
+    one, so a remote-less cwd proves nothing: keep ask / deny."""
+    _unseamed(monkeypatch, tmp_path)
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    _git(pub, "init", "-q", "-b", "feature/x")
+    _git(pub, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    _mark(repo, home)
+    command = form.format(pub=pub)
+    assert _decision(_run(command, repo, home)) == "ask"
+    assert _decision(_run(command, repo, home, dispatched=True)) == "deny"
+
+
+def test_missing_gh_binary_in_a_remote_less_repo_consults_no_budget(monkeypatch, repo):
+    """Launching gh can fail outright (not installed). In a repo with no remote
+    that is still a proven no-PR; with a GitHub remote it stays unknown."""
+    real_run = subprocess.run
+
+    def no_gh(argv, *args, **kwargs):
+        if argv and argv[0] == "gh":
+            raise FileNotFoundError("gh")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.delenv("_TEST_REVIEW_BUDGET_PR", raising=False)
+    monkeypatch.setattr(_guard.subprocess, "run", no_gh)
+    command = 'git commit -m "lab"'
+    segs, _ = _guard.analyze_checked(command)
+    branch = "feature/review-budget"
+    assert _guard._branch_review_budget(str(repo), branch, segs=segs, command=command) is None
+    # Without the parsed command the gate cannot prove where the commit lands.
+    assert _guard._branch_review_budget(str(repo), branch)["status"] == "unknown"
+    _git(repo, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    result = _guard._branch_review_budget(str(repo), branch, segs=segs, command=command)
+    assert result is not None and result["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "git -C {cwd} -C {pub} commit -m fix",
+        "pushd {pub} && git commit -m fix",
+        "env -C {pub} git commit -m fix",
+        "sudo git commit -m fix",
+        # An earlier segment reshapes the probed path before the commit runs.
+        "git -C {pub} worktree add -f {cwd}/sub feature/x && cd {cwd}/sub && git commit -m fix",
+        # A cd that exists at hook time can still fail at run time.
+        "cd {cwd} || git commit -m fix",
+        "cd {cwd}; git commit -m fix",
+        # Documented residue: any cd chain keeps the previous behaviour.
+        "cd {cwd} && git commit -m fix",
+        # Process substitution runs a second command inside ONE parsed segment.
+        "git -C {cwd} commit -m fix > >(git -C {pub} commit -m x)",
+        "git -C {cwd} commit -m fix 2> >(git -C {pub} commit -m x)",
+        "git -C {cwd} commit -F <(git -C {pub} commit -m x)",
+    ],
+)
+def test_other_retargeting_shapes_keep_unknown(monkeypatch, repo, home, tmp_path, form):
+    """NEGATIVE CONTROL. The exemption is an allowlist of command shapes that
+    provably commit in the probed cwd; every other shape keeps ask / deny, even
+    though these particular ones are not individually named anywhere."""
+    _unseamed(monkeypatch, tmp_path)
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    _git(pub, "init", "-q", "-b", "feature/x")
+    _git(pub, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    (repo / "sub").mkdir()  # exists at hook time, as the worktree shape needs
+    _mark(repo, home)
+    command = form.format(pub=pub, cwd=repo)
+    assert _decision(_run(command, repo, home)) == "ask"
+    assert _decision(_run(command, repo, home, dispatched=True)) == "deny"
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("branch.feature/review-budget.remote", "https://github.com/owner/repo.git"),
+        ("branch.feature/review-budget.pushRemote", "origin"),
+        ("remote.pushDefault", "git@github.com:owner/repo.git"),
+    ],
+)
+def test_branch_push_target_without_a_remote_keeps_unknown(
+    monkeypatch, repo, home, tmp_path, key, value
+):
+    """NEGATIVE CONTROL. `git push -u <url>` leaves a branch target with no
+    remote defined; that branch can have an open PR gh simply cannot find."""
+    _unseamed(monkeypatch, tmp_path)
+    _git(repo, "config", key, value)
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "fix"', repo, home)) == "ask"
+
+
+def _clone_of_a_local_bare(tmp_path: Path) -> Path:
+    """What `git clone <path>` actually leaves behind: a remote named `origin`
+    whose URL is a filesystem path, and `branch.<b>.remote = origin` — a remote
+    NAME, not a URL (MEASURED, git 2.43)."""
+    bare = tmp_path / "upstream.git"
+    _git(tmp_path, "-c", "init.defaultBranch=main", "init", "-q", "--bare", str(bare))
+    seed = tmp_path / "seed"
+    _git(tmp_path, "clone", "-q", str(bare), str(seed))
+    _git(
+        seed,
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    )
+    _git(seed, "push", "-q", "origin", "HEAD:refs/heads/main")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(bare), str(clone))
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "tester")
+    _git(clone, "checkout", "-qb", "feature/review-budget", "--track", "origin/main")
+    (clone / "f.py").write_text("value = 2\n")
+    _git(clone, "add", "-A")
+    return clone
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        None,  # exactly what the clone wrote: branch.<b>.remote = origin
+        "branch.feature/review-budget.pushRemote",
+        "remote.pushDefault",
+    ],
+)
+def test_a_branch_target_naming_a_local_remote_is_not_github(monkeypatch, home, tmp_path, key):
+    """Codex P1 on #2480: the branch target was classified as a URL, so the
+    remote NAME `origin` counted as possibly-GitHub and a plain local clone still
+    asked. The name resolves to the remote's URLs, all filesystem paths here."""
+    _unseamed(monkeypatch, tmp_path)
+    clone = _clone_of_a_local_bare(tmp_path)
+    got = subprocess.run(
+        ["git", "-C", str(clone), "config", "branch.feature/review-budget.remote"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert got.stdout.strip() == "origin"  # the fixture really has the shape
+    if key is not None:
+        _git(clone, "config", key, "origin")
+    _mark(clone, home)
+    assert _decision(_run('git commit -m "lab"', clone, home)) == "allow"
+    assert _decision(_run('git commit -m "lab"', clone, home, dispatched=True)) == "allow"
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        ("remote", "set-url", "origin", "https://github.com/owner/repo.git"),
+        ("remote", "set-url", "--push", "origin", "git@github.com:owner/repo.git"),
+        ("config", "branch.feature/review-budget.pushRemote", "fork"),
+    ],
+)
+def test_a_branch_target_naming_a_github_or_unknown_remote_keeps_unknown(
+    monkeypatch, home, tmp_path, setup
+):
+    """NEGATIVE CONTROL for the resolution above. The same local clone whose
+    named remote is a GitHub URL (fetch or push), or whose branch names a remote
+    that is not configured at all, keeps ask / deny."""
+    _unseamed(monkeypatch, tmp_path)
+    clone = _clone_of_a_local_bare(tmp_path)
+    _git(clone, *setup)
+    _mark(clone, home)
+    assert _decision(_run('git commit -m "fix"', clone, home)) == "ask"
+    assert _decision(_run('git commit -m "fix"', clone, home, dispatched=True)) == "deny"
+
+
+def test_a_push_rewrite_to_github_on_a_named_local_remote_keeps_unknown(
+    monkeypatch, home, tmp_path
+):
+    """NEGATIVE CONTROL for the dependency the name resolution relies on: a
+    named remote whose local URL `url.<base>.pushInsteadOf` rewrites to GitHub
+    is caught only because `git remote -v` lists the REWRITTEN push URL
+    (MEASURED, git 2.43). If git stopped applying the rewrite there, the name
+    would resolve to a local path and this would wrongly allow."""
+    _unseamed(monkeypatch, tmp_path)
+    clone = _clone_of_a_local_bare(tmp_path)
+    _git(clone, "config", "url.git@github.com:owner/.pushInsteadOf", str(tmp_path) + "/")
+    listed = subprocess.run(
+        ["git", "-C", str(clone), "remote", "-v"], capture_output=True, text=True, check=True
+    ).stdout
+    assert "git@github.com:owner/" in listed  # the rewrite really reaches the listing
+    _mark(clone, home)
+    assert _decision(_run('git commit -m "fix"', clone, home)) == "ask"
+    assert _decision(_run('git commit -m "fix"', clone, home, dispatched=True)) == "deny"
+
+
+def test_local_branch_target_is_still_no_github(monkeypatch, repo, home, tmp_path):
+    """`branch.<b>.remote = .` means the local repository itself."""
+    _unseamed(monkeypatch, tmp_path)
+    _git(repo, "config", "branch.feature/review-budget.remote", ".")
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "lab"', repo, home, dispatched=True)) == "allow"
+
+
+def test_open_pr_on_another_repository_consults_no_budget(monkeypatch, repo, home):
+    """An exhausted budget on a PR that lives OUTSIDE the configured public repo
+    is not this gate's business."""
+    _evidence(monkeypatch, 5, head=HEADS[5])
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_REPO", "someone/else")
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    _mark(repo, home)
+    assert _decision(_run('git commit -m "fix"', repo, home, dispatched=True)) == "allow"
+
+
+@pytest.mark.parametrize(
+    "canonical",
+    [
+        "owner/repo",
+        "OWNER/Repo",
+        "",
+        # A wrong OWNER in the config (the example file's placeholder, a display
+        # name, a contributor's fork) must not switch the budget off on the real
+        # repository: only a different repository NAME proves "unrelated".
+        "YOUR_GITHUB_USER/repo",
+        "contributor/repo",
+        # A free-text setup answer can carry the clone suffix.
+        "owner/repo.git",
+    ],
+)
+def test_open_pr_budget_still_applies_on_the_public_repo(monkeypatch, repo, home, canonical):
+    """NEGATIVE CONTROL. The public repo's own PR, or any PR while the public
+    repo is undeterminable, keeps the exhausted-budget approval."""
+    _evidence(monkeypatch, 4)
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", canonical)
+    _mark(repo, home)
+    result = _run('git commit -m "fix"', repo, home)
+    assert _decision(result) == "ask"
+    assert f"standing authorization ended after {_HEAD_LIMIT}" in result.stdout
+
+
+def test_canonical_public_repo_matches_the_push_guards_reading(monkeypatch, tmp_path):
+    """Two gates read the same config key. Lock them together so the commit
+    gate's scope cannot drift from the push guard's."""
+    guard_spec = importlib.util.spec_from_file_location(
+        "push_guard_for_scope_parity", ROOT / "scripts" / "hooks" / "git_push_guard.py"
+    )
+    push_guard = importlib.util.module_from_spec(guard_spec)
+    assert guard_spec.loader is not None
+    guard_spec.loader.exec_module(push_guard)
+
+    monkeypatch.delenv("_TEST_CANONICAL_PUBLIC_REPO", raising=False)
+    config_dir = tmp_path / ".genesis" / "config"
+    config_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cases = [
+        "github:\n  user: Owner\n  public_repo: Project\n",
+        "github:\n  user: Owner\n  public_repo: ''\n",
+        "github:\n  user: ''\n  public_repo: Project\n",
+        "github:\n  user: Owner\n  public_repo: a/b\n",
+        "github:\n  user: Owner\n  public_repo: $X\n",
+        "other: 1\n",
+        "github: [unbalanced\n",
+        None,
+    ]
+    for text in cases:
+        cfg = config_dir / "genesis.yaml"
+        if text is None:
+            cfg.unlink(missing_ok=True)
+        else:
+            cfg.write_text(text)
+        assert _guard._canonical_public_repo() == push_guard._canonical_public_repo(), text
+    for seam in ("owner/repo", "github.com/owner/repo", "", "  "):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", seam)
+        assert _guard._canonical_public_repo() == push_guard._canonical_public_repo(), seam
