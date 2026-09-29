@@ -1,14 +1,16 @@
 """Tests for genesis.resilience.tailscale_watchdog_events (the user-side consumer).
 
-The contract test at the bottom runs the REAL root helper file with stub
-binaries and feeds what it writes to this consumer, so the two ends of the
-/run file cannot drift apart unnoticed.
+The contract tests at the bottom run the REAL root helper file with stub
+binaries and feed what it writes to this consumer, so the two ends of the /run
+file cannot drift apart unnoticed.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,7 +19,7 @@ from genesis.db.crud import observations
 from genesis.resilience.tailscale_watchdog_events import (
     CATEGORY_BLIND,
     CATEGORY_DOWN,
-    CATEGORY_HEALED,
+    CATEGORY_RESTART,
     CATEGORY_SILENT,
     SOURCE,
     record_new_events,
@@ -25,20 +27,20 @@ from genesis.resilience.tailscale_watchdog_events import (
 
 BOOT = "5f524ce5-5df1-49b5-a1fe-572ba51e3709"
 NOW = 900_000.0  # CLOCK_MONOTONIC
+A, B = "100.64.0.7", "100.64.0.8"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = REPO_ROOT / "scripts" / "systemd" / "genesis-tailscale-watchdog.py"
 
 
-def _event(action="healed", incident="a" * 32, **extra) -> dict:
+def _event(action="healed", peers=(A,), cleared=None, n=1, **extra) -> dict:
     return {
-        "id": f"{BOOT}:{extra.pop('mono_ns', 1)}",
-        "incident": incident,
+        "id": f"{BOOT}:{n}",
         "action": action,
         "boot_id": BOOT,
         "mono": NOW - 60,
         "at": 2_000_000_000,
-        "peer_ip": "100.64.0.7",
-        "handshake_age_s": 900,
+        "peers": list(peers),
+        "cleared": list(peers if cleared is None else cleared),
         "rc": 0,
         "rate_limit_s": 3600,
         **extra,
@@ -46,7 +48,18 @@ def _event(action="healed", incident="a" * 32, **extra) -> dict:
 
 
 def _write(
-    path: Path, *events, last_action="healed", checked=NOW - 60, boot=BOOT, blind_runs=0
+    path: Path,
+    *,
+    evidence=None,
+    present=None,
+    complete=False,
+    events=(),
+    last_action="none",
+    checked=NOW - 60,
+    boot=BOOT,
+    blind_runs=0,
+    mode="live",
+    ages=None,
 ) -> Path:
     path.write_text(
         json.dumps(
@@ -54,7 +67,12 @@ def _write(
                 "boot_id": boot,
                 "last_check_mono": checked,
                 "last_action": last_action,
+                "mode": mode,
                 "blind_runs": blind_runs,
+                "evidence": evidence or {},
+                "handshake_age_s": ages or {},
+                "present": present if present is not None else [],
+                "present_complete": complete,
                 "events": list(events),
             }
         )
@@ -67,6 +85,7 @@ async def _timer_enabled_active():
         "UnitFileState": "enabled",
         "ActiveState": "active",
         "ActiveEnterTimestampMonotonic": str(int((NOW - 3600) * 1e6)),
+        "ServiceActiveState": "inactive",
     }
 
 
@@ -75,99 +94,219 @@ async def _run(db, state: Path, **kw) -> int:
     return await record_new_events(db, state_file=state, now_mono=NOW, boot_id=BOOT, **kw)
 
 
-async def _rows(db, resolved=None) -> list[dict]:
+async def _rows(db, resolved=None, category=None) -> list[dict]:
     sql = "SELECT * FROM observations WHERE source = ?"
+    params: list = [SOURCE]
     if resolved is not None:
-        sql += f" AND resolved = {int(resolved)}"
-    return [dict(r) for r in await db.execute_fetchall(sql + " ORDER BY created_at", (SOURCE,))]
+        sql += " AND resolved = ?"
+        params.append(int(resolved))
+    if category is not None:
+        sql += " AND category = ?"
+        params.append(category)
+    return [dict(r) for r in await db.execute_fetchall(sql + " ORDER BY created_at", params)]
 
 
-# ── what gets raised, at what priority ───────────────────────────────────
+async def _pages(db) -> list[dict]:
+    return await observations.get_unsurfaced(db, priority_filter=("critical",))
+
+
+async def _age_resolution(db, seconds: float) -> None:
+    """Pretend every resolved row was resolved ``seconds`` ago."""
+    when = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    await db.execute("UPDATE observations SET resolved_at = ? WHERE resolved = 1", (when,))
+    await db.commit()
+
+
+# ── the condition: one alert per stuck peer ──────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_a_heal_is_a_high_observation_not_a_page(db, tmp_path):
-    assert await _run(db, _write(tmp_path / "s.json", _event("healed"))) == 1
-    (row,) = await _rows(db)
-    assert row["priority"] == "high"
-    assert row["category"] == CATEGORY_HEALED
-    assert row["type"] == "infrastructure_alert"
-    assert "100.64.0.7" in row["content"]
-    assert await observations.get_unsurfaced(db, priority_filter=("critical",)) == []
+async def test_a_stuck_peer_pages_once_however_many_ticks_see_it(db, tmp_path):
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"}, ages={A: 900}, last_action="stuck")
+    assert await _run(db, state) == 1
+    assert await _run(db, state) == 0
+    (row,) = await _pages(db)
+    assert (row["category"], row["priority"]) == (CATEGORY_DOWN, "critical")
+    assert A in row["content"] and "for 900s" in row["content"]
+    assert "sudo systemctl restart tailscaled" in row["content"][:300]
+
+
+@pytest.mark.asyncio
+async def test_two_stuck_peers_are_two_alerts(db, tmp_path):
+    state = _write(tmp_path / "s.json", evidence={A: "stuck", B: "stuck"})
+    assert await _run(db, state) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["ok", "offline"])
+async def test_ok_or_offline_evidence_resolves_the_alert(db, tmp_path, verdict):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck", B: "stuck"}))
+    await _run(db, _write(path, evidence={A: verdict}))
+    (still_open,) = await _rows(db, resolved=False)
+    assert B in still_open["content"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("action", "lead"),
+    "overrides",
     [
-        ("restart-no-effect", "tunnel still gets no reply"),
-        ("restart-failed", "Tailscale may be DOWN"),
-        ("not-restarted", "restart of tailscaled failed"),
-        ("unverified", "could not read whether it came back"),
-        ("pending", "may be hung"),
-        ("observed", "observe mode"),
+        {},  # no evidence about the peer: unknown
+        {"last_action": "unavailable"},
+        {"last_action": "incomplete", "present": [B], "complete": False},
+        {"checked": NOW - 700, "evidence": {A: "ok"}},  # stale: not evidence of now
+        {"boot": "00000000-old", "evidence": {A: "ok"}},
+    ],
+    ids=["unknown", "blind", "incomplete-list", "stale", "other-boot"],
+)
+async def test_nothing_but_evidence_resolves_an_alert(db, tmp_path, overrides):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+    await _run(db, _write(path, **overrides))
+    assert len(await _rows(db, resolved=False, category=CATEGORY_DOWN)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_peer_gone_from_a_complete_list_is_resolved(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck", B: "stuck"}))
+    await _run(db, _write(path, present=[B], complete=True))
+    (still_open,) = await _rows(db, resolved=False)
+    assert B in still_open["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_file_raises_nothing(db, tmp_path):
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"}, checked=NOW - 700)
+    await _run(db, state)
+    assert await _rows(db, category=CATEGORY_DOWN) == []
+
+
+@pytest.mark.asyncio
+async def test_a_flap_reopens_the_same_alert_without_paging_again(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+    (first,) = await _rows(db)
+    await observations.mark_surfaced(db, [first["id"]], datetime.now(UTC).isoformat())
+    await _run(db, _write(path, evidence={A: "ok"}))
+    assert await _run(db, _write(path, evidence={A: "stuck"})) == 0
+    (row,) = await _rows(db)
+    assert (row["id"], row["resolved"]) == (first["id"], 0)
+    assert await _pages(db) == []  # it already paged once
+
+
+@pytest.mark.asyncio
+async def test_a_recurrence_long_after_recovery_is_a_new_alert(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+    await _run(db, _write(path, evidence={A: "ok"}))
+    await _age_resolution(db, 3601)
+    assert await _run(db, _write(path, evidence={A: "stuck"})) == 1
+    assert len(await _rows(db, category=CATEGORY_DOWN)) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("note", ["handled by hand", "pruned: stale"])
+async def test_an_alert_resolved_by_anyone_while_still_true_comes_back_without_paging(
+    db, tmp_path, note
+):
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"})
+    await _run(db, state)
+    (first,) = await _rows(db)
+    await observations.mark_surfaced(db, [first["id"]], datetime.now(UTC).isoformat())
+    await db.execute(
+        "UPDATE observations SET resolved = 1, resolved_at = ?, resolution_notes = ?",
+        (datetime.now(UTC).isoformat(), note),
+    )
+    await db.commit()
+    assert await _run(db, state) == 0
+    (row,) = await _rows(db, resolved=False)
+    assert row["id"] == first["id"]
+    assert await _pages(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_alert_does_not_expire_while_the_tunnel_is_stuck(db, tmp_path):
+    await _run(db, _write(tmp_path / "s.json", evidence={A: "stuck"}))
+    (row,) = await _rows(db)
+    expires = datetime.fromisoformat(row["expires_at"])
+    assert expires - datetime.now(UTC) > timedelta(days=365)
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_says_it_will_not_restart(db, tmp_path):
+    await _run(db, _write(tmp_path / "s.json", evidence={A: "stuck"}, mode="observe"))
+    (row,) = await _rows(db)
+    assert "observe mode" in row["content"]
+
+
+# ── restart outcomes ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "priority", "lead"),
+    [
+        ("healed", "high", "answer again"),
+        ("restart-no-effect", "high", "still get no reply"),
+        ("not-restarted", "high", "restart of tailscaled failed"),
+        ("restart-failed", "critical", "Tailscale may be DOWN"),
+        ("unverified", "critical", "could not read whether"),
+        ("pending", "critical", "may be hung"),
     ],
 )
-async def test_every_non_heal_outcome_pages_through_the_critical_job(db, tmp_path, action, lead):
-    await _run(db, _write(tmp_path / "s.json", _event(action), last_action=action))
-    (row,) = await observations.get_unsurfaced(db, priority_filter=("critical",))
-    assert row["source"] == SOURCE
-    assert row["category"] == CATEGORY_DOWN
+async def test_restart_outcomes(db, tmp_path, action, priority, lead):
+    cleared = [A] if action == "healed" else []
+    await _run(
+        db,
+        _write(tmp_path / "s.json", events=[_event(action, cleared=cleared)], last_action=action),
+    )
+    (row,) = await _rows(db, category=CATEGORY_RESTART)
+    assert row["priority"] == priority
     assert lead in row["content"]
-    # The page shows only the start: it must say what to do.
-    assert "systemctl" in row["content"][:260]
-
-
-# ── identity: one page per incident ──────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_one_incident_pages_once_however_often_it_is_detected(db, tmp_path):
-    events = [_event("observed", mono_ns=n) for n in range(1, 6)]
-    state = _write(tmp_path / "s.json", *events, last_action="observed")
-    assert await _run(db, state) == 1
-    assert await _run(db, state) == 0
-    assert len(await _rows(db)) == 1
+@pytest.mark.parametrize("seconds", [300, 3600, 7 * 86400])
+async def test_the_retry_interval_in_the_text_is_the_configured_one(db, tmp_path, seconds):
+    event = _event("restart-no-effect", cleared=[], rate_limit_s=seconds)
+    await _run(db, _write(tmp_path / "s.json", events=[event]))
+    (row,) = await _rows(db)
+    assert f"after {seconds // 60} min" in row["content"]
 
 
 @pytest.mark.asyncio
-async def test_a_resolved_incident_never_pages_again(db, tmp_path):
-    state = _write(tmp_path / "s.json", _event("restart-failed"), last_action="unavailable")
-    assert await _run(db, state) == 1
+async def test_each_event_is_one_row_ever(db, tmp_path):
+    state = _write(tmp_path / "s.json", events=[_event(n=1), _event(n=2)])
+    assert await _run(db, state) == 2
     await db.execute("UPDATE observations SET resolved = 1 WHERE source = ?", (SOURCE,))
     await db.commit()
-    state = _write(
-        tmp_path / "s.json", _event("restart-failed"), _event("restart-failed", mono_ns=9)
-    )
     assert await _run(db, state) == 0
-    assert len(await _rows(db)) == 1
 
 
 @pytest.mark.asyncio
-async def test_two_events_between_ticks_are_two_rows(db, tmp_path):
-    state = _write(
-        tmp_path / "s.json",
-        _event("healed", incident="a" * 32, mono_ns=1),
-        _event("observed", incident="b" * 32, mono_ns=2, peer_ip="100.64.0.8"),
-        last_action="observed",
-    )
-    assert await _run(db, state) == 2
+async def test_a_critical_restart_alert_resolves_once_tailscaled_runs_again(db, tmp_path):
+    path = tmp_path / "s.json"
+    events = [_event("restart-failed", cleared=[])]
+    await _run(db, _write(path, events=events, last_action="restart-failed"))
+    await _run(db, _write(path, events=events, last_action="unavailable"))
+    assert len(await _rows(db, resolved=False, category=CATEGORY_RESTART)) == 1
+    await _run(db, _write(path, events=events, last_action="none"))
+    assert await _rows(db, resolved=False, category=CATEGORY_RESTART) == []
 
 
 @pytest.mark.asyncio
-async def test_the_same_incident_healed_then_failing_is_two_rows(db, tmp_path):
-    state = _write(
-        tmp_path / "s.json",
-        _event("healed", mono_ns=1),
-        _event("restart-failed", mono_ns=2),
-        last_action="unavailable",
-    )
-    assert await _run(db, state) == 2
+async def test_a_failed_restart_already_recovered_is_recorded_but_never_pages(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, events=[_event("restart-failed", cleared=[])], last_action="none"))
+    (row,) = await _rows(db, category=CATEGORY_RESTART)
+    assert row["resolved"] == 1
+    assert await _pages(db) == []
 
 
 @pytest.mark.asyncio
 async def test_a_database_failure_is_retried_next_tick_not_lost(db, tmp_path, monkeypatch):
-    state = _write(tmp_path / "s.json", _event("restart-failed"), last_action="unavailable")
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"})
     real = observations.create
 
     async def broken(*a, **kw):
@@ -179,83 +318,55 @@ async def test_a_database_failure_is_retried_next_tick_not_lost(db, tmp_path, mo
     assert await _run(db, state) == 1
 
 
-# ── self-resolve and silence ─────────────────────────────────────────────
+# ── the watchdog's own health ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_a_healthy_run_resolves_open_pages_but_keeps_heals(db, tmp_path):
-    state = _write(
-        tmp_path / "s.json",
-        _event("healed", incident="a" * 32, mono_ns=1),
-        _event("restart-failed", incident="b" * 32, mono_ns=2),
-        last_action="unavailable",
-    )
-    await _run(db, state)
-    assert len(await _rows(db, resolved=False)) == 2
-    _write(
-        state,
-        _event("healed", incident="a" * 32, mono_ns=1),
-        _event("restart-failed", incident="b" * 32, mono_ns=2),
-        last_action="none",
-    )
-    assert await _run(db, state) == 0
-    (still_open,) = await _rows(db, resolved=False)
-    assert still_open["category"] == CATEGORY_HEALED
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("last_action", ["incomplete", "suspect-unreachable", "unavailable"])
-async def test_only_a_fully_healthy_run_resolves(db, tmp_path, last_action):
-    state = _write(tmp_path / "s.json", _event("restart-failed"), last_action=last_action)
-    await _run(db, state)
-    await _run(db, state)
-    assert len(await _rows(db, resolved=False)) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "file_state", ["missing", "stale", "other-boot", "garbage"], ids=lambda s: s
-)
+@pytest.mark.parametrize("file_state", ["missing", "stale", "garbage"])
 async def test_a_silent_watchdog_is_reported(db, tmp_path, file_state):
     path = tmp_path / "s.json"
     if file_state == "stale":
-        _write(path, checked=NOW - 700, last_action="none")
-    elif file_state == "other-boot":
-        _write(path, boot="0" * 8 + "-old", last_action="none")
+        _write(path, checked=NOW - 700)
     elif file_state == "garbage":
         path.write_text("{not json")
     assert await _run(db, path) == 1
     (row,) = await _rows(db)
-    assert row["category"] == CATEGORY_SILENT
-    assert row["priority"] == "high"
-    assert await _run(db, path) == 0  # once per boot per day
+    assert (row["category"], row["priority"]) == (CATEGORY_SILENT, "high")
+    assert await _run(db, path) == 0  # one row per episode
 
 
 @pytest.mark.asyncio
-async def test_silence_clears_when_the_watchdog_reports_again(db, tmp_path):
+async def test_silence_recurs_after_it_cleared(db, tmp_path):
     path = tmp_path / "s.json"
     await _run(db, path)
-    _write(path, last_action="none")
-    await _run(db, path)
+    await _run(db, _write(path))
     assert await _rows(db, resolved=False) == []
+    path.unlink()
+    assert await _run(db, path) == 1  # a second episode, same day, is raised
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "timer",
     [
-        None,  # systemd could not be asked
-        {"UnitFileState": "disabled", "ActiveState": "inactive"},  # turned off on purpose
+        None,
+        {"UnitFileState": "disabled", "ActiveState": "inactive"},
         {"UnitFileState": "masked", "ActiveState": "inactive"},
-        # Just (re)started, e.g. a container restart wiped /run: give it time.
         {
             "UnitFileState": "enabled",
             "ActiveState": "active",
             "ActiveEnterTimestampMonotonic": str(int((NOW - 60) * 1e6)),
         },
+        {
+            "UnitFileState": "enabled",
+            "ActiveState": "active",
+            "ActiveEnterTimestampMonotonic": str(int((NOW - 3600) * 1e6)),
+            "ServiceActiveState": "activating",
+        },
     ],
+    ids=["unknown", "disabled", "masked", "just-started", "mid-run"],
 )
-async def test_no_silence_alarm_when_the_timer_is_off_or_just_started(db, tmp_path, timer):
+async def test_no_silence_alarm_when_the_timer_is_off_new_or_mid_run(db, tmp_path, timer):
     async def state():
         return timer
 
@@ -271,19 +382,16 @@ async def test_an_enabled_but_stopped_timer_is_silence(db, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["unavailable", "status-unparseable"])
-async def test_a_watchdog_that_runs_but_cannot_see_is_reported(db, tmp_path, action):
+async def test_a_watchdog_that_runs_but_cannot_see_is_reported_and_recurs(db, tmp_path):
     path = tmp_path / "s.json"
-    _write(path, last_action=action, blind_runs=2)
-    assert await _run(db, path) == 0  # a moment's blindness is not news
-    _write(path, last_action=action, blind_runs=3)
-    assert await _run(db, path) == 1
+    assert await _run(db, _write(path, last_action="unavailable", blind_runs=2)) == 0
+    assert await _run(db, _write(path, last_action="unavailable", blind_runs=3)) == 1
     (row,) = await _rows(db)
     assert (row["category"], row["priority"]) == (CATEGORY_BLIND, "high")
-    assert await _run(db, path) == 0  # once per boot per day
-    _write(path, last_action="none")
-    await _run(db, path)
+    assert await _run(db, _write(path, last_action="incomplete", blind_runs=4)) == 0
+    await _run(db, _write(path, last_action="none"))
     assert await _rows(db, resolved=False) == []
+    assert await _run(db, _write(path, last_action="status-unparseable", blind_runs=3)) == 1
 
 
 # ── untrusted file ───────────────────────────────────────────────────────
@@ -293,23 +401,34 @@ async def test_a_watchdog_that_runs_but_cannot_see_is_reported(db, tmp_path, act
 @pytest.mark.parametrize(
     "bad",
     [
-        {"peer_ip": "peer-host"},
-        {"peer_ip": "100.64.0.7 <b>"},
-        {"incident": "short"},
-        {"action": "rm -rf"},
+        {"peers": ["peer-host"]},
+        {"peers": ["100.64.0.7 <b>"]},
+        {"peers": []},
+        {"cleared": ["100.64.0.99"]},
+        {"action": "melt"},
         {"rc": "0"},
-        {"handshake_age_s": True},
     ],
 )
 async def test_a_malformed_event_is_skipped_and_the_rest_recorded(db, tmp_path, bad):
-    state = _write(
-        tmp_path / "s.json",
-        {**_event("observed"), **bad},
-        _event("healed", incident="c" * 32),
-    )
+    state = _write(tmp_path / "s.json", events=[{**_event(n=1), **bad}, _event(n=2)])
     assert await _run(db, state) == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_evidence_is_skipped(db, tmp_path):
+    evidence = {"peer-host": "stuck", "100.64.0.7 <b>": "stuck", B: "stuck", A: "melted"}
+    assert await _run(db, _write(tmp_path / "s.json", evidence=evidence)) == 1
     (row,) = await _rows(db)
-    assert row["category"] == CATEGORY_HEALED
+    assert B in row["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["melted", "", None, 1, "stuck "])
+async def test_an_unrecognised_verdict_never_resolves_an_alert(db, tmp_path, verdict):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+    await _run(db, _write(path, evidence={A: verdict}))
+    assert len(await _rows(db, resolved=False, category=CATEGORY_DOWN)) == 1
 
 
 @pytest.mark.asyncio
@@ -322,7 +441,7 @@ async def test_an_oversized_file_is_ignored(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_no_db_is_a_no_op(tmp_path):
-    assert await _run(None, _write(tmp_path / "s.json", _event())) == 0
+    assert await _run(None, _write(tmp_path / "s.json", evidence={A: "stuck"})) == 0
 
 
 # ── wiring ───────────────────────────────────────────────────────────────
@@ -337,13 +456,15 @@ async def test_the_suite_never_reads_the_real_watchdog(db):
 
 
 @pytest.mark.asyncio
-async def test_a_real_awareness_tick_records_the_event(db, tmp_path, monkeypatch):
+async def test_a_real_awareness_tick_records_the_condition(db, tmp_path, monkeypatch):
     from unittest.mock import AsyncMock, MagicMock
 
     from genesis.awareness.loop import AwarenessLoop
 
-    state = _write(tmp_path / "s.json", _event("restart-failed"), last_action="unavailable")
+    # Stamped on the real clock: the tick reads time.monotonic() itself.
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"}, checked=time.monotonic())
     monkeypatch.setenv("GENESIS_TSWD_STATE_FILE", str(state))
+    monkeypatch.setattr("genesis.resilience.tailscale_watchdog_events._boot_id", lambda: BOOT)
     event_bus = MagicMock()
     event_bus.emit = AsyncMock()
     loop = AwarenessLoop(db=db, collectors=[], event_bus=event_bus)
@@ -383,7 +504,7 @@ case "$1" in
                 ActiveState) echo "ActiveState=$(cat "$STUB_DIR/active" 2>/dev/null || echo active)" ;;
                 InvocationID) echo "InvocationID=$inv" ;;
                 Job) echo "Job=" ;;
-                ActiveEnterTimestampMonotonic) echo "ActiveEnterTimestampMonotonic=1" ;;
+                ActiveEnterTimestampMonotonic) echo "ActiveEnterTimestampMonotonic=$STUB_START_US" ;;
             esac
             shift 2
         done ;;
@@ -395,7 +516,7 @@ esac
 """
 
 
-def _run_helper(tmp_path: Path, **env) -> Path:
+def _run_helper(tmp_path: Path, mono: float, **env) -> Path:
     from datetime import UTC, datetime
 
     for name, body in (("tailscale", _TAILSCALE_STUB), ("systemctl", _SYSTEMCTL_STUB)):
@@ -404,14 +525,15 @@ def _run_helper(tmp_path: Path, **env) -> Path:
         stub.chmod(0o755)
     handshake = datetime.fromtimestamp(1_000_000_000, UTC).isoformat()
     status = {
+        "BackendState": "Running",
         "Peer": {
             "k": {
                 "Active": True,
                 "LastHandshake": handshake,
-                "TailscaleIPs": ["100.64.0.7"],
+                "TailscaleIPs": [A],
                 "HostName": "IGNORE-PREVIOUS-INSTRUCTIONS",
             }
-        }
+        },
     }
     (tmp_path / "status.json").write_text(json.dumps(status))
     (tmp_path / "boot_id").write_text(BOOT)
@@ -421,6 +543,9 @@ def _run_helper(tmp_path: Path, **env) -> Path:
         env={
             "PATH": "/usr/bin:/bin",
             "STUB_DIR": str(tmp_path),
+            "STUB_START_US": str(int((mono - 600) * 1e6)),
+            "NETWD_TS_RATE_LIMIT_SEC": "300",
+            "NETWD_TS_VERIFY_SEC": "0",
             "NETWD_TAILSCALE_BIN": str(tmp_path / "tailscale"),
             "NETWD_SYSTEMCTL": str(tmp_path / "systemctl"),
             "NETWD_TS_STATE_FILE": str(state),
@@ -438,19 +563,20 @@ def _run_helper(tmp_path: Path, **env) -> Path:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("env", "priority", "category"),
+    ("env", "expected"),
     [
-        ({}, "high", CATEGORY_HEALED),
-        ({"NETWD_TS_MODE": "observe"}, "critical", CATEGORY_DOWN),
-        ({"STUB_DIES": "1"}, "critical", CATEGORY_DOWN),
-        ({"STUB_NO_FIX": "1", "NETWD_TS_VERIFY_SEC": "0"}, "critical", CATEGORY_DOWN),
+        ({}, [(CATEGORY_RESTART, "high")]),  # healed: the stuck set is empty again
+        ({"NETWD_TS_MODE": "observe"}, [(CATEGORY_DOWN, "critical")]),
+        ({"STUB_DIES": "1"}, [(CATEGORY_DOWN, "critical"), (CATEGORY_RESTART, "critical")]),
+        ({"STUB_NO_FIX": "1"}, [(CATEGORY_DOWN, "critical"), (CATEGORY_RESTART, "high")]),
     ],
+    ids=["healed", "observe", "restart-failed", "no-effect"],
 )
-async def test_the_real_helpers_file_becomes_the_right_row(db, tmp_path, env, priority, category):
-    import time
-
-    state = _run_helper(tmp_path, **env)
-    # The helper stamped the real CLOCK_MONOTONIC; read it on the same clock.
+async def test_the_real_helpers_file_becomes_the_right_rows(db, tmp_path, env, expected):
+    mono = time.clock_gettime(time.CLOCK_MONOTONIC)
+    if mono < 900:
+        pytest.skip("this machine booted too recently to show a daemon that started long ago")
+    state = _run_helper(tmp_path, mono, **env)
     await record_new_events(
         db,
         state_file=state,
@@ -458,7 +584,7 @@ async def test_the_real_helpers_file_becomes_the_right_row(db, tmp_path, env, pr
         boot_id=BOOT,
         timer_state=_timer_enabled_active,
     )
-    (row,) = await _rows(db)
-    assert (row["priority"], row["category"]) == (priority, category)
-    assert "100.64.0.7" in row["content"]
-    assert "IGNORE" not in row["content"]
+    rows = await _rows(db)
+    assert sorted((r["category"], r["priority"]) for r in rows) == sorted(expected)
+    assert all(A in r["content"] for r in rows if r["category"] == CATEGORY_DOWN)
+    assert not any("IGNORE" in r["content"] for r in rows)

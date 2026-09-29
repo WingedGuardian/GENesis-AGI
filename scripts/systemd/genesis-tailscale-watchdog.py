@@ -34,12 +34,33 @@ back from systemd (InvocationID, ActiveState, pending Job), never inferred
 from the command's exit code.
 
 Output: ``/run/genesis-tailscale-watchdog.json`` (0644), rewritten atomically
-each run. It carries the last run's state and a list of at most 50 events. The
-Genesis runtime, running as the owning user, turns each event into an owner
-alert (``genesis.resilience.tailscale_watchdog_events``). Nothing peer-chosen
-goes into it: a peer is named by a validated IPv4 address only, and its
-HostName is never read. At detection, the raw status is also kept as a
-root-only (0600) snapshot beside it, as evidence.
+each run and read by the Genesis runtime as the owning user
+(``genesis.resilience.tailscale_watchdog_events``). It holds no condition of its
+own, only what THIS run observed:
+
+* ``evidence``: a verdict per peer this run could judge. ``ok`` (a handshake
+  within the stale age, or the tunnel answered), ``stuck`` (all four probes
+  above, this run), ``offline`` (the discovery ping failed too). A peer it
+  could not judge (unprobed, idle, freshly started daemon) is simply absent:
+  unknown.
+* ``present``: every well-formed peer's IPv4, and whether that list is
+  complete, so a peer that left the tailnet can be told apart from one this
+  run skipped.
+* ``events``: at most 50 restart outcomes.
+
+The condition, "this peer's tunnel is stuck", lives in Genesis's open alert
+for that peer: raised on ``stuck``, resolved only on ``ok`` or ``offline``
+evidence (or on absence from a complete list), untouched when unknown. There
+is no saved set here to lose, go stale, or keep a peer that went offline: only
+peers confirmed stuck in THIS run are ever restarted. A peer that two restarts
+this boot did not clear is not restarted for again (the fault is not on this
+node), and a run whose backend is not Running, or whose pings cannot be
+judged, reports nothing about the peers it could not judge.
+
+Nothing peer-chosen goes into it: a peer is named by a validated IPv4 address
+only, and its HostName is never read. When a peer is first confirmed stuck,
+the raw status is also kept as a root-only (0600) snapshot beside it, as
+evidence.
 
 Lever NETWD_TS_MODE (a drop-in on the service): live (default) | observe
 (record, never restart) | off. An unknown value is treated as observe.
@@ -49,7 +70,6 @@ Disabling the timer turns the watchdog off entirely.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import ipaddress
 import json
 import os
@@ -65,24 +85,26 @@ STATE_FILE = "/run/genesis-tailscale-watchdog.json"
 SNAPSHOT_FILE = "/run/genesis-tailscale-watchdog-status.json"
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
 MAX_EVENTS = 50
+# Bounds on what one run records, so a hostile or huge tailnet cannot grow the
+# file without limit: peers named in one restart event, and peers listed in
+# ``evidence`` / ``present`` (a larger tailnet is recorded as incomplete).
+MAX_TARGETS = 20
+MAX_PEERS = 1000
+# A peer that two restarts this boot did not clear is not restarted for again:
+# the fault is not on this node, and every restart drops every SSH session. Its
+# alert stays open until the tunnel answers.
+MAX_INEFFECTIVE_RESTARTS = 2
 MODES = ("live", "observe", "off")
 
-# Actions that are recorded as an event and spend the rate limit. A restart
-# that did not happen (``not-restarted`` with exit 0: tailscaled was stopped
-# when try-restart ran) is not an event and spends nothing.
+# Restart outcomes: each is recorded as an event and spends the rate limit. A
+# restart that did not happen (``not-restarted`` with exit 0: tailscaled was
+# stopped when try-restart ran) is not an event and spends nothing.
 EVENT_ACTIONS = frozenset(
-    {
-        "healed",
-        "restart-no-effect",
-        "restart-failed",
-        "not-restarted",
-        "unverified",
-        "pending",
-        "observed",
-    }
+    {"healed", "restart-no-effect", "restart-failed", "not-restarted", "unverified", "pending"}
 )
-# Runs that could not judge any tunnel. Counted across consecutive runs so the
-# Genesis side can say the watchdog is blind, not only when it is silent.
+# Runs that judged no tunnel. Counted across consecutive runs so the Genesis
+# side can say the watchdog is blind, not only when it is silent. A run that
+# had suspects and probed none of them counts too (see run_once).
 BLIND_ACTIONS = frozenset({"unavailable", "status-unparseable"})
 _TRANSITIONAL = frozenset({"activating", "deactivating", "reloading", "refreshing"})
 
@@ -113,7 +135,6 @@ SETTINGS = {
 }
 
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-_HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def log(msg: str) -> None:
@@ -223,16 +244,18 @@ def unit_props(ctx: Ctx, unit: str, *props: str) -> dict | None:
     return found
 
 
-def _started_mono(ctx: Ctx) -> float:
-    """tailscaled's last start, in CLOCK_MONOTONIC seconds (0 when unknown).
-    systemd writes it on every start, so it records a restart this watchdog
-    made even if the watchdog's own record of it was lost, as well as reboots
-    and an operator's manual restart."""
+def _started_mono(ctx: Ctx) -> float | None:
+    """tailscaled's last start, in CLOCK_MONOTONIC seconds, or None when it
+    cannot be read. systemd writes it on every start, so it records a restart
+    this watchdog made even if the watchdog's own record of it was lost, as well
+    as reboots and an operator's manual restart. Unknown is never read as "long
+    ago": the caller then does not restart (fail closed)."""
     props = unit_props(ctx, "tailscaled", "ActiveEnterTimestampMonotonic") or {}
     try:
-        return int(props.get("ActiveEnterTimestampMonotonic", "0")) / 1e6
+        value = int(props.get("ActiveEnterTimestampMonotonic", ""))
     except ValueError:
-        return 0.0
+        return None
+    return value / 1e6 if value > 0 else None
 
 
 def restart_tailscaled(ctx: Ctx) -> tuple[str, int | None]:
@@ -280,11 +303,10 @@ def restart_tailscaled(ctx: Ctx) -> tuple[str, int | None]:
 
 
 class Suspect:
-    __slots__ = ("ip", "handshake", "age")
+    __slots__ = ("ip", "age")
 
-    def __init__(self, ip: str, handshake: str, age: int | None):
+    def __init__(self, ip: str, age: int | None):
         self.ip = ip
-        self.handshake = handshake  # tailscaled's own value; hashed, never stored
         self.age = age  # None: age unknown (never handshaked, or the clock stepped back)
 
 
@@ -302,20 +324,21 @@ def _parse_handshake(raw: str) -> float:
     return parsed.timestamp()
 
 
-def _suspect(peer, now: float, stale: int, zero_ok: bool) -> Suspect | None:
-    """One peer's verdict. Raises TypeError/ValueError on a malformed entry; the
-    caller skips that peer only. Reads Active, LastHandshake and TailscaleIPs,
-    and nothing else: every other field is chosen by another tailnet member.
+def _classify(peer, now: float, stale: int, zero_ok: bool):
+    """One peer: ("suspect", Suspect), ("ok", ip) or None (idle or unjudgeable).
+    Raises TypeError/ValueError on a malformed entry; the caller skips that peer
+    only. Reads Active, LastHandshake and TailscaleIPs, and nothing else: every
+    other field is chosen by another tailnet member.
 
-    A zero handshake (0001-01-01) is a suspect only when ``zero_ok``: tailscaled
-    has been up longer than the stale age. A fresh daemon has handshaked with
-    nobody yet, but a peer that traffic wants and that has still not completed
-    one long after is exactly the stuck state; after a restart that did not
-    clear the fault, it is the only form the fault takes."""
+    A handshake within the stale age is evidence the tunnel works: that is
+    exactly what the stuck state lacks. A zero handshake (0001-01-01) is a
+    suspect only when ``zero_ok`` (tailscaled has been up longer than the stale
+    age): a fresh daemon has handshaked with nobody yet, but a peer that traffic
+    wants and that still has none long after is the stuck state; after a restart
+    that did not clear the fault, it is the only form the fault takes. A
+    handshake dated in the future means the wall clock stepped back: probed."""
     if not isinstance(peer, dict):
         raise TypeError("peer is not an object")
-    if peer.get("Active") is not True:
-        return None
     raw = peer.get("LastHandshake")
     if not isinstance(raw, str):
         raise TypeError("LastHandshake is not a string")
@@ -323,76 +346,107 @@ def _suspect(peer, now: float, stale: int, zero_ok: bool) -> Suspect | None:
     ips = peer.get("TailscaleIPs")
     if not isinstance(ips, list):
         raise TypeError("TailscaleIPs is not a list")
-    ip = None
+    ip = _first_ipv4(ips)
+    if ip is None:
+        return None
+    if peer.get("Active") is not True:
+        # Idle: no traffic wanted, so nothing to probe. A fresh handshake is
+        # still evidence the tunnel works (an operator fixed it by hand, say).
+        fresh = handshake > 0 and 0 <= now - handshake <= stale
+        return ("ok", ip) if fresh else None
+    if handshake <= 0:
+        return ("suspect", Suspect(ip, None)) if zero_ok else None
+    age = now - handshake
+    if age < 0:
+        return "suspect", Suspect(ip, None)
+    if age > stale:
+        return "suspect", Suspect(ip, int(age))
+    return "ok", ip
+
+
+def _first_ipv4(ips: list) -> str | None:
     for candidate in ips:
         if isinstance(candidate, str) and _IPV4_RE.match(candidate):
             try:
-                ip = str(ipaddress.IPv4Address(candidate))
+                return str(ipaddress.IPv4Address(candidate))
             except ValueError:
                 continue
-            break
-    if ip is None:
-        return None
-    if handshake <= 0:
-        return Suspect(ip, raw, None) if zero_ok else None
-    age = now - handshake
-    if age < 0:
-        return Suspect(ip, raw, None)
-    if age > stale:
-        return Suspect(ip, raw, int(age))
     return None
 
 
-def find_suspects(status_text: str, now: float, stale: int, zero_ok: bool = False):
-    """(suspects, malformed peer count), or None when the status cannot be read
-    as a peer map at all (recorded as its own state, never as healthy)."""
+def read_peers(status_text: str, now: float, stale: int, zero_ok: bool = False):
+    """(suspects, IPv4s with a fresh handshake, malformed peer count, IPv4s of
+    every well-formed peer), or None when the status cannot be read as a peer
+    map at all (recorded as its own state, never as healthy). A MISSING
+    ``Peer`` key is unreadable; an explicit null is a legitimate empty tailnet,
+    but only on a backend that is Running: anything else returns "not-running"."""
     try:
         status = json.loads(status_text)
     except ValueError:
         return None
-    if not isinstance(status, dict):
+    if not isinstance(status, dict) or "Peer" not in status:
         return None
-    peers = status.get("Peer")
-    if peers is None:  # null: no peers, a legitimate empty tailnet
-        return [], 0
+    if status.get("BackendState") != "Running":
+        # Logged out, key expired, `tailscale down`, or still starting: the peer
+        # map is empty or partial and proves nothing about any tunnel.
+        return "not-running"
+    peers = status["Peer"]
+    if peers is None:
+        return [], [], 0, set()
     if not isinstance(peers, dict):
         return None
-    suspects, malformed = [], 0
+    suspects, ok, malformed, present = [], [], 0, set()
     for peer in peers.values():
         try:
-            found = _suspect(peer, now, stale, zero_ok)
-        except (TypeError, ValueError, OverflowError):
+            verdict = _classify(peer, now, stale, zero_ok)
+            ip = _first_ipv4(peer["TailscaleIPs"])
+        except (TypeError, ValueError, OverflowError, KeyError):
             malformed += 1
             continue
-        if found is not None:
-            suspects.append(found)
-    return suspects, malformed
+        if ip is not None:
+            present.add(ip)
+        if verdict is None:
+            continue
+        if verdict[0] == "ok":
+            ok.append(verdict[1])
+        else:
+            suspects.append(verdict[1])
+    return suspects, ok, malformed, present
 
 
 # ── probing ──────────────────────────────────────────────────────────────
 
 
-def _ping(ctx: Ctx, ip: str, *, tsmp: bool) -> bool:
+def _ping(ctx: Ctx, ip: str, *, tsmp: bool) -> bool | None:
+    """True: a reply. False: no reply (the CLI exits 1). None: the ping itself
+    could not be judged (it hung past its bound, could not run, or failed some
+    other way), which is never evidence about the peer."""
     kind = ["--tsmp"] if tsmp else ["--until-direct=false"]
     timeout = ctx.settings["NETWD_TS_PING_TIMEOUT_SEC"]
     rc, _ = ctx.run(
         [ctx.tailscale, "ping", *kind, "-c", "1", "--timeout", f"{timeout}s", "--", ip],
         ctx.settings["NETWD_TS_CALL_TIMEOUT_SEC"],
     )
-    return rc == 0
+    if rc == 0:
+        return True
+    return False if rc == 1 else None
 
 
-def scan(ctx: Ctx, suspects: list) -> tuple[Suspect | None, int, int, bool]:
-    """(stuck peer or None, probed, skipped, saw an unreachable peer).
+def scan(ctx: Ctx, suspects: list) -> tuple[dict, list, int, int, int]:
+    """({ip: "ok" | "offline" | "stuck"} for every suspect judged, the stuck
+    Suspects, probed, unjudged, skipped).
 
-    Bounded by NETWD_TS_MAX_PROBES peers and NETWD_TS_SCAN_BUDGET_SEC seconds.
-    The status lists peers in a fixed order, so the start point rotates each
-    tick; otherwise the same first few would be probed forever."""
+    A suspect whose pings could not be judged is left out of the verdicts and
+    counted as unjudged. Bounded by NETWD_TS_MAX_PROBES peers and
+    NETWD_TS_SCAN_BUDGET_SEC seconds. The status lists peers in a fixed order,
+    so the start point rotates each tick; otherwise the same first few would
+    be probed forever."""
     n = len(suspects)
     offset = int(ctx.mono() // 120) % n if n else 0
     start = ctx.mono()
-    probed = skipped = 0
-    unreachable = False
+    probed = unjudged = skipped = 0
+    verdicts: dict = {}
+    stuck = []
     for k in range(n):
         peer = suspects[(offset + k) % n]
         if (
@@ -402,22 +456,62 @@ def scan(ctx: Ctx, suspects: list) -> tuple[Suspect | None, int, int, bool]:
             skipped += 1
             continue
         probed += 1
-        if _ping(ctx, peer.ip, tsmp=True):
+        verdict = _judge(ctx, peer.ip)
+        if verdict is None:
+            unjudged += 1
             continue
-        if not _ping(ctx, peer.ip, tsmp=False):
-            unreachable = True
-            continue
-        if _ping(ctx, peer.ip, tsmp=True):
-            continue
-        return peer, probed, skipped, unreachable
-    return None, probed, skipped, unreachable
+        verdicts[peer.ip] = verdict
+        if verdict == "stuck":
+            stuck.append(peer)
+    return verdicts, stuck, probed, unjudged, skipped
+
+
+def _judge(ctx: Ctx, ip: str) -> str | None:
+    """The four-probe verdict for one suspect, or None if any ping could not be
+    judged."""
+    first = _ping(ctx, ip, tsmp=True)
+    if first is None:
+        return None
+    if first:
+        return "ok"
+    disco = _ping(ctx, ip, tsmp=False)
+    if disco is None:
+        return None
+    if not disco:
+        return "offline"  # gone, not stuck: a restart cannot help
+    again = _ping(ctx, ip, tsmp=True)
+    if again is None:
+        return None
+    return "ok" if again else "stuck"  # a discovery ping can revive a cold path
+
+
+def _tunnel_answers(ctx: Ctx, ip: str, deadline: float) -> bool:
+    """Whether the peer answers through the tunnel by ``deadline``. After a
+    restart tailscaled needs a few seconds to reconnect, so this retries."""
+    while True:
+        if _ping(ctx, ip, tsmp=True):
+            return True
+        if ctx.mono() >= deadline:
+            return False
+        ctx.sleep(2)
 
 
 # ── state file ───────────────────────────────────────────────────────────
 
 
+def _valid_ip(value) -> bool:
+    try:
+        return isinstance(value, str) and str(ipaddress.IPv4Address(value)) == value
+    except ValueError:
+        return False
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def valid_event(event) -> bool:
-    """Shape check for one event. The consumer
+    """Shape check for one restart event. The consumer
     (genesis.resilience.tailscale_watchdog_events) applies the same contract."""
     if not isinstance(event, dict):
         return False
@@ -425,38 +519,36 @@ def valid_event(event) -> bool:
         return (
             isinstance(event["id"], str)
             and len(event["id"]) <= 128
-            and isinstance(event["incident"], str)
-            and bool(_HEX32_RE.match(event["incident"]))
             and event["action"] in EVENT_ACTIONS
             and isinstance(event["boot_id"], str)
-            and isinstance(event["mono"], (int, float))
-            and not isinstance(event["mono"], bool)
-            and isinstance(event["at"], int)
-            and not isinstance(event["at"], bool)
-            and isinstance(event["peer_ip"], str)
-            and str(ipaddress.IPv4Address(event["peer_ip"])) == event["peer_ip"]
-            and (event["handshake_age_s"] is None or type(event["handshake_age_s"]) is int)
+            and _number(event["mono"])
+            and type(event["at"]) is int
+            and isinstance(event["peers"], list)
+            and 0 < len(event["peers"]) <= MAX_TARGETS
+            and all(_valid_ip(ip) for ip in event["peers"])
+            and isinstance(event["cleared"], list)
+            and all(ip in event["peers"] for ip in event["cleared"])
             and (event["rc"] is None or type(event["rc"]) is int)
             and type(event["rate_limit_s"]) is int
         )
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError):
         return False
 
 
-def read_state(path: str) -> dict:
-    """The prior run's file as a dict (empty when absent or unreadable), with
-    only well-formed events kept."""
+def read_events(path: str) -> tuple[list, dict]:
+    """(well-formed restart events from the prior run's file, the prior file).
+    Only the events matter across runs (they bound the rate limit); losing the
+    file loses nothing else, and systemd's own start time still bounds it."""
     try:
         with open(path, "rb") as fh:
             raw = fh.read(1_000_001)
-        state = json.loads(raw) if len(raw) <= 1_000_000 else {}
+        prior = json.loads(raw) if len(raw) <= 1_000_000 else None
     except (OSError, ValueError):
-        state = {}
-    if not isinstance(state, dict):
-        state = {}
-    events = state.get("events")
-    state["events"] = [e for e in events if valid_event(e)] if isinstance(events, list) else []
-    return state
+        prior = None
+    if not isinstance(prior, dict):
+        return [], {}
+    events = prior.get("events")
+    return ([e for e in events if valid_event(e)] if isinstance(events, list) else []), prior
 
 
 def write_atomic(path: str, data: bytes, mode: int) -> None:
@@ -478,64 +570,58 @@ def write_atomic(path: str, data: bytes, mode: int) -> None:
         raise
 
 
-def incident_id(boot_id: str, peer: Suspect) -> str:
-    """Stable for one stuck incident: the peer's handshake does not move while
-    its tunnel is stuck. So every detection of it, healed or observed, carries
-    the same id, and the owner is paged once per incident."""
-    material = f"{boot_id}|{peer.ip}|{peer.handshake}".encode()
-    return hashlib.sha256(material).hexdigest()[:32]
-
-
 # ── the run ──────────────────────────────────────────────────────────────
 
 
-def _tunnel_answers(ctx: Ctx, ip: str) -> bool:
-    """Whether the peer answers through the tunnel within NETWD_TS_VERIFY_SEC
-    of a restart. tailscaled needs a few seconds to reconnect, so this retries."""
-    deadline = ctx.mono() + ctx.settings["NETWD_TS_VERIFY_SEC"]
-    while True:
-        if _ping(ctx, ip, tsmp=True):
-            return True
-        if ctx.mono() >= deadline:
-            return False
-        ctx.sleep(2)
-
-
 def run_once(ctx: Ctx) -> int:
-    state = read_state(ctx.state_file)
-    events = [e for e in state["events"] if e["boot_id"] == ctx.boot_id]
-    heal_count = state.get("heal_count") if state.get("boot_id") == ctx.boot_id else 0
+    prior_events, prior = read_events(ctx.state_file)
+    same_boot = prior.get("boot_id") == ctx.boot_id
+    events = [e for e in prior_events if e["boot_id"] == ctx.boot_id]
+    heal_count = prior.get("heal_count") if same_boot else 0
     if type(heal_count) is not int or heal_count < 0:
         heal_count = 0
-    counters = {"probed": 0, "skipped": 0, "malformed_peers": 0}
-    blind_runs = state.get("blind_runs") if state.get("boot_id") == ctx.boot_id else 0
+    blind_runs = prior.get("blind_runs") if same_boot else 0
     if type(blind_runs) is not int or blind_runs < 0:
         blind_runs = 0
+    counters = {"probed": 0, "unjudged": 0, "skipped": 0, "malformed_peers": 0}
+    evidence: dict = {}
+    present: list = []
+    present_complete = False
+    ages: dict = {}
 
     def finish(action: str, event: dict | None = None, exit_code: int = 0) -> int:
         nonlocal events, heal_count
-        runs = blind_runs + 1 if action in BLIND_ACTIONS else 0
+        # Blind: the status could not be read, or there were suspects and not
+        # one of them could be judged (scan limits, or every ping hanging).
+        judged = counters["probed"] - counters["unjudged"]
+        waiting = counters["skipped"] + counters["unjudged"]
+        blind = action in BLIND_ACTIONS or (waiting > 0 and judged == 0)
         if event is not None:
             events = (events + [event])[-MAX_EVENTS:]
             if event["action"] == "healed":
                 heal_count += 1
         record = {
-            "version": 1,
+            "version": 3,
             "boot_id": ctx.boot_id,
             "last_check": int(ctx.wall()),
             "last_check_mono": ctx.mono(),
             "last_action": action,
             "mode": ctx.mode,
             "heal_count": heal_count,
-            "blind_runs": runs,
+            "blind_runs": blind_runs + 1 if blind else 0,
             **counters,
+            "evidence": evidence,
+            "handshake_age_s": ages,
+            "present": present,
+            "present_complete": present_complete,
             "events": events,
         }
         try:
             write_atomic(ctx.state_file, json.dumps(record).encode(), 0o644)
         except OSError as exc:
             log(
-                f"could not record '{action}' in {ctx.state_file} ({exc}); the owner will NOT be told of it"
+                f"could not record '{action}' in {ctx.state_file} ({exc}); "
+                "the owner will NOT be told of it"
             )
             return 1
         return exit_code
@@ -547,7 +633,6 @@ def run_once(ctx: Ctx) -> int:
     active = unit_props(ctx, "tailscaled", "ActiveState") or {}
     if active.get("ActiveState") != "active":
         return finish("unavailable")
-
     rc, status = ctx.run(
         [ctx.tailscale, "status", "--json"], ctx.settings["NETWD_TS_CALL_TIMEOUT_SEC"]
     )
@@ -555,89 +640,124 @@ def run_once(ctx: Ctx) -> int:
         return finish("unavailable")
     stale = ctx.settings["NETWD_TS_STALE_SEC"]
     started = _started_mono(ctx)
-    found = find_suspects(
-        status, ctx.wall(), stale, zero_ok=started > 0 and ctx.mono() - started > stale
-    )
+    zero_ok = started is not None and ctx.mono() - started > stale
+    found = read_peers(status, ctx.wall(), stale, zero_ok=zero_ok)
     if found is None:
         log("status --json could not be read as a peer map; cannot judge tunnels this run")
         return finish("status-unparseable")
-    suspects, counters["malformed_peers"] = found
+    if found == "not-running":
+        log(
+            "tailscaled's backend is not Running (logged out, stopped or starting); cannot judge tunnels"
+        )
+        return finish("unavailable")
+    suspects, fresh_ips, counters["malformed_peers"], present_set = found
     if counters["malformed_peers"]:
         log(f"skipped {counters['malformed_peers']} malformed peer entr(y/ies) in status --json")
+    present = sorted(present_set)[:MAX_PEERS]
+    present_complete = not counters["malformed_peers"] and len(present_set) <= MAX_PEERS
+    for ip in fresh_ips:
+        evidence[ip] = "ok"
 
-    stuck, counters["probed"], counters["skipped"], unreachable = scan(ctx, suspects)
+    verdicts, stuck, counters["probed"], counters["unjudged"], counters["skipped"] = scan(
+        ctx, suspects
+    )
+    evidence.update(verdicts)
+    if len(evidence) > MAX_PEERS:
+        evidence = dict(sorted(evidence.items())[:MAX_PEERS])
+        present_complete = False
+    for peer in stuck:
+        ages[peer.ip] = peer.age
+        age = "unknown" if peer.age is None else f"{peer.age}s"
+        log(f"tunnel to {peer.ip} is STUCK (handshake age {age})")
     if counters["skipped"]:
         log(
             f"probed {counters['probed']} suspect peer(s); {counters['skipped']} not probed this run "
             f"(cap {ctx.settings['NETWD_TS_MAX_PROBES']} / {ctx.settings['NETWD_TS_SCAN_BUDGET_SEC']}s)"
         )
-    if stuck is None:
-        # A suspect the cap left unprobed could be the stuck one, so a capped
-        # scan never reads as healthy.
-        if counters["skipped"]:
-            return finish("incomplete")
-        return finish("suspect-unreachable" if unreachable else "none")
+    if stuck:
+        # Evidence at detection. Root-only: it names every node.
+        try:
+            write_atomic(ctx.snapshot_file, status.encode(), 0o600)
+        except OSError as exc:
+            log(f"could not save the status snapshot ({exc})")
 
-    # Evidence before anything changes. Root-only: it names every node.
-    try:
-        write_atomic(ctx.snapshot_file, status.encode(), 0o600)
-    except OSError as exc:
-        log(f"could not save the status snapshot ({exc})")
+    if not stuck:
+        if counters["skipped"] or counters["unjudged"] or counters["malformed_peers"]:
+            return finish("incomplete")  # an unprobed or unread peer could be stuck
+        return finish("suspect-unreachable" if "offline" in verdicts.values() else "none")
+    if ctx.mode == "observe":
+        return finish("stuck")  # reported through the evidence; never restarted
 
-    age = "unknown" if stuck.age is None else f"{stuck.age}s"
+    # The heal: only peers confirmed stuck in THIS run, at most once per window.
     rate = ctx.settings["NETWD_TS_RATE_LIMIT_SEC"]
     now = ctx.mono()
-    spent = max([e["mono"] for e in events if e["action"] in EVENT_ACTIONS] + [started])
-    if spent > 0 and now - spent < rate:
+    if started is None:
         log(
-            f"tunnel to {stuck.ip} stuck (handshake age {age}) but tailscaled started, or this "
-            f"watchdog acted, <{rate}s ago; NOT acting"
+            "tailscaled's start time could not be read, so the rate limit cannot be judged; not restarting"
+        )
+        return finish("stuck")
+    spent = max([e["mono"] for e in events] + [started])
+    if now - spent < rate:
+        log(
+            f"{len(stuck)} tunnel(s) stuck, but tailscaled started or was restarted <{rate}s ago; not restarting"
         )
         return finish("ratelimited")
 
-    def event(action: str, rc: int | None) -> dict:
-        return {
-            "id": f"{ctx.boot_id}:{int(ctx.mono() * 1e9)}",
-            "incident": incident_id(ctx.boot_id, stuck),
-            "action": action,
-            "boot_id": ctx.boot_id,
-            "mono": now,
-            "at": int(ctx.wall()),
-            "peer_ip": stuck.ip,
-            "handshake_age_s": stuck.age,
-            "rc": rc,
-            "rate_limit_s": rate,
-        }
-
-    if ctx.mode == "observe":
-        log(f"OBSERVE: tunnel to {stuck.ip} stuck (handshake age {age}); not restarting")
-        return finish("observed", event("observed", None))
-
-    log(f"HEALING: tunnel to {stuck.ip} stuck (handshake age {age}); restarting tailscaled")
+    ineffective: dict = {}
+    for e in events:
+        if e["action"] == "restart-no-effect":
+            for ip in e["peers"]:
+                if ip not in e["cleared"]:
+                    ineffective[ip] = ineffective.get(ip, 0) + 1
+    targets = sorted(p.ip for p in stuck if ineffective.get(p.ip, 0) < MAX_INEFFECTIVE_RESTARTS)
+    targets = targets[:MAX_TARGETS]
+    if not targets:
+        log(
+            f"{MAX_INEFFECTIVE_RESTARTS} restarts this boot have not cleared the stuck tunnel(s); "
+            "not restarting for them again (the fault is not on this node)"
+        )
+        return finish("stuck")
+    log(f"HEALING: restarting tailscaled for stuck tunnel(s) to {', '.join(targets)}")
     outcome, rc = restart_tailscaled(ctx)
     if outcome == "not-attempted":
         log(
             "could not read tailscaled's InvocationID, so a restart could not be judged; not restarting"
         )
-        return finish("unavailable")
-    if outcome == "healed" and not _tunnel_answers(ctx, stuck.ip):
-        # tailscaled came back, but the tunnel it was restarted for did not.
-        outcome = "restart-no-effect"
+        return finish("stuck")
     if outcome == "not-restarted" and rc == 0:
         # try-restart is a no-op on a stopped unit: nothing was restarted and
         # no session dropped, so nothing is spent.
         log("tailscaled was stopped during the scan; not restarted")
         return finish("unavailable")
+    cleared = []
+    if outcome == "healed":
+        deadline = ctx.mono() + ctx.settings["NETWD_TS_VERIFY_SEC"]
+        cleared = [ip for ip in targets if _tunnel_answers(ctx, ip, deadline)]
+        for ip in cleared:
+            evidence[ip] = "ok"
+        if len(cleared) < len(targets):
+            outcome = "restart-no-effect"
     messages = {
-        "healed": "tailscaled restarted and the tunnel answers again",
-        "restart-no-effect": "tailscaled restarted, but the tunnel still gets no reply; not retrying",
+        "healed": "tailscaled restarted and every stuck tunnel answers again",
+        "restart-no-effect": f"tailscaled restarted, but {len(targets) - len(cleared)} tunnel(s) still get no reply; not retrying for {rate}s",
         "restart-failed": "tailscaled restarted but is NOT active; it may be DOWN; not retrying",
         "not-restarted": f"try-restart failed (rc={rc}) and nothing restarted; not retrying for {rate}s",
-        "unverified": "could not read tailscaled's InvocationID; the restart's outcome is unknown",
+        "unverified": "could not read tailscaled's InvocationID afterwards; the restart's outcome is unknown",
         "pending": "the restart job had not finished when the poll ended; tailscaled may be hung",
     }
     log(messages[outcome])
-    return finish(outcome, event(outcome, rc), 0 if outcome == "healed" else 1)
+    event = {
+        "id": f"{ctx.boot_id}:{int(ctx.mono() * 1e9)}",
+        "action": outcome,
+        "boot_id": ctx.boot_id,
+        "mono": now,
+        "at": int(ctx.wall()),
+        "peers": targets,
+        "cleared": cleared,
+        "rc": rc,
+        "rate_limit_s": rate,
+    }
+    return finish(outcome, event, 0 if outcome == "healed" else 1)
 
 
 def main() -> int:

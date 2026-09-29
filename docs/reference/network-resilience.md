@@ -103,44 +103,77 @@ never from the command's exit code:
 
 | systemd afterwards | Recorded as |
 |---|---|
-| InvocationID unreadable before the restart | nothing is restarted: an outcome it could not judge is not worth the dropped sessions |
-| new InvocationID, unit active, the stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s) | `healed` |
-| new InvocationID, unit active, the peer still gets no reply | `restart-no-effect` |
+| tailscaled's start time or InvocationID unreadable before the restart | nothing is restarted: a rate limit or an outcome it could not judge is not worth the dropped sessions |
+| new InvocationID, unit active, every stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s) | `healed` |
+| new InvocationID, unit active, a stuck peer still gets no reply | `restart-no-effect` |
 | new InvocationID, unit not active | `restart-failed` |
 | same InvocationID, try-restart failed | `not-restarted` |
 | same InvocationID, try-restart exited 0 (tailscaled was stopped) | nothing; no hour spent |
 | a restart job still queued after the poll | `pending` |
 | InvocationID unreadable | `unverified` |
 
-Every run rewrites `/run/genesis-tailscale-watchdog.json` (0644): the run's
-state and the last 50 events. A peer is named by its IPv4 address only; its
-hostname, which another tailnet member chooses, is never read. At detection the
-raw status is also kept as a root-only snapshot,
-`/run/genesis-tailscale-watchdog-status.json` (0600).
+Every run rewrites `/run/genesis-tailscale-watchdog.json` (0644). It holds
+only what THAT run observed; the watchdog keeps nothing about a peer between
+runs, so there is no state to lose or to go stale:
 
-The owner hears about it through the Genesis runtime: the awareness tick
-(`genesis.resilience.tailscale_watchdog_events`) turns each event into an
-`infrastructure_alert` observation.
+- `evidence`: a verdict per peer the run could judge. `ok` means a handshake
+  within the stale age, or the tunnel answered. `stuck` means all four probes,
+  in this run. `offline` means the discovery ping failed too: the peer is gone,
+  which is not a stuck tunnel. A peer it could not judge is absent from the
+  list, meaning unknown: unprobed, idle without a fresh handshake, a daemon too
+  fresh to judge a zero handshake, or a ping that hung or failed oddly (the CLI
+  exits 1 for no reply; anything else proves nothing about the peer). A run
+  whose backend is not `Running` (logged out, key expired, `tailscale down`)
+  judges nobody.
+- `present`: every well-formed peer's IPv4, and whether that list is complete.
+- `events`: at most 50 restart outcomes (the table above).
 
-- `healed` is `high` (dashboard and morning report).
-- Every other outcome, and `observed` in observe mode, is `critical`, and the
-  critical-observations job pages it.
-- One stuck tunnel pages once. An event is identified by the boot, the peer and
-  that peer's handshake time, which does not move while the tunnel stays stuck,
-  and a resolved alert never pages the same incident again.
-- When a later run finds tailscaled active and every tunnel answering, open
-  critical alerts from the watchdog resolve themselves.
-- If the timer is enabled but the file has not been rewritten for 10 minutes, a
-  `high` alert says the watchdog has gone silent; if it reports but has checked
-  no tunnel for three runs in a row (tailscaled down, the CLI failing, a status
-  it cannot parse), a `high` alert says it is blind. Its own failures reach no
-  one otherwise: the owning user cannot read the system journal.
+Only peers confirmed stuck IN THE SAME RUN are ever restarted, so a peer that
+went offline, or one a later run could not probe, never triggers a restart.
+A peer that two restarts this boot did not clear is not restarted for again:
+the fault is not on this node, and every restart drops every SSH session. Its
+alert stays open until the tunnel answers.
+
+A peer is named by its IPv4 address only; its hostname, which another tailnet
+member chooses, is never read. When a peer is confirmed stuck, the raw status is
+also kept as a root-only snapshot, `/run/genesis-tailscale-watchdog-status.json`
+(0600).
+
+The owner hears about it through the Genesis runtime. The awareness tick
+(`genesis.resilience.tailscale_watchdog_events`) holds the condition as one
+`infrastructure_alert` observation per stuck peer:
+
+- `stuck` evidence raises the peer's `critical` alert, which the
+  critical-observations job pages once.
+- `ok` or `offline` evidence resolves it, and so does the peer's absence from a
+  complete `present` list (it left the tailnet). Nothing else does: unknown
+  changes nothing, and evidence is used only while the file is fresh.
+- A tunnel stuck again within an hour of its alert being resolved (a flap, or
+  someone resolving it while it was still true) reopens the same alert without
+  paging again. To stop the alerts for good, set observe or off, or mask the
+  timer.
+- These alerts do not expire on the store's usual 3-day timer: they last while
+  the tunnel is stuck.
+- A restart outcome is one alert each. `restart-failed`, `unverified` and
+  `pending` are `critical`, and resolve once a later run finds tailscaled
+  running with a readable status. `healed` is `high`: the SSH drop was felt
+  and the tunnel is back (when one run both finds and heals a tunnel, no
+  stuck-peer alert is raised at all). `restart-no-effect` and `not-restarted`
+  are `high` because the stuck-peer alert, which stays open, carries the page.
+- The Genesis side reads the latest run only (every ~5 minutes against runs
+  every ~2), so a stuck spell shorter than that can go unreported; restart
+  outcomes are kept and never missed.
+- If the timer is enabled but the file has not been rewritten for 10 minutes,
+  and the oneshot is not mid-run, a `high` alert says the watchdog has gone
+  silent. If it reports but judged no tunnel for three runs in a row
+  (tailscaled down, the CLI failing, a status it cannot parse, or probe limits
+  set to zero), a `high` alert says it is blind. Both are raised again by a new
+  episode after one resolves. The watchdog's own failures reach no one
+  otherwise: the owning user cannot read the system journal.
 - The infra profile records `tailscaled_loaded` and the timer's unit-file state,
   and the protection-posture check flags `tailscale_watchdog_absent` where
   tailscaled is installed and the timer is neither enabled nor masked.
-- An `observed` event spends the hour like a restart does, so switching from
-  observe to live does not restart for up to an hour after the last
-  observation.
+- In observe mode a stuck peer is alerted the same way and never restarted.
 
 Levers, in a drop-in on `genesis-tailscale-watchdog.service`:
 `NETWD_TS_MODE=live|observe|off` (an unknown value means observe), and the
