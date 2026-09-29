@@ -942,7 +942,7 @@ def test_every_rule_names_a_known_operation_and_says_why():
     applicable = {
         "providers": {"off_wins", "lower", "higher", "same_or_excluded", "neutral"},
         "call_sites": {"on_wins", "chain", "dispatch", "retry_profile", "neutral"},
-        "retry": {"lower", "neutral"},
+        "retry": {"lower", "higher"},
     }
     for section, rules in C._FALLBACK_RULES.items():
         for field, rule in rules.items():
@@ -952,8 +952,9 @@ def test_every_rule_names_a_known_operation_and_says_why():
     # Every switch has a reader, and every retry cap a default.
     switches = {f for f, r in C._FALLBACK_RULES["providers"].items() if r.kind == "off_wins"}
     assert switches == set(C._PERMITS) == set(C._SWITCH_DEFAULTS) == set(C._SWITCH_LABELS)
-    caps = {f for f, r in C._FALLBACK_RULES["retry"].items() if r.kind == "lower"}
-    assert caps == set(C._RETRY_CAPS)
+    # Every retry field is a cap or pacing, and each has the default `_parse` uses.
+    assert set(C._FALLBACK_RULES["retry"]) == set(C._RETRY_CAPS) | set(C._PACING_DEFAULTS)
+    assert not set(C._RETRY_CAPS) & set(C._PACING_DEFAULTS)
 
 
 # ── The rules the round-3 review found missing ──────────────────────────────
@@ -1147,6 +1148,98 @@ def test_a_restriction_under_a_renamed_provider_name_still_applies(tmp_path, rec
     assert loaded.call_sites["32_other"].chain == ["paid-a"]
 
 
+def test_a_legacy_and_current_provider_key_settle_as_the_accepted_path_does(
+    tmp_path, recorded, monkeypatch
+):
+    """Both keys resolve to one provider. The accepted path keeps the CURRENT
+    key's entry and drops the legacy one, so the fallback must too, not apply
+    both. CONTROL: the legacy key alone still restricts."""
+    monkeypatch.setitem(C._RENAMED_PROVIDERS, "paid-a-old", "paid-a")
+    both = (
+        "providers:\n  paid-a-old:\n    enabled: false\n  paid-a:\n    enabled: true\n"
+        + _UNRELATED_ERROR
+    )
+    loaded = load_config(_write(tmp_path, both), check_api_keys=False)
+    assert "paid-a" in loaded.providers
+
+    alone = "providers:\n  paid-a-old:\n    enabled: false\n" + _UNRELATED_ERROR
+    control = tmp_path / "control"
+    control.mkdir()
+    loaded = load_config(_write(control, alone), check_api_keys=False)
+    assert "paid-a" not in loaded.providers
+
+
+def test_a_rejected_overlay_keeps_longer_retry_pacing(tmp_path, recorded):
+    """Pacing is not neutral: the router checks the deadline before each retry,
+    so longer waits fit fewer attempts. Longer waits and less jitter are kept;
+    shorter ones are not."""
+    local = (
+        "retry:\n  background:\n    base_delay_ms: 4000\n    max_delay_ms: 90000\n"
+        "    backoff_multiplier: 3\n    jitter_pct: 0\n"
+        "  default:\n    base_delay_ms: 1\n    jitter_pct: 0.9\n  custom:\n"
+    )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    bg = loaded.retry_profiles["background"]
+    assert (bg.base_delay_ms, bg.max_delay_ms, bg.backoff_multiplier, bg.jitter_pct) == (
+        4000, 90000, 3, 0
+    )
+    default = loaded.retry_profiles["default"]
+    assert (default.base_delay_ms, default.jitter_pct) == (500, 0.25)
+
+
+def test_a_huge_kept_backoff_never_overflows_a_retry(tmp_path, recorded):
+    """A kept multiplier and ceiling this large overflow the backoff power on
+    the third attempt; `compute_delay` must cap it rather than raise mid-call."""
+    from genesis.routing.retry import compute_delay
+
+    local = (
+        "retry:\n  background:\n    max_delay_ms: 1.0e+300\n"
+        "    backoff_multiplier: 1.0e+300\n  custom:\n"
+    )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    policy = loaded.retry_profiles["background"]
+    assert policy.backoff_multiplier == 1.0e300
+    for attempt in range(policy.max_retries + 1):
+        assert compute_delay(policy, attempt) <= policy.max_delay_ms * 1.25 / 1000
+
+
+@pytest.mark.parametrize("where", ["same_profile", "moved_site"])
+def test_an_unreadable_retry_wait_reads_as_no_retries(tmp_path, recorded, where):
+    """Pacing restricts, so an unreadable wait is read the restrictive way, like
+    an unreadable cap: no retries. CONTROL: a readable wait keeps the base's."""
+    if where == "same_profile":
+        local = "retry:\n  background:\n    base_delay_ms: slow\n  custom:\n"
+    else:
+        local = (
+            f"call_sites:\n  {SITE}:\n    retry_profile: slow\n"
+            "retry:\n  slow:\n    base_delay_ms: slow\n  custom:\n"
+        )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+    assert loaded.retry_profiles[loaded.call_sites[SITE].retry_profile].max_retries == 0
+
+    control = tmp_path / "control"
+    control.mkdir()
+    readable = local.replace("base_delay_ms: slow", "base_delay_ms: 600")
+    loaded = load_config(_write(control, readable), check_api_keys=False)
+    # A whole overlay profile that omits max_retries has `_parse`'s default, 3.
+    expected = 5 if where == "same_profile" else 3
+    assert loaded.retry_profiles[loaded.call_sites[SITE].retry_profile].max_retries == expected
+
+
+def test_moving_a_site_to_a_slower_profile_keeps_its_pacing(tmp_path, recorded):
+    local = (
+        f"call_sites:\n  {SITE}:\n    retry_profile: slow\n"
+        "retry:\n  slow:\n    max_retries: 9\n    base_delay_ms: 5000\n  custom:\n"
+    )
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    policy = loaded.retry_profiles[loaded.call_sites[SITE].retry_profile]
+    assert (policy.max_retries, policy.base_delay_ms) == (5, 5000)
+    assert loaded.retry_profiles["background"].base_delay_ms == 500, "shared profile untouched"
+
+
 # ── The health observation survives a failed write ──────────────────────────
 
 
@@ -1315,3 +1408,64 @@ def test_a_blocked_essential_site_does_not_raise_system_degradation(tmp_path, re
 
     assert registry.uncovered_essential_sites() == []
     assert registry.compute_degradation_level() == DegradationLevel.NORMAL
+
+
+
+def test_every_essential_site_blocked_stays_in_coverage_mode(tmp_path, recorded):
+    """All essential sites blocked by configuration is not "no map": the
+    registry must stay in coverage mode (NORMAL), not fall back to the legacy
+    provider-count check, which reads every paid provider open as ESSENTIAL."""
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+    from genesis.routing.essential import ESSENTIAL_CLOUD_SITES, build_essential_provider_map
+    from genesis.routing.types import DegradationLevel, ErrorCategory
+
+    shipped = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
+    local = "call_sites:\n" + "".join(f"  {site}: oops\n" for site in ESSENTIAL_CLOUD_SITES)
+    loaded = load_config(
+        _write(tmp_path, local, base=shipped.read_text().rstrip()), check_api_keys=False
+    )
+    essential = build_essential_provider_map(loaded)
+    assert essential == {}, "fixture: every essential site must be blocked"
+
+    registry = CircuitBreakerRegistry(
+        loaded.providers,
+        state_file=tmp_path / "breakers.json",
+        persist=False,
+        essential_sites=essential,
+    )
+    paid = [
+        name
+        for name, cfg in loaded.providers.items()
+        if cfg.provider_type != "ollama" and not cfg.is_free
+    ]
+    assert paid, "fixture: the shipped config has paid providers"
+    for name in paid:
+        for _ in range(10):
+            registry.get(name).record_failure(ErrorCategory.TRANSIENT)
+
+    assert registry.compute_degradation_level() == DegradationLevel.NORMAL
+
+    # CONTROL: no map at all is still the legacy check, which does degrade.
+    legacy = CircuitBreakerRegistry(
+        loaded.providers, state_file=tmp_path / "b2.json", persist=False, essential_sites=None
+    )
+    for name in paid:
+        for _ in range(10):
+            legacy.get(name).record_failure(ErrorCategory.TRANSIENT)
+    assert legacy.compute_degradation_level() != DegradationLevel.NORMAL
+
+
+def test_a_reload_rebuilds_the_essential_map_and_a_bare_registry_stays_legacy(tmp_path):
+    """The blocked set is a property of the config, so a reload after fixing the
+    overlay must restore coverage. A registry built with no map is untouched."""
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+
+    managed = CircuitBreakerRegistry(
+        {}, clock=lambda: 0, persist=False, state_file=tmp_path / "a.json", essential_sites={}
+    )
+    managed.refresh_essential_sites({"9_fact_extraction": ["p1"]})
+    assert managed.uncovered_essential_sites() == ["9_fact_extraction"]
+
+    bare = CircuitBreakerRegistry({}, clock=lambda: 0, persist=False, state_file=tmp_path / "b.json")
+    bare.refresh_essential_sites({"9_fact_extraction": ["p1"]})
+    assert bare.uncovered_essential_sites() == []

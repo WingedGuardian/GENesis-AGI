@@ -53,7 +53,7 @@ def test_build_map_warns_on_missing_site_no_silent_skip(caplog):
 
 def test_build_map_empty_when_all_sites_missing_logs_error(caplog):
     """If NONE of the essential ids are present (e.g. a config rename), the map
-    collapses to {} — the registry would fall back to legacy degradation, so
+    is None — the registry falls back to legacy degradation, so
     this must be LOUD (error), not silent."""
     logger = logging.getLogger("genesis.routing.essential")
     logger.addHandler(caplog.handler)
@@ -64,7 +64,7 @@ def test_build_map_empty_when_all_sites_missing_logs_error(caplog):
     finally:
         logger.removeHandler(caplog.handler)
         logger.setLevel(old_level)
-    assert m == {}
+    assert m is None
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
     assert any(
         "coverage-based degradation is DISABLED" in r.getMessage()

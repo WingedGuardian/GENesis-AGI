@@ -479,6 +479,14 @@ def _limit_value(provider: str, key: str, value: object) -> float | None:
 #: `_parse` uses when the field is absent. None means no cap.
 _RETRY_CAPS: dict[str, object] = {"max_retries": 3, "max_total_s": None}
 
+#: A retry profile's PACING fields, with the value `_parse` uses when absent.
+_PACING_DEFAULTS: dict[str, float] = {
+    "base_delay_ms": 500,
+    "max_delay_ms": 30000,
+    "backoff_multiplier": 2.0,
+    "jitter_pct": 0.25,
+}
+
 #: `open_duration_s` when a provider does not set it. One constant, so the
 #: fallback compares against the value `_parse` actually uses.
 _OPEN_DURATION_DEFAULT_S = 120
@@ -541,9 +549,10 @@ class _Rule(NamedTuple):
       * ``off_wins``    a switch: the value that permits less wins.
       * ``on_wins``     the same, for a switch whose ON value restricts.
       * ``lower``       a limit or cap: the lower value wins.
-      * ``higher``      a wait: the longer value wins (fewer probes of that
-        provider; the rest of its chain carries the load meanwhile, never for
-        longer than the overlay itself asked).
+      * ``higher``      a wait: the longer value wins. For a provider, fewer
+        probes of it (the rest of its chain carries the load meanwhile, never
+        for longer than the overlay itself asked); for retry pacing, fewer
+        attempts before the deadline.
       * ``same_or_excluded``  a value with no order (which model, which
         endpoint). The only restrictive reading of two different values is
         neither, so an overlay that changes it excludes the provider.
@@ -596,18 +605,13 @@ _FALLBACK_RULES: dict[str, dict[str, _Rule]] = {
     "retry": {
         "max_retries": _Rule("lower", "attempts per provider"),
         "max_total_s": _Rule("lower", "the deadline for the whole chain walk; null is none"),
-        "base_delay_ms": _Rule(
-            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
-        ),
-        "max_delay_ms": _Rule(
-            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
-        ),
-        "backoff_multiplier": _Rule(
-            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
-        ),
-        "jitter_pct": _Rule(
-            "neutral", "pacing between attempts; max_retries and max_total_s bound how many"
-        ),
+        # PACING is not neutral. The router checks `max_total_s` before each
+        # retry, so a longer wait between attempts means FEWER attempts fit
+        # before the deadline: `max_retries` is only the ceiling.
+        "base_delay_ms": _Rule("higher", "a longer first wait fits fewer attempts in the deadline"),
+        "max_delay_ms": _Rule("higher", "a longer ceiling on each wait fits fewer attempts"),
+        "backoff_multiplier": _Rule("higher", "faster-growing waits fit fewer attempts"),
+        "jitter_pct": _Rule("lower", "less jitter keeps the shortest wait closer to the backoff"),
     },
 }
 
@@ -691,7 +695,12 @@ def _restrict_base(base_raw: dict, local_raw: object) -> tuple[dict, list[str]]:
     local_providers = local_raw.get("providers")
     known = set(base_providers) if isinstance(base_providers, dict) else set()
     if isinstance(base_providers, dict) and isinstance(local_providers, dict):
-        _restrict_providers(base_providers, local_providers, kept)
+        # The accepted path's own rename chokepoint, on a copy: a legacy key and
+        # its replacement are settled exactly as `_sanitize_local_overlay`
+        # settles them (the replacement wins), not by applying both.
+        migrated = {"providers": copy.deepcopy(local_providers)}
+        _migrate_renamed_providers(migrated, known)
+        _restrict_providers(base_providers, migrated["providers"], kept)
 
     base_sites = fallback.get("call_sites")
     local_sites = local_raw.get("call_sites")
@@ -709,9 +718,15 @@ def _restrict_retry(base_retry: dict, local_retry: dict, kept: list[str]) -> Non
             continue
         if not isinstance(entry, dict):
             entry = dict.fromkeys(_RETRY_CAPS, "unreadable")
+        # The overlay entry merges onto the base profile, so a field it omits
+        # keeps the base's value: only the fields it sets are compared.
+        changes, unreadable = _tighten_pacing(base_entry, entry, absent_is_default=False)
+        kept.extend(f"retry {name} {change}" for change in changes)
+        if unreadable:
+            entry = {**entry, "max_retries": "unreadable"}
         for key, value in entry.items():
             rule = _FALLBACK_RULES["retry"].get(key)
-            if rule is None or rule.kind == "neutral":
+            if rule is None or rule.kind == "neutral" or key in _PACING_DEFAULTS:
                 continue
             limit = _cap_value(key, value)
             base_limit = _cap_value(key, base_entry.get(key, _RETRY_CAPS[key]))
@@ -723,10 +738,45 @@ def _restrict_retry(base_retry: dict, local_retry: dict, kept: list[str]) -> Non
                 kept.append(f"retry {name} {key} {base_entry[key]}")
 
 
+def _tighten_pacing(target: dict, overlay: dict, *, absent_is_default: bool) -> tuple[list[str], bool]:
+    """Apply the overlay's retry pacing to ``target`` where it waits longer.
+
+    Longer waits (``higher``) and less jitter (``lower``) win, per
+    ``_FALLBACK_RULES``. With ``absent_is_default`` a field the overlay omits
+    reads as `_parse`'s default (a whole profile); without it, an omitted field
+    compares nothing (a partial entry that merges onto ``target``).
+
+    Returns a description of each change made, and whether any overlay pacing
+    value was unreadable. The caller reads an unreadable wait restrictively, as
+    no retries, the same as an unreadable cap. A huge kept multiplier is safe:
+    ``compute_delay`` caps an overflowing backoff at ``max_delay_ms``.
+    """
+    changes: list[str] = []
+    unreadable = False
+    for key, default in _PACING_DEFAULTS.items():
+        if key not in overlay and not absent_is_default:
+            continue
+        try:
+            wanted = _number("retry", key, overlay.get(key, default))
+        except Exception:  # noqa: BLE001 - any refusal
+            unreadable = True
+            continue
+        try:
+            current = _number("retry", key, target.get(key, default))
+        except Exception:  # noqa: BLE001 - `_parse` raises on the base itself
+            continue
+        kind = _FALLBACK_RULES["retry"][key].kind
+        if (kind == "higher" and wanted > current) or (kind == "lower" and wanted < current):
+            target[key] = wanted
+            changes.append(f"{key} {wanted}")
+    return changes, unreadable
+
+
 def _restrict_providers(base_providers: dict, local_providers: dict, kept: list[str]) -> None:
-    known = set(base_providers)
-    for raw_name, entry in local_providers.items():
-        name = _resolve_provider_alias(raw_name, known)
+    """``local_providers`` has already been through `_migrate_renamed_providers`,
+    so its names are current and a legacy/current collision is already settled
+    the way the accepted path settles it."""
+    for name, entry in local_providers.items():
         base_entry = base_providers.get(name)
         if not isinstance(base_entry, dict) or entry is None:
             continue
@@ -919,9 +969,16 @@ def _restrict_site_retry(
     base_caps = _profile_caps(base_profile)
     overlay_caps = _profile_caps(overlay_profile)
     tighter = {key: min(base_caps[key], overlay_caps[key]) for key in _RETRY_CAPS}
-    if tighter == base_caps:
-        return
     site_profile = copy.deepcopy(base_profile)
+    # The overlay's profile is a whole profile here, so a field it omits is
+    # `_parse`'s default for it.
+    pacing: list[str] = []
+    if isinstance(overlay_profile, dict):
+        pacing, unreadable = _tighten_pacing(site_profile, overlay_profile, absent_is_default=True)
+        if unreadable:
+            tighter["max_retries"] = _UNREADABLE_CAP["max_retries"]
+    if tighter == base_caps and not pacing:
+        return
     for key, cap in tighter.items():
         site_profile[key] = None if cap == math.inf else cap
     site_name = f"fallback:{name}"
@@ -930,6 +987,7 @@ def _restrict_site_retry(
     kept.append(
         f"call site {name} retry max_retries {site_profile['max_retries']} "
         f"max_total_s {site_profile['max_total_s']}"
+        + "".join(f" {change}" for change in pacing)
     )
 
 
