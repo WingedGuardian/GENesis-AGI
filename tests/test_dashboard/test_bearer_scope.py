@@ -320,9 +320,11 @@ def test_the_mcp_guard_never_accepts_a_non_ascii_token(mcp_server, encoding):
     assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(encoding), token="tök") == 401
 
 
-def test_the_mcp_transport_ignores_a_non_ascii_cli_token(mcp_server, monkeypatch):
-    monkeypatch.setenv(_BROAD, "ascii-env")
-    assert mcp_server._resolve_http_auth_token("tök") == "ascii-env"
+def test_an_invalid_explicit_cli_token_never_falls_back_to_the_env(mcp_server, monkeypatch):
+    """An operator rotating credentials passes --auth-token; if it is invalid the
+    transport must stay unconfigured (startup refuses), not accept the old env token."""
+    monkeypatch.setenv(_BROAD, "old-env-token")
+    assert mcp_server._resolve_http_auth_token("tök") == ""
 
 
 # ── the boot warning names exactly the disabled surfaces ──────────────────────

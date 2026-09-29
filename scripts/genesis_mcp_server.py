@@ -559,8 +559,13 @@ def _resolve_http_auth_token(cli_token: str | None) -> str:
     """
     from genesis.env import ascii_bearer, bearer_token
 
-    cli = ascii_bearer((cli_token or "").strip(), "--auth-token")
-    return cli or bearer_token("GENESIS_MCP_HTTP_TOKEN")
+    cli = (cli_token or "").strip()
+    if cli:
+        # An explicit override is never replaced by the environment token: an
+        # invalid one leaves the transport unconfigured, so startup refuses,
+        # rather than quietly accepting a credential the operator meant to replace.
+        return ascii_bearer(cli, "--auth-token")
+    return bearer_token("GENESIS_MCP_HTTP_TOKEN")
 
 
 def _bearer_auth_middleware(expected_token: str):
