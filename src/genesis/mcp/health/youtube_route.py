@@ -40,9 +40,11 @@ def _format(result) -> str:
         )
     if not result.tls_verified:
         lines.append("Note: fetched without certificate verification (youtube_fetch tls).")
+    # The transcript comes before the description: max_chars clips from the end,
+    # and what the video SAYS must survive a small budget (#2568 review).
+    lines += ["", "## Transcript", result.transcript or "(no transcript)"]
     if meta.get("description"):
         lines += ["", "## Description", meta["description"]]
-    lines += ["", "## Transcript", result.transcript or "(no transcript)"]
     return "\n".join(lines)
 
 

@@ -11,6 +11,7 @@ discoverability.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC
@@ -637,32 +638,30 @@ async def web_fetch(
     from genesis.mcp.health.youtube_route import fetch_youtube
 
     if urls:
-        # YouTube entries take the YouTube route; the rest go to TinyFish
-        # together. Results come back in the caller's order, one per URL.
+        from genesis.knowledge.processors.youtube import is_youtube_video_url
+
         urls = urls[:10]
-        slots: list[dict | None] = []
-        rest: list[str] = []
-        for u in urls:
-            yt, yt_error = await fetch_youtube(u, max_chars)
-            if yt is not None:
-                slots.append(yt)
-            elif yt_error is not None:
+        normalized = [u if u.strip().startswith(("http://", "https://")) else "https://" + u.strip()
+                      for u in urls]
+        if not any(is_youtube_video_url(u) for u in normalized):
+            return await _impl_web_fetch_multi(urls, max_chars)
+
+        # A batch holding a YouTube link: every URL is fetched on its own, all
+        # at once, so each result belongs to its URL by construction and one
+        # slow video never holds up the rest (#2568 review).
+        async def one(u: str) -> dict:
+            try:
+                yt, yt_error = await fetch_youtube(u, max_chars)
+                if yt is not None:
+                    return yt
                 page = await _impl_web_fetch(u, "auto", max_chars)
-                slots.append({**page, "youtube_error": yt_error})
-            else:
-                slots.append(None)
-                rest.append(u)
-        if len(rest) == len(urls):
-            return await _impl_web_fetch_multi(rest, max_chars)
-        merged = await _impl_web_fetch_multi(rest, max_chars) if rest else {"results": []}
-        batch = list(merged.get("results") or [])
-        if rest and not batch:
-            # TinyFish unavailable or failed: name every URL it was given.
-            batch = [{"url": u, "error": merged.get("error", "fetch failed")} for u in rest]
-        fill = iter(batch)
-        results = [s if s is not None else next(fill, {"url": u, "error": "no result"})
-                   for s, u in zip(slots, urls, strict=True)]
-        return {**merged, "results": results}
+                return {**page, "youtube_error": yt_error} if yt_error is not None else page
+            except Exception as exc:  # one URL's failure must not sink the batch
+                logger.warning("web_fetch batch entry failed for %s", u, exc_info=True)
+                return {"url": u, "error": f"{type(exc).__name__}: {exc}"}
+
+        results = await asyncio.gather(*(one(u) for u in urls))
+        return {"results": list(results), "backend_used": "per-url"}
     if backend == "auto":
         yt, yt_error = await fetch_youtube(url.strip(), max_chars)
         if yt is not None:

@@ -49,6 +49,30 @@ _VIDEO_PATH_PREFIXES = ("/shorts/", "/live/", "/embed/")
 # file name and a yt-dlp filter, so it is held to language-tag characters.
 _TRACK_KEY = re.compile(r"[A-Za-z0-9_-]{1,40}")
 
+# Hosts a caption track may be downloaded from. The track URLs come from the
+# video's metadata, and a caption download from --load-info-json follows them
+# as given, so a track pointing anywhere else is dropped (#2568 review).
+_CAPTION_HOST_SUFFIXES = (".youtube.com", ".googlevideo.com")
+
+
+def _caption_urls_allowed(formats: object) -> bool:
+    if not isinstance(formats, list) or not formats:
+        return False
+    for fmt in formats:
+        url = fmt.get("url") if isinstance(fmt, dict) else None
+        if url is None:
+            continue
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return False
+        if parts.scheme != "https" or not (
+            host == "youtube.com" or host.endswith(_CAPTION_HOST_SUFFIXES)
+        ):
+            return False
+    return True
+
 # A certificate-VERIFICATION failure, in both forms yt-dlp prints (MEASURED
 # 2026-09-28 against self-signed, untrusted-root and expired test hosts): Python
 # ssl ("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: ...") and
@@ -120,6 +144,7 @@ def select_caption(info: dict) -> dict | None:
         return {
             k: v for k, v in tracks.items()
             if v and k != "live_chat" and isinstance(k, str) and _TRACK_KEY.fullmatch(k)
+            and _caption_urls_allowed(v)
         }
 
     manual = usable(info.get("subtitles"))
@@ -251,6 +276,11 @@ class YouTubeProcessor:
                 result.errors.append(f"yt-dlp metadata unreadable: {type(exc).__name__}")
                 return result
             result.metadata = _summary(info, url)
+            live_status = info.get("live_status")
+            # Only a finished recording has a length that bounds its audio.
+            recorded = info.get("is_live") is not True and live_status in (
+                None, "not_live", "was_live",
+            )
 
             track = select_caption(info)
             if track:
@@ -277,20 +307,28 @@ class YouTubeProcessor:
 
         cap = audio_max_minutes()
         duration = result.metadata.get("duration")
-        if not result.transcript and audio_fallback and (
-            not isinstance(duration, (int, float)) or duration > cap * 60
-        ):
-            # Unknown or over-cap length: never download an unbounded audio track.
+        bounded = (
+            recorded
+            and isinstance(duration, (int, float)) and not isinstance(duration, bool)
+            and 0 < duration <= cap * 60
+        )
+        if not result.transcript and audio_fallback and not bounded:
+            # Live, upcoming, zero, unknown or over-cap length: never download
+            # an audio track whose size nothing bounds.
             audio_fallback = False
+            if not recorded:
+                why = "a live or unfinished stream"
+            elif isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0:
+                why = f"{int(duration) // 60} min long"
+            else:
+                why = "of unknown length"
             result.errors.append(
-                "no captions; audio transcription skipped: the video is "
-                + (f"{int(duration) // 60} min long" if isinstance(duration, (int, float))
-                   else "of unknown length")
-                + f" (youtube_fetch audio_max_minutes: {cap})"
+                f"no captions; audio transcription skipped: the video is {why} "
+                f"(youtube_fetch audio_max_minutes: {cap})"
             )
         if not result.transcript and audio_fallback:
             logger.info("No captions for %s, attempting audio transcription", url)
-            text = await self._transcribe_audio(result, url)
+            text = await self._transcribe_audio(result, url, max_seconds=cap * 60)
             if text:
                 result.transcript = text
                 result.caption = {"key": None, "language": None, "kind": "audio transcription",
@@ -337,18 +375,27 @@ class YouTubeProcessor:
             argv.extend(["--", url])
         return argv
 
-    async def _transcribe_audio(self, result: YouTubeFetch, url: str) -> str | None:
+    async def _transcribe_audio(
+        self, result: YouTubeFetch, url: str, *, max_seconds: int
+    ) -> str | None:
         """Download audio and transcribe via STT as fallback."""
         try:
             with tempfile.TemporaryDirectory(dir=big_tmp_dir()) as tmpdir:
                 out = str(Path(tmpdir).resolve()).replace("%", "%%") + "/audio.%(ext)s"
                 rc, _, stderr = await self._run(
-                    result, ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-o", out], url,
+                    result,
+                    # The length check again at download time, by yt-dlp itself,
+                    # in case the video changed since the metadata call.
+                    ["--match-filters", f"!is_live & duration > 0 & duration <= {max_seconds}",
+                     "-x", "--audio-format", "mp3", "--audio-quality", "5", "-o", out],
+                    url,
                 )
                 if rc != 0:
                     result.errors.append("audio download failed: " + network_diagnostic(stderr))
                     return None
                 candidates = sorted(Path(tmpdir).glob("audio.*"))
+                if not candidates:
+                    result.errors.append("audio not downloaded (the length check rejected it)")
                 if candidates:
                     from genesis.channels.stt import transcribe
                     return await transcribe(candidates[0].read_bytes())
@@ -363,10 +410,15 @@ class YouTubeProcessor:
     def _parse_vtt(vtt_text: str) -> str:
         """Extract plain text from WebVTT subtitle format."""
         lines: list[str] = []
+        in_header = True  # header lines (WEBVTT, Kind:, Language:) precede the first cue
         for line in vtt_text.split("\n"):
             line = line.strip()
-            # Skip timing lines, headers, empty lines
-            if not line or "-->" in line or line.startswith(("WEBVTT", "Kind:", "Language:")):
+            if "-->" in line:
+                in_header = False
+                continue
+            # Skip empty lines, and anything in the header block: a caption
+            # that says "Language: ..." is speech, not a header.
+            if not line or in_header:
                 continue
             # Skip numeric cue identifiers
             if line.isdigit():

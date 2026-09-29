@@ -276,7 +276,7 @@ async def test_process_keeps_its_contract_and_raises_without_a_transcript(monkey
     monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
     monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
 
-    async def no_audio(self, result, url):
+    async def no_audio(self, result, url, **kw):
         return None
 
     monkeypatch.setattr(YouTubeProcessor, "_transcribe_audio", no_audio)
@@ -385,6 +385,31 @@ async def test_multi_url_routes_youtube_entries_and_batches_the_rest(web):
     assert backends[0] == "yt-dlp" and out["results"][1]["url"] == "https://example.com/a"
 
 
+async def test_a_batch_without_youtube_keeps_the_batch_backend(web):
+    tool, calls, set_fetch = web
+    set_fetch("t")
+    out = await tool(urls=["https://example.com/a", "https://example.com/b"])
+    assert out["backend_used"] == "tinyfish" and calls["page"] == []
+
+
+async def test_a_small_budget_keeps_the_transcript_before_the_description(web, monkeypatch):
+    """#2568 review (Devin): a long description consumed the whole budget, so a
+    fetched transcript never reached the caller."""
+    from genesis.mcp.health import youtube_route
+
+    tool, calls, set_fetch = web
+
+    async def fetch(self, url, *, audio_fallback=True):
+        return YouTubeFetch(url=url, metadata={"title": "V", "description": "D" * 5000},
+                            transcript="the actual speech",
+                            caption={"key": "en", "language": "en", "kind": "manual",
+                                     "provenance": "original"})
+
+    monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", fetch)
+    out = await tool(url="https://youtu.be/abc123", max_chars=300)
+    assert "the actual speech" in out["content"]
+
+
 async def test_the_transcript_is_clipped_to_max_chars(web):
     tool, calls, set_fetch = web
     set_fetch("word " * 1000)
@@ -429,23 +454,60 @@ def test_a_caption_key_that_could_leave_the_temp_dir_is_never_chosen():
     assert select_caption(info)["key"] == "en-orig"
 
 
-async def test_a_mixed_batch_names_every_url_when_the_batch_backend_is_down(web, monkeypatch):
-    """Correctness review: with TinyFish unavailable, the non-YouTube URLs of a
-    mixed batch vanished from results."""
+async def test_a_mixed_batch_fetches_each_url_on_its_own(web, monkeypatch):
+    """#2568 review (Devin): matching batch results to URLs by position misfiled
+    a page when the batch backend omitted one. A batch holding a YouTube link
+    now fetches every URL on its own, so each result belongs to its URL."""
     from genesis.mcp.health import web_tools
 
     tool, calls, set_fetch = web
     set_fetch("t")
 
-    async def down(urls, max_chars=50000):
-        return {"error": "Multi-URL fetch requires API_KEY_TINYFISH"}
+    async def never(urls, max_chars=50000):
+        raise AssertionError("a mixed batch must not go through the positional batch path")
 
-    monkeypatch.setattr(web_tools, "_impl_web_fetch_multi", down)
+    monkeypatch.setattr(web_tools, "_impl_web_fetch_multi", never)
     out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123", "https://example.com/b"])
     assert [r["url"] for r in out["results"]] == [
         "https://example.com/a", "https://youtu.be/abc123", "https://example.com/b"]
-    assert "API_KEY_TINYFISH" in out["results"][0]["error"]
     assert out["results"][1]["backend_used"] == "yt-dlp"
+    assert sorted(calls["page"]) == ["https://example.com/a", "https://example.com/b"]
+
+
+async def test_one_failing_url_does_not_sink_the_batch(web, monkeypatch):
+    from genesis.mcp.health import web_tools
+
+    tool, calls, set_fetch = web
+    set_fetch("t")
+
+    async def boom(url, backend="auto", max_chars=50000):
+        raise RuntimeError("backend exploded")
+
+    monkeypatch.setattr(web_tools, "_impl_web_fetch", boom)
+    out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123"])
+    assert "backend exploded" in out["results"][0]["error"]
+    assert out["results"][1]["backend_used"] == "yt-dlp"
+
+
+async def test_batch_fetches_run_concurrently(web, monkeypatch):
+    """#2568 review (Devin): one slow video held up every other link."""
+    from genesis.mcp.health import youtube_route
+
+    tool, calls, set_fetch = web
+    active = {"now": 0, "peak": 0}
+
+    async def slow(self, url, *, audio_fallback=True):
+        active["now"] += 1
+        active["peak"] = max(active["peak"], active["now"])
+        await asyncio.sleep(0.05)
+        active["now"] -= 1
+        return YouTubeFetch(url=url, metadata={"title": "V"}, transcript="t",
+                            caption={"key": "en", "language": "en", "kind": "manual",
+                                     "provenance": "original"})
+
+    monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", slow)
+    await tool(urls=["https://youtu.be/a1", "https://youtu.be/b2", "https://youtu.be/c3"])
+    assert active["peak"] == 3
 
 
 async def test_multi_url_results_keep_the_callers_order(web):
@@ -473,7 +535,7 @@ async def test_the_audio_fallback_runs_only_within_the_duration_cap(
     monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
     called = []
 
-    async def audio(self, result, url):
+    async def audio(self, result, url, **kw):
         called.append(url)
         return "spoken words"
 
@@ -497,3 +559,68 @@ def test_settings_validator_checks_audio_max_minutes():
     assert _validate_youtube_fetch({"audio_max_minutes": 60}) == []
     assert _validate_youtube_fetch({"audio_max_minutes": -5})
     assert _validate_youtube_fetch({"audio_max_minutes": True})
+
+
+
+# ─── #2568 round 1: the audio bound, caption hosts, the VTT header ──────────
+
+
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [({"duration": 0}, "unknown length"), ({"duration": 60, "is_live": True}, "live"),
+     ({"duration": 60, "live_status": "is_upcoming"}, "live"),
+     ({"duration": 60, "live_status": "post_live"}, "live"), ({"duration": True}, "unknown length")],
+)
+async def test_the_audio_fallback_never_runs_for_an_unbounded_stream(monkeypatch, tmp_path, extra, reason):
+    """#2568 review (Devin + CodeRabbit): a zero duration, or a live stream,
+    passed the length cap."""
+    monkeypatch.setattr(yt, "_exec", _fake_ytdlp({"title": "T", **extra}, None))
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "audio_max_minutes", lambda: 120)
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+
+    async def audio(self, result, url, **kw):
+        raise AssertionError("audio must not be downloaded")
+
+    monkeypatch.setattr(YouTubeProcessor, "_transcribe_audio", audio)
+    result = await YouTubeProcessor().fetch("https://youtu.be/abc123")
+    assert any(reason in e for e in result.errors), result.errors
+
+
+async def test_the_audio_download_repeats_the_length_check_in_yt_dlp(monkeypatch, tmp_path):
+    seen = []
+
+    async def run(argv):
+        seen.append(argv)
+        return 0, b"", b""
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    result = YouTubeFetch(url="https://youtu.be/abc123")
+    assert await YouTubeProcessor()._transcribe_audio(result, result.url, max_seconds=600) is None
+    argv = seen[0]
+    assert argv[argv.index("--match-filters") + 1] == "!is_live & duration > 0 & duration <= 600"
+    assert any("not downloaded" in e for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed"),
+    [("https://www.youtube.com/api/timedtext?v=x&lang=en", True),
+     ("https://rr1---sn-abc.googlevideo.com/x", True),
+     ("https://evil.example/timedtext", False),
+     ("http://www.youtube.com/api/timedtext", False),
+     ("https://youtube.com.evil.example/x", False)],
+)
+def test_a_caption_track_is_used_only_from_youtube_hosts(url, allowed):
+    """#2568 review (Devin): caption URLs come from metadata, and the caption
+    download follows them as given."""
+    info = {"language": "en", "subtitles": {"en": [{"ext": "vtt", "url": url}]}}
+    assert (select_caption(info) is not None) is allowed
+
+
+def test_speech_that_starts_with_language_is_kept():
+    """#2568 review (Devin): the header rule dropped a spoken line."""
+    vtt = ("WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:02.000\n"
+           "Language: Python is the topic\n\n00:00:02.000 --> 00:00:04.000\nKind: of great\n")
+    assert YouTubeProcessor._parse_vtt(vtt) == "Language: Python is the topic Kind: of great"
