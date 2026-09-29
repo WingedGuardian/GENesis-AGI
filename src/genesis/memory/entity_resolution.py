@@ -169,7 +169,7 @@ def surface_variants(
     content: str,
     aliases: dict[str, str] | None = None,
     *,
-    limit: int = 16,
+    limit: int = 64,
 ) -> list[str]:
     r"""Return the raw spellings *content* could have been stored under.
 
@@ -201,8 +201,11 @@ def surface_variants(
     casefolded check accepted them, and with a short canonical that merges
     unrelated rows (``"US"`` makes ``"Talk to USA tomorrow"`` a variant of
     ``"Talk to us tomorrow"``).
-    Capped at *limit*; best-effort like ``normalize_content`` — ``[]`` on any
-    failure.
+    Capped at *limit* (each result costs one indexed equality lookup in the
+    dedup path); variants are emitted with fewest substitutions first — every
+    single-substitution form precedes any pair, and so on — so the cap cuts
+    the least plausible spellings first. Best-effort like
+    ``normalize_content`` — ``[]`` on any failure.
     """
     if aliases is None:
         aliases = load_aliases()
@@ -210,7 +213,7 @@ def surface_variants(
         return []
 
     import re
-    from itertools import islice, product
+    from itertools import combinations, islice, product
 
     def _bounded(term: str) -> re.Pattern:
         return re.compile(
@@ -278,31 +281,41 @@ def surface_variants(
     # {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}) cannot be
     # reduced to one kept set: a legacy row can substitute disjoint dropped
     # spans together ("A Beta G") or a shorter span inside a longer one
-    # ("X Code"). Enumerate every mutually-disjoint subset of matching spans
-    # by include/exclude backtracking — bounded by _SET_BUDGET, correctness
-    # by _emit's normalize_content check.
+    # ("X Code"). Enumerate mutually-disjoint subsets of matching spans by
+    # ASCENDING SIZE: a mixed legacy row differs from the canonical form at a
+    # few slots, so the sets most likely to exist — one or two substitutions
+    # anywhere in the text — must be enumerated before any large set. An
+    # exclude-first DFS starves exactly those: with enough occurrences its
+    # first _SET_BUDGET sets all omit the earliest slot, so a stored "CC /
+    # claude-code / Claude Code / …" is never tried. Bounded by _SET_BUDGET
+    # sets and _SCAN_BUDGET combo inspections (overlapping spans can make
+    # most combinations non-disjoint), correctness by _emit's
+    # normalize_content check.
     span_slots = [p for p in positions if spellings.get(p[2])]
     span_slots.sort(key=lambda p: (p[0], p[1]))
     sets_enumerated = 0
-
-    # Iterative DFS — a memory can carry ~1000 canonical occurrences, past
-    # Python's recursion limit. Stack entries are (index, covered_end,
-    # chosen-spans); include is pushed first so the exclude branch is popped
-    # and fully explored before it, matching exclude-before-include order.
-    stack: list[tuple[int, int, tuple[tuple[int, int, str], ...]]] = [(0, -1, ())]
-    while (
-        stack and sets_enumerated < _SET_BUDGET and len(results) < limit
-    ):
-        i, covered_end, chosen = stack.pop()
-        if i == len(span_slots):
-            if chosen:
+    _SCAN_BUDGET = 8192
+    scans = 0
+    for size in range(1, len(span_slots) + 1):
+        if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
+            break
+        for combo in combinations(span_slots, size):
+            scans += 1
+            if scans > _SCAN_BUDGET:
+                break
+            covered_end = -1
+            for start, end, _c in combo:
+                if start < covered_end:
+                    break
+                covered_end = end
+            else:
                 sets_enumerated += 1
-                _enumerate(list(chosen))
+                _enumerate(list(combo))
+            if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
+                break
+        else:
             continue
-        start, end, canonical = span_slots[i]
-        if start >= covered_end:
-            stack.append((i + 1, end, chosen + ((start, end, canonical),)))
-        stack.append((i + 1, covered_end, chosen))
+        break
 
     return results
 

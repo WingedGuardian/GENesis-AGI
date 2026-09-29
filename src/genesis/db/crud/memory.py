@@ -117,6 +117,16 @@ async def find_exact_duplicate(
     A row missing its metadata is treated as VISIBLE, which keeps the dedup
     working on legacy rows rather than letting a metadata gap mint duplicates.
 
+    A fourth exclusion is structural, not recall's: a row with an OPEN delete
+    intent in ``deferred_work_queue`` (a ``memory_deferred_delete`` tombstone,
+    pending or processing) is already doomed — the reconcile lane will remove
+    it when the dependency recovers. Returning it as the duplicate hands the
+    caller a name that is about to stop existing: the new store is suppressed,
+    then the delete retry removes the only copy. Such rows cannot satisfy the
+    duplicate check. The identity mirrors
+    ``delete_tombstones.has_open_tombstone`` — topic = memory_id,
+    category = 'memory_delete', signal_type NULL (written without one).
+
     *source_subsystem* scopes the candidate pool to the write's own recall
     scope. A foreground write (``None``) dedups only against user-visible
     rows. An automated write dedups only against rows its OWN subsystem wrote
@@ -151,6 +161,17 @@ async def find_exact_duplicate(
         + scope_clause
         + "AND (m.deprecated IS NULL OR m.deprecated = 0) "
         "AND (m.invalid_at IS NULL OR m.invalid_at > ?) "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM deferred_work_queue d "
+        "WHERE d.work_type = 'memory_deferred_delete' "
+        "AND d.status IN ('pending', 'processing') "
+        "AND (CASE WHEN json_valid(d.payload_json) "
+        "THEN json_extract(d.payload_json, '$.topic') END) = f.memory_id "
+        "AND COALESCE(CASE WHEN json_valid(d.payload_json) "
+        "THEN json_extract(d.payload_json, '$.category') END, '') "
+        "= 'memory_delete' "
+        "AND COALESCE(CASE WHEN json_valid(d.payload_json) "
+        "THEN json_extract(d.payload_json, '$.signal_type') END, '') = '') "
         "LIMIT 200",
         params,
     )

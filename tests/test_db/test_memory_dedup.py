@@ -202,3 +202,87 @@ async def test_a_subsystem_write_ignores_user_rows(db):
     assert await memory.find_exact_duplicate(
         db, content="the gate blocks on P1", source_subsystem="reflection",
     ) is None
+
+
+# ── Delete intent: a row queued for deletion cannot be the "duplicate" ─────
+#
+# A deferred delete keeps the FTS row and metadata until the reconcile lane
+# retries it. If dedup names that row, the caller suppresses the new store and
+# returns an id that is about to stop existing — the retry then removes the
+# only copy. The exclusion keys on the same identity `has_open_tombstone`
+# checks: (topic=memory_id, category='memory_delete', signal_type NULL),
+# status pending/processing.
+
+
+async def _tombstone(db, memory_id, status="pending"):
+    """Insert a deferred-delete tombstone row for *memory_id*."""
+    import json
+
+    await db.execute(
+        "INSERT INTO deferred_work_queue "
+        "(id, work_type, priority, payload_json, deferred_at, "
+        " deferred_reason, staleness_policy, status, created_at) "
+        "VALUES (?, 'memory_deferred_delete', 0, ?, "
+        " '2026-09-06T00:00:00+00:00', 'qdrant down', 'drain', ?, "
+        " '2026-09-06T00:00:00+00:00')",
+        (
+            f"ts-{memory_id}-{status}",
+            json.dumps(
+                {
+                    "topic": memory_id,
+                    "category": "memory_delete",
+                    "signal_type": None,
+                    "memory_id": memory_id,
+                }
+            ),
+            status,
+        ),
+    )
+    await db.commit()
+
+
+async def test_a_row_with_an_open_tombstone_is_not_a_duplicate(db):
+    """Pending delete intent: the row is doomed, not a duplicate."""
+    await memory.create(db, memory_id="doomed-1", content="the gate blocks on P1")
+    await _tombstone(db, "doomed-1", status="pending")
+
+    assert (
+        await memory.find_exact_duplicate(db, content="the gate blocks on P1")
+        is None
+    )
+
+
+async def test_a_processing_tombstone_is_also_open(db):
+    """'processing' is still open — the drain worker owns it but has not
+    finished, so the row is still doomed."""
+    await memory.create(db, memory_id="doomed-2", content="the gate blocks on P1")
+    await _tombstone(db, "doomed-2", status="processing")
+
+    assert (
+        await memory.find_exact_duplicate(db, content="the gate blocks on P1")
+        is None
+    )
+
+
+async def test_a_completed_tombstone_does_not_hide_the_row(db):
+    """Control: a closed intent means the delete already resolved — if the
+    row is still indexed it is live, so it must still suppress."""
+    await memory.create(db, memory_id="lives-1", content="the gate blocks on P1")
+    await _tombstone(db, "lives-1", status="completed")
+
+    assert (
+        await memory.find_exact_duplicate(db, content="the gate blocks on P1")
+        == "lives-1"
+    )
+
+
+async def test_another_memory_tombstone_does_not_hide_the_row(db):
+    """Control for the identity join: only THIS row's tombstone excludes it."""
+    await memory.create(db, memory_id="other-1", content="unrelated row")
+    await memory.create(db, memory_id="lives-2", content="the gate blocks on P1")
+    await _tombstone(db, "other-1")
+
+    assert (
+        await memory.find_exact_duplicate(db, content="the gate blocks on P1")
+        == "lives-2"
+    )

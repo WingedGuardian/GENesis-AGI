@@ -122,6 +122,24 @@ def test_normalize_content_converges_chained_aliases():
     assert normalize_content("x", {"x": "y", "y": "x"}) == "x"
 
 
+def test_surface_variants_finds_small_mixed_sets_at_any_position():
+    """A mixed legacy row differs at a FEW slots; those subsets are enumerated
+    before any large one, so a substitution at the earliest slot is never
+    priced out by trailing-span subsets. Exclude-first DFS ordering spent its
+    whole set budget omitting the early slots once the count passed ~7."""
+    aliases = {"CC": "Claude Code", "claude-code": "Claude Code"}
+    content = " / ".join(["Claude Code"] * 7)
+    variants = surface_variants(content, aliases)
+    # Substitutions at the first two slots — the exact shape the DFS starved.
+    assert (
+        "CC / claude-code / " + " / ".join(["Claude Code"] * 5)
+    ) in variants
+    # And a lone substitution at the first slot.
+    assert (
+        "CC / " + " / ".join(["Claude Code"] * 6)
+    ) in variants
+
+
 def test_surface_variants_repeated_canonicals_keep_homogeneous_forms():
     """Three occurrences x two aliases exceeds a naive budget; the all-alias
     forms are emitted before mixed enumeration so they are never priced out.
