@@ -335,3 +335,27 @@ class TestSnapshotRollbackRetry:
         assert ok is False
         snapshots.delete.assert_not_called()
         assert snapshots.restore.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_rollback_retry_follows_listing_order_not_names(config, sm, dispatcher) -> None:
+    """Review: 'newer' is what the manager lists BEFORE the healthy snapshot
+    (created-at order), never a lexical name comparison. A pre-recovery
+    snapshot created after the healthy one but carrying an earlier-looking
+    name must still be removed; an older one with a later-looking name must
+    not be."""
+    from unittest.mock import MagicMock
+
+    healthy = "guardian-20260701-000000-healthy"
+    newer_by_time = "guardian-20260601-000000-pre-recovery"
+    older_by_time = "guardian-20260801-000000-pre-recovery"
+    snapshots = MagicMock()
+    snapshots.get_latest_healthy = AsyncMock(return_value=healthy)
+    snapshots.restore = AsyncMock(side_effect=[False, True])
+    snapshots.list_snapshots = AsyncMock(return_value=[newer_by_time, healthy, older_by_time])
+    snapshots.delete = AsyncMock(return_value=True)
+
+    engine = RecoveryEngine(config, sm, snapshots, dispatcher)
+    ok, _ = await engine._snapshot_rollback()
+    assert ok is True
+    snapshots.delete.assert_called_once_with(newer_by_time)

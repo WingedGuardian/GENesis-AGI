@@ -54,8 +54,12 @@ async def emit_recall_fired(
     entrenchment_corr: float | None = None,
     mean_retrieved_count: float | None = None,
     mean_age_days: float | None = None,
+    trace_id: str | None = None,
 ) -> str | None:
     """Log a memory recall() invocation as an eval event.
+
+    ``trace_id`` joins this event to its ``recall_trace`` row (whose
+    ``eval_events.id`` it is) — set only on the proactive endpoint path.
 
     Returns the event id so callers can link diagnostics events.
 
@@ -90,6 +94,8 @@ async def emit_recall_fired(
             metrics["mean_retrieved_count"] = mean_retrieved_count
         if mean_age_days is not None:
             metrics["mean_age_days"] = mean_age_days
+        if trace_id:
+            metrics["trace_id"] = trace_id
         return await j9_eval.insert_event(
             db,
             dimension="memory",

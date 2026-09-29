@@ -1035,6 +1035,30 @@ done
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
 echo ""
 
+# Restart the tmp watchgod when its code on disk is newer than the running
+# daemon. A long-running bash loop never re-reads its script, so a tree updated
+# any other way (a hand pull, or an update run with nothing to merge) left it
+# on old code until a reboot — MEASURED on a live install, a daemon still
+# running code from before a watchgod fix that merged a day earlier.
+# try-restart never starts a unit that is not running.
+_restart_tmp_watchgod_if_stale() {
+    local since_s newest f m
+    systemctl --user is-active --quiet genesis-tmp-watchgod.service 2>/dev/null || return 0
+    since_s="$(systemctl --user show -p ActiveEnterTimestamp --value genesis-tmp-watchgod.service 2>/dev/null)" || return 0
+    since_s="$(date -d "$since_s" +%s 2>/dev/null)" || return 0
+    newest=0
+    for f in "$SCRIPT_DIR/tmp_watchgod.sh" "$SCRIPT_DIR"/lib/*.sh; do
+        m="$(stat -c %Y -- "$f" 2>/dev/null)" || continue
+        if (( m > newest )); then newest=$m; fi
+    done
+    if (( newest > since_s )); then
+        systemctl --user try-restart genesis-tmp-watchgod.service 2>/dev/null \
+            && echo "  Restarted genesis-tmp-watchgod (its code changed since it started)" \
+            || echo "  WARNING: could not restart genesis-tmp-watchgod — it keeps running its previous code"
+    fi
+    return 0
+}
+
 # ── update_history helper ────────────────────────────────
 # Records an entry in update_history. Silently no-ops if the table
 # doesn't exist yet (first update before migration 0001 has run).
@@ -1586,6 +1610,7 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
         echo "  NOTE: recording degraded subsystem: ${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
         _record_update_history "success" "" "$HOST_CC_DEGRADED"
     fi
+    _restart_tmp_watchgod_if_stale
     echo ""
     echo "  Nothing to do."
     exit 0
@@ -2203,6 +2228,13 @@ fi
 
 # ── Success: disarm trap ──────────────────────────────────
 trap - ERR INT TERM
+
+# The tmp watchgod never re-reads its script (see _restart_tmp_watchgod_if_stale);
+# restart it when this update changed its code — only then, since a restart
+# re-arms its OOM baseline. Placed AFTER the success disarm: a rolled-back
+# deploy must not leave it running the new code.
+systemctl --user daemon-reload 2>/dev/null || true
+_restart_tmp_watchgod_if_stale
 
 # Resume the Guardian now — BEFORE the multi-minute host-sync below — not just on
 # EXIT, else it stays stood-down through the whole guardian/CC/Node sync (server

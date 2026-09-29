@@ -1328,7 +1328,8 @@ class CCInvoker:
         # prompts safely.
         return args
 
-    # CC's Bash sandbox root — persistent disk, managed by tmp_watchgod.
+    # CC's Bash sandbox root — persistent disk; tmp_watchgod sweeps what ended
+    # sessions leave behind.
     _CC_SANDBOX_TMPDIR = Path.home() / ".genesis" / "cc-tmp"
 
     def _build_env(self, inv: CCInvocation | None = None) -> dict[str, str]:
@@ -1433,8 +1434,8 @@ class CCInvoker:
         # failures break the Bash tool for entire sessions.
         # A per-invocation override isolates blast radius: e.g. the model-roster
         # gauntlet points its throwaway CC sessions at a separate sandbox so a
-        # fixture that fills it can't trip genesis-tmp-watchgod into SIGKILLing a
-        # LIVE foreground/background session sharing the default cc-tmp.
+        # fixture that fills it can't exhaust the quota-capped default cc-tmp that
+        # every LIVE foreground/background session's temp shares.
         env["CLAUDE_CODE_TMPDIR"] = str(
             (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
             or self._CC_SANDBOX_TMPDIR
@@ -1444,7 +1445,7 @@ class CCInvoker:
         # sandbox isolation above: without it a headless session's *subprocess*
         # temp (e.g. the gauntlet agent running the fixture's pytest, whose
         # tmp_path defaults under $TMPDIR) still lands in the inherited cc-tmp and
-        # can trip genesis-tmp-watchgod. For the default sandbox both resolve to
+        # can fill the shared volume. For the default sandbox both resolve to
         # cc-tmp (unchanged); for an override (gauntlet) TMPDIR follows it off
         # cc-tmp.
         env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]

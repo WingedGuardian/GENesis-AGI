@@ -96,15 +96,13 @@ def _write_result_artifact(session_id: str, raw: str) -> str | None:
 # Per-session CC Bash-sandbox isolation (background dispatch sessions)
 # ---------------------------------------------------------------------------
 # By default a background session's CC Bash sandbox (CLAUDE_CODE_TMPDIR) lives in
-# the shared, watchgod-policed ~/.genesis/cc-tmp. Giving each session its OWN
-# sandbox under ~/tmp (OFF cc-tmp) means (a) its scratch can't be clipped by
-# tmp_watchgod's RED nuclear-cleanup mid-run, and (b) it stops contributing to
-# cc-tmp pressure that could trip cleanup of foreground CLI sessions. Mirrors the
+# the shared, quota-capped ~/.genesis/cc-tmp. Giving each session its OWN
+# sandbox under ~/tmp (OFF cc-tmp) means its scratch cannot fill the volume
+# every foreground CLI session's temp shares. (v1 of tmp_watchgod also deleted
+# from cc-tmp under a budget; v2 only sweeps what ended sessions left.) Mirrors the
 # gauntlet (eval/gauntlet.py). This overrides CLAUDE_CODE_TMPDIR — the CC-specific
 # per-invocation sandbox var — NOT the shell TMPDIR, which the `tmp_filesystem_limit`
-# procedure correctly says never to override globally. (It does NOT prevent a
-# "kill": background sessions are asyncio subprocesses, not tmux sessions, so
-# watchgod's tmux-kill can't reach them anyway — do not claim otherwise.)
+# procedure correctly says never to override globally.
 _BG_CC_TMP_ROOT = Path.home() / "tmp" / "bg-cc-sessions"
 
 
