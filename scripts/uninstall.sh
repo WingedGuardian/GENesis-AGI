@@ -56,6 +56,20 @@ CONTAINER_NAME="genesis"
 GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
 genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
 genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
+# The ROOT timers scripts/lib/network_resilience.sh installs under
+# /etc/systemd/system, with their scripts and /run files. Both removal paths
+# (direct and via incus) run this one command, so they cannot drift apart. The
+# Tailscale watchdog restarts tailscaled, dropping every SSH session, so it must
+# not outlive Genesis. KeepConfiguration drop-ins are deliberately left: they
+# shape how the network behaves, and removing one needs a networkd restart.
+GENESIS_ROOT_WATCHDOG_REMOVE='for u in genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service \
+genesis-network-watchdog.timer genesis-network-watchdog.service; do sudo -n systemctl disable --now "$u" 2>/dev/null || true; done; \
+sudo -n rm -f /etc/systemd/system/genesis-tailscale-watchdog.service /etc/systemd/system/genesis-tailscale-watchdog.timer \
+/etc/systemd/system/genesis-network-watchdog.service /etc/systemd/system/genesis-network-watchdog.timer \
+/usr/local/lib/genesis/tailscale-watchdog.py /usr/local/lib/genesis/network-watchdog.sh \
+/run/genesis-tailscale-watchdog.json /run/genesis-tailscale-watchdog-status.json \
+/run/genesis-network-watchdog.json /run/genesis-network-watchdog.last 2>/dev/null || true; \
+sudo -n systemctl daemon-reload 2>/dev/null || true'
 CONTAINER_USER="ubuntu"
 IN_CONTAINER=false
 
@@ -338,6 +352,7 @@ fi
 if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
     echo "    Genesis (container-side):"
     echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, qdrant"
+    echo "      - Root timers: genesis-network-watchdog, genesis-tailscale-watchdog"
     echo "      - Repository: ~/genesis/"
     echo "      - Runtime state: ~/.genesis/"
     echo "      - Database: ~/data/"
@@ -480,6 +495,15 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
         fi
 
+        # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
+        if [ "$DRY_RUN" = true ]; then
+            echo "    [DRY RUN] Would disable and remove the root network and Tailscale watchdog timers"
+        else
+            bash -c "$GENESIS_ROOT_WATCHDOG_REMOVE"
+            ok "Removed root network and Tailscale watchdog timers"
+        fi
+        REMOVED+=("root watchdog timers")
+
         # Wait for genesis-server port to close
         for _i in $(seq 1 10); do
             if ! ss -tlnp 2>/dev/null | grep -q ':5000 '; then break; fi
@@ -562,6 +586,11 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
+
+            # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
+            container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE"
+            ok "Removed root network and Tailscale watchdog timers"
+            REMOVED+=("root watchdog timers")
 
             # Persistent= timers keep a stamp file under
             # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it

@@ -2888,7 +2888,11 @@ verified: f24c15e9 2026-09-05
   the default-route link `AdministrativeState=configured`, so the posture check
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
-  docs/reference/network-resilience.md).
+  docs/reference/network-resilience.md). The root Tailscale watchdog
+  (`genesis-tailscale-watchdog.timer`) is reported by enablement only
+  (`tailscale_watchdog_enabled`); its `/run` file is event data for the
+  awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
+  the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

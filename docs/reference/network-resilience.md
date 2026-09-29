@@ -1,4 +1,4 @@
-# Network Resilience — KeepConfiguration + a self-healing networkd watchdog
+# Network Resilience — KeepConfiguration, a self-healing networkd watchdog, and a Tailscale tunnel watchdog
 
 ## The invariant
 
@@ -70,6 +70,85 @@ flap-restarting). The healthy path exits silently — no per-tick journal spam.
 Graceful degradation: no systemd, no `networkctl`, systemd-networkd not the
 active manager (NetworkManager hosts), or no non-interactive sudo each produce
 a one-line skip note and never a failure.
+
+**Layer 3 — a stuck Tailscale tunnel heals itself.**
+`genesis-tailscale-watchdog.timer` runs `/usr/local/lib/genesis/tailscale-watchdog.py`
+as root every ~2 minutes, under the host's `/usr/bin/python3` (standard
+library only). It is its own unit, not part of the networkd watchdog, so it
+installs on any systemd host that has a `tailscaled` unit, whatever manages the
+network.
+
+The failure it targets: every Tailscale SSH session to the box times out while
+nothing else looks wrong. The path to the peer works (discovery pings answer),
+but WireGuard handshakes stop completing, because the peer keeps replying
+through a relay region this node has left. Restarting `tailscaled` on this node
+clears it. A peer counts as stuck only when ALL of these hold:
+
+1. it is `Active` with a handshake older than `NETWD_TS_STALE_SEC` (300s). A
+   handshake dated in the future means the wall clock stepped back, and a peer
+   that has never completed one counts once tailscaled has been up longer than
+   the stale age (after a restart that did not clear the fault, that is the
+   only form it takes); both are probed rather than skipped;
+2. `tailscale ping --tsmp` (through the tunnel) gets no reply;
+3. `tailscale ping --until-direct=false` (discovery; a relayed pong counts)
+   replies, so the peer is reachable and only the tunnel is dead; and
+4. a second `--tsmp` ping still gets no reply (a discovery ping can revive a
+   cold path).
+
+The heal is `systemctl try-restart tailscaled`, which drops every Tailscale SSH
+session on the box, so it runs at most once per `NETWD_TS_RATE_LIMIT_SEC` (an
+hour), measured on the monotonic clock from the later of tailscaled's own start
+and the watchdog's last event. What the restart did is read back from systemd,
+never from the command's exit code:
+
+| systemd afterwards | Recorded as |
+|---|---|
+| InvocationID unreadable before the restart | nothing is restarted: an outcome it could not judge is not worth the dropped sessions |
+| new InvocationID, unit active, the stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s) | `healed` |
+| new InvocationID, unit active, the peer still gets no reply | `restart-no-effect` |
+| new InvocationID, unit not active | `restart-failed` |
+| same InvocationID, try-restart failed | `not-restarted` |
+| same InvocationID, try-restart exited 0 (tailscaled was stopped) | nothing; no hour spent |
+| a restart job still queued after the poll | `pending` |
+| InvocationID unreadable | `unverified` |
+
+Every run rewrites `/run/genesis-tailscale-watchdog.json` (0644): the run's
+state and the last 50 events. A peer is named by its IPv4 address only; its
+hostname, which another tailnet member chooses, is never read. At detection the
+raw status is also kept as a root-only snapshot,
+`/run/genesis-tailscale-watchdog-status.json` (0600).
+
+The owner hears about it through the Genesis runtime: the awareness tick
+(`genesis.resilience.tailscale_watchdog_events`) turns each event into an
+`infrastructure_alert` observation.
+
+- `healed` is `high` (dashboard and morning report).
+- Every other outcome, and `observed` in observe mode, is `critical`, and the
+  critical-observations job pages it.
+- One stuck tunnel pages once. An event is identified by the boot, the peer and
+  that peer's handshake time, which does not move while the tunnel stays stuck,
+  and a resolved alert never pages the same incident again.
+- When a later run finds tailscaled active and every tunnel answering, open
+  critical alerts from the watchdog resolve themselves.
+- If the timer is enabled but the file has not been rewritten for 10 minutes, a
+  `high` alert says the watchdog has gone silent; if it reports but has checked
+  no tunnel for three runs in a row (tailscaled down, the CLI failing, a status
+  it cannot parse), a `high` alert says it is blind. Its own failures reach no
+  one otherwise: the owning user cannot read the system journal.
+- The infra profile records `tailscaled_loaded` and the timer's unit-file state,
+  and the protection-posture check flags `tailscale_watchdog_absent` where
+  tailscaled is installed and the timer is neither enabled nor masked.
+- An `observed` event spends the hour like a restart does, so switching from
+  observe to live does not restart for up to an hour after the last
+  observation.
+
+Levers, in a drop-in on `genesis-tailscale-watchdog.service`:
+`NETWD_TS_MODE=live|observe|off` (an unknown value means observe), and the
+`NETWD_TS_*` bounds, each an integer checked against its own range and replaced
+by its default, with a journal line, when out of range. To turn it off
+durably, `sudo systemctl mask genesis-tailscale-watchdog.timer`: the installer
+respects a mask, and otherwise re-enables a disabled timer, as it does for the
+networkd watchdog. `scripts/uninstall.sh` removes both root timers.
 
 ## How the body schema surfaces it
 

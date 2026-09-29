@@ -41,6 +41,27 @@ _T=genesis-network-watchdog.timer
 _TU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/$_T"
 _masked() { [ -L "$_TU" ]; }                   # persistent mask: /etc unit path is a /dev/null symlink
 _rmasked() { [ -f "$_b.timermaskruntime" ]; }  # runtime mask (`mask --runtime`): /run shadow, modeled as a flag
+# The Tailscale watchdog timer is a second, independent stateful unit
+# (.tstimer{started,enabled}; a persistent mask is its /dev/null symlink). The
+# `cat tailscaled.service` probe is silent; TAILSCALED_CAT_RC=0 models a host
+# with tailscaled, and the default (1) a host without it.
+_TS=genesis-tailscale-watchdog.timer
+_TSU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/$_TS"
+if [ "$1" = "cat" ]; then exit "${TAILSCALED_CAT_RC:-1}"; fi
+if [ "$2" = "$_TS" ]; then
+    case "$1" in
+        is-active) { [ -L "$_TSU" ] || [ ! -f "$_b.tstimerstarted" ]; } && exit 3 || exit 0 ;;
+        is-enabled)
+            [ -L "$_TSU" ] && { printf 'masked'; exit 1; }
+            [ -f "$_b.tstimerenabled" ] && { printf 'enabled'; exit 0; }
+            printf 'disabled'; exit 1 ;;
+        enable|start)
+            echo "$@" >> "$SYSTEMCTL_LOG"
+            [ -L "$_TSU" ] && exit 1
+            [ "$1" = enable ] && : > "$_b.tstimerenabled" || : > "$_b.tstimerstarted"
+            exit 0 ;;
+    esac
+fi
 if [ "$1" = "is-active" ]; then
     if [ "$2" = "$_T" ]; then
         [ -n "${WATCHDOG_TIMER_ACTIVE_RC:-}" ] && exit "$WATCHDOG_TIMER_ACTIVE_RC"
@@ -579,3 +600,87 @@ def test_watchdog_state_file_is_world_readable(tmp_path):
     _run_wd(env)
     mode = Path(env["NETWD_STATE_FILE"]).stat().st_mode & 0o777
     assert mode & 0o044  # infra collector reads it non-root
+
+
+# ── Part C: the Tailscale watchdog installer ─────────────────────────────────
+
+TS_WATCHDOG = REPO_ROOT / "scripts" / "systemd" / "genesis-tailscale-watchdog.py"
+
+
+def _ts_paths(env: dict) -> dict[str, Path]:
+    etc = Path(env["NETRES_ETC_ROOT"]) / "systemd/system"
+    return {
+        "service": etc / "genesis-tailscale-watchdog.service",
+        "timer": etc / "genesis-tailscale-watchdog.timer",
+        "script": Path(env["NETRES_LIBEXEC_DIR"]) / "tailscale-watchdog.py",
+    }
+
+
+def test_tailscale_watchdog_installs_where_tailscaled_exists(tmp_path):
+    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0"}
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    p = _ts_paths(env)
+    assert p["script"].read_text() == TS_WATCHDOG.read_text()
+    service = p["service"].read_text()
+    assert "Type=oneshot" in service
+    # The host's Python, never the venv; and a bound on a hung run.
+    assert f"ExecStart=/usr/bin/python3 {p['script']}" in service
+    assert "TimeoutStartSec=45min" in service
+    assert "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in service
+    assert "OnUnitActiveSec=2min" in p["timer"].read_text()
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "enable genesis-tailscale-watchdog.timer" in calls
+    assert "start genesis-tailscale-watchdog.timer" in calls
+
+
+def test_tailscale_watchdog_rerun_is_churn_free(tmp_path):
+    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0"}
+    _run_apply(env)
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "already in place" in result.stdout
+    assert Path(env["SYSTEMCTL_LOG"]).read_text() == ""
+
+
+def test_tailscale_watchdog_skipped_without_tailscaled(tmp_path):
+    env = _stage(tmp_path)  # TAILSCALED_CAT_RC unset: no tailscaled unit
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "no tailscaled unit" in result.stdout
+    assert not any(p.exists() for p in _ts_paths(env).values())
+    assert "tailscale" not in Path(env["SYSTEMCTL_LOG"]).read_text()
+
+
+def test_tailscale_watchdog_installs_without_networkd(tmp_path):
+    """It does not depend on networkd: a host whose network manager is not
+    networkd still gets it, though the networkd parts are skipped."""
+    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0", "NETWORKD_ACTIVE_RC": "3", "NETWORKD_ENABLED": "disabled"}
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "not this host's network manager" in result.stdout
+    assert _ts_paths(env)["timer"].exists()
+    assert not _paths(env)["timer"].exists()
+
+
+def test_a_masked_tailscale_timer_is_the_operators_off_switch(tmp_path):
+    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0"}
+    p = _ts_paths(env)
+    p["timer"].parent.mkdir(parents=True)
+    p["timer"].symlink_to("/dev/null")
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "masked (operator off switch)" in result.stdout
+    assert p["timer"].is_symlink()  # never unmasked or rewritten
+    assert not p["script"].exists()
+    assert "tailscale" not in Path(env["SYSTEMCTL_LOG"]).read_text()
+
+
+def test_tailscale_watchdog_not_installed_without_a_usable_python(tmp_path):
+    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0", "NETRES_PYTHON": "/bin/false"}
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "needs /bin/false (3.8+)" in result.stdout
+    assert "NOT fully applied" in result.stdout
+    assert not _ts_paths(env)["script"].exists()
