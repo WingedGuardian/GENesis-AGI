@@ -592,6 +592,30 @@ def test_restore_does_not_clobber_a_live_foreign_deploy_marker(sandbox):
             marker.unlink()
 
 
+def test_restore_refuses_when_the_deploy_marker_cannot_be_written(sandbox):
+    """Without a readable marker the watchdog does not defer, so it could restart
+    the server in the middle of the rebuild. An unwritable marker is therefore a
+    refusal BEFORE anything stops, with the live database untouched. A directory
+    at the marker path makes the write fail for any uid, root included."""
+    marker = sandbox["home"] / ".genesis" / "update_in_progress.pid"
+    marker.mkdir(parents=True)
+    _write_systemctl(sandbox["bind"], sandbox["calls"])
+    _seed_live_db(sandbox["gd"])
+    proc = _run_restore(sandbox)
+    assert proc.returncode == 1, f"{proc.stdout}\n{proc.stderr}"
+    assert "cannot write" in proc.stdout.lower(), proc.stdout
+    assert "stop genesis-server" not in _calls(sandbox), "stopped the server without the marker"
+    assert (
+        subprocess.run(
+            ["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"), "SELECT x FROM t;"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "1"
+    ), "restore modified the DB without holding the marker"
+    assert marker.is_dir(), "the blocking directory must be left as found"
+
+
 # ── Pre-restore safety copy must be WAL-correct (a valid undo artifact) ──
 
 

@@ -37,7 +37,8 @@ was this docstring's own bug for a while:
     substring check. That is unchanged, pre-existing behaviour, and the word
     "conservative" applies only relative to the OLD guard being reinstated — it
     is strictly WEAKER than the parse it stands in for (see `_block`'s caller).
-  * A command past one of `shell_parse`'s BOUNDS is REFUSED outright and never
+  * A command past one of `shell_parse`'s BOUNDS — or continued with a trailing
+    backslash, which that module reports the same way — is REFUSED outright and never
     reaches that fallback, because the fallback is weakest exactly where the
     command is most destructive: it cannot see an ancestor of a protected
     directory, nor a glob over its contents. The bounds are a SECURITY limit,
@@ -92,7 +93,7 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
 _DEGRADED_GATED = r"\brm\b|\brmdir\b"
 
 try:
-    from shell_parse import _REPARSE_CARRIERS, analyze_checked  # noqa: E402
+    from shell_parse import _REPARSE_CARRIERS, analyze_checked, mentions  # noqa: E402
 except Exception as _exc:  # noqa: BLE001 — see degraded_exit: exit 1 is a FAIL-OPEN.
     if __name__ != "__main__":
         # A test importing a deliberately broken tree must see the real error, not a
@@ -231,13 +232,24 @@ def _protected_files() -> list[str]:
     return [os.path.join(home, rel) for rel in _PROTECTED_FILES_RELATIVE]
 
 
-def _block(reason: str) -> int:
+def _block(reason: str, *, target_known: bool = True) -> int:
     print(f"BLOCKED: {reason}.", file=sys.stderr)
-    print(
-        "This target holds irreplaceable data (session transcripts, backups, "
-        "snapshots, browser profiles, or the production database).",
-        file=sys.stderr,
-    )
+    if target_known:
+        print(
+            "This target holds irreplaceable data (session transcripts, backups, "
+            "snapshots, browser profiles, or the production database).",
+            file=sys.stderr,
+        )
+    else:
+        # The unreadable-command refusal: the guard has NOT established that the
+        # target is protected, so saying it is would be a false statement to the
+        # one reader who must act on the message.
+        print(
+            "This guard protects irreplaceable data (session transcripts, backups, "
+            "snapshots, browser profiles, the production database) and cannot tell "
+            "whether this command's targets include any of it.",
+            file=sys.stderr,
+        )
     print(
         "Specific files inside a protected directory can be removed by naming "
         "them exactly (no globs).",
@@ -258,8 +270,11 @@ def main() -> int:
     if discarded_write is not None:
         discarded_write.remember(cmd)
 
-    # Fast path: no rm/rmdir word anywhere in the command.
-    if not _RM_PATTERN.search(cmd):
+    # Fast path: no rm/rmdir word anywhere in the command — as the shell would
+    # assemble it. `mentions` also reads the forms with quotes, backslashes and line
+    # continuations removed, so `r''m` or a continuation inside the word cannot skip
+    # the parse below, which resolves them correctly. Widen-only.
+    if not mentions(cmd, _RM_PATTERN):
         return 0
 
     dirs = _protected_dirs()
@@ -304,8 +319,9 @@ def main() -> int:
         # does catch.
         #
         # We are past the _RM_PATTERN fast path, so this can only ever refuse a
-        # command that mentions rm, and bounds-induced blindness fires on 0 of 45,956
-        # real commands — so refusing outright costs nothing measurable.
+        # command that mentions rm. The bounds fire on 0 of 45,956 real commands; a
+        # line continuation, the other bounds-type cause, is ordinary input, and its
+        # cost is measured at `shell_parse._BLIND_CONTINUATION`.
         #
         # Both bounds refuse, uniformly with every other fail-closed guard here.
         # The known cost is real and accepted — a here-doc above the cap whose PROSE
@@ -314,8 +330,9 @@ def main() -> int:
         # action that shape wants anyway.
         if blind.bounds_induced:
             return _block(
-                f"an rm command that {blind.cause}, so its real targets cannot be "
-                f"resolved. To proceed: {blind.hint}"
+                f"a command that mentions rm and {blind.cause}, so whether it removes "
+                f"anything, and what, cannot be resolved. To proceed: {blind.hint}",
+                target_known=False,
             )
         # The substring fallback ADDS to the precise scan below; it does not replace
         # it, and the missing `else` here used to be a fail-open.
@@ -390,7 +407,9 @@ def main() -> int:
         # segment mentioned rm. `_RM_PATTERN` is the same prefilter used at the
         # module's fast path; `seg.raw` is the carrier's own segment text, not
         # the whole command.
-        if seg.exe in _REPARSE_CARRIERS and _RM_PATTERN.search(seg.raw):
+        # Read through `mentions`: a word split by quotes or backslashes inside
+        # the carrier's own payload still names rm to the shell that runs it.
+        if seg.exe in _REPARSE_CARRIERS and mentions(seg.raw, _RM_PATTERN):
             # A LAUNCHER THAT RUNS A COMMAND THIS RESOLVER CANNOT RECOVER.
             # REFUSE OUTRIGHT, deliberately WITHOUT looking at the payload.
             #

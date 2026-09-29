@@ -16,8 +16,10 @@ import time
 from datetime import UTC
 
 from genesis.mcp.health import mcp
+from genesis.security import ContentSanitizer, ContentSource
 
 logger = logging.getLogger(__name__)
+_SANITIZER = ContentSanitizer()
 
 # Lazy singletons — avoids import-time overhead for Playwright/httpx
 _fetcher = None
@@ -177,10 +179,20 @@ async def _try_firecrawl_search(query: str, max_results: int) -> dict | None:
 
 async def _try_tinyfish_search(query: str, max_results: int) -> dict | None:
     """Attempt TinyFish search. Returns result dict or None on failure."""
+    result, _reason = await _tinyfish_search_with_reason(query, max_results)
+    return result
+
+
+async def _tinyfish_search_with_reason(query: str, max_results: int) -> tuple[dict | None, str | None]:
+    """TinyFish search, plus why it produced nothing (for failure reports).
+
+    The reason carries the exception TYPE only: an exception message can embed a
+    service URL, and this text reaches MCP callers and the voice model.
+    """
     import os
 
     if not os.environ.get("API_KEY_TINYFISH"):
-        return None
+        return None, "API_KEY_TINYFISH is not set"
     try:
         from genesis.providers import tinyfish_client
 
@@ -190,7 +202,10 @@ async def _try_tinyfish_search(query: str, max_results: int) -> dict | None:
             {
                 "title": r.get("title", ""),
                 "url": r.get("url", ""),
-                "snippet": r.get("snippet", ""),
+                # Wrapped like the SearXNG/Brave snippets (web/search.py): this is
+                # the first backend of the auto chain, and its text reaches
+                # tool-holding models (e.g. voice, which can approve_pending).
+                "snippet": _SANITIZER.wrap_content(r.get("snippet", ""), ContentSource.WEB_SEARCH),
                 "score": max(0.0, 1.0 - (r.get("position", 1) - 1) * 0.1),
             }
             for r in raw_results
@@ -202,11 +217,41 @@ async def _try_tinyfish_search(query: str, max_results: int) -> dict | None:
             "fallback_used": False,
             "answer": None,
             "error": None,
-        }
+        }, None
     except Exception as exc:
         logger.debug("TinyFish search failed: %s", exc)
-    return None
+        return None, type(exc).__name__
 
+
+
+#: The credential each explicit search backend needs.
+_SEARCH_BACKEND_KEYS = {
+    "tinyfish": "API_KEY_TINYFISH",
+    "firecrawl": "FIRECRAWL_API_KEY",
+    "tavily": "API_KEY_TAVILY",
+    "exa": "API_KEY_EXA",
+    "perplexity": "API_KEY_PERPLEXITY",
+}
+
+
+def _explicit_search_failure(
+    query: str, backend: str, summary: str, detail: str | None = None,
+) -> dict:
+    """Failure dict for an explicit search backend.
+
+    A missing credential is classified from the ENVIRONMENT and named, so the caller
+    can fix configuration. Anything else gets ``summary``: adapters put ``str(exc)``
+    in their error text, which can carry request URLs or response detail, so that
+    goes to the log only.
+    """
+    import os
+
+    key = _SEARCH_BACKEND_KEYS.get(backend)
+    if key and not os.environ.get(key, "").strip():
+        summary = f"{key} is not set"
+    elif detail:
+        logger.warning("%s search failed: %s", backend, detail)
+    return {"query": query, "error": summary, "backend_used": None, "backend_tried": backend}
 
 async def _try_crawl4ai(url: str, max_chars: int) -> dict | None:
     """Attempt Crawl4AI fetch. Returns result dict or None on failure."""
@@ -427,11 +472,13 @@ async def _impl_web_search(
 
     if backend == "auto":
         # Primary: TinyFish (free, faster, better quality)
-        tf_result = await _try_tinyfish_search(query, max_results)
-        if tf_result:
+        tf_result, tf_reason = await _tinyfish_search_with_reason(query, max_results)
+        if tf_result and tf_result.get("results"):
             latency = (time.monotonic() - start) * 1000
             tf_result["latency_ms"] = round(latency, 1)
             return tf_result
+        # An empty TinyFish answer is a miss, not an answer: keep walking the chain.
+        tf_reason = tf_reason or "no results"
 
         # Fallback: SearXNG → Brave
         searcher = _get_searcher()
@@ -445,17 +492,23 @@ async def _impl_web_search(
         return {
             "query": response.query,
             "results": results,
-            "backend_used": response.backend_used.value if response.backend_used else "unknown",
+            "backend_used": response.backend_used.value if response.backend_used else None,
             "fallback_used": True,
             "answer": None,
-            "error": response.error,
+            "error": f"tinyfish: {tf_reason}; {response.error}" if response.error else None,
             "latency_ms": round(latency, 1),
         }
 
     elif backend in ("searxng", "brave"):
-        # Explicit SearXNG/Brave selection
+        # Explicit selection runs ONLY that backend. It used to run the whole
+        # SearXNG-then-Brave chain, so "brave" was answered by SearXNG when it
+        # was up and reported as a SearXNG failure when it was not.
+        from genesis.web.types import SearchBackend
+
         searcher = _get_searcher()
-        response = await searcher.search(query, max_results=max_results)
+        response = await searcher.search(
+            query, max_results=max_results, backends=(SearchBackend(backend),),
+        )
         latency = (time.monotonic() - start) * 1000
 
         results = [
@@ -465,7 +518,7 @@ async def _impl_web_search(
         return {
             "query": response.query,
             "results": results,
-            "backend_used": response.backend_used.value if response.backend_used else "unknown",
+            "backend_used": response.backend_used.value if response.backend_used else None,
             "fallback_used": response.fallback_used,
             "answer": None,
             "error": response.error,
@@ -478,7 +531,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
             tf_result["latency_ms"] = round(latency, 1)
             return tf_result
-        return {"query": query, "error": "TinyFish search failed or unavailable", "backend_used": "tinyfish"}
+        return _explicit_search_failure(query, "tinyfish", "TinyFish search failed or unavailable")
 
     elif backend == "firecrawl":
         # PAID escalation (burns account credits) — explicit-only, like
@@ -488,11 +541,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
             fc_result["latency_ms"] = round(latency, 1)
             return fc_result
-        return {
-            "query": query,
-            "error": "Firecrawl search failed or unavailable (FIRECRAWL_API_KEY set?)",
-            "backend_used": "firecrawl",
-        }
+        return _explicit_search_failure(query, "firecrawl", "Firecrawl search failed or unavailable")
 
     elif backend == "tavily":
         try:
@@ -507,7 +556,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
 
             if not result.success:
-                return {"query": query, "error": result.error or "Tavily search failed", "backend_used": "tavily"}
+                return _explicit_search_failure(query, "tavily", "Tavily search failed", result.error)
 
             data = result.data or {}
             results = [
@@ -524,7 +573,7 @@ async def _impl_web_search(
                 "latency_ms": round(latency, 1),
             }
         except (ImportError, ValueError) as exc:
-            return {"query": query, "error": f"Tavily unavailable: {exc}", "backend_used": "tavily"}
+            return _explicit_search_failure(query, "tavily", f"Tavily unavailable: {type(exc).__name__}")
 
     elif backend == "exa":
         try:
@@ -546,7 +595,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
 
             if not result.success:
-                return {"query": query, "error": result.error or "Exa search failed", "backend_used": "exa"}
+                return _explicit_search_failure(query, "exa", "Exa search failed", result.error)
 
             data = result.data or {}
             results = [
@@ -563,7 +612,7 @@ async def _impl_web_search(
                 "latency_ms": round(latency, 1),
             }
         except (ImportError, ValueError) as exc:
-            return {"query": query, "error": f"Exa unavailable: {exc}", "backend_used": "exa"}
+            return _explicit_search_failure(query, "exa", f"Exa unavailable: {type(exc).__name__}")
 
     elif backend == "perplexity":
         try:
@@ -574,7 +623,7 @@ async def _impl_web_search(
             latency = (time.monotonic() - start) * 1000
 
             if not result.success:
-                return {"query": query, "error": result.error or "Perplexity failed", "backend_used": "perplexity"}
+                return _explicit_search_failure(query, "perplexity", "Perplexity failed", result.error)
 
             return {
                 "query": query,
@@ -586,7 +635,7 @@ async def _impl_web_search(
                 "latency_ms": round(latency, 1),
             }
         except (ImportError, ValueError) as exc:
-            return {"query": query, "error": f"Perplexity unavailable: {exc}", "backend_used": "perplexity"}
+            return _explicit_search_failure(query, "perplexity", f"Perplexity unavailable: {type(exc).__name__}")
 
     else:
         return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, searxng, brave, tavily, exa, perplexity, firecrawl (paid escalation)"}
@@ -650,7 +699,10 @@ async def web_search(
         query: Search query string. Supports site: filters with SearXNG.
         backend: "auto" (TinyFish→SearXNG→Brave), "tinyfish", "searxng",
                  "brave", "tavily", "exa", "perplexity", or "firecrawl"
-                 (paid escalation — burns Firecrawl credits).
+                 (paid escalation — burns Firecrawl credits). Any backend
+                 other than "auto" runs ONLY that backend, with no fallback.
+                 When every backend fails, backend_used is null and error
+                 names each backend tried and why (unreachable, or no key).
         max_results: Maximum results (default 10, max 20).
 
     Returns dict with: query, results (list of title/url/snippet/score),

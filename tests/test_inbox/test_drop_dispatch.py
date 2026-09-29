@@ -85,9 +85,13 @@ def mock_session_manager():
 
 
 def _monitor(db, inbox_dir, invoker, sm, tmp_path, *, items_per_eval=3):
+    # Dispatch/batching mechanics are under test here, with fixture responses
+    # that deliberately do not quote their URLs — so pin the coverage gate to
+    # shadow now that enforce is the default. The gate itself is pinned in
+    # test_url_failures.py and by the enforce-path tests at the end of this file.
     cfg = InboxConfig(
         watch_path=inbox_dir, items_per_eval=items_per_eval,
-        evaluation_cooldown_seconds=0,
+        evaluation_cooldown_seconds=0, url_coverage_mode="shadow",
     )
     return InboxMonitor(
         db=db, invoker=invoker, session_manager=sm, config=cfg,
@@ -190,6 +194,7 @@ async def test_retry_is_cooldown_exempt(
     (which throttles re-evals of edited files) must not defer it."""
     cfg = InboxConfig(
         watch_path=inbox_dir, items_per_eval=3, evaluation_cooldown_seconds=3600,
+        url_coverage_mode="shadow",
     )
     mon = InboxMonitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
@@ -1271,3 +1276,841 @@ async def test_build_verdict_flows_through_monitor_to_greenlight(
     assert row["approval_request_id"] == "req-1"
     gate.ensure_approval.assert_awaited_once()
     assert gate.ensure_approval.await_args.kwargs["action_type"] == "build_greenlight"
+
+
+# ── Parking is visible (975ca61b precondition) + #1952 + #1766 inbox leg ────
+
+
+def _queued_alerts():
+    from genesis.env import alert_queue_root
+    from genesis.guardian.alert.queue import list_queued
+
+    return [entry for _path, entry in list_queued(alert_queue_root())]
+
+
+def _monitor_retries(db, inbox_dir, invoker, sm, *, max_retries):
+    cfg = InboxConfig(
+        watch_path=inbox_dir, items_per_eval=1, evaluation_cooldown_seconds=0,
+        max_retries=max_retries,
+    )
+    return InboxMonitor(
+        db=db, invoker=invoker, session_manager=sm, config=cfg,
+        writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
+        clock=_FakeClock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_lane_storm_parks_the_file_and_alerts(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """#1952: the retry-lane storm site only logged and `continue`d, so the file
+    stayed a retry candidate and was re-checked and re-skipped EVERY scan. It
+    must park like the other two sites — and tell the owner."""
+    from datetime import UTC, datetime
+
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()
+    await inbox_items.create(
+        db, id="done", file_path=str(fp), content_hash=h, status="completed",
+        created_at=recent,
+    )
+    for i in range(3):  # persistent (retry-exhausted, opaque) failures
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h,
+            status="failed", created_at=recent,
+            error_message="partial_url_failure", retry_count=3,
+        )
+    # ...plus one still-RETRIABLE row, which is what makes the file a retry
+    # candidate at all (a file whose rows are all at the cap never is).
+    await inbox_items.create(
+        db, id="live", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="partial_url_failure", retry_count=1,
+    )
+    assert str(fp) in await inbox_items.get_retriable_failure_files(db, max_retries=3)
+
+    await mon.check_once()
+
+    assert mock_invoker.run.call_count == 0
+    assert str(fp) not in await inbox_items.get_retriable_failure_files(
+        db, max_retries=3,
+    ), "a storm-parked file must stop being a retry candidate"
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "Genesis.md" in alerts[0]["title"] + alerts[0]["body"]
+
+    await mon.check_once()  # next scan: parked, not re-checked, no duplicate alert
+    assert mock_invoker.run.call_count == 0
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_modified_path_storm_alerts_the_owner(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    from datetime import UTC, datetime
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    recent = datetime.now(UTC).isoformat()
+    for i in range(3):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash="oldhash",
+            status="failed", created_at=recent,
+            error_message="partial_url_failure", retry_count=3,
+        )
+    await mon.check_once()
+    assert mock_invoker.run.call_count == 0
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1 and "Genesis.md" in alerts[0]["title"] + alerts[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_item_that_exhausts_its_retries_alerts_the_owner(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Retry exhaustion used to notify nobody: under enforce, an evaluation that
+    never quotes its URL would park after max_retries in total silence."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert [tuple(r) for r in rows] == [("failed", 1)]
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "Genesis.md" in alerts[0]["title"] + alerts[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_first_failure_below_the_cap_does_not_alert(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Negative control: a retriable failure is not a parked one."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=3)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    assert [a for a in _queued_alerts() if a.get("source") == "inbox"] == []
+
+
+@pytest.mark.asyncio
+async def test_network_offline_does_not_burn_a_retry(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """#1766 (inbox leg): an outage is not the item's failure. It must leave the
+    retry budget untouched, or a ~90-minute outage parks in-flight items."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert len(rows) == 1 and rows[0]["retry_count"] == 0, [dict(r) for r in rows]
+    assert str(inbox_dir / "Genesis.md") in await inbox_items.get_retriable_failure_files(
+        db, max_retries=1,
+    ), "the item must stay retriable after an outage"
+    assert [a for a in _queued_alerts() if a.get("source") == "inbox"] == []
+
+
+@pytest.mark.asyncio
+async def test_retry_lane_park_spares_non_url_failures(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """Review S1: the storm park must abandon only the URL-failure rows. A
+    retriable failure of a different kind (a crashed CC call) in the same file is
+    not part of the storm and must stay retriable."""
+    from datetime import UTC, datetime
+
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()
+    await inbox_items.create(db, id="done", file_path=str(fp), content_hash=h,
+                             status="completed", created_at=recent)
+    for i in range(3):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h, status="failed",
+            created_at=recent, error_message="partial_url_failure", retry_count=3,
+        )
+    await inbox_items.create(
+        db, id="urlfail", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="partial_url_failure", retry_count=1,
+    )
+    await inbox_items.create(
+        db, id="crash", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="CC invocation failed: boom", retry_count=1,
+    )
+    await mon.check_once()
+    rows = {r["id"]: r["error_message"] for r in await (await db.execute(
+        "SELECT id, error_message FROM inbox_items")).fetchall()}
+    assert rows["urlfail"].startswith("approval_invalidated:")
+    assert not rows["crash"].startswith("approval_invalidated:"), rows["crash"]
+
+
+@pytest.mark.asyncio
+async def test_every_parked_item_in_one_file_is_named_in_one_alert(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Review S2+S3: N items exhausting in one scan produced ONE alert naming
+    none of them (per-file dedupe key hid items 2..N). One alert per file per
+    scan must name every parked item, with query strings redacted."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://example.com/first-item?token=SECRETQ\n\n"
+        "https://example.com/second-item\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    text = alerts[0]["title"] + alerts[0]["body"]
+    assert "example.com — line 1 (url#" in text and "example.com — line 3 (url#" in text, text
+    assert "SECRETQ" not in text and "first-item" not in text
+    assert "2" in alerts[0]["title"]
+
+
+@pytest.mark.asyncio
+async def test_a_later_scan_parking_another_item_alerts_again(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Review S2: a second item parked in a later scan must not be swallowed by
+    the first alert's dedupe key."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://example.com/first-item\n")
+    await mon.check_once()
+    f.write_text("https://example.com/first-item\n\nhttps://example.com/second-item\n")
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 2, alerts
+    assert "example.com — line 3" in alerts[1]["title"] + alerts[1]["body"]
+
+
+# ── Review round 1 on #2447: alert identity ──────────────────────────────────
+
+_UNCOVERED = "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+
+
+def _monitor_cfg(db, inbox_dir, invoker, sm, **overrides):
+    cfg = InboxConfig(
+        watch_path=inbox_dir, evaluation_cooldown_seconds=0,
+        **{"items_per_eval": 1, "max_retries": 1, **overrides},
+    )
+    return InboxMonitor(
+        db=db, invoker=invoker, session_manager=sm, config=cfg,
+        writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
+        clock=_FakeClock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_items_sharing_a_host_and_path_are_counted_separately(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Codex + Devin: two presigned links to one path differ only in the query,
+    which the label drops. Deduplicating on the label reported one item where
+    two had stopped."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://example.com/watch?v=AAAA\n\nhttps://example.com/watch?v=BBBB\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    body = alerts[0]["body"]
+    assert body.count("example.com — line") == 2, body
+    assert "AAAA" not in body and "BBBB" not in body
+
+
+@pytest.mark.asyncio
+async def test_every_url_of_a_multi_item_batch_is_named(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Codex: with items_per_eval > 1 one exhausted batch holds several items,
+    and only the first URL was named."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       items_per_eval=2)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://example.com/first-item\n\nhttps://example.com/second-item\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    text = alerts[0]["body"]
+    assert "example.com — line 1 (url#" in text and "example.com — line 3 (url#" in text, text
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    assert text.count("(url#") == 2, text
+
+
+@pytest.mark.asyncio
+async def test_path_text_never_reaches_the_alert(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Devin: a share link can carry its token in the PATH, not the query.
+    No path or query text reaches the alert at all: each item is its host, its
+    line in the file and its url# id (#2533, after three masking heuristics)."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://files.example.com/s/a8F3kLm29QzX7pRtW4/quarterly-report\n\n"
+        "https://share.example.com/f/Xy7_Kp2-Qw9_Rt4-Zm1_Bn8/2026-09-26-notes\n\n"
+        "https://api.example.com/k/ghp_AbCdEfGhIjKlMnOpQr/view\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    text = alerts[0]["title"] + alerts[0]["body"]
+    for secret in ("a8F3kLm29QzX7pRtW4", "Xy7_Kp2", "AbCdEfGhIjKlMnOpQr",
+                   "quarterly-report", "2026-09-26-notes"):
+        assert secret not in text, (secret, text)
+    for expected in ("- files.example.com — line 1 (url#",
+                     "- share.example.com — line 3 (url#",
+                     "- api.example.com — line 5 (url#"):
+        assert expected in text, (expected, text)
+
+
+@pytest.mark.asyncio
+async def test_same_named_files_in_different_folders_are_told_apart(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Codex: under recursive scanning the alert showed only the basename, so
+    two Genesis.md files in different folders read the same."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       recursive=True)
+    for sub in ("alpha", "beta"):
+        (inbox_dir / sub).mkdir()
+        (inbox_dir / sub / "Genesis.md").write_text(f"https://example.com/{sub}-item\n")
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    titles = sorted(a["title"] for a in alerts)
+    assert len(titles) == 2, alerts
+    assert "alpha/Genesis.md" in titles[0] and "beta/Genesis.md" in titles[1], titles
+
+
+@pytest.mark.asyncio
+async def test_offline_failure_survives_a_failed_row_read(
+    db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch,
+):
+    """CodeRabbit: the offline branch read the row before failing it. If that
+    read raised, the row stayed `processing` until the stuck-row sweep, and a
+    missing row would have written retry_count 0 over a real count."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       max_retries=3)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()  # an ordinary failure: retry_count 1
+    rows = await (await db.execute("SELECT retry_count FROM inbox_items")).fetchall()
+    assert [r["retry_count"] for r in rows] == [1]
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("db read failed")
+
+    monkeypatch.setattr(inbox_items, "get_by_id", _boom)
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    await mon.check_once()  # the retry lane re-dispatches; the network is down
+    rows = await (await db.execute(
+        "SELECT status, retry_count, error_message FROM inbox_items")).fetchall()
+    assert [(r["status"], r["retry_count"]) for r in rows] == [("failed", 1)]
+    assert mock_invoker.run.await_count == 2, "the retry must actually have run"
+    assert rows[0]["error_message"].startswith("CC invocation deferred"), rows[0]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_ended_approval_is_asked_again_when_a_sibling_holds_the_hash(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Internal review of #2447: an approval that ended left its row
+    ``approval_invalidated:``, which the retry lane never retries. When a
+    completed sibling holds the file's current hash, detection never re-surfaces
+    the file either, so the item was stranded silently. An ended approval must
+    leave the row retriable, so the SAME row is asked about again."""
+    from tests.test_inbox.test_monitor import (
+        _error_output,
+        _make_wired_dispatcher,
+        _success_output,
+    )
+
+    good = (
+        "# Inbox Evaluation\n## A\n**Source:** https://a.example.com/alpha\n\n"
+        + "An evaluation body. " * 30
+    )
+
+    async def _run(inv):
+        if "https://b.example.com/beta" in inv.prompt:
+            return _error_output("boom")
+        return _success_output(good)
+
+    mock_invoker.run.side_effect = _run
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager, max_retries=3)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://a.example.com/alpha\n\nhttps://b.example.com/beta\n"
+    )
+    await mon.check_once()  # no gate: alpha completes, beta fails (retry 1)
+
+    approvals = {"req-1": {"id": "req-1", "status": "pending"}}
+    from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
+
+    disp = _make_wired_dispatcher(
+        decision=AutonomousDispatchDecision(
+            mode="blocked", reason="approval requested", approval_request_id="req-1",
+        ),
+        approval_by_id=approvals,
+    )
+    mon._autonomous_dispatcher = disp
+    await mon.check_once()  # the retry lane parks beta on approval req-1
+    parked = await (await db.execute(
+        "SELECT id, retry_count FROM inbox_items WHERE error_message LIKE 'awaiting_approval:%'"
+    )).fetchall()
+    assert len(parked) == 1, "fixture: beta must be parked awaiting approval"
+    beta_id, beta_retries = parked[0]["id"], parked[0]["retry_count"]
+    asked = disp.route.await_count
+
+    approvals["req-1"]["status"] = "expired"
+    disp.route.return_value = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-2",
+    )
+    await mon.check_once()  # the approval ended
+    await mon.check_once()  # ...and the item must be asked about again
+
+    assert disp.route.await_count > asked, "the item was stranded, never re-asked"
+    rows = {r["id"]: dict(r) for r in await (await db.execute(
+        "SELECT id, status, retry_count, error_message FROM inbox_items")).fetchall()}
+    assert len(rows) == 2, rows  # the same row is reused, never duplicated
+    assert rows[beta_id]["retry_count"] == beta_retries, rows[beta_id]
+    assert rows[beta_id]["error_message"] == "awaiting_approval:req-2", rows[beta_id]
+
+
+@pytest.mark.asyncio
+async def test_retry_lane_storm_alert_does_not_repeat_every_scan(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """Internal review of #2447: with a non-URL retriable row left behind, the
+    storm guard trips again on every scan. The alert must go out when URL
+    retries are actually parked, not again on each scan after the queue drains."""
+    from datetime import UTC, datetime
+
+    from genesis.env import alert_queue_root
+    from genesis.guardian.alert.queue import list_queued
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()
+    await inbox_items.create(db, id="done", file_path=str(fp), content_hash=h,
+                             status="completed", created_at=recent)
+    for i in range(3):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h, status="failed",
+            created_at=recent, error_message="partial_url_failure", retry_count=3,
+        )
+    await inbox_items.create(
+        db, id="urlfail", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="partial_url_failure", retry_count=1,
+    )
+    await inbox_items.create(
+        db, id="crash", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="CC invocation failed: boom", retry_count=1,
+    )
+    per_scan = []
+    for _ in range(3):
+        await mon.check_once()
+        queued = [(p, e) for p, e in list_queued(alert_queue_root())
+                  if e.get("source") == "inbox"]
+        per_scan.append(len(queued))
+        for p, _e in queued:  # the awareness tick drains the queue between scans
+            p.unlink()
+    assert per_scan == [1, 0, 0], per_scan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "must_show"),
+    [
+        # Two URL-free notes batched together: the flattened text named only
+        # the first note's first line.
+        ("Look into the new retrieval paper\n\nCompare our reranker to theirs\n",
+         ["a note — line 1", "a note — line 3"]),
+        # Two annotated items sharing one URL: URL extraction deduplicated them.
+        ("https://example.com/shared-post why it matters for memory\n\n"
+         "https://example.com/shared-post the pricing section\n",
+         ["example.com — line 1", "example.com — line 3"]),
+    ],
+)
+async def test_every_logical_item_of_a_batch_gets_its_own_line(
+    db, inbox_dir, mock_invoker, mock_session_manager, content, must_show,
+):
+    """Codex (#2447 round 2): labels were derived from the flattened batch text,
+    so a batch of URL-free notes, or of annotated items sharing a URL,
+    reported fewer items than stopped."""
+    from tests.test_inbox.test_monitor import _error_output
+
+    mock_invoker.run.return_value = _error_output("boom")
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       items_per_eval=2)
+    (inbox_dir / "Genesis.md").write_text(content)
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items")).fetchall()
+    assert [(r["status"], r["retry_count"]) for r in rows] == [("failed", 1)], (
+        "fixture: both items must sit in ONE exhausted row"
+    )
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    body = alerts[0]["body"]
+    lines = [ln for ln in body.splitlines() if ln.startswith("- ")]
+    assert len(lines) == 2, body
+    for expected, line in zip(must_show, lines, strict=True):
+        assert expected in line, (expected, line)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_alert_enqueue_logs_what_stopped(
+    db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch, caplog,
+):
+    """#2447 class audit: the park buffer is cleared before the enqueue, and a
+    row at the cap is never re-dispatched, so if the enqueue fails the log line
+    is the only record of what stopped. It must name the items."""
+    import genesis.guardian.alert.queue as alert_queue
+
+    def _lost(*_a, **_k):
+        # The real contract: enqueue_alert never raises; a failed write
+        # returns False (Codex, #2447 round 3).
+        return False
+
+    monkeypatch.setattr(alert_queue, "enqueue_alert", _lost)
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/lost-item-7c1\n")
+    with caplog.at_level("ERROR"):
+        await mon.check_once()
+    errors = [r for r in caplog.records if r.levelname == "ERROR"
+              and "parked-alert enqueue failed" in r.getMessage()]
+    assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+    assert "example.com — line 1" in errors[0].getMessage()
+    assert "Genesis.md" in errors[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_deduplicated_alert_is_not_logged_as_lost(
+    db, inbox_dir, mock_invoker, mock_session_manager, caplog,
+):
+    """Negative control: False also means "already queued under this key", which
+    is not a loss and must not be reported as one."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/dup-item-4d2\n")
+    await mon.check_once()
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+    key = next(a for a in _queued_alerts() if a.get("source") == "inbox")["dedupe_key"]
+    # Re-flush the same parked set: the live entry dedupes it.
+    mon._park_buffer = {}
+    row = (await (await db.execute("SELECT id FROM inbox_items")).fetchone())["id"]
+    mon._alert_parked(
+        str(inbox_dir / "Genesis.md"), reason="retries_exhausted", detail="d",
+        item_id=row, labels=["x"],
+    )
+    with caplog.at_level("ERROR"):
+        mon._flush_park_alerts()
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+    assert not [r for r in caplog.records if "enqueue failed" in r.getMessage()], key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_retries", [1, 3])
+async def test_offline_failure_keeps_a_row_below_a_lowered_cap(
+    db, inbox_dir, mock_invoker, mock_session_manager, max_retries,
+):
+    """#2447 review: a row whose count dates from an older, higher cap must stay
+    retriable when an outage fails it, including at max_retries=1 (count 0)."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+    from genesis.inbox.types import InboxItem
+
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       max_retries=max_retries)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://example.com/old-cap-item\n")
+    await inbox_items.create(
+        db, id="old", file_path=str(f), content_hash="h", status="processing",
+        created_at="2026-09-01T00:00:00+00:00", retry_count=max_retries + 2,
+    )
+    item = InboxItem(
+        id="old", file_path=str(f), content="https://example.com/old-cap-item",
+        content_hash="h", detected_at="2026-09-01T00:00:00+00:00",
+    )
+    await mon._run_one_batch(
+        item, model="sonnet", effort="high", system_prompt="",
+        now_iso="2026-09-01T00:00:00+00:00", errors=[],
+    )
+    row = await inbox_items.get_by_id(db, "old")
+    assert row["status"] == "failed", row
+    assert row["retry_count"] == max_retries - 1, row
+
+
+def test_item_labels_never_carry_path_or_query_text():
+    """No part of a URL but its host reaches the label, whatever the path holds."""
+    content = "https://drive.example.com/d/1BxiMVs0XRA5nFMdKvB/edit?usp=sharing&tok=Z9\n"
+    lines = ["# notes", "https://drive.example.com/d/1BxiMVs0XRA5nFMdKvB/edit?usp=sharing&tok=Z9"]
+    (label,) = InboxMonitor._item_labels(content, lines)
+    assert label.startswith("drive.example.com — line 2 (url#"), label
+    for fragment in ("/d/", "1BxiMVs0", "edit", "usp", "tok", "Z9"):
+        assert fragment not in label, (fragment, label)
+
+
+@pytest.mark.parametrize(
+    ("content", "lines", "expected"),
+    [
+        # A short note that is a substring of an EARLIER line: exact match wins.
+        ("ai", ["# old", "ai is cool https://news.example.com/abc", "", "ai"], "line 4"),
+        # A URL that prefixes an earlier, longer URL: exact line wins.
+        ("https://x.example.com/post/123",
+         ["https://x.example.com/post/12345 read", "", "https://x.example.com/post/123"],
+         "line 3"),
+        # Identical text twice: the later copy is the new, parked one.
+        ("read later", ["read later", "", "read later"], "line 3"),
+        # The exact line is EARLIER than a later line that merely contains it:
+        # exact still wins over the later substring.
+        ("ai", ["# old", "ai", "", "ai is cool https://news.example.com/abc"], "line 2"),
+        # No exact line (the file was edited since): the LAST containing line.
+        ("https://x.example.com/a",
+         ["see https://x.example.com/a", "", "later https://x.example.com/a again"],
+         "line 3"),
+    ],
+)
+def test_the_line_found_is_the_item_not_an_earlier_lookalike(content, lines, expected):
+    """Internal review (#2533): a first-substring search sent the owner to an
+    earlier, different line, and the alert tells them to edit that line."""
+    (label,) = InboxMonitor._item_labels(content, lines)
+    assert f"— {expected} (" in label, label
+
+
+def test_items_sharing_an_annotation_each_get_their_own_line():
+    """Round 2 (#2533, Codex + Devin): two items that open with the same
+    annotation but carry different links were both sent to the later
+    annotation's line, because only the first line located the item."""
+    lines = ["read later", "https://a.example.com/1", "", "read later", "https://b.example.com/2"]
+    (first,) = InboxMonitor._item_labels("read later\nhttps://a.example.com/1", lines)
+    (second,) = InboxMonitor._item_labels("read later\nhttps://b.example.com/2", lines)
+    assert first.startswith("a.example.com — line 1 ("), first
+    assert second.startswith("b.example.com — line 4 ("), second
+
+
+def test_an_edited_annotation_falls_back_to_the_link_line():
+    """The whole block no longer matches (its annotation was edited since):
+    the link's own line locates it, not a lookalike annotation elsewhere."""
+    lines = ["read later", "https://a.example.com/1", "", "read later!", "https://b.example.com/2"]
+    (label,) = InboxMonitor._item_labels("read later\nhttps://b.example.com/2", lines)
+    assert label.startswith("b.example.com — line 5 ("), label
+
+
+def test_a_legacy_whole_file_row_locates_each_url_on_its_own_line():
+    """A legacy row can hold a whole file; each URL must point at its own line,
+    not all at the file's first line."""
+    content = "intro\nhttps://a.example.com/1\n\nhttps://b.example.com/2"
+    lines = content.split("\n")
+    labels = InboxMonitor._item_labels(content, lines, legacy=True)
+    assert labels[0].startswith("a.example.com — line 2 ("), labels
+    assert labels[1].startswith("b.example.com — line 4 ("), labels
+
+
+def test_notes_stay_distinguishable_when_the_file_cannot_be_read():
+    one = InboxMonitor._item_labels("look into retrieval", [])
+    two = InboxMonitor._item_labels("compare rerankers", [])
+    assert one != two and all("(note#" in label for label in one + two), (one, two)
+
+
+def test_a_schemeless_url_with_a_scheme_in_its_query_keeps_its_host():
+    (label,) = InboxMonitor._item_labels(
+        "example.com/r?u=https://other.example.com", ["example.com/r?u=https://other.example.com"],
+    )
+    assert label.startswith("example.com — line 1 ("), label
+
+
+def test_notes_sharing_a_first_line_get_distinct_ids():
+    """Round 3 (#2533, Codex): the note id hashed only the first line."""
+    (one,) = InboxMonitor._item_labels("Read this\nalpha", [])
+    (two,) = InboxMonitor._item_labels("Read this\nbeta", [])
+    assert one != two, one
+
+
+def test_a_multi_link_item_uses_its_own_block_not_an_earlier_lone_link():
+    """Round 3 (#2533, Codex): a line with several links located each link
+    separately, so an older line holding one of them alone won."""
+    lines = ["https://a.example.com/x", "", "compare https://a.example.com/x https://b.example.com/y"]
+    labels = InboxMonitor._item_labels(lines[2], lines)
+    assert all("— line 3 (" in label for label in labels), labels
+
+
+def test_identical_items_parked_together_get_distinct_lines_in_file_order():
+    """Round 3 (#2533, premise check): two parked items with identical text
+    were both sent to the last copy's line."""
+    claimed: set[int] = set()
+    lines = ["read later", "", "read later"]
+    second = InboxMonitor._item_labels("read later", lines, claimed=claimed)
+    first = InboxMonitor._item_labels("read later", lines, claimed=claimed)
+    assert "— line 3 (" in second[0] and "— line 1 (" in first[0], (first, second)
+
+
+@pytest.mark.asyncio
+async def test_the_flush_reads_each_inbox_file_once(db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch):
+    """Round 3 (#2533, Codex): the file was re-read once per parked batch."""
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://a.example.com/1\n\nhttps://b.example.com/2\n")
+    reads: list[str] = []
+    real = Path.read_bytes
+
+    def counting(self):
+        reads.append(str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    mon._park_buffer = {}
+    for rid, text in (("r1", "https://a.example.com/1"), ("r2", "https://b.example.com/2")):
+        mon._alert_parked(str(f), reason="retries_exhausted", detail="d", item_id=rid, texts=[text])
+    resolved = mon._resolve_park_labels(str(f), mon._park_buffer[(str(f), "retries_exhausted")]["items"])
+    assert [p for p in reads if p == str(f)] == [str(f)]
+    assert "— line 1 (" in resolved["r1"][0] and "— line 3 (" in resolved["r2"][0], resolved
+
+
+def test_identical_rows_parked_in_one_file_get_lines_in_row_order(tmp_path):
+    """The earlier-parked row gets the earlier copy: rows are labelled newest
+    first, each taking the last line still free."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("read later\n\nread later\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"r1": {"texts": ["read later"], "legacy": False},
+             "r2": {"texts": ["read later"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 1 (" in resolved["r1"][0] and "— line 3 (" in resolved["r2"][0], resolved
+
+
+def test_a_loose_match_never_takes_a_line_from_an_exact_owner(tmp_path):
+    """Round 3 audit: a stale note matching a URL line by substring claimed it,
+    and the URL item still in the file lost its line."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://ai.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"r1": {"texts": ["https://ai.example.com/x"], "legacy": False},
+             "r2": {"texts": ["ai"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 1 (" in resolved["r1"][0], resolved
+
+
+def test_two_links_on_one_line_of_a_legacy_row_both_get_that_line():
+    """Round 3 audit: inside one legacy item, the first link's claim blocked a
+    second link on the same line."""
+    lines = ["compare https://a.example.com/1 https://b.example.com/2", "https://c.example.com/3"]
+    labels = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
+    assert [lbl.split(" (")[0] for lbl in labels] == [
+        "a.example.com — line 1", "b.example.com — line 1", "c.example.com — line 2"], labels
+
+
+def test_a_legacy_row_with_one_link_points_at_the_link_line():
+    lines = ["intro", "https://a.example.com/1"]
+    (label,) = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
+    assert label.startswith("a.example.com — line 2 ("), label
+
+
+def test_a_claimed_block_reserves_every_line_it_covers(tmp_path):
+    """Round 4 (Codex): an older bare URL was sent to a line inside a newer
+    multi-line item that repeats it."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://a.example.com/x\n\nread later\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"old": {"texts": ["https://a.example.com/x"], "legacy": False},
+             "new": {"texts": ["read later\nhttps://a.example.com/x"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 3 (" in resolved["new"][0] and "— line 1 (" in resolved["old"][0], resolved
+
+
+def test_notes_differing_only_in_indentation_stay_distinct():
+    """Round 4 (Codex): stripping every line made two notes identical."""
+    lines = ["Example", "  indented", "", "Example", " indented"]
+    (label,) = InboxMonitor._item_labels("Example\n  indented", lines)
+    assert "— line 1 (" in label, label
+
+
+def test_a_copy_below_the_evaluated_prefix_is_never_the_parked_item(tmp_path):
+    """Round 4 (Devin): evaluation reads the first 50 KB; the locator read the
+    whole file and preferred a later copy beyond it."""
+    f = tmp_path / "Genesis.md"
+    filler = "x" * 100 + "\n"
+    # The blank line makes the late copy a valid item start, so only the
+    # 50 KB limit can exclude it.
+    f.write_text("https://a.example.com/x\n" + filler * 600 + "\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 1 (" in resolved["r"][0], resolved
+
+
+def test_line_numbers_count_only_real_newlines(tmp_path):
+    """Round 4 (Codex): a NEL or U+2028 inside prose shifted every later line."""
+    f = tmp_path / "Genesis.md"
+    f.write_bytes("some\u0085prose here\n\nhttps://a.example.com/x\n".encode("utf-8"))
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 3 (" in resolved["r"][0], resolved
+
+
+def test_a_one_line_item_never_matches_inside_a_larger_item(tmp_path):
+    """Round 4 audit: a bare URL matched the last line of an annotated item
+    and claimed it, so the two items swapped lines."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://a.example.com/x\n\nread later\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"old": {"texts": ["read later\nhttps://a.example.com/x"], "legacy": False},
+             "new": {"texts": ["https://a.example.com/x"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 3 (" in resolved["old"][0] and "— line 1 (" in resolved["new"][0], resolved
+
+
+@pytest.mark.parametrize("sep", ["\x85", "\x0c", " ", "\x0b"])
+def test_a_separator_ending_a_line_keeps_the_physical_numbers(tmp_path, sep):
+    """Round 4 audit: a separator at a line's end discarded the whole map."""
+    f = tmp_path / "Genesis.md"
+    f.write_bytes(f"some prose{sep}\n\nhttps://a.example.com/x\n".encode())
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 3 (" in resolved["r"][0], resolved

@@ -1484,19 +1484,55 @@ class TestCleanCommentParsing:
 
 
 class TestCleanCommentFreshness:
-    """_check_codex_reviewed_head — a clean Codex ISSUE-COMMENT at head satisfies
-    freshness even when the review-object path can't (absent / stale review)."""
+    """_check_codex_reviewed_head — a clean Codex ISSUE-COMMENT never satisfies
+    freshness. It names its commit only by an abbreviated id, which identifies no
+    commit, so only a review object whose FULL ``commit_id`` equals the head (or an
+    owner-approved substitute at that exact head) vouches. The comment is still read,
+    to explain the block."""
 
-    def test_no_review_object_but_clean_comment_at_head_allows(self, monkeypatch):
+    def test_no_review_object_and_clean_comment_at_head_still_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
-        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")  # no review object → would block
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
         block, msg, head = _mod._check_codex_reviewed_head("1")
-        assert block is False and msg == "" and head == HEAD  # bound for --match-head-commit
+        assert block is True and head is None
+        assert "no codex review" in msg.lower()
+        # The block explains itself, and names the route that does work.
+        assert "abbreviated commit id" in msg
+        assert "# substitute-review" in msg
 
-    def test_stale_review_object_but_clean_comment_at_head_allows(self, monkeypatch):
+    def test_stale_review_object_and_clean_comment_at_head_still_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
-        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))  # stale → would block
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(STALE))
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        # A stale review with a SUBSTANTIAL delta blocks; the clean comment must not
+        # rescue it. (Stub the delta classifier so the block is the freshness one.)
+        monkeypatch.setattr(_mod, "_classify_post_review_delta", lambda r, h, repo: "substantial")
+        monkeypatch.setattr(_mod, "_pr_base_sha", lambda n, repo=None: None)
+        block, msg, head = _mod._check_codex_reviewed_head("1")
+        assert block is True and head is None
+        assert "STALE" in msg and "abbreviated commit id" in msg
+
+    def test_a_different_head_sharing_the_comments_prefix_blocks(self, monkeypatch):
+        """The defect replay: the comment names a PREFIX, and a head is chosen by
+        the PR author, so a different commit that shares the prefix must not be
+        treated as reviewed. The prior code allowed exactly this case."""
+        other_head = HEAD[:10] + ("0" if HEAD[10] != "0" else "1") + HEAD[11:]
+        assert other_head != HEAD and other_head.startswith(HEAD[:10])  # guard the fixture
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", other_head)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))  # reviewed HEAD, not other
+        monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
+        monkeypatch.setattr(_mod, "_classify_post_review_delta", lambda r, h, repo: "substantial")
+        monkeypatch.setattr(_mod, "_pr_base_sha", lambda n, repo=None: None)
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is True and head is None
+
+    def test_full_review_object_at_head_still_allows_with_a_clean_comment_present(
+        self, monkeypatch
+    ):
+        # Control arm: the exact-identity path is untouched by the change.
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
         block, _, head = _mod._check_codex_reviewed_head("1")
         assert block is False and head == HEAD
@@ -1507,6 +1543,8 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(STALE[:10]))  # not head
         block, msg, _ = _mod._check_codex_reviewed_head("1")
         assert block is True and "no codex review" in msg.lower()
+        # A comment naming a DIFFERENT commit is not reported as a review of this head.
+        assert "abbreviated commit id" not in msg
 
     def test_clean_marker_without_sha_still_blocks(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
@@ -1547,8 +1585,10 @@ class TestCleanCommentFreshness:
             "_TEST_GH_CODEX_COMMENTS",
             _clean_comment_jsonl(HEAD[:10], login="attacker", user_type="User"),
         )
-        block, _, _ = _mod._check_codex_reviewed_head("1")
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
         assert block is True
+        # A non-Codex author's comment is not even reported.
+        assert "abbreviated commit id" not in msg
 
     def test_current_review_object_does_not_need_comment(self, monkeypatch):
         # Fast path: a review object at head allows without any comment.
@@ -1558,7 +1598,9 @@ class TestCleanCommentFreshness:
         block, _, head = _mod._check_codex_reviewed_head("1")
         assert block is False and head == HEAD
 
-    def test_report_labels_clean_comment_at_head(self, monkeypatch, capsys):
+    def test_report_does_not_credit_a_clean_comment(self, monkeypatch, capsys):
+        # The report and the gate share one verdict: the row BLOCKS, it never reads
+        # "ok (clean comment at head)".
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", _clean_comment_jsonl(HEAD[:10]))
@@ -1572,9 +1614,13 @@ class TestCleanCommentFreshness:
         monkeypatch.setattr(
             _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
         )
+        monkeypatch.setattr(
+            _mod, "_substitute_reviewers_at_head", lambda n, h, repo=None: ([], [])
+        )
         _mod.check_pr_report("1")
         out = capsys.readouterr().out
-        assert "clean comment at head" in out
+        assert "clean comment at head" not in out
+        assert "codex-at-head  : BLOCK" in out
 
 
 class TestRequiredScheduledReviewKinds:

@@ -91,6 +91,16 @@
                 "hooks": [
                     {
                         "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook surface_handoffs.py",
+                        "timeout": 10
+                    }
+                ]
+            },
+            {
+                "matcher": "startup|resume|clear",
+                "hooks": [
+                    {
+                        "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
                         "timeout": 30
                     }

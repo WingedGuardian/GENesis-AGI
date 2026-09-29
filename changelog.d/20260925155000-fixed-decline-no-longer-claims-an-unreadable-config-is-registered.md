@@ -1,0 +1,1 @@
+- Declining the Grep code-search server (`GENESIS_GREP_MCP_URL=""`) no longer claims an existing registration is still active when it could not read `~/.claude.json`. It now says the state is unknown and tells you to check with `claude mcp list`, instead of reporting a live entry and offering a removal command for something that may not exist.
