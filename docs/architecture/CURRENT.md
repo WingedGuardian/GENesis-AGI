@@ -1450,6 +1450,8 @@ verified: 84c7259d 2026-08-31
     old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
     live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
     lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    One more create is tried after those reads: only a pool refusal then
+    deletes first (pressure cleared → ordinary create-first rotation).
     The settle is reserved before the delete. Healthy snapshots are never
     retention-evicted before a create. A refused refresh retries in ~1h
     (own `.last_healthy` marker) and alerts, throttled.
@@ -1458,7 +1460,8 @@ verified: 84c7259d 2026-08-31
     pre-recovery oldest first, then superseded healthy, the lifeline last;
     a failed delete falls through to the next unless the client timed out
     (outcome unknown → stop and alert); 5-minute settle stamped before
-    the delete (delete-first starts it too); pool identity re-checked first.
+    the delete (delete-first starts it too); a re-measure just before the
+    delete must show the same pool still short (eased → stop, `eased`).
     `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
     delete never falls through to the lifeline. Pool identity is incus's
     DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);

@@ -747,7 +747,10 @@ class SnapshotManager:
         * ``healthy_confirmed``: this tick's probe found the container HEALTHY
           (the delete goes through the ``delete_healthy`` chokepoint);
         * the create attempt did not already delete a snapshot (retention
-          eviction) whose space may still be coming back.
+          eviction) whose space may still be coming back;
+        * one more create attempt, made AFTER those measurements, is still
+          refused by the pool — pressure that cleared in between makes it an
+          ordinary create-first rotation instead.
 
         Then create-first cannot succeed while that snapshot keeps filling the
         pool — retrying it daily is how one snapshot once survived a week and
@@ -775,22 +778,33 @@ class SnapshotManager:
             deleted = False
             if self.last_take_evicted:
                 logger.info("delete-first deferred: this attempt already deleted a snapshot")
-            elif (
-                stale is not None
-                and held is not None
-                and healthy_confirmed
-                and (reserve_settle is None or reserve_settle())
-            ):
-                deleted = await self.delete_healthy(stale, healthy_confirmed=True)
-                if not deleted and self.last_delete_error == "timeout":
-                    # The client gave up; the daemon may still finish the
-                    # delete. Say so rather than retry as if nothing happened.
-                    self.last_rotation_note = (
-                        f"pool refused the create ({refusal}); deleting the lifeline "
-                        f"{stale} did not confirm (the client timed out) — the rollback "
-                        "lifeline may be gone"
-                    )
-                    return None
+            elif stale is not None and held is not None and healthy_confirmed:
+                # The refusal was measured before the two reads above; pressure
+                # that cleared since (an autoextend landing) would make the
+                # delete needless (review). Retry create-first once: success is
+                # an ordinary rotation below, and only a pool refusal NOW still
+                # licenses deleting the lifeline first.
+                name = await self.take(
+                    label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
+                )
+                if name is None and self.last_take_evicted:
+                    logger.info("delete-first deferred: the retry deleted a snapshot")
+                elif (
+                    name is None
+                    and self.last_refusal in (REFUSED_POOL_GATE, REFUSED_POOL_SPACE)
+                    and (reserve_settle is None or reserve_settle())
+                ):
+                    refusal = self.last_refusal
+                    deleted = await self.delete_healthy(stale, healthy_confirmed=True)
+                    if not deleted and self.last_delete_error == "timeout":
+                        # The client gave up; the daemon may still finish the
+                        # delete. Say so rather than retry as if nothing happened.
+                        self.last_rotation_note = (
+                            f"pool refused the create ({refusal}); deleting the lifeline "
+                            f"{stale} did not confirm (the client timed out) — the rollback "
+                            "lifeline may be gone"
+                        )
+                        return None
             if deleted:
                 self.last_rotation_deleted = True
                 logger.warning(
