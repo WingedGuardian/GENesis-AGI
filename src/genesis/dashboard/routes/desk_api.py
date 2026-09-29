@@ -107,6 +107,19 @@ _MAX_BODY_BYTES = 256 * 1024
 _DEFAULT_MAX_TOKENS = 400
 _MAX_MAX_TOKENS = 8192
 
+# The smallest output budget this endpoint accepts. Below it a turn can come back
+# EMPTY, which the handler must answer as a 502 — a request that cannot succeed,
+# dressed as a server failure the client will retry. MEASURED through the routed
+# path (LiteLLMDelegate, reasoning_effort=disable): the thinking-suppressed
+# gemini lane on desk_fast returned no text at max_tokens 1 and 4 and a single
+# quote character at 5, while 8 and above returned text. 16 is that floor with
+# headroom: an earlier direct-API measurement on the same model saw 12 tokens
+# spent before any text at a 16-token budget. Refused, not raised: the caller
+# asked for a size we cannot deliver, and saying so is a 400 it can act on.
+# Measured on that one model only; the desk_primary hops were not measured, so
+# the floor narrows the empty-turn case rather than ruling it out.
+_MIN_MAX_TOKENS = 16
+
 # One desktop client, occasionally two lanes at once. The bound is not about this
 # endpoint's own cost: provider rate gates serialize process-wide, and the chains
 # here are shared with dozens of Genesis call sites, so an unbounded desk client
@@ -268,8 +281,8 @@ def _sampling_from(data: dict) -> tuple[dict, str | None]:
         max_tokens = int(raw)
     except (TypeError, ValueError, OverflowError):
         return {}, "max_tokens must be an integer"
-    if max_tokens < 1:
-        return {}, "max_tokens must be at least 1"
+    if max_tokens < _MIN_MAX_TOKENS:
+        return {}, f"max_tokens must be at least {_MIN_MAX_TOKENS}"
     kwargs: dict = {"max_tokens": min(max_tokens, _MAX_MAX_TOKENS)}
 
     temperature = data.get("temperature")

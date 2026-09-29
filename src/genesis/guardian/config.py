@@ -112,23 +112,32 @@ class SnapshotConfig:
     take_pre_recovery: bool = True  # Take snapshot before recovery action
     # Daily 'healthy' snapshot while the guardian state is HEALTHY — produces
     # the offline SNAPSHOT_ROLLBACK lifeline (without it, rollback has no
-    # target and always fails). Rotated on each take: exactly one healthy
-    # snapshot, ≤1 maintenance interval old, so CoW divergence never
-    # accumulates. Set false to stop taking (existing healthy snapshots then
-    # age out via max_age_days / expiry).
+    # target and always fails). Rotation is create-then-delete, so it keeps
+    # exactly one healthy snapshot ONLY while creates succeed: a refused
+    # create (the pool gate, or LVM's own threshold) leaves the old one in
+    # place, still diverging. mark_healthy therefore rotates delete-first when
+    # a MEASURED pool refusal meets a lifeline that is over a day old AND LVM
+    # shows the snapshots hold space no live volume maps (LVM-thin only); a
+    # pool full of live data keeps it. Set false to stop taking (existing healthy
+    # snapshots then age out via expiry / pool relief).
     healthy_enabled: bool = True
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
     min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
-    # Age-based prune: delete guardian-* snapshots older than this many days,
-    # regardless of retention count — EXCEPT the newest and the latest healthy
-    # (the offline snapshot-rollback lifeline). Backstops the incident where
+    # Age-based prune: delete non-healthy guardian snapshots older than this
+    # many days, regardless of retention count. Healthy (rollback) snapshots are
+    # never pruned — they are rotated after a successful create and freed by
+    # pool relief under pressure, both via SnapshotManager.delete_healthy.
+    # Backstops the incident where
     # stale guardian-pre-recovery snapshots accumulated CoW divergence for months.
     max_age_days: int = 14
-    # incus `snapshots.expiry` — daemon-side auto-deletion of SCHEDULED snapshots
-    # after this interval (units: s/m/h/d/w/M/y). A guardian-independent kill
-    # switch that fires even if the guardian process is dead. Deliberately does
-    # NOT set `snapshots.expiry.manual` (instance-wide; would expire snapshots
-    # the user creates by hand). Empty string disables enforcement.
+    # incus `snapshots.expiry` — daemon-side auto-deletion after this interval
+    # (units: s/m/h/d/w/M/y). A guardian-independent kill switch that fires even
+    # if the guardian process is dead. Which snapshots it covers depends on the
+    # Incus version: on Incus 6.0.0 it was measured stamping manually-created
+    # snapshots too (a guardian snapshot carried expires_at = created + 2w);
+    # newer releases split manual snapshots out to `snapshots.expiry.manual`,
+    # which this deliberately does not set (instance-wide; it would expire
+    # snapshots the user creates by hand). Empty string disables enforcement.
     expiry: str = "2w"
 
 
@@ -168,6 +177,29 @@ class StoragePoolConfig:
     # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
     # a live problem visible). Tier *increases* always alert immediately.
     realert_hours: float = 6.0
+
+    # --- Pressure RELIEF (pool_relief.py) -----------------------------------
+    # The tiers above only ALERT. A thin pool once filled to 100% while CRITICAL
+    # alerts fired every 6h for four days, because the space was held by a
+    # guardian snapshot nothing was allowed to delete. Relief FREES guardian-
+    # owned space (one snapshot per pass, the rollback lifeline last) when free
+    # data or metadata space drops below its reserve.
+    #   live       — delete guardian snapshots under the reserve
+    #   alert_only — alert, never act
+    #   off        — no relief (and no delete-first rotation)
+    # Invalid values degrade to alert_only. Env kill switch:
+    # GUARDIAN_POOL_RELIEF_DISABLED=1 forces alert_only.
+    relief_mode: str = "live"
+    # Data reserve, % of the pool: relief acts at or below this much free. Sized
+    # to cover a backup-sized write burst (~2 GB) on a ~70 GB pool. A floor, not
+    # the whole defence: delete-first rotation (snapshots.mark_healthy) stops
+    # the snapshot-divergence fill long before the reserve is reached.
+    min_reserve_pct: float = 3.0
+    # Metadata reserve, % of the metadata LV. Higher than data's: metadata is
+    # small (tens of MiB), a thin snapshot steps it up several points at once,
+    # and a full metadata LV needs an offline repair. LVM's autoextend
+    # (threshold 80%) grows metadata first when it can.
+    min_meta_reserve_pct: float = 10.0
 
 
 @dataclass

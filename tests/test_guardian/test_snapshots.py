@@ -4,17 +4,27 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from genesis.guardian.config import GuardianConfig
-from genesis.guardian.snapshots import SnapshotManager
+from genesis.guardian.snapshots import (
+    REFUSED_OTHER,
+    REFUSED_POOL_GATE,
+    REFUSED_POOL_SPACE,
+    REFUSED_PROBE,
+    SnapshotManager,
+    _created_from_name,
+)
 
 
 @pytest.fixture
-def config() -> GuardianConfig:
-    return GuardianConfig()
+def config(tmp_path) -> GuardianConfig:
+    # Never the real state dir.
+    cfg = GuardianConfig()
+    cfg.state_dir = str(tmp_path / "guardian-state")
+    return cfg
 
 
 @pytest.fixture
@@ -57,10 +67,19 @@ class TestSnapshotTake:
             "genesis.guardian.snapshots._run_subprocess",
             _mock_subprocess_smart(snapshot_rc=0),
         ):
-            name = await manager.take(label="test")
+            name = await manager.take(label="pre-recovery")
         assert name is not None
         assert name.startswith("guardian-")
-        assert name.endswith("-test")
+        assert name.endswith("-pre-recovery")
+
+    @pytest.mark.asyncio
+    async def test_take_refuses_an_unknown_label(self, manager: SnapshotManager) -> None:
+        # A label the ownership pattern cannot see would make a snapshot the
+        # guardian never prunes, rotates or frees — refused at the source.
+        run = AsyncMock()
+        with patch("genesis.guardian.snapshots._run_subprocess", run), pytest.raises(ValueError):
+            await manager.take(label="test")
+        run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_take_failure(self, manager: SnapshotManager) -> None:
@@ -79,7 +98,7 @@ class TestSnapshotTake:
         ):
             name = await manager.take()
         assert name is not None
-        assert "-test" not in name
+        assert name.count("-") == 2  # guardian-YYYYmmdd-HHMMSS, no label
 
     @pytest.mark.asyncio
     async def test_take_refuses_when_pool_full(self, manager: SnapshotManager) -> None:
@@ -279,7 +298,7 @@ class TestMarkHealthy:
             "genesis.guardian.snapshots._run_subprocess",
             _mock_subprocess_smart(snapshot_rc=0),
         ):
-            name = await manager.mark_healthy()
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
         assert name is not None
         assert name.endswith("-healthy")
 
@@ -415,7 +434,7 @@ class TestHeadroomGating:
                 post_free_bytes=free_after,
             ),
         ):
-            name = await manager.take(label="test", snapshot_size_history=history)
+            name = await manager.take(label="pre-recovery", snapshot_size_history=history)
         assert name is not None
         assert len(history) == 1
         assert history[0] == free_before - free_after
@@ -447,8 +466,12 @@ class TestGetLatestHealthy:
 
 
 def _pool_status(detected: bool = True, data=None, meta=None):
+    """A NAMED LVM-thin pool measurement (an unnamed one is refused outright)."""
     from genesis.guardian.pool import StoragePoolStatus
-    return StoragePoolStatus(detected=detected, data_pct=data, metadata_pct=meta)
+    return StoragePoolStatus(
+        detected=detected, data_pct=data, metadata_pct=meta, pool_size_bytes=100 * 1024**3,
+        pool_name="default", vg_name="vg0", thinpool_lv="IncusThinPool",
+    )
 
 
 class TestLvmPoolGating:
@@ -598,7 +621,7 @@ class TestMarkHealthyRotation:
                 _take_env_mock(existing, deletes, creates),
             ),
         ):
-            name = await manager.mark_healthy()
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
         assert name is not None and name.endswith("-healthy")
         assert "guardian-20260701-000000-healthy" in deletes
         assert "guardian-20260702-000000-pre-recovery" not in deletes
@@ -636,7 +659,7 @@ class TestMarkHealthyRotation:
             ),
             patch("genesis.guardian.snapshots._run_subprocess", failing_create),
         ):
-            name = await manager.mark_healthy()
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
         assert name is None
         assert deletes == []  # old lifeline untouched
 
@@ -657,3 +680,828 @@ class TestDelete:
             _mock_subprocess(1, "", "nope"),
         ):
             assert await manager.delete("guardian-20260701-000000") is False
+
+
+# --- pool-refusal awareness + delete-first rotation ---------------------------
+
+_LVM_THRESHOLD_ERR = (
+    "Error: Create instance snapshot: Error creating LVM logical volume snapshot: "
+    "Failed to run: lvcreate ... exit status 5 (Cannot create new thin volume, free "
+    "space in thin pool vg0/IncusThinPool reached threshold.)"
+)
+
+
+class _FakeIncus:
+    """incus snapshot list/create/delete over an in-memory table."""
+
+    def __init__(
+        self, snaps: dict[str, str], create_err: str | None = None, *, fail_all: bool = False,
+    ) -> None:
+        self.snaps = dict(snaps)  # name -> created_at (RFC3339)
+        self.create_err = create_err
+        self.fail_all = fail_all
+        self.creates = 0
+        self.deleted: list[str] = []
+
+    async def run(self, *args, **kwargs):
+        if args[:3] == ("incus", "snapshot", "list"):
+            return 0, json.dumps([{"name": n, "created_at": c} for n, c in self.snaps.items()]), ""
+        if args[:3] == ("incus", "snapshot", "delete"):
+            self.deleted.append(args[4])
+            self.snaps.pop(args[4], None)
+            return 0, "", ""
+        if args[:3] == ("incus", "snapshot", "create"):
+            self.creates += 1
+            if self.create_err and (self.creates == 1 or self.fail_all):
+                return 1, "", self.create_err
+            self.snaps[args[4]] = datetime.now(UTC).isoformat()
+            return 0, "", ""
+        return 0, "", ""
+
+
+def _ago(hours: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+
+
+class TestRefusalAndDeleteFirst:
+
+    def test_created_from_name(self) -> None:
+        got = _created_from_name("guardian-20260919-162609-healthy", "guardian-")
+        assert got == datetime(2026, 9, 19, 16, 26, 9, tzinfo=UTC)
+        assert _created_from_name("guardian-manual", "guardian-") is None
+        # Anchored after the prefix: a timestamp-shaped PREFIX is not the date.
+        pre = "archive-20200101-000000-"
+        assert _created_from_name(pre + "20260919-162609-healthy", pre) == got
+        assert _created_from_name(pre + "healthy", pre) is None
+        assert _created_from_name("other-20260919-162609", "guardian-") is None
+
+    @pytest.mark.asyncio
+    async def test_take_classifies_lvm_threshold_as_pool_space(self, manager) -> None:
+        fake = _FakeIncus({}, create_err=_LVM_THRESHOLD_ERR)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", fake.run),
+        ):
+            assert await manager.take(label="pre-recovery") is None
+        assert manager.last_refusal == REFUSED_POOL_SPACE
+
+    @pytest.mark.asyncio
+    async def test_take_classifies_other_failures(self, manager) -> None:
+        fake = _FakeIncus({}, create_err="Error: instance not found")
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", fake.run),
+        ):
+            assert await manager.take(label="pre-recovery") is None
+        assert manager.last_refusal == REFUSED_OTHER
+
+    @pytest.mark.asyncio
+    async def test_take_records_pool_gate(self, manager) -> None:
+        async def refuse_measured(*_a, **_k):
+            manager.last_gate_measured = True
+            return False
+
+        with patch.object(manager, "safe_to_snapshot", refuse_measured):
+            assert await manager.take(label="pre-recovery") is None
+        assert manager.last_refusal == REFUSED_POOL_GATE
+
+    @pytest.mark.asyncio
+    async def test_strict_list_is_none_on_failure_and_falls_back_to_name_time(
+        self, manager,
+    ) -> None:
+        async def fail(*a, **k):
+            return 1, "", "incus: daemon unreachable"
+
+        with patch("genesis.guardian.snapshots._run_subprocess", fail):
+            assert await manager.list_snapshot_meta_strict() is None
+
+        async def ok(*a, **k):
+            return 0, json.dumps([
+                {"name": "guardian-20260919-162609-healthy"},
+                {"name": "someone-elses"},
+            ]), ""
+
+        with patch("genesis.guardian.snapshots._run_subprocess", ok):
+            got = await manager.list_snapshot_meta_strict()
+        assert got == [
+            ("guardian-20260919-162609-healthy", datetime(2026, 9, 19, 16, 26, 9, tzinfo=UTC)),
+        ]
+
+
+def _lvm(used_frac: float, size: int = 100 * 1024**3, **kw):
+    from genesis.guardian.pool import StoragePoolStatus
+
+    base = dict(
+        detected=True, data_pct=used_frac * 100, metadata_pct=40.0, pool_size_bytes=size,
+        pool_name="default", vg_name="vg0", thinpool_lv="IncusThinPool",
+    )
+    base.update(kw)
+    return StoragePoolStatus(**base)
+
+
+_POOL = 100 * 1024**3
+_CT_LV = 90 * 1024**3
+
+
+def _with_thin_lvs(
+    fake, manager, *, live_frac: float, extra_rows=(), pool_frac=None, drop_container=False,
+):
+    """Wrap a _FakeIncus so the one-read `lvs` answers like a real host: the
+    thin-pool row (``pool_frac`` used; defaults to what the patched
+    measurement says), the container's own LV mapping ``live_frac`` of the
+    pool, every guardian snapshot in ``fake.snaps`` inactive (blank data%)."""
+    from genesis.guardian.pool import THIN_LV_SELECT, incus_snapshot_lv_name
+
+    async def run(*args, **kwargs):
+        if "lvs" in args and THIN_LV_SELECT in args:
+            import genesis.guardian.snapshots as snap_mod
+
+            used = pool_frac
+            if used is None:
+                used = (await snap_mod.measure_storage_pool(None)).data_pct / 100
+            rows = [{
+                "lv_name": "IncusThinPool", "pool_lv": "", "segtype": "thin-pool",
+                "data_percent": f"{100 * used:.2f}", "lv_size": str(_POOL),
+            }]
+            if not drop_container:
+                rows.append({
+                    "lv_name": f"containers_{manager._container}", "pool_lv": "IncusThinPool",
+                    "segtype": "thin",
+                    "data_percent": f"{100 * live_frac * _POOL / _CT_LV:.2f}",
+                    "lv_size": str(_CT_LV),
+                })
+            rows += [{
+                "lv_name": incus_snapshot_lv_name(manager._container, n),
+                "pool_lv": "IncusThinPool", "segtype": "thin", "data_percent": "",
+                "lv_size": str(_CT_LV),
+            } for n in fake.snaps]
+            rows += list(extra_rows)
+            return 0, json.dumps({"report": [{"lv": rows}]}), ""
+        return await fake.run(*args, **kwargs)
+
+    return run
+
+
+class TestDeleteFirstRotation:
+    """Delete-first needs ALL of: a MEASURED pool refusal, a lifeline at least
+    a rotation old, LVM evidence that the healthy snapshots hold space no live
+    volume maps, and the caller's permission (relief live, settle reserved)."""
+
+    OLD = "guardian-20260101-000000-healthy"
+
+    async def _run(
+        self, manager, *, snaps, err, now_frac, live_frac=0.80, allowed=True,
+        reserve=None, extra_rows=(), status=None,
+    ):
+        fake = _FakeIncus(snaps, create_err=err)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=live_frac, extra_rows=extra_rows),
+            ),
+            patch(
+                "genesis.guardian.snapshots.measure_storage_pool",
+                return_value=status or _lvm(now_frac),
+            ),
+        ):
+            name = await manager.mark_healthy(
+                delete_first_allowed=allowed, reserve_settle=reserve, healthy_confirmed=True,
+            )
+        return name, fake
+
+    @pytest.mark.asyncio
+    async def test_snapshot_held_space_is_deleted_first(self, manager) -> None:
+        # pool 85 GiB used, the live container maps 80: snapshots hold >= 5.
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR, now_frac=0.85,
+        )
+        assert name is not None and name.endswith("-healthy")
+        assert fake.deleted[0] == self.OLD
+        assert "no live volume maps" in (manager.last_rotation_note or "")
+
+    @pytest.mark.asyncio
+    async def test_report_without_the_container_is_no_evidence(self, manager) -> None:
+        """Internal review: an lvs report missing the running container's own
+        LV (empty, filtered, renamed) must not read as 'the snapshots hold the
+        whole pool'."""
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.1, drop_container=True),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.95)),
+        ):
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_bound_uses_the_same_reads_pool_row(self, manager) -> None:
+        """Both terms from ONE lvs read: the earlier measurement says 95% but
+        the per-volume read (the same instant as its own pool row) says the
+        pool is at 80.5% with the container mapping 80% — nothing held."""
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80, pool_frac=0.805),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.95)),
+        ):
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_timed_out_delete_first_says_the_lifeline_may_be_gone(self, manager) -> None:
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        inner = _with_thin_lvs(fake, manager, live_frac=0.80)
+
+        async def run(*args, **kwargs):
+            if args[:3] == ("incus", "snapshot", "delete"):
+                return -1, "", "timeout"
+            return await inner(*args, **kwargs)
+
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+        assert fake.creates == 1  # no retry create after an unconfirmed delete
+        assert "may be gone" in (manager.last_rotation_note or "")
+
+    @pytest.mark.asyncio
+    async def test_live_data_growth_keeps_the_lifeline(self, manager) -> None:
+        """Devin's example: the pool grew because the CONTAINER wrote new data.
+        The container maps nearly all of it, so the snapshot holds little and
+        deleting it would free nothing."""
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR,
+            now_frac=0.86, live_frac=0.855,
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_unattributable_volume_means_no_evidence(self, manager) -> None:
+        # An operator's own snapshot (inactive, blank) is in the pool: what it
+        # holds is not the lifeline's, so there is no measurement to act on.
+        from genesis.guardian.pool import incus_snapshot_lv_name
+
+        mine = {
+            "lv_name": incus_snapshot_lv_name(manager._container, "my-snap"),
+            "pool_lv": "IncusThinPool", "segtype": "thin", "data_percent": "",
+            "lv_size": str(_CT_LV),
+        }
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR, now_frac=0.95,
+            extra_rows=[mine],
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_other_live_volumes_count_against_the_bound(self, manager) -> None:
+        other = {
+            "lv_name": "custom_default_scratch", "pool_lv": "IncusThinPool", "segtype": "thin",
+            "data_percent": "50.00", "lv_size": str(10 * 1024**3),  # maps 5 GiB
+        }
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR,
+            now_frac=0.85, extra_rows=[other],  # 85 - 80 - 5 = 0 held
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_non_lvm_pool_never_deletes_first(self, manager) -> None:
+        from genesis.guardian.pool import StoragePoolStatus
+
+        btrfs = StoragePoolStatus(
+            detected=True, pool_used_pct=95.0, pool_size_bytes=_POOL, pool_name="p",
+        )
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR, now_frac=0.95,
+            status=btrfs,
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_not_allowed_means_no_delete(self, manager) -> None:
+        """Relief killed / alert_only / settling: delete-first stays off."""
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR, now_frac=0.95,
+            allowed=False,
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_settle_is_reserved_before_the_delete(self, manager) -> None:
+        order: list[str] = []
+        fake_ref: dict = {}
+
+        def reserve() -> bool:
+            order.append(f"reserve deleted={list(fake_ref['fake'].deleted)}")
+            return True
+
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        fake_ref["fake"] = fake
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            await manager.mark_healthy(
+                delete_first_allowed=True, reserve_settle=reserve, healthy_confirmed=True,
+            )
+        assert order == ["reserve deleted=[]"] and fake.deleted[0] == self.OLD
+
+    @pytest.mark.asyncio
+    async def test_unwritable_settle_forbids_the_delete(self, manager) -> None:
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err=_LVM_THRESHOLD_ERR, now_frac=0.85,
+            reserve=lambda: False,
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_fresh_lifeline_is_never_deleted_first(self, manager) -> None:
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(2)}, err=_LVM_THRESHOLD_ERR, now_frac=0.95,
+        )
+        assert name is None and fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_non_pool_failure_never_deletes_first(self, manager) -> None:
+        name, fake = await self._run(
+            manager, snaps={self.OLD: _ago(30)}, err="Error: instance not found",
+            now_frac=0.95,
+        )
+        assert name is None and fake.deleted == []
+        assert manager.last_rotation_note is None
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_is_not_a_pool_refusal(self, manager) -> None:
+        """safe_to_snapshot also refuses when it could not measure (df/incus
+        down). That is REFUSED_PROBE, and it never licenses delete-first."""
+        fake = _FakeIncus({self.OLD: _ago(30)})
+
+        async def refuse_unmeasured(*_a, **_k):
+            manager.last_gate_measured = False
+            return False
+
+        with (
+            patch.object(manager, "safe_to_snapshot", refuse_unmeasured),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.5),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.95)),
+        ):
+            assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+        assert manager.last_refusal == REFUSED_PROBE
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_measured_gate_refusal_is_a_pool_refusal(self, manager) -> None:
+        with patch(
+            "genesis.guardian.snapshots.measure_storage_pool",
+            return_value=_lvm(0.90),  # above the 85% data tier
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is True
+
+    @pytest.mark.asyncio
+    async def test_unnamed_pool_refusal_is_not_a_pool_refusal(self, manager) -> None:
+        """Several thin pools in the VG: the figures may be another pool's."""
+        with patch(
+            "genesis.guardian.snapshots.measure_storage_pool",
+            return_value=_lvm(0.90, thinpool_lv=None),
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is False
+
+    @pytest.mark.asyncio
+    async def test_delete_first_takes_the_oldest_healthy(self, manager) -> None:
+        older = "guardian-20251230-000000-healthy"
+        name, fake = await self._run(
+            manager, snaps={older: _ago(50), self.OLD: _ago(26)}, err=_LVM_THRESHOLD_ERR,
+            now_frac=0.85,
+        )
+        assert fake.deleted[0] == older
+
+
+@pytest.mark.asyncio
+async def test_strict_list_owns_only_generated_names(manager) -> None:
+    """Automatic deletes act on this listing: a hand-made snapshot that merely
+    starts with the prefix is not the guardian's (security review)."""
+    rows = [
+        {"name": "guardian-20260919-162609-healthy"},
+        {"name": "guardian-20260919-162609"},
+        {"name": "guardian-20260919-162609-pre-recovery"},
+        {"name": "guardian-demo"},
+        {"name": "guardian-onboarding-backup"},
+        {"name": "guardian-20260919-162609 x"},
+    ]
+
+    async def ok(*a, **k):
+        return 0, json.dumps(rows), ""
+
+    with patch("genesis.guardian.snapshots._run_subprocess", ok):
+        got = [n for n, _ in await manager.list_snapshot_meta_strict()]
+    assert sorted(got) == sorted([
+        "guardian-20260919-162609-healthy",
+        "guardian-20260919-162609",
+        "guardian-20260919-162609-pre-recovery",
+    ])
+
+
+class TestOwnershipChokepoint:
+    """EVERY listing (prune, retention eviction, rotation, the rollback target)
+    claims only guardian-GENERATED names — never a hand-made snapshot that
+    merely starts with the prefix (review: 'guardian-mine-healthy' used to
+    sort after the real lifeline and become the rollback target)."""
+
+    LIFE = "guardian-20260919-162609-healthy"
+    MINE = ("guardian-mine-healthy", "guardian-20260919-162609-mine", "guardian-demo")
+
+    @pytest.mark.asyncio
+    async def test_listing_and_rollback_target(self, manager) -> None:
+        fake = _FakeIncus({self.LIFE: _ago(5), **{m: _ago(1) for m in self.MINE}})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.list_snapshots() == [self.LIFE]
+            assert await manager.get_latest_healthy() == self.LIFE
+
+    @pytest.mark.asyncio
+    async def test_prune_and_rotation_never_delete_hand_made(self, config) -> None:
+        config.snapshots.max_age_days = 0  # everything is "stale"
+        config.snapshots.retention = 1
+        manager = SnapshotManager(config)
+        fake = _FakeIncus({self.LIFE: _ago(50), **{m: _ago(900) for m in self.MINE}})
+        with (
+            patch("genesis.guardian.snapshots._run_subprocess", fake.run),
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots.measure_storage_pool",
+                return_value=_lvm(0.5),
+            ),
+        ):
+            await manager.prune()
+            await manager.mark_healthy()
+        assert not set(fake.deleted) & set(self.MINE), fake.deleted
+        assert self.LIFE in fake.deleted  # the real lifeline did rotate
+
+    @pytest.mark.asyncio
+    async def test_empty_prefix_claims_nothing(self, config) -> None:
+        config.snapshots.prefix = ""
+        manager = SnapshotManager(config)
+        fake = _FakeIncus({"20260919-162609-healthy": _ago(5)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.list_snapshots() == []
+
+
+def _non_lvm(used_pct: float):
+    from genesis.guardian.pool import StoragePoolStatus
+
+    return StoragePoolStatus(
+        detected=True, pool_used_pct=used_pct, pool_size_bytes=300 * 1024**3, pool_name="p",
+    )
+
+
+class TestGateMeasuredAcrossBackends:
+    """A headroom refusal on a POSITIVELY non-LVM pool is a real pool refusal
+    (so delete-first works on btrfs/dir); on an LVM pool it is df of the host
+    filesystem and stays a probe refusal. And the gate is never looser than
+    relief's reserve."""
+
+    @pytest.mark.asyncio
+    async def test_non_lvm_headroom_refusal_is_measured(self, manager) -> None:
+        with (
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_non_lvm(95.0)),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _mock_subprocess_headroom(free_bytes=1 * 1024**3),
+            ),
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is True
+
+    @pytest.mark.asyncio
+    async def test_lvm_with_blank_percents_df_refusal_is_a_probe(self, manager) -> None:
+        from genesis.guardian.pool import StoragePoolStatus
+
+        blank = StoragePoolStatus(
+            detected=True, pool_name="default", vg_name="vg0", thinpool_lv="IncusThinPool",
+        )
+        with (
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=blank),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _mock_subprocess_headroom(free_bytes=1 * 1024**3),
+            ),
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is False
+
+    @pytest.mark.asyncio
+    async def test_gate_refuses_inside_relief_reserve(self, manager) -> None:
+        # 97.5% used on a large pool, but df says ample absolute headroom: the
+        # headroom gate alone would admit a snapshot relief then deletes.
+        with (
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_non_lvm(97.5)),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _mock_subprocess_headroom(free_bytes=100 * 1024**3),
+            ),
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is True
+
+    @pytest.mark.asyncio
+    async def test_control_room_is_admitted(self, manager) -> None:
+        with (
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_non_lvm(60.0)),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _mock_subprocess_headroom(free_bytes=100 * 1024**3),
+            ),
+        ):
+            assert await manager.safe_to_snapshot() is True
+
+
+@pytest.mark.asyncio
+async def test_refused_retry_note_names_the_surviving_lifeline(manager) -> None:
+    """Two healthy snapshots: delete-first removes the OLDER; if the retry is
+    refused too, the newer still stands and the note must say so."""
+    older, newer = "guardian-20251230-000000-healthy", "guardian-20260101-000000-healthy"
+    fake = _FakeIncus(
+        {older: _ago(50), newer: _ago(26)}, create_err=_LVM_THRESHOLD_ERR, fail_all=True,
+    )
+    with (
+        patch.object(manager, "safe_to_snapshot", return_value=True),
+        patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _with_thin_lvs(fake, manager, live_frac=0.80),
+        ),
+        patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+    ):
+        assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+    assert fake.deleted == [older]
+    assert f"rollback falls back to {newer}" in manager.last_rotation_note
+
+
+class TestChronologyIsCreationTimeNotName:
+    """Security review: a name fitting the ownership pattern can carry any
+    date (``guardian-99999999-999999-healthy``). Every "newest healthy"
+    decision must follow incus's created_at, or such a snapshot outranks the
+    real lifeline — prune deletes the lifeline, rollback restores the forgery,
+    and delete-first sees a "fresh" lifeline and never fires."""
+
+    REAL = "guardian-20260925-120000-healthy"
+    FORGED = "guardian-99999999-999999-healthy"
+
+    @pytest.mark.asyncio
+    async def test_rollback_target_and_prune(self, config) -> None:
+        config.snapshots.retention = 1
+        manager = SnapshotManager(config)
+        fake = _FakeIncus({
+            self.REAL: _ago(20),
+            self.FORGED: _ago(200),  # created long BEFORE the real lifeline
+            "guardian-99999990-999999": _ago(300),
+        })
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.get_latest_healthy() == self.REAL
+            await manager.prune()
+        assert self.REAL not in fake.deleted, fake.deleted
+
+    @pytest.mark.asyncio
+    async def test_forged_name_cannot_suppress_delete_first(self, manager) -> None:
+        # The real lifeline is 30h old; a forged "newest" one was created
+        # minutes ago. By creation time the newest healthy is the forgery, so
+        # it is fresh and delete-first rightly waits — but the forgery must not
+        # masquerade as newer than it is: with it created BEFORE the real one,
+        # the real lifeline is the newest and is nominated.
+        fake = _FakeIncus({self.REAL: _ago(30), self.FORGED: _ago(60)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            stale = await manager._stale_lifeline(datetime.now(UTC))
+        assert stale == self.FORGED  # the OLDEST healthy by creation time goes first
+        meta = None
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            meta = await manager.list_snapshot_meta_strict()
+        assert [n for n, _ in meta][0] == self.REAL
+
+
+
+@pytest.mark.asyncio
+async def test_retention_never_evicts_a_healthy_snapshot(config) -> None:
+    """Review: at retention 2 with two healthy snapshots, take() used to evict
+    the older BEFORE a create LVM then refused, and delete-first took the
+    other — no rollback target left. Healthy snapshots are rotation's alone."""
+    config.snapshots.retention = 1
+    manager = SnapshotManager(config)
+    a, b = "guardian-20260101-000000-healthy", "guardian-20260102-000000-healthy"
+    pre = "guardian-20260103-000000-pre-recovery"
+    fake = _FakeIncus({a: _ago(50), b: _ago(26), pre: _ago(20)}, create_err=_LVM_THRESHOLD_ERR)
+    with (
+        patch.object(manager, "safe_to_snapshot", return_value=True),
+        patch("genesis.guardian.snapshots._run_subprocess", fake.run),
+    ):
+        assert await manager.take(label="healthy") is None
+    assert a not in fake.deleted and b not in fake.deleted
+    assert fake.deleted == [pre]  # retention still applies to non-healthy ones
+
+
+
+class TestReviewRound2:
+    """External review round 2 on the core PR."""
+
+    @pytest.mark.parametrize("stderr", [
+        "Error: no space left on device",           # host fs / daemon ENOSPC
+        "Error: insufficient free space for the database",
+    ])
+    @pytest.mark.asyncio
+    async def test_generic_enospc_is_not_a_pool_refusal(self, manager, stderr) -> None:
+        fake = _FakeIncus({}, create_err=stderr)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", fake.run),
+        ):
+            assert await manager.take(label="pre-recovery") is None
+        assert manager.last_refusal == REFUSED_OTHER
+
+    @pytest.mark.parametrize("status_kw", [
+        dict(data_pct=10.0, metadata_pct=5.0, thinpool_lv=None),   # low % of an unnamed pool
+        dict(data_pct=None, metadata_pct=None),                    # no figures at all
+    ])
+    @pytest.mark.asyncio
+    async def test_gate_refuses_unattributable_lvm_as_probe(self, manager, status_kw) -> None:
+        calls: list = []
+
+        async def run(*a, **k):
+            calls.append(a)
+            return 0, "      Avail    1B-blocks\n90000000000 100000000000\n", ""
+
+        with (
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.1, **status_kw)),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+        ):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is False
+        assert not any(c and c[0] == "df" for c in calls)  # never the host filesystem
+
+    @pytest.mark.asyncio
+    async def test_undated_lifeline_is_ordered_by_its_name(self, manager) -> None:
+        """incus omitted created_at on the NEWEST healthy snapshot: it must not
+        sort behind an older dated one (and so lose the rollback target)."""
+        older, newer = "guardian-20260101-000000-healthy", "guardian-20260105-000000-healthy"
+
+        async def run(*a, **k):
+            return 0, json.dumps([
+                {"name": older, "created_at": "2026-01-01T00:00:00Z"},
+                {"name": newer},
+            ]), ""
+
+        with patch("genesis.guardian.snapshots._run_subprocess", run):
+            assert await manager.get_latest_healthy() == newer
+
+
+
+@pytest.mark.parametrize("bad", ["3", 60, float("nan")])
+@pytest.mark.asyncio
+async def test_gate_ignores_an_invalid_reserve(config, bad) -> None:
+    """Audit: the gate runs before a recovery action; an invalid reserve must
+    neither crash it nor pose as a measured pool refusal."""
+    config.storage_pool.min_reserve_pct = bad
+    manager = SnapshotManager(config)
+    with patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.45)):
+        assert await manager.safe_to_snapshot() is True
+    assert manager.last_gate_measured is False
+
+
+
+class TestRollbackChokepoint:
+    """Review round 3 (owner-chosen shape): ONE chokepoint deletes rollback
+    snapshots; nothing else can."""
+
+    H = "guardian-20260101-000000-healthy"
+
+    @pytest.mark.asyncio
+    async def test_plain_delete_refuses_a_healthy_snapshot(self, manager) -> None:
+        fake = _FakeIncus({self.H: _ago(50)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.delete(self.H) is False
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_chokepoint_needs_confirmation_or_a_replacement(self, manager) -> None:
+        fake = _FakeIncus({self.H: _ago(50)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            assert await manager.delete_healthy(self.H) is False
+            assert fake.deleted == []
+            assert await manager.delete_healthy(self.H, replaced_by="guardian-x-healthy") is True
+        assert fake.deleted == [self.H]
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_health_never_deletes_first(self, manager) -> None:
+        fake = _FakeIncus(
+            {"guardian-20260101-000000-healthy": _ago(30)}, create_err=_LVM_THRESHOLD_ERR,
+        )
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            assert await manager.mark_healthy(delete_first_allowed=True) is None
+        assert fake.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_prune_never_deletes_a_superseded_healthy(self, config) -> None:
+        """Devin: prune removed the fallback right before a refused refresh."""
+        config.snapshots.retention = 1
+        config.snapshots.max_age_days = 1
+        manager = SnapshotManager(config)
+        older, newer = "guardian-20260101-000000-healthy", "guardian-20260102-000000-healthy"
+        pre = "guardian-20260103-000000-pre-recovery"
+        fake = _FakeIncus({older: _ago(90), newer: _ago(60), pre: _ago(50)})
+        with patch("genesis.guardian.snapshots._run_subprocess", fake.run):
+            await manager.prune()
+        assert older not in fake.deleted and newer not in fake.deleted
+        assert pre in fake.deleted  # non-healthy age rule still applies
+
+    @pytest.mark.asyncio
+    async def test_retention_eviction_defers_delete_first(self, config) -> None:
+        """Devin: take() evicted a snapshot, the create was refused, and
+        delete-first then took the lifeline before the first delete's space
+        came back."""
+        config.snapshots.retention = 1
+        manager = SnapshotManager(config)
+        life = "guardian-20260101-000000-healthy"
+        pre = "guardian-20260102-000000-pre-recovery"
+        fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR)
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            assert await manager.mark_healthy(
+                delete_first_allowed=True, healthy_confirmed=True,
+            ) is None
+        assert fake.deleted == [pre]  # the eviction, and nothing on top of it
+        assert life in fake.snaps
+
+    @pytest.mark.parametrize("bad", [-1, "85", 0])
+    @pytest.mark.asyncio
+    async def test_malformed_tier_is_a_probe_refusal(self, config, bad) -> None:
+        config.storage_pool.data_high_pct = bad
+        manager = SnapshotManager(config)
+        with patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.3)):
+            assert await manager.safe_to_snapshot() is False
+        assert manager.last_gate_measured is False
+
+    @pytest.mark.parametrize("prefix", ["", "   ", None])
+    @pytest.mark.asyncio
+    async def test_no_ownership_prefix_creates_nothing(self, config, prefix) -> None:
+        config.snapshots.prefix = prefix
+        manager = SnapshotManager(config)
+        run = AsyncMock()
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+        ):
+            assert await manager.take(label="healthy") is None
+        run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_eviction_also_defers_delete_first(config) -> None:
+    """Review: a retention delete that TIMED OUT may still be running in the
+    daemon, so it must hold delete-first off exactly like a completed one."""
+    config.snapshots.retention = 1
+    manager = SnapshotManager(config)
+    life = "guardian-20260101-000000-healthy"
+    pre = "guardian-20260102-000000-pre-recovery"
+    fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR)
+    inner = _with_thin_lvs(fake, manager, live_frac=0.80)
+
+    async def run(*args, **kwargs):
+        if args[:3] == ("incus", "snapshot", "delete") and args[4] == pre:
+            return -1, "", "timeout"  # client gave up; the snapshot is still listed
+        return await inner(*args, **kwargs)
+
+    with (
+        patch.object(manager, "safe_to_snapshot", return_value=True),
+        patch("genesis.guardian.snapshots._run_subprocess", run),
+        patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+    ):
+        assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
+    assert manager.last_take_evicted is True
+    assert life in fake.snaps and life not in fake.deleted

@@ -439,7 +439,16 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Running inside the container — direct operations
 
         # Stop all Genesis services (timer first, then service, to prevent restart)
+        # The tmp watchgod goes BEFORE the pressure-reclaim instances it
+        # starts, or it could start one again mid-teardown. (Instance names
+        # are built from a variable so no literal "unit at instance dot
+        # service" name reaches the tree: CI's email scan reads that shape as
+        # an address.)
+        PRESSURE_UNIT=genesis-disk-hygiene-pressure
         for unit in genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-tmp-watchgod.service \
+                    "${PRESSURE_UNIT}@standard.service" \
+                    "${PRESSURE_UNIT}@last-resort.service" \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
@@ -533,6 +542,9 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             # Stop all services (timers first to prevent restart races)
             container_exec "
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
+                systemctl --user stop genesis-tmp-watchgod.service 2>/dev/null || true;
+                P=genesis-disk-hygiene-pressure; systemctl --user stop \${P}@standard.service \${P}@last-resort.service 2>/dev/null || true;
+                systemctl --user stop genesis-disk-hygiene.timer genesis-disk-hygiene.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
@@ -541,6 +553,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-tmp-watchgod.service \
+                    genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \

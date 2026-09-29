@@ -1416,3 +1416,329 @@ class TestHealthySnapshotWiring:
         snapshots.mark_healthy = AsyncMock(side_effect=RuntimeError("incus down"))
         await _maintain_snapshots(config, snapshots, is_healthy=True)
         assert (config.state_path / ".last_prune").exists()
+
+
+class TestPoolReliefWiring:
+    """Relief runs every tick BEFORE the cycle; a refused lifeline refresh is
+    loud (throttled) and retried within the hour on its OWN marker, so the
+    daily prune/expiry stay daily."""
+
+    def _snapshots(self, name=None, refusal="pool_gate", note=None):
+        snapshots = MagicMock()
+        snapshots.prune = AsyncMock(return_value=0)
+        snapshots.enforce_expiry_policy = AsyncMock(return_value=True)
+        snapshots.mark_healthy = AsyncMock(return_value=name)
+        snapshots.last_refusal = None if name else refusal
+        snapshots.last_rotation_note = note
+        return snapshots
+
+    @pytest.mark.asyncio
+    async def test_relief_runs_before_the_cycle(self, config: GuardianConfig) -> None:
+        order: list[str] = []
+
+        async def relief(*a, **k):
+            order.append("relief")
+
+        async def cycle(*a, **k):
+            order.append("cycle")
+
+        with (
+            patch("genesis.guardian.check._check_pool_relief", relief),
+            patch("genesis.guardian.check._check_cycle", cycle),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+        assert order == ["relief", "cycle", "relief"]  # pre-probe, cycle, post-probe
+
+    @pytest.mark.asyncio
+    async def test_delete_first_reserves_relief_settle(self, config: GuardianConfig) -> None:
+        """The settle runs both ways, and is persisted BEFORE mark_healthy may
+        delete: the callback it is handed stamps relief's last_action."""
+        from genesis.guardian.pool_relief import delete_first_allowed
+
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        kwargs = snapshots.mark_healthy.await_args.kwargs
+        assert kwargs["delete_first_allowed"] is True
+        assert delete_first_allowed(config)  # nothing stamped until the callback runs
+        assert kwargs["reserve_settle"]() is True
+        assert not delete_first_allowed(config)  # now relief is settling
+
+    @pytest.mark.parametrize("value", ["false", "no", 1])
+    @pytest.mark.asyncio
+    async def test_non_bool_healthy_enabled_takes_nothing(
+        self, config: GuardianConfig, value,
+    ) -> None:
+        """The loader does not coerce: `healthy_enabled: "false"` is a truthy
+        string, and must not take (or delete-first) a healthy snapshot."""
+        config.snapshots.healthy_enabled = value
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        snapshots.mark_healthy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_relief_frees_rollback_snapshots_only_after_the_probe(
+        self, config: GuardianConfig,
+    ) -> None:
+        """The pre-cycle pass never frees rollback snapshots (the probe has not
+        run); the post-cycle pass may, only when THIS tick's probe said
+        HEALTHY."""
+        for post_state, expect in ((GuardianState.HEALTHY, True), (GuardianState.CONFIRMED_DEAD, False)):
+            seen: list = []
+            sm = MagicMock()
+            sm.current_state = GuardianState.HEALTHY  # the STALE pre-probe state
+            sm.state.signal_history = []
+
+            async def relief(
+                *a, healthy_confirmed=False, alert_when_deferred=True, _seen=seen, **k,
+            ):
+                _seen.append((healthy_confirmed, alert_when_deferred))
+
+            async def cycle(*a, _sm=sm, _post=post_state, **k):
+                # The probe's verdict, recorded the way process() records it.
+                from datetime import UTC, datetime
+
+                _sm.current_state = _post
+                _sm.state.signal_history = [{
+                    "at": datetime.now(UTC).isoformat(),
+                    "all_alive": _post == GuardianState.HEALTHY,
+                }]
+
+            with (
+                patch("genesis.guardian.check._check_pool_relief", relief),
+                patch("genesis.guardian.check._check_cycle", cycle),
+                patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+                patch("genesis.guardian.check.load_secrets", return_value={}),
+                patch("genesis.guardian.check.ConfirmationStateMachine", return_value=sm),
+                patch("genesis.guardian.check._maintain_snapshots", AsyncMock()),
+            ):
+                await run_check(config)
+            assert seen == [(False, False), (expect, True)], post_state
+
+    @pytest.mark.asyncio
+    async def test_unwritable_cadence_marker_skips_rotation(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        with patch("genesis.guardian.check._touch_marker", return_value=False):
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        snapshots.mark_healthy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_delete_note_is_throttled(self, config: GuardianConfig) -> None:
+        """A timed-out delete-first (nothing confirmed deleted) says so, but
+        through the refusal throttle — not on every hourly retry."""
+        from datetime import UTC, datetime, timedelta
+
+        dispatcher = AsyncMock()
+        calls = 0
+        for _ in range(3):
+            snapshots = self._snapshots(note="deleting the lifeline did not confirm")
+            snapshots.last_rotation_deleted = False
+            # Make every iteration genuinely due (an absent marker would fall
+            # back to .last_prune, which the first pass stamps).
+            config.state_path.mkdir(parents=True, exist_ok=True)
+            (config.state_path / ".last_healthy").write_text(
+                (datetime.now(UTC) - timedelta(days=2)).isoformat(),
+            )
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+            calls += snapshots.mark_healthy.await_count
+        assert calls == 3  # guard-the-guard: every pass really ran the refresh
+        assert dispatcher.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_lifeline_is_refreshed_early(self, config: GuardianConfig) -> None:
+        """Audit: relief deleted the lifeline; a replacement should not wait for
+        the daily cadence — but a pool that keeps refusing is retried at most
+        hourly, never every tick."""
+        from datetime import UTC, datetime, timedelta
+
+        config.state_path.mkdir(parents=True, exist_ok=True)
+        marker = config.state_path / ".last_healthy"
+        (config.state_path / ".last_prune").write_text(datetime.now(UTC).isoformat())
+        for age_h, has_lifeline, expect in (
+            (2, False, True),    # no lifeline, last try 2h ago -> due now
+            (2, True, False),    # lifeline present -> daily cadence
+            (0.2, False, False), # no lifeline but tried 12 min ago -> wait
+        ):
+            marker.write_text((datetime.now(UTC) - timedelta(hours=age_h)).isoformat())
+            snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+            snapshots.get_latest_healthy = AsyncMock(
+                return_value="guardian-20260101-000000-healthy" if has_lifeline else None,
+            )
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+            assert (snapshots.mark_healthy.await_count == 1) is expect, (age_h, has_lifeline)
+
+    @pytest.mark.asyncio
+    async def test_relief_crash_alerts_once_a_day(self, config: GuardianConfig) -> None:
+        from genesis.guardian.check import _check_pool_relief
+
+        dispatcher = AsyncMock()
+        with patch(
+            "genesis.guardian.pool_relief.check_pool_relief",
+            AsyncMock(side_effect=ValueError("bad config")),
+        ):
+            await _check_pool_relief(config, dispatcher, MagicMock())
+            await _check_pool_relief(config, dispatcher, MagicMock())
+        assert dispatcher.send.await_count == 1
+        assert "failing" in dispatcher.send.await_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_relief_crash_alert_needs_a_persisted_throttle(
+        self, config: GuardianConfig,
+    ) -> None:
+        """Unwritable state dir: the daily throttle cannot stick, so the
+        alert must not be sent at all (else every 30s tick)."""
+        from genesis.guardian.check import _check_pool_relief
+
+        dispatcher = AsyncMock()
+        with (
+            patch(
+                "genesis.guardian.pool_relief.check_pool_relief",
+                AsyncMock(side_effect=ValueError("bad config")),
+            ),
+            patch("genesis.guardian.check._touch_marker", return_value=False),
+        ):
+            for _ in range(3):
+                await _check_pool_relief(config, dispatcher, MagicMock())
+        dispatcher.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refused_refresh_alerts_and_retries_in_an_hour(
+        self, config: GuardianConfig,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        snapshots = self._snapshots(refusal="pool_space")
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        dispatcher.send.assert_awaited_once()
+        alert = dispatcher.send.await_args.args[0]
+        assert "NOT refreshed" in alert.title and "pool_space" in alert.body
+        stamp = datetime.fromisoformat((config.state_path / ".last_healthy").read_text())
+        hours_since = (datetime.now(UTC) - stamp).total_seconds() / 3600
+        assert 22.9 < hours_since < 23.1  # the healthy cadence reopens in ~1h
+
+    @pytest.mark.asyncio
+    async def test_hourly_retry_does_not_rerun_the_daily_prune(
+        self, config: GuardianConfig,
+    ) -> None:
+        """Review: sharing one marker re-ran expiry + prune every hour while
+        the pool refused. The retry now reopens only the healthy snapshot."""
+        from datetime import UTC, datetime, timedelta
+
+        snapshots = self._snapshots()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        # an hour later the healthy retry is due again; the prune is not
+        marker = config.state_path / ".last_healthy"
+        marker.write_text((datetime.now(UTC) - timedelta(hours=25)).isoformat())
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        assert snapshots.mark_healthy.await_count == 2
+        assert snapshots.prune.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_refusal_alert_is_throttled_not_hourly(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots()
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        # an hour later: the retry marker (stamped now - 23h) is due again
+        from datetime import UTC, datetime, timedelta
+
+        (config.state_path / ".last_healthy").write_text(
+            (datetime.now(UTC) - timedelta(hours=24, minutes=1)).isoformat()
+        )
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        assert snapshots.mark_healthy.await_count == 2
+        assert dispatcher.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rotation_passes_the_relief_permission(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        with patch(
+            "genesis.guardian.pool_relief.delete_first_allowed", return_value=False,
+        ):
+            await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=AsyncMock())
+        assert snapshots.mark_healthy.await_args.kwargs["delete_first_allowed"] is False
+
+    @pytest.mark.asyncio
+    async def test_delete_first_rotation_is_reported(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(
+            name="guardian-20260101-000000-healthy",
+            note="pool refused the create (pool_space); deleted ...",
+        )
+        snapshots.last_rotation_deleted = True
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        assert "delete-first" in dispatcher.send.await_args.args[0].title
+
+    @pytest.mark.asyncio
+    async def test_plain_rotation_is_silent(self, config: GuardianConfig) -> None:
+        snapshots = self._snapshots(name="guardian-20260101-000000-healthy")
+        dispatcher = AsyncMock()
+        await _maintain_snapshots(config, snapshots, is_healthy=True, dispatcher=dispatcher)
+        dispatcher.send.assert_not_called()
+
+
+class TestProbeConfirmedHealthy:
+    """Internal review, BLOCKER: the state machine reaches HEALTHY with every
+    signal down (auto-reset out of CONFIRMED_DEAD). Rollback snapshots — relief's
+    post-cycle pass and the daily healthy refresh — must follow THIS tick's
+    probe, never the state. Real state machine, real run_check."""
+
+    @staticmethod
+    async def _run(config, snapshot) -> list:
+        calls: list = []
+
+        async def relief(*a, healthy_confirmed=False, **k):
+            calls.append(("relief", healthy_confirmed))
+
+        async def maintain(*a, is_healthy=False, **k):
+            calls.append(("maintain", is_healthy))
+
+        with (
+            patch("genesis.guardian.check.collect_all_signals", AsyncMock(return_value=snapshot)),
+            patch("genesis.guardian.check._build_dispatcher", return_value=MagicMock(send=AsyncMock())),
+            patch("genesis.guardian.check._handle_healthy", AsyncMock()),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch("genesis.guardian.check._check_pool_relief", relief),
+            patch("genesis.guardian.check._maintain_snapshots", maintain),
+        ):
+            await run_check(config)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_auto_reset_while_down_confirms_nothing(self, config: GuardianConfig) -> None:
+        import json
+
+        state_path = _seed_state(
+            config,
+            current_state="confirmed_dead",
+            first_failure_at="2026-01-01T00:00:00+00:00",  # long past → auto-reset
+            auto_reset_count=0,
+        )
+        calls = await self._run(config, _dead_snapshot())
+        # guard-the-guard: the auto-reset really landed on HEALTHY
+        assert json.loads(state_path.read_text())["current_state"] == "healthy"
+        assert calls == [("relief", False), ("relief", False), ("maintain", False)]
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_probe_confirms(self, config: GuardianConfig) -> None:
+        calls = await self._run(config, _healthy_snapshot())
+        assert calls == [("relief", False), ("relief", True), ("maintain", True)]
+
+    def test_a_stale_probe_confirms_nothing(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from genesis.guardian.check import _probe_confirmed_healthy
+
+        now = datetime.now(UTC)
+        sm = MagicMock()
+        sm.current_state = GuardianState.HEALTHY
+        sm.state.signal_history = [{"at": (now - timedelta(minutes=5)).isoformat(), "all_alive": True}]
+        assert _probe_confirmed_healthy(sm, now) is False  # an EARLIER tick's probe
+        sm.state.signal_history = [{"at": now.isoformat(), "all_alive": True}]
+        assert _probe_confirmed_healthy(sm, now) is True
+        sm.state.signal_history = [{"at": now.isoformat(), "all_alive": False}]
+        assert _probe_confirmed_healthy(sm, now) is False
+        sm.state.signal_history = []
+        assert _probe_confirmed_healthy(sm, now) is False
