@@ -57,21 +57,23 @@ class InboxPromptLoadError(RuntimeError):
 def _eval_disallowed_tools() -> list[str]:
     """Tools denied to the inbox-eval judge (runs skip_permissions on EXTERNAL input).
 
-    This is the reflection read-only denylist (``build_reflection_disallowed``)
-    MINUS ``Bash``. It denies file writes, the whole SPAWN class
+    This is the full reflection read-only denylist (``build_reflection_disallowed``),
+    ``Bash`` included. It denies shell access, file writes, the whole SPAWN class
     (Agent/Task/Workflow/Skill — a spawned child would escape with a fresh,
     unrestricted toolset), the user-scoped MCP servers, and every genesis MCP
     *write* (``memory_store`` / ``settings_update`` / ``follow_up_create`` / …),
     while KEEPING the reads the prompt needs (``memory_recall`` /
-    ``procedure_recall`` / genesis-health status reads) and the one write the
-    prompt still uses (``observation_write`` — the OPTIONAL ``user_signal`` digest).
+    ``procedure_recall`` / genesis-health status reads, and ``web_fetch``, which
+    fetches YouTube videos through yt-dlp in Python) and the one write the prompt
+    still uses (``observation_write`` — the OPTIONAL ``user_signal`` digest).
 
-    ``Bash`` is deliberately RETAINED: the prompt shells out to ``yt-dlp`` /
-    ``curl`` to fetch YouTube (and SSL-failing) inbox URLs. Relocating that fetch
-    into Python so ``Bash`` can also be denied is the remaining residual of
-    follow-up 727a3724 (the inbox judge's injection→RCE surface). Deriving from
-    ``build_reflection_disallowed`` (live per call) means a genesis MCP write
-    added in a future PR is auto-denied here with no code change.
+    ``Bash`` used to be retained only so the prompt could shell out to ``yt-dlp`` /
+    ``curl``; that fetch now lives behind ``web_fetch`` (follow-up d83569bf).
+    Deriving from ``build_reflection_disallowed`` (live per call) means a genesis
+    MCP write added in a future PR is auto-denied here with no code change. If
+    that registry enumeration fails, the denylist falls back to denying both MCP
+    servers wholesale (fail-closed): the judge then has no ``web_fetch`` and can
+    fetch only with the built-in WebFetch, so a YouTube item reports the gap.
 
     NOTE: the retained ``observation_write`` now STAMPS the session origin (WS-3):
     an eval-session write lands ``origin_class='external_untrusted'`` (like the
@@ -86,10 +88,9 @@ def _eval_disallowed_tools() -> list[str]:
     always-loaded L1 file; ``reflection`` context; several ego/sentinel raw-SQL
     reads). Closing that broader observation-content-surfacing surface (exclude/wrap
     external-origin content at the surfacing points) is tracked — see the
-    "external-origin observation content" follow-up. (The ``Bash``/fetch relocation
-    remains the open part of 727a3724, above.)
+    "external-origin observation content" follow-up.
     """
-    return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
+    return SessionConfigBuilder().build_reflection_disallowed()
 
 
 # URL extraction now lives in scanner.py (canonical). Kept as a module-level
@@ -128,7 +129,7 @@ def _extract_bracket_directives(text: str) -> list[str]:
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
 # Tested against all 8 existing response files: 0 false positives, 0 false negatives.
 # Crucially, these do NOT include "ssl error" or "could not fetch" which appear
-# in SUCCESSFUL evaluations that worked around SSL via yt-dlp/curl.
+# in SUCCESSFUL evaluations that worked around a fetch failure.
 _URL_FAILURE_PATTERNS = [
     "unfetchable",
     "unreachable from this host",

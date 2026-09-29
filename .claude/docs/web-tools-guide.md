@@ -10,6 +10,7 @@ These are the PRIMARY tools. Use them by default in all contexts.
 | Need | Tool | Notes |
 |------|------|-------|
 | Fetch URL content | `web_fetch(url)` | Anti-bot, JS fallback, structured output |
+| YouTube video (what it says) | `web_fetch(url)` | Metadata + transcript via yt-dlp (original-language captions, else audio transcription); no Bash needed. `config/youtube_fetch.yaml` sets certificate handling |
 | Search the web | `web_search(query)` | SearXNG unlimited, structured results |
 | AI-summarized fetch | CC `WebFetch` | Foreground only — when you need AI summary |
 | Quick general lookup | CC `WebSearch` | Foreground only — simple questions |

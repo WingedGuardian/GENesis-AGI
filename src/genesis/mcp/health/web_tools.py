@@ -625,11 +625,50 @@ async def web_fetch(
     - Parallel multi-URL fetching (urls parameter)
     - Background sessions (no Bash available)
 
+    - YouTube videos: with backend "auto", a video URL returns its metadata,
+      description and transcript (captions in the video's own language, else
+      an audio transcription) via yt-dlp — backend_used "yt-dlp", plus
+      `caption` provenance. If that fails, the page is fetched as usual and
+      `youtube_error` says why.
+
     Use CC WebFetch when you specifically need AI-processed summaries.
     Use browser_navigate when you need to interact with the page.
     """
+    from genesis.mcp.health.youtube_route import fetch_youtube
+
     if urls:
-        return await _impl_web_fetch_multi(urls, max_chars)
+        # YouTube entries take the YouTube route; the rest go to TinyFish
+        # together. Results come back in the caller's order, one per URL.
+        urls = urls[:10]
+        slots: list[dict | None] = []
+        rest: list[str] = []
+        for u in urls:
+            yt, yt_error = await fetch_youtube(u, max_chars)
+            if yt is not None:
+                slots.append(yt)
+            elif yt_error is not None:
+                page = await _impl_web_fetch(u, "auto", max_chars)
+                slots.append({**page, "youtube_error": yt_error})
+            else:
+                slots.append(None)
+                rest.append(u)
+        if len(rest) == len(urls):
+            return await _impl_web_fetch_multi(rest, max_chars)
+        merged = await _impl_web_fetch_multi(rest, max_chars) if rest else {"results": []}
+        batch = list(merged.get("results") or [])
+        if rest and not batch:
+            # TinyFish unavailable or failed: name every URL it was given.
+            batch = [{"url": u, "error": merged.get("error", "fetch failed")} for u in rest]
+        fill = iter(batch)
+        results = [s if s is not None else next(fill, {"url": u, "error": "no result"})
+                   for s, u in zip(slots, urls, strict=True)]
+        return {**merged, "results": results}
+    if backend == "auto":
+        yt, yt_error = await fetch_youtube(url.strip(), max_chars)
+        if yt is not None:
+            return yt
+        if yt_error is not None:
+            return {**await _impl_web_fetch(url, backend, max_chars), "youtube_error": yt_error}
     return await _impl_web_fetch(url, backend, max_chars)
 
 
