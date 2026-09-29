@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -77,6 +78,7 @@ def _run_hook(
     home: Path,
     payload_cwd: str | None = None,
     extra_env: dict[str, str] | None = None,
+    hook: Path = _HOOK,
 ) -> subprocess.CompletedProcess:
     body = {
         "hook_event_name": "PreToolUse",
@@ -92,7 +94,7 @@ def _run_hook(
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        [sys.executable, str(_HOOK)],
+        [sys.executable, str(hook)],
         input=payload,
         cwd=str(repo),
         env=env,
@@ -244,6 +246,82 @@ def test_literal_absolute_cd_still_allows(repo: Path, home: Path) -> None:
 def test_literal_dash_C_still_allows(repo: Path, home: Path) -> None:
     _mark(repo, home)
     res = _run_hook(f"git -C {repo} commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def _hook_inside(repo: Path) -> Path:
+    """A copy of the gate that lives inside ``repo``'s own ``.git``.
+
+    The live-branch refusal applies only when the commit is in the repository
+    the gate ships in. The shipped gate belongs to THIS repository, so against a
+    scratch repo it correctly stands aside. A copy under the scratch repo's
+    ``.git`` (untracked, so it never enters the staged diff) resolves to the
+    scratch repo's git dir, the same one a commit there uses."""
+    dest = repo / ".git" / "genesis-scripts"
+    shutil.copytree(
+        _REPO_ROOT / "scripts", dest, ignore=shutil.ignore_patterns("__pycache__")
+    )
+    return dest / "review_enforcement_commit.py"
+
+
+def _live_with_manifest(repo: Path, home: Path) -> None:
+    _git(repo, "checkout", "-q", "-b", "live")
+    (repo / "f.py").write_text("base = 4\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    (home / ".genesis").mkdir(exist_ok=True)
+    (home / ".genesis" / "deploy_manifest.json").write_text("{}\n")
+
+
+def test_commit_on_live_integration_branch_is_blocked(repo: Path, home: Path) -> None:
+    # `live` is rebuilt by `git commit-tree` from origin/main plus the manifest's
+    # candidates, so a hand commit there is refused like one on main — even with
+    # a valid review marker, which would otherwise allow it.
+    hook = _hook_inside(repo)
+    _live_with_manifest(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home, hook=hook)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Commit on 'live'" in res.stderr
+
+
+def test_commit_on_another_repositorys_live_branch_is_ordinary(repo: Path, home: Path) -> None:
+    # The manifest describes THIS install's repository. A session also commits in
+    # unrelated checkouts, and their own `live` branches are not its business:
+    # the shipped gate (this repository's) stands aside for the scratch repo.
+    _live_with_manifest(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_live_repo_identity_unreadable_fails_closed(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the manifest present, a commit whose repository cannot be identified
+    # is treated as one in this repository, as the gate treats an unreadable
+    # branch: refuse rather than guess.
+    import importlib.util
+
+    (home / ".genesis" / "deploy_manifest.json").write_text("{}\n")
+    monkeypatch.setenv("HOME", str(home))
+    spec = importlib.util.spec_from_file_location("rec_live_probe", str(_HOOK))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._live_integration_repo(str(tmp_path / "missing")) is True
+    # An existing directory that is no repository at all is unreadable too.
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    assert mod._live_integration_repo(str(not_a_repo)) is True
+
+
+def test_commit_on_a_live_branch_without_a_manifest_is_ordinary(repo: Path, home: Path) -> None:
+    # No deploy manifest = no integration branch: a branch that merely happens
+    # to be named `live` is an ordinary branch.
+    _git(repo, "checkout", "-q", "-b", "live")
+    (repo / "f.py").write_text("base = 4\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    assert not (home / ".genesis" / "deploy_manifest.json").exists()
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
 
 

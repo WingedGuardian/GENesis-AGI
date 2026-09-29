@@ -564,7 +564,7 @@ def _handle_enter_worktree(data: dict) -> int:
     )
     print("Keep the session findable — do this instead:", file=sys.stderr)
     print(
-        "  - Isolated file changes: `git worktree add .claude/worktrees/<name> "
+        "  - Isolated file changes: `git worktree add --no-track .claude/worktrees/<name> "
         "-b <scope>/<desc> origin/main`, then edit via the worktree's ABSOLUTE "
         "paths and test with `PYTHONPATH=<worktree>/src pytest <files>`. Your "
         "session stays in the main repo and in /resume.",

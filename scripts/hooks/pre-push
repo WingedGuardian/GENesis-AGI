@@ -1,16 +1,78 @@
 #!/bin/bash
-# Genesis pre-push hook — block ALL direct pushes to main on origin
-# Private/fork remotes are unrestricted — users own their forks.
-# Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
+# Genesis pre-push hook — block ALL direct pushes to main on origin, and block
+# publishing a `Deploy-rebuild:` commit to ANY remote.
+# Private/fork remotes are otherwise unrestricted — users own their forks.
+# Portable copy: lives in scripts/hooks/, installed by scripts/hooks/sync-hooks.sh
 
 remote="$1"
 
-# Only protect the public repo (origin). Private forks can force push freely.
-if [ "$remote" != "origin" ]; then
-    exit 0
-fi
+# An all-zero object id means "no object" (a deletion, or a ref the remote does
+# not have yet). Its length depends on the repository's hash: 40 for SHA-1, 64
+# for SHA-256, so test the shape, never one fixed string.
+is_zero_oid() {
+    case "$1" in
+        ""|*[!0]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
 while read local_ref local_oid remote_ref remote_oid; do
+    # A `Deploy-rebuild:` commit exists only on `live`, the local integration
+    # branch (origin/main plus unmerged candidate branches, rebuilt locally).
+    # A branch that contains one was cut from `live`, so it carries other PRs'
+    # unreviewed code; publishing it anywhere, fork included, is never right.
+    # Deletions (local_oid all zeros) publish no commits.
+    if ! is_zero_oid "$local_oid"; then
+        # Walk exactly what this push adds when the remote's current tip is known
+        # locally. Otherwise (a new ref, or a tip updated elsewhere and never
+        # fetched) walk the WHOLE ancestry: remote-tracking refs record the last
+        # fetch, not what the remote holds now, so excluding what they reach could
+        # hide a rebuild commit the remote has since dropped. (MEASURED 0.18 s for
+        # a whole-history walk of this repository.)
+        if ! is_zero_oid "$remote_oid" && git cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
+            range_args=("$remote_oid..$local_oid")
+        else
+            range_args=("$local_oid")
+        fi
+        # The one exclusion that IS safe: origin's main. It is protected and only
+        # moves forward, so even a stale local copy of it reaches only commits the
+        # public repository already carries on main; publishing them again adds
+        # nothing unreviewed. Without it, a single rebuild commit reaching main
+        # (a squash commit whose message happens to end in the trailer) would
+        # refuse every new branch cut from main, on every install.
+        if git rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1; then
+            range_args+=(--not refs/remotes/origin/main)
+        fi
+        # No `valueonly`: git prints the key itself (`Deploy-rebuild: <v>`), so a
+        # trailer with an EMPTY value is still seen. The `-c` settings pin how git
+        # finds trailers (a separator without `:`, or a comment character that
+        # swallows the trailer line, would hide it), and --no-show-signature keeps
+        # gpg's report off stdout under `log.showSignature`. The output is then
+        # read strictly as `<hash><TAB><trailer>`, so no other line can pose as
+        # a hit.
+        if ! rebuilt=$(git -c trailer.separators=: -c core.commentChar='#' -c core.commentString='#' \
+                log --no-show-signature --format='%H%x09%(trailers:key=Deploy-rebuild,separator=%x2C)' \
+                "${range_args[@]}" 2>/dev/null); then
+            echo "BLOCKED: could not list the commits this push publishes to $remote_ref."
+            echo "Refusing rather than risk publishing a Deploy-rebuild commit."
+            exit 1
+        fi
+        hit=$(printf '%s\n' "$rebuilt" | awk -F'\t' '$1 ~ /^[0-9a-f]+$/ && length($1) >= 40 && $2 != "" {print $1; exit}')
+        if [ -n "$hit" ]; then
+            echo "BLOCKED: this push to $remote_ref publishes a Deploy-rebuild commit ($hit)."
+            echo ""
+            echo "Deploy-rebuild commits exist only on 'live', the local integration branch,"
+            echo "so this branch was cut from 'live' and carries other candidates' unmerged"
+            echo "code. Recreate it from origin/main and carry only your own commits over:"
+            echo "  git worktree add --no-track .claude/worktrees/<name> -b <scope>/<desc> origin/main"
+            exit 1
+        fi
+    fi
+
+    # Only protect the public repo (origin) for direct pushes to main.
+    if [ "$remote" != "origin" ]; then
+        continue
+    fi
     if echo "$remote_ref" | grep -qE 'refs/heads/(main|master)$'; then
         # Block ALL direct pushes to main — force or fast-forward.
         # The only way to update main is via PR merge (gh pr merge).

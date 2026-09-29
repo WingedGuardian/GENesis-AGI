@@ -933,14 +933,20 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
 
     _validate_positive_int(section, "check_interval_seconds", errors)
     _validate_positive_int(section, "timeout_s", errors)
+    # #1953: these two were never bounded here, and 0 is harmful for both —
+    # items_per_eval=0 divides a drop into nothing, max_retries=0 parks on the
+    # first miss. config.py floors them too, for the paths this never sees.
+    _validate_positive_int(section, "items_per_eval", errors)
+    _validate_positive_int(section, "max_retries", errors)
 
-    if "batch_size" in section:
-        try:
-            val = int(section["batch_size"])
-            if val < 1 or val > 10:
-                errors.append("inbox_monitor.batch_size must be 1-10")
-        except (ValueError, TypeError):
-            errors.append("inbox_monitor.batch_size must be an integer")
+    # Same integer rule as every other numeric key here (#2447 review): the
+    # hand-written int() branch accepted `true` and 2.7 and raised on inf.
+    if _validate_int(section, "batch_size", errors) and not (
+        1 <= int(section["batch_size"]) <= 10
+    ):
+        errors.append("inbox_monitor.batch_size must be 1-10")
+    # 0 means "no cooldown", so the floor is 0, not 1 (config.py agrees).
+    _validate_int(section, "evaluation_cooldown_seconds", errors, minimum=0)
 
     valid_models = VALID_MODEL_NAMES
     model = section.get("model")
@@ -2122,14 +2128,37 @@ def _validate_float_range(
 
 
 def _validate_positive_int(d: dict, key: str, errors: list[str]) -> None:
+    _validate_int(d, key, errors, minimum=1)
+
+
+def _validate_int(d: dict, key: str, errors: list[str], *, minimum: int = 1) -> bool:
+    """Append an error unless ``d[key]`` is an integer >= ``minimum``.
+
+    Returns True only when the key is present AND valid, so a caller can add
+    its own further bounds without re-parsing.
+    """
     if key not in d:
-        return
+        return False
+    raw = d[key]
+    # int() alone was too forgiving: `true` became 1, 2.7 became 2 and was
+    # reported "applied", and inf raised OverflowError out of the validator.
+    # Same rule as the inbox config loader, so what this accepts is what the
+    # loader keeps (#2447 review): no bools, no fractions; 4.0 and "4" are ints.
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        errors.append(f"{key} must be an integer, got {raw!r}")
+        return False
     try:
-        val = int(d[key])
-        if val <= 0:
-            errors.append(f"{key} must be a positive integer, got {val}")
-    except (ValueError, TypeError):
-        errors.append(f"{key} must be an integer, got {d[key]!r}")
+        val = int(raw)
+    except (ValueError, TypeError, OverflowError):
+        errors.append(f"{key} must be an integer, got {raw!r}")
+        return False
+    if val < minimum:
+        errors.append(
+            f"{key} must be a positive integer, got {val}" if minimum == 1
+            else f"{key} must be an integer >= {minimum}, got {val}"
+        )
+        return False
+    return True
 
 
 # ── Tool implementations ──────────────────────────────────────────────

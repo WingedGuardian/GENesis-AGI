@@ -45,13 +45,14 @@ class InboxConfig:
     effort: str = "high"
     timeout_s: int = 1200
     max_retries: int = 3
-    # "shadow" computes the URL-coverage verdict and logs it without acting;
-    # "enforce" re-queues an item whose response never quotes one of its URLs.
-    # Defaults to shadow because this gate is NEW (main has none) and a corpus
-    # replay says it would flag roughly half of legacy-shaped responses on day
-    # one, into a retry path that parks a file after 3 failures with no
-    # notification. Flip to enforce on measured compliance, not on hope.
-    url_coverage_mode: str = "shadow"
+    # "enforce" re-queues an item whose response never quotes one of its URLs;
+    # "shadow" computes and logs the verdict without acting. Shipped shadow in
+    # #1820 because the gate was new; flipped to enforce on measurement: over the
+    # first 42 evaluations run under the `**Source:**` prompt contract, 42 carried
+    # Source lines and 0 would have been re-queued (pre-registered bar: >=30
+    # evals, <=10%). Parking now alerts the owner, so enforcing cannot turn a
+    # silent loss into a silent stall. Shadow stays one config line away.
+    url_coverage_mode: str = "enforce"
     recursive: bool = False
     # timezone removed — uses genesis.env.user_timezone()
     evaluation_cooldown_seconds: int = 3600

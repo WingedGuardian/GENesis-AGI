@@ -1796,7 +1796,121 @@ def _run_carrier_command_start(argv: list[str], i: int) -> tuple[int, bool] | No
     return None  # `uv run --flag` with no command after it
 
 
-def _strip_wrappers(argv: list[str]) -> list[str]:
+def _net_subshell_depth(src: str) -> int:
+    """Parens this segment's SOURCE opens minus those it closes, outside quotes.
+
+    Counted on the source text rather than on shlex tokens because tokens have
+    already lost their quotes: in ``(echo "a)"; git push)`` the quoted ``a)``
+    token looks exactly like a closer, cancels the opener, and the push is hidden
+    again — MEASURED on the first, token-based version. Here a paren inside single
+    quotes, double quotes, after a backslash, or inside a ``${...}`` expansion
+    (``${v:-)}``, ``${v//[(]/}``) is text, not an operator. A ``$(...)``
+    substitution opens and closes within itself, so it nets to zero.
+
+    This count only decides how many subshells are CARRIED into later segments.
+    It is not trusted to decide how many ``)`` a segment peels; see
+    _strip_wrappers.
+    """
+    depth = 0
+    brace = 0  # nesting of ${...}; only `${` nests, as in bash
+    in_single = in_double = False
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if in_single:
+            if c == "'":
+                in_single = False
+        elif c == "\\":
+            i += 1  # the next character is literal, in or out of double quotes
+        elif in_double:
+            if c == '"':
+                in_double = False
+        elif c == "'":
+            in_single = True
+        elif c == '"':
+            in_double = True
+        elif c == "$" and i + 1 < n and src[i + 1] == "{":
+            brace += 1
+            i += 1
+        elif brace:
+            if c == "}":
+                brace -= 1
+        elif c == "#" and (i == 0 or src[i - 1] in " \t\n;&|("):
+            # a comment runs to end of line; parens in it are text
+            nl = src.find("\n", i)
+            if nl < 0:
+                break
+            i = nl
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def _wrapper_takes_assignment(wrapper: str, word: str, options_done: bool) -> bool:
+    """Whether ``wrapper`` consumes ``word`` as an environment assignment.
+
+    Only ``env`` and ``sudo`` take assignments; every other wrapper here executes
+    a word containing ``=`` as its program (MEASURED in bash).
+
+    MEASURED against GNU env 9.4 and sudo 1.9.15 with a stub per candidate
+    program, reading which one ran:
+
+    * ``env`` takes every word containing ``=`` — ``=x``, ``A.B=1``, even a path
+      such as ``/opt/k=v/git`` — and ``--`` does not end that: ``env -- A=1 cmd``
+      runs cmd.
+    * ``sudo`` takes a word containing ``=`` unless it starts with ``=`` or ``/``:
+      ``sudo /opt/k=v/git push`` RUNS that path and ``sudo =x cmd`` runs ``=x``.
+      After ``--`` it takes none: ``sudo -- A=1 cmd`` runs ``A=1``.
+    """
+    if "=" not in word:
+        return False
+    if wrapper == "env":
+        return True
+    if wrapper == "sudo":
+        # sudo tests the word it RECEIVES, after bash expanded it, and this word
+        # is the one BEFORE expansion: `sudo ~/k=v/git` and `sudo $HOME/k=v/git`
+        # reach sudo as absolute paths and run them, while `sudo $X=1 cmd` with
+        # X=A reaches it as `A=1` and runs cmd (MEASURED). Which one an expansion
+        # produces is not knowable here, so the shape decides: a leading `~`, or
+        # an expansion in front of a `/`, is read as the path it almost always
+        # is; an expansion with no `/` before the `=` as the assignment.
+        if options_done or word[0] in "=/~":
+            return False
+        name = word.split("=", 1)[0]
+        if "$" in name or "`" in name:
+            return "/" not in name
+        return True
+    return False
+
+
+_SUBSCRIPT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]$")
+
+
+def _is_prefix_assignment(tok: str) -> bool:
+    """Whether a command-position word is a bash prefix assignment.
+
+    ``NAME=value`` and ``NAME+=value``. The ``+=`` form was missing, so
+    ``FOO+=1 git push`` resolved its command to ``FOO+=1`` and every guard saw
+    no push at all — MEASURED, no decision from the push guard, including for a
+    push onto the default branch. bash runs the command with the variable set.
+    An ARRAY SUBSCRIPT (``a[0]=1 cmd``) is accepted too. bash prints "not a
+    valid identifier" for it and then RUNS the command anyway — MEASURED, bash
+    5.2. An earlier revision said the opposite: its probe piped the output through
+    ``head -1``, which kept the error line and discarded the proof that the
+    command ran.
+    """
+    if "=" not in tok:
+        return False
+    name = tok.split("=", 1)[0]
+    if name.endswith("+"):
+        name = name[:-1]
+    return name.isidentifier() or bool(_SUBSCRIPT_NAME.match(name))
+
+
+def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
     command, and peel the matching subshell-close `)` off the revealed argv.
@@ -1843,6 +1957,13 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     i = 0
     open_parens = 0
     via_uv_tool = False  # reached the command through `uvx` / `uv tool run`
+    # Once a wrapper has been consumed, bash is no longer parsing the words
+    # that follow: `nohup A=b/git push` runs the program `A=b/git`, it does not
+    # assign A. So the PREFIX-assignment rule applies only before the first
+    # wrapper (MEASURED: applying it after `nohup` resolved that command to
+    # `push` and hid it). Assignment-taking wrappers (env, sudo) skip their own
+    # `=`-words inside the wrapper loop below.
+    after_wrapper = False
     opaque = False  # a uv tool-runner met an option of unknown arity
     while i < len(argv):
         tok = argv[i]
@@ -1856,8 +1977,13 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         if tok in _CMD_POSITION_WORDS:
             i += 1  # reserved word / brace-group opener at command position
             continue
-        if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
-            i += 1  # leading VAR=value assignment
+        if (
+            not after_wrapper
+            and "=" in tok
+            and not tok.startswith("-")
+            and _is_prefix_assignment(tok)
+        ):
+            i += 1  # leading VAR=value / VAR+=value assignment
             continue
         if _basename(tok) in _RUN_CARRIERS:
             found = _run_carrier_command_start(argv, i)
@@ -1869,6 +1995,16 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
+        # A bare `time` at command position is the bash KEYWORD, not a program:
+        # bash keeps parsing a simple command after it, so `time A=1 git push`
+        # (and `time -p …`, `time -- …`, `time time …`) assigns A and runs git —
+        # MEASURED, bash 5.2. Only a `time` reached THROUGH a wrapper (`env time`,
+        # `nohup time`) is the external program, which executes a `=`-word.
+        # A `time` after a prefix assignment is also external in bash; resolving
+        # it as the keyword there over-gates (reveals a command that does not
+        # run), never hides one.
+        if not (tok == "time" and not after_wrapper):
+            after_wrapper = True
         if _basename(tok) == "uvx":
             via_uv_tool = True
         # `uvx` is the one wrapper whose CALLER can recover an unresolved
@@ -1879,14 +2015,21 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         recoverable = _basename(tok) == "uvx"
         wrapper_at = i
         argflags, positional = spec
+        wrapper_name = _basename(tok)
         i += 1
+        # `--` ends OPTION parsing only. It does not end the wrapper's positional
+        # or assignment operands: `timeout -- 5 git push` still takes `5` as the
+        # duration and `env -- A=1 git push` still assigns A — MEASURED, both run
+        # git. Breaking out at `--` resolved those to `5` and `A=1`, hiding git.
+        options_done = False
         # consume the wrapper's own value-flags and leading positional args
         while i < len(argv):
             t = argv[i]
-            if t == "--":
+            if t == "--" and not options_done:
+                options_done = True
                 i += 1
-                break
-            if t.startswith("-"):
+                continue
+            if t.startswith("-") and not options_done:
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
                 elif recoverable and "=" not in t:
@@ -1905,7 +2048,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 else:
                     i += 1
                 continue
-            if "=" in t and t.split("=", 1)[0].isidentifier():
+            if _wrapper_takes_assignment(wrapper_name, t, options_done):
+                # `env` takes ANY word containing `=` as an assignment and runs
+                # what follows, before or after `--` — MEASURED, `env A.B=1 cmd`,
+                # `env 1X=1 cmd`, `env =x cmd` and `env -- A=1 cmd` all run cmd,
+                # so an identifier test left `env A.B=1 git push` hidden from
+                # every guard. `sudo` is narrower; see _wrapper_takes_assignment.
+                #
+                # ONLY for those wrappers. An earlier revision applied the rule to
+                # every wrapper, claiming the worst case was an over-gate. That was
+                # wrong, MEASURED in bash: `nohup`, `timeout`, `nice`, `command`,
+                # `time`, `stdbuf`, `setsid`, `chrt`, `ionice`, `exec` and `xargs`
+                # EXECUTE a word containing `=` — `nohup ./a=b/git push` runs git —
+                # so skipping it landed the resolver on `push` and HID the command.
                 i += 1
                 continue
             if positional > 0:
@@ -1917,6 +2072,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             i = wrapper_at  # leave the segment ON the carrier — see above
             break
     result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
+    # Subshells left open by EARLIER segments close here too. `(export A=1; git
+    # push)` splits at `;` into `(export A=1` and `git push)`: this segment opened
+    # nothing, so without the carry its `)` stayed glued, the subcommand read as
+    # `push)`, and no guard saw a push. MEASURED: no decision.
+    #
+    # The peel is by TOKEN, so a QUOTED trailing `)` inside a still-open subshell
+    # is peeled too: `(echo x; git push origin 'HEAD:main)'; echo done)` pushes
+    # to `main)` and reads as `HEAD:main`. That misreads an argument in the
+    # over-gate direction, and it is kept on purpose. Letting the source text
+    # decide which `)` are quoted was tried and REMOVED: every way that reading
+    # goes wrong (`$'\''`, `${v:-{}`, nested quotes inside `"$(…)"`) left a real
+    # closer glued to the verb and hid the push — MEASURED in real bash.
+    open_parens += carried_open
     if open_parens and result:
         # Peel matching trailing `)` closers off the operand(s) carrying the
         # subshell close — up to the number of `(` openers consumed, scanning from
@@ -2803,12 +2971,19 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         return [], "length"
     out: list[Segment] = []
     truncated = False
+    # Subshells opened and not yet closed by earlier segments of this command. A
+    # `(` opener counts; a `)` closer (bare or glued) at the end of a segment
+    # closes. Counted on the segment SOURCE text outside quotes and comments, so a
+    # paren inside a quoted argument is never mistaken for a subshell.
+    carried_open = 0
     for seg in parse_segments(command):
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
-        argv = _strip_wrappers(_argv(seg.argv_src))
+        tokens = _argv(seg.argv_src)
+        argv = _strip_wrappers(tokens, carried_open)
+        carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
             Segment(

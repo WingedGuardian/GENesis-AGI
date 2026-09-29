@@ -707,6 +707,36 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
     return "branch" if sub == "switch" or targets else None
 
 
+def _git_common_dir(cwd: str | None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        out = result.stdout.strip()
+        return os.path.realpath(out) if result.returncode == 0 and out else None
+    except Exception:
+        return None
+
+
+def _live_integration_repo(cwd: str | None) -> bool:
+    """Whether ``cwd``'s repository runs a local integration branch named ``live``.
+
+    The deploy manifest declares that this install runs one (without it a
+    branch named ``live`` is ordinary), and the commit must be in THIS
+    repository or one of its worktrees: a session commits in unrelated
+    checkouts too, and their own ``live`` branches are none of this gate's
+    business. With the manifest present but an identity unreadable, fail
+    closed, as this gate does for an unverifiable branch."""
+    if not (Path.home() / ".genesis" / "deploy_manifest.json").is_file():
+        return False
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
+    there = _git_common_dir(cwd)
+    if here is None or there is None:
+        return True
+    return here == there
+
+
 def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
     """The git worktree ROOT that owns ``cwd`` (canonicalized), or ``realpath(cwd)``
     as a fallback. Two different SUBDIRECTORIES of one worktree — and a symlink alias
@@ -1231,6 +1261,23 @@ def main() -> None:
             _deny(
                 "BLOCKED: Direct commits to main are not allowed. "
                 "Create a branch first: git checkout -b <scope>/<description>"
+            )
+            return
+        if seg_branch == "live" and _live_integration_repo(
+            seg_cwd if isinstance(seg_cwd, str) else None
+        ):
+            # `live` is the local integration branch: origin/main plus the
+            # candidate branches in ~/.genesis/deploy_manifest.json, rebuilt with
+            # `git commit-tree`. A hand commit here is one the planned rebuild
+            # engine (not built yet) will refuse as unknown, so it belongs on a
+            # branch cut from origin/main.
+            _deny(
+                "BLOCKED: Commit on 'live', the local integration branch. It is "
+                "rebuilt from origin/main plus the candidates in "
+                "~/.genesis/deploy_manifest.json. Commit on a branch cut from "
+                "origin/main (git worktree add --no-track "
+                ".claude/worktrees/<name> -b <scope>/<desc> origin/main), then "
+                "add it as a candidate."
             )
             return
     # Commits chained into DIFFERENT dirs share this one gate, but the review
