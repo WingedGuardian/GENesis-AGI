@@ -2595,7 +2595,60 @@ class TestClaudeAiSyncOptOut:
         finally:
             d.chmod(0o755)
         assert "syncClaudeAiSkills" not in json.loads(s.read_text())
-        assert "synced exists but cannot be read" in r.stderr, r.stderr
+        assert "holds synced skills could not be read" in r.stderr, r.stderr
+
+    def test_an_unsearchable_parent_is_not_read_as_nothing_synced(self, tmp_path: Path) -> None:
+        """Review (Devin, #2561): `[ -e skills/synced ]` is false for EACCES as well
+        as ENOENT, so a skills/ the reconcile cannot search read a full synced/ as
+        missing and wrote the opt-out. Missing now counts only when the nearest
+        existing ancestor is searchable."""
+        if os.geteuid() == 0:
+            pytest.skip("root searches any directory; the unsearchable case cannot be built")
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        parent = tmp_path / "home" / ".claude" / "skills"
+        parent.chmod(0)
+        try:
+            r = _run(tmp_path, self._CALL)
+        finally:
+            parent.chmod(0o755)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data, "an unverified synced/ must not be read as empty"
+        assert data["syncClaudeAiPlugins"] is False, "a kind whose absence IS provable still gets it"
+        assert "holds synced skills could not be read" in r.stderr, r.stderr
+
+    def test_an_unreadable_withholding_record_withholds_every_kind(self, tmp_path: Path) -> None:
+        """Review (Codex, #2561): a record that exists but cannot be read (e.g.
+        left root-owned by a restore) used to read as "no history", so an emptied
+        synced/ got the opt-out the record existed to prevent."""
+        if os.geteuid() == 0:
+            pytest.skip("root reads any file; the unreadable case cannot be built")
+        s = self._seed(tmp_path)
+        rec = tmp_path / "home" / ".genesis" / "cc_sync_optout_withheld"
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text("skills\n")
+        rec.chmod(0)
+        try:
+            r = _run(tmp_path, self._CALL)
+        finally:
+            rec.chmod(0o644)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+        assert "exists but cannot be read" in r.stderr, r.stderr
+        assert "the record of which opt-outs were withheld cannot be read" in r.stderr, r.stderr
+        assert rec.read_text() == "skills\n", "the record itself is left alone"
+
+    @pytest.mark.parametrize("value", ["true", None, 1])
+    def test_a_non_boolean_value_is_reported_with_nothing_synced(self, tmp_path: Path, value) -> None:
+        """Review (Devin + Codex, #2561): the type check lived inside the withheld
+        loop, so with nothing synced a preserved non-boolean (which CC reads as
+        false) went unreported."""
+        s = self._seed(tmp_path, {"syncClaudeAiSkills": value})
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] == value, "set-if-absent never replaces it"
+        assert '"syncClaudeAiSkills" in' in r.stderr and "is not true/false" in r.stderr, r.stderr
+        assert r.stderr.count("is not true/false") == 1, "only the non-boolean key is flagged"
 
     def test_a_withheld_opt_out_still_reports_defaults_not_degraded(self, tmp_path: Path) -> None:
         """Holding one key back is not a failure: the deploy reads `defaults`."""

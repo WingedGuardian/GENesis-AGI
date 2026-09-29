@@ -1621,7 +1621,7 @@ _settings_file="$HOME/.claude/settings.json"
 #     genesis-cc-settings-align timer re-run, so setup and steady state cannot
 #     drift apart);
 #   * the container defaults (subagent nesting, the MCP description cap, and the
-#     claude.ai skills/plugins sync opt-outs where nothing is synced yet) are SET
+#     claude.ai skills/plugins sync opt-outs where nothing was synced when checked) are SET
 #     IF ABSENT, so a deliberate operator value is preserved. The list — and its
 #     rationale, including CC's trash-on-disable behaviour for synced skills and
 #     plugins — lives in scripts/lib/cc_version.sh (cc_reconcile_container_settings),

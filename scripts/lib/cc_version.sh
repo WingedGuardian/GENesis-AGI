@@ -92,9 +92,12 @@ CC_CONTAINER_SETTINGS_DEFAULTS=(
 # plugins (~/.claude/plugins/synced) "are hidden from every session started
 # afterwards, and are moved to ~/.claude/<kind>/.trash at the next launch"; if sync
 # is re-enabled they are re-downloaded, not restored. So each opt-out is added only
-# where that kind has NOTHING synced yet — which covers every fresh install — and
-# withheld where something is, with a notice the operator can act on
-# (cc_reconcile_container_settings). `kind:key` pairs; the directory is
+# where that kind had NOTHING synced when the reconcile checked — which covers every
+# fresh install — and withheld where something is, or where that cannot be read,
+# with a notice the operator can act on (cc_reconcile_container_settings). The
+# check and the write are one reconcile, not one atomic step: a sync landing in
+# that sub-second window is not seen, and the decision is made once per install
+# (afterwards the key is present). `kind:key` pairs; the directory is
 # <claude dir>/<kind>/synced.
 CC_CLAUDE_AI_SYNC_OPTOUTS=(
     "skills:syncClaudeAiSkills"
@@ -257,14 +260,31 @@ cc_ensure_updater_suppressed() {
 }
 
 # _cc_synced_entries <dir> — print how many entries <dir> holds: 0 if it is
-# missing or empty, a count otherwise, or `unreadable` if it exists but cannot be
-# listed. Bash builtins only (a subshell glob), because the reconcile runs where
-# only a minimal PATH is guaranteed. An unreadable directory counts as NOT empty:
-# the cost of guessing "empty" is retiring someone's synced skills.
+# missing or empty, a count otherwise, or `unreadable` if that cannot be
+# established. Bash builtins only (a subshell glob), because the reconcile runs
+# where only a minimal PATH is guaranteed. Only a POSITIVE reading counts as
+# empty — the cost of guessing "empty" is retiring someone's synced skills:
+#   * a directory that exists must be listable;
+#   * "missing" is believed only when the nearest existing ancestor is a
+#     searchable directory. `[ -e ]` is false for EACCES as well as ENOENT, so
+#     an unsearchable parent (e.g. skills/ at mode 000) would otherwise read a
+#     full synced/ as absent (review).
 _cc_synced_entries() {
-    local d="$1"
+    local d="$1" p
     if [ ! -e "$d" ] && [ ! -L "$d" ]; then
-        echo 0
+        p="$d"
+        while :; do
+            case "$p" in
+                */*) p="${p%/*}"; [ -z "$p" ] && p="/" ;;
+                *) p="." ;;
+            esac
+            if [ -e "$p" ] || [ -L "$p" ] || [ "$p" = "/" ] || [ "$p" = "." ]; then break; fi
+        done
+        if [ -d "$p" ] && [ -x "$p" ]; then
+            echo 0
+        else
+            echo unreadable
+        fi
         return 0
     fi
     if [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then
@@ -276,7 +296,8 @@ _cc_synced_entries() {
 
 # cc_resolve_container_defaults [claude_dir] — the set-if-absent defaults THIS
 # install should receive: CC_CONTAINER_SETTINGS_DEFAULTS always, plus each
-# claude.ai sync opt-out whose <kind>/synced directory is empty or missing. Sets
+# claude.ai sync opt-out whose <kind>/synced directory is PROVABLY empty or missing
+# (see _cc_synced_entries). Sets
 # CC_CONTAINER_DEFAULTS_EFFECTIVE (array) and CC_SYNC_OPTOUT_WITHHELD (array of
 # `kind:key:count` for each opt-out held back). claude_dir defaults to ~/.claude.
 #
@@ -299,16 +320,27 @@ _cc_line_in() {
 }
 
 cc_resolve_container_defaults() {
-    local claude_dir="${1:-$HOME/.claude}" pair kind key n recorded=""
+    local claude_dir="${1:-$HOME/.claude}" pair kind key n recorded="" record_lost=0
     CC_CONTAINER_DEFAULTS_EFFECTIVE=("${CC_CONTAINER_SETTINGS_DEFAULTS[@]}")
     CC_SYNC_OPTOUT_WITHHELD=()
-    if [ -r "$_CC_SYNC_WITHHELD_FILE" ]; then
-        recorded="$(cat "$_CC_SYNC_WITHHELD_FILE" 2>/dev/null || true)"
+    if [ -e "$_CC_SYNC_WITHHELD_FILE" ] || [ -L "$_CC_SYNC_WITHHELD_FILE" ]; then
+        # A record that exists but cannot be read is not "no history": it may
+        # name a kind withheld on purpose, so every kind stays withheld (review).
+        if ! recorded="$(cat "$_CC_SYNC_WITHHELD_FILE" 2>/dev/null)"; then
+            record_lost=1
+            echo "  WARNING: $_CC_SYNC_WITHHELD_FILE exists but cannot be read — every" \
+                 "claude.ai sync opt-out is held back until it can be (fix its ownership" \
+                 "or permissions, or set the keys in settings.json yourself)" >&2
+        fi
     fi
     for pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
         kind="${pair%%:*}"
         key="${pair#*:}"
         n="$(_cc_synced_entries "$claude_dir/$kind/synced")"
+        if [ "$record_lost" = 1 ]; then
+            CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:record-unreadable")
+            continue
+        fi
         if [ "$n" = "0" ] && ! _cc_line_in "$kind" "$recorded"; then
             CC_CONTAINER_DEFAULTS_EFFECTIVE+=("top:${key}=false")
             continue
@@ -347,25 +379,35 @@ cc_reconcile_container_settings() {
     return "$rc"
 }
 
-# _cc_sync_optout_notice <settings_file> — one stderr NOTE per withheld sync
-# opt-out, printed on EVERY reconcile while the key is still absent (a decision
-# the operator has not made yet should stay visible), and silent once they set it
-# either way. update.sh reaches this through its own cc_ensure_local call, whose
-# output is not trimmed. Key presence is read with python3; without it, or with a
-# settings file it cannot parse, the note is printed (a spare line beats silence).
+# _cc_sync_optout_notice <settings_file> — the operator-facing report on the two
+# claude.ai sync keys, run on EVERY reconcile:
+#   * a key present but NOT a boolean is warned about whatever else holds —
+#     Claude Code treats it as false, so sync is off, and a set-if-absent default
+#     never replaces it (review: this used to be checked only for a withheld key);
+#   * a withheld key that is still absent gets one NOTE naming both choices (a
+#     decision the operator has not made yet stays visible), and goes silent once
+#     they set it either way.
+# update.sh reaches this through its own cc_ensure_local call, whose output is
+# not trimmed. Key state is read with python3; without it, or with a settings
+# file it cannot parse, a withheld key's note is printed (a spare line beats
+# silence) and no type warning can be given.
 _cc_sync_optout_notice() {
-    local sf="$1" entry kind key n rest what
-    for entry in "${CC_SYNC_OPTOUT_WITHHELD[@]}"; do
-        kind="${entry%%:*}"
-        rest="${entry#*:}"
-        key="${rest%%:*}"
-        n="${rest#*:}"
-        # rc 0 = the operator decided (a JSON boolean); 2 = present but NOT a
-        # boolean, which CC treats as false (so the sync IS off); 1 = absent, or
-        # the file cannot be read.
-        local decided=1
+    local sf="$1" pair entry kind key n what state withheld_n
+    for pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
+        kind="${pair%%:*}"
+        key="${pair#*:}"
+        withheld_n=""
+        for entry in "${CC_SYNC_OPTOUT_WITHHELD[@]}"; do
+            if [ "${entry%%:*}" = "$kind" ]; then
+                n="${entry#*:}"
+                withheld_n="${n#*:}"
+            fi
+        done
+        # rc 0 = a JSON boolean (the operator decided); 2 = present but NOT a
+        # boolean; 1 = absent, or the file cannot be read.
+        state=1
         if command -v python3 >/dev/null 2>&1; then
-            decided=0
+            state=0
             python3 -c '
 import json, sys
 try:
@@ -375,22 +417,23 @@ except Exception:
 if not isinstance(d, dict) or sys.argv[2] not in d:
     sys.exit(1)
 sys.exit(0 if isinstance(d[sys.argv[2]], bool) else 2)
-' "$sf" "$key" 2>/dev/null || decided=$?
-            # Any other non-zero (python crashed) reads as undecided: print the note.
-            case "$decided" in 0|1|2) ;; *) decided=1 ;; esac
+' "$sf" "$key" 2>/dev/null || state=$?
+            # Any other non-zero (python crashed) reads as absent.
+            case "$state" in 0|1|2) ;; *) state=1 ;; esac
         fi
-        [ "$decided" = "0" ] && continue
-        if [ "$decided" = "2" ]; then
+        if [ "$state" = "2" ]; then
             echo "  WARNING: \"${key}\" in ${sf} is not true/false, and Claude Code treats any" \
                  "other value as false — so claude.ai ${kind} sync is OFF, and anything in" \
                  "${sf%/*}/${kind}/synced is moved to .trash at its next launch. Set it to" \
                  "true to keep syncing, or false to confirm." >&2
             continue
         fi
-        case "$n" in
-            unreadable) what="${sf%/*}/${kind}/synced exists but cannot be read, so it may hold synced ${kind}" ;;
+        [ "$state" = "1" ] && [ -n "$withheld_n" ] || continue
+        case "$withheld_n" in
+            unreadable) what="whether ${sf%/*}/${kind}/synced holds synced ${kind} could not be read" ;;
+            record-unreadable) what="the record of which opt-outs were withheld cannot be read" ;;
             previously*) what="this install was syncing ${kind} when Genesis first checked (none are in ${sf%/*}/${kind}/synced right now)" ;;
-            *) what="${n} ${kind} already synced in ${sf%/*}/${kind}/synced" ;;
+            *) what="${withheld_n} ${kind} already synced in ${sf%/*}/${kind}/synced" ;;
         esac
         echo "  NOTE: claude.ai ${kind} sync is left ON here: ${what}. Turning it off makes" \
              "Claude Code hide them and move them to ${sf%/*}/${kind}/.trash at its next" \
