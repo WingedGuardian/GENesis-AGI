@@ -266,7 +266,7 @@ class TestBoundaryMarkers:
         wrapped = sanitizer.wrap_content("hello world", ContentSource.WEB_FETCH)
         assert wrapped.startswith('<external-content source="web_fetch"')
         # Both markers carry the same per-wrap id.
-        wrap_id = re.search(r'id="([0-9a-f]{16})">\n', wrapped).group(1)
+        wrap_id = re.search(r'id="([0-9a-f]{16})"', wrapped).group(1)
         assert wrapped.endswith(f'</external-content id="{wrap_id}">')
         assert "hello world" in wrapped
 

@@ -228,6 +228,17 @@ def alert_queue_root() -> Path:
     return genesis_home() / "alerts" / "queue"
 
 
+def boundary_key_path() -> Path:
+    """Path to the per-install secret that keys content-boundary ids.
+
+    ``ContentSanitizer.wrap_content`` derives each wrap's marker id from this key
+    and the content, so the same content always wraps identically (caches and
+    duplicate checks keep working) while text inside a block cannot compute the
+    id that would close it. Created once, mode 0600, by the sanitizer.
+    """
+    return genesis_home() / "boundary_key"
+
+
 def internal_api_token_path() -> Path:
     """Path to the persistent internal API token (generated once at server boot).
 
