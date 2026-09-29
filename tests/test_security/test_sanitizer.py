@@ -6,6 +6,8 @@ INBOX), should_block() can signal blocking for high-severity patterns.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from genesis.security.patterns import InjectionPattern, load_default_patterns
@@ -43,7 +45,7 @@ class TestStripBoundaryMarkers:
         once = s.wrap_content("data", ContentSource.WEB_FETCH)
         twice = s.wrap_content(strip_boundary_markers(once), ContentSource.WEB_FETCH)
         assert twice.count("<external-content") == 1
-        assert twice.count("</external-content>") == 1
+        assert twice.count("</external-content") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +265,9 @@ class TestBoundaryMarkers:
     def test_wrap_produces_xml_tags(self, sanitizer: ContentSanitizer) -> None:
         wrapped = sanitizer.wrap_content("hello world", ContentSource.WEB_FETCH)
         assert wrapped.startswith('<external-content source="web_fetch"')
-        assert wrapped.endswith("</external-content>")
+        # Both markers carry the same per-wrap id.
+        wrap_id = re.search(r'id="([0-9a-f]{16})">\n', wrapped).group(1)
+        assert wrapped.endswith(f'</external-content id="{wrap_id}">')
         assert "hello world" in wrapped
 
     def test_wrap_includes_source(self, sanitizer: ContentSanitizer) -> None:
@@ -283,9 +287,8 @@ class TestBoundaryMarkers:
     def test_content_not_modified_inside_markers(self, sanitizer: ContentSanitizer) -> None:
         original = "This <is> some & special \"content\" with 'quotes'"
         wrapped = sanitizer.wrap_content(original, ContentSource.WEB_FETCH)
-        # Content appears between the tags verbatim except "<", which is escaped so
-        # that no boundary marker can form inside untrusted text.
-        assert original.replace("<", "&lt;") in wrapped
+        # Content appears verbatim between tags
+        assert original in wrapped
 
     def test_sanitize_wrapped_matches_wrap(self, sanitizer: ContentSanitizer) -> None:
         """sanitize().wrapped should match wrap_content() output."""
@@ -293,7 +296,9 @@ class TestBoundaryMarkers:
         source = ContentSource.RECON
         result = sanitizer.sanitize(content, source)
         expected_wrapped = sanitizer.wrap_content(content, source)
-        assert result.wrapped == expected_wrapped
+        # Identical apart from the per-wrap id, which is fresh on every call.
+        without_id = re.compile(r' id="[0-9a-f]{16}"')
+        assert without_id.sub("", result.wrapped) == without_id.sub("", expected_wrapped)
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +392,10 @@ class TestEdgeCases:
         """Content with existing XML tags doesn't confuse boundary markers."""
         content = '<div class="test">Some <b>HTML</b> content</div>'
         result = sanitizer.sanitize(content, ContentSource.WEB_FETCH)
-        assert content.replace("<", "&lt;") in result.wrapped
-        assert result.content == content  # the original is kept unmodified
+        assert content in result.wrapped
         # Our boundary tags are distinct from the content's tags
         assert result.wrapped.count("<external-content") == 1
-        assert result.wrapped.count("</external-content>") == 1
+        assert result.wrapped.count("</external-content") == 1
 
     def test_unicode_content(self, sanitizer: ContentSanitizer) -> None:
         """Unicode content is handled correctly."""

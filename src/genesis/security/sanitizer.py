@@ -8,11 +8,9 @@ use should_block() to check if high-severity patterns warrant blocking.
 from __future__ import annotations
 
 import enum
-import functools
 import logging
 import re
-import sys
-import unicodedata
+import secrets
 from dataclasses import dataclass
 
 from genesis.security.patterns import InjectionPattern, load_default_patterns
@@ -23,7 +21,10 @@ logger = logging.getLogger(__name__)
 # any pre-existing boundary markers before (re-)wrapping, so content that was
 # already wrapped at an upstream ingestion point (e.g. WebFetcher) is never
 # double-wrapped into nested tags that blur the data/instruction boundary.
-_BOUNDARY_MARKER_RE = re.compile(r"<external-content[^>]*>|</external-content>")
+# The attribute run stops at "<" as well as ">": a marker never contains "<", and
+# stopping there keeps each match attempt short, so a long run of unterminated
+# openers costs linear time instead of quadratic.
+_BOUNDARY_MARKER_RE = re.compile(r"<external-content[^<>]*>|</external-content[^<>]*>")
 
 
 def strip_boundary_markers(text: str) -> str:
@@ -33,9 +34,7 @@ def strip_boundary_markers(text: str) -> str:
     before wrapping content that may already carry markers from an upstream
     ingestion point, to avoid nested wrappers that confuse the LLM boundary.
     """
-    # Real markers are removed, then every remaining "<"-like character is escaped:
-    # whatever the removal left behind cannot form a marker, however it is spelled.
-    return _escape_markup(_BOUNDARY_MARKER_RE.sub("", _display_untrusted(text)))
+    return _BOUNDARY_MARKER_RE.sub("", text)
 
 
 # Any maximal run of characters that break — or conceal a break in — a single line
@@ -156,85 +155,59 @@ _PERIMETER_SOURCES = frozenset({ContentSource.EMAIL, ContentSource.INBOX})
 _PERIMETER_BLOCK_THRESHOLD = 0.6
 
 
-# Two forms of untrusted text, each for one job.
-#
-# DISPLAY form (what gets wrapped and passed on): None-safe; Unicode line and
-# paragraph separators become newlines (deleting them would join words); every
-# "<"-like character is escaped. No boundary marker can form without "<", so this
-# holds however a forged marker is spelled or split, and it is a plain character
-# translation: linear, no pattern to evade and nothing to backtrack on. Legitimate
-# "<" in wrapped text reads as "&lt;", which models read without trouble.
-#
-# DETECTION forms (what the injection scanner also checks, never passed on):
-# hidden characters, chosen BY UNICODE CATEGORY rather than a hand-kept list, are
-# once deleted and once turned into spaces, so a hidden character can neither
-# split a phrase from inside a word nor glue its words together.
-_SEPARATORS = str.maketrans({" ": "\n", " ": "\n"})
-_LT_LIKE = str.maketrans({"<": "&lt;", "＜": "&lt;", "﹤": "&lt;"})
-_MARKER_NAME = "external-content"
-# The only hidden characters plain ASCII can carry: controls other than tab/newline/return.
-_ASCII_HIDDEN = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# The boundary is keyed, not escaped. Every wrap carries a fresh random id on both
+# markers, and the prompts that read wrapped content say a block ends only at the
+# closing marker that repeats its opening marker's id. Untrusted text cannot know
+# the id, so no closing marker it spells, in any encoding or look-alike, ends the
+# block. Escaping characters cannot give that guarantee: the reader is a model, and
+# a model reads an entity-spelled or look-alike marker as the marker itself.
+_WRAP_ID_BYTES = 8
 
+# Unicode line and paragraph separators end a line for a model as surely as "\n"
+# does, so they are shown as newlines.
+_SEPARATORS = str.maketrans(dict.fromkeys((chr(0x2028), chr(0x2029)), "\n"))
 
-@functools.lru_cache(maxsize=1)
-def _unicode_tables() -> tuple[re.Pattern[str], re.Pattern[str]]:
-    """Built once, from the Unicode database rather than hand-kept lists.
+# For the scan, EVERY character str.splitlines() treats as a line boundary becomes
+# "\n", so a fake line after a carriage return, form feed or NEL starts a line the
+# line-anchored patterns can see. test_scan_line_breaks_are_splitlines keeps it whole.
+_LINE_BREAKS = str.maketrans(
+    dict.fromkeys(("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", chr(0x2028), chr(0x2029)), "\n")
+)
 
-    - hidden characters (format Cf, control Cc except tab/newline/return, and
-      variation selectors) for the detection forms, mapped to delete / to space;
-    - opening angle-bracket look-alikes (names containing LESS-THAN or a LEFT /
-      LEFT-POINTING ANGLE BRACKET), which a model may read as "<".
-    """
-    delete: dict[int, None] = {}
-    for code in range(sys.maxunicode + 1):
-        ch = chr(code)
-        cat = unicodedata.category(ch)
-        if (cat == "Cf" or (cat == "Cc" and ch not in "\t\n\r")
-                or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF):
-            delete[code] = None
-    delete[0x2028] = None
-    delete[0x2029] = None
-    angles = set()
-    for code in range(0x2000, 0x10000):
-        name = unicodedata.name(chr(code), "")
-        if ("LESS-THAN" in name and "OR" not in name) or (
-            "ANGLE BRACKET" in name and "LEFT" in name
-        ) or "LEFT-POINTING ANGLE" in name:
-            angles.add(chr(code))
-    hidden = re.compile("[" + "".join(re.escape(chr(c)) for c in sorted(delete)) + "]")
-    angle = re.compile("[" + "".join(re.escape(c) for c in sorted(angles - {"＜", "﹤"})) + "]")
-    return hidden, angle
+# Characters a reader never sees. They are deleted, and separately turned into
+# spaces, only in the forms the injection scan checks, never in what is passed on.
+# Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties.txt, Unicode
+# 15.0; test_hidden_set_matches_unicode keeps it in step) plus the C0/C1 controls
+# other than tab, newline and return.
+_HIDDEN_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f"
+    r"­͏؜ᅟᅠ឴឵᠋-᠏​-‏"
+    r"‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸"
+    r"\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
 
 
 def _display_untrusted(text: object) -> str:
+    """The text as it is passed on: None-safe, separators as newlines."""
     return ("" if text is None else str(text)).translate(_SEPARATORS)
 
 
-def _escape_markup(text: str) -> str:
-    """Escape every "<" (always), and any opening angle look-alike that is followed,
-    within a short window, by the marker name. Look-alikes elsewhere are ordinary
-    punctuation and are left alone. Bounded work per look-alike, so linear overall."""
-    text = text.translate(_LT_LIKE)
-    if text.isascii():  # every look-alike is non-ASCII
-        return text
-    hidden, angle = _unicode_tables()
+def _scan_forms(text: object) -> tuple[str, ...]:
+    """Every form the injection scan checks, duplicates dropped.
 
-    def _maybe(m: re.Match[str]) -> str:
-        window = hidden.sub("", text[m.end() : m.end() + 64]).lower()
-        window = window.lstrip().lstrip("/").lstrip()
-        return "&lt;" if window.startswith(_MARKER_NAME) else m.group()
-
-    return angle.sub(_maybe, text)
-
-
-def _detection_forms(text: object) -> tuple[str, str]:
-    """Two scan-only forms: hidden characters deleted (catches one inside a word)
-    and hidden characters as spaces (catches one standing in for a space)."""
+    - the text as given, so a configured rule may target a hidden character itself;
+    - the text with every line boundary as "\n", so a fake line behind any of them
+      starts a line;
+    - that text with hidden characters deleted (one inside a word) and turned into
+      spaces (one standing in for a space between words).
+    """
     raw = "" if text is None else str(text)
-    hidden = _ASCII_HIDDEN if raw.isascii() else _unicode_tables()[0]
-    if hidden.search(raw) is None:  # the common case: nothing to normalize
-        return raw, raw
-    return hidden.sub("", raw), hidden.sub(" ", raw)
+    shown = raw.translate(_LINE_BREAKS)
+    if _HIDDEN_RE.search(shown) is None:  # the common case
+        return tuple(dict.fromkeys((raw, shown)))
+    return tuple(
+        dict.fromkeys((raw, shown, _HIDDEN_RE.sub("", shown), _HIDDEN_RE.sub(" ", shown)))
+    )
 
 
 class ContentSanitizer:
@@ -256,14 +229,17 @@ class ContentSanitizer:
         return list(self._patterns)
 
     def wrap_content(self, content: str, source: ContentSource) -> str:
-        """Wrap content in boundary markers. Use this at ingestion points."""
+        """Wrap content in boundary markers. Use this at ingestion points.
+
+        Both markers carry the same fresh random ``id``, so text inside the block
+        cannot close it: see ``_WRAP_ID_BYTES``.
+        """
         risk = _SOURCE_RISK.get(source, 0.5)
-        # Untrusted text must not be able to close its own boundary.
-        content = _escape_markup(_display_untrusted(content))
+        wrap_id = secrets.token_hex(_WRAP_ID_BYTES)
         return (
-            f'<external-content source="{source.value}" risk="{risk:.1f}">\n'
-            f"{content}\n"
-            f"</external-content>"
+            f'<external-content source="{source.value}" risk="{risk:.1f}" id="{wrap_id}">\n'
+            f"{_display_untrusted(content)}\n"
+            f'</external-content id="{wrap_id}">'
         )
 
     def sanitize(self, content: str, source: ContentSource) -> SanitizationResult:
@@ -280,13 +256,9 @@ class ContentSanitizer:
         detected: list[str] = []
         max_severity = 0.0
 
-        # Scan the NORMALIZED text too: it is what wrap_content hands on, so an
-        # invisible character inside a phrase must not hide it from the scanner.
-        joined, spaced = _detection_forms(content)
-        # With no hidden characters all three forms are the same text: scan once.
-        # With some, the spaced form matches everything the original would (a hidden
-        # character never completes a pattern), so the original is not rescanned.
-        forms = (spaced,) if joined is spaced else (joined, spaced)
+        # Scan what a reader would see as well as what was given: a hidden character
+        # inside a phrase, or a separator before a fake line, must not hide it.
+        forms = _scan_forms(content)
         for pattern in self._patterns:
             if any(pattern.matches(form) for form in forms):
                 detected.append(pattern.name)
