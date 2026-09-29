@@ -1016,9 +1016,9 @@ verified: 640c4f2e3 2026-09-18
   item that exhausts its retries, or a file the retry-storm guard parks (at all
   three of its call sites), queues ONE durable owner alert per file and reason
   per scan, naming the file by its path inside the inbox folder; an exhausted
-  item's alert also names each parked logical item (URLs as host+path plus the
-  coverage-log `url#` id, query strings dropped, token-like path segments
-  masked), while a storm alert names the file only. The retry-lane storm site
+  item's alert also names each parked logical item by the URL's HOST, its LINE
+  in the file and the coverage-log `url#` id — never path or query text, which
+  can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
   the same row is asked about again; with `resilience.parking_mode:
@@ -1150,7 +1150,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: d0627c854 2026-09-11
+verified: 246808153 2026-09-24
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1183,9 +1183,36 @@ verified: d0627c854 2026-09-11
   `cc_sessions.satellite_id` (added via `_migrate_add_columns`, not the base
   `CREATE TABLE` — mirrors `last_extracted_*`) persists the device for the optional
   `per_device` scope; default `global`.
-- **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
+- **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal.
+  **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
+  keep rediscovering.** Exactly two `before_request` hooks exist, and between
+  them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
+  pages only, returning None for any `/api/` or `/v1/` path;
+  `auth.check_api_mutation_auth` is app-level and returns None for
+  GET/HEAD/OPTIONS. So a dashboard password does protect the blueprint's HTML
+  pages — that gate is structural and it does refuse an unauthenticated page
+  GET — except `/genesis/monitor`, which the standalone host registers directly
+  on the app (`hosting/standalone.py`), outside the blueprint, and serves to
+  anyone (a static shell whose data comes from the open API reads below). It
+  protects the MUTATION routes only while the `GENESIS_DASHBOARD_API_AUTH` kill
+  switch is on (the default); set to off, `check_api_mutation_auth` returns
+  before any credential check. And **no request hook gates an API read on any
+  install, configured or not.** A GET under the API prefixes (`/api/genesis/`
+  and `/api/t/`) is therefore anonymous unless its own handler adds a
+  predicate, and only a small minority do (`routes/references.py` is one: its
+  `_auth_or_403` does refuse an anonymous caller once a password is set).
+  API read protection is per-handler or absent — never structural.
+  `is_authenticated()` returns True
+  when no password is set, so such a predicate is INERT on a passwordless
+  install by design (nothing is narrowed for an operator who chose not to
+  configure a credential). The `/v1/*` bearer predicates are the opposite and
+  should not be generalised from: `auth.check_bearer_token` fails CLOSED with a
+  503 when `GENESIS_MCP_HTTP_TOKEN` is unset, password or not. Network
+  isolation is the primary control — see
+  `SECURITY.md`, which is authoritative for the threat model. Consult this
+  before concluding a route is protected because a password exists.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
@@ -1413,9 +1440,11 @@ verified: 84c7259d 2026-08-31
   stands the whole check cycle down beside the indefinite `maintenance_file`. This
   is the *capability* a deploy uses to pause the Guardian across the server restart
   — instead of escalating to `confirmed_dead` and firing a false down/recovered
-  alert — so that a paused restart is silent; the `scripts/update.sh` caller that
-  actually writes the pause across its stop/restart lands as a separate change (a
-  deploy on the old caller simply runs unpaused, as today). The TTL means a deploy
+  alert — so that a paused restart is silent. The container-side caller is
+  `scripts/lib/guardian_pause.sh` (`_guardian_pause`/`_guardian_resume` plus a lease
+  renewer that holds no lock and, once its parent is gone, stops at its next wake
+  instead of pausing again), sourced by
+  `scripts/update.sh`, which arms the resume on its EXIT trap. The TTL means a deploy
   killed before its `resume` self-heals rather than muting the watchdog. During
   stand-down the heartbeat carries a `standdown` marker so `probe_guardian` reports
   DEGRADED (alive, not watching) rather than HEALTHY. Distinct from the container
@@ -1450,6 +1479,8 @@ verified: 84c7259d 2026-08-31
     old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
     live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
     lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    One more create is tried after those reads: only a pool refusal then
+    deletes first (pressure cleared → ordinary create-first rotation).
     The settle is reserved before the delete. Healthy snapshots are never
     retention-evicted before a create. A refused refresh retries in ~1h
     (own `.last_healthy` marker) and alerts, throttled.
@@ -1458,7 +1489,8 @@ verified: 84c7259d 2026-08-31
     pre-recovery oldest first, then superseded healthy, the lifeline last;
     a failed delete falls through to the next unless the client timed out
     (outcome unknown → stop and alert); 5-minute settle stamped before
-    the delete (delete-first starts it too); pool identity re-checked first.
+    the delete (delete-first starts it too); a re-measure just before the
+    delete must show the same pool still short (eased → stop, `eased`).
     `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
     delete never falls through to the lifeline. Pool identity is incus's
     DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
@@ -2902,7 +2934,10 @@ verified: f24c15e9 2026-09-05
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open
-  to "no deploy". `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  to "no deploy". A marker or state-file holder counts only while it is running and
+  not a zombie (`_marker_holder_live`, mirrored in `scripts/lib/deploy_marker.sh`);
+  a reused pid still reads as live until the marker records a start tick (#2535).
+  `secrets_path()` is repo-relative unless SECRETS_PATH set.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.

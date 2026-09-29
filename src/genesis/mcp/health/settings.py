@@ -81,7 +81,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "(`graph_expansion.mode` off/shadow/live + neighbor caps) and the "
             "entity lane (PR-2, off/shadow for now), and the Voyage reranker on "
             "the recall tools (`reranker.mode` off/live, default live; kill via "
-            "GENESIS_MEMORY_RERANK_OFF). Read live per recall by "
+            "GENESIS_MEMORY_RERANK_OFF), and `proactive.trace` on/off (the "
+            "per-recall retrieval trace, default on). Read live per recall by "
             "genesis.memory.graph_expansion (no restart); shadow only emits "
             "eval_events metrics, live appends linked neighbors after the "
             "organic results."
@@ -1676,6 +1677,18 @@ def _validate_memory_recall(changes: dict) -> list[str]:
         if key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
+        elif key == "proactive":
+            # Only the trace kill switch is writable here; the rest of the
+            # proactive section (engine enable, per-profile budgets) stays
+            # file-edited until it gets its own validation.
+            if not isinstance(value, dict):
+                errors.append("'proactive' must be a mapping like {trace: off}")
+                continue
+            for sub_key, sub_value in value.items():
+                if sub_key != "trace":
+                    errors.append(f"Unknown key 'proactive.{sub_key}'. Valid: trace")
+                elif not (isinstance(sub_value, bool) or sub_value in ("on", "off")):
+                    errors.append(f"'proactive.trace' must be on/off or a boolean; got {sub_value!r}")
         elif key in section_modes:
             if not isinstance(value, dict):
                 errors.append(f"'{key}' must be a mapping like {{mode: shadow}}")
@@ -1703,7 +1716,8 @@ def _validate_memory_recall(changes: dict) -> list[str]:
                     errors.append(f"Unknown key '{key}.{sub_key}'")
         else:
             errors.append(
-                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker"
+                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker, "
+                "proactive"
             )
     return errors
 

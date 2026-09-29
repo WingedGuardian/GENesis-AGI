@@ -14,7 +14,9 @@
 #     cases blocked rm -rf on ANY absolute path, ANY ~/ path, and ANY
 #     .-prefixed relative (.venv, .pytest_cache): a standing false-positive
 #     cluster. USER-APPROVED POLICY (2026-08-01): deep non-protected paths
-#     (depth >= 4) are now deletable everywhere; shallow/broad targets and the
+#     (depth >= 4) are now deletable everywhere — a wildcard counts only its
+#     literal prefix, so <a>/<b>/<c>/* is depth 3 (2026-09);
+#     shallow/broad targets and the
 #     protected data dirs (genesis data/DB, transcripts, backups, snapshots,
 #     browser profiles) stay hard-blocked. If the guards are unavailable or
 #     crash, the legacy globs run instead (degraded, never open).

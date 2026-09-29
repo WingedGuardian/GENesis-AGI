@@ -180,32 +180,35 @@ decisions:
 
   # D5 — how quickly will this memory go stale? Assigned at write time,
   # asynchronously. Expiry policy is label + re-verify, never delete: the
-  # class decides WHEN a memory is re-checked, not whether it survives.
+  # answer decides WHEN a memory is re-checked, not whether it survives.
   #
-  # NO USABLE OUTCOME SIGNAL YET. MEASURED 2026-09-27 on a live install:
-  # supersession is recorded on about 0.05% of memories, and it records
-  # CORRECTIONS of claims believed durable, not volatility. A hosted decision
-  # model's volatile-class score separated superseded memories from survivors
-  # at AUC 0.53 (chance). Deprecation is mostly consolidation of near-duplicates,
-  # which is redundancy, not staleness. Until a "still current?" judgment is
-  # recorded somewhere, this site can be declared but not graded or calibrated.
+  # MEASURED 2026-09-27/28 on a live install, zero-shot on a hosted decision
+  # model:
+  # - Supersession is NOT a usable label. It is recorded on about 0.05% of
+  #   memories and marks corrections of claims believed durable; graded against
+  #   it, a volatility-class question scored AUC 0.53 (chance).
+  # - Against LATER EVIDENCE there is a real signal. The label: a newer memory
+  #   on the same topic shows that something this one stated as current is no
+  #   longer true. Over 1,000 fact-like memories, 6.3% went stale within 60 days.
+  #   This yes/no question separated them at AUC 0.66 (95% CI 0.60-0.73),
+  #   better than a five-way volatility choice ranked by P(not durable_fact),
+  #   AUC 0.62.
+  # A noul, not a choice: P(yes) IS the ranking scalar, so `ordering` needs no
+  # projection rule. Good enough to rank memories for re-verification; not to
+  # act on a single answer. Activity-log records describe events, which do not
+  # go stale, and are out of scope for this question.
   memory_volatility:
-    type: choice
+    type: noul
     instructions: >-
-      How long is this memory likely to stay true without being replaced?
-    options:
-      ephemeral_state: "a transient condition; stale within hours or days"
-      project_status: "the state of ongoing work; changes as the work moves"
-      preference: "a stated taste or choice; stable but can change"
-      decision: "a ruling that holds until explicitly revisited"
-      durable_fact: "true for the foreseeable future"
-    consumes: argmax
+      Is this memory likely to stop being true within the next two months
+      (changed, fixed, reversed, replaced or found to be wrong)?
+    consumes: ordering
     latency_budget_ms: 5000
     fallback:
-      typed: argmax_advisory
+      typed: rank_advisory
       legacy: no_volatility_class
-    # outcome_source deliberately unset: see above. Supersession is not a
-    # volatility label, so declaring it would have extraction mine it.
+    # outcome_source unset: the later-evidence label above was a one-off
+    # measurement, not a persisted signal.
     owner: memory.store
 
   # --- ego ---------------------------------------------------------------

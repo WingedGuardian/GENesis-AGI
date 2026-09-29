@@ -270,7 +270,22 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
                 create_standalone_router()
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
-            embedding = EmbeddingProvider()
+            # Split providers, mirroring runtime/init/memory.py: writes on the
+            # ordinary rate tier, recall on the priority tier the operator
+            # lever selects. One shared provider would put memory_recall /
+            # knowledge_recall on the ordinary tier, whose documented queue
+            # under load (8.6-13.3s) then becomes interactive recall latency.
+            # Both chains come from build_chain, so they share one vector space.
+            from genesis.env import embed_priority_tier
+
+            storage_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(ollama_first=False),
+            )
+            recall_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(
+                    ollama_first=False, priority_tier=embed_priority_tier(),
+                ),
+            )
             # The activity tracker enables InstrumentationMiddleware, which also
             # runs the per-call commit/rollback boundary that releases read
             # snapshots (WS-15 follow-up). Without a tracker the middleware — and
@@ -281,7 +296,9 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # memory_recall / knowledge_recall rerank here exactly as in the
             # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
             reranker = VoyageReranker()
-            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+            init(db=db, qdrant_client=qdrant,
+                 storage_embedding_provider=storage_embedding,
+                 recall_embedding_provider=recall_embedding,
                  activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
             clear_mcp_crash("memory")
             yield
@@ -554,11 +571,18 @@ def _resolve_http_auth_token(cli_token: str | None) -> str:
     value as absent.
 
     Reads ONLY ``GENESIS_MCP_HTTP_TOKEN``. The desk-scoped token must never reach
-    this transport, which exposes the full MCP tool surface (#2442).
+    this transport, which exposes the full MCP tool surface (#2442). A non-ASCII
+    token is unconfigured here too (``genesis.env.ascii_bearer``).
     """
-    from genesis.env import bearer_token
+    from genesis.env import ascii_bearer, bearer_token
 
-    return (cli_token or "").strip() or bearer_token("GENESIS_MCP_HTTP_TOKEN")
+    cli = (cli_token or "").strip()
+    if cli:
+        # An explicit override is never replaced by the environment token: an
+        # invalid one leaves the transport unconfigured, so startup refuses,
+        # rather than quietly accepting a credential the operator meant to replace.
+        return ascii_bearer(cli, "--auth-token")
+    return bearer_token("GENESIS_MCP_HTTP_TOKEN")
 
 
 def _bearer_auth_middleware(expected_token: str):
@@ -568,10 +592,11 @@ def _bearer_auth_middleware(expected_token: str):
     streaming responses pass through without buffering (unlike
     BaseHTTPMiddleware which breaks text/event-stream).
     """
-    import hmac
     import json as _json
 
     from starlette.middleware import Middleware
+
+    from genesis.env import bearer_matches
 
     _token = expected_token
 
@@ -583,9 +608,12 @@ def _bearer_auth_middleware(expected_token: str):
             if scope["type"] not in ("http", "websocket"):
                 return await self.app(scope, receive, send)
 
+            # Compare BYTES, never decoded str: a strict decode raises on
+            # non-UTF-8 header bytes, and compare_digest raises on non-ASCII
+            # str, so either turned a bad credential into a 500 (#2467).
             headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], _token):
+            auth = headers.get(b"authorization", b"")
+            if auth.startswith(b"Bearer ") and bearer_matches(auth[7:], _token):
                 return await self.app(scope, receive, send)
 
             if scope["type"] == "http":

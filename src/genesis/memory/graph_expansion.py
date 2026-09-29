@@ -334,6 +334,7 @@ async def maybe_expand(
     *,
     surface: str,
     recall_event_id: str | None = None,
+    neighbor_sink: list[RetrievalResult] | None = None,
 ) -> list[RetrievalResult]:
     """Apply configured graph expansion to a recall surface's results.
 
@@ -346,6 +347,11 @@ async def maybe_expand(
     (``proactive_max_neighbors`` vs ``max_neighbors``). Best-effort: any
     failure logs and returns *results* unchanged — expansion must never
     break recall.
+
+    *neighbor_sink* (optional, caller-owned) receives the COMPUTED neighbors in
+    every mode that computes them — including ``shadow``, where they are not
+    returned — so a caller's trace can record graph candidates it did not
+    inject. Observation only; never changes what is returned.
     """
     if not results:
         return results
@@ -381,6 +387,8 @@ async def maybe_expand(
         )
         return results
     latency_ms = int((time.monotonic() - t0) * 1000)
+    if neighbor_sink is not None:
+        neighbor_sink.extend(neighbors)
 
     try:
         await j9_eval.insert_event(

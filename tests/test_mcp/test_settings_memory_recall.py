@@ -92,3 +92,17 @@ def test_reranker_rejects_unknown_subkey():
 def test_section_must_be_mapping():
     assert _validate_memory_recall({"graph_expansion": "live"})
     assert _validate_memory_recall({"entity_lane": []})
+
+
+def test_proactive_trace_kill_switch_is_writable():
+    """PR #2455 review: the trace kill switch must be reachable through
+    settings_update, not only by hand-editing the overlay."""
+    assert _validate_memory_recall({"proactive": {"trace": "off"}}) == []
+    assert _validate_memory_recall({"proactive": {"trace": "on"}}) == []
+    assert _validate_memory_recall({"proactive": {"trace": False}}) == []
+
+
+def test_proactive_rejects_other_keys_and_bad_values():
+    assert _validate_memory_recall({"proactive": {"trace": "maybe"}})
+    assert _validate_memory_recall({"proactive": {"enabled": False}})
+    assert _validate_memory_recall({"proactive": "off"})

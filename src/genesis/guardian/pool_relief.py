@@ -31,8 +31,9 @@ Fail-closed rules (each one a review finding):
 * an invalid configuration → alert-only, one warning a day;
 * an undetected or ambiguous pool (unknown backend, several thin pools in the
   VG) → no action, and a WARNING once that has lasted an hour;
-* the pool's identity is re-checked immediately before the delete (the same
-  pool, still nameable — not a re-check of the shortfall);
+* the pool is re-measured immediately before the delete: it must be the same,
+  still-nameable pool AND still at or below a reserve (eased → ``eased``,
+  nothing deleted); the alert then reports that fresh measurement;
 * a delete that fails falls through to the next snapshot in the plan, so one
   undeletable snapshot cannot pin relief; still at most one delete per pass;
 * the settle stamp is persisted BEFORE the delete — if it cannot be written,
@@ -263,19 +264,32 @@ def _numbers(status: StoragePoolStatus) -> str:
     return ", ".join(parts)
 
 
-async def _same_pool_now(config, status: StoragePoolStatus) -> bool:
-    """Re-measure immediately before the delete: the pool must still be the
-    one the decision was made on (identity only — a shortfall that eased in
-    between still lets this pass free one snapshot)."""
+async def _recheck_before_delete(
+    config, status: StoragePoolStatus, cfg,
+) -> tuple[str | None, StoragePoolStatus | None]:
+    """Re-measure immediately before the delete: ``(stop, fresh)``.
+
+    ``stop`` is None — go ahead, with ``fresh`` the measurement to report —
+    only when the pool is still the one the decision was made on AND it is
+    still at or below a reserve: a shortfall that eased in between (an
+    autoextend landing, space freed elsewhere) is no longer a reason to
+    delete (review). Otherwise ``stop`` is ``"pool_changed"`` (unmeasurable
+    now, or a different pool) or ``"eased"``.
+    """
     from genesis.guardian.pool import measure_storage_pool
 
     try:
         again = await measure_storage_pool(config)
     except Exception:
         logger.warning("pre-delete pool re-check failed", exc_info=True)
-        return False
+        return "pool_changed", None
     key = pool_key(status)
-    return key is not None and unactionable(again) is None and pool_key(again) == key
+    if key is None or unactionable(again) is not None or pool_key(again) != key:
+        return "pool_changed", None
+    if shortfall(again, cfg) is None:
+        logger.info("pool relief: the shortfall eased before the delete (%s)", _numbers(again))
+        return "eased", None
+    return None, again
 
 
 # --- planning ------------------------------------------------------------------
@@ -517,8 +531,11 @@ async def check_pool_relief(
             )
         return "no_target"
 
-    if not await _same_pool_now(config, status):
-        return "pool_changed"
+    stop, fresh = await _recheck_before_delete(config, status, cfg)
+    if stop is not None:
+        return stop
+    # Report what the delete acts on, not the earlier decision's figures.
+    reason, numbers = shortfall(fresh, cfg), _numbers(fresh)
     if not _stamp(state_path, state, "last_action", now):
         # The settle stamp could not persist: deleting now would let the next
         # tick delete again at once. Stop; the tier alerts still report.
@@ -531,6 +548,14 @@ async def check_pool_relief(
             # in flight can fail with a non-timeout error), so the space may be
             # coming back already (review).
             break
+        if failed:
+            # The failed delete can have taken minutes (incus's client waits),
+            # long enough for the pool to recover. Every delete, not only the
+            # first, acts on a measurement taken just before it (review).
+            stop, fresh = await _recheck_before_delete(config, status, cfg)
+            if stop is not None:
+                return stop
+            reason, numbers = shortfall(fresh, cfg), _numbers(fresh)
         # A snapshot whose delete keeps failing (busy LV, an export in flight)
         # must not pin relief to it forever: fall through to the next one, but
         # still free at most ONE per pass. A failure is only DEFINITE once a

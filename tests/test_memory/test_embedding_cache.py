@@ -193,6 +193,7 @@ class TestCacheStats:
         fake_vec = [0.1] * 1024
         b = AsyncMock()
         b.name = "test"
+        b.vector_space = "test-space"
         b.embed = AsyncMock(return_value=fake_vec)
         p = EmbeddingProvider(backends=[b], cache_dir=None)
         await p.embed("unique_text")
@@ -205,9 +206,11 @@ class TestBackendChain:
         """First backend in chain succeeds — no fallback."""
         b1 = AsyncMock()
         b1.name = "primary"
+        b1.vector_space = "test-space"
         b1.embed = AsyncMock(return_value=[1.0] * 1024)
         b2 = AsyncMock()
         b2.name = "fallback"
+        b2.vector_space = "test-space"
 
         p = EmbeddingProvider(backends=[b1, b2], cache_dir=None)
         vec = await p.embed("test")
@@ -220,9 +223,11 @@ class TestBackendChain:
         """Primary fails, fallback succeeds."""
         b1 = AsyncMock()
         b1.name = "primary"
+        b1.vector_space = "test-space"
         b1.embed = AsyncMock(side_effect=Exception("down"))
         b2 = AsyncMock()
         b2.name = "fallback"
+        b2.vector_space = "test-space"
         b2.embed = AsyncMock(return_value=[2.0] * 1024)
 
         p = EmbeddingProvider(backends=[b1, b2], cache_dir=None)
@@ -236,9 +241,11 @@ class TestBackendChain:
 
         b1 = AsyncMock()
         b1.name = "b1"
+        b1.vector_space = "test-space"
         b1.embed = AsyncMock(side_effect=Exception("down"))
         b2 = AsyncMock()
         b2.name = "b2"
+        b2.vector_space = "test-space"
         b2.embed = AsyncMock(side_effect=Exception("also down"))
 
         p = EmbeddingProvider(backends=[b1, b2], cache_dir=None)
