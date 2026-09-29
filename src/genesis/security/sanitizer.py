@@ -219,7 +219,9 @@ def _wrap_id(source: str, text: str) -> str:
     mac = hmac.new(_load_boundary_key(), digestmod=hashlib.sha256)
     mac.update(source.encode())
     mac.update(b"\0")
-    mac.update(text.encode("utf-8", "surrogateescape"))
+    # surrogatepass encodes EVERY str, including lone surrogates a JSON response can
+    # carry; surrogateescape covers only U+DC80-U+DCFF and raised on the rest.
+    mac.update(text.encode("utf-8", "surrogatepass"))
     return mac.hexdigest()[:_WRAP_ID_CHARS]
 
 

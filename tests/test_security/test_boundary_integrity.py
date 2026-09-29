@@ -149,6 +149,15 @@ def test_creating_the_key_leaves_no_temporary_files(tmp_path, monkeypatch):
     assert [p.name for p in key_file.parent.iterdir()] == ["boundary_key"]
 
 
+@pytest.mark.parametrize("lone", ["\ud800", "\udbff", "\udc00", "\udfff"])
+def test_a_lone_surrogate_wraps_instead_of_raising(lone):
+    """JSON accepts escaped unpaired surrogates, so a search snippet can carry one;
+    raising here dropped that backend's whole result set."""
+    text = f"snippet {lone} tail"
+    assert _split(_wrap(text, ContentSource.WEB_SEARCH))[1] == text
+    assert _wrap(text) == _wrap(text)
+
+
 def test_the_opening_marker_states_the_rule():
     wrapped = _wrap("x")
     wrap_id = _split(wrapped)[0]
