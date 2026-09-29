@@ -209,8 +209,11 @@ def _load_boundary_key() -> bytes:
         # block the first wrap in the process indefinitely. The read is bounded.
         rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(rfd, "rb") as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            info = os.fstat(fh.fileno())
+            if not stat.S_ISREG(info.st_mode):
                 raise OSError(f"{path} is not a regular file")
+            if info.st_size > _KEY_FILE_MAX_BYTES:
+                raise OSError(f"{path} is larger than a boundary key")
             key = bytes.fromhex(fh.read(_KEY_FILE_MAX_BYTES).decode("ascii").strip())
     except (OSError, ValueError, UnicodeDecodeError):
         logger.warning("Content-boundary key unavailable; using a per-process key", exc_info=True)

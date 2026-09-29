@@ -884,7 +884,7 @@ if $_ENCRYPT_READY; then
         "$HOME/.genesis/guardian_remote.yaml:guardian_remote.yaml" \
         "$HOME/.genesis/config/genesis.yaml:genesis.yaml" \
         "$HOME/.genesis/release-fingerprints.txt:release-fingerprints.txt" \
-        "$HOME/.genesis/boundary_key:boundary_key"; do
+        "$_GENESIS_HOME/boundary_key:boundary_key"; do
         _srcf="${_spec%%:*}"; _dstn="${_spec##*:}"
         [ -f "$_srcf" ] || continue
         if encrypt_file "$_srcf" "creds/${_dstn}.gpg"; then

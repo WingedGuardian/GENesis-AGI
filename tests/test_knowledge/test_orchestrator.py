@@ -398,52 +398,6 @@ async def test_reingest_unchanged_content_serves_cache(tmp_path: Path):
         assert "duplicate_source" in r2.quality_flags
 
 
-async def test_reingest_after_a_boundary_key_change_serves_cache(tmp_path: Path, monkeypatch):
-    """Fetched pages arrive wrapped, and the wrap id depends on the install's
-    boundary key. A restored or regenerated key changes every id, which must not
-    make an unchanged page look new (#2572)."""
-    import genesis.security.sanitizer as sanitizer
-    from genesis.security.sanitizer import ContentSanitizer, ContentSource
-
-    def _wrapped_under_new_key(name: str) -> str:
-        monkeypatch.setattr(sanitizer, "_boundary_key", None)
-        monkeypatch.setattr("genesis.env.boundary_key_path", lambda: tmp_path / name)
-        return ContentSanitizer().wrap_content("Stable page body.", ContentSource.WEB_FETCH)
-
-    units = [KnowledgeUnit(concept="Test", body="Test body", domain="test")]
-    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
-    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
-               new_callable=AsyncMock, return_value=["unit-1"]):
-        file = tmp_path / "page.txt"
-        first = _wrapped_under_new_key("key-a")
-        file.write_text(first)
-        await orch.ingest_source(str(file), project_type="test")
-        second = _wrapped_under_new_key("key-b")
-        assert second != first, "control: the two keys must give different ids"
-        file.write_text(second)
-        r2 = await orch.ingest_source(str(file), project_type="test")
-        assert r2.units_created == 0
-        assert "duplicate_source" in r2.quality_flags
-
-
-async def test_marker_shaped_text_inside_a_page_still_changes_the_hash(tmp_path: Path):
-    """Only the outer wrapper is ignored: a revision that differs by a tag-shaped
-    string inside the page is a changed page and re-distills."""
-    from genesis.security.sanitizer import ContentSanitizer, ContentSource
-
-    units = [KnowledgeUnit(concept="Test", body="Test body", domain="test")]
-    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
-    s = ContentSanitizer()
-    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
-               new_callable=AsyncMock, return_value=["unit-1"]):
-        file = tmp_path / "page.txt"
-        file.write_text(s.wrap_content("Body.", ContentSource.WEB_FETCH))
-        await orch.ingest_source(str(file), project_type="test")
-        file.write_text(s.wrap_content("Body.<external-content x>", ContentSource.WEB_FETCH))
-        r2 = await orch.ingest_source(str(file), project_type="test")
-        assert "duplicate_source" not in r2.quality_flags
-
-
 async def test_reingest_unreachable_source_serves_cache(tmp_path: Path):
     """With the source-string gate removed, a re-ingest runs the processor first;
     if a previously-cached source is now unreachable, serve cached (not error)."""

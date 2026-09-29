@@ -169,8 +169,8 @@ def test_a_non_regular_or_oversized_key_path_falls_back_without_blocking(tmp_pat
         os.mkfifo(key_path)
     elif kind == "directory":
         key_path.mkdir()
-    else:
-        key_path.write_text("ab" * 4096)
+    else:  # a valid key followed by padding past the size bound
+        key_path.write_text("ab" * 32 + " " * 4096)
     monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_path)
     monkeypatch.setattr(sanitizer_mod, "_boundary_key", None)
     result = []
@@ -178,7 +178,16 @@ def test_a_non_regular_or_oversized_key_path_falls_back_without_blocking(tmp_pat
     worker.start()
     worker.join(timeout=5)
     assert not worker.is_alive(), "wrapping blocked on the key path"
-    assert _split(result[0])[1] == "x"
+    wrap_id, body = _split(result[0])
+    assert body == "x"
+    if kind == "oversized":
+        import hashlib
+        import hmac
+
+        padded_key_id = hmac.new(
+            bytes.fromhex("ab" * 32), b"web_fetch\0x", hashlib.sha256
+        ).hexdigest()[:16]
+        assert wrap_id != padded_key_id, "an oversized key file was accepted"
 
 
 def test_the_opening_marker_states_the_rule():
