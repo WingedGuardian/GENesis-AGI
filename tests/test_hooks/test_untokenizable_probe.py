@@ -434,7 +434,7 @@ class TestEveryGuardConsultsTheChokepoint:
         # been a non-zero exit that looked like a wired guard.)
         target = (hooks if guard.parent.name == "hooks" else scripts) / guard.name
         target.write_text(guard.read_text())
-        for dep in ("hook_input.py", "native_approval.py"):
+        for dep in ("hook_input.py", "native_approval.py", "git_repo_selection.py"):
             (hooks / dep).write_text((_HOOKS_DIR / dep).read_text())
         (scripts / "review_deadline.py").write_text(
             (_WORKTREE / "scripts" / "review_deadline.py").read_text()

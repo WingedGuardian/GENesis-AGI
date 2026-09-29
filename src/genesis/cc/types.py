@@ -337,7 +337,7 @@ class CCInvocation:
     # Per-invocation override for CC's Bash sandbox root (CLAUDE_CODE_TMPDIR).
     # None → the shared default (~/.genesis/cc-tmp). Set by throwaway sessions
     # (e.g. the model-roster gauntlet) to isolate their tmp blast radius from
-    # live sessions policed by genesis-tmp-watchgod.
+    # the quota-capped cc-tmp that live sessions share.
     claude_code_tmpdir: str | None = None
     # When non-empty, the session's Bash is restricted to these command binaries
     # (enforced by scripts/bash_safety_hook.sh via the GENESIS_BASH_ALLOWLIST env

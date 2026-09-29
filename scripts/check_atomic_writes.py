@@ -7,7 +7,7 @@ is not theoretical: `~/.genesis/tmp9cis_fly.tmp` sat on the origin install for
 3.5 months, 0 bytes, with `mkstemp`'s default naming signature. One file proves
 both halves -- the leak happens, and nothing sweeps that directory
 (`disk_hygiene.sh` roots every find at a named SUBdirectory; `tmp_watchgod.sh`
-covers `~/.genesis/cc-tmp` and `/tmp`. Neither covers the `~/.genesis` root).
+sweeps only `~/.genesis/cc-tmp`. Neither covers the `~/.genesis` root).
 
 WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
 tree (re-derived 2026-09-18): 64 atomic-write sites across 56 files, 30 of them dirty.

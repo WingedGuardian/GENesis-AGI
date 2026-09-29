@@ -49,6 +49,10 @@ def main() -> None:
     from genesis.restore import cli as restore_cli
     restore_cli.add_parser(sub)
 
+    # Peer handoffs: genesis handoffs list/mark
+    from genesis.session_awareness import handoffs_cli
+    handoffs_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -61,7 +65,7 @@ def main() -> None:
 
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
-    elif args.command in ("contribute", "eval", "restore"):
+    elif args.command in ("contribute", "eval", "restore", "handoffs"):
         sys.exit(args.func(args))
     else:
         parser.print_help()

@@ -18,6 +18,9 @@ CLAUDE.md: Generated from `config/guardian-claude.md` (NOT the repo root CLAUDE.
 - `health_signals.py` — 5 probes + 6 suspicious checks (including I/O pressure)
 - `state_machine.py` — confirmation protocol with event-driven Sentinel coordination
 - `snapshots.py` — Incus snapshot management with headroom-based gating
+- `pool.py` — storage-pool measurement (LVM-thin data/metadata, df fallback) + tiered alerts
+- `pool_relief.py` — pool relief: frees guardian-owned snapshots when free
+  space reaches its reserve (runbook: `docs/reference/thin-pool-recovery.md`)
 - `_subprocess.py` — shared async subprocess runner (used by 5+ modules)
 - `cgroup_ops.py` — host-side cgroup operations (I/O pressure, PID enumeration, process kill)
 - `approval.py` — HTTP approval server for recovery confirmation

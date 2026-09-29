@@ -1,0 +1,283 @@
+# Decision question registry — the home for every bounded-choice decision
+# Genesis makes. COVERAGE IS NOT YET COMPLETE: sites are added as they are
+# found, so an enumeration of this file is a floor, not the full set.
+#
+# INCLUSION TEST, and it is structural rather than a value judgment: is the
+# answer drawn from a declarable finite set? If yes it belongs here — including
+# decisions currently made by a hardcoded constant standing in for a judgment.
+#
+# DECLARED IS NOT WIRED. A spec here records what a site asks and what it does
+# with the answer. Nothing below is load-bearing yet; each site is promoted
+# individually, in shadow, on measured evidence that it beats its incumbent.
+# Register liberally, promote individually.
+#
+# The question WORDING is shared across backends: one spec drives a hosted or a
+# local decision model unchanged. Measure every question on a corpus the author
+# did not write — wording that looks strong on hand-written cases can collapse
+# on real text.
+#
+# `consumes` decides what a site needs and therefore how it degrades:
+#   argmax   — top label only.   Needs accuracy. Works uncalibrated.
+#   ordering — relative order.   Needs ranking.  Works uncalibrated.
+#   threshold— absolute p.       REQUIRES calibration; a threshold is mandatory.
+#              A threshold site also declares `dead_band` (it abstains inside
+#              threshold ± band: decisions near a cut flip on an identical retry)
+#              and `tie_rule` (inclusive | exclusive — is a score exactly on a band
+#              edge decided, or does it abstain?).
+#
+# `outcome_source` names a PERSISTED signal that labels a site's answers. It
+# is set only where such a signal exists; declaring an aspirational one made
+# sites look trainable while label extraction would find nothing or the
+# wrong thing. No shipped site has one yet.
+#
+# A local `decisions.local.yaml` overlay is deep-merged on top, resolved like
+# every other config overlay: `~/.genesis/config/` first, then a gitignored
+# sibling of this file. An overlay may only OVERRIDE decisions shipped here —
+# it cannot add one, so a decision retired upstream cannot survive in an
+# overlay written before the retirement. The cost is deliberate: once a
+# decision is retired, an overlay that still overrides it fails the load
+# loudly until that entry is removed. An overlay may reword and retune a
+# question, but not add options or change its type, `consumes` or criteria:
+# those define what the question IS.
+
+decisions:
+
+  # --- memory ------------------------------------------------------------
+  memory_relationship:
+    type: choice
+    instructions: "How does Note B relate to Note A?"
+    options:
+      duplicate: "B restates A with no new information"
+      contradicts: "B asserts something incompatible with A"
+      succeeded_by: "B updates or replaces A"
+      distinct: "unrelated, or independently true"
+    consumes: argmax
+    latency_budget_ms: 2000
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: memory.relationship_classifier
+
+  # --- egress ------------------------------------------------------------
+  # MEASURED 2026-09-26 on 110 real, length-matched items (AUC): an untrained
+  # local encoder checkpoint 0.559, a hosted decision model 0.871. The
+  # incumbent nine-regex scanner cannot see this class at all.
+  #
+  # `ordering`, NOT `threshold`, deliberately. The natural consumption here is
+  # pass/review/block, but no calibrated threshold exists yet.
+  # Promote to `threshold` only once a calibration fitted on a corpus this
+  # project did not author says what the number should be.
+  egress_personal_context:
+    type: noul
+    instructions: >-
+      Does this text reveal details of the author's personal life — household
+      members, family, languages spoken at home, daily schedule, habits,
+      health, or physical location?
+    consumes: ordering
+    latency_budget_ms: 4000
+    fallback:
+      typed: rank_for_human_review
+      legacy: regex_scan_only
+    owner: security.output_scanner
+
+  # Complementary to the regexes, NOT a replacement. MEASURED: this caught an
+  # email address scan_outbound missed; scan_outbound caught a /home/<user>/
+  # path this missed. Union covered 4/4. Both arms stay.
+  egress_direct_identifier:
+    type: noul
+    instructions: >-
+      Does this text contain a direct identifier: an IP address, a real
+      person's name, an email address, a file path containing a username, or a
+      credential or API key?
+    consumes: ordering
+    latency_budget_ms: 4000
+    fallback:
+      typed: rank_for_human_review
+      legacy: regex_scan_only
+    owner: security.output_scanner
+
+  # --- triage ------------------------------------------------------------
+  # Promotes a hardcoded constant to a judgment. The incumbent is
+  # `token_count < 100` in learning/triage/prefilter.py — a threshold nobody
+  # believes is correct, sitting there because asking cost two seconds and a
+  # model call.
+  triage_depth:
+    type: choice
+    instructions: "How much analysis does this interaction warrant?"
+    options:
+      skip: "no durable signal; nothing to extract or act on"
+      micro: "one fact or preference worth storing, nothing more"
+      standard: "ordinary extraction and classification"
+      deep: "decisions, commitments or corrections that need full reasoning"
+    consumes: argmax
+    latency_budget_ms: 1500
+    fallback:
+      typed: argmax_advisory
+      legacy: token_count_heuristic
+    owner: learning.triage.prefilter
+
+  # --- routing -----------------------------------------------------------
+  model_route_difficulty:
+    type: score
+    instructions: "How hard is this request for a language model?"
+    criteria:
+      - "trivial — lookup, formatting, or a one-line transformation"
+      - "moderate — ordinary reasoning within one domain"
+      - "hard — multi-step reasoning, or judgment with real consequences"
+    consumes: ordering
+    latency_budget_ms: 800
+    fallback:
+      typed: rank_advisory
+      legacy: static_chain_selection
+    owner: routing.router
+
+  # --- skills ------------------------------------------------------------
+  # 69 SKILL.md files on this install, well past the soft cap. Declared here
+  # mainly to pin the constraint: at default token budgets a 77-option choice
+  # measured 0.425 against 0.870 for a model without the limit, because each
+  # label got ~3-4 tokens. Options are resolved at call time from the skill
+  # index; the strategy is what makes the question answerable at all.
+  skill_selection:
+    type: choice
+    instructions: "Which skill best fits the task described?"
+    options:
+      __dynamic__: "resolved at call time from the skill index"
+      __none__: "no skill applies; proceed without one"
+    consumes: argmax
+    cardinality_strategy: shortlist
+    latency_budget_ms: 1200
+    fallback:
+      typed: argmax_advisory
+      legacy: skill_injection_hook
+    owner: skills.injection
+
+  # --- memory lifecycle -------------------------------------------------
+  # D3 — does a recalled memory apply to the task at hand? Off the per-prompt
+  # hook path (that hook already runs close to its time budget); used where a
+  # recall is explicit or asynchronous. The REWRITE of a partially-applying
+  # memory stays with an LLM — this gate only decides.
+  #
+  # Training labels exist (LLM-judge relevance grades on past recalls), but
+  # judge labels teach the model to imitate the judge and carry the judge's
+  # miscalibration. They may train the adapter; they must never fit its
+  # calibration. An outcome signal (was the injected memory used, corrected,
+  # or ignored?) is required before this site may threshold.
+  recall_applies:
+    type: choice
+    instructions: >-
+      Given the current task and a memory recalled for it, does the memory
+      apply to this task?
+    options:
+      applies: "directly relevant and correct for this task as written"
+      partially: "relevant, but needs adapting before it holds here"
+      does_not_transfer: "about a different situation; misleading if applied"
+    consumes: argmax
+    latency_budget_ms: 3000
+    fallback:
+      typed: argmax_advisory
+      legacy: inject_unfiltered
+    owner: memory.recall
+
+  # D5 — how quickly will this memory go stale? Assigned at write time,
+  # asynchronously. Expiry policy is label + re-verify, never delete: the
+  # class decides WHEN a memory is re-checked, not whether it survives.
+  #
+  # NO USABLE OUTCOME SIGNAL YET. MEASURED 2026-09-27 on a live install:
+  # supersession is recorded on about 0.05% of memories, and it records
+  # CORRECTIONS of claims believed durable, not volatility. A hosted decision
+  # model's volatile-class score separated superseded memories from survivors
+  # at AUC 0.53 (chance). Deprecation is mostly consolidation of near-duplicates,
+  # which is redundancy, not staleness. Until a "still current?" judgment is
+  # recorded somewhere, this site can be declared but not graded or calibrated.
+  memory_volatility:
+    type: choice
+    instructions: >-
+      How long is this memory likely to stay true without being replaced?
+    options:
+      ephemeral_state: "a transient condition; stale within hours or days"
+      project_status: "the state of ongoing work; changes as the work moves"
+      preference: "a stated taste or choice; stable but can change"
+      decision: "a ruling that holds until explicitly revisited"
+      durable_fact: "true for the foreseeable future"
+    consumes: argmax
+    latency_budget_ms: 5000
+    fallback:
+      typed: argmax_advisory
+      legacy: no_volatility_class
+    # outcome_source deliberately unset: see above. Supersession is not a
+    # volatility label, so declaring it would have extraction mine it.
+    owner: memory.store
+
+  # --- ego ---------------------------------------------------------------
+  # The ego's proposal pipeline asks an LLM for one label per draft, in a
+  # batched JSON array (ego/session.py: the reconcile and realist stages).
+  # The verdict LABEL is bounded and registered here. Where a verdict also
+  # names a board item (reaffirm / revise / withdraw carry a target_id), that
+  # id is an open-ended pointer, not part of the answer space.
+  # Call-site default a backend must keep: an invalid label becomes `new`.
+  ego_proposal_reconcile:
+    type: choice
+    instructions: >-
+      How does this proposal draft relate to the items already on the board
+      and to work already covered by active jobs or merged changes?
+    options:
+      new: "nothing on the board or in covered work already does this"
+      reaffirm: "a pending board item already covers it as written"
+      revise: "a board item covers it, and this draft sharpens or updates it"
+      withdraw: "an active job or a merged change already covers the work"
+    consumes: argmax
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: ego.session.reconcile
+
+  # Operations (genesis) ego only, emitted by the realist per proposal and by
+  # reconcile on a `revise`. Call-site behaviour, which a backend must keep:
+  # an absent or invalid label leaves the draft unstamped, and an unstamped
+  # genesis-ego draft is DROPPED (fail-closed); a deterministic domain
+  # classifier forces `develop` for self-modification and autonomous builds
+  # whatever the label says. The prompt's own tie-break is "when in doubt,
+  # develop" (it routes to review and never silently ships).
+  ego_proposal_scope:
+    type: choice
+    instructions: >-
+      Does this proposal operate the running system or develop it? The test is
+      the deliverable: a patch or a patch plan is development, even when the
+      work itself is read-only.
+    options:
+      operate: >-
+        diagnose health or reliability, pull a reversible operational lever,
+        or investigate a specific live defect where the deliverable is
+        escalated findings, even if the trail leads into code
+      develop: >-
+        write or refactor code, change a schema, an install script or a
+        configuration value, or dev-artifact work such as reviewing a change
+        or tracing source to scope a fix
+    consumes: argmax
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: ego.session.scope
+
+  # The realist also rejects zombies (re-proposals with no change in
+  # circumstances) and duplicates of pending or approved items, using the
+  # proposal history. Call-site defaults, which a backend must keep: an
+  # invalid label becomes `pass`, and so does every proposal when the reply
+  # does not parse. An `amend` also carries amended content, which is open
+  # text outside the answer space.
+  ego_proposal_realist:
+    type: choice
+    instructions: >-
+      Given the proposal history, should this proposal go forward as written,
+      go forward amended, or be rejected (not actionable, a zombie re-proposed
+      with no change in circumstances, or a duplicate of a pending or approved
+      item)?
+    options:
+      pass: "sound as written"
+      amend: "worth doing, but the content needs changing"
+      reject: "not actionable, a zombie, or a duplicate"
+    consumes: argmax
+    fallback:
+      typed: argmax_advisory
+      legacy: existing_llm_path
+    owner: ego.session.realist
