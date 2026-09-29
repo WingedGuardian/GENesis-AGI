@@ -372,3 +372,139 @@ def test_seeing_only_yourself_in_proc_is_blind(tmp_path):
     )
     r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     assert r.stdout.split() == ["BLIND", "VISIBLE"], r.stdout + r.stderr
+
+
+def test_standard_pressure_never_clears_the_code_intel_indexes(tmp_path):
+    """#2521 item 1: left to disk_reclaim.py's 95 % default, an ORANGE pass
+    on a >=95 % disk deleted the index DBs before RED. Only last-resort may."""
+    home = tmp_path / "home"
+    (home / "tmp").mkdir(parents=True)
+    log = tmp_path / "args"
+    fake = tmp_path / "fake_py"
+    fake.write_text(f'#!/usr/bin/env bash\necho "$*" >> "{log}"\n')
+    fake.chmod(0o755)
+    env = dict(os.environ, HOME=str(home), RECLAIM_LOCK=str(tmp_path / "lock"))
+    for tier in ("standard", "last-resort"):
+        subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nVENV_PY='{fake}'\npressure_main {tier}"],
+                       env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=True)
+    std, lr = log.read_text().splitlines()
+    assert "--last-resort-above 101" in std
+    assert "--last-resort-above 0" in lr
+
+
+def _stat_shim(tmp_path: Path, other_dev_path: Path) -> Path:
+    """A `stat` that reports a different device for one path — a stand-in for a
+    separate mount, which a test cannot create without root."""
+    bindir = tmp_path / "shim"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / "stat"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$*" == *"%d"* && "${{@: -1}}" == "{other_dev_path}" ]]; then echo 999999; exit 0; fi\n'
+        'exec /usr/bin/stat "$@"\n'
+    )
+    shim.chmod(0o755)
+    return bindir
+
+
+def test_prune_never_recurses_into_a_separate_filesystem(tmp_path):
+    """#2521 item 6: a direct child that is its own mount frees nothing here."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    mnt, plain = d / "downloads", d / "old_job"
+    mnt.mkdir()
+    plain.mkdir()
+    (mnt / "keep.bin").write_text("x")
+    for p in (mnt / "keep.bin", mnt, plain):
+        _age(p, 10)
+    shim = _stat_shim(tmp_path, mnt.resolve())
+    env = dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}")
+    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
+                       env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert mnt.exists() and (mnt / "keep.bin").exists(), r.stdout + r.stderr
+    assert "a separate filesystem" in r.stdout
+    assert not plain.exists(), "control: an ordinary old child is still pruned"
+
+
+def test_bg_sandbox_reap_never_recurses_into_a_separate_filesystem(tmp_path):
+    root = tmp_path / "bg-cc-sessions"
+    mnt, dead = root / "mounted", root / "dead"
+    mnt.mkdir(parents=True)
+    dead.mkdir()
+    for p in (mnt, dead):
+        _age(p, 2)
+    shim = _stat_shim(tmp_path, mnt.resolve())
+    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nreap_bg_sandboxes '{root}'"],
+                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert mnt.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+    assert not dead.exists(), "control: an ordinary old sandbox is still reaped"
+
+
+def _mount_shim(tmp_path: Path, mountpoint_path: Path | None = None, table: list[str] | None = None) -> Path:
+    """`mountpoint` / `findmnt` stand-ins: a bind mount keeps its parent's
+    device number, so only the mount table can see it."""
+    bindir = tmp_path / "mshim"
+    bindir.mkdir(exist_ok=True)
+    mp = bindir / "mountpoint"
+    target = str(mountpoint_path) if mountpoint_path else "/nonexistent-mount"
+    mp.write_text(f'#!/usr/bin/env bash\n[[ "${{@: -1}}" == "{target}" ]] && exit 0\nexit 1\n')
+    mp.chmod(0o755)
+    fm = bindir / "findmnt"
+    fm.write_text("#!/usr/bin/env bash\ncat <<'EOF'\n/\n" + "".join(f"{t}\n" for t in (table or [])) + "EOF\n")
+    fm.chmod(0o755)
+    return bindir
+
+
+def test_prune_spares_a_bind_mount_the_device_number_cannot_see(tmp_path):
+    """Review of #2521 item 6: a bind mount (or an incus dir-pool volume) keeps
+    its parent's device; the mount table is what tells."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    bind, plain = d / "downloads", d / "old_job"
+    for p in (bind, plain):
+        p.mkdir()
+        _age(p, 10)
+    shim = _mount_shim(tmp_path, mountpoint_path=bind.resolve())
+    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
+                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert bind.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+    assert not plain.exists()
+
+
+def test_prune_spares_a_child_with_a_mount_inside_it(tmp_path):
+    d = tmp_path / "tmp"
+    d.mkdir()
+    outer = d / "job"
+    (outer / "data").mkdir(parents=True)
+    _age(outer / "data", 10)
+    _age(outer, 10)
+    shim = _mount_shim(tmp_path, table=[str((outer / "data").resolve())])
+    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
+                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert outer.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+
+
+def test_bg_sandbox_reap_spares_a_bind_mount(tmp_path):
+    root = tmp_path / "bg-cc-sessions"
+    bind, dead = root / "bound", root / "dead"
+    for p in (bind, dead):
+        p.mkdir(parents=True)
+        _age(p, 2)
+    shim = _mount_shim(tmp_path, mountpoint_path=bind.resolve())
+    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nreap_bg_sandboxes '{root}'"],
+                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert bind.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+    assert not dead.exists()
+
+
+def test_the_daily_groom_leaves_the_indexes_to_the_guardians_red_pass():
+    """Review of #2521 item 1: the daily groom's disk_reclaim call must not
+    fall back to the 95 % last-resort default either."""
+    text = _HYGIENE.read_text()
+    main = text[text.index("\nmain() {"):]
+    call = main[main.index("disk_reclaim.py"):main.index("disk_reclaim_rc=$?")]
+    assert "--last-resort-above 101" in call

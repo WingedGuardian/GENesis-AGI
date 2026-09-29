@@ -50,15 +50,29 @@ def box(tmp_path):
         'case "$*" in *"show -p MainPID"*) echo 0;; esac\nexit 0\n',
     )
     queue = tmp_path / "queue"
-    return {
+    state = home / ".genesis" / "watchgod"
+    yield {
         "home": home,
         "dl": dl,
         "bin": bindir,
         "calls": calls,
         "queue": queue,
-        "state": home / ".genesis" / "watchgod",
+        "state": state,
         "tmp": tmp_path,
     }
+    # The reserve is a REAL fallocate on the real disk. Every test deletes its
+    # own, and a reserve over the sandbox cap fails the test: uncapped, these
+    # suites left 156 x 1 GB reserves behind and took a live container's quota
+    # to within 611 MB of full (2026-09-29).
+    reserve = state / "reserve"
+    if reserve.exists():
+        size = reserve.stat().st_size
+        reserve.unlink()
+        assert size <= _TEST_RESERVE_MAX_MB * 1024 * 1024, f"sandbox reserve of {size} bytes exceeds the test cap"
+
+
+# Cap for the reserve file in every sandbox (see the box fixture's teardown).
+_TEST_RESERVE_MAX_MB = 64
 
 
 def _run(box, snippet: str, act: int = 1) -> subprocess.CompletedProcess:
@@ -70,6 +84,10 @@ def _run(box, snippet: str, act: int = 1) -> subprocess.CompletedProcess:
     )
     script = (
         f"set -euo pipefail\nsource '{_WATCHGOD}'\nload_config\nWATCHGOD_ACT={act}\n"
+        # Both the live value AND the reload baseline: load_config restores
+        # _WG_BASE, so capping only the variable would let any snippet that
+        # reloads the config fallocate the real 2 GB default.
+        f"RESERVE_MAX_MB={_TEST_RESERVE_MAX_MB}; _WG_BASE[RESERVE_MAX_MB]={_TEST_RESERVE_MAX_MB}\n"
         f'mkdir -p "$DG_STATE_DIR"\n{snippet}\n'
     )
     proc = subprocess.run(
@@ -171,7 +189,7 @@ def test_orange_on_home_starts_standard_reclaim_and_pages_once(box):
 def test_orange_elsewhere_pages_without_a_lever(box):
     _handle(box, "orange", dev="999999")
     assert not [c for c in _calls(box) if " start " in f" {c} "], _calls(box)
-    assert "has no lever on this filesystem" in _pages(box)[0]["body"]
+    assert "Reclaim: none on this filesystem" in _pages(box)[0]["body"]
 
 
 def test_red_after_orange_still_pages_the_emergency(box):
@@ -569,7 +587,7 @@ def test_orange_on_cc_tmp_runs_the_pressure_sweep(box, cctmp):
     dev = str(os.stat(root).st_dev)
     _run(box, f"home_dev() {{ echo not-this; }}; handle_fs '{root}' '{dev}' orange 100 2048 - '' btrfs")
     assert not s.exists()
-    assert "retention sweep at 2 days" in _pages(box)[0]["body"]
+    assert "cc-tmp sweep at 2 days reaped" in _pages(box)[0]["body"]
 
 
 def test_the_hourly_sweep_is_rate_limited(box, cctmp):
@@ -1002,3 +1020,100 @@ def test_a_future_dated_usage_cache_is_not_trusted(box):
     (box["state"] / "cc_used_du").write_text(f"{int(time.time()) + 100000} 7\n")
     out = _run(box, 'CC_COMPAT="green 1000 5000 0"; SYS_COMPAT=""; DISK_JSON=""; write_state; cat "$STATE_FILE"')
     assert json.loads(out.stdout)["cc_tmp"]["used_mb"] == 123
+
+
+# ── #2521: round-3 review fixes (act-mode prerequisites) ─────────
+
+
+def test_a_full_tiny_filesystem_still_reaches_red(box):
+    """#2521 item 2: under ~25 MB the capped RED floor rounded to 0 MB, and
+    `free < 0` is never true — a completely full one stayed ORANGE."""
+    out = _run(box, "dg_floor_tier 0 20 - -; dg_floor_tier 0 512 - -").stdout.split()
+    assert out == ["red", "red"], out
+
+
+def test_a_new_episode_gets_its_levers_back(box):
+    """#2521 item 3: a GREEN between two episodes left the reclaim cooldown
+    running, so the second episode paged but reclaimed nothing."""
+    _handle(box, "orange")
+    _handle(box, "green", free=50_000, total=100_000)
+    _handle(box, "orange")
+    assert len([c for c in _calls(box) if "@standard" in c]) == 2
+
+
+def test_green_without_an_episode_keeps_the_cooldown(box):
+    """Control for the above: only the END of an episode resets the levers."""
+    _handle(box, "orange")
+    box["state"].joinpath(f"episode_{_home_dev(box)}_yellow").unlink()
+    for p in box["state"].glob("episode_*"):
+        p.unlink()
+    _handle(box, "green", free=50_000, total=100_000)
+    _handle(box, "orange")
+    assert len([c for c in _calls(box) if "@standard" in c]) == 1
+
+
+def test_the_warning_page_states_what_reclaim_actually_did(box):
+    """#2521 item 4: the page said "started" even when the start failed."""
+    _stub(box["bin"] / "systemctl", '#!/usr/bin/env bash\ncase "$*" in *"show -p MainPID"*) echo 0; exit 0;; esac\nexit 1\n')
+    _handle(box, "orange")
+    body = [p for p in _pages(box) if p["title"].startswith("Disk filling")][0]["body"]
+    assert "could NOT start" in body and "started genesis" not in body
+
+
+def test_pages_label_writers_as_process_wide(box):
+    """#2521 item 5: /proc/<pid>/io is process-wide; a page must not present
+    it as this filesystem's writers."""
+    _handle(box, "red")
+    body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
+    assert "process-wide, not only this filesystem" in body
+
+
+def test_observe_mode_message_does_not_overclaim():
+    """#2521 item 7: OOM capture still pages in observe mode."""
+    text = _WATCHGOD.read_text()
+    assert "no disk action is taken and no disk page is sent (OOM capture still pages)" in text
+    assert "nothing is reclaimed, released or paged" not in text
+
+
+def test_episode_end_resets_last_resort_and_observe_cooldowns(box):
+    """Review of #2521 item 3: the reset covers the last-resort instance and
+    the observe-mode stamps too, not only the standard instance."""
+    _handle(box, "red")
+    _handle(box, "green", free=50_000, total=100_000)
+    _handle(box, "red")
+    assert len([c for c in _calls(box) if "@last-resort" in c]) == 2
+    _handle(box, "orange", act=0)
+    assert (box["state"] / "pressure_standard_observe").exists()
+    _handle(box, "green", free=50_000, total=100_000, act=0)
+    assert not (box["state"] / "pressure_standard_observe").exists()
+
+
+def test_episode_end_resets_the_cc_tmp_pressure_sweep(box, cctmp):
+    root, _ = cctmp
+    cc_dev = str(os.stat(root).st_dev)
+    out = _run(box, f"""
+        CC_KEY='{cc_dev}'; HOME_KEY=none
+        sweep_cc_tmp() {{ echo SWEPT; }}
+        handle_fs '{root}' '{cc_dev}' orange 100 2048 - '' btrfs
+        handle_fs '{root}' '{cc_dev}' green 1900 2048 - '' btrfs
+        handle_fs '{root}' '{cc_dev}' orange 100 2048 - '' btrfs
+    """).stdout
+    assert out.count("SWEPT") == 2, out
+
+
+
+def test_a_sandbox_poll_never_allocates_more_than_the_test_reserve_cap(box):
+    """A full poll against a large stubbed filesystem sizes the reserve at
+    min(RESERVE_MAX_MB, 1 %) = 1 GB unless the sandbox caps it."""
+    _poll(box, {"/": "90000 100000 0 - - ext4", str(box["home"]): "90000 100000 0 - - ext4"})
+    reserve = box["state"] / "reserve"
+    assert reserve.exists(), "control: the poll does create a reserve"
+    assert reserve.stat().st_size <= _TEST_RESERVE_MAX_MB * 1024 * 1024
+
+
+def test_a_config_reload_keeps_the_test_reserve_cap(box):
+    """Review: load_config restores the startup baseline; the sandbox cap must
+    survive a reload, or a reloading snippet fallocates the real default."""
+    _run(box, f"load_config; handle_fs '{box['home']}' '{_home_dev(box)}' green 90000 100000 - '' btrfs")
+    r = box["state"] / "reserve"
+    assert r.exists() and r.stat().st_size <= _TEST_RESERVE_MAX_MB * 1024 * 1024

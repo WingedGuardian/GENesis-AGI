@@ -371,24 +371,47 @@ _wg_page() {
 }
 
 # ── Reclaim (the one deleter lives in disk_hygiene.sh) ───────
+# What each lever ACTUALLY did on this poll, for the page text: a page states
+# the outcome, never the intent (review finding, #2521 item 4 — the WARNING
+# said "started" when the start had failed or the sweep had refused).
+_WG_LEVER_START=""
+_WG_LEVER_SWEEP=""
+
 start_pressure_unit() {
     # $1 = standard | last-resort. Rate-limited per instance while a tier
     # persists; a repeat start of a running instance is a systemd no-op.
     local inst="$1" unit
     unit="genesis-disk-hygiene-pressure@${inst}.service"
-    _wg_due "pressure_${inst}" "$PRESSURE_RETRIGGER_S" || return 0
+    if ! _wg_due "pressure_${inst}" "$PRESSURE_RETRIGGER_S"; then
+        _WG_LEVER_START="${unit} already started within the last ${PRESSURE_RETRIGGER_S} s"
+        return 0
+    fi
     if (( WATCHGOD_ACT == 0 )); then
         log WARN "OBSERVE: would start ${unit}"
         _wg_stamp "pressure_${inst}"
+        _WG_LEVER_START="would start ${unit} (observe mode)"
         return 0
     fi
     if systemctl --user start --no-block "$unit" 2>/dev/null; then
         _wg_stamp "pressure_${inst}"
         log WARN "started ${unit}"
+        _WG_LEVER_START="started ${unit}"
     else
         log WARN "could not start ${unit} — retrying next poll (is it rendered? bootstrap renders scripts/systemd/*.template)"
+        _WG_LEVER_START="could NOT start ${unit} (retrying every poll)"
     fi
     return 0
+}
+
+_wg_unstamp() {
+    # Drop the named stamps in BOTH modes: a new episode starts with its
+    # levers available (review finding, #2521 item 3 — a GREEN between two
+    # episodes left the cooldowns running, so the second episode paged but
+    # reclaimed nothing for up to PRESSURE_RETRIGGER_S).
+    local n
+    for n in "$@"; do
+        rm -f -- "$DG_STATE_DIR/$n" "$DG_STATE_DIR/${n}_observe" 2>/dev/null || true
+    done
 }
 
 # ── cc-tmp retention sweep ───────────────────────────────────
@@ -449,9 +472,13 @@ sweep_cc_tmp() {
     # CANONICAL root: /proc reports fully resolved paths, so a symlinked
     # ancestor (e.g. /home -> /var/home) would make every held path miss the
     # prefix and silently empty the held table.
-    root="$(cd -P -- "$CC_TMP_DIR" 2>/dev/null && pwd -P)" || return 0
+    root="$(cd -P -- "$CC_TMP_DIR" 2>/dev/null && pwd -P)" || {
+        _WG_LEVER_SWEEP="cc-tmp sweep did NOT run (${CC_TMP_DIR} unreachable)"
+        return 0
+    }
     if ! liveness_visible; then
         log WARN "cc-tmp sweep skipped: no process outside this daemon is visible in /proc, so nothing can be proven unused"
+        _WG_LEVER_SWEEP="cc-tmp sweep REFUSED to run (cannot see which files are in use)"
         return 0
     fi
     snap="$(live_open_paths)"
@@ -489,7 +516,7 @@ sweep_cc_tmp() {
         if (( WATCHGOD_ACT == 0 )); then
             log INFO "OBSERVE: cc-tmp sweep would reap ${u}"
         else
-            rm -rf -- "$u" 2>/dev/null || log WARN "cc-tmp sweep could not remove ${u}"
+            rm -rf --one-file-system -- "$u" 2>/dev/null || log WARN "cc-tmp sweep could not remove ${u}"
         fi
         n=$(( n + 1 ))
     done < <(_cc_sweep_units "$root")
@@ -504,6 +531,7 @@ sweep_cc_tmp() {
     if (( n > 0 )); then
         log INFO "cc-tmp sweep (${why}, age>$(( age / 1440 ))d): $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}"
     fi
+    _WG_LEVER_SWEEP="cc-tmp sweep at $(( age / 1440 )) days $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}"
     return 0
 }
 
@@ -518,10 +546,18 @@ maybe_sweep_cc_tmp() {
     else
         every=$CC_SWEEP_INTERVAL_S; age=$CC_SWEEP_AGE_MIN
     fi
-    _wg_due "cc_sweep_${kind}" "$every" || return 0
+    if ! _wg_due "cc_sweep_${kind}" "$every"; then
+        _WG_LEVER_SWEEP="cc-tmp sweep already ran within the last ${every} s"
+        return 0
+    fi
     _wg_stamp "cc_sweep_${kind}"
     sweep_cc_tmp "$age" "$kind"
 }
+
+# /proc/<pid>/io counts a process's writes to EVERY filesystem, so the list a
+# page carries is not this filesystem's writers — say so rather than imply it
+# (review finding, #2521 item 5).
+_WG_WRITERS_LABEL="Top writers on the whole machine this poll (process-wide, not only this filesystem):"
 
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {
@@ -540,6 +576,12 @@ handle_fs() {
     pg="$(_wg_mode_tag)"
 
     if [[ "$tier" == green ]]; then
+        # Only on the way OUT of an episode (a marker exists): a green poll
+        # with no episode behind it has no cooldowns worth resetting.
+        if ls "$DG_STATE_DIR/episode_${dev}_"* >/dev/null 2>&1; then
+            (( is_home )) && _wg_unstamp pressure_standard pressure_last-resort
+            (( is_cc )) && _wg_unstamp cc_sweep_pressure
+        fi
         episode_clear "$dev"
         (( is_home )) && reserve_ensure "$free" "$total"
         return 0
@@ -553,13 +595,17 @@ handle_fs() {
     fi
 
     if [[ "$tier" == orange || "$tier" == red ]]; then
+        _WG_LEVER_START=""; _WG_LEVER_SWEEP=""
         (( is_home )) && start_pressure_unit standard
         (( is_cc )) && maybe_sweep_cc_tmp pressure
         if [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg"; then
-            lever="has no lever on this filesystem"
-            (( is_home )) && lever="started (genesis-disk-hygiene-pressure@standard)"
-            (( is_cc )) && lever="ran: cc-tmp retention sweep at 2 days"
-            body="${summary}. Reclaim ${lever}. Top writers:"$'\n'"${writers:-none measurable}"
+            lever="none on this filesystem"
+            if [[ -n "$_WG_LEVER_START" && -n "$_WG_LEVER_SWEEP" ]]; then
+                lever="${_WG_LEVER_START}; ${_WG_LEVER_SWEEP}"
+            elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
+                lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
+            fi
+            body="${summary}. Reclaim: ${lever}. ${_WG_WRITERS_LABEL}"$'\n'"${writers:-none measurable}"
             _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
                 && episode_mark "$dev" "orange$pg"
         fi
@@ -572,7 +618,7 @@ handle_fs() {
             start_pressure_unit last-resort
         fi
         if ! episode_seen "$dev" "red$pg"; then
-            body="${summary}. Reserve: ${rel}."$'\n'"Top writers:"$'\n'"${writers:-none measurable}"
+            body="${summary}. Reserve: ${rel}."$'\n'"${_WG_WRITERS_LABEL}"$'\n'"${writers:-none measurable}"
             _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
                 && episode_mark "$dev" "red$pg"
         fi
@@ -775,7 +821,7 @@ main() {
     # a leftover would sit there forever looking like a live alarm.
     rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" "$ALERT_DIR/tmp_orange_stuck" 2>/dev/null || true
     log INFO "Watchgod v2 starting (poll=${POLL_INTERVAL}s, fast=${FAST_POLL_INTERVAL}s, act=${WATCHGOD_ACT}, downloads=${DOWNLOADS_DIR})"
-    (( WATCHGOD_ACT )) || log WARN "OBSERVE mode (WATCHGOD_ACT=0): tiers are measured and logged; nothing is reclaimed, released or paged"
+    (( WATCHGOD_ACT )) || log WARN "OBSERVE mode (WATCHGOD_ACT=0): disk tiers are measured and logged; no disk action is taken and no disk page is sent (OOM capture still pages)"
 
     # Baseline the OOM counter at startup so we only page on NEW kills (never the
     # cumulative-since-boot history). Empty baseline = monitoring unavailable.

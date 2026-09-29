@@ -8,6 +8,7 @@ so they travel with the code rather than being lost with the v1 sweep tests.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -99,3 +100,28 @@ def test_path_is_held_survives_a_large_snapshot_with_the_path_first():
     snapshot outgrew the pipe buffer, and a held file was deleted."""
     snap = "/t/a.bin\n" + "".join(f"/elsewhere/{i:06d}/file\n" for i in range(40_000))
     assert _held("/t/a.bin", snap)
+
+
+def _crosses(tmp_path, path: str, table: list[str]) -> bool:
+    lib = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "tmp_liveness.sh"
+    bindir = tmp_path / "nomp"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "mountpoint").write_text("#!/bin/sh\nexit 1\n")  # the table alone decides
+    (bindir / "mountpoint").chmod(0o755)
+    tbl = "\\n".join(table)
+    r = subprocess.run(
+        ["bash", "-c", f"source '{lib}'\nif path_crosses_mount \"$1\" \"$(printf '{tbl}')\"; then echo Y; else echo N; fi", "_", path],
+        env=dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}"), capture_output=True, text=True,
+    )
+    return r.stdout.strip() == "Y"
+
+
+def test_path_crosses_mount_reads_the_table_exactly(tmp_path):
+    """Review of #2521 item 6: with `mountpoint` unavailable the table must
+    catch a mount AT the path and below it, never a sibling sharing a prefix,
+    and compare a path with a space in findmnt's escaped form."""
+    assert _crosses(tmp_path, "/h/tmp/job", ["/h/tmp/job"])
+    assert _crosses(tmp_path, "/h/tmp/job", ["/h/tmp/job/data"])
+    assert not _crosses(tmp_path, "/h/tmp/job", ["/h/tmp/job2"])
+    assert not _crosses(tmp_path, "/h/tmp/job", ["/h/tmp/job2/data"])
+    assert _crosses(tmp_path, "/h/tmp/a b", ["/h/tmp/a\\\\x20b/m"])

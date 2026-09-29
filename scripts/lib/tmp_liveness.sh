@@ -79,6 +79,31 @@ live_open_paths() {
     } 2>/dev/null || true
 }
 
+mount_targets() {
+    # Every mount point, one per line, from the MOUNT TABLE, in findmnt -r's
+    # raw form (space, tab and backslash escaped as \x20, \x09, \x5c —
+    # path_crosses_mount escapes its path the same way before comparing).
+    findmnt -rn -o TARGET 2>/dev/null || true
+}
+
+path_crosses_mount() {
+    # 0 when $1 is a mount point, or has a mount somewhere below it, per the
+    # mount table ($2 = mount_targets output, computed once by the caller).
+    # A device-number comparison alone misses a bind mount and an incus
+    # dir-pool volume, which keep their parent's device (review finding on
+    # #2521 item 6). Callers keep that comparison too, and rm with
+    # --one-file-system, as backstops when the mount table is unreadable.
+    local p="$1" targets="${2:-}" esc
+    mountpoint -q -- "$p" 2>/dev/null && return 0
+    [[ -n "$targets" ]] || return 1
+    esc="${p//\\/\\x5c}"; esc="${esc// /\\x20}"; esc="${esc//$'\t'/\\x09}"
+    # A mount AT the path or anywhere below it: the table alone must catch
+    # both, since `mountpoint` may be absent (review finding).
+    printf '%s\n' "$targets" | _tl_p="$esc" awk '
+        $0 == ENVIRON["_tl_p"] || index($0, ENVIRON["_tl_p"] "/") == 1 { f = 1 }
+        END { exit !f }'
+}
+
 liveness_visible() {
     # 0 when this process can see the descriptors of at least one OTHER
     # process — the precondition for reading "nothing holds it" as evidence.

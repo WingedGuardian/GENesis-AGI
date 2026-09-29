@@ -93,13 +93,24 @@ prune_tmp() {
         age_pred=(-mmin "+$age_min")
         recent_pred=(-mmin "-$age_min")
     fi
-    local snap child
+    local snap child root_dev mounts
     if ! liveness_visible; then
         echo "tmp prune SKIPPED: no other process is visible in /proc, so nothing can be proven unused"
         return 0
     fi
     snap="$(live_open_paths)"
+    root_dev="$(stat -c %d -- "$tmp_dir" 2>/dev/null)" || return 0
+    mounts="$(mount_targets)"
     while IFS= read -r -d '' child; do
+        # A child that is, or holds, a separate mount (a separately mounted
+        # ~/tmp/downloads) frees nothing on this filesystem; never recurse into
+        # it (#2521 item 6). The mount table catches a bind or same-device
+        # mount; the device number and --one-file-system are backstops.
+        if [ -e "$child" ] && { [ "$(stat -c %d -- "$child" 2>/dev/null)" != "$root_dev" ] \
+                || path_crosses_mount "$child" "$mounts"; }; then
+            echo "tmp prune: sparing $child (a separate filesystem)"
+            continue
+        fi
         if [ -d "$child" ] && dir_has_live_writer "$child" "$snap"; then
             echo "tmp prune: sparing $child (held open by a live process)"
             continue
@@ -116,7 +127,7 @@ prune_tmp() {
             echo "tmp prune: sparing $child (modified inside the window)"
             continue
         fi
-        rm -rf -- "$child" 2>/dev/null || echo "tmp prune failed for $child"
+        rm -rf --one-file-system -- "$child" 2>/dev/null || echo "tmp prune failed for $child"
     done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
 }
@@ -128,7 +139,7 @@ prune_tmp() {
 # its cwd — and the whole reap is refused when liveness is blind, like every
 # other deleter here (review finding).
 reap_bg_sandboxes() {
-    local dir="$1" snap d
+    local dir="$1" snap d root_dev mounts
     [ -d "$dir" ] || return 0
     dir="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
     if ! liveness_visible; then
@@ -136,12 +147,19 @@ reap_bg_sandboxes() {
         return 0
     fi
     snap="$(live_open_paths)"
+    root_dev="$(stat -c %d -- "$dir" 2>/dev/null)" || return 0
+    mounts="$(mount_targets)"
     while IFS= read -r -d '' d; do
+        if [ -e "$d" ] && { [ "$(stat -c %d -- "$d" 2>/dev/null)" != "$root_dev" ] \
+                || path_crosses_mount "$d" "$mounts"; }; then
+            echo "bg-cc sandbox reap: sparing $d (a separate filesystem)"
+            continue
+        fi
         if dir_has_live_writer "$d" "$snap"; then
             echo "bg-cc sandbox reap: sparing $d (held open or in use by a live process)"
             continue
         fi
-        rm -rf -- "$d" 2>/dev/null || echo "bg-cc sandbox reap failed for $d"
+        rm -rf --one-file-system -- "$d" 2>/dev/null || echo "bg-cc sandbox reap failed for $d"
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -print0 2>/dev/null)
 }
 
@@ -182,10 +200,14 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # deletes anything itself.
 pressure_main() {
     local last_resort="${1:-}"
-    local -a reclaim=(--apply --if-above 0 --fail-above 101)
+    # The standard (ORANGE) pass pins --last-resort-above past 100 %: left to
+    # disk_reclaim.py's own 95 % default, an ORANGE pass on a >=95 % disk
+    # deleted the code-intel indexes before RED ever fired (review finding,
+    # #2521 item 1). Only the last-resort (RED) pass clears them.
+    local -a reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 101)
     # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
     if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
-        reclaim+=(--last-resort-above 0)
+        reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 0)
     fi
     echo "=== genesis-disk-hygiene PRESSURE ${last_resort:-} $(date -u +%FT%TZ) ==="
     # Standard waits up to one watchgod re-trigger interval and then yields —
@@ -299,8 +321,11 @@ main() {
     fi
     if [ "$reclaim_locked" -eq 1 ]; then
     echo "--- cache reclamation ---"
+    # --last-resort-above 101: the code-intel indexes are cleared only by the
+    # guardian's RED (last-resort) pass, never by the daily groom on a disk
+    # that happens to be at 95 % (review finding on #2521 item 1).
     "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 \
-        --fail-above 95 || disk_reclaim_rc=$?
+        --fail-above 95 --last-resort-above 101 || disk_reclaim_rc=$?
     if [ "$disk_reclaim_rc" -ne 0 ]; then
         echo "disk_reclaim exited $disk_reclaim_rc"
     fi
@@ -389,7 +414,7 @@ main() {
                 if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
                     continue
                 fi
-                rm -rf "$_sess_dir" || echo "sessions prune failed for $_sess_dir"
+                rm -rf --one-file-system -- "$_sess_dir" || echo "sessions prune failed for $_sess_dir"
             done
     fi
     echo "--- entity merge-journal reversibility retention prune (>180d) ---"
