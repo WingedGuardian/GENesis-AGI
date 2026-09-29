@@ -158,6 +158,10 @@ body {
 .bg-learning   { background: rgba(251,146,60,0.08); }
 .bg-contingency{ background: rgba(248,113,113,0.08); }
 .bg-utility    { background: rgba(148,163,184,0.08); }
+.bg-dream_cycle  { background: rgba(34,211,238,0.08); }
+.bg-awareness    { background: rgba(45,212,191,0.08); }
+.bg-conversation { background: rgba(244,114,182,0.08); }
+.bg-evaluation   { background: rgba(250,204,21,0.08); }
 
 /* Enrichment cards grid below battleship */
 .enrichment-cards {
@@ -517,6 +521,32 @@ const SITE_META = {
     '34_research_synthesis': { name: 'Research Synth', category: 'content' },
     '37_infrastructure_monitor': { name: 'Infra Monitor', category: 'surplus' },
     'autonomous_executor_reasoning': { name: 'Executor', category: 'reasoning' },
+    '21_session_observer': { name: 'Session Obs', category: 'memory' },
+    'crag_grade': { name: 'Recall Grade', category: 'memory' },
+    '38a_procedure_novelty_llm': { name: 'Proc Novelty', category: 'content' },
+    '41_reflection_json_salvage': { name: 'JSON Salvage', category: 'processing' },
+    '43_task_retrospective': { name: 'Retrospect', category: 'assessment' },
+    '44_task_premortem': { name: 'Premortem', category: 'assessment' },
+    'failure_exit_gate': { name: 'Exit Gate', category: 'reasoning' },
+    'dream_cycle_synthesis': { name: 'Dream Synth', category: 'memory' },
+    'dream_cycle_synthesis_challenge': { name: 'Synth Check', category: 'memory' },
+    'dream_cycle_entity_check': { name: 'Entity Check', category: 'memory' },
+    'dream_cycle_entity_challenge': { name: 'Entity Challenge', category: 'memory' },
+    'dream_cycle_relationship_classify': { name: 'Relations', category: 'memory' },
+    'entity_adjudication': { name: 'Entity Adjud', category: 'memory' },
+    'entity_adjudication_challenge': { name: 'Adjud Check', category: 'memory' },
+    'wing_backfill': { name: 'Wing Backfill', category: 'memory' },
+    '45_intelligence_intake': { name: 'Intel Intake', category: 'processing' },
+    '46_infra_annotation': { name: 'Infra Notes', category: 'processing' },
+    'attention_salience': { name: 'Salience', category: 'processing' },
+    'repo_pulse': { name: 'Repo Pulse', category: 'processing' },
+    'ambient_ledger_extractor': { name: 'Ledger Extract', category: 'processing' },
+    'desk_primary': { name: 'Desk', category: 'core' },
+    'desk_fast': { name: 'Desk Fast', category: 'core' },
+    'voice_conversation': { name: 'Voice', category: 'core' },
+    'judge': { name: 'Eval Judge', category: 'assessment' },
+    'contribution_gate': { name: 'Contrib Gate', category: 'assessment' },
+    'models_md_synthesis': { name: 'Models.md', category: 'surplus' },
 };
 
 // Category colors (used in detail panel category badge)
@@ -1913,18 +1943,21 @@ const SUBSYSTEM_GROUPS = {
         name: 'Reflection', domId: 'sub-reflection',
         desc: 'Periodic thinking cycles at micro, light, deep, and strategic depth',
         sites: ['3_micro_reflection', '4_light_reflection', '5_deep_reflection',
-                '6_strategic_reflection', '14_weekly_self_assessment', '16_quality_calibration'],
+                '6_strategic_reflection', '14_weekly_self_assessment', '16_quality_calibration',
+                '41_reflection_json_salvage'],
     },
     memory: {
         name: 'Memory', domId: 'sub-memory',
         desc: 'Storage, fact extraction, embeddings, knowledge retrieval, and resume review',
         sites: ['9_fact_extraction', '21_embeddings', '21b_query_embedding',
-                '41_resume_review_pass1', '42_resume_review_pass2', 'ambient_arbiter'],
+                '41_resume_review_pass1', '42_resume_review_pass2', 'ambient_arbiter',
+                'crag_grade', '21_session_observer'],
     },
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
         desc: 'Idle-time tasks \u2014 brainstorms, code audits, infrastructure monitoring',
-        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor'],
+        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor',
+                'models_md_synthesis'],
     },
     outreach: {
         name: 'Outreach', domId: 'sub-outreach',
@@ -1935,14 +1968,16 @@ const SUBSYSTEM_GROUPS = {
         name: 'Executor', domId: 'sub-executor',
         desc: 'Task execution review \u2014 pre-assessment, adversarial challenge, autonomous dispatch',
         sites: ['27_pre_execution_assessment', '17_executor_review',
-                '20_adversarial_counterargument', 'autonomous_executor_reasoning'],
+                '20_adversarial_counterargument', 'autonomous_executor_reasoning',
+                'failure_exit_gate', '44_task_premortem', '43_task_retrospective'],
     },
     learning: {
         name: 'Learning', domId: 'sub-learning',
         desc: 'Observation triage, calibration, outcome classification, skill refinement',
         sites: ['29_retrospective_triage',
                 '30_triage_calibration', '31_outcome_classification', '32_delta_assessment',
-                '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation'],
+                '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation',
+                '38a_procedure_novelty_llm'],
     },
     contingency: {
         name: 'Contingency', domId: 'sub-contingency',
@@ -1960,6 +1995,30 @@ const SUBSYSTEM_GROUPS = {
         name: 'Model Fusion', domId: 'sub-model-fusion',
         desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — a custom panel + judge return a synthesized verdict plus explicit dissent for high-stakes, contested decisions. Invoked via the deliberate MCP tool.',
         sites: ['model_fusion'],
+    },
+    dream_cycle: {
+        name: 'Dream Cycle', domId: 'sub-dream-cycle',
+        desc: 'Memory consolidation \u2014 synthesis, entity resolution and relationship classification, each with an adversarial check',
+        sites: ['dream_cycle_synthesis', 'dream_cycle_synthesis_challenge',
+                'dream_cycle_entity_check', 'dream_cycle_entity_challenge',
+                'dream_cycle_relationship_classify', 'entity_adjudication',
+                'entity_adjudication_challenge', 'wing_backfill'],
+    },
+    awareness: {
+        name: 'Awareness', domId: 'sub-awareness',
+        desc: 'Intake and attention \u2014 intelligence triage, infra notes, salience, repo and session-ledger pulse',
+        sites: ['45_intelligence_intake', '46_infra_annotation', 'attention_salience',
+                'repo_pulse', 'ambient_ledger_extractor'],
+    },
+    conversation: {
+        name: 'Conversation', domId: 'sub-conversation',
+        desc: 'Direct conversation surfaces \u2014 the foreground session, dashboard desk and voice',
+        sites: ['cc_foreground', 'desk_primary', 'desk_fast', 'voice_conversation'],
+    },
+    evaluation: {
+        name: 'Evaluation', domId: 'sub-evaluation',
+        desc: 'Judging and gating \u2014 the eval judge and the upstream-contribution gate',
+        sites: ['judge', 'contribution_gate'],
     },
 };
 
@@ -1985,6 +2044,7 @@ const SUBSYSTEM_BORDER_COLORS = {
     ego: '#c084fc', reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80',
     outreach: '#fbbf24', executor: '#a78bfa', learning: '#fb923c',
     contingency: '#f87171', utility: '#94a3b8', model_fusion: '#e879f9',
+    dream_cycle: '#22d3ee', awareness: '#2dd4bf', conversation: '#f472b6', evaluation: '#facc15',
 };
 
 
@@ -2013,20 +2073,34 @@ function updateSubsystemGrid(data) {
         learning:    [[4,1],[5,1],[6,1],[7,1],[4,2],[5,2],[6,2],[7,2]],
         reflection:  [[4,3],[5,3],[6,3],[4,4],[5,4],[6,4]],
         ego:         [[7,3],[7,4],[7,5]],
-        memory:      [[1,4],[3,4],[1,5],[2,5],[2,4],[1,6]],
+        memory:      [[1,4],[3,4],[1,5],[2,5],[2,4],[1,6],[2,6],[1,7]],
         surplus:     [[3,5],[4,5],[3,6],[4,6]],
-        executor:    [[5,5],[6,5],[5,6],[6,6]],
+        executor:    [[5,5],[6,5],[5,6],[6,6],[7,6]],
         outreach:    [[3,7],[4,7]],
         contingency: [[5,7],[6,7]],
         model_fusion: [[7,7]],
     };
 
+    // A site with no hand position used to fall back to [1, 1], stacking on
+    // top of whatever was there. Instead, sites beyond a group's hand-placed
+    // cells, and whole groups with none, flow row-major into the rows below
+    // the hand-placed map, each group's cells kept together.
+    const GRID_COLS = 7;
+    let flowRow = 1 + Math.max(0, ...Object.values(GRID_POSITIONS).flat().map(([, r]) => r));
+    let flowCol = 1;
+    const nextFlowCell = () => {
+        const cell = [flowCol, flowRow];
+        flowCol += 1;
+        if (flowCol > GRID_COLS) { flowCol = 1; flowRow += 1; }
+        return cell;
+    };
+
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {
-        // ── Top: flat grid cells, explicitly positioned ──────────────────
+        // ── Top: flat grid cells, hand-placed where a position exists ─────
         const positions = GRID_POSITIONS[key] || [];
         for (let si = 0; si < group.sites.length; si++) {
             const siteId = group.sites[si];
-            const [col, row] = positions[si] || [1, 1];
+            const [col, row] = positions[si] || nextFlowCell();
             const siteData = callSites[siteId] || {};
             const meta = getMeta(siteId);
             const status = siteData.status || 'unknown';
