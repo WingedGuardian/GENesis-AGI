@@ -1946,7 +1946,7 @@ def test_a_legacy_whole_file_row_locates_each_url_on_its_own_line():
     not all at the file's first line."""
     content = "intro\nhttps://a.example.com/1\n\nhttps://b.example.com/2"
     lines = content.split("\n")
-    labels = InboxMonitor._item_labels(content, lines)
+    labels = InboxMonitor._item_labels(content, lines, legacy=True)
     assert labels[0].startswith("a.example.com — line 2 ("), labels
     assert labels[1].startswith("b.example.com — line 4 ("), labels
 
@@ -1962,3 +1962,89 @@ def test_a_schemeless_url_with_a_scheme_in_its_query_keeps_its_host():
         "example.com/r?u=https://other.example.com", ["example.com/r?u=https://other.example.com"],
     )
     assert label.startswith("example.com — line 1 ("), label
+
+
+def test_notes_sharing_a_first_line_get_distinct_ids():
+    """Round 3 (#2533, Codex): the note id hashed only the first line."""
+    (one,) = InboxMonitor._item_labels("Read this\nalpha", [])
+    (two,) = InboxMonitor._item_labels("Read this\nbeta", [])
+    assert one != two, one
+
+
+def test_a_multi_link_item_uses_its_own_block_not_an_earlier_lone_link():
+    """Round 3 (#2533, Codex): a line with several links located each link
+    separately, so an older line holding one of them alone won."""
+    lines = ["https://a.example.com/x", "", "compare https://a.example.com/x https://b.example.com/y"]
+    labels = InboxMonitor._item_labels(lines[2], lines)
+    assert all("— line 3 (" in label for label in labels), labels
+
+
+def test_identical_items_parked_together_get_distinct_lines_in_file_order():
+    """Round 3 (#2533, premise check): two parked items with identical text
+    were both sent to the last copy's line."""
+    claimed: set[int] = set()
+    lines = ["read later", "", "read later"]
+    second = InboxMonitor._item_labels("read later", lines, claimed=claimed)
+    first = InboxMonitor._item_labels("read later", lines, claimed=claimed)
+    assert "— line 3 (" in second[0] and "— line 1 (" in first[0], (first, second)
+
+
+@pytest.mark.asyncio
+async def test_the_flush_reads_each_inbox_file_once(db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch):
+    """Round 3 (#2533, Codex): the file was re-read once per parked batch."""
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://a.example.com/1\n\nhttps://b.example.com/2\n")
+    reads: list[str] = []
+    real = Path.read_bytes
+
+    def counting(self):
+        reads.append(str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    mon._park_buffer = {}
+    for rid, text in (("r1", "https://a.example.com/1"), ("r2", "https://b.example.com/2")):
+        mon._alert_parked(str(f), reason="retries_exhausted", detail="d", item_id=rid, texts=[text])
+    resolved = mon._resolve_park_labels(str(f), mon._park_buffer[(str(f), "retries_exhausted")]["items"])
+    assert [p for p in reads if p == str(f)] == [str(f)]
+    assert "— line 1 (" in resolved["r1"][0] and "— line 3 (" in resolved["r2"][0], resolved
+
+
+def test_identical_rows_parked_in_one_file_get_lines_in_row_order(tmp_path):
+    """The earlier-parked row gets the earlier copy: rows are labelled newest
+    first, each taking the last line still free."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("read later\n\nread later\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"r1": {"texts": ["read later"], "legacy": False},
+             "r2": {"texts": ["read later"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 1 (" in resolved["r1"][0] and "— line 3 (" in resolved["r2"][0], resolved
+
+
+def test_a_loose_match_never_takes_a_line_from_an_exact_owner(tmp_path):
+    """Round 3 audit: a stale note matching a URL line by substring claimed it,
+    and the URL item still in the file lost its line."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://ai.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"r1": {"texts": ["https://ai.example.com/x"], "legacy": False},
+             "r2": {"texts": ["ai"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 1 (" in resolved["r1"][0], resolved
+
+
+def test_two_links_on_one_line_of_a_legacy_row_both_get_that_line():
+    """Round 3 audit: inside one legacy item, the first link's claim blocked a
+    second link on the same line."""
+    lines = ["compare https://a.example.com/1 https://b.example.com/2", "https://c.example.com/3"]
+    labels = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
+    assert [lbl.split(" (")[0] for lbl in labels] == [
+        "a.example.com — line 1", "b.example.com — line 1", "c.example.com — line 2"], labels
+
+
+def test_a_legacy_row_with_one_link_points_at_the_link_line():
+    lines = ["intro", "https://a.example.com/1"]
+    (label,) = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
+    assert label.startswith("a.example.com — line 2 ("), label

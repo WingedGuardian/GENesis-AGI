@@ -2138,22 +2138,22 @@ class InboxMonitor:
             # line and collapses annotated items that share a URL (#2447
             # review). Unreadable storage falls back to the flattened text,
             # which for a legacy resume row can be the whole file: shown as one
-            # item. Legacy only; v2 rows always carry item boundaries.
-            items = inbox_items.stored_item_texts(row.get("batch_items")) or [content]
-            try:
-                # Same decoding as the scanner (utf-8, replace), whatever the locale.
-                file_lines = (
-                    Path(file_path).read_bytes().decode("utf-8", errors="replace").splitlines()
-                )
-            except OSError:
-                file_lines = []
+            # item. Legacy only; v2 rows always carry item boundaries. The
+            # labels are resolved at flush, once per file (#2533 round 3).
+            items = inbox_items.stored_item_texts(row.get("batch_items"))
             self._alert_parked(
                 file_path, reason=reason, detail=detail, item_id=row_id,
-                labels=[", ".join(self._item_labels(text, file_lines)) for text in items],
+                texts=items or [content], legacy=not items,
             )
 
     @staticmethod
-    def _item_labels(content: str, file_lines: list[str] | None = None) -> list[str]:
+    def _item_labels(
+        content: str,
+        file_lines: list[str] | None = None,
+        *,
+        legacy: bool = False,
+        claimed: set[int] | None = None,
+    ) -> list[str]:
         """Human handles for an item, safe for the owner's channel.
 
         Each URL is shown as its HOST, the LINE of the inbox file the item sits
@@ -2170,18 +2170,29 @@ class InboxMonitor:
         match wins among equals (a parked item is new text, appended below the
         older items it may resemble: a short note like ``ai``, or a URL that
         prefixes an earlier one). An item with no URL is a note on its line,
-        with a ``note#`` id for when the file can no longer be read.
+        with a ``note#`` id (a hash of its whole text) for when the file can no
+        longer be read.
+
+        ``legacy`` marks the whole-file text of a legacy row: there each URL
+        locates itself. ``claimed`` holds lines other items parked in the same
+        file matched EXACTLY (whole block); they are skipped. Only an exact
+        block match claims a line, so two identical items never share one,
+        while a loose fallback match never takes a line from an exact owner.
         """
         lines = [ln.strip() for ln in (file_lines or [])]
+        taken = claimed if claimed is not None else set()
+
+        def last_free(candidates: list[int]) -> int | None:
+            free = [n for n in candidates if n not in taken]
+            return free[-1] if free else None
 
         def line_of(needle: str) -> int | None:
             if not needle:
                 return None
-            exact = [n for n, text in enumerate(lines, 1) if text == needle]
+            exact = last_free([n for n, text in enumerate(lines, 1) if text == needle])
             if exact:
-                return exact[-1]
-            partial = [n for n, text in enumerate(lines, 1) if needle in text]
-            return partial[-1] if partial else None
+                return exact
+            return last_free([n for n, text in enumerate(lines, 1) if needle in text])
 
         block = [ln.strip() for ln in (content or "").splitlines() if ln.strip()]
         first = block[0] if block else ""
@@ -2193,18 +2204,20 @@ class InboxMonitor:
             # annotation differ in their link line (#2533 round 2).
             if not block:
                 return None
-            starts = [
+            return last_free([
                 i + 1 for i in range(len(lines) - len(block) + 1)
                 if lines[i:i + len(block)] == block
-            ]
-            return starts[-1] if starts else None
+            ])
 
-        # One logical item: its whole block locates it; once edited, its link's
-        # own line, then its first line. Several URLs in the text (a legacy row
-        # holding a whole file): each URL locates itself.
+        # One logical item, however many URLs its line holds: its whole block
+        # locates it; once edited, its link's own line, then its first line. A
+        # legacy row holding a whole file: each URL locates itself.
+        exact_line = None if legacy and urls else block_start()
+        if exact_line:
+            taken.add(exact_line)
         item_line = (
-            block_start() or (line_of(urls[0]) if urls else None) or line_of(first)
-            if len(urls) <= 1 else None
+            None if legacy and urls
+            else exact_line or (line_of(urls[0]) if urls else None) or line_of(first)
         )
         labels: list[str] = []
         for url in urls:
@@ -2220,7 +2233,7 @@ class InboxMonitor:
                 labels.append(label)
         if labels:
             return labels
-        note_id = "note#" + hashlib.sha256(first.encode("utf-8")).hexdigest()[:12]
+        note_id = "note#" + hashlib.sha256("\n".join(block).encode("utf-8")).hexdigest()[:12]
         where = f" — line {item_line}" if item_line else ""
         return [f"a note{where} ({note_id})"]
 
@@ -2232,6 +2245,8 @@ class InboxMonitor:
         detail: str,
         item_id: str | None = None,
         labels: list[str] | None = None,
+        texts: list[str] | None = None,
+        legacy: bool = False,
     ) -> None:
         """Record that part of a file stopped being evaluated; sent at scan end.
 
@@ -2240,13 +2255,40 @@ class InboxMonitor:
         id, never by their label: two presigned links to one path share a
         redacted label, and keying on it reported one item where two stopped
         (#2447 review). A call with no ``item_id`` parks the whole file.
+        ``texts`` are the row's item texts, labelled at flush (``labels``
+        given directly are used as they are).
         """
         buf = getattr(self, "_park_buffer", None)
         if buf is None:  # called outside check_once (tests, direct calls)
             self._park_buffer = buf = {}
         entry = buf.setdefault((file_path, reason), {"detail": detail, "items": {}})
         if item_id is not None:
-            entry["items"][item_id] = labels or ["an item"]
+            entry["items"][item_id] = (
+                {"texts": texts, "legacy": legacy} if texts else (labels or ["an item"])
+            )
+
+    def _resolve_park_labels(self, file_path: str, items: dict) -> dict[str, list[str]]:
+        """Labels for every item parked in one file, read from the file ONCE.
+
+        Labelled newest row first, each taking the last line not yet claimed,
+        so identical items get distinct lines in file order (#2533 round 3).
+        """
+        pending = [(rid, v) for rid, v in items.items() if isinstance(v, dict)]
+        if not pending:
+            return items
+        try:
+            # Same decoding as the scanner (utf-8, replace), whatever the locale.
+            file_lines = Path(file_path).read_bytes().decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            file_lines = []
+        claimed: set[int] = set()
+        resolved: dict[str, list[str]] = {}
+        for rid, v in reversed(pending):
+            resolved[rid] = [
+                ", ".join(self._item_labels(text, file_lines, legacy=v["legacy"], claimed=claimed))
+                for text in reversed(v["texts"])
+            ][::-1]
+        return {rid: resolved.get(rid, v) for rid, v in items.items()}
 
     def _flush_park_alerts(self) -> None:
         """Queue one durable owner alert per (file, reason) parked this scan.
@@ -2274,7 +2316,8 @@ class InboxMonitor:
                     name = Path(file_path).relative_to(self._config.watch_path).as_posix()
                 except ValueError:
                     name = Path(file_path).name
-                items = entry["items"]
+                items = self._resolve_park_labels(file_path, entry["items"])
+                entry["items"] = items  # the failure log below reads the labels
                 # One line per LOGICAL item, not per row: a row holds several
                 # items when items_per_eval > 1, and the title counts them.
                 lines = [f"- {lbl}" for lbls in items.values() for lbl in lbls]
@@ -2324,7 +2367,9 @@ class InboxMonitor:
                     "Inbox parked-alert enqueue failed for %s (%s): %s",
                     file_path, reason,
                     "; ".join(
-                        lbl for lbls in entry.get("items", {}).values() for lbl in lbls
+                        lbl for rid, lbls in entry.get("items", {}).items()
+                        for lbl in (lbls if isinstance(lbls, list)
+                                    else [f"row {rid}: {len(lbls['texts'])} unlabelled item(s)"])
                     ) or entry.get("detail", ""),
                     exc_info=True,
                 )
