@@ -955,3 +955,33 @@ async def test_list_for_pr_returns_OPEN_rows_the_closed_reader_cannot_reach(db):
     assert rows[0]["status"] == "open"
     assert rows[0]["verdict"] == "fail-intent"
     assert '"verdict": "fail"' in rows[0]["evidence"]
+
+
+async def test_an_attempt_without_a_document_does_not_inherit_the_previous_one(db):
+    """Round-2 finding. With COALESCE, a second attempt that passed no document left the
+    first attempt's measured-failure document displayed under the new verdict. Every
+    attempt field must describe the LATEST attempt."""
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=94, pr_title="t", merged_at=NOW, now=NOW
+    )
+    await verif_crud.record_attempt(
+        db,
+        repo=REPO,
+        pr_number=94,
+        verdict="fail-intent",
+        note="it broke",
+        now=NOW,
+        evidence='{"claims": [{"verdict": "fail"}]}',
+    )
+    await verif_crud.record_attempt(
+        db,
+        repo=REPO,
+        pr_number=94,
+        verdict="cannot-verify",
+        note="needs another install",
+        now=NOW,
+    )
+    row = (await verif_crud.list_for_pr(db, pr_number=94))[0]
+    assert row["verdict"] == "cannot-verify"
+    assert row["evidence"] is None, "an older attempt's document must not wear the new verdict"
+    assert row["attempt_count"] == 2

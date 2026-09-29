@@ -356,3 +356,15 @@ def test_a_scoped_read_renders_a_PARKED_row_as_OPEN(tmp_path, capsys):
     assert "cannot-verify" in out
     assert "needs another install entirely" in out
     assert "attempts: 1" in out
+
+
+def test_a_scoped_read_COUNTS_a_parked_row_as_open(tmp_path, capsys):
+    """Round-2 finding: the footer said '1 closed row(s) shown' directly under a line
+    reading OPEN. A reader gets two answers about whether the obligation is pending."""
+    db = tmp_path / "genesis.db"
+    _build(db, open_rows=1, parked=True)
+    _w._print_verification_log(str(db), 1)
+    out = capsys.readouterr().out
+    assert "1 open, 0 closed" in out
+    assert "closed row(s) shown" not in out, "the closed-only footer is for unscoped reads"
+    assert "CAPPED read" not in out

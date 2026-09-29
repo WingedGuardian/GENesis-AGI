@@ -306,6 +306,11 @@ async def record_attempt(
     ``note`` is required and non-empty for the same reason ``reason`` is on the
     closer: "attempted but could not be completed" with no stated cause is
     precisely the unverifiable claim that guard exists to refuse.
+
+    ``evidence`` REPLACES the stored document, and ``None`` clears it. Every attempt
+    field describes the LATEST attempt, so an attempt made without a document leaves
+    the row with none rather than showing an earlier attempt's document under this
+    attempt's verdict. Capped at :data:`MAX_EVIDENCE_BYTES`; over the cap raises.
     """
     if verdict not in VERDICTS:
         raise ValueError(
@@ -325,17 +330,22 @@ async def record_attempt(
         )
     if not await _verdict_columns_available(db):
         return "unavailable"
-    # The evidence document is stored on a NON-closing attempt too, and COALESCE
-    # keeps a prior document when this attempt has none rather than erasing it.
-    # Without this a failed verification discarded everything the validator
-    # assembled — claims, tiers, measurements, controls — and kept only the
-    # one-line note, so the next validator inherited a summary of work it could no
-    # longer inspect. A fail-intent is exactly the case where that detail is worth
-    # most, because someone has to act on it.
+    # The evidence document is stored on a NON-closing attempt too. Without this a
+    # failed verification discarded everything the validator assembled — claims,
+    # tiers, measurements, controls — and kept only the one-line note. A fail-intent
+    # is exactly the case where that detail is worth most, because someone has to
+    # act on it.
+    #
+    # It is REPLACED, even with NULL — never COALESCEd. An earlier version kept the
+    # prior document when this attempt passed none, and a review measured what that
+    # does: a second attempt recording 'cannot-verify' without a document left the
+    # FIRST attempt's measured-failure document displayed under the new verdict,
+    # unlabelled. The row's rule is that every attempt field describes the LATEST
+    # attempt; a missing document is shown as missing, not disguised by an older one.
     cursor = await db.execute(
         "UPDATE pr_verifications SET verdict = ?, last_attempt_at = ?, "
         "last_attempt_note = ?, attempt_count = attempt_count + 1, "
-        "evidence = COALESCE(?, evidence) "
+        "evidence = ? "
         "WHERE repo = ? AND pr_number = ? AND status = 'open'",
         (verdict, now, note, evidence, repo, pr_number),
     )

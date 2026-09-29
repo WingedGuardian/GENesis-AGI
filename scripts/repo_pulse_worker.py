@@ -275,6 +275,21 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
     # count alone lets a reader take it for a total — the same omission the backlog
     # reader states with both numbers. Say so rather than letting the two disagree
     # in silence.
+    if pr_number is not None:
+        # A scoped read covers OPEN rows too, so a closed-only count here told a
+        # reader a parked obligation was discharged — the line directly above it said
+        # OPEN. Count each status; list_for_pr is unlimited (one row per repository
+        # holding that number), so there is no cap to disclose.
+        n_open = sum(1 for r in rows if r.get("status") != "closed")
+        print(
+            f"pr_verifications: {len(rows)} row(s) for PR #{pr_number} — "
+            f"{n_open} open, {len(rows) - n_open} closed ({resolved})"
+        )
+        return
+    # A listing whose length EQUALS its cap is a truncated read, and printing the
+    # count alone lets a reader take it for a total — the same omission the backlog
+    # reader states with both numbers. Say so rather than letting the two disagree
+    # in silence.
     if len(rows) >= _LOG_LIMIT:
         print(
             f"  <listed the {_LOG_LIMIT} most recently closed; this is a CAPPED read, "
