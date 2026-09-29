@@ -599,6 +599,107 @@ def test_branch_push_target_without_a_remote_keeps_unknown(
     assert _decision(_run('git commit -m "fix"', repo, home)) == "ask"
 
 
+def _clone_of_a_local_bare(tmp_path: Path) -> Path:
+    """What `git clone <path>` actually leaves behind: a remote named `origin`
+    whose URL is a filesystem path, and `branch.<b>.remote = origin` — a remote
+    NAME, not a URL (MEASURED, git 2.43)."""
+    bare = tmp_path / "upstream.git"
+    _git(tmp_path, "-c", "init.defaultBranch=main", "init", "-q", "--bare", str(bare))
+    seed = tmp_path / "seed"
+    _git(tmp_path, "clone", "-q", str(bare), str(seed))
+    _git(
+        seed,
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    )
+    _git(seed, "push", "-q", "origin", "HEAD:refs/heads/main")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(bare), str(clone))
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "tester")
+    _git(clone, "checkout", "-qb", "feature/review-budget", "--track", "origin/main")
+    (clone / "f.py").write_text("value = 2\n")
+    _git(clone, "add", "-A")
+    return clone
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        None,  # exactly what the clone wrote: branch.<b>.remote = origin
+        "branch.feature/review-budget.pushRemote",
+        "remote.pushDefault",
+    ],
+)
+def test_a_branch_target_naming_a_local_remote_is_not_github(monkeypatch, home, tmp_path, key):
+    """Codex P1 on #2480: the branch target was classified as a URL, so the
+    remote NAME `origin` counted as possibly-GitHub and a plain local clone still
+    asked. The name resolves to the remote's URLs, all filesystem paths here."""
+    _unseamed(monkeypatch, tmp_path)
+    clone = _clone_of_a_local_bare(tmp_path)
+    got = subprocess.run(
+        ["git", "-C", str(clone), "config", "branch.feature/review-budget.remote"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert got.stdout.strip() == "origin"  # the fixture really has the shape
+    if key is not None:
+        _git(clone, "config", key, "origin")
+    _mark(clone, home)
+    assert _decision(_run('git commit -m "lab"', clone, home)) == "allow"
+    assert _decision(_run('git commit -m "lab"', clone, home, dispatched=True)) == "allow"
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        ("remote", "set-url", "origin", "https://github.com/owner/repo.git"),
+        ("remote", "set-url", "--push", "origin", "git@github.com:owner/repo.git"),
+        ("config", "branch.feature/review-budget.pushRemote", "fork"),
+    ],
+)
+def test_a_branch_target_naming_a_github_or_unknown_remote_keeps_unknown(
+    monkeypatch, home, tmp_path, setup
+):
+    """NEGATIVE CONTROL for the resolution above. The same local clone whose
+    named remote is a GitHub URL (fetch or push), or whose branch names a remote
+    that is not configured at all, keeps ask / deny."""
+    _unseamed(monkeypatch, tmp_path)
+    clone = _clone_of_a_local_bare(tmp_path)
+    _git(clone, *setup)
+    _mark(clone, home)
+    assert _decision(_run('git commit -m "fix"', clone, home)) == "ask"
+    assert _decision(_run('git commit -m "fix"', clone, home, dispatched=True)) == "deny"
+
+
+def test_a_push_rewrite_to_github_on_a_named_local_remote_keeps_unknown(
+    monkeypatch, home, tmp_path
+):
+    """NEGATIVE CONTROL for the dependency the name resolution relies on: a
+    named remote whose local URL `url.<base>.pushInsteadOf` rewrites to GitHub
+    is caught only because `git remote -v` lists the REWRITTEN push URL
+    (MEASURED, git 2.43). If git stopped applying the rewrite there, the name
+    would resolve to a local path and this would wrongly allow."""
+    _unseamed(monkeypatch, tmp_path)
+    clone = _clone_of_a_local_bare(tmp_path)
+    _git(clone, "config", "url.git@github.com:owner/.pushInsteadOf", str(tmp_path) + "/")
+    listed = subprocess.run(
+        ["git", "-C", str(clone), "remote", "-v"], capture_output=True, text=True, check=True
+    ).stdout
+    assert "git@github.com:owner/" in listed  # the rewrite really reaches the listing
+    _mark(clone, home)
+    assert _decision(_run('git commit -m "fix"', clone, home)) == "ask"
+    assert _decision(_run('git commit -m "fix"', clone, home, dispatched=True)) == "deny"
+
+
 def test_local_branch_target_is_still_no_github(monkeypatch, repo, home, tmp_path):
     """`branch.<b>.remote = .` means the local repository itself."""
     _unseamed(monkeypatch, tmp_path)

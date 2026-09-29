@@ -1028,7 +1028,15 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
     a GitHub URL is listed as the GitHub URL). Also reads the branch push/pull
     targets: ``git push -u <url>`` leaves ``branch.<b>.remote`` set to a URL with
     no remote defined, and that branch can have an open PR even though gh finds
-    no remote (MEASURED by audit). None = could not tell."""
+    no remote (MEASURED by audit). None = could not tell.
+
+    A branch target is USUALLY a remote NAME, not a URL: ``git clone <path>``
+    writes ``branch.<b>.remote=origin`` (MEASURED, git 2.43). A name is resolved
+    through the remotes ``git remote -v`` just listed, and it is possibly GitHub
+    exactly when one of that remote's URLs is — which the first loop has already
+    answered, so a name that resolves there adds nothing. Only a value that is
+    NOT a listed remote is classified as a URL/path in its own right; an unknown
+    name therefore stays possibly-GitHub, the conservative direction."""
     try:
         read = subprocess.run(
             ["git", "-C", cwd, "remote", "-v"],
@@ -1058,15 +1066,18 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
     # `git config --get-regexp` exits 1 when nothing matches; anything else is an error.
     if targets.returncode not in (0, 1) or (targets.returncode == 1 and targets.stdout.strip()):
         return None
+    remote_names: set[str] = set()
     for line in read.stdout.splitlines():
         if not line.strip():
             continue
-        _name, sep, rest = line.partition("\t")
+        name, sep, rest = line.partition("\t")
         if not sep:
             return None
+        remote_names.add(name.strip())
         url = rest.rsplit(" (", 1)[0].strip()
         if not _is_local_remote_url(url):
             return True
+    # Every listed remote's fetch AND push URL is a filesystem path by now.
     for line in targets.stdout.splitlines():
         if not line.strip():
             continue
@@ -1074,9 +1085,12 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
         value = value.strip()
         if not sep or not value:
             return None
-        # "." is the local repository itself; a filesystem path is not GitHub.
-        # Anything else — a remote name or a URL — might be, so it counts.
-        if value != "." and not _is_local_remote_url(value):
+        # "." is the local repository itself. A listed remote NAME resolves to
+        # the URLs just classified, all local. A filesystem path is not GitHub.
+        # Anything else — an unlisted name or a URL — might be, so it counts.
+        if value == "." or value in remote_names:
+            continue
+        if not _is_local_remote_url(value):
             return True
     return False
 
@@ -1086,8 +1100,8 @@ def _no_pr_possible_or_unknown(
 ) -> dict | None:
     """After a failed PR lookup: None when gh cannot resolve any repository here.
 
-    A repository with nothing gh could resolve to GitHub (no such remote, no
-    branch push target, no ``GH_REPO``) gives gh no repository to find a pull
+    A repository with nothing gh could resolve to GitHub (no remote or branch
+    target that might be GitHub, no ``GH_REPO``) gives gh no repository to find a pull
     request in, so there is no budget to consult: a scratch or lab repo. The
     claim is about what gh can resolve, not about GitHub at large, so it is only
     made when the command provably commits in the probed repository
@@ -1133,7 +1147,8 @@ def _branch_review_budget(
     nothing else. Two cases therefore return None, and only these two:
 
     * the lookup failed, but the repository has no remote gh could resolve to
-      GitHub (no such remote or branch push target, ``GH_REPO`` unset) and the
+      GitHub (no remote or branch target that might be GitHub — a target naming
+      a remote counts by that remote's URLs — and ``GH_REPO`` unset) and the
       command provably commits in that repository — gh has no repository to find
       a pull request in (``_no_pr_possible_or_unknown``; ``segs`` is the parsed
       command, and None keeps the unknown result);

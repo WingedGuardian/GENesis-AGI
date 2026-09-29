@@ -6,8 +6,10 @@
   "gh has no repository to look in here". The review budget now applies only to
   an open pull request on the configured public repository. A failed lookup
   consults no budget when the repository has nothing gh could resolve to GitHub
-  (no such remote, no branch push target, `GH_REPO` and `GIT_DIR` unset) and
-  the command is a single `git commit`, optionally with `-c <key>=<value>` and one
+  (no remote or branch push target that might be GitHub — a target naming a
+  remote counts by that remote's own URLs, so a clone of a local repository
+  qualifies — and `GH_REPO` and `GIT_DIR` unset) and the command is a single
+  `git commit`, optionally with `-c <key>=<value>` and one
   `-C <dir>` — the one shape that provably commits in the repository that was
   checked. A branch whose open pull request lives in a repository with a
   different name also consults no budget. Nothing changes on the public
