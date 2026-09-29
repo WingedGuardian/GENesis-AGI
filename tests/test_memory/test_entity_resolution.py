@@ -122,6 +122,46 @@ def test_normalize_content_converges_chained_aliases():
     assert normalize_content("x", {"x": "y", "y": "x"}) == "x"
 
 
+def test_normalize_content_self_expanding_alias_is_idempotent():
+    from genesis.memory.entity_resolution import normalize_content
+
+    aliases = {"AI": "AI assistant"}
+    # "AI" converges to the canonical...
+    assert normalize_content("AI runs", aliases) == "AI assistant runs"
+    # ...and the canonical is already its own fixed point, so the two
+    # surface forms dedup to the same memory instead of growing forever.
+    assert normalize_content("AI assistant runs", aliases) == (
+        "AI assistant runs"
+    )
+    assert normalize_content(
+        normalize_content("AI runs", aliases), aliases
+    ) == normalize_content("AI runs", aliases)
+    # An alias outside a canonical occurrence still expands.
+    assert normalize_content("AI and AI assistant", aliases) == (
+        "AI assistant and AI assistant"
+    )
+
+
+def test_surface_variants_skips_inverse_maps_without_a_canonical():
+    """Unrelated text must not pay the quadratic forward/fixed build:
+    normalize_content is never invoked when no canonical appears."""
+    import genesis.memory.entity_resolution as er
+
+    calls = 0
+    real = er.normalize_content
+
+    def spy(content, aliases=None):
+        nonlocal calls
+        calls += 1
+        return real(content, aliases)
+
+    aliases = {f"alias{i}": f"canonical{i}" for i in range(200)}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(er, "normalize_content", spy)
+        assert surface_variants("unrelated memory here", aliases) == []
+    assert calls == 0
+
+
 def test_surface_variants_walks_back_multi_link_alias_chains():
     """A canonical that is itself an alias leaves no trace in normalized
     content: {"CC": "Claude Code", "Claude": "Anthropic"} stores "Anthropic

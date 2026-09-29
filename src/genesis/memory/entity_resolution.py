@@ -143,7 +143,33 @@ def normalize_content(content: str, aliases: dict[str, str] | None = None) -> st
             if alias == canonical:
                 continue
             # Word-boundary replacement, case-insensitive
-            content = _alias_pattern(alias).sub(canonical, content)
+            pattern = _alias_pattern(alias)
+            if not pattern.search(canonical):
+                content = pattern.sub(canonical, content)
+                continue
+            # Self-expanding rule ("AI" -> "AI assistant"): the replacement
+            # re-supplies the alias as a whole word, so an unguarded pass
+            # grows forever and idempotency — which dedup relies on — is
+            # lost. Apply it only to alias occurrences NOT already covered
+            # by a canonical occurrence: "AI" still converges to
+            # "AI assistant", and "AI assistant" is already its own fixed
+            # point, so both surface forms dedup to one memory.
+            spans = [
+                (m.start(), m.end())
+                for m in _alias_pattern(canonical).finditer(content)
+            ]
+            out: list[str] = []
+            cursor = 0
+            for m in pattern.finditer(content):
+                if any(
+                    m.start() >= s and m.end() <= e for s, e in spans
+                ):
+                    continue
+                out.append(content[cursor:m.start()])
+                out.append(canonical)
+                cursor = m.end()
+            out.append(content[cursor:])
+            content = "".join(out)
         if content in seen:
             break
         seen.add(content)
@@ -163,6 +189,36 @@ def _alias_pattern(alias: str) -> re.Pattern[str]:
     ``normalize_content`` walks aliases in the same order) and the quadratic
     cost returns. The live file is far below it."""
     return re.compile(r"\b" + re.escape(alias) + r"\b", re.IGNORECASE)
+
+
+def _alias_version(aliases: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    """Hashable snapshot of an alias mapping, used to memoize derived maps.
+
+    Order is preserved — rules apply in mapping order, so a reordering is a
+    different normalization, not a reordering of the same key."""
+    return tuple(aliases.items())
+
+
+@functools.lru_cache(maxsize=8)
+def _inverse_maps(
+    alias_version: tuple[tuple[str, str], ...],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """(forward, fixed) normalization maps for an alias file, built once.
+
+    forward[a] = fixed point of alias ``a``; fixed[c] = fixed point of
+    canonical ``c``. Building them is quadratic — every alias normalized
+    against the whole dictionary — so they are cached by the file's content
+    version: an edited alias file yields a new key and recomputes, while the
+    steady state shares one build across every store's dedup pass."""
+    aliases = dict(alias_version)
+    forward = {
+        a: normalize_content(a, aliases) for a in dict.fromkeys(aliases)
+    }
+    fixed = {
+        c: normalize_content(c, aliases)
+        for c in dict.fromkeys(aliases.values())
+    }
+    return forward, fixed
 
 
 def surface_variants(
@@ -247,12 +303,22 @@ def surface_variants(
         whole-word canonical occurrence with an alias whose own normalization
         reaches the same fixed point as that canonical."""
         nonlocal forward, fixed
+        # Canonical scan BEFORE the inverse maps: unrelated text — the common
+        # case — must not pay the quadratic forward/fixed construction at all.
+        present: list[str] = []
+        positions: list[tuple[int, int, str]] = []
+        for canonical in canonicals:
+            matches = list(_bounded(canonical).finditer(text))
+            if not matches:
+                continue
+            present.append(canonical)
+            positions.extend(
+                (m.start(), m.end(), canonical) for m in matches
+            )
+        if not present:
+            return
         if forward is None:
-            forward = {
-                a: normalize_content(a, aliases)
-                for a in dict.fromkeys(aliases)
-            }
-            fixed = {c: normalize_content(c, aliases) for c in canonicals}
+            forward, fixed = _inverse_maps(_alias_version(aliases))
 
         # A spelling reaches a slot when its normalization CONVERGES to the
         # same fixed point as the canonical — `normalize(a) == fixed(c)`, not
@@ -260,20 +326,14 @@ def surface_variants(
         # "Claude" -> "Anthropic" rule) never survives normalization, so it
         # cannot appear in *text*; its spellings ("CC") only surface when a
         # LATER hop exposes them on an emitted intermediate like "Claude Code".
-        spellings: dict[str, list[str]] = {}
-        positions: list[tuple[int, int, str]] = []
-        for canonical in canonicals:
-            matches = list(_bounded(canonical).finditer(text))
-            if not matches:
-                continue
-            spellings[canonical] = [
+        spellings: dict[str, list[str]] = {
+            canonical: [
                 alias
                 for alias, target in forward.items()
                 if alias != canonical and target == fixed[canonical]
             ]
-            positions.extend(
-                (m.start(), m.end(), canonical) for m in matches
-            )
+            for canonical in present
+        }
         positions.sort(key=lambda p: (p[0], -p[1]))
 
         for canonical, names in spellings.items():
