@@ -16,9 +16,11 @@ typed entity node — those live in the entity layer (``entity_registry``
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -125,15 +127,27 @@ def normalize_content(content: str, aliases: dict[str, str] | None = None) -> st
     if not aliases:
         return content
 
-    import re
-
     for alias, canonical in aliases.items():
         if alias == canonical:
             continue
         # Word-boundary replacement, case-insensitive
-        pattern = re.compile(r"\b" + re.escape(alias) + r"\b", re.IGNORECASE)
-        content = pattern.sub(canonical, content)
+        content = _alias_pattern(alias).sub(canonical, content)
     return content
+
+
+@functools.lru_cache(maxsize=8192)
+def _alias_pattern(alias: str) -> re.Pattern[str]:
+    """The compiled whole-word pattern for *alias*, compiled once.
+
+    ``surface_variants`` calls ``normalize_content`` once per alias, and each
+    call walks every alias, so recompiling per call is quadratic in regex
+    compiles; past ``re``'s own 512-entry cache that measured 34 s for 750
+    aliases on one canonical. The key is the alias text alone, so an edited
+    alias file needs no invalidation: a new alias is a new key. ``maxsize``
+    bounds the win: an alias file larger than it cycles the cache (every
+    ``normalize_content`` walks aliases in the same order) and the quadratic
+    cost returns. The live file is far below it."""
+    return re.compile(r"\b" + re.escape(alias) + r"\b", re.IGNORECASE)
 
 
 def surface_variants(
@@ -165,9 +179,13 @@ def surface_variants(
     before the mixed enumeration, so the common legacy shape cannot be priced
     out of *limit* by intermediate combinations. Every candidate is verified
     by re-running ``normalize_content`` on it — the enumeration is only ever
-    as precise as the inverse, and the check keeps it honest. The check
-    compares casefolded, because normalization preserves the casing it found:
-    a lowercase canonical in *content* must still accept the alias spellings.
+    as precise as the inverse, and the check keeps it honest. The check is
+    EXACT: normalization writes the canonical as spelled in the alias file, so
+    a candidate that only normalizes to a different casing of *content* is a
+    spelling the write path could never have stored under this content. A
+    casefolded check accepted them, and with a short canonical that merges
+    unrelated rows (``"US"`` makes ``"Talk to USA tomorrow"`` a variant of
+    ``"Talk to us tomorrow"``).
     Capped at *limit*; best-effort like ``normalize_content`` — ``[]`` on any
     failure.
     """
@@ -185,17 +203,21 @@ def surface_variants(
         )
 
     # Positions and per-slot spellings for each canonical present in content.
+    # Each alias's forward form is computed once, lazily, and shared by every
+    # canonical: per canonical it would repeat the same normalization C times.
     spellings: dict[str, list[str]] = {}
     positions: list[tuple[int, int, str]] = []
+    forward: dict[str, str] | None = None
     for canonical in dict.fromkeys(aliases.values()):
         matches = list(_bounded(canonical).finditer(content))
         if not matches:
             continue
+        if forward is None:
+            forward = {a: normalize_content(a, aliases) for a in dict.fromkeys(aliases)}
         spellings[canonical] = [
             alias
-            for alias in dict.fromkeys(aliases)
-            if alias != canonical
-            and normalize_content(alias, aliases) == canonical
+            for alias, target in forward.items()
+            if alias != canonical and target == canonical
         ]
         positions.extend((m.start(), m.end(), canonical) for m in matches)
     positions.sort(key=lambda p: (p[0], -p[1]))
@@ -206,7 +228,7 @@ def surface_variants(
     def _emit(text: str) -> None:
         if len(results) >= limit or text in seen:
             return
-        if normalize_content(text, aliases).casefold() != content.casefold():
+        if normalize_content(text, aliases) != content:
             return  # not a spelling this normalization could have produced
         seen.add(text)
         results.append(text)

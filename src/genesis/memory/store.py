@@ -850,7 +850,7 @@ class MemoryStore:
         if old_id == new_id:
             raise SupersedeUnresolved(old_id, "self_supersede", new_id)
         # Both ids, in sorted order — a total acquisition order cannot cycle,
-        # which is the one sanctioned relaxation of _locks.py's
+        # which is one of the two sanctioned relaxations of _locks.py's
         # one-lock-per-holder invariant (see that module's docstring). Holding
         # both through validate + mark closes the validate→mark window: a
         # delete or supersession of new_id can no longer commit in between and

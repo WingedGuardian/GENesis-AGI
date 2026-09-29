@@ -122,14 +122,39 @@ def test_surface_variants_repeated_canonicals_keep_homogeneous_forms():
     assert "CC / Claude Code / claude-code" in variants
 
 
-def test_surface_variants_accepts_canonical_case_differences():
-    """Matching is case-insensitive, so a lowercase canonical in content still
-    yields its alias spellings — normalization only differs in the canonical's
-    own casing, which the verification must tolerate."""
+def test_surface_variants_rejects_canonical_case_differences():
+    """Normalization writes the canonical as spelled in the alias file, so
+    "CC owns the gate" is stored as "Claude Code owns the gate", never as the
+    lowercase content below. Offering it would match a row the write path
+    could not have produced from this content."""
     aliases = {"CC": "Claude Code"}
-    assert "CC owns the gate" in surface_variants(
+    assert "CC owns the gate" not in surface_variants(
         "claude code owns the gate", aliases
     )
+    # Control: the canonical as written still yields the alias spelling.
+    assert "CC owns the gate" in surface_variants(
+        "Claude Code owns the gate", aliases
+    )
+
+
+def test_surface_variants_does_not_merge_a_different_word():
+    """A short canonical matched case-insensitively must not turn an unrelated
+    word into a duplicate: "us" is not "US", so "USA" is no variant of it."""
+    aliases = {"USA": "US"}
+    assert surface_variants("Talk to us tomorrow", aliases) == []
+    assert "Talk to USA tomorrow" in surface_variants("Talk to US tomorrow", aliases)
+
+
+def test_surface_variants_scales_to_a_large_alias_file():
+    """750 aliases on one canonical measured 34 s before patterns were cached;
+    it must stay well inside a store() call's budget."""
+    import time
+
+    aliases = {f"alias{i}": "Target" for i in range(750)}
+    start = time.monotonic()
+    out = surface_variants("Target here", aliases, limit=4)
+    assert time.monotonic() - start < 5.0
+    assert "alias0 here" in out
 
 
 def test_surface_variants_prefers_longest_nested_canonical():
