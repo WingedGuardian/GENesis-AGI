@@ -1927,10 +1927,10 @@ def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
             print("Another lifecycle run (trash expiry or a recovery) is in progress; "
                   "retry in a moment.", file=sys.stderr)
             return False
-        return _recover_locked(name, repo_root)
+        return _recover_locked(name, repo_root, dry_run=dry_run)
 
 
-def _recover_locked(name: str, repo_root: Path) -> bool:
+def _recover_locked(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
     matches = [
         stored for stored, _ in _iter_trash_entries() if stored.name.startswith(name)
     ]
