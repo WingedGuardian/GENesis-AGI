@@ -1922,6 +1922,25 @@ def test_the_line_found_is_the_item_not_an_earlier_lookalike(content, lines, exp
     assert f"— {expected} (" in label, label
 
 
+def test_items_sharing_an_annotation_each_get_their_own_line():
+    """Round 2 (#2533, Codex + Devin): two items that open with the same
+    annotation but carry different links were both sent to the later
+    annotation's line, because only the first line located the item."""
+    lines = ["read later", "https://a.example.com/1", "", "read later", "https://b.example.com/2"]
+    (first,) = InboxMonitor._item_labels("read later\nhttps://a.example.com/1", lines)
+    (second,) = InboxMonitor._item_labels("read later\nhttps://b.example.com/2", lines)
+    assert first.startswith("a.example.com — line 1 ("), first
+    assert second.startswith("b.example.com — line 4 ("), second
+
+
+def test_an_edited_annotation_falls_back_to_the_link_line():
+    """The whole block no longer matches (its annotation was edited since):
+    the link's own line locates it, not a lookalike annotation elsewhere."""
+    lines = ["read later", "https://a.example.com/1", "", "read later!", "https://b.example.com/2"]
+    (label,) = InboxMonitor._item_labels("read later\nhttps://b.example.com/2", lines)
+    assert label.startswith("b.example.com — line 5 ("), label
+
+
 def test_a_legacy_whole_file_row_locates_each_url_on_its_own_line():
     """A legacy row can hold a whole file; each URL must point at its own line,
     not all at the file's first line."""

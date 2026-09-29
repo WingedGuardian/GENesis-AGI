@@ -2162,9 +2162,11 @@ class InboxMonitor:
         is secret cannot be made complete: three masking heuristics in a row
         each hid readable slugs or leaked token fragments under review
         (#2447, #2533). The owner finds the item by its line; the ``url#`` id
-        matches the coverage log. The line is found from the item's own first
-        line, so two annotated items that share one URL get their own lines.
-        An exact whole-line match wins over a substring match, and the LAST
+        matches the coverage log. The line is found from the item's whole
+        block of lines, so two items that share a URL, or an annotation, get
+        their own lines. If the file was edited since, the link's own line
+        locates it, then its first line: there an exact whole-line match wins
+        over a substring match, and the LAST
         match wins among equals (a parked item is new text, appended below the
         older items it may resemble: a short note like ``ai``, or a URL that
         prefixes an earlier one). An item with no URL is a note on its line,
@@ -2181,11 +2183,29 @@ class InboxMonitor:
             partial = [n for n, text in enumerate(lines, 1) if needle in text]
             return partial[-1] if partial else None
 
-        first = next((ln.strip() for ln in (content or "").splitlines() if ln.strip()), "")
+        block = [ln.strip() for ln in (content or "").splitlines() if ln.strip()]
+        first = block[0] if block else ""
         urls = _extract_coverage_input_urls(content or "")
-        # One logical item: its own first line locates it. Several URLs in the
-        # text (a legacy row holding a whole file): each URL locates itself.
-        item_line = line_of(first) if len(urls) <= 1 else None
+
+        def block_start() -> int | None:
+            # The item is a contiguous run of file lines (scanner.segment_items),
+            # so its WHOLE text locates it: two items that open with the same
+            # annotation differ in their link line (#2533 round 2).
+            if not block:
+                return None
+            starts = [
+                i + 1 for i in range(len(lines) - len(block) + 1)
+                if lines[i:i + len(block)] == block
+            ]
+            return starts[-1] if starts else None
+
+        # One logical item: its whole block locates it; once edited, its link's
+        # own line, then its first line. Several URLs in the text (a legacy row
+        # holding a whole file): each URL locates itself.
+        item_line = (
+            block_start() or (line_of(urls[0]) if urls else None) or line_of(first)
+            if len(urls) <= 1 else None
+        )
         labels: list[str] = []
         for url in urls:
             try:
