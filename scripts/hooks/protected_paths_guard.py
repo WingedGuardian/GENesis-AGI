@@ -330,8 +330,8 @@ def main() -> int:
         # action that shape wants anyway.
         if blind.bounds_induced:
             return _block(
-                f"an rm command that {blind.cause}, so its real targets cannot be "
-                f"resolved. To proceed: {blind.hint}",
+                f"a command that mentions rm and {blind.cause}, so whether it removes "
+                f"anything, and what, cannot be resolved. To proceed: {blind.hint}",
                 target_known=False,
             )
         # The substring fallback ADDS to the precise scan below; it does not replace

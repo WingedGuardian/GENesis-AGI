@@ -10149,17 +10149,28 @@ def _run_merge_and_push_gates() -> int:
             hidden_gated_verb
             or (
                 not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-                # The mention is read through `mention_view`: a line continuation
-                # inside the verb (`pu<continuation>sh`) is exactly the blind spot
-                # that returned no segments, and it also hides the word from the
-                # raw text — so the raw test alone let the one command this branch
-                # exists for through.
+                # The mention is read through `mention_view`, the text the shell
+                # assembles: a word split by a line continuation is exactly the blind
+                # spot that returned no segments, so the raw text is the wrong place
+                # to look for it.
                 and (
                     _mentions_gated_op(mention_view(cmd))
-                    # BOUNDS-TYPE ONLY: an untokenizable command still returns
-                    # its segments, so the round-budget gate below sees its
-                    # comment; widening there would refuse every PR comment whose
-                    # body carries an apostrophe.
+                    # BOUNDS-TYPE ONLY, both arms: an untokenizable command still
+                    # returns its segments, so the gates below see them.
+                    #
+                    # A hook-skipping COMMIT. On one line this guard refuses
+                    # `commit -n` from the segment (`commit_skips_hooks`); a withheld
+                    # parse has no segment, and `_GATED_MENTION` deliberately omits
+                    # `commit`, so the carrier net's word list is read instead. The
+                    # commit gate refuses the same commands on its own blind branch,
+                    # so this adds no refusal overall — it keeps this guard from
+                    # quietly depending on another one.
+                    or (
+                        blind.bounds_induced
+                        and bool(_CARRIER_GATED_MENTION.search(mention_view(cmd)))
+                    )
+                    # A review request: widening this on an untokenizable command
+                    # would refuse every PR comment whose body carries an apostrophe.
                     or (
                         blind.bounds_induced
                         and bool(_GH_MENTION.search(mention_view(cmd)))

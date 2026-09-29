@@ -4,16 +4,15 @@ THE DEFECT. The shell deletes an unescaped backslash-newline and runs the two li
 as one command; the parser splits there instead. A gated verb on the far side of the
 split landed in a segment of its own, the guards found no operation, and "not found"
 was read as "not present". MEASURED on the pre-change tree, each guard driven as a
-subprocess with the one-line form as the control: the discard guard, the
-protected-path guard, the push gate and the commit gate each refused the one-line
-command and allowed the continued one.
+subprocess with the one-line form as the control: four guards gave the continued
+command a different verdict from the one-line command.
 
-THE FIX IS A REFUSAL, NOT A READING. Three review rounds on an earlier attempt that
-modelled the join (continuation groups, joined views, heredoc and quote readings)
-each found new defects in that modelling. So a continuation is now reported by
-``analyze_checked`` as a BOUNDS-type blind spot: the segments cannot be trusted, and
-every consumer already refuses a bounds blind spot when its early exit says the
-command names its operation. No guard gained a new code path for it.
+THE FIX IS A REFUSAL, NOT A READING. Review rounds on attempts that modelled the join
+(continuation groups, joined views, heredoc and quote readings, and later a recovery
+of the segments from several readings) each found new defects in that modelling. So
+a continuation is reported by ``analyze_checked`` as a BOUNDS-type blind spot: the
+segments cannot be trusted, and each consumer refuses when its early exit says the
+command names its operation, or, for an advisory, gives a short note.
 
 The early exits read ``shell_parse.mention_view`` rather than the raw text, so a
 continuation or a quote INSIDE the verb (which the shell removes) cannot hide the
@@ -212,7 +211,7 @@ def test_a_continued_review_request_is_refused_not_passed_unbudgeted(sandbox):
     assert res.returncode == 2, (res.stdout + res.stderr)[:400]
 
 
-_WORKTREE = _HOOKS_DIR / "worktree_cwd_guard.py"
+_WORKTREE_GUARD = _HOOKS_DIR / "worktree_cwd_guard.py"
 
 
 @pytest.mark.parametrize(
@@ -226,15 +225,13 @@ _WORKTREE = _HOOKS_DIR / "worktree_cwd_guard.py"
 )
 def test_a_continued_worktree_removal_is_refused(sandbox, command):
     """Every direct worktree removal is refused on one line (the lifecycle manager
-    owns removal). The guard's fallback for an unreadable parse reads the text, and
-    read the RAW text, so a continuation hid the removal and it ran — MEASURED on
-    main and on this branch before the fallback read `mention_view`."""
+    owns removal). The continued form must get the same verdict."""
     home, repo = sandbox
     target = repo / "wt"
     target.mkdir()
-    one_line = _run(_WORKTREE, f"git worktree remove {target}", home, repo)
+    one_line = _run(_WORKTREE_GUARD, f"git worktree remove {target}", home, repo)
     assert one_line.returncode == 2, "control: the one-line removal must be refused"
-    res = _run(_WORKTREE, command.format(t=target), home, repo)
+    res = _run(_WORKTREE_GUARD, command.format(t=target), home, repo)
     assert res.returncode == 2, (res.stdout + res.stderr)[:400]
 
 
@@ -450,14 +447,15 @@ def test_the_close_advisory_still_speaks_for_a_continued_close(sandbox):
     assert res.stdout.strip(), "the advisory went silent on a continued close"
 
 
-# ── A withheld parse withholds per-segment facts: each consumer that reads one gets
-#    it back from `shell_parse.recovered_segments`, never from nothing. ──
+# ── A withheld parse withholds per-segment facts. The guards refuse on the blind
+#    spot itself; the advisories give a short note from the assembled text. Nothing
+#    re-parses the join (review found a new defect each round in a version that did).
 
 
-def test_the_close_advisory_speaks_when_the_backslash_does_not_join(sandbox):
-    """A backslash inside a `#` comment is not a continuation: the close on the next
-    line is its own command. Folding every backslash-newline glued it into the
-    comment, so the advisory needs the as-written reading too."""
+def test_the_close_advisory_notes_a_close_after_a_backslash_comment(sandbox):
+    """A backslash inside a `#` comment does not join, so the close on the next line
+    is its own command. The note is read from the text, so it is not lost to how the
+    lines join."""
     home, repo = sandbox
     res = _run(
         _HOOKS_DIR / "pr_close_advisory.py",
@@ -466,37 +464,74 @@ def test_the_close_advisory_speaks_when_the_backslash_does_not_join(sandbox):
         repo,
     )
     assert res.returncode == 0
-    assert res.stdout.strip(), "the advisory went silent on a close after a comment"
+    assert "could not check whether it closes" in res.stdout, res.stdout
 
 
-def test_a_continued_listing_is_advised_after_the_blind_note_is_spent(sandbox):
-    """The capped-read blind note is recorded once per session. A continued listing
-    later in the same session must still get its own per-target advisory."""
+def test_a_continued_close_gets_the_short_note_and_no_step_count(sandbox):
+    """No count is claimed for a command the parse could not read."""
+    home, repo = sandbox
+    res = _run(
+        _HOOKS_DIR / "pr_close_advisory.py",
+        "gh pr close 5" + CONT + "--comment superseded",
+        home,
+        repo,
+    )
+    assert res.returncode == 0
+    assert "could not check whether it closes" in res.stdout, res.stdout
+    assert "steps that close" not in res.stdout, res.stdout
+
+
+def test_a_continued_listing_is_noted_every_time(sandbox):
+    """The capped-read note for an unreadable command is per command, not per
+    session: once a keyed note was spent, a later continued listing got nothing."""
     home, repo = sandbox
     capped = _HOOKS_DIR / "capped_read_advisory.py"
-    first = _run(capped, "gh repo view" + CONT + "--json name", home, repo)
-    assert first.returncode == 0 and "could not be read" in first.stdout, first.stdout
-    res = _run(capped, "gh pr list" + CONT + "--state open", home, repo)
-    assert res.returncode == 0
-    assert "gh pr list" in res.stdout, f"no advisory for the continued listing: {res.stdout!r}"
+    for cmd in (
+        "gh api repos/o/r/pulls" + CONT + "--jq length",
+        "gh pr list" + CONT + "--state open",
+    ):
+        res = _run(capped, cmd, home, repo)
+        assert res.returncode == 0
+        assert "could not check the gh read" in res.stdout, (cmd, res.stdout)
 
 
-def test_a_listing_whose_program_word_is_split_is_still_advised(sandbox):
+def test_a_listing_whose_program_word_is_split_is_still_noted(sandbox):
     """The capped-read early exit reads the text the shell assembles, so a `gh` word
-    split by a continuation still reaches the parse."""
+    split by a continuation still reaches the check."""
     home, repo = sandbox
     res = _run(_HOOKS_DIR / "capped_read_advisory.py", "g" + MID + "h pr list", home, repo)
     assert res.returncode == 0
-    assert res.stdout.strip(), "the capped-read advisory skipped a split `gh` word"
+    assert "could not check the gh read" in res.stdout, res.stdout
 
 
-def test_a_worktree_mention_takes_no_target_from_another_reading(sandbox):
-    """The mention readings are alternatives, not one text: a target read past the end
-    of one reading comes from the next and refused a harmless command."""
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf x" + CONT + "&& echo 'git worktree remove'",
+        "echo 'git worktree remove is documented' && printf x" + CONT + "y",
+    ],
+    ids=["mention-after", "mention-before"],
+)
+def test_a_continued_worktree_mention_is_refused_without_a_guessed_target(sandbox, command):
+    """Every direct removal is refused whatever its target, so a continued command
+    naming the operation is refused on its cause and remedy. Guessing a target from
+    the text lent prose words (even from a later command) as the target; the refusal
+    now names none. Refusing a continued mention in prose is the priced cost."""
+    home, repo = sandbox
+    res = _run(_HOOKS_DIR / "worktree_cwd_guard.py", command, home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+    assert "cannot tell whether it removes one" in res.stderr, res.stderr
+    assert "Direct worktree removal is disabled" not in res.stderr, res.stderr
+
+
+def test_a_launcher_next_to_a_mention_borrows_no_target_from_another_reading(sandbox):
+    """The launcher fallback still reads targets from TEXT, over each mention reading
+    separately; read as one joined string, the word after a mention at the end of
+    one reading was taken from the start of the next."""
     home, repo = sandbox
     res = _run(
         _HOOKS_DIR / "worktree_cwd_guard.py",
-        "printf x" + CONT + "&& echo 'git worktree remove'",
+        "eval 'echo x' && echo 'git worktree remove'",
         home,
         repo,
     )
@@ -504,11 +539,53 @@ def test_a_worktree_mention_takes_no_target_from_another_reading(sandbox):
 
 
 def test_the_tmux_note_survives_a_continuation(sandbox):
-    """Advisory-only, and it sees the verb only once the split is undone."""
+    """Advisory-only: the binding cannot be read from a continued command, so the
+    advice is given as it stands."""
     home, repo = sandbox
     res = _run(_HOOKS_DIR / "tmux_kill_server_guard.py", "tmux" + CONT + "kill-server", home, repo)
     assert res.returncode == 0
     assert "kill-server" in res.stdout, f"the tmux note went silent: {res.stdout!r}"
+
+
+def test_the_push_guard_refuses_a_continued_hook_skipping_commit(sandbox):
+    """On one line the push guard refuses `commit -n` from the segment; a withheld
+    parse has no segment, so its blind branch must still name the commit. The commit
+    gate refuses the same command too; this pins that the push guard does not quietly
+    depend on it."""
+    home, repo = sandbox
+    one_line = _run(_PUSH_GUARD, f"{GIT} {COMMIT} -n -m x", home, repo)
+    assert _refused(one_line), "control: the one-line form must be refused"
+    res = _run(_PUSH_GUARD, f"{GIT} {COMMIT} -n" + CONT + "-m x", home, repo)
+    assert _refused(res), (res.stdout + res.stderr)[:400]
+
+
+# ── Refusal messages say only what the guard knows: a continued command whose text
+#    merely MENTIONS an operation may not perform it. ──
+
+
+def test_the_discard_refusal_names_the_word_it_matched(sandbox):
+    home, repo = sandbox
+    res = _run(_DISCARD, f"{GIT} log" + CONT + f"--grep={RM}", home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+    assert f"mentions `git` and `{RM}`" in res.stderr, res.stderr
+    assert "one line" in res.stderr, res.stderr
+
+
+def test_the_protected_refusal_does_not_call_it_an_rm_command(sandbox):
+    home, repo = sandbox
+    res = _run(_PROTECTED, "echo x" + CONT + f"&& {RM} -rf ~/genesis/data", home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+    assert f"a command that mentions {RM}" in res.stderr, res.stderr
+    assert f"an {RM} command that" not in res.stderr, res.stderr
+
+
+def test_the_clean_refusal_scopes_its_dry_run_promise(sandbox):
+    """A continued dry run is refused too, so the message may only promise dry runs
+    once the command parses."""
+    home, repo = sandbox
+    res = _run(_DISCARD, f"{GIT} {CLEAN}" + CONT + "-n", home, repo)
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+    assert "Once the command parses, its dry-run forms are allowed" in res.stderr, res.stderr
 
 
 def test_a_bound_still_outranks_a_continuation():

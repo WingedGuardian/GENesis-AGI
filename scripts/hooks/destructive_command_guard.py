@@ -863,9 +863,9 @@ def main() -> int:
         # carries it is `_RM_CARRIER_WORD`, and that one is mutation-pinned.
         #
         # Both prefilters read `_mention_view`, the text the shell would
-        # assemble: `r''m` or a line continuation inside the word hides `rm`
-        # from a raw test, so the command exited here unread — MEASURED allowed
-        # before this, while the resolver resolves both. Widen-only.
+        # assemble after quote removal and line joining, so a word the shell
+        # builds from pieces reaches the resolver the way its plain spelling does.
+        # Widen-only.
         view = _mention_view(cmd) if cmd else cmd
         if not cmd or not _RM_WORD.search(view):
             return 0

@@ -35,7 +35,7 @@ from hook_input import read_payload, tool_input  # noqa: E402
 from shell_parse import (  # noqa: E402
     analyze,
     has_continuation,
-    recovered_segments,
+    mention_view,
     untokenizable,
 )
 
@@ -106,14 +106,17 @@ def _command_word_and_binding(argv: list[str]) -> tuple[str | None, bool]:
 def _advisory(command: str) -> str | None:
     if untokenizable(command):
         return None
-    segments = analyze(command)
     # A line continuation splits the command where the shell joins it, so the verb
-    # can land in a segment of its own and the advice never fires. Add the segments
-    # either reading of the command finds; advisory-only, so the worst an extra
-    # segment can do is one unneeded note.
+    # can land in a segment of its own and the advice never fires. The binding
+    # (-S/-L) cannot be read from a command the parser splits wrongly either, so a
+    # continued command whose assembled text names the operation gets the advice as
+    # it stands — advisory-only, so the worst case is one unneeded note — rather than
+    # a re-parse of the join.
     if has_continuation(command):
-        segments = segments + recovered_segments(command)
-    for seg in segments:
+        view = mention_view(command)
+        if "tmux" in view and "kill-server" in view:
+            return _ADVICE
+    for seg in analyze(command):
         if seg.exe != "tmux":
             continue
         word, bound = _command_word_and_binding(seg.argv)

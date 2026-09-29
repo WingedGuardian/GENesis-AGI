@@ -548,49 +548,56 @@ def test_reset_hard_is_snapshotted(repo, snap_log):
 
 
 @pytest.mark.parametrize(
-    "cmd",
-    ["git reset \\\n --hard", "git re\\\nset --hard", "g\\\nit checkout -- ."],
-    ids=["after-verb", "inside-verb", "inside-program"],
+    "cmd_t",
+    [
+        "git reset \\\n --hard",
+        "git re\\\nset --hard",
+        "g\\\nit checkout -- .",
+        "git -C {repo} reset \\\n --hard",
+        "git checkout {old} -- . && printf x \\\n y",
+    ],
+    ids=["after-verb", "inside-verb", "inside-program", "other-repo", "rewind-elsewhere"],
 )
-def test_a_continued_discard_still_snapshots_the_session_cwd(repo, snap_log, cmd):
-    """A line continuation is a blind spot: the parse returns NO segments, so the
-    per-segment loop over them finds no snapshot verb. The recovery net must not go
-    with it — a continued `git reset --hard` is not refused (it is recoverable, by
-    design), so the snapshot is the only thing standing between it and lost work.
-    The guard reads the segments back from both readings of the command; here they
-    name the session's directory, and the note says that is ALL it covered."""
+def test_a_continued_snapshot_verb_is_refused_with_the_one_line_remedy(
+    repo, tmp_path, snap_log, monkeypatch, capsys, cmd_t
+):
+    """A snapshot verb is let through because the guard snapshots the repository it
+    discards in first. A line continuation withholds the segments, and with them
+    which repository that is (a `-C` target) and whether it is a whole-tree rewind,
+    so no snapshot can be promised: the command is refused, with the one-line
+    remedy, and nothing is snapshotted on the way. Re-parsing the join to recover
+    those facts was tried and drew a new review finding each round."""
+    old = _git(repo, "rev-parse", "HEAD").strip()
+    cmd = cmd_t.format(repo=repo, old=old)
     _segs, blind = shell_parse.analyze_checked(cmd)
     assert blind is not None and blind.bounds_induced, "fixture must be a blind parse"
     (repo / "tracked.py").write_text("dirty\n")
-    notes = _gd._record_snapshots(cmd, {"cwd": str(repo)})
-    rows = _rows(snap_log)
-    assert len(rows) == 1 and rows[0]["cwd"] == str(repo)
-    joined = "\n".join(notes)
-    assert "snapshotted the worktree" in joined
-    assert "only the session's working directory" in joined, joined
-
-
-def test_a_continued_discard_in_another_repo_snapshots_that_repo(repo, tmp_path, snap_log):
-    """The `-C` target is a per-segment fact the withheld parse dropped. Snapshotting
-    the session's directory instead left the discard in the OTHER repository with no
-    recovery point, so the guard reads the segments back from both readings."""
-    cmd = f"git -C {repo} reset \\\n --hard"
-    _segs, blind = shell_parse.analyze_checked(cmd)
-    assert blind is not None and blind.bounds_induced, "fixture must be a blind parse"
-    (repo / "tracked.py").write_text("dirty\n")
-    notes = _gd._record_snapshots(cmd, {"cwd": str(tmp_path)})
-    rows = _rows(snap_log)
-    assert len(rows) == 1 and rows[0]["cwd"] == str(repo), rows
-    joined = "\n".join(notes)
-    assert str(repo) in joined and "only the session's working directory" not in joined, joined
-
-
-def test_a_blind_command_naming_no_discard_verb_takes_no_snapshot(repo, snap_log):
-    """Only a segment naming a snapshot verb is snapshotted, in either reading, so an
-    ordinary continued git command does not snapshot on every call."""
-    (repo / "tracked.py").write_text("dirty\n")
-    _gd._record_snapshots("git log \\\n --oneline", {"cwd": str(repo)})
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(tmp_path)}
+    )
+    assert _gd.main() == 2
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err and "one line" in err, err
     assert _rows(snap_log) == []
+
+
+def test_a_continued_git_command_naming_no_snapshot_verb_runs_quietly(
+    repo, snap_log, monkeypatch, capsys
+):
+    """The control: a continued git command that names no snapshot verb is neither
+    refused nor snapshotted, and says nothing. `format` carries the `rm` trigger
+    SUBSTRING, so this command gets past the early exits and reaches the blind
+    refusal (a command with no trigger substring would exit before it, and prove
+    nothing): the refusal must turn on the whole WORD."""
+    cmd = "git log \\\n --format=%H"
+    assert any(t in cmd for t in _gd._TRIGGER_SUBSTRINGS), "fixture must reach the parse"
+    monkeypatch.setattr(
+        _gd, "read_payload", lambda: {"tool_input": {"command": cmd}, "cwd": str(repo)}
+    )
+    (repo / "tracked.py").write_text("dirty\n")
+    assert _gd.main() == 0
+    assert _rows(snap_log) == []
+    assert capsys.readouterr().out == ""
 
 
 # ── snapshot misses degrade to status quo (never block, never lie) ───────────

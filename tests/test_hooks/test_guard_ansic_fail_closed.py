@@ -1138,9 +1138,8 @@ class TestAcceptanceCorpus:
     def test_line_continuation_is_refused(self, tmp_path, label, cmd_tpl):
         """Formerly DOCUMENTED RESIDUE, and locked so a fix would flip it on purpose.
 
-        A `\\`-newline continuation tokenizes cleanly, so the tokenizability probe
-        never fired, while the parser split where bash joins — and bash then ran
-        the push. The parser now REPORTS a continuation as a bounds-type blind
+        The parser splits where bash joins, and a split command is not the
+        command bash runs. It now REPORTS a continuation as a bounds-type blind
         spot (`shell_parse._BLIND_CONTINUATION`), so the push guard refuses it
         through its existing bounds branch, naming the one-line remedy.
         """
@@ -1152,10 +1151,9 @@ class TestAcceptanceCorpus:
     def test_continuation_after_subcommand_is_refused_not_downgraded(self, tmp_path):
         """The third severity in this class, and the worst: formerly a DOWNGRADE.
 
-        `git push \\<NL>origin main {FORCE}` resolved `push` but severed the flag
-        into the next segment, so the guard saw an ordinary push and ASKED under a
-        description that never mentioned the force — consent obtained for a
-        different operation than bash then ran. The continuation is now a blind
+        Splitting after the subcommand severed the flag into the next segment, so
+        the guard ASKED under a description of an ordinary push — consent sought for
+        a different operation than the one on the command line. The continuation is now a blind
         spot, so no segment is trusted and the command is refused outright; the
         human is never asked about a command whose flags the guard cannot read.
         """

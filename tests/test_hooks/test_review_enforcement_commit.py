@@ -738,11 +738,10 @@ def test_invalidate_clears_for_every_commit_form_the_checker_gates(
 def test_invalidate_clears_for_a_commit_the_raw_text_does_not_spell(
     repo: Path, home: Path, command: str
 ) -> None:
-    """The invalidator's early exit tests for the word `commit` before parsing. A
-    raw-text test misses a commit the shell assembles, and exiting there leaves the
-    marker valid for a commit that ran — the next commit then reuses a review that
-    no longer applies. It reads the same `mention_view` the checker's early exit
-    reads, so the two cannot disagree about which commands are commits."""
+    """The invalidator's early exit tests for the word `commit` before parsing, and
+    must test the text the shell assembles: otherwise a review marker could stay
+    valid past the commit it was for. It reads the same `mention_view` the checker's
+    early exit reads, so the two cannot disagree about which commands are commits."""
     assert _mark(repo, home).returncode == 0
     assert len(_markers(home)) == 1
     _run_invalidate(command, repo, home)

@@ -428,9 +428,9 @@ def _handle_bash(data: dict) -> int:
     # wrapped past the depth bound parses to [], `_extract_worktree_targets`
     # finds nothing, and a guard whose whole job is blocking allows it — the
     # BLOCK -> ALLOW shape `analyze_checked`'s docstring measured for the guards
-    # that already fail closed here. The legacy regex extractor is the same
-    # coarser reading the untokenizable case falls back to: weaker than the
-    # parser, but it reads the raw text, so a bound cannot hide anything from it.
+    # that already fail closed here. The branch refuses on the assembled text's
+    # mention of the operation alone; it needs no target, since every direct removal
+    # is refused anyway.
     # `blind.bounds_induced`, NOT `blind is not None`, and the comment above says
     # why without meaning to: it justifies this fallback with "a BOUND stopped the
     # parse — and `analyze_checked` then returns NO segments". That is the whole
@@ -445,19 +445,39 @@ def _handle_bash(data: dict) -> int:
     # something sessions do constantly — this one's own body does it — and a hard
     # block on prose is the worst direction available to this guard.
     #
+    # A LINE CONTINUATION is the knowing exception: its parse has no segments at all,
+    # so prose and a real removal cannot be told apart, and a continued command whose
+    # text mentions the operation is refused. Priced, not assumed: MEASURED over
+    # 86,684 recorded commands, 0 continued commands reach that refusal, and its
+    # remedy (one line) is always performable.
+    #
     # `untokenizable` keeps the fallback unchanged: there the tokens really are
     # unreliable. The parsed route below has its own carrier fallback for a removal
     # the parser cannot see, so declining to degrade here is not the same as
     # trusting the parse blindly.
+    # No target is needed to refuse: every direct removal is refused whatever it
+    # targets (Check 3 below). So a bounds-type blind parse — a line continuation, or
+    # a real bound — whose assembled text names the operation is refused outright,
+    # with the blind spot's own cause and one-line remedy. Guessing its target from
+    # the text instead lent prose words, even from a later command, as the "target"
+    # (MEASURED in review), and re-parsing the join is what the blind spot exists to
+    # avoid.
     if blind is not None and blind.bounds_induced:
-        # The coarse reader reads TEXT, so give it the text the shell assembles: a
-        # line continuation (a bounds-type blind spot) splits `worktree remove`
-        # across lines, and the raw-text reader found no target (MEASURED, before
-        # this read the view). `mention_view` keeps the
-        # raw text as its first line, so this can only find MORE targets, and every
-        # direct removal is refused anyway: it moves only toward refusing.
-        targets = _view_targets(cmd)
-    elif untokenizable(cmd):
+        if not _WORKTREE_REMOVE.search(mention_view(cmd)):
+            return 0
+        # Only what is known: the text mentions the operation and cannot be read. The
+        # lifecycle-manager redirect is NOT printed here, because the command may be
+        # prose that merely mentions a removal, and that text would assert one.
+        print(
+            f"BLOCKED: this command {blind.cause}, and it mentions removing a "
+            f"worktree, so this guard cannot tell whether it removes one or which. "
+            f"To proceed: {blind.hint}.",
+            file=sys.stderr,
+        )
+        if discarded_write is not None:
+            discarded_write.warn()
+        return 2
+    if untokenizable(cmd):
         targets = _legacy_targets(cmd)
     else:
         targets = _extract_worktree_targets(segs)

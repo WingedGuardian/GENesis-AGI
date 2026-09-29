@@ -106,6 +106,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -171,7 +172,6 @@ try:
         git_subcommand_index,
         has_trailing_override,
         mention_view,
-        recovered_segments,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -270,6 +270,15 @@ _TRIGGER_SUBSTRINGS = (
 # EXCLUDED (all-untracked → zero snapshot value — it stays the one BLOCK).
 _SNAPSHOT_VERBS = frozenset(
     {"checkout", "restore", "switch", "reset", "rm", "mv", "checkout-index", "read-tree"}
+)
+# The same verbs as whole words, for the one place a verb is read from TEXT rather
+# than argv: `_blind_discard_violation`, for a parse that returned no segments. Two
+# independent searches, never one pattern with `.*` between the words: that shape is
+# quadratic in the command's length, and this runs on the hook path, where MEASURED
+# a 32,000-character command took 4 seconds with it.
+_GIT_WORD = re.compile(r"\bgit\b")
+_SNAPSHOT_VERB_WORD = re.compile(
+    r"\b(?:" + "|".join(re.escape(v) for v in sorted(_SNAPSHOT_VERBS)) + r")\b"
 )
 # The sanctioned escape for the clean block: `git clean -f  # discard-override`.
 _OVERRIDE_SIGIL = "discard-override"
@@ -588,8 +597,8 @@ def _clean_blind_msg(blind) -> str:
         f"[git-discard-guard] BLOCKED: this command {blind.cause}, and it mentions "
         "`clean`. `git clean` permanently deletes untracked files that no snapshot "
         "can recover, so a command the parser cannot read in full fails CLOSED. "
-        f"To proceed: {blind.hint}. Dry-run forms are allowed, and "
-        "`# discard-override` is honoured once the command parses."
+        f"To proceed: {blind.hint}. Once the command parses, its dry-run forms are "
+        "allowed and `# discard-override` is honoured."
     )
 
 
@@ -1338,36 +1347,16 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     # payload can snapshot several repos while rewinding one; a sha from the
     # wrong repo does not even resolve there.
     sha_by_cwd: dict[str, str] = {}
-    segs, blind = _parse_once(cmd)
-    # The same "never silent" rule the time budget already obeys, applied to the other
-    # reason this can come up short: a parse stopped by a bound yields no segment for
-    # a nested snapshot verb, so the recovery point is simply missing — and a missing
-    # recovery point that says nothing is indistinguishable from "nothing needed one"
-    # exactly when someone is about to discard work. (`untokenizable` excluded for the
-    # reason given in _clean_violation: pre-existing here, and noting it would fire on
-    # ordinary work.)
-    #
-    # DEFERRED until after the loop, never appended ahead of it. This note asserts
-    # that NO snapshot was recorded, and the loop below can still record one for a
-    # repository the parse did reach. Emitting first produced additional context that
-    # said "no recovery snapshot was recorded" AND supplied a recovery SHA — leaving
-    # the recovery status unreadable at the one moment it is load-bearing. The note is
-    # about what the guard could NOT see, so it can only be written once the loop has
-    # finished establishing what it could.
-    blind_unrecorded = blind is not None and blind.bounds_induced
-    # A BLIND parse returns no segments — and a line continuation is a blind spot
-    # that ordinary work produces. A continued `git reset --hard` is not refused (it
-    # is recoverable by design), so the snapshot is the only thing between it and
-    # lost work, and the repository it targets (`git -C <repo>`) is a per-segment
-    # fact the withheld parse dropped with everything else. `recovered_segments`
-    # reads the command both ways and returns what either reading finds; for a
-    # snapshot that is the right direction, since an extra snapshot costs nothing
-    # and a missing one costs the work. MEASURED: without it a continued
-    # `git -C <other repo> reset --hard` snapshotted the session's directory while
-    # the discard ran in the other repository.
-    scan = recovered_segments(cmd) if blind_unrecorded else segs
+    segs, _blind = _parse_once(cmd)
+    # Nothing to say here about a blind parse. A bounds-type blind spot (a line
+    # continuation, or a real bound) whose text names a snapshot verb is REFUSED in
+    # main() before this runs (`_blind_discard_violation`): the repository it
+    # discards in cannot be read, so no snapshot taken here could be trusted to
+    # cover it. Every blind command that reaches this function names no snapshot
+    # verb and has nothing to snapshot, so a "no snapshot was recorded" note there
+    # was noise on ordinary continued git commands.
     targets: list[str | None] = []
-    for seg in scan:
+    for seg in segs:
         if seg.exe != "git":
             continue
         # Literal VERB membership — never positional subcommand resolution
@@ -1377,12 +1366,6 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         if not set(seg.argv[1:]) & _SNAPSHOT_VERBS:
             continue
         targets.append(_segment_cwd(seg, payload))
-    # No text-matching fallback on top of the two readings. An earlier revision
-    # snapshotted the session's directory whenever the TEXT named a snapshot verb and
-    # no reading resolved one. Once both readings are parsed, the only commands that
-    # reach that case have a verb built by an expansion — which the one-line form of
-    # the same command does not snapshot either — and MEASURED by mutation, no test
-    # could tell the fallback was there. So it was deleted rather than kept alive.
     for cwd in targets:
         if not cwd or cwd in seen_cwds or not os.path.isdir(cwd):
             continue
@@ -1551,38 +1534,41 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             "repos in this compound were NOT snapshotted. Run a single git "
             "command per repo if you need its recovery point."
         )
-    # On a blind parse every snapshot came from the recovered readings, so the note
-    # names exactly the repositories that got one — never more.
-    # The wording depends on WHAT was snapshotted, not on which route found it.
-    blind_recorded = (
-        [c for c in dict.fromkeys(targets) if c and c in sha_by_cwd] if blind_unrecorded else []
-    )
-    session_cwd = payload.get("cwd") or os.getcwd()
-    if blind_recorded and blind_recorded == [session_cwd]:
-        warnings.append(
-            f"[git-discard-guard] this command {blind.cause}, so the guard could not "
-            f"tell which repositories it touches: it snapshotted only the session's "
-            f"working directory ({session_cwd}). Any OTHER repository this command "
-            f"discards work in has no recovery point. To get one: {blind.hint}."
-        )
-    elif blind_recorded:
-        warnings.append(
-            f"[git-discard-guard] this command {blind.cause}, so the guard read it both "
-            f"ways the shell might and snapshotted only what those readings named: "
-            f"{', '.join(blind_recorded)}. Any OTHER repository this command discards "
-            f"work in has no recovery point. To get one: {blind.hint}."
-        )
-    elif blind_unrecorded:
-        # No snapshot was recorded: neither reading named a snapshot target that
-        # landed, and the fallback did not either (no snapshot verb named, not a
-        # repository, or a clean tree). An earlier revision spoke of repositories it
-        # "did snapshot" on a branch that could not reach one; say only what is true.
-        warnings.append(
-            f"[git-discard-guard] no recovery snapshot was recorded at all: this "
-            f"command {blind.cause}, so the guard could not tell which "
-            f"repositories it touches. To get the missing snapshots: {blind.hint}."
-        )
     return warnings + notes
+
+
+def _blind_discard_violation(cmd: str, view: str) -> str | None:
+    """Refuse a snapshot verb the parse could not read. None otherwise.
+
+    A snapshot verb is let through because the guard snapshots the repository it
+    discards in first. On a bounds-type blind parse (a line continuation, or a real
+    bound) that repository is a per-segment fact the parse withheld, so the guard
+    cannot know what it would be snapshotting, and a snapshot of the wrong
+    repository is a false recovery promise. Refusing costs the session a one-line
+    rewrite; re-parsing the command to guess the target was tried, and review found
+    a new defect in that modelling each round (the target repository, then the
+    tree-rewind warning, then the escaped backslashes in a path).
+
+    Read from the text the shell assembles, as the other early exits are: a verb
+    split by the continuation still names itself there. The override is not honoured
+    on this path, for the reason `_clean_blind_msg` gives.
+    """
+    _segs, blind = _parse_once(cmd)
+    if blind is None or not blind.bounds_induced:
+        return None
+    verb = _SNAPSHOT_VERB_WORD.search(view)
+    if not (_GIT_WORD.search(view) and verb):
+        return None
+    # Says only what is known: the text names git and a word that is a discarding verb
+    # when git runs it. It may be prose (a commit message, a `--grep` pattern), and the
+    # message must not assert a discard it cannot see.
+    return (
+        f"[git-discard-guard] BLOCKED: this command {blind.cause}, and it mentions "
+        f"`git` and `{verb.group()}`, which discards uncommitted work when git runs "
+        f"it. The guard cannot read whether it runs, or in which repository, so it "
+        f"cannot take the recovery snapshot that normally lets such a command run. "
+        f"To proceed: {blind.hint}."
+    )
 
 
 def _emit_additional_context(notes: list[str]) -> None:
@@ -1716,8 +1702,9 @@ def _fit_whole_notes(notes: list[str], budget: int) -> list[str]:
 
 def main() -> int:
     """Block a non-dry-run ``git clean`` (the one unrecoverable verb); for every
-    other trigger verb, snapshot-and-allow. Returns 2 ONLY for a clean
-    violation; 0 otherwise.
+    other trigger verb, snapshot-and-allow. Returns 2 for a clean violation, a
+    submodule-recursive overwrite, or a snapshot verb the parse could not read;
+    0 otherwise.
 
     Fail directions are SPLIT by consequence (Codex round-5 P1): the clean BLOCK
     fails CLOSED — if the precise parse raises, `main` blocks UNCONDITIONALLY with
@@ -1798,6 +1785,22 @@ def main() -> int:
                     ):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
                         discarded_write.warn()
                 return 2
+
+    # Phase 1c — a snapshot verb the parse could not read (a line continuation, or a
+    # real bound): the target repository cannot be established, so no snapshot can be
+    # promised, and the verb is refused like the two above. Fails OPEN on a parser
+    # crash, like 1b: the verb is normally recoverable.
+    with contextlib.suppress(Exception):
+        blind_msg = _blind_discard_violation(cmd, view)
+        if blind_msg:
+            with contextlib.suppress(OSError):
+                print(blind_msg, file=sys.stderr)
+            if discarded_write is not None:
+                with contextlib.suppress(
+                    Exception
+                ):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                    discarded_write.warn()
+            return 2
 
     # Phase 2 — the snapshot recovery net (ADVISORY → fail OPEN).
     try:
