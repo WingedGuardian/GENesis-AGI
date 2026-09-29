@@ -442,12 +442,24 @@ class TestBashHookRmRf:
         )
         assert result.returncode == 0, result.stderr
 
-    def test_rm_rf_line_continuation_deep_allowed(self, rm_rf_hook_command: str) -> None:
-        r"""A `\`-newline continuation inside one rm invocation stays one path."""
+    def test_rm_rf_line_continuation_is_refused_with_the_one_line_remedy(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        r"""A `\`-newline continuation is a blind spot the shared parser REPORTS, so
+        the resolver refuses a continued removal it cannot read — even a deep, safe
+        target that the same command on one line is allowed (control below). The
+        cost was accepted on purpose: the refusal names the one-line remedy, and the
+        guard's own continuation fold is still pinned by its unit tests."""
         result = run_hook(
             rm_rf_hook_command,
             {"command": "rm -rf \\\n/home/u/proj/build"},
         )
+        assert result.returncode == 2, result.stderr
+        assert "one line" in result.stderr, result.stderr
+
+    def test_rm_rf_deep_target_on_one_line_allowed(self, rm_rf_hook_command: str) -> None:
+        """The control for the refusal above: the same target, one line, runs."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /home/u/proj/build"})
         assert result.returncode == 0, result.stderr
 
     def test_rm_rf_background_deep_allowed(self, rm_rf_hook_command: str) -> None:

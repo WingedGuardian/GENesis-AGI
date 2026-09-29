@@ -270,7 +270,22 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
                 create_standalone_router()
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
-            embedding = EmbeddingProvider()
+            # Split providers, mirroring runtime/init/memory.py: writes on the
+            # ordinary rate tier, recall on the priority tier the operator
+            # lever selects. One shared provider would put memory_recall /
+            # knowledge_recall on the ordinary tier, whose documented queue
+            # under load (8.6-13.3s) then becomes interactive recall latency.
+            # Both chains come from build_chain, so they share one vector space.
+            from genesis.env import embed_priority_tier
+
+            storage_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(ollama_first=False),
+            )
+            recall_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(
+                    ollama_first=False, priority_tier=embed_priority_tier(),
+                ),
+            )
             # The activity tracker enables InstrumentationMiddleware, which also
             # runs the per-call commit/rollback boundary that releases read
             # snapshots (WS-15 follow-up). Without a tracker the middleware — and
@@ -281,7 +296,9 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # memory_recall / knowledge_recall rerank here exactly as in the
             # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
             reranker = VoyageReranker()
-            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+            init(db=db, qdrant_client=qdrant,
+                 storage_embedding_provider=storage_embedding,
+                 recall_embedding_provider=recall_embedding,
                  activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
             clear_mcp_crash("memory")
             yield

@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Worktree lifecycle manager — archives stale worktrees, deletes nothing.
+"""Worktree lifecycle manager — archives stale worktrees; can expire merged archives.
 
 A worktree is only ever touched when it is unused, unlocked, has no paused Git
 operation, and contains no nested worktree. Past those protections it is
-ARCHIVED into the trash as a gzip tarball, together with a tombstone row. It is
-never deleted, and nothing in the trash expires.
+ARCHIVED into the trash as a gzip tarball, together with a tombstone row. The
+reaper itself never deletes a worktree. Retention is OFF: nothing schedules
+``--expire-trash``, and it deletes nothing unless an operator passes an explicit
+window (``TRASH_RETENTION_DAYS`` is None). When run with one it expires clean
+MERGED archives — archive first, then its registration anchor; see
+``_expire_trash`` for why that order is the safety property. Turning retention
+on waits for a predicate that proves redundancy from the archive's own content
+(issue #2504): the archive-time metadata this one reads is not a losslessness
+proof. UNMERGED archives, and merged ones that held uncommitted changes, are
+never expired.
 
 That is a deliberate reversal of an earlier design that deleted merged
 worktrees outright. The reason is that a worktree can hold the only surviving
@@ -16,8 +24,17 @@ is in a position to make, and the storage does not justify guessing — the 192
 worktrees present that day were ~11 GB raw, ~2.9 GB archived, against 265 GB
 free.
 
-Two lanes remain, but they now differ only in WHEN and in the label they carry,
-never in whether the work survives:
+That reasoning still decides what the REAPER does, and it still holds for every
+UNMERGED archive, which is never auto-expired, and for a merged archive that
+held uncommitted changes. A clean MERGED archive should duplicate main, and
+keeping it for ever also keeps its locked registration alive indefinitely, so
+those grow without bound alongside the trash. The owner ruled for retention of
+clean merged archives (2026-09-26/27), but it stays off until "clean" and
+"merged" are proven from the archive at expiry time (#2504). The tombstone
+index is kept.
+
+Two lanes remain. They differ in WHEN, in the label they carry, and in
+retention (only clean MERGED archives are eligible, and retention is off, #2504):
 
   MERGED (7+ days idle)     content is also in main, so it drains sooner
   UNMERGED (14+ days idle)  may be the only copy, so it is held longer
@@ -42,6 +59,8 @@ Usage:
     worktree_lifecycle.py --no-network       # Skip the one gh call (faster, safe)
     worktree_lifecycle.py --list-trash       # Show archives with age, lane, size
     worktree_lifecycle.py --recover <name>   # Restore an archived worktree
+    worktree_lifecycle.py --expire-trash --retention-days N  # Expire clean MERGED archives (off by default)
+    worktree_lifecycle.py --release-stale-claims  # Drop claims of dead sessions
 
 Run daily by the genesis-disk-hygiene.timer systemd unit (via
 scripts/disk_hygiene.sh, alongside disk_reclaim.py). Also runnable by hand.
@@ -57,9 +76,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -70,7 +91,8 @@ from pathlib import Path, PurePosixPath
 
 # Two lanes, by whether the work is already in main (owner ruling 2026-09-10).
 # MERGED work is a duplicate of main, so it drains fast. UNMERGED work may be the
-# only copy, so it is held longer AND is never auto-purged from the trash.
+# only copy, so it is held longer before archiving AND its archive is never
+# auto-expired. Retention of clean merged archives is off by default (#2504).
 MERGED_STALE_DAYS = 7
 UNMERGED_STALE_DAYS = 14
 STALE_DAYS = UNMERGED_STALE_DAYS  # back-compat alias (the conservative bound)
@@ -849,6 +871,21 @@ def classify_all(
 
 ARCHIVE_SUFFIX = ".tar.gz"
 
+# The lock reason that marks a registration as an ARCHIVE ANCHOR. Built in one
+# place because two readers parse it: expiry here, and the stranded-work sweep
+# (`session_awareness/zero_drop_worker.py`, which cannot import this script and
+# restates the prefix; a contract test drives this writer into that reader). The
+# entry is named WITHOUT its `.tar.gz` extension.
+ARCHIVE_LOCK_PREFIX = "archived by the reaper -> "
+ARCHIVE_LOCK_SUFFIXES = (
+    "; recover with --recover",
+    "; recovery did not complete, still recoverable with --recover",
+)
+
+
+def _archive_lock_reason(entry: str, *, recovery_failed: bool = False) -> str:
+    return f"{ARCHIVE_LOCK_PREFIX}{entry}{ARCHIVE_LOCK_SUFFIXES[1 if recovery_failed else 0]}"
+
 
 def _archive_path(trash_path: Path) -> Path:
     """Sibling archive for a trash entry. Built by APPENDING, not by replacing a
@@ -1118,9 +1155,11 @@ def _trash_worktree(
     """Move a worktree to the trash directory.
 
     ``lane`` records WHY it was reaped: ``"unmerged"`` content exists nowhere
-    else, while ``"merged"`` content is a duplicate of main. Nothing expires on
-    either lane — the field is provenance for a human reading ``--list-trash``,
-    not a retention switch.
+    else, while ``"merged"`` content is a duplicate of main. It IS the retention
+    input: ``--expire-trash`` (off unless given an explicit window, #2504)
+    expires only ``"merged"`` archives recorded with no uncommitted changes, and
+    keeps every other case (``"unmerged"``, absent, unreadable, or
+    ``had_uncommitted_changes`` not False) indefinitely.
 
     Returns True if trashed (or would be trashed in dry-run).
     """
@@ -1296,13 +1335,14 @@ def _trash_worktree(
         staging_meta.write_text(json.dumps(meta, indent=2))
 
         if meta["secret_files"]:
-            # S9: nothing here expires any more, so an archived credential lives
-            # indefinitely. Say so at reap time rather than discovering it later.
+            # S9: an archived credential lives as long as the archive does (30
+            # days for a clean merged archive, otherwise indefinitely). Say so
+            # at reap time rather than discovering it later.
             # MEASURED 2026-09-10: 0 real secret files across the 48 worktrees due
             # for archiving (the `secrets.env` entries are symlinks, so the LINK
             # is stored, never the content) — this warns if that ever changes.
             _log(f"  NOTE {trash_path.name} archives secret-shaped file(s): "
-                 f"{', '.join(meta['secret_files'][:5])} — retained indefinitely")
+                 f"{', '.join(meta['secret_files'][:5])} — retained as long as the archive")
 
         # Move worktree to trash, WITHOUT ever releasing the claimed name.
         # `os.rename` atomically replaces the empty claim directory, so the name
@@ -1470,15 +1510,19 @@ def _trash_worktree(
         #   * a LOCKED registration survives `worktree prune`, `prune --expire
         #     now`, and `gc` with gc.worktreePruneExpire=now;
         #   * an UNLOCKED sibling did not — its commit was collected;
-        #   * locking CLEARS the `prunable` porcelain marker, which is what keeps
-        #     the zero-drop sweep from holding an archived worktree's findings
-        #     open forever.
+        #   * locking CLEARS the `prunable` porcelain marker. That does NOT keep
+        #     the zero-drop sweep from holding an archived worktree (an earlier
+        #     version of this comment said it did): with the marker gone the
+        #     sweep falls through to `git status`, which fails rc=128, and holds
+        #     it as unreadable. The sweep now recognises this lock reason PLUS
+        #     the tarball it names as positive evidence of an archive.
+        # The anchor is removed only by `--expire-trash` (off by default,
+        # #2504), and only AFTER the archive it protects has been deleted.
         # Locking works AFTER the directory has already moved, so there is no
         # window where a failed move leaves a live worktree locked.
         locked_anchor = _run_git(
             repo_root,
-            ["worktree", "lock", "--reason", f"archived by the reaper -> {trash_path.name}; recover with --recover",
-             str(wt_path)],
+            ["worktree", "lock", "--reason", _archive_lock_reason(trash_path.name), str(wt_path)],
             timeout=15,
         )
         if locked_anchor is None:
@@ -1876,6 +1920,17 @@ def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
         print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
         return False
 
+    # Held for the whole recovery so trash expiry cannot remove this path's
+    # registration, or delete the archive, while it is being restored.
+    with _lifecycle_lock() as held:
+        if not held:
+            print("Another lifecycle run (trash expiry or a recovery) is in progress; "
+                  "retry in a moment.", file=sys.stderr)
+            return False
+        return _recover_locked(name, repo_root)
+
+
+def _recover_locked(name: str, repo_root: Path) -> bool:
     matches = [
         stored for stored, _ in _iter_trash_entries() if stored.name.startswith(name)
     ]
@@ -2034,8 +2089,7 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         _run_git(
             repo_root,
             ["worktree", "lock", "--reason",
-             f"archived by the reaper -> {trash_path.name}; recovery did not "
-             "complete, still recoverable with --recover",
+             _archive_lock_reason(trash_path.name, recovery_failed=True),
              original_path],
             timeout=15,
         )
@@ -2237,8 +2291,9 @@ def _iter_trash_entries() -> list[tuple[Path, Path]]:
 def _list_trash() -> None:
     """Show trash contents with age, lane, and size.
 
-    There is no "purge in Nd" column any more, because nothing here expires. The
-    columns that replace it are the ones a reader actually needs: which LANE an
+    Age is what an explicitly-run ``--expire-trash`` window is compared with
+    (retention is off by default, #2504). The other
+    columns are the ones a reader actually needs: which LANE an
     entry came from (merged content is a duplicate of main; unmerged content is
     not, and is the only copy) and how much space it occupies.
     """
@@ -2261,7 +2316,8 @@ def _list_trash() -> None:
                 meta = json.loads(meta_path.read_text())
                 branch = meta.get("branch", "") or ("detached " + meta.get("commit", "")[:8])
                 original = meta.get("original_path", "")
-                lane = meta.get("lane") or "merged"
+                # No recorded lane reads "?", matching expiry, which keeps it.
+                lane = meta.get("lane") or "?"
                 ts = meta.get("trashed_at", "")
                 if ts:
                     age_days = (now - datetime.fromisoformat(ts).timestamp()) / 86400
@@ -2295,7 +2351,612 @@ def _list_trash() -> None:
               f"{branch:<28} {original}")
 
     print(f"\n{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}, "
-          f"{total_mb:.0f} MB archived. Nothing here is deleted on a timer.")
+          f"{total_mb:.0f} MB archived. Retention is off: nothing expires "
+          f"automatically, and --expire-trash deletes nothing without an explicit "
+          f"--retention-days or {RETENTION_ENV}.")
+# ---------------------------------------------------------------------------
+# Retention: expiring old archives, and the anchors that pointed at them
+# ---------------------------------------------------------------------------
+
+# Owner decisions 2026-09-26/27: a MERGED archive with no uncommitted changes may
+# be expired after a retention window; UNMERGED archives, and merged ones that
+# held uncommitted changes, are never expired. Without retention two things
+# grow without bound: the archives, and their locked registrations (one per
+# archive, each an anchor that `git worktree list` reports for ever); nothing
+# else ever releases those anchors.
+#
+# RETENTION IS OFF BY DEFAULT (owner ruling 2026-09-27, split out of #2458).
+# The predicate below reads `lane` and `had_uncommitted_changes` from metadata
+# the reaper recorded at ARCHIVE time for a REVERSIBLE action, and that is not a
+# proof that deleting the archive loses nothing: `lane: merged` includes
+# patch-id verdicts, which cannot see an evil merge; the dirty-state sample
+# ignores gitignored files the tarball does capture; and it is taken before the
+# tree is archived. A read-only pass over one install (2026-09-27, method in
+# #2504) found 15 of 131 eligible archives holding files their recorded head
+# does not. So nothing schedules
+# expiry, and `--expire-trash` deletes nothing unless an operator names a window
+# explicitly. Issue #2504 specifies the content-verified predicate that has to
+# land before a default window returns. The delete -> unpin -> unlock -> prune
+# machinery below is kept: it is the part that is sound.
+#
+# The tombstone index is NOT pruned: it is kilobytes, it is the greppable record
+# of every reaped worktree, and it also records each expiry.
+TRASH_RETENTION_DAYS: int | None = None
+
+# The only lane that expires. Written by `main` from the classification's
+# `merged` flag (`lane="merged" if r["merged"] else "unmerged"`).
+MERGED_LANE = "merged"
+
+# The operator lever. `0`/`off` disables expiry; a value that is not a whole
+# number ALSO disables it — an unreadable lever grants less authority, not more.
+# It wins over `--retention-days`, so it works as a kill switch for any caller.
+RETENTION_ENV = "GENESIS_WORKTREE_TRASH_RETENTION_DAYS"
+# Kill switch for releasing stale session-claim locks (`0`/`off` disables).
+STALE_CLAIM_ENV = "GENESIS_WORKTREE_STALE_CLAIM_RELEASE"
+_OFF_VALUES = ("0", "off", "false", "no", "disabled")
+
+# Serialises expiry against `--recover`. Without it a recovery can re-register a
+# path in the window between expiry's "is the path absent?" check and its removal
+# of that path's registration, and expiry would then remove the RECOVERED
+# worktree's registration while having already deleted the archive being
+# recovered. Neither operation is long, so both take it non-blocking and say so.
+LIFECYCLE_LOCK_NAME = ".lifecycle.lock"
+
+# The shape `_scratch_dir_for` produces (fixed-width digest), so a worktree whose
+# own name merely starts with `.extract-` is still treated as an archive.
+_SCRATCH_NAME = re.compile(r"\.extract-[0-9a-f]{24}\Z")
+_ON_VALUES = ("1", "on", "true", "yes", "enabled")
+
+
+def _archive_entry_from_reason(reason: str) -> str | None:
+    """The trash entry an archive-anchor lock reason names, or None.
+
+    Matched against the FULL reason — prefix and one of the known suffixes —
+    rather than cut at the first ``;``: an entry name may itself contain a
+    ``;``, and a prefix match on ``-> a;`` would also match a different archive
+    named ``a;b``. Anything that is not exactly our shape is not ours.
+    """
+    if not reason.startswith(ARCHIVE_LOCK_PREFIX):
+        return None
+    rest = reason[len(ARCHIVE_LOCK_PREFIX) :]
+    for suffix in ARCHIVE_LOCK_SUFFIXES:
+        if rest.endswith(suffix):
+            entry = rest[: -len(suffix)]
+            if entry and entry not in (".", "..") and "/" not in entry and "\0" not in entry:
+                return entry
+    return None
+
+
+def _env_disabled(var: str) -> bool:
+    """Unset or empty means enabled; anything but a clear "on" disables, so a
+    typo in a kill switch grants less authority rather than more."""
+    raw = os.environ.get(var)
+    if raw is None or not raw.strip():
+        return False
+    return raw.strip().lower() not in _ON_VALUES
+
+
+def _resolve_retention_days(cli_days: int | None) -> tuple[int | None, str]:
+    """``(days, source)``; ``days`` is None when expiry must not run."""
+    raw = os.environ.get(RETENTION_ENV)
+    if raw is not None and raw.strip():
+        value = raw.strip().lower()
+        if value in _OFF_VALUES:
+            return None, f"disabled by {RETENTION_ENV}={raw.strip()}"
+        try:
+            days = int(value)
+        except ValueError:
+            return None, (
+                f"{RETENTION_ENV}={raw.strip()!r} is not a whole number of "
+                "days — expiry DISABLED rather than guessed"
+            )
+        if days <= 0:
+            return None, f"disabled by {RETENTION_ENV}={days}"
+        return days, f"{days}d from {RETENTION_ENV}"
+    if cli_days is not None:
+        if cli_days <= 0:
+            return None, "disabled by --retention-days"
+        return cli_days, f"{cli_days}d from --retention-days"
+    if TRASH_RETENTION_DAYS is None:
+        return None, (
+            "retention is off by default; pass --retention-days or set "
+            f"{RETENTION_ENV} to run it (see #2504)"
+        )
+    return TRASH_RETENTION_DAYS, f"{TRASH_RETENTION_DAYS}d default"
+
+
+@contextlib.contextmanager
+def _lifecycle_lock():
+    """Exclusive, NON-blocking lock over the trash. Yields False when busy."""
+    try:
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            str(TRASH_DIR / LIFECYCLE_LOCK_NAME), os.O_RDWR | os.O_CREAT, _PRIVATE_FILE_MODE
+        )
+    except OSError as e:
+        _log(f"WARN could not open the lifecycle lock: {e}")
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def _admin_worktrees_dir(repo_root: Path) -> Path | None:
+    out = _run_git(repo_root, ["rev-parse", "--git-common-dir"], timeout=15)
+    if not out or not out.strip():
+        return None
+    common = Path(out.strip())
+    if not common.is_absolute():
+        common = repo_root / common
+    return common / "worktrees"
+
+
+def _registration_path(admin: Path) -> str | None:
+    """The worktree path an admin dir registers, from its ``gitdir`` file
+    (``<path>/.git``; documented in gitrepository-layout)."""
+    try:
+        raw = (admin / "gitdir").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return None
+    target = raw.rstrip("\n")
+    if not target.endswith("/.git"):
+        return None
+    if not os.path.isabs(target):
+        target = os.path.normpath(os.path.join(str(admin), target))
+    return target[: -len("/.git")]
+
+
+def _read_lock_file(admin: Path) -> str | None:
+    """The lock reason exactly as git stored it, or None when unlocked/unreadable."""
+    try:
+        raw = (admin / "locked").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return None
+    return raw[:-1] if raw.endswith("\n") else raw
+
+
+def _archive_anchors(repo_root: Path) -> list[dict] | None:
+    """Every registration locked as a reaper archive anchor, or None when the
+    registrations could not be enumerated (the caller then does nothing).
+
+    Read from the ADMIN DIRECTORIES rather than by path, because removal must act
+    on the registration itself: `git worktree unlock/remove <path>` resolve the
+    path at call time, and a path can be re-registered in between — by a
+    recovery, or any `worktree add --force` of the same basename. Each anchor is
+    cross-checked against `git worktree list`, so a layout this code misreads is
+    skipped rather than acted on.
+    """
+    admin_root = _admin_worktrees_dir(repo_root)
+    if admin_root is None:
+        return None
+    try:
+        listed = {wt["path"]: wt for wt in _list_worktrees(repo_root)}
+    except WorktreeScanError as e:
+        _log(f"WARN could not enumerate worktrees: {e}")
+        return None
+    if not admin_root.exists():
+        return []
+    try:
+        admins = sorted(admin_root.iterdir())
+    except OSError as e:
+        _log(f"WARN could not list {admin_root}: {e}")
+        return None
+    anchors: list[dict] = []
+    for admin in admins:
+        if admin.is_symlink() or not admin.is_dir():
+            continue
+        reason = _read_lock_file(admin)
+        entry = _archive_entry_from_reason(reason) if reason is not None else None
+        if entry is None:
+            continue
+        path = _registration_path(admin)
+        if path is None or path not in listed:
+            _log(f"WARN archive anchor {admin.name} names a path git does not list — skipped")
+            continue
+        anchors.append({"admin": admin, "path": path, "reason": reason, "entry": entry})
+    return anchors
+
+
+def _entry_name(stored: Path) -> str:
+    name = stored.name
+    return name[: -len(ARCHIVE_SUFFIX)] if name.endswith(ARCHIVE_SUFFIX) else name
+
+
+def _entry_age_days(stored: Path, meta: dict, now: float) -> float | None:
+    ts = meta.get("trashed_at")
+    if isinstance(ts, str) and ts:
+        with contextlib.suppress(ValueError, TypeError, OverflowError):
+            return (now - datetime.fromisoformat(ts).timestamp()) / 86400
+    try:
+        return (now - stored.lstat().st_mtime) / 86400
+    except OSError:
+        return None
+
+
+def _read_meta(meta_path: Path) -> dict:
+    try:
+        data = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _append_record(record: dict) -> bool:
+    """Append to the tombstone index, REPORTING failure. Expiry must not delete
+    an archive whose intent it could not record: the record is what lets a later
+    run finish removing the anchor if this one dies half-way."""
+    try:
+        TOMBSTONE_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        with TOMBSTONE_INDEX.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as e:
+        _log(f"WARN could not append to the tombstone index: {e}")
+        return False
+    return True
+
+
+def _deleted_names() -> set[str]:
+    """Entries a previous run recorded as DELETED by expiry (written only after
+    the deletion was verified). The retry path requires this POSITIVE record: an
+    archive that is merely missing — an unmounted trash, a hand deletion — or
+    one whose deletion was attempted and failed, is never read as expired."""
+    names: set[str] = set()
+    try:
+        with TOMBSTONE_INDEX.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                with contextlib.suppress(ValueError):
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("event") == "deleted":
+                        name = row.get("name")
+                        if isinstance(name, str):
+                            names.add(name)
+    except OSError:
+        pass
+    return names
+
+
+def _delete_stored(stored: Path, meta_path: Path) -> bool:
+    """Delete an archive (or a legacy uncompressed entry) and its sidecar.
+    True only when the stored form is verifiably gone."""
+    try:
+        if stored.is_dir() and not stored.is_symlink():
+            shutil.rmtree(stored)
+        else:
+            stored.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        _log(f"ERROR could not delete {stored.name}: {e} — its anchor is left in place")
+        return False
+    if meta_path.parent == TRASH_DIR:  # a sidecar; a directory entry's meta went with it
+        with contextlib.suppress(OSError):
+            meta_path.unlink()
+    _fsync_path(TRASH_DIR)
+    if not _path_absent(stored):
+        _log(f"ERROR {stored.name} still exists after deletion — its anchor is left in place")
+        return False
+    return True
+
+
+def _path_absent(path) -> bool:
+    """True ONLY when ``lstat`` says the path does not exist.
+
+    Every de-anchoring decision below asks "is this path gone?". ``os.path.lexists``
+    answers False for EVERY ``OSError``, so an EACCES or EIO on a present tree
+    would read as absent and let its registration be released. Here any error
+    other than ENOENT/ENOTDIR means "could not tell", which keeps the anchor.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _delete_archive_refs(repo_root: Path, entry: str) -> list[str]:
+    """Delete the ``refs/archived/*`` pin for ``entry`` if one exists.
+
+    Coupled to the scheme that pins archived commits under
+    ``refs/archived/<sanitised entry>-<sha256(entry)[:10]>``: the readable part
+    is a lossy sanitisation, so the digest suffix is what identifies an entry.
+    A no-op when no such ref exists. Called only AFTER the archive is gone —
+    while it exists, the pin is what keeps its commits collectable-proof. A
+    failure leaves the ref, which keeps commits alive: the safe direction.
+    """
+    digest = hashlib.sha256(entry.encode("utf-8", "surrogateescape")).hexdigest()[:10]
+    out = _run_git(repo_root, ["for-each-ref", "--format=%(refname)", "refs/archived/"], timeout=15)
+    if out is None:
+        _log(f"WARN could not list refs/archived for {entry}; any pin is left in place")
+        return []
+    deleted = []
+    for ref in out.splitlines():
+        if ref.endswith(f"-{digest}"):
+            if _run_git(repo_root, ["update-ref", "-d", ref], timeout=15) is not None:
+                deleted.append(ref)
+            else:
+                _log(f"WARN could not delete {ref}")
+    return deleted
+
+
+def _unlock_anchor(anchor: dict) -> bool:
+    """Release the archive lock on ONE registration, verified by identity.
+
+    Re-checks at the moment of acting that the path is still absent, that the
+    admin dir still registers that path, and that the lock is still exactly the
+    reason we matched — so a registration re-created or re-locked since the scan
+    is never touched. Removing the ``locked`` file is what `git worktree unlock`
+    does; doing it on the admin dir rather than by path is the point.
+    """
+    admin, path = anchor["admin"], anchor["path"]
+    if not _path_absent(path):
+        _log(f"SKIP anchor {admin.name}: {path} exists again (or cannot be read)")
+        return False
+    if _registration_path(admin) != path or _read_lock_file(admin) != anchor["reason"]:
+        _log(f"SKIP anchor {admin.name}: registration changed since the scan")
+        return False
+    try:
+        (admin / "locked").unlink()
+    except OSError as e:
+        _log(f"WARN could not unlock {admin.name}: {e}")
+        return False
+    return True
+
+
+def _prune_anchor(anchor: dict) -> bool:
+    """Remove ONE unlocked, directoryless registration — never `git worktree
+    prune`, which is repo-wide and would also drop every moved-aside sibling and
+    any other unlocked archive anchor (the recovery path measured that hazard).
+    Deleting the admin dir is what prune does for a single entry, and it cannot
+    touch a working tree."""
+    admin, path = anchor["admin"], anchor["path"]
+    if not _path_absent(path) or (admin / "locked").exists() or _registration_path(admin) != path:
+        _log(f"SKIP pruning {admin.name}: it changed after unlocking")
+        return False
+    try:
+        shutil.rmtree(admin)
+    except OSError as e:
+        _log(f"WARN could not prune {admin.name}: {e}")
+        return False
+    return True
+
+
+def _remove_anchors(repo_root: Path, entry: str, anchors: list[dict]) -> int:
+    """Refs, then unlock, then prune — only ever AFTER the archive is gone."""
+    for ref in _delete_archive_refs(repo_root, entry):
+        _log(f"  deleted {ref}")
+    removed = 0
+    for anchor in anchors:
+        if _unlock_anchor(anchor) and _prune_anchor(anchor):
+            removed += 1
+            _log(f"  removed anchor for {anchor['path']}")
+    return removed
+
+
+def _expire_trash(
+    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False
+) -> dict:
+    """Expire clean MERGED archives older than ``days``: DELETE THE ARCHIVE, then
+    its commit pin, then UNLOCK its anchor, then PRUNE that registration. Unmerged
+    archives, merged ones that held uncommitted changes, and any whose metadata
+    cannot be read, are never expired.
+
+    The order IS the safety property. The lock keeps an archive's registration
+    — and with it the commits the archive points at — alive; once the archive
+    is gone there is nothing left for it to protect, so removing it is lossless
+    by construction. The reverse order would let `gc` collect the commits of an
+    archive that still exists. Nothing is unlocked unless the archive was
+    verifiably deleted first, in this run or (retry) in a recorded earlier one.
+    """
+    now = time.time() if now is None else now
+    counts = {"expired": 0, "anchors_removed": 0, "skipped": 0, "retried": 0,
+              "kept": 0}
+    with _lifecycle_lock() as held:
+        if not held:
+            _log("SKIP expiry: another lifecycle run (expiry or --recover) holds the lock")
+            return counts
+        anchors = _archive_anchors(repo_root)
+        if anchors is None:
+            _log("SKIP expiry: registrations could not be enumerated, so nothing is deleted")
+            return counts
+        by_entry: dict[str, list[dict]] = {}
+        for a in anchors:
+            by_entry.setdefault(a["entry"], []).append(a)
+
+        entries = _iter_trash_entries()
+        present = {_entry_name(stored) for stored, _ in entries}
+        handled: set[str] = set()
+        for stored, meta_path in entries:
+            name = _entry_name(stored)
+            if _SCRATCH_NAME.match(stored.name):
+                # A recovery's extraction directory, not an archive. It lives in
+                # the trash, so the listing includes it — and expiring it would
+                # also disarm the guard just below for the archive it belongs to.
+                continue
+            if _scratch_dir_for(stored).exists():
+                _log(f"SKIP {name}: a recovery left its extraction directory behind")
+                counts["skipped"] += 1
+                continue
+            meta = _read_meta(meta_path)
+            age = _entry_age_days(stored, meta, now)
+            if age is None or age <= days:
+                continue
+            if meta.get("lane") != MERGED_LANE or meta.get("had_uncommitted_changes") is not False:
+                # UNMERGED ARCHIVES ARE KEPT FOR EVER (owner ruling 2026-09-26),
+                # and so are MERGED archives that held uncommitted changes: those
+                # changes exist nowhere but the archive (owner ruling 2026-09-27).
+                # `had_uncommitted_changes` is recorded at archive time; only an
+                # explicit False expires — absent or non-boolean is kept.
+                # `lane` is the reaper's own merged/unmerged verdict, recorded at
+                # archive time from `_classify`'s `merged` — the same predicate
+                # that picked the lane, not a new one. Anything other than an
+                # explicit "merged" — "unmerged", absent (entries archived before
+                # lanes were recorded), unreadable metadata — is KEPT: an
+                # undecidable status fails toward keeping.
+                counts["kept"] += 1
+                continue
+            mine = by_entry.get(name, [])
+            live = [a["path"] for a in mine if not _path_absent(a["path"])]
+            if live:
+                # The anchor's directory is back (a recovery that stopped part
+                # way re-locks a PRESENT tree). Deleting the archive would leave
+                # a lock nothing could ever clear; hold the whole entry.
+                _log(f"SKIP {name}: its registration's directory exists ({live[0]})")
+                counts["skipped"] += 1
+                continue
+            summary = {
+                "lane": meta.get("lane") or "?",
+                "branch": meta.get("branch", ""),
+                "unique_commits": len(meta.get("unique_commits") or []),
+                "had_uncommitted_changes": bool(meta.get("had_uncommitted_changes")),
+            }
+            if dry_run:
+                _log(f"WOULD EXPIRE {name} ({age:.0f}d, {summary}) and {len(mine)} anchor(s)")
+                continue
+            if not _append_record(
+                {
+                    "event": "expiring",
+                    "name": name,
+                    "stored_at": str(stored),
+                    "anchors": [a["path"] for a in mine],
+                    "age_days": round(age, 1),
+                    "retention_days": days,
+                    "at": datetime.now(UTC).isoformat(),
+                    **summary,
+                }
+            ):
+                counts["skipped"] += 1
+                continue
+            if not _delete_stored(stored, meta_path):
+                counts["skipped"] += 1
+                continue
+            counts["expired"] += 1
+            # The POSITIVE record the retry path requires. "expiring" alone is
+            # not enough: it is written before the deletion, which can fail.
+            _append_record({"event": "deleted", "name": name,
+                            "at": datetime.now(UTC).isoformat()})
+            _log(f"EXPIRED {name} ({age:.0f}d > {days}d; {summary})")
+            # An archive and a leftover directory can share a base name (a
+            # partial cleanup after compressing). The anchor protects whichever
+            # form is left, so it goes only once NO stored form of this entry
+            # remains; that other form's own turn in this loop removes it.
+            if any(_entry_name(s) == name and not _path_absent(s) for s, _m in entries):
+                continue
+            present.discard(name)
+            handled.add(name)
+            removed = _remove_anchors(repo_root, name, mine)
+            counts["anchors_removed"] += removed
+            _append_record(
+                {
+                    "event": "expired",
+                    "name": name,
+                    "anchors_removed": removed,
+                    "at": datetime.now(UTC).isoformat(),
+                }
+            )
+
+        # RETRY: an earlier run deleted the archive, then died before removing
+        # the anchor. Requires that run's "deleted" record AND the archive absent
+        # from a trash directory we just listed successfully.
+        if not dry_run and TRASH_DIR.is_dir():
+            deleted = _deleted_names()
+            for name, mine in by_entry.items():
+                if name in present or name in handled or name not in deleted:
+                    continue
+                if any(not _path_absent(a["path"]) for a in mine):
+                    continue
+                removed = _remove_anchors(repo_root, name, mine)
+                if removed:
+                    counts["retried"] += 1
+                    counts["anchors_removed"] += removed
+                    _log(f"FINISHED expiry of {name}: removed {removed} leftover anchor(s)")
+    _log(
+        f"Expiry: {counts['expired']} archive(s) expired, {counts['anchors_removed']} "
+        f"anchor(s) removed, {counts['retried']} earlier expiry finished, "
+        f"{counts['skipped']} skipped, {counts['kept']} kept (unmerged, held uncommitted changes, or undetermined)"
+    )
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Stale session-claim locks
+# ---------------------------------------------------------------------------
+
+
+def _load_claim_module():
+    """``scripts/hooks/worktree_claim.py`` under a private name (never
+    registered in ``sys.modules``). Stdlib-only, like this file."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "hooks" / "worktree_claim.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_worktree_lifecycle_claim", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001 — any load failure means "do not release"
+        _log(f"WARN could not load {path.name}: {e}")
+        return None
+    return module
+
+
+def _release_stale_claims(repo_root: Path, *, dry_run: bool = False) -> int:
+    """Release session-claim locks whose claiming process is gone.
+
+    Every judgement is the claim module's own: `read_lock` decides whether the
+    lock is OURS (namespaced JSON — a human's lock, a Claude Code agent's lock
+    and an archive anchor are all FOREIGN and never touched), `is_releasable`
+    decides staleness (pid gone, start time checked, an unreadable /proc is
+    "unknown", not "gone"), and `unlock_worktree` re-checks both before acting.
+    Staleness is established first and the unlock follows; a claim whose
+    directory is missing is left alone, since there is nothing to verify it by.
+    """
+    claim = _load_claim_module()
+    if claim is None:
+        return 0
+    try:
+        worktrees = _list_worktrees(repo_root)
+    except WorktreeScanError as e:
+        _log(f"SKIP stale-claim release: {e}")
+        return 0
+    released = 0
+    for wt in worktrees:
+        if not wt.get("locked"):
+            continue
+        root = Path(wt["path"])
+        if not root.is_dir():
+            continue
+        lock = claim.read_lock(root)
+        if lock is None or lock.foreign:
+            continue
+        releasable, why = claim.is_releasable(lock)
+        if not releasable:
+            continue
+        # The lock read above came through `<root>/.git`; confirm that admin
+        # dir really is THIS registration before acting on it by path.
+        admin = claim.gitdir_for(root)
+        if admin is None or _registration_path(Path(admin)) != str(root):
+            _log(f"SKIP claim on {root}: its .git does not point at its own registration")
+            continue
+        if dry_run:
+            _log(f"WOULD RELEASE claim on {root}: {why}")
+            continue
+        if claim.unlock_worktree(root):
+            released += 1
+            _log(f"RELEASED stale claim on {root}: {why}")
+    _log(f"Stale-claim release: {released} released")
+    return released
 
 
 # ---------------------------------------------------------------------------
@@ -2314,6 +2975,19 @@ def main() -> int:
     parser.add_argument("--report-json", action="store_true",
                         help="Print the classification of every worktree as JSON "
                              "and exit, changing nothing")
+    parser.add_argument("--expire-trash", action="store_true",
+                        help="Expire clean MERGED archives older than the retention window: "
+                             "delete the archive, then unlock and prune its registration. "
+                             "OFF by default: deletes nothing unless --retention-days or "
+                             f"{RETENTION_ENV} names a window. WARNING: the predicate is "
+                             "NOT a losslessness proof (#2504) and can delete content "
+                             "found nowhere else")
+    parser.add_argument("--retention-days", type=int, default=None, metavar="N",
+                        help=f"Retention for --expire-trash; {RETENTION_ENV} "
+                             "overrides it (0/off disables)")
+    parser.add_argument("--release-stale-claims", action="store_true",
+                        help="Release session-claim locks whose claiming process "
+                             f"is gone ({STALE_CLAIM_ENV}=0 disables)")
     parser.add_argument("--no-network", action="store_true",
                         help="Skip the one merge check that hits the network "
                              "(gh pr list). Faster, and can only ever under-report "
@@ -2325,6 +2999,24 @@ def main() -> int:
         return 0
 
     repo_root = _repo_root()
+
+    if args.expire_trash:
+        days, source = _resolve_retention_days(args.retention_days)
+        if days is None:
+            _log(f"Trash expiry not run: {source}")
+            return 0
+        _log(f"Trash expiry starting ({source}). WARNING: retention is off by default "
+             "because this predicate is NOT a losslessness proof (#2504); an archive it "
+             "expires may hold files no commit has")
+        _expire_trash(repo_root, days=days, dry_run=args.dry_run)
+        return 0
+
+    if args.release_stale_claims:
+        if _env_disabled(STALE_CLAIM_ENV):
+            _log(f"Stale-claim release not run: disabled by {STALE_CLAIM_ENV}")
+            return 0
+        _release_stale_claims(repo_root, dry_run=args.dry_run)
+        return 0
 
     if args.recover:
         # --dry-run must reach the recover path too (#2188): the flag's contract

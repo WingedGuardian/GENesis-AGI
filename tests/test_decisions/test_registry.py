@@ -1361,3 +1361,54 @@ def test_no_shipped_site_declares_an_outcome_source_it_does_not_have():
     root = Path(__file__).resolve().parents[2]
     reg = load_registry(root / "config" / "decisions.yaml")
     assert all(spec.outcome_source is None for spec in reg.values())
+
+
+# ---------------------------------------------------------------------------
+# Follow-up to #2482 review round 4.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2020-13-40",  # resolves as a timestamp, then fails: ValueError
+        "!!timestamp nope",  # AttributeError inside PyYAML's constructor
+        "!!bool abc",  # KeyError inside PyYAML's constructor
+        "!!int abc",
+        "!!float x",
+        "!!set abc",
+        "!!omap [1, 2]",
+        "!!pairs [1]",
+    ],
+)
+def test_every_yaml_constructor_failure_is_a_registry_error(value):
+    """PyYAML's inherited constructors raise ValueError, AttributeError and
+    KeyError on bad input, not only YAMLError; the first three cases escaped
+    RegistryError before the fix. The rest are regression guards."""
+    body = _VALID.replace("    owner: memory.relationship_classifier", f"    owner: {value}")
+    with pytest.raises(RegistryError):
+        _spec(body)
+
+
+def test_the_volatility_site_ranks_rather_than_decides():
+    """Measured zero-shot at AUC 0.66 (95% CI 0.60-0.73) against later
+    evidence: good enough to order memories for re-verification, not to act
+    on one answer."""
+    from pathlib import Path
+
+    from genesis.decisions.registry import load_registry
+
+    root = Path(__file__).resolve().parents[2]
+    spec = load_registry(root / "config" / "decisions.yaml")["memory_volatility"]
+    assert spec.consumes == Consumes.ORDERING
+    assert not spec.requires_calibration
+    # A noul, so P(yes) is the ranking scalar; a choice would need a projection.
+    assert spec.type == QuestionType.NOUL
+
+
+def test_a_loader_failure_keeps_its_original_cause():
+    """The broad catch must not erase WHICH exception happened."""
+    body = _VALID.replace("    owner: memory.relationship_classifier", "    owner: !!bool abc")
+    with pytest.raises(RegistryError) as info:
+        _spec(body)
+    assert isinstance(info.value.__cause__, KeyError)

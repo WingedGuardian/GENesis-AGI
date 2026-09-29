@@ -804,6 +804,28 @@ def test_invalidate_clears_for_every_commit_form_the_checker_gates(
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git com\\\nmit -m done",  # a line continuation inside the verb
+        "git \\\n  commit -m done",  # a continuation before the verb
+        "git co''mmit -m done",  # a quote inside the verb, which the shell removes
+    ],
+    ids=["continuation-inside-verb", "continuation-before-verb", "quote-inside-verb"],
+)
+def test_invalidate_clears_for_a_commit_the_raw_text_does_not_spell(
+    repo: Path, home: Path, command: str
+) -> None:
+    """The invalidator's early exit tests for the word `commit` before parsing, and
+    must test the text the shell assembles: otherwise a review marker could stay
+    valid past the commit it was for. It reads the same `mentions` the checker's
+    early exit reads, so the two cannot disagree about which commands are commits."""
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+    _run_invalidate(command, repo, home)
+    assert _markers(home) == [], f"{command!r} ran a commit and left the marker in place"
+
+
 # ── Invalidator/checker cwd symmetry (the #1254 follow-up, ab42b04f) ──────
 # #1254 made the PreToolUse checker resolve the commit's real worktree via
 # `git -C` / the last `cd` / the payload cwd. The PostToolUse invalidator was

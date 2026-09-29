@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from genesis.memory.embeddings import (
+    CANONICAL_VECTOR_SPACE,
     DashScopeBackend,
     DeepInfraBackend,
     EmbeddingProvider,
@@ -162,6 +163,7 @@ class TestEmbedProviderChain:
         ollama = OllamaBackend(url="http://fake:11434", client=client)
         deepinfra = AsyncMock()
         deepinfra.name = "deepinfra_embedding"
+        deepinfra.vector_space = CANONICAL_VECTOR_SPACE
 
         p = EmbeddingProvider(backends=[ollama, deepinfra], cache_dir=None)
         result = await p.embed("test")
@@ -190,9 +192,11 @@ class TestEmbedProviderChain:
         """All backends fail → EmbeddingUnavailableError."""
         b1 = AsyncMock()
         b1.name = "b1"
+        b1.vector_space = "test-space"
         b1.embed = AsyncMock(side_effect=Exception("fail"))
         b2 = AsyncMock()
         b2.name = "b2"
+        b2.vector_space = "test-space"
         b2.embed = AsyncMock(side_effect=Exception("fail"))
 
         p = EmbeddingProvider(backends=[b1, b2], cache_dir=None)
@@ -203,6 +207,7 @@ class TestEmbedProviderChain:
     async def test_embed_batch(self) -> None:
         b = AsyncMock()
         b.name = "test"
+        b.vector_space = "test-space"
         b.embed = AsyncMock(return_value=VEC_1024)
         p = EmbeddingProvider(backends=[b], cache_dir=None)
         results = await p.embed_batch(["a", "b", "c"])
@@ -220,9 +225,11 @@ class TestEmbedProviderChain:
         """After 3 consecutive failures, backend errors log at DEBUG not WARNING."""
         b_fail = AsyncMock()
         b_fail.name = "ollama_embedding"
+        b_fail.vector_space = "test-space"
         b_fail.embed = AsyncMock(side_effect=httpx.ReadTimeout("timeout"))
         b_ok = AsyncMock()
         b_ok.name = "deepinfra_embedding"
+        b_ok.vector_space = "test-space"
         b_ok.embed = AsyncMock(return_value=VEC_1024)
         p = EmbeddingProvider(backends=[b_fail, b_ok], cache_dir=None)
 
@@ -247,6 +254,7 @@ class TestEmbedProviderChain:
 
         b = AsyncMock()
         b.name = "flaky"
+        b.vector_space = "test-space"
         b.embed = _flaky_embed
         p = EmbeddingProvider(backends=[b], cache_dir=None)
 
@@ -407,6 +415,79 @@ class TestBuildChainPriorityTier:
         assert backend is not None
         assert backend._service_tier is None
 
+    def test_the_builder_DEFAULT_is_cloud_first(self, monkeypatch) -> None:
+        """The default is the change; an explicit-argument test cannot bind it.
+
+        FIFTEEN callers construct `EmbeddingProvider()` with no chain and
+        inherit whatever this default is — six in the package (trace,
+        stale-embedding repair, procedural embedding and its promoter, the
+        procedural MCP, the session-awareness worker) and nine in `scripts/`,
+        the busiest being `genesis_mcp_server.py`, the provider behind
+        `memory_store` / `reference_store` / `knowledge_ingest` for every
+        session. Flipping only `runtime/init/memory.py` would have left every
+        one of them on local inference and made the change cosmetic. (They are
+        not all write paths — an earlier revision said so; the query-embedding
+        callers are named in the build_chain docstring.)
+
+        This docstring said "six" until an audit enumerated `scripts/` too — the
+        original count swept `src/` only and was repeated into the changelog and
+        the builder docstring before anyone checked it.
+
+        MEASURED 2026-09-26 through this chain, 20 calls each: Ollama p50
+        2395.8ms, DeepInfra p50 207.8ms.
+        """
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+
+        chain = EmbeddingProvider.build_chain()
+        names = [b.name for b in chain]
+
+        assert "deepinfra_embedding" in names and "ollama_embedding" in names, (
+            f"both backends must be present for this test to mean anything: {names}"
+        )
+        assert names.index("deepinfra_embedding") < names.index("ollama_embedding"), (
+            f"the DEFAULT chain must lead with the cloud backend, got {names}"
+        )
+
+    def test_a_bare_EmbeddingProvider_is_cloud_first(self, monkeypatch) -> None:
+        """The path the six bare callers actually take, end to end.
+
+        `build_chain()` and `_build_default_chain()` are separate lines; binding
+        only the former leaves the second free to disagree, which is exactly how
+        the two could drift apart unnoticed.
+        """
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+
+        # cache_dir=None: every other test in this file does the same. The
+        # default opens ~/.genesis/embedding_cache, which is shared live with
+        # the running MCP servers and sits at its 100 MB eviction ceiling. This
+        # test asserts on _backends, so the cache is pure side effect.
+        provider = EmbeddingProvider(cache_dir=None)
+        names = [b.name for b in provider._backends]
+
+        assert "deepinfra_embedding" in names and "ollama_embedding" in names, names
+        assert names.index("deepinfra_embedding") < names.index("ollama_embedding"), (
+            f"a provider built with no explicit chain must be cloud-first, got {names}"
+        )
+
+    def test_ollama_first_is_still_reachable_when_asked_for(self, monkeypatch) -> None:
+        """CONTROL — the flip must change the default, not remove the capability.
+
+        Ollama-first remains the right order for anything that must not leave the
+        host. If this goes red the parameter has stopped working rather than the
+        default having moved.
+        """
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+
+        chain = EmbeddingProvider.build_chain(ollama_first=True)
+        names = [b.name for b in chain]
+
+        assert names.index("ollama_embedding") < names.index("deepinfra_embedding"), (
+            f"ollama_first=True must still lead with Ollama, got {names}"
+        )
+
     def test_priority_defaults_off_at_the_builder(self, monkeypatch) -> None:
         """build_chain must not opt anyone in silently; the CALLER decides."""
         monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
@@ -456,8 +537,364 @@ class TestRecallChainWiring:
             "storage is a background write with no deadline — it must not pay 1.5x"
         )
 
+    def test_the_storage_chain_is_cloud_first(self) -> None:
+        """The one line the flip exists for, and it was unlocked.
+
+        MEASURED: reverting `storage_backends` to `ollama_first=True` left all
+        59 tests in this file green — including the three added with the flip,
+        because those bind the BUILDER default and this binds the CALLER. The
+        purpose-built harness for exactly this was sitting twenty lines above
+        and went unused.
+        """
+        src = self._init_source()
+        assert "storage_backends = EmbeddingProvider.build_chain(" in src
+        storage_call = src.split("storage_backends = EmbeddingProvider.build_chain(")[1]
+        storage_call = storage_call.split(")")[0]
+        assert "ollama_first=False" in storage_call, (
+            "storage must lead with the cloud backend — without this line the "
+            "flip is inert for the runtime, whatever the builder default says"
+        )
+
     def test_the_tier_decision_reads_the_config_lever(self) -> None:
         """A hardcoded True would pass both tests above; the lever must be used."""
         src = self._init_source()
         assert "embed_priority_tier" in src
         assert "priority = embed_priority_tier()" in src
+
+
+class TestOneVectorSpacePerChain:
+    """A chain may only contain backends that produce vectors in ONE space.
+
+    Matching dimension proves nothing: DashScope's text-embedding-v4 and the
+    Qwen3-Embedding-0.6B model are both 1024-d, but they place the same text at
+    unrelated coordinates. A write through one and a query through the other
+    scores as noise with no error anywhere. Before this, the cloud-first flip put
+    DashScope AHEAD of the local Qwen3 backend whenever DeepInfra was absent, so
+    every successful DashScope write went into the Qwen3 corpus.
+
+    The env matrix below is swept rather than sampled: every combination of
+    {ollama off, ollama qwen3, ollama other-model} x {deepinfra key} x
+    {dashscope key}, and for each the STORAGE chain and the RECALL chain must
+    resolve to the same single space — the property the corpus depends on.
+    """
+
+    @staticmethod
+    def _env(monkeypatch, *, ollama: str | None, deepinfra: bool, dashscope: bool) -> None:
+        if ollama is None:
+            monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "false")
+            monkeypatch.delenv("OLLAMA_EMBEDDING_MODEL", raising=False)
+        else:
+            monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+            monkeypatch.setenv("OLLAMA_EMBEDDING_MODEL", ollama)
+        if deepinfra:
+            monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        else:
+            monkeypatch.delenv("API_KEY_DEEPINFRA", raising=False)
+        if dashscope:
+            monkeypatch.setenv("API_KEY_QWEN", "k")
+        else:
+            monkeypatch.delenv("API_KEY_QWEN", raising=False)
+
+    @staticmethod
+    def _names(chain) -> list[str]:
+        return [b.name for b in chain]
+
+    @pytest.mark.parametrize(
+        "ollama",
+        [None, "qwen3-embedding:0.6b-fp16", "hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0", "nomic-embed-text"],
+    )
+    @pytest.mark.parametrize("deepinfra", [False, True])
+    @pytest.mark.parametrize("dashscope", [False, True])
+    def test_storage_and_recall_resolve_to_one_shared_space(
+        self, monkeypatch, ollama, deepinfra, dashscope,
+    ) -> None:
+        self._env(monkeypatch, ollama=ollama, deepinfra=deepinfra, dashscope=dashscope)
+
+        storage = EmbeddingProvider.build_chain(ollama_first=False)
+        recall = EmbeddingProvider.build_chain(ollama_first=False, priority_tier=True)
+
+        storage_spaces = {b.vector_space for b in storage}
+        recall_spaces = {b.vector_space for b in recall}
+        configured = ollama is not None or deepinfra or dashscope
+        if not configured:
+            assert storage == [] and recall == []
+            return
+        assert len(storage_spaces) == 1, f"storage chain mixes spaces: {storage_spaces}"
+        assert storage_spaces == recall_spaces, (
+            f"storage {storage_spaces} and recall {recall_spaces} must agree on the model"
+        )
+        # And the provider built from each carries that one space.
+        assert (
+            EmbeddingProvider(backends=storage, cache_dir=None).vector_space
+            == EmbeddingProvider(backends=recall, cache_dir=None).vector_space
+        )
+
+    def test_dashscope_never_leads_a_qwen3_local_chain(self, monkeypatch) -> None:
+        """The P1 shape: DashScope + local Qwen3, no DeepInfra.
+
+        Before the fix the cloud-first order made this [dashscope, ollama], so a
+        healthy DashScope answered every write and Ollama was never reached.
+        """
+        self._env(monkeypatch, ollama="qwen3-embedding:0.6b-fp16", deepinfra=False, dashscope=True)
+        assert self._names(EmbeddingProvider.build_chain()) == ["ollama_embedding"]
+        assert self._names(
+            EmbeddingProvider.build_chain(ollama_first=False, priority_tier=True)
+        ) == ["ollama_embedding"]
+
+    def test_full_install_keeps_the_cloud_first_flip_within_qwen3(self, monkeypatch) -> None:
+        """All three configured: the flip survives, DashScope does not."""
+        self._env(monkeypatch, ollama="qwen3-embedding:0.6b-fp16", deepinfra=True, dashscope=True)
+        assert self._names(EmbeddingProvider.build_chain()) == [
+            "deepinfra_embedding", "ollama_embedding",
+        ]
+
+    def test_dashscope_alone_is_still_usable(self, monkeypatch) -> None:
+        """CONTROL — a DashScope-only install keeps working, in its own space."""
+        self._env(monkeypatch, ollama=None, deepinfra=False, dashscope=True)
+        chain = EmbeddingProvider.build_chain()
+        assert self._names(chain) == ["dashscope_embedding"]
+        assert chain[0].vector_space != CANONICAL_VECTOR_SPACE
+
+    def test_the_corpus_space_is_anchored_to_the_local_model(self, monkeypatch) -> None:
+        """A non-Qwen3 local model + DeepInfra: storage has been writing the LOCAL
+        model's vectors, so the chain stays in that space rather than switching the
+        corpus to DeepInfra's model because cloud now leads the order."""
+        self._env(monkeypatch, ollama="nomic-embed-text", deepinfra=True, dashscope=False)
+        assert self._names(EmbeddingProvider.build_chain()) == ["ollama_embedding"]
+
+    def test_a_hand_built_mixed_chain_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="vector space"):
+            EmbeddingProvider(
+                backends=[
+                    DeepInfraBackend(api_key="k", client=MagicMock()),
+                    DashScopeBackend(api_key="k", client=MagicMock()),
+                ],
+                cache_dir=None,
+            )
+
+    def test_upstream_named_qwen3_pull_keeps_the_cloud_rung(self, monkeypatch) -> None:
+        """Same weights pulled under the upstream repo name are the canonical space.
+
+        A library-tag-only rule dropped DeepInfra from BOTH chains here, so
+        recall lost its priority-tier cloud rung and ran local-only.
+        """
+        self._env(
+            monkeypatch, ollama="hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0",
+            deepinfra=True, dashscope=False,
+        )
+        assert self._names(
+            EmbeddingProvider.build_chain(ollama_first=False, priority_tier=True)
+        ) == ["deepinfra_embedding", "ollama_embedding"]
+
+    def test_an_excluded_dashscope_is_never_constructed(self, monkeypatch) -> None:
+        """Callers build a provider per call; an excluded backend must not
+        leave an HTTP client behind each time."""
+        from genesis.memory import embeddings as mod
+
+        built: list[object] = []
+        real_init = mod.DashScopeBackend.__init__
+
+        def spy(self, *a, **k):
+            built.append(self)
+            real_init(self, *a, **k)
+
+        monkeypatch.setattr(mod.DashScopeBackend, "__init__", spy)
+        self._env(monkeypatch, ollama="qwen3-embedding:0.6b-fp16", deepinfra=True, dashscope=True)
+        EmbeddingProvider.build_chain()
+        assert built == []
+        # Control: with nothing else configured it IS built.
+        self._env(monkeypatch, ollama=None, deepinfra=False, dashscope=True)
+        EmbeddingProvider.build_chain()
+        assert len(built) == 1
+
+    def test_known_spaces(self) -> None:
+        assert OllamaBackend(url="http://x", client=MagicMock()).vector_space == CANONICAL_VECTOR_SPACE
+        assert DeepInfraBackend(api_key="k", client=MagicMock()).vector_space == CANONICAL_VECTOR_SPACE
+        assert DashScopeBackend(api_key="k", client=MagicMock()).vector_space != CANONICAL_VECTOR_SPACE
+
+    def test_cache_keys_are_scoped_by_space(self) -> None:
+        """A vector cached by one space must never be served to another.
+
+        The pre-existing key ("qwen3-embedding:{text}") was shared by EVERY
+        backend, so it may hold a DashScope fallback vector; no space reads it.
+        """
+        import hashlib
+
+        qwen = EmbeddingProvider(
+            backends=[DeepInfraBackend(api_key="k", client=MagicMock())], cache_dir=None,
+        )
+        dash = EmbeddingProvider(
+            backends=[DashScopeBackend(api_key="k", client=MagicMock())], cache_dir=None,
+        )
+        legacy = hashlib.sha256(b"qwen3-embedding:hello").hexdigest()
+        assert qwen._cache_key("hello") != legacy
+        assert dash._cache_key("hello") != legacy
+        assert qwen._cache_key("hello") != dash._cache_key("hello")
+
+
+class TestStandaloneMemoryMcpSplitsRecall:
+    """The standalone memory MCP must not recall through the storage provider.
+
+    It used to pass ONE bare provider as ``embedding_provider``, which
+    ``genesis.mcp.memory.init`` reuses for both MemoryStore and HybridRetriever.
+    With the default chain now cloud-first on the ordinary tier, memory_recall
+    would inherit that tier's documented queue under load. Source assertion, for
+    the same reason as TestRecallChainWiring: the lifespan needs a live DB and
+    Qdrant to execute.
+    """
+
+    @staticmethod
+    def _src() -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parents[2] / "scripts" / "genesis_mcp_server.py").read_text()
+
+    def test_recall_provider_is_separate_and_priority_tier(self) -> None:
+        src = self._src()
+        assert "recall_embedding_provider=recall_embedding" in src
+        assert "storage_embedding_provider=storage_embedding" in src
+        assert "priority_tier=embed_priority_tier()" in src
+
+    def test_the_shared_legacy_argument_is_gone(self) -> None:
+        """Control: if the legacy kwarg were still passed, init would reuse it."""
+        assert "embedding_provider=embedding," not in self._src()
+
+
+class _SpaceFake:
+    """A minimal backend double that DECLARES its space, as every backend must."""
+
+    def __init__(self, name: str, *, space: object, model: str = "m", fail: bool = False) -> None:
+        self.name = name
+        self.vector_space = space
+        self._model = model
+        self._fail = fail
+        self.calls = 0
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls += 1
+        if self._fail:
+            raise httpx.ConnectError("down")
+        return [0.5] * 4
+
+    async def is_available(self) -> bool:
+        return not self._fail
+
+
+class TestFreshCollectionAnchor:
+    """A caller writing into a brand-new, EMPTY collection has no corpus to match.
+
+    The default anchor is the space of the historical storage leader, because a
+    live collection was written in that space. A fresh collection (the
+    LongMemEval ephemeral store) was not written in any space yet, so anchoring
+    it to the local model threw away the cloud rung the caller asked to lead.
+    """
+
+    _env = staticmethod(TestOneVectorSpacePerChain._env)
+
+    @staticmethod
+    def _names(chain) -> list[str]:
+        return [b.name for b in chain]
+
+    def test_fresh_collection_keeps_the_cloud_leader_beside_a_foreign_local_model(
+        self, monkeypatch,
+    ) -> None:
+        self._env(monkeypatch, ollama="nomic-embed-text", deepinfra=True, dashscope=False)
+        assert self._names(
+            EmbeddingProvider.build_chain(ollama_first=False, fresh_collection=True)
+        ) == ["deepinfra_embedding"]
+
+    def test_the_corpus_anchor_is_still_the_default(self, monkeypatch) -> None:
+        """CONTROL — without the flag a live corpus keeps its local space."""
+        self._env(monkeypatch, ollama="nomic-embed-text", deepinfra=True, dashscope=False)
+        assert self._names(EmbeddingProvider.build_chain(ollama_first=False)) == [
+            "ollama_embedding",
+        ]
+
+    @pytest.mark.parametrize(
+        "ollama", [None, "qwen3-embedding:0.6b-fp16", "nomic-embed-text"],
+    )
+    @pytest.mark.parametrize("deepinfra", [False, True])
+    @pytest.mark.parametrize("dashscope", [False, True])
+    @pytest.mark.parametrize("ollama_first", [False, True])
+    def test_a_fresh_chain_is_one_space_led_by_the_requested_order(
+        self, monkeypatch, ollama, deepinfra, dashscope, ollama_first,
+    ) -> None:
+        self._env(monkeypatch, ollama=ollama, deepinfra=deepinfra, dashscope=dashscope)
+        chain = EmbeddingProvider.build_chain(ollama_first=ollama_first, fresh_collection=True)
+        if not (ollama or deepinfra or dashscope):
+            assert chain == []
+            return
+        assert len({b.vector_space for b in chain}) == 1
+        # The leader is the first backend the caller's ORDER names.
+        clouds = (["deepinfra_embedding"] if deepinfra else []) + (
+            ["dashscope_embedding"] if dashscope else []
+        )
+        local = ["ollama_embedding"] if ollama else []
+        expected_leader = (local + clouds if ollama_first else clouds + local)[0]
+        assert chain[0].name == expected_leader
+
+    @pytest.mark.parametrize(
+        "rel", ["src/genesis/eval/longmemeval/store.py", "src/genesis/eval/longmemeval/runner.py"],
+    )
+    def test_the_ephemeral_eval_stores_request_a_fresh_chain(self, rel) -> None:
+        from pathlib import Path
+
+        src = (Path(__file__).parents[2] / rel).read_text()
+        assert "build_chain(ollama_first=False, fresh_collection=True)" in src
+
+
+class TestSpaceDeclarationIsMandatory:
+    """The one-space rule used to skip any backend that declared no space.
+
+    So an undeclared backend could sit beside a Qwen3 one and write whatever
+    model it is into the same collection, and every undeclared provider shared
+    one cache namespace. A backend now either names its space or is refused.
+    """
+
+    def test_an_undeclared_backend_beside_a_declared_one_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="vector space"):
+            EmbeddingProvider(
+                backends=[
+                    _SpaceFake("custom", space=None),
+                    DeepInfraBackend(api_key="k", client=MagicMock()),
+                ],
+                cache_dir=None,
+            )
+
+    @pytest.mark.parametrize("space", [None, "", MagicMock()])
+    def test_an_undeclared_backend_alone_is_refused(self, space) -> None:
+        with pytest.raises(ValueError, match="vector space"):
+            EmbeddingProvider(backends=[_SpaceFake("custom", space=space)], cache_dir=None)
+
+    def test_declared_same_space_fakes_are_accepted(self) -> None:
+        """CONTROL — declaring the space is all it takes."""
+        p = EmbeddingProvider(
+            backends=[_SpaceFake("a", space="s"), _SpaceFake("b", space="s")], cache_dir=None,
+        )
+        assert p.vector_space == "s"
+
+    def test_an_empty_chain_is_still_constructible(self) -> None:
+        """No backend means nothing can be written, so nothing can mix."""
+        assert EmbeddingProvider(backends=[], cache_dir=None).vector_space is None
+
+
+class TestLastBackendIsObserved:
+    """Which backend wrote a vector is observed, not inferred from chain order."""
+
+    @pytest.mark.asyncio
+    async def test_a_fallback_answer_is_recorded_as_the_last_backend(self) -> None:
+        primary = _SpaceFake("primary", space="s", model="cloud-model", fail=True)
+        fallback = _SpaceFake("fallback", space="s", model="local-model")
+        p = EmbeddingProvider(backends=[primary, fallback], cache_dir=None)
+        assert p.last_backend is None
+        await p.embed("hello")
+        assert p.last_backend is fallback
+
+    @pytest.mark.asyncio
+    async def test_the_primary_is_recorded_when_it_answers(self) -> None:
+        """CONTROL — the field follows the answer, it is not pinned to a rung."""
+        primary = _SpaceFake("primary", space="s", model="cloud-model")
+        fallback = _SpaceFake("fallback", space="s", model="local-model")
+        p = EmbeddingProvider(backends=[primary, fallback], cache_dir=None)
+        await p.embed("hello")
+        assert p.last_backend is primary
