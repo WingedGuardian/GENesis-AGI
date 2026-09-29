@@ -1401,6 +1401,8 @@ def test_the_volatility_site_ranks_rather_than_decides():
     spec = load_registry(root / "config" / "decisions.yaml")["memory_volatility"]
     assert spec.consumes == Consumes.ORDERING
     assert not spec.requires_calibration
+    # A noul, so P(yes) is the ranking scalar; a choice would need a projection.
+    assert spec.type == QuestionType.NOUL
 
 
 def test_a_loader_failure_keeps_its_original_cause():
