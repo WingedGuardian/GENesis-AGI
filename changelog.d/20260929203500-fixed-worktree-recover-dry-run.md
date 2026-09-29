@@ -1,0 +1,1 @@
+- **Recovering an archived worktree works again.** Two changes that landed together left the recovery step reading an option it was no longer given, so every `worktree_lifecycle.py --recover` run stopped with an error. The option is passed through again, and `--dry-run` still only previews.
