@@ -136,6 +136,23 @@ def test_a_non_ascii_header_is_still_a_401_not_a_500(app, monkeypatch):
     assert _check(app, "Bearer d\xe9sk", accept=_DESK_ACCEPT) == ("Invalid bearer token", 401)
 
 
+def _as_wsgi_delivers(header: str) -> dict:
+    """A WSGI server hands header values over latin-1-decoded (PEP 3333), so a
+    client that sends UTF-8 bytes arrives as their latin-1 reading."""
+    return {"HTTP_AUTHORIZATION": header.encode("utf-8").decode("latin-1")}
+
+
+def test_a_correct_non_ascii_token_sent_as_utf8_is_accepted(app, monkeypatch):
+    from genesis.dashboard.auth import presented_bearer_is
+
+    monkeypatch.setenv(_BROAD, "tök")
+    with app.test_request_context(environ_overrides=_as_wsgi_delivers("Bearer tök")):
+        assert check_bearer_token("test surface") is None
+        assert presented_bearer_is(_BROAD) is True
+    with app.test_request_context(environ_overrides=_as_wsgi_delivers("Bearer tok")):
+        assert check_bearer_token("test surface") == ("Invalid bearer token", 401)
+
+
 def test_an_empty_accept_is_refused_loudly(app):
     """A caller passing no names would otherwise get a 503 naming nothing."""
     with pytest.raises(ValueError):
@@ -253,6 +270,44 @@ def test_the_mcp_transport_never_accepts_the_desk_token(mcp_server, monkeypatch)
     over HTTP. The transport resolves only its own variable."""
     monkeypatch.setenv(_DESK, "desk-only")
     assert mcp_server._resolve_http_auth_token(None) == ""
+
+
+def _drive_mcp_guard(mcp_server, header: bytes | None, token: str = "tok") -> int:  # noqa: S107
+    """Run one HTTP request through the MCP transport's ASGI guard; return the status
+    it answers with (200 = passed through to the app)."""
+    import asyncio
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    guard = mcp_server._bearer_auth_middleware(token).cls(app)
+    headers = [] if header is None else [(b"authorization", header)]
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(guard({"type": "http", "headers": headers}, None, send))
+    return sent[0]["status"]
+
+
+@pytest.mark.parametrize(
+    "header,expected",
+    [
+        (b"Bearer tok", 200),
+        (b"Bearer nope", 401),
+        (None, 401),
+        # #2467: a bad credential is refused with 401, never a 500 from the guard.
+        ("Bearer tök".encode(), 401),
+        (b"Bearer \xff\xfe", 401),
+    ],
+)
+def test_the_mcp_guard_refuses_bad_credentials_with_401(mcp_server, header, expected):
+    assert _drive_mcp_guard(mcp_server, header) == expected
+
+
+def test_the_mcp_guard_accepts_a_non_ascii_configured_token(mcp_server):
+    assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(), token="tök") == 200
 
 
 # ── the boot warning names exactly the disabled surfaces ──────────────────────

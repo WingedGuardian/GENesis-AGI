@@ -573,7 +573,7 @@ def _bearer_auth_middleware(expected_token: str):
 
     from starlette.middleware import Middleware
 
-    _token = expected_token
+    _token_bytes = expected_token.encode("utf-8", "surrogateescape")
 
     class _AuthGuard:
         def __init__(self, app):
@@ -583,9 +583,12 @@ def _bearer_auth_middleware(expected_token: str):
             if scope["type"] not in ("http", "websocket"):
                 return await self.app(scope, receive, send)
 
+            # Compare BYTES, never decoded str: a strict decode raises on
+            # non-UTF-8 header bytes, and compare_digest raises on non-ASCII
+            # str, so either turned a bad credential into a 500 (#2467).
             headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], _token):
+            auth = headers.get(b"authorization", b"")
+            if auth.startswith(b"Bearer ") and hmac.compare_digest(auth[7:], _token_bytes):
                 return await self.app(scope, receive, send)
 
             if scope["type"] == "http":
