@@ -1,14 +1,58 @@
 #!/bin/bash
-# Genesis pre-merge-commit hook — block merging PR branches into local main.
+# Genesis pre-merge-commit hook — block merging PR branches into local main, and
+# block every merge into `live`, the local integration branch.
 #
 # PR branches are cherry-picked onto origin/main for the public repo. Because
 # origin/main diverges from local main (squash merges), merging a PR branch
 # back into local main creates spurious conflicts. The PR branch's job is done
 # once pushed — never merge it back.
 #
-# Portable copy: scripts/hooks/pre-merge-commit (symlinked by install scripts)
+# Installed by scripts/hooks/sync-hooks.sh (HOOKS_TO_SYNC; version-tracked in
+# .genesis-hook-versions) and by the hook loops in install.sh and bootstrap.sh.
+#
+# Git runs this hook only for a merge that creates a merge commit. A merge that
+# stops on a conflict is committed later through pre-commit, which refuses it on
+# `live` too. A FAST-FORWARD runs no hook at all, so this hook cannot stop one:
+# `git merge <branch>` on `live`, where <branch> descends from live's tip (a
+# branch cut from `live`, or any branch while `live` still equals origin/main),
+# moves `live` onto that branch's commits with nothing here noticing. The
+# Claude Code merge guard refuses that command before git runs it; typed in a
+# plain shell it is not refused. The same holds for every other way of moving
+# the `live` ref (a fast-forward pull, reset, branch -f, update-ref, checkout -B,
+# a fetch into it): no git hook refuses them. A check that `live` holds only
+# what a rebuild wrote is planned with the rebuild engine, which is not built
+# yet.
 
 current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+
+# `live` is rebuilt from origin/main plus the manifest's candidate branches, and
+# the rebuild writes its merge commits with `git commit-tree`, which runs no
+# hooks. So every merge that reaches this hook on `live` came from somewhere
+# else — update.sh merging origin/main in, `git pull --no-rebase`, a hand merge —
+# and each one leaves a commit the planned rebuild engine (not built yet) will
+# refuse as unknown. There is
+# deliberately no override. Applies only where the manifest exists, so an
+# install's own branch that happens to be named `live` is left alone.
+if [ "$current_branch" = "live" ] && [ -f "$HOME/.genesis/deploy_manifest.json" ]; then
+    echo ""
+    echo "BLOCKED: Merge into 'live', the local integration branch."
+    echo ""
+    echo "'live' is rebuilt from origin/main plus the candidate branches listed in"
+    echo "~/.genesis/deploy_manifest.json; it never takes a merge by hand. To bring"
+    echo "in newer main or a new candidate, update the manifest and rebuild."
+    echo ""
+    echo "Git has stopped with the merge staged but not committed. Undo it with:"
+    echo "  git merge --abort"
+    echo ""
+    exit 1
+fi
+
+# INERT on current git, deliberately left so: MEASURED on git 2.43, MERGE_HEAD
+# does not exist yet while pre-merge-commit runs (`git rev-parse MERGE_HEAD`
+# fails, and no MERGE_HEAD file is present), so `merge_head` below is always
+# empty and this block always exits 0. Making it work is not a fix to make
+# quietly: it would refuse update.sh's own merge of origin/main into a local main
+# that has diverged. Tracked in issue #2509.
 
 # Only care about merges INTO main
 if [ "$current_branch" != "main" ] && [ "$current_branch" != "master" ]; then

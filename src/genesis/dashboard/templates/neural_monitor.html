@@ -129,7 +129,7 @@ body {
 .region-enrichment .section-row .label,
 .region-enrichment .section-row .value { font-size: 11px; }
 
-/* Battleship-style flat dot grid — explicit 7×7 block layout */
+/* Battleship-style flat dot grid — 7 columns, hand-placed blocks, then flow rows */
 .battleship-grid {
     display: grid;
     grid-template-columns: repeat(7, 72px);
@@ -158,6 +158,10 @@ body {
 .bg-learning   { background: rgba(251,146,60,0.08); }
 .bg-contingency{ background: rgba(248,113,113,0.08); }
 .bg-utility    { background: rgba(148,163,184,0.08); }
+.bg-dream_cycle  { background: rgba(34,211,238,0.08); }
+.bg-awareness    { background: rgba(45,212,191,0.08); }
+.bg-conversation { background: rgba(244,114,182,0.08); }
+.bg-evaluation   { background: rgba(250,204,21,0.08); }
 
 /* Enrichment cards grid below battleship */
 .enrichment-cards {
@@ -517,6 +521,31 @@ const SITE_META = {
     '34_research_synthesis': { name: 'Research Synth', category: 'content' },
     '37_infrastructure_monitor': { name: 'Infra Monitor', category: 'surplus' },
     'autonomous_executor_reasoning': { name: 'Executor', category: 'reasoning' },
+    '21_session_observer': { name: 'Session Obs', category: 'memory' },
+    'crag_grade': { name: 'Recall Grade', category: 'memory' },
+    '38a_procedure_novelty_llm': { name: 'Proc Novelty', category: 'content' },
+    '41_reflection_json_salvage': { name: 'JSON Salvage', category: 'processing' },
+    '43_task_retrospective': { name: 'Retrospect', category: 'assessment' },
+    '44_task_premortem': { name: 'Premortem', category: 'assessment' },
+    'failure_exit_gate': { name: 'Exit Gate', category: 'reasoning' },
+    'dream_cycle_synthesis': { name: 'Dream Synth', category: 'memory' },
+    'dream_cycle_synthesis_challenge': { name: 'Synth Check', category: 'memory' },
+    'dream_cycle_entity_check': { name: 'Entity Check', category: 'memory' },
+    'dream_cycle_entity_challenge': { name: 'Entity Challenge', category: 'memory' },
+    'dream_cycle_relationship_classify': { name: 'Relations', category: 'memory' },
+    'entity_adjudication': { name: 'Entity Adjud', category: 'memory' },
+    'entity_adjudication_challenge': { name: 'Adjud Check', category: 'memory' },
+    'wing_backfill': { name: 'Wing Backfill', category: 'memory' },
+    '45_intelligence_intake': { name: 'Intel Intake', category: 'processing' },
+    '46_infra_annotation': { name: 'Infra Notes', category: 'processing' },
+    'attention_salience': { name: 'Salience', category: 'processing' },
+    'repo_pulse': { name: 'Repo Pulse', category: 'processing' },
+    'ambient_ledger_extractor': { name: 'Ledger Extract', category: 'processing' },
+    'desk_primary': { name: 'Desk', category: 'core' },
+    'desk_fast': { name: 'Desk Fast', category: 'core' },
+    'voice_conversation': { name: 'Voice', category: 'core' },
+    'judge': { name: 'Eval Judge', category: 'assessment' },
+    'contribution_gate': { name: 'Contrib Gate', category: 'assessment' },
 };
 
 // Category colors (used in detail panel category badge)
@@ -1735,6 +1764,70 @@ async function clearDiscardedItem(itemId) {
 
 // ── Surplus detail (expandable) ─────────────────────────────────────
 
+// Pure view-models for the eval section, kept free of the DOM so
+// tests/assets/eval_render_check.js can run them against every state the
+// eval_staleness snapshot emits. A snapshot state with no branch here is a
+// state the dashboard silently misreports.
+function evalSnapshotNotice(evalData) {
+    const status = evalData && evalData.status;
+    if (status === 'ok') return null;
+    if (status === 'error') {
+        return {text: 'eval snapshot read failed' + (evalData.error ? ` (${evalData.error})` : ''), color: '#ef4444'};
+    }
+    if (status === 'no_data') return {text: 'no benchmark runs recorded yet', color: '#94a3b8'};
+    if (status === 'no_db') return {text: 'eval data unavailable: database not connected', color: '#fbbf24'};
+    return {text: `eval snapshot status not recognised: ${status == null ? 'missing' : status}`, color: '#fbbf24'};
+}
+
+function evalProfileView(p) {
+    const label = p.profile && p.profile !== p.provider ? `${p.provider} / ${p.profile}` : p.provider;
+    // A manual or superseded profile is never expected to re-run, so its age
+    // is informational (grey), not an overdue warning.
+    const notRecurring = p.scheduled === false || p.superseded === true;
+    let age, ageColor;
+    if (notRecurring) {
+        age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
+        age += p.superseded ? ' · superseded' : ' · manual';
+        ageColor = '#94a3b8';
+    } else {
+        // Overdue is judged on the last SCHEDULED run; a manual run refreshes
+        // days_ago but not the scheduler, so show the age the verdict used.
+        const sched = p.days_since_scheduled;
+        if (sched == null) age = 'scheduled run age unknown' + (p.days_ago != null ? ` · last run ${p.days_ago}d ago` : '');
+        else if (p.days_ago != null && p.days_ago !== sched) age = `${sched}d since scheduled run · last run ${p.days_ago}d ago`;
+        else age = sched + 'd ago';
+        ageColor = p.stale ? '#ef4444' : (sched == null || sched > 14) ? '#fbbf24' : '#4ade80';
+    }
+    const r = p.recent || {};
+    const pct = (x) => Math.round((x || 0) * 100);
+    const scored = (r.passed || 0) + (r.failed || 0);
+    const infraCases = (r.skipped || 0) + (r.infra_failed || 0);
+    // Scored wrong answers, kept apart from the infrastructural share that
+    // drives the unreliable badge. Each renders on its own count, so a window
+    // the harness could not score at all still shows why.
+    const fail = scored > 0 ? {
+        text: `fail ${pct(r.failure_rate)}%`,
+        title: `${r.failed || 0} wrong / ${scored} scored in the last ${r.window_days}d of runs`,
+    } : null;
+    const infra = infraCases > 0 ? {
+        text: `infra ${pct(r.infra_rate)}%`,
+        title: `${r.skipped || 0} skipped + ${r.infra_failed || 0} provider errors of ${scored + infraCases} cases in the last ${r.window_days}d of runs`,
+    } : null;
+    const unscored = scored === 0 ? {
+        text: 'unscored',
+        title: infraCases > 0 ? 'no case in the window was scored: every case hit an infrastructure error'
+             : !r.runs ? 'no run could be placed in the recent window (no readable run timestamp)'
+             : 'the window holds no cases',
+    } : null;
+    // Runs whose timestamp could not be read are excluded from every age and
+    // from the window; say so rather than let the ages look complete.
+    const unreadable = p.unreadable_runs > 0 ? {
+        text: `${p.unreadable_runs} unreadable`,
+        title: `${p.unreadable_runs} run(s) with an unreadable timestamp, left out of the ages and the recent window`,
+    } : null;
+    return {label, age, ageColor, fail, infra, unscored, unreadable, unreliable: p.unreliable === true};
+}
+
 async function loadSurplusDetail(container) {
     container.replaceChildren();
     container.appendChild(el('div', null, 'Loading...'));
@@ -1797,20 +1890,34 @@ async function loadSurplusDetail(container) {
         const evalRuns = evalMetrics.runs || [];
         const j9Snaps = evalMetrics.j9 || [];
 
-        if (providers.length > 0 || evalRuns.length > 0 || j9Snaps.length > 0) {
+        // The snapshot's own status renders whenever it is not ``ok``: a failed
+        // read must not pass for "no benchmarks", nor vanish behind healthy runs.
+        const evalNotice = evalSnapshotNotice(data.eval_staleness);
+        if (evalNotice || providers.length > 0 || evalRuns.length > 0 || j9Snaps.length > 0) {
             const evalSection = el('div', 'detail-section');
             evalSection.appendChild(el('h4', null, 'Eval & Assessment'));
 
+            if (evalNotice) {
+                const noticeEl = el('div', 'surplus-task-row', evalNotice.text);
+                noticeEl.style.color = evalNotice.color;
+                evalSection.appendChild(noticeEl);
+            }
+
             // Provider freshness
             for (const p of providers) {
+                const v = evalProfileView(p);
                 const row = el('div', 'surplus-task-row');
-                row.appendChild(el('span', 'task-type', p.provider));
-                const age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
-                const ageColor = p.stale ? '#ef4444' : p.days_ago > 14 ? '#fbbf24' : '#4ade80';
-                const ageEl = el('span', 'task-time', age);
-                ageEl.style.color = ageColor;
+                row.appendChild(el('span', 'task-type', v.label));
+                const ageEl = el('span', 'task-time', v.age);
+                ageEl.style.color = v.ageColor;
                 row.appendChild(ageEl);
-                if (p.unreliable) {
+                for (const part of [v.fail, v.infra, v.unscored, v.unreadable]) {
+                    if (!part) continue;
+                    const partEl = el('span', 'task-time', part.text);
+                    partEl.title = part.title;
+                    row.appendChild(partEl);
+                }
+                if (v.unreliable) {
                     const badge = el('span', 'follow-up-badge failed', 'unreliable');
                     row.appendChild(badge);
                 }
@@ -1913,13 +2020,15 @@ const SUBSYSTEM_GROUPS = {
         name: 'Reflection', domId: 'sub-reflection',
         desc: 'Periodic thinking cycles at micro, light, deep, and strategic depth',
         sites: ['3_micro_reflection', '4_light_reflection', '5_deep_reflection',
-                '6_strategic_reflection', '14_weekly_self_assessment', '16_quality_calibration'],
+                '6_strategic_reflection', '14_weekly_self_assessment', '16_quality_calibration',
+                '41_reflection_json_salvage'],
     },
     memory: {
         name: 'Memory', domId: 'sub-memory',
         desc: 'Storage, fact extraction, embeddings, knowledge retrieval, and resume review',
         sites: ['9_fact_extraction', '21_embeddings', '21b_query_embedding',
-                '41_resume_review_pass1', '42_resume_review_pass2', 'ambient_arbiter'],
+                '41_resume_review_pass1', '42_resume_review_pass2', 'ambient_arbiter',
+                'crag_grade', '21_session_observer'],
     },
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
@@ -1935,14 +2044,16 @@ const SUBSYSTEM_GROUPS = {
         name: 'Executor', domId: 'sub-executor',
         desc: 'Task execution review \u2014 pre-assessment, adversarial challenge, autonomous dispatch',
         sites: ['27_pre_execution_assessment', '17_executor_review',
-                '20_adversarial_counterargument', 'autonomous_executor_reasoning'],
+                '20_adversarial_counterargument', 'autonomous_executor_reasoning',
+                'failure_exit_gate', '44_task_premortem', '43_task_retrospective'],
     },
     learning: {
         name: 'Learning', domId: 'sub-learning',
         desc: 'Observation triage, calibration, outcome classification, skill refinement',
         sites: ['29_retrospective_triage',
                 '30_triage_calibration', '31_outcome_classification', '32_delta_assessment',
-                '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation'],
+                '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation',
+                '38a_procedure_novelty_llm'],
     },
     contingency: {
         name: 'Contingency', domId: 'sub-contingency',
@@ -1960,6 +2071,30 @@ const SUBSYSTEM_GROUPS = {
         name: 'Model Fusion', domId: 'sub-model-fusion',
         desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — a custom panel + judge return a synthesized verdict plus explicit dissent for high-stakes, contested decisions. Invoked via the deliberate MCP tool.',
         sites: ['model_fusion'],
+    },
+    dream_cycle: {
+        name: 'Dream Cycle', domId: 'sub-dream-cycle',
+        desc: 'Memory consolidation \u2014 synthesis, entity resolution and relationship classification; synthesis and entity verdicts each get an adversarial check',
+        sites: ['dream_cycle_synthesis', 'dream_cycle_synthesis_challenge',
+                'dream_cycle_entity_check', 'dream_cycle_entity_challenge',
+                'dream_cycle_relationship_classify', 'entity_adjudication',
+                'entity_adjudication_challenge', 'wing_backfill'],
+    },
+    awareness: {
+        name: 'Awareness', domId: 'sub-awareness',
+        desc: 'Intake and attention \u2014 intelligence triage, infra notes, salience, repo and session-ledger pulse',
+        sites: ['45_intelligence_intake', '46_infra_annotation', 'attention_salience',
+                'repo_pulse', 'ambient_ledger_extractor'],
+    },
+    conversation: {
+        name: 'Conversation', domId: 'sub-conversation',
+        desc: 'Direct conversation surfaces \u2014 the foreground session, dashboard desk and voice',
+        sites: ['cc_foreground', 'desk_primary', 'desk_fast', 'voice_conversation'],
+    },
+    evaluation: {
+        name: 'Evaluation', domId: 'sub-evaluation',
+        desc: 'Judging and gating \u2014 the eval judge and the upstream-contribution gate',
+        sites: ['judge', 'contribution_gate'],
     },
 };
 
@@ -1985,6 +2120,7 @@ const SUBSYSTEM_BORDER_COLORS = {
     ego: '#c084fc', reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80',
     outreach: '#fbbf24', executor: '#a78bfa', learning: '#fb923c',
     contingency: '#f87171', utility: '#94a3b8', model_fusion: '#e879f9',
+    dream_cycle: '#22d3ee', awareness: '#2dd4bf', conversation: '#f472b6', evaluation: '#facc15',
 };
 
 
@@ -2006,27 +2142,50 @@ function updateSubsystemGrid(data) {
 
     const callSites = data.call_sites || {};
 
-    // Explicit 7×7 block layout — each subsystem occupies a compact 2D region
-    // Positions: [col, row] (1-indexed). Order matches group.sites order.
+    // Explicit 7-column block layout — each subsystem occupies a compact 2D
+    // region. Positions: [col, row] (1-indexed). Order matches group.sites
+    // order. A hand-placed group lists one connected cell per site; the
+    // contract test in tests/test_dashboard enforces both.
     const GRID_POSITIONS = {
         utility:     [[1,1],[2,1],[3,1],[1,2],[2,2],[3,2],[1,3],[2,3],[3,3]],
         learning:    [[4,1],[5,1],[6,1],[7,1],[4,2],[5,2],[6,2],[7,2]],
-        reflection:  [[4,3],[5,3],[6,3],[4,4],[5,4],[6,4]],
+        reflection:  [[4,3],[5,3],[6,3],[4,4],[5,4],[6,4],[4,5]],
         ego:         [[7,3],[7,4],[7,5]],
-        memory:      [[1,4],[3,4],[1,5],[2,5],[2,4],[1,6]],
-        surplus:     [[3,5],[4,5],[3,6],[4,6]],
-        executor:    [[5,5],[6,5],[5,6],[6,6]],
-        outreach:    [[3,7],[4,7]],
-        contingency: [[5,7],[6,7]],
-        model_fusion: [[7,7]],
+        memory:      [[1,4],[3,4],[1,5],[2,5],[2,4],[1,6],[2,6],[1,7]],
+        surplus:     [[3,5],[3,6],[4,6]],
+        executor:    [[5,5],[6,5],[5,6],[6,6],[7,6],[6,7],[7,7]],
+        outreach:    [[2,7],[3,7]],
+        contingency: [[4,7],[5,7]],
+        model_fusion: [[1,8]],
+    };
+
+    // Groups with no hand positions flow into the rows below the map. Each
+    // group is kept in one connected block: one that does not fit in what is
+    // left of the current row starts a new row, so a group never wraps from
+    // the right edge to the left. A hand-placed group is never split into
+    // the flow region; if it has more sites than positions, the whole group
+    // flows instead.
+    const GRID_COLS = 7;
+    let flowRow = 1 + Math.max(0, ...Object.values(GRID_POSITIONS).flat().map(([, r]) => r));
+    let flowCol = 1;
+    const flowBlock = (n) => {
+        if (flowCol > 1 && flowCol - 1 + n > GRID_COLS) { flowCol = 1; flowRow += 1; }
+        const cells = [];
+        for (let i = 0; i < n; i++) {
+            cells.push([flowCol, flowRow]);
+            flowCol += 1;
+            if (flowCol > GRID_COLS) { flowCol = 1; flowRow += 1; }
+        }
+        return cells;
     };
 
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {
-        // ── Top: flat grid cells, explicitly positioned ──────────────────
-        const positions = GRID_POSITIONS[key] || [];
+        // ── Top: flat grid cells, hand-placed where a position exists ─────
+        const hand = GRID_POSITIONS[key] || [];
+        const positions = hand.length >= group.sites.length ? hand : flowBlock(group.sites.length);
         for (let si = 0; si < group.sites.length; si++) {
             const siteId = group.sites[si];
-            const [col, row] = positions[si] || [1, 1];
+            const [col, row] = positions[si];
             const siteData = callSites[siteId] || {};
             const meta = getMeta(siteId);
             const status = siteData.status || 'unknown';
@@ -2339,8 +2498,8 @@ function updateSubsystemGrid(data) {
     }
 
     // ── "Other": call sites the backend emits that aren't assigned to any
-    // subsystem group above. The 7×7 battleship grid is a fixed hand-placed
-    // layout, so an ungrouped site would otherwise render nowhere and stay
+    // subsystem group above. The battleship grid holds only grouped sites (hand-placed
+    // or flowed), so an ungrouped site would otherwise render nowhere and stay
     // invisible. Computed from the live data, so it self-maintains as new
     // sites are added; rendered as an enrichment card (no grid cell) to avoid
     // disturbing the fixed layout.

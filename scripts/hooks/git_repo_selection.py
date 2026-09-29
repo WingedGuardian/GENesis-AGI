@@ -188,10 +188,12 @@ def raw_sets_repo_env(raw: str) -> bool:
     """
     segs, blind = analyze_checked(raw)
     if blind is not None and _MENTION_RE.search(raw):
-        # Includes a line continuation: the segmenter splits at `\<newline>` but
-        # bash joins the lines, so `GIT_DIR=x \<newline> git push` is ONE command.
-        # The split-off half ends in a lone backslash, which the parser reports as
-        # unreadable, and that is what routes it here.
+        # Includes a line continuation: bash joins the lines the segmenter keeps
+        # apart, so an assignment on one line and a push on the next are ONE
+        # command. The parser reports a continuation as a blind spot of its own,
+        # and that is what routes it here. (A caller that hands this function one
+        # split-off piece still arrives here: the piece ends in a lone backslash,
+        # which the parser reports as unreadable.)
         return True
     return any(seg_sets_repo_env(s) for s in segs)
 

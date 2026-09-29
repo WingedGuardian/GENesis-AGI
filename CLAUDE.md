@@ -30,10 +30,13 @@ Use `codebase_navigate` MCP to explore.
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 - **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
 - **Temp files**: `~/tmp/` for transient files and any LARGE temp (downloads,
-  media, DB dumps, exports). NEVER write large files to `/tmp/` (a small
+  media, DB dumps, exports). NEVER write large files to `/tmp/` (often a small
   tmpfs/RAM) or `~/.genesis/cc-tmp/` — the latter is Claude Code's working temp
-  ("oxygen"), policed by the `genesis-tmp-watchgod` service, which **kills CC
-  sessions** when it fills. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  ("oxygen"), usually a quota-capped volume: filling it breaks EVERY session's temp at
+  once. The `genesis-tmp-watchgod` service guards whole disks and sweeps cc-tmp
+  of what ended sessions left behind (untouched 7 days, nothing holding it); it
+  never kills a session and never deletes live work — so nothing will clean up
+  a big file you park there in time. A CC session's `TMPDIR` points at `cc-tmp` by design;
   do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
@@ -57,7 +60,8 @@ Other units: `genesis-bridge.service` (LEGACY fallback — full stack incl.
 Telegram, only when genesis-server is DOWN; it yields/exits 200 if the server
 lock is held, and must never run alongside the server — dual getUpdates
 pollers split updates and break approval buttons),
-`genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
+`genesis-tmp-watchgod.service` (whole-disk guardian + cc-tmp retention;
+`scripts/watchgod status`), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),

@@ -270,7 +270,22 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
                 create_standalone_router()
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
-            embedding = EmbeddingProvider()
+            # Split providers, mirroring runtime/init/memory.py: writes on the
+            # ordinary rate tier, recall on the priority tier the operator
+            # lever selects. One shared provider would put memory_recall /
+            # knowledge_recall on the ordinary tier, whose documented queue
+            # under load (8.6-13.3s) then becomes interactive recall latency.
+            # Both chains come from build_chain, so they share one vector space.
+            from genesis.env import embed_priority_tier
+
+            storage_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(ollama_first=False),
+            )
+            recall_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(
+                    ollama_first=False, priority_tier=embed_priority_tier(),
+                ),
+            )
             # The activity tracker enables InstrumentationMiddleware, which also
             # runs the per-call commit/rollback boundary that releases read
             # snapshots (WS-15 follow-up). Without a tracker the middleware — and
@@ -281,7 +296,9 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # memory_recall / knowledge_recall rerank here exactly as in the
             # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
             reranker = VoyageReranker()
-            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+            init(db=db, qdrant_client=qdrant,
+                 storage_embedding_provider=storage_embedding,
+                 recall_embedding_provider=recall_embedding,
                  activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
             clear_mcp_crash("memory")
             yield
@@ -545,6 +562,22 @@ def _fastmcp_version() -> str:
         return "unknown"
 
 
+def _resolve_http_auth_token(cli_token: str | None) -> str:
+    """The HTTP transport's bearer token: ``--auth-token`` if given, else the env.
+
+    Both are stripped, so a whitespace-only value is unconfigured here exactly as
+    it is on the dashboard's /v1 routes (#2110). Before this, a quoted "   " in
+    secrets.env became the literal MCP secret while the dashboard read the same
+    value as absent.
+
+    Reads ONLY ``GENESIS_MCP_HTTP_TOKEN``. The desk-scoped token must never reach
+    this transport, which exposes the full MCP tool surface (#2442).
+    """
+    from genesis.env import bearer_token
+
+    return (cli_token or "").strip() or bearer_token("GENESIS_MCP_HTTP_TOKEN")
+
+
 def _bearer_auth_middleware(expected_token: str):
     """Create a raw ASGI middleware for bearer token auth.
 
@@ -670,7 +703,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # HTTP transport: validate auth token is configured
     if args.transport == "streamable-http":
-        token = args.auth_token or os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
+        token = _resolve_http_auth_token(args.auth_token)
         if not token:
             logger.error(
                 "HTTP transport requires auth token. Set GENESIS_MCP_HTTP_TOKEN "

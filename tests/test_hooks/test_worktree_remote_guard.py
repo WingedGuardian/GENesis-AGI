@@ -172,6 +172,37 @@ def sibling_trees(tmp_path):
     return feature, main
 
 
+class TestLiveIntegrationActive:
+    """The manifest alone does not make every `live` branch the integration
+    branch: the target must be the repository this guard ships in."""
+
+    @staticmethod
+    def _home_with_manifest(tmp_path, monkeypatch, *, manifest: bool = True):
+        home = tmp_path / "home"
+        (home / ".genesis").mkdir(parents=True)
+        if manifest:
+            (home / ".genesis" / "deploy_manifest.json").write_text("{}\n")
+        monkeypatch.setenv("HOME", str(home))
+
+    def test_this_repository_is_active(self, guard_module, tmp_path, monkeypatch):
+        self._home_with_manifest(tmp_path, monkeypatch)
+        assert guard_module._live_integration_active(str(_SCRIPTS)) is True
+
+    def test_another_repository_is_not(self, guard_module, tmp_path, monkeypatch):
+        self._home_with_manifest(tmp_path, monkeypatch)
+        other = tmp_path / "other"
+        _init_repo(other, "live")
+        assert guard_module._live_integration_active(str(other)) is False
+
+    def test_no_manifest_is_never_active(self, guard_module, tmp_path, monkeypatch):
+        self._home_with_manifest(tmp_path, monkeypatch, manifest=False)
+        assert guard_module._live_integration_active(str(_SCRIPTS)) is False
+
+    def test_unreadable_target_fails_closed(self, guard_module, tmp_path, monkeypatch):
+        self._home_with_manifest(tmp_path, monkeypatch)
+        assert guard_module._live_integration_active(str(tmp_path / "missing")) is True
+
+
 # ── Change 1 + 3: worktree-aware merge-into-main ─────────────────────────
 
 
@@ -195,6 +226,111 @@ class TestMergeIntoMainWorktreeAware:
         self._prep(guard_module, monkeypatch, "git merge upstream/feat", cwd=None)
         assert guard_module.main() == 2
         assert "Merging into main" in capsys.readouterr().err
+
+    def test_merge_on_live_blocked(self, guard_module, monkeypatch, capsys):
+        # `live` is rebuilt by `git commit-tree`, never merged into. The message
+        # names the branch that fired, not main.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: True)
+        self._prep(guard_module, monkeypatch, "git merge origin/main", cwd=None)
+        assert guard_module.main() == 2
+        err = capsys.readouterr().err
+        assert "Merging into 'live'" in err
+        assert "Merging into main" not in err
+
+    def test_merge_on_main_message_does_not_mention_live(self, guard_module, monkeypatch, capsys):
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "main")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: True)
+        self._prep(guard_module, monkeypatch, "git merge upstream/feat", cwd=None)
+        assert guard_module.main() == 2
+        assert "'live'" not in capsys.readouterr().err
+
+    def test_main_override_does_not_waive_a_merge_on_live(self, guard_module, monkeypatch, capsys):
+        # The sigil acknowledges a merge into MAIN. The git hooks refuse a merge on
+        # `live` with no override, and a fast-forward reaches no git hook at all,
+        # so this guard is the only thing that sees it.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: True)
+        self._prep(
+            guard_module,
+            monkeypatch,
+            "git merge --ff-only feature  # merge-to-main-override",
+            cwd=None,
+        )
+        assert guard_module.main() == 2
+        assert "Merging into 'live'" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "GIT_DIR=/r/.git git merge --ff-only feature  # merge-to-main-override",
+            "git --git-dir=/r/.git merge feature  # merge-to-main-override",
+            'cd "$X" && git merge feature  # merge-to-main-override',
+            "export GIT_DIR=/r/.git; git merge feature  # merge-to-main-override",
+            'bash -c "git merge feature  # merge-to-main-override"',
+        ],
+    )
+    def test_main_override_cannot_pass_an_unresolvable_merge_where_live_exists(
+        self, guard_module, monkeypatch, capsys, cmd
+    ):
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_manifest_present", lambda: True)
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: True)
+        self._prep(guard_module, monkeypatch, cmd, cwd="/wt")
+        assert guard_module.main() == 2
+        assert "cannot tell which branch" in capsys.readouterr().err
+
+    def test_main_override_on_an_unresolvable_merge_without_a_manifest_is_allowed(
+        self, guard_module, monkeypatch
+    ):
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "main")
+        monkeypatch.setattr(guard_module, "_live_manifest_present", lambda: False)
+        self._prep(
+            guard_module,
+            monkeypatch,
+            "GIT_DIR=/r/.git git merge feature  # merge-to-main-override",
+            cwd="/wt",
+        )
+        assert guard_module.main() == 0
+
+    def test_live_check_receives_the_directory_the_merge_runs_in(
+        self, guard_module, monkeypatch
+    ):
+        seen = []
+
+        def _active(cwd):
+            seen.append(cwd)
+            return True
+
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", _active)
+        self._prep(guard_module, monkeypatch, "git -C /other merge feature", cwd="/wt")
+        assert guard_module.main() == 2
+        assert seen == ["/other"]
+
+    def test_main_override_on_a_live_branch_without_a_manifest_is_allowed(
+        self, guard_module, monkeypatch
+    ):
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: False)
+        self._prep(
+            guard_module, monkeypatch, "git merge feature  # merge-to-main-override", cwd=None
+        )
+        assert guard_module.main() == 0
+
+    def test_merge_on_live_without_a_manifest_is_allowed(self, guard_module, monkeypatch):
+        # No deploy manifest = no integration branch: `live` is just a name.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: False)
+        self._prep(guard_module, monkeypatch, "git merge origin/main", cwd=None)
+        assert guard_module.main() == 0
+
+    def test_merge_on_a_branch_merely_named_like_live_is_allowed(self, guard_module, monkeypatch):
+        # Exact-name match: `live-fixes` is an ordinary feature branch.
+        monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "live-fixes")
+        monkeypatch.setattr(guard_module, "_live_integration_active", lambda *a: True)
+        self._prep(guard_module, monkeypatch, "git merge origin/main", cwd=None)
+        assert guard_module.main() == 0
 
     def test_merge_on_main_with_override_allowed(self, guard_module, monkeypatch):
         monkeypatch.setattr(guard_module, "_current_branch", lambda cwd=None: "main")

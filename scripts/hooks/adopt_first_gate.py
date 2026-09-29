@@ -82,7 +82,7 @@ _GIT_ENV = {
 #: the trigger is every source extension, not only .py — a plan that adds a
 #: dashboard module is exactly the "new capability" this question is for.
 _SOURCE_PATH = re.compile(
-    r"\bsrc/[\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|html|css|sh)\b"
+    r"(?<![\w./-])(?:\./)?src/[\w./-]+\.(?:pyi|py|jsx|js|tsx|ts|mjs|cjs|html|css|sh)\b"
 )
 
 #: The verdict header, tolerant of the spellings a writer will actually use:
@@ -115,8 +115,9 @@ _VERDICT_TOKEN = re.compile(r"\b(ADOPT|ADAPT|BUILD|WATCH|IGNORE)\b", re.IGNORECA
 #: not exist yet but adds no capability — the plan names both endpoints and the
 #: verb joining them is the tell.
 _RENAME = re.compile(
-    r"\b(?:rename|moves?|relocat\w*)\b[\s\S]{0,80}?(\S+)[\s\S]{0,40}?"
-    r"\b(?:to|into|as)\b[\s\S]{0,40}?(\S+)",
+    r"\b(?:rename|moves?|relocat\w*)\b[\s\S]{0,80}?"
+    r"(?<![\w./-])(src/[\w./-]+\.(?:pyi|py|jsx|js|tsx|ts|mjs|cjs|html|css|sh))\b"
+    r"[\s\S]{0,40}?\b(?:to|into|as)\b[\s\S]{0,40}?(\S+)",
     re.IGNORECASE,
 )
 
@@ -395,7 +396,7 @@ def _check_plan(payload: dict) -> int:
     # source to the candidate, exclude it.
     for rm in _RENAME.finditer(live):
         if rm.group(1).strip("'`") in existing:
-            renamed = rm.group(2).strip("'`.,;:")
+            renamed = rm.group(2).strip("'`.,;:\"")
             sources = [s for s in sources if s != renamed and not renamed.endswith("/" + s)]
     if not sources:
         return 0

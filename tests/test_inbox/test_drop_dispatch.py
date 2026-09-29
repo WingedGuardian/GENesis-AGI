@@ -85,9 +85,13 @@ def mock_session_manager():
 
 
 def _monitor(db, inbox_dir, invoker, sm, tmp_path, *, items_per_eval=3):
+    # Dispatch/batching mechanics are under test here, with fixture responses
+    # that deliberately do not quote their URLs — so pin the coverage gate to
+    # shadow now that enforce is the default. The gate itself is pinned in
+    # test_url_failures.py and by the enforce-path tests at the end of this file.
     cfg = InboxConfig(
         watch_path=inbox_dir, items_per_eval=items_per_eval,
-        evaluation_cooldown_seconds=0,
+        evaluation_cooldown_seconds=0, url_coverage_mode="shadow",
     )
     return InboxMonitor(
         db=db, invoker=invoker, session_manager=sm, config=cfg,
@@ -190,6 +194,7 @@ async def test_retry_is_cooldown_exempt(
     (which throttles re-evals of edited files) must not defer it."""
     cfg = InboxConfig(
         watch_path=inbox_dir, items_per_eval=3, evaluation_cooldown_seconds=3600,
+        url_coverage_mode="shadow",
     )
     mon = InboxMonitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
@@ -1271,3 +1276,605 @@ async def test_build_verdict_flows_through_monitor_to_greenlight(
     assert row["approval_request_id"] == "req-1"
     gate.ensure_approval.assert_awaited_once()
     assert gate.ensure_approval.await_args.kwargs["action_type"] == "build_greenlight"
+
+
+# ── Parking is visible (975ca61b precondition) + #1952 + #1766 inbox leg ────
+
+
+def _queued_alerts():
+    from genesis.env import alert_queue_root
+    from genesis.guardian.alert.queue import list_queued
+
+    return [entry for _path, entry in list_queued(alert_queue_root())]
+
+
+def _monitor_retries(db, inbox_dir, invoker, sm, *, max_retries):
+    cfg = InboxConfig(
+        watch_path=inbox_dir, items_per_eval=1, evaluation_cooldown_seconds=0,
+        max_retries=max_retries,
+    )
+    return InboxMonitor(
+        db=db, invoker=invoker, session_manager=sm, config=cfg,
+        writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
+        clock=_FakeClock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_lane_storm_parks_the_file_and_alerts(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """#1952: the retry-lane storm site only logged and `continue`d, so the file
+    stayed a retry candidate and was re-checked and re-skipped EVERY scan. It
+    must park like the other two sites — and tell the owner."""
+    from datetime import UTC, datetime
+
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()
+    await inbox_items.create(
+        db, id="done", file_path=str(fp), content_hash=h, status="completed",
+        created_at=recent,
+    )
+    for i in range(3):  # persistent (retry-exhausted, opaque) failures
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h,
+            status="failed", created_at=recent,
+            error_message="partial_url_failure", retry_count=3,
+        )
+    # ...plus one still-RETRIABLE row, which is what makes the file a retry
+    # candidate at all (a file whose rows are all at the cap never is).
+    await inbox_items.create(
+        db, id="live", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="partial_url_failure", retry_count=1,
+    )
+    assert str(fp) in await inbox_items.get_retriable_failure_files(db, max_retries=3)
+
+    await mon.check_once()
+
+    assert mock_invoker.run.call_count == 0
+    assert str(fp) not in await inbox_items.get_retriable_failure_files(
+        db, max_retries=3,
+    ), "a storm-parked file must stop being a retry candidate"
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "Genesis.md" in alerts[0]["title"] + alerts[0]["body"]
+
+    await mon.check_once()  # next scan: parked, not re-checked, no duplicate alert
+    assert mock_invoker.run.call_count == 0
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_modified_path_storm_alerts_the_owner(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    from datetime import UTC, datetime
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    recent = datetime.now(UTC).isoformat()
+    for i in range(3):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash="oldhash",
+            status="failed", created_at=recent,
+            error_message="partial_url_failure", retry_count=3,
+        )
+    await mon.check_once()
+    assert mock_invoker.run.call_count == 0
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1 and "Genesis.md" in alerts[0]["title"] + alerts[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_item_that_exhausts_its_retries_alerts_the_owner(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Retry exhaustion used to notify nobody: under enforce, an evaluation that
+    never quotes its URL would park after max_retries in total silence."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert [tuple(r) for r in rows] == [("failed", 1)]
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "Genesis.md" in alerts[0]["title"] + alerts[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_first_failure_below_the_cap_does_not_alert(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Negative control: a retriable failure is not a parked one."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=3)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    assert [a for a in _queued_alerts() if a.get("source") == "inbox"] == []
+
+
+@pytest.mark.asyncio
+async def test_network_offline_does_not_burn_a_retry(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """#1766 (inbox leg): an outage is not the item's failure. It must leave the
+    retry budget untouched, or a ~90-minute outage parks in-flight items."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert len(rows) == 1 and rows[0]["retry_count"] == 0, [dict(r) for r in rows]
+    assert str(inbox_dir / "Genesis.md") in await inbox_items.get_retriable_failure_files(
+        db, max_retries=1,
+    ), "the item must stay retriable after an outage"
+    assert [a for a in _queued_alerts() if a.get("source") == "inbox"] == []
+
+
+@pytest.mark.asyncio
+async def test_retry_lane_park_spares_non_url_failures(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """Review S1: the storm park must abandon only the URL-failure rows. A
+    retriable failure of a different kind (a crashed CC call) in the same file is
+    not part of the storm and must stay retriable."""
+    from datetime import UTC, datetime
+
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()
+    await inbox_items.create(db, id="done", file_path=str(fp), content_hash=h,
+                             status="completed", created_at=recent)
+    for i in range(3):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h, status="failed",
+            created_at=recent, error_message="partial_url_failure", retry_count=3,
+        )
+    await inbox_items.create(
+        db, id="urlfail", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="partial_url_failure", retry_count=1,
+    )
+    await inbox_items.create(
+        db, id="crash", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="CC invocation failed: boom", retry_count=1,
+    )
+    await mon.check_once()
+    rows = {r["id"]: r["error_message"] for r in await (await db.execute(
+        "SELECT id, error_message FROM inbox_items")).fetchall()}
+    assert rows["urlfail"].startswith("approval_invalidated:")
+    assert not rows["crash"].startswith("approval_invalidated:"), rows["crash"]
+
+
+@pytest.mark.asyncio
+async def test_every_parked_item_in_one_file_is_named_in_one_alert(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Review S2+S3: N items exhausting in one scan produced ONE alert naming
+    none of them (per-file dedupe key hid items 2..N). One alert per file per
+    scan must name every parked item, with query strings redacted."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://example.com/first-item?token=SECRETQ\n\n"
+        "https://example.com/second-item\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    text = alerts[0]["title"] + alerts[0]["body"]
+    assert "example.com/first-item" in text and "example.com/second-item" in text
+    assert "SECRETQ" not in text
+    assert "2" in alerts[0]["title"]
+
+
+@pytest.mark.asyncio
+async def test_a_later_scan_parking_another_item_alerts_again(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Review S2: a second item parked in a later scan must not be swallowed by
+    the first alert's dedupe key."""
+    mock_invoker.run.return_value = _ok(
+        "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+    )
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://example.com/first-item\n")
+    await mon.check_once()
+    f.write_text("https://example.com/first-item\n\nhttps://example.com/second-item\n")
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 2, alerts
+    assert "second-item" in alerts[1]["title"] + alerts[1]["body"]
+
+
+# ── Review round 1 on #2447: alert identity ──────────────────────────────────
+
+_UNCOVERED = "# Inbox Evaluation\n\nA thorough answer about something else. " + "x" * 300
+
+
+def _monitor_cfg(db, inbox_dir, invoker, sm, **overrides):
+    cfg = InboxConfig(
+        watch_path=inbox_dir, evaluation_cooldown_seconds=0,
+        **{"items_per_eval": 1, "max_retries": 1, **overrides},
+    )
+    return InboxMonitor(
+        db=db, invoker=invoker, session_manager=sm, config=cfg,
+        writer=ResponseWriter(watch_path=inbox_dir, timezone="UTC"),
+        clock=_FakeClock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_items_sharing_a_redacted_label_are_counted_separately(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Codex + Devin: two presigned links to one path differ only in the query,
+    which the label drops. Deduplicating on the label reported one item where
+    two had stopped."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://example.com/watch?v=AAAA\n\nhttps://example.com/watch?v=BBBB\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    body = alerts[0]["body"]
+    assert body.count("example.com/watch") == 2, body
+    assert "AAAA" not in body and "BBBB" not in body
+
+
+@pytest.mark.asyncio
+async def test_every_url_of_a_multi_item_batch_is_named(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Codex: with items_per_eval > 1 one exhausted batch holds several items,
+    and only the first URL was named."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       items_per_eval=2)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://example.com/first-item\n\nhttps://example.com/second-item\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    text = alerts[0]["body"]
+    assert "example.com/first-item" in text and "example.com/second-item" in text
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    assert text.count("(url#") == 2, text
+
+
+@pytest.mark.asyncio
+async def test_opaque_path_segments_are_masked_in_the_alert(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Devin: a share link can carry its token in the PATH, not the query."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://files.example.com/s/a8F3kLm29QzX7pRtW4/quarterly-report\n\n"
+        "https://share.example.com/f/Xy7_Kp2-Qw9_Rt4-Zm1_Bn8/2026-09-26-notes\n\n"
+        "https://api.example.com/k/ghp_AbCdEfGhIjKlMnOpQr/view\n"
+    )
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    text = alerts[0]["title"] + alerts[0]["body"]
+    assert "a8F3kLm29QzX7pRtW4" not in text and "Xy7_Kp2" not in text
+    assert "AbCdEfGhIjKlMnOpQr" not in text
+    assert "- files.example.com/s/…/quarterly-report (url#" in text, text
+    assert "2026-09-26-notes" in text  # a dated slug is readable, not a token
+
+
+@pytest.mark.asyncio
+async def test_same_named_files_in_different_folders_are_told_apart(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Codex: under recursive scanning the alert showed only the basename, so
+    two Genesis.md files in different folders read the same."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       recursive=True)
+    for sub in ("alpha", "beta"):
+        (inbox_dir / sub).mkdir()
+        (inbox_dir / sub / "Genesis.md").write_text(f"https://example.com/{sub}-item\n")
+    await mon.check_once()
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    titles = sorted(a["title"] for a in alerts)
+    assert len(titles) == 2, alerts
+    assert "alpha/Genesis.md" in titles[0] and "beta/Genesis.md" in titles[1], titles
+
+
+@pytest.mark.asyncio
+async def test_offline_failure_survives_a_failed_row_read(
+    db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch,
+):
+    """CodeRabbit: the offline branch read the row before failing it. If that
+    read raised, the row stayed `processing` until the stuck-row sweep, and a
+    missing row would have written retry_count 0 over a real count."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       max_retries=3)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()  # an ordinary failure: retry_count 1
+    rows = await (await db.execute("SELECT retry_count FROM inbox_items")).fetchall()
+    assert [r["retry_count"] for r in rows] == [1]
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("db read failed")
+
+    monkeypatch.setattr(inbox_items, "get_by_id", _boom)
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    await mon.check_once()  # the retry lane re-dispatches; the network is down
+    rows = await (await db.execute(
+        "SELECT status, retry_count, error_message FROM inbox_items")).fetchall()
+    assert [(r["status"], r["retry_count"]) for r in rows] == [("failed", 1)]
+    assert mock_invoker.run.await_count == 2, "the retry must actually have run"
+    assert rows[0]["error_message"].startswith("CC invocation deferred"), rows[0]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_ended_approval_is_asked_again_when_a_sibling_holds_the_hash(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """Internal review of #2447: an approval that ended left its row
+    ``approval_invalidated:``, which the retry lane never retries. When a
+    completed sibling holds the file's current hash, detection never re-surfaces
+    the file either, so the item was stranded silently. An ended approval must
+    leave the row retriable, so the SAME row is asked about again."""
+    from tests.test_inbox.test_monitor import (
+        _error_output,
+        _make_wired_dispatcher,
+        _success_output,
+    )
+
+    good = (
+        "# Inbox Evaluation\n## A\n**Source:** https://a.example.com/alpha\n\n"
+        + "An evaluation body. " * 30
+    )
+
+    async def _run(inv):
+        if "https://b.example.com/beta" in inv.prompt:
+            return _error_output("boom")
+        return _success_output(good)
+
+    mock_invoker.run.side_effect = _run
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager, max_retries=3)
+    (inbox_dir / "Genesis.md").write_text(
+        "https://a.example.com/alpha\n\nhttps://b.example.com/beta\n"
+    )
+    await mon.check_once()  # no gate: alpha completes, beta fails (retry 1)
+
+    approvals = {"req-1": {"id": "req-1", "status": "pending"}}
+    from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
+
+    disp = _make_wired_dispatcher(
+        decision=AutonomousDispatchDecision(
+            mode="blocked", reason="approval requested", approval_request_id="req-1",
+        ),
+        approval_by_id=approvals,
+    )
+    mon._autonomous_dispatcher = disp
+    await mon.check_once()  # the retry lane parks beta on approval req-1
+    parked = await (await db.execute(
+        "SELECT id, retry_count FROM inbox_items WHERE error_message LIKE 'awaiting_approval:%'"
+    )).fetchall()
+    assert len(parked) == 1, "fixture: beta must be parked awaiting approval"
+    beta_id, beta_retries = parked[0]["id"], parked[0]["retry_count"]
+    asked = disp.route.await_count
+
+    approvals["req-1"]["status"] = "expired"
+    disp.route.return_value = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-2",
+    )
+    await mon.check_once()  # the approval ended
+    await mon.check_once()  # ...and the item must be asked about again
+
+    assert disp.route.await_count > asked, "the item was stranded, never re-asked"
+    rows = {r["id"]: dict(r) for r in await (await db.execute(
+        "SELECT id, status, retry_count, error_message FROM inbox_items")).fetchall()}
+    assert len(rows) == 2, rows  # the same row is reused, never duplicated
+    assert rows[beta_id]["retry_count"] == beta_retries, rows[beta_id]
+    assert rows[beta_id]["error_message"] == "awaiting_approval:req-2", rows[beta_id]
+
+
+@pytest.mark.asyncio
+async def test_retry_lane_storm_alert_does_not_repeat_every_scan(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    """Internal review of #2447: with a non-URL retriable row left behind, the
+    storm guard trips again on every scan. The alert must go out when URL
+    retries are actually parked, not again on each scan after the queue drains."""
+    from datetime import UTC, datetime
+
+    from genesis.env import alert_queue_root
+    from genesis.guardian.alert.queue import list_queued
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    fp = inbox_dir / "Genesis.md"
+    fp.write_text(_urls(2))
+    h = compute_hash(fp)
+    recent = datetime.now(UTC).isoformat()
+    await inbox_items.create(db, id="done", file_path=str(fp), content_hash=h,
+                             status="completed", created_at=recent)
+    for i in range(3):
+        await inbox_items.create(
+            db, id=f"puf{i}", file_path=str(fp), content_hash=h, status="failed",
+            created_at=recent, error_message="partial_url_failure", retry_count=3,
+        )
+    await inbox_items.create(
+        db, id="urlfail", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="partial_url_failure", retry_count=1,
+    )
+    await inbox_items.create(
+        db, id="crash", file_path=str(fp), content_hash=h, status="failed",
+        created_at=recent, error_message="CC invocation failed: boom", retry_count=1,
+    )
+    per_scan = []
+    for _ in range(3):
+        await mon.check_once()
+        queued = [(p, e) for p, e in list_queued(alert_queue_root())
+                  if e.get("source") == "inbox"]
+        per_scan.append(len(queued))
+        for p, _e in queued:  # the awareness tick drains the queue between scans
+            p.unlink()
+    assert per_scan == [1, 0, 0], per_scan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "must_show"),
+    [
+        # Two URL-free notes batched together: the flattened text named only
+        # the first note's first line.
+        ("Look into the new retrieval paper\n\nCompare our reranker to theirs\n",
+         ["Look into the new retrieval paper", "Compare our reranker to theirs"]),
+        # Two annotated items sharing one URL: URL extraction deduplicated them.
+        ("https://example.com/shared-post why it matters for memory\n\n"
+         "https://example.com/shared-post the pricing section\n",
+         ["example.com/shared-post", "example.com/shared-post"]),
+    ],
+)
+async def test_every_logical_item_of_a_batch_gets_its_own_line(
+    db, inbox_dir, mock_invoker, mock_session_manager, content, must_show,
+):
+    """Codex (#2447 round 2): labels were derived from the flattened batch text,
+    so a batch of URL-free notes, or of annotated items sharing a URL,
+    reported fewer items than stopped."""
+    from tests.test_inbox.test_monitor import _error_output
+
+    mock_invoker.run.return_value = _error_output("boom")
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       items_per_eval=2)
+    (inbox_dir / "Genesis.md").write_text(content)
+    await mon.check_once()
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items")).fetchall()
+    assert [(r["status"], r["retry_count"]) for r in rows] == [("failed", 1)], (
+        "fixture: both items must sit in ONE exhausted row"
+    )
+    alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
+    assert len(alerts) == 1, alerts
+    assert "2 item" in alerts[0]["title"], alerts[0]["title"]
+    body = alerts[0]["body"]
+    lines = [ln for ln in body.splitlines() if ln.startswith("- ")]
+    assert len(lines) == 2, body
+    for expected, line in zip(must_show, lines, strict=True):
+        assert expected in line, (expected, line)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_alert_enqueue_logs_what_stopped(
+    db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch, caplog,
+):
+    """#2447 class audit: the park buffer is cleared before the enqueue, and a
+    row at the cap is never re-dispatched, so if the enqueue fails the log line
+    is the only record of what stopped. It must name the items."""
+    import genesis.guardian.alert.queue as alert_queue
+
+    def _lost(*_a, **_k):
+        # The real contract: enqueue_alert never raises; a failed write
+        # returns False (Codex, #2447 round 3).
+        return False
+
+    monkeypatch.setattr(alert_queue, "enqueue_alert", _lost)
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/lost-item-7c1\n")
+    with caplog.at_level("ERROR"):
+        await mon.check_once()
+    errors = [r for r in caplog.records if r.levelname == "ERROR"
+              and "parked-alert enqueue failed" in r.getMessage()]
+    assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+    assert "example.com/lost-item-7c1" in errors[0].getMessage()
+    assert "Genesis.md" in errors[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_deduplicated_alert_is_not_logged_as_lost(
+    db, inbox_dir, mock_invoker, mock_session_manager, caplog,
+):
+    """Negative control: False also means "already queued under this key", which
+    is not a loss and must not be reported as one."""
+    mock_invoker.run.return_value = _ok(_UNCOVERED)
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/dup-item-4d2\n")
+    await mon.check_once()
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+    key = next(a for a in _queued_alerts() if a.get("source") == "inbox")["dedupe_key"]
+    # Re-flush the same parked set: the live entry dedupes it.
+    mon._park_buffer = {}
+    row = (await (await db.execute("SELECT id FROM inbox_items")).fetchone())["id"]
+    mon._alert_parked(
+        str(inbox_dir / "Genesis.md"), reason="retries_exhausted", detail="d",
+        item_id=row, labels=["x"],
+    )
+    with caplog.at_level("ERROR"):
+        mon._flush_park_alerts()
+    assert len([a for a in _queued_alerts() if a.get("source") == "inbox"]) == 1
+    assert not [r for r in caplog.records if "enqueue failed" in r.getMessage()], key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_retries", [1, 3])
+async def test_offline_failure_keeps_a_row_below_a_lowered_cap(
+    db, inbox_dir, mock_invoker, mock_session_manager, max_retries,
+):
+    """#2447 review: a row whose count dates from an older, higher cap must stay
+    retriable when an outage fails it, including at max_retries=1 (count 0)."""
+    from genesis.cc.exceptions import CCNetworkOfflineError
+    from genesis.inbox.types import InboxItem
+
+    mock_invoker.run.side_effect = CCNetworkOfflineError("offline")
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager,
+                       max_retries=max_retries)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://example.com/old-cap-item\n")
+    await inbox_items.create(
+        db, id="old", file_path=str(f), content_hash="h", status="processing",
+        created_at="2026-09-01T00:00:00+00:00", retry_count=max_retries + 2,
+    )
+    item = InboxItem(
+        id="old", file_path=str(f), content="https://example.com/old-cap-item",
+        content_hash="h", detected_at="2026-09-01T00:00:00+00:00",
+    )
+    await mon._run_one_batch(
+        item, model="sonnet", effort="high", system_prompt="",
+        now_iso="2026-09-01T00:00:00+00:00", errors=[],
+    )
+    row = await inbox_items.get_by_id(db, "old")
+    assert row["status"] == "failed", row
+    assert row["retry_count"] == max_retries - 1, row

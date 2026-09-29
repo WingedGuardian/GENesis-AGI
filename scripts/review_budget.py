@@ -123,6 +123,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_enforcement_commit.py",
         "scripts/review_enforcement_prompt.py",
         "scripts/review_invalidate_on_commit.py",
+        "scripts/surface_handoffs.py",
         "scripts/surface_open_prs.py",
         "scripts/surface_pr_updates.py",
         "config/protected_paths.yaml",

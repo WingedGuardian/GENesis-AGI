@@ -15,7 +15,7 @@ from qdrant_client import QdrantClient
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
-from genesis.db.crud._fts import fts5_term
+from genesis.db.crud._fts import drop_bm25_inert_terms, fts5_term
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
@@ -765,8 +765,17 @@ class HybridRetriever:
         rerank_timeout_s: float | None = None,
         stats: dict | None = None,
         defer_side_effects: bool = False,
+        trace: dict | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
+
+        ``trace``: optional caller-owned sink for the per-recall retrieval trace
+        (``genesis.memory.recall_trace``). Only REFERENCES and one dict copy are
+        dropped into it on this path (the ranked lane lists, the pre-rerank fused
+        scores, raw reranker scores, the final results); the per-candidate record
+        is assembled off-path by the caller. ``trace["trace_id"]`` (if set) is
+        stamped onto the ``recall_fired`` event as the join key. ``None`` (every
+        caller but the proactive endpoint) is a byte-for-byte no-op.
 
         ``rerank_timeout_s``: optional wall-clock bound on the cross-encoder
         rerank stage ONLY (latency-budgeted callers, e.g. the per-prompt
@@ -882,7 +891,7 @@ class HybridRetriever:
         # 2c. Expand query via tag co-occurrence (SWR — stale index rebuilds in
         # the background, never inline on this path; see intent.expand_query)
         _ts = time.monotonic()
-        fts_query = await self._expand_fts_query(
+        fts_query, fts_fallback_query = await self._expand_fts_query(
             query,
             collections,
             expand_query_terms=expand_query_terms,
@@ -893,17 +902,37 @@ class HybridRetriever:
 
         # 3. FTS5 text search (using expanded query)
         _ts = time.monotonic()
+        _fts_info: dict = {}
         fts_results, fts_by_id = await self._gather_fts_candidates(
             query=query,
             fts_query=fts_query,
+            fallback_query=fts_fallback_query,
             collections=collections,
             candidate_limit=candidate_limit,
             exclude_subsystems=exclude_subsystems,
             include_only_subsystems=include_only_subsystems,
             include_deprecated=include_deprecated,
+            info=_fts_info,
         )
         if stats is not None:
             stats["fts_ms"] = round((time.monotonic() - _ts) * 1000, 1)
+        if trace is not None:
+            # Set BEFORE the zero-hit early return below, so a completed recall
+            # with no candidates is distinguishable from a partial trace.
+            trace["recall_limit"] = limit
+            trace["embedding_available"] = embedding_available
+            # True when tag expansion AND/OR the file-keyword lane rewrote the
+            # FTS expression — deliberately not called 'expanded'.
+            trace["fts_query_rewritten"] = fts_query != query
+            # ONLY the inert-file-term fallback (``_gather_fts_candidates``).
+            # search_ranked's own AND->OR retry and bare-term syntax retry are
+            # not surfaced here, so the name says which fallback this is.
+            trace["file_lane_fallback_used"] = bool(_fts_info.get("fallback_used"))
+            trace["lane_hits"] = {
+                "vector": len(qdrant_by_id),
+                "fts": len(fts_by_id),
+                "event": len(event_memory_ids),
+            }
 
         # 4. Union of all candidate memory_ids
         all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
@@ -947,6 +976,8 @@ class HybridRetriever:
                 _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow")
             else:
                 await _zero_hit_shadow
+            if trace is not None:
+                trace["zero_hit"] = True
             return []
 
         now_str = datetime.now(UTC).isoformat()
@@ -995,6 +1026,17 @@ class HybridRetriever:
         if event_memory_ids:
             ranked_lists.append(event_memory_ids)
         fused = _rrf_fuse(ranked_lists)
+        if trace is not None:
+            # References only (these lists are not mutated below) + ONE copy of
+            # ``fused``, which rerank may replace and graph boost mutates.
+            trace["lanes"] = {
+                "vector": vector_ranked_dedup,
+                "fts": fts_ranked,
+                "event": event_memory_ids,
+                "activation": activation_ranked,
+                "intent": intent_ranked or [],
+            }
+            trace["fused"] = dict(fused)
 
         # 7.5 Cross-encoder reranking (optional, off by default) — the ONLY
         # post-fusion point where ``fused`` is reassigned rather than mutated.
@@ -1007,6 +1049,7 @@ class HybridRetriever:
             rerank=rerank,
             timeout_s=rerank_timeout_s,
             stats=stats,
+            trace=trace,
         )
 
         # 7b. Graph boost: backlink + adjacency (floor-gated); mutates
@@ -1028,6 +1071,8 @@ class HybridRetriever:
         # ``fused`` in place, and J-9 must log retrieval QUALITY, not the
         # halved dedup artifact. ``fused`` (penalized) still drives ordering.
         raw_fused = dict(fused)
+        if trace is not None:
+            trace["post_rerank"] = raw_fused  # a copy already; read-only below
         candidates = _apply_diversity_penalty(
             candidates,
             fused,
@@ -1097,6 +1142,8 @@ class HybridRetriever:
 
         if stats is not None:
             stats["assembly_ms"] = round((time.monotonic() - _ts_asm) * 1000, 1)
+        if trace is not None:
+            trace["results"] = [(r.memory_id, r.retrieval_score, r.score) for r in results]
 
         # 11/11b/11c. Retrieval write-backs (Qdrant counts, observation +
         # knowledge_units sync) — each individually swallowed. Runs AFTER
@@ -1168,6 +1215,7 @@ class HybridRetriever:
                 entrenchment_corr=_entrenchment,
                 mean_retrieved_count=_mean_retrieved,
                 mean_age_days=_mean_age_days,
+                trace_id=trace.get("trace_id") if trace is not None else None,
             )
 
             # MEM-003: hand the emitted event id back to an MCP caller so it can
@@ -1358,7 +1406,7 @@ class HybridRetriever:
         *,
         expand_query_terms: bool,
         extra_fts_terms: list[str] | None = None,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         """Stage 2c: expand the FTS query via tag co-occurrence (degrades to
         the original query on failure).
 
@@ -1390,12 +1438,34 @@ class HybridRetriever:
                 )
             except Exception:
                 logger.warning("Query expansion failed, using original", exc_info=True)
+        fallback: str | None = None
         if extra_fts_terms:
             safe_terms = [t for t in (fts5_term(t) for t in extra_fts_terms) if t]
-            extra = " OR ".join(safe_terms)
-            if extra:
-                fts_query = f"({fts_query}) OR ({extra})"
-        return fts_query
+            # This lane is a TOP-LEVEL disjunction, so terms FTS5's bm25 treats
+            # as inert (in >= half the rows — e.g. ``genesis``/``memory`` from a
+            # src/genesis/memory/... path, which every row carries as a tag) are
+            # dropped: they add only ~0-scored rows but force FTS5 to score the
+            # whole corpus. That is rank-neutral only while the selective part
+            # FILLS the candidate window — RRF consumes positions, not bm25
+            # magnitude, so in an underfilled window the inert term's rows were
+            # the remaining candidates. So the unpruned expression is returned as
+            # ``fallback`` and ``_gather_fts_candidates`` runs it when the pruned
+            # query comes back short. MEASURED on a 100k-row copy over 150 real
+            # recent queries with a 4-term file lane: FTS stage p50 456→115ms,
+            # p95 1291→614ms; top-48 set identical on 144/150, every difference a
+            # near-tie swap at ranks 44–48. See ``_fts.drop_bm25_inert_terms``.
+            kept = await self._ro_read(drop_bm25_inert_terms, safe_terms) if safe_terms else []
+            base = fts_query
+            if kept:
+                fts_query = f"({base}) OR ({' OR '.join(kept)})"
+            elif safe_terms:
+                # Whole lane inert: keep the base PARENTHESISED so it stays on the
+                # same boolean path the unpruned ``(base) OR (…)`` took, instead of
+                # silently entering the non-boolean AND→OR-retry path.
+                fts_query = f"({base})"
+            if len(kept) != len(safe_terms):
+                fallback = f"({base}) OR ({' OR '.join(safe_terms)})"
+        return fts_query, fallback
 
     async def _gather_fts_candidates(
         self,
@@ -1407,6 +1477,8 @@ class HybridRetriever:
         exclude_subsystems: list[str] | None,
         include_only_subsystems: list[str] | None,
         include_deprecated: bool,
+        fallback_query: str | None = None,
+        info: dict | None = None,
     ) -> tuple[list[dict], dict[str, dict]]:
         """Stage 3: FTS5 text search using the expanded query.
 
@@ -1417,20 +1489,34 @@ class HybridRetriever:
         filter at the SQL level so the candidate set matches Qdrant's
         filtered search and RRF fuses comparable lists.
 
+        ``fallback_query`` (set only when inert file terms were pruned — see
+        ``_expand_fts_query``) is the unpruned expression; it runs only when the
+        pruned query returns fewer than ``candidate_limit`` rows, so the cheap
+        query answers whenever it fills the window and the original behaviour
+        is kept exactly when it does not.
+
         Returns ``(fts_results, fts_by_id)``.
         """
         fts_is_boolean = fts_query != query  # expansion produced boolean syntax
         fts_collection = collections[0] if len(collections) == 1 else None
-        fts_results = await self._ro_read(
-            memory_crud.search_ranked,
-            query=fts_query,
-            collection=fts_collection,
-            limit=candidate_limit,
-            boolean=fts_is_boolean,
-            exclude_subsystems=exclude_subsystems,
-            include_only_subsystems=include_only_subsystems,
-            include_deprecated=include_deprecated,
-        )
+
+        async def _search(q: str, boolean: bool) -> list[dict]:
+            return await self._ro_read(
+                memory_crud.search_ranked,
+                query=q,
+                collection=fts_collection,
+                limit=candidate_limit,
+                boolean=boolean,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
+                include_deprecated=include_deprecated,
+            )
+
+        fts_results = await _search(fts_query, fts_is_boolean)
+        if fallback_query is not None and len(fts_results) < candidate_limit:
+            fts_results = await _search(fallback_query, True)
+            if info is not None:
+                info["fallback_used"] = True
 
         fts_by_id: dict[str, dict] = {}
         for row in fts_results:
@@ -1578,6 +1664,7 @@ class HybridRetriever:
         rerank: bool,
         timeout_s: float | None = None,
         stats: dict | None = None,
+        trace: dict | None = None,
     ) -> dict[str, float]:
         """Stage 7.5: cross-encoder reranking (optional, off by default).
 
@@ -1670,6 +1757,10 @@ class HybridRetriever:
                         self._rerank_breaker.record_success()
                     if stats is not None:
                         stats["rerank_executed"] = True
+                    if trace is not None:
+                        # The reranker's own relevance scores — the positional
+                        # rewrite below discards them.
+                        trace["rerank"] = {item["id"]: item.get("score") for item in reranked}
                     # Rebuild fused with only reranked candidates, using
                     # positional scores so graph boost floor-gating works.
                     fused = {item["id"]: 1.0 / (1 + rank) for rank, item in enumerate(reranked)}

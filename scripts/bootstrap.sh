@@ -45,7 +45,10 @@ if [ -f "$UPDATE_STATE" ]; then
     STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
     STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
 
-    # Check if the update process is still alive
+    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
+    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
+    # zombie or reused pid: the "dead" branch below resets the tree, so here a
+    # stale holder must err toward "still running", never toward the reset.
     if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
         echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
     elif [ "$STATE_PHASE" = "done" ]; then
@@ -330,15 +333,14 @@ if [ -f "$_cc_env" ]; then
     # not swallow the suppression outcome — this was the one caller with no
     # signal at all: `|| true` discarded the return code AND nothing read the
     # state, so bootstrap completed cleanly over a failed suppression check.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "  WARNING: CC auto-updater suppression not verified" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
-                 "the pin; the daily genesis-cc-settings-align timer will retry" \
-                 "and its unit goes red if it cannot"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list of
+    # good states: a reader that did not know a new state would warn falsely.
+    if ! cc_suppression_verified; then
+        echo "  WARNING: CC auto-updater suppression not verified" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+             "the pin; the daily genesis-cc-settings-align timer will retry" \
+             "and its unit goes red if it cannot"
+    fi
     cc_shadow_scan || true
 fi
 
@@ -737,7 +739,7 @@ else
 fi
 if [[ -n "$HOOKS_DST" ]]; then
     # Phase 6: prefer sync-hooks.sh if available — it handles the
-    # full set (pre-commit, pre-push, post-commit) + helper scripts
+    # full set (HOOKS_TO_SYNC in sync-hooks.sh) + helper scripts
     # (emit_bugfix_audit.py) + version tracking via
     # .genesis-hook-versions. Legacy loop remains as a fallback for
     # very old installs that don't have sync-hooks.sh yet.
@@ -745,7 +747,7 @@ if [[ -n "$HOOKS_DST" ]]; then
         "$HOOKS_SRC/sync-hooks.sh" --quiet || echo "  WARNING: sync-hooks.sh exited non-zero (may be user-modified — leaving alone)"
         echo "  + hooks synced via sync-hooks.sh"
     else
-        for hook in pre-commit pre-push; do
+        for hook in pre-commit pre-push pre-merge-commit; do
             if [[ -f "$HOOKS_SRC/$hook" ]]; then
                 cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
                 chmod +x "$HOOKS_DST/$hook"
@@ -882,39 +884,18 @@ CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
-# Watchgod config — 500MB budget, 150MB sacred ground
-#
-# Normalized to the SAME contract the volume-creation lib applies in
-# _cctmpvol_size_gib (scripts/lib/cc_tmp_volume.sh): a non-numeric or sub-1
-# value becomes 2 GiB. Using the raw value here diverged from the volume in
-# both directions — under `set -u` an alphabetic value aborts the install at
-# the arithmetic, and 0 writes a capacity of 0, which makes every computed
-# headroom negative and so pins the oxygen floor permanently ON, bypassing the
-# in-flight guard on every RED run.
-_cc_cap_gib="${CCTMPVOL_SIZE_GIB:-2}"
-if [[ ! "$_cc_cap_gib" =~ ^[0-9]+$ ]] || (( 10#$_cc_cap_gib < 1 )); then
-    _cc_cap_gib=2
-fi
-_cc_cap_mb=$(( 10#$_cc_cap_gib * 1024 ))
+# Watchgod config. The watchgod (scripts/tmp_watchgod.sh) guards whole
+# filesystems and measures cc-tmp's real capacity itself — statvfs plus the
+# btrfs quota on the volume — so the only thing it needs from here is where
+# cc-tmp lives. The v1 keys this block used to write (a 500 MB budget, a
+# "sacred ground", a hand-propagated volume capacity) are gone with the budget
+# they served. Install-local overrides — observe mode, thresholds, extra
+# watched paths — belong in watchgod.local.conf, which nothing regenerates.
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
-# True capacity of the cc-tmp volume in MB. On a btrfs storage backend df
-# CANNOT see the volume's cap (statfs reports the shared pool; the quota
-# lives in a qgroup), so the watchgod computes true headroom from THIS
-# number: headroom = min(fs_total, capacity) - used. Derived from the same
-# variable the volume-creation lib uses (scripts/lib/cc_tmp_volume.sh,
-# CCTMPVOL_SIZE_GIB, default 2GiB) rather than hardcoded. host-setup.sh passes
-# that override into the container for install.sh; a bootstrap run WITHOUT it
-# in the environment falls back to the 2 GiB default, so an install on a
-# custom-size volume re-exports it or edits watchgod.conf. A mismatch in the
-# LARGER direction fires the oxygen floor early and bypasses the in-flight
-# guard permanently, which is why the value is normalized rather than trusted.
-CC_TMP_CAPACITY_MB=$_cc_cap_mb
 WEOF
-echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB, capacity: ${_cc_cap_mb}MB)"
+echo "  CC temp: ${CC_TMP_DIR}"
 
 echo "  ~/.genesis/ initialized"
 echo

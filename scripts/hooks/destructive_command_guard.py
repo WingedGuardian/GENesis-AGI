@@ -7,7 +7,7 @@ deep (e.g., /home/user/project/some_dir) to pass.
 
 Blocks:  rm -rf /  |  rm -r -f ~  |  rm --recursive --force .  |
          rm -Rf ~/project  |  rm -rf -- /  |  rm -rf deep/path /
-Allows:  rm -rf /home/user/project/.claude/worktrees/old-branch
+Allows:  rm -rf /home/user/project/build/cache
 
 Parsing is token-based (shlex): flags accumulate across tokens, `--`
 ends flag parsing, and every operand is depth-checked individually —
@@ -75,6 +75,27 @@ _RM_RF_PATTERN = re.compile(
 
 # Dangerous special targets — always block regardless of depth
 _ALWAYS_BLOCK = {".", "..", "/", "~", "*"}
+
+# Bash pathname-expansion syntax. A path component containing it is a pattern,
+# not a name, and _check_target judges depth from the literal prefix before
+# it. `* ? [` are the base set; `+( @( !(` are extglob openers (`?( *(` are
+# already covered), which apply when a command turns extglob on for itself,
+# e.g. `shopt -s extglob` on an earlier line. (Braces are not here:
+# brace_expand has already split them into separate operands before any
+# operand reaches the depth check.)
+_GLOB_CHARS = re.compile(r"[*?\[]|[+@!]\(")
+
+# An extglob group opener, including `?(` and `*(`.
+_EXTGLOB_GROUP = re.compile(r"[?*+@!]\(")
+
+
+def _can_match_dot_entry(component: str) -> bool:
+    """True if a path component is a pattern that can expand to `.` or `..`.
+
+    Extglob groups are refused before this is consulted, so only a
+    dot-leading pattern is left to catch.
+    """
+    return component.startswith(".") and bool(_GLOB_CHARS.search(component))
 
 # Programs that RUN a command string handed to them as one argument. A quoted
 # string is a single shlex token, so the every-token scan below cannot see the
@@ -199,8 +220,13 @@ _COMMAND_OPENERS = frozenset(
 # and here it is not. Same shape as `protected_paths_guard`'s guarded import.
 try:  # noqa: SIM105
     from shell_parse import analyze_checked as _analyze_checked
+    from shell_parse import mentions as _mentions
 except Exception:  # noqa: BLE001 — degraded, never permissive
     _analyze_checked = None
+
+    def _mentions(command: str, *patterns) -> bool:
+        """No resolver: the raw text is the only reading, as before this existed."""
+        return all(p.search(command) for p in patterns)
 
 # The launchers the RESOLVER refuses to model. The shells are deliberately NOT
 # here: the resolver recovers `sh -c "…"` into real segments (MEASURED:
@@ -264,7 +290,7 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
         return (
             f"this command cannot be read ({blind.cause}) and it names a "
             f"removal, so the guard cannot verify what would be deleted. "
-            f"Re-issue it in a form the parser can read."
+            f"To proceed: {blind.hint}."
         ), True
     for seg in segs:
         # PER SEGMENT, like `protected_paths_guard` and `git_push_guard`: refuse
@@ -277,7 +303,9 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
         # rm-bearing command that merely CONTAINED a carrier anywhere — MEASURED
         # as a large over-block of ordinary multi-step work.
         if seg.exe in _UNMODELLABLE_CARRIERS and (
-            _RM_CARRIER_WORD.search(seg.raw)
+            # The view, so a word split by quotes or backslashes inside the
+            # payload still names rm to the shell that runs it (widen-only).
+            _mentions(seg.raw, _RM_CARRIER_WORD)
             or _OPAQUE_CARRIER_PAYLOAD.search(seg.raw)
         ):
             return (
@@ -637,6 +665,76 @@ def _check_target(target: str) -> str | None:
     # review: this was a live bypass.)
     if ".." in parts:
         return f"rm -rf on '{clean}' traverses upward ('..') — refusing."
+    # A pathname wildcard (* ? [) matches ANY name at its level, so what the
+    # command reaches is everything under the literal prefix before the first
+    # wildcard component — `<a>/<b>/<c>/*` deletes all that `<a>/<b>/<c>` does.
+    # Counting the wildcard as a component made the floor one level shallower
+    # than it reads: the directory was refused while its whole contents were
+    # allowed. The floor therefore applies to the literal prefix.
+    #
+    # Quote syntax is already stripped here, so a quoted literal '*' (which the
+    # shell passes through unexpanded) is indistinguishable from a real
+    # wildcard and is judged the same way. That over-blocks a file literally
+    # named with a wildcard character near the top of a tree, which is the
+    # safe direction for a recursive-force removal.
+    #
+    # That bound holds only while no pattern can climb ABOVE the prefix, and
+    # both checks below read the RAW components, before normpath: normpath
+    # treats a pattern as exactly one level, but the shell expands it first
+    # and a pattern's level count is not fixed. `.*` can match `.` (zero
+    # levels) or `..` (minus one) when globskipdots is off (the default
+    # before bash 5.2, a `shopt` away after), and globstar `**` can match
+    # zero directories. So normpath cancelling `<pattern>/..` hides a climb:
+    # `<deep>/.*/../../x` and `<deep>/**/../../x` reach above what the
+    # collapsed path shows.
+    raw = [p for p in os.path.expanduser(clean).split("/") if p]
+    # ANY extglob group is refused outright, wherever it sits. Its extent is
+    # unknowable from here: an unquoted `|` inside `@(a|b)` is split off as a
+    # pipe before this function runs, and quoting or escaping inside the group
+    # has already been stripped, so no count of the parentheses left can tell a
+    # whole group from a fragment. One alternative can also be `..`. The opener
+    # (`@(`, `!(`, `+(`, `?(`, `*(`) always survives in the FIRST fragment,
+    # because it comes before anything inside the group, so this test needs no
+    # parsing. Cost, measured 2026-09-27 by replaying one install's recorded
+    # agent commands through both versions (method and table in PR #2495):
+    # this refusal changed none of 1,621 verdicts.
+    if _EXTGLOB_GROUP.search(clean):
+        return (
+            f"rm -rf on '{clean}' contains an extglob group, whose real targets "
+            f"this guard cannot see — refusing."
+        )
+    first_glob = next((i for i, p in enumerate(raw) if _GLOB_CHARS.search(p)), None)
+    if first_glob is not None and ".." in raw[first_glob + 1 :]:
+        return (
+            f"rm -rf on '{clean}' has '..' after a wildcard, so its real depth "
+            f"is unknown — refusing."
+        )
+    # A pattern component can itself BE `..`: `<deep>/.?/.?/*` climbs with no
+    # literal `..` at all. Plain `*`, `?` and `[...]` never match a leading
+    # dot, so the pattern must start with one (extglob groups, which could
+    # hide one, were refused above). rm refuses a FINAL `..` itself, so the
+    # last component is exempt and `<dir>/.*` cleanups keep working.
+    if any(_can_match_dot_entry(p) for p in raw[:-1]):
+        return (
+            f"rm -rf on '{clean}' has a dot-leading wildcard path component that "
+            f"can match '..' and climb above it — refusing."
+        )
+    literal = next((i for i, p in enumerate(parts) if _GLOB_CHARS.search(p)), len(parts))
+    if literal < len(parts) and literal < 4:
+        # Keep the operand's own anchor: an absolute prefix reads '/a/b', a
+        # relative one 'a/b' (or '.' when the wildcard is the first component),
+        # so the message never claims a cwd-relative path is under '/'.
+        lead = "/" if expanded.startswith("/") else ""
+        prefix = (lead + "/".join(parts[:literal])) or (lead or ".")
+        return (
+            f"rm -rf on '{clean}' uses a wildcard under '{prefix}' (depth {literal}), "
+            f"so it can reach everything there — too broad."
+        )
+    # #2424: no worktree exemption, and git is never consulted. A linked worktree
+    # is judged by the same depth rule wherever it lives, so git availability
+    # cannot change a verdict. (A git-based exemption was rejected: a relative
+    # target would be resolved against the hook's cwd, which need not match the
+    # Bash invocation's.)
     if len(parts) < 4:
         return f"rm -rf on '{clean}' (depth {len(parts)}) is too broad."
     return None
@@ -854,7 +952,12 @@ def main() -> int:
         # SURVIVE the whole suite for exactly that reason — behaviourally null,
         # not an untested mechanism. The property moved; the constant that
         # carries it is `_RM_CARRIER_WORD`, and that one is mutation-pinned.
-        if not cmd or not _RM_WORD.search(cmd):
+        #
+        # Both prefilters read `_mentions`, each reading of the text the shell
+        # would assemble after quote removal and line joining, so a word the shell
+        # builds from pieces reaches the resolver the way its plain spelling does.
+        # Widen-only.
+        if not cmd or not _mentions(cmd, _RM_WORD):
             return 0
 
         # THE RESOLVER DECIDES CARRIERS, not a name list over flat tokens.
@@ -884,7 +987,7 @@ def main() -> int:
         # carrier pre-pass has no business with, not one nothing could read.
         carrier_reason, analysed = (
             _resolver_carrier_refusal(cmd)
-            if _RM_CARRIER_WORD.search(cmd)
+            if _mentions(cmd, _RM_CARRIER_WORD)
             else (None, True)
         )
         if carrier_reason:
@@ -926,7 +1029,8 @@ def main() -> int:
             for reason in violations:
                 print(f"BLOCKED: {reason}", file=sys.stderr)
             print(
-                "Recursive+force rm targets must be at least 4 levels deep. "
+                "Recursive+force rm targets must be at least 4 levels deep "
+                "(a wildcard counts only the path before it). "
                 "If intentional, ask the user to confirm.",
                 file=sys.stderr,
             )

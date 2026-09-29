@@ -66,7 +66,7 @@ _MAX_SCAN_BYTES = 25_000_000
 # the same path.
 #
 # Say what it is NOT: a fallback, never a backstop. SessionEnd does not fire when
-# a session is KILLED (OOM, SIGKILL, the tmp-watchgod sweep), so that gap is
+# a session is KILLED (OOM, SIGKILL), so that gap is
 # narrowed, not closed.
 #
 # Cost, MEASURED 2026-09-08 on this install (1,093 transcripts: p50 93 KB, p99

@@ -1163,6 +1163,7 @@ async def _proactive_impl(
     rerank_timeout_s: float | None = None,
     stats: dict | None = None,
     defer_side_effects: bool = False,
+    trace: dict | None = None,
 ) -> list[dict]:
     """Cross-session context injection for prompts — shared engine.
 
@@ -1190,6 +1191,12 @@ async def _proactive_impl(
     function's ``record_would_block`` immunity emit off the request's latency
     path into background tasks, so the per-prompt path returns without waiting
     on those DB writes (follow-up ac27b693). All best-effort.
+
+    ``trace``: proactive-endpoint only — the per-recall retrieval-trace sink
+    (``genesis.memory.recall_trace``). Handed to ``recall()``; this function adds
+    the per-candidate DROP reason (``memory_operation`` / ``noise`` / ``kb_cap`` /
+    ``enforce``) and the graph neighbors, and passes ``trace["trace_id"]`` to
+    graph expansion so its event joins the trace. ``None`` = no-op.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -1221,6 +1228,7 @@ async def _proactive_impl(
         stats=stats,
         extra_fts_terms=extra_fts_terms,
         defer_side_effects=defer_side_effects,
+        trace=trace,
         skip_writeback=lambda r: (
             immunity_shadow.should_enforce_drop(
                 gate="injection",
@@ -1238,7 +1246,13 @@ async def _proactive_impl(
     # leave the result underfilled when the top slice is blockable-external
     # while safe candidates sit just past it (Codex #1048 P2). We take the
     # final `limit` AFTER dropping, backfilling from the deeper pool.
+    _drops: dict[str, str] = trace.setdefault("drops", {}) if trace is not None else {}
     filtered = [r for r in results if "memory_operation" not in (r.payload.get("tags") or [])]
+    if trace is not None and len(filtered) != len(results):
+        _kept_ids = {r.memory_id for r in filtered}
+        for r in results:
+            if r.memory_id not in _kept_ids:
+                _drops[r.memory_id] = "memory_operation"
     # Injection defense (PR2): recall defaults to source="both", so KB content
     # can appear here and flow straight into prompt context — wrap external-world
     # items so the model treats them as data, not first-party instructions.
@@ -1263,12 +1277,14 @@ async def _proactive_impl(
         # them before they could reach the prompt; the ledger measures enforce-
         # gate activity (delivered-blockable + enforce-dropped), not quality drops.
         if _is_noise(r):
+            _drops[r.memory_id] = "noise"
             continue
         # KB slot cap IN the backfill loop (endpoint sets kb_slots; the MCP tool
         # leaves it None = uncapped). Capping here, not post-selection, means an
         # over-cap KB hit is replaced by the next safe candidate instead of
         # leaving the prompt under-filled below its intent budget (Codex #1169).
         if kb_slots is not None and r.collection == "knowledge_base" and kb_count >= kb_slots:
+            _drops[r.memory_id] = "kb_cap"
             continue
         # WS-3 B4 gate-4 ENFORCE (pushed-surfaces cut): memory_proactive is a
         # query-less ambient feed — in a DISPATCHED session under enforce,
@@ -1284,6 +1300,7 @@ async def _proactive_impl(
             unsupervised=_unsupervised,
         ):
             dropped += 1
+            _drops[r.memory_id] = "enforce"
             continue
         # Kept items (shadow mode / foreground): wrap keys on STORED origin
         # first — a kept external episodic row must stay delimited + counted,
@@ -1309,22 +1326,33 @@ async def _proactive_impl(
     # enforce-drop, and blockable+wrap pipeline as organic items — expansion
     # must never be a bypass around the gate-4 pushed-surface defenses. Merged
     # BEFORE the emit below so neighbors are counted. Shadow only emits.
+    _graph_seen: list | None = [] if trace is not None else None
     _expanded = await graph_expansion.maybe_expand(
         memory_mod._db,
         kept,
         surface="proactive",
+        # Joins the graph_expansion_* event to this recall's trace row.
+        recall_event_id=trace.get("trace_id") if trace is not None else None,
+        # Every COMPUTED neighbor, including shadow mode's (not injected).
+        neighbor_sink=_graph_seen,
     )
+    if trace is not None:
+        trace["graph_mode"] = graph_expansion.expansion_mode()
+        trace["graph_neighbors"] = [(nr.memory_id, nr.score) for nr in _graph_seen or []]
     for nr in _expanded[len(kept) :]:
         # Neighbor tags come from the FTS row as a STRING — substring check
         # mirrors the organic list-membership filter above.
         if "memory_operation" in (nr.payload.get("tags") or ""):
+            _drops[nr.memory_id] = "memory_operation"
             continue
         # Same proactive noise + KB-cap guards as the organic loop — a graph
         # neighbor must not bypass the garbage/non-intentional-KB filter or the
         # KB slot budget.
         if _is_noise(nr):
+            _drops[nr.memory_id] = "noise"
             continue
         if kb_slots is not None and nr.collection == "knowledge_base" and kb_count >= kb_slots:
+            _drops[nr.memory_id] = "kb_cap"
             continue
         if immunity_shadow.should_enforce_drop(
             gate="injection",
@@ -1335,6 +1363,7 @@ async def _proactive_impl(
             unsupervised=_unsupervised,
         ):
             dropped += 1
+            _drops[nr.memory_id] = "enforce"
             continue
         nd = asdict(nr) | {"via_graph": True}
         _nb = immunity_shadow.item_is_blockable(
