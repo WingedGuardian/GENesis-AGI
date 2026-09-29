@@ -1735,6 +1735,70 @@ async function clearDiscardedItem(itemId) {
 
 // ── Surplus detail (expandable) ─────────────────────────────────────
 
+// Pure view-models for the eval section, kept free of the DOM so
+// tests/assets/eval_render_check.js can run them against every state the
+// eval_staleness snapshot emits. A snapshot state with no branch here is a
+// state the dashboard silently misreports.
+function evalSnapshotNotice(evalData) {
+    const status = evalData && evalData.status;
+    if (status === 'ok') return null;
+    if (status === 'error') {
+        return {text: 'eval snapshot read failed' + (evalData.error ? ` (${evalData.error})` : ''), color: '#ef4444'};
+    }
+    if (status === 'no_data') return {text: 'no benchmark runs recorded yet', color: '#94a3b8'};
+    if (status === 'no_db') return {text: 'eval data unavailable: database not connected', color: '#fbbf24'};
+    return {text: `eval snapshot status not recognised: ${status == null ? 'missing' : status}`, color: '#fbbf24'};
+}
+
+function evalProfileView(p) {
+    const label = p.profile && p.profile !== p.provider ? `${p.provider} / ${p.profile}` : p.provider;
+    // A manual or superseded profile is never expected to re-run, so its age
+    // is informational (grey), not an overdue warning.
+    const notRecurring = p.scheduled === false || p.superseded === true;
+    let age, ageColor;
+    if (notRecurring) {
+        age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
+        age += p.superseded ? ' · superseded' : ' · manual';
+        ageColor = '#94a3b8';
+    } else {
+        // Overdue is judged on the last SCHEDULED run; a manual run refreshes
+        // days_ago but not the scheduler, so show the age the verdict used.
+        const sched = p.days_since_scheduled;
+        if (sched == null) age = 'scheduled run age unknown' + (p.days_ago != null ? ` · last run ${p.days_ago}d ago` : '');
+        else if (p.days_ago != null && p.days_ago !== sched) age = `${sched}d since scheduled run · last run ${p.days_ago}d ago`;
+        else age = sched + 'd ago';
+        ageColor = p.stale ? '#ef4444' : (sched == null || sched > 14) ? '#fbbf24' : '#4ade80';
+    }
+    const r = p.recent || {};
+    const pct = (x) => Math.round((x || 0) * 100);
+    const scored = (r.passed || 0) + (r.failed || 0);
+    const infraCases = (r.skipped || 0) + (r.infra_failed || 0);
+    // Scored wrong answers, kept apart from the infrastructural share that
+    // drives the unreliable badge. Each renders on its own count, so a window
+    // the harness could not score at all still shows why.
+    const fail = scored > 0 ? {
+        text: `fail ${pct(r.failure_rate)}%`,
+        title: `${r.failed || 0} wrong / ${scored} scored in the last ${r.window_days}d of runs`,
+    } : null;
+    const infra = infraCases > 0 ? {
+        text: `infra ${pct(r.infra_rate)}%`,
+        title: `${r.skipped || 0} skipped + ${r.infra_failed || 0} provider errors of ${scored + infraCases} cases in the last ${r.window_days}d of runs`,
+    } : null;
+    const unscored = scored === 0 ? {
+        text: 'unscored',
+        title: infraCases > 0 ? 'no case in the window was scored: every case hit an infrastructure error'
+             : !r.runs ? 'no run could be placed in the recent window (no readable run timestamp)'
+             : 'the window holds no cases',
+    } : null;
+    // Runs whose timestamp could not be read are excluded from every age and
+    // from the window; say so rather than let the ages look complete.
+    const unreadable = p.unreadable_runs > 0 ? {
+        text: `${p.unreadable_runs} unreadable`,
+        title: `${p.unreadable_runs} run(s) with an unreadable timestamp, left out of the ages and the recent window`,
+    } : null;
+    return {label, age, ageColor, fail, infra, unscored, unreadable, unreliable: p.unreliable === true};
+}
+
 async function loadSurplusDetail(container) {
     container.replaceChildren();
     container.appendChild(el('div', null, 'Loading...'));
@@ -1797,34 +1861,34 @@ async function loadSurplusDetail(container) {
         const evalRuns = evalMetrics.runs || [];
         const j9Snaps = evalMetrics.j9 || [];
 
-        if (providers.length > 0 || evalRuns.length > 0 || j9Snaps.length > 0) {
+        // The snapshot's own status renders whenever it is not ``ok``: a failed
+        // read must not pass for "no benchmarks", nor vanish behind healthy runs.
+        const evalNotice = evalSnapshotNotice(data.eval_staleness);
+        if (evalNotice || providers.length > 0 || evalRuns.length > 0 || j9Snaps.length > 0) {
             const evalSection = el('div', 'detail-section');
             evalSection.appendChild(el('h4', null, 'Eval & Assessment'));
 
+            if (evalNotice) {
+                const noticeEl = el('div', 'surplus-task-row', evalNotice.text);
+                noticeEl.style.color = evalNotice.color;
+                evalSection.appendChild(noticeEl);
+            }
+
             // Provider freshness
             for (const p of providers) {
+                const v = evalProfileView(p);
                 const row = el('div', 'surplus-task-row');
-                row.appendChild(el('span', 'task-type', p.profile && p.profile !== p.provider ? `${p.provider} / ${p.profile}` : p.provider));
-                // A manual or superseded profile is never expected to re-run, so
-                // its age is informational (grey), not an overdue warning.
-                const notRecurring = p.scheduled === false || p.superseded === true;
-                let age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
-                if (p.superseded) age += ' · superseded';
-                else if (p.scheduled === false) age += ' · manual';
-                const ageColor = p.stale ? '#ef4444' : notRecurring ? '#94a3b8' : p.days_ago > 14 ? '#fbbf24' : '#4ade80';
-                const ageEl = el('span', 'task-time', age);
-                ageEl.style.color = ageColor;
+                row.appendChild(el('span', 'task-type', v.label));
+                const ageEl = el('span', 'task-time', v.age);
+                ageEl.style.color = v.ageColor;
                 row.appendChild(ageEl);
-                // Scored wrong answers over the recent window, kept apart from
-                // the infrastructural share that drives the unreliable badge.
-                const recent = p.recent || {};
-                if (recent.failure_rate != null && (recent.passed || recent.failed)) {
-                    const failEl = el('span', 'task-time', `fail ${Math.round(recent.failure_rate * 100)}%`);
-                    failEl.title = `${recent.failed} wrong / ${recent.passed + recent.failed} scored in the last ${recent.window_days}d of runs; ` +
-                        `infra ${Math.round((recent.infra_rate || 0) * 100)}% (skips + provider errors)`;
-                    row.appendChild(failEl);
+                for (const part of [v.fail, v.infra, v.unscored, v.unreadable]) {
+                    if (!part) continue;
+                    const partEl = el('span', 'task-time', part.text);
+                    partEl.title = part.title;
+                    row.appendChild(partEl);
                 }
-                if (p.unreliable) {
+                if (v.unreliable) {
                     const badge = el('span', 'follow-up-badge failed', 'unreliable');
                     row.appendChild(badge);
                 }
