@@ -1016,9 +1016,9 @@ verified: 640c4f2e3 2026-09-18
   item that exhausts its retries, or a file the retry-storm guard parks (at all
   three of its call sites), queues ONE durable owner alert per file and reason
   per scan, naming the file by its path inside the inbox folder; an exhausted
-  item's alert also names each parked logical item (URLs as host+path plus the
-  coverage-log `url#` id, query strings dropped, token-like path segments
-  masked), while a storm alert names the file only. The retry-lane storm site
+  item's alert also names each parked logical item by the URL's HOST, its LINE
+  in the file and the coverage-log `url#` id — never path or query text, which
+  can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
   the same row is asked about again; with `resilience.parking_mode:

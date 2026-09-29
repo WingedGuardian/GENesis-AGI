@@ -1489,8 +1489,8 @@ async def test_every_parked_item_in_one_file_is_named_in_one_alert(
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 1, alerts
     text = alerts[0]["title"] + alerts[0]["body"]
-    assert "example.com/first-item" in text and "example.com/second-item" in text
-    assert "SECRETQ" not in text
+    assert "example.com — line 1 (url#" in text and "example.com — line 3 (url#" in text, text
+    assert "SECRETQ" not in text and "first-item" not in text
     assert "2" in alerts[0]["title"]
 
 
@@ -1512,7 +1512,7 @@ async def test_a_later_scan_parking_another_item_alerts_again(
     await mon.check_once()
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 2, alerts
-    assert "second-item" in alerts[1]["title"] + alerts[1]["body"]
+    assert "example.com — line 3" in alerts[1]["title"] + alerts[1]["body"]
 
 
 # ── Review round 1 on #2447: alert identity ──────────────────────────────────
@@ -1533,7 +1533,7 @@ def _monitor_cfg(db, inbox_dir, invoker, sm, **overrides):
 
 
 @pytest.mark.asyncio
-async def test_items_sharing_a_redacted_label_are_counted_separately(
+async def test_items_sharing_a_host_and_path_are_counted_separately(
     db, inbox_dir, mock_invoker, mock_session_manager,
 ):
     """Codex + Devin: two presigned links to one path differ only in the query,
@@ -1549,7 +1549,7 @@ async def test_items_sharing_a_redacted_label_are_counted_separately(
     assert len(alerts) == 1, alerts
     assert "2 item" in alerts[0]["title"], alerts[0]["title"]
     body = alerts[0]["body"]
-    assert body.count("example.com/watch") == 2, body
+    assert body.count("example.com — line") == 2, body
     assert "AAAA" not in body and "BBBB" not in body
 
 
@@ -1569,16 +1569,18 @@ async def test_every_url_of_a_multi_item_batch_is_named(
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 1, alerts
     text = alerts[0]["body"]
-    assert "example.com/first-item" in text and "example.com/second-item" in text
+    assert "example.com — line 1 (url#" in text and "example.com — line 3 (url#" in text, text
     assert "2 item" in alerts[0]["title"], alerts[0]["title"]
     assert text.count("(url#") == 2, text
 
 
 @pytest.mark.asyncio
-async def test_opaque_path_segments_are_masked_in_the_alert(
+async def test_path_text_never_reaches_the_alert(
     db, inbox_dir, mock_invoker, mock_session_manager,
 ):
-    """Devin: a share link can carry its token in the PATH, not the query."""
+    """Devin: a share link can carry its token in the PATH, not the query.
+    No path or query text reaches the alert at all: each item is its host, its
+    line in the file and its url# id (#2533, after three masking heuristics)."""
     mock_invoker.run.return_value = _ok(_UNCOVERED)
     mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
     (inbox_dir / "Genesis.md").write_text(
@@ -1590,10 +1592,13 @@ async def test_opaque_path_segments_are_masked_in_the_alert(
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 1, alerts
     text = alerts[0]["title"] + alerts[0]["body"]
-    assert "a8F3kLm29QzX7pRtW4" not in text and "Xy7_Kp2" not in text
-    assert "AbCdEfGhIjKlMnOpQr" not in text
-    assert "- files.example.com/s/…/quarterly-report (url#" in text, text
-    assert "2026-09-26-notes" in text  # a dated slug is readable, not a token
+    for secret in ("a8F3kLm29QzX7pRtW4", "Xy7_Kp2", "AbCdEfGhIjKlMnOpQr",
+                   "quarterly-report", "2026-09-26-notes"):
+        assert secret not in text, (secret, text)
+    for expected in ("- files.example.com — line 1 (url#",
+                     "- share.example.com — line 3 (url#",
+                     "- api.example.com — line 5 (url#"):
+        assert expected in text, (expected, text)
 
 
 @pytest.mark.asyncio
@@ -1761,11 +1766,11 @@ async def test_retry_lane_storm_alert_does_not_repeat_every_scan(
         # Two URL-free notes batched together: the flattened text named only
         # the first note's first line.
         ("Look into the new retrieval paper\n\nCompare our reranker to theirs\n",
-         ["Look into the new retrieval paper", "Compare our reranker to theirs"]),
+         ["a note — line 1", "a note — line 3"]),
         # Two annotated items sharing one URL: URL extraction deduplicated them.
         ("https://example.com/shared-post why it matters for memory\n\n"
          "https://example.com/shared-post the pricing section\n",
-         ["example.com/shared-post", "example.com/shared-post"]),
+         ["example.com — line 1", "example.com — line 3"]),
     ],
 )
 async def test_every_logical_item_of_a_batch_gets_its_own_line(
@@ -1819,7 +1824,7 @@ async def test_a_failed_alert_enqueue_logs_what_stopped(
     errors = [r for r in caplog.records if r.levelname == "ERROR"
               and "parked-alert enqueue failed" in r.getMessage()]
     assert len(errors) == 1, [r.getMessage() for r in caplog.records]
-    assert "example.com/lost-item-7c1" in errors[0].getMessage()
+    assert "example.com — line 1" in errors[0].getMessage()
     assert "Genesis.md" in errors[0].getMessage()
 
 
@@ -1880,64 +1885,61 @@ async def test_offline_failure_keeps_a_row_below_a_lowered_cap(
     assert row["retry_count"] == max_retries - 1, row
 
 
-def _path_parts(out: str) -> list[str]:
-    import re
-
-    return [p for p in re.split(r"[-_:.@+~/]", out) if p]
-
-
-@pytest.mark.parametrize(
-    ("path", "kept", "hidden"),
-    [
-        # A post slug keeps its words and its short random suffix: it is not
-        # token-shaped (MEASURED 2026-09-28: the whole-segment rule hid a
-        # readable word on 90 of 498 real inbox URLs).
-        ("/posts/someuser7_ai-rag-agents-share-7473249679800107008-bpJ9/",
-         ["someuser7", "ai", "rag", "agents", "share", "bpJ9"], []),
-        # Hashtag slugs concatenate words into 20+ lowercase runs.
-        ("/posts/someone_agentengineering-enterprisearchitecture-share-748/",
-         ["agentengineering", "enterprisearchitecture"], []),
-        # A token inside an otherwise readable path is masked on its own.
-        ("/s/a8F3kLm29QzX7pRtW4/quarterly-report", ["quarterly", "report"],
-         ["a8F3kLm29QzX7pRtW4"]),
-        ("/k/ghp_AbCdEfGhIjKlMnOpQr/x", ["x"], ["AbCdEfGhIjKlMnOpQr"]),
-    ],
-)
-def test_masking_hides_tokens_but_keeps_slug_words(path, kept, hidden):
-    out = InboxMonitor._mask_opaque_segments(path)
-    parts = _path_parts(out)
-    for word in kept:
-        assert word in parts, (path, out)
-    for token in hidden:
-        assert token not in out, (path, out)
+def test_item_labels_never_carry_path_or_query_text():
+    """No part of a URL but its host reaches the label, whatever the path holds."""
+    content = "https://drive.example.com/d/1BxiMVs0XRA5nFMdKvB/edit?usp=sharing&tok=Z9\n"
+    lines = ["# notes", "https://drive.example.com/d/1BxiMVs0XRA5nFMdKvB/edit?usp=sharing&tok=Z9"]
+    (label,) = InboxMonitor._item_labels(content, lines)
+    assert label.startswith("drive.example.com — line 2 (url#"), label
+    for fragment in ("/d/", "1BxiMVs0", "edit", "usp", "tok", "Z9"):
+        assert fragment not in label, (fragment, label)
 
 
 @pytest.mark.parametrize(
-    "token",
+    ("content", "lines", "expected"),
     [
-        "Xy7_Kp2-Qw9_Rt4-Zm1_Bn8",  # URL-safe base64: short mixed parts
-        "sk-proj-9swRy5pG9nJ_BUnwGTGawS-KMNJzYanbJdtOgE",  # lowercase prefix parts
-        "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0NTY3ODkw.SflKxwRJSMeKKF2QT4fw",  # JWT
+        # A short note that is a substring of an EARLIER line: exact match wins.
+        ("ai", ["# old", "ai is cool https://news.example.com/abc", "", "ai"], "line 4"),
+        # A URL that prefixes an earlier, longer URL: exact line wins.
+        ("https://x.example.com/post/123",
+         ["https://x.example.com/post/12345 read", "", "https://x.example.com/post/123"],
+         "line 3"),
+        # Identical text twice: the later copy is the new, parked one.
+        ("read later", ["read later", "", "read later"], "line 3"),
+        # The exact line is EARLIER than a later line that merely contains it:
+        # exact still wins over the later substring.
+        ("ai", ["# old", "ai", "", "ai is cool https://news.example.com/abc"], "line 2"),
+        # No exact line (the file was edited since): the LAST containing line.
+        ("https://x.example.com/a",
+         ["see https://x.example.com/a", "", "later https://x.example.com/a again"],
+         "line 3"),
     ],
 )
-def test_a_token_shaped_segment_is_masked_whole(token):
-    """Internal review (#2447 follow-up): masking only the long parts of a
-    token-shaped segment left its short letter-only pieces visible."""
-    out = InboxMonitor._mask_opaque_segments(f"/s/{token}/view")
-    assert out == "/s/…/view", out
+def test_the_line_found_is_the_item_not_an_earlier_lookalike(content, lines, expected):
+    """Internal review (#2533): a first-substring search sent the owner to an
+    earlier, different line, and the alert tells them to edit that line."""
+    (label,) = InboxMonitor._item_labels(content, lines)
+    assert f"— {expected} (" in label, label
 
 
-def test_random_url_safe_tokens_leak_no_fragment():
-    """Recall arm from a generator, not a hand-picked list: 300 seeded random
-    base64url tokens of 24 and 32 bytes; no 6-character run of any may survive."""
-    import base64
-    import random
-    import re
+def test_a_legacy_whole_file_row_locates_each_url_on_its_own_line():
+    """A legacy row can hold a whole file; each URL must point at its own line,
+    not all at the file's first line."""
+    content = "intro\nhttps://a.example.com/1\n\nhttps://b.example.com/2"
+    lines = content.split("\n")
+    labels = InboxMonitor._item_labels(content, lines)
+    assert labels[0].startswith("a.example.com — line 2 ("), labels
+    assert labels[1].startswith("b.example.com — line 4 ("), labels
 
-    rng = random.Random(2447)
-    for n in (24, 32) * 150:
-        token = base64.urlsafe_b64encode(rng.randbytes(n)).decode().rstrip("=")
-        out = InboxMonitor._mask_opaque_segments(f"/s/{token}/view")
-        core = re.sub(r"[^A-Za-z0-9]", "", token)
-        shown = re.sub(r"[^A-Za-z0-9]", "", out)
-        assert not any(core[i:i + 6] in shown for i in range(len(core) - 5)), (token, out)
+
+def test_notes_stay_distinguishable_when_the_file_cannot_be_read():
+    one = InboxMonitor._item_labels("look into retrieval", [])
+    two = InboxMonitor._item_labels("compare rerankers", [])
+    assert one != two and all("(note#" in label for label in one + two), (one, two)
+
+
+def test_a_schemeless_url_with_a_scheme_in_its_query_keeps_its_host():
+    (label,) = InboxMonitor._item_labels(
+        "example.com/r?u=https://other.example.com", ["example.com/r?u=https://other.example.com"],
+    )
+    assert label.startswith("example.com — line 1 ("), label
