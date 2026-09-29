@@ -268,6 +268,27 @@ def bearer_token(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+def bearer_matches(presented: bytes, token: str) -> bool:
+    """Constant-time check that ``presented`` (the bytes after ``Bearer ``) is
+    ``token``, in either encoding a client may use for a non-ASCII token.
+
+    HTTP fixes no charset for header values: a client may send the token as UTF-8
+    or, like Python's ``http.client``, as latin-1. Both spellings of the same
+    configured secret are accepted; either still requires knowing the secret.
+    Every spelling is compared, with no short-circuit.
+    """
+    import contextlib
+    import hmac
+
+    forms = [token.encode("utf-8", "surrogateescape")]
+    with contextlib.suppress(UnicodeEncodeError):
+        forms.append(token.encode("latin-1"))
+    matched = False
+    for form in forms:
+        matched |= hmac.compare_digest(presented, form)
+    return matched
+
+
 def memory_writebacks_off() -> bool:
     """True when retrieval write-backs (retrieved_count / last_retrieved_at
     bumps on recall) must be suppressed.

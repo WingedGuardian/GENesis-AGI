@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from flask import jsonify, redirect, request, session
 
 from genesis.dashboard._blueprint import blueprint
-from genesis.env import bearer_token
+from genesis.env import bearer_matches, bearer_token
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +127,10 @@ def _presented_bearer_bytes(auth_header: str) -> bytes:
     """The credential after ``Bearer `` as the bytes the client actually sent.
 
     WSGI (PEP 3333) hands header values over latin-1-decoded, one character per
-    received byte, so encoding back to latin-1 recovers those bytes exactly and a
-    token the client sent as UTF-8 compares equal to the UTF-8 configured value.
-    Re-encoding as UTF-8 instead turned every non-ASCII byte into two, so a
-    correct non-ASCII token was refused. A value that is not latin-1 cannot come
-    from a WSGI server; it is encoded as UTF-8, which can only match the same text.
+    received byte, so encoding back to latin-1 recovers those bytes exactly;
+    ``bearer_matches`` then accepts them in either encoding a client may use. A
+    value that is not latin-1 cannot come from a WSGI server; it is encoded as
+    UTF-8, which can only match the same text.
     """
     value = auth_header[7:]
     try:
@@ -152,8 +151,7 @@ def presented_bearer_is(name: str) -> bool:
     auth_header = request.headers.get("Authorization", "")
     if not configured or not auth_header.startswith("Bearer "):
         return False
-    presented = _presented_bearer_bytes(auth_header)
-    return hmac.compare_digest(presented, configured.encode("utf-8", "surrogateescape"))
+    return bearer_matches(_presented_bearer_bytes(auth_header), configured)
 
 
 def check_bearer_token(
@@ -202,7 +200,7 @@ def check_bearer_token(
     presented = _presented_bearer_bytes(auth_header)
     matched = False
     for token in candidates:
-        matched |= hmac.compare_digest(presented, token.encode("utf-8", "surrogateescape"))
+        matched |= bearer_matches(presented, token)
     if not matched:
         return ("Invalid bearer token", 401)
 
@@ -377,10 +375,7 @@ def check_api_mutation_auth():
         expected = get_or_create_internal_api_token()
         # Bytes, as in check_bearer_token: compare_digest raises on non-ASCII
         # str, which turned a bad credential into a 500 (#2467).
-        presented = _presented_bearer_bytes(auth_header)
-        if expected and hmac.compare_digest(
-            presented, expected.encode("utf-8", "surrogateescape")
-        ):
+        if expected and bearer_matches(_presented_bearer_bytes(auth_header), expected):
             return None
 
     # Trusted browser session (session cookie). A cookie is NOT proof of

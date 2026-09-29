@@ -568,12 +568,13 @@ def _bearer_auth_middleware(expected_token: str):
     streaming responses pass through without buffering (unlike
     BaseHTTPMiddleware which breaks text/event-stream).
     """
-    import hmac
     import json as _json
 
     from starlette.middleware import Middleware
 
-    _token_bytes = expected_token.encode("utf-8", "surrogateescape")
+    from genesis.env import bearer_matches
+
+    _token = expected_token
 
     class _AuthGuard:
         def __init__(self, app):
@@ -588,7 +589,7 @@ def _bearer_auth_middleware(expected_token: str):
             # str, so either turned a bad credential into a 500 (#2467).
             headers = dict(scope.get("headers", []))
             auth = headers.get(b"authorization", b"")
-            if auth.startswith(b"Bearer ") and hmac.compare_digest(auth[7:], _token_bytes):
+            if auth.startswith(b"Bearer ") and bearer_matches(auth[7:], _token):
                 return await self.app(scope, receive, send)
 
             if scope["type"] == "http":

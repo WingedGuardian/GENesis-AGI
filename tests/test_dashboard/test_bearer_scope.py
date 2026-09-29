@@ -153,6 +153,17 @@ def test_a_correct_non_ascii_token_sent_as_utf8_is_accepted(app, monkeypatch):
         assert check_bearer_token("test surface") == ("Invalid bearer token", 401)
 
 
+def test_a_correct_non_ascii_token_sent_as_latin1_is_accepted(app, monkeypatch):
+    """Python's http.client, among others, sends a str header as latin-1: "tök"
+    arrives as the single byte f6, which WSGI shows as "ö"."""
+    from genesis.dashboard.auth import presented_bearer_is
+
+    monkeypatch.setenv(_BROAD, "tök")
+    with app.test_request_context(environ_overrides={"HTTP_AUTHORIZATION": "Bearer tök"}):
+        assert check_bearer_token("test surface") is None
+        assert presented_bearer_is(_BROAD) is True
+
+
 def test_an_empty_accept_is_refused_loudly(app):
     """A caller passing no names would otherwise get a 503 naming nothing."""
     with pytest.raises(ValueError):
@@ -306,8 +317,9 @@ def test_the_mcp_guard_refuses_bad_credentials_with_401(mcp_server, header, expe
     assert _drive_mcp_guard(mcp_server, header) == expected
 
 
-def test_the_mcp_guard_accepts_a_non_ascii_configured_token(mcp_server):
-    assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(), token="tök") == 200
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1"])
+def test_the_mcp_guard_accepts_a_non_ascii_configured_token(mcp_server, encoding):
+    assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(encoding), token="tök") == 200
 
 
 # ── the boot warning names exactly the disabled surfaces ──────────────────────
