@@ -1392,7 +1392,7 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     umask "$_prev_umask"
     if ! $DRY_RUN; then
         log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
-        log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, boundary_key → ~/.genesis/boundary_key, etc.)."
+        log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, boundary_key → ${GENESIS_HOME:-~/.genesis}/boundary_key, etc.)."
     fi
 else
     log "Creds: no backup payload at $CREDS_SRC_DIR"
