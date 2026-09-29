@@ -158,6 +158,29 @@ def test_a_lone_surrogate_wraps_instead_of_raising(lone):
     assert _wrap(text) == _wrap(text)
 
 
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized"])
+def test_a_non_regular_or_oversized_key_path_falls_back_without_blocking(tmp_path, monkeypatch, kind):
+    """A FIFO at the key path used to block the first wrap forever (#2572)."""
+    import os
+    import threading
+
+    key_path = tmp_path / "boundary_key"
+    if kind == "fifo":
+        os.mkfifo(key_path)
+    elif kind == "directory":
+        key_path.mkdir()
+    else:
+        key_path.write_text("ab" * 4096)
+    monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_path)
+    monkeypatch.setattr(sanitizer_mod, "_boundary_key", None)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(_wrap("x")), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "wrapping blocked on the key path"
+    assert _split(result[0])[1] == "x"
+
+
 def test_the_opening_marker_states_the_rule():
     wrapped = _wrap("x")
     wrap_id = _split(wrapped)[0]

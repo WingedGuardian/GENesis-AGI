@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,12 @@ from genesis.knowledge.processors.registry import ContentProcessorRegistry
 from genesis.security.sanitizer import ContentSanitizer, ContentSource
 
 logger = logging.getLogger(__name__)
+
+# The single wrapper WebFetcher puts around a fetched page: an opening marker at the
+# very start and its closing marker at the very end.
+_OUTER_WRAPPER_RE = re.compile(
+    r"\A<external-content(?=[\s>])[^<>]*>\n|\n</external-content(?=[\s>])[^<>]*>\Z"
+)
 
 #: Strong references to compensation tasks that outlived the turn that started
 #: them. The event loop holds only WEAK references to tasks, so a shielded
@@ -131,8 +138,13 @@ class KnowledgeOrchestrator:
         # Content-hash dedup gate (moved here from the top of the method). Now that
         # the text is extracted, short-circuit ONLY if the content is unchanged;
         # changed content falls through and re-distills. sha256[:32] mirrors the
-        # content-hash pattern in recon/web_monitoring.py.
-        content_hash = hashlib.sha256(content.text.encode()).hexdigest()[:32]
+        # content-hash pattern in recon/web_monitoring.py. Only the OUTER boundary
+        # wrapper is removed: its id depends on the install's boundary key, and a
+        # changed key must not make an unchanged page look new (#2572). Marker-shaped
+        # text inside the page is left in, so it still changes the hash.
+        content_hash = hashlib.sha256(
+            _OUTER_WRAPPER_RE.sub("", content.text).encode()
+        ).hexdigest()[:32]
         if self._manifest.has_unchanged_source(source, content_hash):
             return IngestResult(
                 source=source,
