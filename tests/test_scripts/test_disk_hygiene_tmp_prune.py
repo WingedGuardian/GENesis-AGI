@@ -392,25 +392,25 @@ def test_standard_pressure_never_clears_the_code_intel_indexes(tmp_path):
     assert "--last-resort-above 0" in lr
 
 
-def _stat_shim(tmp_path: Path, other_dev_path: Path) -> Path:
-    """A `stat` that reports a different device for one path — a stand-in for a
-    separate mount, which a test cannot create without root."""
-    bindir = tmp_path / "shim"
-    bindir.mkdir(exist_ok=True)
-    shim = bindir / "stat"
-    shim.write_text(
-        "#!/usr/bin/env bash\n"
-        f'if [[ "$*" == *"%d"* && "${{@: -1}}" == "{other_dev_path}" ]]; then echo 999999; exit 0; fi\n'
-        'exec /usr/bin/stat "$@"\n'
-    )
-    shim.chmod(0o755)
-    # The device comparison is the fallback for an UNREADABLE mount table: a
-    # readable one lists every mount and decides alone (review of #2570). So
-    # this shim also hides the table, or the fake device would never be read.
-    fm = bindir / "findmnt"
-    fm.write_text("#!/usr/bin/env bash\nexit 1\n")
-    fm.chmod(0o755)
-    return bindir
+def _mountinfo(tmp_path: Path, mounts=(), readable: bool = True) -> dict:
+    """The env for a crafted mount table (TL_MOUNTINFO, /proc/self/mountinfo
+    format, field 5 octal-escaped like the kernel's). A separate filesystem and
+    a bind mount are both just ENTRIES here, which is the point: the table sees
+    what a device number cannot. readable=False leaves no file at all."""
+    f = tmp_path / "mountinfo"
+
+    def esc(m) -> str:
+        return (str(m).replace("\\", "\\134").replace(" ", "\\040")
+                .replace("\t", "\\011").replace("\n", "\\012"))
+
+    if readable:
+        f.write_text("".join(f"{i} 1 0:{i} / {esc(m)} rw - x x rw\n" for i, m in enumerate(["/", *mounts], 20)))
+    return dict(os.environ, TL_MOUNTINFO=str(f))
+
+
+def _hyg(call: str, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\n{call}"], env=env,
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
 
 def test_prune_never_recurses_into_a_separate_filesystem(tmp_path):
@@ -421,12 +421,9 @@ def test_prune_never_recurses_into_a_separate_filesystem(tmp_path):
     mnt.mkdir()
     plain.mkdir()
     (mnt / "keep.bin").write_text("x")
-    for p in (mnt / "keep.bin", mnt, plain):
-        _age(p, 10)
-    shim = _stat_shim(tmp_path, mnt.resolve())
-    env = dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}")
-    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
-                       env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    for q in (mnt / "keep.bin", mnt, plain):
+        _age(q, 10)
+    r = _hyg(f"prune_tmp '{d}'", _mountinfo(tmp_path, [mnt.resolve()]))
     assert mnt.exists() and (mnt / "keep.bin").exists(), r.stdout + r.stderr
     assert "a separate filesystem" in r.stdout
     assert not plain.exists(), "control: an ordinary old child is still pruned"
@@ -437,81 +434,56 @@ def test_bg_sandbox_reap_never_recurses_into_a_separate_filesystem(tmp_path):
     mnt, dead = root / "mounted", root / "dead"
     mnt.mkdir(parents=True)
     dead.mkdir()
-    for p in (mnt, dead):
-        _age(p, 2)
-    shim = _stat_shim(tmp_path, mnt.resolve())
-    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nreap_bg_sandboxes '{root}'"],
-                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    for q in (mnt, dead):
+        _age(q, 2)
+    r = _hyg(f"reap_bg_sandboxes '{root}'", _mountinfo(tmp_path, [mnt.resolve()]))
     assert mnt.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
     assert not dead.exists(), "control: an ordinary old sandbox is still reaped"
 
 
-def _mount_shim(tmp_path: Path, mountpoint_path: Path | None = None, table: list[str] | None = None,
-                readable: bool = True) -> Path:
-    """`mountpoint` / `findmnt` stand-ins: a bind mount keeps its parent's
-    device number, so only the mount table can see it."""
-    bindir = tmp_path / "mshim"
-    bindir.mkdir(exist_ok=True)
-    mp = bindir / "mountpoint"
-    target = str(mountpoint_path) if mountpoint_path else "/nonexistent-mount"
-    mp.write_text(f'#!/usr/bin/env bash\n[[ "${{@: -1}}" == "{target}" ]] && exit 0\nexit 1\n')
-    mp.chmod(0o755)
-    fm = bindir / "findmnt"
-    # An unreadable table prints no "/" line, so mount_targets reports it
-    # unreadable and the deleters fall back to `mountpoint`.
-    lines = (["/"] if readable else []) + list(table or [])
-    fm.write_text("#!/usr/bin/env bash\ncat <<'EOF'\n" + "".join(f"{t}\n" for t in lines) + "EOF\n")
-    fm.chmod(0o755)
-    return bindir
-
-
-def test_prune_spares_a_bind_mount_the_device_number_cannot_see(tmp_path):
-    """Review of #2521 item 6: a bind mount (or an incus dir-pool volume) keeps
-    its parent's device; the mount table is what tells."""
-    d = tmp_path / "tmp"
-    d.mkdir()
-    bind, plain = d / "downloads", d / "old_job"
-    for p in (bind, plain):
-        p.mkdir()
-        _age(p, 10)
-    # The TABLE alone must catch it: `mountpoint` is not consulted when the
-    # table is readable (one fork less per candidate, review of #2570).
-    shim = _mount_shim(tmp_path, table=[str(bind.resolve())])
-    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
-                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert bind.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
-    assert not plain.exists()
-
-
 def test_prune_spares_a_child_with_a_mount_inside_it(tmp_path):
+    """The mount is BELOW the child, which only the table can reveal."""
     d = tmp_path / "tmp"
     d.mkdir()
     outer = d / "job"
     (outer / "data").mkdir(parents=True)
     _age(outer / "data", 10)
     _age(outer, 10)
-    shim = _mount_shim(tmp_path, table=[str((outer / "data").resolve())])
-    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
-                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    r = _hyg(f"prune_tmp '{d}'", _mountinfo(tmp_path, [(outer / "data").resolve()]))
     assert outer.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
 
 
-def test_bg_sandbox_reap_spares_a_bind_mount(tmp_path):
+def test_bg_sandbox_reap_spares_a_mount_below_a_sandbox(tmp_path):
     root = tmp_path / "bg-cc-sessions"
-    bind, dead = root / "bound", root / "dead"
-    for p in (bind, dead):
-        p.mkdir(parents=True)
-        _age(p, 2)
-    # Unreadable table: the `mountpoint` fallback must catch it.
-    shim = _mount_shim(tmp_path, mountpoint_path=bind.resolve(), readable=False)
-    r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nreap_bg_sandboxes '{root}'"],
-                       env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert bind.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+    bound, dead = root / "bound", root / "dead"
+    (bound / "data").mkdir(parents=True)
+    dead.mkdir()
+    for q in (bound / "data", bound, dead):
+        _age(q, 2)
+    r = _hyg(f"reap_bg_sandboxes '{root}'", _mountinfo(tmp_path, [(bound / "data").resolve()]))
+    assert bound.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
     assert not dead.exists()
+
+
+def test_an_unreadable_mount_table_refuses_every_prune_with_a_reason(tmp_path):
+    """#2570 premise check: with no table, nothing can be proven free of
+    mounts, so the WHOLE pass refuses and says why -- never a per-candidate
+    "spared" that reads like real mounts, and never a fallback that cannot
+    see a mount below a candidate."""
+    d = tmp_path / "tmp"
+    old = d / "old_job"
+    old.mkdir(parents=True)
+    _age(old, 10)
+    root = tmp_path / "bg-cc-sessions"
+    dead = root / "dead"
+    dead.mkdir(parents=True)
+    _age(dead, 2)
+    env = _mountinfo(tmp_path, readable=False)
+    r1 = _hyg(f"prune_tmp '{d}'", env)
+    r2 = _hyg(f"reap_bg_sandboxes '{root}'", env)
+    assert old.exists() and dead.exists(), r1.stdout + r2.stdout
+    assert "tmp prune SKIPPED: the mount table" in r1.stdout
+    assert "bg-cc sandbox reap SKIPPED: the mount table" in r2.stdout
 
 
 def test_the_daily_groom_leaves_the_indexes_to_the_guardians_red_pass():

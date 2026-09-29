@@ -79,89 +79,94 @@ live_open_paths() {
     } 2>/dev/null || true
 }
 
+_tl_unescape() {
+    # Decode one mountinfo field into the variable named $1. The kernel writes
+    # every escape as exactly three octal digits (\040 \011 \012 \134), but
+    # `printf %b` reads \0NNN as \0 plus up to THREE more digits, so "\0401"
+    # (a space, then "1") decodes to garbage and a mount named "job 1" would
+    # slip past the guard. Rewriting each "\" as "\0" makes %b consume exactly
+    # the kernel's three digits. Safe because the kernel escapes every
+    # backslash, so each one in the field starts an escape.
+    printf -v "$1" '%b' "${2//\\/\\0}"
+}
+
 mount_targets() {
-    # Mount points from the MOUNT TABLE, one per line, in findmnt -r's raw
-    # form: every unsafe byte, newline included, escaped as \xNN, and every
-    # backslash as \x5c (measured on util-linux 2.39.3 with crafted names —
-    # `\c`, `\n`, `\x41`, a trailing backslash; review of #2570). Lines stay
-    # escaped so a newline in a name cannot split a record; path_crosses_mount
-    # decodes them.
+    # Mount points from the kernel's mount table, one per line, as field 5 of
+    # /proc/self/mountinfo: space, tab, newline and backslash escaped as \NNN
+    # octal (\040 \011 \012 \134), so every backslash in a field starts an
+    # escape and a newline in a name cannot split a record. path_crosses_mount
+    # decodes them. Read directly rather than through findmnt, so the guard
+    # needs no util-linux and uses the same source and escape format as
+    # disk_reclaim.py's _mount_points (premise check on #2570: two formats is
+    # where the round-1 escape finding came from, and a missing findmnt made
+    # "unreadable" a permanent state on some hosts). TL_MOUNTINFO exists so
+    # tests can present a crafted table.
     #
     # With $1 (a canonical ROOT), only the mounts strictly below ROOT: a
     # deleter under ROOT never needs the rest, and filtering once keeps the
-    # per-candidate check O(mounts under ROOT) — usually zero — instead of
-    # O(whole table) per candidate (review: ~29 ms per candidate at 500 mounts).
+    # per-candidate check O(mounts under ROOT), usually zero.
     #
-    # Returns 1 when the table could not be read — findmnt failed (a table
-    # it abandoned partway must not pass as complete), or no line decodes to
-    # "/", which every real table has — so a caller never mistakes
-    # "unreadable" for "no mounts". Captured by command substitution and fed
-    # back through a pipe, never a here-string: bash spools a large
-    # here-string to a temp file, which fails on a full disk.
-    local root="${1:-}" line t seen_root=0 out
-    root="${root%/}"  # a root of "/" would otherwise match nothing ("//*")
-    out="$(findmnt -rn -o TARGET 2>/dev/null)" || return 1
-    while IFS= read -r line; do
-        printf -v t '%b' "$line"
+    # Returns 1 when the table cannot be read, or has no "/" entry (every real
+    # table does), so a caller never mistakes "unreadable" for "no mounts".
+    # mapfile reads the file with no temp file and no fork.
+    local root="${1:-}" src="${TL_MOUNTINFO:-/proc/self/mountinfo}" line t seen_root=0 filter=0
+    local -a fields lines
+    [[ -n "$root" ]] && filter=1
+    root="${root%/}"  # "/" becomes "", so the pattern below is "/*", not "//*"
+    mapfile -t lines 2>/dev/null < "$src" || return 1
+    for line in "${lines[@]}"; do
+        read -r -a fields <<< "$line"
+        (( ${#fields[@]} > 4 )) || continue
+        _tl_unescape t "${fields[4]}"
         [[ "$t" == / ]] && seen_root=1
-        if [[ -z "$root" || "$t" == "$root"/* ]]; then
-            printf '%s\n' "$line"
+        # STRICTLY below ROOT ("/" itself is not below "/").
+        if (( ! filter )) || [[ "$t" == "$root"/* && "$t" != "${root:-/}" ]]; then
+            printf '%s\n' "${fields[4]}"
         fi
-    done < <(printf '%s\n' "$out")
+    done
     (( seen_root ))
 }
 
 path_crosses_mount() {
-    # 0 when $1 is a mount point, or has a mount somewhere below it.
-    # $2 = mount_targets output (computed once by the caller), $3 = 1 when
-    # that table was read successfully. A device-number comparison alone
-    # misses a bind mount and an incus dir-pool volume, which keep their
-    # parent's device (review finding on #2521 item 6).
-    #
-    # Each entry is DECODED and compared raw, rather than encoding $1 to
-    # match: an encoder has to know findmnt's whole escape set, and every byte
-    # it missed (a newline, any control byte) was a way past this guard
-    # (review findings on #2570). A readable table decides alone — it holds a
-    # mount AT the path too; `mountpoint` (one fork per candidate) is the
-    # fallback only when the table could not be read.
-    local p="$1" targets="${2:-}" table_ok="${3:-0}" line t
-    if [[ "$table_ok" != 1 ]]; then
-        mountpoint -q -- "$p" 2>/dev/null && return 0
-    fi
+    # 0 when $1 is a mount point, or has a mount somewhere below it, per $2 =
+    # mount_targets output (read once by the caller). A device-number
+    # comparison misses a bind mount and an incus dir-pool volume, which keep
+    # their parent's device (review finding on #2521 item 6); the table lists
+    # every mount, same device or not. Each entry is DECODED and compared raw,
+    # rather than encoding $1 to match: an encoder must know the whole escape
+    # set, and every byte it missed was a way past this guard (#2570).
+    local p="$1" targets="${2:-}" line t
     [[ -n "$targets" ]] || return 1
     while IFS= read -r line; do
-        printf -v t '%b' "$line"
+        _tl_unescape t "$line"
         [[ "$t" == "$p" || "$t" == "$p"/* ]] && return 0
     done < <(printf '%s\n' "$targets")
     return 1
 }
 
 tree_holds_mount() {
-    # 0 when $1 exists and is, or holds, a separate mount. $2 = device number
-    # of the tree being pruned, $3/$4 = mount_targets output and whether it
-    # was readable (all computed once by the caller). A readable table lists
-    # every mount, separate device or not, so it decides alone and costs no
-    # fork per candidate; only an unreadable table falls back to the device
-    # comparison and `mountpoint` (review of #2570: forks per candidate made a
-    # 1,000-unit sweep take seconds).
-    local p="$1" dev="$2" mounts="${3:-}" table_ok="${4:-0}"
+    # 0 when $1 is, or holds, a mount — or when that cannot be known ($3 != 1:
+    # the table was unreadable), so a caller that skips its own table check
+    # still fails closed. $2/$3 = mount_targets output and whether it was
+    # readable. Callers refuse a whole pass on an unreadable table, with a
+    # reason of their own, before reaching this (#2570 premise check: a
+    # per-candidate refusal read as "kept N" on the page, which looks exactly
+    # like sparing real mounts).
+    local p="$1" mounts="${2:-}" table_ok="${3:-0}"
+    [[ "$table_ok" == 1 ]] || return 0
     [ -e "$p" ] || return 1
-    if [[ "$table_ok" == 1 ]]; then
-        path_crosses_mount "$p" "$mounts" 1
-        return
-    fi
-    [ "$(stat -c %d -- "$p" 2>/dev/null)" != "$dev" ] || path_crosses_mount "$p" "$mounts" 0
+    path_crosses_mount "$p" "$mounts"
 }
 
 remove_tree_one_fs() {
-    # Recursively remove $1 unless it is, or holds, a separate mount — the one
-    # way every recursive deleter in the guardian's SHELL scripts removes a
-    # tree (review finding on #2570: the guard existed in two of four).
+    # Recursively remove $1 unless it is, or holds, a mount — the one way
+    # every recursive deleter in the guardian's SHELL scripts removes a tree
+    # (review finding on #2570: the guard existed in two of four).
     # disk_reclaim.py's rmtree carries its own mount check. Arguments as for
-    # tree_holds_mount. Returns 0 when $1 is gone, 2 when it was spared as a
-    # mount, 1 when removal failed and it is still there. --one-file-system
-    # stays as a backstop; it cannot see a same-device bind mount, which is
-    # why the table check comes first.
+    # tree_holds_mount; the table is the one the caller read at the start of
+    # its pass, not re-read here. Returns 0 when $1 is gone, 2 when it was
+    # spared, 1 when removal failed and it is still there. --one-file-system
+    # stays as a backstop for a mount that appears mid-pass on another device.
     if tree_holds_mount "$@"; then
         return 2
     fi

@@ -470,7 +470,7 @@ sweep_cc_tmp() {
     # One find pass and three lookup tables, not a find per unit: MEASURED on a
     # live cc-tmp of ~1,000 units, the per-unit form cost 30 s of CPU and held
     # the poll loop for all of it.
-    local age="$1" why="${2:-hourly}" root snap u key n=0 kept=0 failed=0 root_dev mounts table_ok rc
+    local age="$1" why="${2:-hourly}" root snap u key n=0 kept=0 failed=0 mounts rc
     # CANONICAL root: /proc reports fully resolved paths, so a symlinked
     # ancestor (e.g. /home -> /var/home) would make every held path miss the
     # prefix and silently empty the held table.
@@ -486,13 +486,14 @@ sweep_cc_tmp() {
     snap="$(live_open_paths)"
     # Every unit is removed through remove_tree_one_fs, which spares one
     # that is, or holds, a mount (review finding on #2570: a same-device
-    # bind mount inside an aged unit passed --one-file-system).
-    if ! root_dev="$(stat -c %d -- "$root" 2>/dev/null)"; then
-        log WARN "cc-tmp sweep skipped: cannot read the device of ${root}"
-        _WG_LEVER_SWEEP="cc-tmp sweep did NOT run (cannot read the device of ${root})"
+    # bind mount inside an aged unit passed --one-file-system). An unreadable
+    # table refuses the whole sweep, with its own outcome on the page, rather
+    # than sparing every unit as "kept" (#2570 premise check).
+    if ! mounts="$(mount_targets "$root")"; then
+        log WARN "cc-tmp sweep skipped: the mount table (/proc/self/mountinfo) is unreadable, so no unit can be proven free of mounts"
+        _WG_LEVER_SWEEP="cc-tmp sweep REFUSED to run (mount table unreadable)"
         return 0
     fi
-    mounts="$(mount_targets "$root")" && table_ok=1 || table_ok=0
     local -A held=() recent=() socket=()
     # Held: every open path or cwd under cc-tmp, mapped to its unit.
     while IFS= read -r key; do [[ -n "$key" ]] && held[$key]=1; done < <(
@@ -525,7 +526,7 @@ sweep_cc_tmp() {
             continue
         fi
         if (( WATCHGOD_ACT == 0 )); then
-            if tree_holds_mount "$u" "$root_dev" "$mounts" "$table_ok"; then
+            if tree_holds_mount "$u" "$mounts" 1; then
                 log INFO "OBSERVE: cc-tmp sweep would spare ${u}: it is, or holds, a separate mount"
                 kept=$(( kept + 1 ))
                 continue
@@ -537,7 +538,7 @@ sweep_cc_tmp() {
         # Count only what is actually gone: the page reports this number as
         # reclaimed (review finding on #2570).
         rc=0
-        remove_tree_one_fs "$u" "$root_dev" "$mounts" "$table_ok" || rc=$?
+        remove_tree_one_fs "$u" "$mounts" 1 || rc=$?
         case "$rc" in
             0) n=$(( n + 1 )) ;;
             2) log INFO "cc-tmp sweep spared ${u}: it is, or holds, a separate mount"
@@ -584,16 +585,26 @@ maybe_sweep_cc_tmp() {
 
 # /proc/<pid>/io counts a process's writes to EVERY filesystem, so the list a
 # page carries is not this filesystem's writers -- say so rather than imply it
-# (review finding, #2521 item 5). And dg_io_snapshot reads only this daemon's
-# own-user processes, so a root or other-user writer is never in it (review
-# finding on #2570).
-_WG_WRITERS_LABEL="Top writers among this user's processes this poll (all filesystems; other users' processes are not visible):"
+# (review finding, #2521 item 5). dg_io_snapshot reads only this daemon's
+# own-user processes, and write_bytes counts only writes that reach a block
+# device (review findings on #2570).
+_WG_WRITERS_LABEL="Top writers among this user's processes this poll (block-device writes on every filesystem; other users' processes are not visible):"
+# On tmpfs the list would name processes that cannot be the culprit: tmpfs
+# writes never reach write_bytes. Say that instead of listing them (#2570
+# premise check); the du list in the log shows what holds the space.
+_WG_WRITERS_TMPFS="Writer attribution unavailable: tmpfs writes are not counted per process. The watchgod log lists what is using the space (du)."
 
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {
     # $1 path $2 limit-domain key (see check_disks) $3 tier $4 free $5 total
     # $6 eta $7 writers $8 fstype
     local path="$1" dev="$2" tier="$3" free="$4" total="$5" eta="$6" writers="$7" fstype="$8"
+    local writers_block
+    if [[ "$fstype" == tmpfs ]]; then
+        writers_block="$_WG_WRITERS_TMPFS"
+    else
+        writers_block="${_WG_WRITERS_LABEL}"$'\n'"${writers:-none measurable}"
+    fi
     local is_home=0 is_cc=0 body rel lever
     # Levers act only on the domain they relieve. check_disks sets the keys;
     # a direct call (tests) falls back to device numbers.
@@ -635,7 +646,7 @@ handle_fs() {
             elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
                 lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
             fi
-            body="${summary}. Reclaim: ${lever}. ${_WG_WRITERS_LABEL}"$'\n'"${writers:-none measurable}"
+            body="${summary}. Reclaim: ${lever}. ${writers_block}"
             _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
                 && episode_mark "$dev" "orange$pg"
         fi
@@ -648,7 +659,7 @@ handle_fs() {
             start_pressure_unit last-resort
         fi
         if ! episode_seen "$dev" "red$pg"; then
-            body="${summary}. Reserve: ${rel}."$'\n'"${_WG_WRITERS_LABEL}"$'\n'"${writers:-none measurable}"
+            body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}"
             _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
                 && episode_mark "$dev" "red$pg"
         fi

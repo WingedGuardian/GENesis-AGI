@@ -93,20 +93,21 @@ prune_tmp() {
         age_pred=(-mmin "+$age_min")
         recent_pred=(-mmin "-$age_min")
     fi
-    local snap child root_dev mounts table_ok
+    local snap child mounts
     if ! liveness_visible; then
         echo "tmp prune SKIPPED: no other process is visible in /proc, so nothing can be proven unused"
         return 0
     fi
+    if ! mounts="$(mount_targets "$tmp_dir")"; then
+        echo "tmp prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
     snap="$(live_open_paths)"
-    root_dev="$(stat -c %d -- "$tmp_dir" 2>/dev/null)" || return 0
-    mounts="$(mount_targets "$tmp_dir")" && table_ok=1 || table_ok=0
     while IFS= read -r -d '' child; do
-        # A child that is, or holds, a separate mount (a separately mounted
-        # ~/tmp/downloads) frees nothing on this filesystem; never recurse into
-        # it (#2521 item 6). The mount table catches a bind or same-device
-        # mount; the device number and --one-file-system are backstops.
-        if tree_holds_mount "$child" "$root_dev" "$mounts" "$table_ok"; then
+        # A child that is, or holds, a mount (a separately mounted or
+        # bind-mounted ~/tmp/downloads) frees nothing here; never recurse into
+        # it (#2521 item 6). The table lists every mount, same device or not.
+        if tree_holds_mount "$child" "$mounts" 1; then
             echo "tmp prune: sparing $child (a separate filesystem)"
             continue
         fi
@@ -126,9 +127,9 @@ prune_tmp() {
             echo "tmp prune: sparing $child (modified inside the window)"
             continue
         fi
-        # remove_tree_one_fs re-checks the mount table at the moment of
-        # removal, so no path reaches rm unguarded.
-        remove_tree_one_fs "$child" "$root_dev" "$mounts" "$table_ok" || echo "tmp prune failed or spared $child"
+        # The ONLY way a tree is removed: remove_tree_one_fs re-checks the
+        # table this pass read at its start (not a fresh read).
+        remove_tree_one_fs "$child" "$mounts" 1 || echo "tmp prune failed or spared $child"
     done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
 }
@@ -140,18 +141,20 @@ prune_tmp() {
 # its cwd — and the whole reap is refused when liveness is blind, like every
 # other deleter here (review finding).
 reap_bg_sandboxes() {
-    local dir="$1" snap d root_dev mounts table_ok
+    local dir="$1" snap d mounts
     [ -d "$dir" ] || return 0
     dir="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
     if ! liveness_visible; then
         echo "bg-cc sandbox reap SKIPPED: no other process is visible in /proc"
         return 0
     fi
+    if ! mounts="$(mount_targets "$dir")"; then
+        echo "bg-cc sandbox reap SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
     snap="$(live_open_paths)"
-    root_dev="$(stat -c %d -- "$dir" 2>/dev/null)" || return 0
-    mounts="$(mount_targets "$dir")" && table_ok=1 || table_ok=0
     while IFS= read -r -d '' d; do
-        if tree_holds_mount "$d" "$root_dev" "$mounts" "$table_ok"; then
+        if tree_holds_mount "$d" "$mounts" 1; then
             echo "bg-cc sandbox reap: sparing $d (a separate filesystem)"
             continue
         fi
@@ -159,7 +162,7 @@ reap_bg_sandboxes() {
             echo "bg-cc sandbox reap: sparing $d (held open or in use by a live process)"
             continue
         fi
-        remove_tree_one_fs "$d" "$root_dev" "$mounts" "$table_ok" || echo "bg-cc sandbox reap failed or spared $d"
+        remove_tree_one_fs "$d" "$mounts" 1 || echo "bg-cc sandbox reap failed or spared $d"
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -print0 2>/dev/null)
 }
 
@@ -411,16 +414,18 @@ main() {
     # -- --one-file-system alone misses a same-device bind mount). CANONICAL
     # root, like prune_tmp: the mount table holds resolved paths, so a
     # symlinked ancestor would hide a mount below a session directory.
-    if _sess_root="$(cd -P -- "$HOME/.genesis/sessions" 2>/dev/null && pwd -P)" \
-            && _sess_root_dev="$(stat -c %d -- "$_sess_root" 2>/dev/null)"; then
-        _sess_mounts="$(mount_targets "$_sess_root")" && _sess_tok=1 || _sess_tok=0
+    if ! _sess_root="$(cd -P -- "$HOME/.genesis/sessions" 2>/dev/null && pwd -P)"; then
+        :
+    elif ! _sess_mounts="$(mount_targets "$_sess_root")"; then
+        echo "sessions prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+    else
         while IFS= read -r -d '' _sess_dir; do
             # -print -quit: stop at the FIRST recent file; no need to walk
             # the rest of the directory to know it must be kept.
             if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
                 continue
             fi
-            remove_tree_one_fs "$_sess_dir" "$_sess_root_dev" "$_sess_mounts" "$_sess_tok" \
+            remove_tree_one_fs "$_sess_dir" "$_sess_mounts" 1 \
                 || echo "sessions prune failed or spared $_sess_dir"
         done < <(find "$_sess_root" -mindepth 1 -maxdepth 1 -type d -mtime +60 -print0 2>/dev/null)
     fi

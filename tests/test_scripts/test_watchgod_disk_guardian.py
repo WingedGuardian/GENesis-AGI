@@ -1065,7 +1065,7 @@ def test_pages_label_writers_as_process_wide(box):
     it as this filesystem's writers."""
     _handle(box, "red")
     body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
-    assert "all filesystems; other users' processes are not visible" in body
+    assert "block-device writes on every filesystem; other users' processes are not visible" in body
     assert "whole machine" not in body, "dg_io_snapshot reads only own-user processes (#2570)"
 
 
@@ -1138,8 +1138,8 @@ def test_the_sweep_spares_a_unit_that_holds_a_mount(box, cctmp):
     (s / "data" / "precious").write_text("x")
     _age_tree(s, 10)
     # The mount is BELOW the unit, so only the mount table can reveal it.
-    _stub(box["bin"] / "findmnt", f'#!/usr/bin/env bash\nprintf "%s\\n" / "{s / "data"}"\n')
-    _sweep(box)
+    mi = _mountinfo(box, ["/", s / "data"])
+    _run(box, f"export TL_MOUNTINFO='{mi}'; sweep_cc_tmp 10080 test")
     assert (s / "data" / "precious").exists()
     assert "it is, or holds, a separate mount" in _log(box)
 
@@ -1162,3 +1162,37 @@ def test_the_sweep_counts_only_units_it_removed(box, cctmp):
         assert "reaped 0 unit(s)" in body and "could NOT remove 1" in body
     finally:
         (s / "ro").chmod(0o755)
+
+
+def _mountinfo(box, mounts) -> Path:
+    """A crafted /proc/self/mountinfo for TL_MOUNTINFO (field 5 = mount point)."""
+    f = box["tmp"] / "mountinfo"
+    f.write_text("".join(f"{i} 1 0:{i} / {m} rw - x x rw\n" for i, m in enumerate(mounts, 20)))
+    return f
+
+
+def test_an_unreadable_mount_table_refuses_the_sweep_and_says_so(box, cctmp):
+    """#2570 premise check: with no table, no unit can be proven free of
+    mounts. The whole sweep refuses with its own outcome on the page -- never
+    a per-unit "kept" that reads like real mounts were spared."""
+    root, proj = cctmp
+    s = proj / "dead"
+    s.mkdir()
+    _age_tree(s, 10)
+    dev = str(os.stat(root).st_dev)
+    _run(box, f"export TL_MOUNTINFO='{box['tmp'] / 'no-such-table'}'; home_dev() {{ echo not-this; }}; "
+              f"handle_fs '{root}' '{dev}' orange 100 2048 - '' btrfs")
+    assert s.exists(), "nothing is deleted without a table"
+    assert "cc-tmp sweep REFUSED to run (mount table unreadable)" in _pages(box)[0]["body"]
+
+
+def test_a_tmpfs_page_says_writers_cannot_be_attributed(box):
+    """#2570 premise check: write_bytes never counts tmpfs writes, so on a
+    tmpfs page the writer list would name processes that cannot be the
+    culprit. Say that instead of listing them."""
+    dev = _home_dev(box)
+    _run(box, f"ALL_WRITERS='1 2 999 0 innocent'; handle_fs '{box['home']}' '{dev}' red 1 100000 - "
+              f"'1 2 999 0 innocent' tmpfs")
+    body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
+    assert "Writer attribution unavailable: tmpfs writes are not counted" in body
+    assert "innocent" not in body
