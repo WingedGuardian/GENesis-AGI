@@ -7012,6 +7012,32 @@ def _required_ci_workflows() -> tuple[str, ...]:
     return tuple(configured)
 
 
+def _ambiguous_public_repo_keys(yaml, text: str) -> bool:
+    """True if ``github``, ``user`` or ``public_repo`` repeats, or a merge key
+    (``<<``) appears, on the path ``_canonical_public_repo`` reads. Walks the
+    composed node graph, so quoting cannot hide a key and an unrelated section is
+    never counted (the same approach as ``hook_ask_policy``'s policy-path check)."""
+
+    def _merges(mapping) -> bool:
+        return any(
+            isinstance(k, yaml.ScalarNode) and k.tag == "tag:yaml.org,2002:merge"
+            for k, _ in mapping.value
+        )
+
+    def _count(mapping, key: str) -> int:
+        return sum(1 for k, _ in mapping.value if isinstance(k, yaml.ScalarNode) and k.value == key)
+
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    if not isinstance(root, yaml.MappingNode):
+        return False
+    if _merges(root) or _count(root, "github") > 1:
+        return True
+    gh = next((v for k, v in root.value if isinstance(k, yaml.ScalarNode) and k.value == "github"), None)
+    if not isinstance(gh, yaml.MappingNode):
+        return False
+    return _merges(gh) or _count(gh, "user") > 1 or _count(gh, "public_repo") > 1
+
+
 def _canonical_public_repo() -> str | None:
     """The ONE public repo the scheduled-review gate is scoped to, as ``owner/repo``
     (normalized, case-preserved), or None if it cannot be determined.
@@ -7034,7 +7060,16 @@ def _canonical_public_repo() -> str | None:
         import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
 
         with open(path) as fh:
-            cfg = yaml.safe_load(fh) or {}
+            text = fh.read()
+        # safe_load keeps the LAST value of a repeated key (and resolves `<<`
+        # merges by rules a reader cannot see), so a badly merged config could
+        # silently name a different public repo. That repo scopes a prompt
+        # suppression as well as this gate, so a repeated or merged key on the
+        # github -> user/public_repo path is refused: None, the fail-closed answer
+        # for both callers.
+        if _ambiguous_public_repo_keys(yaml, text):
+            return None
+        cfg = yaml.safe_load(text) or {}
         gh = cfg.get("github") or {}
         user = (gh.get("user") or "").strip()
         repo = (gh.get("public_repo") or "").strip()
@@ -9338,7 +9373,7 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     remote, any of the above, or any config-read error → False (prompt).
 
     BEST-EFFORT, not a hard boundary (`remote` is already resolved with git's
-    pushRemote/pushDefault precedence by the caller). It reads REPO config only, so a
+    pushRemote / pushDefault / branch.remote precedence by the caller). It reads REPO config only, so a
     command-line ``git -c key=val push`` override, ``remote.<remote>.mirror``,
     ``push.followTags``, or a ``url.*.pushInsteadOf`` rewrite are NOT caught — tabled
     adversarial residue (each needs a deliberately unusual command / hostile config,
@@ -9476,7 +9511,8 @@ def _push_targets_current_branch(
     """Whether a non-force ``git push`` seg plainly UPDATES the current branch ``cur``.
 
     ``remote`` is the destination the push will ACTUALLY go to, resolved by the
-    caller with git's pushRemote/pushDefault precedence (``_effective_push_remote``).
+    caller with git's pushRemote / pushDefault / branch.remote precedence
+    (``_effective_push_remote``).
 
     ALLOWLIST posture — the branch checked against the remote is always ``cur``
     itself, never a parsed destination. True ONLY when BOTH hold:
@@ -9546,7 +9582,9 @@ def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str 
 
     An explicit ``--repo`` or positional remote wins. For a bare ``git push`` git
     picks, in order: ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
-    ``branch.<cur>.remote`` (the ``@{upstream}`` remote) → ``origin``. The
+    ``branch.<cur>.remote`` → ``origin``. ``branch.<cur>.remote`` is read on its
+    own, before the ``@{upstream}`` fallback, because ``@{upstream}`` resolves only
+    when ``branch.<cur>.merge`` is also set. The
     republish + config checks MUST target this remote, not the fetch/upstream
     remote — otherwise a triangular fork workflow (pull from origin, push to fork)
     checks the wrong remote and can silently allow a first push to the fork.
@@ -9562,6 +9600,16 @@ def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str 
     got = _git_config_get(base, "remote.pushDefault")
     if got and got[0] == 0 and got[1]:
         return got[1]
+    # branch.<cur>.remote is read DIRECTLY: `@{upstream}` needs branch.<cur>.merge
+    # too, which a new branch lacks, so the upstream fallback alone would answer
+    # "origin" for a branch whose configured remote is elsewhere — and that is the
+    # remote git actually pushes to (git-config: branch.<name>.remote). A value of
+    # "." or a path names no remote with push urls: the destination check and the
+    # re-push check (`_push_is_republish`) both refuse it, so the prompt stays.
+    if cur:
+        got = _git_config_get(base, f"branch.{cur}.remote")
+        if got and got[0] == 0 and got[1]:
+            return got[1]
     return _resolve_push_remote(seg, cwd=cwd) or "origin"
 
 
@@ -9632,7 +9680,8 @@ def _push_dest_is_public_repo(dest: str | None, cwd: str | None = None) -> bool:
 
     The url set comes from ``_push_dest_urls``, the helper the force arm uses, so
     a named non-origin remote, a raw URL or path, an unresolvable name, and a
-    ``remote.pushDefault`` / ``branch.<cur>.pushRemote`` redirect (the caller
+    ``remote.pushDefault`` / ``branch.<cur>.pushRemote`` / ``branch.<cur>.remote``
+    redirect (the caller
     passes the destination ``_effective_push_remote`` resolved) are all judged by
     the url git will actually push to.
     """
@@ -9768,6 +9817,14 @@ def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None =
     case we allow.
     """
     if not remote or not branch:
+        return False
+    # Only a NAMED remote with push urls can be a re-push target. `.` and a bare
+    # path have none, and `ls-remote .` lists the local repository's own
+    # branches, so the current branch would always "hit" and every first push
+    # to such a destination (redirected elsewhere by url.<x>.pushInsteadOf)
+    # would read as an already-approved re-push. `_effective_push_remote` names
+    # these destinations whenever branch.<cur>.remote holds them.
+    if not _remote_push_urls(remote, cwd):
         return False
     return _remote_branch_sha(remote, branch, cwd=cwd) is not None
 
@@ -10518,7 +10575,7 @@ def _run_merge_and_push_gates() -> int:
                 #     <cur>` push with only ref-neutral flags and (for bare/remote-only)
                 #     a simple repo config — everything else prompts;
                 #   • _push_is_republish → live ls-remote confirms `cur` is present on
-                #     the remote git will ACTUALLY push to (pushRemote/pushDefault
+                #     the remote git will ACTUALLY push to (pushRemote/pushDefault/branch.remote
                 #     resolved by _effective_push_remote, so a triangular fork workflow
                 #     checks the fork, not the upstream).
                 # Dispatched sessions were hard-denied above, so this _allow is

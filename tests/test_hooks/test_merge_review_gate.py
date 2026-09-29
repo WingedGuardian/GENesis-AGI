@@ -743,7 +743,7 @@ class TestGetPushRemoteAndBranch:
 class TestEffectivePushRemote:
     """_effective_push_remote follows git's real bare-push remote precedence:
     explicit --repo/positional > branch.<cur>.pushRemote > remote.pushDefault >
-    @{upstream} remote > origin."""
+    branch.<cur>.remote > @{upstream} remote > origin."""
 
     def test_explicit_positional_remote(self, guard_module):
         with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
@@ -775,6 +775,26 @@ class TestEffectivePushRemote:
             side_effect=_config_run({"remote.pushDefault": (0, "fork")}),
         ):
             assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "fork"
+
+    def test_bare_uses_branch_remote_without_upstream(self, guard_module):
+        # branch.<cur>.remote is honored even when @{upstream} cannot resolve
+        # (no branch.<cur>.merge), which is how a new branch is configured.
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"branch.feat.remote": (0, "fork")}),
+        ):
+            assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "fork"
+
+    def test_push_default_outranks_branch_remote(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run(
+                {"remote.pushDefault": (0, "pd"), "branch.feat.remote": (0, "fork")}
+            ),
+        ):
+            assert guard_module._effective_push_remote(_push_seg("git push"), "feat") == "pd"
 
     def test_bare_falls_back_to_upstream(self, guard_module):
         with patch.object(

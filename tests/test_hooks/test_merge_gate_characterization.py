@@ -1596,6 +1596,39 @@ def test_canonical_public_repo_reads_genesis_yaml(monkeypatch, tmp_path):
     assert _mod._canonical_public_repo() is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # yaml.safe_load keeps the LAST of each; the read must refuse, not guess.
+        "github:\n  user: A\n  public_repo: R\ngithub:\n  user: B\n  public_repo: S\n",
+        "github:\n  user: A\n  user: B\n  public_repo: R\n",
+        "github:\n  user: A\n  public_repo: R\n  public_repo: S\n",
+        'github:\n  user: A\n  "user": B\n  public_repo: R\n',
+        "github:\n  <<: {user: B}\n  user: A\n  public_repo: R\n",
+        "<<: {github: {user: B, public_repo: S}}\ngithub:\n  user: A\n  public_repo: R\n",
+    ],
+)
+def test_canonical_public_repo_refuses_ambiguous_keys(monkeypatch, tmp_path, text):
+    """A repeated or merged key on github -> user/public_repo makes the declared
+    repo undeterminable (None, fail-closed for every caller)."""
+    monkeypatch.delenv("_TEST_CANONICAL_PUBLIC_REPO", raising=False)
+    cfg = tmp_path / "genesis.yaml"
+    cfg.write_text(text)
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(cfg))
+    assert _mod._canonical_public_repo() is None
+
+
+def test_canonical_public_repo_ignores_same_names_elsewhere(monkeypatch, tmp_path):
+    """Control: `user`/`public_repo` in an UNRELATED section are not duplicates."""
+    monkeypatch.delenv("_TEST_CANONICAL_PUBLIC_REPO", raising=False)
+    cfg = tmp_path / "genesis.yaml"
+    cfg.write_text(
+        "other:\n  user: X\n  public_repo: Y\ngithub:\n  user: A\n  public_repo: R\n"
+    )
+    monkeypatch.setattr(_mod.os.path, "expanduser", lambda p: str(cfg))
+    assert _mod._canonical_public_repo() == "A/R"
+
+
 def test_enforcement_surfaces_note_on_off_public_repo_no_op(monkeypatch, capsys):
     """Provision-or-surface: when the scheduled gate no-ops because the merge targets
     a repo other than the canonical public one, the ENFORCEMENT path emits an advisory

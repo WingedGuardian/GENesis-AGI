@@ -570,6 +570,9 @@ def test_a_push_to_a_local_path_keeps_the_ask(monkeypatch, tmp_path, capsys, fir
     [
         ("remote.pushDefault", "stranger"),
         ("branch.feat/x.pushRemote", "stranger"),
+        # branch.<cur>.remote with NO branch.<cur>.merge: @{upstream} does not
+        # resolve, but git still pushes there. The guard once answered "origin".
+        ("branch.feat/x.remote", "stranger"),
     ],
 )
 def test_a_bare_push_redirected_by_config_keeps_the_ask(
@@ -581,6 +584,61 @@ def test_a_bare_push_redirected_by_config_keeps_the_ask(
     repo = _repo(tmp_path)
     _git(repo, "config", *config)
     _assert_asks(*_run_in(monkeypatch, capsys, repo, "git push"))
+
+
+def test_a_branch_remote_of_origin_is_still_suppressed(
+    monkeypatch, tmp_path, capsys, first_push
+) -> None:
+    """Positive control for the branch.<cur>.remote read: pointed at origin, the
+    bare push is the routine publish and stays suppressed."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
+    repo = _repo(tmp_path)
+    _git(repo, "config", "branch.feat/x.remote", "origin")
+    _assert_suppressed(*_run_in(monkeypatch, capsys, repo, "git push"))
+
+
+@pytest.fixture
+def real_republish(monkeypatch):
+    """Like `first_push`, but `_push_is_republish` runs for real, so the re-push
+    arm's own reading of the destination is what decides."""
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
+    monkeypatch.setattr(gpg, "_pr_create_would_publish", lambda argv: False)
+
+
+@pytest.mark.parametrize("branch_remote", [".", "SELF"])
+def test_a_dot_or_path_branch_remote_is_never_a_republish(
+    monkeypatch, tmp_path, capsys, real_republish, branch_remote: str
+) -> None:
+    """`ls-remote .` (or the repository's own path) lists the local branch, so it
+    always "hits". With the destination redirected elsewhere by pushInsteadOf,
+    a FIRST push would otherwise be allowed as an already-approved re-push. This
+    arm does not depend on the switch, so the policy is left at its default."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "")
+    repo = _repo(tmp_path)
+    remote = str(repo) if branch_remote == "SELF" else branch_remote
+    _git(repo, "config", "push.default", "current")
+    _git(repo, "config", "branch.feat/x.remote", remote)
+    _git(repo, "config", f"url.{_STRANGER}.pushInsteadOf", remote)
+    _assert_asks(*_run_in(monkeypatch, capsys, repo, "git push"))
+
+
+def test_a_real_republish_to_a_named_remote_is_still_allowed(
+    monkeypatch, tmp_path, capsys, real_republish
+) -> None:
+    """Control: the same unstubbed arm still recognises a genuine re-push, so the
+    test above is not passing because the arm can never allow."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "")
+    repo = _repo(tmp_path, origin=False)
+    bare = tmp_path / "published.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], capture_output=True, check=True)
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "origin", "feat/x")
+    _git(repo, "config", "branch.feat/x.remote", "origin")
+    rc, out, err = _run_in(monkeypatch, capsys, repo, "git push")
+    assert rc == 0, (rc, out, err)
+    assert _decision(json.loads(out)) == "allow", (out, err)
 
 
 def test_a_remote_with_an_extra_push_url_keeps_the_ask(
