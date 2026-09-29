@@ -1391,8 +1391,9 @@ def test_every_yaml_constructor_failure_is_a_registry_error(value):
 
 
 def test_the_volatility_site_ranks_rather_than_decides():
-    """Measured zero-shot at AUC 0.60 against later evidence: good enough to
-    order memories for re-verification, not to act on one answer."""
+    """Measured zero-shot at AUC 0.66 (95% CI 0.60-0.73) against later
+    evidence: good enough to order memories for re-verification, not to act
+    on one answer."""
     from pathlib import Path
 
     from genesis.decisions.registry import load_registry
