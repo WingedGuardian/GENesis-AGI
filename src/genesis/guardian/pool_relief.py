@@ -548,6 +548,14 @@ async def check_pool_relief(
             # in flight can fail with a non-timeout error), so the space may be
             # coming back already (review).
             break
+        if failed:
+            # The failed delete can have taken minutes (incus's client waits),
+            # long enough for the pool to recover. Every delete, not only the
+            # first, acts on a measurement taken just before it (review).
+            stop, fresh = await _recheck_before_delete(config, status, cfg)
+            if stop is not None:
+                return stop
+            reason, numbers = shortfall(fresh, cfg), _numbers(fresh)
         # A snapshot whose delete keeps failing (busy LV, an export in flight)
         # must not pin relief to it forever: fall through to the next one, but
         # still free at most ONE per pass. A failure is only DEFINITE once a
