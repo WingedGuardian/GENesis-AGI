@@ -19,6 +19,7 @@ services and returns structured text results.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -30,6 +31,11 @@ if TYPE_CHECKING:
     from genesis.channels.voice.handler import VoiceConversationHandler
 
 logger = logging.getLogger(__name__)
+
+# The voice route abandons a tool call at 30s (dashboard/routes/voice_api.py
+# _TOOL_CALL_TIMEOUT_SECONDS). The auto search chain can run longer (TinyFish 10s,
+# then SearXNG and Brave at 15s each), so voice search stops first and says so.
+_VOICE_SEARCH_DEADLINE_S = 20.0
 
 _ESSENTIAL_KNOWLEDGE_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 
@@ -347,13 +353,35 @@ class GenesisBridge:
         try:
             from genesis.mcp.health.web_tools import _impl_web_search
 
-            result = await _impl_web_search(query, backend="brave", max_results=3)
+            # "auto" is the standard chain (TinyFish, then SearXNG, then Brave).
+            # This used to pass "brave", which then meant "SearXNG, then Brave";
+            # an explicit backend now runs only that backend.
+            try:
+                result = await asyncio.wait_for(
+                    _impl_web_search(query, backend="auto", max_results=3),
+                    timeout=_VOICE_SEARCH_DEADLINE_S,
+                )
+            except TimeoutError:
+                logger.warning("Voice web search timed out after %.0fs", _VOICE_SEARCH_DEADLINE_S)
+                return json.dumps({"error": "Web search timed out"})
             search_results = result.get("results", [])
             if search_results:
+                # Snippets arrive already wrapped by every search backend; titles do
+                # not, and they are third-party text reaching a model that can
+                # approve pending actions, so they are wrapped here.
+                from genesis.security import ContentSanitizer, ContentSource
+
+                sanitizer = ContentSanitizer()
                 snippets = [
-                    f"{r.get('title', '')}: {r.get('snippet', '')}" for r in search_results[:3]
+                    f"{sanitizer.wrap_content(r.get('title', ''), ContentSource.WEB_SEARCH)}: "
+                    f"{r.get('snippet', '')}"
+                    for r in search_results[:3]
                 ]
                 return json.dumps({"results": snippets})
+            # A failed search is not "no results": say so, so the voice model
+            # does not tell the user the web has nothing.
+            if result.get("error"):
+                return json.dumps({"error": f"Web search failed: {result['error']}"})
             return json.dumps({"results": [], "note": "No results found"})
         except ImportError:
             logger.warning("Web search provider not available")
