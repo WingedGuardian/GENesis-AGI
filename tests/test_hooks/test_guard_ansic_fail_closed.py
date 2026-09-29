@@ -1592,6 +1592,14 @@ class TestVerbPositionIsUnestablished:
     @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB + _HIDDEN_GH_VERB)
     def test_a_shell_built_verb_is_reported_as_a_blind_spot(self, name, cmd):
         segs, blind = sp.analyze_checked(cmd)
+        if sp.has_built_escape(cmd):
+            # A verb decoded from an escape is the bounds-type built-escape blind
+            # spot, which outranks this cause the way a line continuation does. Its
+            # segments are withheld, so the per-segment fact must stay recoverable.
+            assert blind is sp._BLIND_BUILT_ESCAPE, f"{name}: {blind!r}"
+            assert segs == []
+            assert sp.unresolved_verb_programs(cmd), f"{name}: the hidden verb was lost"
+            return
         assert blind is sp._BLIND_UNRESOLVED_VERB, (
             f"{name}: the parse resolved a verb bash never runs and reported "
             f"{blind!r}. A guard reading the empty gated-segment list cannot "
