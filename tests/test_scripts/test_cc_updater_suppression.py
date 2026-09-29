@@ -2538,7 +2538,8 @@ class TestClaudeAiSyncOptOut:
         r = _run(tmp_path, self._CALL)
         data = json.loads(s.read_text())
         assert data["syncClaudeAiSkills"] is False and data["syncClaudeAiPlugins"] is False, data
-        assert "NOTE: claude.ai" not in r.stderr, r.stderr
+        assert "sync is left ON" not in r.stderr, r.stderr
+        assert r.stderr.count("sync is now OFF here") == 2, "writing each opt-out is announced"
 
     def test_an_empty_synced_dir_counts_as_nothing_synced(self, tmp_path: Path) -> None:
         s = self._seed(tmp_path)
@@ -2555,9 +2556,10 @@ class TestClaudeAiSyncOptOut:
         assert data["syncClaudeAiPlugins"] is False, "the other kind is decided on its own"
         assert data["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "2", "env defaults still land"
         assert "NOTE: claude.ai skills sync is left ON" in r.stderr, r.stderr
-        assert "2 skills already synced" in r.stderr, r.stderr
+        assert "synced content is present in" in r.stderr, "no item count it cannot back"
         assert '"syncClaudeAiSkills": false' in r.stderr, "the notice names the opt-out"
-        assert "plugins sync" not in r.stderr, r.stderr
+        assert "plugins sync is left ON" not in r.stderr, r.stderr
+        assert "plugins sync is now OFF here" in r.stderr, r.stderr
 
     def test_synced_plugins_withhold_only_the_plugins_opt_out(self, tmp_path: Path) -> None:
         s = self._seed(tmp_path)
@@ -2617,26 +2619,18 @@ class TestClaudeAiSyncOptOut:
         assert data["syncClaudeAiPlugins"] is False, "a kind whose absence IS provable still gets it"
         assert "holds synced skills could not be read" in r.stderr, r.stderr
 
-    def test_an_unreadable_withholding_record_withholds_every_kind(self, tmp_path: Path) -> None:
-        """Review (Codex, #2561): a record that exists but cannot be read (e.g.
-        left root-owned by a restore) used to read as "no history", so an emptied
-        synced/ got the opt-out the record existed to prevent."""
-        if os.geteuid() == 0:
-            pytest.skip("root reads any file; the unreadable case cannot be built")
-        s = self._seed(tmp_path)
-        rec = tmp_path / "home" / ".genesis" / "cc_sync_optout_withheld"
-        rec.parent.mkdir(parents=True, exist_ok=True)
-        rec.write_text("skills\n")
-        rec.chmod(0)
-        try:
-            r = _run(tmp_path, self._CALL)
-        finally:
-            rec.chmod(0o644)
-        data = json.loads(s.read_text())
-        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
-        assert "exists but cannot be read" in r.stderr, r.stderr
-        assert "the record of which opt-outs were withheld cannot be read" in r.stderr, r.stderr
-        assert rec.read_text() == "skills\n", "the record itself is left alone"
+    def test_a_fifo_settings_file_does_not_hang_the_notice(self, tmp_path: Path) -> None:
+        """The reconciler already declines a settings.json that is not a regular
+        file, but the sync notice runs after it and opened the same path; on a
+        FIFO that open blocked (review, the unnamed sibling of the record case)."""
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(s)
+        self._synced(tmp_path, "skills")  # a withheld kind, so the notice reads the file
+        r = _run(tmp_path, self._CALL)  # a hang raises TimeoutExpired here
+        assert "not a regular file" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+        assert "skills sync is left ON" in r.stderr, "an unreadable file still gets the note"
+        assert "now OFF" not in r.stderr, "nothing was written, so nothing is announced"
 
     @pytest.mark.parametrize("value", ["true", None, 1])
     def test_a_non_boolean_value_is_reported_with_nothing_synced(self, tmp_path: Path, value) -> None:
@@ -2667,21 +2661,69 @@ class TestClaudeAiSyncOptOut:
         assert "syncClaudeAiPlugins" not in data and data["syncClaudeAiSkills"] is False
         assert "plugins sync is left ON" in r.stderr
 
-    def test_a_withheld_opt_out_stays_withheld_when_the_synced_dir_empties(
-        self, tmp_path: Path
-    ) -> None:
-        """Sticky: the operator may have emptied synced/ by turning every skill off
-        on claude.ai, and writing `false` then would silently disable a sync they
-        chose to keep. Only the operator's own value ends the withholding."""
+    def test_the_measured_account_layout_withholds_with_zero_items(self, tmp_path: Path) -> None:
+        """MEASURED on Claude Code 2.1.280: once sync has run, <kind>/synced holds a
+        `.bucket-<id>` marker and an `<id>/` folder whatever the item count —
+        plugins/synced has both with zero plugins synced. That keeps an install
+        that has ever synced withheld with no record of Genesis's own, so the
+        withholding survives items disappearing (the earlier sticky record's job)."""
         s = self._seed(tmp_path)
-        d = self._synced(tmp_path, "skills")
-        _run(tmp_path, self._CALL)
-        (d / "item0").rmdir()  # now empty
+        for kind, inner in (("skills", "manifest.json"), ("plugins", ".marketplaces.json")):
+            d = tmp_path / "home" / ".claude" / kind / "synced"
+            (d / "acct").mkdir(parents=True)
+            (d / ".bucket-acct").write_text("")
+            (d / "acct" / inner).write_text("{}")
         r = _run(tmp_path, self._CALL)
-        assert "syncClaudeAiSkills" not in json.loads(s.read_text()), "never written without a decision"
-        assert "was syncing skills when Genesis first checked" in r.stderr, r.stderr
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+        assert r.stderr.count("sync is left ON") == 2, r.stderr
+        assert "now OFF" not in r.stderr, r.stderr
+
+    def test_writing_the_opt_out_is_announced_once(self, tmp_path: Path) -> None:
+        """Turning sync off is never silent: the reconcile that writes an opt-out
+        says so, and later runs (the key now present) do not repeat it."""
+        s = self._seed(tmp_path)
+        r = _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is False
+        assert "claude.ai skills sync is now OFF here" in r.stderr, r.stderr
+        assert "claude.ai plugins sync is now OFF here" in r.stderr, r.stderr
+        again = _run(tmp_path, self._CALL)
+        assert "now OFF" not in again.stderr, "announced on the run that wrote it, only"
+
+    def test_no_note_when_the_write_was_not_ours(self, tmp_path: Path) -> None:
+        """Review: 'written' comes from the reconciler's own verified write list,
+        not a before/after re-read. A reconciler that fails while something else
+        sets the key (here: a stub writing `true`, then returning 1) must not be
+        announced as Genesis turning sync off."""
+        s = self._seed(tmp_path)
+        stub = (
+            'cc_ensure_updater_suppressed() { python3 -c "import json,sys; p=sys.argv[1]; '
+            'd=json.load(open(p)); d[\'syncClaudeAiSkills\']=True; json.dump(d,open(p,\'w\'))" '
+            f'"{s}"; return 1; }}; '
+        )
+        r = _run(tmp_path, stub + 'cc_reconcile_container_settings; echo "rc=$?"')
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is True
+        assert "rc=1" in r.stdout, (r.stdout, r.stderr)
+        assert "now OFF" not in r.stderr, r.stderr
+
+    def test_the_old_withholding_record_is_removed_and_not_read(self, tmp_path: Path) -> None:
+        """#2561 shipped a persisted record that is no longer read. It is removed on
+        the next reconcile, and a kind it named is decided afresh (here: nothing
+        synced, so the opt-out is written and announced)."""
+        s = self._seed(tmp_path)
         rec = tmp_path / "home" / ".genesis" / "cc_sync_optout_withheld"
-        assert rec.read_text().splitlines() == ["skills"], "recorded once, not appended per run"
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text("skills\n")
+        r = _run(tmp_path, self._CALL)
+        assert not rec.exists(), "the orphaned record is cleaned up"
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is False
+        assert "claude.ai skills sync is now OFF here" in r.stderr, r.stderr
+
+    def test_an_operators_own_false_is_not_announced_as_ours(self, tmp_path: Path) -> None:
+        self._seed(tmp_path, {"syncClaudeAiSkills": False})
+        r = _run(tmp_path, self._CALL)
+        assert "skills sync is now OFF" not in r.stderr, r.stderr
+        assert "plugins sync is now OFF" in r.stderr, "the kind it did write is announced"
 
     @pytest.mark.parametrize("value", [None, "true", 1])
     def test_a_non_boolean_value_is_flagged_not_silenced(self, tmp_path: Path, value) -> None:
@@ -2702,7 +2744,7 @@ class TestClaudeAiSyncOptOut:
         start = src.index('    _sync_hint=""')
         end = src.index("\n", src.index("CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", start))
         block = src[start:end]
-        for withheld, expect_skills in (("", True), ("skills:syncClaudeAiSkills:2", False)):
+        for withheld, expect_skills in (("", True), ("skills:syncClaudeAiSkills:present", False)):
             arr = f'("{withheld}")' if withheld else "()"
             r = subprocess.run(
                 ["bash", "-c", f'set -u; source "{_LIB}"; CC_SYNC_OPTOUT_WITHHELD={arr}\n{block}'],
