@@ -130,9 +130,21 @@ def _config_run(values: dict, default: tuple = (1, "")):
     """A ``subprocess.run`` side_effect mapping a git-config KEY (the last argv
     token) to ``(rc, stdout)``. Unlisted keys resolve to ``default`` = ``(1, "")``
     (git's "unset" signal). Order/count-independent — robust to how many config
-    reads _push_config_is_simple performs."""
+    reads _push_config_is_simple performs.
+
+    ``git remote get-url [--push] --all <remote>`` (the push-URL-vs-probe check)
+    is keyed as ``get-url`` / ``get-url --push`` and defaults to one identical
+    URL for both, i.e. no pushurl / pushInsteadOf divergence. ``git rev-parse
+    --git-common-dir`` (the legacy remote-file check) resolves to a directory
+    that does not exist, i.e. no legacy remote file."""
 
     def run(argv, **kwargs):
+        if "--git-common-dir" in argv:
+            return _proc(0, "/nonexistent-git-common-dir")
+        if "get-url" in argv:
+            key = "get-url --push" if "--push" in argv else "get-url"
+            rc, out = values.get(key, (0, "https://example.invalid/r.git"))
+            return _proc(rc, out)
         key = argv[-1]
         rc, out = values.get(key, default)
         return _proc(rc, out)
