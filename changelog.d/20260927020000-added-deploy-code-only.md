@@ -36,9 +36,22 @@
     stops at "Already up to date" without reinstalling, unless update.sh-only
     paths changed since its last recorded run), and neither when the
     venv's python is older than the incoming `requires-python`.
+  - **`deploy` stops the server before the fast-forward**, as `update.sh` does,
+    so no request runs against a mix of old and new modules. A merge git refuses
+    starts it again on the unchanged tree, and any failure while it is stopped
+    starts it before exiting. If the checkout moves under the run (a bare git
+    command outside the lock), the run refuses to restart onto code it did not
+    check.
+  - **A range that adds a file already present here, untracked, is refused.** A
+    fast-forward overwrites an ignored file without asking, so a local secrets or
+    settings file would be lost.
   - **Across a restart** it holds the deploy marker (the watchdog defers) and
     pauses the host Guardian (no false "Genesis down" alert), then waits for
-    health with the same window `update.sh` computes. Healthy means the
+    health with the same window `update.sh` computes. The health request goes to
+    the loopback address with no proxy and no `.curlrc`, and counts only if the
+    same unit pid owns the port before and after it.
+  - It queues for the lock for up to two hours by default, as long as a
+    validation's documented hold. Healthy means the
     RESTARTED unit is serving: the unit is active with a new pid, and every
     socket listening on the health port is one of that pid's own (read from
     `/proc`; when ownership cannot be read the answer is no). The subsystems are
@@ -53,4 +66,5 @@
     is in the script's header): a session's background job dies with the session.
   - For a validation against the live server, `status` at the start and the end
     is the bracket: the run is invalid unless the server booted from HEAD at the
-    start, and the boot commit, HEAD and MainPID are unchanged at the end.
+    start, the boot commit, HEAD and MainPID are unchanged at the end, and there
+    are no uncommitted runtime edits at either end.

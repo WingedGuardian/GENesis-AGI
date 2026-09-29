@@ -8,7 +8,9 @@
 #
 # Usage: scripts/deploy_code_only.sh [deploy|pull|restart|status] [--wait N]
 #
-#   deploy   (the default) pull main, then restart genesis-server.
+#   deploy   (the default) fetch main and run every check, then stop
+#            genesis-server, fast-forward, and start it again (stopped first, so
+#            no request runs against a mix of old and new modules).
 #   pull     pull main and sync the git hook copies; NO restart. For a change the
 #            tree applies by itself (Claude Code hooks, docs), or to stage code
 #            for a later restart. Any range is accepted: the report names every
@@ -17,8 +19,8 @@
 #   status   read-only, takes no lock: the commit the server booted from, HEAD,
 #            and the server's MainPID. This is the validation bracket's reading.
 #            Run from a linked worktree, it reports the main checkout.
-#   --wait N seconds to queue for the lock (default 900, or
-#            GENESIS_DEPLOY_LOCK_WAIT)
+#   --wait N seconds to queue for the lock (default 7200, the same two hours a
+#            validation's hold may run, or GENESIS_DEPLOY_LOCK_WAIT)
 #
 # Every mode except status runs with:
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
@@ -51,16 +53,17 @@
 # the server the calling session may depend on, so launch deploy and restart
 # DETACHED, as a transient systemd unit, never under a tool timeout or a session's
 # background job (both die with the session). Substitute your checkout for
-# $HOME/genesis. The unit name carries the time, so a second launch queues on the
-# lock instead of failing on a name in use. It needs linger
+# $HOME/genesis, and the mode you want for `deploy`. The unit name carries the
+# time to the nanosecond, so a second launch queues on the lock instead of
+# failing on a name in use. It needs linger
 # (`loginctl show-user "$(id -u)" -p Linger` prints Linger=yes), or the unit dies
 # at logout:
 #   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
 #   DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
-#   systemd-run --user --collect --unit "genesis-deploy-code-only-$(date +%s)" \
+#   systemd-run --user --collect --unit "genesis-deploy-code-only-$(date +%s%N)" \
 #     --working-directory="$HOME/genesis" --setenv=PATH="$PATH" \
 #     --setenv=SSH_AUTH_SOCK --setenv=GENESIS_HOME \
-#     /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/deploy_code_only.sh restart > ~/tmp/deploy-code-only-$(date +%Y%m%d-%H%M%S).log 2>&1'
+#     /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/deploy_code_only.sh deploy > ~/tmp/deploy-code-only-$(date +%Y%m%d-%H%M%S%N).log 2>&1'
 #
 # Exit codes: 0 done (or nothing to do) · 200 lock wait timed out · 1 any
 # refusal or failure (the message says which; refusals change nothing).
@@ -75,8 +78,10 @@
 # dashboard's service routes, Guardian recovery) and not a bare `git pull`. So run
 # `scripts/deploy_code_only.sh status` at the start and at the end. The run is
 # INVALID if, at the start, the server booted from a commit other than HEAD or
-# from an unknown one (a pull left code unloaded: restart first), or if at the end
-# the booted commit, HEAD or the MainPID differs from the start.
+# from an unknown one (a pull left code unloaded: restart first), if at the end
+# the booted commit, HEAD or the MainPID differs from the start, or if
+# runtime-edits (uncommitted changes under src/, config/, pyproject.toml, which
+# the editable install can import without HEAD moving) is not "none" at both ends.
 
 set -euo pipefail
 
@@ -99,7 +104,9 @@ GENESIS_ROOT="${GENESIS_DEPLOY_ROOT:-$(unset CDPATH; cd -- "$(dirname -- "${BASH
 VENV_DIR="${GENESIS_DEPLOY_VENV:-$GENESIS_ROOT/.venv}"
 UPDATE_STATE_FILE="$HOME/.genesis/update_state.json"
 LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
-HEALTH_URL="http://localhost:5000/api/genesis/health"
+# The loopback address, not a name: nothing in the resolver's configuration can
+# point the health request elsewhere.
+HEALTH_URL="http://127.0.0.1:5000/api/genesis/health"
 LOCK_HELD_RC=200
 
 # CC sessions lack the D-Bus env `systemctl --user` needs (same guard as update.sh).
@@ -125,7 +132,9 @@ _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
 
 MODE=""
-WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-900}"
+# Two hours: a validation's documented hold is `flock -s -w 7200`, and a detached
+# deploy that gave up sooner would leave nobody to retry it.
+WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
 while [ $# -gt 0 ]; do
     case "$1" in
         deploy|pull|restart|status)
@@ -232,11 +241,27 @@ _report_pending() {
     echo "  (launch it detached; the header of this script has the command)."
 }
 
+# Uncommitted edits to what the server loads: the editable install imports src/
+# from disk, so a tracked edit or an untracked module there runs without moving
+# HEAD. Prints "none", the first paths, or "unreadable".
+_runtime_edits() {
+    local st
+    st="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames --untracked-files=all \
+        -- src config pyproject.toml 2>/dev/null)" || { echo unreadable; return 0; }
+    if [ -z "$st" ]; then
+        echo none
+    else
+        printf '%s paths: %s\n' "$(printf '%s\n' "$st" | wc -l)" \
+            "$(printf '%s\n' "$st" | cut -c4- | head -n 5 | paste -sd ' ' -)"
+    fi
+}
+
 if [ "$MODE" = status ]; then
     _read_serving
     echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
     echo "head: $(git -C "$GENESIS_ROOT" rev-parse HEAD)"
     echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
+    echo "runtime-edits: $(_runtime_edits)"
     _report_pending
     exit 0
 fi
@@ -266,12 +291,22 @@ _cleanup() {
     # A second signal during cleanup must not cut it short (skipping the marker
     # release or the Guardian resume).
     trap '' INT TERM
+    # A server this run stopped and has not started again goes back up on the
+    # tree as it stands, before anything else: never left down.
+    local _restarted_note=""
+    if [ -n "${_STOPPED:-}" ]; then
+        if systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- 2>/dev/null; then
+            _restarted_note=" genesis-server, stopped for this deploy, was started again on that tree without a health check."
+        else
+            _restarted_note=" genesis-server was stopped for this deploy and could NOT be started again: it is DOWN."
+        fi
+    fi
     if [ "$rc" -ne 0 ] && [ -z "$_ALERTED" ] && [ "$_PHASE" != "checks" ]; then
         local _sha
         _sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
         queue_alert critical deploy-code-only \
             "code-only deploy failed at phase $_PHASE ($_sha)" \
-            "The code-only deploy ($MODE) stopped at phase '$_PHASE'. The tree is at $_sha and was NOT reverted (by design). If the merge ran but the restart did not, the running server still has the old code in memory and imports new files lazily. Converge by hand: journalctl --user -u genesis-server -n 50, then scripts/deploy_code_only.sh restart."
+            "The code-only deploy ($MODE) stopped at phase '$_PHASE'. The tree is at $_sha and was NOT reverted (by design).${_restarted_note} If the merge ran but no restart did, a running server still has the old code in memory and imports new files lazily. Converge by hand: journalctl --user -u genesis-server -n 50, then scripts/deploy_code_only.sh restart."
     fi
     _guardian_resume
     _release_deploy_marker
@@ -296,8 +331,10 @@ fi
 _branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
 [ "$_branch" = main ] || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not main."
 # The status is read on its own first: in a pipeline its failure would be
-# swallowed, and an unreadable status would pass as a clean tree.
-_status="$(git -C "$GENESIS_ROOT" status --porcelain)" \
+# swallowed, and an unreadable status would pass as a clean tree. --no-renames:
+# a rename is one line naming BOTH paths, so a tracked file renamed INTO an
+# excused path would be excused whole; split, the deletion of the old path shows.
+_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)" \
     || die "cannot read the working tree's status — nothing was deployed."
 _dirty="$(printf '%s\n' "$_status" | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" | grep -v '^$' || true)"
 if [ -n "$_dirty" ]; then
@@ -373,6 +410,37 @@ _both_refs() {
     { "$@" "$_head"; "$@" "$_upstream"; } | sort -u
 }
 
+# The pre-restart identity and manifest, read while the old server is ALIVE (a
+# stopped unit reports MainPID 0, and its manifest then belongs to nobody). They
+# are what makes the health check about the RESTARTED unit rather than about
+# whatever answers on the port, and the baseline for the subsystem delta. Read
+# once per run.
+_BASELINE_READ=""
+_read_baseline() {
+    [ -z "$_BASELINE_READ" ] || return 0
+    _SERVER_PID_BEFORE="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
+    _MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
+    _read_serving
+    echo "  The server booted from ${SERVING:-an unknown commit ($SERVING_WHY)}."
+    _BASELINE_READ=1
+}
+
+# deploy's stop before the fast-forward. _STOPPED stays set until the server is
+# started again; the exit trap starts it if this run ends first, so a failure
+# never leaves it down.
+_STOPPED=""
+_PAUSED_THIS_RUN=""
+_stop_for_deploy() {
+    _read_baseline
+    _guardian_pause
+    _PAUSED_THIS_RUN=1
+    _PHASE="stopping"
+    echo "  Stopping genesis-server before the fast-forward…"
+    _STOPPED=1
+    systemctl --user stop genesis-server {_UPDATE_LOCK_FD}>&-
+    _PHASE="stopped"
+}
+
 # ── Pull ──────────────────────────────────────────────────────────────
 # The pull for <branch>: a bounded fetch of that branch's configured upstream,
 # the dependency gate on the INCOMING pyproject.toml, then a fast-forward. The
@@ -428,6 +496,33 @@ _pull() {
             die "$_f is edited locally and changed upstream — run scripts/update.sh, which carries it across."
         fi
     done
+    # Paths the range ADDS that already exist here, untracked (or with a file
+    # where a parent directory goes). git refuses to overwrite a plain untracked
+    # file, but it overwrites an IGNORED one without asking (measured, git 2.43):
+    # a local secrets or settings file would be lost.
+    git -C "$GENESIS_ROOT" diff --no-renames --name-only --diff-filter=A "$_head" "$_upstream" >/dev/null \
+        || die "cannot list the files this range adds — nothing changed."
+    _collisions=""
+    while IFS= read -r -d '' _f; do
+        if [ -e "$GENESIS_ROOT/$_f" ] || [ -L "$GENESIS_ROOT/$_f" ]; then
+            _collisions+="$_f"$'\n'
+            continue
+        fi
+        _p="$_f"
+        while [ "$_p" != "${_p%/*}" ]; do
+            _p="${_p%/*}"
+            [ -d "$GENESIS_ROOT/$_p" ] && break
+            if [ -e "$GENESIS_ROOT/$_p" ] || [ -L "$GENESIS_ROOT/$_p" ]; then
+                _collisions+="$_f"$'\n'
+                break
+            fi
+        done
+    done < <(git -C "$GENESIS_ROOT" diff -z --no-renames --name-only --diff-filter=A "$_head" "$_upstream")
+    if [ -n "$_collisions" ]; then
+        echo "ERROR: this range adds files that already exist here, untracked; the fast-forward would overwrite them:" >&2
+        printf '%s' "$_collisions" | sed 's/^/         /' >&2
+        die "move them aside first (scripts/update.sh carries .claude/settings.local.json, .serena/project.yml and src/genesis/identity/USER.md across) — nothing changed."
+    fi
     # Advisory: what this deploy does NOT activate. scripts/hooks is on the
     # snapshot's list but is applied here: the tree runs the Claude Code hooks,
     # and the git hook copies are synced after the merge.
@@ -462,6 +557,11 @@ _pull() {
             echo "$_wg" | sed 's/^/          /'
         fi
     fi
+    # deploy stops the server BEFORE the fast-forward, as update.sh does: the
+    # editable install imports src/ from disk, so a live server would serve
+    # requests against a mix of old and new modules until its restart. pull keeps
+    # the server running by design, and reports the pending changes instead.
+    [ "$MODE" = deploy ] && _stop_for_deploy
     _PHASE="merging"
     for _f in AGENTS.md config/procedure_triggers.yaml; do
         if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
@@ -482,12 +582,25 @@ _pull() {
         _status_after="$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null)" || _status_after="unreadable after"
         if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null)" = "$_head" ] \
             && [ "$_status_after" = "$_status_before" ]; then
-            _PHASE="checks"
-            die "git refused the fast-forward to $_upstream (see above) — nothing changed."
+            # Nothing changed. A server this run stopped goes back up on the same
+            # tree; only if that fails does the exit still alert.
+            if [ -n "$_STOPPED" ]; then
+                echo "  Starting genesis-server again on the unchanged tree…"
+                systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
+            fi
+            [ -n "$_STOPPED" ] || _PHASE="checks"
+            die "git refused the fast-forward to $_upstream (see above) — nothing merged."
         fi
         exit 1
     fi
     _PHASE="merged"
+    # The lock serializes deploys, not a bare git command: if the checkout moved
+    # after this run checked what it would deploy, that is not what was checked.
+    _now_head="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unreadable)"
+    _now_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
+    if [ "$_now_head" != "$_upstream" ] || [ "$_now_branch" != "$branch" ]; then
+        die "the checkout moved during this run (now $_now_branch at $_now_head; this run checked $_upstream) — something outside the lock changed it."
+    fi
     echo "  Merged $_head..$_upstream"
 }
 
@@ -527,14 +640,9 @@ if [ "$MODE" = pull ]; then
 fi
 
 # ── Restart ───────────────────────────────────────────────────────────
-# The pre-restart identity and manifest, read while the old server is ALIVE (a
-# stopped unit reports MainPID 0, and its manifest then belongs to nobody). They
-# are what makes the health check below about the RESTARTED unit rather than
-# about whatever answers on the port, and the baseline for the subsystem delta.
-_SERVER_PID_BEFORE="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
-_MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
-_read_serving
-echo "  The server booted from ${SERVING:-an unknown commit ($SERVING_WHY)}."
+# (deploy with something to merge read the baseline and stopped the server
+# before the fast-forward; every other path reads it here, server still alive.)
+_read_baseline
 # A deploy with nothing to deploy: nothing merged, and the server provably booted
 # from HEAD. A restart would only cost an outage and end in-flight dispatched
 # sessions. The restart mode is there to force one.
@@ -546,10 +654,11 @@ fi
 # commit is only readable when no move of HEAD shares the boot's second. A second
 # of wait puts this boot clear of the merge above.
 sleep 1
-_guardian_pause
+[ -n "$_PAUSED_THIS_RUN" ] || _guardian_pause
 _PHASE="restarting"
 echo "  Restarting genesis-server at $SHA…"
 systemctl --user restart genesis-server {_UPDATE_LOCK_FD}>&-
+_STOPPED=""
 _PHASE="restarted"
 
 # Is the RESTARTED unit the one serving? A 200 from the port alone cannot say: a
@@ -616,8 +725,14 @@ while [ "$_attempt" -lt "$_max_attempts" ] && [ "$(_now)" -lt "$_deadline" ]; do
     _attempt=$((_attempt + 1))
     sleep "$_poll"
     _seen="not answering yet"
-    if curl -sf --max-time 20 "$HEALTH_URL" >/dev/null 2>&1; then
-        if _SERVER_PID="$(_restarted_unit_serving)"; then
+    # The answer and the identity must be about ONE process: read the unit's pid
+    # before the request and require the same pid after it (a restart in between
+    # would otherwise let one process's answer vouch for its replacement). -q
+    # (first, as curl requires) skips any .curlrc, and --noproxy '*' any proxy
+    # the environment sets, so the request goes straight to the local port.
+    _pid_asked="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
+    if curl -q --noproxy '*' -sf --max-time 20 "$HEALTH_URL" >/dev/null 2>&1; then
+        if _SERVER_PID="$(_restarted_unit_serving)" && [ "$_SERVER_PID" = "$_pid_asked" ]; then
             _healthy=true
             break
         fi

@@ -92,9 +92,18 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         f'  p="${{UNIT_PYTHON:-{VENV}/bin/python}}"; [ "$p" = - ] && exit 0\n'
         '  echo "{ path=$p ; argv[]=$p -m genesis serve ${UNIT_ARGS:-} ; ignore_errors=no }"; exit 0\n'
         "fi\n"
+        # After a restart, MainPID is $NEW_PID; with $NEW_PID_LATER set, every read
+        # after the first one reports that pid instead (the unit restarted again).
         'if [[ " $* " == *" MainPID "* ]]; then\n'
-        f'  if grep -q "restart genesis-server" "{calls}"; then echo "${{NEW_PID:-2222}}"; '
-        "else echo 1111; fi; exit 0\n"
+        f'  if grep -q "restart genesis-server" "{calls}"; then\n'
+        f'    if [ -n "${{NEW_PID_LATER:-}}" ] && [ -f "{calls}.pidread" ]; then echo "$NEW_PID_LATER";\n'
+        f'    else touch "{calls}.pidread"; echo "${{NEW_PID:-2222}}"; fi\n'
+        "  else echo 1111; fi; exit 0\n"
+        "fi\n"
+        # A stop records the HEAD it found, so a test can tell whether it came
+        # before or after the fast-forward.
+        'if [[ " $* " == *" stop "* ]]; then\n'
+        f'  git -C "${{GENESIS_DEPLOY_ROOT:-.}}" rev-parse HEAD > "{calls}.stop_head"\n'
         "fi\n"
         'if [[ " $* " == *" restart "* ]]; then\n'
         f'  echo "${{RESTARTED_AT:-$(date +%s)}}" > "{calls}.restarted_at"\n'
@@ -175,6 +184,7 @@ def station(tmp_path):
         shims / "curl",
         "#!/bin/bash\n"
         f'[ -f "{marker}" ] && echo held >> "{tmp_path}/marker_seen"\n'
+        f'printf "%s\\n" "$*" >> "{tmp_path}/curl_args"\n'
         "exit ${CURL_RC:-0}\n",
     )
     # The port-ownership probe (GENESIS_DEPLOY_PORT_PROBE, standing in for
@@ -207,6 +217,7 @@ def station(tmp_path):
                 "CURL_RC",
                 "NEW_PID",
                 "NO_BOOTSTRAP",
+                "SYNC_LOG",
                 "MANIFEST_AFTER",
                 "PROBE_OWNER",
                 "PROBE_NONE",
