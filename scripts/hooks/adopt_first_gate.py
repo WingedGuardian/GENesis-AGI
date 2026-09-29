@@ -115,8 +115,9 @@ _VERDICT_TOKEN = re.compile(r"\b(ADOPT|ADAPT|BUILD|WATCH|IGNORE)\b", re.IGNORECA
 #: not exist yet but adds no capability — the plan names both endpoints and the
 #: verb joining them is the tell.
 _RENAME = re.compile(
-    r"\b(?:rename|moves?|relocat\w*)\b[\s\S]{0,80}?(\S+)[\s\S]{0,40}?"
-    r"\b(?:to|into|as)\b[\s\S]{0,40}?(\S+)",
+    r"\b(?:rename|moves?|relocat\w*)\b[\s\S]{0,80}?"
+    r"(src/[\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|html|css|sh))"
+    r"[\s\S]{0,40}?\b(?:to|into|as)\b[\s\S]{0,40}?(\S+)",
     re.IGNORECASE,
 )
 

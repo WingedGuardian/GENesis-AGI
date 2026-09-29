@@ -384,6 +384,25 @@ def test_a_rename_is_not_a_new_capability(home: Path, repo: Path):
     assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
 
 
+def test_a_move_with_descriptive_wording_is_not_a_new_capability(
+    home: Path, repo: Path
+):
+    """A natural-language move should not be classified as a new capability."""
+    src = repo / "src" / "genesis" / "autonomy" / "old.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+
+    p = _plan(
+        home,
+        "# Plan\nMove the file "
+        "`src/genesis/autonomy/old.py` to "
+        "`src/genesis/autonomy/new.py`.\n",
+    )
+
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+
+    assert result.returncode == 0
+
+
 def test_the_plan_gate_sees_non_python_sources(home: Path, repo: Path):
     """Genesis has first-party JS/HTML/CSS under src/genesis/dashboard/ — a plan
     adding a dashboard module is a new capability too."""
