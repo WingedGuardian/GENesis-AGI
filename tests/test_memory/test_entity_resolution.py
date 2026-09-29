@@ -122,6 +122,23 @@ def test_normalize_content_converges_chained_aliases():
     assert normalize_content("x", {"x": "y", "y": "x"}) == "x"
 
 
+def test_surface_variants_walks_back_multi_link_alias_chains():
+    """A canonical that is itself an alias leaves no trace in normalized
+    content: {"CC": "Claude Code", "Claude": "Anthropic"} stores "Anthropic
+    Code", and a legacy "CC owns" row is only reachable by recursing —
+    "Anthropic" -> "Claude" exposes "Claude Code", then "Claude Code" -> "CC".
+    """
+    aliases = {
+        "CC": "Claude Code",
+        "claude-code": "Claude Code",
+        "Claude": "Anthropic",
+    }
+    variants = surface_variants("Anthropic Code owns", aliases)
+    assert "CC owns" in variants
+    assert "claude-code owns" in variants
+    assert "Claude Code owns" in variants
+
+
 def test_surface_variants_finds_small_mixed_sets_at_any_position():
     """A mixed legacy row differs at a FEW slots; those subsets are enumerated
     before any large one, so a substitution at the earliest slot is never

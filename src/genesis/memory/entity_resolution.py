@@ -183,11 +183,14 @@ def surface_variants(
 
     Each canonical occurrence is a SLOT, enumerated independently — a legacy
     row can mix spellings (``"CC reviews claude-code"``). A slot's candidate
-    spellings are the aliases that forward-normalize to that canonical, which
-    is what makes chained mappings (``foo -> bar``, ``bar -> baz``) and
-    dictionary-order sensitivity come out right: ``normalize_content``
-    decides, so no spelling is offered that the write path could not itself
-    produce. Boundaries are ``(?<!\w)``/``(?!\w)`` lookarounds, not ``\b``, so
+    spellings are the aliases whose own normalization converges to the same
+    fixed point as that canonical: ``normalize_content`` decides, so no
+    spelling is offered that the write path could not itself produce. Because
+    a canonical can itself be an alias (``CC -> Claude Code`` plus
+    ``Claude -> Anthropic`` leaves nothing holding ``Claude Code``), the
+    enumeration recurses breadth-first over the variants it emits — each hop
+    walks one chain link back, so a row spelled at any depth is reached.
+    Boundaries are ``(?<!\w)``/``(?!\w)`` lookarounds, not ``\b``, so
     a canonical starting or ending with punctuation (``"C++"``) still matches.
 
     Homogeneous forms (every slot carrying the same alias) are emitted FIRST,
@@ -220,26 +223,6 @@ def surface_variants(
             r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.IGNORECASE
         )
 
-    # Positions and per-slot spellings for each canonical present in content.
-    # Each alias's forward form is computed once, lazily, and shared by every
-    # canonical: per canonical it would repeat the same normalization C times.
-    spellings: dict[str, list[str]] = {}
-    positions: list[tuple[int, int, str]] = []
-    forward: dict[str, str] | None = None
-    for canonical in dict.fromkeys(aliases.values()):
-        matches = list(_bounded(canonical).finditer(content))
-        if not matches:
-            continue
-        if forward is None:
-            forward = {a: normalize_content(a, aliases) for a in dict.fromkeys(aliases)}
-        spellings[canonical] = [
-            alias
-            for alias, target in forward.items()
-            if alias != canonical and target == canonical
-        ]
-        positions.extend((m.start(), m.end(), canonical) for m in matches)
-    positions.sort(key=lambda p: (p[0], -p[1]))
-
     results: list[str] = []
     seen = {content}
 
@@ -251,71 +234,131 @@ def surface_variants(
         seen.add(text)
         results.append(text)
 
-    for canonical, names in spellings.items():
-        if not names:
-            continue
-        pattern = _bounded(canonical)
-        for alias in names:
-            _emit(pattern.sub(alias, content))
+    canonicals = list(dict.fromkeys(aliases.values()))
+    forward: dict[str, str] | None = None
+    fixed: dict[str, str] | None = None
 
     _CANDIDATE_BUDGET = 512
     _SET_BUDGET = 64
-
-    def _enumerate(slot_list: list[tuple[int, int, str]]) -> None:
-        """Product over one mutually-disjoint slot set; every slot takes an
-        alias (an unset slot is a subset that doesn't contain it)."""
-        choice_lists = [spellings[c] for (_, _, c) in slot_list]
-        for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
-            out: list[str] = []
-            cursor = 0
-            for (start, end, _c), pick in zip(slot_list, picks, strict=True):
-                out.append(content[cursor:start])
-                out.append(pick)
-                cursor = end
-            out.append(content[cursor:])
-            _emit("".join(out))
-            if len(results) >= limit:
-                return
-
-    # Overlapping canonicals ({"X": "Claude", "CC": "Claude Code"}, or
-    # {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}) cannot be
-    # reduced to one kept set: a legacy row can substitute disjoint dropped
-    # spans together ("A Beta G") or a shorter span inside a longer one
-    # ("X Code"). Enumerate mutually-disjoint subsets of matching spans by
-    # ASCENDING SIZE: a mixed legacy row differs from the canonical form at a
-    # few slots, so the sets most likely to exist — one or two substitutions
-    # anywhere in the text — must be enumerated before any large set. An
-    # exclude-first DFS starves exactly those: with enough occurrences its
-    # first _SET_BUDGET sets all omit the earliest slot, so a stored "CC /
-    # claude-code / Claude Code / …" is never tried. Bounded by _SET_BUDGET
-    # sets and _SCAN_BUDGET combo inspections (overlapping spans can make
-    # most combinations non-disjoint), correctness by _emit's
-    # normalize_content check.
-    span_slots = [p for p in positions if spellings.get(p[2])]
-    span_slots.sort(key=lambda p: (p[0], p[1]))
-    sets_enumerated = 0
     _SCAN_BUDGET = 8192
-    scans = 0
-    for size in range(1, len(span_slots) + 1):
-        if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
-            break
-        for combo in combinations(span_slots, size):
-            scans += 1
-            if scans > _SCAN_BUDGET:
-                break
-            covered_end = -1
-            for start, end, _c in combo:
-                if start < covered_end:
-                    break
-                covered_end = end
-            else:
-                sets_enumerated += 1
-                _enumerate(list(combo))
+
+    def _expand(text: str) -> None:
+        """Emit every single-hop inverse spelling of *text*: substitutes a
+        whole-word canonical occurrence with an alias whose own normalization
+        reaches the same fixed point as that canonical."""
+        nonlocal forward, fixed
+        if forward is None:
+            forward = {
+                a: normalize_content(a, aliases)
+                for a in dict.fromkeys(aliases)
+            }
+            fixed = {c: normalize_content(c, aliases) for c in canonicals}
+
+        # A spelling reaches a slot when its normalization CONVERGES to the
+        # same fixed point as the canonical — `normalize(a) == fixed(c)`, not
+        # `== c`. A canonical that is itself an alias ("Claude Code" under a
+        # "Claude" -> "Anthropic" rule) never survives normalization, so it
+        # cannot appear in *text*; its spellings ("CC") only surface when a
+        # LATER hop exposes them on an emitted intermediate like "Claude Code".
+        spellings: dict[str, list[str]] = {}
+        positions: list[tuple[int, int, str]] = []
+        for canonical in canonicals:
+            matches = list(_bounded(canonical).finditer(text))
+            if not matches:
+                continue
+            spellings[canonical] = [
+                alias
+                for alias, target in forward.items()
+                if alias != canonical and target == fixed[canonical]
+            ]
+            positions.extend(
+                (m.start(), m.end(), canonical) for m in matches
+            )
+        positions.sort(key=lambda p: (p[0], -p[1]))
+
+        for canonical, names in spellings.items():
+            if not names:
+                continue
+            pattern = _bounded(canonical)
+            for alias in names:
+                _emit(pattern.sub(alias, text))
+
+        def _enumerate(
+            slot_list: list[tuple[int, int, str]],
+        ) -> None:
+            """Product over one mutually-disjoint slot set; every slot takes
+            an alias (an unset slot is a subset that doesn't contain it)."""
+            choice_lists = [spellings[c] for (_, _, c) in slot_list]
+            for picks in islice(product(*choice_lists), _CANDIDATE_BUDGET):
+                out: list[str] = []
+                cursor = 0
+                for (start, end, _c), pick in zip(
+                    slot_list, picks, strict=True
+                ):
+                    out.append(text[cursor:start])
+                    out.append(pick)
+                    cursor = end
+                out.append(text[cursor:])
+                _emit("".join(out))
+                if len(results) >= limit:
+                    return
+
+        # Overlapping canonicals ({"X": "Claude", "CC": "Claude Code"}, or
+        # {"WHOLE": "Alpha Beta Gamma", "A": "Alpha", "G": "Gamma"}) cannot be
+        # reduced to one kept set: a legacy row can substitute disjoint
+        # dropped spans together ("A Beta G") or a shorter span inside a
+        # longer one ("X Code"). Enumerate mutually-disjoint subsets of
+        # matching spans by ASCENDING SIZE: a mixed legacy row differs from
+        # the canonical form at a few slots, so the sets most likely to exist
+        # — one or two substitutions anywhere in the text — must be
+        # enumerated before any large set. An exclude-first DFS starves
+        # exactly those: with enough occurrences its first _SET_BUDGET sets
+        # all omit the earliest slot, so a stored "CC / claude-code / Claude
+        # Code / …" is never tried. Bounded by _SET_BUDGET sets and
+        # _SCAN_BUDGET combo inspections (overlapping spans can make most
+        # combinations non-disjoint), correctness by _emit's
+        # normalize_content check.
+        span_slots = [p for p in positions if spellings.get(p[2])]
+        span_slots.sort(key=lambda p: (p[0], p[1]))
+        sets_enumerated = 0
+        scans = 0
+        for size in range(1, len(span_slots) + 1):
             if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
                 break
-        else:
+            for combo in combinations(span_slots, size):
+                scans += 1
+                if scans > _SCAN_BUDGET:
+                    break
+                covered_end = -1
+                for start, end, _c in combo:
+                    if start < covered_end:
+                        break
+                    covered_end = end
+                else:
+                    sets_enumerated += 1
+                    _enumerate(list(combo))
+                if sets_enumerated >= _SET_BUDGET or len(results) >= limit:
+                    break
+            else:
+                continue
+            break
+
+    # The inverse of a fixed-point map is transitive: a legacy row can hold a
+    # spelling several chain links back ("CC owns" under {"CC": "Claude
+    # Code", "Claude": "Anthropic"} normalizes to "Anthropic Code owns" but no
+    # single substitution of a canonical in that text produces it — it takes
+    # "Anthropic" -> "Claude" exposing "Claude Code", then "Claude Code" ->
+    # "CC"). Breadth-first over emitted variants, depth-bounded by the longest
+    # possible chain — one alias consumed per hop.
+    queue: list[tuple[str, int]] = [(content, 0)]
+    while queue and len(results) < limit:
+        text, depth = queue.pop(0)
+        if depth > len(aliases):
             continue
-        break
+        before = len(results)
+        _expand(text)
+        for variant in results[before:]:
+            queue.append((variant, depth + 1))
 
     return results
 
