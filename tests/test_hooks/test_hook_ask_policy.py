@@ -894,10 +894,13 @@ def test_the_no_open_pr_block_survives_the_knob(monkeypatch, tmp_path, capsys) -
 
 
 def test_the_no_open_pr_ask_survives_the_knob(monkeypatch, tmp_path, capsys) -> None:
-    """Off the declared public repo the same state is an ask, and it is
-    classified unsuppressible: the knob must not silence it."""
+    """Where the block does not apply, the same state is an ask, classified
+    unsuppressible. The repo stays declared and the destination reads as the
+    public repo, so the switch is live and a suppressible class here would fail
+    this test."""
     _no_open_pr_repush(monkeypatch)
-    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
+    monkeypatch.setattr(gpg, "_no_pr_block_applies", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_push_dest_is_public_repo", lambda *a, **k: True)
     doc = _assert_asks(*_run(monkeypatch, tmp_path, capsys, "git push origin feat/x"))
     assert "NO OPEN PR" in _hso(doc)["permissionDecisionReason"]
 

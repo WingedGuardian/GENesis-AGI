@@ -929,6 +929,32 @@ def _normalize_public_repo(value: str) -> str | None:
     return f"{parts[0]}/{parts[1]}"
 
 
+def _ambiguous_public_repo_keys(yaml, text: str) -> bool:
+    """True if ``github``, ``user`` or ``public_repo`` repeats, or a merge key
+    (``<<``) appears, on the path ``_canonical_public_repo`` reads. A copy of the
+    push guard's helper of the same name (kept local for the same import reason);
+    the parity test in test_review_budget_commit_gate.py holds the two together."""
+
+    def _merges(mapping) -> bool:
+        return any(
+            isinstance(k, yaml.ScalarNode) and k.tag == "tag:yaml.org,2002:merge"
+            for k, _ in mapping.value
+        )
+
+    def _count(mapping, key: str) -> int:
+        return sum(1 for k, _ in mapping.value if isinstance(k, yaml.ScalarNode) and k.value == key)
+
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    if not isinstance(root, yaml.MappingNode):
+        return False
+    if _merges(root) or _count(root, "github") > 1:
+        return True
+    gh = next((v for k, v in root.value if isinstance(k, yaml.ScalarNode) and k.value == "github"), None)
+    if not isinstance(gh, yaml.MappingNode):
+        return False
+    return _merges(gh) or _count(gh, "user") > 1 or _count(gh, "public_repo") > 1
+
+
 def _canonical_public_repo() -> str | None:
     """The configured public repo (``github.user``/``github.public_repo`` in
     ``~/.genesis/config/genesis.yaml``) as ``owner/repo``, or None when it cannot
@@ -942,7 +968,12 @@ def _canonical_public_repo() -> str | None:
         import yaml  # lazy: the genesis venv has pyyaml; absence → None → engage.
 
         with open(os.path.expanduser("~/.genesis/config/genesis.yaml")) as fh:
-            cfg = yaml.safe_load(fh) or {}
+            text = fh.read()
+        # Mirrors the push guard: a repeated or merged key on the github ->
+        # user/public_repo path is undeterminable (None), never last-wins.
+        if _ambiguous_public_repo_keys(yaml, text):
+            return None
+        cfg = yaml.safe_load(text) or {}
         gh = cfg.get("github") or {}
         user = (gh.get("user") or "").strip()
         repo = (gh.get("public_repo") or "").strip()

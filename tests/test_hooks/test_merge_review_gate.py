@@ -414,13 +414,30 @@ class TestPushIsRepublish:
     and approved on its first push). Fail-safe to False (→ prompt) on any
     uncertainty — an unresolved remote/branch never triggers a network call."""
 
+    _URLS = {"https://example.invalid/o/r.git"}
+
     def test_present_is_republish(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", return_value="abc123"):
+        with (
+            patch.object(guard_module, "_remote_push_urls", return_value=self._URLS),
+            patch.object(guard_module, "_remote_branch_sha", return_value="abc123"),
+        ):
             assert guard_module._push_is_republish("origin", "feat") is True
 
     def test_absent_is_not_republish(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", return_value=None):
+        with (
+            patch.object(guard_module, "_remote_push_urls", return_value=self._URLS),
+            patch.object(guard_module, "_remote_branch_sha", return_value=None),
+        ):
             assert guard_module._push_is_republish("origin", "feat") is False
+
+    def test_a_destination_with_no_push_urls_is_never_republish(self, guard_module):
+        # `.` or a path: ls-remote would list the LOCAL branches and always hit,
+        # so it must not be consulted at all.
+        with (
+            patch.object(guard_module, "_remote_push_urls", return_value=set()),
+            patch.object(guard_module, "_remote_branch_sha", side_effect=AssertionError),
+        ):
+            assert guard_module._push_is_republish(".", "feat") is False
 
     def test_none_remote_short_circuits(self, guard_module):
         # unresolved remote → never republish; must NOT touch the remote.
@@ -432,8 +449,12 @@ class TestPushIsRepublish:
             assert guard_module._push_is_republish("origin", None) is False
 
     def test_cwd_forwarded(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", return_value="x") as srch:
+        with (
+            patch.object(guard_module, "_remote_push_urls", return_value=self._URLS) as urls,
+            patch.object(guard_module, "_remote_branch_sha", return_value="x") as srch,
+        ):
             guard_module._push_is_republish("origin", "feat", cwd="/wt")
+        assert urls.call_args_list[0].args[1] == "/wt" or urls.call_args_list[0].kwargs.get("cwd") == "/wt"
         assert srch.call_args_list[0].kwargs.get("cwd") == "/wt"
 
 

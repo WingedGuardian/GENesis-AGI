@@ -766,6 +766,11 @@ def test_canonical_public_repo_matches_the_push_guards_reading(monkeypatch, tmp_
         "github:\n  user: Owner\n  public_repo: $X\n",
         "other: 1\n",
         "github: [unbalanced\n",
+        # Ambiguous keys: both readers must refuse (None), never last-wins.
+        "github:\n  user: Owner\n  public_repo: Project\n  public_repo: Other\n",
+        "github:\n  user: A\n  user: Owner\n  public_repo: Project\n",
+        "github:\n  user: A\n  public_repo: B\ngithub:\n  user: Owner\n  public_repo: Project\n",
+        "github:\n  <<: {public_repo: Other}\n  user: Owner\n  public_repo: Project\n",
         None,
     ]
     for text in cases:
