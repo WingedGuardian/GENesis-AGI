@@ -1179,9 +1179,14 @@ verified: 246808153 2026-09-24
   them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
   pages only, returning None for any `/api/` or `/v1/` path;
   `auth.check_api_mutation_auth` is app-level and returns None for
-  GET/HEAD/OPTIONS. So a dashboard password does protect the HTML pages — that
-  gate is structural and it does refuse an unauthenticated page GET — and it
-  protects the MUTATION routes, and **no request hook gates an API read on any
+  GET/HEAD/OPTIONS. So a dashboard password does protect the blueprint's HTML
+  pages — that gate is structural and it does refuse an unauthenticated page
+  GET — except `/genesis/monitor`, which the standalone host registers directly
+  on the app (`hosting/standalone.py`), outside the blueprint, and serves to
+  anyone (a static shell whose data comes from the open API reads below). It
+  protects the MUTATION routes only while the `GENESIS_DASHBOARD_API_AUTH` kill
+  switch is on (the default); set to off, `check_api_mutation_auth` returns
+  before any credential check. And **no request hook gates an API read on any
   install, configured or not.** A GET under the API prefixes (`/api/genesis/`
   and `/api/t/`) is therefore anonymous unless its own handler adds a
   predicate, and only a small minority do (`routes/references.py` is one: its
