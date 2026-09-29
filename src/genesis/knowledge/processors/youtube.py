@@ -17,6 +17,7 @@ MIT License, Copyright (c) 2026 Bradley Bonanno).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import logging
@@ -37,6 +38,9 @@ logger = logging.getLogger(__name__)
 # One audio transcription at a time per process: each can download up to the
 # length cap of audio and hold it in memory for speech-to-text (#2568 review).
 _AUDIO_SLOTS = asyncio.Semaphore(1)
+# At most three yt-dlp processes at once per process: a 10-link batch would
+# otherwise start ten, each with a JavaScript runtime (#2568 class audit).
+_YTDLP_SLOTS = asyncio.Semaphore(3)
 # Audio download ceiling per allowed minute of video. 2 MB per minute is well
 # above speech bitrates, so a real track fits and a padded stream cannot.
 _AUDIO_MB_PER_MINUTE = 2
@@ -58,7 +62,9 @@ _TRACK_KEY = re.compile(r"[A-Za-z0-9_-]{1,40}")
 
 # Hosts a caption track may be downloaded from. The track URLs come from the
 # video's metadata, and a caption download from --load-info-json follows them
-# as given, so a track pointing anywhere else is dropped (#2568 review).
+# as given, so a track pointing anywhere else is dropped (#2568 review). If
+# that download fails, yt-dlp may re-extract from the video page and follow
+# fresh URLs this check never saw; those still come from the YouTube extractor.
 _CAPTION_HOST_SUFFIXES = (".youtube.com", ".googlevideo.com")
 
 
@@ -182,8 +188,10 @@ def select_caption(info: dict) -> dict | None:
             )
             if keys:
                 key = keys[0]
+                # "language-match": the track's language matches the video's
+                # stated language. Not a check of the captions against the audio.
                 return {"key": key, "language": key.removesuffix("-orig"), "kind": kind,
-                        "provenance": "original"}
+                        "provenance": "language-match"}
     # No language evidence matched: take one available track, labelled unknown.
     for kind, tracks in (("manual", manual), ("automatic", automatic)):
         if tracks:
@@ -220,19 +228,20 @@ def _summary(info: dict, url: str) -> dict:
 async def _exec(argv: list[str]) -> tuple[int, bytes, bytes]:
     """Run one yt-dlp process in its own group; kill the group if cancelled,
     so a caller's timeout never orphans yt-dlp or its JavaScript runtime."""
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = await proc.communicate()
-    except BaseException:
-        kill_process_group(proc)
-        await reap_bounded(proc)
-        raise
-    return proc.returncode or 0, stdout, stderr
+    async with _YTDLP_SLOTS:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = await proc.communicate()
+        except BaseException:
+            kill_process_group(proc)
+            await reap_bounded(proc)
+            raise
+        return proc.returncode or 0, stdout, stderr
 
 
 class YouTubeProcessor:
@@ -257,6 +266,9 @@ class YouTubeProcessor:
     async def fetch(self, url: str, *, audio_fallback: bool = True) -> YouTubeFetch:
         """Metadata plus the best caption track; audio transcription when the
         video has no captions and ``audio_fallback`` is set."""
+        url = url.strip()
+        if "://" not in url:
+            url = "https://" + url  # the ingestion registry pattern allows no scheme
         result = YouTubeFetch(url=url, metadata={"url": url})
         if not is_youtube_video_url(url):
             result.errors.append("not a YouTube video URL")
@@ -411,9 +423,26 @@ class YouTubeProcessor:
                 candidates = sorted(Path(tmpdir).glob("audio.*"))
                 if not candidates:
                     result.errors.append("audio not downloaded (the length check rejected it)")
+                    return None
+                # --max-filesize bounds the DOWNLOAD; the converted file is a
+                # separate file, so it is checked before it is read (#2568 review).
+                limit = max(1, max_seconds // 60) * _AUDIO_MB_PER_MINUTE * 1024 * 1024
+                if candidates[0].stat().st_size > limit:
+                    result.errors.append("audio file larger than the audio size limit; not transcribed")
+                    return None
                 if candidates:
                     from genesis.channels.stt import transcribe
-                    text = await transcribe(candidates[0].read_bytes())
+
+                    # transcribe() runs its request in a worker thread that a
+                    # cancellation cannot stop, so a cancelled fetch waits for it
+                    # before releasing the audio slot (#2568 review).
+                    job = asyncio.ensure_future(transcribe(candidates[0].read_bytes()))
+                    try:
+                        text = await asyncio.shield(job)
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(BaseException):
+                            await job
+                        raise
                     if not text:
                         result.errors.append(
                             "audio downloaded but speech-to-text returned nothing "

@@ -21,7 +21,7 @@ CC's built-in WebFetch only gets the page shell, not what the video says
 `mcp__genesis-health__web_fetch` with the video URL (or `urls=[...]` for a
 batch). For a YouTube video it runs yt-dlp in Python and returns the title,
 channel, description and transcript, choosing captions in the video's own
-language (manual over automatic), else an audio transcription, with a
+language (manual over automatic), with a
 `Transcript source` line and a `caption` field giving the track and its
 provenance. It needs no shell, so it also works in background sessions. If it
 reports `youtube_error`, read the error; the rest of the result is the page's

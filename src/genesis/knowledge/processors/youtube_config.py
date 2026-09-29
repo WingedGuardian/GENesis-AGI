@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import _resolve_overlay_path, merge_local_overlay
+from genesis._config_overlay import merge_local_overlay
 from genesis.env import repo_root
 
 logger = logging.getLogger(__name__)
@@ -54,8 +54,12 @@ def _overlay_damaged(base_path: Path) -> bool:
     would silently drop an operator's ``tls: verify``. This check lets the
     lever fail toward verification instead (#2568 review).
     """
+    # Imported here, not at module level: a module-level binding of the
+    # user-config-dir resolver escapes the test suite's config isolation.
+    from genesis import _config_overlay
+
     try:
-        path = _resolve_overlay_path(base_path)
+        path = _config_overlay._resolve_overlay_path(base_path)
         if not path.exists():
             return False
         loaded = yaml.safe_load(path.read_text())
@@ -97,13 +101,18 @@ def load_config() -> dict[str, Any]:
 
 
 def audio_max_minutes() -> int:
-    """The audio-fallback duration cap in minutes, read live. Invalid → default."""
-    value = load_config().get("audio_max_minutes")
+    """The audio-fallback duration cap in minutes, read live.
+
+    A damaged config or an invalid value answers 0 (no audio transcription):
+    the operator's cap may be exactly what failed to load (#2568 class audit).
+    """
+    cfg = load_config()
+    if cfg.get("_damaged"):
+        return 0
+    value = cfg.get("audio_max_minutes")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        if value is not None:
-            logger.warning("youtube_fetch has invalid audio_max_minutes %r — using %d",
-                           value, DEFAULT_AUDIO_MAX_MINUTES)
-        return DEFAULT_AUDIO_MAX_MINUTES
+        logger.warning("youtube_fetch has invalid audio_max_minutes %r — audio transcription off", value)
+        return 0
     return value
 
 

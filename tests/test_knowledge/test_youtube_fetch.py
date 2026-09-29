@@ -76,7 +76,7 @@ def test_a_dubbed_video_keeps_its_original_language_track():
         "key": "fr-orig",
         "language": "fr",
         "kind": "automatic",
-        "provenance": "original",
+        "provenance": "language-match",
     }
 
 
@@ -90,7 +90,7 @@ def test_manual_captions_in_the_original_language_beat_automatic():
         "key": "de",
         "language": "de",
         "kind": "manual",
-        "provenance": "original",
+        "provenance": "language-match",
     }
 
 
@@ -357,11 +357,27 @@ async def test_a_schemeless_youtube_url_is_routed_too(web):
     assert out["backend_used"] == "yt-dlp"
 
 
-async def test_a_failed_youtube_fetch_falls_back_to_the_page_and_says_why(web):
+async def test_a_video_without_captions_keeps_its_metadata(web):
+    """Class audit: good yt-dlp metadata was dropped for a page fetch that is
+    often only a consent or script shell."""
     tool, calls, set_fetch = web
-    set_fetch(None)
+    set_fetch(None)  # metadata {"title": "V"}, no transcript
     out = await tool(url="https://youtu.be/abc123")
-    assert out["content"] == "page" and "private video" in out["youtube_error"]
+    assert out["backend_used"] == "yt-dlp" and "(no transcript)" in out["content"]
+    assert "private video" in out["youtube_error"] and calls["page"] == []
+
+
+async def test_a_failed_metadata_fetch_falls_back_to_the_page(web, monkeypatch):
+    from genesis.mcp.health import youtube_route
+
+    tool, calls, set_fetch = web
+
+    async def fetch(self, url, *, audio_fallback=True):
+        return YouTubeFetch(url=url, metadata={"url": url}, errors=["ERROR: unavailable"])
+
+    monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", fetch)
+    out = await tool(url="https://youtu.be/abc123")
+    assert out["content"] == "page" and "unavailable" in out["youtube_error"]
 
 
 async def test_a_lookalike_url_never_reaches_yt_dlp(web):
@@ -548,10 +564,18 @@ async def test_the_audio_fallback_runs_only_within_the_duration_cap(
         assert any("audio_max_minutes" in e for e in result.errors), result.errors
 
 
-@pytest.mark.parametrize(("value", "expected"), [(30, 30), (0, 0), (-1, 120), (True, 120), ("9", 120), (None, 120)])
-def test_audio_max_minutes_reads_the_lever_and_degrades_to_the_default(monkeypatch, value, expected):
+@pytest.mark.parametrize(("value", "expected"), [(30, 30), (0, 0), (-1, 0), (True, 0), ("9", 0), (None, 0)])
+def test_audio_max_minutes_reads_the_lever_and_fails_safe(monkeypatch, value, expected):
+    """Class audit: an invalid value never turns audio on at the default."""
     monkeypatch.setattr(youtube_config, "load_config", lambda: {"audio_max_minutes": value})
     assert youtube_config.audio_max_minutes() == expected
+
+
+def test_a_damaged_config_turns_audio_off(monkeypatch):
+    """Class audit: an operator's audio_max_minutes: 0 in a broken overlay came back as 120."""
+    monkeypatch.setattr(youtube_config, "load_config",
+                        lambda: {"audio_max_minutes": 120, "_damaged": True})
+    assert youtube_config.audio_max_minutes() == 0
 
 
 def test_settings_validator_checks_audio_max_minutes():
@@ -661,7 +685,9 @@ def test_a_damaged_config_degrades_tls_to_verify(monkeypatch, tmp_path):
 
 def test_an_unparseable_overlay_counts_as_damage(monkeypatch, tmp_path):
     overlay = tmp_path / "youtube_fetch.local.yaml"
-    monkeypatch.setattr(youtube_config, "_resolve_overlay_path", lambda p: overlay)
+    from genesis import _config_overlay
+
+    monkeypatch.setattr(_config_overlay, "_resolve_overlay_path", lambda p: overlay)
     assert youtube_config._overlay_damaged(tmp_path / "youtube_fetch.yaml") is False  # absent
     overlay.write_text("tls: verify\n")
     assert youtube_config._overlay_damaged(tmp_path / "youtube_fetch.yaml") is False
@@ -708,8 +734,9 @@ async def test_an_empty_speech_to_text_result_is_reported(monkeypatch, tmp_path)
     assert any("speech-to-text returned nothing" in e for e in result.errors), result.errors
 
 
-async def test_a_batch_never_transcribes_audio(web, monkeypatch):
-    """Codex P1: a 10-link batch of captionless videos started ten audio jobs."""
+async def test_web_fetch_never_transcribes_audio(web, monkeypatch):
+    """Owner decision 2026-09-29: audio transcription is unbounded work, so the
+    attacker-reachable web_fetch route never runs it; ingestion keeps it."""
     from genesis.mcp.health import youtube_route
 
     tool, calls, set_fetch = web
@@ -719,14 +746,13 @@ async def test_a_batch_never_transcribes_audio(web, monkeypatch):
         flags.append(audio_fallback)
         return YouTubeFetch(url=url, metadata={"title": "V"}, transcript="t",
                             caption={"key": "en", "language": "en", "kind": "manual",
-                                     "provenance": "original"})
+                                     "provenance": "language-match"})
 
     monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", fetch)
-    await tool(urls=["https://youtu.be/a1", "https://youtu.be/b2"])
-    assert flags == [False, False]
-    flags.clear()
     await tool(url="https://youtu.be/a1")
-    assert flags == [True]
+    await tool(urls=["https://youtu.be/only1"])
+    await tool(urls=["https://youtu.be/a1", "https://youtu.be/b2", "https://example.com/x"])
+    assert flags == [False, False, False, False]
 
 
 async def test_audio_transcriptions_run_one_at_a_time(monkeypatch, tmp_path):
@@ -747,3 +773,140 @@ async def test_audio_transcriptions_run_one_at_a_time(monkeypatch, tmp_path):
     monkeypatch.setattr(YouTubeProcessor, "_transcribe_audio", audio)
     await asyncio.gather(*(YouTubeProcessor().fetch(f"https://youtu.be/v{i}") for i in range(3)))
     assert active["peak"] == 1
+
+
+# ─── #2568 round 3 ───────────────────────────────────────────────────────────
+
+
+async def test_an_oversized_converted_file_is_never_read(monkeypatch, tmp_path):
+    """Devin: --max-filesize bounds the download, not the converted MP3."""
+    async def run(argv):
+        out = argv[argv.index("-o") + 1].replace("%%", "%").replace("%(ext)s", "mp3")
+        with open(out, "wb") as fh:
+            fh.truncate(3 * 1024 * 1024)  # 3 MB against a 2 MB limit (1 minute cap)
+        return 0, b"", b""
+
+    import genesis.channels.stt as stt
+
+    async def never(data):
+        raise AssertionError("an oversized file must not be sent to speech-to-text")
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    monkeypatch.setattr(stt, "transcribe", never)
+    result = YouTubeFetch(url="https://youtu.be/a")
+    assert await YouTubeProcessor()._transcribe_audio(result, result.url, max_seconds=60) is None
+    assert any("larger than the audio size limit" in e for e in result.errors)
+
+
+async def test_a_cancelled_transcription_holds_its_slot_until_the_request_ends(monkeypatch, tmp_path):
+    """Devin: cancelling released the audio slot while STT's worker thread kept running."""
+    async def run(argv):
+        out = argv[argv.index("-o") + 1].replace("%%", "%").replace("%(ext)s", "mp3")
+        Path(out).write_bytes(b"audio")
+        return 0, b"", b""
+
+    import genesis.channels.stt as stt
+
+    finished = asyncio.Event()
+
+    async def slow(data):
+        await asyncio.sleep(0.2)
+        finished.set()
+        return "words"
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    monkeypatch.setattr(stt, "transcribe", slow)
+
+    async def guarded():
+        async with yt._AUDIO_SLOTS:
+            await YouTubeProcessor()._transcribe_audio(
+                YouTubeFetch(url="https://youtu.be/a"), "https://youtu.be/a", max_seconds=600)
+
+    task = asyncio.create_task(guarded())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set(), "the slot was released before the transcription request ended"
+
+
+# ─── #2568 class audit ───────────────────────────────────────────────────────
+
+
+async def test_ingestion_accepts_a_schemeless_youtube_link(monkeypatch, tmp_path):
+    """Class audit: the ingestion registry routes youtu.be/abc (no scheme) here,
+    and fetch() rejected it as not a YouTube URL."""
+    seen = []
+
+    async def run(argv):
+        seen.append(argv)
+        return 1, b"", b"ERROR: [youtube] x: Video unavailable"
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+    result = await YouTubeProcessor().fetch("youtu.be/abc123", audio_fallback=False)
+    assert seen and seen[0][-1] == "https://youtu.be/abc123"
+    assert "not a YouTube video URL" not in result.errors
+
+
+async def test_at_most_three_yt_dlp_processes_run_at_once():
+    """Class audit: a 10-link batch started ten yt-dlp processes at once."""
+    active = {"now": 0, "peak": 0}
+    real = asyncio.create_subprocess_exec
+
+    async def counting(*argv, **kw):
+        active["now"] += 1
+        active["peak"] = max(active["peak"], active["now"])
+        proc = await real(sys.executable, "-c", "import time; time.sleep(0.2)", **kw)
+        orig = proc.communicate
+
+        async def communicate():
+            try:
+                return await orig()
+            finally:
+                active["now"] -= 1
+
+        proc.communicate = communicate
+        return proc
+
+    import unittest.mock as mock
+
+    with mock.patch.object(yt.asyncio, "create_subprocess_exec", counting):
+        await asyncio.gather(*(yt._exec(["x"]) for _ in range(6)))
+    assert active["peak"] == 3
+
+
+async def test_a_cancelled_fetch_kills_grandchildren_too(tmp_path):
+    """Class audit: the old test started one process with no children, so a
+    plain proc.kill() passed it too. yt-dlp starts a JavaScript runtime."""
+    import os
+
+    pidfile = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n"
+    )
+    task = asyncio.create_task(yt._exec([sys.executable, "-c", script]))
+    for _ in range(50):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.05)
+    grandchild = int(pidfile.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(40):
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the grandchild outlived the cancelled fetch")

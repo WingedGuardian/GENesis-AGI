@@ -315,7 +315,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "certificate-verification error, logged at warning and flagged "
             "tls_verified=false in the result; verify never skips; off always skips. "
             "Unverified calls carry no cookies or config-file options. "
-            "`audio_max_minutes` (default 120): the audio-transcription fallback for "
+            "`audio_max_minutes` (default 120; knowledge ingestion only, web_fetch "
+            "never transcribes audio): the audio-transcription fallback for "
             "a captionless video runs only up to this length (0 = never). Read fresh "
             "per fetch — takes effect immediately, no restart."
         ),

@@ -41,7 +41,7 @@ SEED_PROCEDURES = [
         ),
         "steps": [
             "Call mcp__genesis-health__web_fetch with the video URL (urls=[...] for several)",
-            "Read the Transcript source line: which caption track (and its provenance) or audio transcription",
+            "Read the Transcript source line: which caption track was used (and its provenance)",
             "If the result has youtube_error, report that error; the rest is only the page title and description",
             "Foreground sessions only, if web_fetch is unavailable: the youtube-fetch skill's yt-dlp via Bash fallback",
         ],

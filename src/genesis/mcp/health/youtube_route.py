@@ -1,7 +1,7 @@
 """YouTube route for the ``web_fetch`` MCP tool.
 
 A YouTube video URL is fetched through ``YouTubeProcessor`` (yt-dlp: metadata
-plus the best caption track, else an audio transcription) instead of the page
+plus the best caption track; never an audio transcription) instead of the page
 HTML, so a session without Bash — the inbox judge — still reads what a video
 says. Wired into the MCP tool wrapper only: ``_impl_web_fetch``'s other callers
 (the corrective memory search, the dashboard) keep plain page fetches.
@@ -48,9 +48,7 @@ def _format(result) -> str:
     return "\n".join(lines)
 
 
-async def fetch_youtube(
-    url: str, max_chars: int, *, audio_fallback: bool = True
-) -> tuple[dict | None, str | None]:
+async def fetch_youtube(url: str, max_chars: int) -> tuple[dict | None, str | None]:
     """``(result, None)`` on success, ``(None, error)`` when the caller should
     fall back to the ordinary fetch chain; ``(None, None)`` for a non-YouTube URL."""
     url = (url or "").strip()
@@ -60,14 +58,35 @@ async def fetch_youtube(
         return None, None
     start = time.monotonic()
     try:
-        result = await YouTubeProcessor().fetch(url, audio_fallback=audio_fallback)
+        # Never an audio transcription here: this route is reachable from
+        # attacker-authored inbox links, and audio is unbounded work (download,
+        # conversion, speech-to-text) that round after round of review had to
+        # fence in. Knowledge ingestion keeps it (owner decision, 2026-09-29).
+        result = await YouTubeProcessor().fetch(url, audio_fallback=False)
     except Exception as exc:  # never let the route break web_fetch
         logger.warning("YouTube fetch raised for %s", url, exc_info=True)
         return None, f"{type(exc).__name__}: {exc}"
     if not result.transcript:
-        error = "; ".join(result.errors) or "no transcript"
+        error = "; ".join(result.errors) or "no captions"
         logger.info("YouTube fetch produced no transcript for %s: %s", url, error)
-        return None, error
+        if not result.metadata.get("title"):
+            return None, error  # metadata failed too: the page is the best left
+        # Metadata came through: return it (it says "(no transcript)") rather
+        # than a page fetch that is often only a consent or script shell.
+        content = _format(result)
+        return {
+            "url": url,
+            "title": result.metadata.get("title", ""),
+            "content": content[:max_chars],
+            "backend_used": "yt-dlp",
+            "status_code": 200,
+            "truncated": len(content) > max_chars,
+            "error": None,
+            "youtube_error": error,
+            "caption": None,
+            "tls_verified": result.tls_verified,
+            "latency_ms": round((time.monotonic() - start) * 1000, 1),
+        }, None
     content = _format(result)
     return {
         "url": url,

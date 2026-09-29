@@ -136,7 +136,7 @@ You MUST address every single one:
 
 - **YouTube videos: use `web_fetch`.** For a YouTube video URL it returns the
   title, channel, description and the TRANSCRIPT (captions in the video's own
-  language, or an audio transcription when there are none), with a
+  language; a video without captions returns its metadata only), with a
   `Transcript source` line saying which. Evaluate what the video actually says,
   not its title. If the transcript could not be fetched, the result carries
   the page's title and description plus a `youtube_error` saying why: report

@@ -676,10 +676,11 @@ async def web_fetch(
     - Background sessions (no Bash available)
 
     - YouTube videos: with backend "auto", a video URL returns its metadata,
-      description and transcript (captions in the video's own language, else
-      an audio transcription) via yt-dlp — backend_used "yt-dlp", plus
-      `caption` provenance. If that fails, the page is fetched as usual and
-      `youtube_error` says why.
+      description and transcript (captions in the video's own language) via
+      yt-dlp — backend_used "yt-dlp", plus `caption` provenance. A video with
+      no captions returns its metadata and `youtube_error`; no audio is
+      transcribed here. If yt-dlp gets nothing at all, the page is fetched as
+      usual and `youtube_error` says why.
 
     Use CC WebFetch when you specifically need AI-processed summaries.
     Use browser_navigate when you need to interact with the page.
@@ -698,12 +699,9 @@ async def web_fetch(
         # A batch holding a YouTube link: every URL is fetched on its own, all
         # at once, so each result belongs to its URL by construction and one
         # slow video never holds up the rest (#2568 review).
-        # In a batch, a captionless video is not transcribed from its audio:
-        # ten at once would multiply downloads and speech-to-text work from one
-        # external request (#2568 review). Fetching the URL on its own does.
         async def one(u: str) -> dict:
             try:
-                yt, yt_error = await fetch_youtube(u, max_chars, audio_fallback=False)
+                yt, yt_error = await fetch_youtube(u, max_chars)
                 if yt is not None:
                     return yt
                 page = await _impl_web_fetch(u, "auto", max_chars)

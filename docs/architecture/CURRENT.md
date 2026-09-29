@@ -521,7 +521,7 @@ verified: 18e41e1e1 2026-09-23
   `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
   Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
   `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
-  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes` for the captionless-video audio fallback); if the
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback); if the
   MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
   judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the

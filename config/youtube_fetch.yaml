@@ -16,7 +16,8 @@
 # An invalid value degrades to `verify`. Read fresh per fetch; no restart needed.
 tls: auto_fallback
 
-# audio_max_minutes: a video with no captions is transcribed from its audio only
+# audio_max_minutes: KNOWLEDGE INGESTION only (the web_fetch route never
+# transcribes audio). A video with no captions is transcribed from its audio only
 # if it is at most this many minutes long (0 = never). The length comes from the
 # metadata, before anything is downloaded; unknown length is treated as too long.
 audio_max_minutes: 120
