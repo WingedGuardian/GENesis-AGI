@@ -130,9 +130,15 @@ def _print_verification_backlog(db_path: str | None) -> None:
     print(
         "  close one: python3 scripts/pr_verification.py close --pr <N> --verdict "
         "<pass-mechanical|pass-with-measured-gaps|fail-intent|cannot-verify> "
-        "--evidence-file <doc.json>   (see --verification-log for what was decided)"
+        "--evidence-file <doc.json>   "
+        "(--verification-log --pr <N> shows what was decided, on any row)"
     )
 
+
+#: Characters of one evidence document a scoped read prints before clipping. The
+#: document is capped at 256 KiB by the writer, which is far more than belongs in a
+#: terminal; this is the reading budget, and a clip SAYS it clipped.
+_EVIDENCE_SHOW = 8000
 
 #: Rows one `--verification-log` run will show. Named rather than inline so the
 #: truncation disclosure below cannot drift from the value it describes.
@@ -140,7 +146,14 @@ _LOG_LIMIT = 500
 
 
 def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
-    """The closed-obligation reader: what a validator DECIDED, and on what evidence.
+    """What a validator DECIDED about an obligation, and on what evidence.
+
+    UNSCOPED it lists discharged rows — the census of what has been closed. SCOPED to a
+    PR it shows every row for that PR, OPEN ones included, because an open row carrying
+    a recorded attempt is exactly where the evidence document is most worth reading: a
+    fail-intent is the highest-value record here and its row never closes. An
+    adversarial audit measured that filtering on status made that row unreachable from
+    every reader at once, which is this reader's own defect one row-state over.
 
     The counterpart to the backlog. Without it the evidence column is write-only —
     MEASURED before this shipped: nothing in ``src/`` or ``scripts/`` ever SELECTed
@@ -179,34 +192,85 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
             # The filter goes to SQL, never to a Python pass over a capped page:
             # paging 500 and filtering after it reported "no closed rows for PR #N"
             # about a row that WAS closed, and blamed an empty table for it.
-            return await verif_crud.list_closed(db, limit=_LOG_LIMIT, pr_number=pr_number)
+            #
+            # A SCOPED read asks "what is the state of this obligation", which includes
+            # an OPEN row carrying a recorded attempt — the state where the evidence
+            # document is most worth reading, since a fail-intent is the highest-value
+            # record here and its row never closes. Filtering on status made that row
+            # unreachable from every reader at once.
+            if pr_number is not None:
+                return await verif_crud.list_for_pr(db, pr_number=pr_number)
+            return await verif_crud.list_closed(db, limit=_LOG_LIMIT, pr_number=None)
 
     rows = _asyncio.run(_read())
     if not rows:
-        scope = f" for PR #{pr_number}" if pr_number is not None else ""
-        print(
-            f"pr_verifications: no closed rows{scope} — the table is empty, "
-            f"pre-migration, or nothing matching has been discharged"
-        )
+        if pr_number is not None:
+            print(
+                f"pr_verifications: no rows for PR #{pr_number} — the table is empty, "
+                f"pre-migration, or no obligation was ever opened for it. This read "
+                f"covers OPEN rows too, so a parked attempt would have appeared here"
+            )
+        else:
+            print(
+                "pr_verifications: no closed rows — the table is empty, "
+                "pre-migration, or nothing has been discharged yet"
+            )
         return
 
     for row in rows:
         # A NULL verdict is stated, never blanked: it means the row was closed
         # before verdicts existed, or by the deterministic docs-path exemption —
         # not that a validator reached no conclusion.
-        verdict = row.get("verdict") or "<no verdict — auto-exempt by path, or pre-verdict>"
-        print(
-            f"CLOSED  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
-            f"{str(row.get('closed_at') or '')[:19]}  {verdict}"
-        )
-        reason = (row.get("closed_reason") or "").strip()
-        if reason:
-            print(f"        reason  : {reason[:160]}")
-        evidence = row.get("evidence")
-        if evidence:
-            print(f"        evidence: {len(evidence)} bytes")
+        closed = row.get("status") == "closed"
+        if closed:
+            verdict = row.get("verdict") or "<no verdict — auto-exempt by path, or pre-verdict>"
+            print(
+                f"CLOSED  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
+                f"{str(row.get('closed_at') or '')[:19]}  {verdict}"
+            )
+            reason = (row.get("closed_reason") or "").strip()
+            if reason:
+                print(f"        reason  : {reason[:160]}")
         else:
+            # An OPEN row reached here only from a scoped read, and it is open BECAUSE a
+            # verdict was recorded that does not discharge the obligation. Say which,
+            # and how many attempts it has cost — the escalation signal.
+            verdict = row.get("verdict") or "<never attempted>"
+            print(
+                f"OPEN    {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
+                f"{str(row.get('last_attempt_at') or row.get('merged_at') or '')[:19]}  "
+                f"{verdict}"
+            )
+            note = (row.get("last_attempt_note") or "").strip()
+            if note:
+                print(f"        note    : {note[:160]}")
+            if row.get("attempt_count"):
+                print(f"        attempts: {row['attempt_count']}")
+        evidence = row.get("evidence")
+        if not evidence:
             print("        evidence: none recorded")
+        elif pr_number is None:
+            # An unscoped listing can carry 500 rows; printing every document would
+            # bury the census this mode exists to give. The pointer is the affordance.
+            print(
+                f"        evidence: {len(evidence)} bytes "
+                f"— read it with --verification-log --pr {row['pr_number']}"
+            )
+        else:
+            # A SCOPED read is someone asking what was concluded, so show it. Without
+            # this the column was written by the validator and read by nobody, and a
+            # daily retention timer deletes closed rows at 45 days — the whole reason
+            # this reader ships in the same change as the writer.
+            print(f"        evidence: {len(evidence)} bytes")
+            body = evidence
+            if len(body) > _EVIDENCE_SHOW:
+                body = (
+                    body[:_EVIDENCE_SHOW]
+                    + f"\n<CLIPPED at {_EVIDENCE_SHOW} of {len(evidence)} chars — "
+                    f"query pr_verifications.evidence for the whole document>"
+                )
+            for line in body.splitlines():
+                print(f"          {line}")
     # A listing whose length EQUALS its cap is a truncated read, and printing the
     # count alone lets a reader take it for a total — the same omission the backlog
     # reader states with both numbers. Say so rather than letting the two disagree
@@ -259,6 +323,13 @@ def main() -> None:
         help="scope --verification-log to a single PR number",
     )
     args = parser.parse_args()
+
+    # --pr scopes ONE mode. Accepted-and-ignored elsewhere, it reads as a filter that
+    # was applied: a full-pulse run would report on every PR while the operator
+    # believed they had narrowed it. parser.error exits 2, which is the one nonzero
+    # this module's always-exit-0 contract already allows (argument parsing failing).
+    if args.pr is not None and not args.verification_log:
+        parser.error("--pr only scopes --verification-log; pass it alongside that flag, or drop it")
 
     if args.verification_backlog:
         _print_verification_backlog(args.db_path)

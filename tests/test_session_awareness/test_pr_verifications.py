@@ -120,8 +120,13 @@ async def test_a_closed_row_is_not_reopened_by_a_late_open(db):
         db, repo=REPO, pr_number=10, pr_title="a", merged_at="2026-09-06T10:00:00Z", now=NOW
     )
     assert await verif_crud.close_verification(
-        db, repo=REPO, pr_number=10, verdict="pass-mechanical", reason="verified",
-        evidence="ran the E2E", now=NOW
+        db,
+        repo=REPO,
+        pr_number=10,
+        verdict="pass-mechanical",
+        reason="verified",
+        evidence="ran the E2E",
+        now=NOW,
     )
     out = await verif_crud.open_verification(
         db, repo=REPO, pr_number=10, pr_title="a", merged_at="2026-09-06T10:00:00Z", now=NOW
@@ -152,15 +157,25 @@ async def test_close_records_evidence_and_only_touches_open_rows(db):
         db, repo=REPO, pr_number=12, pr_title="a", merged_at="2026-09-06T10:00:00Z", now=NOW
     )
     assert await verif_crud.close_verification(
-        db, repo=REPO, pr_number=12, verdict="pass-mechanical", reason="verified",
-        evidence="health 200", now=NOW
+        db,
+        repo=REPO,
+        pr_number=12,
+        verdict="pass-mechanical",
+        reason="verified",
+        evidence="health 200",
+        now=NOW,
     )
     row = await _row(db, 12)
     assert (row["status"], row["evidence"]) == ("closed", "health 200")
     # A second close must not overwrite the record — two validators cannot fight.
     assert not await verif_crud.close_verification(
-        db, repo=REPO, pr_number=12, verdict="pass-mechanical", reason="other",
-        evidence="other", now=NOW
+        db,
+        repo=REPO,
+        pr_number=12,
+        verdict="pass-mechanical",
+        reason="other",
+        evidence="other",
+        now=NOW,
     )
     assert (await _row(db, 12))["evidence"] == "health 200"
 
@@ -256,7 +271,7 @@ async def test_record_attempt_refuses_a_pass(db, verdict):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["", "   ", "\n\t "])
 async def test_record_attempt_refuses_an_empty_note(db, bad):
-    """"Attempted but could not finish" with no stated cause is the unverifiable
+    """ "Attempted but could not finish" with no stated cause is the unverifiable
     claim in permanent record that this guard exists to refuse."""
     await _open(db, 56)
     with pytest.raises(ValueError, match="non-empty note"):
@@ -511,6 +526,7 @@ async def test_everything_noops_before_the_migration(bare_db):
     # test's whole claim, so a new function missing here is a false claim.
     assert await verif_crud.open_repos_for_pr(bare_db, pr_number=1) == []
     assert await verif_crud.list_closed(bare_db) == []
+    assert await verif_crud.list_for_pr(bare_db, pr_number=1) == []
     assert not await verif_crud._verdict_columns_available(bare_db)
     assert (
         await verif_crud.record_attempt(
@@ -803,8 +819,13 @@ async def test_close_refuses_an_empty_reason(db, bad):
     )
     with pytest.raises(ValueError, match="non-empty reason"):
         await verif_crud.close_verification(
-            db, repo=REPO, pr_number=40, verdict="pass-mechanical", reason=bad,
-            evidence="x", now=NOW
+            db,
+            repo=REPO,
+            pr_number=40,
+            verdict="pass-mechanical",
+            reason=bad,
+            evidence="x",
+            now=NOW,
         )
     assert (await _row(db, 40))["status"] == "open", "the row must be untouched"
 
@@ -823,7 +844,12 @@ async def test_close_refuses_an_empty_reason(db, bad):
 @pytest.mark.parametrize("bad", [0, -1, -180])
 async def test_prune_closed_refuses_a_sub_one_day_window(db, bad):
     await verif_crud.open_verification(
-        db, repo=REPO, pr_number=90, pr_title="closed", merged_at=OLD, now=OLD,
+        db,
+        repo=REPO,
+        pr_number=90,
+        pr_title="closed",
+        merged_at=OLD,
+        now=OLD,
         closed_reason="docs-only",
     )
 
@@ -838,7 +864,94 @@ async def test_prune_closed_refuses_a_sub_one_day_window(db, bad):
 async def test_prune_closed_still_accepts_a_one_day_window(db):
     """The boundary stays OPEN: >= 1 is valid, so the guard cannot over-refuse."""
     await verif_crud.open_verification(
-        db, repo=REPO, pr_number=91, pr_title="closed", merged_at=OLD, now=OLD,
+        db,
+        repo=REPO,
+        pr_number=91,
+        pr_title="closed",
+        merged_at=OLD,
+        now=OLD,
         closed_reason="docs-only",
     )
     assert await verif_crud.prune_closed(db, older_than_days=1, now=NOW) == 1
+
+
+# ── the column's own writers bound it (adversarial audit, round 1) ────────
+
+
+async def test_both_writers_refuse_an_over_cap_evidence_document(db):
+    """The cap lived only in the CLI, and an audit measured 2 MiB reaching the column
+    through record_attempt. The CLI still checks it, for a readable refusal before any
+    database work; this module enforces it, because this module owns the column and a
+    second caller is anticipated."""
+    import pytest as _pytest
+
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=91, pr_title="t", merged_at=NOW, now=NOW
+    )
+    over = "z" * (verif_crud.MAX_EVIDENCE_BYTES + 1)
+    with _pytest.raises(ValueError, match="over the"):
+        await verif_crud.record_attempt(
+            db,
+            repo=REPO,
+            pr_number=91,
+            verdict="cannot-verify",
+            note="n",
+            now=NOW,
+            evidence=over,
+        )
+    with _pytest.raises(ValueError, match="over the"):
+        await verif_crud.close_verification(
+            db,
+            repo=REPO,
+            pr_number=91,
+            verdict="pass-mechanical",
+            reason="r",
+            evidence=over,
+            now=NOW,
+        )
+    row = await verif_crud.list_open(db)
+    assert [r["pr_number"] for r in row] == [91], "neither refusal wrote anything"
+    assert row[0]["attempt_count"] == 0
+
+
+async def test_a_document_exactly_at_the_cap_is_accepted(db):
+    """The boundary in the other direction, or the cap could be off by any amount and
+    both refusals above would still pass."""
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=92, pr_title="t", merged_at=NOW, now=NOW
+    )
+    assert (
+        await verif_crud.record_attempt(
+            db,
+            repo=REPO,
+            pr_number=92,
+            verdict="cannot-verify",
+            note="n",
+            now=NOW,
+            evidence="z" * verif_crud.MAX_EVIDENCE_BYTES,
+        )
+        == "recorded"
+    )
+
+
+async def test_list_for_pr_returns_OPEN_rows_the_closed_reader_cannot_reach(db):
+    """The reader record_attempt needed. Its document sits on an OPEN row, and every
+    other reader filters status='closed' — so it was written and unreadable."""
+    await verif_crud.open_verification(
+        db, repo=REPO, pr_number=93, pr_title="t", merged_at=NOW, now=NOW
+    )
+    await verif_crud.record_attempt(
+        db,
+        repo=REPO,
+        pr_number=93,
+        verdict="fail-intent",
+        note="it broke",
+        now=NOW,
+        evidence='{"claims": [{"verdict": "fail"}]}',
+    )
+    assert await verif_crud.list_closed(db, pr_number=93) == [], "not reachable there"
+    rows = await verif_crud.list_for_pr(db, pr_number=93)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "open"
+    assert rows[0]["verdict"] == "fail-intent"
+    assert '"verdict": "fail"' in rows[0]["evidence"]

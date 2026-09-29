@@ -265,6 +265,11 @@ The evidence document is validated by `scripts/pr_verification.py`; its shape wa
 derived from pilot validations rather than designed, because each pilot broke a
 field the obvious version would have had:
 
+- **`repo` + `pr`** — the ledger row's KEY, both halves. A document naming only
+  its PR number can be pointed at a different repository's open row for the same
+  number, and a closed row cannot be amended, so that mis-bind would be permanent
+  and invisible. `--repo` is a disambiguator, never the binding; if it contradicts
+  the document the write is refused rather than resolved either way.
 - **`deploy.method` + detail** — because ancestry lies (above). HOW deployment
   was established travels with the row.
 - **`claims[]` with a per-claim TIER** (`MEASURED` / `INFERRED` / `READ` /
@@ -274,10 +279,44 @@ field the obvious version would have had:
   rest. An INFERRED claim is one you composed from two measured facts — label it,
   never promote it.
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
-  a vacuous one without them.
-- **`scope_limits[]`** — what this install could not reach, named.
+  a vacuous one without them. **Required for `pass-mechanical`.** Not for
+  `pass-with-measured-gaps`: "this claim has no control" is a legitimate measured
+  gap, and demanding one there would leave the honest document no verdict at all.
+- **`scope_limits[]`** — what this install could not reach, named. Required for
+  `pass-with-measured-gaps`, whose entire content is WHICH gaps.
 - **`findings[]`, each with a DISPOSITION** — an undispositioned finding is a
   drop wearing a record, and the validator refuses one.
+
+**THE FLOOR: at least one claim must be passing AND at tier `MEASURED` or `READ`
+before any verdict can close a row.** `INFERRED` does not count — an inferred claim
+never enters permanent record in the grammar of a fact, and a discharged obligation
+is permanent record. This exists because the first version of the closer had only
+disqualifying rules, and a document whose claims were EVERY ONE of them
+`NOT_VERIFIABLE_HERE` satisfied all of them and closed the row having established
+nothing. If that is your document, the verdict is `cannot-verify`: the row stays
+open, your note travels with it, and the next validator inherits what you found.
+
+A **non-closing** verdict is bound to the claims too, as exact converses:
+
+- **A failing claim means `fail-intent`, and nothing else.** A document with a
+  measured failure is refused under every other verdict — including
+  `cannot-verify`, because parking a measured failure skips the conversation the
+  standing ruling requires.
+- **`cannot-verify` is refused only when the document reached EVERYTHING** — every
+  claim passing and at `MEASURED` or `READ`, which is the one case where a passing
+  verdict is available. Inferred, unreachable or partial is exactly what it is for.
+
+That second rule is stated as the complement of the floor on purpose. Written the
+obvious way — "requires a `NOT_VERIFIABLE_HERE` claim" — it left a document whose
+claims were all `INFERRED` with no legal verdict at all: every one of the four
+refused, and the two refusals pointed at each other. The only way out was to
+relabel the tier, which is the tool paying you to falsify the one field it exists
+to protect. If you ever find a document the tool will not accept under ANY verdict,
+that is a defect in the tool — file it; do not edit the evidence to fit.
+
+The row stays open either way, so none of this is about protecting the ledger from
+a false closure: the row is what the next validator reads, and a verdict its own
+evidence contradicts is worse than no verdict.
 
 ---
 

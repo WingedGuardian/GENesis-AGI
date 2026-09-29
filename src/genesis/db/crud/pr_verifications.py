@@ -4,7 +4,7 @@ Issue #1718 half B. One row per merged PR, written ONLY by the repo-pulse
 worker's verification lane (``repo_pulse_worker._verification_lane``): a
 docs-only diff arrives already ``closed`` with the deterministic-exemption
 reason; everything else arrives ``open`` and stays open until the validator
-session records evidence via :func:`close_verification`. Read by the worker
+session records evidence via :func:`close_verification` when the obligation is discharged and via :func:`record_attempt` when it is not — a FAILED verification is the highest-value record here and keeps its document too. Read by the worker
 CLI's ``--verification-backlog`` (the day-one reader) and, later, the Wave-3
 validator.
 
@@ -26,6 +26,34 @@ import uuid
 import aiosqlite
 
 STATUSES = ("open", "closed")
+
+#: Serialised-evidence ceiling, enforced HERE because this module owns the column.
+#: The CLI checks it too, so a validator gets a readable refusal before any database
+#: work; this is the backstop. An adversarial audit measured 2 MiB reaching the column
+#: through :func:`record_attempt` when the CLI was the only enforcement, and a second
+#: caller is anticipated — the PR that shipped this names an MCP tool as deliberately
+#: cut. A writer that trusts its callers to bound a column is not bounding it.
+MAX_EVIDENCE_BYTES = 256 * 1024
+
+
+def _check_evidence_size(evidence: str | None) -> None:
+    """Raise if *evidence* would exceed :data:`MAX_EVIDENCE_BYTES` once stored.
+
+    REFUSED rather than truncated: a cut-down evidence record still looks complete,
+    which is the one failure an evidence column cannot afford. Raises rather than
+    returning a status, because a caller that assembled an over-cap document has a bug
+    and a silent no-op would read as a successful write.
+    """
+    if evidence is None:
+        return
+    size = len(evidence.encode("utf-8"))
+    if size > MAX_EVIDENCE_BYTES:
+        raise ValueError(
+            f"evidence is {size} bytes, over the {MAX_EVIDENCE_BYTES}-byte cap. "
+            f"Refused rather than truncated — a cut evidence record still reads as "
+            f"complete."
+        )
+
 
 #: The four verdicts a validator session returns (owner standing ruling,
 #: 2026-09-26). Enforced HERE rather than by a CHECK constraint: SQLite cannot
@@ -186,6 +214,20 @@ async def close_verification(
     ``attempt_count`` is incremented here too, so it counts every attempt rather
     than only the failed ones: without this a cleanly verified PR would read
     ``attempt_count = 0``, indistinguishable from never attempted.
+
+    ``last_attempt_note`` is CLEARED and ``evidence`` is REPLACED. A row that failed
+    or parked before finally passing would otherwise carry a verdict and a sentence
+    explaining why it could not be verified, side by side, and a reader would have to
+    know which column wins.
+
+    Be exact about what that costs, because an earlier draft of this docstring was not
+    and claimed the superseded reason stayed recoverable: **it does not.** Closing a
+    row discards the previous attempt's note AND its evidence document. What survives
+    is ``attempt_count`` — how many attempts the row cost, which is the escalation
+    signal and the only part not derivable from the final state. That is the accepted
+    price of a last-wins record: the row always describes its LATEST state, and nothing
+    here keeps attempt history. If per-attempt history is ever wanted it needs a child
+    table, which the shipping PR considered and rejected against the New-Store Gate.
     """
     if verdict not in PASS_VERDICTS:
         raise ValueError(
@@ -193,6 +235,7 @@ async def close_verification(
             f"'fail-intent' and 'cannot-verify' do not discharge the obligation — "
             f"record them with record_attempt(), which leaves the row OPEN."
         )
+    _check_evidence_size(evidence)
     if not reason or not reason.strip():
         # A closed row with no reason is an unverifiable claim in permanent
         # record — the row would say "handled" and carry nothing. The schema
@@ -208,7 +251,7 @@ async def close_verification(
     cursor = await db.execute(
         "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
         "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
-        "attempt_count = attempt_count + 1 "
+        "last_attempt_note = NULL, attempt_count = attempt_count + 1 "
         "WHERE repo = ? AND pr_number = ? AND status = 'open'",
         (reason, now, evidence, verdict, now, repo, pr_number),
     )
@@ -244,6 +287,7 @@ async def record_attempt(
     verdict: str,
     note: str,
     now: str,
+    evidence: str | None = None,
 ) -> str:
     """Record a NON-closing validation attempt. ``"recorded" | "missing" | "unavailable"``.
 
@@ -273,6 +317,7 @@ async def record_attempt(
             f"must go through close_verification, so exactly one writer moves the row "
             f"to 'closed'."
         )
+    _check_evidence_size(evidence)
     if not note or not note.strip():
         raise ValueError(
             "record_attempt requires a non-empty note — the whole point of the row "
@@ -280,11 +325,19 @@ async def record_attempt(
         )
     if not await _verdict_columns_available(db):
         return "unavailable"
+    # The evidence document is stored on a NON-closing attempt too, and COALESCE
+    # keeps a prior document when this attempt has none rather than erasing it.
+    # Without this a failed verification discarded everything the validator
+    # assembled — claims, tiers, measurements, controls — and kept only the
+    # one-line note, so the next validator inherited a summary of work it could no
+    # longer inspect. A fail-intent is exactly the case where that detail is worth
+    # most, because someone has to act on it.
     cursor = await db.execute(
         "UPDATE pr_verifications SET verdict = ?, last_attempt_at = ?, "
-        "last_attempt_note = ?, attempt_count = attempt_count + 1 "
+        "last_attempt_note = ?, attempt_count = attempt_count + 1, "
+        "evidence = COALESCE(?, evidence) "
         "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (verdict, now, note, repo, pr_number),
+        (verdict, now, note, evidence, repo, pr_number),
     )
     await db.commit()
     return "recorded" if cursor.rowcount else "missing"
@@ -312,6 +365,30 @@ async def open_repos_for_pr(db: aiosqlite.Connection, *, pr_number: int) -> list
         (int(pr_number),),
     )
     return [row[0] for row in await cursor.fetchall()]
+
+
+async def list_for_pr(db: aiosqlite.Connection, *, pr_number: int) -> list[dict]:
+    """Every row for one PR, OPEN or CLOSED, oldest merge first.
+
+    Exists because :func:`list_closed` cannot answer the question a scoped read asks.
+    An adversarial audit measured the gap: :func:`record_attempt` persists the evidence
+    document onto an OPEN row, and nothing could display it — the backlog reader prints
+    only the note and the attempt count, and every other reader filters
+    ``status='closed'``. So half of the attempt record was written and unreadable, which
+    is the same write-only-column defect the closed-row reader was added to fix.
+
+    Scoped by an exact ``pr_number``, served by ``idx_prv_repo_pr``, and deliberately
+    UNLIMITED: the key is (repo, pr_number), so the result is one row per repository
+    holding that number — single digits on any real install, and a LIMIT here could
+    hide the very row the caller is asking about.
+    """
+    if not await _tables_available(db):
+        return []
+    cursor = await db.execute(
+        "SELECT * FROM pr_verifications WHERE pr_number = ? ORDER BY merged_at ASC",
+        (pr_number,),
+    )
+    return [dict(row) for row in await cursor.fetchall()]
 
 
 async def list_closed(
