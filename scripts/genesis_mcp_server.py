@@ -554,11 +554,13 @@ def _resolve_http_auth_token(cli_token: str | None) -> str:
     value as absent.
 
     Reads ONLY ``GENESIS_MCP_HTTP_TOKEN``. The desk-scoped token must never reach
-    this transport, which exposes the full MCP tool surface (#2442).
+    this transport, which exposes the full MCP tool surface (#2442). A non-ASCII
+    token is unconfigured here too (``genesis.env.ascii_bearer``).
     """
-    from genesis.env import bearer_token
+    from genesis.env import ascii_bearer, bearer_token
 
-    return (cli_token or "").strip() or bearer_token("GENESIS_MCP_HTTP_TOKEN")
+    cli = ascii_bearer((cli_token or "").strip(), "--auth-token")
+    return cli or bearer_token("GENESIS_MCP_HTTP_TOKEN")
 
 
 def _bearer_auth_middleware(expected_token: str):

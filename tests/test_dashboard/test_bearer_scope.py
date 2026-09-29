@@ -136,32 +136,30 @@ def test_a_non_ascii_header_is_still_a_401_not_a_500(app, monkeypatch):
     assert _check(app, "Bearer d\xe9sk", accept=_DESK_ACCEPT) == ("Invalid bearer token", 401)
 
 
-def _as_wsgi_delivers(header: str) -> dict:
-    """A WSGI server hands header values over latin-1-decoded (PEP 3333), so a
-    client that sends UTF-8 bytes arrives as their latin-1 reading."""
-    return {"HTTP_AUTHORIZATION": header.encode("utf-8").decode("latin-1")}
+@pytest.mark.parametrize("token", ["tök", "é", "Ã©", "ðŸ”‘"])
+def test_a_non_ascii_token_is_unconfigured(app, monkeypatch, caplog, token):
+    """A non-ASCII token has several byte spellings, which let two configured
+    tokens alias; it is ignored (with a warning) rather than half-accepted."""
+    import genesis.env as env_mod
+
+    monkeypatch.setattr(env_mod, "_NON_ASCII_BEARER_WARNED", set())
+    monkeypatch.setenv(_BROAD, token)
+    assert bearer_token(_BROAD) == ""
+    assert _check(app, "Bearer x")[1] == 503
+    assert "non-ASCII" in caplog.text
 
 
-def test_a_correct_non_ascii_token_sent_as_utf8_is_accepted(app, monkeypatch):
-    from genesis.dashboard.auth import presented_bearer_is
-
-    monkeypatch.setenv(_BROAD, "tök")
-    with app.test_request_context(environ_overrides=_as_wsgi_delivers("Bearer tök")):
-        assert check_bearer_token("test surface") is None
-        assert presented_bearer_is(_BROAD) is True
-    with app.test_request_context(environ_overrides=_as_wsgi_delivers("Bearer tok")):
-        assert check_bearer_token("test surface") == ("Invalid bearer token", 401)
-
-
-def test_a_correct_non_ascii_token_sent_as_latin1_is_accepted(app, monkeypatch):
-    """Python's http.client, among others, sends a str header as latin-1: "tök"
-    arrives as the single byte f6, which WSGI shows as "ö"."""
-    from genesis.dashboard.auth import presented_bearer_is
-
-    monkeypatch.setenv(_BROAD, "tök")
-    with app.test_request_context(environ_overrides={"HTTP_AUTHORIZATION": "Bearer tök"}):
-        assert check_bearer_token("test surface") is None
-        assert presented_bearer_is(_BROAD) is True
+def test_non_ascii_tokens_cannot_alias_across_scopes(app, monkeypatch):
+    """Desk token "é" sent as UTF-8 is the same bytes as broad token "Ã©" sent as
+    latin-1. Neither may open anything, least of all a broad route."""
+    monkeypatch.setenv(_DESK, "é")
+    monkeypatch.setenv(_BROAD, "Ã©")
+    wire = {"HTTP_AUTHORIZATION": "Bearer " + "é".encode().decode("latin-1")}
+    with app.test_request_context(environ_overrides=wire):
+        broad = check_bearer_token("test surface")
+        desk = check_bearer_token("test surface", accept=_DESK_ACCEPT)
+    assert broad is not None, "the desk credential opened a broad route"
+    assert broad[1] == 503 and desk is not None and desk[1] == 503
 
 
 def test_an_empty_accept_is_refused_loudly(app):
@@ -318,8 +316,13 @@ def test_the_mcp_guard_refuses_bad_credentials_with_401(mcp_server, header, expe
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1"])
-def test_the_mcp_guard_accepts_a_non_ascii_configured_token(mcp_server, encoding):
-    assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(encoding), token="tök") == 200
+def test_the_mcp_guard_never_accepts_a_non_ascii_token(mcp_server, encoding):
+    assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(encoding), token="tök") == 401
+
+
+def test_the_mcp_transport_ignores_a_non_ascii_cli_token(mcp_server, monkeypatch):
+    monkeypatch.setenv(_BROAD, "ascii-env")
+    assert mcp_server._resolve_http_auth_token("tök") == "ascii-env"
 
 
 # ── the boot warning names exactly the disabled surfaces ──────────────────────

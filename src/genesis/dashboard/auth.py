@@ -127,10 +127,10 @@ def _presented_bearer_bytes(auth_header: str) -> bytes:
     """The credential after ``Bearer `` as the bytes the client actually sent.
 
     WSGI (PEP 3333) hands header values over latin-1-decoded, one character per
-    received byte, so encoding back to latin-1 recovers those bytes exactly;
-    ``bearer_matches`` then accepts them in either encoding a client may use. A
-    value that is not latin-1 cannot come from a WSGI server; it is encoded as
-    UTF-8, which can only match the same text.
+    received byte, so encoding back to latin-1 recovers those bytes exactly.
+    Configured tokens are ASCII, so any non-ASCII byte here simply fails to match.
+    A value that is not latin-1 cannot come from a WSGI server; it is encoded as
+    UTF-8, which cannot match an ASCII token either.
     """
     value = auth_header[7:]
     try:
