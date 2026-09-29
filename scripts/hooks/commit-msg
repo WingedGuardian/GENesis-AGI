@@ -57,11 +57,74 @@ fi
 # echo which fingerprint matched (the matched text is the private value).
 FP_FILE="${GENESIS_RELEASE_FINGERPRINTS:-$HOME/.genesis/release-fingerprints.txt}"
 if [ -f "$FP_FILE" ]; then
-    FP_PATTERNS="$(grep -vE '^[[:space:]]*(#|$)' "$FP_FILE" || true)"
-    if [ -n "$FP_PATTERNS" ] && printf '%s\n' "$FP_PATTERNS" | grep -qE -f - "$MSG_FILE"; then
+    # Each line is read the way the pre-push reader reads the same file
+    # (src/genesis/contribution/sanitize.py, _check_fingerprints): surrounding
+    # whitespace (a CRLF file's \r included) is trimmed, and comment and blank
+    # lines are skipped. grep -E then fails SILENTLY on a pattern it cannot use:
+    # one it rejects (an unbalanced paren) makes the whole -f read exit 2, which
+    # reads as "no match", so every fingerprint goes dark; one it only warns
+    # about (a PCRE lookbehind like "(?<!...)") never matches. So the set is
+    # checked in one grep, and only when that fails is each line tried alone. A
+    # line grep -E cannot use is matched as literal text instead, as the pre-push
+    # reader does for a line Python cannot compile, so the rest keep working. It
+    # is named by line number only: the pattern IS the private value, so it is
+    # never printed.
+    FP_PATTERNS=""
+    _fp_nums=()
+    _fp_n=0
+    while IFS= read -r _fp_line || [ -n "$_fp_line" ]; do
+        _fp_n=$((_fp_n + 1))
+        _fp_line="${_fp_line#"${_fp_line%%[![:space:]]*}"}"
+        _fp_line="${_fp_line%"${_fp_line##*[![:space:]]}"}"
+        if [ -z "$_fp_line" ] || [ "${_fp_line:0:1}" = "#" ]; then
+            continue
+        fi
+        FP_PATTERNS="$FP_PATTERNS$_fp_line"$'\n'
+        _fp_nums+=("$_fp_n")
+    done < "$FP_FILE"
+    FP_PATTERNS="${FP_PATTERNS%$'\n'}"
+    # Does grep -E take every pattern on stdin, with nothing on stderr?
+    _fp_usable() {
+        local err rc=0
+        err="$(grep -E -f - /dev/null 2>&1 >/dev/null)" || rc=$?
+        [ "$rc" -le 1 ] && [ -z "$err" ]
+    }
+    FP_LITERALS=""
+    _fp_bad=""
+    if [ -n "$FP_PATTERNS" ] && ! printf '%s\n' "$FP_PATTERNS" | _fp_usable; then
+        _fp_good=""
+        _fp_i=0
+        while IFS= read -r _fp_line; do
+            if printf '%s\n' "$_fp_line" | _fp_usable; then
+                _fp_good="$_fp_good$_fp_line"$'\n'
+            else
+                FP_LITERALS="$FP_LITERALS$_fp_line"$'\n'
+                _fp_bad="$_fp_bad ${_fp_nums[$_fp_i]}"
+            fi
+            _fp_i=$((_fp_i + 1))
+        done <<< "$FP_PATTERNS"
+        FP_PATTERNS="${_fp_good%$'\n'}"
+        FP_LITERALS="${FP_LITERALS%$'\n'}"
+    fi
+    if [ -n "$_fp_bad" ]; then
+        echo ""
+        echo "WARNING: $FP_FILE has patterns grep -E cannot use (line$_fp_bad)."
+        echo "  Here they match only as literal text, as the pre-push review treats a line"
+        echo "  Python cannot compile. Rewrite each in POSIX ERE that Python's re also"
+        echo "  accepts (no lookbehind or other PCRE-only syntax; see"
+        echo "  src/genesis/contribution/fingerprints.py). Values are not shown."
+    fi
+    _fp_hits=""
+    if [ -n "$FP_PATTERNS" ]; then
+        _fp_hits="$(printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1)"
+    fi
+    if [ -n "$FP_LITERALS" ]; then
+        _fp_hits="$_fp_hits"$'\n'"$(printf '%s\n' "$FP_LITERALS" | grep -nF -f - "$MSG_FILE" | cut -d: -f1)"
+    fi
+    _fp_lines="$(printf '%s\n' "$_fp_hits" | grep -v '^$' | sort -un)"
+    if [ -n "$_fp_lines" ]; then
         echo ""
         echo "BLOCKED: Commit message contains an install-specific private identifier."
-        _fp_lines="$(printf '%s\n' "$FP_PATTERNS" | grep -nE -f - "$MSG_FILE" | cut -d: -f1 | sort -un)"
         printf '%s\n' "$_fp_lines" | sed 's/^/  line /'
         blocked=1
         # The advisory below withholds its subject only when the SUBJECT ITSELF
