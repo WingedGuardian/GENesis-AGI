@@ -694,6 +694,14 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
         "status_reason": "DEPRECATED_REMOVED",
     },
+    "models_md_synthesis": {
+        "description": "NO LONGER A CALL SITE: removed from routing when it became a direct Claude Code session dispatch (recon/models_md_synthesis.py), which writes no call-site data. The job still runs; its last routed run left a stale history row (2026-05-25).",
+        "category": "surplus",
+        "frequency": "Was: surplus schedule",
+        "model_tier": "cc",
+        "wired": False,
+        "status_reason": "DEPRECATED_REMOVED",
+    },
     "embedding": {
         "description": "REMOVED: superseded by 21_embeddings / 21b_query_embedding; nothing records runs under this id. Last recorded run 2026-03-21.",
         "category": "processing",

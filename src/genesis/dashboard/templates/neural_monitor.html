@@ -546,7 +546,6 @@ const SITE_META = {
     'voice_conversation': { name: 'Voice', category: 'core' },
     'judge': { name: 'Eval Judge', category: 'assessment' },
     'contribution_gate': { name: 'Contrib Gate', category: 'assessment' },
-    'models_md_synthesis': { name: 'Models.md', category: 'surplus' },
 };
 
 // Category colors (used in detail panel category badge)
@@ -1956,8 +1955,7 @@ const SUBSYSTEM_GROUPS = {
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
         desc: 'Idle-time tasks \u2014 brainstorms, code audits, infrastructure monitoring',
-        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor',
-                'models_md_synthesis'],
+        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor'],
     },
     outreach: {
         name: 'Outreach', domId: 'sub-outreach',
