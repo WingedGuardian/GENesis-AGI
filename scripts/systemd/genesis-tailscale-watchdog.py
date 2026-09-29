@@ -47,6 +47,11 @@ own, only what THIS run observed:
   complete, so a peer that left the tailnet can be told apart from one this
   run skipped.
 * ``events``: at most 50 restart outcomes.
+* ``ineffective`` and ``unconfirmed_restarts``: per peer, how many restarts
+  this boot did not clear its tunnel, and how many could not be checked
+  afterwards. The only things remembered about a peer between runs, only to
+  stop restarting for a fault a restart does not fix, and both are forgotten
+  once the peer is seen working.
 
 The condition, "this peer's tunnel is stuck", lives in Genesis's open alert
 for that peer: raised on ``stuck``, resolved only on ``ok`` or ``offline``
@@ -55,7 +60,9 @@ is no saved set here to lose, go stale, or keep a peer that went offline: only
 peers confirmed stuck in THIS run are ever restarted. A peer that two restarts
 this boot did not clear is not restarted for again (the fault is not on this
 node), and a run whose backend is not Running, or whose pings cannot be
-judged, reports nothing about the peers it could not judge.
+judged, reports nothing about the peers it could not judge. A run during which
+tailscaled itself restarted reports nothing either: its verdicts describe a
+daemon that is gone.
 
 Nothing peer-chosen goes into it: a peer is named by a validated IPv4 address
 only, and its HostName is never read. When a peer is first confirmed stuck,
@@ -63,8 +70,11 @@ the raw status is also kept as a root-only (0600) snapshot beside it, as
 evidence.
 
 Lever NETWD_TS_MODE (a drop-in on the service): live (default) | observe
-(record, never restart) | off. An unknown value is treated as observe.
-Disabling the timer turns the watchdog off entirely.
+(record, never restart) | off. An unknown value is treated as observe. The
+drop-in is the durable off switch: the installer never touches drop-ins, but it
+re-enables a disabled timer, and no mask works on a unit whose file is in
+/etc/systemd/system: ``mask`` refuses it, and a ``mask --runtime`` symlink in
+/run is shadowed by that file.
 """
 
 from __future__ import annotations
@@ -94,18 +104,35 @@ MAX_PEERS = 1000
 # the fault is not on this node, and every restart drops every SSH session. Its
 # alert stays open until the tunnel answers.
 MAX_INEFFECTIVE_RESTARTS = 2
+# A restart whose check afterwards could not be judged proves nothing either
+# way, so it is not ineffective; but each one still drops every SSH session, so
+# a peer gets at most this many of them. Both counts reset once the peer is
+# seen working.
+MAX_UNCONFIRMED_RESTARTS = 3
 MODES = ("live", "observe", "off")
 
 # Restart outcomes: each is recorded as an event and spends the rate limit. A
 # restart that did not happen (``not-restarted`` with exit 0: tailscaled was
 # stopped when try-restart ran) is not an event and spends nothing.
 EVENT_ACTIONS = frozenset(
-    {"healed", "restart-no-effect", "restart-failed", "not-restarted", "unverified", "pending"}
+    {
+        "healed",
+        "restart-no-effect",
+        "restart-unconfirmed",
+        "restart-failed",
+        "not-restarted",
+        "unverified",
+        "pending",
+    }
 )
 # Runs that judged no tunnel. Counted across consecutive runs so the Genesis
 # side can say the watchdog is blind, not only when it is silent. A run that
 # had suspects and probed none of them counts too (see run_once).
 BLIND_ACTIONS = frozenset({"unavailable", "status-unparseable"})
+# tailscaled turned off on purpose (a disabled or masked unit, or `tailscale
+# down`): nothing to watch, so not blind. A crashed but enabled unit, or a
+# logged-out node, is still blind.
+_DAEMON_OFF_STATES = frozenset({"disabled", "masked", "masked-runtime"})
 _TRANSITIONAL = frozenset({"activating", "deactivating", "reloading", "refreshing"})
 
 # name: (default, min, max). Every bound is finite and positive where 0 would
@@ -124,10 +151,12 @@ SETTINGS = {
     # this plus the poll is recorded as "pending".
     "NETWD_TS_RESTART_TIMEOUT_SEC": (200, 30, 900),
     "NETWD_TS_POLL_SEC": (30, 0, 300),
-    # After a restart, how long to keep pinging the stuck peer through the
+    # After a restart, how long to keep pinging the stuck peers through the
     # tunnel before calling the restart ineffective. tailscaled reconnects in
-    # seconds; a minute leaves room for its coordination-server round trip.
-    "NETWD_TS_VERIFY_SEC": (60, 0, 300),
+    # seconds; a minute leaves room for its coordination-server round trip. It
+    # bounds the WHOLE check (no peer starts a ping after it), so it must leave
+    # room for at least one.
+    "NETWD_TS_VERIFY_SEC": (60, 10, 300),
     # Normally 0 or 1 peers are suspects; 3 covers a shared outage without
     # letting a large tailnet hold the oneshot for minutes.
     "NETWD_TS_MAX_PROBES": (3, 0, 20),
@@ -166,16 +195,19 @@ def load_settings(env) -> tuple[dict, str]:
     return out, mode
 
 
-def default_run(argv, timeout):
-    """(returncode, stdout). returncode is None when the command could not run
-    or hit its timeout. stdout is read whole: the largest is ``status --json``,
-    whose size the coordination server bounds by the tailnet's own peers."""
+def default_run(argv, timeout, merge_stderr=False):
+    """(returncode, output). returncode is None when the command could not run
+    or hit its timeout. The output is stdout, with stderr interleaved into it
+    when ``merge_stderr`` (never for ``status --json``, whose stdout must
+    parse). It
+    is read whole: the largest is ``status --json``, whose size the
+    coordination server bounds by the tailnet's own peers."""
     try:
         proc = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
             timeout=timeout,
             check=False,
         )
@@ -379,17 +411,19 @@ def read_peers(status_text: str, now: float, stale: int, zero_ok: bool = False):
     every well-formed peer), or None when the status cannot be read as a peer
     map at all (recorded as its own state, never as healthy). A MISSING
     ``Peer`` key is unreadable; an explicit null is a legitimate empty tailnet,
-    but only on a backend that is Running: anything else returns "not-running"."""
+    but only on a backend that is Running: anything else returns
+    ("not-running", BackendState)."""
     try:
         status = json.loads(status_text)
     except ValueError:
         return None
     if not isinstance(status, dict) or "Peer" not in status:
         return None
-    if status.get("BackendState") != "Running":
+    backend = status.get("BackendState")
+    if backend != "Running":
         # Logged out, key expired, `tailscale down`, or still starting: the peer
         # map is empty or partial and proves nothing about any tunnel.
-        return "not-running"
+        return "not-running", backend if isinstance(backend, str) else ""
     peers = status["Peer"]
     if peers is None:
         return [], [], 0, set()
@@ -418,18 +452,26 @@ def read_peers(status_text: str, now: float, stale: int, zero_ok: bool = False):
 
 
 def _ping(ctx: Ctx, ip: str, *, tsmp: bool) -> bool | None:
-    """True: a reply. False: no reply (the CLI exits 1). None: the ping itself
-    could not be judged (it hung past its bound, could not run, or failed some
-    other way), which is never evidence about the peer."""
+    """True: a reply. False: no reply. None: the ping itself could not be
+    judged, which is never evidence about the peer.
+
+    The CLI exits 1 for MANY failures, not only a missing reply: it cannot
+    reach the local tailscaled (a restart in progress), the backend is not
+    running, no peer has that address. Its only no-reply path prints
+    ``ping "<ip>" timed out`` per attempt and then fails with the error
+    ``no reply`` (tailscale v1.102.4, cmd/tailscale/cli/ping.go, runPing), so
+    exit 1 counts as no reply only when that is the last line it printed."""
     kind = ["--tsmp"] if tsmp else ["--until-direct=false"]
     timeout = ctx.settings["NETWD_TS_PING_TIMEOUT_SEC"]
-    rc, _ = ctx.run(
+    rc, out = ctx.run(
         [ctx.tailscale, "ping", *kind, "-c", "1", "--timeout", f"{timeout}s", "--", ip],
         ctx.settings["NETWD_TS_CALL_TIMEOUT_SEC"],
+        merge_stderr=True,
     )
     if rc == 0:
         return True
-    return False if rc == 1 else None
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    return False if rc == 1 and lines and lines[-1] == "no reply" else None
 
 
 def scan(ctx: Ctx, suspects: list) -> tuple[dict, list, int, int, int]:
@@ -485,15 +527,29 @@ def _judge(ctx: Ctx, ip: str) -> str | None:
     return "ok" if again else "stuck"  # a discovery ping can revive a cold path
 
 
-def _tunnel_answers(ctx: Ctx, ip: str, deadline: float) -> bool:
-    """Whether the peer answers through the tunnel by ``deadline``. After a
-    restart tailscaled needs a few seconds to reconnect, so this retries."""
-    while True:
-        if _ping(ctx, ip, tsmp=True):
-            return True
-        if ctx.mono() >= deadline:
-            return False
-        ctx.sleep(2)
+def _check_tunnels(ctx: Ctx, targets: list, deadline: float) -> dict:
+    """{ip: True | False | None} for whether each peer answers through the
+    tunnel by ``deadline``: True, False (pinged, judged, never answered), or
+    None (no ping to it could be judged, or it was never reached). After a
+    restart tailscaled needs a few seconds to reconnect, so this retries,
+    pinging the peers still waiting IN TURN so one dead tunnel cannot use the
+    whole window. The deadline is checked before every ping, so it bounds the
+    whole check."""
+    answers: dict = {ip: None for ip in targets}
+    waiting = list(targets)
+    while waiting and ctx.mono() < deadline:
+        for ip in list(waiting):
+            if ctx.mono() >= deadline:
+                break
+            answer = _ping(ctx, ip, tsmp=True)
+            if answer:
+                answers[ip] = True
+                waiting.remove(ip)
+            elif answer is False:
+                answers[ip] = False
+        if waiting and ctx.mono() < deadline:
+            ctx.sleep(2)
+    return answers
 
 
 # ── state file ───────────────────────────────────────────────────────────
@@ -528,6 +584,8 @@ def valid_event(event) -> bool:
             and all(_valid_ip(ip) for ip in event["peers"])
             and isinstance(event["cleared"], list)
             and all(ip in event["peers"] for ip in event["cleared"])
+            and isinstance(event.get("unconfirmed", []), list)
+            and all(ip in event["peers"] for ip in event.get("unconfirmed", []))
             and (event["rc"] is None or type(event["rc"]) is int)
             and type(event["rate_limit_s"]) is int
         )
@@ -549,6 +607,43 @@ def read_events(path: str) -> tuple[list, dict]:
         return [], {}
     events = prior.get("events")
     return ([e for e in events if valid_event(e)] if isinstance(events, list) else []), prior
+
+
+def _read_counts(raw) -> dict:
+    return {
+        ip: n
+        for ip, n in list(raw.items())[:MAX_PEERS]
+        if _valid_ip(ip) and type(n) is int and n > 0
+    }
+
+
+def read_ineffective(prior: dict, events: list) -> dict:
+    """{ip: restarts this boot that did not clear its tunnel}, from the prior
+    run's file. Kept apart from ``events``, which is trimmed to the newest
+    MAX_EVENTS: a count rebuilt from that list would forget old restarts and
+    let a peer be restarted for again. A file from before this field existed
+    is counted from its events once."""
+    raw = prior.get("ineffective")
+    if isinstance(raw, dict):
+        return _read_counts(raw)
+    counts: dict = {}
+    for e in events:
+        if e["action"] == "restart-no-effect":
+            for ip in _not_cleared(e):
+                counts[ip] = counts.get(ip, 0) + 1
+    return counts
+
+
+def read_unconfirmed(prior: dict) -> dict:
+    """{ip: restarts this boot whose check afterwards could not be judged}."""
+    raw = prior.get("unconfirmed_restarts")
+    return _read_counts(raw) if isinstance(raw, dict) else {}
+
+
+def _not_cleared(event: dict) -> list:
+    """The peers a restart verifiably did not clear: judged, and no answer."""
+    skip = set(event["cleared"]) | set(event.get("unconfirmed", []))
+    return [ip for ip in event["peers"] if ip not in skip]
 
 
 def write_atomic(path: str, data: bytes, mode: int) -> None:
@@ -583,6 +678,8 @@ def run_once(ctx: Ctx) -> int:
     blind_runs = prior.get("blind_runs") if same_boot else 0
     if type(blind_runs) is not int or blind_runs < 0:
         blind_runs = 0
+    ineffective = read_ineffective(prior, events) if same_boot else {}
+    unconfirmed_n = read_unconfirmed(prior) if same_boot else {}
     counters = {"probed": 0, "unjudged": 0, "skipped": 0, "malformed_peers": 0}
     evidence: dict = {}
     present: list = []
@@ -600,6 +697,17 @@ def run_once(ctx: Ctx) -> int:
             events = (events + [event])[-MAX_EVENTS:]
             if event["action"] == "healed":
                 heal_count += 1
+            if event["action"] == "restart-no-effect":
+                for ip in _not_cleared(event):
+                    ineffective[ip] = ineffective.get(ip, 0) + 1
+            for ip in event.get("unconfirmed", []):
+                unconfirmed_n[ip] = unconfirmed_n.get(ip, 0) + 1
+        # A peer seen working has recovered: whatever the restarts did not fix
+        # is gone, so a later stall is judged afresh.
+        for ip, verdict in evidence.items():
+            if verdict == "ok":
+                ineffective.pop(ip, None)
+                unconfirmed_n.pop(ip, None)
         record = {
             "version": 3,
             "boot_id": ctx.boot_id,
@@ -615,6 +723,8 @@ def run_once(ctx: Ctx) -> int:
             "present": present,
             "present_complete": present_complete,
             "events": events,
+            "ineffective": dict(sorted(ineffective.items())[:MAX_PEERS]),
+            "unconfirmed_restarts": dict(sorted(unconfirmed_n.items())[:MAX_PEERS]),
         }
         try:
             write_atomic(ctx.state_file, json.dumps(record).encode(), 0o644)
@@ -630,8 +740,14 @@ def run_once(ctx: Ctx) -> int:
         return finish("off")
     if not ctx.which(ctx.tailscale):
         return finish("unavailable")
-    active = unit_props(ctx, "tailscaled", "ActiveState") or {}
-    if active.get("ActiveState") != "active":
+    unit = unit_props(ctx, "tailscaled", "ActiveState", "UnitFileState") or {}
+    if unit.get("ActiveState") != "active":
+        # Stopped (not crashed: "failed") AND disabled or masked: off on purpose.
+        if (
+            unit.get("ActiveState") == "inactive"
+            and unit.get("UnitFileState") in _DAEMON_OFF_STATES
+        ):
+            return finish("tailscaled-off")
         return finish("unavailable")
     rc, status = ctx.run(
         [ctx.tailscale, "status", "--json"], ctx.settings["NETWD_TS_CALL_TIMEOUT_SEC"]
@@ -645,9 +761,13 @@ def run_once(ctx: Ctx) -> int:
     if found is None:
         log("status --json could not be read as a peer map; cannot judge tunnels this run")
         return finish("status-unparseable")
-    if found == "not-running":
+    if found[0] == "not-running":
+        if found[1] == "Stopped":
+            log("tailscale is down (`tailscale down`); nothing to watch")
+            return finish("tailscaled-off")
         log(
-            "tailscaled's backend is not Running (logged out, stopped or starting); cannot judge tunnels"
+            f"tailscaled's backend is {found[1] or 'unknown'}, not Running (logged out or"
+            " starting); cannot judge tunnels"
         )
         return finish("unavailable")
     suspects, fresh_ips, counters["malformed_peers"], present_set = found
@@ -661,9 +781,20 @@ def run_once(ctx: Ctx) -> int:
     verdicts, stuck, counters["probed"], counters["unjudged"], counters["skipped"] = scan(
         ctx, suspects
     )
+    started_after = _started_mono(ctx)
+    if started is not None and started_after is not None and started_after != started:
+        # tailscaled restarted during the scan (an operator, an upgrade): every
+        # verdict describes the daemon that is gone, and restarting again now
+        # would drop the sessions the new one just brought back.
+        log("tailscaled restarted during the scan; its verdicts are void and nothing is restarted")
+        evidence = {}
+        present_complete = False
+        return finish("daemon-restarted")
     evidence.update(verdicts)
     if len(evidence) > MAX_PEERS:
-        evidence = dict(sorted(evidence.items())[:MAX_PEERS])
+        # Keep what can be acted on: stuck, then offline, then ok.
+        rank = {"stuck": 0, "offline": 1, "ok": 2}
+        evidence = dict(sorted(evidence.items(), key=lambda kv: (rank[kv[1]], kv[0]))[:MAX_PEERS])
         present_complete = False
     for peer in stuck:
         ages[peer.ip] = peer.age
@@ -703,18 +834,18 @@ def run_once(ctx: Ctx) -> int:
         )
         return finish("ratelimited")
 
-    ineffective: dict = {}
-    for e in events:
-        if e["action"] == "restart-no-effect":
-            for ip in e["peers"]:
-                if ip not in e["cleared"]:
-                    ineffective[ip] = ineffective.get(ip, 0) + 1
-    targets = sorted(p.ip for p in stuck if ineffective.get(p.ip, 0) < MAX_INEFFECTIVE_RESTARTS)
+    targets = sorted(
+        p.ip
+        for p in stuck
+        if ineffective.get(p.ip, 0) < MAX_INEFFECTIVE_RESTARTS
+        and unconfirmed_n.get(p.ip, 0) < MAX_UNCONFIRMED_RESTARTS
+    )
     targets = targets[:MAX_TARGETS]
     if not targets:
         log(
-            f"{MAX_INEFFECTIVE_RESTARTS} restarts this boot have not cleared the stuck tunnel(s); "
-            "not restarting for them again (the fault is not on this node)"
+            f"restarts this boot have not cleared the stuck tunnel(s) ({MAX_INEFFECTIVE_RESTARTS}"
+            f" checked, or {MAX_UNCONFIRMED_RESTARTS} that could not be checked); not restarting"
+            " for them again until they are seen working"
         )
         return finish("stuck")
     log(f"HEALING: restarting tailscaled for stuck tunnel(s) to {', '.join(targets)}")
@@ -729,17 +860,26 @@ def run_once(ctx: Ctx) -> int:
         # no session dropped, so nothing is spent.
         log("tailscaled was stopped during the scan; not restarted")
         return finish("unavailable")
-    cleared = []
+    cleared: list = []
+    unconfirmed: list = []
     if outcome == "healed":
         deadline = ctx.mono() + ctx.settings["NETWD_TS_VERIFY_SEC"]
-        cleared = [ip for ip in targets if _tunnel_answers(ctx, ip, deadline)]
+        answers = _check_tunnels(ctx, targets, deadline)
+        cleared = [ip for ip in targets if answers[ip] is True]
+        unconfirmed = [ip for ip in targets if answers[ip] is None]
         for ip in cleared:
             evidence[ip] = "ok"
-        if len(cleared) < len(targets):
+        if any(answers[ip] is False for ip in targets):
             outcome = "restart-no-effect"
+        elif unconfirmed:
+            # Restarted and back, but no check could be judged: neither a heal
+            # nor a restart that failed to help (that would count toward the
+            # limit and could stop healing this peer for the boot).
+            outcome = "restart-unconfirmed"
     messages = {
         "healed": "tailscaled restarted and every stuck tunnel answers again",
-        "restart-no-effect": f"tailscaled restarted, but {len(targets) - len(cleared)} tunnel(s) still get no reply; not retrying for {rate}s",
+        "restart-no-effect": f"tailscaled restarted, but {len(targets) - len(cleared) - len(unconfirmed)} tunnel(s) still get no reply; not retrying for {rate}s",
+        "restart-unconfirmed": f"tailscaled restarted and is active, but the tunnel(s) to {', '.join(unconfirmed)} could not be checked afterwards; not retrying for {rate}s",
         "restart-failed": "tailscaled restarted but is NOT active; it may be DOWN; not retrying",
         "not-restarted": f"try-restart failed (rc={rc}) and nothing restarted; not retrying for {rate}s",
         "unverified": "could not read tailscaled's InvocationID afterwards; the restart's outcome is unknown",
@@ -754,6 +894,7 @@ def run_once(ctx: Ctx) -> int:
         "at": int(ctx.wall()),
         "peers": targets,
         "cleared": cleared,
+        "unconfirmed": unconfirmed,
         "rc": rc,
         "rate_limit_s": rate,
     }

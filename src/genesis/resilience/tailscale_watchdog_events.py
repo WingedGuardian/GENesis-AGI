@@ -26,13 +26,22 @@ Two refinements keep this from paging too much:
 * A tunnel stuck again within :data:`_REOPEN_S` of its alert being resolved,
   by this module (a flap) or by anyone else while it was still true (the owner,
   a reflection prune), REOPENS that alert instead of raising a new one. A
-  reopened row keeps its ``surfaced_at``, so it does not page again. To stop
-  alerts for good, turn the watchdog to observe or off, or mask its timer.
+  reopened row keeps its ``surfaced_at``, so it does not page again.
 * A stuck episode more than :data:`_REOPEN_S` after the last one is a new alert
-  and pages.
+  and pages, and so is one after the alert expired or was withdrawn (below).
 
-These alerts are given a far expiry: the store's default expiry for
-``infrastructure_alert`` would end a still-true alert on its own.
+**Expiry.** Every run that still finds the tunnel stuck moves the alert's
+expiry to :data:`_STUCK_TTL` ahead, so it lives while the tunnel is seen stuck
+and ends on the store's expiry sweep a day after it was last seen. A peer
+nobody connects to again produces no evidence at all, and without this its
+alert would stay open forever.
+
+**The off switch.** When the watchdog is turned off (``off`` mode in a fresh
+file, the durable switch; or, once the file has gone stale, a timer that is
+masked, disabled or not installed, or a masked service) every open alert from
+this source is WITHDRAWN: resolved with a note saying nothing is watching any
+more, which is not a claim that the tunnel recovered. An unreadable timer state
+changes nothing.
 
 **Restart outcomes** are one-off events, one row each (keyed on the event id).
 ``restart-failed``, ``unverified`` and ``pending`` are ``critical`` (the daemon
@@ -40,7 +49,8 @@ itself may be down or hung), and resolve once a later run finds tailscaled
 running and its status readable. ``healed`` is ``high``: the owner felt the SSH
 drop, and the tunnel is back, so there is nothing left to do (when one run both
 finds and heals a tunnel, no stuck-peer alert is ever raised).
-``restart-no-effect`` and ``not-restarted`` are ``high`` because the stuck-peer
+``restart-no-effect``, ``restart-unconfirmed`` (the tunnel could not be
+checked afterwards) and ``not-restarted`` are ``high`` because the stuck-peer
 alert, which stays open, carries the page; these say what the restart did.
 
 **The watchdog's own health**, both ``high``, both raised again by a new episode
@@ -90,10 +100,16 @@ _MAX_STATE_BYTES = 1_000_000
 _SILENT_AFTER_S = 600
 _BLIND_AFTER_RUNS = 3
 _REOPEN_S = 3600
-#: A stuck-tunnel alert lasts while the tunnel is stuck, not for a TTL.
-_DOWN_EXPIRY = timedelta(days=3650)
+#: How long a stuck-tunnel alert outlives the last run that saw it stuck.
+_STUCK_TTL = timedelta(hours=24)
 #: Marks the resolutions this module makes, for whoever reads the row.
 _NOTE = "[tailscale-watchdog] "
+_WITHDRAWN = _NOTE + "withdrawn: "
+#: The store's expiry sweep (``observations.resolve_expired``) writes this.
+_EXPIRED_NOTE = "auto-expired (TTL)"
+#: Timer unit-file states that mean the watchdog was turned off or removed
+#: ("" is what systemd reports for a unit that is not installed).
+_TIMER_OFF_STATES = frozenset({"masked", "masked-runtime", "disabled", ""})
 _MAX_PEERS = 1000
 _MAX_TARGETS = 20
 _BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
@@ -102,7 +118,12 @@ _EVIDENCE_TEXT = (
 )
 _CRITICAL_ACTIONS = frozenset({"restart-failed", "unverified", "pending"})
 #: The same contract as the watchdog's EVENT_ACTIONS.
-_ACTIONS = _CRITICAL_ACTIONS | {"healed", "restart-no-effect", "not-restarted"}
+_ACTIONS = _CRITICAL_ACTIONS | {
+    "healed",
+    "restart-no-effect",
+    "restart-unconfirmed",
+    "not-restarted",
+}
 #: Runs after which tailscaled is known to be running with a readable status.
 _DAEMON_OK_ACTIONS = frozenset(
     {
@@ -113,6 +134,7 @@ _DAEMON_OK_ACTIONS = frozenset(
         "ratelimited",
         "healed",
         "restart-no-effect",
+        "restart-unconfirmed",
     }
 )
 
@@ -143,6 +165,8 @@ def _valid_event(event: Any) -> bool:
             and all(_valid_ip(ip) for ip in event["peers"])
             and isinstance(event["cleared"], list)
             and all(ip in event["peers"] for ip in event["cleared"])
+            and isinstance(event.get("unconfirmed", []), list)
+            and all(ip in event["peers"] for ip in event.get("unconfirmed", []))
             and (event["rc"] is None or type(event["rc"]) is int)
             and type(event["rate_limit_s"]) is int
         )
@@ -191,7 +215,8 @@ def _event_content(event: dict[str, Any]) -> tuple[str, str]:
     """(priority, content). The first sentence says what happened or what to
     do: the critical page shows only the start of the content."""
     peers = ", ".join(event["peers"])
-    left = [ip for ip in event["peers"] if ip not in event["cleared"]]
+    unconfirmed = event.get("unconfirmed", [])
+    left = [ip for ip in event["peers"] if ip not in event["cleared"] and ip not in unconfirmed]
     wait = f"the next automatic restart is allowed after {_minutes(event['rate_limit_s'])}"
     check = " Check: sudo systemctl status tailscaled."
     text = {
@@ -201,6 +226,10 @@ def _event_content(event: dict[str, Any]) -> tuple[str, str]:
         "restart-no-effect": f"The Tailscale watchdog restarted tailscaled, which came back,"
         f" but the tunnel(s) to {', '.join(left)} still get no reply; {wait}. Check the peer"
         " and this node's relay (tailscale netcheck).",
+        "restart-unconfirmed": "The Tailscale watchdog restarted tailscaled, which came back,"
+        f" but could not check the tunnel(s) to {', '.join(unconfirmed)} afterwards (the"
+        " tailscale CLI did not give an answer); the stuck-tunnel alert stays open until a"
+        f" later run sees the tunnel answer; {wait}.",
         "not-restarted": f"The Tailscale watchdog's restart of tailscaled failed"
         f" (rc={event['rc']}) and nothing restarted; the tunnel(s) to {peers} are still"
         f" stuck; {wait}. Fix: sudo systemctl restart tailscaled.",
@@ -265,8 +294,9 @@ async def _systemd_timer_state() -> dict[str, str] | None:
     )
     if timer is None:
         return None
-    service = await _systemctl_show(SERVICE_UNIT, "ActiveState") or {}
+    service = await _systemctl_show(SERVICE_UNIT, "ActiveState", "UnitFileState") or {}
     timer["ServiceActiveState"] = service.get("ActiveState", "")
+    timer["ServiceUnitFileState"] = service.get("UnitFileState", "")
     return timer
 
 
@@ -307,63 +337,56 @@ async def _create(
 
 async def _resolve(
     db,
-    category: str,
+    category: str | None,
     note: str,
     *,
     hashes: set[str] | None = None,
     keep: set[str] | None = None,
     priority: str | None = None,
 ) -> int:
-    """Resolve this source's open rows in ``category``: only ``hashes`` when
-    given, all but ``keep`` otherwise, optionally only one ``priority``."""
-    sql = (
-        "UPDATE observations SET resolved = 1, resolved_at = ?, resolution_notes = ? "
-        "WHERE source = ? AND type = ? AND category = ? AND resolved = 0"
+    """Resolve this source's open rows in ``category`` (every category when
+    None): only ``hashes`` when given, all but ``keep`` otherwise, optionally
+    only one ``priority``. ``note`` is the full resolution note."""
+    from genesis.db.crud import observations
+
+    return await observations.resolve_by_source_and_type(
+        db,
+        source=SOURCE,
+        type=TYPE,
+        category=category,
+        content_hashes=hashes,
+        exclude_content_hashes=keep,
+        priority=priority,
+        resolved_at=_now().isoformat(),
+        resolution_notes=note,
     )
-    params: list[Any] = [_now().isoformat(), _NOTE + note, SOURCE, TYPE, category]
-    if hashes is not None:
-        if not hashes:
-            return 0
-        sql += f" AND content_hash IN ({','.join('?' for _ in hashes)})"
-        params += sorted(hashes)
-    if keep:
-        sql += f" AND content_hash NOT IN ({','.join('?' for _ in keep)})"
-        params += sorted(keep)
-    if priority is not None:
-        sql += " AND priority = ?"
-        params.append(priority)
-    cursor = await db.execute(sql, params)
-    await db.commit()
-    return cursor.rowcount
 
 
 async def _raise_stuck(db, ip: str, age: Any, mode: Any) -> bool:
-    """Raise, reopen, or leave the peer's alert. True if a new row was made."""
-    content_hash = _hash(f"stuck:{ip}")
-    rows = await db.execute_fetchall(
-        "SELECT id, resolved, resolved_at, resolution_notes FROM observations "
-        "WHERE source = ? AND content_hash = ? ORDER BY created_at DESC LIMIT 1",
-        (SOURCE, content_hash),
-    )
-    if rows:
-        row = dict(rows[0])
+    """Raise, reopen, or keep alive the peer's alert. True if a new row was
+    made. Every call moves the open alert's expiry to :data:`_STUCK_TTL` ahead."""
+    from genesis.db.crud import observations
+
+    expires_at = (_now() + _STUCK_TTL).isoformat()
+    row = await observations.latest_by_hash(db, source=SOURCE, content_hash=_hash(f"stuck:{ip}"))
+    if row is not None:
         if not row["resolved"]:
+            await observations.set_expires_at(db, row["id"], expires_at)
             return False
+        notes = row.get("resolution_notes") or ""
+        # Expired (unseen for a day) or withdrawn (the watchdog was off): a new
+        # sighting is a new alert and pages.
+        ended = notes == _EXPIRED_NOTE or notes.startswith(_WITHDRAWN)
         try:
             since = (_now() - datetime.fromisoformat(row["resolved_at"])).total_seconds()
         except (TypeError, ValueError):
             since = float("inf")
-        if since <= _REOPEN_S:
+        if not ended and since <= _REOPEN_S:
             # Still or again stuck within the hour: a flap, or someone (the
             # owner, a reflection prune) resolved it while it was still true.
             # Bring the same alert back; it keeps its surfaced_at, so it does
             # not page again.
-            await db.execute(
-                "UPDATE observations SET resolved = 0, resolved_at = NULL,"
-                " resolution_notes = NULL WHERE id = ?",
-                (row["id"],),
-            )
-            await db.commit()
+            await observations.reopen(db, row["id"], expires_at=expires_at)
             return False
     created = await _create(
         db,
@@ -371,7 +394,7 @@ async def _raise_stuck(db, ip: str, age: Any, mode: Any) -> bool:
         priority="critical",
         category=CATEGORY_DOWN,
         once=False,
-        expires_at=(_now() + _DOWN_EXPIRY).isoformat(),
+        expires_at=expires_at,
         content=_stuck_content(ip, age, mode),
     )
     if created:
@@ -379,9 +402,9 @@ async def _raise_stuck(db, ip: str, age: Any, mode: Any) -> bool:
     return created
 
 
-async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer_state) -> int:
+async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer) -> int:
     if fresh:
-        await _resolve(db, CATEGORY_SILENT, "the Tailscale watchdog is reporting again")
+        await _resolve(db, CATEGORY_SILENT, _NOTE + "the Tailscale watchdog is reporting again")
         blind_runs = state.get("blind_runs")
         if type(blind_runs) is int and blind_runs >= _BLIND_AFTER_RUNS:
             return int(
@@ -401,11 +424,19 @@ async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer_
                     ),
                 )
             )
-        await _resolve(db, CATEGORY_BLIND, "the Tailscale watchdog can check tunnels again")
+        await _resolve(
+            db,
+            CATEGORY_BLIND,
+            _NOTE
+            + (
+                "tailscaled is turned off, so there is nothing to watch"
+                if state.get("last_action") == "tailscaled-off"
+                else "the Tailscale watchdog can check tunnels again"
+            ),
+        )
         return 0
-    timer = await timer_state()
     if not timer or timer.get("UnitFileState") != "enabled":
-        return 0  # not installed, turned off on purpose, or unknown
+        return 0  # turned off (the caller withdrew its alerts) or unknown
     if timer.get("ServiceActiveState") in ("activating", "active"):
         return 0  # a long run is still in progress
     try:
@@ -450,13 +481,15 @@ async def _apply_evidence(db, state: dict[str, Any]) -> int:
     await _resolve(
         db,
         CATEGORY_DOWN,
-        "the Tailscale watchdog found this tunnel answering again, or the peer offline",
+        _NOTE + "the Tailscale watchdog found this tunnel answering again, or the peer offline",
         hashes=cleared,
     )
     present = state.get("present")
     if state.get("present_complete") is True and isinstance(present, list):
         keep = {_hash(f"stuck:{ip}") for ip in present[:_MAX_PEERS] if _valid_ip(ip)}
-        await _resolve(db, CATEGORY_DOWN, "this peer is no longer in the tailnet", keep=keep)
+        await _resolve(
+            db, CATEGORY_DOWN, _NOTE + "this peer is no longer in the tailnet", keep=keep
+        )
     return created
 
 
@@ -492,9 +525,27 @@ async def record_new_events(
             and _number(last)
             and now - last <= _SILENT_AFTER_S
         )
-        created = await _watchdog_health(
-            db, state, fresh, boot, now, timer_state or _systemd_timer_state
-        )
+        timer = None
+        if fresh:
+            # Running and reporting, whatever its enablement: off only if its
+            # own mode says so.
+            off = state.get("mode") == "off"
+        else:
+            timer = await (timer_state or _systemd_timer_state)()
+            off = timer is not None and (
+                timer.get("UnitFileState") in _TIMER_OFF_STATES
+                # A masked service cannot run, whatever the timer says.
+                or timer.get("ServiceUnitFileState", "").startswith("masked")
+            )
+        if off:
+            await _resolve(
+                db,
+                None,
+                _WITHDRAWN + "the Tailscale watchdog was turned off, so nothing is watching"
+                " this any more; this is not a recovery",
+            )
+            return 0
+        created = await _watchdog_health(db, state, fresh, boot, now, timer)
         if not fresh:
             return created  # old evidence is not evidence of now
 
@@ -521,7 +572,7 @@ async def record_new_events(
             await _resolve(
                 db,
                 CATEGORY_RESTART,
-                "tailscaled is running and its status is readable",
+                _NOTE + "tailscaled is running and its status is readable",
                 priority="critical",
             )
 

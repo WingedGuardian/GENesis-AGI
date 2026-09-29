@@ -75,7 +75,7 @@ class World:
         self.mono = MONO
         self.status_rc = 0
 
-    def run(self, argv, timeout):
+    def run(self, argv, timeout, merge_stderr=False):
         self.calls.append(list(argv))
         cmd = argv[1]
         if cmd == "status":
@@ -87,7 +87,8 @@ class World:
                 ok = seq.pop(0) if len(seq) > 1 else seq[0]
             else:
                 ok = self.disco.get(ip, True)
-            return (0 if ok else 1), ""
+            # The real CLI's output for a missing reply (see _ping).
+            return (0, "pong") if ok else (1, f'ping "{ip}" timed out\nno reply')
         if cmd == "show":
             props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
             return 0, "".join(f"{p}={self.unit.get(p, '')}\n" for p in props)
@@ -177,7 +178,7 @@ def test_an_offline_peer_is_never_restarted_however_long_it_stays_offline(tmp_pa
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
-    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="0")
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10")
     tw.run_once(c)
     assert world.restarts() == 1
     world.disco[A] = False  # the laptop was closed
@@ -239,7 +240,7 @@ def test_an_idle_peer_with_a_fresh_handshake_is_ok(tmp_path):
     assert state(tmp_path)["evidence"] == {A: "ok"}
 
 
-@pytest.mark.parametrize("backend", ["NeedsLogin", "Stopped", "Starting", None])
+@pytest.mark.parametrize("backend", ["NeedsLogin", "Starting", "NoState", None])
 def test_a_backend_that_is_not_running_proves_nothing(tmp_path, backend):
     """Logged out, key expired, `tailscale down`: the peer map is empty, and an
     empty map from a stopped backend must never read as a complete, healthy
@@ -267,12 +268,12 @@ def test_a_ping_that_cannot_be_judged_is_not_evidence(tmp_path, hang):
     calls = {"n": 0}
     target = {"first": 1, "discovery": 2, "second": 3}[hang]
 
-    def hangs(argv, timeout):
+    def hangs(argv, timeout, **kw):
         if argv[1] == "ping":
             calls["n"] += 1
             if calls["n"] == target:
                 return None, ""
-        return real(argv, timeout)
+        return real(argv, timeout, **kw)
 
     c = ctx(world, tmp_path)
     c.run = hangs
@@ -287,10 +288,10 @@ def test_an_odd_ping_exit_code_is_not_a_missing_reply(tmp_path):
     world = World({"a": peer(A)})
     real = world.run
 
-    def usage_error(argv, timeout):
+    def usage_error(argv, timeout, **kw):
         if argv[1] == "ping":
             return 2, ""
-        return real(argv, timeout)
+        return real(argv, timeout, **kw)
 
     c = ctx(world, tmp_path)
     c.run = usage_error
@@ -302,7 +303,7 @@ def test_a_peer_two_restarts_did_not_clear_is_not_restarted_for_again(tmp_path):
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
-    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="0", NETWD_TS_RATE_LIMIT_SEC="300")
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10", NETWD_TS_RATE_LIMIT_SEC="300")
     for n in range(4):
         world.restart = (0, {"InvocationID": f"inv-{n + 10}"})
         s = tick(world, c, 301)
@@ -378,7 +379,7 @@ def test_a_stuck_peer_confirmed_during_cooldown_is_still_reported(tmp_path):
     world = World({"a": peer(A), "b": peer(B, age=30)})
     world.stuck(A)
     world.restart_fixes = False
-    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="0")
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10")
     tw.run_once(c)
     world.status["Peer"]["b"] = peer(B)
     world.stuck(B)
@@ -600,7 +601,7 @@ def test_the_restart_outcome_table(tmp_path, restart, fixes, action, exit_code):
     world.stuck(A)
     world.restart = restart
     world.restart_fixes = fixes
-    assert tw.run_once(ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="0")) == exit_code
+    assert tw.run_once(ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10")) == exit_code
     s = state(tmp_path)
     assert s["last_action"] == action
     (event,) = s["events"]
@@ -624,12 +625,12 @@ def test_a_restart_that_clears_only_some_tunnels_is_not_a_heal(tmp_path):
     world.restart_fixes = False
     real = world.run
 
-    def fixes_a(argv, timeout):
+    def fixes_a(argv, timeout, **kw):
         if argv[1] == "try-restart":
             world.fixed(A)
-        return real(argv, timeout)
+        return real(argv, timeout, **kw)
 
-    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="0")
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10")
     c.run = fixes_a
     tw.run_once(c)
     s = state(tmp_path)
@@ -644,10 +645,10 @@ def test_a_tunnel_that_answers_a_little_after_the_restart_is_healed(tmp_path):
     world.restart_fixes = False
     real = world.run
 
-    def slow_reconnect(argv, timeout):
+    def slow_reconnect(argv, timeout, **kw):
         if argv[1] == "try-restart":
             world.tsmp[A] = [False, False, True]
-        return real(argv, timeout)
+        return real(argv, timeout, **kw)
 
     c = ctx(world, tmp_path)
     c.run = slow_reconnect
@@ -662,10 +663,10 @@ def test_a_restart_that_lands_during_the_poll_is_healed(tmp_path):
     settle_at = world.mono + 5
     real = world.run
 
-    def show_then_settle(argv, timeout):
+    def show_then_settle(argv, timeout, **kw):
         if argv[1] == "show" and world.mono >= settle_at:
             world.unit.update({"Job": "", "ActiveState": "active", "InvocationID": "inv-2"})
-        return real(argv, timeout)
+        return real(argv, timeout, **kw)
 
     c = ctx(world, tmp_path)
     c.run = show_then_settle
@@ -690,12 +691,14 @@ def test_the_event_list_keeps_the_newest_fifty(tmp_path, monkeypatch):
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
-    c = ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300", NETWD_TS_VERIFY_SEC="0")
+    c = ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300", NETWD_TS_VERIFY_SEC="10")
     for n in range(55):
         world.restart = (0, {"InvocationID": f"inv-{n + 10}"})
         s = tick(world, c, 301)
     assert len(s["events"]) == 50
-    assert s["events"][-1]["mono"] == world.mono
+    # The newest run's event: stamped when its restart began, before the check.
+    assert world.mono - 10 <= s["events"][-1]["mono"] <= world.mono
+    assert all(a["mono"] < b["mono"] for a, b in zip(s["events"], s["events"][1:], strict=False))
 
 
 def test_consecutive_blind_runs_are_counted_and_reset(tmp_path):
@@ -727,7 +730,7 @@ def test_every_event_it_writes_passes_its_own_contract(tmp_path):
     world = World({"a": peer(A), "b": peer(B)})
     world.stuck(A, B)
     world.restart_fixes = False
-    tw.run_once(ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="0"))
+    tw.run_once(ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10"))
     s = state(tmp_path)
     assert s["events"] and all(tw.valid_event(e) for e in s["events"])
     assert not tw.valid_event({**s["events"][0], "peers": ["peer-host"]})
@@ -742,7 +745,7 @@ case "$1" in
     ping)
         if [[ " $* " == *" --tsmp "* ]]; then
             [ "$(cat "$STUB_DIR/inv" 2>/dev/null)" = inv-2 ] && exit 0
-            exit 1
+            echo "ping timed out"; echo "no reply" >&2; exit 1
         fi
         exit 0 ;;
 esac
@@ -800,3 +803,325 @@ def test_the_real_file_heals_with_stub_binaries(tmp_path):
     assert "HEALING" in result.stdout
     s = json.loads((tmp_path / "state.json").read_text())
     assert (s["last_action"], s["boot_id"], s["evidence"]) == ("healed", BOOT, {A: "ok"})
+
+
+# ── round 2: judging pings by their output ───────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "failed to connect to local tailscaled (which appears to be running). Got error: x",
+        "no matching peer",
+        "",
+    ],
+    ids=["local-api-down", "no-such-peer", "silent"],
+)
+def test_exit_1_is_a_missing_reply_only_when_the_cli_says_no_reply(tmp_path, output):
+    """The CLI exits 1 for many failures. Read as "no reply", an unreachable
+    local API made a peer "offline", which resolves its stuck alert."""
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    real = world.run
+
+    def api_down(argv, timeout, **kw):
+        if argv[1] == "ping":
+            return 1, output
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path)
+    c.run = api_down
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["evidence"], s["unjudged"], s["last_action"]) == ({}, 1, "incomplete")
+    assert world.restarts() == 0
+
+
+def test_the_real_no_reply_output_is_a_missing_reply(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.disco[A] = False
+    tw.run_once(ctx(world, tmp_path))
+    assert state(tmp_path)["evidence"] == {A: "offline"}
+
+
+def test_the_ping_asks_for_stderr_where_the_cli_prints_no_reply(tmp_path):
+    seen = []
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    real = world.run
+
+    def record(argv, timeout, **kw):
+        if argv[1] == "ping":
+            seen.append(kw.get("merge_stderr"))
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path, NETWD_TS_MODE="observe")
+    c.run = record
+    tw.run_once(c)
+    assert seen and all(seen)
+
+
+# ── round 2: what a restart did, when the check cannot be judged ─────────
+
+
+def _after_restart(world, fn):
+    """Route pings through ``fn`` once try-restart has run."""
+    real = world.run
+    restarted = {"yes": False}
+
+    def run(argv, timeout, **kw):
+        if argv[1] == "try-restart":
+            restarted["yes"] = True
+        if argv[1] == "ping" and restarted["yes"]:
+            return fn(argv)
+        return real(argv, timeout, **kw)
+
+    return run
+
+
+def test_a_restart_whose_check_cannot_be_judged_is_unconfirmed_not_ineffective(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.restart_fixes = False
+    c = ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300")
+    c.run = _after_restart(world, lambda argv: (1, "failed to connect to local tailscaled"))
+    for n in range(3):
+        world.restart = (0, {"InvocationID": f"inv-{n + 10}"})
+        s = tick(world, c, 301)
+        c.run = _after_restart(world, lambda argv: (1, "failed to connect to local tailscaled"))
+        (last,) = [e for e in s["events"] if e["mono"] == max(x["mono"] for x in s["events"])]
+        assert (last["action"], last["cleared"], last["unconfirmed"]) == (
+            "restart-unconfirmed",
+            [],
+            [A],
+        )
+    # Never counted as a restart that failed to help...
+    assert s["ineffective"] == {}
+    assert (world.restarts(), s["unconfirmed_restarts"]) == (3, {A: 3})
+    # ...but each one dropped every SSH session, so there is a limit of its own.
+    s = tick(world, c, 301)
+    assert world.restarts() == 3
+    assert s["last_action"] == "stuck"
+
+
+def test_the_check_deadline_bounds_the_whole_check_not_each_peer(tmp_path):
+    """With the deadline tested only after each peer's first ping, N slow
+    peers each got one full call past it."""
+    world = World({"a": peer(A), "b": peer(B), "c": peer(C)})
+    world.stuck(A, B, C)
+    world.restart_fixes = False
+    checks = []
+
+    def slow_no_reply(argv):
+        checks.append(argv[-1])
+        world.mono += 100  # one hung call, far past a 10s deadline
+        return 1, "no reply"
+
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10")
+    c.run = _after_restart(world, slow_no_reply)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert len(checks) == 1
+    (event,) = s["events"]
+    assert event["action"] == "restart-no-effect"
+    assert sorted(event["unconfirmed"]) == sorted({A, B, C} - {checks[0]})
+    assert s["ineffective"] == {checks[0]: 1}
+
+
+def test_the_check_setting_cannot_be_zero():
+    settings, _ = tw.load_settings({"NETWD_TS_VERIFY_SEC": "0"})
+    assert settings["NETWD_TS_VERIFY_SEC"] == 60
+
+
+# ── round 2: the ineffective-restart count outlives the event trim ───────
+
+
+def test_ineffective_restarts_are_counted_per_peer_in_the_file(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.restart_fixes = False
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10", NETWD_TS_RATE_LIMIT_SEC="300")
+    for n in range(2):
+        world.restart = (0, {"InvocationID": f"inv-{n + 10}"})
+        s = tick(world, c, 301)
+    assert s["ineffective"] == {A: 2}
+
+
+def test_a_peer_stays_excluded_after_its_events_are_trimmed_away(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.restart_fixes = False
+    (tmp_path / "state.json").write_text(
+        json.dumps({"boot_id": BOOT, "events": [], "ineffective": {A: 2}})
+    )
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10", NETWD_TS_RATE_LIMIT_SEC="300")
+    s = tick(world, c, 301)
+    assert world.restarts() == 0
+    assert (s["last_action"], s["ineffective"]) == ("stuck", {A: 2})
+
+
+def test_a_file_from_before_the_count_is_counted_from_its_events(tmp_path):
+    old = {
+        "id": f"{BOOT}:1",
+        "action": "restart-no-effect",
+        "boot_id": BOOT,
+        "mono": MONO - 7200,
+        "at": int(NOW),
+        "peers": [A],
+        "cleared": [],
+        "rc": 0,
+        "rate_limit_s": 300,
+    }
+    (tmp_path / "state.json").write_text(json.dumps({"boot_id": BOOT, "events": [old, old]}))
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    tw.run_once(ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300"))
+    assert world.restarts() == 0
+    assert state(tmp_path)["ineffective"] == {A: 2}
+
+
+def test_the_count_does_not_carry_across_a_reboot(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"boot_id": "another-boot", "events": [], "ineffective": {A: 2}})
+    )
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    tw.run_once(ctx(world, tmp_path))
+    assert world.restarts() == 1
+
+
+# ── round 2: the evidence cap keeps what can be acted on ─────────────────
+
+
+def test_the_evidence_cap_keeps_a_stuck_peer_that_sorts_last(tmp_path, monkeypatch):
+    monkeypatch.setattr(tw, "MAX_PEERS", 2)
+    world = World({"a": peer(A, age=30), "b": peer(B, age=30), "z": peer("100.64.9.9")})
+    world.stuck("100.64.9.9")
+    tw.run_once(ctx(world, tmp_path, NETWD_TS_MODE="observe"))
+    s = state(tmp_path)
+    assert s["evidence"]["100.64.9.9"] == "stuck"
+    assert len(s["evidence"]) == 2
+    assert s["present_complete"] is False
+
+
+# ── round 2: tailscaled restarted during the scan ────────────────────────
+
+
+def test_a_daemon_restart_during_the_scan_voids_the_run_and_restarts_nothing(tmp_path):
+    world = World({"a": peer(A), "b": peer(B, age=30)})
+    world.stuck(A)
+    real = world.run
+
+    def operator_restarts_it(argv, timeout, **kw):
+        if argv[1] == "ping" and "--tsmp" not in argv:
+            world.unit["ActiveEnterTimestampMonotonic"] = str(int(world.mono * 1e6))
+            world.unit["InvocationID"] = "inv-operator"
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path)
+    c.run = operator_restarts_it
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"], s["present_complete"]) == (
+        "daemon-restarted",
+        {},
+        False,
+    )
+    assert world.restarts() == 0
+    assert s["blind_runs"] == 0
+
+
+# ── round 2: tailscaled turned off on purpose is not blindness ───────────
+
+
+@pytest.mark.parametrize(
+    ("unit", "backend", "action", "blind"),
+    [
+        ({"ActiveState": "inactive", "UnitFileState": "disabled"}, "Running", "tailscaled-off", 0),
+        ({"ActiveState": "inactive", "UnitFileState": "masked"}, "Running", "tailscaled-off", 0),
+        ({}, "Stopped", "tailscaled-off", 0),
+        ({"ActiveState": "failed", "UnitFileState": "enabled"}, "Running", "unavailable", 1),
+        ({"ActiveState": "failed", "UnitFileState": "disabled"}, "Running", "unavailable", 1),
+        ({"ActiveState": "inactive", "UnitFileState": ""}, "Running", "unavailable", 1),
+        ({}, "NeedsLogin", "unavailable", 1),
+    ],
+    ids=[
+        "disabled",
+        "masked",
+        "tailscale-down",
+        "crashed",
+        "crashed-though-disabled",
+        "unit-state-unknown",
+        "logged-out",
+    ],
+)
+def test_tailscaled_turned_off_on_purpose_is_not_blind(tmp_path, unit, backend, action, blind):
+    world = World({"a": peer(A)})
+    world.unit.update(unit)
+    world.status["BackendState"] = backend
+    tw.run_once(ctx(world, tmp_path))
+    s = state(tmp_path)
+    assert (s["last_action"], s["blind_runs"], s["evidence"]) == (action, blind, {})
+
+
+# ── round 2, second pass ─────────────────────────────────────────────────
+
+
+def test_both_restart_counts_reset_once_the_peer_is_seen_working(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "boot_id": BOOT,
+                "events": [],
+                "ineffective": {A: 2, B: 1},
+                "unconfirmed_restarts": {A: 3},
+            }
+        )
+    )
+    world = World({"a": peer(A, age=30), "b": peer(B, active=False)})
+    s = tick(world, ctx(world, tmp_path, NETWD_TS_MODE="observe"))
+    assert (s["evidence"], s["ineffective"], s["unconfirmed_restarts"]) == ({A: "ok"}, {B: 1}, {})
+
+
+def test_one_dead_tunnel_does_not_use_up_the_check_for_the_others(tmp_path):
+    """The check pings the waiting peers in turn: checked one after another,
+    a tunnel that never answers held the whole window and left the rest
+    unchecked."""
+    world = World({"a": peer(A), "b": peer(B)})
+    world.stuck(A, B)
+    world.restart_fixes = False
+
+    def a_dead_b_back(argv):
+        world.mono += 1
+        return (1, "no reply") if argv[-1] == A else (0, "pong")
+
+    c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10")
+    c.run = _after_restart(world, a_dead_b_back)
+    tw.run_once(c)
+    (event,) = state(tmp_path)["events"]
+    assert (event["action"], event["cleared"], event["unconfirmed"]) == (
+        "restart-no-effect",
+        [B],
+        [],
+    )
+
+
+def test_an_unreadable_second_start_time_does_not_void_the_run(tmp_path):
+    world = World({"a": peer(A, age=30)})
+    real = world.run
+    reads = {"n": 0}
+
+    def flaky_show(argv, timeout, **kw):
+        if argv[1] == "show" and "ActiveEnterTimestampMonotonic" in argv:
+            reads["n"] += 1
+            if reads["n"] == 2:
+                return 1, ""
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path)
+    c.run = flaky_show
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert reads["n"] == 2
+    assert (s["last_action"], s["evidence"]) == ("none", {A: "ok"})

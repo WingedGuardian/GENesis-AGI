@@ -627,6 +627,7 @@ def test_tailscale_watchdog_absent_where_tailscaled_runs(state):
     [
         (True, "enabled"),
         (True, "masked"),  # the operator's deliberate off switch
+        (True, "masked-runtime"),  # a runtime mask, where one takes effect
         (True, None),  # unknown: silent
         (False, ""),  # no tailscaled: nothing to watch
         (None, ""),

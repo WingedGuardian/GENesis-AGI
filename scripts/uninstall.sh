@@ -62,14 +62,41 @@ genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
 # Tailscale watchdog restarts tailscaled, dropping every SSH session, so it must
 # not outlive Genesis. KeepConfiguration drop-ins are deliberately left: they
 # shape how the network behaves, and removing one needs a networkd restart.
-GENESIS_ROOT_WATCHDOG_REMOVE='for u in genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service \
-genesis-network-watchdog.timer genesis-network-watchdog.service; do sudo -n systemctl disable --now "$u" 2>/dev/null || true; done; \
-sudo -n rm -f /etc/systemd/system/genesis-tailscale-watchdog.service /etc/systemd/system/genesis-tailscale-watchdog.timer \
-/etc/systemd/system/genesis-network-watchdog.service /etc/systemd/system/genesis-network-watchdog.timer \
-/usr/local/lib/genesis/tailscale-watchdog.py /usr/local/lib/genesis/network-watchdog.sh \
-/run/genesis-tailscale-watchdog.json /run/genesis-tailscale-watchdog-status.json \
-/run/genesis-network-watchdog.json /run/genesis-network-watchdog.last 2>/dev/null || true; \
-sudo -n systemctl daemon-reload 2>/dev/null || true'
+#
+# Every step needs sudo and tolerates failure, so the command then CHECKS: a
+# unit file or script still present, or a timer still active, is printed after
+# GENESIS_ROOT_WATCHDOG_LEFT and the command exits 1. The callers report that
+# instead of success (on the incus path the exit status does not come back).
+# BEGIN root-watchdog-remove
+_WD_ROOT="${GENESIS_ROOT_WATCHDOG_PREFIX:-}"  # test seam; empty = the real root
+_WD_UNITS="genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service genesis-network-watchdog.timer genesis-network-watchdog.service"
+_WD_FILES="$_WD_ROOT/etc/systemd/system/genesis-tailscale-watchdog.service $_WD_ROOT/etc/systemd/system/genesis-tailscale-watchdog.timer \
+$_WD_ROOT/etc/systemd/system/genesis-network-watchdog.service $_WD_ROOT/etc/systemd/system/genesis-network-watchdog.timer \
+$_WD_ROOT/usr/local/lib/genesis/tailscale-watchdog.py $_WD_ROOT/usr/local/lib/genesis/network-watchdog.sh"
+_WD_RUN_FILES="$_WD_ROOT/run/genesis-tailscale-watchdog.json $_WD_ROOT/run/genesis-tailscale-watchdog-status.json \
+$_WD_ROOT/run/genesis-network-watchdog.json $_WD_ROOT/run/genesis-network-watchdog.last"
+GENESIS_ROOT_WATCHDOG_LEFT="root watchdog still present:"
+GENESIS_ROOT_WATCHDOG_REMOVE="for u in $_WD_UNITS; do sudo -n systemctl disable --now \"\$u\" 2>/dev/null || true; done; \
+sudo -n rm -f $_WD_FILES $_WD_RUN_FILES 2>/dev/null || true; \
+sudo -n systemctl daemon-reload 2>/dev/null || true; \
+left=''; for f in $_WD_FILES; do if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then left=\"\$left \$f\"; fi; done; \
+for u in $_WD_UNITS; do case \"\$u\" in *.timer) if systemctl is-active --quiet \"\$u\" 2>/dev/null; then left=\"\$left \$u\"; fi ;; esac; done; \
+if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi"
+# END root-watchdog-remove
+
+# report_root_watchdog_removal <output> — the removal command's verdict. It
+# never aborts the uninstall: the rest of Genesis still comes out.
+report_root_watchdog_removal() {
+    local out="$1"
+    if [[ "$out" == *"$GENESIS_ROOT_WATCHDOG_LEFT"* ]]; then
+        warn "The root network/Tailscale watchdog was NOT fully removed, and can keep restarting tailscaled (dropping SSH sessions). Needs root:${out#*"$GENESIS_ROOT_WATCHDOG_LEFT"}"
+        warn "Remove it as root: systemctl disable --now $_WD_UNITS; then delete the files listed above."
+        return 0
+    fi
+    [ -n "$out" ] && echo "$out"
+    ok "Removed root network and Tailscale watchdog timers"
+    REMOVED+=("root watchdog timers")
+}
 CONTAINER_USER="ubuntu"
 IN_CONTAINER=false
 
@@ -499,10 +526,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         if [ "$DRY_RUN" = true ]; then
             echo "    [DRY RUN] Would disable and remove the root network and Tailscale watchdog timers"
         else
-            bash -c "$GENESIS_ROOT_WATCHDOG_REMOVE"
-            ok "Removed root network and Tailscale watchdog timers"
+            report_root_watchdog_removal "$(bash -c "$GENESIS_ROOT_WATCHDOG_REMOVE")"
         fi
-        REMOVED+=("root watchdog timers")
 
         # Wait for genesis-server port to close
         for _i in $(seq 1 10); do
@@ -588,9 +613,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             ok "Stopped Genesis services"
 
             # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
-            container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE"
-            ok "Removed root network and Tailscale watchdog timers"
-            REMOVED+=("root watchdog timers")
+            report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
 
             # Persistent= timers keep a stamp file under
             # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it

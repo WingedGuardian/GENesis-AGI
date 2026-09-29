@@ -226,11 +226,34 @@ async def test_an_alert_resolved_by_anyone_while_still_true_comes_back_without_p
 
 
 @pytest.mark.asyncio
-async def test_a_stuck_alert_does_not_expire_while_the_tunnel_is_stuck(db, tmp_path):
-    await _run(db, _write(tmp_path / "s.json", evidence={A: "stuck"}))
+async def test_a_stuck_alert_expires_a_day_after_it_was_last_seen_stuck(db, tmp_path):
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"})
+    await _run(db, state)
     (row,) = await _rows(db)
-    expires = datetime.fromisoformat(row["expires_at"])
-    assert expires - datetime.now(UTC) > timedelta(days=365)
+    left = datetime.fromisoformat(row["expires_at"]) - datetime.now(UTC)
+    assert timedelta(hours=23) < left <= timedelta(hours=24)
+    # Seen stuck again later: the expiry moves a day ahead of that sighting.
+    soon = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    await observations.set_expires_at(db, row["id"], soon)
+    await _run(db, state)
+    (row,) = await _rows(db)
+    left = datetime.fromisoformat(row["expires_at"]) - datetime.now(UTC)
+    assert left > timedelta(hours=23)
+
+
+@pytest.mark.asyncio
+async def test_an_alert_that_expired_unseen_pages_again_when_seen_stuck(db, tmp_path):
+    state = _write(tmp_path / "s.json", evidence={A: "stuck"})
+    await _run(db, state)
+    (row,) = await _rows(db)
+    await observations.mark_surfaced(db, [row["id"]], datetime.now(UTC).isoformat())
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    await observations.set_expires_at(db, row["id"], past)
+    assert await observations.resolve_expired(db) == 1
+    await _run(db, state)  # within the reopen hour, but it EXPIRED: a new alert
+    rows = await _rows(db)
+    assert len(rows) == 2
+    assert [p["category"] for p in await _pages(db)] == [CATEGORY_DOWN]
 
 
 @pytest.mark.asyncio
@@ -249,6 +272,7 @@ async def test_observe_mode_says_it_will_not_restart(db, tmp_path):
     [
         ("healed", "high", "answer again"),
         ("restart-no-effect", "high", "still get no reply"),
+        ("restart-unconfirmed", "high", "could not check the tunnel"),
         ("not-restarted", "high", "restart of tailscaled failed"),
         ("restart-failed", "critical", "Tailscale may be DOWN"),
         ("unverified", "critical", "could not read whether"),
@@ -257,9 +281,14 @@ async def test_observe_mode_says_it_will_not_restart(db, tmp_path):
 )
 async def test_restart_outcomes(db, tmp_path, action, priority, lead):
     cleared = [A] if action == "healed" else []
+    extra = {"unconfirmed": [A]} if action == "restart-unconfirmed" else {}
     await _run(
         db,
-        _write(tmp_path / "s.json", events=[_event(action, cleared=cleared)], last_action=action),
+        _write(
+            tmp_path / "s.json",
+            events=[_event(action, cleared=cleared, **extra)],
+            last_action=action,
+        ),
     )
     (row,) = await _rows(db, category=CATEGORY_RESTART)
     assert row["priority"] == priority
@@ -488,7 +517,7 @@ case "$1" in
         # unless STUB_NO_FIX says the restart does not clear it.
         if [[ " $* " == *" --tsmp "* ]]; then
             [ -z "$STUB_NO_FIX" ] && [ "$(cat "$STUB_DIR/inv" 2>/dev/null)" = inv-2 ] && exit 0
-            exit 1
+            echo "ping timed out"; echo "no reply" >&2; exit 1
         fi
         exit 0 ;;
 esac
@@ -545,7 +574,7 @@ def _run_helper(tmp_path: Path, mono: float, **env) -> Path:
             "STUB_DIR": str(tmp_path),
             "STUB_START_US": str(int((mono - 600) * 1e6)),
             "NETWD_TS_RATE_LIMIT_SEC": "300",
-            "NETWD_TS_VERIFY_SEC": "0",
+            "NETWD_TS_VERIFY_SEC": "10",
             "NETWD_TAILSCALE_BIN": str(tmp_path / "tailscale"),
             "NETWD_SYSTEMCTL": str(tmp_path / "systemctl"),
             "NETWD_TS_STATE_FILE": str(state),
@@ -588,3 +617,116 @@ async def test_the_real_helpers_file_becomes_the_right_rows(db, tmp_path, env, e
     assert sorted((r["category"], r["priority"]) for r in rows) == sorted(expected)
     assert all(A in r["content"] for r in rows if r["category"] == CATEGORY_DOWN)
     assert not any("IGNORE" in r["content"] for r in rows)
+
+
+# ── round 2: the off switch withdraws every alert ────────────────────────
+
+
+async def _open_every_kind(db, path: Path) -> None:
+    await _run(
+        db,
+        _write(
+            path,
+            evidence={A: "stuck"},
+            events=[_event("restart-failed", cleared=[])],
+            last_action="restart-failed",
+            blind_runs=3,
+        ),
+    )
+    assert {r["category"] for r in await _rows(db, resolved=False)} == {
+        CATEGORY_DOWN,
+        CATEGORY_RESTART,
+        CATEGORY_BLIND,
+    }
+
+
+@pytest.mark.asyncio
+async def test_off_mode_withdraws_every_alert_and_says_it_is_not_a_recovery(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _open_every_kind(db, path)
+    await _run(db, _write(path, mode="off", last_action="off"))
+    rows = await _rows(db)
+    assert all(r["resolved"] == 1 for r in rows)
+    assert all("withdrawn" in r["resolution_notes"] for r in rows)
+    assert all("not a recovery" in r["resolution_notes"] for r in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unit_file_state", ["masked", "disabled", ""])
+async def test_a_stale_file_and_a_timer_turned_off_withdraws_every_alert(
+    db, tmp_path, unit_file_state
+):
+    path = tmp_path / "s.json"
+    await _open_every_kind(db, path)
+    await _run(db, _write(path, evidence={A: "stuck"}, checked=NOW - 3600))  # stale, silent
+    assert await _rows(db, resolved=False, category=CATEGORY_SILENT)
+
+    async def timer():
+        return {"UnitFileState": unit_file_state, "ActiveState": "inactive"}
+
+    await _run(db, path, timer_state=timer)
+    assert await _rows(db, resolved=False) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_timer_withdraws_nothing(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _open_every_kind(db, path)
+    _write(path, checked=NOW - 3600)
+
+    async def unreadable():
+        return None
+
+    await _run(db, path, timer_state=unreadable)
+    assert len(await _rows(db, resolved=False)) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_timer_still_running_is_not_off(db, tmp_path):
+    """`systemctl disable` without --now leaves the timer running until the
+    next boot: a fresh file means it is still watching."""
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+
+    async def disabled():
+        return {"UnitFileState": "disabled", "ActiveState": "active"}
+
+    await _run(db, _write(path, evidence={}), timer_state=disabled)
+    assert len(await _rows(db, resolved=False, category=CATEGORY_DOWN)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_withdrawn_alert_pages_again_when_the_watchdog_returns_to_a_stuck_tunnel(
+    db, tmp_path
+):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+    (row,) = await _rows(db)
+    await observations.mark_surfaced(db, [row["id"]], datetime.now(UTC).isoformat())
+    await _run(db, _write(path, mode="off", last_action="off"))
+    await _run(db, _write(path, evidence={A: "stuck"}))  # back on, within the hour
+    assert len(await _rows(db, category=CATEGORY_DOWN)) == 2
+    assert [p["category"] for p in await _pages(db)] == [CATEGORY_DOWN]
+
+
+@pytest.mark.asyncio
+async def test_a_masked_service_is_off_even_with_the_timer_enabled(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _open_every_kind(db, path)
+    _write(path, checked=NOW - 3600)
+
+    async def service_masked():
+        return {**await _timer_enabled_active(), "ServiceUnitFileState": "masked"}
+
+    assert await _run(db, path, timer_state=service_masked) == 0
+    assert await _rows(db, resolved=False) == []
+    assert await _rows(db, category=CATEGORY_SILENT) == []  # no false "silent" alert
+
+
+@pytest.mark.asyncio
+async def test_a_blind_alert_resolved_by_tailscaled_being_off_says_so(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, blind_runs=3, last_action="unavailable"))
+    await _run(db, _write(path, blind_runs=0, last_action="tailscaled-off"))
+    (row,) = await _rows(db, category=CATEGORY_BLIND)
+    assert "tailscaled is turned off" in row["resolution_notes"]

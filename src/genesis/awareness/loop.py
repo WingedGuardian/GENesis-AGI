@@ -721,7 +721,7 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     if (
         network.get("tailscaled_loaded") is True
         and isinstance(ts_state, str)
-        and ts_state not in ("enabled", "masked")
+        and ts_state not in ("enabled", "masked", "masked-runtime")
     ):
         missing.append("tailscale_watchdog_absent")
     # Storage plane: cc-tmp blast-radius isolation (EFFECTIVE-state fact from

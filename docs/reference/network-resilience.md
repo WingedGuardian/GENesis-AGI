@@ -104,8 +104,10 @@ never from the command's exit code:
 | systemd afterwards | Recorded as |
 |---|---|
 | tailscaled's start time or InvocationID unreadable before the restart | nothing is restarted: a rate limit or an outcome it could not judge is not worth the dropped sessions |
-| new InvocationID, unit active, every stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s) | `healed` |
+| tailscaled's start time changed during the scan (an operator or an upgrade restarted it) | `daemon-restarted`: every verdict is void and nothing is restarted |
+| new InvocationID, unit active, every stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s; it bounds the whole check, and no peer starts a ping after it) | `healed` |
 | new InvocationID, unit active, a stuck peer still gets no reply | `restart-no-effect` |
+| new InvocationID, unit active, but no check of a stuck peer could be judged (the CLI gave no answer) | `restart-unconfirmed`, not counted as a restart that failed to help |
 | new InvocationID, unit not active | `restart-failed` |
 | same InvocationID, try-restart failed | `not-restarted` |
 | same InvocationID, try-restart exited 0 (tailscaled was stopped) | nothing; no hour spent |
@@ -113,20 +115,26 @@ never from the command's exit code:
 | InvocationID unreadable | `unverified` |
 
 Every run rewrites `/run/genesis-tailscale-watchdog.json` (0644). It holds
-only what THAT run observed; the watchdog keeps nothing about a peer between
-runs, so there is no state to lose or to go stale:
+only what THAT run observed, plus one per-boot count, so there is no condition
+to lose or to go stale:
 
 - `evidence`: a verdict per peer the run could judge. `ok` means a handshake
   within the stale age, or the tunnel answered. `stuck` means all four probes,
   in this run. `offline` means the discovery ping failed too: the peer is gone,
   which is not a stuck tunnel. A peer it could not judge is absent from the
   list, meaning unknown: unprobed, idle without a fresh handshake, a daemon too
-  fresh to judge a zero handshake, or a ping that hung or failed oddly (the CLI
-  exits 1 for no reply; anything else proves nothing about the peer). A run
-  whose backend is not `Running` (logged out, key expired, `tailscale down`)
-  judges nobody.
+  fresh to judge a zero handshake, or a ping that hung or failed oddly. The CLI
+  exits 1 for many failures (it cannot reach the local tailscaled, no peer has
+  that address), so only exit 1 whose last line is `no reply` counts as a
+  missing reply: that is the CLI's only no-reply path (tailscale v1.102.4,
+  `cmd/tailscale/cli/ping.go`). A run whose backend is not `Running` judges
+  nobody.
+- The evidence is capped at 1000 peers, keeping `stuck`, then `offline`, then
+  `ok` verdicts, so a cap never drops the one that pages.
 - `present`: every well-formed peer's IPv4, and whether that list is complete.
 - `events`: at most 50 restart outcomes (the table above).
+- `ineffective`: per peer, how many restarts this boot did not clear its tunnel,
+  kept apart from `events` so trimming that list never resets it.
 
 Only peers confirmed stuck IN THE SAME RUN are ever restarted, so a peer that
 went offline, or one a later run could not probe, never triggers a restart.
@@ -150,38 +158,60 @@ The owner hears about it through the Genesis runtime. The awareness tick
   changes nothing, and evidence is used only while the file is fresh.
 - A tunnel stuck again within an hour of its alert being resolved (a flap, or
   someone resolving it while it was still true) reopens the same alert without
-  paging again. To stop the alerts for good, set observe or off, or mask the
-  timer.
-- These alerts do not expire on the store's usual 3-day timer: they last while
-  the tunnel is stuck.
+  paging again.
+- Each run that still sees the tunnel stuck moves the alert's expiry a day
+  ahead, so it ends on the store's expiry sweep a day after the tunnel was last
+  seen stuck (a peer nobody connects to again gives no evidence either way). A
+  tunnel seen stuck after that is a new alert and pages.
+- Turning the watchdog off withdraws every alert it raised: `off` mode, or,
+  once its file has gone stale, a timer that is masked, disabled or not
+  installed, or a masked service. The resolution note says nothing is watching any more, which is
+  not a recovery. An unreadable timer state withdraws nothing, and a disabled
+  timer that is still running is still watching.
 - A restart outcome is one alert each. `restart-failed`, `unverified` and
   `pending` are `critical`, and resolve once a later run finds tailscaled
   running with a readable status. `healed` is `high`: the SSH drop was felt
   and the tunnel is back (when one run both finds and heals a tunnel, no
-  stuck-peer alert is raised at all). `restart-no-effect` and `not-restarted`
-  are `high` because the stuck-peer alert, which stays open, carries the page.
+  stuck-peer alert is raised at all). `restart-no-effect`,
+  `restart-unconfirmed` and `not-restarted` are `high` because the stuck-peer
+  alert, which stays open, carries the page.
 - The Genesis side reads the latest run only (every ~5 minutes against runs
   every ~2), so a stuck spell shorter than that can go unreported; restart
   outcomes are kept and never missed.
 - If the timer is enabled but the file has not been rewritten for 10 minutes,
   and the oneshot is not mid-run, a `high` alert says the watchdog has gone
   silent. If it reports but judged no tunnel for three runs in a row
-  (tailscaled down, the CLI failing, a status it cannot parse, or probe limits
-  set to zero), a `high` alert says it is blind. Both are raised again by a new
+  (tailscaled crashed, logged out, the CLI failing, a status it cannot parse,
+  or probe limits set to zero), a `high` alert says it is blind. tailscaled
+  turned off on purpose (a disabled or masked unit, or `tailscale down`) is
+  nothing to watch, not blindness. Both are raised again by a new
   episode after one resolves. The watchdog's own failures reach no one
   otherwise: the owning user cannot read the system journal.
 - The infra profile records `tailscaled_loaded` and the timer's unit-file state,
   and the protection-posture check flags `tailscale_watchdog_absent` where
-  tailscaled is installed and the timer is neither enabled nor masked.
+  tailscaled is installed and the timer is neither enabled nor masked
+  (a runtime mask counts).
 - In observe mode a stuck peer is alerted the same way and never restarted.
 
 Levers, in a drop-in on `genesis-tailscale-watchdog.service`:
 `NETWD_TS_MODE=live|observe|off` (an unknown value means observe), and the
 `NETWD_TS_*` bounds, each an integer checked against its own range and replaced
-by its default, with a journal line, when out of range. To turn it off
-durably, `sudo systemctl mask genesis-tailscale-watchdog.timer`: the installer
-respects a mask, and otherwise re-enables a disabled timer, as it does for the
-networkd watchdog. `scripts/uninstall.sh` removes both root timers.
+by its default, with a journal line, when out of range. **To turn it off
+durably, set `NETWD_TS_MODE=off` in that drop-in**: the installer never
+touches drop-ins, and off mode withdraws every alert the watchdog raised.
+`systemctl disable` does not last, because the installer re-enables a disabled
+timer (as it does for the networkd watchdog). No mask works on these units
+as installed: `systemctl mask` refuses while the unit file is in
+`/etc/systemd/system`, and a `mask --runtime` symlink in `/run/systemd/system`
+is shadowed by that file, which comes earlier on systemd's search path
+(`systemd-analyze unit-paths`). The installer, the posture rule and the alerts
+still respect a mask where one exists (a unit masked before it was ever
+installed). The installer never
+writes through a symlink: a masked unit is a symlink to `/dev/null`, and
+writing and chmodding through it would change `/dev/null` itself.
+`scripts/uninstall.sh` removes both root timers, then checks: a unit file or
+script it could not remove (it needs sudo), or a timer still active, is named
+in a warning rather than reported as removed.
 
 ## How the body schema surfaces it
 

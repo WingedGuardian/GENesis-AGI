@@ -47,7 +47,13 @@ _rmasked() { [ -f "$_b.timermaskruntime" ]; }  # runtime mask (`mask --runtime`)
 # with tailscaled, and the default (1) a host without it.
 _TS=genesis-tailscale-watchdog.timer
 _TSU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/$_TS"
+# Its service can be masked too (a /dev/null symlink); otherwise it is static.
+_TSSU="${NETRES_ETC_ROOT:-/nonexistent}/systemd/system/genesis-tailscale-watchdog.service"
 if [ "$1" = "cat" ]; then exit "${TAILSCALED_CAT_RC:-1}"; fi
+if [ "$1" = "is-enabled" ] && [ "$2" = "genesis-tailscale-watchdog.service" ]; then
+    [ -L "$_TSSU" ] && { printf 'masked'; exit 1; }
+    printf 'static'; exit 0
+fi
 if [ "$2" = "$_TS" ]; then
     case "$1" in
         is-active) { [ -L "$_TSU" ] || [ ! -f "$_b.tstimerstarted" ]; } && exit 3 || exit 0 ;;
@@ -684,3 +690,124 @@ def test_tailscale_watchdog_not_installed_without_a_usable_python(tmp_path):
     assert "needs /bin/false (3.8+)" in result.stdout
     assert "NOT fully applied" in result.stdout
     assert not _ts_paths(env)["script"].exists()
+
+
+# ── round 2: never write through a symlink (a masked unit) ───────────────
+
+
+def _stand_in_for_dev_null(tmp_path: Path) -> Path:
+    """A file standing in for /dev/null, so a write or chmod through the mask
+    symlink is observable (and the real /dev/null is never at risk)."""
+    target = tmp_path / "dev-null"
+    target.write_text("")
+    target.chmod(0o666)
+    return target
+
+
+def test_a_masked_tailscale_service_is_an_off_switch_and_its_target_is_untouched(tmp_path):
+    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0"}
+    p = _ts_paths(env)
+    target = _stand_in_for_dev_null(tmp_path)
+    p["service"].parent.mkdir(parents=True)
+    p["service"].symlink_to(target)
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "genesis-tailscale-watchdog.service is masked (operator off switch)" in result.stdout
+    assert p["service"].is_symlink()
+    assert (target.read_text(), oct(target.stat().st_mode & 0o777)) == ("", "0o666")
+    assert not p["script"].exists()
+
+
+def test_the_writer_never_writes_or_chmods_through_a_symlink(tmp_path):
+    """A masked networkd watchdog SERVICE (only its timer is unmasked first):
+    tee would discard the unit and chmod 0644 would change the link's target,
+    which for a real mask is /dev/null."""
+    env = _stage(tmp_path)
+    target = _stand_in_for_dev_null(tmp_path)
+    service = _paths(env)["service"]
+    service.parent.mkdir(parents=True)
+    service.symlink_to(target)
+    result = _run_apply(env)
+    assert result.returncode == 0
+    assert "is a symlink (a masked unit?)" in result.stdout
+    assert "NOT fully applied" in result.stdout
+    assert service.is_symlink()
+    assert (target.read_text(), oct(target.stat().st_mode & 0o777)) == ("", "0o666")
+
+
+# ── round 2: uninstall reports a root watchdog it could not remove ───────
+
+UNINSTALL = REPO_ROOT / "scripts" / "uninstall.sh"
+
+_UN_SUDO_STUB = """#!/bin/bash
+[ -n "${SUDO_OK:-}" ] || exit 1
+[ "$1" = "-n" ] && shift
+exec "$@"
+"""
+
+_UN_SYSTEMCTL_STUB = """#!/bin/bash
+if [ "$1" = "is-active" ]; then
+    for u in ${ACTIVE_TIMERS:-}; do [ "$u" = "$3" ] && exit 0; done
+    exit 3
+fi
+exit 0
+"""
+
+
+def _run_removal(tmp_path: Path, **env) -> subprocess.CompletedProcess:
+    root = tmp_path / "root"
+    for rel in (
+        "etc/systemd/system/genesis-tailscale-watchdog.service",
+        "etc/systemd/system/genesis-tailscale-watchdog.timer",
+        "usr/local/lib/genesis/tailscale-watchdog.py",
+        "run/genesis-tailscale-watchdog.json",
+    ):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("x")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("sudo", _UN_SUDO_STUB), ("systemctl", _UN_SYSTEMCTL_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    block = (
+        f'eval "$(sed -n "/^# BEGIN root-watchdog-remove/,/^# END root-watchdog-remove/p" '
+        f'"{UNINSTALL}")"; bash -c "$GENESIS_ROOT_WATCHDOG_REMOVE"'
+    )
+    return subprocess.run(
+        ["/bin/bash", "-c", block],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "GENESIS_ROOT_WATCHDOG_PREFIX": str(root), **env},
+    )
+
+
+def test_uninstall_removes_the_root_watchdog_and_reports_nothing_left(tmp_path):
+    result = _run_removal(tmp_path, SUDO_OK="1")
+    assert (result.returncode, result.stdout) == (0, "")
+    assert not any((tmp_path / "root").rglob("genesis-*watchdog*"))
+    assert not (tmp_path / "root/usr/local/lib/genesis/tailscale-watchdog.py").exists()
+
+
+def test_uninstall_without_sudo_names_what_survived(tmp_path):
+    result = _run_removal(tmp_path, ACTIVE_TIMERS="genesis-tailscale-watchdog.timer")
+    assert result.returncode == 1
+    assert result.stdout.startswith("root watchdog still present:")
+    assert "genesis-tailscale-watchdog.service" in result.stdout
+    assert "tailscale-watchdog.py" in result.stdout
+    assert result.stdout.rstrip().endswith("genesis-tailscale-watchdog.timer")
+
+
+def test_uninstall_reports_a_timer_still_running_after_its_files_are_gone(tmp_path):
+    result = _run_removal(tmp_path, SUDO_OK="1", ACTIVE_TIMERS="genesis-network-watchdog.timer")
+    assert result.returncode == 1
+    assert result.stdout.strip() == "root watchdog still present: genesis-network-watchdog.timer"
+
+
+def test_both_uninstall_paths_report_instead_of_claiming_success():
+    text = UNINSTALL.read_text()
+    assert text.count('report_root_watchdog_removal "$(') == 2
+    assert 'ok "Removed root network and Tailscale watchdog timers"' in text.split(
+        "report_root_watchdog_removal() {"
+    )[1].split("\n}\n")[0]
+

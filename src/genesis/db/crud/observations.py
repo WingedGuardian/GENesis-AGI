@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import logging
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -1038,6 +1039,9 @@ async def resolve_by_source_and_type(
     resolved_at: str,
     resolution_notes: str,
     category: str | None = None,
+    content_hashes: Collection[str] | None = None,
+    exclude_content_hashes: Collection[str] | None = None,
+    priority: str | None = None,
 ) -> int:
     """Resolve all unresolved observations matching a source + type pair.
 
@@ -1048,8 +1052,15 @@ async def resolve_by_source_and_type(
     clear every matching row regardless of category (including legacy
     NULL-category rows).
 
+    ``content_hashes`` narrows it further to exactly those rows; an EMPTY
+    collection resolves nothing (it names no row), which is different from
+    omitting it. ``exclude_content_hashes`` leaves those rows open, and
+    ``priority`` narrows to one priority.
+
     Returns the number of rows resolved.
     """
+    if content_hashes is not None and not content_hashes:
+        return 0
     sql = (
         "UPDATE observations SET resolved = 1, resolved_at = ?, "
         "resolution_notes = ? "
@@ -1059,6 +1070,17 @@ async def resolve_by_source_and_type(
     if category is not None:
         sql += " AND category = ?"
         params.append(category)
+    if content_hashes is not None:
+        wanted = sorted(set(content_hashes))
+        sql += f" AND content_hash IN ({','.join('?' for _ in wanted)})"
+        params += wanted
+    if exclude_content_hashes:
+        unwanted = sorted(set(exclude_content_hashes))
+        sql += f" AND content_hash NOT IN ({','.join('?' for _ in unwanted)})"
+        params += unwanted
+    if priority is not None:
+        sql += " AND priority = ?"
+        params.append(priority)
     cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount
@@ -1089,6 +1111,53 @@ async def resolve_by_content_hash(
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def latest_by_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_hash: str,
+) -> dict | None:
+    """The newest observation for ONE ``(source, content_hash)``, resolved or
+    not, or None. For a writer whose rows are one alert per subject and that
+    decides between raising, reopening and leaving it by the latest row's
+    state (``unresolved_by_hash`` sees only open rows)."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM observations WHERE source = ? AND content_hash = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (source, content_hash),
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def reopen(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    expires_at: str | None = None,
+) -> bool:
+    """Mark a resolved observation unresolved again, clearing its resolution
+    and setting ``expires_at``. ``surfaced_at`` is left as it is, so a row
+    that already paged does not page again. True if a resolved row changed."""
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 0, resolved_at = NULL, "
+        "resolution_notes = NULL, expires_at = ? WHERE id = ? AND resolved = 1",
+        (expires_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def set_expires_at(db: aiosqlite.Connection, id: str, expires_at: str | None) -> bool:
+    """Move an UNRESOLVED observation's expiry, e.g. to keep a condition alert
+    alive for a window after it was last confirmed. True if a row changed."""
+    cursor = await db.execute(
+        "UPDATE observations SET expires_at = ? WHERE id = ? AND resolved = 0",
+        (expires_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def supersede_except_hash(

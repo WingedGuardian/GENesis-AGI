@@ -89,6 +89,14 @@ _netres_ts_service_content() {
 # fails the caller (returns 0) so `set -e` callers are safe even outside an if.
 _netres_put_file() {
     local path="$1" content="$2" mode="$3"
+    # Never write THROUGH a symlink. A masked unit is a symlink to /dev/null:
+    # tee would discard the file and chmod would change /dev/null itself, which
+    # breaks every non-root process that writes to it.
+    if sudo test -L "$path" 2>/dev/null; then
+        echo "  WARNING: $path is a symlink (a masked unit?) — not writing through it; network resilience NOT fully applied."
+        _NETRES_FAILED=1
+        return 0
+    fi
     if [[ "$(sudo cat "$path" 2>/dev/null)" == "$content" ]]; then
         return 0
     fi
@@ -222,10 +230,13 @@ _netres_install_tailscale_watchdog() {
         echo "  Tailscale watchdog: no tailscaled unit on this host — skipping."
         return 0
     fi
-    if [[ "$(systemctl is-enabled genesis-tailscale-watchdog.timer 2>/dev/null || true)" == masked* ]]; then
-        echo "  Tailscale watchdog: timer is masked (operator off switch) — leaving it alone."
-        return 0
-    fi
+    local _unit
+    for _unit in genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service; do
+        if [[ "$(systemctl is-enabled "$_unit" 2>/dev/null || true)" == masked* ]]; then
+            echo "  Tailscale watchdog: $_unit is masked (operator off switch) — leaving it alone."
+            return 0
+        fi
+    done
     if ! "$NETRES_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
         echo "  WARNING: Tailscale watchdog needs $NETRES_PYTHON (3.8+) — NOT installed."
         _NETRES_FAILED=1
