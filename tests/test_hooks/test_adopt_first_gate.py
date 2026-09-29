@@ -531,6 +531,19 @@ def test_a_foreign_src_genesis_path_neither_nudges_nor_marks(home: Path, repo: P
         "a path outside the repo must not create the branch sentinel"
     )
 
+def test_a_foreign_src_genesis_path_in_a_plan_does_not_block(
+    home: Path, repo: Path
+):
+    """A src/genesis substring inside a foreign path is not this repo's source."""
+    p = _plan(
+        home,
+        "# Plan\nUpdate `/repo/docs/src/genesis/example.py`.\n",
+    )
+
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+
+    assert result.returncode == 0
+
 
 # ── wiring: a hook nobody registered is a hook that does nothing ─────────────
 

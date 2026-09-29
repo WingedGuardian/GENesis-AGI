@@ -82,7 +82,7 @@ _GIT_ENV = {
 #: the trigger is every source extension, not only .py — a plan that adds a
 #: dashboard module is exactly the "new capability" this question is for.
 _SOURCE_PATH = re.compile(
-    r"\bsrc/[\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|html|css|sh)\b"
+    r"(?<![\w./-])src/[\w./-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|html|css|sh)\b"
 )
 
 #: The verdict header, tolerant of the spellings a writer will actually use:
