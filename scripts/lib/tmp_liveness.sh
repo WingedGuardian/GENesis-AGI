@@ -128,8 +128,15 @@ mount_targets() {
 }
 
 path_crosses_mount() {
-    # 0 when $1 is a mount point, or has a mount somewhere below it, per $2 =
-    # mount_targets output (read once by the caller). A device-number
+    # 0 when a mount in $2 (mount_targets output, read once by the caller and
+    # already limited to mounts strictly below the caller's ROOT) is EQUAL to
+    # $1, BELOW it, or ABOVE it. Every candidate lies under ROOT, so those
+    # three relations are the only ways a mount under ROOT can meet it; any
+    # other mount is disjoint and rm of $1 never reaches it. ABOVE matters
+    # where a walk descends past a mount: the cc-tmp sweep emits
+    # claude-<uid>/<project>/<session>, and a mount at <project> put every
+    # session in it inside the mount, where --one-file-system cannot help
+    # (review finding on #2570, round 3). A device-number
     # comparison misses a bind mount and an incus dir-pool volume, which keep
     # their parent's device (review finding on #2521 item 6); the table lists
     # every mount, same device or not. Each entry is DECODED and compared raw,
@@ -139,7 +146,7 @@ path_crosses_mount() {
     [[ -n "$targets" ]] || return 1
     while IFS= read -r line; do
         _tl_unescape t "$line"
-        [[ "$t" == "$p" || "$t" == "$p"/* ]] && return 0
+        [[ "$t" == "$p" || "$t" == "$p"/* || "$p" == "$t"/* ]] && return 0
     done < <(printf '%s\n' "$targets")
     return 1
 }
@@ -167,6 +174,10 @@ remove_tree_one_fs() {
     # its pass, not re-read here. Returns 0 when $1 is gone, 2 when it was
     # spared, 1 when removal failed and it is still there. --one-file-system
     # stays as a backstop for a mount that appears mid-pass on another device.
+    # Accepted residual: a SAME-device bind mount created between the table
+    # read and this rm is not seen. Creating one needs CAP_SYS_ADMIN, which
+    # nothing this guardian protects against holds without also being able to
+    # delete the data directly.
     if tree_holds_mount "$@"; then
         return 2
     fi

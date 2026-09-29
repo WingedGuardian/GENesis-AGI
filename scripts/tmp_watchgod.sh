@@ -552,6 +552,10 @@ sweep_cc_tmp() {
         local c
         for c in "$root"/claude-*; do
             [[ "${c##*/}" =~ ^claude-[0-9]+$ && -d "$c" ]] || continue
+            # Not routed through remove_tree_one_fs on purpose: -empty -delete
+            # removes only EMPTY directories (rmdir), so it can never delete
+            # data, and an empty directory that is a mount point cannot be
+            # removed at all (EBUSY).
             find "$c" -mindepth 1 -maxdepth 1 -type d -empty -mmin "+$age" -delete 2>/dev/null || true
         done
     fi

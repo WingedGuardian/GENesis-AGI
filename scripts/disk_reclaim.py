@@ -208,7 +208,10 @@ def _mount_points(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[Path] 
     Field 5 of mountinfo escapes space, tab, newline and backslash as \\NNN;
     other bytes pass raw, so records are split on "\\n" only (splitlines()
     would also split on \\x0b, \\x1c, U+2028 ... inside a path). None when
-    the table cannot be read — the caller refuses rather than guessing.
+    the table cannot be read, or has no "/" entry — every real table has one,
+    so an empty or truncated read is not mistaken for "no mounts" (the same
+    rule as the shell guard's mount_targets; review finding on #2570). The
+    caller refuses rather than guessing.
     """
     try:
         text = mountinfo.read_text(errors="surrogateescape")
@@ -220,6 +223,8 @@ def _mount_points(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[Path] 
         if len(fields) > 4:
             raw = fields[4].encode("utf-8", "surrogateescape")
             out.append(Path(os.fsdecode(_unescape_octal(raw))))
+    if Path("/") not in out:
+        return None
     return out
 
 

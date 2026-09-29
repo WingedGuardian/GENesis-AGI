@@ -12,6 +12,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _LIB = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "tmp_liveness.sh"
 
 
@@ -238,3 +240,32 @@ def test_remove_tree_one_fs_reports_what_happened(tmp_path):
             assert _remove(tmp_path, stuck, []) == 1 and stuck.exists()
     finally:
         (stuck / "ro").chmod(0o755)
+
+
+# Every relation a mount under ROOT can have to a candidate under ROOT, in one
+# table (#2570 premise check: the review rounds found these one at a time
+# because no single test enumerated them). ROOT = /r, candidate = /r/c/s.
+_RELATIONS = [
+    ("equal", "/r/c/s", True),
+    ("below", "/r/c/s/vol", True),
+    ("deep below", "/r/c/s/a/b/vol", True),
+    ("above (between root and candidate)", "/r/c", True),
+    ("sibling", "/r/c/t", False),
+    ("sibling sharing a prefix", "/r/c/s2", False),
+    ("prefix of the candidate's name", "/r/c/s2/x", False),
+    ("disjoint", "/r/other", False),
+]
+
+
+@pytest.mark.parametrize(("relation", "mount", "crosses"), _RELATIONS, ids=[r[0] for r in _RELATIONS])
+def test_path_crosses_mount_covers_every_relation(relation, mount, crosses):
+    assert _crosses("/r/c/s", [_esc(mount)]) is crosses, relation
+
+
+@pytest.mark.parametrize(("relation", "mount", "crosses"), _RELATIONS, ids=[r[0] for r in _RELATIONS])
+def test_every_relation_survives_escaping(relation, mount, crosses):
+    """The same table with a space, a tab, a newline and a digit after each
+    escape in every name: decoding must not change any answer."""
+    def odd(p: str) -> str:
+        return p.replace("/c", "/c 1").replace("/s", "/s\t2").replace("/vol", "/v\n3")
+    assert _crosses(odd("/r/c/s"), [_esc(odd(mount))]) is crosses, relation

@@ -1196,3 +1196,18 @@ def test_a_tmpfs_page_says_writers_cannot_be_attributed(box):
     body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
     assert "Writer attribution unavailable: tmpfs writes are not counted" in body
     assert "innocent" not in body
+
+
+def test_the_sweep_spares_sessions_inside_a_mounted_project(box, cctmp):
+    """Review of #2570 round 3: the sweep walks claude-<uid>/<project>/<session>;
+    a mount at <project> puts every session inside it, which a check for
+    mounts at or below the candidate cannot see."""
+    root, proj = cctmp
+    s = proj / "old-session"
+    s.mkdir()
+    (s / "data").write_text("x")
+    _age_tree(proj, 10)
+    mi = _mountinfo(box, ["/", proj])
+    _run(box, f"export TL_MOUNTINFO='{mi}'; sweep_cc_tmp 10080 test")
+    assert (s / "data").exists(), "a session inside a mounted project is never deleted"
+    assert "it is, or holds, a separate mount" in _log(box)

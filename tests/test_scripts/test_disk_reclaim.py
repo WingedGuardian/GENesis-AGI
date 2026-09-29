@@ -324,3 +324,39 @@ def test_an_unreadable_mount_table_refuses_the_target(tmp_path):
     assert _READ_MOUNTS(tmp_path / "missing") is None
     with patch.object(_mod, "_mount_points", lambda: None):
         assert _mod._is_safe_target(cache) is False
+
+
+# The same relation set as the shell guard's table-driven test. disk_reclaim's
+# targets are FIXED cache paths, not candidates under a sweep root, so a mount
+# ABOVE the target is not a refusal here: "/" is always one (#2570 premise
+# check). Only a mount AT or BELOW the target is.
+_PY_RELATIONS = [
+    ("equal", "cache", False),
+    ("below", "cache/vol", False),
+    ("deep below", "cache/a/b/vol", False),
+    ("above", "", True),
+    ("sibling sharing a prefix", "cache2", True),
+    ("disjoint", "other/vol", True),
+]
+
+
+@pytest.mark.parametrize(("relation", "mount", "allowed"), _PY_RELATIONS, ids=[r[0] for r in _PY_RELATIONS])
+def test_is_safe_target_covers_every_relation(tmp_path, relation, mount, allowed):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    info = tmp_path / "mountinfo"
+    entries = ["/", str(tmp_path / mount) if mount else str(tmp_path)]
+    info.write_text("".join(f"{i} 1 0:{i} / {m.replace(' ', chr(92) + '040')} rw - x x rw\n"
+                            for i, m in enumerate(entries, 20)))
+    with patch.object(_mod, "_mount_points", lambda: _READ_MOUNTS(info)):
+        assert _mod._is_safe_target(cache) is allowed, relation
+
+
+@pytest.mark.parametrize("text", ["", "\n", "36 35 98:0 / /home/x rw - btrfs /dev/x rw\n", "garbage\n"],
+                         ids=["empty", "blank", "truncated-no-root", "malformed"])
+def test_a_table_without_the_root_entry_is_unreadable(tmp_path, text):
+    """Review of #2570 round 3: an empty or truncated read must refuse, like
+    the shell guard, never read as "no mounts"."""
+    info = tmp_path / "mountinfo"
+    info.write_text(text)
+    assert _READ_MOUNTS(info) is None
