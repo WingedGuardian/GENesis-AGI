@@ -79,6 +79,7 @@ try:
         analyze_checked,
         git_subcommand_index,
         mention_view,
+        mention_views,
         untokenizable,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -225,6 +226,17 @@ def _legacy_targets(cmd: str) -> list[str]:
             break
     return targets
 
+
+def _view_targets(cmd: str) -> list[str]:
+    """`_legacy_targets` over each reading in `mention_views`, SEPARATELY.
+
+    The readings are alternatives, not consecutive text. Given the joined view, the
+    extractor read past the end of one reading and took the first word of the next as
+    the target, so a harmless continued command ending in a quoted mention of the
+    operation was refused as a direct removal. Reading each view on its own keeps the
+    target inside the reading that named it. Order-preserving, deduplicated.
+    """
+    return list(dict.fromkeys(t for view in mention_views(cmd) for t in _legacy_targets(view)))
 
 def _extract_worktree_targets(segs: list) -> list[str]:
     """Target paths of every EXECUTED worktree-removal segment.
@@ -444,7 +456,7 @@ def _handle_bash(data: dict) -> int:
         # this read the view). `mention_view` keeps the
         # raw text as its first line, so this can only find MORE targets, and every
         # direct removal is refused anyway: it moves only toward refusing.
-        targets = _legacy_targets(mention_view(cmd))
+        targets = _view_targets(cmd)
     elif untokenizable(cmd):
         targets = _legacy_targets(cmd)
     else:
@@ -484,7 +496,7 @@ def _handle_bash(data: dict) -> int:
             and _GIT_TOKEN.search(mention_view(cmd))
             and _carries_a_command(cmd, segs)
         ):
-            targets = _legacy_targets(mention_view(cmd))
+            targets = _view_targets(cmd)
     if not targets:
         return 0
 

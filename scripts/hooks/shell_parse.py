@@ -1625,37 +1625,72 @@ def mention_view(command: str) -> str:
     only sends a command on to the parse, which is where the decision is made. Use it
     for a MENTION test and nothing else; never parse it.
     """
+    return "\n".join(mention_views(command))
+
+
+def mention_views(command: str) -> tuple[str, ...]:
+    """The separate readings :func:`mention_view` joins, one per element.
+
+    For a reader that extracts TOKENS rather than testing for a mention. The joined
+    view is one string only for convenience; its lines are alternative readings of
+    the same command, not consecutive text, so a token read past the end of one
+    belongs to a different reading. MEASURED: a worktree-target reader given the
+    joined view took a target from the next reading and refused a harmless command.
+    """
     folded = fold_continuations(command)
     stripped = folded.replace('"', "").replace("'", "").replace("\\", "")
-    views = [command]
-    for view in (folded, stripped):
-        if view not in views:
-            views.append(view)
-    return "\n".join(views)
+    return tuple(dict.fromkeys((command, folded, stripped)))
+
+
+def recovered_segments(command: str) -> list[Segment]:
+    """Segments from BOTH readings of a command whose parse :func:`analyze_checked`
+    withheld because of a line continuation.
+
+    A withheld parse withholds every per-segment fact with it, not only the verdict,
+    and each consumer that reads one of those facts has to get it back from
+    somewhere. MEASURED on this change: the push guard lost the "verb held in a
+    variable" fact and allowed what main refused; the discard guard lost a
+    ``git -C <repo>`` target and snapshotted the wrong repository; two advisories
+    went silent. One chokepoint, so a consumer cannot recover a fact by hand and
+    get it subtly different.
+
+    Two readings, because neither is right on its own. The FOLDED reading joins
+    every backslash run before a newline, which is what the shell does to an odd
+    run outside a comment. The AS-WRITTEN reading keeps the newline, which is what
+    the shell does to an even run, or to a backslash inside a ``#`` comment, where
+    the next line is a separate command that folding would glue into the comment.
+    The union holds every segment either reading finds, deduplicated.
+
+    ADD-ONLY: a consumer may use these segments to add a refusal, an advisory note
+    or a recovery snapshot, never to decide an allow — a segment here may be one the
+    shell does not run. Bounded exactly like :func:`analyze_checked`: a reading that
+    trips a bound contributes nothing, and the caller's bounds branch has already
+    refused.
+    """
+    out: list[Segment] = []
+    seen: set[tuple] = set()
+    for text in dict.fromkeys((command, fold_continuations(command))):
+        segments, reason = _analyze_bounded(text)
+        if reason:
+            continue
+        for seg in segments:
+            key = (seg.depth, tuple(seg.argv), seg.raw)
+            if key not in seen:
+                seen.add(key)
+                out.append(seg)
+    return out
 
 
 def unresolved_verb_programs(command: str) -> frozenset[str]:
     """The programs whose operation is named by an expansion, in EITHER reading.
 
-    For a consumer whose segments :func:`analyze_checked` withheld. A bounds-type
-    blind spot returns no segments, and with them the one per-segment fact a
-    consumer refuses on by itself: a dispatcher (``git``, ``gh``) whose verb the
-    shell builds, so the guard cannot tell which operation runs. Withholding it
-    turned a refusal into an allow — see :func:`analyze_checked`.
-
-    Reads the command as written and with its continuations folded, and returns the
-    union. The folded reading is used ONLY to add names here, so an error in it can
-    add a refusal or miss one the as-written reading also misses; it never decides an
-    allow. Bounded exactly like :func:`analyze_checked`: a reading that trips a bound
-    contributes nothing, and the caller's own bounds branch has already refused.
+    A dispatcher (``git``, ``gh``) whose verb the shell builds is refused on by
+    itself, and a withheld parse would otherwise drop that fact — see
+    :func:`recovered_segments`, which this reads.
     """
-    programs: set[str] = set()
-    for text in dict.fromkeys((command, fold_continuations(command))):
-        segments, reason = _analyze_bounded(text)
-        if reason:
-            continue
-        programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
-    return frozenset(programs)
+    return frozenset(
+        _basename(s.argv[0]) for s in recovered_segments(command) if _dispatcher_verb_unresolved(s)
+    )
 
 #: THE OTHER HALF OF VERB POSITION IS DELIBERATELY NOT REPORTED, and the reason is
 #: measurement rather than oversight. When the PROGRAM ITSELF is built by the shell

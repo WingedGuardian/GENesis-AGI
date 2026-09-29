@@ -75,9 +75,9 @@ from shell_parse import (  # noqa: E402
     _GH_ALL_VALUE_FLAGS,
     _GH_FLAG_TABLE,
     analyze_checked,
-    fold_continuations,
     gh_command,
     mention_view,
+    recovered_segments,
 )
 
 #: Cheap prefilter, same reasoning as `capped_read_advisory._GH_WORD`: this runs
@@ -347,12 +347,15 @@ def _process(payload: dict) -> None:
     # genuine close attempt a flag check would silence. A BOUNDS-TYPE one returns
     # none, which used to be harmless because the bounds are measured at 0 of
     # 45,956 real commands; a line continuation is also bounds-type and is
-    # ordinary input, so for that case this reads the command with its
-    # continuations folded instead. An advisory may do what a guard's verdict may
-    # not: a wrong reading here costs one spurious sentence. Over-long or
-    # over-nested commands stay bounded when folded, so they stay silent.
+    # ordinary input, so for that case this reads the segments EITHER reading of
+    # the command finds (`recovered_segments`). Folding alone was wrong: a
+    # backslash inside a `#` comment does not join, and folding glued the close
+    # on the next line into the comment, so a genuine close got no advisory.
+    # An advisory may do what a guard's verdict may not: a wrong reading here
+    # costs one spurious sentence. Over-long or over-nested commands stay bounded
+    # in both readings, so they stay silent.
     if blind is not None and blind.bounds_induced:
-        segments, _ = analyze_checked(fold_continuations(cmd))
+        segments = recovered_segments(cmd)
     # Advising on what DID parse is right for an advisory: a spurious note costs a
     # sentence, where a fail-closed guard in the same position must refuse,
     # because for it a spurious ALLOW costs a bypass. `_LIMIT` already tells the

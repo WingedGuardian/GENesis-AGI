@@ -106,7 +106,6 @@ import datetime
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -172,6 +171,7 @@ try:
         git_subcommand_index,
         has_trailing_override,
         mention_view,
+        recovered_segments,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -270,15 +270,6 @@ _TRIGGER_SUBSTRINGS = (
 # EXCLUDED (all-untracked → zero snapshot value — it stays the one BLOCK).
 _SNAPSHOT_VERBS = frozenset(
     {"checkout", "restore", "switch", "reset", "rm", "mv", "checkout-index", "read-tree"}
-)
-# The same verbs as whole words, for the one place a verb is read from TEXT rather
-# than argv: the snapshot fallback for a parse that returned no segments. Two
-# independent searches, never one pattern with `.*` between the words: that shape is
-# quadratic in the command's length, and this runs on the hook path, where MEASURED
-# a 32,000-character command took 4 seconds with it.
-_GIT_WORD = re.compile(r"\bgit\b")
-_SNAPSHOT_VERB_WORD = re.compile(
-    r"\b(?:" + "|".join(re.escape(v) for v in sorted(_SNAPSHOT_VERBS)) + r")\b"
 )
 # The sanctioned escape for the clean block: `git clean -f  # discard-override`.
 _OVERRIDE_SIGIL = "discard-override"
@@ -1364,8 +1355,19 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
     # about what the guard could NOT see, so it can only be written once the loop has
     # finished establishing what it could.
     blind_unrecorded = blind is not None and blind.bounds_induced
+    # A BLIND parse returns no segments — and a line continuation is a blind spot
+    # that ordinary work produces. A continued `git reset --hard` is not refused (it
+    # is recoverable by design), so the snapshot is the only thing between it and
+    # lost work, and the repository it targets (`git -C <repo>`) is a per-segment
+    # fact the withheld parse dropped with everything else. `recovered_segments`
+    # reads the command both ways and returns what either reading finds; for a
+    # snapshot that is the right direction, since an extra snapshot costs nothing
+    # and a missing one costs the work. MEASURED: without it a continued
+    # `git -C <other repo> reset --hard` snapshotted the session's directory while
+    # the discard ran in the other repository.
+    scan = recovered_segments(cmd) if blind_unrecorded else segs
     targets: list[str | None] = []
-    for seg in segs:
+    for seg in scan:
         if seg.exe != "git":
             continue
         # Literal VERB membership — never positional subcommand resolution
@@ -1375,21 +1377,12 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
         if not set(seg.argv[1:]) & _SNAPSHOT_VERBS:
             continue
         targets.append(_segment_cwd(seg, payload))
-    # A BLIND parse returns no segments, so the loop above finds nothing — and a
-    # line continuation is a blind spot that ordinary work produces. A continued
-    # `git reset --hard` is not refused (it is recoverable by design), so the
-    # snapshot is the only thing between it and lost work. MEASURED: before the
-    # continuation became a blind spot, the verb survived the parser's split and the
-    # snapshot fired; after, nothing did. So when the command VISIBLY names a
-    # snapshot verb, fall back to the session's working directory — the repository
-    # such a command most likely touches — and say below that it is ALL we covered.
-    # A word match on the text the shell assembles, not a parse: over-matching costs
-    # one harmless snapshot, under-matching is the status quo, neither can block.
-    fallback_cwd: str | None = None
-    view = mention_view(cmd) if blind_unrecorded else ""
-    if blind_unrecorded and _GIT_WORD.search(view) and _SNAPSHOT_VERB_WORD.search(view):
-        fallback_cwd = payload.get("cwd") or os.getcwd()
-        targets.append(fallback_cwd)
+    # No text-matching fallback on top of the two readings. An earlier revision
+    # snapshotted the session's directory whenever the TEXT named a snapshot verb and
+    # no reading resolved one. Once both readings are parsed, the only commands that
+    # reach that case have a verb built by an expansion — which the one-line form of
+    # the same command does not snapshot either — and MEASURED by mutation, no test
+    # could tell the fallback was there. So it was deleted rather than kept alive.
     for cwd in targets:
         if not cwd or cwd in seen_cwds or not os.path.isdir(cwd):
             continue
@@ -1558,22 +1551,32 @@ def _record_snapshots(cmd: str, payload: dict) -> list[str]:
             "repos in this compound were NOT snapshotted. Run a single git "
             "command per repo if you need its recovery point."
         )
-    if blind_unrecorded and fallback_cwd is not None and fallback_cwd in sha_by_cwd:
-        # The fallback above is the ONLY way a blind parse records anything, so a sha
-        # for it means exactly one snapshot, of the session's directory.
+    # On a blind parse every snapshot came from the recovered readings, so the note
+    # names exactly the repositories that got one — never more.
+    # The wording depends on WHAT was snapshotted, not on which route found it.
+    blind_recorded = (
+        [c for c in dict.fromkeys(targets) if c and c in sha_by_cwd] if blind_unrecorded else []
+    )
+    session_cwd = payload.get("cwd") or os.getcwd()
+    if blind_recorded and blind_recorded == [session_cwd]:
         warnings.append(
             f"[git-discard-guard] this command {blind.cause}, so the guard could not "
             f"tell which repositories it touches: it snapshotted only the session's "
-            f"working directory ({fallback_cwd}). Any OTHER repository this command "
+            f"working directory ({session_cwd}). Any OTHER repository this command "
             f"discards work in has no recovery point. To get one: {blind.hint}."
         )
+    elif blind_recorded:
+        warnings.append(
+            f"[git-discard-guard] this command {blind.cause}, so the guard read it both "
+            f"ways the shell might and snapshotted only what those readings named: "
+            f"{', '.join(blind_recorded)}. Any OTHER repository this command discards "
+            f"work in has no recovery point. To get one: {blind.hint}."
+        )
     elif blind_unrecorded:
-        # No snapshot was recorded. A bounds-induced blind spot returns no segments,
-        # so the only snapshot this function can take for it is the fallback above,
-        # and that one did not land (no snapshot verb named, not a repository, or a
-        # clean tree). An earlier revision branched on `sorted(seen_cwds)` and spoke
-        # of the repositories it "did snapshot"; that branch was unreachable, and the
-        # wording it left on the live path implied repositories that cannot exist.
+        # No snapshot was recorded: neither reading named a snapshot target that
+        # landed, and the fallback did not either (no snapshot verb named, not a
+        # repository, or a clean tree). An earlier revision spoke of repositories it
+        # "did snapshot" on a branch that could not reach one; say only what is true.
         warnings.append(
             f"[git-discard-guard] no recovery snapshot was recorded at all: this "
             f"command {blind.cause}, so the guard could not tell which "

@@ -554,11 +554,11 @@ def test_reset_hard_is_snapshotted(repo, snap_log):
 )
 def test_a_continued_discard_still_snapshots_the_session_cwd(repo, snap_log, cmd):
     """A line continuation is a blind spot: the parse returns NO segments, so the
-    per-segment loop finds no snapshot verb. The recovery net must not go with it —
-    a continued `git reset --hard` is not refused (it is recoverable, by design), so
-    the snapshot is the only thing standing between it and lost work. The fallback
-    snapshots the session's working directory, the repository such a command most
-    likely touches, and the note says that is ALL it covered."""
+    per-segment loop over them finds no snapshot verb. The recovery net must not go
+    with it — a continued `git reset --hard` is not refused (it is recoverable, by
+    design), so the snapshot is the only thing standing between it and lost work.
+    The guard reads the segments back from both readings of the command; here they
+    name the session's directory, and the note says that is ALL it covered."""
     _segs, blind = shell_parse.analyze_checked(cmd)
     assert blind is not None and blind.bounds_induced, "fixture must be a blind parse"
     (repo / "tracked.py").write_text("dirty\n")
@@ -570,8 +570,23 @@ def test_a_continued_discard_still_snapshots_the_session_cwd(repo, snap_log, cmd
     assert "only the session's working directory" in joined, joined
 
 
-def test_a_blind_command_naming_no_discard_verb_takes_no_fallback_snapshot(repo, snap_log):
-    """The fallback is gated on the command visibly naming a snapshot verb, so an
+def test_a_continued_discard_in_another_repo_snapshots_that_repo(repo, tmp_path, snap_log):
+    """The `-C` target is a per-segment fact the withheld parse dropped. Snapshotting
+    the session's directory instead left the discard in the OTHER repository with no
+    recovery point, so the guard reads the segments back from both readings."""
+    cmd = f"git -C {repo} reset \\\n --hard"
+    _segs, blind = shell_parse.analyze_checked(cmd)
+    assert blind is not None and blind.bounds_induced, "fixture must be a blind parse"
+    (repo / "tracked.py").write_text("dirty\n")
+    notes = _gd._record_snapshots(cmd, {"cwd": str(tmp_path)})
+    rows = _rows(snap_log)
+    assert len(rows) == 1 and rows[0]["cwd"] == str(repo), rows
+    joined = "\n".join(notes)
+    assert str(repo) in joined and "only the session's working directory" not in joined, joined
+
+
+def test_a_blind_command_naming_no_discard_verb_takes_no_snapshot(repo, snap_log):
+    """Only a segment naming a snapshot verb is snapshotted, in either reading, so an
     ordinary continued git command does not snapshot on every call."""
     (repo / "tracked.py").write_text("dirty\n")
     _gd._record_snapshots("git log \\\n --oneline", {"cwd": str(repo)})

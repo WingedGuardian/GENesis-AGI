@@ -32,7 +32,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import read_payload, tool_input  # noqa: E402
-from shell_parse import analyze, untokenizable  # noqa: E402
+from shell_parse import (  # noqa: E402
+    analyze,
+    has_continuation,
+    recovered_segments,
+    untokenizable,
+)
 
 _ADVICE = (
     "ADVISORY: this runs `tmux kill-server` with no explicit socket binding "
@@ -101,7 +106,14 @@ def _command_word_and_binding(argv: list[str]) -> tuple[str | None, bool]:
 def _advisory(command: str) -> str | None:
     if untokenizable(command):
         return None
-    for seg in analyze(command):
+    segments = analyze(command)
+    # A line continuation splits the command where the shell joins it, so the verb
+    # can land in a segment of its own and the advice never fires. Add the segments
+    # either reading of the command finds; advisory-only, so the worst an extra
+    # segment can do is one unneeded note.
+    if has_continuation(command):
+        segments = segments + recovered_segments(command)
+    for seg in segments:
         if seg.exe != "tmux":
             continue
         word, bound = _command_word_and_binding(seg.argv)

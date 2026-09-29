@@ -85,7 +85,11 @@ NAMED GAPS, so this is not read as covering more than it does:
     19,607 gh-bearing ones) report a blind spot, and ZERO of those were
     bounds-induced. So the silence this closes is CONSTRUCTIBLE rather than
     observed, which is why the lock on it is structural
-    (``test_untokenizable_probe``) rather than a rate.
+    (``test_untokenizable_probe``) rather than a rate. That measurement predates
+    the parser reporting a LINE CONTINUATION as a bounds-type blind spot, which is
+    ordinary input; for that one cause the hook also reads the segments either
+    reading of the command finds (``shell_parse.recovered_segments``), so a
+    continued listing still gets its own per-target advisory.
 """
 
 from __future__ import annotations
@@ -101,7 +105,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import field, read_payload, session_id, session_path, tool_input  # noqa: E402
 from hook_output import DEFAULT_BUDGET, emit_cost, print_json_bounded  # noqa: E402
-from shell_parse import BlindSpot, analyze_checked, gh_command  # noqa: E402
+from shell_parse import (  # noqa: E402
+    BlindSpot,
+    analyze_checked,
+    gh_command,
+    mention_view,
+    recovered_segments,
+)
 
 
 def _envelope(context: str) -> dict:
@@ -506,6 +516,15 @@ def _hits(command: str) -> tuple[list[tuple[str, str, int, bool]], object]:
     second -- so a count drawn from the run listing got no warning at all.
     """
     segments, blind = analyze_checked(command)
+    # A line continuation is a bounds-type blind spot, so the parse withholds every
+    # segment, and the blind note below is recorded ONCE per session. MEASURED: after
+    # any continued `gh` command used that note up, a later continued capped listing
+    # found no target and got no advisory at all. So on that path read the segments
+    # either reading of the command finds: a target named there still gets its own
+    # per-target advisory, which is keyed by target and not spent by other commands.
+    # An advisory may over-read; a spurious note costs a sentence.
+    if blind is not None and blind.bounds_induced:
+        segments = recovered_segments(command)
     found: list[tuple[str, str, int, bool]] = []
     for seg in segments:
         argv = seg.argv
@@ -540,7 +559,9 @@ def _hits(command: str) -> tuple[list[tuple[str, str, int, bool]], object]:
 
 def _process(payload: dict) -> None:
     command = field(tool_input(payload), "command")
-    if not command or not _GH_WORD.search(command):
+    # The text the shell assembles, so a `gh` word split by a line continuation or
+    # by quotes still reaches the parse (`mention_view` is widen-only).
+    if not command or not _GH_WORD.search(mention_view(command)):
         return
     sid = session_id(payload)
     found, blind = _hits(command)

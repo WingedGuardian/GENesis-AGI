@@ -276,6 +276,9 @@ def test_a_continued_command_naming_no_gated_operation_is_allowed(sandbox, guard
         f"{guard.name} refused {command!r}, which names nothing it gates. The refusal "
         f"must stay behind each guard's own mention check.\n{res.stderr[:400]}"
     )
+    # "Not refused" is also what a CRASH looks like (the degraded exit is 1, which
+    # the harness treats as non-blocking), so pin the clean allow itself.
+    assert res.returncode == 0, f"{guard.name} exited {res.returncode}.\n{res.stderr[:400]}"
 
 
 @pytest.mark.parametrize("guard", [g for _, g, _ in _GATED], ids=[i for i, _, _ in _GATED])
@@ -283,6 +286,7 @@ def test_the_one_line_benign_command_is_still_allowed(sandbox, guard):
     home, repo = sandbox
     res = _run(guard, "git status", home, repo)
     assert not _refused(res), f"{guard.name} refused `git status`.\n{res.stderr[:400]}"
+    assert res.returncode == 0, f"{guard.name} exited {res.returncode}.\n{res.stderr[:400]}"
 
 
 def test_the_refusal_names_the_continuation_and_the_one_line_remedy(sandbox):
@@ -444,6 +448,67 @@ def test_the_close_advisory_still_speaks_for_a_continued_close(sandbox):
     )
     assert res.returncode == 0
     assert res.stdout.strip(), "the advisory went silent on a continued close"
+
+
+# ── A withheld parse withholds per-segment facts: each consumer that reads one gets
+#    it back from `shell_parse.recovered_segments`, never from nothing. ──
+
+
+def test_the_close_advisory_speaks_when_the_backslash_does_not_join(sandbox):
+    """A backslash inside a `#` comment is not a continuation: the close on the next
+    line is its own command. Folding every backslash-newline glued it into the
+    comment, so the advisory needs the as-written reading too."""
+    home, repo = sandbox
+    res = _run(
+        _HOOKS_DIR / "pr_close_advisory.py",
+        "echo ok # a note \\\ngh pr close 5",
+        home,
+        repo,
+    )
+    assert res.returncode == 0
+    assert res.stdout.strip(), "the advisory went silent on a close after a comment"
+
+
+def test_a_continued_listing_is_advised_after_the_blind_note_is_spent(sandbox):
+    """The capped-read blind note is recorded once per session. A continued listing
+    later in the same session must still get its own per-target advisory."""
+    home, repo = sandbox
+    capped = _HOOKS_DIR / "capped_read_advisory.py"
+    first = _run(capped, "gh repo view" + CONT + "--json name", home, repo)
+    assert first.returncode == 0 and "could not be read" in first.stdout, first.stdout
+    res = _run(capped, "gh pr list" + CONT + "--state open", home, repo)
+    assert res.returncode == 0
+    assert "gh pr list" in res.stdout, f"no advisory for the continued listing: {res.stdout!r}"
+
+
+def test_a_listing_whose_program_word_is_split_is_still_advised(sandbox):
+    """The capped-read early exit reads the text the shell assembles, so a `gh` word
+    split by a continuation still reaches the parse."""
+    home, repo = sandbox
+    res = _run(_HOOKS_DIR / "capped_read_advisory.py", "g" + MID + "h pr list", home, repo)
+    assert res.returncode == 0
+    assert res.stdout.strip(), "the capped-read advisory skipped a split `gh` word"
+
+
+def test_a_worktree_mention_takes_no_target_from_another_reading(sandbox):
+    """The mention readings are alternatives, not one text: a target read past the end
+    of one reading comes from the next and refused a harmless command."""
+    home, repo = sandbox
+    res = _run(
+        _HOOKS_DIR / "worktree_cwd_guard.py",
+        "printf x" + CONT + "&& echo 'git worktree remove'",
+        home,
+        repo,
+    )
+    assert res.returncode == 0, (res.stdout + res.stderr)[:400]
+
+
+def test_the_tmux_note_survives_a_continuation(sandbox):
+    """Advisory-only, and it sees the verb only once the split is undone."""
+    home, repo = sandbox
+    res = _run(_HOOKS_DIR / "tmux_kill_server_guard.py", "tmux" + CONT + "kill-server", home, repo)
+    assert res.returncode == 0
+    assert "kill-server" in res.stdout, f"the tmux note went silent: {res.stdout!r}"
 
 
 def test_a_bound_still_outranks_a_continuation():

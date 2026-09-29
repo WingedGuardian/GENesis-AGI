@@ -1128,7 +1128,7 @@ class TestAcceptanceCorpus:
             #   'space + backslash'    -> segments as ['\\', None]
             #   'no space + backslash' -> segments as [None, None]  (exe is 'git\')
             # A fix keying on the " \" TOKEN shape would have closed the first
-            # two and left the third open; the parser now reports ANY odd
+            # two and left the third open; the parser now reports ANY
             # backslash run before a newline, so all three share one fate.
             ("space_backslash", "{GIT} \\\n{PUSH} origin main {FORCE}"),
             ("space_backslash_then_space", "{GIT} \\\n {PUSH} origin main {FORCE}"),

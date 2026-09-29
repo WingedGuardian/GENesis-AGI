@@ -350,7 +350,11 @@ _GATED_EXES = frozenset({"git", "gh"})
 
 
 def _mentions_gated_op(command: str) -> bool:
-    """Whether the RAW text names any gated operation, on the blind path only."""
+    """Whether the text names any gated operation, on the blind path only.
+
+    Every caller passes `mention_view(...)`, the text the shell would assemble, so
+    a gated word split by quotes or a line continuation is still named here.
+    """
     if _GATED_MENTION.search(command):
         return True
     return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
