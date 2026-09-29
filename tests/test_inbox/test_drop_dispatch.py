@@ -2048,3 +2048,69 @@ def test_a_legacy_row_with_one_link_points_at_the_link_line():
     lines = ["intro", "https://a.example.com/1"]
     (label,) = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
     assert label.startswith("a.example.com — line 2 ("), label
+
+
+def test_a_claimed_block_reserves_every_line_it_covers(tmp_path):
+    """Round 4 (Codex): an older bare URL was sent to a line inside a newer
+    multi-line item that repeats it."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://a.example.com/x\n\nread later\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"old": {"texts": ["https://a.example.com/x"], "legacy": False},
+             "new": {"texts": ["read later\nhttps://a.example.com/x"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 3 (" in resolved["new"][0] and "— line 1 (" in resolved["old"][0], resolved
+
+
+def test_notes_differing_only_in_indentation_stay_distinct():
+    """Round 4 (Codex): stripping every line made two notes identical."""
+    lines = ["Example", "  indented", "", "Example", " indented"]
+    (label,) = InboxMonitor._item_labels("Example\n  indented", lines)
+    assert "— line 1 (" in label, label
+
+
+def test_a_copy_below_the_evaluated_prefix_is_never_the_parked_item(tmp_path):
+    """Round 4 (Devin): evaluation reads the first 50 KB; the locator read the
+    whole file and preferred a later copy beyond it."""
+    f = tmp_path / "Genesis.md"
+    filler = "x" * 100 + "\n"
+    # The blank line makes the late copy a valid item start, so only the
+    # 50 KB limit can exclude it.
+    f.write_text("https://a.example.com/x\n" + filler * 600 + "\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 1 (" in resolved["r"][0], resolved
+
+
+def test_line_numbers_count_only_real_newlines(tmp_path):
+    """Round 4 (Codex): a NEL or U+2028 inside prose shifted every later line."""
+    f = tmp_path / "Genesis.md"
+    f.write_bytes("some\u0085prose here\n\nhttps://a.example.com/x\n".encode("utf-8"))
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 3 (" in resolved["r"][0], resolved
+
+
+def test_a_one_line_item_never_matches_inside_a_larger_item(tmp_path):
+    """Round 4 audit: a bare URL matched the last line of an annotated item
+    and claimed it, so the two items swapped lines."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://a.example.com/x\n\nread later\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"old": {"texts": ["read later\nhttps://a.example.com/x"], "legacy": False},
+             "new": {"texts": ["https://a.example.com/x"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 3 (" in resolved["old"][0] and "— line 1 (" in resolved["new"][0], resolved
+
+
+@pytest.mark.parametrize("sep", ["\x85", "\x0c", " ", "\x0b"])
+def test_a_separator_ending_a_line_keeps_the_physical_numbers(tmp_path, sep):
+    """Round 4 audit: a separator at a line's end discarded the whole map."""
+    f = tmp_path / "Genesis.md"
+    f.write_bytes(f"some prose{sep}\n\nhttps://a.example.com/x\n".encode())
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 3 (" in resolved["r"][0], resolved
