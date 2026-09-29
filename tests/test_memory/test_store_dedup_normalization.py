@@ -239,6 +239,36 @@ async def test_an_unresolvable_pair_raises_without_writing_a_duplicate(store):
     store.embedding_provider.embed.assert_not_awaited()
 
 
+@pytest.mark.asyncio()
+async def test_a_supersession_infra_failure_never_writes_a_duplicate(store):
+    """A transient failure after a duplicate is found must reach the caller,
+    not fall through the best-effort dedup guard to a second write.
+
+    The guard covers discovery only: once `existing` is established, an error
+    from resolve/validate/mark is not a failed lookup. Before the split, a
+    RuntimeError here was logged as a dedup failure and the pipeline wrote
+    another copy of the same content.
+    """
+    import genesis.memory.entity_resolution as er
+    import genesis.memory.store as store_mod
+
+    async def hit(_db, *, content, source_subsystem=None):
+        return "pre-existing-id"
+
+    async def resolve(handle):
+        raise RuntimeError("transient db blip")
+
+    with (
+        patch.object(er, "load_aliases", lambda: ALIASES),
+        patch.object(store_mod.memory_crud, "find_exact_duplicate", hit),
+        patch.object(store, "_resolve_supersede_target", resolve),
+        pytest.raises(RuntimeError),
+    ):
+        await store.store(RAW, "conversation", supersedes="live-handle")
+
+    store.embedding_provider.embed.assert_not_awaited()
+
+
 # ── Both surface forms are checked ───────────────────────────────────────────
 #
 # `load_aliases()` is mtime-driven and best-effort, so an alias added AFTER a

@@ -382,6 +382,7 @@ class MemoryStore:
         # failed once and later recovered — leaves the RAW text in the index.
         # Querying only the normalized form would miss that row and mint the
         # very duplicate normalizing-first exists to prevent.
+        existing: str | None = None
         try:
             # Scoped to the write's own recall scope: a subsystem write
             # dedups against its own subsystem's rows, a foreground write
@@ -411,49 +412,50 @@ class MemoryStore:
                     )
                     if existing:
                         break
-            if existing:
-                # A duplicate does NOT discharge the supersession. The caller
-                # asked for two things — store this, deprecate that — and only
-                # the first is already satisfied. Returning bare here dropped
-                # the second silently, leaving the stale memory live while the
-                # API reported success. Supersede onto the row that already
-                # carries this content.
-                #
-                # Resolution happens HERE rather than reusing the block below,
-                # which runs after this early return. It raises on an
-                # unresolvable handle exactly as the normal path does, and
-                # nothing has been written at this point either.
-                if supersedes:
-                    resolved = await self._resolve_supersede_target(supersedes)
-                    # The pair still has to be a legal supersession. The
-                    # normal path's successor is a fresh uuid, so it cannot
-                    # collide with the target; here the successor is the
-                    # PRE-EXISTING duplicate row, so `resolved == existing` is
-                    # reachable and would deprecate the only copy while
-                    # pointing it at itself. Check equality BEFORE locking —
-                    # taking `memory_id_lock` twice on the same id deadlocks —
-                    # then lock the pair and run the same validation
-                    # `supersede()` does before mutating.
-                    if resolved == existing:
-                        raise SupersedeUnresolved(
-                            resolved, "self_supersede", existing
-                        )
-                    first, second = sorted((resolved, existing))
-                    async with memory_id_lock(first), memory_id_lock(second):
-                        await self._validate_supersede_pair(resolved, existing)
-                        await self._mark_superseded(
-                            resolved, existing, datetime.now(UTC).isoformat(),
-                        )
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                # NOT created by this call: the caller must not compensate it.
-                return (existing, False)
-        except SupersedeUnresolved:
-            # A bad supersede handle is the caller's error and must reach them,
-            # not be swallowed by the best-effort dedup guard below.
-            raise
         except Exception:
-            # Dedup check is best-effort — never block a store on lookup failure
+            # Dedup DISCOVERY is best-effort — never block a store on lookup
+            # failure. The supersession below is deliberately outside this
+            # guard: once a duplicate is established, a transient failure in
+            # resolve/validate/mark must surface to the caller rather than
+            # falling through to a second write of the same content.
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+            existing = None
+        if existing:
+            # A duplicate does NOT discharge the supersession. The caller
+            # asked for two things — store this, deprecate that — and only
+            # the first is already satisfied. Returning bare here dropped
+            # the second silently, leaving the stale memory live while the
+            # API reported success. Supersede onto the row that already
+            # carries this content.
+            #
+            # Resolution happens HERE rather than reusing the block below,
+            # which runs after this early return. It raises on an
+            # unresolvable handle exactly as the normal path does, and
+            # nothing has been written at this point either.
+            if supersedes:
+                resolved = await self._resolve_supersede_target(supersedes)
+                # The pair still has to be a legal supersession. The
+                # normal path's successor is a fresh uuid, so it cannot
+                # collide with the target; here the successor is the
+                # PRE-EXISTING duplicate row, so `resolved == existing` is
+                # reachable and would deprecate the only copy while
+                # pointing it at itself. Check equality BEFORE locking —
+                # taking `memory_id_lock` twice on the same id deadlocks —
+                # then lock the pair and run the same validation
+                # `supersede()` does before mutating.
+                if resolved == existing:
+                    raise SupersedeUnresolved(
+                        resolved, "self_supersede", existing
+                    )
+                first, second = sorted((resolved, existing))
+                async with memory_id_lock(first), memory_id_lock(second):
+                    await self._validate_supersede_pair(resolved, existing)
+                    await self._mark_superseded(
+                        resolved, existing, datetime.now(UTC).isoformat(),
+                    )
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            # NOT created by this call: the caller must not compensate it.
+            return (existing, False)
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception

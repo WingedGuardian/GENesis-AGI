@@ -117,21 +117,36 @@ def load_aliases() -> dict[str, str]:
 
 
 def normalize_content(content: str, aliases: dict[str, str] | None = None) -> str:
-    """Replace known surface forms with canonical names.
+    """Replace known surface forms with canonical names, to a fixed point.
 
     Case-insensitive, whole-word matching. Returns content unchanged if
     no aliases loaded or no matches found.
+
+    Rules apply in mapping order AND the pass repeats until a pass changes
+    nothing: chained mappings (``foo -> bar``, ``bar -> baz``) converge to
+    ``baz`` regardless of order, so no intermediate canonical can ever be
+    stored. That convergence is what dedup relies on — an intermediate form
+    like ``"bar item"`` persisting in the index would be a different content
+    than the same spelling written later, and a text-equal match between the
+    two silently suppresses the newer memory. Termination is guaranteed: a
+    pass that produces an already-seen value (a mapping cycle) or exceeds
+    ``len(aliases)`` passes stops and returns the last value.
     """
     if aliases is None:
         aliases = load_aliases()
     if not aliases:
         return content
 
-    for alias, canonical in aliases.items():
-        if alias == canonical:
-            continue
-        # Word-boundary replacement, case-insensitive
-        content = _alias_pattern(alias).sub(canonical, content)
+    seen = {content}
+    for _ in range(len(aliases)):
+        for alias, canonical in aliases.items():
+            if alias == canonical:
+                continue
+            # Word-boundary replacement, case-insensitive
+            content = _alias_pattern(alias).sub(canonical, content)
+        if content in seen:
+            break
+        seen.add(content)
     return content
 
 

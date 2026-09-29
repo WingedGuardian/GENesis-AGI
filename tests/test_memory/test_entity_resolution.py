@@ -96,17 +96,30 @@ def test_surface_variants_follows_alias_chains_to_fixpoint():
     assert "bar item" in variants
 
 
-def test_surface_variants_respects_mapping_order_on_chains():
-    """Only spellings that forward-normalize to the input are variants.
-
-    With ``{"bar": "baz", "foo": "bar"}`` (baz-rule first), ``normalize("foo")
-    == "bar"`` — the foo spelling must NOT be offered for "baz item", or a
-    stored "foo item" row (which persists as "bar item") would suppress a
-    different write. For "bar item" it must be offered.
+def test_surface_variants_converges_regardless_of_mapping_order():
+    """Fixed-point normalization removes order sensitivity: with
+    ``{"bar": "baz", "foo": "bar"}`` the foo spelling converges to "baz",
+    so it IS a variant of "baz item" — and can never be a variant of the
+    intermediate "bar item" (nothing stores under an intermediate canonical
+    anymore).
     """
     aliases = {"bar": "baz", "foo": "bar"}
-    assert "foo item" not in surface_variants("baz item", aliases)
-    assert "foo item" in surface_variants("bar item", aliases)
+    assert "foo item" in surface_variants("baz item", aliases)
+    assert "foo item" not in surface_variants("bar item", aliases)
+
+
+def test_normalize_content_converges_chained_aliases():
+    from genesis.memory.entity_resolution import normalize_content
+
+    # Chain resolves to the end regardless of which rule is listed first.
+    assert normalize_content("foo item", {"bar": "baz", "foo": "bar"}) == (
+        "baz item"
+    )
+    assert normalize_content("foo item", {"foo": "bar", "bar": "baz"}) == (
+        "baz item"
+    )
+    # A mapping cycle terminates instead of looping.
+    assert normalize_content("x", {"x": "y", "y": "x"}) == "x"
 
 
 def test_surface_variants_repeated_canonicals_keep_homogeneous_forms():
