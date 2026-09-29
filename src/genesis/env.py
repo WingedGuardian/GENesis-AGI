@@ -506,6 +506,31 @@ def _deploy_state_is_recent(state: dict) -> bool:
     return (datetime.now(UTC) - started).total_seconds() < _UPDATE_STALE_AFTER_S
 
 
+def _marker_holder_live(pid: int) -> bool:
+    """Is `pid` a LIVE holder of a deploy signal?
+
+    ``os.kill(pid, 0)`` alone says yes for a zombie (a killed deploy its parent
+    has not reaped), which kept the watchdog from reviving a down server until
+    the parent reaped it. So: running and not a zombie. Nothing here compares
+    clocks, so a wall-clock step can never make a live holder read as stale. A
+    reused pid still reads as live; recording the holder's start tick with its
+    pid is the complete fix (a marker format change for every writer, tracked
+    separately). Where /proc cannot answer, liveness is all there is. Mirrors
+    ``_deploy_marker_holder_live`` in scripts/lib/deploy_marker.sh.
+    """
+    if pid <= 1:  # 0 and -1 address process GROUPS; 1 is init (and AsyncMock().pid)
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 2 :].split()[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return True
+
+
 def update_in_progress() -> bool:
     """True while a Genesis self-update (deploy) is actively running.
 
@@ -527,9 +552,10 @@ def update_in_progress() -> bool:
       before the file is removed) and ``started_at`` is recent.
 
     A signal counts only if its PID is > 1 (an ``AsyncMock().pid`` is 1) AND
-    still alive (``os.kill(pid, 0)``). Any dead / absent / corrupt / ``done`` /
-    expired signal is treated as "no deploy", so a stale file can never
-    permanently disable the watchdog. This check is defensive by contract: it
+    that process is a live holder of it (``_marker_holder_live``: running and not
+    a zombie). Any dead / zombie / absent / corrupt / ``done`` / expired signal
+    is treated as "no deploy", so a stale file can never permanently disable
+    the watchdog. This check is defensive by contract: it
     NEVER raises into the caller (the watchdog restart path).
     """
     try:
@@ -540,11 +566,10 @@ def update_in_progress() -> bool:
         if pid_file.exists():
             try:
                 pid = int(pid_file.read_text().strip())
-                if pid > 1:
-                    os.kill(pid, 0)
+                if pid > 1 and _marker_holder_live(pid):
                     return True
-            except (ProcessLookupError, ValueError, OSError):
-                pass  # dead / invalid PID — not an active deploy
+            except (ValueError, OSError):
+                pass  # dead / zombie / invalid PID — not an active deploy
 
         # CLI path: update.sh state file with phase + owning PID + start time.
         state_file = home / "update_state.json"
@@ -561,9 +586,9 @@ def update_in_progress() -> bool:
                 pid = state.get("pid")
                 if isinstance(pid, int) and pid > 1:
                     try:
-                        os.kill(pid, 0)
-                        return True
-                    except (ProcessLookupError, OSError):
+                        if _marker_holder_live(pid):
+                            return True
+                    except OSError:
                         pass  # owning process gone — stale state file
 
         return False

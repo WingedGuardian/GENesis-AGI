@@ -900,6 +900,9 @@
                     <!-- Model & dual chain info -->
                     <div style="display: flex; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.7rem; flex-wrap: wrap;">
                       <span>Model: <b x-text="v.embedding?.active_model || '—'"></b></span>
+                      <template x-if="v.embedding?.active_model_observed && v.embedding?.primary_model && v.embedding?.active_model !== v.embedding?.primary_model">
+                        <span style="color: #f0ad4e;" x-text="'(fallback — primary ' + v.embedding.primary_model + ')'"></span>
+                      </template>
                     </div>
                     <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem; font-size: 0.68rem; flex-wrap: wrap;">
                       <span style="background: rgba(76,175,80,0.12); padding: 0.15rem 0.4rem; border-radius: 3px;">

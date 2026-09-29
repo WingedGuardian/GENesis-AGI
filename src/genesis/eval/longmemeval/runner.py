@@ -673,8 +673,10 @@ async def run_longmemeval(
         root = Path.home() / "tmp" / "longmemeval_runs"
         root.mkdir(parents=True, exist_ok=True)
         run_cache_dir = Path(tempfile.mkdtemp(prefix="lme_emb_", dir=str(root)))
+        # Shared only across per-question EPHEMERAL stores, each a brand-new
+        # collection: there is no corpus space to match.
         embedding_provider = EmbeddingProvider(
-            backends=EmbeddingProvider.build_chain(ollama_first=False),
+            backends=EmbeddingProvider.build_chain(ollama_first=False, fresh_collection=True),
             cache_dir=run_cache_dir,
         )
 

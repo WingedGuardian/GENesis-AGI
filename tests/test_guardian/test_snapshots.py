@@ -696,10 +696,13 @@ class _FakeIncus:
 
     def __init__(
         self, snaps: dict[str, str], create_err: str | None = None, *, fail_all: bool = False,
+        until_delete: bool = False,
     ) -> None:
         self.snaps = dict(snaps)  # name -> created_at (RFC3339)
         self.create_err = create_err
         self.fail_all = fail_all
+        # A pool refused BECAUSE of the lifeline keeps refusing until one goes.
+        self.until_delete = until_delete
         self.creates = 0
         self.deleted: list[str] = []
 
@@ -712,7 +715,8 @@ class _FakeIncus:
             return 0, "", ""
         if args[:3] == ("incus", "snapshot", "create"):
             self.creates += 1
-            if self.create_err and (self.creates == 1 or self.fail_all):
+            refuse = self.creates == 1 or self.fail_all or (self.until_delete and not self.deleted)
+            if self.create_err and refuse:
                 return 1, "", self.create_err
             self.snaps[args[4]] = datetime.now(UTC).isoformat()
             return 0, "", ""
@@ -737,7 +741,7 @@ class TestRefusalAndDeleteFirst:
 
     @pytest.mark.asyncio
     async def test_take_classifies_lvm_threshold_as_pool_space(self, manager) -> None:
-        fake = _FakeIncus({}, create_err=_LVM_THRESHOLD_ERR)
+        fake = _FakeIncus({}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
         with (
             patch.object(manager, "safe_to_snapshot", return_value=True),
             patch("genesis.guardian.snapshots._run_subprocess", fake.run),
@@ -853,7 +857,7 @@ class TestDeleteFirstRotation:
         self, manager, *, snaps, err, now_frac, live_frac=0.80, allowed=True,
         reserve=None, extra_rows=(), status=None,
     ):
-        fake = _FakeIncus(snaps, create_err=err)
+        fake = _FakeIncus(snaps, create_err=err, until_delete=True)
         with (
             patch.object(manager, "safe_to_snapshot", return_value=True),
             patch(
@@ -881,11 +885,104 @@ class TestDeleteFirstRotation:
         assert "no live volume maps" in (manager.last_rotation_note or "")
 
     @pytest.mark.asyncio
+    async def test_pressure_cleared_before_the_delete_rotates_create_first(self, manager) -> None:
+        """Review: the refusal was measured before the lifeline reads, and was
+        trusted through the delete. When the pool accepts a create by then
+        (an autoextend landed), the old lifeline must go only AFTER its
+        replacement exists — never first."""
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)  # refuses once
+        order: list[str] = []
+        inner = _with_thin_lvs(fake, manager, live_frac=0.80)
+
+        async def run(*args, **kwargs):
+            if args[:3] in (("incus", "snapshot", "create"), ("incus", "snapshot", "delete")):
+                order.append(args[2])
+            return await inner(*args, **kwargs)
+
+        with (
+            patch.object(manager, "safe_to_snapshot", return_value=True),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
+        assert name is not None and name.endswith("-healthy")
+        assert order == ["create", "create", "delete"] and fake.deleted == [self.OLD]
+        assert manager.last_rotation_deleted is False  # an ordinary rotation, not delete-first
+        assert "deleted first" not in (manager.last_rotation_note or "")
+
+    @pytest.mark.parametrize("retry", ["create_error", "probe_failure"])
+    @pytest.mark.asyncio
+    async def test_retry_refused_for_a_non_pool_reason_keeps_the_lifeline(
+        self, manager, retry,
+    ) -> None:
+        """Internal review: only a POOL refusal of the pre-delete retry licenses
+        the delete. A retry that failed for any other reason — the create erred
+        (not a pool-space message), or the gate's probe could not measure —
+        says nothing about the pool, so the lifeline stays."""
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
+        inner = _with_thin_lvs(fake, manager, live_frac=0.80)
+        gate_calls = 0
+
+        async def run(*args, **kwargs):
+            if retry == "create_error" and args[:3] == ("incus", "snapshot", "create") and fake.creates:
+                fake.creates += 1
+                return 1, "", "Error: instance not found"
+            return await inner(*args, **kwargs)
+
+        async def gate(*_a, **_k):
+            nonlocal gate_calls
+            gate_calls += 1
+            if retry == "probe_failure" and gate_calls == 2:
+                manager.last_gate_measured = False
+                return False
+            return True
+
+        with (
+            patch.object(manager, "safe_to_snapshot", side_effect=gate),
+            patch("genesis.guardian.snapshots._run_subprocess", run),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+        ):
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
+        assert name is None and fake.deleted == [] and self.OLD in fake.snaps
+        assert manager.last_refusal == (REFUSED_OTHER if retry == "create_error" else REFUSED_PROBE)
+        assert gate_calls == 2  # the retry really ran
+
+    @pytest.mark.asyncio
+    async def test_retry_that_evicted_defers_the_delete(self, manager) -> None:
+        """Internal review: a retry whose retention eviction deleted a snapshot
+        must not also delete the lifeline — at most one delete per attempt, the
+        freed space may still be coming back."""
+        pre = "guardian-20251231-000000-pre-recovery"
+        fake = _FakeIncus({self.OLD: _ago(30), pre: _ago(40)}, create_err=_LVM_THRESHOLD_ERR)
+        manager._retention = 1
+        gate_calls = 0
+
+        async def gate(*_a, **_k):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 1:  # the first attempt: refused on a real measurement
+                manager.last_gate_measured = True
+                return False
+            return True
+
+        with (
+            patch.object(manager, "safe_to_snapshot", side_effect=gate),
+            patch(
+                "genesis.guardian.snapshots._run_subprocess",
+                _with_thin_lvs(fake, manager, live_frac=0.80),
+            ),
+            patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
+            patch("genesis.guardian.snapshots.snapshot_only_bytes", return_value=10 * 1024**3),
+        ):
+            name = await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True)
+        assert name is None and fake.deleted == [pre] and self.OLD in fake.snaps
+
+    @pytest.mark.asyncio
     async def test_report_without_the_container_is_no_evidence(self, manager) -> None:
         """Internal review: an lvs report missing the running container's own
         LV (empty, filtered, renamed) must not read as 'the snapshots hold the
         whole pool'."""
-        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
         with (
             patch.object(manager, "safe_to_snapshot", return_value=True),
             patch(
@@ -902,7 +999,7 @@ class TestDeleteFirstRotation:
         """Both terms from ONE lvs read: the earlier measurement says 95% but
         the per-volume read (the same instant as its own pool row) says the
         pool is at 80.5% with the container mapping 80% — nothing held."""
-        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
         with (
             patch.object(manager, "safe_to_snapshot", return_value=True),
             patch(
@@ -916,7 +1013,7 @@ class TestDeleteFirstRotation:
 
     @pytest.mark.asyncio
     async def test_timed_out_delete_first_says_the_lifeline_may_be_gone(self, manager) -> None:
-        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
         inner = _with_thin_lvs(fake, manager, live_frac=0.80)
 
         async def run(*args, **kwargs):
@@ -930,7 +1027,8 @@ class TestDeleteFirstRotation:
             patch("genesis.guardian.snapshots.measure_storage_pool", return_value=_lvm(0.85)),
         ):
             assert await manager.mark_healthy(delete_first_allowed=True, healthy_confirmed=True) is None
-        assert fake.creates == 1  # no retry create after an unconfirmed delete
+        # The first create and the pre-delete retry; none after an unconfirmed delete.
+        assert fake.creates == 2
         assert "may be gone" in (manager.last_rotation_note or "")
 
     @pytest.mark.asyncio
@@ -1004,7 +1102,7 @@ class TestDeleteFirstRotation:
             order.append(f"reserve deleted={list(fake_ref['fake'].deleted)}")
             return True
 
-        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR)
+        fake = _FakeIncus({self.OLD: _ago(30)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
         fake_ref["fake"] = fake
         with (
             patch.object(manager, "safe_to_snapshot", return_value=True),
@@ -1304,7 +1402,7 @@ async def test_retention_never_evicts_a_healthy_snapshot(config) -> None:
     manager = SnapshotManager(config)
     a, b = "guardian-20260101-000000-healthy", "guardian-20260102-000000-healthy"
     pre = "guardian-20260103-000000-pre-recovery"
-    fake = _FakeIncus({a: _ago(50), b: _ago(26), pre: _ago(20)}, create_err=_LVM_THRESHOLD_ERR)
+    fake = _FakeIncus({a: _ago(50), b: _ago(26), pre: _ago(20)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
     with (
         patch.object(manager, "safe_to_snapshot", return_value=True),
         patch("genesis.guardian.snapshots._run_subprocess", fake.run),
@@ -1443,7 +1541,7 @@ class TestRollbackChokepoint:
         manager = SnapshotManager(config)
         life = "guardian-20260101-000000-healthy"
         pre = "guardian-20260102-000000-pre-recovery"
-        fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR)
+        fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
         with (
             patch.object(manager, "safe_to_snapshot", return_value=True),
             patch(
@@ -1489,7 +1587,7 @@ async def test_timed_out_eviction_also_defers_delete_first(config) -> None:
     manager = SnapshotManager(config)
     life = "guardian-20260101-000000-healthy"
     pre = "guardian-20260102-000000-pre-recovery"
-    fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR)
+    fake = _FakeIncus({life: _ago(30), pre: _ago(29)}, create_err=_LVM_THRESHOLD_ERR, until_delete=True)
     inner = _with_thin_lvs(fake, manager, live_frac=0.80)
 
     async def run(*args, **kwargs):

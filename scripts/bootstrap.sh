@@ -45,7 +45,10 @@ if [ -f "$UPDATE_STATE" ]; then
     STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
     STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
 
-    # Check if the update process is still alive
+    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
+    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
+    # zombie or reused pid: the "dead" branch below resets the tree, so here a
+    # stale holder must err toward "still running", never toward the reset.
     if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
         echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
     elif [ "$STATE_PHASE" = "done" ]; then

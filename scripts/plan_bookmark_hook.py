@@ -42,6 +42,10 @@ _ARCH_REVIEW = (
     "catching real issues, not ceremony."
 )
 
+# #2424: step 1 names `.claude/worktrees/` because that is the documented
+# location (.claude/skills/genesis-development/references/worktrees.md).
+# It is a recommendation, not detection: nothing here matches worktree paths
+# or runs git, so git availability cannot change this hook's behaviour.
 _EXECUTION_PROTOCOL = (
     "EXECUTION PROTOCOL — You MUST follow these steps IN ORDER before "
     "writing any code:\n"

@@ -1440,9 +1440,11 @@ verified: 84c7259d 2026-08-31
   stands the whole check cycle down beside the indefinite `maintenance_file`. This
   is the *capability* a deploy uses to pause the Guardian across the server restart
   — instead of escalating to `confirmed_dead` and firing a false down/recovered
-  alert — so that a paused restart is silent; the `scripts/update.sh` caller that
-  actually writes the pause across its stop/restart lands as a separate change (a
-  deploy on the old caller simply runs unpaused, as today). The TTL means a deploy
+  alert — so that a paused restart is silent. The container-side caller is
+  `scripts/lib/guardian_pause.sh` (`_guardian_pause`/`_guardian_resume` plus a lease
+  renewer that holds no lock and, once its parent is gone, stops at its next wake
+  instead of pausing again), sourced by
+  `scripts/update.sh`, which arms the resume on its EXIT trap. The TTL means a deploy
   killed before its `resume` self-heals rather than muting the watchdog. During
   stand-down the heartbeat carries a `standdown` marker so `probe_guardian` reports
   DEGRADED (alive, not watching) rather than HEALTHY. Distinct from the container
@@ -1477,6 +1479,8 @@ verified: 84c7259d 2026-08-31
     old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
     live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
     lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    One more create is tried after those reads: only a pool refusal then
+    deletes first (pressure cleared → ordinary create-first rotation).
     The settle is reserved before the delete. Healthy snapshots are never
     retention-evicted before a create. A refused refresh retries in ~1h
     (own `.last_healthy` marker) and alerts, throttled.
@@ -1485,7 +1489,8 @@ verified: 84c7259d 2026-08-31
     pre-recovery oldest first, then superseded healthy, the lifeline last;
     a failed delete falls through to the next unless the client timed out
     (outcome unknown → stop and alert); 5-minute settle stamped before
-    the delete (delete-first starts it too); pool identity re-checked first.
+    the delete (delete-first starts it too); a re-measure just before the
+    delete must show the same pool still short (eased → stop, `eased`).
     `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
     delete never falls through to the lifeline. Pool identity is incus's
     DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
@@ -2924,7 +2929,10 @@ verified: f24c15e9 2026-09-05
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open
-  to "no deploy". `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  to "no deploy". A marker or state-file holder counts only while it is running and
+  not a zombie (`_marker_holder_live`, mirrored in `scripts/lib/deploy_marker.sh`);
+  a reused pid still reads as live until the marker records a start tick (#2535).
+  `secrets_path()` is repo-relative unless SECRETS_PATH set.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
