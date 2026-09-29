@@ -175,6 +175,7 @@ _PERIMETER_BLOCK_THRESHOLD = 0.6
 # look-alike marker as the marker itself.
 _WRAP_ID_CHARS = 16
 _KEY_FILE_MAX_BYTES = 256  # 64 hex characters plus slack
+_KEY_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _boundary_key: bytes | None = None
 
 
@@ -214,7 +215,10 @@ def _load_boundary_key() -> bytes:
                 raise OSError(f"{path} is not a regular file")
             if info.st_size > _KEY_FILE_MAX_BYTES:
                 raise OSError(f"{path} is larger than a boundary key")
-            key = bytes.fromhex(fh.read(_KEY_FILE_MAX_BYTES).decode("ascii").strip())
+            text = fh.read(_KEY_FILE_MAX_BYTES).decode("ascii").strip()
+            if not _KEY_HEX_RE.fullmatch(text):
+                raise ValueError(f"{path} does not hold a boundary key")
+            key = bytes.fromhex(text)
     except (OSError, ValueError, UnicodeDecodeError):
         logger.warning("Content-boundary key unavailable; using a per-process key", exc_info=True)
     if len(key) != 32:

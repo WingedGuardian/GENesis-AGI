@@ -95,6 +95,21 @@ def test_the_id_depends_on_the_install_key(tmp_path, monkeypatch):
     assert _split(_wrap("same"))[0] != first
 
 
+def test_a_key_file_with_spaces_inside_is_not_used(tmp_path, monkeypatch, caplog):
+    """bytes.fromhex accepts spaces between byte pairs; the key file must be exactly
+    64 hex characters, like the backup checks, so the two never disagree."""
+    import hashlib
+    import hmac
+
+    key_file = tmp_path / "boundary_key"
+    key_file.write_text(" ".join(["ab"] * 32))
+    monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_file)
+    monkeypatch.setattr(sanitizer_mod, "_boundary_key", None)
+    spaced_id = hmac.new(bytes.fromhex("ab" * 32), b"web_fetch\0x", hashlib.sha256).hexdigest()[:16]
+    assert _split(_wrap("x"))[0] != spaced_id
+    assert "per-process key" in caplog.text
+
+
 def test_the_key_is_created_once_private_and_reused(tmp_path, monkeypatch):
     key_file = tmp_path / "k" / "boundary_key"
     monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_file)

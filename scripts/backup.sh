@@ -854,12 +854,6 @@ else
     log "WARNING: secrets file not found at $SECRETS_FILE"
 fi
 
-_is_boundary_key() {
-    [ -f "$1" ] && [ ! -L "$1" ] || return 1
-    [ "$(stat -c %s "$1" 2>/dev/null || echo 999)" -le 256 ] || return 1
-    tr -d '[:space:]' < "$1" | grep -qxE '[0-9a-f]{64}'
-}
-
 # --- 8. Critical credential & wiring files (encrypted, Tier 1) ---
 # Small, high-value files whose loss means "reprovision from scratch" instead of
 # "restore": SSH keys (incl. the guardian control-plane key), the gh + Claude
@@ -889,17 +883,9 @@ if $_ENCRYPT_READY; then
         "$HOME/.claude/settings.json:claude_settings.json" \
         "$HOME/.genesis/guardian_remote.yaml:guardian_remote.yaml" \
         "$HOME/.genesis/config/genesis.yaml:genesis.yaml" \
-        "$HOME/.genesis/release-fingerprints.txt:release-fingerprints.txt" \
-        "$_GENESIS_HOME/boundary_key:boundary_key"; do
+        "$HOME/.genesis/release-fingerprints.txt:release-fingerprints.txt"; do
         _srcf="${_spec%%:*}"; _dstn="${_spec##*:}"
         [ -f "$_srcf" ] || continue
-        # The boundary key must look exactly like one (a regular file holding 64 hex
-        # characters) before it replaces the backed-up copy; the runtime applies the
-        # same test and would ignore anything else.
-        if [ "$_dstn" = "boundary_key" ] && ! _is_boundary_key "$_srcf"; then
-            log "WARNING: $_srcf is not a valid boundary key; keeping the previous backup of it"
-            continue
-        fi
         if encrypt_file "$_srcf" "creds/${_dstn}.gpg"; then
             _CREDS_COUNT=$(( _CREDS_COUNT + 1 ))
         else
