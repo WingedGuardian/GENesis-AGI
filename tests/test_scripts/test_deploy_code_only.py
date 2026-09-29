@@ -8,9 +8,10 @@ interpreter's own environment as the venv, and PATH shims for ``systemctl`` and
 
 What is pinned:
   * refusals happen BEFORE anything changes, and change nothing: a dirty tree,
-    a live foreign deploy marker, an unfinished update.sh run, a branch other
-    than main, a diverged tree, a pull the venv's dependencies do not satisfy,
-    a linked worktree, a zero fetch timeout, a hung fetch;
+    a live foreign deploy marker, an unfinished update.sh run (a finished one
+    left behind does not block), a branch other than main, a diverged tree, a
+    venv not installed from this checkout's pyproject.toml, a unit that runs
+    another venv, a linked worktree, a zero fetch timeout, a hung fetch;
   * the lock: a validation's SHARED hold makes a deploy queue for its whole
     run, and a deploy that cannot get the lock in time exits 200 untouched;
   * the happy path: fast-forward, marker held across the restart and gone
@@ -85,6 +86,12 @@ def _systemctl_shim(calls: Path, manifest: Path, on_restart: str = "") -> str:
         's="$UNIT_STATE_LATER"; fi\n'
         f'  touch "{calls}.isactive"; echo "$s"; [ "$s" = active ]; exit\n'
         "fi\n"
+        # `show -p ExecStart`: the python the unit runs ($UNIT_PYTHON, default the
+        # station's venv; "-" = systemd answers nothing).
+        'if [[ " $* " == *" ExecStart "* ]]; then\n'
+        f'  p="${{UNIT_PYTHON:-{VENV}/bin/python}}"; [ "$p" = - ] && exit 0\n'
+        '  echo "{ path=$p ; argv[]=$p -m genesis serve ${UNIT_ARGS:-} ; ignore_errors=no }"; exit 0\n'
+        "fi\n"
         'if [[ " $* " == *" MainPID "* ]]; then\n'
         f'  if grep -q "restart genesis-server" "{calls}"; then echo "${{NEW_PID:-2222}}"; '
         "else echo 1111; fi; exit 0\n"
@@ -102,6 +109,34 @@ def _systemctl_shim(calls: Path, manifest: Path, on_restart: str = "") -> str:
 
 
 PYPROJECT_OK = '[project]\nname = "fixture"\ndependencies = ["packaging"]\n'
+
+
+def _install_fixture(
+    site: Path,
+    source: Path,
+    requires: tuple[str, ...] = ("packaging",),
+    *,
+    name: str = "fixture",
+    editable: bool = True,
+    requires_python: str = "",
+) -> None:
+    """What `pip install -e <source>` leaves behind, as importlib.metadata reads
+    it: a .dist-info with the project's requirements and a direct_url.json naming
+    the source. Put `site` on PYTHONPATH and the venv's python finds it first."""
+    import json
+
+    info = site / f"{name}-0.0.0.dist-info"
+    info.mkdir(parents=True, exist_ok=True)
+    lines = ["Metadata-Version: 2.1", f"Name: {name}", "Version: 0.0.0"]
+    if requires_python:
+        lines.append(f"Requires-Python: {requires_python}")
+    lines += [f"Requires-Dist: {r}" for r in requires]
+    (info / "METADATA").write_text("\n".join(lines) + "\n")
+    direct = {"url": source.resolve().as_uri()}
+    direct["dir_info"] = {"editable": True} if editable else {}
+    (info / "direct_url.json").write_text(json.dumps(direct))
+
+
 PYPROJECT_UNMET = '[project]\nname = "fixture"\ndependencies = ["packaging>=9999"]\n'
 
 
@@ -177,12 +212,18 @@ def station(tmp_path):
                 "PROBE_OWNER",
                 "PROBE_NONE",
                 "PROBE_FOREIGN_TOO",
+                "UNIT_PYTHON",
+                "UNIT_ARGS",
+                "PYTHONPATH",
             )
         )
     }
+    site = tmp_path / "site"
+    _install_fixture(site, root)
     env.update(
         HOME=str(home),
         PATH=f"{shims}:{env['PATH']}",
+        PYTHONPATH=str(site),
         GENESIS_DEPLOY_ROOT=str(root),
         GENESIS_DEPLOY_VENV=str(VENV),
         GENESIS_DEPLOY_HEALTH_POLL="1",
@@ -195,6 +236,7 @@ def station(tmp_path):
         "root": root,
         "seed": seed,
         "tmp": tmp_path,
+        "site": site,
         "shims": shims,
         "calls": calls,
         "manifest": manifest,
@@ -340,13 +382,28 @@ def test_a_dead_marker_is_replaced(station):
     assert not station["marker"].exists()
 
 
-def test_an_unfinished_update_is_refused(station):
+@pytest.mark.parametrize(
+    "state",
+    ['{"phase": "merged"}', "{not json", '["done"]', '{"pid": 7}', '{"phase": 1}'],
+    ids=["mid-run", "malformed", "not-an-object", "no-phase", "non-string-phase"],
+)
+def test_an_unfinished_update_is_refused(station, state):
     head = _git(station["root"], "rev-parse", "HEAD")
-    (station["home"] / ".genesis" / "update_state.json").write_text('{"phase": "merged"}')
+    (station["home"] / ".genesis" / "update_state.json").write_text(state)
     _advance_upstream(station)
     r = _run(station)
     _assert_untouched(station, head, r)
     assert "update.sh --post-merge" in r.stderr
+
+
+def test_a_finished_update_left_behind_does_not_block(station):
+    """update.sh writes phase "done" just before deleting its state file; one
+    killed in between left a FINISHED run, and the deploy proceeds."""
+    (station["home"] / ".genesis" / "update_state.json").write_text('{"phase": "done", "pid": 7}')
+    _advance_upstream(station)
+    r = _run(station)
+    assert r.returncode == 0, r.stderr
+    assert "genesis-server pid 2222" in r.stdout, r.stdout
 
 
 def test_a_branch_other_than_main_is_refused(station):
@@ -566,7 +623,7 @@ def test_a_failed_restart_after_the_merge_alerts(station):
     tip = _advance_upstream(station)
     _exec(
         station["shims"] / "systemctl",
-        '#!/bin/bash\n[ "$1 $2" = "--user restart" ] && exit 1\nexit 0\n',
+        _systemctl_shim(station["calls"], station["manifest"], on_restart="exit 1"),
     )
     r = _run(station)
     assert r.returncode != 0
@@ -867,65 +924,149 @@ def test_no_child_outlives_the_script_holding_the_lock(station):
         subprocess.run(["pkill", "-f", f"sleep {marker_arg}"])
 
 
+GATE = REPO / "scripts" / "lib" / "venv_matches_pyproject.py"
+_OPT = "[project.optional-dependencies]\n"
+
+
 @pytest.mark.parametrize(
-    "pyproject, rc",
+    ("pyproject", "installed", "rc"),
     [
-        ('[project]\ndependencies = ["packaging"]\n', 0),
-        ('[project]\ndependencies = ["packaging>=9999"]\n', 1),
-        ('[project]\nrequires-python = ">=3.99"\ndependencies = []\n', 1),
-        ('[project]\ndependencies = ["foo @ https://example.invalid/foo.whl"]\n', 2),
-        ('[project]\ndependencies = ["nope; python_version < \\"3\\""]\n', 0),
-        ("not toml [[[", 2),
-        ("[project]\n", 2),
-        # Optional groups (Devin on #2494). "packaging" is installed here, so a
-        # group containing it is one this install uses: a package newly added to
-        # it must be installed too.
+        # Equal: the install describes this pyproject.
+        ('[project]\nname = "fixture"\ndependencies = ["packaging>=20"]\n', ("packaging>=20",), 0),
+        # A changed specifier, an added and a removed requirement all differ.
+        ('[project]\nname = "fixture"\ndependencies = ["packaging>=21"]\n', ("packaging>=20",), 1),
+        ('[project]\nname = "fixture"\ndependencies = ["packaging", "httpx"]\n', ("packaging",), 1),
+        ('[project]\nname = "fixture"\ndependencies = []\n', ("packaging",), 1),
+        # Optional groups are recorded with the extra folded into the marker.
         (
-            "[project]\ndependencies = []\n[project.optional-dependencies]\n"
-            'used = ["packaging", "zz-not-installed-pkg"]\n',
+            '[project]\nname = "fixture"\ndependencies = []\n' + _OPT + 'voice = ["packaging"]\n',
+            ('packaging; extra == "voice"',),
+            0,
+        ),
+        (
+            '[project]\nname = "fixture"\ndependencies = []\n'
+            + _OPT
+            + 'voice = ["packaging; python_version >= \\"3\\""]\n',
+            ('packaging; python_version >= "3" and extra == "voice"',),
+            0,
+        ),
+        # A group's requirement added upstream is a difference even though no
+        # installed package of that group exists (the old checker skipped it).
+        (
+            '[project]\nname = "fixture"\ndependencies = []\n' + _OPT + 'voice = ["zz-absent"]\n',
+            (),
             1,
         ),
-        # A group none of whose packages is installed is not in use: silent.
+        # A direct-URL requirement compares like any other: equal passes.
         (
-            "[project]\ndependencies = []\n[project.optional-dependencies]\n"
-            'unused = ["zz-not-installed-pkg", "zz-also-absent"]\n',
+            '[project]\nname = "fixture"\ndependencies = []\n'
+            + _OPT
+            + 'vcs = ["foo @ https://example.invalid/foo.whl"]\n',
+            ('foo @ https://example.invalid/foo.whl ; extra == "vcs"',),
             0,
         ),
-        # A used group, fully satisfied.
+        # Order and spelling do not matter; the parsed requirement does.
         (
-            '[project]\ndependencies = []\n[project.optional-dependencies]\nused = ["packaging"]\n',
+            '[project]\nname = "fixture"\ndependencies = ["Packaging >= 20", "httpx"]\n',
+            ("httpx", "packaging>=20"),
             0,
         ),
-        ('[project]\ndependencies = []\n[project.optional-dependencies]\nbad = "packaging"\n', 2),
-        # A package the BASE dependencies already install says nothing about the
-        # extra (review finding on #2494: openai arrives through litellm), so it
-        # must not mark the group "in use" — directly shared...
-        (
-            '[project]\ndependencies = ["packaging"]\n[project.optional-dependencies]\n'
-            'shared = ["packaging", "zz-not-installed-pkg"]\n',
-            0,
-        ),
-        # ...or transitively (anyio is a dependency of httpx).
-        (
-            '[project]\ndependencies = ["httpx"]\n[project.optional-dependencies]\n'
-            'shared = ["anyio", "zz-not-installed-pkg"]\n',
-            0,
-        ),
-        # Control for the two above: without the base dependency, the same
-        # installed package IS the group's own, so the group is in use and refuses.
-        (
-            "[project]\ndependencies = []\n[project.optional-dependencies]\n"
-            'own = ["anyio", "zz-not-installed-pkg"]\n',
-            1,
-        ),
+        # Cannot tell: unreadable input, no name, the project not installed.
+        ("not toml [[[", (), 2),
+        ("[project]\ndependencies = []\n", (), 2),
+        ('[project]\nname = "not-installed-here"\ndependencies = []\n', (), 2),
     ],
 )
-def test_the_dependency_gate_answers(pyproject, rc):
+def test_the_dependency_gate_compares_the_install_with_the_pyproject(
+    tmp_path, pyproject, installed, rc
+):
+    site = tmp_path / "site"
+    _install_fixture(site, tmp_path, installed)
     r = subprocess.run(
-        [sys.executable, str(REPO / "scripts" / "lib" / "venv_satisfies_pyproject.py")],
+        [sys.executable, str(GATE), str(tmp_path)],
         input=pyproject,
         capture_output=True,
         text=True,
         timeout=30,
+        env={**os.environ, "PYTHONPATH": str(site)},
     )
     assert r.returncode == rc, (r.stdout, r.stderr)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "source", "needle"),
+    [
+        ({}, "other", "is installed from"),
+        ({"editable": False}, "root", "not an editable install"),
+        ({"requires_python": ">=3.12"}, "root", "requires-python"),
+    ],
+    ids=["another-checkout", "not-editable", "requires-python"],
+)
+def test_the_dependency_gate_checks_where_and_how_it_was_installed(
+    tmp_path, kwargs, source, needle
+):
+    """The restarted server imports whatever the install points at: a worktree's
+    src/, or a wheel's copy, is not this checkout's code."""
+    root = tmp_path / "root"
+    root.mkdir()
+    site = tmp_path / "site"
+    _install_fixture(site, root if source == "root" else tmp_path / "other", **kwargs)
+    r = subprocess.run(
+        [sys.executable, str(GATE), str(root)],
+        input='[project]\nname = "fixture"\ndependencies = ["packaging"]\n',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PYTHONPATH": str(site)},
+    )
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert needle in r.stdout, r.stdout
+
+
+def test_a_venv_installed_from_another_checkout_is_refused(station):
+    """Codex P1 on #2494: the deploy checks what the venv imports, not just its
+    dependency versions."""
+    head = _git(station["root"], "rev-parse", "HEAD")
+    _install_fixture(station["site"], station["tmp"] / "some-worktree")
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "is installed from" in r.stderr and "run scripts/update.sh instead" in r.stderr
+
+
+@pytest.mark.parametrize(
+    ("unit_python", "needle"),
+    [("/opt/elsewhere/.venv/bin/python", "genesis-server runs"), ("-", "cannot read which python")],
+    ids=["another-venv", "unreadable"],
+)
+def test_a_unit_that_runs_another_venv_is_refused(station, unit_python, needle):
+    head = _git(station["root"], "rev-parse", "HEAD")
+    _advance_upstream(station)
+    r = _run(station, env={**station["env"], "UNIT_PYTHON": unit_python})
+    _assert_untouched(station, head, r)
+    assert needle in r.stderr, r.stderr
+
+
+def test_a_path_argument_in_the_unit_is_not_read_as_its_python(station):
+    """Only systemd's leading `path=` names the executable; an argument such as
+    `--db-path=` later on the same line must not be taken for it."""
+    _advance_upstream(station)
+    r = _run(station, env={**station["env"], "UNIT_ARGS": "--db-path=/data/x.db"})
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("direct_url", ["[]", '{"url": "file:///x", "dir_info": []}'])
+def test_the_dependency_gate_cannot_tell_from_a_malformed_direct_url(tmp_path, direct_url):
+    site = tmp_path / "site"
+    _install_fixture(site, tmp_path)
+    (site / "fixture-0.0.0.dist-info" / "direct_url.json").write_text(direct_url)
+    r = subprocess.run(
+        [sys.executable, str(GATE), str(tmp_path)],
+        input=PYPROJECT_OK,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PYTHONPATH": str(site)},
+    )
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr

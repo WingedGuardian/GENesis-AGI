@@ -147,3 +147,35 @@ def test_a_second_ipv4_listener_held_by_another_process_is_not_owned(listener):
 def test_bad_arguments_are_never_proof(args):
     r = subprocess.run([sys.executable, str(PROBE), *args], capture_output=True, timeout=30)
     assert r.returncode == 1
+
+
+def _load_probe():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("port_owned_by", PROBE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [(PermissionError, 1), (FileNotFoundError, 0)],
+    ids=["unreadable-tcp6-refuses", "absent-tcp6-is-skipped"],
+)
+def test_only_an_absent_ipv6_table_may_be_skipped(listener, monkeypatch, error, expected):
+    """A tcp6 table that exists but cannot be read may hide a foreign IPv6
+    listener, so it refuses; an absent one (IPv6 disabled) is skipped."""
+    import builtins
+    import os
+
+    mod = _load_probe()
+    real_open = builtins.open
+
+    def fake_open(path, *a, **kw):
+        if str(path) == "/proc/net/tcp6":
+            raise error(path)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert mod.main(["port_owned_by.py", str(listener), str(os.getpid())]) == expected

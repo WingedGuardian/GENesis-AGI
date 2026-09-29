@@ -10,12 +10,14 @@
   Guardian recovery), so a validation also compares the server's MainPID and the
   checkout's HEAD at its start and end.
   - **It refuses before anything changes:** a linked worktree, an unfinished
-    `update.sh` run, a branch other than main, a dirty tracked tree, a live
-    foreign deploy marker, a diverged tree, and a pull whose `pyproject.toml` the
-    venv does not already satisfy. The dependency check reads the incoming file
-    before the merge and asks the environment, not the diff — including every
-    optional-dependency group this install uses (one with any of its packages
-    installed).
+    `update.sh` run, a branch other than main, a dirty tracked tree, a unit that
+    runs a different venv, a live foreign deploy marker, a diverged tree, and a
+    venv that no longer describes the tree being deployed. That last check reads
+    the installed project's own metadata: it must be an editable install from
+    this checkout, and its requirements (base and every optional group, compared
+    parsed) and `requires-python` must equal the incoming `pyproject.toml`'s. Any
+    difference routes to `update.sh`, whose reinstall clears it. A state
+    file left by an `update.sh` run that finished (phase `done`) does not block.
   - **Across the restart** it holds the deploy marker (the watchdog defers) and
     pauses the host Guardian (no false "Genesis down" alert), then waits for
     health with the same window `update.sh` computes.
@@ -57,10 +59,10 @@
   with the new script; the deploy marker and the list of tracked files a deploy
   may find dirty moved to `scripts/lib/deploy_marker.sh`, shared with
   `restore.sh`.
-- **A stale deploy marker no longer blocks deploys or the watchdog.** A deploy
-  that was killed could leave `~/.genesis/update_in_progress.pid` naming a process
-  that was a zombie, or whose pid had since been reused, and every liveness check
-  read that as a deploy still running: new deploys refused, and the watchdog kept
-  from restarting a down server. The marker's holder now counts only if it is
-  running, not a zombie, and started no later than the marker was written — the
-  same rule in the deploy scripts and the watchdog's reader.
+- **A zombie no longer holds the deploy marker.** A deploy that was killed but
+  not yet reaped left `~/.genesis/update_in_progress.pid` naming a zombie, and
+  every liveness check read that as a deploy still running: new deploys refused,
+  and the watchdog kept from restarting a down server. The marker's holder now
+  counts only if it is running and not a zombie, in the deploy scripts and the
+  watchdog's reader alike. The holder check compares no clocks, so a wall-clock
+  step cannot make a live holder read as stale.

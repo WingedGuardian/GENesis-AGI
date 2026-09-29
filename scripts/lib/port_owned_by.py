@@ -28,14 +28,17 @@ _LISTEN = "0A"
 def _listening_inodes(port: int) -> set[str]:
     """Inodes of every LISTEN socket on `port`, from /proc/net/tcp and tcp6.
 
-    Raises OSError if the IPv4 table cannot be read (IPv6 may be absent).
+    Raises OSError if the IPv4 table cannot be read, or if the IPv6 table exists
+    but cannot be read; only an absent IPv6 table (IPv6 disabled) is skipped.
     """
     inodes: set[str] = set()
     for table, required in (("/proc/net/tcp", True), ("/proc/net/tcp6", False)):
         try:
             with open(table) as fh:
                 lines = fh.read().splitlines()[1:]
-        except OSError:
+        except FileNotFoundError:
+            # Only an ABSENT IPv6 table (IPv6 disabled) may be skipped: one that
+            # exists but cannot be read may hold a foreign listener.
             if required:
                 raise
             continue

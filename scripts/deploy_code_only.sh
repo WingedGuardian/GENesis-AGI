@@ -9,9 +9,10 @@
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
 #     REFUSES while a validation holds the lock shared);
 #   refusals BEFORE anything changes: a linked worktree, an unfinished update.sh
-#     run, a branch other than main, a dirty tree, a live foreign deploy marker,
-#     and a pull whose pyproject.toml the venv does not satisfy (that one needs
-#     update.sh, which reinstalls);
+#     run, a branch other than main, a dirty tree, a unit that runs a different
+#     venv, a live foreign deploy marker, and a venv that was not installed
+#     (editable) from this checkout with the pyproject.toml being deployed (that
+#     one needs update.sh, which reinstalls);
 #   a bounded fetch and a fast-forward-only merge;
 #   the deploy marker (the watchdog defers) and a Guardian pause (no false
 #     "Genesis down" alert or paid diagnosis) across the restart;
@@ -28,7 +29,7 @@
 # Usage: scripts/deploy_code_only.sh [--wait N] [--no-pull] [--no-restart]
 #   --wait N      seconds to queue for the lock (default 900, or
 #                 GENESIS_DEPLOY_LOCK_WAIT)
-#   --no-pull     restart the tree as it stands (still dependency-checked)
+#   --no-pull     restart the tree as it stands (still checked against the venv)
 #   --no-restart  a locked pull only: for a hooks or docs change, which takes
 #                 effect without a restart. Refuses a range touching anything
 #                 outside .claude/, docs/, tests/, changelog.d/, .github/,
@@ -147,8 +148,18 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ── Refusals: nothing has changed yet ─────────────────────────────────
-[ ! -e "$UPDATE_STATE_FILE" ] \
-    || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
+# A state file is an unfinished update.sh run UNLESS its phase is "done": update.sh
+# writes "done" just before deleting the file, so a run killed in between leaves a
+# finished one behind, and the watchdog's reader already treats it as over. Under
+# the exclusive lock no update.sh can be running. Anything unreadable refuses.
+if [ -e "$UPDATE_STATE_FILE" ]; then
+    _state_phase="$(python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+p = d.get("phase") if isinstance(d, dict) else None
+print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
+    [ "$_state_phase" = "done" ] \
+        || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
+fi
 _branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
 [ "$_branch" = main ] || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not main."
 _dirty="$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" || true)"
@@ -157,6 +168,15 @@ if [ -n "$_dirty" ]; then
     echo "$_dirty" >&2
     exit 1
 fi
+# The dependency gate asks $VENV_DIR, so the unit must RUN $VENV_DIR: its python
+# path is fixed in the unit file at install time and need not be this checkout's
+# .venv. Compared as directories, never by resolving the interpreter (a venv's
+# python is a symlink to the base one). Unreadable refuses.
+_unit_python="$(systemctl --user show genesis-server -p ExecStart --value 2>/dev/null \
+    | sed -n 's/^{ path=\([^ ;]*\) .*$/\1/p' | head -n 1 || true)"
+[ -n "$_unit_python" ] || die "cannot read which python genesis-server runs (systemctl show ExecStart)."
+[ "$(realpath -m "$(dirname "$_unit_python")")" = "$(realpath -m "$VENV_DIR/bin")" ] \
+    || die "genesis-server runs $_unit_python, not $VENV_DIR — run scripts/update.sh instead."
 # The deploy marker is taken NOW, before any pull, in every mode: a live foreign
 # holder (a dashboard update between its tiers, a restore) is refused before the
 # tree moves, and nothing can take the marker between our check and our restart.
@@ -165,19 +185,26 @@ if ! _acquire_deploy_marker; then
     die "a live deploy (pid $DEPLOY_MARKER_HOLDER) holds $DEPLOY_MARKER_FILE — a dashboard update or a restore is running."
 fi
 
-# Does the venv satisfy a pyproject.toml read from stdin? A code-only deploy never
-# reinstalls, so an unsatisfied dependency must go through update.sh.
+# Was the venv installed from THIS checkout with the pyproject.toml read from
+# stdin (the tree being deployed)? A code-only deploy never reinstalls, so any
+# difference must go through update.sh, whose unconditional reinstall clears it.
 _deps_ok() {
     local out rc=0
-    out="$("$VENV_DIR/bin/python" "$_SELF_DIR/lib/venv_satisfies_pyproject.py" 2>&1)" || rc=$?
+    out="$("$VENV_DIR/bin/python" "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     [ "$rc" -eq 0 ] && return 0
-    echo "ERROR: the venv does not satisfy $1's dependencies — run scripts/update.sh instead:" >&2
+    echo "ERROR: the venv was not installed from $1's pyproject.toml in this checkout — run scripts/update.sh instead:" >&2
     echo "$out" | sed 's/^/         /' >&2
     return 1
 }
 
 # ── Pull ──────────────────────────────────────────────────────────────
-if [ "$DO_PULL" -eq 1 ]; then
+# The pull for <branch>: a bounded fetch of that branch's configured upstream,
+# the dependency gate on the INCOMING pyproject.toml, then a fast-forward. The
+# branch is an argument so that another way of advancing the tree can sit
+# beside this one, dispatched on the branch, without touching the lock, marker,
+# restart or health sections.
+_pull() {
+    local branch="$1"
     _fetch_timeout="${GENESIS_DEPLOY_FETCH_TIMEOUT:-120}"
     # `timeout 0` means NO limit, and so does `timeout 00`: judge the VALUE, never
     # the spelling.
@@ -187,19 +214,19 @@ if [ "$DO_PULL" -eq 1 ]; then
     echo "  Fetching (bounded, ${_fetch_timeout}s)…"
     # Every git that can outlive this script (an auto-gc) runs in the foreground
     # and without the lock fd.
-    # Only main's configured upstream: a bare `git fetch` pulls every branch on the
+    # Only the branch's configured upstream: a bare `git fetch` pulls every branch on the
     # remote (dozens of PR branches), all of it while the exclusive lock is held.
-    _remote="$(git -C "$GENESIS_ROOT" config --get branch.main.remote || true)"
-    _merge_ref="$(git -C "$GENESIS_ROOT" config --get branch.main.merge || true)"
-    [ -n "$_remote" ] && [ -n "$_merge_ref" ] || die "main has no upstream to pull from."
+    _remote="$(git -C "$GENESIS_ROOT" config --get "branch.$branch.remote" || true)"
+    _merge_ref="$(git -C "$GENESIS_ROOT" config --get "branch.$branch.merge" || true)"
+    [ -n "$_remote" ] && [ -n "$_merge_ref" ] || die "$branch has no upstream to pull from."
     timeout -k 10 "$_fetch_timeout" git -c gc.autoDetach=false -C "$GENESIS_ROOT" fetch -q "$_remote" "$_merge_ref" {_UPDATE_LOCK_FD}>&- \
         || die "fetch failed or timed out — nothing changed."
-    _upstream="$(git -C "$GENESIS_ROOT" rev-parse --verify -q '@{u}' || true)"
-    [ -n "$_upstream" ] || die "main has no upstream to pull from."
+    _upstream="$(git -C "$GENESIS_ROOT" rev-parse --verify -q "$branch@{u}" || true)"
+    [ -n "$_upstream" ] || die "$branch has no upstream to pull from."
     _head="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"
     if [ "$_head" != "$_upstream" ]; then
         git -C "$GENESIS_ROOT" merge-base --is-ancestor "$_head" "$_upstream" \
-            || die "main has diverged from its upstream — nothing changed; reconcile by hand."
+            || die "$branch has diverged from its upstream — nothing changed; reconcile by hand."
         # The dependency gate reads the INCOMING pyproject.toml, before the merge,
         # so a refusal leaves the tree untouched.
         git -C "$GENESIS_ROOT" show "$_upstream:pyproject.toml" | _deps_ok "$_upstream" \
@@ -287,6 +314,10 @@ PY
         echo "  Already at the upstream tip."
         _deps_ok "the working tree" < "$GENESIS_ROOT/pyproject.toml" || exit 1
     fi
+}
+
+if [ "$DO_PULL" -eq 1 ]; then
+    _pull "$_branch"
 else
     _deps_ok "the working tree" < "$GENESIS_ROOT/pyproject.toml" || exit 1
 fi

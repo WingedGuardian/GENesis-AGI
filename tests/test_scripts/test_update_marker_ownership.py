@@ -171,11 +171,11 @@ def test_deletes_a_zombie_holders_marker(tmp_path: Path, text: str, zombie_pid: 
     assert not marker_exists, "a zombie holder's marker must be cleaned"
 
 
-def test_deletes_a_marker_whose_pid_was_reused(tmp_path: Path, text: str) -> None:
-    """The recorded pid is alive, but that process started long AFTER the marker
-    was written, so it cannot be the writer: a reused pid, and a stale marker."""
+def test_keeps_a_live_holders_marker_however_old(tmp_path: Path, text: str) -> None:
+    """No clock comparison: a live holder's marker whose mtime is far behind the
+    holder's start (what a forward clock step produces) is kept."""
     marker_exists, _ = _run_clear(tmp_path, text, str(os.getpid()), marker_mtime=1_000_000_000)
-    assert not marker_exists, "a reused-pid marker must be cleaned"
+    assert marker_exists, "a live holder's marker must survive a clock step"
 
 
 # ── The acquire side: deploy_code_only.sh and restore.sh take the marker through
@@ -216,8 +216,8 @@ def _run_acquire(
 
 
 def test_acquire_refuses_a_live_holder(tmp_path: Path) -> None:
-    """Control for the two below: a live holder that started before its marker
-    was written (this pytest process) is refused and left in place."""
+    """Control for the zombie case below: a live holder (this pytest process) is
+    refused and left in place."""
     rc, held = _run_acquire(tmp_path, str(os.getpid()))
     assert (rc, held) == (1, str(os.getpid()))
 
@@ -227,7 +227,7 @@ def test_acquire_replaces_a_zombie_holder(tmp_path: Path, zombie_pid: int) -> No
     assert (rc, held) == (0, "SELF"), "a zombie holder is stale; the marker is taken"
 
 
-def test_acquire_replaces_a_reused_pid(tmp_path: Path) -> None:
-    """A live pid whose process started long after the marker was written."""
+def test_acquire_refuses_a_live_holder_however_old_its_marker(tmp_path: Path) -> None:
+    """A clock step must not hand a live holder's marker to a second deploy."""
     rc, held = _run_acquire(tmp_path, str(os.getpid()), marker_mtime=1_000_000_000)
-    assert (rc, held) == (0, "SELF"), "a reused pid is stale; the marker is taken"
+    assert (rc, held) == (1, str(os.getpid()))

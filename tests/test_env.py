@@ -732,10 +732,11 @@ class TestNestedConfigReadsAreRouted:
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
 class TestSignalHolderIdentity:
-    """A live pid is not enough: the process must be the signal's WRITER. A
-    zombie (a killed deploy its parent never reaped) and a pid reused after the
-    signal was written both pass `os.kill(pid, 0)`, and each kept the watchdog
-    from reviving a down server for as long as it lived (#2494 review)."""
+    """A live pid is not enough when it is a zombie (a killed deploy its parent
+    never reaped): it passes `os.kill(pid, 0)` and kept the watchdog from
+    reviving a down server until reaped. And nothing may compare clocks: a
+    wall-clock step must never make a LIVE holder read as stale, or the
+    watchdog restarts the server in the middle of a restore (#2494 review)."""
 
     @staticmethod
     def _zombie():
@@ -781,14 +782,16 @@ class TestSignalHolderIdentity:
             holder.kill()
             holder.wait()
 
-    def test_a_pid_reused_after_the_pid_file_was_written_is_not_a_deploy(self, home: Path):
+    def test_a_live_holder_counts_however_old_its_pid_file(self, home: Path):
+        """A pid file whose mtime is far behind the holder's start (what a forward
+        clock step produces) still marks a deploy in progress."""
         marker = home / "update_in_progress.pid"
         marker.write_text(str(os.getpid()))
-        os.utime(marker, (1_000_000_000, 1_000_000_000))  # written long before we started
-        assert update_in_progress() is False
+        os.utime(marker, (1_000_000_000, 1_000_000_000))
+        assert update_in_progress() is True
 
-    def test_a_pid_reused_after_the_state_file_was_written_is_not_a_deploy(self, home: Path):
+    def test_a_live_owner_counts_however_old_its_state_file(self, home: Path):
         _write_state(home, pid=os.getpid())
         state = home / "update_state.json"
         os.utime(state, (1_000_000_000, 1_000_000_000))
-        assert update_in_progress() is False
+        assert update_in_progress() is True
