@@ -392,10 +392,12 @@ start_pressure_unit() {
         _WG_LEVER_START="would start ${unit} (observe mode)"
         return 0
     fi
+    # --no-block: success means systemd QUEUED the start job, not that the
+    # reclaim ran or succeeded -- say exactly that (review finding on #2570).
     if systemctl --user start --no-block "$unit" 2>/dev/null; then
         _wg_stamp "pressure_${inst}"
-        log WARN "started ${unit}"
-        _WG_LEVER_START="started ${unit}"
+        log WARN "queued ${unit}"
+        _WG_LEVER_START="queued ${unit} (its result is in: journalctl --user -u ${unit})"
     else
         log WARN "could not start ${unit} — retrying next poll (is it rendered? bootstrap renders scripts/systemd/*.template)"
         _WG_LEVER_START="could NOT start ${unit} (retrying every poll)"
@@ -468,7 +470,7 @@ sweep_cc_tmp() {
     # One find pass and three lookup tables, not a find per unit: MEASURED on a
     # live cc-tmp of ~1,000 units, the per-unit form cost 30 s of CPU and held
     # the poll loop for all of it.
-    local age="$1" why="${2:-hourly}" root snap u key n=0 kept=0
+    local age="$1" why="${2:-hourly}" root snap u key n=0 kept=0 failed=0 root_dev mounts table_ok rc
     # CANONICAL root: /proc reports fully resolved paths, so a symlinked
     # ancestor (e.g. /home -> /var/home) would make every held path miss the
     # prefix and silently empty the held table.
@@ -482,6 +484,15 @@ sweep_cc_tmp() {
         return 0
     fi
     snap="$(live_open_paths)"
+    # Every unit is removed through remove_tree_one_fs, which spares one
+    # that is, or holds, a mount (review finding on #2570: a same-device
+    # bind mount inside an aged unit passed --one-file-system).
+    if ! root_dev="$(stat -c %d -- "$root" 2>/dev/null)"; then
+        log WARN "cc-tmp sweep skipped: cannot read the device of ${root}"
+        _WG_LEVER_SWEEP="cc-tmp sweep did NOT run (cannot read the device of ${root})"
+        return 0
+    fi
+    mounts="$(mount_targets "$root")" && table_ok=1 || table_ok=0
     local -A held=() recent=() socket=()
     # Held: every open path or cwd under cc-tmp, mapped to its unit.
     while IFS= read -r key; do [[ -n "$key" ]] && held[$key]=1; done < <(
@@ -514,11 +525,26 @@ sweep_cc_tmp() {
             continue
         fi
         if (( WATCHGOD_ACT == 0 )); then
+            if tree_holds_mount "$u" "$root_dev" "$mounts" "$table_ok"; then
+                log INFO "OBSERVE: cc-tmp sweep would spare ${u}: it is, or holds, a separate mount"
+                kept=$(( kept + 1 ))
+                continue
+            fi
             log INFO "OBSERVE: cc-tmp sweep would reap ${u}"
-        else
-            rm -rf --one-file-system -- "$u" 2>/dev/null || log WARN "cc-tmp sweep could not remove ${u}"
+            n=$(( n + 1 ))
+            continue
         fi
-        n=$(( n + 1 ))
+        # Count only what is actually gone: the page reports this number as
+        # reclaimed (review finding on #2570).
+        rc=0
+        remove_tree_one_fs "$u" "$root_dev" "$mounts" "$table_ok" || rc=$?
+        case "$rc" in
+            0) n=$(( n + 1 )) ;;
+            2) log INFO "cc-tmp sweep spared ${u}: it is, or holds, a separate mount"
+               kept=$(( kept + 1 )) ;;
+            *) log WARN "cc-tmp sweep could not remove ${u}"
+               failed=$(( failed + 1 )) ;;
+        esac
     done < <(_cc_sweep_units "$root")
     # Project directories a sweep emptied (never a container, never recent).
     if (( WATCHGOD_ACT )); then
@@ -528,10 +554,12 @@ sweep_cc_tmp() {
             find "$c" -mindepth 1 -maxdepth 1 -type d -empty -mmin "+$age" -delete 2>/dev/null || true
         done
     fi
-    if (( n > 0 )); then
-        log INFO "cc-tmp sweep (${why}, age>$(( age / 1440 ))d): $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}"
+    local failed_note=""
+    (( failed > 0 )) && failed_note=", could NOT remove ${failed}"
+    if (( n > 0 || failed > 0 )); then
+        log INFO "cc-tmp sweep (${why}, age>$(( age / 1440 ))d): $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}${failed_note}"
     fi
-    _WG_LEVER_SWEEP="cc-tmp sweep at $(( age / 1440 )) days $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}"
+    _WG_LEVER_SWEEP="cc-tmp sweep at $(( age / 1440 )) days $( (( WATCHGOD_ACT )) && echo reaped || echo "would reap" ) ${n} unit(s), kept ${kept}${failed_note}"
     return 0
 }
 
@@ -555,9 +583,11 @@ maybe_sweep_cc_tmp() {
 }
 
 # /proc/<pid>/io counts a process's writes to EVERY filesystem, so the list a
-# page carries is not this filesystem's writers — say so rather than imply it
-# (review finding, #2521 item 5).
-_WG_WRITERS_LABEL="Top writers on the whole machine this poll (process-wide, not only this filesystem):"
+# page carries is not this filesystem's writers -- say so rather than imply it
+# (review finding, #2521 item 5). And dg_io_snapshot reads only this daemon's
+# own-user processes, so a root or other-user writer is never in it (review
+# finding on #2570).
+_WG_WRITERS_LABEL="Top writers among this user's processes this poll (all filesystems; other users' processes are not visible):"
 
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {

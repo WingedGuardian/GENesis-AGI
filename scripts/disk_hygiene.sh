@@ -93,21 +93,20 @@ prune_tmp() {
         age_pred=(-mmin "+$age_min")
         recent_pred=(-mmin "-$age_min")
     fi
-    local snap child root_dev mounts
+    local snap child root_dev mounts table_ok
     if ! liveness_visible; then
         echo "tmp prune SKIPPED: no other process is visible in /proc, so nothing can be proven unused"
         return 0
     fi
     snap="$(live_open_paths)"
     root_dev="$(stat -c %d -- "$tmp_dir" 2>/dev/null)" || return 0
-    mounts="$(mount_targets)"
+    mounts="$(mount_targets "$tmp_dir")" && table_ok=1 || table_ok=0
     while IFS= read -r -d '' child; do
         # A child that is, or holds, a separate mount (a separately mounted
         # ~/tmp/downloads) frees nothing on this filesystem; never recurse into
         # it (#2521 item 6). The mount table catches a bind or same-device
         # mount; the device number and --one-file-system are backstops.
-        if [ -e "$child" ] && { [ "$(stat -c %d -- "$child" 2>/dev/null)" != "$root_dev" ] \
-                || path_crosses_mount "$child" "$mounts"; }; then
+        if tree_holds_mount "$child" "$root_dev" "$mounts" "$table_ok"; then
             echo "tmp prune: sparing $child (a separate filesystem)"
             continue
         fi
@@ -127,7 +126,9 @@ prune_tmp() {
             echo "tmp prune: sparing $child (modified inside the window)"
             continue
         fi
-        rm -rf --one-file-system -- "$child" 2>/dev/null || echo "tmp prune failed for $child"
+        # remove_tree_one_fs re-checks the mount table at the moment of
+        # removal, so no path reaches rm unguarded.
+        remove_tree_one_fs "$child" "$root_dev" "$mounts" "$table_ok" || echo "tmp prune failed or spared $child"
     done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
                 ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
 }
@@ -139,7 +140,7 @@ prune_tmp() {
 # its cwd — and the whole reap is refused when liveness is blind, like every
 # other deleter here (review finding).
 reap_bg_sandboxes() {
-    local dir="$1" snap d root_dev mounts
+    local dir="$1" snap d root_dev mounts table_ok
     [ -d "$dir" ] || return 0
     dir="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
     if ! liveness_visible; then
@@ -148,10 +149,9 @@ reap_bg_sandboxes() {
     fi
     snap="$(live_open_paths)"
     root_dev="$(stat -c %d -- "$dir" 2>/dev/null)" || return 0
-    mounts="$(mount_targets)"
+    mounts="$(mount_targets "$dir")" && table_ok=1 || table_ok=0
     while IFS= read -r -d '' d; do
-        if [ -e "$d" ] && { [ "$(stat -c %d -- "$d" 2>/dev/null)" != "$root_dev" ] \
-                || path_crosses_mount "$d" "$mounts"; }; then
+        if tree_holds_mount "$d" "$root_dev" "$mounts" "$table_ok"; then
             echo "bg-cc sandbox reap: sparing $d (a separate filesystem)"
             continue
         fi
@@ -159,7 +159,7 @@ reap_bg_sandboxes() {
             echo "bg-cc sandbox reap: sparing $d (held open or in use by a live process)"
             continue
         fi
-        rm -rf --one-file-system -- "$d" 2>/dev/null || echo "bg-cc sandbox reap failed for $d"
+        remove_tree_one_fs "$d" "$root_dev" "$mounts" "$table_ok" || echo "bg-cc sandbox reap failed or spared $d"
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -print0 2>/dev/null)
 }
 
@@ -406,16 +406,23 @@ main() {
     # instead of the margin that made it unnecessary — a directory is pruned
     # only when it contains NO file modified inside the window. Costs one extra
     # stat pass over ~160 candidate dirs, once a day.
-    if [ -d "$HOME/.genesis/sessions" ]; then
-        find "$HOME/.genesis/sessions" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null |
-            while IFS= read -r _sess_dir; do
-                # -print -quit: stop at the FIRST recent file; no need to walk
-                # the rest of the directory to know it must be kept.
-                if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
-                    continue
-                fi
-                rm -rf --one-file-system -- "$_sess_dir" || echo "sessions prune failed for $_sess_dir"
-            done
+    # Same guarded removal as every other recursive deleter: a session
+    # directory that is, or holds, a mount is spared (review finding on #2570
+    # -- --one-file-system alone misses a same-device bind mount). CANONICAL
+    # root, like prune_tmp: the mount table holds resolved paths, so a
+    # symlinked ancestor would hide a mount below a session directory.
+    if _sess_root="$(cd -P -- "$HOME/.genesis/sessions" 2>/dev/null && pwd -P)" \
+            && _sess_root_dev="$(stat -c %d -- "$_sess_root" 2>/dev/null)"; then
+        _sess_mounts="$(mount_targets "$_sess_root")" && _sess_tok=1 || _sess_tok=0
+        while IFS= read -r -d '' _sess_dir; do
+            # -print -quit: stop at the FIRST recent file; no need to walk
+            # the rest of the directory to know it must be kept.
+            if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
+                continue
+            fi
+            remove_tree_one_fs "$_sess_dir" "$_sess_root_dev" "$_sess_mounts" "$_sess_tok" \
+                || echo "sessions prune failed or spared $_sess_dir"
+        done < <(find "$_sess_root" -mindepth 1 -maxdepth 1 -type d -mtime +60 -print0 2>/dev/null)
     fi
     echo "--- entity merge-journal reversibility retention prune (>180d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_entity_merge_journal.py" --days 180 \

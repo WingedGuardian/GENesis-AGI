@@ -279,3 +279,48 @@ class TestLastResortTier:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+_READ_MOUNTS = _mod._mount_points  # the real parser, fed a crafted table
+
+
+class TestMountRefusal:
+    """Review of #2570: rmtree follows into mounts, so a cache dir that is, or
+    holds, a mount (a bind mount keeps its parent's device) is refused."""
+
+    def _info(self, tmp_path, *mounts: str) -> Path:
+        f = tmp_path / "mountinfo"
+        f.write_text("".join(f"36 35 98:0 / {m} rw - btrfs /dev/x rw\n" for m in ("/", *mounts)))
+        return f
+
+    def test_refuses_a_cache_holding_a_mount(self, tmp_path):
+        cache = tmp_path / "cache"
+        (cache / "vol").mkdir(parents=True)
+        info = self._info(tmp_path, str(cache / "vol"))
+        with patch.object(_mod, "_mount_points", lambda: _READ_MOUNTS(info)):
+            assert _mod._is_safe_target(cache) is False
+
+    def test_refuses_a_mount_whose_name_is_escaped(self, tmp_path):
+        cache = tmp_path / "a b"
+        cache.mkdir()
+        info = self._info(tmp_path, str(cache).replace(" ", "\\040"))
+        with patch.object(_mod, "_mount_points", lambda: _READ_MOUNTS(info)):
+            assert _mod._is_safe_target(cache) is False
+
+    def test_allows_a_cache_with_no_mount(self, tmp_path):
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        info = self._info(tmp_path, str(tmp_path / "elsewhere"))
+        with patch.object(_mod, "_mount_points", lambda: _READ_MOUNTS(info)):
+            assert _mod._is_safe_target(cache) is True
+
+
+
+def test_an_unreadable_mount_table_refuses_the_target(tmp_path):
+    """Review of #2570: nothing else guards these rmtree targets, so a table
+    that cannot be read must refuse, never read as "no mounts"."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    assert _READ_MOUNTS(tmp_path / "missing") is None
+    with patch.object(_mod, "_mount_points", lambda: None):
+        assert _mod._is_safe_target(cache) is False

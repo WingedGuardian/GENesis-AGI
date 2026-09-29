@@ -1065,7 +1065,8 @@ def test_pages_label_writers_as_process_wide(box):
     it as this filesystem's writers."""
     _handle(box, "red")
     body = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")][0]["body"]
-    assert "process-wide, not only this filesystem" in body
+    assert "all filesystems; other users' processes are not visible" in body
+    assert "whole machine" not in body, "dg_io_snapshot reads only own-user processes (#2570)"
 
 
 def test_observe_mode_message_does_not_overclaim():
@@ -1117,3 +1118,47 @@ def test_a_config_reload_keeps_the_test_reserve_cap(box):
     _run(box, f"load_config; handle_fs '{box['home']}' '{_home_dev(box)}' green 90000 100000 - '' btrfs")
     r = box["state"] / "reserve"
     assert r.exists() and r.stat().st_size <= _TEST_RESERVE_MAX_MB * 1024 * 1024
+
+
+def test_the_warning_page_says_queued_not_started(box):
+    """Review of #2570: `systemctl start --no-block` returning 0 proves only
+    that the job was queued."""
+    _handle(box, "orange")
+    body = [p for p in _pages(box) if p["title"].startswith("Disk filling")][0]["body"]
+    assert "queued genesis-disk-hygiene-pressure@standard" in body
+    assert "started genesis" not in body
+
+
+def test_the_sweep_spares_a_unit_that_holds_a_mount(box, cctmp):
+    """Review of #2570: a same-device bind mount inside an aged cc-tmp unit
+    passed --one-file-system; the sweep now checks the mount table first."""
+    _, proj = cctmp
+    s = proj / "bound"
+    (s / "data").mkdir(parents=True)
+    (s / "data" / "precious").write_text("x")
+    _age_tree(s, 10)
+    # The mount is BELOW the unit, so only the mount table can reveal it.
+    _stub(box["bin"] / "findmnt", f'#!/usr/bin/env bash\nprintf "%s\\n" / "{s / "data"}"\n')
+    _sweep(box)
+    assert (s / "data" / "precious").exists()
+    assert "it is, or holds, a separate mount" in _log(box)
+
+
+def test_the_sweep_counts_only_units_it_removed(box, cctmp):
+    """Review of #2570: a failed rm was counted as reaped, so the page claimed
+    reclaim that never happened."""
+    if os.geteuid() == 0:
+        pytest.skip("root removes read-only trees")
+    root, proj = cctmp
+    s = proj / "stuck"
+    (s / "ro").mkdir(parents=True)
+    (s / "ro" / "f").write_text("x")
+    _age_tree(proj, 3)
+    (s / "ro").chmod(0o555)
+    try:
+        dev = str(os.stat(root).st_dev)
+        _run(box, f"home_dev() {{ echo not-this; }}; handle_fs '{root}' '{dev}' orange 100 2048 - '' btrfs")
+        body = _pages(box)[0]["body"]
+        assert "reaped 0 unit(s)" in body and "could NOT remove 1" in body
+    finally:
+        (s / "ro").chmod(0o755)

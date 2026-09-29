@@ -404,6 +404,12 @@ def _stat_shim(tmp_path: Path, other_dev_path: Path) -> Path:
         'exec /usr/bin/stat "$@"\n'
     )
     shim.chmod(0o755)
+    # The device comparison is the fallback for an UNREADABLE mount table: a
+    # readable one lists every mount and decides alone (review of #2570). So
+    # this shim also hides the table, or the fake device would never be read.
+    fm = bindir / "findmnt"
+    fm.write_text("#!/usr/bin/env bash\nexit 1\n")
+    fm.chmod(0o755)
     return bindir
 
 
@@ -441,7 +447,8 @@ def test_bg_sandbox_reap_never_recurses_into_a_separate_filesystem(tmp_path):
     assert not dead.exists(), "control: an ordinary old sandbox is still reaped"
 
 
-def _mount_shim(tmp_path: Path, mountpoint_path: Path | None = None, table: list[str] | None = None) -> Path:
+def _mount_shim(tmp_path: Path, mountpoint_path: Path | None = None, table: list[str] | None = None,
+                readable: bool = True) -> Path:
     """`mountpoint` / `findmnt` stand-ins: a bind mount keeps its parent's
     device number, so only the mount table can see it."""
     bindir = tmp_path / "mshim"
@@ -451,7 +458,10 @@ def _mount_shim(tmp_path: Path, mountpoint_path: Path | None = None, table: list
     mp.write_text(f'#!/usr/bin/env bash\n[[ "${{@: -1}}" == "{target}" ]] && exit 0\nexit 1\n')
     mp.chmod(0o755)
     fm = bindir / "findmnt"
-    fm.write_text("#!/usr/bin/env bash\ncat <<'EOF'\n/\n" + "".join(f"{t}\n" for t in (table or [])) + "EOF\n")
+    # An unreadable table prints no "/" line, so mount_targets reports it
+    # unreadable and the deleters fall back to `mountpoint`.
+    lines = (["/"] if readable else []) + list(table or [])
+    fm.write_text("#!/usr/bin/env bash\ncat <<'EOF'\n" + "".join(f"{t}\n" for t in lines) + "EOF\n")
     fm.chmod(0o755)
     return bindir
 
@@ -465,7 +475,9 @@ def test_prune_spares_a_bind_mount_the_device_number_cannot_see(tmp_path):
     for p in (bind, plain):
         p.mkdir()
         _age(p, 10)
-    shim = _mount_shim(tmp_path, mountpoint_path=bind.resolve())
+    # The TABLE alone must catch it: `mountpoint` is not consulted when the
+    # table is readable (one fork less per candidate, review of #2570).
+    shim = _mount_shim(tmp_path, table=[str(bind.resolve())])
     r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nprune_tmp '{d}'"],
                        env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
                        capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -493,7 +505,8 @@ def test_bg_sandbox_reap_spares_a_bind_mount(tmp_path):
     for p in (bind, dead):
         p.mkdir(parents=True)
         _age(p, 2)
-    shim = _mount_shim(tmp_path, mountpoint_path=bind.resolve())
+    # Unreadable table: the `mountpoint` fallback must catch it.
+    shim = _mount_shim(tmp_path, mountpoint_path=bind.resolve(), readable=False)
     r = subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nreap_bg_sandboxes '{root}'"],
                        env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"),
                        capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -508,3 +521,52 @@ def test_the_daily_groom_leaves_the_indexes_to_the_guardians_red_pass():
     main = text[text.index("\nmain() {"):]
     call = main[main.index("disk_reclaim.py"):main.index("disk_reclaim_rc=$?")]
     assert "--last-resort-above 101" in call
+
+
+def test_every_recursive_delete_goes_through_the_mount_guard():
+    """Review of #2570: the mount-table guard existed in two of four recursive
+    deleters, so the cc-tmp sweep and the sessions prune could follow a
+    same-device bind mount. Allowlist polarity: the ONLY recursive `rm` in the
+    guardian's scripts is the one inside remove_tree_one_fs, so a deleter
+    added later fails here until it uses the helper."""
+    import re
+
+    scripts = Path(__file__).resolve().parents[2] / "scripts"
+    lib = scripts / "lib"
+    files = [scripts / "disk_hygiene.sh", scripts / "tmp_watchgod.sh",
+             *(lib / n for n in ("tmp_liveness.sh", "disk_guardian.sh", "watchgod_oom.sh", "alert_queue.sh"))]
+    # Short (-r, -rf, -Rf) and long (--recursive) spellings, after any
+    # number of other flags (review of #2570: --recursive was missed).
+    rm_r = re.compile(r"(?<![\w-])rm\s+(?:-\S*\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?![\w-])")
+    # A comment starts at a # that opens the line or follows whitespace;
+    # `$#` and `${#arr[@]}` are code, and must not hide what follows them.
+    comment = re.compile(r"(?:^|\s)#.*$")
+    hits = []
+    for f in files:
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            code = comment.sub("", line)
+            if rm_r.search(code):
+                hits.append(f"{f.name}:{n}")
+    helper = scripts / "lib" / "tmp_liveness.sh"
+    body = helper.read_text()
+    start = body.index("remove_tree_one_fs() {")
+    end = body.index("\n}\n", start)
+    first = body[:start].count("\n") + 1
+    last = body[:end].count("\n") + 1
+    inside = [h for h in hits if h.startswith("tmp_liveness.sh:") and first <= int(h.split(":")[1]) <= last]
+    assert inside, "the helper itself must perform the removal"
+    assert sorted(set(hits) - set(inside)) == [], hits
+
+
+def test_the_recursive_delete_scan_sees_every_spelling():
+    """Control for the allowlist test: its detector must catch the spellings
+    a later deleter could use, or the allowlist passes vacuously."""
+    import re
+
+    rm_r = re.compile(r"(?<![\w-])rm\s+(?:-\S*\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?![\w-])")
+    comment = re.compile(r"(?:^|\s)#.*$")
+    for line in ('rm -rf -- "$x"', 'rm -f --recursive "$x"', 'rm --recursive "$x"',
+                 'n=${#arr[@]}; rm -Rf "$x"', '[ $# -gt 0 ] && rm -r "$x"'):
+        assert rm_r.search(comment.sub("", line)), line
+    for line in ('rm -f -- "$x"', '# rm -rf "$x"', 'echo x  # rm -rf "$x"', 'find . -delete'):
+        assert not rm_r.search(comment.sub("", line)), line

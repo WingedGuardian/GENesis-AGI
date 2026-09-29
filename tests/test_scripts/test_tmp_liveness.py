@@ -125,3 +125,90 @@ def test_path_crosses_mount_reads_the_table_exactly(tmp_path):
     assert not _crosses(tmp_path, "/h/tmp/job", ["/h/tmp/job2"])
     assert not _crosses(tmp_path, "/h/tmp/job", ["/h/tmp/job2/data"])
     assert _crosses(tmp_path, "/h/tmp/a b", ["/h/tmp/a\\\\x20b/m"])
+
+
+def test_path_crosses_mount_decodes_every_findmnt_escape(tmp_path):
+    """Review of #2570: findmnt -r escapes EVERY unsafe byte as \\xNN, not
+    only space/tab/backslash. A child named with a newline or another control
+    byte, holding a bind mount, must still be recognised."""
+    assert _crosses(tmp_path, "/h/tmp/a\nb", ["/h/tmp/a\\\\x0ab/m"])
+    assert _crosses(tmp_path, "/h/tmp/a\x01b", ["/h/tmp/a\\\\x01b"])
+    assert _crosses(tmp_path, "/h/tmp/a\\b", ["/h/tmp/a\\\\x5cb/m"])
+    assert not _crosses(tmp_path, "/h/tmp/a\nb", ["/h/tmp/a\\\\x0abc/m"])
+
+
+def _remove(tmp_path, target: Path, mount_at: str = "") -> int:
+    lib = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "tmp_liveness.sh"
+    bindir = tmp_path / "mp"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "mountpoint").write_text(f'#!/bin/sh\n[ "$3" = "{mount_at}" ] && exit 0\nexit 1\n')
+    (bindir / "mountpoint").chmod(0o755)
+    r = subprocess.run(
+        ["bash", "-c", f"source '{lib}'\nremove_tree_one_fs \"$1\" \"$(stat -c %d -- \"$2\")\" ''; echo $?",
+         "_", str(target), str(target.parent)],
+        env=dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}"), capture_output=True, text=True,
+    )
+    return int(r.stdout.strip())
+
+
+def test_remove_tree_one_fs_reports_what_happened(tmp_path):
+    """Review of #2570: every recursive deleter goes through this one helper,
+    and its callers count a unit as reclaimed only on 0."""
+    root = tmp_path / "root"
+    gone = root / "gone"
+    (gone / "d").mkdir(parents=True)
+    assert _remove(tmp_path, gone) == 0 and not gone.exists()
+
+    mounted = root / "mounted"
+    mounted.mkdir()
+    (mounted / "keep").write_text("x")
+    assert _remove(tmp_path, mounted, mount_at=str(mounted)) == 2
+    assert (mounted / "keep").exists(), "a mount is never recursed into"
+
+    stuck = root / "stuck"
+    (stuck / "ro").mkdir(parents=True)
+    (stuck / "ro" / "f").write_text("x")
+    (stuck / "ro").chmod(0o555)
+    try:
+        if os.geteuid() != 0:
+            assert _remove(tmp_path, stuck) == 1 and stuck.exists()
+    finally:
+        (stuck / "ro").chmod(0o755)
+
+
+def _targets(tmp_path, root: str, lines: list[str]) -> tuple[str, int]:
+    lib = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "tmp_liveness.sh"
+    bindir = tmp_path / "fm"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "findmnt").write_text("#!/bin/sh\ncat <<'EOF'\n" + "".join(f"{x}\n" for x in lines) + "EOF\n")
+    (bindir / "findmnt").chmod(0o755)
+    r = subprocess.run(
+        ["bash", "-c", f"source '{lib}'\nmount_targets \"$1\"; echo \"rc=$?\"", "_", root],
+        env=dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}"), capture_output=True, text=True,
+    )
+    *out, rc = r.stdout.splitlines()
+    return "\n".join(out), int(rc.removeprefix("rc="))
+
+
+def test_mount_targets_keeps_only_mounts_below_the_root_and_reports_unreadable(tmp_path):
+    """Review of #2570: filter the table once per deleter (the per-candidate
+    check was O(whole table)), keep lines escaped, and never let an unreadable
+    table read as "no mounts"."""
+    out, rc = _targets(tmp_path, "/h/tmp", ["/", "/h", "/h/tmp", "/h/tmp/a\\x0ab", "/h/tmpx/c", "/h/tmp/d"])
+    assert rc == 0
+    assert out.splitlines() == ["/h/tmp/a\\x0ab", "/h/tmp/d"]
+    out, rc = _targets(tmp_path, "/h/tmp", ["/h/tmp/d"])
+    assert rc == 1, "no '/' line: the table was not read, whatever else it printed"
+
+
+def test_mount_targets_rejects_a_table_findmnt_abandoned(tmp_path):
+    """Review of #2570: findmnt printed "/" and then failed — a partial
+    table must not pass as readable, or a missing tail reads as no mounts."""
+    lib = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "tmp_liveness.sh"
+    bindir = tmp_path / "fmx"
+    bindir.mkdir()
+    (bindir / "findmnt").write_text("#!/bin/sh\necho /\nexit 1\n")
+    (bindir / "findmnt").chmod(0o755)
+    r = subprocess.run(["bash", "-c", f"source '{lib}'\nmount_targets /h/tmp; echo \"rc=$?\""],
+                       env=dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}"), capture_output=True, text=True)
+    assert r.stdout.strip().endswith("rc=1"), r.stdout
