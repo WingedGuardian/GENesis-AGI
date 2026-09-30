@@ -160,9 +160,11 @@ async def procedure_recall(
 
     Candidates come from tag overlap: ``context_tags`` when given (plus the best
     procedure whose stored task type equals ``task_description`` exactly),
-    otherwise the words of ``task_description``. All candidates are then ranked
-    together and cut to 3. Each result carries the procedure's steps,
-    confidence, and id; an empty list means nothing matched.
+    otherwise the words of ``task_description``. The overlap search reads only
+    the 200 most confident active procedures and keeps the best 10 of those
+    before the final ranking and cut to 3, so an empty or short result means
+    nothing matched within that window, not that nothing exists. Each result
+    carries the procedure's steps, confidence, and id.
 
     Calling it counts as a use: each returned procedure's usage counter goes up,
     which also raises its future ranking, so call it when you intend to apply

@@ -554,6 +554,8 @@ async def outreach_queue(
 
     Reads delivery history (id, category, channel, topic, delivered_at,
     engagement_outcome), optionally filtered by ``category`` and ``channel``.
+    A row is written after its send; ``delivered_at`` can be null when
+    recording the delivery time failed.
     The 20-row cap is fixed, so older messages are not reachable here. Messages
     queued but not yet sent are in ``outreach_pending``.
     """

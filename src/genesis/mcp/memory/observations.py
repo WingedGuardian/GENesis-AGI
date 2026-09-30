@@ -39,7 +39,9 @@ async def observation_write(
     ``source`` names the writer (e.g. ``conversation_intent``,
     ``inbox_evaluation``); ``type`` is a free-form kind that also sets its
     lifetime: most types expire and are auto-resolved after a type-specific
-    TTL (unlisted types after 14 days), and only a few are permanent.
+    TTL (unlisted types after 14 days). The few types with no TTL still get
+    auto-resolved after 60 days at low/medium priority; only high/critical
+    stay until resolved by hand.
     ``priority`` must be one of low / medium / high / critical;
     any other value fails the write. ``speculative`` marks an unverified
     inference. The writer's session origin is stamped automatically.
@@ -84,11 +86,15 @@ async def observation_query(
 ) -> list[dict]:
     """List observations, newest first, filtered by type, priority, source, or resolved state.
 
-    Returns at most ``limit`` rows (default 50) and no total count, so a result
-    of exactly ``limit`` rows is truncated: raise ``limit`` or narrow the
-    filters before concluding something is absent. Each row includes its id,
-    for ``observation_resolve``.
+    Returns at most ``limit`` rows (default 50; must be 1 or more) and no total
+    count, so a result of exactly ``limit`` rows may be truncated: raise
+    ``limit`` or narrow the filters before concluding something is absent. Each
+    row includes its id, for ``observation_resolve``.
     """
+    # SQLite reads a negative LIMIT as "no limit", which would turn this bounded
+    # page into the whole table.
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        return [{"error": "limit must be an integer of 1 or more"}]
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
