@@ -548,7 +548,12 @@ def _git_common_dir(cwd: str | None) -> str | None:
         args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
         result = subprocess.run(args, capture_output=True, text=True, timeout=5)
         out = result.stdout.strip()
-        return os.path.realpath(out) if result.returncode == 0 and out else None
+        # One absolute line or nothing: git before 2.31 does not know
+        # `--path-format`, exits 0, and echoes the option back beside a relative
+        # `.git`, which must read as unreadable (fail closed), never as an identity.
+        if result.returncode != 0 or "\n" in out or not os.path.isabs(out):
+            return None
+        return os.path.realpath(out)
     except Exception:
         return None
 
@@ -560,23 +565,157 @@ def _live_manifest_present() -> bool:
     )
 
 
+def _live_manifest_binding() -> tuple[str, str | None]:
+    """What the deploy manifest says about WHICH repository it belongs to.
+
+    The manifest may carry a top-level ``"repo"``: the ABSOLUTE git common dir of
+    the checkout it belongs to. Returns one of:
+
+    * ``("bound", <canonical path>)`` — the key names an existing git common dir
+      (a directory holding ``objects/`` and ``HEAD``);
+    * ``("absent", None)`` — a JSON object without the key: the caller keeps its
+      rule for manifests written before the key existed;
+    * ``("malformed", None)`` — anything else: unreadable or malformed JSON, not a
+      JSON object, or a key that is not the absolute path of an existing git
+      common dir (a work-tree path, a checkout that has since moved). The caller
+      ARMS, for every target: a broken manifest fails closed.
+
+    The same rule is kept in ``review_enforcement_commit._live_manifest_binding`` and in the git hooks'
+    ``live_manifest_applies``; ``TestManifestRepoBinding`` pins all four copies
+    to one verdict table."""
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — unreadable fails closed, never "disarmed"
+        return ("malformed", None)
+    if not isinstance(data, dict):
+        return ("malformed", None)
+    if "repo" not in data:
+        return ("absent", None)
+    repo = data["repo"]
+    if (
+        isinstance(repo, str)
+        and os.path.isabs(repo)
+        and os.path.isdir(os.path.join(repo, "objects"))
+        and os.path.isfile(os.path.join(repo, "HEAD"))
+    ):
+        return ("bound", os.path.realpath(repo))
+    return ("malformed", None)
+
+
 def _live_integration_active(cwd: str | None) -> bool:
     """Whether ``cwd``'s repository runs a local integration branch named ``live``.
 
     Two conditions. The deploy manifest declares that this install runs one;
     without it, a branch named ``live`` is just an ordinary branch. And the
-    target must be THIS repository (the one this guard ships in, any of its
-    worktrees): a session can run git in unrelated checkouts, whose own `live`
-    branches the manifest says nothing about. When the manifest exists but a
-    repository identity cannot be read, fail closed, as this guard does for an
-    unreadable branch."""
+    target must be the repository the manifest is about
+    (``_live_manifest_binding``): when it names one, that repository and no
+    other; when it has no ``"repo"`` key, THIS repository (the one this guard
+    ships in, any of its worktrees), since a session can run git in unrelated
+    checkouts whose own `live` branches the manifest says nothing about. A
+    malformed manifest, or a repository identity that cannot be read, fails
+    closed, as this guard does for an unreadable branch."""
     if not _live_manifest_present():
         return False
-    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
+    kind, bound = _live_manifest_binding()
+    if kind == "malformed":
+        return True
     there = _git_common_dir(cwd)
+    if kind == "bound":
+        return there is None or there == bound
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
     if here is None or there is None:
         return True
     return here == there
+
+
+# Git subcommands that cannot change WHICH branch HEAD is on. An ALLOWLIST on
+# purpose: the set of commands that can switch branches is open (checkout,
+# switch, rebase <upstream> <branch>, worktree, stash branch, branch -M, bisect,
+# and whatever a later git adds), while this set is closed and checkable.
+_KEEPS_HEAD_BRANCH = frozenset(
+    {
+        "add",
+        "blame",
+        "cat-file",
+        "check-attr",
+        "check-ignore",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "config",
+        "describe",
+        "diff",
+        "fetch",
+        "for-each-ref",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge",
+        "merge-base",
+        "mv",
+        "pull",
+        "remote",
+        "reset",
+        "restore",
+        "rev-list",
+        "rev-parse",
+        "revert",
+        "rm",
+        "shortlog",
+        "show",
+        "show-ref",
+        "status",
+        "tag",
+    }
+)
+# Deliberately NOT here although most of their forms keep the branch: `stash`
+# (`git stash branch <name>` switches), `branch` (`git branch -M` renames the
+# current branch), `rebase` (`--abort` returns to the branch it started from).
+# Telling their forms apart would mean reading argv, which is what this set exists
+# to avoid; chained before a merge they are refused, and run separately they pass.
+
+
+def _moves_head(seg) -> bool:
+    """Whether ``seg`` can change the branch a LATER merge in the same command
+    lands on, after this guard has read that branch.
+
+    Decided by SUBCOMMAND, with no argv parsing, against an allowlist
+    (``_KEEPS_HEAD_BRANCH``): a ``git`` command counts unless its subcommand is
+    one that cannot move HEAD to another branch, and any ``gh`` command counts
+    (``gh pr checkout``). Telling a HEAD-moving form from one that leaves HEAD
+    put is an open-set question about git's argv (``git checkout live --``
+    switches branches although it looks like a file restore; ``git rebase
+    <upstream> <branch>`` ends on <branch>), and here a miss is not backstopped:
+    a fast-forward runs no git hook. A file restore chained before a merge is
+    therefore refused too; the remedy, running the two separately, costs one
+    more command.
+
+    ACCEPTED RESIDUE: a git ALIAS (``co``), a dashed executable
+    (``/usr/lib/git-core/git-checkout``, which this guard family does not read as
+    git anywhere, merges included), and anything hidden from the shell parser
+    (``eval``, ``xargs``, a script). ``git pull`` is not in this walk's
+    population as a merge at all."""
+    exe = getattr(seg, "exe", None)
+    if exe == "gh":
+        return True
+    if exe != "git":
+        return False
+    return git_subcommand(getattr(seg, "argv", None) or []) not in _KEEPS_HEAD_BRANCH
+
+
+def _mover_label(seg) -> str:
+    """``git <subcommand>``, or ``gh``, for a refusal message: never the rest of
+    argv (a command line can carry a credential)."""
+    exe = getattr(seg, "exe", None) or "?"
+    if exe != "git":
+        # `gh` alone: its first positional can be a flag's value (`gh --repo x pr
+        # checkout`), and naming it would mean modelling gh's argv.
+        return exe
+    sub = git_subcommand(getattr(seg, "argv", None) or [])
+    return f"git {sub}" if sub else "git"
 
 
 def _walk_merge_into_main(
@@ -603,6 +742,16 @@ def _walk_merge_into_main(
     segment. Fail closed: a merge nested at depth>0, reached under an unresolvable
     cwd, OR whose branch cannot be read (None) is treated as targeting main and
     blocked (unless overridden). A detached HEAD ("") is left allowed.
+
+    Every branch is read BEFORE the command runs, so a merge that follows a
+    ``git checkout``, ``git switch``, ``git rebase`` or any other command that
+    can change the current branch, in the same command
+    (``_moves_head``; earlier segments, or a substitution inside the merge's own
+    segment) lands on a branch the read never saw: ``git checkout live && git
+    merge --ff-only feature`` moves ``live`` with no git hook firing. Such a
+    merge is unresolvable and refused, "switched" in ``fired_on``, whatever the
+    stale read says. The main override still passes it where no ``live`` is
+    declared, as it does any merge it covers.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
     #
@@ -631,8 +780,11 @@ def _walk_merge_into_main(
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
     repo_env_redirected = False  # persistent, for the same reason as in _effective_cwd
+    head_moved = False  # a segment earlier in this command may have changed branch
+    head_mover = None  # the first such segment, named in the refusal
     for raw in split_segments(cmd):
-        top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
+        segs_here = analyze(raw)
+        top = [s for s in segs_here if getattr(s, "depth", 0) == 0]
         merge_here = next(
             (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
             None,
@@ -640,7 +792,23 @@ def _walk_merge_into_main(
         overridden = merge_here is not None and has_trailing_override(
             raw, "merge-to-main-override"
         )
-        if overridden:
+        # A switch nested in the merge's own segment (a command substitution)
+        # runs before the merge, so it counts as earlier too.
+        nested_mover = next(
+            (s for s in segs_here if s is not merge_here and _moves_head(s)), None
+        )
+        switched = merge_here is not None and (head_moved or nested_mover is not None)
+        if switched:
+            # The branch read above predates the switch. Unresolvable: refused, and
+            # with the main override refused wherever a `live` may exist, exactly
+            # like an unresolvable directory below.
+            if not overridden or _live_manifest_present():
+                if fired_on is not None:
+                    fired_on.append("switched")
+                    mover = head_mover if head_mover is not None else nested_mover
+                    fired_on.append("switched-by:" + _mover_label(mover))
+                return True
+        elif overridden:
             # The override acknowledges a merge into main, never into `live`. So
             # the branch is still resolved; where it cannot be (a redirected
             # repository, an unresolvable directory) and a `live` may exist, the
@@ -658,7 +826,7 @@ def _walk_merge_into_main(
                     if fired_on is not None:
                         fired_on.append("live")
                     return True
-        if merge_here is not None and not overridden:
+        if merge_here is not None and not overridden and not switched:
             # This walk resolves the repo itself rather than through
             # `_effective_cwd`, so it carried the same hole: a merge pointed at a
             # repository on main by --git-dir / GIT_DIR was checked against the
@@ -682,6 +850,9 @@ def _walk_merge_into_main(
                 if fired_on is not None:
                     fired_on.append("live")
                 return True
+        if not head_moved:
+            head_mover = next((s for s in segs_here if _moves_head(s)), None)
+            head_moved = head_mover is not None
         if raw_sets_repo_env(raw):
             repo_env_redirected = True
         cd = _cd_target(raw)
@@ -10653,7 +10824,26 @@ def _run_merge_and_push_gates() -> int:
         if merge_git_segs and _walk_merge_into_main(
             cmd, payload, merge_git_segs, fired_on=merge_fired_on
         ):
-            if "unresolved" in merge_fired_on:
+            if "switched" in merge_fired_on:
+                mover = next(
+                    (f[len("switched-by:") :] for f in merge_fired_on if f.startswith("switched-by:")),
+                    "a git or gh command",
+                )
+                print(
+                    f"BLOCKED: `{mover}` runs before a merge in this command, and it is "
+                    "not one of the commands known to leave the current branch alone "
+                    "(add, commit, diff, fetch, log, pull, reset, restore, status and "
+                    "similar). This guard reads each merge's branch before the command "
+                    "runs, so it cannot tell which branch the merge lands on — main, "
+                    "or 'live', the local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Run the branch switch and the merge as SEPARATE commands; the "
+                    "merge is then checked on the branch it actually runs on.",
+                    file=sys.stderr,
+                )
+            elif "unresolved" in merge_fired_on:
                 print(
                     "BLOCKED: cannot tell which branch this merge lands on, and "
                     "'# merge-to-main-override' covers main only, never 'live', the "
