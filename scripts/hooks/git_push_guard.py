@@ -157,8 +157,13 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
 
 # The per-reviewer severity parsers and the reviewer table live in a stdlib
 # sibling so every gate reads the SAME table, and so the round counter can later
-# read findings with the same code this gate scores them with. A HARD dependency: every merge-gate scan needs
-# them, so a broken tree blocks, exactly like the two helpers above.
+# read findings with the same code this gate scores them with. Only the MERGE gate
+# needs them, so a missing or broken module must not take down every push and git
+# command this guard sees. It degrades to stubs that fail closed where they are read:
+# the table readers report an error (each findings scanner and freshness then
+# block, naming it), no substitute is offered, and a parser raises, which
+# `run_guard` turns into a block.
+_REVIEW_FINDINGS_ERROR: str | None = None
 try:
     from review_findings import (  # noqa: E402
         CR_HEADER_FIELD_RE as _CR_HEADER_FIELD_RE,
@@ -184,18 +189,31 @@ try:
     from review_findings import (
         devin_finding as _devin_finding,
     )
-except Exception:  # noqa: BLE001 — a missing NEW helper must block.
-    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
-        raise
-    try:
-        sys.stderr.write(
-            "GUARD DEGRADED (git_push_guard): review_findings is incompatible; "
-            "BLOCKING until the hook tree is repaired.\n"
-        )
-        sys.stderr.flush()
-    except BaseException:
-        pass
-    os._exit(2)
+except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate only.
+    _REVIEW_FINDINGS_ERROR = (
+        f"scripts/review_findings.py is unimportable ({type(_findings_exc).__name__}: "
+        f"{_findings_exc}); repair the hook tree"
+    )
+    _INLINE_P1_RE = _INLINE_P2_RE = _CR_HEADER_FIELD_RE = None  # type: ignore[assignment]
+    _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
+
+    def configured_reviewers():  # type: ignore[no-redef]
+        return None, _REVIEW_FINDINGS_ERROR
+
+    def enforced_logins():  # type: ignore[no-redef]
+        return None, _REVIEW_FINDINGS_ERROR
+
+    def primary_reviewer_login():  # type: ignore[no-redef]
+        return None
+
+    def substitute_reviewer_logins():  # type: ignore[no-redef]
+        return ()
+
+    def _cr_severity(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _devin_finding(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
@@ -1514,8 +1532,8 @@ def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
     if sets is None:
         return {}, (
             f"the reviewer table is unreadable ({error}), so review findings cannot be "
-            f"attributed to their reviewers. Fix config/reviewers.yaml or "
-            f"~/.genesis/config/reviewers.local.yaml, or append '# review-override'."
+            f"attributed to their reviewers. Fix config/reviewers.yaml, or append "
+            f"'# review-override'."
         )
     return sets, ""
 
@@ -4247,9 +4265,10 @@ def _check_pr_review_findings(
 # stale prefix (or a ground SHA sharing it) could satisfy. Waived by
 # '# review-override' (the conscious "merge without a current Codex review" case).
 def _reviewer_config_note() -> str:
-    """A NOTE for freshness blocks when the reviewer table departs from the shipped
-    Codex-primary set, whose remediation text the messages below spell out. Empty on
-    the shipped table, so its messages stay word-for-word what they were."""
+    """A NOTE for freshness blocks when ``config/reviewers.yaml`` (changed only by a
+    reviewed PR) departs from the Codex-primary set whose remediation text the
+    messages below spell out. Empty on that set, so its messages stay word-for-word
+    what they were."""
     table, error = configured_reviewers()
     if error or not table:
         return ""
@@ -4261,8 +4280,8 @@ def _reviewer_config_note() -> str:
     }:
         return ""
     return (
-        f"\nNOTE: this install's reviewer table (config/reviewers.yaml + "
-        f"~/.genesis/config/reviewers.local.yaml) makes {primary} the primary reviewer"
+        f"\nNOTE: the reviewer table (config/reviewers.yaml) makes {primary} the "
+        f"primary reviewer"
         f" and {', '.join(subs) or 'no reviewer'} the possible stand-in(s). Where the text "
         f"above names Codex, '@codex review', Devin or CodeRabbit, read the configured "
         f"reviewers instead: only a review by {primary} at the head clears this gate."
@@ -4270,8 +4289,8 @@ def _reviewer_config_note() -> str:
 
 
 # WHICH reviewer merge freshness requires comes from the reviewer table
-# (`config/reviewers.yaml` plus the install-local overlay): the one marked
-# `primary`, Codex by default.
+# (`config/reviewers.yaml`, the shipped file only): the one marked `primary`,
+# Codex by default.
 def _primary_reviewer_login() -> str | None:
     """The configured primary reviewer's REST login, or None when unreadable.
 
@@ -4798,8 +4817,8 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     if result.get("status") != "ok" and table_errors:
         return (
             f"The reviewer table is unreadable ({table_errors[0]}), so the review budget "
-            f"for PR #{pr_num} cannot be evaluated. Fix config/reviewers.yaml or "
-            f"~/.genesis/config/reviewers.local.yaml; autonomous sessions are denied."
+            f"for PR #{pr_num} cannot be evaluated. Fix config/reviewers.yaml; "
+            f"autonomous sessions are denied."
         )
     if result.get("status") != "ok":
         return (
@@ -6470,8 +6489,7 @@ def _check_codex_reviewed_head_core(
             True,
             (
                 f"the reviewer table is unreadable ({table_error}), so no review can be "
-                f"matched to its reviewer. Fix config/reviewers.yaml or "
-                f"~/.genesis/config/reviewers.local.yaml (format in the shipped file's "
+                f"matched to its reviewer. Fix config/reviewers.yaml (format in its "
                 f"header), then re-run."
             ),
             None,

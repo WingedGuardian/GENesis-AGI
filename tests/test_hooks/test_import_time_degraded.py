@@ -816,14 +816,34 @@ def test_new_guard_with_old_tree_missing_native_approval_fails_closed(tmp_path, 
     assert message in res.stderr
 
 
-def test_push_guard_with_old_tree_missing_review_findings_fails_closed(tmp_path):
-    """The reviewer table and severity parsers are a HARD dependency of the merge
-    gate: a tree without them must refuse, never exit 1 (which runs the command)."""
+def test_push_guard_with_old_tree_missing_review_findings_degrades_the_merge_gate_only(
+    tmp_path,
+):
+    """The reviewer table and severity parsers are needed by the MERGE gate alone.
+    A tree without them must not take down every git command (exit 1 would run the
+    command; exit 2 would block all of them), and every merge-side reader must fail
+    closed naming the cause."""
     root = _tree(tmp_path, poisoned=False)
     (root / "scripts" / "review_findings.py").unlink()
     res = _run(root, "hooks/git_push_guard.py", "git status", tmp_path / "home_no_findings")
-    assert res.returncode == 2
-    assert "review_findings is incompatible" in res.stderr
+    assert res.returncode == 0, res.stderr
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts/hooks'); import git_push_guard as g;"
+            " sets, block = g._enforced_logins_or_block();"
+            " print(repr((sets, 'unimportable' in block, g._primary_reviewer_login(),"
+            " g._substitute_review_logins(), g.configured_reviewers()[0])))",
+        ],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "HOME": str(tmp_path / "home_no_findings")},
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "({}, True, None, (), None)"
 
 
 def test_commit_guard_with_old_tree_missing_deadline_helper_fails_closed(tmp_path):

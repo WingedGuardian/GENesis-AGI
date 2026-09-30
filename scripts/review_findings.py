@@ -3,8 +3,7 @@
 
 Two things live here, both stdlib-only so every gate can import them:
 
-1. The REVIEWER TABLE, read from ``config/reviewers.yaml`` plus the install-local
-   overlay ``~/.genesis/config/reviewers.local.yaml``. It names the reviewers
+1. The REVIEWER TABLE, read from ``config/reviewers.yaml`` alone. It names the reviewers
    whose reviews count, which one is primary (the one merge freshness asks for),
    which parser reads each one's findings, and the severity words that parser
    maps to ``floor`` / ``minor`` / ``analysis``. The merge gate reads from it the
@@ -23,12 +22,16 @@ REST login (with the ``[bot]`` suffix) and the value space-separated words::
     reviewers:
       chatgpt-codex-connector[bot]: primary parser=codex-badge floor=P1 minor=P2
 
-Words are bare flags (``primary``, ``body-findings``, ``surface-only``,
-``disabled``) or ``key=value`` pairs (``parser``, and the comma-separated word
-lists ``floor``, ``minor``, ``analysis``). An overlay line for a login replaces
-the shipped line; ``disabled`` removes the reviewer. Anything malformed makes the
-whole table UNKNOWN (``None`` plus an error), never a partial table: a reviewer
-silently dropped by a typo would un-count its reviews.
+Words are bare flags (``primary``, ``body-findings``, ``surface-only``) or
+``key=value`` pairs (``parser``, and the comma-separated word lists ``floor``,
+``minor``, ``analysis``). A reviewer is removed by deleting its line. Anything
+malformed makes the whole table UNKNOWN (``None`` plus an error), never a partial
+table: a reviewer silently dropped by a typo would un-count its reviews.
+
+There is deliberately NO install-local overlay. The table decides whose review
+satisfies the merge gate, so it lives only in the shipped file, which changes
+through a reviewed PR; a file outside the repo is one any session can write, and
+a session-writable file must not be able to grant review trust.
 """
 
 from __future__ import annotations
@@ -41,18 +44,17 @@ from pathlib import Path
 
 #: The parsers this module registers, by the name config binds a reviewer to.
 PARSERS = frozenset({"codex-badge", "coderabbit-header", "devin-marker", "codeql"})
-_FLAGS = frozenset({"primary", "body-findings", "surface-only", "disabled"})
+_FLAGS = frozenset({"primary", "body-findings", "surface-only"})
 _LIST_KEYS = ("floor", "minor", "analysis")
 # A GitHub APP's REST login: its lowercase slug plus the `[bot]` suffix. REQUIRED,
 # not optional: a human account's login can never contain `[`, so the suffix is what
-# proves a configured reviewer is an App. Without it an overlay could name the
+# proves a configured reviewer is an App. Without it a config line could name the
 # session's OWN account primary and satisfy merge freshness with its own review.
 # Lowercase-only because App slugs are, and GitHub compares logins case-blind: a
 # `CodeRabbitAI[bot]` line would otherwise match nothing and silently do nothing.
 # Bounded and anchored, so a line cannot put markup into gate output.
 _LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}\[bot\]$")
 _SHIPPED = Path(__file__).resolve().parents[1] / "config" / "reviewers.yaml"
-_OVERLAY = Path.home() / ".genesis" / "config" / "reviewers.local.yaml"
 
 
 @dataclass(frozen=True)
@@ -86,9 +88,9 @@ def _strip_comment(line: str) -> str:
     return line.rstrip()
 
 
-def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
-    """``{login: (reviewer or None when disabled, disabled)}`` for ONE file."""
-    entries: dict[str, tuple[Reviewer | None, bool]] = {}
+def _parse(text: str) -> dict[str, Reviewer]:
+    """``{login: reviewer}`` for the table's text, in file order."""
+    entries: dict[str, Reviewer] = {}
     in_block = False
     for raw in text.splitlines():
         line = _strip_comment(raw)
@@ -110,7 +112,7 @@ def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
         if not _LOGIN_RE.fullmatch(login):
             raise _Malformed("a login is not a GitHub REST login")
         if login in entries:
-            raise _Malformed("a login is listed twice in one file")
+            raise _Malformed("a login is listed twice")
         flags: set[str] = set()
         values: dict[str, str] = {}
         for word in words:
@@ -123,14 +125,6 @@ def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
                 raise _Malformed("an unknown, repeated or empty key")
             else:
                 values[key] = value
-        if "disabled" in flags:
-            # `disabled` stands ALONE: a disabled line that also carries other words
-            # is ambiguous about what was meant, so it is malformed, never a silent
-            # removal of a reviewer.
-            if len(flags) > 1 or values:
-                raise _Malformed("`disabled` must stand alone")
-            entries[login] = (None, True)
-            continue
         parser = values.get("parser")
         if parser not in PARSERS:
             raise _Malformed("every reviewer needs a registered `parser=`")
@@ -141,16 +135,13 @@ def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
             # parsers, so `surface-only` on one would silently still score.
             raise _Malformed("surface-only goes with parser=codeql, and only there")
         lists = {key: tuple(w for w in values.get(key, "").split(",") if w) for key in _LIST_KEYS}
-        entries[login] = (
-            Reviewer(
-                login=login,
-                parser=parser,
-                primary="primary" in flags,
-                body_findings="body-findings" in flags,
-                surface_only="surface-only" in flags,
-                **lists,
-            ),
-            False,
+        entries[login] = Reviewer(
+            login=login,
+            parser=parser,
+            primary="primary" in flags,
+            body_findings="body-findings" in flags,
+            surface_only="surface-only" in flags,
+            **lists,
         )
     return entries
 
@@ -170,30 +161,23 @@ def _source(env_name: str, path: Path) -> str | None:
 def configured_reviewers() -> tuple[dict[str, Reviewer] | None, str | None]:
     """``(table, None)`` or ``(None, error)``. Read fresh on every call.
 
-    The table is ordered shipped-first, then overlay additions, in file order.
-    Exactly one active reviewer is ``primary`` and it is not ``surface-only``;
-    at least one active reviewer is not ``surface-only``. Anything else is an
-    error, and every consumer treats an error as UNKNOWN. The env seams
-    ``_TEST_REVIEWERS_YAML`` / ``_TEST_REVIEWERS_LOCAL_YAML`` replace the two
-    files' TEXT (an empty overlay seam means "no overlay").
+    The table is the shipped file only, in file order; nothing outside the repo
+    is read (see the module docstring for why). Exactly one reviewer is
+    ``primary`` and it is not ``surface-only``; at least one reviewer is not
+    ``surface-only``. Anything else is an error, and every consumer treats an
+    error as UNKNOWN. The env seam ``_TEST_REVIEWERS_YAML`` replaces the shipped
+    file's TEXT.
     """
     try:
         shipped = _source("_TEST_REVIEWERS_YAML", _SHIPPED)
-        overlay = _source("_TEST_REVIEWERS_LOCAL_YAML", _OVERLAY)
     except (OSError, UnicodeDecodeError):
         return None, "reviewers_config_unreadable"
     if shipped is None:
         return None, "reviewers_config_missing"
     try:
-        merged: dict[str, Reviewer | None] = {
-            login: reviewer for login, (reviewer, _) in _parse(shipped).items()
-        }
-        if overlay is not None:
-            for login, (reviewer, _) in _parse(overlay).items():
-                merged[login] = reviewer
+        table = _parse(shipped)
     except _Malformed:
         return None, "reviewers_config_malformed"
-    table = {login: r for login, r in merged.items() if r is not None}
     primaries = [r for r in table.values() if r.primary]
     if len(primaries) != 1 or primaries[0].surface_only:
         return None, "reviewers_config_malformed"
@@ -214,29 +198,21 @@ def enforced_logins() -> tuple[dict[str, frozenset[str]] | None, str | None]:
     """``({parser: logins}, None)`` — whose findings the merge gate READS with
     which parser — or ``(None, error)`` when the table is unknown.
 
-    Every reviewer the table TRUSTS is here, so a trusted reviewer's findings are
-    always read. And the SHIPPED file's reviewers are here even when the overlay
-    disables one: the overlay lives outside the repo, in a file any session can
-    write, so it may ADD enforcement but never remove it. ``disabled`` therefore
-    withdraws a reviewer's trust (primary, stand-in) and leaves its findings scored.
-    An unknown table is an error, never an empty set: an empty set would drop every
-    finding to the unscored channel, which is a fail-open.
+    Every reviewer the table names is here, so a trusted reviewer's findings are
+    always read. An unknown table is an error, never an empty set: an empty set
+    would drop every finding to the unscored channel, which is a fail-open.
     """
     table, error = configured_reviewers()
     if error or not table:
         return None, error or "reviewers_config_missing"
-    try:
-        shipped = _parse(_source("_TEST_REVIEWERS_YAML", _SHIPPED) or "")
-    except (_Malformed, OSError, UnicodeDecodeError):
-        return None, "reviewers_config_malformed"
     by_parser: dict[str, set[str]] = {}
-    for reviewer in [*table.values(), *(r for r, _ in shipped.values() if r is not None)]:
+    for reviewer in table.values():
         by_parser.setdefault(reviewer.parser, set()).add(reviewer.login)
     return {parser: frozenset(logins) for parser, logins in by_parser.items()}, None
 
 
 def substitute_reviewer_logins() -> tuple[str, ...]:
-    """Every active non-primary reviewer that reviews (not ``surface-only``).
+    """Every non-primary reviewer that reviews (not ``surface-only``).
 
     Empty when the table is unknown: no substitute is ever offered on config the
     gate could not read.

@@ -504,7 +504,7 @@ def test_the_round_counter_counts_the_tables_primary(monkeypatch):
     _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
     assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 0
     monkeypatch.setenv(
-        "_TEST_REVIEWERS_LOCAL_YAML",
+        "_TEST_REVIEWERS_YAML",
         f"reviewers:\n  {rb.CODEX_REVIEW_BOT}: parser=codex-badge\n  {devin}: primary parser=devin-marker\n",
     )
     got = rb.evaluate_pr("o/r", 1, external_identity_templates=())

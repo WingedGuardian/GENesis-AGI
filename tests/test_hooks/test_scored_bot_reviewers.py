@@ -128,28 +128,20 @@ class TestDevinSeverity:
         """A2a round 1 (Codex P1 / Devin 🔴): a reviewer the table TRUSTS must be a
         reviewer whose findings are READ. Bound to the Devin parser, its severe
         finding hits the floor exactly as Devin's does."""
+        shipped = (_GUARD.parents[2] / "config" / "reviewers.yaml").read_text(encoding="utf-8")
         monkeypatch.setenv(
-            "_TEST_REVIEWERS_LOCAL_YAML",
-            "reviewers:\n  acme-review[bot]: parser=devin-marker\n",
+            "_TEST_REVIEWERS_YAML", shipped + "  acme-review[bot]: parser=devin-marker\n"
         )
         block, msg = _scan(
             guard, [_c(1, _devin_body("🔴", "Severe from an added reviewer"), login="acme-review[bot]")]
         )
         assert block and "always-fix floor" in msg
 
-    def test_an_overlay_cannot_silence_a_shipped_reviewers_floor(self, guard, monkeypatch):
-        """The overlay is an unprotected file any session can write, so `disabled`
-        there withdraws a reviewer's TRUST but never its findings: a shipped
-        reviewer's severe finding still hits the floor."""
-        monkeypatch.setenv("_TEST_REVIEWERS_LOCAL_YAML", f"reviewers:\n  {DEVIN}: disabled\n")
-        block, msg = _scan(guard, [_c(1, _devin_body("🔴", "A severe from a disabled reviewer"))])
-        assert block and "always-fix floor" in msg
-
     def test_an_unreadable_table_blocks_the_scan_instead_of_reading_nobody(self, guard, monkeypatch):
         """Fix-audit B-1: an empty scanner set would drop every finding to the
         unscored channel — under `# stale-review-override`, which waives the
         freshness table-error block, nothing else would catch it."""
-        monkeypatch.setenv("_TEST_REVIEWERS_LOCAL_YAML", "reviewers:\n  Bad: x\n")
+        monkeypatch.setenv("_TEST_REVIEWERS_YAML", "reviewers:\n  Bad: x\n")
         block, msg = _scan(guard, [_c(1, _devin_body("🔴", "Severe while the table is broken"))])
         assert block and "reviewer table is unreadable" in msg
         # `# review-override` (force) still waives the scan, as it always has.

@@ -8,14 +8,15 @@
 #   flags:  primary        the reviewer merge freshness asks for (exactly one)
 #           body-findings  also reads findings posted in the review BODY
 #           surface-only   its findings are shown, never counted or scored
-#           disabled       (overlay only) remove a reviewer listed here
 #   keys:   parser=        codex-badge | coderabbit-header | devin-marker | codeql
 #           floor= minor= analysis=   comma-separated severity words that
 #                          parser reports, by class
 #
-# These are the review apps installed on this repository. An install changes the
-# set in ~/.genesis/config/reviewers.local.yaml (same format): a line there
-# replaces the line here for that login, and `<login>: disabled` removes one.
+# These are the review apps installed on this repository. The set changes ONLY
+# through a PR to this file (delete a line to remove a reviewer). There is no
+# install-local overlay on purpose: this table decides whose review satisfies the
+# merge gate, and a file outside the repo is one any session can write, so it
+# must not be able to grant review trust.
 #
 # Logins are GitHub App logins: lowercase, with the `[bot]` suffix (anything else
 # is malformed). A malformed file makes the whole table UNKNOWN, never a partial

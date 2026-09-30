@@ -217,20 +217,6 @@ def pytest_unconfigure(config):
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──
 @pytest.fixture(autouse=True)
-def _pin_reviewer_overlay(monkeypatch):
-    """Pin the reviewer table's install-local overlay for EVERY test.
-
-    ``review_findings.configured_reviewers`` reads the shipped
-    ``config/reviewers.yaml`` plus ``~/.genesis/config/reviewers.local.yaml``;
-    without this pin a test's reviewer set would be whatever the dev box
-    declares (the merge gate is imported and run well outside tests/test_hooks).
-    Pinned to NO overlay: tests run against the shipped table, and a
-    test that wants a different set sets the two ``_TEST_REVIEWERS_*`` seams."""
-    monkeypatch.setenv("_TEST_REVIEWERS_LOCAL_YAML", "")
-    yield
-
-
-@pytest.fixture(autouse=True)
 def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     """Redirect circuit breaker state file to tmp_path for all tests."""
     import genesis.routing.circuit_breaker as cb_mod

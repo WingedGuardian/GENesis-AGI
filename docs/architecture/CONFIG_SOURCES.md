@@ -186,18 +186,18 @@ overlay key. It also lists and writes any existing repo-sibling `config/*.local.
 which is an overlay rather than a base, and the read-only list matches exact file
 names, so an overlay of a read-only file is editable (#2446).
 
-**E. Reviewer table** — `config/reviewers.yaml` plus `~/.genesis/config/reviewers.local.yaml`,
-read by `scripts/review_findings.py::configured_reviewers` (stdlib line parser, no YAML
-library, because every review gate imports it). Re-read on every call. An overlay line
-REPLACES the base line for the same reviewer login and `<login>: disabled` removes one;
-there is no deep merge. Unlike pattern A, a malformed file of EITHER kind is not ignored:
-the whole table reads as unknown and the merge gate blocks, naming the config error,
-rather than silently dropping a reviewer. The merge gate reads from it the primary
-(freshness), the substitute set, and which logins its inline finding scanner reads with
-each parser; the round counter (`scripts/review_budget.py`) counts the primary's reviewed
-heads. The overlay path follows `$HOME`, so a process run under another account (sudo,
-CI) sees a different table. Not a settings domain: no dashboard or `settings_update`
-writer.
+**E. Reviewer table** — `config/reviewers.yaml` ONLY, read by
+`scripts/review_findings.py::configured_reviewers` (stdlib line parser, no YAML library,
+because every review gate imports it). Re-read on every call. There is deliberately no
+install-local overlay: the table decides whose review satisfies the merge gate, and a
+file outside the repo is one any session can write, so it must not be able to grant
+review trust. Reviewers change only through a PR to the shipped file. Unlike pattern A,
+a malformed file is not ignored: the whole table reads as unknown and the merge gate
+blocks, naming the config error, rather than silently dropping a reviewer. The merge gate
+reads from it the primary (freshness), the substitute set, and which logins its inline
+finding scanner reads with each parser; the round counter (`scripts/review_budget.py`)
+counts the primary's reviewed heads. Not a settings domain: no dashboard or
+`settings_update` writer.
 
 ---
 

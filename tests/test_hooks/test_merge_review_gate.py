@@ -6957,7 +6957,7 @@ def test_review_body_scan_blocks_when_the_reviewer_table_is_unreadable(guard_mod
     tell a Codex verdict from anyone else's, so it blocks rather than walk to 'clean'."""
     import json as _json
 
-    monkeypatch.setenv("_TEST_REVIEWERS_LOCAL_YAML", "reviewers:\n  Bad: x\n")
+    monkeypatch.setenv("_TEST_REVIEWERS_YAML", "reviewers:\n  Bad: x\n")
     body = {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": "[P1] a real bug"}
     with patch.object(
         guard_module.subprocess,

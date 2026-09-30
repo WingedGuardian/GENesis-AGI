@@ -1275,8 +1275,8 @@ def _commit_budget_reason(result: dict) -> str:
         if table_errors:
             return (
                 f"The reviewer table is unreadable ({table_errors[0]}), so the review "
-                f"budget cannot be evaluated. Fix config/reviewers.yaml or "
-                f"~/.genesis/config/reviewers.local.yaml; autonomous sessions are denied."
+                f"budget cannot be evaluated. Fix config/reviewers.yaml; autonomous "
+                f"sessions are denied."
             )
         return (
             "The open pull request's review history could not be read reliably. "
