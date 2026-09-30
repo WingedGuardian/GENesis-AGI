@@ -211,7 +211,7 @@ def test_an_ignored_file_the_upstream_adds_is_refused_before_the_stop(ignored_co
     head = _git(clone, "rev-parse", "HEAD")
     r = _run(_fetch_script(clone), tmp_path)
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "adds files that already exist here" in r.stdout
+    assert "brings in files that already exist here" in r.stdout
     assert "local.env" in r.stdout
     assert "CLEARED-STATE" in r.stdout and "ROLLBACK" not in r.stdout
     assert (clone / "local.env").read_bytes() == b"LOCAL-SECRET\n"
@@ -223,7 +223,56 @@ def test_the_same_diverged_range_without_the_local_file_is_admitted(ignored_coll
     up, clone = ignored_collision
     r = _run(_fetch_script(clone), tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "adds files that already exist" not in r.stdout
+    assert "brings in files that already exist" not in r.stdout
+
+
+def _late_scan_script(clone: Path) -> str:
+    _git(clone, "fetch", "-q", "origin")
+    deploy_head = _git(clone, "rev-parse", "origin/main")
+    return (
+        f'GENESIS_ROOT="{clone}"\nUPDATE_REMOTE=origin\nDEPLOY_BRANCH=main\n'
+        f'DEPLOY_HEAD="{deploy_head}"\n'
+        '. "'
+        + str(REPO_ROOT / "scripts/lib/deploy_checkout.sh")
+        + '"\n'
+        + _STUBS
+        + _block("late-collision-scan")
+        + 'echo "MERGE-WOULD-RUN"\n'
+    )
+
+
+def test_a_file_that_appears_during_the_stop_is_refused_before_the_merge(
+    ignored_collision, tmp_path
+):
+    """The pre-stop scan cannot see a file created during the stop; on a diverged
+    (3-way) merge the flag does not protect it either. The scan runs again as the
+    last step before the merge, and a hit rolls back with HEAD unmoved — so the
+    rollback's reset leaves the ignored file exactly as it was."""
+    up, clone = ignored_collision
+    head = _git(clone, "rev-parse", "HEAD")
+    (clone / "local.env").write_bytes(b"LOCAL-SECRET\n")  # created during the stop
+    r = _run(_late_scan_script(clone), tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "ROLLBACK: incoming files collide" in r.stdout and "local.env" in r.stdout
+    assert "MERGE-WOULD-RUN" not in r.stdout
+    assert (clone / "local.env").read_bytes() == b"LOCAL-SECRET\n"
+    assert _git(clone, "rev-parse", "HEAD") == head
+
+
+def test_the_late_scan_lets_a_clean_range_through(ignored_collision, tmp_path):
+    """Control: the same diverged range with nothing in the way reaches the merge."""
+    up, clone = ignored_collision
+    r = _run(_late_scan_script(clone), tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "MERGE-WOULD-RUN" in r.stdout and "ROLLBACK" not in r.stdout
+
+
+def test_the_late_scan_sits_between_the_clear_and_the_merge():
+    text = UPDATE.read_text()
+    clear = text.index("# END ephemeral-clear")
+    scan = text.index("# BEGIN late-collision-scan")
+    merge = text.index('merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit')
+    assert clear < scan < merge
 
 
 def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path):
@@ -555,6 +604,67 @@ def test_every_cleared_path_is_one_the_dirty_gate_excuses():
 
 
 # ── retention for the backups ───────────────────────────────────────────────
+
+
+# ── the rollback's reset keeps edits too ────────────────────────────────────
+
+
+def _rollback_script(root: Path, post_merge: bool, between: str = "") -> str:
+    return (
+        f'GENESIS_ROOT="{root}"\nPOST_MERGE={"true" if post_merge else "false"}\n'
+        + _deploy_head(root)
+        + _STUBS
+        + _block("ephemeral-prestop-backup")
+        + 'echo "ROOT=$EPHEMERAL_BACKUP_ROOT"\n'
+        + between
+        + '_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"\n'
+    )
+
+
+def test_a_post_merge_rollback_backs_up_edits_first(dirty_checkout, tmp_path):
+    """--post-merge takes no pre-stop backup, so the rollback's reset would drop an
+    edit made there with no copy. The rollback now saves it first."""
+    root = dirty_checkout
+    (root / "AGENTS.md").write_text("edited before a --post-merge run\n")
+    r = _run(_rollback_script(root, post_merge=True), tmp_path / "home")
+    assert r.returncode == 0, r.stderr
+    backup_root = Path(re.search(r"ROOT=(\S+)", r.stdout).group(1))
+    assert not (backup_root / "AGENTS.md").exists(), "control: post-merge took no pre-stop backup"
+    saved = backup_root / "rollback" / "AGENTS.md" / "current"
+    assert saved.read_text() == "edited before a --post-merge run\n", r.stdout
+
+
+def test_an_edit_made_after_the_backup_is_saved_before_the_reset(dirty_checkout, tmp_path):
+    root = dirty_checkout
+    (root / "AGENTS.md").write_text("first local edit\n")
+    later = f'printf "rewritten during the update\\n" > "{root}/AGENTS.md"\n'
+    r = _run(_rollback_script(root, post_merge=False, between=later), tmp_path / "home")
+    assert r.returncode == 0, r.stderr
+    backup_root = Path(re.search(r"ROOT=(\S+)", r.stdout).group(1))
+    assert (backup_root / "AGENTS.md" / "current").read_text() == "first local edit\n"
+    assert (
+        backup_root / "rollback" / "AGENTS.md" / "current"
+    ).read_text() == "rewritten during the update\n"
+
+
+def test_an_unchanged_edit_is_not_backed_up_twice(dirty_checkout, tmp_path):
+    root = dirty_checkout
+    (root / "AGENTS.md").write_text("one local edit\n")
+    r = _run(_rollback_script(root, post_merge=False), tmp_path / "home")
+    assert r.returncode == 0, r.stderr
+    backup_root = Path(re.search(r"ROOT=(\S+)", r.stdout).group(1))
+    assert (backup_root / "AGENTS.md" / "current").exists()
+    assert not (backup_root / "rollback").exists(), r.stdout
+
+
+def test_the_rollback_saves_edits_before_its_reset():
+    text = UPDATE.read_text()
+    start = text.index("_do_rollback() {")
+    body = text[start : text.index("\n}\n", start)]
+    body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+    save = body.index('_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"')
+    reset = body.index('reset --hard "$ROLLBACK_TAG"')
+    assert save < reset
 
 
 def test_disk_hygiene_prunes_old_backup_runs_only(tmp_path):

@@ -320,6 +320,43 @@ def test_the_range_is_taken_from_the_merge_base(ranged):
     assert _collisions(root, head, incoming) == (1, ["new.env"])
 
 
+def test_an_incoming_modification_over_a_locally_detracked_file_collides(tmp_path):
+    """The local branch deleted tracked `X` and keeps an ignored copy; upstream
+    MODIFIES `X`. From the merge base that is `M`, not `A`, and git writes the
+    incoming version over the local file in the modify/delete conflict (measured,
+    git 2.43), so the scan must cover every change but a deletion."""
+    root = tmp_path / "root"
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    (root / "X").write_text("base\n")
+    (root / "f").write_text("1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "base")
+    _git(root, "checkout", "-q", "-b", "incoming")
+    (root / "X").write_text("upstream modification\n")
+    _git(root, "commit", "-qam", "upstream modifies X")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "main")
+    _git(root, "rm", "-q", "X")
+    _git(root, "commit", "-qm", "local deletes X")
+    (root / ".git" / "info" / "exclude").write_text("X\n")
+    (root / "X").write_text("LOCAL-SECRET\n")
+    head = _git(root, "rev-parse", "HEAD")
+    add_only = _git(root, "diff", "--name-only", "--diff-filter=A", f"{head}...{incoming}")
+    assert "X" not in add_only.splitlines(), "control: an additions-only scan misses X"
+    assert _collisions(root, head, incoming) == (1, ["X"])
+
+
+def test_an_incoming_modification_of_a_tracked_file_is_not_a_collision(ranged):
+    """A path the local side still tracks is git's own to merge."""
+    root, base, _ = ranged
+    _git(root, "checkout", "-q", "-b", "touch-f")
+    (root / "f").write_text("changed upstream\n")
+    _git(root, "commit", "-qam", "modifies f")
+    modifies_f = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "main")
+    assert _collisions(root, base, modifies_f) == (0, [])
+
+
 def test_an_unlistable_range_returns_2(ranged):
     root, base, _ = ranged
     assert _collisions(root, base, "0" * 40) == (2, [])
@@ -339,7 +376,8 @@ def test_both_deploy_paths_source_the_lib_and_keep_no_inline_copy():
         code = "\n".join(_code_lines(script))
         for inline in ("--git-common-dir", "--absolute-git-dir", "--is-inside-work-tree"):
             assert inline not in code, f"{script.name} carries an inline {inline} check"
-        assert "--diff-filter=A" not in code, f"{script.name} carries an inline collision scan"
+        for spelling in ("--diff-filter=A", "--diff-filter=d"):
+            assert spelling not in code, f"{script.name} carries an inline collision scan"
         for call in (
             "genesis_checkout_git_dirs",
             "genesis_is_primary_checkout",

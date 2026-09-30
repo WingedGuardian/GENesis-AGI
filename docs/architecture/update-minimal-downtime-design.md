@@ -120,20 +120,26 @@ through the rollback trap.
 - **The fetched head is pinned** from the tracking ref an explicit refspec
   writes, and the merge takes that commit. `FETCH_HEAD` is not used: every fetch
   rewrites it, and other sessions fetch in the same checkout.
-- **Incoming additions that would overwrite a local untracked or ignored file are
-  refused** (`genesis_range_collisions`, over the range from the merge base). The
+- **Incoming changes that would overwrite a local untracked or ignored file are
+  refused** (`genesis_range_collisions`, over the range from the merge base, every
+  change but a deletion: an incoming MODIFICATION of a path the local branch
+  deleted and keeps an ignored copy of is overwritten in the modify/delete
+  conflict too). The
   merge also passes `--no-overwrite-ignore`, but git 2.43 honours that only on a
   fast-forward; a true 3-way merge overwrites the file, and a rollback's
-  `reset --hard` then deletes it. So the scan, before the stop, is the protection;
-  the flag covers a file that appears during the stop on a fast-forward.
+  `reset --hard` then deletes it. So the scan is the protection: before the stop,
+  and again as the last step before the merge (`late-collision-scan`), where a hit
+  rolls back with HEAD unmoved, which leaves an untracked file where it is.
 - **Local edits to the ephemeral files are backed up** (`ephemeral-prestop-backup`)
   between the fetch and `_write_state "fetching"` — every dirty one, because a
   rollback's `reset --hard` discards any of them. The clear before the merge
   touches only the files the incoming range changes, plus any with a STAGED edit
   (git keeps an unstaged edit to any other file through the merge, but a true
   3-way merge refuses on any index change), and discards a file's edits only when a backup of
-  its current content exists. After the stop, the merge is also checked against
-  the branch the run started on.
+  its current content exists. `_do_rollback` saves any dirty ephemeral file whose
+  current edits have no backup (a `--post-merge` run, or an edit made after the
+  backup) before its `reset --hard`. After the stop, the merge is also checked
+  against the branch the run started on.
 
 ## New test — phase-order lock
 

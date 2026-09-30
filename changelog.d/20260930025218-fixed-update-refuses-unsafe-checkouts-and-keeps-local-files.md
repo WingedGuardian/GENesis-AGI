@@ -17,16 +17,16 @@
   on, is rolled back.
 - **`update.sh` no longer overwrites a local ignored file that the update starts
   tracking.** Before any service stops, it lists the files the incoming commits
-  add and refuses, naming them, if any already exist locally as untracked or
+  add or change and refuses, naming them, if any already exist locally as untracked or
   ignored files (a local settings or secrets file, for example). Move them aside and
-  re-run. On a fast-forward, the merge itself also refuses to overwrite one that
-  appears later.
+  re-run. The same check runs again as the last step before the merge, so a file
+  that appears while services are stopped is refused too, before anything merges.
 - **Local edits to `AGENTS.md` and `config/procedure_triggers.yaml` are kept.**
   `update.sh` used to discard them before every merge, with no copy. It now saves
   them first, before any service stops, under `~/.genesis/premerge-backups/<run>/`
-  (a patch plus a copy) and prints where — so a rollback, which resets tracked
-  files, cannot lose them either. It discards an edit only when the update changes
+  (a patch plus a copy) and prints where. `update.sh`'s own rollback, which resets
+  tracked files, first saves any edit not already backed up, including on a
+  `--post-merge` run. It discards an edit only when the update changes
   that file or the edit is staged (otherwise git keeps it through the merge), and
-  only once a backup of
-  its current content exists. The daily disk-hygiene run prunes these backups
+  only once a backup of its current content exists. The daily disk-hygiene run prunes these backups
   after 45 days.

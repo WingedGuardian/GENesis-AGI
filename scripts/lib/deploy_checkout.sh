@@ -88,20 +88,35 @@ genesis_untracked_node() {
     [ -z "$tracked" ]
 }
 
-# Paths the range <from>...<to> ADDS that already exist in <root> untracked (or
-# with an untracked file where a parent directory goes). git refuses to overwrite a
+# Paths the range <from>...<to> brings in (every change but a deletion) that
+# already exist in <root> untracked (or with an untracked file where a parent
+# directory goes). Not only additions: when a diverged local branch deleted a
+# tracked path and keeps an ignored local copy there, the incoming side's
+# MODIFICATION of it is `M` from the merge base, and git writes that version over
+# the local file in the modify/delete conflict (measured, git 2.43); the
+# conflict path's `merge --abort` then removes it. git refuses to overwrite a
 # plain untracked file, but it overwrites an IGNORED one without asking (measured,
 # git 2.43), and on a true 3-way merge `--no-overwrite-ignore` does not stop it: a
 # local secrets or settings file would be lost. The range is taken from the merge
 # base (`...`), so on a fast-forward it is exactly <from>..<to>, and on a diverged
-# branch it is what the incoming side adds.
+# branch it is what the incoming side changes. A path the local side still
+# tracks is git's own to merge, so only untracked ones count.
 # Prints the colliding paths, one per line. Returns 0 when there are none, 1 when
 # there are, 2 when the range cannot be listed.
 genesis_range_collisions() {
-    local root="$1" from="$2" to="$3" collisions="" f p
-    git -C "$root" diff --no-renames --name-only --diff-filter=A "$from...$to" >/dev/null 2>&1 \
+    local root="$1" from="$2" to="$3" collisions="" f p t
+    git -C "$root" diff --no-renames --name-only --diff-filter=d "$from...$to" >/dev/null 2>&1 \
         || return 2
+    # A path in the index can never collide, and the second scan runs while the
+    # server is stopped, so the index is read ONCE and those paths skip the two
+    # per-path git calls below. An unreadable index leaves the set empty: every
+    # path then takes the full check, which is slower, never less safe.
+    local -A tracked=()
+    while IFS= read -r -d '' t; do
+        tracked["$t"]=1
+    done < <(git -C "$root" ls-files -z 2>/dev/null)
     while IFS= read -r -d '' f; do
+        [ -n "${tracked[$f]:-}" ] && continue
         if genesis_untracked_node "$root" "$f"; then
             collisions+="$f"$'\n'
             continue
@@ -116,7 +131,7 @@ genesis_range_collisions() {
                 break
             fi
         done
-    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=A "$from...$to" 2>/dev/null)
+    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$from...$to" 2>/dev/null)
     printf '%s' "$collisions"
     [ -z "$collisions" ]
 }

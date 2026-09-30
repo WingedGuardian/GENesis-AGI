@@ -815,7 +815,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
     fi
     echo "  Deploy target: $UPDATE_REMOTE/$DEPLOY_BRANCH at ${DEPLOY_HEAD:0:12}"
 
-    # Paths the incoming side ADDS that already exist here untracked or IGNORED.
+    # Paths the incoming side adds or changes that already exist here untracked or IGNORED.
     # git overwrites an ignored file without asking, and on a true 3-way merge
     # `--no-overwrite-ignore` (on the merge below) does not stop it (measured, git
     # 2.43); a rollback's `reset --hard` then deletes the file, because the rollback
@@ -825,9 +825,9 @@ if [[ "$POST_MERGE" == "false" ]]; then
     _collisions="$(genesis_range_collisions "$GENESIS_ROOT" HEAD "$DEPLOY_HEAD")" || _coll_rc=$?
     if [ "$_coll_rc" -ne 0 ]; then
         if [ "$_coll_rc" -eq 2 ]; then
-            echo "  Could not list the files $UPDATE_REMOTE/$DEPLOY_BRANCH adds — server NOT stopped, nothing changed."
+            echo "  Could not list the files $UPDATE_REMOTE/$DEPLOY_BRANCH brings in — server NOT stopped, nothing changed."
         else
-            echo "ERROR: $UPDATE_REMOTE/$DEPLOY_BRANCH adds files that already exist here untracked or ignored;"
+            echo "ERROR: $UPDATE_REMOTE/$DEPLOY_BRANCH brings in files that already exist here untracked or ignored;"
             echo "       the merge would overwrite them. Move them aside first — server NOT stopped, nothing changed:"
             printf '%s\n' "$_collisions" | sed 's/^/         /'
         fi
@@ -888,6 +888,28 @@ _ephemeral_backup_is_current() {
     [ -f "$dest/worktree.patch" ] && [ -f "$dest/index.patch" ] \
         && cmp -s "$dest/worktree.patch" <(git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p") \
         && cmp -s "$dest/index.patch" <(git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p")
+}
+
+# Called by _do_rollback just before its `reset --hard`, which discards edits to
+# every tracked file. The pre-stop backup can be missing (a --post-merge run takes
+# none) or stale (an indexer rewrote AGENTS.md after it), so each dirty ephemeral
+# file whose CURRENT edits are not already saved is backed up under <root>/rollback.
+# Never fails: a rollback must go ahead, so a failed backup is named, not fatal.
+_ephemeral_backup_before_reset() {
+    local root="$1" p
+    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
+        _ephemeral_is_dirty "$p" || continue
+        if _ephemeral_backup_is_current "$p" "$root" \
+            || _ephemeral_backup_is_current "$p" "$root/late"; then
+            continue
+        fi
+        if _ephemeral_backup "$p" "$root/rollback"; then
+            echo "  Backed up local edits to $p before the rollback: $root/rollback/$p"
+        else
+            echo "  WARNING: could not back up local edits to $p before the rollback — the reset discards them."
+        fi
+    done
+    return 0
 }
 
 if [[ "$POST_MERGE" == "false" ]]; then
@@ -1248,6 +1270,15 @@ _do_rollback() {
     fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
 
+    # The reset below discards edits to every tracked file. Save the ephemeral
+    # files' current edits first, when no backup of them exists yet. (The helper is
+    # defined with the pre-stop backup; this function is only reached after it.)
+    if declare -F _ephemeral_backup_before_reset >/dev/null; then
+        _ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"
+    else
+        echo "  WARNING: the ephemeral-file backup helper is not defined; the reset may discard local edits."
+    fi
+
     # Restore the original branch, then reset it to the rollback tag.
     # This keeps us on a named branch (not detached HEAD) at the pre-update state.
     local checkout_ok=true
@@ -1497,6 +1528,30 @@ for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
     fi
 done
 # END ephemeral-clear
+
+# The pre-stop collision scan again, as the last step before the merge. A file
+# created during the stop (another session, an editor) is not covered by the
+# first scan, and on a true 3-way merge `--no-overwrite-ignore` does not protect
+# it. Refused here, HEAD has not moved, so the rollback's reset leaves an
+# untracked or ignored file where it is.
+# BEGIN late-collision-scan (extracted by tests/test_scripts/test_update_activation.py)
+_late_coll_rc=0
+_late_collisions="$(genesis_range_collisions "$GENESIS_ROOT" HEAD "$DEPLOY_HEAD")" || _late_coll_rc=$?
+if [ "$_late_coll_rc" -ne 0 ]; then
+    if [ "$_late_coll_rc" -eq 2 ]; then
+        echo "  Could not list the files $UPDATE_REMOTE/$DEPLOY_BRANCH brings in, just before the merge."
+        _late_reason="could not list the files the incoming range brings in"
+    else
+        echo "  Files appeared during the stop that $UPDATE_REMOTE/$DEPLOY_BRANCH brings in; the merge would overwrite them:"
+        printf '%s\n' "$_late_collisions" | sed 's/^/    /'
+        echo "  Move them aside and re-run."
+        _late_reason="incoming files collide with local untracked or ignored files: $(printf '%s' "$_late_collisions" | tr '\n' ' ')"
+    fi
+    trap - ERR INT TERM
+    _do_rollback "$_late_reason"
+    exit 1
+fi
+# END late-collision-scan
 
 echo "--- Merging $UPDATE_REMOTE/$DEPLOY_BRANCH (${DEPLOY_HEAD:0:12}) ---"
 MERGE_OUTPUT=""

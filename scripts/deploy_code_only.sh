@@ -549,7 +549,8 @@ _pull() {
             die "$_f is edited locally and changed upstream — run scripts/update.sh, which carries it across."
         fi
     done
-    # Paths the range ADDS that already exist here, untracked (or with a file
+    # Paths the range brings in that already exist here, untracked (on a fast-forward
+    # these can only be additions: every path it changes is tracked here) (or with a file
     # where a parent directory goes): git would overwrite an IGNORED one without
     # asking. The scan is the shared lib's genesis_range_collisions; only what git
     # does NOT track counts.
