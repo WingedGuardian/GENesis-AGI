@@ -1,10 +1,11 @@
-- **The merge gate now reads each CI check by its latest result.** A PR whose CI
-  failed (for example on a broken base branch) and then passed in a new run on
-  the same head used to stay `ci: red`, because the check rollup keeps every run.
-  For each check (same job name and workflow), the result that completed last
-  now decides: a later success clears an earlier failure, and a later failure or
-  cancellation overturns an earlier success. Results that finished in the same
-  second are all kept, so any failure among them still reads red, and a check
-  whose completion time is unknown is never cleared. A newer run that skipped a
-  job does not clear that job's earlier failure. This does not block re-running
-  a failed job until it passes: GitHub reports only a re-run's latest attempt.
+- **The merge gate now reads CI from the newest run of each workflow.** A PR
+  whose CI failed (for example on a broken base branch) and then passed in a
+  new run on the same head used to stay `ci: red`, because the check rollup
+  keeps every run. For each workflow, the newest run on the head now decides as
+  a whole: a newer passing run clears an older run's failures, and a newer run
+  that failed, was cancelled or is still running decides the result in the same
+  way. Results are never mixed across runs, so two failed runs cannot add up to
+  a pass. A newer run that skips a job also clears that job's failure from an
+  older run. A check whose run cannot be identified is always counted. This does
+  not block re-running a failed job until it passes: GitHub reports only a
+  re-run's latest attempt.
