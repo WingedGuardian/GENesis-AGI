@@ -30,7 +30,24 @@ async def observation_write(
     category: str | None = None,
     speculative: bool = False,
 ) -> str:
-    """Write processed reflection/observation. Returns observation_id."""
+    """Record an observation: a typed, prioritized note for Genesis's cognitive loops.
+
+    Use for signals other subsystems should act on or surface later (e.g. a
+    ``task_detected`` from conversation, a ``user_signal`` from an inbox
+    evaluation). Durable facts and decisions belong in ``memory_store`` instead.
+
+    ``source`` names the writer (e.g. ``conversation_intent``,
+    ``inbox_evaluation``); ``type`` is a free-form kind that also sets its
+    lifetime: most types expire and are auto-resolved after a type-specific
+    TTL (unlisted types after 14 days), and only a few are permanent.
+    ``priority`` must be one of low / medium / high / critical;
+    any other value fails the write. ``speculative`` marks an unverified
+    inference. The writer's session origin is stamped automatically.
+
+    Returns the new observation_id, or ``"duplicate_skipped"`` when an unresolved
+    observation with the same source, identical content and the same writer
+    origin already exists.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -65,7 +82,13 @@ async def observation_query(
     resolved: bool | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Query observations by type/priority/source."""
+    """List observations, newest first, filtered by type, priority, source, or resolved state.
+
+    Returns at most ``limit`` rows (default 50) and no total count, so a result
+    of exactly ``limit`` rows is truncated: raise ``limit`` or narrow the
+    filters before concluding something is absent. Each row includes its id,
+    for ``observation_resolve``.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -84,7 +107,11 @@ async def observation_resolve(
     observation_id: str,
     resolution_notes: str,
 ) -> bool:
-    """Mark observation resolved with notes."""
+    """Mark one observation resolved, recording why in ``resolution_notes``.
+
+    Resolved observations stop surfacing and no longer block a duplicate write
+    of the same content. Returns True if the observation was found and updated.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
