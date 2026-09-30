@@ -295,17 +295,67 @@ def test_a_same_named_key_in_an_UNRELATED_section_is_not_a_duplicate(
     assert "more than" not in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("body", ["off", "[secrets_env]", '"secrets_env: off"'])
+@pytest.mark.parametrize(
+    "body", ["off", "false", "0", "[]", '""', "[secrets_env]", '"secrets_env: off"']
+)
 def test_a_non_mapping_asks_section_keeps_the_ask_and_says_so(config_file, capsys, body) -> None:
     config_file.write_text(f"hooks:\n  asks: {body}\n")
     assert policy.ask_suppressed(_KEY) is False
     assert "not a mapping" in capsys.readouterr().err
 
 
-def test_a_bodiless_asks_key_keeps_the_ask(config_file) -> None:
+@pytest.mark.parametrize("body", ["false", "off", "0", "[]", '""', "[x]", "5"])
+def test_a_non_mapping_hooks_section_keeps_the_ask_and_says_so(config_file, capsys, body) -> None:
+    """Falsey values included: `or {}` used to read `hooks: false` / `[]` / `0`
+    as "declared nothing" and drop the operator's declaration without a word."""
+    config_file.write_text(f"hooks: {body}\n")
+    assert policy.ask_suppressed(_KEY) is False
+    assert "not a mapping" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("body", ["false", "0", "[]", '""', "[x]"])
+def test_a_non_mapping_config_document_keeps_the_ask_and_says_so(config_file, capsys, body) -> None:
+    config_file.write_text(f"{body}\n")
+    assert policy.ask_suppressed(_KEY) is False
+    assert "not a mapping" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "hooks:\n",
+        "hooks: null\n",
+        "hooks: ~\n",
+        "hooks: {}\n",
+        "hooks:\n  asks:\n",
+        "other: 1\n",
+    ],
+)
+def test_an_empty_file_or_bodiless_hooks_declares_nothing_quietly(
+    config_file, capsys, text
+) -> None:
+    """CONTROL: None (an empty file, a bodiless key) or an absent section is no
+    declaration, so there is nothing to report."""
+    config_file.write_text(text)
+    assert policy.ask_suppressed(_KEY) is False
+    assert capsys.readouterr().err == ""
+
+
+def test_a_bodiless_asks_key_keeps_the_ask(config_file, capsys) -> None:
     """YAML loads a bodiless key as None, not {}."""
     config_file.write_text("hooks:\n  asks:\n")
     assert policy.ask_suppressed(_KEY) is False
+    assert capsys.readouterr().err == ""
+
+
+def test_a_long_malformed_value_is_clipped_in_the_note(config_file, capsys) -> None:
+    """The note quotes the value; a whole file must not flood the prompt."""
+    config_file.write_text("- " + "x" * 3000 + "\n")
+    assert policy.ask_suppressed(_KEY) is False
+    err = capsys.readouterr().err
+    assert "not a mapping" in err
+    assert len(err) < 400
 
 
 # ─── a declaration that changed nothing must SAY so ─────────────────────────

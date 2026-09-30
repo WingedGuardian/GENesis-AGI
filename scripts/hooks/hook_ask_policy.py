@@ -27,7 +27,9 @@ default is unchanged for every other clone. It is deliberately not a general
   in the hook's own stdout payload (see :func:`drain_notes`) on the next ask the
   policy is consulted for. There is no value that produces a suppression by
   accident, which is the property that matters: the safe direction has to be
-  the one you get when something goes wrong.
+  the one you get when something goes wrong. A null section (``hooks:`` or
+  ``asks:`` with no body, or an explicit ``null``/``~``) is not a declaration,
+  so it asks without a NOTE: a partly uncommented template leaves exactly that.
 
 **The push / PR-open approval prompt is deliberately NOT suppressible.** It is
 the point where code leaves the machine, and publication is meant to stay a
@@ -229,6 +231,14 @@ def _duplicates_on_the_policy_path(yaml, text: str) -> list[str]:
     return dupes
 
 
+def _clip(value: object, limit: int = 80) -> str:
+    """``repr(value)`` cut to ``limit`` characters. A note quotes what the
+    operator wrote, and a whole config file pasted into the approval prompt would
+    drown the question it is attached to."""
+    shown = repr(value)
+    return shown if len(shown) <= limit else shown[: limit - 3] + "..."
+
+
 def _declared() -> dict[str, object]:
     """The raw ``hooks.asks`` mapping this install declares, or ``{}``.
 
@@ -255,15 +265,33 @@ def _declared() -> dict[str, object]:
                 f"ENABLED. Merge the duplicates to restore your declared policy."
             )
             return {}
-        cfg = yaml.safe_load(text) or {}
-        asks = (cfg.get("hooks") or {}).get("asks")
+        # Each level is checked explicitly, never collapsed with `or {}`: that
+        # turns `hooks: false`, `hooks: []` or a `0` document into "declared
+        # nothing" and drops the operator's malformed declaration without a
+        # word. Only None (an empty file, a bodiless key, or an explicit
+        # null/~) declares nothing.
+        cfg = yaml.safe_load(text)
+        if cfg is None:
+            return {}
+        if not isinstance(cfg, dict):
+            _note(f"{_CONFIG_PATH} is {_clip(cfg)}, not a mapping — every ask stays ENABLED.")
+            return {}
+        hooks = cfg.get("hooks")
+        if hooks is None:
+            return {}
+        if not isinstance(hooks, dict):
+            _note(
+                f"hooks in {_CONFIG_PATH} is {_clip(hooks)}, not a mapping — every ask stays ENABLED."
+            )
+            return {}
+        asks = hooks.get("asks")
         if asks is not None and not isinstance(asks, dict):
             # `asks: off` or `asks: [secrets_env]` is a declaration the
             # operator wrote; dropping it without a word is the silent discard
             # this module promises not to do. A bodiless `asks:` (None)
             # declares nothing and stays quiet.
             _note(
-                f"hooks.asks in {_CONFIG_PATH} is {asks!r}, not a mapping of "
+                f"hooks.asks in {_CONFIG_PATH} is {_clip(asks)}, not a mapping of "
                 f"<prompt>: on/off — every ask stays ENABLED."
             )
         return asks if isinstance(asks, dict) else {}
