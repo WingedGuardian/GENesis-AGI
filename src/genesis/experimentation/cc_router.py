@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 
+from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.types import (
     SPAWN_TOOL_NAMES,
     VALID_EFFORT_NAMES,
@@ -105,6 +106,7 @@ class CCCliRouter:
         # identity/context injection — we want a clean completion on the given
         # text, not Genesis's project context bleeding into the reflection.
         env["GENESIS_CC_SESSION"] = "1"
+        pin_dispatched_env(env)  # shared dispatched pins (genesis.cc.child_env)
 
         proc = None
         try:

@@ -519,62 +519,13 @@ because the preview reads as ordinary furniture at the top of a window.
 The size threshold is undocumented and **moves between CC versions** — treat
 the wrapper itself as the signal, never a byte count.
 `scripts/hooks/hook_output.py` is the single home of the measured cap;
-**route any new model-facing stdout through it.** That instruction is now
-ENFORCED rather than advisory: `tests/test_scripts/test_hook_output_contract.py`
-enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
-`UserPromptSubmit` / `UserPromptExpansion` — the three events whose bare stdout
-the model reads, DERIVED by AST from `hook_output.py`'s own `BARE_STDOUT_EVENTS`
-so the gate keeps no copy to drift — and fails
-unless each one either routes through the writer or carries a stated, measured
-reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
-with unbounded output fails by construction, which a known-bad-pattern scan could
-not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
-change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
-`.local.yaml` overlay can raise a default.
-
-There is a SECOND, weaker category, kept so that describing only the first does
-not overstate the gate: `_MEASURED_PENDING_ROUTING` is for a hook that is NOT
-structurally bounded and has simply never been observed filing. It is **empty** —
-its only ever member now routes through the writer and bounds each surface by
-meaning. The category stays because the next hook with that shape needs a
-labelled place to sit; a row filed under "structurally bounded" is a false claim
-rather than visible debt.
-
-Two rules from that work, because both are the kind you get wrong while
-believing otherwise. **A size bound must be measured in the unit the harness
-bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
-not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
-rather than trying one huge value. A bound on MEANING (is this token a word?)
-stays in codepoints; say which you are writing. And **a bound must not decide
-eligibility** — filtering what gets rendered is not a judgement about whether the
-work is worth doing, and conflating them silently skipped recall for a whole
-class of prompt. Detail lives with the code, in
-`.claude/docs/proactive-memory-hook.md`.
-
-Three limits, so it is not read as total coverage. Hooks wired in a user-level
-`~/.claude/settings.json` or a `settings.local.json` are outside the repo and
-invisible to it. An exemption still skips the PRINT SCAN — every row now carries
-a checker, but it re-runs a NECESSARY CONDITION of the row's claim, never a
-verification of it: a checker shows a constant or pattern still EXISTS, not that
-it still BINDS the output. Which is why the table stays small and why ROUTING a
-hook through the writer still beats adding a row. And the detector's
-enumeration is bounded, not total: it covers `print`, `builtins.print`,
-`file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
-but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
-inheriting stdout. That list grew four times under review; treat it as the
-spellings checked so far rather than a closed set.
-
-Hooks on the OTHER events reach the model through JSON `additionalContext`, the
-same persistence path with a different failure mode — an oversized advisory must
-lose prose, never its `permissionDecision`, which is what `print_json_bounded`
-protects. They are out of the gate's scope today, deliberately, rather than
-exempted in bulk.
-
-The hourly `context_injection_monitor` watches the harness's own filings
-independently of every emitter's arithmetic, so this class cannot go quiet
-again — and its record is the evidence that the chokepoint works: of 849 filings
-on this install, 842 were one emitter that stopped filing the day it was moved
-behind the writer, and 7 were a guard since removed.
+**route any new model-facing stdout through it** — a contract test enforces
+this for every hook wired in `.claude/settings.json` to `SessionStart`,
+`UserPromptSubmit` or `UserPromptExpansion`. Hooks on other events reach the
+model through JSON `additionalContext`; emit those with `print_json_bounded`, so
+an oversized advisory loses prose and never its `permissionDecision`. How the
+gate works, its exemption categories, and the unit rules for size bounds:
+`.claude/docs/proactive-memory-hook.md` → "Hook output contract".
 
 ## Traps
 
@@ -626,10 +577,8 @@ behind the writer, and 7 were a guard since removed.
   conversation each time; the sigil records the yes.
   Maintainer-replied findings and findings on files outside the PR diff do not
   score; under the shipped `doc_findings: skip`, documentation findings do not
-  score either. Until 2026-09-10 CodeRabbit was
-  named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
-  "review is clear" and were surprised by the score. Read the `inline-findings` row,
-  not just the Codex row.
+  score either. `codex-at-head: ok` is not "review is clear": read the
+  `inline-findings` row, not just the Codex row.
   **Below the floor, how much a change can afford depends on its LANE** — a
   consequence class computed from the diff, not chosen by the author. Two P2s
   block a `critical` change (enforcement hooks, `.github/**`, api/migration

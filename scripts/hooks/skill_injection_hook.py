@@ -9,7 +9,9 @@ Budget: <50ms (JSON file read + keyword match).
 """
 from __future__ import annotations
 
+import functools
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -20,9 +22,9 @@ from pathlib import Path
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 _CATALOG_MAX_AGE_S = 3600  # Regenerate catalog if older than 1h
 
-# Minimum raw match score — a single name or explicit-keyword hit scores
-# 2 points and is enough to surface the skill. A lone description hit
-# (1 point) is not. Raw points, NOT normalized by prompt keyword count:
+# Minimum raw match score — the skill's FULL name or one explicit-keyword hit
+# scores 2 points and is enough to surface the skill. One token of a
+# multi-word name scores 1 and is not (see `_score_skill`). Raw points, NOT normalized by prompt keyword count:
 # normalization made keyword-rich prompts dilute genuine hits below the
 # threshold, so catalog nudges near-never fired.
 _MIN_SCORE = 2
@@ -137,11 +139,14 @@ def _save_session_nudge(session_id: str, skill_name: str) -> None:
     path.write_text(json.dumps(sorted(existing)))
 
 
-def _score_skill(skill: dict, keywords: list[str]) -> float:
+def _score_skill(
+    skill: dict, keywords: list[str], prompt_text: str | None = None
+) -> float:
     """Score a skill against prompt keywords. Returns raw match points.
 
-    Scores the CURATED signals only: a whole-word skill-NAME token hit or an
-    explicit frontmatter-KEYWORD hit is worth 2 points each. DESCRIPTION prose
+    Scores the CURATED signals only: the skill's WHOLE name (its tokens adjacent
+    and in order) or an explicit frontmatter-KEYWORD hit is worth 2 points each;
+    loose tokens of a multi-word name are worth 1 IN TOTAL, however many appear. DESCRIPTION prose
     is deliberately NOT scored. Free-text descriptions name many tools in
     passing (an AWS skill's prose mentions "SageMaker", "usage plan",
     "timeout"), so the old substring match over descriptions surfaced skills
@@ -149,7 +154,7 @@ def _score_skill(skill: dict, keywords: list[str]) -> float:
     summing two incidental hits to the firing threshold. A term distinctive
     enough to nudge a skill belongs in that skill's `keywords:` frontmatter,
     not mined from prose. Matching is whole-word (token membership), so "aws"
-    matches the name "aws-lambda" but not "awesome". Deliberately NOT
+    counts toward the name "aws-lambda" but "awesome" does not. Deliberately NOT
     normalized by prompt length — a long prompt must not dilute a genuine hit
     below the firing threshold.
     """
@@ -161,17 +166,106 @@ def _score_skill(skill: dict, keywords: list[str]) -> float:
         skill.get("name", "").lower().replace("-", " ").replace("_", " ").split()
     )
     skill_kws = {kw.lower() for kw in skill.get("keywords", [])}
+    kw_words = {kw.lower() for kw in keywords}
 
-    matches = 0
-    for kw in keywords:
-        kw_lower = kw.lower()
-        if kw_lower in name_tokens:
-            matches += 2  # Whole-word name-token match
-        elif kw_lower in skill_kws:
+    # The WHOLE name in the prompt is a curated signal: it scores like a keyword.
+    # Loose tokens of a multi-word name are not — together they score at most
+    # 1, below `_MIN_SCORE`, so "closing the loop on this session" does not add
+    # up to closing-session. MEASURED 2026-09-30 by replaying 6,803 user prompts
+    # from one install's transcripts (compaction summaries and headless-judge
+    # prompts excluded): scoring each name token 2 put a catalog nudge on 28.5%
+    # of prompts, "session" -> closing-session alone on 344 of them;
+    # `/claude-api` fired api-gateway on "api". A token distinctive enough to
+    # fire alone belongs in the skill's `keywords:` frontmatter, the same rule
+    # the docstring states for description prose.
+    #
+    # "Whole name" means the tokens appear ADJACENT and IN ORDER, as a phrase
+    # (`closing-session`, `closing session`, `closing_session`); a long prompt
+    # contains most common words somewhere, so mere presence is not a name. The
+    # test reads the prompt TEXT rather than the keyword list, because
+    # `_extract_keywords` drops short words and stopwords (`cc`, `use`).
+    # A one-word name keeps the keyword-window rule it always had; only a
+    # multi-word name needs the phrase search.
+    if len(name_tokens) <= 1 or not prompt_text:
+        full_name = bool(name_tokens) and name_tokens <= kw_words
+    else:
+        full_name = _names_skill(skill.get("name", ""), prompt_text)
+
+    matches = 2 if full_name else 0
+    partial = False
+    for kw in kw_words:
+        if kw in skill_kws:
             matches += 2  # Explicit frontmatter-keyword match
+        elif kw in name_tokens:
+            partial = True  # Loose name token: supporting evidence only
         # Description prose intentionally not scored (see docstring).
+    if partial and not full_name:
+        matches += 1  # At most 1 in total, so loose tokens never reach the threshold
 
     return float(matches)
+
+
+# `[^<]*` rather than `.*?`: a command name holds no `<`, and a lazy scan over
+# unclosed tags is quadratic (MEASURED: 37.7s on 280 KB of them).
+_COMMAND_TAG = re.compile(r"<command-(?:name|message)>[^<]*</command-(?:name|message)>")
+_COMMAND_ARGS_MARKER = re.compile(r"</?command-args>")
+# Only a bare command token: `/api/v1/users` is a path, not a command, and keeps
+# its words.
+_LEADING_SLASH_COMMAND = re.compile(r"\A\s*/[\w:.-]+(?=\s|\Z)")
+
+
+def _prompt_for_matching(prompt: str) -> str:
+    """Drop a slash command's NAME; keep its arguments.
+
+    The user already chose that skill or command by typing it, so its name is
+    not evidence of what the task is — `/claude-api prompt audit` split into
+    "api" and fired a TDD nudge and an unrelated AWS `api-gateway` skill. The
+    arguments ARE the task, so they stay. Handles both the raw form
+    (`/name args`) and the tagged form Claude Code records
+    (`<command-name>/name</command-name>…<command-args>args</command-args>`).
+    """
+    if _COMMAND_TAG.search(prompt):
+        # Tagged form: the name lives in the tags, so the arguments are kept
+        # whole even when they start with a `/` (`<command-args>/api build`).
+        return _COMMAND_ARGS_MARKER.sub(" ", _COMMAND_TAG.sub(" ", prompt))
+    return _LEADING_SLASH_COMMAND.sub(" ", prompt, count=1)
+
+
+@functools.lru_cache(maxsize=256)
+def _name_pattern(name: str) -> re.Pattern[str] | None:
+    tokens = name.lower().replace("-", " ").replace("_", " ").split()
+    if not tokens:
+        return None
+    return re.compile(
+        r"(?<![a-z0-9])" + r"[\s_-]+".join(map(re.escape, tokens)) + r"(?![a-z0-9])"
+    )
+
+
+@functools.lru_cache(maxsize=4)
+def _lower(text: str) -> str:
+    return text.lower()
+
+
+@functools.lru_cache(maxsize=4)
+def _words(text: str) -> frozenset[str]:
+    """Every lowercase alphanumeric word in the prompt, computed once per prompt."""
+    return frozenset(re.findall(r"[a-z0-9]+", _lower(text)))
+
+
+def _names_skill(name: str, text: str) -> bool:
+    """True when the prompt names the skill as a phrase, in any separator."""
+    pattern = _name_pattern(name)
+    if pattern is None:
+        return False
+    # Every name token must be a word of the prompt before the phrase regex
+    # runs. The word set is built once per prompt, so a skill whose name is not
+    # present costs a set lookup rather than a full-text scan: without this the
+    # hook did one scan per multi-word skill (MEASURED: 426 ms on a 195 KB
+    # prompt with 67 skills, against ~50 ms with the gate).
+    tokens = name.lower().replace("-", " ").replace("_", " ").split()
+    if not set(tokens) <= _words(text):
+        return False
+    return pattern.search(_lower(text)) is not None
 
 
 def _extract_keywords(prompt: str) -> list[str]:
@@ -254,7 +348,8 @@ def main() -> None:
 
         catalog = _load_catalog()
 
-        keywords = _extract_keywords(prompt)
+        text = _prompt_for_matching(prompt)
+        keywords = _extract_keywords(text)
         if not keywords:
             return
 
@@ -278,7 +373,7 @@ def main() -> None:
             name = skill.get("name", "")
             if name in already_nudged:
                 continue
-            score = _score_skill(skill, keywords)
+            score = _score_skill(skill, keywords, text)
             if score >= _MIN_SCORE:
                 candidates.append((score, skill))
 

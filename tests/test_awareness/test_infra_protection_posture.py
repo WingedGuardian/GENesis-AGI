@@ -61,6 +61,8 @@ def _profile(
     networkd_route: object = True,
     keepconfig: object = True,
     watchdog: object = True,
+    tailscaled: object = None,
+    ts_watchdog: object = None,
     cc_tmp_isolated: object = True,
     container: object = "lxc",
     age_days: float = 0.0,
@@ -95,6 +97,8 @@ def _profile(
                     "networkd_manages_default_route": networkd_route,
                     "networkd_default_route_keepconfig": keepconfig,
                     "network_watchdog_enabled": watchdog,
+                    "tailscaled_loaded": tailscaled,
+                    "tailscale_watchdog_unit_state": ts_watchdog,
                 },
             },
             "virt": {"status": "ok", "facts": {"container": container}},
@@ -132,6 +136,8 @@ _ALL_DEFECTS = dict(
     networkd_route=True,  # networkd owns the route, so the network rules apply
     keepconfig=False,
     watchdog=False,
+    tailscaled=True,  # tailscaled installed, its watchdog timer not
+    ts_watchdog="",
     cc_tmp_isolated=False,
 )
 
@@ -147,6 +153,7 @@ def test_all_defects_detected():
         "oom_adj_declaration_not_applied",
         "oomd_pressure_kill_off",
         "pid_ceiling_unprovisioned",
+        "tailscale_watchdog_absent",
     ]
 
 
@@ -602,3 +609,32 @@ def test_both_cc_tmp_slugs_have_detail_entries():
     # WITHOUT a detail entry would crash the (best-effort) posture check.
     assert "cc_tmp_apply_blocked_on_cc" in _loop._INFRA_POSTURE_DETAIL
     assert "cc_tmp_shared_fs" in _loop._INFRA_POSTURE_DETAIL
+
+
+# ── the Tailscale watchdog rule (gated on tailscaled, not on networkd) ────────
+
+
+@pytest.mark.parametrize("state", ["", "disabled", "static"])
+def test_tailscale_watchdog_absent_where_tailscaled_runs(state):
+    missing = _infra_missing_protections(
+        _profile(networkd_route=False, tailscaled=True, ts_watchdog=state)
+    )
+    assert missing == ["tailscale_watchdog_absent"]
+
+
+@pytest.mark.parametrize(
+    ("tailscaled", "state"),
+    [
+        (True, "enabled"),
+        (True, "masked"),  # the operator's deliberate off switch
+        (True, "masked-runtime"),  # a runtime mask, where one takes effect
+        (True, None),  # unknown: silent
+        (False, ""),  # no tailscaled: nothing to watch
+        (None, ""),
+    ],
+)
+def test_tailscale_watchdog_rule_silent_otherwise(tailscaled, state):
+    assert "tailscale_watchdog_absent" not in _infra_missing_protections(
+        _profile(tailscaled=tailscaled, ts_watchdog=state)
+    )
+

@@ -89,6 +89,20 @@ def _pin_required_ci_workflows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_pr_commits(monkeypatch):
+    """Give EVERY hook test an empty PR commit list by default.
+
+    The freshness gate resolves a clean Codex signal's abbreviated id against
+    ``pulls/N/commits``; without this pin a test that never mentions commits would
+    make a live ``gh`` call. Empty resolves nothing, so no clean signal is accepted
+    and every test keeps the verdict it was written against. Tests of the clean
+    signal set ``_TEST_GH_PR_COMMITS`` themselves."""
+    monkeypatch.setenv("_TEST_GH_PR_COMMITS", "")
+    monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", "")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_e2e_declaration(monkeypatch):
     """Keep the ADVISORY E2E read hermetic for EVERY hook test (§8.12).
 
