@@ -144,6 +144,23 @@ def test_every_failure_falls_through_to_the_builtin(label, spec):
     assert res["thrown"] is None
 
 
+def test_non_string_backend_fields_cannot_break_the_answer():
+    """Review: a title such as {"toString": null} passed the url filter and threw
+    inside the template. Non-string fields are dropped, and the url stands in for
+    a missing title."""
+    bad = {
+        **GOOD,
+        "results": [{"title": {"toString": None}, "url": "https://a.example/1", "snippet": 5}],
+        "backend_used": ["x"],
+        "answer": {"a": 1},
+    }
+    res = _run(reply=_reply(bad))
+    assert res["thrown"] is None and res["calls"]["next"] == 0, res
+    links, text = res["out"]["result"]["results"]
+    assert links["content"] == [{"title": "https://a.example/1", "url": "https://a.example/1"}]
+    assert "backend: unknown" in text and "Summary from" not in text
+
+
 def test_a_failing_logger_changes_nothing():
     res = _run(reply=_reply(GOOD), logThrows=True)
     assert res["calls"]["logs"] >= 1 and res["out"]["result"]["searchCount"] == 1

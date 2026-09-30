@@ -50,6 +50,34 @@ def _spawns_a_session(tree: ast.AST) -> bool:
     )
 
 
+_CC_FLAGS = {"--output-format", "--dangerously-skip-permissions", "--max-turns", "--model"}
+
+
+def _text(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
+    return None
+
+
+def _carries_cc_flags(tree: ast.AST) -> bool:
+    """True when the module builds a print-mode argv or command string by
+    Claude Code's own flags, whatever the binary is called (`cc_path`, a remote
+    path): a list with "-p" plus one of the flags, or an f-string holding both
+    (review: two sites were invisible to the name-based match)."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            vals = {_text(e) for e in node.elts}
+            if "-p" in vals and vals & _CC_FLAGS:
+                return True
+        if isinstance(node, ast.JoinedStr):
+            text = _text(node) or ""
+            if " -p" in text and any(f in text for f in _CC_FLAGS):
+                return True
+    return False
+
+
 def _marks_dispatched(tree: ast.AST) -> bool:
     """True when the module assigns "1" to a GENESIS_CC_SESSION subscript."""
     for node in ast.walk(tree):
@@ -68,12 +96,16 @@ def _marks_dispatched(tree: ast.AST) -> bool:
 
 
 def _calls_pin(tree: ast.AST) -> bool:
+    """A pin_dispatched_env call, or a use of FUNCTION_HOOKS_ENV (the remote
+    command sets it as a shell assignment)."""
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             fn = node.func
             name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
             if name == "pin_dispatched_env":
                 return True
+        if isinstance(node, ast.Name) and node.id == "FUNCTION_HOOKS_ENV":
+            return True
     return False
 
 
@@ -81,23 +113,26 @@ def _spawn_sites() -> list[Path]:
     sites = []
     for p in SRC.rglob("*.py"):
         tree = ast.parse(p.read_text(), str(p))
-        if _spawns_a_session(tree) or _marks_dispatched(tree):
+        if _spawns_a_session(tree) or _carries_cc_flags(tree) or _marks_dispatched(tree):
             sites.append(p)
     return sorted(sites)
 
 
 def test_the_enumeration_finds_the_known_spawn_sites():
     """Guard the guard: if the AST match stopped matching, the lock below would
-    pass on an empty population. The population is found two ways (a `claude -p`
-    argv, or the dispatched marker), because one spawn site carries no marker.
-    Neither sees an argv assembled at run time or a command string, so this is a
-    floor on the population, not a proof of it."""
+    pass on an empty population. The population is found three ways (a `claude -p`
+    argv, Claude Code's own flags in an argv or command string, or the
+    dispatched marker), because no single one sees every site.
+    None sees a command whose binary and flags all arrive in variables at run
+    time, so this is a floor on the population, not a proof of it."""
     names = {p.relative_to(SRC).as_posix() for p in _spawn_sites()}
     assert {
         "cc/invoker.py",
         "session_awareness/headless.py",
         "experimentation/cc_router.py",
         "dashboard/routes/updates.py",
+        "guardian/diagnosis.py",
+        "modules/external/ipc.py",
     } <= names, names
 
 

@@ -1518,6 +1518,9 @@ class CCInvoker:
         """
         if inv.bash_allowlist:
             _assert_hardening_present(env, tuple(inv.bash_allowlist))
+        # Re-applied here, after every merge (env_overrides, the login fallback),
+        # so no later layer can turn function hooks back on (review).
+        pin_dispatched_env(env)
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:

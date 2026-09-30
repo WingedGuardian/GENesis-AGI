@@ -57,9 +57,16 @@ line to turn it off: new slots then unset the flag. An existing slot keeps what 
 started with until it is recreated, and relaunching `claude` by hand inside a slot
 runs without the plugin.
 
-Dispatched sessions never run it: CCInvoker, the headless judge, the
-experimentation router and the dashboard's update sessions all pin
-`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` (`src/genesis/cc/child_env.py`). Claude Code
+Dispatched sessions never run it. These all pin
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` (`src/genesis/cc/child_env.py`), CCInvoker
+at its last launch gate, after every env merge:
+
+- CCInvoker;
+- the headless judge;
+- the experimentation router;
+- the dashboard's update sessions;
+- the guardian's recovery session on the host;
+- remote sessions started over SSH. Claude Code
 resolves the flag as the env var if set, otherwise a server-side default, so
 unset is not the same as off. Do not put the flag in a `settings.json` `env`
 block: Claude Code applies that over the inherited environment, including a

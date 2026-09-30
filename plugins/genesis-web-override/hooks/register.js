@@ -41,6 +41,9 @@ const log = ($, message) => {
 };
 
 const hasEntries = (value) => Array.isArray(value) && value.length > 0;
+// Backend text reaches a template string; anything that is not a string is
+// dropped rather than coerced, since coercing an object can throw (review).
+const str = (value) => (typeof value === "string" ? value : "");
 
 // Returns the parsed Genesis reply, or a string naming why it cannot be used.
 export function parseGenesisReply(reply) {
@@ -59,10 +62,12 @@ export function parseGenesisReply(reply) {
   if (data === null || typeof data !== "object") return "the reply was not an object";
   if (data.error) return `web_search error: ${String(data.error)}`;
   const results = Array.isArray(data.results)
-    ? data.results.filter((r) => r && typeof r.url === "string" && r.url !== "")
+    ? data.results
+        .filter((r) => r && typeof r.url === "string" && r.url !== "")
+        .map((r) => ({ url: r.url, title: str(r.title), snippet: str(r.snippet) }))
     : [];
   if (results.length === 0) return "no results";
-  return { ...data, results };
+  return { results, backend_used: str(data.backend_used), answer: str(data.answer) };
 }
 
 export function toWebSearchResult(query, data, durationSeconds) {

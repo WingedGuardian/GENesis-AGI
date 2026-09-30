@@ -572,6 +572,14 @@ def test_build_env_pins_function_hooks_off(invoker):
     assert env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
 
 
+def test_launch_env_repins_function_hooks_after_an_explicit_override(invoker):
+    """Review: env_overrides are merged after the builder's pin, and the login
+    fallback after that, so the pin is re-applied at the last gate."""
+    inv = CCInvocation(prompt="hi", env_overrides={"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"})
+    env = invoker._build_env(inv)
+    assert invoker._launch_env(env, inv)["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+
+
 def test_build_env_pins_function_hooks_off_when_unset(invoker, monkeypatch):
     """Unset is not off: Claude Code falls back to a server-side default, so
     the pin must be written even when nothing was inherited."""
