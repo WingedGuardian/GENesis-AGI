@@ -6,8 +6,9 @@ HTML, so a session without Bash — the inbox judge — still reads what a video
 says. Wired into the MCP tool wrapper only: ``_impl_web_fetch``'s other callers
 (the corrective memory search, the dashboard) keep plain page fetches.
 
-If yt-dlp yields nothing usable, the caller falls through to the ordinary
-fetch chain (the page's title and description) and reports ``youtube_error``.
+If yt-dlp yields nothing usable, a single-URL call falls through to the
+ordinary fetch chain (the page's title and description) and reports
+``youtube_error``; in a ``urls`` batch the video keeps the batch's page entry.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import logging
 import time
 
 from genesis.knowledge.processors.youtube import YouTubeProcessor, is_youtube_video_url
+from genesis.security import ContentSanitizer, ContentSource
+from genesis.security.sanitizer import strip_boundary_markers
 
 logger = logging.getLogger(__name__)
 
@@ -73,30 +76,32 @@ async def fetch_youtube(url: str, max_chars: int) -> tuple[dict | None, str | No
             return None, error  # metadata failed too: the page is the best left
         # Metadata came through: return it (it says "(no transcript)") rather
         # than a page fetch that is often only a consent or script shell.
-        content = _format(result)
-        return {
-            "url": url,
-            "title": result.metadata.get("title", ""),
-            "content": content[:max_chars],
-            "backend_used": "yt-dlp",
-            "status_code": 200,
-            "truncated": len(content) > max_chars,
-            "error": None,
-            "youtube_error": error,
-            "caption": None,
-            "tls_verified": result.tls_verified,
-            "latency_ms": round((time.monotonic() - start) * 1000, 1),
-        }, None
+        return _result(url, result, max_chars, start, youtube_error=error, caption=None), None
+    return _result(url, result, max_chars, start, caption=result.caption), None
+
+
+def _result(url: str, result, max_chars: int, start: float, **extra) -> dict:
+    """The web_fetch result for a yt-dlp fetch.
+
+    The text is attacker-authorable (captions, description), so it is wrapped in
+    the keyed untrusted-content boundary like every WebFetcher page (#2568
+    review). It is clipped BEFORE wrapping, so the closing marker survives a
+    small ``max_chars``, and forged markers inside the video text are stripped.
+    """
     content = _format(result)
+    body = content[:max_chars]
+    # To a fixpoint: one pass leaves a marker behind from a nested forgery.
+    while (stripped := strip_boundary_markers(body)) != body:
+        body = stripped
     return {
         "url": url,
         "title": result.metadata.get("title", ""),
-        "content": content[:max_chars],
+        "content": ContentSanitizer().wrap_content(body, ContentSource.WEB_FETCH),
         "backend_used": "yt-dlp",
         "status_code": 200,
         "truncated": len(content) > max_chars,
         "error": None,
-        "caption": result.caption,
+        **extra,
         "tls_verified": result.tls_verified,
         "latency_ms": round((time.monotonic() - start) * 1000, 1),
-    }, None
+    }

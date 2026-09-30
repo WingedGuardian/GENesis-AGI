@@ -23,9 +23,12 @@ batch). For a YouTube video it runs yt-dlp in Python and returns the title,
 channel, description and transcript, choosing captions in the video's own
 language (manual over automatic), with a
 `Transcript source` line and a `caption` field giving the track and its
-provenance. It needs no shell, so it also works in background sessions. If it
-reports `youtube_error`, read the error; the rest of the result is the page's
-title and description.
+provenance. It needs no shell, so it also works in background sessions. The
+video text arrives inside `<external-content>` markers, because captions and
+descriptions are written by whoever uploaded the video. If it reports
+`youtube_error`, read the error; the rest of the result is the page's title and
+description. In a `urls=[...]` batch, a video's entry is its transcript result
+when yt-dlp succeeds and the ordinary page entry when it does not.
 
 **Fallback — yt-dlp via Bash** (foreground sessions only), when `web_fetch` is
 unavailable or you need a specific track. The workflow below is that fallback.
