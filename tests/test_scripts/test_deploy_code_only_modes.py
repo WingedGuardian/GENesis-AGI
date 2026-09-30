@@ -666,6 +666,17 @@ def test_a_boot_older_than_the_expiry_cutoff_is_unknown(station, setting, known)
     assert (s["serving"] == head) is known, s
 
 
+def test_an_unreadable_expiry_setting_reads_unknown(station):
+    """git exits 128 on a gc.reflogExpireUnreachable value it cannot parse, and
+    the cutoff is then unknown, so the boot commit is too. Control: the same
+    fresh reflog with the setting unset takes git's 30-day default and is known."""
+    head = _git(station["root"], "rev-parse", "HEAD")
+    assert _status(station)["serving"] == head, "control: the setting unset"
+    _git(station["root"], "config", "gc.reflogExpireUnreachable", "not-a-date")
+    s = _status(station)
+    assert s["serving"].startswith("unknown") and "gc.reflogExpireUnreachable" in s["serving"], s
+
+
 def test_a_deploy_with_nothing_to_deploy_does_not_restart(station):
     r = _run(station)
     assert r.returncode == 0, r.stderr

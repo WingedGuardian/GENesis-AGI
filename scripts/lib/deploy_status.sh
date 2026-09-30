@@ -36,7 +36,7 @@ _unit_dir_is_ours() {
 # git records it: an uncommitted edit present at boot and reverted since is
 # invisible to it.
 _read_serving() {
-    local state boot cutoff out rc=0
+    local state boot cutoff out rc=0 crc=0
     SERVING=""
     SERVING_WHY=""
     SERVING_HELD=""
@@ -60,11 +60,14 @@ _read_serving() {
     esac
     # Before this cutoff git may have expired unreachable reflog entries (a
     # detour, as a pair). git resolves the setting itself; unset means its
-    # 30-day default, and a value it cannot read leaves the cutoff empty, which
-    # the reader answers as unknown.
-    cutoff="$(_git_ro config --type=expiry-date gc.reflogExpireUnreachable 2>/dev/null)" || {
-        [ "$?" -eq 1 ] && cutoff=$(( $(date +%s) - 30 * 86400 )) || cutoff=""
-    }
+    # 30-day default (git exits 1), and a value it cannot read (git exits 128)
+    # leaves the cutoff empty, which the reader answers as unknown.
+    cutoff="$(_git_ro config --type=expiry-date gc.reflogExpireUnreachable 2>/dev/null)" || crc=$?
+    case "$crc" in
+        0) ;;
+        1) cutoff=$(( $(date +%s) - 30 * 86400 )) ;;
+        *) cutoff="" ;;
+    esac
     out="$(python3 -c "$_SERVING_COMMIT_PY" --held "$_git_dir/logs/HEAD" "$boot" \
         "$(_git_ro rev-parse HEAD)" "$cutoff" 2>/dev/null)" || rc=$?
     if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
