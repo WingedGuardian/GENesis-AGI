@@ -1050,4 +1050,14 @@ jobs:
         # skipif and attaches no client: it drives the real picker over a pipe
         # with a fake tmux on PATH, so there is no runner capability it can miss
         # and no runtime-skip path to lose a coin-flip on.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23476
+        #
+        # The update success-records branch adds one test file that does not
+        # exist on main (its delta is its FULL count) and grows one other:
+        #   pytest tests/test_scripts/test_update_success_records.py --collect-only -q
+        #     -> 10 tests collected
+        #   test_update_tier2_baseline.py goes 5 -> 8 (unreadable history, no
+        #   history table, and no interpreter for the reader are each a new case).
+        # test_update_rollback_recovery.py is edited count-neutrally (8 == 8).
+        # So the floor is 23476 + 13 = 23489. No new test carries a skipif, so
+        # the ceiling does not move.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23489
