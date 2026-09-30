@@ -700,8 +700,9 @@ _UNREAD_TARGET_REMOVALS = [
     f"bash <<'EOF'\necho /tmp/wt-x | xargs {_PHRASE}\nEOF",
     # B: a carrier whose payload names no worktree
     f"echo /tmp/wt-x | eval 'xargs {_PHRASE}'",
-    # U: text the tokenizer cannot read, with the target on stdin
-    "echo $'it\\'s' /tmp/wt-x | xargs " + _PHRASE,
+    # U: text the tokenizer cannot read (an apostrophe in a comment line the shell
+    # skips), with the target on stdin
+    "# it's a note\necho /tmp/wt-x | xargs " + _PHRASE,
 ]
 
 # Real removals whose whole command is text handed to a shell or `source`, which
@@ -745,6 +746,8 @@ _ALREADY_REFUSED_REMOVALS = [
     f"xargs -r {_PHRASE} < list",
     f"xargs git -C /r {_SUB} {_OP} < list",
     f"xargs {_PHRASE} <<< /tmp/wt-x",
+    # An escape-built word inside $'...': refused by the escape blind spot.
+    "echo $'it\\'s' /tmp/wt-x | xargs " + _PHRASE,
 ]
 
 
