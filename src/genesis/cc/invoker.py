@@ -777,6 +777,13 @@ async def _emit_invocation_failed_event(
         if bus is None:
             return
         error_class = type(exc).__name__
+        # A call pre-stamped with peer overrides but roster_eligible=False (e.g.
+        # the fallback probe of a peer) is reported native by apply_active, yet
+        # the subprocess targets the peer: attribute and key it to the peer.
+        if roster_model in ("", roster.CLAUDE) and (
+            invocation.model_id_override or invocation.anthropic_base_url
+        ):
+            roster_model = invocation.model_id_override or "routed"
         coalesced = 0
         if invocation.caller_tag is not None:
             key = (error_class, invocation.caller_tag, roster_model)

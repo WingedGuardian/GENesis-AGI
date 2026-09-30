@@ -4,8 +4,9 @@
   common signal. The invoker now emits the event on both its entry points —
   including the pre-spawn offline check — and then re-raises the original
   error unchanged. It carries the error class, streaming flag, requested model,
-  the roster model the call was actually routed to, session id and a caller
-  tag naming the dispatching subsystem, and appears in
+  the roster model the call was actually routed to, session id and, where the
+  call site is tagged, a caller tag naming the dispatching subsystem, and
+  appears in
   `health_errors`. The raw error text is not stored in the event (it is built
   from unbounded CLI output); only its length is recorded. Rate-limit and
   quota errors are WARNING; everything else is ERROR. Repeats of the same error

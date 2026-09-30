@@ -5075,5 +5075,30 @@ async def test_invocation_failed_attributes_and_keys_by_routed_model(monkeypatch
     invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
     for prompt in ("native", "peer"):
         with pytest.raises(CCTimeoutError):
-            await _call(invoker, entry, CCInvocation(prompt=prompt, caller_tag="direct_session.observe"))
+            await _call(
+                invoker, entry, CCInvocation(prompt=prompt, caller_tag="direct_session.observe")
+            )
     assert [e[4]["roster_model"] for e in fail_bus.events] == ["claude", "peer-model"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"model_id_override": "peer-x"}, "peer-x"),
+        ({"anthropic_base_url": "https://peer.invalid"}, "routed"),
+        ({}, "claude"),
+    ],
+)
+async def test_invocation_failed_attributes_pre_routed_non_roster_calls(
+    monkeypatch,
+    fail_bus,
+    overrides,
+    expected,
+):
+    """A call pre-stamped with peer overrides but roster_eligible=False (e.g. the
+    fallback probe of a peer) is routed to that peer even though apply_active
+    reports native; the event must attribute and key it to the peer."""
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    with pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="t", **overrides))
+    assert fail_bus.events[0][4]["roster_model"] == expected
