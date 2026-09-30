@@ -26,10 +26,16 @@ the live DDL already allows ``'superseded'`` (fresh DBs get it from the canonica
 CREATE in ``db/schema/_tables.py``); the backfill is a guarded UPDATE that
 matches nothing on a second run. A live column this rebuild target does not
 declare RAISES rather than being dropped — the runner rolls the whole migration
-back. No ``db.commit()`` — the runner owns the transaction.
+back. The rebuild also refuses, before changing anything, when an object named
+``inbox_items_new`` already exists (it is the operator's, never the migration's
+to drop) or when the live table carries a constraint the fixed rebuild template
+does not produce (see ``_refuse_constraints_the_rebuild_would_drop``).
+No ``db.commit()`` — the runner owns the transaction.
 """
 
 from __future__ import annotations
+
+import sqlite3
 
 import aiosqlite
 
@@ -73,6 +79,219 @@ _SUPERSEDED_REASONS = (
 )
 
 
+_SCRATCH_TABLE = "inbox_items_new"
+
+
+def _sql_tokens(sql: str) -> list[str]:
+    """Split CREATE TABLE text into tokens, dropping comments and whitespace.
+
+    Keywords and identifiers are lowercased; a quoted identifier ("x", `x`,
+    [x]) becomes its bare lowercased name; a string literal is kept verbatim
+    (quotes included), so text inside one never reads as a keyword. Anything the
+    scanner cannot close (an unterminated quote or comment) raises: the caller
+    treats that as "cannot verify" and refuses the rebuild.
+    """
+    tokens: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end == -1 else end + 1
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2  # SQLite accepts an unclosed trailing /*
+        elif c == "'":
+            j = i + 1
+            while True:
+                j = sql.find("'", j)
+                if j == -1:
+                    raise ValueError("unterminated string literal")
+                if sql.startswith("''", j):
+                    j += 2
+                    continue
+                break
+            tokens.append(sql[i : j + 1])
+            i = j + 1
+        elif c in '"`[':
+            close = "]" if c == "[" else c
+            j = i + 1
+            parts = []
+            while True:
+                k = sql.find(close, j)
+                if k == -1:
+                    raise ValueError("unterminated quoted identifier")
+                parts.append(sql[j:k])
+                if close != "]" and sql.startswith(close * 2, k):
+                    parts.append(close)
+                    j = k + 2
+                    continue
+                break
+            tokens.append("".join(parts).lower())
+            i = k + 1
+        elif c.isalnum() or c == "_" or c == "$" or ord(c) > 127:
+            j = i
+            while j < n and (sql[j].isalnum() or sql[j] in "_$" or ord(sql[j]) > 127):
+                j += 1
+            tokens.append(sql[i:j].lower())
+            i = j
+        else:
+            tokens.append(c)
+            i += 1
+    return tokens
+
+
+def _ddl_features(sql: str) -> tuple[list[tuple[str, ...]], list[str]]:
+    """Return (CHECK expressions, other clause keywords) found in a CREATE TABLE.
+
+    CHECK expressions are token tuples of the parenthesised body. The other list
+    names every COLLATE / ON CONFLICT / AUTOINCREMENT clause, plus any table
+    option after the column list (STRICT, WITHOUT ROWID) — the constraint kinds
+    no PRAGMA reports.
+    """
+    toks = _sql_tokens(sql)
+    checks: list[tuple[str, ...]] = []
+    other: list[str] = []
+    depth = 0
+    body_closed_at = None
+    for idx, tok in enumerate(toks):
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+            if depth == 0 and body_closed_at is None:
+                body_closed_at = idx
+        elif tok == "check" and idx + 1 < len(toks) and toks[idx + 1] == "(":
+            level, j = 0, idx + 1
+            while j < len(toks):
+                level += toks[j] == "("
+                level -= toks[j] == ")"
+                if level == 0:
+                    break
+                j += 1
+            checks.append(tuple(toks[idx + 1 : j + 1]))
+        elif tok == "collate" and idx + 1 < len(toks):
+            other.append(f"COLLATE {toks[idx + 1]}")
+        elif tok == "conflict":
+            other.append("ON CONFLICT")
+        elif tok == "autoincrement":
+            other.append("AUTOINCREMENT")
+    if body_closed_at is None:
+        raise ValueError("no closed column list")
+    trailing = [t for t in toks[body_closed_at + 1 :] if t not in (",", ";")]
+    if trailing:
+        other.append("table option " + " ".join(trailing).upper())
+    return checks, other
+
+
+def _canonical_shape(status_values: str) -> dict:
+    """What the rebuild target declares, measured from a private in-memory copy."""
+    sql = f"CREATE TABLE inbox_items ({_COLUMNS_TEMPLATE.format(status_values=status_values)})"
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(sql)
+        cols = {
+            r[1]: (str(r[2]).upper(), r[3], r[4])
+            for r in conn.execute("PRAGMA table_xinfo(inbox_items)")
+        }
+        pk = [
+            r[1]
+            for r in sorted(conn.execute("PRAGMA table_xinfo(inbox_items)"), key=lambda r: r[5])
+            if r[5]
+        ]
+    finally:
+        conn.close()
+    checks, _other = _ddl_features(sql)
+    return {"cols": cols, "pk": pk, "checks": checks}
+
+
+async def _refuse_constraints_the_rebuild_would_drop(db: aiosqlite.Connection, ddl: str) -> None:
+    """Raise if the live table carries a constraint the fixed template lacks.
+
+    The rebuild recreates inbox_items from _COLUMNS_TEMPLATE, so anything an
+    install added to the table definition itself would be silently lost.
+    Reconstructing arbitrary DDL is out of scope; refusing is not. Coverage of
+    SQLite's constraint kinds:
+
+    - PRIMARY KEY (column or table)   -> table_xinfo pk columns must equal the target's
+    - UNIQUE (column or table)        -> index_list origin 'u' (its autoindex has NULL
+                                         sql, so the index copy would miss it)
+    - FOREIGN KEY / REFERENCES        -> foreign_key_list must be empty (target has none)
+    - CHECK (column or table)         -> every CHECK in the live DDL must be one the
+                                         narrow or wide target declares (the status CHECK)
+    - NOT NULL, DEFAULT, declared type -> table_xinfo, per shared column
+    - COLLATE, ON CONFLICT, AUTOINCREMENT, STRICT / WITHOUT ROWID -> DDL scan (no
+                                         PRAGMA reports them; the target has none)
+    - GENERATED columns               -> table_xinfo hidden flag (a canonical name) and
+                                         the column drift check in _rebuild (a new name)
+    PK ASC/DESC is not compared: it orders the autoindex only, with no effect on
+    which rows the key admits.
+    Explicit CREATE [UNIQUE] INDEX objects are not constraints of the table
+    definition: they are copied verbatim by _rebuild.
+    """
+    found: list[str] = []
+    try:
+        live_checks, live_other = _ddl_features(ddl)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"inbox_items rebuild: cannot read the live table definition ({exc}); "
+            "refusing to rebuild a table whose constraints it cannot verify."
+        ) from exc
+    found += live_other
+
+    allowed_checks = {
+        c for sv in (_NARROW_STATUSES, _WIDE_STATUSES) for c in _canonical_shape(sv)["checks"]
+    }
+    for chk in live_checks:
+        if chk not in allowed_checks:
+            found.append("CHECK " + " ".join(chk))
+
+    target = _canonical_shape(_WIDE_STATUSES)
+    cursor = await db.execute("PRAGMA table_xinfo(inbox_items)")
+    xinfo = list(await cursor.fetchall())
+    live_pk = [r[1] for r in sorted(xinfo, key=lambda r: r[5]) if r[5]]
+    if live_pk and live_pk != target["pk"]:
+        found.append(f"PRIMARY KEY ({', '.join(live_pk)})")
+    for r in xinfo:
+        name, ctype, notnull, dflt = r[1], str(r[2]).upper(), r[3], r[4]
+        if r[6]:
+            # A generated column reports a plain declared type; only the hidden
+            # flag (2 virtual, 3 stored) shows the expression the rebuild would
+            # lose. Unknown names are also caught by the drift check, but one
+            # shadowing a canonical name is caught only here.
+            found.append(f"column {name} GENERATED (hidden={r[6]})")
+        want = target["cols"].get(name)
+        if want is None:
+            continue  # unknown columns are reported by the drift check
+        if ctype != want[0]:
+            found.append(f"column {name} declared type {ctype} (target {want[0]})")
+        if notnull and not want[1]:
+            found.append(f"column {name} NOT NULL")
+        if dflt is not None and dflt != want[2]:
+            found.append(f"column {name} DEFAULT {dflt}")
+
+    cursor = await db.execute("PRAGMA index_list(inbox_items)")
+    for row in await cursor.fetchall():
+        if row[3] == "u":
+            cur2 = await db.execute(f'PRAGMA index_info("{row[1].replace(chr(34), chr(34) * 2)}")')
+            cols = [c[2] for c in await cur2.fetchall()]
+            found.append(f"UNIQUE ({', '.join(cols)})")
+    cursor = await db.execute("PRAGMA foreign_key_list(inbox_items)")
+    for row in await cursor.fetchall():
+        if row[1] == 0:  # seq 0 = first column of each constraint
+            found.append(f"FOREIGN KEY ({row[3]}) REFERENCES {row[2]}")
+
+    if found:
+        raise RuntimeError(
+            "inbox_items rebuild: the live table carries constraint(s) the rebuild "
+            f"template does not produce and would silently drop: {found}. This "
+            "migration will not reconstruct install-local DDL. Remove them (or "
+            "recreate inbox_items with the canonical DDL) and re-run; nothing was changed."
+        )
+
+
 async def _live_ddl(db: aiosqlite.Connection) -> str | None:
     cursor = await db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbox_items'"
@@ -112,6 +331,27 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
                 "fail. Apply this migration with foreign_keys=OFF."
             )
 
+    # The scratch name is created here, so anything already holding it belongs
+    # to the operator (a retained manual-recovery copy, say). Dropping it would
+    # destroy their data and the migration would commit the loss: refuse
+    # instead. Names are case-insensitive, and a TEMP object of that name would
+    # shadow the unqualified references below, so both schemas are checked.
+    cursor = await db.execute(
+        "SELECT type, name FROM sqlite_master WHERE lower(name) = ? "
+        "UNION ALL SELECT type, name FROM sqlite_temp_master WHERE lower(name) = ?",
+        (_SCRATCH_TABLE, _SCRATCH_TABLE),
+    )
+    squatter = await cursor.fetchone()
+    if squatter:
+        raise RuntimeError(
+            f"inbox_items rebuild: a {squatter[0]} named {squatter[1]!r} already exists "
+            f"and this migration needs the name {_SCRATCH_TABLE!r} for its scratch table. "
+            "It is not the migration's to drop: rename or remove it, then re-run. "
+            "Nothing was changed."
+        )
+
+    await _refuse_constraints_the_rebuild_would_drop(db, await _live_ddl(db) or "")
+
     # Capture every explicit index on the live table so none is lost to the
     # DROP (autoindexes have NULL sql and are recreated by the PRIMARY KEY), and
     # EVERY view and trigger in the schema: ALTER TABLE ... RENAME reparses the
@@ -136,15 +376,15 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
     )
     live_triggers = list(await cursor.fetchall())
 
-    await db.execute("DROP TABLE IF EXISTS inbox_items_new")
     await db.execute(
         f"CREATE TABLE inbox_items_new ({_COLUMNS_TEMPLATE.format(status_values=status_values)})"
     )
 
     # table_xinfo, not table_info: table_info omits generated columns, which
     # would let an install-added generated column pass the drift check and be
-    # silently dropped. The rebuild target declares none, so any live one
-    # (hidden flag 2/3) is reported as drift below.
+    # silently dropped. A generated column under a NEW name is reported as drift
+    # below; one reusing a canonical name was already refused by the hidden-flag
+    # check in _refuse_constraints_the_rebuild_would_drop.
     cursor = await db.execute("PRAGMA table_xinfo(inbox_items)")
     src_cols = [r[1] for r in await cursor.fetchall()]
     cursor = await db.execute("PRAGMA table_xinfo(inbox_items_new)")

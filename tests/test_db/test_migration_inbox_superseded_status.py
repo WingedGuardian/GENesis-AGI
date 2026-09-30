@@ -61,9 +61,9 @@ _ROWS = [
 ]
 
 
-async def _make_legacy_db() -> aiosqlite.Connection:
+async def _make_legacy_db(ddl: str = _LEGACY_DDL) -> aiosqlite.Connection:
     db = await aiosqlite.connect(":memory:")
-    await db.execute(_LEGACY_DDL)
+    await db.execute(ddl)
     for stmt in _LEGACY_INDEXES:
         await db.execute(stmt)
     # Insert in an order that makes rowid differ from id order, so a renumbering
@@ -369,4 +369,208 @@ async def test_down_restores_failed_and_narrow_check():
     with pytest.raises(sqlite3.IntegrityError):
         await db.execute("UPDATE inbox_items SET status = 'superseded' WHERE id = 'a'")
     await M.down(db)  # already narrowed — no-op
+    await db.close()
+
+
+# ── Refusals: the rebuild must never destroy something it did not create ──
+
+
+async def _table_ddl(db):
+    cur = await db.execute("SELECT sql FROM sqlite_master WHERE name='inbox_items'")
+    return (await cur.fetchone())[0]
+
+
+async def _assert_untouched(db, ddl_before, snap_before, statuses_before):
+    assert await _table_ddl(db) == ddl_before
+    assert await _snapshot(db) == snap_before
+    assert await _statuses(db) == statuses_before  # backfill did not run either
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "create_stmt",
+    [
+        "CREATE TABLE inbox_items_new (note TEXT)",
+        "CREATE TABLE INBOX_ITEMS_NEW (note TEXT)",  # SQLite names are case-insensitive
+        "CREATE TEMP TABLE inbox_items_new (note TEXT)",  # would shadow the unqualified name
+        "CREATE VIEW inbox_items_new AS SELECT 'keep me' AS note",
+    ],
+)
+async def test_preexisting_inbox_items_new_is_preserved_and_migration_aborts(create_stmt):
+    """A table (or view) already named inbox_items_new belongs to the operator —
+    e.g. a retained manual-recovery copy. The migration must refuse, name it,
+    and leave both it and inbox_items exactly as they were."""
+    db = await _make_legacy_db()
+    await db.execute(create_stmt)
+    if "VIEW" not in create_stmt:
+        await db.execute("INSERT INTO inbox_items_new VALUES ('keep me')")
+    await db.commit()
+    before = (await _table_ddl(db), await _snapshot(db), await _statuses(db))
+
+    with pytest.raises(RuntimeError, match="inbox_items_new"):
+        await M.up(db)
+
+    cur = await db.execute("SELECT note FROM inbox_items_new")
+    assert [r[0] for r in await cur.fetchall()] == ["keep me"]
+    await _assert_untouched(db, *before)
+    await db.close()
+
+
+def _with(old: str, new: str) -> str:
+    assert _LEGACY_DDL.count(old) == 1, old
+    return _LEGACY_DDL.replace(old, new)
+
+
+_TAIL = "batch_items TEXT)"
+
+# (case id, live DDL, text the refusal must name). Each is a constraint or table
+# property the fixed rebuild template does not produce, so a rebuild would drop it.
+_DROPPED_CONSTRAINTS = [
+    ("table-unique", _with(_TAIL, "batch_items TEXT, UNIQUE (file_path, content_hash))"), "UNIQUE"),
+    (
+        "column-unique",
+        _with("content_hash   TEXT NOT NULL,", "content_hash TEXT NOT NULL UNIQUE,"),
+        "UNIQUE",
+    ),
+    (
+        "table-fk",
+        _with(_TAIL, "batch_items TEXT, FOREIGN KEY (batch_id) REFERENCES batches(id))"),
+        "FOREIGN KEY",
+    ),
+    (
+        "column-fk",
+        _with("batch_id       TEXT,", "batch_id TEXT REFERENCES batches(id),"),
+        "FOREIGN KEY",
+    ),
+    ("table-check", _with(_TAIL, "batch_items TEXT, CHECK (retry_count >= 0))"), "CHECK"),
+    (
+        "column-check",
+        _with(
+            "created_at     TEXT NOT NULL,",
+            "created_at TEXT NOT NULL CHECK (length(created_at) > 0),",
+        ),
+        "CHECK",
+    ),
+    (
+        "status-check-extra-value",
+        _with("'completed', 'failed')", "'completed', 'failed', 'archived')"),
+        "CHECK",
+    ),
+    (
+        "collate",
+        _with("file_path      TEXT NOT NULL,", "file_path TEXT NOT NULL COLLATE NOCASE,"),
+        "COLLATE",
+    ),
+    (
+        "on-conflict",
+        _with("id             TEXT PRIMARY KEY,", "id TEXT PRIMARY KEY ON CONFLICT REPLACE,"),
+        "CONFLICT",
+    ),
+    (
+        "composite-pk",
+        _with(_TAIL, "batch_items TEXT, PRIMARY KEY (id, file_path))").replace(
+            "id             TEXT PRIMARY KEY,", "id TEXT,"
+        ),
+        "PRIMARY KEY",
+    ),
+    (
+        "extra-not-null",
+        _with("response_path  TEXT,", "response_path TEXT NOT NULL DEFAULT '',"),
+        "response_path",
+    ),
+    ("changed-default", _with("DEFAULT 0", "DEFAULT 3"), "retry_count"),
+    (
+        "changed-type",
+        _with("evaluated_content TEXT", "evaluated_content BLOB"),
+        "evaluated_content",
+    ),
+    ("strict", _with(_TAIL, "batch_items TEXT) STRICT"), "STRICT"),
+    # table_xinfo reports these as plain TEXT; only the hidden flag differs.
+    (
+        "generated-virtual-shadow",
+        _with("response_path  TEXT,", "response_path TEXT GENERATED ALWAYS AS (id) VIRTUAL,"),
+        "GENERATED",
+    ),
+    (
+        "generated-stored-shadow",
+        _with("response_path  TEXT,", "response_path TEXT GENERATED ALWAYS AS (id) STORED,"),
+        "GENERATED",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ddl", "named"),
+    [c[1:] for c in _DROPPED_CONSTRAINTS],
+    ids=[c[0] for c in _DROPPED_CONSTRAINTS],
+)
+async def test_install_local_constraint_aborts_with_table_untouched(ddl, named):
+    db = await _make_legacy_db(ddl)
+    before = (await _table_ddl(db), await _snapshot(db), await _statuses(db))
+
+    with pytest.raises(RuntimeError, match=named):
+        await M.up(db)
+
+    await _assert_untouched(db, *before)
+    cur = await db.execute("SELECT name FROM sqlite_master WHERE name='inbox_items_new'")
+    assert await cur.fetchone() is None
+    await db.close()
+
+
+# Spellings of the canonical schema that must still migrate: the detection keys
+# on constraints, not on how the DDL happens to be written.
+_CANONICAL_SPELLINGS = [
+    ("live-shape", _LEGACY_DDL),
+    (
+        "keywords-in-a-comment",
+        _with("batch_id       TEXT,", "batch_id TEXT, -- CHECK (x) UNIQUE COLLATE nocase STRICT\n"),
+    ),
+    (
+        "keywords-in-a-block-comment",
+        _with("batch_id       TEXT,", "batch_id TEXT /* REFERENCES t(x) ON CONFLICT */,"),
+    ),
+    (
+        "compact-status-check",
+        _with(
+            "CHECK (\n            status IN ('pending', 'processing', 'completed', 'failed')\n        )",
+            "CHECK(status IN('pending','processing','completed','failed'))",
+        ),
+    ),
+    ("quoted-status-identifier", _with("status IN (", '"status" IN (')),
+    (
+        "named-status-check",
+        _with("DEFAULT 'pending' CHECK", "DEFAULT 'pending' CONSTRAINT ck_status CHECK"),
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ddl", [c[1] for c in _CANONICAL_SPELLINGS], ids=[c[0] for c in _CANONICAL_SPELLINGS]
+)
+async def test_canonical_schema_spellings_still_migrate(ddl):
+    db = await _make_legacy_db(ddl)
+    await M.up(db)
+    assert await _statuses(db) == {r[0]: r[4] for r in _ROWS}
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_canonical_schema_round_trips_down_then_up():
+    """The shipped CREATE (which carries an SQL comment inside the table body)
+    must pass the constraint check in both directions."""
+    db = await aiosqlite.connect(":memory:")
+    await create_all_tables(db)
+    await db.execute(
+        "INSERT INTO inbox_items (id, file_path, content_hash, status, created_at, "
+        "error_message) VALUES ('x', '/f', 'h', 'superseded', 't', "
+        "'approval_invalidated:content changed')"
+    )
+    await M.down(db)
+    assert await _statuses(db) == {"x": "failed"}
+    assert "'superseded'" not in await _table_ddl(db)
+    await M.up(db)
+    assert await _statuses(db) == {"x": "superseded"}
+    assert "'superseded'" in await _table_ddl(db)
     await db.close()
