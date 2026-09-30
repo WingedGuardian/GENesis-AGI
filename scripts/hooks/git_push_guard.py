@@ -156,8 +156,8 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
     os._exit(2)
 
 # The per-reviewer severity parsers and the reviewer table live in a stdlib
-# sibling so the round counter (review_budget) reads findings with the SAME code
-# this gate scores them with. A HARD dependency: every merge-gate scan needs
+# sibling so every gate reads the SAME table, and so the round counter can later
+# read findings with the same code this gate scores them with. A HARD dependency: every merge-gate scan needs
 # them, so a broken tree blocks, exactly like the two helpers above.
 try:
     from review_findings import (  # noqa: E402
@@ -174,6 +174,7 @@ try:
     )
     from review_findings import (
         configured_reviewers,
+        enforced_logins,
         primary_reviewer_login,
         substitute_reviewer_logins,
     )
@@ -1504,7 +1505,25 @@ _CLEAN_PATTERNS = [
 ]
 
 # Bot usernames that post automated reviews
-_REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
+def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
+    """``(sets, "")`` or ``({}, block message)``: which logins each finding scanner
+    reads, from the reviewer table (see `review_findings.enforced_logins`). A scanner
+    that cannot know whose findings it is reading BLOCKS rather than read none —
+    after its own override check, so `# review-override` still waives it."""
+    sets, error = enforced_logins()
+    if sets is None:
+        return {}, (
+            f"the reviewer table is unreadable ({error}), so review findings cannot be "
+            f"attributed to their reviewers. Fix config/reviewers.yaml or "
+            f"~/.genesis/config/reviewers.local.yaml, or append '# review-override'."
+        )
+    return sets, ""
+
+
+def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
+    """The review-body verdict scan's authors: the Codex-badge reviewers, plus the CI
+    bot, whose comments are walked and skipped as non-verdicts."""
+    return sets.get("codex-badge", frozenset()) | {"github-actions[bot]"}
 
 # ── Inline review comments (pulls/N/comments — a DIFFERENT endpoint) ──
 # Codex posts its actual P1/P2 findings ONLY as inline review comments;
@@ -1518,7 +1537,6 @@ _REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
 # they pass the author filter — and then dropped, because neither badge pattern
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
 # a Major reported `inline-findings: ok`, indistinguishable from a clean one.
-_CODERABBIT_LOGINS = {"coderabbitai[bot]"}
 _CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
 # CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
 # markdown rule, when they land near each other in the diff. Each segment is
@@ -1552,7 +1570,6 @@ _CR_BLOCKING_WEIGHT = 1.0
 # surfaced as format drift and never scored. Guessing a severity from an
 # unknown marker would be worse than the blindness, and the vendor adding a
 # level must not silently start blocking every PR.
-_DEVIN_LOGINS = frozenset({"devin-ai-integration[bot]"})
 # Strength order among the copies of a duplicated finding. Compared only AFTER
 # each copy's scope is judged on its own anchor (see `_devin_disposition`).
 _DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
@@ -2112,7 +2129,7 @@ def _coderabbit_title(body: str) -> str:
 # cannot create an inline review comment for it, so it puts the finding in the
 # review BODY under a collapsible section instead. NEITHER existing scan sees
 # these: `_check_inline_review_findings` reads `pulls/N/comments` (a different
-# endpoint entirely), and `_check_pr_review_findings` gates on `_REVIEW_BOTS`,
+# endpoint entirely), and `_check_pr_review_findings` gates on `_review_bots(...)`,
 # which does not contain CodeRabbit.
 #
 # MEASURED 2026-09-07, all 84 then-open non-draft PRs: 27 deduped findings
@@ -3018,6 +3035,9 @@ def _check_inline_review_findings(
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
+    scanner_sets, table_block = _enforced_logins_or_block()
+    if table_block:
+        return True, table_block
     # Paginate via the shared helper (findings beyond the first REST page must still
     # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
     # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
@@ -3061,6 +3081,9 @@ def _check_inline_review_findings(
         and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
     }
+    # The reviewer table decides which logins each parser reads (read ONCE per scan).
+    devin_logins = scanner_sets.get("devin-marker", frozenset())
+    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
     devin_cleared: set[str] = set()
     # Groups a MAINTAINER answered. A group cleared only by Devin's own reply is
     # surfaced below rather than dropped: Devin's reviewer and its builder post
@@ -3070,7 +3093,7 @@ def _check_inline_review_findings(
     devin_maint_cleared: set[str] = set()
     devin_copies: dict[str, list[dict]] = {}
     for c in raw:
-        if c.get("reply_to") or (c.get("login") or "") not in _DEVIN_LOGINS:
+        if c.get("reply_to") or (c.get("login") or "") not in devin_logins:
             continue
         if c.get("type") != "Bot":
             continue
@@ -3202,7 +3225,7 @@ def _check_inline_review_findings(
         # So an unrecognised author skips the matchers entirely and falls to the
         # unrecognised branch: SURFACED, never scored, never blocking.
         parseable = utype == "Bot" or login in _INLINE_REVIEW_BOTS
-        if login in _DEVIN_LOGINS and utype == "Bot":
+        if login in devin_logins and utype == "Bot":
             # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
             # Devin quotes guard output and code in its findings, so a body can
             # contain `![P1 Badge]` as QUOTED TEXT. Falling through to the badge
@@ -3288,7 +3311,7 @@ def _check_inline_review_findings(
                 devin_minor.append(title)
                 scored_at.append(("DVm", dv_path or ""))
             continue
-        if login in _CODERABBIT_LOGINS:
+        if login in coderabbit_logins:
             # Engagement is checked ONCE, for the whole comment, BEFORE severity —
             # not per-severity below. It used to sit inside the blocking branch, so
             # only Critical/Major honoured a maintainer reply while every Minor,
@@ -3496,7 +3519,7 @@ def _check_inline_review_findings(
             # merge clock; that trade is open, not settled.
             continue
         review_login = review.get("login") or ""
-        if review_login not in _CODERABBIT_LOGINS:
+        if review_login not in coderabbit_logins:
             # NOT a silent drop any more. An author this scan cannot parse still
             # gets NAMED, so the session knows the input exists.
             #
@@ -4139,6 +4162,9 @@ def _check_pr_review_findings(
             file=sys.stderr,
         )
         return False, ""
+    scanner_sets, table_block = _enforced_logins_or_block()
+    if table_block:
+        return True, table_block
 
     # Paginate via the shared helper (a review-body finding beyond the first REST
     # page must still gate). ``comments is None`` = the first page was unreadable;
@@ -4164,14 +4190,15 @@ def _check_pr_review_findings(
     # This closes the fail-open (Codex P1) where the old terminal clause
     # ``if is_clean or not blocking_matches: return clean`` let ANY marker-less
     # comment from a Bot-typed account (Dependabot, or github-actions — which is IN
-    # _REVIEW_BOTS) end the walk clean, silently clearing an earlier ERROR. Requiring
+    # _review_bots()) end the walk clean, silently clearing an earlier ERROR. Requiring
     # a recognized verdict marker closes BOTH the unrecognized-bot and the
     # recognized-but-non-verdict (status-comment) masking paths.
+    review_bots = _review_bots(scanner_sets)
     for c in reversed(comments):
         login = c.get("login") or ""
         body = c.get("body") or ""  # GitHub returns null body for deleted comments
         # Only recognized review bots set the verdict.
-        if login not in _REVIEW_BOTS:
+        if login not in review_bots:
             continue
         # Codex quota-exhausted messages are not a review.
         if "reached your Codex usage limits" in body and not any(
@@ -4219,9 +4246,32 @@ def _check_pr_review_findings(
 # (the review object's ``commit_id``) — NOT a short prefix from the body, which a
 # stale prefix (or a ground SHA sharing it) could satisfy. Waived by
 # '# review-override' (the conscious "merge without a current Codex review" case).
-#
-# WHICH reviewer that is comes from the reviewer table (`config/reviewers.yaml`
-# plus the install-local overlay): the one marked `primary`, Codex by default.
+def _reviewer_config_note() -> str:
+    """A NOTE for freshness blocks when the reviewer table departs from the shipped
+    Codex-primary set, whose remediation text the messages below spell out. Empty on
+    the shipped table, so its messages stay word-for-word what they were."""
+    table, error = configured_reviewers()
+    if error or not table:
+        return ""
+    primary = next(login for login, r in table.items() if r.primary)
+    subs = substitute_reviewer_logins()
+    if primary == "chatgpt-codex-connector[bot]" and set(subs) == {
+        "devin-ai-integration[bot]",
+        "coderabbitai[bot]",
+    }:
+        return ""
+    return (
+        f"\nNOTE: this install's reviewer table (config/reviewers.yaml + "
+        f"~/.genesis/config/reviewers.local.yaml) makes {primary} the primary reviewer"
+        f" and {', '.join(subs) or 'no reviewer'} the possible stand-in(s). Where the text "
+        f"above names Codex, '@codex review', Devin or CodeRabbit, read the configured "
+        f"reviewers instead: only a review by {primary} at the head clears this gate."
+    )
+
+
+# WHICH reviewer merge freshness requires comes from the reviewer table
+# (`config/reviewers.yaml` plus the install-local overlay): the one marked
+# `primary`, Codex by default.
 def _primary_reviewer_login() -> str | None:
     """The configured primary reviewer's REST login, or None when unreadable.
 
@@ -4744,6 +4794,13 @@ def _comment_repo(argv: list[str]) -> str | None:
 
 def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     """Native-approval reason for one review request; no self-issued sigil exists."""
+    table_errors = [e for e in result.get("errors") or [] if "reviewers_config" in str(e)]
+    if result.get("status") != "ok" and table_errors:
+        return (
+            f"The reviewer table is unreadable ({table_errors[0]}), so the review budget "
+            f"for PR #{pr_num} cannot be evaluated. Fix config/reviewers.yaml or "
+            f"~/.genesis/config/reviewers.local.yaml; autonomous sessions are denied."
+        )
     if result.get("status") != "ok":
         return (
             f"Review evidence for PR #{pr_num} in {repo} could not be read reliably. "
@@ -6470,6 +6527,7 @@ def _check_codex_reviewed_head_core(
                 f"post '@codex review' and check for a review at head BEFORE concluding "
                 f"Codex is unavailable."
                 f"{clean_note}"
+                f"{_reviewer_config_note()}"
             ),
             None,
         )
@@ -6539,6 +6597,7 @@ def _check_codex_reviewed_head_core(
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
                 f"{clean_note}"
+                f"{_reviewer_config_note()}"
             ),
             None,
         )

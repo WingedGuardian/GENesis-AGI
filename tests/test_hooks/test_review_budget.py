@@ -486,3 +486,33 @@ def test_the_cli_loads_configured_reviewer_identities():
     assert parser.parse_args(
         ["--external-identity-template", "x{head}"]
     ).external_identity_template == ["x{head}"]
+
+
+
+def _seams(monkeypatch, reviews):
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", H5)
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps({"sha": h}) for h in (H1, H2, H3, H4, H5)))
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "\n".join(json.dumps(r) for r in reviews))
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_FILES", json.dumps({"filename": "src/x.py"}))
+
+
+def test_the_round_counter_counts_the_tables_primary(monkeypatch):
+    """A2a round 1 (Devin 🔴): moving the primary must move what is counted, or the
+    approval limits count a reviewer nobody waits on and never engage."""
+    devin = "devin-ai-integration[bot]"
+    _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
+    assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 0
+    monkeypatch.setenv(
+        "_TEST_REVIEWERS_LOCAL_YAML",
+        f"reviewers:\n  {rb.CODEX_REVIEW_BOT}: parser=codex-badge\n  {devin}: primary parser=devin-marker\n",
+    )
+    got = rb.evaluate_pr("o/r", 1, external_identity_templates=())
+    assert got["count"] == 4 and got["commit_approval_required"] is True
+
+
+def test_an_unreadable_table_makes_the_budget_unknown(monkeypatch):
+    _seams(monkeypatch, [_review(H4)])
+    monkeypatch.setenv("_TEST_REVIEWERS_YAML", "garbage")
+    got = rb.evaluate_pr("o/r", 1, external_identity_templates=())
+    assert got["status"] == "unknown" and "reviewers_config_malformed" in got["errors"]

@@ -118,6 +118,15 @@ def test_disabled_removes_a_reviewer(monkeypatch):
             id="human-login",
         ),
         pytest.param(SHIPPED + "  CodeRabbitAI[bot]: disabled\n", "", id="uppercase-login"),
+        pytest.param(
+            SHIPPED + f"  {DEVIN}: disabled parser=bogus\n", "", id="disabled-with-other-words"
+        ),
+        pytest.param(
+            SHIPPED + "  github-advanced-security[bot]: parser=codeql\n", "", id="codeql-not-surface-only"
+        ),
+        pytest.param(
+            SHIPPED + f"  {RABBIT}: surface-only parser=coderabbit-header\n", "", id="surface-only-scored-parser"
+        ),
         pytest.param(SHIPPED + "other:\n  x: y\n", "", id="second-block"),
         pytest.param(f"  {CODEX}: primary parser=codex-badge\n", "", id="entry-outside-block"),
         pytest.param(f"reviewers:\n  {CODEX}: parser=codex-badge\n", "", id="no-primary"),
@@ -244,3 +253,72 @@ def test_the_moved_parsers_are_the_ones_the_gate_uses(guard):
     assert guard._cr_severity is rf.cr_severity
     assert guard._devin_finding is rf.devin_finding
     assert guard._INLINE_P1_RE is rf.INLINE_P1_RE
+
+
+
+def test_enforced_logins_add_but_never_remove(monkeypatch):
+    """Trust follows the merged table; enforcement is the merged table PLUS the
+    shipped file, so an overlay can add a reviewer whose findings are read but can
+    never stop a shipped reviewer's findings being read."""
+    shipped = SHIPPED + f"  {DEVIN}: parser=devin-marker\n  {RABBIT}: parser=coderabbit-header\n"
+    overlay = f"reviewers:\n  acme-review[bot]: parser=devin-marker\n  {RABBIT}: disabled\n"
+    _table(monkeypatch, shipped=shipped, overlay=overlay)
+    sets, error = rf.enforced_logins()
+    assert error is None
+    assert sets["devin-marker"] == {DEVIN, "acme-review[bot]"}
+    assert sets["coderabbit-header"] == {RABBIT}, "an overlay `disabled` must not drop enforcement"
+    assert sets["codex-badge"] == {CODEX}
+    assert RABBIT not in rf.substitute_reviewer_logins(), "but it does withdraw trust"
+    monkeypatch.setenv("_TEST_REVIEWERS_YAML", "garbage")
+    assert rf.enforced_logins() == (None, "reviewers_config_malformed")
+
+
+def test_a_byte_order_mark_is_tolerated_in_the_file(monkeypatch, tmp_path):
+    shipped = tmp_path / "reviewers.yaml"
+    shipped.write_text("\ufeff" + SHIPPED, encoding="utf-8")
+    monkeypatch.delenv("_TEST_REVIEWERS_YAML", raising=False)
+    monkeypatch.setenv("_TEST_REVIEWERS_LOCAL_YAML", "")
+    monkeypatch.setattr(rf, "_SHIPPED", shipped)
+    assert rf.primary_reviewer_login() == CODEX
+
+
+def test_a_long_line_is_parsed_in_linear_time(monkeypatch):
+    """The reader runs on a hook path; a pathological line must not backtrack."""
+    import time
+
+    line = f"  {DEVIN}: parser=devin-marker" + " " * 200_000 + "x\n"
+    start = time.perf_counter()
+    _table(monkeypatch, shipped=SHIPPED + line)
+    assert time.perf_counter() - start < 2.0
+
+
+def test_freshness_block_names_a_non_default_primary(guard, monkeypatch):
+    """When the table moves the primary, the Codex remediation text is not the way
+    out; the block says who the gate actually waits on."""
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", H)
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+    monkeypatch.setenv(
+        "_TEST_REVIEWERS_LOCAL_YAML",
+        f"reviewers:\n  {CODEX}: parser=codex-badge\n  {DEVIN}: primary parser=devin-marker\n",
+    )
+    block, msg, _ = guard._check_codex_reviewed_head("1")
+    assert block is True
+    assert f"makes {DEVIN} the primary reviewer" in msg
+
+
+def test_freshness_block_on_the_shipped_table_has_no_note(guard, monkeypatch):
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", H)
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+    block, msg, _ = guard._check_codex_reviewed_head("1")
+    assert block is True and "reviewer table" not in msg
+
+
+def test_budget_messages_name_a_reviewer_table_error(guard):
+    """A typo in the overlay makes the budget unknown; the approval text must say it
+    is a config problem, not that GitHub's review history was unreadable."""
+    import review_enforcement_commit as rec
+
+    result = {"status": "unknown", "errors": ["reviewers_config_malformed"]}
+    for text in (rec._commit_budget_reason(result), guard._review_budget_message("7", result, "o/r")):
+        assert "reviewer table is unreadable (reviewers_config_malformed)" in text
+        assert "reviewers.local.yaml" in text

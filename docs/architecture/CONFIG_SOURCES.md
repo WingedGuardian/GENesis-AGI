@@ -192,9 +192,12 @@ library, because every review gate imports it). Re-read on every call. An overla
 REPLACES the base line for the same reviewer login and `<login>: disabled` removes one;
 there is no deep merge. Unlike pattern A, a malformed file of EITHER kind is not ignored:
 the whole table reads as unknown and the merge gate blocks, naming the config error,
-rather than silently dropping a reviewer. Today the gate reads only the primary
-(freshness) and the substitute set from it. Not a settings domain: no dashboard or
-`settings_update` writer.
+rather than silently dropping a reviewer. The merge gate reads from it the primary
+(freshness), the substitute set, and which logins its inline finding scanner reads with
+each parser; the round counter (`scripts/review_budget.py`) counts the primary's reviewed
+heads. The overlay path follows `$HOME`, so a process run under another account (sudo,
+CI) sees a different table. Not a settings domain: no dashboard or `settings_update`
+writer.
 
 ---
 

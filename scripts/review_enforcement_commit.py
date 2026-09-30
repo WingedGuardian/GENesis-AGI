@@ -1271,6 +1271,13 @@ def _branch_review_budget(
 
 def _commit_budget_reason(result: dict) -> str:
     if result.get("status") != "ok":
+        table_errors = [e for e in result.get("errors") or [] if "reviewers_config" in str(e)]
+        if table_errors:
+            return (
+                f"The reviewer table is unreadable ({table_errors[0]}), so the review "
+                f"budget cannot be evaluated. Fix config/reviewers.yaml or "
+                f"~/.genesis/config/reviewers.local.yaml; autonomous sessions are denied."
+            )
         return (
             "The open pull request's review history could not be read reliably. "
             "Approve this one commit only if you independently verified that the "

@@ -7,11 +7,11 @@ Two things live here, both stdlib-only so every gate can import them:
    overlay ``~/.genesis/config/reviewers.local.yaml``. It names the reviewers
    whose reviews count, which one is primary (the one merge freshness asks for),
    which parser reads each one's findings, and the severity words that parser
-   maps to ``floor`` / ``minor`` / ``analysis``. TODAY the merge gate reads two
-   things from it: the primary (merge freshness) and the substitute set. Scoring
-   and round counting still key on their own login sets; they move onto this
-   table in later changes, which is when the parser and severity words start
-   being consumed.
+   maps to ``floor`` / ``minor`` / ``analysis``. The merge gate reads from it the
+   primary (merge freshness), the substitute set, and which logins its inline
+   finding scanner reads with each parser; the round counter reads the primary.
+   The severity WORDS are declared here but not yet consumed: each parser still
+   maps its own vocabulary, which is the shipped one.
 2. The per-reviewer SEVERITY PARSERS (Codex badges, CodeRabbit's header, Devin's
    marker), moved here from the merge gate so the round counter can read a
    finding with the same code the merge gate scores it with.
@@ -51,7 +51,6 @@ _LIST_KEYS = ("floor", "minor", "analysis")
 # `CodeRabbitAI[bot]` line would otherwise match nothing and silently do nothing.
 # Bounded and anchored, so a line cannot put markup into gate output.
 _LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}\[bot\]$")
-_ENTRY_RE = re.compile(r"^\s+(\S+?)\s*:\s*(.*?)\s*$")
 _SHIPPED = Path(__file__).resolve().parents[1] / "config" / "reviewers.yaml"
 _OVERLAY = Path.home() / ".genesis" / "config" / "reviewers.local.yaml"
 
@@ -78,8 +77,13 @@ def _strip_comment(line: str) -> str:
     if line.lstrip().startswith("#"):
         return ""
     # A comment needs whitespace before `#`, as in YAML, so a word such as
-    # `floor=#1` could never be read as a comment.
-    return re.split(r"\s+#", line, maxsplit=1)[0].rstrip()
+    # `floor=#1` could never be read as a comment. One linear pass: a regex such as
+    # `\s+#` rescans a run of whitespace from every start position, which MEASURED
+    # 85s on one 200,000-space line — and this runs on a hook path.
+    for i in range(1, len(line)):
+        if line[i] == "#" and line[i - 1].isspace():
+            return line[:i].rstrip()
+    return line.rstrip()
 
 
 def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
@@ -97,10 +101,12 @@ def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
             continue
         if not in_block:
             raise _Malformed("an indented line outside the `reviewers:` block")
-        match = _ENTRY_RE.match(line)
-        if match is None:
+        # partition, not a regex: this runs on a hook path, and a pattern with a lazy
+        # group against a trailing `\s*$` backtracks quadratically on a long line.
+        login, sep, rest = line.strip().partition(":")
+        login, words = login.strip(), rest.split()
+        if not sep or not login or " " in login:
             raise _Malformed("an entry is not `<login>: <words>`")
-        login, words = match.group(1), match.group(2).split()
         if not _LOGIN_RE.fullmatch(login):
             raise _Malformed("a login is not a GitHub REST login")
         if login in entries:
@@ -118,11 +124,22 @@ def _parse(text: str) -> dict[str, tuple[Reviewer | None, bool]]:
             else:
                 values[key] = value
         if "disabled" in flags:
+            # `disabled` stands ALONE: a disabled line that also carries other words
+            # is ambiguous about what was meant, so it is malformed, never a silent
+            # removal of a reviewer.
+            if len(flags) > 1 or values:
+                raise _Malformed("`disabled` must stand alone")
             entries[login] = (None, True)
             continue
         parser = values.get("parser")
         if parser not in PARSERS:
             raise _Malformed("every reviewer needs a registered `parser=`")
+        if (parser == "codeql") != ("surface-only" in flags):
+            # CodeQL, and only CodeQL, is surface-only. Nothing scores its findings,
+            # so a CodeQL reviewer that could stand in for the primary would be trusted
+            # unenforced; and the scanner has no display-only mode for the scored
+            # parsers, so `surface-only` on one would silently still score.
+            raise _Malformed("surface-only goes with parser=codeql, and only there")
         lists = {key: tuple(w for w in values.get(key, "").split(",") if w) for key in _LIST_KEYS}
         entries[login] = (
             Reviewer(
@@ -145,7 +162,9 @@ def _source(env_name: str, path: Path) -> str | None:
         return override or None
     if not path.exists():
         return None
-    return path.read_text(encoding="utf-8")
+    # utf-8-sig: an editor that writes a byte-order mark must not make the whole
+    # table malformed with an error that points at nothing visible.
+    return path.read_text(encoding="utf-8-sig")
 
 
 def configured_reviewers() -> tuple[dict[str, Reviewer] | None, str | None]:
@@ -189,6 +208,31 @@ def primary_reviewer_login() -> str | None:
     if error or not table:
         return None
     return next(login for login, r in table.items() if r.primary)
+
+
+def enforced_logins() -> tuple[dict[str, frozenset[str]] | None, str | None]:
+    """``({parser: logins}, None)`` — whose findings the merge gate READS with
+    which parser — or ``(None, error)`` when the table is unknown.
+
+    Every reviewer the table TRUSTS is here, so a trusted reviewer's findings are
+    always read. And the SHIPPED file's reviewers are here even when the overlay
+    disables one: the overlay lives outside the repo, in a file any session can
+    write, so it may ADD enforcement but never remove it. ``disabled`` therefore
+    withdraws a reviewer's trust (primary, stand-in) and leaves its findings scored.
+    An unknown table is an error, never an empty set: an empty set would drop every
+    finding to the unscored channel, which is a fail-open.
+    """
+    table, error = configured_reviewers()
+    if error or not table:
+        return None, error or "reviewers_config_missing"
+    try:
+        shipped = _parse(_source("_TEST_REVIEWERS_YAML", _SHIPPED) or "")
+    except (_Malformed, OSError, UnicodeDecodeError):
+        return None, "reviewers_config_malformed"
+    by_parser: dict[str, set[str]] = {}
+    for reviewer in [*table.values(), *(r for r, _ in shipped.values() if r is not None)]:
+        by_parser.setdefault(reviewer.parser, set()).add(reviewer.login)
+    return {parser: frozenset(logins) for parser, logins in by_parser.items()}, None
 
 
 def substitute_reviewer_logins() -> tuple[str, ...]:

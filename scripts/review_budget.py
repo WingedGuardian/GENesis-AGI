@@ -281,6 +281,7 @@ def evaluate_evidence(
     issue_comments: Sequence[Mapping[str, object]],
     changed_files: Sequence[Mapping[str, object] | str],
     external_identity_templates: Sequence[str] = (),
+    primary_login: str = CODEX_REVIEW_BOT,
 ) -> dict[str, Any]:
     """Evaluate already-fetched PR evidence without I/O.
 
@@ -321,7 +322,7 @@ def evaluate_evidence(
             continue
         if not isinstance(login, str):
             return _unknown("malformed_review_record", current_head=head)
-        if login != CODEX_REVIEW_BOT:
+        if login != primary_login:
             continue
         resolved, error = _resolve_sha(str(item.get("commit_id") or ""), commits)
         if error:
@@ -352,7 +353,7 @@ def evaluate_evidence(
         comment_bodies.append(body)
         if any(m.group(1).lower() == head for m in _CONFIRMATION_RE.finditer(body)):
             confirmation_requested = True
-        if login == CODEX_REVIEW_BOT and author_type == "Bot" and _CODEX_CLEAN_RE.search(body):
+        if login == primary_login and author_type == "Bot" and _CODEX_CLEAN_RE.search(body):
             match = _REVIEWED_COMMIT_RE.search(body)
             if match is None:
                 return _unknown("clean_comment_missing_head", current_head=head)
@@ -489,6 +490,19 @@ def _evaluate_pr_inner(
         external_identity_templates, config_error = configured_external_identity_templates()
         if config_error:
             return _unknown(config_error)
+
+    # The reviewer whose reviewed heads are rounds is the table's PRIMARY — the same
+    # reviewer merge freshness requires — so moving the primary moves the count with
+    # it instead of leaving the approval limits counting a reviewer nobody waits on.
+    # An unreadable table is unknown, never "Codex by default".
+    try:
+        import review_findings  # noqa: PLC0415 - sibling stdlib module, per call
+    except Exception:  # noqa: BLE001 - reverse skew is unknown, never zero rounds.
+        return _unknown("reviewer_table_unavailable")
+    table, table_error = review_findings.configured_reviewers()
+    if table_error or not table:
+        return _unknown(table_error or "reviewer_table_unavailable")
+    primary_login = next(login for login, r in table.items() if r.primary)
 
     timeout_for = timeout_for or (lambda seconds: seconds)
     deadline = Deadline.after(budget_seconds, monotonic=monotonic)
@@ -660,6 +674,7 @@ def _evaluate_pr_inner(
         issue_comments=fetched["comments"],
         changed_files=fetched["files"],
         external_identity_templates=external_identity_templates,
+        primary_login=primary_login,
     )
 
 
