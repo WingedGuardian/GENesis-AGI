@@ -1,13 +1,17 @@
-- **The commit-message hook no longer goes blind on a fingerprint line it cannot
-  read.** It checks the install's private-identifier fingerprints with `grep -E -f`.
-  A pattern `grep -E` rejects outright (an unbalanced parenthesis) made that read
-  exit 2, which the hook took as "no match", so one bad line turned off every
-  fingerprint in the file. A pattern it only warns about (a PCRE lookbehind, which
-  Python's `re` accepts and POSIX ERE does not) never matched anything, and a file
-  saved with CRLF line endings matched nothing at all, silently. The hook now reads
-  the file the way the pre-push review reads it: surrounding whitespace (the `\r`
-  included) is trimmed, and a line `grep -E` cannot use is matched as literal text,
-  as the pre-push review does for a line Python cannot compile, so the other lines
-  keep working. The hook names such lines by line number with how to rewrite them,
-  and never prints the pattern itself, since it is the private value. The whole
-  file is checked in one `grep` first, so a clean file costs what it did before.
+- **The commit-message hook reads the install's private-identifier fingerprints
+  the way the pre-push review does.** Both read the same fingerprint file, but the
+  hook used `grep -E` and the pre-push review uses Python's `re`, so they disagreed
+  about the same pattern. A pattern using Python-only syntax (`\A`, `\d`, a
+  lookbehind) matched nothing at commit time. A pattern `grep -E` rejected (an
+  unbalanced parenthesis) made the whole file read as "no match", so one bad line
+  turned off every fingerprint, and a file saved with CRLF line endings matched
+  nothing. The hook now reads the file with the pre-push rules, in Python: each line
+  trimmed, comments and blank lines skipped, and a pattern Python cannot compile
+  matched as literal text, named in a warning by line number. It prints line numbers
+  only, never a pattern (the pattern is the private value) or the file's path (which
+  can name a user or a host). A line that is not UTF-8 is still checked, byte for
+  byte, instead of stopping the whole check. Without a working `python3` it falls back
+  to `grep -E`, one pattern at a time, says the check is degraded, and names the lines
+  that use syntax grep reads differently from Python. An `errexit` or `pipefail`
+  inherited through `SHELLOPTS` or `BASH_ENV` no longer turns a clean commit into a
+  failed hook.
