@@ -10,11 +10,12 @@ written:
   SUBCOMMAND goes, so the operation is decided at run time.
 
 THE FIX FOLLOWS THE LINE-CONTINUATION ONE: report, do not model. A built escape
-that decodes to anything outside a small formatting set is a BOUNDS-type blind
-spot (no segments returned), and ``mention_views`` gains a reading with the escapes
-decoded, so each guard's existing mention test and blind-spot refusal apply. A git
-subcommand the parse cannot read is refused by the discard guard and the commit
-gate, as the push guard already refused it.
+that decodes to anything outside a small inert set is a BOUNDS-type blind spot (no
+segments returned), and ``mention_views`` gains a reading with the escapes decoded,
+so each guard's existing mention test and blind-spot refusal apply. A git
+subcommand the parse cannot read (a variable, a substitution, a brace expansion) is
+refused by the discard guard and the commit gate, as the push guard already refused
+it.
 
 Trigger literals are assembled from fragments so this file's own text does not carry
 them, per the convention in the other guard suites.
@@ -113,7 +114,13 @@ def _refused(res: subprocess.CompletedProcess) -> bool:
         "\\162m",  # a letter by octal
         "\\u0065",  # a letter by code point
         "a\\cJb",  # a control character that is a newline
-        "\\x24",  # punctuation: not on the formatting list, so it counts
+        "\\x24",  # punctuation: not on the inert list, so it counts
+        "a\\tb",  # a tab: a word separator to a nested shell
+        "a\\\\b",  # a backslash: escapes the next character in a nested shell
+        "it\\'s",  # a quote: opens a string in a nested shell
+        '\\"x\\"',  # a double quote, likewise
+        "cl\\?an",  # a glob character
+        "\\cß",  # a control escape on a non-ASCII character
     ],
     ids=[
         "newline",
@@ -123,6 +130,12 @@ def _refused(res: subprocess.CompletedProcess) -> bool:
         "unicode",
         "control-J",
         "dollar",
+        "tab",
+        "backslash",
+        "single-quote",
+        "double-quote",
+        "glob",
+        "control-non-ascii",
     ],
 )
 def test_an_escape_that_builds_text_is_a_bounds_type_blind_spot(body):
@@ -137,18 +150,48 @@ def test_an_escape_that_builds_text_is_a_bounds_type_blind_spot(body):
 @pytest.mark.parametrize(
     "command",
     [
-        f"printf {E}%s\\t%s' a b",  # layout only
         f"echo {E}plain text'",  # no escape at all
-        f"echo {E}a\\\\b'",  # an escaped backslash
         f"echo {E}\\e[1m'",  # a terminal escape
+        f"echo {E}a\\ab'",  # a bell
+        f"echo {E}a\\fb\\vc\\bd'",  # form feed, vertical tab, backspace
         "echo 'not ANSI-C: \\x65'",  # a plain single-quoted string
     ],
-    ids=["tab", "no-escape", "escaped-backslash", "terminal-escape", "plain-quotes"],
+    ids=["no-escape", "terminal-escape", "bell", "ff-vt-bs", "plain-quotes"],
 )
-def test_formatting_escapes_leave_the_command_readable(command):
+def test_inert_escapes_leave_the_command_readable(command):
     assert not sp.has_built_escape(command)
     _segments, blind = sp.analyze_checked(command)
     assert blind is None or blind.cause != sp._BLIND_BUILT_ESCAPE.cause
+
+
+def test_the_inert_set_holds_no_shell_syntax():
+    """A character bash's grammar gives meaning to (a separator, a quote, an escape,
+    a glob, an expansion) changes what a NESTED shell runs, so it cannot be inert.
+    Found in review: tab and the quotes were once on this list."""
+    syntax = set(" \t\n|&;()<>'\"\\`$*?[]{}~#=%!")
+    assert not sp._ANSI_C_INERT & syntax
+    assert all(len(ch) == 1 and not ch.isprintable() for ch in sp._ANSI_C_INERT)
+
+
+@pytest.mark.parametrize("char", sorted(sp._ANSI_C_INERT), ids=repr)
+def test_an_inert_escape_keeps_a_nested_word_whole(tmp_path, char):
+    """MEASURED on bash itself, not reasoned: with the character between two words in
+    a script handed to ``bash -c``, the two words stay one word, so the second
+    never becomes a command of its own."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    ran = tmp_path / "ran"
+    (shim / GIT).write_text(f'#!/bin/sh\necho "$@" > {ran}\n')
+    (shim / GIT).chmod(0o755)
+    escape = {"\a": "\\a", "\b": "\\b", "\x1b": "\\e", "\f": "\\f", "\v": "\\v"}[char]
+    script = f"bash -c {E}{GIT}{escape}{CLEAN} -n'"
+    subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{shim}:/usr/bin:/bin"},
+        capture_output=True,
+        timeout=30,
+    )
+    assert not ran.exists(), "the escape split the word, so it is not inert"
 
 
 def test_the_blind_spot_is_in_the_domain():
@@ -199,6 +242,30 @@ _BUILT = [
     ),
     ("discard-letter", _DISCARD, f"{GIT} {CLEAN} -fd", f"{GIT} {E}cl\\x65an' -fd"),
     (
+        "discard-nested-tab",
+        _DISCARD,
+        f"bash -c '{GIT} {CLEAN} -fdx'",
+        f"bash -c {E}{GIT}\\t{CLEAN} -fdx'",
+    ),
+    (
+        "discard-nested-double-quote",
+        _DISCARD,
+        f"bash -c 'echo x; {GIT} {CLEAN} -fd'",
+        f'bash -c {E}echo \\"x\\"; {GIT} {CLEAN} -fd\'',
+    ),
+    (
+        "discard-nested-single-quote",
+        _DISCARD,
+        f"bash -c 'echo x; {GIT} {CLEAN} -fd'",
+        f"bash -c {E}echo \\'x\\'; {GIT} {CLEAN} -fd'",
+    ),
+    (
+        "discard-control-non-ascii",
+        _DISCARD,
+        f"true; {GIT} {CLEAN} -fd",
+        f"true {E}\\cß'; {GIT} {CLEAN} -fd",
+    ),
+    (
         "protected-separator",
         _PROTECTED,
         f"bash -c 'true; {RM} -rf ~/genesis/data'",
@@ -232,8 +299,12 @@ def test_text_built_from_an_escape_is_refused_where_its_plain_form_is(sandbox, g
 _HIDDEN = [
     ("discard-substitution", _DISCARD, f"{GIT} $(printf 'cl\\x65an') -fd"),
     ("discard-variable", _DISCARD, f"V={CLEAN}; {GIT} $V -fd"),
+    ("discard-brace-range", _DISCARD, f"{GIT} cl{{e..e}}an -fd"),
+    ("discard-brace-range-late", _DISCARD, f"{GIT} cle{{a..a}}n -fd"),
+    ("discard-brace-list", _DISCARD, f"{GIT} cl{{e,}}an -fd"),
     ("commit-substitution", _COMMIT_GATE, f"{GIT} $(printf 'co\\x6dmit') -n -m x"),
     ("commit-variable-unnamed", _COMMIT_GATE, f"{GIT} $SUB -n -m x"),
+    ("commit-brace-range", _COMMIT_GATE, f"{GIT} com{{m..m}}it -n -m x"),
 ]
 
 
@@ -298,16 +369,99 @@ def test_the_capped_read_note_reads_a_decoded_word(sandbox):
 # ── the decoder never raises ─────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("head", list("xuUc01234567abefnrtv\\'\"?qzXY8"))
-@pytest.mark.parametrize("tail", ["", "g", "0", "41", "4142", "FFFFFFFFF", "?", " "])
+@pytest.mark.parametrize("head", list("xuUc01234567abefnrtv\\'\"?qzXYß8"))
+@pytest.mark.parametrize(
+    "tail", ["", "g", "0", "41", "4142", "FFFFFFFFF", "?", " ", "ß", "ﬀ", "ŉ", "é", "😀", "\ud800"]
+)
 def test_the_decoder_never_raises(head, tail):
     """A raise inside the parse reaches guards whose parse-error path fails open.
-    MEASURED in review: a bare hex escape crashed it, and one guard exited 1
-    (non-blocking) while another swallowed the error and allowed the command."""
+    MEASURED in review, twice: a bare hex escape crashed it, then a control escape on
+    a character whose upper case is two characters. Each time one guard exited 1
+    (non-blocking). The tails now include non-ASCII characters: the first grid held
+    only ASCII, which is why it could not find the second."""
     command = f"echo {E}\\{head}{tail}'"
     sp.has_built_escape(command)
     sp.decode_ansi_c(command)
+    sp.mention_views(command)
     sp.analyze_checked(command)
+
+
+def test_an_escape_the_decoder_cannot_place_counts_as_built(monkeypatch):
+    """The ONE decoding chokepoint stays total even if a decode rule raises, and what
+    it could not decode is built text, so the refusal still applies."""
+
+    def boom(_escape):
+        raise ValueError("a decode rule that raises")
+
+    monkeypatch.setattr(sp, "_ansi_c_char", boom)
+    command = f"{GIT} {E}cl\\x65an' -fd"
+    assert sp.has_built_escape(command)
+    assert sp._UNDECODABLE in sp.decode_ansi_c(command)
+    sp.mention_views(command)
+    _segments, blind = sp.analyze_checked(command)
+    assert blind is not None and blind.cause == sp._BLIND_BUILT_ESCAPE.cause
+
+
+def test_every_control_escape_decodes_to_one_character():
+    """Over EVERY code point, not a sample: ``\\c`` + any character is one control
+    character, so it is always built text and never raises."""
+    bad = []
+    for cp in range(0x110000):
+        try:
+            out = sp._ansi_c_char("c" + chr(cp))
+        except Exception as exc:  # noqa: BLE001 — the point is to record every raise
+            bad.append((hex(cp), type(exc).__name__))
+            continue
+        if len(out) != 1 or ord(out) > 0x7F:
+            bad.append((hex(cp), repr(out)))
+    assert not bad, bad[:10]
+
+
+@pytest.mark.parametrize("char", ["a", "Z", "[", "?", "ß", "é", "ﬀ", "😀"])
+def test_a_control_escape_decodes_like_bash(char):
+    """bash masks the FIRST BYTE of the character; compared against bash itself."""
+    out = subprocess.run(
+        ["bash", "-c", f"printf %s {E}\\c{char}'"], capture_output=True, timeout=30
+    ).stdout
+    assert out[:1] == sp.decode_ansi_c(f"{E}\\c{char}'").encode("latin-1")[:1]
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "$V",
+        "${V}",
+        "$(printf x)",
+        "`printf x`",
+        "cl{e..e}an",
+        "cle{a..a}n",
+        "cl{e,}an",
+        "{a,b}",
+        "x" * (sp._MAX_VERB_WORD_CHARS + 1),
+    ],
+    ids=[
+        "var",
+        "braced-var",
+        "subst",
+        "backtick",
+        "range",
+        "range-late",
+        "list",
+        "bare-list",
+        "long",
+    ],
+)
+def test_may_build_words_sees_every_word_the_parser_cannot_read(token):
+    """The discard guard's early exit asks :func:`may_build_words` whether to let the
+    parse look. It must hold for every word the parser itself would refuse to read;
+    a hand-kept list missed brace expansion in review."""
+    assert not sp._word_is_literal(token), "fixture: the parser must refuse to read it"
+    assert sp.may_build_words(f"{GIT} {token} -fd")
+
+
+def test_may_build_words_leaves_ordinary_commands_on_the_fast_path():
+    for command in (f"{GIT} status", f"{GIT} log -3 --oneline", "ls -la"):
+        assert not sp.may_build_words(command)
 
 
 @pytest.mark.parametrize(

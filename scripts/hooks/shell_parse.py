@@ -1620,16 +1620,21 @@ def fold_continuations(text: str) -> str:
 #: what the shell runs. Each consumer then refuses when its mention test, which
 #: reads the decoded text too (:func:`mention_views`), names its operation.
 #:
-#: Only an escape that decodes to something OUTSIDE a small formatting set counts
-#: (see :data:`_ANSI_C_FORMATTING`), so ``printf $'%s\t%s\n'``-style layout in a
-#: command that names nothing gated is untouched. Anything else (a letter, a digit,
-#: a separator, punctuation, a byte the decoder cannot place) counts: the list of
-#: what is harmless is the closed one, so a character nobody listed fails closed.
+#: Only an escape that decodes to something OUTSIDE a small inert set counts (see
+#: :data:`_ANSI_C_INERT`), so a terminal escape in a command that names nothing
+#: gated is untouched. Anything else (a letter, a digit, a separator, whitespace, a
+#: quote, punctuation, a byte the decoder cannot place) counts: the list of what is
+#: harmless is the closed one, so a character nobody listed fails closed. A command
+#: that names nothing gated is refused by no guard either way; the set only decides
+#: what a command that DOES name a gated operation may carry.
 #:
 #: COST, measured over 82,442 recorded commands on one install, both trees run through
-#: the real hooks against the same base: 16 commands (0.019%) that no guard refused
-#: before are refused now, and none moves toward allowing. Half are here-documents
-#: whose text quotes the syntax; the hint names the file remedy.
+#: the real hooks against the same base: 87 commands (0.106%) that no guard refused
+#: before are refused now, and none moves toward allowing. 79 are here-documents or
+#: ``python -c`` scripts whose text quotes the syntax, most of them about this
+#: parser; 3 are ordinary tab escapes (a field separator) in a command that also
+#: names a checked operation; 5 are shell scripts that build text with an escape or
+#: quote the syntax. The hint names the file remedy.
 _BLIND_BUILT_ESCAPE = BlindSpot(
     bounds_induced=True,
     cause=(
@@ -1656,18 +1661,27 @@ _ANSI_C_SIMPLE = {
     "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
     "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
 }
-#: What an escape may decode to and still leave the text readable as written:
-#: layout and the characters an escape exists to quote. Everything else is built text.
-_ANSI_C_FORMATTING = frozenset({"\t", "\a", "\b", "\x1b", "\f", "\v", "\\", "'", '"', "?"})
+#: What an escape may decode to and still leave the text readable as written, in
+#: EVERY place the text can end up. That includes a script handed to another shell
+#: (``bash -c``, ``ssh host``, ``eval``), where the decoded text is parsed again, so
+#: the test is the nested shell's grammar, not what the character looks like.
+#: MEASURED against bash, one escape between two words of a script handed to
+#: ``bash -c``: bell, backspace, escape, form feed and vertical tab leave one word;
+#: a tab separates two; a quote opens a quoted string; a backslash escapes the next
+#: character; ``?`` is a glob. So only the first five are inert. Everything else is
+#: built text, the tab included although it is the commonest escape in ordinary
+#: commands: counting it cost 3 more refusals over the recorded commands.
+_ANSI_C_INERT = frozenset({"\a", "\b", "\x1b", "\f", "\v"})
+#: The value :func:`_decode_escape` stands in for an escape it could not decode: one
+#: character outside :data:`_ANSI_C_INERT`, so it counts as built text.
+_UNDECODABLE = "\x00"
 
 
 def _ansi_c_char(escape: str) -> str:
     """The text bash puts where ``\\`` + *escape* stood, per the bash manual's
     "ANSI-C Quoting". An escape bash does not recognise keeps its backslash."""
-    # NEVER RAISES, and that is load-bearing: this runs inside the parse and inside
-    # the mention test, and a raise there reaches guards whose own parse-error path
-    # fails open. A ``\\x`` or ``\\u`` with no digit after it (the regex hands over
-    # the bare letter) is an escape bash does not recognise, so it keeps its backslash.
+    # A ``\\x`` or ``\\u`` with no digit after it (the regex hands over the bare
+    # letter) is an escape bash does not recognise, so it keeps its backslash.
     head, digits = escape[0], escape[1:]
     if head == "x" and digits:
         return chr(int(digits, 16))
@@ -1676,27 +1690,57 @@ def _ansi_c_char(escape: str) -> str:
     if head in "01234567":
         return chr(int(escape, 8) & 0xFF)
     if head == "c" and len(escape) == 2:
-        return "\x7f" if escape[1] == "?" else chr(ord(escape[1].upper()) & 0x1F)
+        return _control_char(escape[1])
     return _ANSI_C_SIMPLE.get(head, "\\" + escape)
+
+
+def _control_char(char: str) -> str:
+    """What bash makes of ``\\c`` + *char*: one control character.
+
+    bash masks the character's FIRST BYTE and passes any bytes after it through
+    (MEASURED: ``\\cß`` is bytes 03 9f, ``\\cﬀ`` is 0f ac 80). Only the masked byte
+    can matter to a verdict, so that is what this returns, always one character.
+    bash upper-cases the byte first, which the mask makes irrelevant (it clears the
+    case bit), so this does not: ``"ß".upper()`` is two characters, and reading it as
+    one raised inside the parse.
+    """
+    if char == "?":
+        return "\x7f"
+    return chr(char.encode("utf-8", "surrogatepass")[0] & 0x1F)
+
+
+def _decode_escape(escape: str) -> str:
+    """:func:`_ansi_c_char`, made total. The ONE place an escape is decoded.
+
+    NEVER RAISES, and that is load-bearing: this runs inside the parse and inside
+    every guard's mention test, and a raise there reaches guards whose own
+    parse-error path fails open (MEASURED in review twice: a bare hex escape, then a
+    control escape on a non-ASCII character, each made a guard exit 1). An escape
+    it cannot decode becomes :data:`_UNDECODABLE`, which counts as built text.
+    """
+    try:
+        return _ansi_c_char(escape)
+    except Exception:  # noqa: BLE001 — see above: unreadable counts as built
+        return _UNDECODABLE
 
 
 def _is_built(decoded: str) -> bool:
     """Whether one decoded escape is text the shell builds. An escape bash does not
     recognise keeps its backslash (MEASURED against bash: ``\\q``, a bare ``\\x``),
     so it is the literal text it is spelled with, and only a single decoded
-    character outside :data:`_ANSI_C_FORMATTING` counts."""
-    return len(decoded) == 1 and decoded not in _ANSI_C_FORMATTING
+    character outside :data:`_ANSI_C_INERT` counts."""
+    return len(decoded) == 1 and decoded not in _ANSI_C_INERT
 
 def has_built_escape(command: str) -> bool:
     """Whether ``command`` has a ``$'…'`` escape that decodes to text outside
-    :data:`_ANSI_C_FORMATTING` (see :data:`_BLIND_BUILT_ESCAPE`).
+    :data:`_ANSI_C_INERT` (see :data:`_BLIND_BUILT_ESCAPE`).
 
     Fails CLOSED: an escape the decoder cannot place is reported as built text, since
     declining to read it is not evidence that it is harmless.
     """
     try:
         return any(
-            _is_built(_ansi_c_char(m.group(1)))
+            _is_built(_decode_escape(m.group(1)))
             for body in _ANSI_C_STRING.findall(command)
             for m in _ANSI_C_ESCAPE.finditer(body)
         )
@@ -1723,7 +1767,7 @@ def decode_ansi_c(text: str) -> str:
     mention test which words the shell will assemble, and nothing else.
     """
     return _ANSI_C_STRING.sub(
-        lambda m: _ANSI_C_ESCAPE.sub(lambda e: _ansi_c_char(e.group(1)), m.group(1)), text
+        lambda m: _ANSI_C_ESCAPE.sub(lambda e: _decode_escape(e.group(1)), m.group(1)), text
     )
 
 
@@ -1767,6 +1811,24 @@ def mentions(command: str, *patterns: re.Pattern[str] | str) -> bool:
     return any(
         all((p in view) if isinstance(p, str) else bool(p.search(view)) for p in patterns)
         for view in mention_views(command)
+    )
+
+
+def may_build_words(command: str) -> bool:
+    """Whether some word of ``command`` might not be the characters it spells.
+
+    A cheap SUPERSET of what :func:`_word_is_literal` rejects in any token of the
+    command: an expansion mark, a brace, or a word longer than it will read. For an
+    early exit that must let every command whose git subcommand could be built reach
+    :func:`unresolved_verb_programs`. It is derived from the same constants that
+    function reads, so a construct added there is seen here without a second list.
+    MEASURED in review: an early exit that listed ``$`` and a backtick by hand missed
+    brace expansion, so the parse never looked at such a subcommand.
+    """
+    return (
+        len(command) > _MAX_VERB_WORD_CHARS
+        or "{" in command
+        or any(mark in command for mark in _EXPANSION_MARKS)
     )
 
 

@@ -171,6 +171,7 @@ try:
         analyze_checked,
         git_subcommand_index,
         has_trailing_override,
+        may_build_words,
         mention_views,
         mentions,
         unresolved_verb_programs,
@@ -1757,9 +1758,10 @@ def main() -> int:
     # reaches the parse; every verdict is still made on the parse.
     if not any(mentions(cmd, "git", s) for s in _TRIGGER_SUBSTRINGS) and not (
         # A subcommand the shell BUILDS names none of the trigger verbs, so the
-        # words above cannot see it; an expansion in the text is what lets the
-        # parse (Phase 1d) look.
-        mentions(cmd, _GIT_WORD) and ("$" in cmd or "`" in cmd)
+        # words above cannot see it; a word that might be built is what lets the
+        # parse (Phase 1d) look. The parser answers which words those are, so this
+        # keeps no list of its own.
+        mentions(cmd, _GIT_WORD) and may_build_words(cmd)
     ):
         return 0
 
