@@ -1,0 +1,27 @@
+# The reviewers whose reviews count on this repository's review chain.
+#
+# Read by scripts/review_findings.py (stdlib, no YAML library), so the format is
+# deliberately flat: ONE `reviewers:` block, one reviewer per indented line, the
+# key the reviewer's REST login (GitHub Apps carry a `[bot]` suffix) and the value
+# space-separated words.
+#
+#   flags:  primary        the reviewer merge freshness asks for (exactly one)
+#           body-findings  also reads findings posted in the review BODY
+#           surface-only   its findings are shown, never counted or scored
+#           disabled       (overlay only) remove a reviewer listed here
+#   keys:   parser=        codex-badge | coderabbit-header | devin-marker | codeql
+#           floor= minor= analysis=   comma-separated severity words that
+#                          parser reports, by class
+#
+# These are the review apps installed on this repository. An install changes the
+# set in ~/.genesis/config/reviewers.local.yaml (same format): a line there
+# replaces the line here for that login, and `<login>: disabled` removes one.
+#
+# Logins are GitHub App logins: lowercase, with the `[bot]` suffix (anything else
+# is malformed). A malformed file makes the whole table UNKNOWN, never a partial
+# table: the merge gate then BLOCKS and names the config error.
+reviewers:
+  chatgpt-codex-connector[bot]: primary parser=codex-badge floor=P1 minor=P2 analysis=P3
+  devin-ai-integration[bot]: parser=devin-marker floor=🔴,🟥 minor=🟡,🟨 analysis=🔍
+  coderabbitai[bot]: body-findings parser=coderabbit-header floor=critical,major minor=minor,trivial,info
+  github-advanced-security[bot]: surface-only parser=codeql

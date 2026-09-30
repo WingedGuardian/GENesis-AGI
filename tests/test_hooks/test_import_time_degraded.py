@@ -816,6 +816,16 @@ def test_new_guard_with_old_tree_missing_native_approval_fails_closed(tmp_path, 
     assert message in res.stderr
 
 
+def test_push_guard_with_old_tree_missing_review_findings_fails_closed(tmp_path):
+    """The reviewer table and severity parsers are a HARD dependency of the merge
+    gate: a tree without them must refuse, never exit 1 (which runs the command)."""
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_findings.py").unlink()
+    res = _run(root, "hooks/git_push_guard.py", "git status", tmp_path / "home_no_findings")
+    assert res.returncode == 2
+    assert "review_findings is incompatible" in res.stderr
+
+
 def test_commit_guard_with_old_tree_missing_deadline_helper_fails_closed(tmp_path):
     root = _tree(tmp_path, poisoned=False)
     (root / "scripts" / "review_deadline.py").unlink()

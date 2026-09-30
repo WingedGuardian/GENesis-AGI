@@ -123,7 +123,7 @@ every other placeholder is env → inline `:-default` → left literal.
 
 ## 3. `config/*.yaml` and `.local.yaml` overlays
 
-Base files in `config/` are tracked upstream defaults. Four patterns exist. Each
+Base files in `config/` are tracked upstream defaults. Five patterns exist. Each
 describes the default path; the exceptions known when this was written are listed
 with it, and the code is the authority where the two disagree.
 
@@ -185,6 +185,16 @@ directly (read-only list excepted). The edit dirties the checkout and is shadowe
 overlay key. It also lists and writes any existing repo-sibling `config/*.local.yaml`,
 which is an overlay rather than a base, and the read-only list matches exact file
 names, so an overlay of a read-only file is editable (#2446).
+
+**E. Reviewer table** — `config/reviewers.yaml` plus `~/.genesis/config/reviewers.local.yaml`,
+read by `scripts/review_findings.py::configured_reviewers` (stdlib line parser, no YAML
+library, because every review gate imports it). Re-read on every call. An overlay line
+REPLACES the base line for the same reviewer login and `<login>: disabled` removes one;
+there is no deep merge. Unlike pattern A, a malformed file of EITHER kind is not ignored:
+the whole table reads as unknown and the merge gate blocks, naming the config error,
+rather than silently dropping a reviewer. Today the gate reads only the primary
+(freshness) and the substitute set from it. Not a settings domain: no dashboard or
+`settings_update` writer.
 
 ---
 

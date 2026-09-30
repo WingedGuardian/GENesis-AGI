@@ -100,6 +100,8 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_scope.py",
         "scripts/review_state.py",
         "scripts/review_budget.py",
+        "scripts/review_findings.py",
+        "config/reviewers.yaml",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
