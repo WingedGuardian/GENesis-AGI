@@ -5114,7 +5114,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
 # "Swish!", "You're on a roll.", "Keep them coming!", … — VARIES, so anchor ONLY on the
 # stable prefix) and carries a "**Reviewed commit:** `<sha>`" line with a 10-char
 # ABBREVIATED sha. Both must be present for the comment to be REPORTED; it never vouches
-# for a commit (see ``_latest_codex_clean_comment_sha``).
+# for a commit by itself (see ``_codex_clean_signal_at_head``).
 _CODEX_CLEAN_COMMENT_RE = re.compile(
     r"Codex Review:\s*Didn'?t find any major issues", re.IGNORECASE
 )
@@ -5178,7 +5178,7 @@ def _pr_commit_shas(pr_num: str, repo: str | None = None) -> list[str] | None:
 
 
 def _codex_clean_signal_at_head(
-    pr_num: str, head: str, repo: str | None = None
+    pr_num: str, head: str, repo: str | None = None, why: dict | None = None
 ) -> str | None:
     """``"comment"`` / ``"summary"`` when Codex said it finished at ``head`` clean, else None.
 
@@ -5211,23 +5211,22 @@ def _codex_clean_signal_at_head(
       route also leaves the list, with no event here; exploiting that needs a
       deliberately ground prefix collision as well.
 
-    Anything unreadable is None: the gate then blocks exactly as before.
+    Anything unreadable is None: the gate then blocks exactly as before. When a
+    clean signal WAS seen and refused, ``why`` (if given) receives ``signal`` (what
+    was seen), ``reason`` (why it did not count) and ``permanent`` (True when no
+    later clean signal on this PR can count either), so the block can say so
+    rather than send the reader to re-request a review that cannot help.
     """
+    note = why if why is not None else {}
     if _review_budget is None:
-        return None
-    reviews = _codex_reviews(pr_num, repo=repo)
-    if reviews is None or any((r.get("commit_id") or "").lower() == head for r in reviews):
-        return None
-    commits = _pr_commit_shas(pr_num, repo=repo)
-    if not commits:
         return None
     evidence = _codex_signal_evidence(pr_num, repo=repo)
     if evidence is None:
-        return None
-    if evidence["history_moved"]:
+        note["reason"] = "Codex's comments on this PR could not be read in full"
         return None
     codex = _CODEX_REVIEW_BOT.removesuffix("[bot]")  # GraphQL names an App by its slug
     candidates: list[tuple[str, str]] = []
+    findings = False
     for c in evidence["comments"]:
         if c["login"] != codex or c["type"] != "Bot":
             continue
@@ -5237,7 +5236,8 @@ def _codex_clean_signal_at_head(
         # gate scores that channel yet, so a clean signal on a later head must not
         # walk past findings filed there on an earlier one (2 of 339 PRs, measured).
         if not summary and _CODEX_FINDINGS_COMMENT_RE.search(body):
-            return None
+            findings = True
+            continue
         # An edit keeps the original author, so only an unedited comment, or one Codex
         # itself edited (it rewrites its summary in place), speaks for Codex.
         if c["editor"] not in (None, codex):
@@ -5249,10 +5249,41 @@ def _codex_clean_signal_at_head(
         if summary:
             for m in _CODEX_SUMMARY_ROW_RE.finditer(body):
                 candidates.append(("summary", m.group(2).lower()))
+    if not candidates:
+        return None  # nothing clean was said; there is nothing to explain
+    kind, short = candidates[-1]
+    note["signal"] = f"{kind} naming commit {short}"
+    if findings:
+        note["reason"] = "a Codex findings comment sits on this PR, and no gate scores that channel yet"
+        note["permanent"] = True
+        return None
+    if evidence["history_moved"]:
+        note["reason"] = (
+            "this PR's history moved (a force-push, base change, base force-push or "
+            "branch restore), so a short id can no longer be bound to the head"
+        )
+        note["permanent"] = True
+        return None
+    reviews = _codex_reviews(pr_num, repo=repo)
+    if reviews is None:
+        note["reason"] = "Codex's reviews on this PR could not be read"
+        return None
+    if any((r.get("commit_id") or "").lower() == head for r in reviews):
+        note["reason"] = "a Codex review object (dismissed or pending) sits at the head"
+        return None
+    commits = _pr_commit_shas(pr_num, repo=repo)
+    if not commits:
+        note["reason"] = "this PR's commit list could not be read in full"
+        return None
     for kind, short in candidates:
         resolved, error = _review_budget._resolve_sha(short, commits)
         if not error and resolved == head:
+            note.clear()
             return kind
+    note["reason"] = (
+        "its abbreviated id does not resolve uniquely to the head among this PR's "
+        "commits (it names an older commit, or is ambiguous)"
+    )
     return None
 
 
@@ -5329,72 +5360,6 @@ def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return None
     return {"comments": rows, "history_moved": bool(nodes)}
-
-
-def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """The ABBREVIATED commit sha from Codex's most recent CLEAN issue-comment, or None.
-
-    DIAGNOSTIC ONLY — this value never satisfies a gate by itself. A prefix MATCH
-    against the head binds nothing: the head is whatever the branch's author pushed,
-    so "the head starts with this prefix" is not "this head was reviewed" (#2487).
-    What the freshness gate accepts instead is ``_codex_clean_signal_at_head``, which
-    RESOLVES the id uniquely within the PR's own commits and requires the result to be
-    the head. This reader only explains a block.
-
-    Reads ``issues/N/comments``; for a comment authored by the Codex bot (login AND
-    ``user.type == "Bot"``) it requires BOTH the clean marker AND a parseable
-    ``Reviewed commit: <sha>`` line (fail-closed to None). Returns a lowercased prefix
-    (>=7 hex). Comments come oldest-first, so the last match wins. Tests inject via
-    ``_TEST_GH_CODEX_COMMENTS`` (one JSON object per line: ``{login, type, body}``).
-    Fail-safe: None on any API/parse error.
-    """
-    raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
-    if raw is None:
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
-                    "--paginate",
-                    "--jq",
-                    ".[] | {login: .user.login, type: .user.type, body: .body}",
-                ],
-                capture_output=True,
-                text=True,
-                # See the merge-path timeout budget note in main(): fail-safe → None.
-                timeout=_gh_timeout(8),
-            )
-            if result.returncode != 0:
-                return None
-            raw = result.stdout
-        except Exception:
-            return None
-    latest: str | None = None
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
-            continue
-        # Require the GitHub-enforced Bot author type too — belt-and-suspenders against
-        # a spoofed login string in an injected/malformed payload.
-        if (obj.get("type") or "") != "Bot":
-            continue
-        body = obj.get("body") or ""
-        if not _CODEX_CLEAN_COMMENT_RE.search(body):
-            continue
-        m = _CODEX_REVIEWED_COMMIT_RE.search(body)
-        if not m:
-            continue  # clean marker but no parseable sha → does not vouch (fail-closed)
-        latest = m.group(1).strip().lower()
-    return latest
 
 
 # ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
@@ -6711,7 +6676,8 @@ def _check_codex_reviewed_head_core(
     # UNIQUELY within this PR's own commits to the head and no Codex review object
     # sits at the head (#2418; the resolution is what answers #2487's objection that
     # a prefix alone binds nothing). The merge stays bound to this head.
-    clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo)
+    refused: dict = {}
+    clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo, why=refused)
     if clean_kind:
         _FRESHNESS_PASS["reason"] = f"clean signal at head: {clean_kind}"
         _FRESHNESS_PASS["head"] = head
@@ -6723,21 +6689,23 @@ def _check_codex_reviewed_head_core(
         )
         return False, "", head
     # Neither a review object nor a resolvable clean signal vouches for the head.
-    # A clean comment whose id merely PREFIXES the head is still read, on this
-    # would-block path only, so the block can say it was seen and why it did not
-    # count (its id did not resolve uniquely to the head within this PR's commits).
-    clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
+    # When a clean signal WAS seen, say which and why it did not count; when no later
+    # clean signal can count either, say that too, so the reader is not sent to
+    # re-request a review that cannot clear this.
     clean_note = ""
-    if clean_short and head.startswith(clean_short):
+    if refused.get("signal"):
         clean_note = (
-            f"\nNOTE: Codex posted a clean re-review naming commit {clean_short}. It is "
-            f"not accepted as a review of head {head[:12]} because that abbreviated commit "
-            f"id did not resolve uniquely to the head among this PR's own commits, or "
-            f"something else refused it: a Codex review object at the head, a Codex "
-            f"findings comment anywhere on the PR, a comment edited by someone other than "
-            f"Codex, a force-push, base change or branch restore on the PR, or a read "
-            f"that failed or was truncated."
+            f"\nNOTE: Codex's clean {refused['signal']} was read but not accepted as a "
+            f"review of head {head[:12]}: {refused.get('reason', 'it did not qualify')}."
         )
+        if refused.get("permanent"):
+            clean_note += (
+                " That holds for every clean signal on this PR, so a finding-free Codex "
+                "re-review (which posts no review object) cannot clear this block. What "
+                "can: '# substitute-review' with the owner's approval, "
+                "'# stale-review-override', or a Codex review that posts a review object "
+                "at the head (only a review WITH findings does)."
+            )
     if not reviewed:
         return (
             True,

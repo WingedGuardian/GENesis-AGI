@@ -3790,11 +3790,14 @@ findings below, a gated `gh pr merge`:
   sits at the head, no Codex issue comment on the PR carries findings (Codex
   usually files findings as a review object, but MEASURED on 2 of 339 PRs it posted
   them as a `💡` issue comment with none), the comment is unedited or Codex-edited,
-  and no force-push can have swapped in a lookalike of the reviewed commit (a short
-  id is cheap to grind: the commits force-pushes replaced join the resolution list,
-  and a force-push after the signal voids it). A second PR
-  commit sharing the prefix, a commit outside the PR, an unreadable or 250-capped
-  commit list: all block, and the block message says the comment was seen.
+  and the PR's history has never moved under it: ANY force-push, base change, base
+  force-push or head-branch restore on the PR refuses every clean signal on it, whenever
+  it happened (each can drop the reviewed commit from the list while a lookalike
+  sharing its short id, which is cheap to grind, stays). A second PR commit sharing
+  the prefix, a commit outside the PR, an unreadable or 250-capped commit list: all
+  block. The block message says which clean signal it read and why it was refused,
+  and when no later clean signal on the PR can count either (history moved, or a
+  findings comment sits on the PR) it says a finding-free re-review cannot help.
   `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
   the signal does not resolve, the routes are an owner-approved `# substitute-review`
   on a Devin or CodeRabbit review at that exact head, or a conscious
