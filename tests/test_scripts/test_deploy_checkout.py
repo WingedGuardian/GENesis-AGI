@@ -208,12 +208,20 @@ def test_tracked_dirty_paths_excuse_only_the_ephemeral_allowlist(repos):
 
 
 def test_a_rename_into_an_excused_path_is_still_dirty(repos):
-    """With rename detection, `R code.py -> AGENTS.md` is ONE line naming the
-    excused path, and the whole line would be excused. Split, the deletion of
-    code.py shows."""
+    """With rename detection, `R code.py -> config/procedure_triggers.yaml` is ONE
+    line naming the excused path, and the whole line would be excused. Split, the
+    deletion of code.py shows. (The destination must be NEW to the index, or git
+    reports a modify plus a delete rather than a rename, and the test would pass
+    with or without --no-renames.)"""
     root = repos["primary"]
-    _git(root, "rm", "-q", "AGENTS.md")
-    _git(root, "mv", "code.py", "AGENTS.md")
+    (root / "config").mkdir()
+    _git(root, "mv", "code.py", "config/procedure_triggers.yaml")
+    renamed = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True
+    ).stdout
+    assert "R  code.py -> config/procedure_triggers.yaml" in renamed, (
+        "control: without --no-renames git reports ONE rename line"
+    )
     r = _dirty(root)
     assert r.stdout.startswith("RC=0\n")
     assert "code.py" in r.stdout, r.stdout
