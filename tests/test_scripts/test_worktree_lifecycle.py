@@ -24,6 +24,7 @@ import errno
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2391,3 +2392,65 @@ def test_a_relock_that_fails_after_a_failed_recovery_is_said_out_loud(
     assert report.get("incomplete") is True, report
     err = capsys.readouterr().err
     assert "UNLOCKED" in err, err
+
+
+def test_a_printed_restore_command_quotes_the_branch(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """Git accepts shell syntax in a branch name, so the command recovery prints for
+    restoring a deleted branch must carry it as ONE word, or pasting it runs it."""
+    wt = reaper_repo.wt_branch_merged
+    odd = "q;x"
+    _git(wt, "switch", "-q", "-c", odd)
+    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    _git(reaper_repo.repo, "update-ref", "-d", f"refs/heads/{odd}")
+    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
+    err = capsys.readouterr().err
+    line = next(ln for ln in err.splitlines() if "switch -c" in ln)
+    # punctuation_chars: plain shlex.split reads `;` as a word character, which
+    # made this assertion pass on the unquoted form too.
+    lexer = shlex.shlex(line.split("To restore the name: ", 1)[1], posix=True,
+                        punctuation_chars=True)
+    lexer.whitespace_split = True
+    words = list(lexer)
+    assert words[-3:] == ["switch", "-c", odd], words
+
+
+def test_an_unrecorded_aside_meta_is_named_not_left_silently(tmp_path, capsys):
+    """With no record of where the worktree's own `.trash_meta.json` went, a file
+    under the aside name is named and the recovery is not reported exact."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    assert wl._restore_preserved_meta(dest, {}) is True
+    (dest / ".trash_meta.json.from-worktree-1").write_text("MINE\n")
+    assert wl._restore_preserved_meta(dest, {}) is False
+    assert ".trash_meta.json.from-worktree-1" in capsys.readouterr().err
+    assert (dest / ".trash_meta.json.from-worktree-1").read_text() == "MINE\n"
+
+
+def test_the_aside_name_is_recorded_even_if_the_final_meta_write_fails(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+):
+    """The final metadata rewrite ignores write errors, so the aside name must already
+    be on disk before it runs."""
+    _disable_compression(monkeypatch)
+    wt = reaper_repo.wt_branch_merged
+    (wt / ".trash_meta.json").write_text("MINE\n")
+    real_write = Path.write_text
+
+    def failing_final(self, *a, **k):
+        if self.name == ".trash_meta.json" and self.parent.parent == tmp_path / "trash":
+            raise OSError(errno.EIO, "injected")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", failing_final)
+    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    monkeypatch.setattr(Path, "write_text", real_write)
+    meta = json.loads((_only_entry(tmp_path) / ".trash_meta.json").read_text())
+    assert meta.get("preserved_meta") == ".trash_meta.json.from-worktree-1", meta
+

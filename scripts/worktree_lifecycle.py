@@ -1479,8 +1479,15 @@ def _trash_worktree(
                 try:
                     final_meta.rename(preserved)
                     renamed = True
-                    # So a reattach can give the worktree its own file back.
+                    # So a reattach can give the worktree its own file back. Written
+                    # to the staging copy NOW: the final rewrite below ignores write
+                    # errors, and a record held only in memory would be lost with it.
                     meta["preserved_meta"] = preserved.name
+                    try:
+                        staging_meta.write_text(json.dumps(meta, indent=2))
+                    except OSError as e:
+                        _log(f"  WARN {trash_path.name}: could not record where its own "
+                             f".trash_meta.json went ({e}); recovery will name it")
                 except OSError as e:
                     _log(f"  WARN {trash_path.name}: could not move its own "
                          f".trash_meta.json aside ({e})")
@@ -2373,7 +2380,7 @@ def _restore_from_dir(
             print(
                 f"Branch {branch!r} no longer exists; recreated as a DETACHED "
                 f"worktree at {commit[:8]}. To restore the branch name: "
-                f"git -C {original_path} switch -c {branch}",
+                f"git -C {_shell_word(original_path)} switch -c {_shell_word(branch)}",
                 file=sys.stderr,
             )
             result = retry
@@ -2718,7 +2725,23 @@ def _restore_preserved_meta(dest: Path, meta: dict) -> bool:
     """
     preserved = meta.get("preserved_meta")
     meta_file = dest / ".trash_meta.json"
-    if (isinstance(preserved, str) and preserved.startswith(".trash_meta.json.from-worktree-")
+    if not isinstance(preserved, str):
+        # No record, which a failed metadata write can cause. A file under the aside
+        # name is then the worktree's own, but which one cannot be told, so it is
+        # named rather than renamed, and the recovery is not reported exact.
+        try:
+            aside = sorted(e.name for e in dest.iterdir()
+                           if e.name.startswith(".trash_meta.json.from-worktree-"))
+        except OSError:
+            aside = []
+        if aside:
+            print(f"{', '.join(str(dest / n) for n in aside)}: set aside at archive time "
+                  "under a name the archive did not record. One of them is probably this "
+                  "worktree's own .trash_meta.json; rename it back once checked.",
+                  file=sys.stderr)
+            return False
+        return True
+    if (preserved.startswith(".trash_meta.json.from-worktree-")
             and "/" not in preserved and os.path.lexists(dest / preserved)
             and not os.path.lexists(meta_file)):
         try:
@@ -2788,7 +2811,7 @@ def _reattach(
     ):
         note = (f"Branch {branch!r} no longer exists; the worktree is DETACHED at "
                 f"{commit[:8]}. To restore the name: git -C {_shell_word(original_path)} "
-                f"switch -c {branch}")
+                f"switch -c {_shell_word(branch)}")
 
     # VERIFY THE BINDING, and nothing else. `git status` was the check once: it walks
     # the whole tree, so on a slow disk it timed out and a healthy reattach went to
