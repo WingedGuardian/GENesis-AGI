@@ -1193,7 +1193,7 @@ async def test_a_failed_batch_call_still_reports_a_top_level_error(web, monkeypa
     _no_page_chain(monkeypatch)
     _count_multi(monkeypatch, lambda urls: {"error": "Multi-URL fetch requires API_KEY_TINYFISH"})
     out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123"])
-    assert out["error"] == "Multi-URL fetch requires API_KEY_TINYFISH"
+    assert _body(out["error"]) == "Multi-URL fetch requires API_KEY_TINYFISH"
 
 
 async def test_a_nested_forged_marker_is_stripped_completely(web, monkeypatch):
