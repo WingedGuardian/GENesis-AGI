@@ -35,16 +35,18 @@ SEED_PROCEDURES = [
     {
         "id": _id("youtube_content_fetch"),
         "task_type": "youtube_content_fetch",
-        "principle": "YouTube WebFetch is unreliable in this environment. Use yt-dlp instead.",
+        "principle": (
+            "Fetch YouTube videos with the genesis web_fetch MCP tool: it returns "
+            "metadata and the transcript. CC's built-in WebFetch gets only the page shell."
+        ),
         "steps": [
-            "Use yt-dlp instead of WebFetch for YouTube URLs",
-            "For metadata: yt-dlp --skip-download --print '%(title)s|||%(uploader)s|||%(description)s' URL",
-            "For transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o '~/tmp/%(id)s' URL",
-            "Read the VTT file at ~/tmp/VIDEO_ID.en.vtt for full transcript",
-            "If SSL issues recur: add --no-check-certificate flag",
+            "Call mcp__genesis-health__web_fetch with the video URL (urls=[...] for several)",
+            "Read the Transcript source line: which caption track was used (and its provenance)",
+            "If the result has youtube_error, report that error; the rest is only the page title and description",
+            "Foreground sessions only, if web_fetch is unavailable: the youtube-fetch skill's yt-dlp via Bash fallback",
         ],
-        "tools_used": ["Bash", "Read"],
-        "context_tags": ["youtube", "video", "transcript", "ssl", "content-fetch"],
+        "tools_used": ["mcp__genesis-health__web_fetch"],
+        "context_tags": ["youtube", "video", "transcript", "content-fetch"],
         "activation_tier": "CORE",
         "tool_trigger": ["WebFetch"],
         "draft": 0,
@@ -123,12 +125,13 @@ SEED_PROCEDURES = [
     {
         "id": _id("tmp_filesystem_limit"),
         "task_type": "tmp_filesystem_limit",
-        "principle": "CC sessions use ~/.genesis/cc-tmp/ via TMPDIR — never override TMPDIR in hooks or scripts. /tmp is monitored by the watchgod service.",
+        "principle": "CC sessions use ~/.genesis/cc-tmp/ via TMPDIR — never override TMPDIR in hooks or scripts. cc-tmp is a quota-capped volume every session shares; large temp goes to ~/tmp.",
         "steps": [
             "Never clone repos or write large files to /tmp/ or ~/.genesis/cc-tmp/",
             "Use ~/tmp/ instead for large temporary files",
             "CC temp is redirected to ~/.genesis/cc-tmp/ via TMPDIR env var",
-            "The genesis-tmp-watchgod systemd service monitors both zones",
+            "genesis-tmp-watchgod guards whole disks and sweeps cc-tmp of what ENDED "
+            "sessions left (untouched 7 days); it never deletes live work or kills a session",
             "Never override TMPDIR in hooks, scripts, or service files",
         ],
         "tools_used": ["Bash"],

@@ -1127,68 +1127,40 @@ class TestAcceptanceCorpus:
             # rather than spot-checking one form:
             #   'space + backslash'    -> segments as ['\\', None]
             #   'no space + backslash' -> segments as [None, None]  (exe is 'git\')
-            # A fix keying on the " \" TOKEN shape closes the first two and
-            # leaves the third silently open. The durable fix is continuation
-            # JOINING before segmentation, not token recognition after it.
+            # A fix keying on the " \" TOKEN shape would have closed the first
+            # two and left the third open; the parser now reports ANY
+            # backslash run before a newline, so all three share one fate.
             ("space_backslash", "{GIT} \\\n{PUSH} origin main {FORCE}"),
             ("space_backslash_then_space", "{GIT} \\\n {PUSH} origin main {FORCE}"),
             ("no_space_backslash", "{GIT}\\\n {PUSH} origin main {FORCE}"),
         ],
     )
-    def test_line_continuation_is_documented_residue(self, tmp_path, label, cmd_tpl):
-        """DOCUMENTED RESIDUE (not closed by this PR) — the WHOLE class, not one form.
+    def test_line_continuation_is_refused(self, tmp_path, label, cmd_tpl):
+        """Formerly DOCUMENTED RESIDUE, and locked so a fix would flip it on purpose.
 
-        A `\\`-newline continuation tokenizes cleanly, so the tokenizability
-        probe never fires — analyze() mis-attributing it is the SEPARATE
-        mis-segmentation class (follow-up `dc5ae7ff`). Locked here so the
-        boundary is explicit and a future fix flips these deliberately rather
-        than silently.
-
-        This is the one residue class measured to BOTH mis-parse and really
-        execute: bash joins the continuation before reading the command, so the
-        push actually runs. The `$( )` shapes mis-parse but never execute, which
-        makes them parser defects rather than gate bypasses.
-
-        NOT residue, asserted as the control in the sibling test below: a
-        continuation AFTER the subcommand (`git push \\<NL>origin`) still
-        resolves to `push`, because the subcommand was already read.
+        The parser splits where bash joins, and a split command is not the
+        command bash runs. It now REPORTS a continuation as a bounds-type blind
+        spot (`shell_parse._BLIND_CONTINUATION`), so the push guard refuses it
+        through its existing bounds branch, naming the one-line remedy.
         """
         cmd = cmd_tpl.format(GIT=GIT, PUSH=PUSH, FORCE=FORCE)
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", f"{label}: {r.stdout + r.stderr}"
+        assert _decision(r) == "block", f"{label}: {r.stdout + r.stderr}"
+        assert "one line" in r.stderr, f"{label}: {r.stderr}"
 
-    def test_continuation_after_subcommand_downgrades_the_verdict(self, tmp_path):
-        """A THIRD severity in the same class — measured, and worse than it reads.
+    def test_continuation_after_subcommand_is_refused_not_downgraded(self, tmp_path):
+        """The third severity in this class, and the worst: formerly a DOWNGRADE.
 
-        `git push \\<NL>origin main {FORCE}` was assumed harmless by two
-        independent readings, on the reasoning that `push` still resolves. It
-        does — but the FLAG is severed into the next segment:
-
-            seg[0] argv=['git', 'push', '\\\\']          <- subcommand, no flag
-            seg[1] argv=['origin', 'main', '--force']    <- flag, no exe
-
-        So the guard sees an ORDINARY push and emits `ask` instead of the hard
-        block a force-push warrants, and the prompt reads "git push needs your
-        approval before publishing externally" — it never mentions the force.
-        Bash, having joined the continuation before reading the command, really
-        does force-push. Consent is obtained under a description that omits the
-        dangerous flag, which is a worse failure than a silent allow: a silent
-        allow leaves no record of the operator agreeing to anything.
-
-        PRE-EXISTING, not introduced here — measured identical on the base
-        branch (base: ask, this branch: ask; plain force-push blocks on both,
-        which validates the comparison). Locked so the eventual segmentation fix
-        has to address flag ATTRIBUTION, not just subcommand resolution.
+        Splitting after the subcommand severed the flag into the next segment, so
+        the guard ASKED under a description of an ordinary push — consent sought for
+        a different operation than the one on the command line. The continuation is now a blind
+        spot, so no segment is trusted and the command is refused outright; the
+        human is never asked about a command whose flags the guard cannot read.
         """
         cmd = f"{GIT} {PUSH} \\\norigin main {FORCE}"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        decision = _decision(r)
-        assert decision == "ask", r.stdout + r.stderr
-        # The point of the finding: the approval text omits the force flag.
-        assert FORCE not in r.stdout, (
-            "prompt now names the force flag — the downgrade may be fixed; "
-            "re-derive this test rather than loosening it"
-        )
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert '"ask"' not in (r.stdout or ""), "must never prompt for a continued push"
 
 
 # ══════════════════════════════════════════════════════════════════════════

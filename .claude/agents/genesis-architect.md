@@ -97,6 +97,53 @@ Like Step 0.5, this step is INFORMATIONAL — it reports a judgment about
 direction to whoever owns the change. It never blocks, never authorises a
 rewrite, and is never a reason to close anything.
 
+## Step 0.7 — Persisted-State Check
+
+Step 0.6 asks whether the change should exist in this shape. This asks about
+one shape in particular, a shape that has proven expensive here: does
+the change add PERSISTED STATE to a guard or gate — a marker file, a cache, a
+counter, a row that one invocation writes and a later one reads?
+
+1. **Ask whether it can be stateless.** Can the answer be derived at the moment
+   it is needed from state that already exists — git, the database, a counter
+   another component already keeps? If yes, that is the better shape: report it
+   as SOUND-BUT-INFERIOR with the derivation named, and render it on the
+   severity ladder (normally SHOULD-FIX).
+2. **If the state is genuinely needed, enumerate its lifecycle** — who WRITES
+   it, who READS it, what RETIRES it, how a malformed or stale value is
+   VALIDATED, and what SCOPES it (session, branch, worktree, head). Each stage is
+   a place for a defect. A design that cannot name all five has not finished
+   being designed.
+3. **Count findings by machinery, not by round.** If step 1 found a
+   derivation and the machinery THIS change adds draws a second
+   should-fix-or-worse finding, recommend DELETING it in favour of that
+   derivation rather than hardening it again. If no derivation exists, recommend
+   narrowing the lifecycle instead. Out of scope for deletion: pre-existing state
+   the change only reads, and approval records (grants, consent receipts) — an
+   approval gate's memory is the gate, not a defect site to remove.
+
+MEASURED on this repo's gate-menu feature, at comparable size: the persisted
+"gate demand" marker layer drew roughly 15 should-fix-or-worse findings against
+roughly 3 in the substitution half it served (179 vs 155 non-comment lines; the
+controlled count in #2027's PR body). Raw totals point the same way but are
+confounded — the two marker designs drew 20 and 14 top-level bot inline
+findings and were closed (#1863, #1999), the counter-based design drew 6 and
+merged (#2027), but #2027 was narrower in scope and saw fewer review passes.
+
+Emit, before the main review:
+
+```
+Persisted-state: NONE | STATELESS-ALTERNATIVE (<the derivation>) | LIFECYCLE (write=<…> read=<…> retire=<…> validate=<…> scope=<…>)
+```
+
+This is about the COST of state, not about whether to gate. It does not say a
+single incident is too few to justify a guard — a credential exposure or an
+irreversible action can warrant one the first time. The genesis-development
+skill's advisory-default rule decides WHETHER to refuse; this step prices WHAT
+the refusal is allowed to remember.
+
+Like Steps 0.5 and 0.6, this step is INFORMATIONAL — it never blocks.
+
 ## Genesis Design Principles (Non-Negotiable)
 
 1. **Flexibility > lock-in**: Every external dependency must be swappable. Adapter patterns, generic interfaces. A new provider should be a config change, not a refactor.
