@@ -110,7 +110,12 @@ Before recommending IO_TRIAGE, check the PSI trend:
   recent snapshots))
 - Pool relief runs every tick BEFORE the recovery cycle: when free data or
   metadata space reaches its reserve it deletes ONE guardian-generated snapshot
-  (pre-recovery first, the rollback lifeline last) and alerts. The daily
+  (pre-recovery first, the rollback lifeline last) and alerts. It also acts
+  EARLY when the measured growth (`pool_history.jsonl`) would fill the pool
+  within 48h, but then never takes a rollback lifeline younger than 48h (or,
+  on LVM, one LVM shows holding little). On LVM with the `genesis-thinpool`
+  profile, at 80% data with VG free below one 20% step, it grows the pool into
+  that space LVM's autoextend could not use (a CRITICAL alert says so). The daily
   healthy snapshot rotates delete-first when the pool refuses its create and
   LVM shows the snapshots hold space no live volume maps. If you are diagnosing
   a full pool, read the relief alerts and `pool_relief_state.json` in the

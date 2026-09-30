@@ -59,6 +59,12 @@ class StoragePoolStatus:
     # leaves thinpool_lv None, and relief never acts on a pool it cannot name.
     vg_name: str | None = None
     thinpool_lv: str | None = None
+    # LVM-thin only: the metadata LV's byte size (relief's runway tracks
+    # metadata in bytes, since LVM can grow it and a percentage then drops
+    # while usage keeps rising) and the LVM profile attached to the pool (the
+    # install's opt-in to growing the pool into VG free space).
+    metadata_size_bytes: int | None = None
+    thinpool_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,9 +123,16 @@ class ThinPoolReport:
     metadata_pct: float | None = None
     size_bytes: int | None = None
     lv_name: str | None = None
+    metadata_size_bytes: int | None = None
+    profile: str | None = None
 
 
-LVS_FIELDS = ("data_percent", "metadata_percent", "lv_size", "lv_name")
+# lv_metadata_size and lv_profile: measured on LVM 2.03.16, e.g.
+# "lv_metadata_size":"88080384", "lv_profile":"genesis-thinpool" (blank when
+# no profile is attached).
+LVS_FIELDS = (
+    "data_percent", "metadata_percent", "lv_size", "lv_name", "lv_metadata_size", "lv_profile",
+)
 
 
 def parse_lvs_report(stdout: str, thinpool_lv: str | None = None) -> ThinPoolReport:
@@ -165,12 +178,16 @@ def parse_lvs_report(stdout: str, thinpool_lv: str | None = None) -> ThinPoolRep
     if len(rows) != 1:
         return ThinPoolReport(data_pct=data, metadata_pct=meta)
     size = _num(first, "lv_size")
+    meta_size = _num(first, "lv_metadata_size")
     name = first.get("lv_name")
+    profile = first.get("lv_profile")
     return ThinPoolReport(
         data_pct=data,
         metadata_pct=meta,
         size_bytes=int(size) if size is not None and size > 0 else None,
         lv_name=name.strip() if isinstance(name, str) and name.strip() else None,
+        metadata_size_bytes=int(meta_size) if meta_size is not None and meta_size > 0 else None,
+        profile=profile.strip() if isinstance(profile, str) and profile.strip() else None,
     )
 
 
@@ -530,4 +547,6 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
         pool_name=pool_name,
         vg_name=vg_name,
         thinpool_lv=report.lv_name,
+        metadata_size_bytes=report.metadata_size_bytes,
+        thinpool_profile=report.profile,
     )

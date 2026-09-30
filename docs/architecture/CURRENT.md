@@ -1522,8 +1522,25 @@ verified: 84c7259d 2026-08-31
     (`unactionable`) and trusts only validated tiers/reserves.
   - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
     `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
-    (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an
+    (prune, rotation, rollback target), and `take()` refuses any other label. It never acts on an
     unmeasured or ambiguous pool (unknown backend, several thin pools).
+  - EARLY level (`pool_runway.py`): a bounded 7-day `pool_history.jsonl`
+    (bytes, per pool identity) gives a growth rate (seen in BOTH halves of a
+    2/6/24/72h window, or across a sample gap > max(30 min, 3 intervals));
+    data or metadata full within `early_horizon_hours` (48) → relief acts
+    with LESS authority: pre-recovery, superseded healthy, and the lifeline
+    only once older than `lifeline_max_age_hours` (48) AND, on LVM,
+    `SnapshotManager.lifeline_holds_space` (delete-first's evidence). A young
+    lifeline is taken only at the reserve; the pre-delete re-check re-applies
+    the level. Invalid early keys disable early + extend only
+    (`validate_early_config`), never the reserve.
+  - LVM partial extend (`pool_extend.py`): autoextend's OWN trigger, not the
+    rate — `genesis-thinpool` profile, data ≥ 80%, VG free < one 20% step,
+    metadata not short → `lvextend` by VG free minus
+    max(`extend_keep_free_mib`, 2× metadata LV), ≥ 1 GiB, whole extents,
+    re-planned right before the mutation (never above the fresh plan); a
+    timeout → `extend_indeterminate` (pass ends); a failure → 24h backoff.
+    The only way the guardian grows a pool.
   - Levers: `storage_pool.relief_mode` (`live`/`alert_only`/`off`) and
     `GUARDIAN_POOL_RELIEF_DISABLED=1`. Runbook:
     `docs/reference/thin-pool-recovery.md`.
