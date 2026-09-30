@@ -195,13 +195,21 @@ def _minutes(seconds: int) -> str:
     return f"{max(1, seconds // 60)} min"
 
 
-def _stuck_content(ip: str, age: Any, mode: Any) -> str:
-    action = (
-        "The watchdog is in observe mode, so it will not restart tailscaled."
-        if mode == "observe"
-        else "The watchdog restarts tailscaled for it at most once per rate-limit window;"
-        " restart outcomes are reported separately."
-    )
+def _stuck_content(ip: str, age: Any, mode: Any, capped: bool = False) -> str:
+    if mode == "observe":
+        action = "The watchdog is in observe mode, so it will not restart tailscaled."
+    elif capped:
+        action = (
+            "The watchdog has STOPPED restarting tailscaled for it: restarts this boot did"
+            " not clear it, so the fault is probably not on this node. Check the peer, or"
+            " restart tailscaled by hand; the watchdog tries again once the tunnel has been"
+            " seen working."
+        )
+    else:
+        action = (
+            "The watchdog restarts tailscaled for it at most once per rate-limit window;"
+            " restart outcomes are reported separately."
+        )
     return (
         f"The Tailscale tunnel to {ip} is stuck: no WireGuard handshake"
         + (f" for {age}s" if type(age) is int else "")
@@ -362,16 +370,20 @@ async def _resolve(
     )
 
 
-async def _raise_stuck(db, ip: str, age: Any, mode: Any) -> bool:
+async def _raise_stuck(db, ip: str, age: Any, mode: Any, capped: bool = False) -> bool:
     """Raise, reopen, or keep alive the peer's alert. True if a new row was
-    made. Every call moves the open alert's expiry to :data:`_STUCK_TTL` ahead."""
+    made. Every call moves the open alert's expiry to :data:`_STUCK_TTL` ahead
+    and rewrites its text to the current age and mode (an operator may have
+    switched between live and observe), without paging again."""
     from genesis.db.crud import observations
 
     expires_at = (_now() + _STUCK_TTL).isoformat()
+    content = _stuck_content(ip, age, mode, capped)
     row = await observations.latest_by_hash(db, source=SOURCE, content_hash=_hash(f"stuck:{ip}"))
     if row is not None:
         if not row["resolved"]:
             await observations.set_expires_at(db, row["id"], expires_at)
+            await observations.update_content(db, row["id"], content)
             return False
         notes = row.get("resolution_notes") or ""
         # Expired (unseen for a day) or withdrawn (the watchdog was off): a new
@@ -387,6 +399,7 @@ async def _raise_stuck(db, ip: str, age: Any, mode: Any) -> bool:
             # Bring the same alert back; it keeps its surfaced_at, so it does
             # not page again.
             await observations.reopen(db, row["id"], expires_at=expires_at)
+            await observations.update_content(db, row["id"], content)
             return False
     created = await _create(
         db,
@@ -395,7 +408,7 @@ async def _raise_stuck(db, ip: str, age: Any, mode: Any) -> bool:
         category=CATEGORY_DOWN,
         once=False,
         expires_at=expires_at,
-        content=_stuck_content(ip, age, mode),
+        content=content,
     )
     if created:
         logger.warning("tailscale tunnel to %s is stuck", ip)
@@ -470,12 +483,18 @@ async def _apply_evidence(db, state: dict[str, Any]) -> int:
     evidence = evidence if isinstance(evidence, dict) else {}
     ages = state.get("handshake_age_s")
     ages = ages if isinstance(ages, dict) else {}
+    capped_list = state.get("capped")
+    capped = (
+        {ip for ip in capped_list[:_MAX_PEERS] if _valid_ip(ip)}
+        if isinstance(capped_list, list)
+        else set()
+    )
     cleared: set[str] = set()
     for ip, verdict in list(evidence.items())[:_MAX_PEERS]:
         if not _valid_ip(ip):
             continue
         if verdict == "stuck":
-            created += await _raise_stuck(db, ip, ages.get(ip), state.get("mode"))
+            created += await _raise_stuck(db, ip, ages.get(ip), state.get("mode"), ip in capped)
         elif verdict in ("ok", "offline"):
             cleared.add(_hash(f"stuck:{ip}"))
     await _resolve(

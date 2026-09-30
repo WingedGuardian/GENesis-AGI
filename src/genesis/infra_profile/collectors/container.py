@@ -820,7 +820,7 @@ async def collect_network(
     facts["network_watchdog_enabled"] = (
         await _run_cmd("systemctl", "is-enabled", "genesis-network-watchdog.timer")
     ) == "enabled"
-    # The Tailscale watchdog's unit-file state only ("enabled", "masked" = the
+    # The Tailscale watchdog's unit-file state only ("enabled", "masked" = an
     # operator's off switch, "disabled", "" = not installed; None = unknown).
     # Its /run file is deliberately not read here: this section reaches an LLM
     # prompt, and that file is event data for the awareness tick

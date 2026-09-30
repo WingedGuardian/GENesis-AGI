@@ -103,14 +103,14 @@ never from the command's exit code:
 
 | systemd afterwards | Recorded as |
 |---|---|
-| tailscaled's start time or InvocationID unreadable before the restart | nothing is restarted: a rate limit or an outcome it could not judge is not worth the dropped sessions |
-| tailscaled's start time changed during the scan (an operator or an upgrade restarted it) | `daemon-restarted`: every verdict is void and nothing is restarted |
+| tailscaled's identity (InvocationID, start time, state) unreadable at the scan's start or immediately before the restart | nothing is restarted: a rate limit or an outcome it could not judge is not worth the dropped sessions |
+| tailscaled restarted or stopped since the scan began, seen after the scan or immediately before `try-restart` (an operator, an upgrade), or a `try-restart` that found it stopped | `daemon-changed`: every verdict is void and nothing is restarted |
 | new InvocationID, unit active, every stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s; it bounds the whole check, and no peer starts a ping after it) | `healed` |
 | new InvocationID, unit active, a stuck peer still gets no reply | `restart-no-effect` |
-| new InvocationID, unit active, but no check of a stuck peer could be judged (the CLI gave no answer) | `restart-unconfirmed`, not counted as a restart that failed to help |
+| new InvocationID, unit active, but no check of a stuck peer could be judged (the CLI gave no answer) | `restart-unconfirmed` |
 | new InvocationID, unit not active | `restart-failed` |
 | same InvocationID, try-restart failed | `not-restarted` |
-| same InvocationID, try-restart exited 0 (tailscaled was stopped) | nothing; no hour spent |
+| same InvocationID, try-restart exited 0 (tailscaled was stopped) | `daemon-changed`; no hour spent |
 | a restart job still queued after the poll | `pending` |
 | InvocationID unreadable | `unverified` |
 
@@ -133,14 +133,18 @@ to lose or to go stale:
   `ok` verdicts, so a cap never drops the one that pages.
 - `present`: every well-formed peer's IPv4, and whether that list is complete.
 - `events`: at most 50 restart outcomes (the table above).
-- `ineffective`: per peer, how many restarts this boot did not clear its tunnel,
-  kept apart from `events` so trimming that list never resets it.
+- `unhelped_restarts`: per peer, how many restarts this boot dropped every SSH
+  session without a verified heal, kept apart from `events` so trimming that
+  list never resets it.
 
 Only peers confirmed stuck IN THE SAME RUN are ever restarted, so a peer that
 went offline, or one a later run could not probe, never triggers a restart.
-A peer that two restarts this boot did not clear is not restarted for again:
-the fault is not on this node, and every restart drops every SSH session. Its
-alert stays open until the tunnel answers.
+Every restart drops every SSH session, so a peer gets at most three per boot
+that did not end in a verified heal, whatever the outcome (`restart-no-effect`,
+`restart-unconfirmed`, `unverified`, `pending`, `restart-failed`; a
+`not-restarted` restarted nothing and does not count). After that it is not
+restarted for again until it is seen working, which resets the count. Its alert
+stays open meanwhile.
 
 A peer is named by its IPv4 address only; its hostname, which another tailnet
 member chooses, is never read. When a peer is confirmed stuck, the raw status is

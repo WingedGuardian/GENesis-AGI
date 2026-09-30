@@ -607,7 +607,10 @@ _INFRA_POSTURE_DETAIL = {
         "tunnel is never auto-healed or reported, and SSH over Tailscale stays "
         "dead until a manual `systemctl restart tailscaled`. Re-run "
         "scripts/bootstrap.sh (lib/network_resilience.sh installs and enables "
-        "it); mask the timer instead if it is meant to be off"
+        "it). If it is meant to be off, set NETWD_TS_MODE=off in a drop-in on "
+        "genesis-tailscale-watchdog.service and leave the timer enabled: the "
+        "installer re-enables a disabled timer, and a unit installed in "
+        "/etc/systemd/system cannot be masked"
     ),
     "cc_tmp_shared_fs": (
         "the Claude Code scratch dir (~/.genesis/cc-tmp) shares a filesystem "
@@ -715,8 +718,9 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         if network.get("network_watchdog_enabled") is False:
             missing.append("network_watchdog_absent")
     # Independent of networkd: wherever tailscaled is installed, its watchdog
-    # should be. Masked is the operator's deliberate off switch; unknown (None)
-    # stays silent.
+    # should be. A mask, where one exists (masked before install), is
+    # deliberate; the durable off switch is a NETWD_TS_MODE=off drop-in, which
+    # leaves the timer enabled. Unknown (None) stays silent.
     ts_state = network.get("tailscale_watchdog_unit_state")
     if (
         network.get("tailscaled_loaded") is True

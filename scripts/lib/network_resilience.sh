@@ -66,9 +66,11 @@ _NETRES_TS_TIMER=$'[Unit]\nDescription=Genesis Tailscale watchdog — heal a stu
 
 # TimeoutStartSec bounds a HUNG run; the oneshot otherwise has no start timeout
 # and a hang would stop its timer. The worst legitimate run under every
-# setting's maximum (genesis-tailscale-watchdog.py SETTINGS) is about 38 min:
-# a 600s scan budget plus one 3 x 120s probe in flight, a 900s restart, a 300s
-# poll and a 120s status call. 45min clears that; the defaults take ~6 min.
+# setting's maximum (genesis-tailscale-watchdog.py SETTINGS), with every phase
+# overrunning its own deadline by the one call in flight, is about 55 min;
+# tests/test_scripts/test_network_resilience.py derives it from SETTINGS and
+# fails if this limit does not clear it by 5 min. 65min clears it; the
+# defaults take ~6 min.
 _netres_ts_service_content() {
     printf '%s\n' \
         '[Unit]' \
@@ -77,7 +79,7 @@ _netres_ts_service_content() {
         '' \
         '[Service]' \
         'Type=oneshot' \
-        'TimeoutStartSec=45min' \
+        'TimeoutStartSec=65min' \
         '# Root resolves tailscale and systemctl by name: pin PATH to root-owned' \
         "# directories (systemd's own default for system services, made explicit)." \
         'Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
@@ -220,11 +222,12 @@ _netres_ensure_timer_enabled() {
 
 # Part C — install the Tailscale watchdog (helper + oneshot service + timer).
 # Its own gates, independent of networkd: a systemd host with a tailscaled unit,
-# the host's Python 3.8+, and non-interactive sudo. A MASKED timer is the
-# operator's durable off switch and is respected: nothing is written or
-# enabled. (The networkd timer above unmasks instead; that is its older,
-# deliberate contract, NR1.) Softer levers: NETWD_TS_MODE=observe|off in a
-# drop-in on the service.
+# the host's Python 3.8+, and non-interactive sudo. The durable off switch is
+# NETWD_TS_MODE=off (or observe) in a drop-in on the service: a unit installed
+# in /etc/systemd/system cannot be masked. A mask that does exist (the timer or
+# service masked before it was ever installed) is still respected: nothing is
+# written or enabled. (The networkd timer above unmasks instead; that is its
+# older, deliberate contract, NR1.)
 _netres_install_tailscale_watchdog() {
     if ! systemctl cat tailscaled.service >/dev/null 2>&1; then
         echo "  Tailscale watchdog: no tailscaled unit on this host — skipping."

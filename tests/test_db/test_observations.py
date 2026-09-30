@@ -847,3 +847,18 @@ async def test_set_expires_at_moves_only_an_open_row(db):
     await observations.resolve(db, "e1", resolved_at="2026-01-02T00:00:00", resolution_notes="x")
     assert await observations.set_expires_at(db, "e1", "2026-02-01T00:00:00") is False
     assert (await observations.get_by_id(db, "e1"))["expires_at"] == "2026-01-09T00:00:00"
+
+
+async def test_update_content_rewrites_only_an_open_row_and_keeps_surfacing(db):
+    await _hashed(db, "c1", "hash-a")
+    await observations.mark_surfaced(db, ["c1"], "2026-01-01T01:00:00")
+    assert await observations.update_content(db, "c1", "new text") is True
+    row = await observations.get_by_id(db, "c1")
+    assert (row["content"], row["content_hash"], row["surfaced_at"]) == (
+        "new text",
+        "hash-a",
+        "2026-01-01T01:00:00",
+    )
+    assert await observations.update_content(db, "c1", "new text") is False  # unchanged
+    await observations.resolve(db, "c1", resolved_at="2026-01-02T00:00:00", resolution_notes="x")
+    assert await observations.update_content(db, "c1", "later") is False

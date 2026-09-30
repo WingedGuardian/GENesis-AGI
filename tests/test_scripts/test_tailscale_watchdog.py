@@ -299,21 +299,21 @@ def test_an_odd_ping_exit_code_is_not_a_missing_reply(tmp_path):
     assert state(tmp_path)["evidence"] == {}
 
 
-def test_a_peer_two_restarts_did_not_clear_is_not_restarted_for_again(tmp_path):
+def test_a_peer_three_restarts_did_not_clear_is_not_restarted_for_again(tmp_path):
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
     c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10", NETWD_TS_RATE_LIMIT_SEC="300")
-    for n in range(4):
+    for n in range(5):
         world.restart = (0, {"InvocationID": f"inv-{n + 10}"})
         s = tick(world, c, 301)
-    assert world.restarts() == 2
+    assert world.restarts() == 3
     assert (s["last_action"], s["evidence"]) == ("stuck", {A: "stuck"})
     world.status["Peer"]["b"] = peer(B)
     world.stuck(B)  # a different peer is still healed
     world.restart = (0, {"InvocationID": "inv-99"})
     tick(world, c, 301)
-    assert world.restarts() == 3
+    assert world.restarts() == 4
 
 
 def test_an_idle_peer_is_unknown(tmp_path):
@@ -680,14 +680,15 @@ def test_try_restart_on_a_stopped_unit_spends_nothing(tmp_path):
     world.restart = (0, {"ActiveState": "inactive"})
     assert tw.run_once(ctx(world, tmp_path)) == 0
     s = state(tmp_path)
-    assert (s["last_action"], s["events"]) == ("unavailable", [])
+    # Stopped between the last check and try-restart: the verdicts are void.
+    assert (s["last_action"], s["events"], s["evidence"]) == ("daemon-changed", [], {})
 
 
 # ── the file ─────────────────────────────────────────────────────────────
 
 
 def test_the_event_list_keeps_the_newest_fifty(tmp_path, monkeypatch):
-    monkeypatch.setattr(tw, "MAX_INEFFECTIVE_RESTARTS", 10**6)
+    monkeypatch.setattr(tw, "MAX_UNHELPED_RESTARTS", 10**6)
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
@@ -880,7 +881,7 @@ def _after_restart(world, fn):
     return run
 
 
-def test_a_restart_whose_check_cannot_be_judged_is_unconfirmed_not_ineffective(tmp_path):
+def test_a_restart_whose_check_cannot_be_judged_is_unconfirmed_and_counts(tmp_path):
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
@@ -896,10 +897,8 @@ def test_a_restart_whose_check_cannot_be_judged_is_unconfirmed_not_ineffective(t
             [],
             [A],
         )
-    # Never counted as a restart that failed to help...
-    assert s["ineffective"] == {}
-    assert (world.restarts(), s["unconfirmed_restarts"]) == (3, {A: 3})
-    # ...but each one dropped every SSH session, so there is a limit of its own.
+    # Not a heal, and each one dropped every SSH session: they count.
+    assert (world.restarts(), s["unhelped_restarts"]) == (3, {A: 3})
     s = tick(world, c, 301)
     assert world.restarts() == 3
     assert s["last_action"] == "stuck"
@@ -926,7 +925,7 @@ def test_the_check_deadline_bounds_the_whole_check_not_each_peer(tmp_path):
     (event,) = s["events"]
     assert event["action"] == "restart-no-effect"
     assert sorted(event["unconfirmed"]) == sorted({A, B, C} - {checks[0]})
-    assert s["ineffective"] == {checks[0]: 1}
+    assert s["unhelped_restarts"] == {A: 1, B: 1, C: 1}
 
 
 def test_the_check_setting_cannot_be_zero():
@@ -934,10 +933,10 @@ def test_the_check_setting_cannot_be_zero():
     assert settings["NETWD_TS_VERIFY_SEC"] == 60
 
 
-# ── round 2: the ineffective-restart count outlives the event trim ───────
+# ── the unhelped-restart count outlives the event trim ───────────────────
 
 
-def test_ineffective_restarts_are_counted_per_peer_in_the_file(tmp_path):
+def test_unhelped_restarts_are_counted_per_peer_in_the_file(tmp_path):
     world = World({"a": peer(A)})
     world.stuck(A)
     world.restart_fixes = False
@@ -945,7 +944,7 @@ def test_ineffective_restarts_are_counted_per_peer_in_the_file(tmp_path):
     for n in range(2):
         world.restart = (0, {"InvocationID": f"inv-{n + 10}"})
         s = tick(world, c, 301)
-    assert s["ineffective"] == {A: 2}
+    assert s["unhelped_restarts"] == {A: 2}
 
 
 def test_a_peer_stays_excluded_after_its_events_are_trimmed_away(tmp_path):
@@ -953,37 +952,17 @@ def test_a_peer_stays_excluded_after_its_events_are_trimmed_away(tmp_path):
     world.stuck(A)
     world.restart_fixes = False
     (tmp_path / "state.json").write_text(
-        json.dumps({"boot_id": BOOT, "events": [], "ineffective": {A: 2}})
+        json.dumps({"boot_id": BOOT, "events": [], "unhelped_restarts": {A: 3}})
     )
     c = ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10", NETWD_TS_RATE_LIMIT_SEC="300")
     s = tick(world, c, 301)
     assert world.restarts() == 0
-    assert (s["last_action"], s["ineffective"]) == ("stuck", {A: 2})
-
-
-def test_a_file_from_before_the_count_is_counted_from_its_events(tmp_path):
-    old = {
-        "id": f"{BOOT}:1",
-        "action": "restart-no-effect",
-        "boot_id": BOOT,
-        "mono": MONO - 7200,
-        "at": int(NOW),
-        "peers": [A],
-        "cleared": [],
-        "rc": 0,
-        "rate_limit_s": 300,
-    }
-    (tmp_path / "state.json").write_text(json.dumps({"boot_id": BOOT, "events": [old, old]}))
-    world = World({"a": peer(A)})
-    world.stuck(A)
-    tw.run_once(ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300"))
-    assert world.restarts() == 0
-    assert state(tmp_path)["ineffective"] == {A: 2}
+    assert (s["last_action"], s["unhelped_restarts"]) == ("stuck", {A: 3})
 
 
 def test_the_count_does_not_carry_across_a_reboot(tmp_path):
     (tmp_path / "state.json").write_text(
-        json.dumps({"boot_id": "another-boot", "events": [], "ineffective": {A: 2}})
+        json.dumps({"boot_id": "another-boot", "events": [], "unhelped_restarts": {A: 3}})
     )
     world = World({"a": peer(A)})
     world.stuck(A)
@@ -1024,12 +1003,12 @@ def test_a_daemon_restart_during_the_scan_voids_the_run_and_restarts_nothing(tmp
     tw.run_once(c)
     s = state(tmp_path)
     assert (s["last_action"], s["evidence"], s["present_complete"]) == (
-        "daemon-restarted",
+        "daemon-changed",
         {},
         False,
     )
     assert world.restarts() == 0
-    assert s["blind_runs"] == 0
+    assert s["blind_runs"] == 1  # nothing it could keep was judged
 
 
 # ── round 2: tailscaled turned off on purpose is not blindness ───────────
@@ -1068,20 +1047,13 @@ def test_tailscaled_turned_off_on_purpose_is_not_blind(tmp_path, unit, backend, 
 # ── round 2, second pass ─────────────────────────────────────────────────
 
 
-def test_both_restart_counts_reset_once_the_peer_is_seen_working(tmp_path):
+def test_the_restart_count_resets_once_the_peer_is_seen_working(tmp_path):
     (tmp_path / "state.json").write_text(
-        json.dumps(
-            {
-                "boot_id": BOOT,
-                "events": [],
-                "ineffective": {A: 2, B: 1},
-                "unconfirmed_restarts": {A: 3},
-            }
-        )
+        json.dumps({"boot_id": BOOT, "events": [], "unhelped_restarts": {A: 3, B: 1}})
     )
     world = World({"a": peer(A, age=30), "b": peer(B, active=False)})
     s = tick(world, ctx(world, tmp_path, NETWD_TS_MODE="observe"))
-    assert (s["evidence"], s["ineffective"], s["unconfirmed_restarts"]) == ({A: "ok"}, {B: 1}, {})
+    assert (s["evidence"], s["unhelped_restarts"]) == ({A: "ok"}, {B: 1})
 
 
 def test_one_dead_tunnel_does_not_use_up_the_check_for_the_others(tmp_path):
@@ -1125,3 +1097,190 @@ def test_an_unreadable_second_start_time_does_not_void_the_run(tmp_path):
     s = state(tmp_path)
     assert reads["n"] == 2
     assert (s["last_action"], s["evidence"]) == ("none", {A: "ok"})
+
+
+# ── round 3: one identity check before the heal ──────────────────────────
+
+
+def _identity_reads(world, on_read):
+    """Call ``on_read(n)`` on the n-th read of tailscaled's identity (1: scan
+    start, 2: after the scan, 3: immediately before try-restart); it may
+    change the unit or return a (rc, out) to answer instead."""
+    real = world.run
+    n = {"reads": 0}
+
+    def run(argv, timeout, **kw):
+        if argv[1] == "show" and "ActiveEnterTimestampMonotonic" in argv:
+            n["reads"] += 1
+            answer = on_read(n["reads"])
+            if answer is not None:
+                return answer
+        return real(argv, timeout, **kw)
+
+    return run
+
+
+def test_tailscaled_stopped_just_before_the_heal_voids_the_run(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+
+    def stop_at_heal(n):
+        if n == 3:
+            world.unit["ActiveState"] = "inactive"
+
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, stop_at_heal)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"], s["events"]) == ("daemon-changed", {}, [])
+    assert world.restarts() == 0
+
+
+def test_an_unreadable_post_scan_read_cannot_let_a_restart_through(tmp_path):
+    """The post-scan read failed while tailscaled HAD restarted: the check
+    immediately before try-restart still sees another invocation."""
+    world = World({"a": peer(A)})
+    world.stuck(A)
+
+    def restarted_unseen(n):
+        if n == 2:
+            world.unit["InvocationID"] = "inv-operator"
+            world.unit["ActiveEnterTimestampMonotonic"] = str(int(world.mono * 1e6))
+            return 1, ""
+        return None
+
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, restarted_unseen)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"]) == ("daemon-changed", {})
+    assert world.restarts() == 0
+
+
+def test_an_unreadable_check_before_the_heal_restarts_nothing(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, lambda n: (1, "") if n == 3 else None)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["events"]) == ("stuck", [])
+    assert world.restarts() == 0
+
+
+# ── round 3: every restart that dropped sessions without a heal counts ───
+
+
+@pytest.mark.parametrize(
+    ("after", "action"),
+    [
+        ({"InvocationID": ""}, "unverified"),
+        ({"Job": "42 restart running", "ActiveState": "deactivating"}, "pending"),
+        ({"ActiveState": "failed"}, "restart-failed"),
+    ],
+)
+def test_an_unknown_or_failed_restart_counts_toward_the_cap(tmp_path, after, action):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.restart_fixes = False
+    c = ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300", NETWD_TS_POLL_SEC="0")
+    for n in range(4):
+        # Each run finds tailscaled up again, under a new invocation.
+        world.unit.update({"InvocationID": f"inv-{n + 10}", "ActiveState": "active", "Job": ""})
+        world.restart = (
+            0,
+            {
+                **after,
+                **(
+                    {"InvocationID": ""}
+                    if action == "unverified"
+                    else {"InvocationID": f"inv-{n + 50}"}
+                ),
+            },
+        )
+        s = tick(world, c, 301)
+    assert world.restarts() == 3
+    assert s["unhelped_restarts"] == {A: 3}
+    assert {e["action"] for e in s["events"]} == {action}
+
+
+def test_a_restart_that_did_not_happen_does_not_count(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.restart = (1, {})  # try-restart failed, same invocation: nothing dropped
+    world.restart_fixes = False
+    c = ctx(world, tmp_path, NETWD_TS_RATE_LIMIT_SEC="300")
+    for _ in range(4):
+        s = tick(world, c, 301)
+    assert world.restarts() == 4
+    assert s["unhelped_restarts"] == {}
+
+
+def test_a_daemon_restart_during_the_scan_voids_evidence_even_with_no_heal(tmp_path):
+    """Observe mode never reaches the heal's own check, so the post-scan check
+    is what keeps verdicts about a daemon that is gone out of the file (a
+    restarting tunnel reads as "offline", which would resolve an alert)."""
+    world = World({"a": peer(A), "b": peer(B, age=30)})
+    world.stuck(A)
+    world.disco[A] = False  # mid-restart, even discovery fails: would read "offline"
+    real = world.run
+
+    def operator_restarts_it(argv, timeout, **kw):
+        if argv[1] == "ping" and "--tsmp" not in argv:
+            world.unit["ActiveEnterTimestampMonotonic"] = str(int(world.mono * 1e6))
+            world.unit["InvocationID"] = "inv-operator"
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path, NETWD_TS_MODE="observe")
+    c.run = operator_restarts_it
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"], s["present_complete"]) == (
+        "daemon-changed",
+        {},
+        False,
+    )
+
+
+def test_a_crash_looping_tailscaled_cannot_keep_the_blind_count_at_zero(tmp_path):
+    """Runs alternate between finding tailscaled down and seeing it restart
+    mid-scan. Both judge nothing usable, so the count climbs to an alert."""
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    c = ctx(world, tmp_path, NETWD_TS_MODE="observe")
+    real = world.run
+
+    def restarts_mid_scan(argv, timeout, **kw):
+        if argv[1] == "ping" and "--tsmp" not in argv:
+            world.unit["InvocationID"] = f"inv-{world.mono}"
+            world.unit["ActiveEnterTimestampMonotonic"] = str(int(world.mono * 1e6))
+        return real(argv, timeout, **kw)
+
+    counts = []
+    for n in range(4):
+        world.unit.update({"ActiveState": "failed" if n % 2 else "active"})
+        c.run = restarts_mid_scan
+        counts.append(tick(world, c)["blind_runs"])
+    assert counts == [1, 2, 3, 4]
+
+
+def test_the_file_names_the_peers_at_the_restart_limit(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"boot_id": BOOT, "events": [], "unhelped_restarts": {A: 3, B: 1}})
+    )
+    world = World({"a": peer(A), "b": peer(B)})
+    world.stuck(A, B)
+    world.restart_fixes = False
+    s = tick(world, ctx(world, tmp_path, NETWD_TS_VERIFY_SEC="10"), 7200)
+    assert s["capped"] == [A]
+    assert s["version"] == 4
+
+
+def test_the_judged_daemon_is_read_before_the_status_it_vouches_for(tmp_path):
+    world = World({"a": peer(A, age=30)})
+    tw.run_once(ctx(world, tmp_path))
+    verbs = [c[1] for c in world.calls]
+    first_identity = next(
+        i for i, c in enumerate(world.calls) if c[1] == "show" and "InvocationID" in c
+    )
+    assert first_identity < verbs.index("status")

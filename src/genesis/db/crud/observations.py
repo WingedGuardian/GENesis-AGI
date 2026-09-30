@@ -1149,6 +1149,19 @@ async def reopen(
     return cursor.rowcount > 0
 
 
+async def update_content(db: aiosqlite.Connection, id: str, content: str) -> bool:
+    """Rewrite an UNRESOLVED observation's content, e.g. a condition alert
+    whose details changed while it stays open. ``content_hash`` and
+    ``surfaced_at`` are untouched, so it neither dedups differently nor pages
+    again. True if a row changed."""
+    cursor = await db.execute(
+        "UPDATE observations SET content = ? WHERE id = ? AND resolved = 0 AND content != ?",
+        (content, id, content),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def set_expires_at(db: aiosqlite.Connection, id: str, expires_at: str | None) -> bool:
     """Move an UNRESOLVED observation's expiry, e.g. to keep a condition alert
     alive for a window after it was last confirmed. True if a row changed."""

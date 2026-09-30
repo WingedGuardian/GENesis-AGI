@@ -730,3 +730,42 @@ async def test_a_blind_alert_resolved_by_tailscaled_being_off_says_so(db, tmp_pa
     await _run(db, _write(path, blind_runs=0, last_action="tailscaled-off"))
     (row,) = await _rows(db, category=CATEGORY_BLIND)
     assert "tailscaled is turned off" in row["resolution_notes"]
+
+
+@pytest.mark.asyncio
+async def test_an_open_alert_follows_a_mode_change_without_paging_again(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}, mode="observe"))
+    (row,) = await _rows(db)
+    assert "observe mode" in row["content"]
+    await observations.mark_surfaced(db, [row["id"]], datetime.now(UTC).isoformat())
+    await _run(db, _write(path, evidence={A: "stuck"}, mode="live"))
+    (row,) = await _rows(db)
+    assert "observe mode" not in row["content"]
+    assert "restarts tailscaled for it" in row["content"]
+    assert await _pages(db) == []
+
+
+@pytest.mark.asyncio
+async def test_a_capped_peers_alert_says_the_watchdog_stopped_restarting(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}))
+    (row,) = await _rows(db)
+    assert "at most once per rate-limit window" in row["content"]
+    state = json.loads(path.read_text())
+    path.write_text(json.dumps({**state, "capped": [A]}))
+    await _run(db, path)
+    (row,) = await _rows(db)
+    assert "STOPPED restarting" in row["content"]
+    assert "at most once per rate-limit window" not in row["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_reopened_alert_gets_the_current_text(db, tmp_path):
+    path = tmp_path / "s.json"
+    await _run(db, _write(path, evidence={A: "stuck"}, mode="observe"))
+    await _run(db, _write(path, evidence={A: "ok"}))  # resolved: a flap begins
+    await _run(db, _write(path, evidence={A: "stuck"}, mode="live"))  # within the hour
+    (row,) = await _rows(db)
+    assert row["resolved"] == 0
+    assert "observe mode" not in row["content"]

@@ -47,22 +47,23 @@ own, only what THIS run observed:
   complete, so a peer that left the tailnet can be told apart from one this
   run skipped.
 * ``events``: at most 50 restart outcomes.
-* ``ineffective`` and ``unconfirmed_restarts``: per peer, how many restarts
-  this boot did not clear its tunnel, and how many could not be checked
-  afterwards. The only things remembered about a peer between runs, only to
-  stop restarting for a fault a restart does not fix, and both are forgotten
-  once the peer is seen working.
+* ``unhelped_restarts``: per peer, how many restarts this boot dropped every
+  SSH session without a verified heal (no effect, not checkable, outcome
+  unreadable or still pending, or the daemon not coming back). The only thing
+  remembered about a peer between runs, only to stop restarting for a fault a
+  restart does not fix, and forgotten once the peer is seen working.
 
 The condition, "this peer's tunnel is stuck", lives in Genesis's open alert
 for that peer: raised on ``stuck``, resolved only on ``ok`` or ``offline``
 evidence (or on absence from a complete list), untouched when unknown. There
 is no saved set here to lose, go stale, or keep a peer that went offline: only
-peers confirmed stuck in THIS run are ever restarted. A peer that two restarts
-this boot did not clear is not restarted for again (the fault is not on this
-node), and a run whose backend is not Running, or whose pings cannot be
-judged, reports nothing about the peers it could not judge. A run during which
-tailscaled itself restarted reports nothing either: its verdicts describe a
-daemon that is gone.
+peers confirmed stuck in THIS run are ever restarted. A peer that three
+restarts this boot did not verifiably clear is not restarted for again until
+it is seen working, and a run whose backend is not Running, or whose pings
+cannot be judged, reports nothing about the peers it could not judge. A run
+during which tailscaled itself restarted or stopped reports nothing either: its
+verdicts describe a daemon that is gone. That is checked once after the scan
+and once more immediately before the restart.
 
 Nothing peer-chosen goes into it: a peer is named by a validated IPv4 address
 only, and its HostName is never read. When a peer is first confirmed stuck,
@@ -100,15 +101,12 @@ MAX_EVENTS = 50
 # ``evidence`` / ``present`` (a larger tailnet is recorded as incomplete).
 MAX_TARGETS = 20
 MAX_PEERS = 1000
-# A peer that two restarts this boot did not clear is not restarted for again:
-# the fault is not on this node, and every restart drops every SSH session. Its
-# alert stays open until the tunnel answers.
-MAX_INEFFECTIVE_RESTARTS = 2
-# A restart whose check afterwards could not be judged proves nothing either
-# way, so it is not ineffective; but each one still drops every SSH session, so
-# a peer gets at most this many of them. Both counts reset once the peer is
-# seen working.
-MAX_UNCONFIRMED_RESTARTS = 3
+# Every restart drops every SSH session. A peer gets at most this many restarts
+# per boot that did not end in a verified heal, whatever the outcome (no effect,
+# a check that could not be judged, an unreadable or pending outcome, a daemon
+# that did not come back). The count resets once the peer is seen working. Its
+# alert stays open meanwhile.
+MAX_UNHELPED_RESTARTS = 3
 MODES = ("live", "observe", "off")
 
 # Restart outcomes: each is recorded as an event and spends the rate limit. A
@@ -128,7 +126,10 @@ EVENT_ACTIONS = frozenset(
 # Runs that judged no tunnel. Counted across consecutive runs so the Genesis
 # side can say the watchdog is blind, not only when it is silent. A run that
 # had suspects and probed none of them counts too (see run_once).
-BLIND_ACTIONS = frozenset({"unavailable", "status-unparseable"})
+# A run whose verdicts were voided because tailscaled restarted or stopped
+# under it judged nothing it could keep, so it counts too: a crash-looping
+# tailscaled must not reset the count on every other run.
+BLIND_ACTIONS = frozenset({"unavailable", "status-unparseable", "daemon-changed"})
 # tailscaled turned off on purpose (a disabled or masked unit, or `tailscale
 # down`): nothing to watch, so not blind. A crashed but enabled unit, or a
 # logged-out node, is still blind.
@@ -276,28 +277,50 @@ def unit_props(ctx: Ctx, unit: str, *props: str) -> dict | None:
     return found
 
 
-def _started_mono(ctx: Ctx) -> float | None:
-    """tailscaled's last start, in CLOCK_MONOTONIC seconds, or None when it
-    cannot be read. systemd writes it on every start, so it records a restart
-    this watchdog made even if the watchdog's own record of it was lost, as well
-    as reboots and an operator's manual restart. Unknown is never read as "long
-    ago": the caller then does not restart (fail closed)."""
-    props = unit_props(ctx, "tailscaled", "ActiveEnterTimestampMonotonic") or {}
+_IDENTITY = ("InvocationID", "ActiveState", "ActiveEnterTimestampMonotonic")
+
+
+def _identity(props: dict | None) -> tuple | None:
+    """(InvocationID, ActiveState, start in CLOCK_MONOTONIC seconds) from
+    ``systemctl show`` properties, or None when any is unreadable. The start is
+    written by systemd on every start, so it records a restart this watchdog
+    made even if its own record was lost, as well as reboots and an operator's
+    restart. Unknown is never read as "long ago": callers fail closed."""
+    if not props or not props.get("InvocationID"):
+        return None
     try:
-        value = int(props.get("ActiveEnterTimestampMonotonic", ""))
+        start = int(props.get("ActiveEnterTimestampMonotonic", ""))
     except ValueError:
         return None
-    return value / 1e6 if value > 0 else None
+    if start <= 0:
+        return None
+    return props["InvocationID"], props.get("ActiveState", ""), start / 1e6
 
 
-def restart_tailscaled(ctx: Ctx) -> tuple[str, int | None]:
+def daemon_identity(ctx: Ctx) -> tuple | None:
+    return _identity(unit_props(ctx, "tailscaled", *_IDENTITY))
+
+
+def same_daemon(expected: tuple, now: tuple | None) -> bool:
+    """Whether ``now`` is the same running tailscaled as ``expected``: same
+    invocation, same start, still active. Unreadable is not the same."""
+    return (
+        now is not None and now[0] == expected[0] and now[2] == expected[2] and now[1] == "active"
+    )
+
+
+def restart_tailscaled(ctx: Ctx, expected: tuple) -> tuple[str, int | None]:
     """Run ``try-restart tailscaled`` and return (outcome, exit code).
 
     The outcome is read from systemd's state, never from the exit code: a
     killed or failing client proves nothing about whether a restart happened.
 
-    * InvocationID unreadable BEFORE → ``not-attempted`` (nothing is run: a
-      restart whose outcome could not be judged is not worth the dropped sessions)
+    * the daemon read immediately BEFORE is not ``expected`` (the one the scan
+      judged: another invocation, another start, or no longer active) →
+      ``daemon-changed``; nothing is run, the verdicts describe a daemon that
+      is gone
+    * that read unreadable → ``not-attempted`` (nothing is run: a restart
+      whose outcome could not be judged is not worth the dropped sessions)
     * InvocationID unreadable after → ``unverified``
     * a job still queued after the poll → ``pending``
     * a new InvocationID, unit active → ``healed``
@@ -307,10 +330,13 @@ def restart_tailscaled(ctx: Ctx) -> tuple[str, int | None]:
     ``try-restart`` rather than ``restart``: restart STARTS a stopped unit, and
     an operator may have stopped tailscaled during the scan.
     """
-    props = ("InvocationID", "ActiveState", "Job")
-    before = (unit_props(ctx, "tailscaled", *props) or {}).get("InvocationID", "")
-    if not before:
+    now = daemon_identity(ctx)
+    if now is None:
         return "not-attempted", None
+    if not same_daemon(expected, now):
+        return "daemon-changed", None
+    before = now[0]
+    props = ("InvocationID", "ActiveState", "Job")
     rc, _ = ctx.run(
         [ctx.systemctl, "try-restart", "tailscaled"],
         ctx.settings["NETWD_TS_RESTART_TIMEOUT_SEC"],
@@ -617,33 +643,22 @@ def _read_counts(raw) -> dict:
     }
 
 
-def read_ineffective(prior: dict, events: list) -> dict:
-    """{ip: restarts this boot that did not clear its tunnel}, from the prior
-    run's file. Kept apart from ``events``, which is trimmed to the newest
-    MAX_EVENTS: a count rebuilt from that list would forget old restarts and
-    let a peer be restarted for again. A file from before this field existed
-    is counted from its events once."""
-    raw = prior.get("ineffective")
-    if isinstance(raw, dict):
-        return _read_counts(raw)
-    counts: dict = {}
-    for e in events:
-        if e["action"] == "restart-no-effect":
-            for ip in _not_cleared(e):
-                counts[ip] = counts.get(ip, 0) + 1
-    return counts
-
-
-def read_unconfirmed(prior: dict) -> dict:
-    """{ip: restarts this boot whose check afterwards could not be judged}."""
-    raw = prior.get("unconfirmed_restarts")
+def read_unhelped(prior: dict) -> dict:
+    """{ip: restarts this boot that dropped sessions without a verified heal},
+    from the prior run's file. Kept apart from ``events``, which is trimmed to
+    the newest MAX_EVENTS: a count rebuilt from that list would forget old
+    restarts and let a peer be restarted for again."""
+    raw = prior.get("unhelped_restarts")
     return _read_counts(raw) if isinstance(raw, dict) else {}
 
 
-def _not_cleared(event: dict) -> list:
-    """The peers a restart verifiably did not clear: judged, and no answer."""
-    skip = set(event["cleared"]) | set(event.get("unconfirmed", []))
-    return [ip for ip in event["peers"] if ip not in skip]
+def unhelped_by(event: dict) -> list:
+    """The peers an event's restart dropped sessions for without verifiably
+    clearing: every target not cleared, for every outcome but
+    ``not-restarted`` (nothing restarted, nothing dropped)."""
+    if event["action"] == "not-restarted":
+        return []
+    return [ip for ip in event["peers"] if ip not in event["cleared"]]
 
 
 def write_atomic(path: str, data: bytes, mode: int) -> None:
@@ -678,8 +693,7 @@ def run_once(ctx: Ctx) -> int:
     blind_runs = prior.get("blind_runs") if same_boot else 0
     if type(blind_runs) is not int or blind_runs < 0:
         blind_runs = 0
-    ineffective = read_ineffective(prior, events) if same_boot else {}
-    unconfirmed_n = read_unconfirmed(prior) if same_boot else {}
+    unhelped = read_unhelped(prior) if same_boot else {}
     counters = {"probed": 0, "unjudged": 0, "skipped": 0, "malformed_peers": 0}
     evidence: dict = {}
     present: list = []
@@ -697,19 +711,15 @@ def run_once(ctx: Ctx) -> int:
             events = (events + [event])[-MAX_EVENTS:]
             if event["action"] == "healed":
                 heal_count += 1
-            if event["action"] == "restart-no-effect":
-                for ip in _not_cleared(event):
-                    ineffective[ip] = ineffective.get(ip, 0) + 1
-            for ip in event.get("unconfirmed", []):
-                unconfirmed_n[ip] = unconfirmed_n.get(ip, 0) + 1
+            for ip in unhelped_by(event):
+                unhelped[ip] = unhelped.get(ip, 0) + 1
         # A peer seen working has recovered: whatever the restarts did not fix
         # is gone, so a later stall is judged afresh.
         for ip, verdict in evidence.items():
             if verdict == "ok":
-                ineffective.pop(ip, None)
-                unconfirmed_n.pop(ip, None)
+                unhelped.pop(ip, None)
         record = {
-            "version": 3,
+            "version": 4,
             "boot_id": ctx.boot_id,
             "last_check": int(ctx.wall()),
             "last_check_mono": ctx.mono(),
@@ -723,8 +733,12 @@ def run_once(ctx: Ctx) -> int:
             "present": present,
             "present_complete": present_complete,
             "events": events,
-            "ineffective": dict(sorted(ineffective.items())[:MAX_PEERS]),
-            "unconfirmed_restarts": dict(sorted(unconfirmed_n.items())[:MAX_PEERS]),
+            "unhelped_restarts": dict(sorted(unhelped.items())[:MAX_PEERS]),
+            # Peers at the limit, which are not restarted for again until seen
+            # working: the owner's alert must not promise a restart.
+            "capped": sorted(ip for ip, n in unhelped.items() if n >= MAX_UNHELPED_RESTARTS)[
+                :MAX_PEERS
+            ],
         }
         try:
             write_atomic(ctx.state_file, json.dumps(record).encode(), 0o644)
@@ -740,7 +754,9 @@ def run_once(ctx: Ctx) -> int:
         return finish("off")
     if not ctx.which(ctx.tailscale):
         return finish("unavailable")
-    unit = unit_props(ctx, "tailscaled", "ActiveState", "UnitFileState") or {}
+    unit = unit_props(ctx, "tailscaled", "UnitFileState", *_IDENTITY) or {}
+    # The daemon this run's verdicts describe, read BEFORE the status they rest on.
+    judged_daemon = _identity(unit)
     if unit.get("ActiveState") != "active":
         # Stopped (not crashed: "failed") AND disabled or masked: off on purpose.
         if (
@@ -755,7 +771,7 @@ def run_once(ctx: Ctx) -> int:
     if rc != 0 or not status.strip():
         return finish("unavailable")
     stale = ctx.settings["NETWD_TS_STALE_SEC"]
-    started = _started_mono(ctx)
+    started = judged_daemon[2] if judged_daemon else None
     zero_ok = started is not None and ctx.mono() - started > stale
     found = read_peers(status, ctx.wall(), stale, zero_ok=zero_ok)
     if found is None:
@@ -781,15 +797,27 @@ def run_once(ctx: Ctx) -> int:
     verdicts, stuck, counters["probed"], counters["unjudged"], counters["skipped"] = scan(
         ctx, suspects
     )
-    started_after = _started_mono(ctx)
-    if started is not None and started_after is not None and started_after != started:
-        # tailscaled restarted during the scan (an operator, an upgrade): every
-        # verdict describes the daemon that is gone, and restarting again now
-        # would drop the sessions the new one just brought back.
-        log("tailscaled restarted during the scan; its verdicts are void and nothing is restarted")
+
+    def void(why: str) -> int:
+        # tailscaled restarted or stopped (an operator, an upgrade): every
+        # verdict describes a daemon that is gone, and restarting now would
+        # drop the sessions a new one just brought back.
+        nonlocal evidence, present_complete
+        log(f"{why}; this run's verdicts are void and nothing is restarted")
         evidence = {}
         present_complete = False
-        return finish("daemon-restarted")
+        return finish("daemon-changed")
+
+    # A post-scan read that fails keeps the verdicts (one flaky systemctl call
+    # should not blank a run); the check immediately before try-restart still
+    # refuses to heal on anything but the same daemon.
+    after_scan = daemon_identity(ctx)
+    if (
+        judged_daemon is not None
+        and after_scan is not None
+        and not same_daemon(judged_daemon, after_scan)
+    ):
+        return void("tailscaled restarted or stopped during the scan")
     evidence.update(verdicts)
     if len(evidence) > MAX_PEERS:
         # Keep what can be acted on: stuck, then offline, then ok.
@@ -834,22 +862,18 @@ def run_once(ctx: Ctx) -> int:
         )
         return finish("ratelimited")
 
-    targets = sorted(
-        p.ip
-        for p in stuck
-        if ineffective.get(p.ip, 0) < MAX_INEFFECTIVE_RESTARTS
-        and unconfirmed_n.get(p.ip, 0) < MAX_UNCONFIRMED_RESTARTS
-    )
+    targets = sorted(p.ip for p in stuck if unhelped.get(p.ip, 0) < MAX_UNHELPED_RESTARTS)
     targets = targets[:MAX_TARGETS]
     if not targets:
         log(
-            f"restarts this boot have not cleared the stuck tunnel(s) ({MAX_INEFFECTIVE_RESTARTS}"
-            f" checked, or {MAX_UNCONFIRMED_RESTARTS} that could not be checked); not restarting"
-            " for them again until they are seen working"
+            f"{MAX_UNHELPED_RESTARTS} restarts this boot have not verifiably cleared the stuck"
+            " tunnel(s); not restarting for them again until they are seen working"
         )
         return finish("stuck")
     log(f"HEALING: restarting tailscaled for stuck tunnel(s) to {', '.join(targets)}")
-    outcome, rc = restart_tailscaled(ctx)
+    outcome, rc = restart_tailscaled(ctx, judged_daemon)
+    if outcome == "daemon-changed":
+        return void("tailscaled restarted or stopped before the heal")
     if outcome == "not-attempted":
         log(
             "could not read tailscaled's InvocationID, so a restart could not be judged; not restarting"
@@ -858,8 +882,7 @@ def run_once(ctx: Ctx) -> int:
     if outcome == "not-restarted" and rc == 0:
         # try-restart is a no-op on a stopped unit: nothing was restarted and
         # no session dropped, so nothing is spent.
-        log("tailscaled was stopped during the scan; not restarted")
-        return finish("unavailable")
+        return void("tailscaled was stopped just before the heal (try-restart did nothing)")
     cleared: list = []
     unconfirmed: list = []
     if outcome == "healed":
