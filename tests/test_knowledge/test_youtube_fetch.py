@@ -25,6 +25,15 @@ def _body(text):
     """A fetched page's text without its untrusted-content boundary markers."""
     return strip_boundary_markers(text).strip("\n") if isinstance(text, str) else text
 
+
+def _plain(value):
+    """``value`` with every string unwrapped, for comparing whole entries."""
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return _body(value)
+
 # ─── host allowlist ─────────────────────────────────────────────────────────
 
 
@@ -404,8 +413,8 @@ async def test_multi_url_routes_youtube_entries_and_batches_the_rest(web):
     tool, calls, set_fetch = web
     set_fetch("t")
     out = await tool(urls=["https://youtu.be/abc123", "https://example.com/a"])
-    backends = [r.get("backend_used") for r in out["results"]]
-    assert backends[0] == "yt-dlp" and out["results"][1]["url"] == "https://example.com/a"
+    backends = [_body(r.get("backend_used")) for r in out["results"]]
+    assert backends[0] == "yt-dlp" and _body(out["results"][1]["url"]) == "https://example.com/a"
 
 
 async def test_a_batch_without_youtube_keeps_the_batch_backend(web):
@@ -515,8 +524,8 @@ async def test_a_mixed_batch_overlays_transcripts_on_one_batch_call(web, monkeyp
     urls = ["https://example.com/a", "https://youtu.be/abc123", "https://example.com/b"]
     out = await tool(urls=urls)
     assert seen == [urls]
-    assert [r["url"] for r in out["results"]] == urls
-    assert out["results"][1]["backend_used"] == "yt-dlp"
+    assert [_body(r["url"]) for r in out["results"]] == urls
+    assert _body(out["results"][1]["backend_used"]) == "yt-dlp"
     assert _body(out["results"][0]["text"]) == "tf" and _body(out["results"][2]["text"]) == "tf"
 
 
@@ -580,12 +589,12 @@ async def test_a_url_the_batch_backend_omitted_is_an_error_not_a_misfile(web, mo
     out = await tool(
         urls=["https://example.com/a", "https://youtu.be/abc123", "https://example.com/b"]
     )
-    assert [r["url"] for r in out["results"]] == [
+    assert [_body(r["url"]) for r in out["results"]] == [
         "https://youtu.be/abc123",
         "https://example.com/b",
     ]
     assert _body(out["results"][1]["text"]) == "B"
-    assert [{**e, "error": _body(e["error"])} for e in out["errors"]] == [
+    assert _plain(out["errors"]) == [
         {"url": "https://example.com/a", "error": "page_not_found"}
     ]
 
@@ -596,8 +605,8 @@ async def test_a_batch_without_a_batch_backend_still_returns_transcripts(web, mo
     _no_page_chain(monkeypatch)
     _count_multi(monkeypatch, lambda urls: {"error": "Multi-URL fetch requires API_KEY_TINYFISH"})
     out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123"])
-    assert [r["url"] for r in out["results"]] == ["https://youtu.be/abc123"]
-    assert [{**e, "error": _body(e["error"])} for e in out["errors"]] == [
+    assert [_body(r["url"]) for r in out["results"]] == ["https://youtu.be/abc123"]
+    assert _plain(out["errors"]) == [
         {"url": "https://example.com/a", "error": "Multi-URL fetch requires API_KEY_TINYFISH"}
     ]
 
@@ -614,7 +623,7 @@ async def test_a_raising_batch_backend_does_not_sink_the_transcripts(web, monkey
 
     monkeypatch.setattr(web_tools, "_impl_web_fetch_multi", boom)
     out = await tool(urls=["https://youtu.be/abc123", "https://example.com/a"])
-    assert out["results"][0]["backend_used"] == "yt-dlp"
+    assert _body(out["results"][0]["backend_used"]) == "yt-dlp"
     assert "batch backend exploded" in out["errors"][0]["error"]
 
 
@@ -627,7 +636,7 @@ async def test_duplicate_urls_each_get_their_own_entry(web, monkeypatch):
     out = await tool(
         urls=["https://example.com/a", "https://example.com/a", "https://youtu.be/abc123"]
     )
-    assert [r["url"] for r in out["results"]] == [
+    assert [_body(r["url"]) for r in out["results"]] == [
         "https://example.com/a",
         "https://example.com/a",
         "https://youtu.be/abc123",
@@ -1154,7 +1163,7 @@ async def test_the_overlay_runs_against_the_real_batch_implementation(monkeypatc
     assert out.get("errors", []) == []
     assert [_body(r.get("text")) for r in out["results"][:2]] == [
         "page for https://example.com/a", "page for https://example.com/b"]
-    assert out["results"][2]["backend_used"] == "yt-dlp"
+    assert _body(out["results"][2]["backend_used"]) == "yt-dlp"
 
 
 async def test_a_page_echoed_under_another_spelling_is_kept_not_dropped(web, monkeypatch):
@@ -1166,7 +1175,7 @@ async def test_a_page_echoed_under_another_spelling_is_kept_not_dropped(web, mon
         {"url": "https://example.com/a/", "text": "A"}]})
     out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123"])
     assert any(_body(r.get("text")) == "A" for r in out["results"])
-    assert out["errors"][0]["url"] == "https://example.com/a"
+    assert _body(out["errors"][0]["url"]) == "https://example.com/a"
     assert "no batch entry matched" in out["errors"][0]["error"]
 
 
