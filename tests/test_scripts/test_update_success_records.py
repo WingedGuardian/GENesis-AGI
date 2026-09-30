@@ -188,7 +188,7 @@ def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> Non
         "_nd_last_status",
         "_last_status",
     ]
-    assert text.count("SELECT status FROM update_history ORDER BY started_at DESC") == 1
+    assert text.count("SELECT status FROM update_history ORDER BY datetime(started_at) DESC") == 1
 
 
 def test_noop_history_does_not_duplicate_pre_update_degraded() -> None:
@@ -245,7 +245,13 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
             'exit "$rc"\n'
         )
         (shim_dir / "curl").chmod(0o755)
-        (shim_dir / "systemctl").write_text(f"#!/bin/sh\nprintf '%s' '{unit_state}'\nexit 0\n")
+        # An empty state is an UNREADABLE answer, as a lost user bus gives it:
+        # nothing on stdout, an error on stderr, a non-zero exit.
+        (shim_dir / "systemctl").write_text(
+            f"#!/bin/sh\nprintf '%s' '{unit_state}'\nexit 0\n"
+            if unit_state
+            else "#!/bin/sh\necho 'Failed to connect to bus' >&2\nexit 1\n"
+        )
         (shim_dir / "systemctl").chmod(0o755)
         result = subprocess.run(
             [
@@ -269,9 +275,15 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     # after a few attempts (the exact count depends on the clock, not a counter).
     ok, n = healthy("activating", [7], wait=2)
     assert not ok and 1 <= n <= 4, n
-    # Any other unit state stops at once: no waiting on a stopped server.
-    for state in ("inactive", "failed", "deactivating", ""):
+    # An affirmative stopped state stops at once: no waiting on a stopped server.
+    for state in ("inactive", "failed", "deactivating"):
         assert healthy(state, [7]) == (False, 1), f"unit state {state!r}"
+    # An UNREADABLE state is not evidence of death (P6 reads it the same way):
+    # keep polling, so a server still booting behind a lost bus is waited for...
+    assert healthy("", [7, 22, 0]) == (True, 3), "unreadable state must keep polling"
+    # ...and the elapsed bound still ends it when it never comes back.
+    ok, n = healthy("", [7], wait=2)
+    assert not ok and 2 <= n <= 4, n
     # 7 refused, 22 an HTTP error, 28 timed out — none reads as up.
     for rc in (7, 22, 28):
         assert healthy("inactive", [rc])[0] is False, rc
@@ -282,8 +294,9 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     finally:
         sleeper.kill()
         sleeper.wait()
-    # ...and not at all once it is gone.
+    # ...and not at all once it is gone, whether the unit reads stopped or unreadable.
     assert healthy("inactive", [7], direct_pid=str(sleeper.pid)) == (False, 1)
+    assert healthy("", [7], direct_pid=str(sleeper.pid)) == (False, 1)
     # A transfer that hangs counts against the bound: each attempt takes 3s here,
     # so a 3s bound allows ONE attempt (a sleep-only counter would allow four).
     slow = shim_dir / "slow-curl"
@@ -350,6 +363,16 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     con.close()
     assert latest() == "rolled_back", "the NEWEST row, by started_at, must win"
 
+    # started_at is `date -Iseconds`: LOCAL time with its offset. Across a DST
+    # fall-back the later run can carry the textually SMALLER value (01:10-05:00
+    # is 06:10Z, after 01:30-04:00 = 05:30Z), so the newest row is by INSTANT.
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO update_history VALUES ('success', '2026-11-01T01:30:00-04:00')")
+    con.execute("INSERT INTO update_history VALUES ('failed', '2026-11-01T01:10:00-05:00')")
+    con.commit()
+    con.close()
+    assert latest() == "failed", "newest by instant, not by text, across a DST fall-back"
+
     decoy = home / "genesis" / "data" / "genesis.db"
     decoy.parent.mkdir(parents=True)
     con = sqlite3.connect(decoy)
@@ -357,7 +380,7 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     con.execute("INSERT INTO update_history VALUES ('success', '2027-01-01T00:00:00')")
     con.commit()
     con.close()
-    assert latest() == "rolled_back", "must read $GENESIS_ROOT's database, not ~/genesis's"
+    assert latest() == "failed", "must read $GENESIS_ROOT's database, not ~/genesis's"
 
     no_python = tmp_path / "no-python-bin"
     no_python.mkdir()

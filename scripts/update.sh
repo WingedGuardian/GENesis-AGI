@@ -1178,8 +1178,11 @@ try:
     # Read-only: never create or migrate the database from a status probe.
     con = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True, timeout=5)
     try:
+        # started_at is `date -Iseconds` (LOCAL time plus offset): order by the
+        # instant, not the text, or a DST fall-back puts a later run behind an
+        # earlier one.
         row = con.execute(
-            "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
+            "SELECT status FROM update_history ORDER BY datetime(started_at) DESC LIMIT 1"
         ).fetchone()
     except sqlite3.OperationalError as exc:
         if "no such table" not in str(exc).lower():
@@ -1203,11 +1206,11 @@ _server_health_ok() {
     # at most 180s — P6's own floor for its health window. A unit reading
     # `active`/`activating` is never proof by itself: a crash-looping unit under
     # Restart=on-failure reads `activating` between attempts, so it waits out the
-    # bound and reads "not back". Any other unit state (inactive, failed, or an
-    # unreadable empty answer) stops at once, unless _start_genesis_server fell
-    # back to a direct start: no unit tracks that process, so the wait follows its
-    # pid instead. A server booting slower than the bound reads "not back": the side
-    # that reports a problem. The bound is ELAPSED time ($SECONDS), so a transfer
+    # bound and reads "not back". An unreadable (empty) answer keeps polling to the
+    # bound. Any other unit state (inactive, failed) stops at once, unless
+    # _start_genesis_server fell back to a direct start: no unit tracks that
+    # process, so the wait follows its pid instead. A server booting slower than
+    # the bound reads "not back": the side that reports a problem. The bound is ELAPSED time ($SECONDS), so a transfer
     # that hangs for its full --max-time counts against it too; the worst overrun is
     # one poll step plus one transfer (the deadline is checked before the sleep).
     local state
@@ -1217,6 +1220,14 @@ _server_health_ok() {
         state="$(systemctl --user is-active genesis-server.service 2>/dev/null || true)"
         case "$state" in
             active | activating | reloading) ;;
+            "")
+                # Unreadable (a lost user bus prints nothing and exits non-zero),
+                # not evidence of death — P6 reads it the same way. Keep polling
+                # to the bound; a direct-started process that is gone still stops it.
+                if [ -n "${_SERVER_DIRECT_PID:-}" ]; then
+                    kill -0 "$_SERVER_DIRECT_PID" 2>/dev/null || return 1
+                fi
+                ;;
             *)
                 [ -n "${_SERVER_DIRECT_PID:-}" ] && kill -0 "$_SERVER_DIRECT_PID" 2>/dev/null \
                     || return 1
