@@ -72,44 +72,34 @@ fi
 # name a user or a host.
 FP_FILE="${GENESIS_RELEASE_FINGERPRINTS:-$HOME/.genesis/release-fingerprints.txt}"
 
-# Without python3, or if it fails, grep -E reads the patterns instead: a
-# degraded check, since a Python-only pattern is read in another dialect. One
-# grep per pattern, so a pattern grep rejects (exit 2) cannot take the rest down
-# with it; that one is matched as literal text, as Python does. grep cannot
-# emulate Python's dialect, so a line using syntax it reads differently is named
-# (by number) rather than trusted: MEASURED on GNU grep 3.11, \d, \A, \Z and any
-# "(?" group match nothing where Python matches, silently or with a warning, while
-# \w, \W, \s, \S, \b, \B and \1-\9 agree. Any other backslash-letter is named too.
-_fp_py_only='\\[^wWsSbB1-9[:punct:][:space:]]|\(\?'
-_fp_grep() {
-    local line rc n=0
-    while IFS= read -r line || [ -n "$line" ]; do
-        n=$((n + 1))
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        if [ -z "$line" ] || [ "${line:0:1}" = "#" ]; then
-            continue
-        fi
-        if printf '%s\n' "$line" | grep -qE -e "$_fp_py_only"; then
-            echo "unchecked $n"
-        fi
-        rc=0
-        grep -nE -e "$line" -- "$MSG_FILE" 2>/dev/null | cut -d: -f1 | sed 's/^/hit /'
-        rc=${PIPESTATUS[0]}
-        if [ "$rc" -eq 2 ]; then
-            grep -nF -e "$line" -- "$MSG_FILE" 2>/dev/null | cut -d: -f1 | sed 's/^/hit /'
-        fi
-    done < "$FP_FILE"
-}
+# The interpreter: the Genesis venv's, found the way .claude/hooks/genesis-hook
+# finds it (this checkout, then the main worktree), because the pre-push review
+# runs under it and a regex can compile under one Python version and not another
+# (atomic groups arrived in 3.11). A system python3 is the fallback. There is no
+# grep fallback: grep is another regex dialect, and emulating Python in it was
+# where the divergences lived. A checkout with this hook installed has built a
+# Python venv (bootstrap does that before it installs the hooks), so with no
+# usable Python the check says it could not run, and the commit proceeds.
+_fp_python=""
+_fp_common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || _fp_common=""
+for _fp_root in "$(git rev-parse --show-toplevel 2>/dev/null)" "${_fp_common%/.git}"; do
+    if [ -n "$_fp_root" ] && [ -x "$_fp_root/.venv/bin/python" ]; then
+        _fp_python="$_fp_root/.venv/bin/python"
+        break
+    fi
+done
+if [ -z "$_fp_python" ]; then
+    _fp_python="$(command -v python3 2>/dev/null)" || _fp_python=""
+fi
 
 if [ -f "$FP_FILE" ]; then
     _fp_out=""
     _fp_rc=127
-    if command -v python3 >/dev/null 2>&1; then
+    if [ -n "$_fp_python" ]; then
         _fp_rc=0
         # -I: no PYTHON* variables, no user site, no script directory on the
         # path, so nothing in the environment can shadow the stdlib `re`.
-        _fp_out="$(python3 -I - "$FP_FILE" "$MSG_FILE" 2>/dev/null <<'PY'
+        _fp_out="$("$_fp_python" -I - "$FP_FILE" "$MSG_FILE" 2>/dev/null <<'PY'
 import re
 import sys
 
@@ -124,13 +114,16 @@ except OSError:
 patterns = []
 for n, line in enumerate(raw.splitlines(), 1):
     stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
-        continue
     if any("\udc80" <= c <= "\udcff" for c in stripped):
         print("undecodable", n)
+    if not stripped or stripped.startswith("#"):
+        continue
+    # Any failure, not only re.error: a repeat count past the C limit raises
+    # OverflowError and deep nesting RecursionError, and one bad line must not
+    # take the other fingerprints down with it.
     try:
         patterns.append(re.compile(stripped))
-    except re.error:
+    except Exception:
         patterns.append(re.compile(re.escape(stripped)))
         print("literal", n)
 with open(msg_path, "rb") as f:
@@ -152,19 +145,14 @@ PY
             echo "  permissions."
             ;;
         *)
+            # No usable Python, or it failed part-way. Any line it did report
+            # before failing is still used below.
             echo ""
-            echo "WARNING: python3 is not available (or failed), so the release fingerprints are"
-            echo "  read with grep -E, one at a time. A pattern using Python-only syntax may match"
-            echo "  nothing here while the pre-push review blocks it."
-            _fp_out="$(_fp_grep)"
+            echo "WARNING: the release-fingerprint check could not run: no usable Python was"
+            echo "  found (the Genesis venv or python3), or the check failed. This commit"
+            echo "  message was NOT checked for install-specific identifiers."
             ;;
     esac
-    _fp_unchecked="$(printf '%s\n' "$_fp_out" | sed -n 's/^unchecked //p' | tr '\n' ' ')"
-    if [ -n "$_fp_unchecked" ]; then
-        echo ""
-        echo "WARNING: in this degraded mode these release-fingerprint lines use syntax grep"
-        echo "  reads differently from Python, and may match nothing: line ${_fp_unchecked% }."
-    fi
     _fp_undecodable="$(printf '%s\n' "$_fp_out" | sed -n 's/^undecodable //p' | tr '\n' ' ')"
     if [ -n "$_fp_undecodable" ]; then
         echo ""

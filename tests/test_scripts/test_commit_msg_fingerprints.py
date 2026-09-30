@@ -30,7 +30,8 @@ LOOKBEHIND = r"(?<![0-9.])\.shh\b"
 UNBALANCED = "SECRET_HOST_(9"
 # A directory name the output must never contain.
 PATH_MARK = "PATHMARK_NOT_FOR_OUTPUT"
-# What a real `git commit` has on a stock install: the system python3, no venv.
+# A minimal PATH with the system python3. The hook runs outside any repository
+# (cwd=tmp_path), so it finds no Genesis venv and uses this python3.
 BASE_PATH = "/usr/bin:/bin:/usr/local/bin"
 
 
@@ -58,6 +59,7 @@ def _run(
         ["/bin/bash", str(HOOK), str(f)],
         capture_output=True,
         text=True,
+        cwd=tmp_path,
         env={
             "PATH": path,
             # As a real `git commit` runs it: the user's UTF-8 locale.
@@ -125,7 +127,7 @@ def test_the_hook_flags_the_lines_the_prepush_reader_flags(case, tmp_path):
     assert r.returncode == 1, r.stdout + r.stderr
 
 
-def test_a_grep_warning_does_not_weaken_a_valid_pattern(tmp_path):
+def test_a_stray_backslash_warning_setting_does_not_weaken_a_pattern(tmp_path):
     """Debian's grep warns about a stray backslash when this variable is set,
     and still matches. Round 1 took any warning as "unusable" and fell back to
     searching for the pattern's own text, backslash included."""
@@ -161,6 +163,28 @@ def test_a_non_utf8_line_does_not_switch_the_other_fingerprints_off(tmp_path):
     assert PATH_MARK not in r.stdout + r.stderr
 
 
+@pytest.mark.parametrize(
+    "bad_line",
+    ["x{4294967296}", "(" * 1500 + "a" + ")" * 1500],
+    ids=["repeat-count-overflow", "nesting-recursion"],
+)
+def test_a_line_that_breaks_the_compiler_does_not_switch_the_rest_off(bad_line, tmp_path):
+    """re.compile raises OverflowError or RecursionError, not re.error, on these.
+    They used to end the reader, so every fingerprint went unchecked."""
+    r = _run(f"fix: {GOOD}\n", f"{GOOD}\n{bad_line}\n", tmp_path)
+    assert r.returncode == 1 and _blocked_lines(r) == {1}, r.stdout + r.stderr
+    assert "cannot compile" in r.stdout and "(line 2)" in r.stdout, r.stdout
+
+
+def test_a_non_utf8_comment_line_is_still_reported(tmp_path):
+    """The pre-push reader cannot open a file with any non-UTF-8 byte, comments
+    included, so the hook names such a line even though it is not a pattern."""
+    fps = b"# caf\xe9 notes\n" + GOOD.encode() + b"\n"
+    r = _run(f"fix: {GOOD}\n", fps, tmp_path)
+    assert r.returncode == 1 and _blocked_lines(r) == {1}, r.stdout + r.stderr
+    assert "not all UTF-8" in r.stdout and "(line 1)" in r.stdout, r.stdout
+
+
 def test_a_non_utf8_fingerprint_matches_byte_for_byte(tmp_path):
     """A Latin-1 byte in a fingerprint is kept as itself, in the patterns and the
     message alike. Control: the same text with a different byte passes."""
@@ -184,6 +208,7 @@ def test_an_unreadable_file_warns_without_blocking_or_naming_it(tmp_path):
             ["/bin/bash", str(HOOK), str(msg)],
             capture_output=True,
             text=True,
+            cwd=tmp_path,
             env={
                 "PATH": BASE_PATH,
                 "LC_ALL": "C.UTF-8",
@@ -236,7 +261,7 @@ def _bin_without_python(tmp_path: Path, python3: str | None = None) -> str:
     given, a stand-in python3."""
     b = tmp_path / "bin"
     b.mkdir()
-    for tool in ("bash", "grep", "sed", "sort", "cut", "tr", "cat", "head"):
+    for tool in ("bash", "grep", "sed", "sort", "cut", "tr", "cat", "head", "git"):
         for d in ("/usr/bin", "/bin"):
             if os.path.exists(f"{d}/{tool}"):
                 (b / tool).symlink_to(f"{d}/{tool}")
@@ -247,34 +272,125 @@ def _bin_without_python(tmp_path: Path, python3: str | None = None) -> str:
     return str(b)
 
 
+def test_the_genesis_venv_interpreter_is_preferred(tmp_path):
+    """The pre-push review runs under the Genesis venv, and a regex can compile
+    under one Python version and not another, so the hook uses that venv when
+    the repository has one, even with no python3 on PATH."""
+    repo = tmp_path / "repo"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    marker = tmp_path / "venv_used"
+    venv_python = repo / ".venv" / "bin" / "python"
+    venv_python.write_text(f'#!/bin/sh\n/usr/bin/touch {marker}\nexec /usr/bin/python3 "$@"\n')
+    venv_python.chmod(0o755)
+    path = _bin_without_python(tmp_path)
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text(f"{GOOD}\n")
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text(f"fix: {GOOD}\n")
+    r = subprocess.run(
+        ["/bin/bash", str(HOOK), str(msg)],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        env={
+            "PATH": path,
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(tmp_path),
+            "GENESIS_RELEASE_FINGERPRINTS": str(fp),
+        },
+    )
+    assert r.returncode == 1 and "BLOCKED" in r.stdout, r.stdout + r.stderr
+    assert "could not run" not in r.stdout, r.stdout
+    assert marker.exists(), "the venv interpreter was not the one that ran"
+
+
 @pytest.mark.parametrize(
     "python3",
     [None, "#!/bin/sh\nexit 1\n"],
     ids=["python3-absent", "python3-failing"],
 )
-def test_without_a_working_python3_grep_reads_them_one_at_a_time(python3, tmp_path):
+def test_without_a_usable_python_the_check_says_it_did_not_run(python3, tmp_path):
+    """There is no grep fallback: grep is another regex dialect. A checkout with
+    this hook installed has built a Python venv, so this is a broken install, and
+    the hook says loudly that nothing was checked rather than blocking."""
     path = _bin_without_python(tmp_path, python3)
-    # No newline after the last line: the loop must still read it.
-    fps = f"{UNBALANCED}\n{GOOD}"
-    r = _run(f"fix: ok\n\n{GOOD}\n", fps, tmp_path, path=path)
-    assert "python3 is not available" in r.stdout, r.stdout
-    # The pattern grep rejects does not take the one after it down with it...
-    assert r.returncode == 1 and _blocked_lines(r) == {3}, r.stdout + r.stderr
-    # ...and is itself matched as literal text.
-    lit = _run(f"fix: ok\n\n{UNBALANCED}\n", fps, tmp_path, path=path)
-    assert lit.returncode == 1 and _blocked_lines(lit) == {3}, lit.stdout + lit.stderr
-    clean = _run("fix: an ordinary subject\n", fps, tmp_path, path=path)
-    assert clean.returncode == 0, clean.stdout + clean.stderr
-    assert PATH_MARK not in r.stdout + r.stderr + lit.stdout + clean.stdout
+    r = _run(f"fix: ok\n\n{GOOD}\n", f"{GOOD}\n", tmp_path, path=path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "check could not run" in r.stdout and "NOT checked" in r.stdout, r.stdout
+    assert PATH_MARK not in r.stdout + r.stderr
 
 
-def test_without_python3_a_line_grep_reads_differently_is_named(tmp_path):
-    """grep cannot emulate Python's dialect: MEASURED on GNU grep 3.11, \\d and a
-    "(?" group match nothing where Python matches. The degraded path names such
-    lines rather than trusting them, and \\s, which grep reads the same way, is
-    not named."""
+def test_a_linked_worktree_uses_the_main_checkouts_venv(tmp_path):
+    """Commits are made from linked worktrees, which have no .venv of their own:
+    the hook finds the main checkout's through git's common directory."""
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run(
+        ["git", "-C", str(main), *ident, "commit", "-q", "--allow-empty", "-m", "base"], check=True
+    )
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    (main / ".venv" / "bin").mkdir(parents=True)
+    marker = tmp_path / "venv_used"
+    venv_python = main / ".venv" / "bin" / "python"
+    venv_python.write_text(f'#!/bin/sh\n/usr/bin/touch {marker}\nexec /usr/bin/python3 "$@"\n')
+    venv_python.chmod(0o755)
     path = _bin_without_python(tmp_path)
-    fps = "acct-\\d{4}\n(?<!public-)hostx\nx\\sbeta\n" + GOOD + "\n"
-    r = _run(f"fix: ok\n\n{GOOD}\n", fps, tmp_path, path=path)
-    assert r.returncode == 1 and _blocked_lines(r) == {3}, r.stdout + r.stderr
-    assert "may match nothing: line 1 2." in r.stdout, r.stdout
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text(f"{GOOD}\n")
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text(f"fix: {GOOD}\n")
+    r = subprocess.run(
+        ["/bin/bash", str(HOOK), str(msg)],
+        capture_output=True,
+        text=True,
+        cwd=wt,
+        env={
+            "PATH": path,
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(tmp_path),
+            "GENESIS_RELEASE_FINGERPRINTS": str(fp),
+        },
+    )
+    assert r.returncode == 1 and "BLOCKED" in r.stdout, r.stdout + r.stderr
+    assert marker.exists(), "the main checkout's venv interpreter was not the one that ran"
+
+
+def test_a_worktree_with_its_own_venv_uses_it_first(tmp_path):
+    """The same order as .claude/hooks/genesis-hook: this checkout's venv before
+    the main checkout's."""
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run(
+        ["git", "-C", str(main), *ident, "commit", "-q", "--allow-empty", "-m", "base"], check=True
+    )
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    for root, name in ((main, "main_used"), (wt, "wt_used")):
+        (root / ".venv" / "bin").mkdir(parents=True)
+        py = root / ".venv" / "bin" / "python"
+        py.write_text(f'#!/bin/sh\n/usr/bin/touch {tmp_path / name}\nexec /usr/bin/python3 "$@"\n')
+        py.chmod(0o755)
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text(f"{GOOD}\n")
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_text(f"fix: {GOOD}\n")
+    r = subprocess.run(
+        ["/bin/bash", str(HOOK), str(msg)],
+        capture_output=True,
+        text=True,
+        cwd=wt,
+        env={
+            "PATH": _bin_without_python(tmp_path),
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(tmp_path),
+            "GENESIS_RELEASE_FINGERPRINTS": str(fp),
+        },
+    )
+    assert r.returncode == 1 and "BLOCKED" in r.stdout, r.stdout + r.stderr
+    assert (tmp_path / "wt_used").exists() and not (tmp_path / "main_used").exists()
