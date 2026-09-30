@@ -11,6 +11,7 @@ discoverability.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC
@@ -674,12 +675,112 @@ async def web_fetch(
     - Parallel multi-URL fetching (urls parameter)
     - Background sessions (no Bash available)
 
+    - YouTube videos: with backend "auto", a video URL returns its metadata,
+      description and transcript (captions in the video's own language) via
+      yt-dlp — backend_used "yt-dlp", plus `caption` provenance. A video with
+      no captions returns its metadata and `youtube_error`; no audio is
+      transcribed here. If yt-dlp gets nothing at all, a single URL is fetched
+      as usual and `youtube_error` says why. The video text comes back inside
+      `<external-content>` markers: it is untrusted, like any fetched page.
+      In a `urls` batch (backend "auto") a video's entry is replaced by its
+      transcript result; a miss keeps the batch's page entry.
+
     Use CC WebFetch when you specifically need AI-processed summaries.
     Use browser_navigate when you need to interact with the page.
     """
+    from genesis.mcp.health.youtube_route import fetch_youtube
+
     if urls:
-        return await _impl_web_fetch_multi(urls, max_chars)
+        from genesis.knowledge.processors.youtube import is_youtube_video_url
+
+        urls = urls[:10]
+        # The spelling _impl_web_fetch_multi sends and its backend echoes back,
+        # so the video overlay can match entries by URL.
+        normalized = [u.strip() if u.strip().startswith(("http://", "https://"))
+                      else "https://" + u.strip() for u in urls]
+        if backend != "auto" or not any(is_youtube_video_url(u) for u in normalized):
+            return await _impl_web_fetch_multi(urls, max_chars)
+        return await _overlay_video_batch(urls, normalized, max_chars)
+    if backend == "auto":
+        yt, yt_error = await fetch_youtube(url.strip(), max_chars)
+        if yt is not None:
+            return yt
+        if yt_error is not None:
+            return {**await _impl_web_fetch(url, backend, max_chars), "youtube_error": yt_error}
     return await _impl_web_fetch(url, backend, max_chars)
+
+
+async def _overlay_video_batch(urls: list[str], normalized: list[str], max_chars: int) -> dict:
+    """A batch holding a YouTube link: the batch call main makes, plus transcripts.
+
+    Every URL, videos included, goes through the ONE ordinary batch call, while
+    yt-dlp fetches the videos alongside it (bounded by the processor's own
+    process limit). A fetched transcript replaces that video's page entry; a
+    miss keeps the page entry and says why in ``youtube_error``. No per-URL
+    fallback chain ever starts here: the earlier per-URL design let one
+    attacker-authored batch launch ten full chains at once (#2568 review).
+
+    Entries are matched by the URL the batch backend echoes back, never by
+    position (a backend that drops a URL must not shift the rest), and a URL
+    with no page entry becomes an ``errors`` row, the batch path's own shape.
+    """
+    from genesis.knowledge.processors.youtube import is_youtube_video_url
+    from genesis.mcp.health.youtube_route import fetch_youtube
+
+    start = time.monotonic()
+    video_idx = [i for i, u in enumerate(normalized) if is_youtube_video_url(u)]
+
+    async def page_batch() -> dict:
+        try:
+            return await _impl_web_fetch_multi(urls, max_chars)
+        except Exception as exc:  # the transcripts must survive a failed batch call
+            logger.warning("web_fetch batch call failed", exc_info=True)
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    async def video(u: str) -> tuple[dict | None, str | None]:
+        try:
+            return await fetch_youtube(u, max_chars)
+        except Exception as exc:  # formatting a result must not sink the batch
+            logger.warning("web_fetch video overlay failed for %s", u, exc_info=True)
+            return None, f"{type(exc).__name__}: {exc}"
+
+    page, *videos = await asyncio.gather(page_batch(), *(video(normalized[i]) for i in video_idx))
+    video_by_idx = dict(zip(video_idx, videos, strict=True))
+
+    pages: dict[str, list[dict]] = {}
+    for item in page.get("results") or []:
+        pages.setdefault(item.get("url"), []).append(item)
+    page_errors: dict[str, list[dict]] = {}
+    for item in page.get("errors") or []:
+        page_errors.setdefault(item.get("url"), []).append(item)
+    batch_error = page.get("error")
+
+    results: list[dict] = []
+    errors: list[dict] = []
+    for i, u in enumerate(normalized):
+        page_entry = pages[u].pop(0) if pages.get(u) else None
+        yt, yt_error = video_by_idx.get(i, (None, None))
+        if yt is not None:
+            results.append(yt)
+            continue
+        if page_entry is not None:
+            results.append({**page_entry, "youtube_error": yt_error} if yt_error else page_entry)
+            continue
+        error = (page_errors[u].pop(0) if page_errors.get(u)
+                 else {"url": u, "error": batch_error or "no batch entry matched this URL"})
+        errors.append({**error, "youtube_error": yt_error} if yt_error else error)
+    # An entry echoed under a spelling no input matched is still the backend's
+    # page: return it rather than drop it.
+    results.extend(item for items in pages.values() for item in items)
+    out = {
+        "results": results,
+        "errors": errors,
+        "backend_used": page.get("backend_used"),  # None when the batch call failed
+        "latency_ms": round((time.monotonic() - start) * 1000, 1),
+    }
+    if batch_error:
+        out["error"] = batch_error  # the batch path's own shape for a failed call
+    return out
 
 
 @mcp.tool()

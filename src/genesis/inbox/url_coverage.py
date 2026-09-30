@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
 # Tested against all 8 existing response files: 0 false positives, 0 false negatives.
 # Crucially, these do NOT include "ssl error" or "could not fetch" which appear
-# in SUCCESSFUL evaluations that worked around SSL via yt-dlp/curl.
+# in SUCCESSFUL evaluations that worked around a fetch failure.
 _URL_FAILURE_PATTERNS = [
     "unfetchable",
     "unreachable from this host",
