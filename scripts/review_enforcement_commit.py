@@ -1106,6 +1106,14 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
             return None
         remote_names.add(name.strip())
         url = rest.rsplit(" (", 1)[0].strip()
+        # A remote with NO URL gives gh nothing to resolve. Any `remote.<name>.*`
+        # key makes git list the name, so one global key (say
+        # `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in every
+        # repository that has no remote (MEASURED: a bare `origin<TAB>` line). A
+        # URL git does know is listed on its own line, a push-only URL included,
+        # so skipping the empty one hides nothing.
+        if not url:
+            continue
         if not _is_local_remote_url(url):
             return True
     # Every listed remote's fetch AND push URL is a filesystem path by now.
