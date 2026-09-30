@@ -3526,8 +3526,10 @@ class TestPrCiStatusCancelSibling:
         assert guard_module._pr_ci_status("1") == ("red", ["lint"])
 
     def test_timed_out_with_success_sibling_still_red(self, guard_module, monkeypatch):
-        # Scope lock: ONLY CANCELLED is laundered. TIMED_OUT carries a real
-        # verdict and still blocks even with a same-identity success.
+        # Scope lock: without cross-run evidence ONLY CANCELLED is laundered.
+        # TIMED_OUT carries a real verdict and still blocks beside a same-identity
+        # success that has no parseable detailsUrl (the #2607 cross-run rule needs a
+        # NEWER run id of this repo; see test_ci_failure_supersession.py).
         self._set(monkeypatch, [
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},

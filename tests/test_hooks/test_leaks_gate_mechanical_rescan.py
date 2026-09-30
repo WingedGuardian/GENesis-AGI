@@ -599,7 +599,8 @@ class TestSupersededConcurrencyCancels:
         """THE GUARANTEE THIS PATH MUST KEEP. Under `# ci-override` this relief is
         the only remaining check of the mechanical layer, so a SUCCESS-then-FAILURE
         pair must still read red even when a superseded cancel is dropped beside
-        it. FAILURE is not in the cancel set and is never dropped."""
+        it. FAILURE is not in the cancel set, and with no detailsUrl it carries no
+        cross-run evidence (#2607), so it is not dropped."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
@@ -622,7 +623,10 @@ class TestSupersededConcurrencyCancels:
     def test_only_cancelled_is_droppable(self, monkeypatch, conclusion):
         """Scope lock on _CI_CANCEL_CONCLUSIONS: every other non-green terminal
         conclusion carries a real verdict and survives a later same-identity
-        success. STALE is a real GitHub conclusion, and it is red, not a pass."""
+        success that has NO cross-run evidence (these fixtures carry no
+        detailsUrl). FAILURE / TIMED_OUT gained a narrow cross-run rule in #2607,
+        locked separately in test_ci_failure_supersession.py. STALE is a real
+        GitHub conclusion, and it is red, not a pass."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
