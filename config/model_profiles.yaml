@@ -366,7 +366,7 @@ profiles:
   claude-opus-4.6:
     display_name: "Claude 4.6 Opus"
     provider: anthropic
-    api_id: "anthropic/claude-opus-4-6"
+    api_id: "anthropic/claude-opus-4.6"
     intelligence_tier: S
     reasoning: S
     instruction_following: S
@@ -394,7 +394,7 @@ profiles:
   claude-sonnet-4.5:
     display_name: "Claude 4.5 Sonnet"
     provider: anthropic
-    api_id: "anthropic/claude-sonnet-4-5-20250929"
+    api_id: "anthropic/claude-sonnet-4.5"
     intelligence_tier: A
     reasoning: A
     instruction_following: A
@@ -422,7 +422,7 @@ profiles:
   claude-haiku-4.5:
     display_name: "Claude 4.5 Haiku"
     provider: anthropic
-    api_id: "anthropic/claude-haiku-4-5-20251001"
+    api_id: "anthropic/claude-haiku-4.5"
     intelligence_tier: B
     reasoning: B
     instruction_following: A
@@ -698,7 +698,7 @@ profiles:
   claude-sonnet-4.6:
     display_name: "Claude 4.6 Sonnet"
     provider: anthropic
-    api_id: "anthropic/claude-sonnet-4-6-20250514"
+    api_id: "anthropic/claude-sonnet-4.6"
     intelligence_tier: A
     reasoning: A
     instruction_following: S
@@ -1401,6 +1401,61 @@ profiles:
     free_tier:
       available: false
     last_reviewed: "2026-09-21"
+    review_source: manual
+
+  claude-sonnet-5.5:
+    display_name: "Claude Sonnet 5.5"
+    provider: anthropic
+    api_id: "anthropic/claude-sonnet-5.5"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: S
+    anti_sycophancy: A
+    context_window: 1000000
+    cost_tier: moderate
+    cost_per_mtok_in: 2.00
+    cost_per_mtok_out: 10.00
+    latency: moderate
+    strengths:
+      - agentic coding
+      - instruction following
+      - tool use precision
+      - long-context work at 1M tokens
+    weaknesses:
+      - speed (slower than Flash-class models)
+      - cost for bulk background work
+    best_for: [deep_reflection, code_work, foreground_conversation, quality_calibration]
+    avoid_for: [surplus_brainstorm, micro_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-09-30"
+    review_source: manual
+
+  claude-opus-5.5:
+    display_name: "Claude Opus 5.5"
+    provider: anthropic
+    api_id: "anthropic/claude-opus-5.5"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: S
+    anti_sycophancy: S
+    context_window: 1000000
+    cost_tier: expensive
+    cost_per_mtok_in: 4.00
+    cost_per_mtok_out: 20.00
+    latency: moderate
+    strengths:
+      - hardest reasoning and judgement
+      - strategic and self-assessment work
+      - resistance to sycophancy
+    weaknesses:
+      - cost (highest tier in this config)
+      - overkill for extraction and tagging
+    best_for: [strategic_reflection, weekly_self_assessment, adversarial_counterargument]
+    avoid_for: [surplus_brainstorm, micro_reflection, tagging, fact_extraction]
+    free_tier:
+      available: false
+    last_reviewed: "2026-09-30"
     review_source: manual
 
   gpt-5.6-sol:

@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT / "scripts"))
 
@@ -261,20 +263,54 @@ def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
     runs the whole way through and the cost is the SUM of the calls.
     """
 
+    serve = _graphql_server(
+        head=H5,
+        files=[{"path": "src/x.py", "changeType": "MODIFIED"}],
+        commits=[{"commit": {"oid": h}} for h in (H1, H2, H3, H4, H5)],
+    )
+
     def run(argv, *, timeout):
-        joined = " ".join(argv)
         calls.append((" ".join(argv[:3]), timeout))
         clock.now += timeout
-        if "headRefOid" in joined:
-            return 0, H5 + "\n", ""
-        if joined.endswith("/files") or "/files" in joined:
-            return 0, json.dumps({"path": "src/x.py"}) + "\n", ""
-        if "/commits" in joined:
-            return 0, "\n".join(json.dumps({"sha": h}) for h in (H1, H2, H3, H4, H5)) + "\n", ""
-        if "/reviews" in joined or "/comments" in joined:
-            return 0, "", ""
-        return 0, "", ""
+        return serve(argv, timeout=timeout)
 
+    return run
+
+
+def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
+    """A fake `gh api graphql` that honours the query's connections and cursors.
+
+    It reads WHICH connections the query selects from the query text and each
+    one's `after_<name>` cursor from argv, and serves `page_size` nodes per page,
+    so pagination, per-connection cursors and re-reads are exercised against the
+    real argv the module builds rather than a canned reply. `heads`, when given,
+    is consumed one per call (a head that moves between reads). Anything that is
+    not a GraphQL call fails, so an unexpected REST call is loud.
+    """
+    head_seq = list(heads or [])
+    seen: list[list[str]] = []
+
+    def run(argv, *, timeout):
+        if argv[:3] != ["gh", "api", "graphql"]:
+            return 1, "", "unexpected non-graphql call"
+        seen.append(list(argv))
+        query = next(a for a in argv if a.startswith("query="))
+        fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
+        pr: dict = {"headRefOid": head_seq.pop(0) if head_seq else head}
+        for name in ("reviews", "comments", "files", "commits"):
+            if f" {name}(first: 100" not in query:
+                continue
+            nodes = connections.get(name, [])
+            offset = int(fields.get(f"after_{name}", "0"))
+            page = nodes[offset : offset + page_size]
+            more = offset + page_size < len(nodes)
+            pr[name] = {
+                "pageInfo": {"hasNextPage": more, "endCursor": str(offset + page_size)},
+                "nodes": page,
+            }
+        return 0, json.dumps({"data": {"repository": {"pullRequest": pr}}}), ""
+
+    run.seen = seen  # type: ignore[attr-defined]
     return run
 
 
@@ -326,7 +362,7 @@ def test_no_deadline_leaves_every_call_at_its_own_cap():
     )
     assert calls, "no call was issued at all"
     # The first call keeps its own full cap rather than a clamped remainder.
-    assert calls[0][1] >= 6.0, calls
+    assert calls[0][1] >= 8.0, calls
 
 
 def test_the_budget_is_not_spent_on_a_call_too_small_to_finish():
@@ -344,7 +380,7 @@ def test_the_budget_is_not_spent_on_a_call_too_small_to_finish():
         "1",
         runner=_slow_runner(clock, calls),
         external_identity_templates=(),
-        budget_seconds=6.2,  # one 6s call, then 0.2s left -- below the floor
+        budget_seconds=8.2,  # one 8s call, then 0.2s left -- below the floor
         monotonic=clock,
     )
     assert len(calls) == 1, f"a doomed sub-floor call was issued: {calls}"
@@ -384,7 +420,7 @@ def test_the_commit_hook_budget_fits_inside_its_registered_timeout():
 
 
 def test_every_paginated_read_asks_for_a_full_page_in_the_path():
-    """The page size must ride in the PATH, never as a `gh api -f` field.
+    """A REST read's page size must ride in the PATH, never as a `gh api -f` field.
 
     Two separate defects, and the second is why this test exists rather than a
     comment. First, gh defaults to 30 per page while the caps above tolerate 250
@@ -423,8 +459,217 @@ def test_every_paginated_read_asks_for_a_full_page_in_the_path():
         assert "per_page=" in path, (
             f"a paginated read does not request a full page in its path: {path}"
         )
-    assert paginated == 4, f"expected 4 paginated reads, found {paginated}"
+    # One REST read survives: the files fallback for a PR carrying a rename,
+    # because GraphQL does not expose a renamed file's earlier path.
+    assert paginated == 1, f"expected 1 paginated REST read, found {paginated}"
     assert rb._PAGE_SIZE == 100, "100 is the GitHub API maximum page size"
+    graphql_sites = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.List)
+        and [ast.unparse(e).strip("\"'") for e in node.elts][:3] == ["gh", "api", "graphql"]
+    ]
+    assert len(graphql_sites) == 1, "the PR evidence is read by exactly one GraphQL query site"
+
+
+# -- the GraphQL read (A1: one query instead of five REST reads) ----------
+# MEASURED 2026-09-29 over all 70 open PRs: the old and new `evaluate_pr` gave
+# identical results on every one, p90 5.98s -> 1.80s (full figures in the
+# `snapshot` docstring). These pin the read's own
+# mechanics, which that replay cannot: pagination, the bot-login mapping, the
+# rename fallback, and every way the read can fail closed.
+
+
+def _no_seams(monkeypatch):
+    for name in (
+        "_TEST_REVIEW_BUDGET_HEAD",
+        "_TEST_REVIEW_BUDGET_HEAD_AFTER",
+        "_TEST_GH_CODEX_REVIEWS",
+        "_TEST_GH_CODEX_COMMENTS",
+        "_TEST_REVIEW_BUDGET_FILES",
+        "_TEST_REVIEW_BUDGET_COMMITS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _gql_review(head, *, login="chatgpt-codex-connector", kind="Bot", state="COMMENTED"):
+    return {"state": state, "author": {"login": login, "__typename": kind}, "commit": {"oid": head}}
+
+
+_COMMITS = [{"commit": {"oid": h}} for h in (H1, H2, H3, H4, H5)]
+_FILES = [{"path": "src/x.py", "changeType": "MODIFIED"}]
+
+
+def test_graphql_read_counts_bot_reviews_under_their_rest_login(monkeypatch):
+    """GraphQL names an App `chatgpt-codex-connector`; REST and every hook
+    constant say `chatgpt-codex-connector[bot]`. Without the mapping every Codex
+    review would read as a stranger's and the count would silently drop to 0."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        reviews=[_gql_review(H3), _gql_review(H4)], files=_FILES, commits=_COMMITS
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["reviewed_heads"] == [H3, H4], got
+    # Two reads: the snapshot, then the head + mutable-evidence re-read.
+    assert len(serve.seen) == 2, serve.seen
+
+
+def test_graphql_read_never_promotes_a_human_to_a_bot(monkeypatch):
+    """The suffix is keyed on `__typename`, not on the login's spelling."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        reviews=[_gql_review(H4, login="chatgpt-codex-connector", kind="User")],
+        files=_FILES,
+        commits=_COMMITS,
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["count"] == 0, got
+
+
+def test_graphql_read_follows_every_page_of_every_connection(monkeypatch):
+    """Page size 1 forces a cursor walk; the review on the LAST page must count."""
+    _no_seams(monkeypatch)
+    comment = {
+        "body": "Codex Review: Didn't find any major issues.\nReviewed commit: `" + H2[:10] + "`",
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    serve = _graphql_server(
+        page_size=1,
+        reviews=[_gql_review(H1), _gql_review(H3), _gql_review(H5)],
+        comments=[{"body": "hello", "author": {"login": "someone", "__typename": "User"}}, comment],
+        files=_FILES,
+        commits=_COMMITS,
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["reviewed_heads"] == [H1, H2, H3, H5], got
+    # A follow-up page queries only the connections that still have pages.
+    later = [a for a in serve.seen[1] if a.startswith("query=")][0]
+    assert " files(" not in later, later
+
+
+def test_graphql_read_that_never_ends_is_unknown(monkeypatch):
+    """Past the page bound the evidence is incomplete, never partially counted."""
+    _no_seams(monkeypatch)
+    monkeypatch.setattr(rb, "_GRAPHQL_MAX_PAGES", 2)
+    serve = _graphql_server(
+        page_size=1, reviews=[_gql_review(h) for h in (H1, H2, H3)], files=_FILES, commits=_COMMITS
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "reviews_response_truncated" in got["errors"], got
+
+
+def test_graphql_head_moving_between_pages_is_unknown(monkeypatch):
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        page_size=1,
+        # The head moves on page 2 and moves BACK for the final read, so the
+        # final head check cannot see it: only the per-page check can.
+        # Exactly two pages per read (two reviews, page size 1): H4 then H5 on
+        # the first read, H4 twice on the re-read.
+        heads=[H4, H5, H4, H4],
+        reviews=[_gql_review(H4), _gql_review(H4)],
+        files=_FILES,
+        commits=[{"commit": {"oid": H4}}],
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "head_changed_during_evaluation" in got["errors"], got
+
+
+def test_graphql_evidence_changing_between_reads_is_unknown(monkeypatch):
+    """A review landing between the snapshot and the re-read is a race, not a count."""
+    _no_seams(monkeypatch)
+    base = _graphql_server(reviews=[_gql_review(H3)], files=_FILES, commits=_COMMITS)
+    grown = _graphql_server(
+        reviews=[_gql_review(H3), _gql_review(H4)], files=_FILES, commits=_COMMITS
+    )
+    calls = []
+
+    def serve(argv, *, timeout):
+        calls.append(argv)
+        return (base if len(calls) == 1 else grown)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "evidence_changed_during_evaluation" in got["errors"], got
+
+
+def test_graphql_failures_fail_closed(monkeypatch):
+    """An error exit, a missing pull request and a malformed node all read as
+    unknown -- never as an empty, zero-round PR."""
+    _no_seams(monkeypatch)
+
+    def erroring(argv, *, timeout):
+        return 1, "", "gh: Could not resolve to a PullRequest"
+
+    def missing(argv, *, timeout):
+        return 0, json.dumps({"data": {"repository": {"pullRequest": None}}}), ""
+
+    bad_node = _graphql_server(reviews=[{"author": 17}], files=_FILES, commits=_COMMITS)
+    for runner, error in (
+        (erroring, "graphql_unreadable"),
+        (missing, "graphql_malformed"),
+        (bad_node, "reviews_malformed"),
+    ):
+        got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+        assert got["status"] == "unknown", (error, got)
+        assert error in got["errors"], (error, got)
+        assert got["approval_required"] is True and got["commit_approval_required"] is True
+
+
+def test_graphql_deleted_author_is_skipped_like_rest_ghost(monkeypatch):
+    _no_seams(monkeypatch)
+    ghost = {"state": "COMMENTED", "author": None, "commit": {"oid": H2}}
+    serve = _graphql_server(reviews=[ghost, _gql_review(H5)], files=_FILES, commits=_COMMITS)
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["reviewed_heads"] == [H5], got
+
+
+def test_a_renamed_file_falls_back_to_rest_for_its_earlier_path(monkeypatch):
+    """GraphQL has no earlier path for a renamed file, and a file renamed OUT of
+    the hook surface is still a gate change. The fallback is what keeps it one."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        files=[{"path": "scripts/moved.py", "changeType": "RENAMED"}], commits=_COMMITS
+    )
+    rest_calls = []
+
+    def runner(argv, *, timeout):
+        if argv[:3] == ["gh", "api", "graphql"]:
+            return serve(argv, timeout=timeout)
+        rest_calls.append(argv)
+        row = {"filename": "scripts/moved.py", "previous_filename": "scripts/hooks/guard.py"}
+        return 0, json.dumps(row) + "\n", ""
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["gate_surface"] is True, got
+    assert len(rest_calls) == 1 and "/files?per_page=100" in rest_calls[0][2], rest_calls
+
+    def runner_fails(argv, *, timeout):
+        if argv[:3] == ["gh", "api", "graphql"]:
+            return serve(argv, timeout=timeout)
+        return 1, "", "boom"
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner_fails, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "files_unreadable" in got["errors"], got
+
+
+def test_graphql_read_queries_the_base_repository(monkeypatch):
+    """Owner, name and number come from the PR identity (the BASE repository,
+    so a fork PR is read where it lives), sent as GraphQL variables."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(files=_FILES, commits=_COMMITS)
+    rb.evaluate_pr("acme/widgets", 42, runner=serve, external_identity_templates=())
+    argv = serve.seen[0]
+    assert "owner=acme" in argv and "name=widgets" in argv and "number=42" in argv, argv
+    assert argv[argv.index("number=42") - 1] == "-F", "number must be sent typed (-F) as an Int"
 
 
 # ── records whose author account is gone ────────────────────────────
@@ -486,3 +731,135 @@ def test_the_cli_loads_configured_reviewer_identities():
     assert parser.parse_args(
         ["--external-identity-template", "x{head}"]
     ).external_identity_template == ["x{head}"]
+
+
+def test_graphql_comment_landing_between_reads_is_unknown(monkeypatch):
+    """The re-read covers issue comments as well as reviews: a clean-review or
+    confirmation comment is budget evidence too."""
+    _no_seams(monkeypatch)
+    late = {"body": "late", "author": {"login": "someone", "__typename": "User"}}
+    base = _graphql_server(files=_FILES, commits=_COMMITS)
+    grown = _graphql_server(comments=[late], files=_FILES, commits=_COMMITS)
+    calls = []
+
+    def serve(argv, *, timeout):
+        calls.append(argv)
+        return (base if len(calls) == 1 else grown)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "evidence_changed_during_evaluation" in got["errors"], got
+
+
+def test_a_copied_file_on_a_later_page_still_triggers_the_rest_fallback(monkeypatch):
+    """COPIED carries an earlier path too, and the flag must survive paging."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        page_size=1,
+        files=[
+            # COPIED on page 1, a plain change on page 2: the flag must survive.
+            {"path": "src/b.py", "changeType": "COPIED"},
+            {"path": "src/a.py", "changeType": "MODIFIED"},
+        ],
+        commits=[{"commit": {"oid": H5}}],
+    )
+    rest_calls = []
+
+    def runner(argv, *, timeout):
+        if argv[:3] == ["gh", "api", "graphql"]:
+            return serve(argv, timeout=timeout)
+        rest_calls.append(argv)
+        return 0, json.dumps({"filename": "src/b.py", "previous_filename": "src/a.py"}) + "\n", ""
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert len(rest_calls) == 1, rest_calls
+
+
+def test_cursors_are_sent_raw_never_typed(monkeypatch):
+    """`-F` would read a cursor starting with `@` as a FILE and turn an
+    all-digit one into a number; only `-f` sends the string as written."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        page_size=1, reviews=[_gql_review(H1), _gql_review(H2)], files=_FILES, commits=_COMMITS
+    )
+    rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    later = serve.seen[1]
+    cursor_args = [i for i, a in enumerate(later) if a.startswith("after_")]
+    assert cursor_args, later
+    assert all(later[i - 1] == "-f" for i in cursor_args), later
+
+
+def test_one_read_is_bounded_even_without_a_caller_budget(monkeypatch):
+    """Without `budget_seconds` each page still gets 8s, so a many-page read
+    needs its own ceiling or it runs to 50 x 8s -- past the push guard's
+    registered hook timeout, where a SIGKILL lets the command through."""
+    _no_seams(monkeypatch)
+    clock = _FakeClock()
+    serve = _graphql_server(
+        page_size=1, reviews=[_gql_review(H5)] * 40, files=_FILES, commits=_COMMITS
+    )
+
+    def slow(argv, *, timeout):
+        clock.now += timeout
+        return serve(argv, timeout=timeout)
+
+    start = clock.now
+    got = rb.evaluate_pr(
+        "owner/repo", 7, runner=slow, external_identity_templates=(), monotonic=clock
+    )
+    assert got["status"] == "unknown", got
+    assert "graphql_read_timeout" in got["errors"], got
+    assert clock.now - start <= rb._GRAPHQL_READ_SECONDS, clock.now - start
+
+
+def test_an_errors_payload_or_a_missing_page_flag_is_never_evidence(monkeypatch):
+    _no_seams(monkeypatch)
+    ok_pr = {"headRefOid": H5, "reviews": {"pageInfo": {}, "nodes": []}}
+
+    def with_errors(argv, *, timeout):
+        body = {"data": {"repository": {"pullRequest": {"headRefOid": H5}}}, "errors": [{}]}
+        return 0, json.dumps(body), ""
+
+    def no_flag(argv, *, timeout):
+        return 0, json.dumps({"data": {"repository": {"pullRequest": ok_pr}}}), ""
+
+    for runner, error in ((with_errors, "graphql_errors"), (no_flag, "reviews_malformed")):
+        got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+        assert got["status"] == "unknown", (error, got)
+        assert error in got["errors"], (error, got)
+
+
+@pytest.mark.parametrize("stalled_to", [100.0, 19.9], ids=["past-deadline", "just-short"])
+def test_a_stall_before_the_call_is_a_timeout_never_a_traceback_or_a_doomed_call(
+    monkeypatch, stalled_to
+):
+    """Codex P2 on #2594, and the case next to it. The read's deadline is taken,
+    then the process stalls before the call is issued. Past the deadline that
+    raised out of `evaluate_pr` (which catches only the aggregate-budget stop,
+    and the CLI calls it with no handler); just short of it, a call too small to
+    finish went out. Both must read as a timed-out read, with no call issued.
+    """
+    _no_seams(monkeypatch)
+    ticks = {"n": 0}
+
+    def clock():
+        # Call 1 creates the read deadline at t=0; call 2 is the one reading
+        # that decides the call, after the stall. (No caller budget, so the
+        # aggregate deadline never reads the clock.)
+        ticks["n"] += 1
+        return 0.0 if ticks["n"] == 1 else stalled_to
+
+    calls = []
+
+    def runner(argv, *, timeout):
+        calls.append((argv, timeout))
+        return 1, "", "must not be reached"
+
+    got = rb.evaluate_pr(
+        "owner/repo", 7, runner=runner, external_identity_templates=(), monotonic=clock
+    )
+    assert got["status"] == "unknown", got
+    assert "graphql_read_timeout" in got["errors"], got
+    assert calls == [], calls
+    assert ticks["n"] == 2, "the call decision must rest on exactly one clock reading"

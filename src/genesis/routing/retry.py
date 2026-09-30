@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 
 from genesis.routing.types import ErrorCategory, RetryPolicy
@@ -89,7 +90,13 @@ def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
 
 def compute_delay(policy: RetryPolicy, attempt: int) -> float:
     """Compute retry delay in seconds with exponential backoff and jitter."""
-    raw = policy.base_delay_ms * (policy.backoff_multiplier**attempt)
+    # A large multiplier overflows the power long before the cap applies
+    # (1e308 ** 2), and nothing above this catches it: an OverflowError here
+    # would fail the call mid-retry. The cap is the answer either way.
+    try:
+        raw = policy.base_delay_ms * (policy.backoff_multiplier**attempt)
+    except OverflowError:
+        raw = math.inf
     capped = min(raw, policy.max_delay_ms)
     jitter = capped * policy.jitter_pct
     delay_ms = capped + random.uniform(-jitter, jitter)  # noqa: S311

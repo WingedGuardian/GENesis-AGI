@@ -3445,24 +3445,21 @@ class TestRequiredCiWorkflowsConfig:
 
 
 class TestPrCiStatusCancelSibling:
-    """Concurrency-cancel dedup (approach B): a CANCELLED CheckRun is dropped IFF a
-    check of the SAME identity (name + workflowName) concluded SUCCESS STRICTLY AFTER
-    it — so a superseded `cancel-in-progress` duplicate (cancel older than its
-    re-run's success) drops, but a SUCCESS-then-cancel re-run on an unchanged head
-    still blocks. Both sides are terminal COMPLETED runs (always carry completedAt);
-    every unresolvable case (no identity, no completedAt, no strictly-later success)
-    fails closed to red.
-
-    The rule now lives in the SHARED `_drop_superseded_cancels`, which the leaks relief
-    path also calls. The boundary was tightened from at-or-after to strictly-after when
-    that second caller appeared (Codex P1): an EQUAL second-precision timestamp orders
-    nothing, and an unprovable ordering must fail closed on a gate that forces --admin.
-    Measured cost on the CI path before tightening: 0 of 30 real cancelled jobs turned
-    on a tie."""
+    """Concurrency-cancel dedup. Since #2607 the rule is the more general NEWEST-RUN-PER-WORKFLOW rule in the
+    SHARED `_newest_run_per_workflow`, which the leaks relief path also calls: per
+    workflow, only the newest workflow run (run id parsed from detailsUrl) decides,
+    and anything whose run cannot be established is kept. A superseded concurrency
+    cancel comes from an OLDER run, so the fixtures that expect a drop now carry the
+    run each entry came from (older run for the cancel, newer run for the success);
+    their assertions are unchanged. Fixtures with no detailsUrl exercise the
+    fail-closed side: nothing is dropped, so they stay red as before. No timestamp is
+    consulted any more; completedAt values are left in place for realism."""
 
     @staticmethod
     def _set(monkeypatch, checks):
         monkeypatch.setenv("_TEST_GH_CI_ROLLUP", json.dumps(checks))
+        # Repo identity for the detailsUrl provenance check, so no live `gh` call.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "acme/pub")
 
     def test_cancel_with_success_sibling_is_green(self, guard_module, monkeypatch):
         # The ec925917 incident: concurrency-cancelled CodeQL dups (older) + their
@@ -3471,10 +3468,10 @@ class TestPrCiStatusCancelSibling:
         # incident payload stays byte-faithful — CodeQL-only was the real rollup.)
         monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CodeQL")
         self._set(monkeypatch, [
-            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
-            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
-            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
-            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000001/job/1"},
+            {"name": "Analyze (python)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000002/job/2"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000001/job/1"},
+            {"name": "Analyze (actions)", "workflowName": "CodeQL", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000002/job/2"},
         ])
         assert guard_module._pr_ci_status("1") == ("green", [])
 
@@ -3487,13 +3484,14 @@ class TestPrCiStatusCancelSibling:
         assert guard_module._pr_ci_status("1") == ("red", ["Analyze"])
 
     def test_cross_workflow_same_name_does_not_drop(self, guard_module, monkeypatch):
-        # SECURITY (HIGH lock): a same-NAME success from a DIFFERENT workflow is
-        # NOT a valid sibling and must not mask a genuinely-cancelled required
-        # check. Identity is (name, workflowName), so this stays red. Under a
-        # bare-name match this would wrongly go green.
+        # SECURITY (HIGH lock): a newer run of a DIFFERENT workflow publishing a
+        # same-NAME success must not mask a genuinely-cancelled required check.
+        # Runs are grouped per workflowName, so this stays red. Both entries carry
+        # run URLs (the decoy's run is newer), so a workflow-blind grouping would
+        # drop the cancel and wrongly go green.
         self._set(monkeypatch, [
-            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
-            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test-suite", "workflowName": "real-ci", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000001/job/11"},
+            {"name": "test-suite", "workflowName": "decoy", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000002/job/12"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["test-suite"])
 
@@ -3519,15 +3517,17 @@ class TestPrCiStatusCancelSibling:
         # Dropping a cancelled-with-sibling must never hide a DIFFERENT check's
         # real failure — the core wrong-green guard.
         self._set(monkeypatch, [
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000001/job/1"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000002/job/2"},
             {"name": "lint", "workflowName": "CI", "status": "COMPLETED", "conclusion": "FAILURE"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["lint"])
 
     def test_timed_out_with_success_sibling_still_red(self, guard_module, monkeypatch):
-        # Scope lock: ONLY CANCELLED is laundered. TIMED_OUT carries a real
-        # verdict and still blocks even with a same-identity success.
+        # No detailsUrl on either side: neither entry can be placed in a workflow
+        # run, so under the #2607 newest-run rule nothing is dropped and TIMED_OUT
+        # still blocks (fail closed). A TIMED_OUT in an older run superseded by a
+        # newer run is covered in test_ci_failure_supersession.py.
         self._set(monkeypatch, [
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
@@ -3548,8 +3548,8 @@ class TestPrCiStatusCancelSibling:
         # Dropping a cancelled-with-sibling must not swallow an UNRELATED pending
         # check — the merge still blocks on the in-flight one.
         self._set(monkeypatch, [
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z"},
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:00:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000001/job/1"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000002/job/2"},
             {"name": "deploy", "workflowName": "CI", "status": "IN_PROGRESS", "conclusion": None},
         ])
         assert guard_module._pr_ci_status("1") == ("pending", ["deploy"])
@@ -3565,20 +3565,19 @@ class TestPrCiStatusCancelSibling:
         assert guard_module._pr_ci_status("1") == ("red", ["check"])
 
     def test_success_then_cancel_on_unchanged_head_stays_red(self, guard_module, monkeypatch):
-        # Codex P1: a job passed (older), then was re-run on the UNCHANGED head and
-        # that re-run was CANCELLED (newer). The latest attempt never passed, so the
-        # cancel is NOT superseded by a later success → stays red. Under a bare
-        # set-membership match (no completedAt) this wrongly returned green.
+        # A job passed in an older run, then a NEWER run's attempt was CANCELLED.
+        # The newest run never passed, so the older success is dropped and the
+        # cancel stays red. Both entries carry run URLs so the newest-run rule is
+        # what decides (a rule that let the older success win would go green).
         self._set(monkeypatch, [
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:00:00Z"},
-            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:05:00Z"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:00:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000001/job/11"},
+            {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED", "completedAt": "2026-08-21T10:05:00Z", "detailsUrl": "https://github.com/acme/pub/actions/runs/36000000002/job/12"},
         ])
         assert guard_module._pr_ci_status("1") == ("red", ["test"])
 
-    def test_cancel_without_completedat_stays_red(self, guard_module, monkeypatch):
-        # Fail-closed: a CANCELLED entry with no completedAt can't be proven
-        # superseded (no timestamp to order it), so even a same-identity SUCCESS
-        # does not drop it — stays red.
+    def test_cancel_without_a_run_id_stays_red(self, guard_module, monkeypatch):
+        # Fail-closed: a CANCELLED entry with no detailsUrl cannot be placed in a
+        # workflow run, so even a same-identity SUCCESS does not drop it — stays red.
         self._set(monkeypatch, [
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-08-21T10:05:00Z"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "CANCELLED"},

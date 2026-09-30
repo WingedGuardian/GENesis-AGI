@@ -1117,7 +1117,7 @@ else
 fi
 echo
 
-# --- Network resilience (KeepConfiguration + networkd watchdog) ---
+# --- Network resilience (KeepConfiguration + networkd and Tailscale watchdogs) ---
 # Same guarded-source contract as memory resilience: a partial checkout without
 # the lib degrades to a warning, never aborts bootstrap under set -e.
 if [[ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]]; then
