@@ -1013,33 +1013,13 @@ _CI_GREEN = {"SUCCESS"}
 # a required context that has not reported a status yet (not started); it must not
 # read green. (A CheckRun uses `status` for this; a StatusContext uses `state`.)
 _CI_PENDING_STATES = {"PENDING", "EXPECTED"}
-# A CANCELLED check-run carries NO pass/fail verdict — the run was aborted,
-# almost always by a `concurrency: cancel-in-progress` supersession, which leaves
-# the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
-# in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
-# (name + workflowName, see _ci_identity) concluded SUCCESS STRICTLY AFTER it on this
-# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks, and so does
-# an EQUAL second-precision timestamp, which orders nothing — see
-# _drop_superseded_cancels for why an unprovable ordering fails closed).
-# CANCELLED needs no run-id test: a concurrency cancel is cross-run by nature.
-_CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
-# FAILURE / TIMED_OUT carry real verdicts, so they are superseded on STRICTER terms
-# than a cancel (issue #2607): only by a same-identity SUCCESS completing STRICTLY
-# AFTER them in a DIFFERENT, NEWER workflow run (run id from detailsUrl, see
-# _ci_actions_run_url). A failure still in the rollup is never cleared by its own
-# run's success nor an older run's (the rollup keeps only each run's latest attempt;
-# see _drop_superseded_cancels). ACTION_REQUIRED / STARTUP_FAILURE / STALE are NOT here —
-# see _drop_superseded_cancels for why — and always block.
-_CI_CROSS_RUN_SUPERSEDABLE_CONCLUSIONS = {"FAILURE", "TIMED_OUT"}
-# The ONLY detailsUrl shape that yields a workflow run id: an Actions JOB page on
-# github.com. Anchored at both ends, https only, exactly OWNER/REPO, a run id and a
-# job id with no leading zero and at most 19 digits (so int() is exact and bounded),
-# and nothing after. The CheckRun page form
-# (`/<owner>/<repo>/runs/<n>`) is deliberately NOT accepted: its number is a
-# check-run id, not a workflow run id, so it cannot tell two runs apart.
-_CI_ACTIONS_JOB_URL_RE = re.compile(
-    r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/actions/runs/([1-9][0-9]{0,18})/job/[1-9][0-9]{0,18}"
-)
+# Rollup entries are reduced to the LATEST result per check before classification —
+# see _latest_result_per_check for the rule (strict (name, workflowName) identity,
+# strictly-latest parsed completedAt wins, ties keep every member, anything without an
+# identity or a timestamp is kept and never superseded).
+# The conclusions that may take part in that ordering: a recognised verdict. SKIPPED /
+# NEUTRAL and any unrecognised value are outside it and never supersede.
+_CI_ORDERABLE_VERDICTS = _CI_GREEN | _CI_RED_CONCLUSIONS
 # The only CheckRun.status that means "finished". Everything else
 # (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
 # a new/renamed non-terminal state can never be silently mistaken for green.
@@ -1059,22 +1039,20 @@ def _check_name(c: dict) -> str:
 
 
 def _ci_identity(c: dict) -> tuple[str, str] | None:
-    """Strict same-check identity for the superseding-sibling match (the
-    concurrency-cancel rule and, since #2607, the cross-run failure rule):
+    """Strict same-check identity for the latest-result-per-check grouping
+    (``_latest_result_per_check``):
     ``(name, workflowName)`` for a GitHub Actions CheckRun, or ``None`` when the
     entry cannot be identity-matched — a legacy StatusContext (no workflowName) or
     a CheckRun from a non-Actions app (empty workflowName). ``None`` means the
-    entry is NEVER a sibling and NEVER droppable → it fails CLOSED (a cancel with
-    no resolvable identity stays red).
+    entry is NEVER grouped: it never supersedes and is never superseded, so it
+    fails CLOSED (a red entry with no resolvable identity stays red).
 
     Keying on name ALONE would be unsafe: this gate forces `--admin`, which
     bypasses GitHub's server-side required-status-checks, so _pr_ci_status is the
     SOLE CI enforcement for every merge it allows. A bare-name match would let a
     same-named SUCCESS from a DIFFERENT workflow (an accidental collision, or a
-    decoy job) mask a genuinely-cancelled required check → wrong-green. Requiring
-    workflowName to match scopes the drop to a true same-job re-run — the only
-    thing `cancel-in-progress` produces. Still pure set-membership: no
-    time-ordering (that surface was the pulled #1420 finding-magnet)."""
+    decoy job) mask a genuinely-red required check → wrong-green. Requiring
+    workflowName to match scopes the grouping to runs of the same job."""
     name = (c.get("name") or "").strip()
     wf = (c.get("workflowName") or "").strip()
     if name and wf:
@@ -1091,8 +1069,8 @@ def _ci_completed_at(entry: dict) -> _dt.datetime | None:
     ``run_guard`` converts to exit 2, a BLOCK. Unreachable from GitHub (the
     ``DateTime`` scalar is string-or-null) and fail-closed either way, but the
     enumeration above would otherwise be false. Every caller treats None as "cannot be compared", which on
-    this path means an unparseable SUCCESS supersedes nothing and an unparseable
-    CANCEL is kept — the fail-closed direction.
+    this path means an unparseable entry supersedes nothing and is never itself
+    superseded — the fail-closed direction.
 
     Naive is rejected rather than assumed UTC. Comparing a naive datetime against
     an aware one raises TypeError, and the alternative to rejecting it is guessing
@@ -1112,236 +1090,123 @@ def _ci_completed_at(entry: dict) -> _dt.datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
-def _ci_actions_run_url(entry: dict) -> tuple[str, str] | None:
-    """``(OWNER/REPO, RUN_ID)`` parsed strictly from an Actions CheckRun's
-    ``detailsUrl``, or None when the value is not exactly an Actions JOB page.
+def _latest_result_per_check(checks: list) -> list:
+    """Return *checks* reduced to the LATEST result per check; every entry this does
+    not remove is returned unchanged, in order.
 
-    Accepted, whole string after trimming whitespace:
-    ``https://github.com/<OWNER>/<REPO>/actions/runs/<RUN>/job/<JOB>``. None on a
-    missing, blank or non-string value; any other scheme, host or path shape
-    (including the CheckRun page ``/runs/<n>``, whose number is a check-run id,
-    not a workflow run id); a non-numeric or zero-padded id; or trailing text.
+    THE RULE (issue #2607). Terminal CheckRuns are grouped by strict identity
+    (``_ci_identity`` → ``(name, workflowName)``). Within a group, only the entry (or
+    entries) with the strictly LATEST parsed ``completedAt`` is kept, and that result
+    decides the check. Every older entry of the group is dropped, whatever it
+    concluded. So across separate workflow runs on one head, the NEWEST result per
+    check decides: an earlier FAILURE is cleared by a later SUCCESS, and an earlier
+    SUCCESS is overturned by a later FAILURE or CANCELLED.
 
-    This is only the SHAPE half. Provenance — that the slug is THIS repo — is
-    decided by the caller against a resolved repo identity (see
-    ``_drop_superseded_cancels``), with the same rule ``_pr_ci_status`` applies
-    to its self-exclusion: host pinned to github.com AND the slug equal to this
-    repo's, casefolded. The run id is returned as its decimal string and is only
-    ever compared for equality.
+    WHY. ``statusCheckRollup`` keeps every workflow run on the head commit, so a PR
+    whose run failed on a broken base and then passed in a new run after the base was
+    fixed used to read ``ci: red`` forever (PR #2484: ``lint`` and ``test`` FAILED in
+    two runs, then PASSED in a third). The earlier cancel-only supersession rule is a
+    special case of this one: a concurrency cancel is superseded by any strictly-later
+    result of the same check.
+
+    RE-RUN-UNTIL-GREEN IS NOT BLOCKED, and this function does not pretend to block it.
+    GitHub's rollup lists only the LATEST attempt of a re-attempted run: MEASURED
+    2026-09-30 on 2 of 2 re-attempted ``ci.yml`` runs sampled, a first attempt's
+    ``test`` FAILURE was absent from the commit's ``statusCheckRollup`` and visible
+    only in the REST check-runs list with ``filter=all``. So a passing ``gh run
+    rerun`` has already replaced its failure before any reader of the rollup sees it
+    — before this change as after it. For context, over every ``ci.yml``
+    ``pull_request`` run (4,776 runs, 2026-04 to 2026-09), 11 same-input re-runs
+    turned a failure into a success. Real re-run protection needs a different read
+    path and is tracked as #2624; nothing here should be read as providing it.
+
+    Every case the rule cannot ORDER fails CLOSED — the entry is kept, so the caller's
+    own red/pending logic sees it:
+
+    * TIES keep every member. ``completedAt`` is second-precision, so two results in
+      the same second are unordered; keeping all of them means any red among them
+      stays red. An unprovable ordering must not hide a failure.
+    * No identity (a legacy StatusContext, a non-Actions check with no
+      ``workflowName``, a nameless entry): always kept, never superseded, and it
+      cannot supersede anything. So a StatusContext SUCCESS can never clear a
+      same-named CheckRun failure.
+    * No parseable, offset-aware ``completedAt`` (``_ci_completed_at`` → None):
+      always kept, never superseded, cannot supersede.
+    * Only a COMPLETED CheckRun whose conclusion is a RECOGNISED verdict
+      (``_CI_ORDERABLE_VERDICTS`` = SUCCESS plus ``_CI_RED_CONCLUSIONS``) takes part.
+      Everything else is always kept and never supersedes: a non-COMPLETED or missing
+      ``status`` (so an in-flight re-run still reads PENDING and a queued run cannot
+      clear anything), a null conclusion, and an unrecognised or wrongly-cased
+      conclusion. That last case matters: the classifier ignores such an entry when
+      it has no status, so letting it supersede would erase an older FAILURE and read
+      green on nothing (found in review, pinned by a test).
+    * SKIPPED / NEUTRAL (``_CI_SKIP_CONCLUSIONS``) are outside the verdict set, so they
+      are always kept and never supersede. This is the one exception to latest-wins,
+      for a real reason: a skipped job produced no verdict about the code, so a newer
+      run that SKIPPED a job (a path filter, an ``if:`` condition) must not clear an
+      older run's FAILURE of that job. Kept entries of this kind are ignored by the
+      classifiers anyway.
+    * ACTION_REQUIRED, STARTUP_FAILURE and STALE follow the same latest-wins rule as
+      every other verdict: each is red while it is the latest result of its check,
+      and a strictly-later result of the same check supersedes it. None needs an
+      exception: a later same-identity run of the job means the job ran again.
+    * Entries that are not dicts pass through untouched.
+
+    THE ONE home of this rule. Two consumers call it — ``_pr_ci_status`` and
+    ``_mechanical_scan_is_green`` — and neither re-derives it. They once disagreed
+    about one payload inside ONE process (``ci: green`` beside "'leak-detector' is
+    not green at this head") because the mechanical scan had its own naive
+    ``all(c == "SUCCESS")``; any future consumer of check-run conclusions calls this.
+
+    Residuals, stated rather than assumed away. The rule trusts ``(name,
+    workflowName)`` as identity: a same-repo workflow file sharing the display name
+    and job name would share the identity (see the note at
+    ``_MECHANICAL_RESCAN_BY_KIND`` and the uniqueness test it cites). The rule trusts
+    ``completedAt`` ordering as run ordering. And identity does not include the
+    triggering EVENT: ``ci.yml`` also declares ``workflow_dispatch``, and a dispatch
+    on the PR branch runs on the head sha under the same workflow and job names. If
+    such a run appeared in the PR's rollup, its later SUCCESS (testing the head
+    alone) would clear a ``pull_request`` FAILURE (testing the merge ref). One
+    sampled dispatch run on a PR's head sha was ABSENT from that PR's rollup (1 of 1
+    — not proof), and the rollup does not expose the event, so this cannot be
+    checked here; it belongs with the read-path work in #2624.
+
+    Comparison PARSES ``completedAt`` into datetimes (never a string compare: a
+    ``+00:00`` offset or fractional seconds reverse a lexicographic ordering, and the
+    ``DateTime`` scalar is documented only as "An ISO-8601 encoded UTC date string").
+    This is NOT the pulled #1420 finding-magnet, which sorted the WHOLE set,
+    including QUEUED runs with a null ``startedAt``, to pick one global "latest":
+    here ordering is per identity, over terminal entries with a parseable timestamp
+    only, and ties keep everything.
     """
-    raw = entry.get("detailsUrl")
-    if not isinstance(raw, str):
-        return None
-    m = _CI_ACTIONS_JOB_URL_RE.fullmatch(raw.strip())
-    if not m:
-        return None
-    return m.group(1), m.group(2)
-
-
-def _drop_superseded_cancels(checks: list, *, repo: str | None = None) -> list:
-    """Return *checks* with SUPERSEDED non-green entries removed; every other entry is
-    returned unchanged, in order. (The name predates the failure rule below and is
-    kept so its consumers and tests stay stable; it drops superseded FAILURE /
-    TIMED_OUT entries too.) Two rules, deliberately on different terms:
-
-    1. CANCELLED (``_CI_CANCEL_CONCLUSIONS``) — a ``concurrency: cancel-in-progress``
-       duplicate — is dropped when a SUCCESS of the EXACT same ``(name,
-       workflowName)`` identity completed STRICTLY AFTER it. No run-id test: a
-       concurrency cancel is cross-run by nature, and a cancel carries no verdict.
-       This rule is unchanged by #2607.
-    2. FAILURE / TIMED_OUT (``_CI_CROSS_RUN_SUPERSEDABLE_CONCLUSIONS``, issue #2607)
-       is dropped ONLY when a SUCCESS of the same identity completed STRICTLY AFTER
-       it AND came from a DIFFERENT, NEWER workflow run (a strictly larger run id),
-       where both run ids are parsed strictly from ``detailsUrl``
-       (``_ci_actions_run_url``) and both URLs point at THIS repo (*repo*, or the
-       repo derived from the cwd when None).
-
-    WHY THE FAILURE RULE NEEDS ANOTHER RUN. ``statusCheckRollup`` keeps every
-    workflow run on the head commit (the latest attempt of each), so a PR whose
-    failing run was followed by a new, passing run — after a base-branch fix, a reopen, a push of the same tree — used
-    to read red forever. A new run is a new TRIGGER: GitHub computes the merge commit
-    afresh, so a base-branch fix is picked up. It is NOT always new inputs — a reopen
-    on an unchanged base re-tests the same merge tree — and that residual is the
-    accepted cost of the relief. What this rule refuses to count is a re-attempt
-    WITHIN a run (``gh run rerun``): it keeps its run id and replays the same merge
-    commit, and letting its success clear the failure is "re-run until green" on a
-    flaky or intermittent failure. This gate forces ``--admin``, so it is the ONLY CI
-    enforcement, and the relief must not add a route to that. MEASURED over every
-    ``ci.yml`` ``pull_request`` run (4,776 runs, 2026-04 to 2026-09): 11 same-input
-    re-runs turned a failure into a success. Read the next-but-one paragraph before
-    concluding the gate keeps those red: the rollup it reads does not retain the
-    failing attempt, so it did not keep them red before this change either.
-
-    WHY NEWER, NOT MERELY DIFFERENT. With two failing runs A and B on one head, a
-    bare "different run id" test lets A's re-attempt clear B's failure and B's clear
-    A's, so re-attempts alone turn the head green (found in review, pinned by a
-    test). Requiring the superseding run id to be strictly LARGER closes that: the
-    newest failing run can only be cleared by an even newer run, never by a
-    re-attempt of another run. That rests on Actions run ids increasing with creation
-    time (INFERRED from their being sequential database ids, not documented as a
-    contract). If it were ever false, an older-created run's success could clear a
-    newer run's failure; accepted because run ids are sequential database ids.
-
-    WHAT THE SAME-RUN RULE CAN AND CANNOT SEE. It governs the entries the rollup
-    hands this helper, and the rollup does NOT keep a re-attempted run's earlier
-    attempts. MEASURED 2026-09-30 on 2 of 2 re-attempted ``ci.yml`` runs sampled
-    (attempt 1 concluded ``failure`` on ``test``, attempt 2 ``success``): the
-    commit's ``statusCheckRollup`` lists only attempt 2's check-runs; attempt 1's
-    ``test`` FAILURE appears only in the REST check-runs list with ``filter=all``.
-    So a ``gh run rerun`` that passes REPLACES its failure before this helper runs,
-    and on a head with a single run the gate reads green — as it already did before
-    #2607. This change does not create that and does not close it (closing it needs
-    a different read path, e.g. the check-runs API with ``filter=all``). What the
-    rules here do guarantee is narrower: a failure still PRESENT in the rollup is
-    never cleared by its own run's success, nor by any OLDER run's. CONSEQUENCE,
-    stated because it is a real widening: with failing runs A < B, re-attempting
-    only B to green now also discharges A's failure (B's passing attempt is a
-    newer run's success), which the pre-#2607 code kept red until A was re-run
-    too. The gate's verdict per job is now effectively "the newest run wins".
-
-    Two residuals, stated rather than assumed away. A ``workflow_dispatch`` run of the
-    same workflow would be a newer run id; one sampled dispatch run on a PR's head
-    sha was ABSENT from that PR's rollup (1 of 1 — not proof), and nothing in a
-    rollup entry names the triggering event. And a same-repo decoy workflow sharing
-    the display name and job name can now clear a FAILURE as well as a cancel — see
-    the note at ``_MECHANICAL_RESCAN_BY_KIND`` and the uniqueness test it cites;
-    anyone who can add that file could equally edit the real one.
-
-    WHY ONLY FAILURE AND TIMED_OUT. Those are the verdicts a later run on new inputs
-    can genuinely answer, and the ones in the measured shape (PR #2484: ``lint`` and
-    ``test`` FAILED in two runs on a broken base, then PASSED in a third). The rest
-    of ``_CI_RED_CONCLUSIONS`` stays non-droppable:
-      * ACTION_REQUIRED is a request for a HUMAN decision (e.g. approving a run),
-        not a test verdict; another run passing does not discharge it.
-      * STARTUP_FAILURE means the workflow never started its jobs; its check-run
-        shape and identity under ``(name, workflowName)`` are unmeasured, so there
-        is no evidence a same-identity sibling is even the right comparison.
-      * STALE is GitHub marking a run outdated; it is red and stays red.
-    Widening this set is a policy change; a derived-set test locks it.
-
-    THE ONE home of both rules. It has two consumers: ``_pr_ci_status`` and
-    ``_mechanical_scan_is_green`` (added later, which once re-derived a naive
-    ``all(c == "SUCCESS")`` and never handled a cancel at all). A doubled workflow
-    dispatch — two ``pull_request`` runs for one sha, leaving EVERY check-run as a
-    success+cancelled pair — made the two disagree about one payload inside ONE
-    process: ``ci: green`` alongside "'leak-detector' is not green at this head", a
-    message that sends the reader to inspect a job that is green. Any FUTURE consumer
-    of check-run conclusions calls this rather than re-deriving it a third time.
-
-    STRICTLY after, not at-or-after, for both rules. ``completedAt`` is
-    second-precision, so an EQUAL timestamp does not order the two runs at all. An
-    unprovable ordering fails CLOSED. MEASURED before tightening the cancel rule (the
-    Actions runs API over 400 runs / 2 days, 30 real cancelled jobs on 25 shas):
-    18/30 had a strictly-later success, 12/30 had none, and **0/30 turned on a tie**
-    — being wrong here over-blocks, it cannot wrong-green.
-
-    Every condition below fails CLOSED — an entry that cannot be PROVEN superseded is
-    returned, and the caller's own red/not-green logic then sees it:
-
-    * Only GitHub Actions CheckRuns with a resolvable identity AND a ``completedAt``
-      may serve as the superseding success (``_ci_identity`` → None for a legacy
-      StatusContext or a non-Actions check; a timestampless SUCCESS is skipped). So
-      a StatusContext SUCCESS can never drop a same-named CheckRun entry.
-    * A cancel or failure with no identity, no ``completedAt``, or no qualifying
-      success STAYS. That includes SUCCESS-then-cancel / SUCCESS-then-FAILURE on an
-      unchanged head: the latest attempt never passed.
-    * A failure additionally STAYS when its own run id, or every candidate success's
-      run id, cannot be parsed; when either URL names another repo (a fork's run is
-      not this repo's evidence); when *repo* is None and the cwd does not resolve
-      to a repo; and when no later success comes from a strictly NEWER run.
-    * ACTION_REQUIRED / STARTUP_FAILURE / STALE are never dropped, whatever
-      completed beside them — so this can never widen into "ignore anything that is
-      not SUCCESS".
-    * Non-terminal entries (an in-flight re-run) are not conclusions and are never
-      touched; the caller still counts them PENDING.
-    * Entries that are not dicts are passed through untouched, so a caller's own
-      shape checks still see the payload it was given.
-
-    The repo identity is resolved LAZILY, only when a failure/success pair with
-    parseable URLs could actually qualify, so a payload with nothing to decide costs
-    no ``gh`` call.
-
-    Comparison PARSES both ``completedAt`` values and compares datetimes. This is NOT
-    the pulled #1420 finding-magnet, which sorted the WHOLE set (including QUEUED
-    runs with a null ``startedAt``) to pick a global "latest".
-
-    IT USED TO BE A LEXICOGRAPHIC STRING COMPARE, and the reason it no longer is was
-    written down here before it was acted on. GitHub's GraphQL ``completedAt`` is
-    emitted as second-precision UTC with a literal ``Z`` (MEASURED 2017/2017 entries
-    across 122 PR rollups — every one ``Z``-suffixed with no fractional part). That
-    is an OBSERVATION, not a contract: the schema documents the ``DateTime`` scalar
-    only as "An ISO-8601 encoded UTC date string", which constrains neither
-    sub-second precision nor the offset spelling. String order equals chronological
-    order only while EVERY value shares one format, and two real shapes break it — a
-    ``+00:00`` offset instead of ``Z``, and fractional seconds (``'Z'`` sorts ABOVE
-    ``'.'``, so a SUCCESS at ``:00Z`` compares as later than a cancel at ``:00.9Z``
-    and wrongly drops it). `_mechanical_scan_is_green` consumes this, so a reversed
-    ordering drops a real verdict and carries an old leaks review forward — and
-    under ``# ci-override`` that relief is the only remaining check of the
-    mechanical layer.
-
-    ``_ci_completed_at`` fails CLOSED on anything it cannot parse into an
-    OFFSET-AWARE datetime, including a naive value: an unparseable SUCCESS cannot
-    supersede anything, and an unparseable cancel or failure is kept.
-    """
-    # Pass 1: every SUCCESS with an identity and a timestamp, per identity, as
-    # (completedAt, parsed detailsUrl or None). The cancel rule needs only the
-    # timestamps; the failure rule also compares each success's run id.
-    successes: dict[tuple[str, str], list[tuple[_dt.datetime, tuple[str, str] | None]]] = {}
-    for c in checks:
-        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+    # Pass 1: the latest parsed completedAt per identity, over entries that can order.
+    latest: dict[tuple[str, str], _dt.datetime] = {}
+    orderable: dict[int, tuple[tuple[str, str], _dt.datetime]] = {}
+    for i, c in enumerate(checks):
+        if not isinstance(c, dict):
             continue
+        conclusion = c.get("conclusion")
+        status = c.get("status")
+        if status not in _CI_TERMINAL_STATUSES:
+            continue  # not a COMPLETED CheckRun (in flight, or no status): kept
+        if conclusion not in _CI_ORDERABLE_VERDICTS:
+            continue  # no recognised verdict (null, SKIPPED/NEUTRAL, unknown): kept
         ident = _ci_identity(c)
         ts = _ci_completed_at(c)
         if ident is None or ts is None:
-            continue
-        successes.setdefault(ident, []).append((ts, _ci_actions_run_url(c)))
+            continue  # cannot be ordered: kept, never superseded
+        orderable[i] = (ident, ts)
+        known = latest.get(ident)
+        if known is None or ts > known:
+            latest[ident] = ts
 
-    own_repo_cache: list[str | None] = []
-
-    def _own_repo() -> str | None:
-        # Resolved at most once, and only when a failure could actually qualify.
-        if not own_repo_cache:
-            own_repo_cache.append(repo if repo is not None else _derive_repo_from_cwd(os.getcwd()))
-        return own_repo_cache[0]
-
-    def _superseded_across_runs(c: dict, ident: tuple[str, str], fts: _dt.datetime) -> bool:
-        own_run = _ci_actions_run_url(c)
-        if own_run is None:
-            return False
-        for sts, s_run in successes.get(ident, ()):
-            # STRICTLY later, from a parseable run that is NEWER than this one. Newer,
-            # not merely different: with two failing runs A < B, "different" lets A's
-            # re-attempt clear B's failure and B's clear A's, so re-attempts alone turn
-            # the head green. Ids are canonical decimals (no leading zero, regex), so
-            # int() is exact; a same-run re-attempt is equal, never newer.
-            if not (sts > fts) or s_run is None or int(s_run[1]) <= int(own_run[1]):
-                continue
-            me = _own_repo()
-            if not me:
-                return False  # no repo identity => no provenance => fail closed
-            me = me.casefold()
-            if own_run[0].casefold() == me and s_run[0].casefold() == me:
-                return True
-        return False
-
-    # Pass 2: drop only what pass 1 proves superseded. STRICTLY after, so a tie keeps
-    # the entry: equal second-precision stamps make the ordering unprovable, and
-    # unprovable must not mean droppable.
+    # Pass 2: drop only orderable entries STRICTLY older than their group's latest.
+    # A tie equals the latest and is kept, so every tied member survives.
     kept: list = []
-    for c in checks:
-        if isinstance(c, dict):
-            conclusion = c.get("conclusion")
-            is_cancel = conclusion in _CI_CANCEL_CONCLUSIONS
-            if is_cancel or conclusion in _CI_CROSS_RUN_SUPERSEDABLE_CONCLUSIONS:
-                ident = _ci_identity(c)
-                cts = _ci_completed_at(c)
-                if ident is not None and cts is not None:
-                    if is_cancel:
-                        if any(sts > cts for sts, _ in successes.get(ident, ())):
-                            continue
-                    elif _superseded_across_runs(c, ident, cts):
-                        continue
+    for i, c in enumerate(checks):
+        entry = orderable.get(i)
+        if entry is not None and entry[1] < latest[entry[0]]:
+            continue
         kept.append(c)
     return kept
 
@@ -1351,20 +1216,14 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
 
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
-      * ``"red"``     — at least one check failed/timed-out, or was cancelled
-                        with NO same-identity SUCCESS completing STRICTLY AFTER it.
-                        A CANCELLED CheckRun that a same (name, workflowName)
-                        SUCCESS completed strictly after is a superseded
-                        `concurrency: cancel-in-progress` duplicate and is dropped
-                        by the SHARED _drop_superseded_cancels helper (see
-                        _ci_identity) — strict identity, terminal completedAt
-                        comparison only, fail-closed. The same helper drops a
-                        FAILURE / TIMED_OUT only when a same-identity SUCCESS
-                        completed strictly after it in a DIFFERENT, NEWER workflow run
-                        of this repo (issue #2607). A failure still in the
-                        rollup is never cleared by its own run's or an older
-                        run's success; a passing re-attempt replaces its
-                        failure in the rollup itself (see that helper).
+      * ``"red"``     — the LATEST result of at least one check is a failure,
+                        timeout, cancel or other red conclusion. Older results of
+                        the same (name, workflowName) check are first dropped by
+                        the SHARED _latest_result_per_check helper (issue #2607):
+                        strictly-latest completedAt wins, ties keep every member,
+                        entries with no identity or timestamp are always kept.
+                        Re-run-until-green is NOT blocked (the rollup shows only a
+                        re-run's latest attempt; see that helper and #2624).
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
                         exist, i.e. CI has NOT run. A DEFINITE fact, not a read
@@ -1489,23 +1348,21 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # empty rollup carries.
         return "absent", []
 
-    # Drop superseded `concurrency: cancel-in-progress` duplicates, and failures a
-    # later, NEWER run passed, via the SHARED primitive (_drop_superseded_cancels —
-    # read its docstring for the strict identity + strictly-after + run-id rules and
-    # every fail-closed case). `_self_repo` is the provenance the failure rule checks
-    # detailsUrl against. Filtering here rather
-    # than branching inside the classify loop is behaviour-identical: a drop implies
-    # a same-identity SUCCESS in this very list, and that sibling sets
-    # `saw_recognized` and contributes the same casefolded `workflowName` to
-    # `workflows_ran` on its own. A cancel or failure that is NOT dropped falls
-    # through to the red branch below, because both are in _CI_RED_CONCLUSIONS.
+    # Reduce to the latest result per check via the SHARED primitive
+    # (_latest_result_per_check — read its docstring for the rule and every
+    # fail-closed case). Filtering here rather than branching inside the classify
+    # loop is safe for the required-workflow check below: every dropped entry has a
+    # strictly-later same-identity COMPLETED recognised verdict that survives
+    # (red or SUCCESS — nothing the classifier ignores), with the same
+    # workflowName, so the head either reads red on that survivor or the survivor
+    # vouches for the workflow itself.
     #
     # Deliberately AFTER the empty-rollup "absent" return above, which reads the
     # RAW payload: "zero checks exist" must stay a fact about what GitHub reported,
     # never an artefact of our own filtering. (The filter cannot empty a non-empty
-    # list anyway — a drop requires a surviving SUCCESS sibling — but the ordering
+    # list anyway — the latest member of every group survives — but the ordering
     # makes that independent of this helper's behaviour.)
-    checks = _drop_superseded_cancels(checks, repo=_self_repo)
+    checks = _latest_result_per_check(checks)
 
     red: list[str] = []
     pending: list[str] = []
@@ -1527,12 +1384,11 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
-        # Any CANCELLED / FAILURE / TIMED_OUT entry still present here was NOT
-        # superseded (the shared filter above proved it, or could not) and falls
-        # through to the red branch, because each is in _CI_RED_CONCLUSIONS. The
-        # dropped ones need no arm
-        # of their own: each implies a same-identity SUCCESS in this list, which
-        # sets saw_recognized and adds the identical workflowName to workflows_ran.
+        # Any red entry still present here is the latest result of its check, or
+        # could not be ordered, and falls through to the red branch. The dropped ones
+        # need no arm of their own: each has a strictly-later same-identity COMPLETED
+        # recognised verdict that survives — a red one blocks here, a SUCCESS sets
+        # saw_recognized and adds the identical workflowName to workflows_ran.
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
@@ -7012,8 +6868,8 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # reference states no such constraint; an OMITTED name falls back to the file path, which
 # is unique — an explicit one is not). So a second file declaring `name: CI` with a job
 # named `leak-detector` would share this tuple, and its SUCCESS could both supersede the
-# real scanner's CANCELLED (or, since #2607, its FAILURE: a decoy's run is a different
-# run id in this same repo) in _drop_superseded_cancels and satisfy the pin below.
+# real scanner's red result (a later decoy SUCCESS is the latest result of the shared
+# identity) in _latest_result_per_check, and satisfy the pin below.
 # Real provenance exists in GraphQL (checkSuite.workflowRun.workflow.databaseId, or
 # checkSuite.workflowRun.file.path) but `gh pr view --json statusCheckRollup` does NOT
 # expose it — a rollup entry carries only __typename/completedAt/conclusion/detailsUrl/
@@ -7754,10 +7610,9 @@ def _mechanical_scan_is_green(
     class this file already documents at _ci_identity, and the whole point of
     this relief is that the mechanical layer really ran.
 
-    Superseded ``concurrency: cancel-in-progress`` duplicates, and failures a later
-    NEWER run passed (#2607), are dropped first, by the SHARED
-    ``_drop_superseded_cancels`` — the same primitive ``_pr_ci_status`` uses, so
-    the two gates cannot disagree about one rollup.
+    The rollup is first reduced to the latest result per check by the SHARED
+    ``_latest_result_per_check`` (#2607) — the same primitive ``_pr_ci_status``
+    uses, so the two gates cannot disagree about one rollup.
 
     Returns False on ANY doubt: a gh error, an unparseable payload, a head that
     does not match, no entry with that identity, or any surviving conclusion other
@@ -7812,23 +7667,22 @@ def _mechanical_scan_is_green(
     wanted_workflow = (workflow or "").strip().lower()
     if not wanted_workflow:
         return False  # an unpinned kind can never be established -> fail closed
-    # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
-    # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
-    # (name, workflowName) identity, a SUCCESS completing STRICTLY AFTER, fail-closed on
-    # every unresolvable case). This path used to have no cancel handling at all, so a
-    # doubled workflow dispatch — which leaves every check-run as a success+cancelled
-    # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
+    # Reduce to the latest result per check FIRST, through the SAME primitive the CI
+    # gate uses (_latest_result_per_check — strict (name, workflowName) identity,
+    # strictly-latest completedAt wins, ties keep all, fail-closed on every
+    # unorderable case). This path once had its own naive reading, so a doubled
+    # workflow dispatch — which leaves every check-run as a success+cancelled pair —
+    # made ONE `--check-pr` run report `ci: green` and, on the same rollup,
     # "'leak-detector' is not green at this head", pointing the reader at a green job
     # while relief stayed unreachable for as long as that head stood.
     #
-    # Note what the drop does NOT do, because this is where it would be dangerous: it
-    # removes ONLY entries proven superseded — a cancel under the cancel rule, or a
-    # FAILURE/TIMED_OUT that a same-identity SUCCESS in a NEWER run of this repo
-    # completed strictly after (#2607). A failure present with no NEWER run's later
-    # success, STALE, and an unsuperseded cancel all survive into `conclusions` and
-    # still contradict SUCCESS,
-    # so the guarantee below is intact. No re-derivation here: the helper is the rule.
-    rollup = _drop_superseded_cancels(rollup, repo=repo)
+    # Note what the reduction does NOT do, because this is where it would be
+    # dangerous: it removes ONLY entries a strictly-later result of the same check
+    # superseded. The latest result, every member of a tie, and anything unorderable
+    # all survive into `conclusions`, and any of them that is not SUCCESS still
+    # contradicts it, so the guarantee below is intact. No re-derivation here: the
+    # helper is the rule.
+    rollup = _latest_result_per_check(rollup)
     # Collect EVERY same-identity entry, never the first match. One head can carry
     # several runs of one job (a re-run after a ruleset change, a superseded
     # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status

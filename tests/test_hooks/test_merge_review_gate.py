@@ -3450,11 +3450,13 @@ class TestPrCiStatusCancelSibling:
     it — so a superseded `cancel-in-progress` duplicate (cancel older than its
     re-run's success) drops, but a SUCCESS-then-cancel re-run on an unchanged head
     still blocks. Both sides are terminal COMPLETED runs (always carry completedAt);
-    every unresolvable case (no identity, no completedAt, no strictly-later success)
+    every unresolvable case (no identity, no completedAt, no strictly-later result)
     fails closed to red.
 
-    The rule now lives in the SHARED `_drop_superseded_cancels`, which the leaks relief
-    path also calls. The boundary was tightened from at-or-after to strictly-after when
+    Since #2607 the rule is the more general latest-result-per-check rule in the
+    SHARED `_latest_result_per_check` (a cancel is superseded by ANY strictly-later
+    result of the same check), which the leaks relief path also calls. These cancel
+    cases all read the same under it. The boundary was tightened from at-or-after to strictly-after when
     that second caller appeared (Codex P1): an EQUAL second-precision timestamp orders
     nothing, and an unprovable ordering must fail closed on a gate that forces --admin.
     Measured cost on the CI path before tightening: 0 of 30 real cancelled jobs turned
@@ -3526,10 +3528,10 @@ class TestPrCiStatusCancelSibling:
         assert guard_module._pr_ci_status("1") == ("red", ["lint"])
 
     def test_timed_out_with_success_sibling_still_red(self, guard_module, monkeypatch):
-        # Scope lock: without cross-run evidence ONLY CANCELLED is laundered.
-        # TIMED_OUT carries a real verdict and still blocks beside a same-identity
-        # success that has no parseable detailsUrl (the #2607 cross-run rule needs a
-        # NEWER run id of this repo; see test_ci_failure_supersession.py).
+        # No completedAt on either side: the pair cannot be ORDERED, so under the
+        # #2607 latest-result rule neither supersedes the other and TIMED_OUT still
+        # blocks (fail closed). A TIMED_OUT with a strictly-later SUCCESS is covered
+        # in test_ci_failure_supersession.py.
         self._set(monkeypatch, [
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
             {"name": "test", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},

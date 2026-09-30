@@ -1,30 +1,24 @@
-"""A FAILURE / TIMED_OUT check-run is superseded ONLY by a strictly-later SUCCESS of the
-same ``(name, workflowName)`` from a DIFFERENT, NEWER workflow run (issue #2607).
+"""Latest result per check decides CI (issue #2607).
 
-WHY the relief exists. ``statusCheckRollup`` keeps every workflow run on the head
-commit. After a base-branch fix, a fresh ``pull_request`` run on the SAME head passes,
-but the earlier run's FAILURE is still in the rollup, so the gate read ``ci: red`` on a
-PR whose latest run is green.
+WHY. ``statusCheckRollup`` keeps every workflow run on the head commit. After a
+base-branch fix, a fresh ``pull_request`` run on the SAME head passes, but the earlier
+run's FAILURE is still in the rollup, so the gate read ``ci: red`` on a PR whose latest
+run is green.
 
-WHY it stays narrow. The merge gate forces ``--admin``, so it is the only CI
-enforcement. A re-attempt of the same run (``gh run rerun``) keeps its run id and
-replays the same inputs; letting that turn a failure green is "re-run until green".
-NOTE: the live rollup keeps only each run's LATEST attempt, so a passing re-attempt
-replaces its own failure before this helper sees it. The same-run cases below are
-UNIT properties of the rule (a failure still present is not cleared by its own or an
-older run), not a claim that the gate refuses `gh run rerun`.
-So the superseding success must come from a DIFFERENT, NEWER run (larger run id),
-parsed strictly from the CheckRun's ``detailsUrl`` (github.com, this repo's slug, a
-numeric run id). Anything
-that cannot be proven — no run id, a foreign repo, no timestamp, a tie, a different
-workflow — stays red.
+THE RULE, in the one shared primitive ``_latest_result_per_check``: terminal CheckRuns
+are grouped by strict identity ``(name, workflowName)``; within a group the entry with
+the strictly-latest parsed ``completedAt`` decides. Ties keep every member (any red
+stays red). An entry with no identity or no parseable timestamp is always kept and
+never supersedes; non-terminal and SKIPPED/NEUTRAL entries are always kept and never
+supersede.
 
-Both consumers (``_pr_ci_status`` and ``_mechanical_scan_is_green``) get this through
-the ONE shared primitive, ``_drop_superseded_cancels``; the agreement tests below lock
-that.
+NOT A RE-RUN GUARD. GitHub's rollup lists only a re-run's LATEST attempt, so
+re-run-until-green is not blocked by this gate, before or after this change (#2624).
 
-Network-free: ``_TEST_GH_CI_ROLLUP`` / ``_TEST_GH_ROLLUP_WITH_HEAD`` /
-``_TEST_GH_DERIVED_REPO`` seams.
+Both consumers (``_pr_ci_status`` and ``_mechanical_scan_is_green``) get the rule
+through the helper; the agreement tests below lock that.
+
+Network-free: ``_TEST_GH_CI_ROLLUP`` / ``_TEST_GH_ROLLUP_WITH_HEAD`` seams.
 """
 
 from __future__ import annotations
@@ -44,54 +38,26 @@ _mod = private_module(
 REPO = "acme/pub"
 HEAD = "0cd13afeb51025af5dc7bd24df1ffa57cd2babab"
 
-FAIL_AT = "2026-09-29T22:20:11Z"
-PASS_AT = "2026-09-30T00:39:24Z"
-LATER_AT = "2026-09-30T01:00:00Z"
-
-RUN_A = 36638934761
-RUN_B = 36651350733
-RUN_C = 36660000001
-# Run id used inside the malformed-URL cells: strictly BETWEEN RUN_A and RUN_B, so on
-# the failure side it is older than RUN_B and on the success side newer than RUN_A. A
-# mutation that let a spoofed URL parse is then not masked by the newer-run rule.
-RUN_G = 36645000009
-assert RUN_A < RUN_G < RUN_B
-
-_job_counter = iter(range(109600000000, 109700000000))
+T1 = "2026-09-29T22:20:11Z"
+T2 = "2026-09-30T00:39:24Z"
+T3 = "2026-09-30T01:00:00Z"
 
 
-def _url(run_id, *, slug=REPO):
-    return f"https://github.com/{slug}/actions/runs/{run_id}/job/{next(_job_counter)}"
-
-
-def _run(
-    conclusion,
-    run_id=None,
-    *,
-    completed_at=None,
-    name="leak-detector",
-    workflow="CI",
-    slug=REPO,
-    details_url=None,
-):
+def _run(conclusion, *, completed_at=None, name="leak-detector", workflow="CI", status="COMPLETED"):
     entry = {
         "__typename": "CheckRun",
         "name": name,
         "workflowName": workflow,
-        "status": "COMPLETED",
+        "status": status,
         "conclusion": conclusion,
     }
     if completed_at is not None:
         entry["completedAt"] = completed_at
-    if details_url is not None:
-        entry["detailsUrl"] = details_url
-    elif run_id is not None:
-        entry["detailsUrl"] = _url(run_id, slug=slug)
     return entry
 
 
-def _drop(*entries, repo=REPO):
-    return _mod._drop_superseded_cancels(list(entries), repo=repo)
+def _latest(*entries):
+    return _mod._latest_result_per_check(list(entries))
 
 
 def _both(monkeypatch, *entries, scanner=("leak-detector", "CI")):
@@ -111,332 +77,247 @@ def _both(monkeypatch, *entries, scanner=("leak-detector", "CI")):
 # ── The primitive ──────────────────────────────────────────────────────────────
 
 
-class TestFailureSupersessionPrimitive:
-    def test_failure_then_later_success_from_another_run_is_dropped(self):
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(fail, ok) == [ok]
+class TestLatestWinsPrimitive:
+    def test_later_success_supersedes_an_earlier_failure(self):
+        fail = _run("FAILURE", completed_at=T1)
+        ok = _run("SUCCESS", completed_at=T2)
+        assert _latest(fail, ok) == [ok]
+
+    def test_later_failure_overturns_an_earlier_success(self):
+        ok = _run("SUCCESS", completed_at=T1)
+        fail = _run("FAILURE", completed_at=T2)
+        assert _latest(ok, fail) == [fail]
+
+    def test_later_cancel_overturns_an_earlier_success(self):
+        """Unchanged from the pre-#2607 cancel rule: SUCCESS then CANCELLED is red."""
+        ok = _run("SUCCESS", completed_at=T1)
+        cancel = _run("CANCELLED", completed_at=T2)
+        assert _latest(ok, cancel) == [cancel]
 
     def test_timed_out_is_superseded_the_same_way(self):
-        timed_out = _run("TIMED_OUT", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(timed_out, ok) == [ok]
+        timed_out = _run("TIMED_OUT", completed_at=T1)
+        ok = _run("SUCCESS", completed_at=T2)
+        assert _latest(timed_out, ok) == [ok]
 
-    def test_same_run_id_reattempt_stays_red(self):
-        """Unit property: a success from the SAME run id never clears a failure that is
-        still present. (The live rollup drops a re-attempted run's earlier attempts,
-        so this pair only reaches the helper if both attempts are listed.)"""
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_A, completed_at=PASS_AT)
-        assert _drop(fail, ok) == [fail, ok]
+    def test_three_results_only_the_latest_survives(self):
+        a = _run("FAILURE", completed_at=T1)
+        b = _run("SUCCESS", completed_at=T2)
+        c = _run("FAILURE", completed_at=T3)
+        assert _latest(a, b, c) == [c]
 
-    def test_tie_stays_red(self):
-        fail = _run("FAILURE", RUN_A, completed_at=PASS_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(fail, ok) == [fail, ok]
+    def test_input_order_does_not_matter(self):
+        fail = _run("FAILURE", completed_at=T1)
+        ok = _run("SUCCESS", completed_at=T2)
+        assert _latest(ok, fail) == [ok]
 
-    def test_success_before_failure_stays_red(self):
-        ok = _run("SUCCESS", RUN_A, completed_at=FAIL_AT)
-        fail = _run("FAILURE", RUN_B, completed_at=PASS_AT)
-        assert _drop(ok, fail) == [ok, fail]
+    def test_tie_keeps_every_member(self):
+        """Second-precision timestamps in the same second are unordered: keep both, so
+        the red one still reads red."""
+        fail = _run("FAILURE", completed_at=T2)
+        ok = _run("SUCCESS", completed_at=T2)
+        assert _latest(fail, ok) == [fail, ok]
 
-    def test_later_failure_from_a_third_run_stays_red(self):
-        """A success supersedes the failures BEFORE it, never one after it."""
-        first = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        last = _run("FAILURE", RUN_C, completed_at=LATER_AT)
-        assert _drop(first, ok, last) == [ok, last]
+    def test_tie_at_the_latest_keeps_all_tied_and_drops_older(self):
+        old = _run("FAILURE", completed_at=T1)
+        tie_ok = _run("SUCCESS", completed_at=T2)
+        tie_fail = _run("FAILURE", completed_at=T2)
+        assert _latest(old, tie_ok, tie_fail) == [tie_ok, tie_fail]
 
-    def test_reattempt_success_does_not_hide_an_earlier_cross_run_success(self):
-        """Run A fails, run B passes, then A is re-attempted and passes. B is the
-        proof, so A's failure is superseded; A's own re-attempt is irrelevant."""
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok_b = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        ok_a = _run("SUCCESS", RUN_A, completed_at=LATER_AT)
-        assert _drop(fail, ok_b, ok_a) == [ok_b, ok_a]
+    def test_tie_across_spellings_is_still_a_tie(self):
+        a = _run("FAILURE", completed_at="2026-09-30T00:39:24+00:00")
+        b = _run("SUCCESS", completed_at="2026-09-30T00:39:24Z")
+        assert _latest(a, b) == [a, b]
 
-    def test_two_runs_cannot_cross_cover_via_reattempts(self):
-        """Two failing runs, each then re-attempted to green. Every pass is a same-run
-        re-attempt, so BOTH failures must stay red. Under a bare 'different run id'
-        test, run A's re-attempt covers run B's failure and vice versa, and the gate
-        reads green: re-run-until-green by another route. The superseding run must be
-        NEWER than the failing one."""
-        fail_a = _run("FAILURE", RUN_A, completed_at="2026-09-29T22:00:00Z")
-        fail_b = _run("FAILURE", RUN_B, completed_at="2026-09-29T22:10:00Z")
-        ok_a = _run("SUCCESS", RUN_A, completed_at="2026-09-29T22:20:00Z")
-        ok_b = _run("SUCCESS", RUN_B, completed_at="2026-09-29T22:30:00Z")
-        kept = _drop(fail_a, fail_b, ok_a, ok_b)
-        assert fail_b in kept, "run B's failure was cleared by a re-attempt of an OLDER run"
+    @pytest.mark.parametrize("side", ["older", "newer"])
+    def test_missing_timestamp_is_kept_and_never_supersedes(self, side):
+        """An entry with no completedAt cannot be ordered: it is always kept, and it
+        cannot supersede anything either."""
+        no_ts = _run("FAILURE" if side == "older" else "SUCCESS")
+        other = _run("SUCCESS" if side == "older" else "FAILURE", completed_at=T2)
+        assert _latest(no_ts, other) == [no_ts, other]
 
-    def test_reattempt_of_an_older_run_does_not_clear_a_newer_failure(self):
-        """The narrowest form of the cross-cover: an OLDER run's success, completing
-        after a NEWER run failed, is not new evidence about the newer run."""
-        fail_new = _run("FAILURE", RUN_B, completed_at=FAIL_AT)
-        ok_old = _run("SUCCESS", RUN_A, completed_at=PASS_AT)
-        assert _drop(fail_new, ok_old) == [fail_new, ok_old]
+    @pytest.mark.parametrize("bad", ["not-a-timestamp", "2026-09-30T00:39:24", ""])
+    def test_unparseable_or_naive_timestamp_is_kept(self, bad):
+        a = _run("FAILURE", completed_at=bad)
+        b = _run("SUCCESS", completed_at=T2)
+        assert _latest(a, b) == [a, b]
 
-    def test_different_workflow_name_stays_red(self):
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        decoy = _run("SUCCESS", RUN_B, completed_at=PASS_AT, workflow="Decoy")
-        assert _drop(fail, decoy) == [fail, decoy]
+    def test_different_workflow_name_is_independent(self):
+        fail = _run("FAILURE", completed_at=T1)
+        decoy = _run("SUCCESS", completed_at=T2, workflow="Decoy")
+        assert _latest(fail, decoy) == [fail, decoy]
 
-    def test_different_check_name_stays_red(self):
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT, name="lint")
-        other = _run("SUCCESS", RUN_B, completed_at=PASS_AT, name="test")
-        assert _drop(fail, other) == [fail, other]
+    def test_different_check_name_is_independent(self):
+        fail = _run("FAILURE", completed_at=T1, name="lint")
+        other = _run("SUCCESS", completed_at=T2, name="test")
+        assert _latest(fail, other) == [fail, other]
 
-    @pytest.mark.parametrize("side", ["failure", "success"])
-    def test_missing_completed_at_stays_red(self, side):
-        fail = _run("FAILURE", RUN_A, completed_at=None if side == "failure" else FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=None if side == "success" else PASS_AT)
-        assert _drop(fail, ok) == [fail, ok]
+    def test_no_identity_is_kept_and_never_supersedes(self):
+        """A legacy StatusContext (no workflowName) is never grouped."""
+        fail = _run("FAILURE", completed_at=T1)
+        legacy = {"context": "leak-detector", "state": "SUCCESS", "completedAt": T2}
+        assert _latest(fail, legacy) == [fail, legacy]
+        nameless_fail = {
+            "workflowName": "CI",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "completedAt": T1,
+        }
+        nameless_ok = {
+            "workflowName": "CI",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "completedAt": T2,
+        }
+        assert _latest(nameless_fail, nameless_ok) == [nameless_fail, nameless_ok]
 
-    @pytest.mark.parametrize("side", ["failure", "success"])
-    def test_missing_details_url_stays_red(self, side):
-        fail = _run("FAILURE", RUN_A if side != "failure" else None, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B if side != "success" else None, completed_at=PASS_AT)
-        assert _drop(fail, ok) == [fail, ok]
+    @pytest.mark.parametrize("status", ["IN_PROGRESS", "QUEUED", "WAITING"])
+    def test_pending_is_kept_and_never_supersedes(self, status):
+        fail = _run("FAILURE", completed_at=T1)
+        pending = _run(None, completed_at=T2, status=status)
+        assert _latest(fail, pending) == [fail, pending]
+
+    def test_non_completed_status_never_supersedes_even_with_a_conclusion(self):
+        """The status check is its own layer: an entry whose status is not COMPLETED
+        must not supersede even if it carries a (stale or inconsistent) conclusion.
+        Without this case the conclusion check alone masks the status check."""
+        fail = _run("FAILURE", completed_at=T1)
+        inflight = _run("SUCCESS", completed_at=T2, status="IN_PROGRESS")
+        assert _latest(fail, inflight) == [fail, inflight]
 
     @pytest.mark.parametrize(
-        "garbage",
+        "newer",
         [
-            "",
-            "   ",
-            "not a url",
-            # the CheckRun page form: the number is a check-run id, NOT a run id
-            f"https://github.com/{REPO}/runs/109646322702",
-            # scheme, host and host-suffix spoofs
-            f"http://github.com/{REPO}/actions/runs/{RUN_G}/job/1",
-            f"https://evil.example/{REPO}/actions/runs/{RUN_G}/job/1",
-            f"https://github.com.evil.example/{REPO}/actions/runs/{RUN_G}/job/1",
-            f"https://api.github.com/{REPO}/actions/runs/{RUN_G}/job/1",
-            # malformed run / job ids
-            f"https://github.com/{REPO}/actions/runs/abc/job/1",
-            f"https://github.com/{REPO}/actions/runs/0{RUN_G}/job/1",
-            f"https://github.com/{REPO}/actions/runs/{RUN_G}",
-            f"https://github.com/{REPO}/actions/runs/{RUN_G}/job/",
-            f"https://github.com/{REPO}/actions/runs/{RUN_G}/job/1/extra",
-            f"https://github.com/{REPO}/actions/runs/{RUN_G}/job/1?x=1",
-            # path games: the slug must be exactly OWNER/REPO
-            f"https://github.com/acme/pub/extra/actions/runs/{RUN_G}/job/1",
-            f"https://github.com/acme/actions/runs/{RUN_G}/job/1",
-            f"https://github.com/acme/../pub/actions/runs/{RUN_G}/job/1",
+            {"conclusion": "FOO"},  # unrecognised verdict, no status
+            {"conclusion": "success"},  # wrong case, no status
+            {"conclusion": "SUCCESS"},  # recognised, but status missing
+            {"conclusion": "FOO", "status": "COMPLETED"},  # unrecognised, completed
         ],
     )
-    @pytest.mark.parametrize("side", ["failure", "success"])
-    def test_garbage_details_url_stays_red(self, garbage, side):
-        fail = _run(
-            "FAILURE",
-            RUN_A,
-            completed_at=FAIL_AT,
-            details_url=garbage if side == "failure" else None,
+    def test_only_a_completed_recognised_verdict_supersedes(self, newer):
+        """Found in review: a newer entry the classifier would IGNORE must not erase an
+        older FAILURE, or the head reads green on nothing. Only a COMPLETED CheckRun
+        whose conclusion is SUCCESS or a recognised red may supersede."""
+        fail = _run("FAILURE", completed_at=T1)
+        entry = {"name": "leak-detector", "workflowName": "CI", "completedAt": T2, **newer}
+        assert _latest(fail, entry) == [fail, entry]
+
+    def test_unrecognised_newer_entry_keeps_ci_red(self, monkeypatch):
+        """The same case end to end: before the fix this read `green`."""
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps(
+                [
+                    _run("FAILURE", completed_at=T1, name="test"),
+                    {"name": "test", "workflowName": "CI", "conclusion": "FOO", "completedAt": T2},
+                    _run("SUCCESS", completed_at=T2, name="lint"),
+                ]
+            ),
         )
-        ok = _run(
-            "SUCCESS",
-            RUN_B,
-            completed_at=PASS_AT,
-            details_url=garbage if side == "success" else None,
-        )
-        assert _drop(fail, ok) == [fail, ok]
+        monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CI")
+        assert _mod._pr_ci_status("1", repo=REPO)[0] == "red"
 
-    @pytest.mark.parametrize("side", ["failure", "success"])
-    def test_garbage_cells_control_valid_form_supersedes(self, side):
-        """GUARD-THE-GUARD for the garbage cells: the SAME run id (RUN_G) in the valid
-        form must supersede, so each garbage cell fails on its shape alone, not on a
-        run-id collision."""
-        valid = f"https://github.com/{REPO}/actions/runs/{RUN_G}/job/1"
-        fail = _run(
-            "FAILURE", RUN_A, completed_at=FAIL_AT, details_url=valid if side == "failure" else None
-        )
-        ok = _run(
-            "SUCCESS", RUN_B, completed_at=PASS_AT, details_url=valid if side == "success" else None
-        )
-        assert _drop(fail, ok) == [ok]
+    def test_completed_without_conclusion_never_supersedes(self):
+        fail = _run("FAILURE", completed_at=T1)
+        empty = _run(None, completed_at=T2)
+        assert _latest(fail, empty) == [fail, empty]
 
-    def test_overlong_run_id_stays_red(self):
-        """Ids are capped at 19 digits so int() is exact and bounded; a longer one is
-        not a shape GitHub emits and is not parsed."""
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run(
-            "SUCCESS",
-            completed_at=PASS_AT,
-            details_url=f"https://github.com/{REPO}/actions/runs/{'9' * 20}/job/1",
-        )
-        assert _drop(fail, ok) == [fail, ok]
+    @pytest.mark.parametrize("skip", ["SKIPPED", "NEUTRAL"])
+    def test_skipped_never_supersedes_a_verdict(self, skip):
+        """The one exception: a newer run that SKIPPED the job produced no verdict, so
+        it must not clear an older run's failure."""
+        fail = _run("FAILURE", completed_at=T1)
+        skipped = _run(skip, completed_at=T2)
+        assert _latest(fail, skipped) == [fail, skipped]
 
-    def test_rollup_dedupe_consequence_newest_run_wins(self):
-        """DOCUMENTED CONSEQUENCE, not a guarantee. The live rollup keeps only each
-        run's latest attempt. Runs A < B both fail; B is re-attempted and passes, so the
-        rollup shows A:FAILURE and B:SUCCESS. B is a newer run, so A's failure is
-        cleared: re-attempting the newest run discharges older runs' failures. The
-        pre-#2607 gate kept this red until A was re-run too. Pinned so a change to it
-        is a visible decision."""
-        fail_a = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok_b_latest_attempt = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(fail_a, ok_b_latest_attempt) == [ok_b_latest_attempt]
+    @pytest.mark.parametrize(
+        "conclusion",
+        ["CANCELLED", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"],
+    )
+    def test_every_red_conclusion_follows_latest_wins(self, conclusion):
+        red_old = _run(conclusion, completed_at=T1)
+        ok_new = _run("SUCCESS", completed_at=T2)
+        assert _latest(red_old, ok_new) == [ok_new]
+        ok_old = _run("SUCCESS", completed_at=T1)
+        red_new = _run(conclusion, completed_at=T2)
+        assert _latest(ok_old, red_new) == [red_new]
 
-    def test_non_string_details_url_stays_red(self):
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", completed_at=PASS_AT)
-        ok["detailsUrl"] = 12345
-        assert _drop(fail, ok) == [fail, ok]
+    def test_skip_set_is_fully_enumerated(self):
+        """DERIVED-SET GUARD for the one exception."""
+        test = TestLatestWinsPrimitive.test_skipped_never_supersedes_a_verdict
+        parametrized = [m for m in test.pytestmark if m.name == "parametrize"]
+        assert set(parametrized[0].args[1]) == set(_mod._CI_SKIP_CONCLUSIONS)
+        assert not set(_mod._CI_SKIP_CONCLUSIONS) & set(_mod._CI_ORDERABLE_VERDICTS)
 
-    @pytest.mark.parametrize("side", ["failure", "success"])
-    def test_foreign_repo_details_url_stays_red(self, side):
-        fail = _run(
-            "FAILURE",
-            RUN_A,
-            completed_at=FAIL_AT,
-            slug="other/fork" if side == "failure" else REPO,
-        )
-        ok = _run(
-            "SUCCESS",
-            RUN_B,
-            completed_at=PASS_AT,
-            slug="other/fork" if side == "success" else REPO,
-        )
-        assert _drop(fail, ok) == [fail, ok]
+    def test_red_set_is_fully_enumerated(self):
+        """DERIVED-SET GUARD: no red conclusion may be added untested."""
+        test = TestLatestWinsPrimitive.test_every_red_conclusion_follows_latest_wins
+        parametrized = [m for m in test.pytestmark if m.name == "parametrize"]
+        assert set(parametrized[0].args[1]) == set(_mod._CI_RED_CONCLUSIONS)
 
-    def test_slug_match_is_case_insensitive(self):
-        """CONTROL for provenance: GitHub slugs are case-insensitive, so a URL that
-        spells this repo in another case is still this repo."""
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT, slug="ACME/Pub")
-        assert _drop(fail, ok) == [ok]
-
-    def test_unresolvable_own_repo_stays_red(self, monkeypatch):
-        """No repo identity means no provenance: a failure cannot be superseded."""
-        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(fail, ok, repo=None) == [fail, ok]
-
-    def test_no_repo_lookup_when_nothing_could_qualify(self, monkeypatch):
-        """The repo identity is resolved LAZILY: a payload with no qualifying
-        failure/success pair costs no `gh repo view` on the merge path."""
-        calls = []
-        monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda cwd: calls.append(cwd))
-        _drop(
-            _run("CANCELLED", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT),
-            _run("FAILURE", RUN_A, completed_at=PASS_AT, name="lint"),  # no later success
-            _run("FAILURE", completed_at=FAIL_AT, name="test"),  # no run id
-            _run("SUCCESS", completed_at=PASS_AT, name="test"),
-            repo=None,
-        )
-        assert calls == []
-        # CONTROL: a pair that could qualify does trigger exactly one lookup.
-        _drop(
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT),
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT, name="lint"),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT, name="lint"),
-            repo=None,
-        )
-        assert len(calls) == 1
-
-    def test_repo_none_derives_from_cwd(self, monkeypatch):
-        """CONTROL for the above: when the derived repo resolves, provenance holds."""
-        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", REPO)
-        fail = _run("FAILURE", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(fail, ok, repo=None) == [ok]
-
-    @pytest.mark.parametrize("conclusion", ["ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"])
-    def test_other_red_conclusions_are_never_superseded(self, conclusion):
-        """Scope lock: only FAILURE and TIMED_OUT gained cross-run supersession."""
-        red = _run(conclusion, RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_B, completed_at=PASS_AT)
-        assert _drop(red, ok) == [red, ok]
-
-    def test_scope_lock_enumerates_every_non_droppable_red_conclusion(self):
-        """DERIVED-SET GUARD: the parametrize above must cover the WHOLE remainder of
-        _CI_RED_CONCLUSIONS, so a conclusion added to the constant cannot ship
-        untested."""
-        marks = TestFailureSupersessionPrimitive.test_other_red_conclusions_are_never_superseded
-        parametrized = [m for m in marks.pytestmark if m.name == "parametrize"]
-        assert len(parametrized) == 1
-        covered = set(parametrized[0].args[1])
-        assert covered == (
-            set(_mod._CI_RED_CONCLUSIONS)
-            - set(_mod._CI_CANCEL_CONCLUSIONS)
-            - set(_mod._CI_CROSS_RUN_SUPERSEDABLE_CONCLUSIONS)
-        )
-        assert set(_mod._CI_CROSS_RUN_SUPERSEDABLE_CONCLUSIONS) == {"FAILURE", "TIMED_OUT"}
-
-    def test_cancel_rule_is_unchanged_by_run_ids(self):
-        """A cancel needs no run id and no different run: concurrency cancels are
-        cross-run by nature, and the cancel rule predates this change untouched."""
-        cancel = _run("CANCELLED", RUN_A, completed_at=FAIL_AT)
-        ok = _run("SUCCESS", RUN_A, completed_at=PASS_AT)
-        assert _drop(cancel, ok) == [ok]
-        bare_cancel = _run("CANCELLED", completed_at=FAIL_AT)
-        bare_ok = _run("SUCCESS", completed_at=PASS_AT)
-        assert _drop(bare_cancel, bare_ok) == [bare_ok]
+    def test_non_dict_entries_pass_through(self):
+        payload = ["junk", None, _run("SUCCESS", completed_at=T2)]
+        assert _latest(*payload) == payload
 
     def test_input_is_not_mutated(self):
-        entries = [
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT),
-        ]
+        entries = [_run("FAILURE", completed_at=T1), _run("SUCCESS", completed_at=T2)]
         before = json.dumps(entries)
-        _mod._drop_superseded_cancels(entries, repo=REPO)
+        _mod._latest_result_per_check(entries)
         assert json.dumps(entries) == before
 
 
 # ── Both consumers, one payload ─────────────────────────────────────────────────
 
 
-class TestBothConsumersAgreeOnFailures:
-    def test_cross_run_supersession_is_green_to_both(self, monkeypatch):
+class TestBothConsumersAgree:
+    def test_later_success_is_green_to_both(self, monkeypatch):
         assert _both(
-            monkeypatch,
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT),
+            monkeypatch, _run("FAILURE", completed_at=T1), _run("SUCCESS", completed_at=T2)
         ) == ("green", True)
 
-    def test_timed_out_cross_run_is_green_to_both(self, monkeypatch):
+    def test_later_failure_is_red_to_both(self, monkeypatch):
         assert _both(
-            monkeypatch,
-            _run("TIMED_OUT", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT),
-        ) == ("green", True)
-
-    def test_same_run_reattempt_is_red_to_both(self, monkeypatch):
-        assert _both(
-            monkeypatch,
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_A, completed_at=PASS_AT),
+            monkeypatch, _run("SUCCESS", completed_at=T1), _run("FAILURE", completed_at=T2)
         ) == ("red", False)
 
-    def test_cross_cover_via_reattempts_is_red_to_both(self, monkeypatch):
+    def test_tie_with_a_red_member_is_red_to_both(self, monkeypatch):
         assert _both(
-            monkeypatch,
-            _run("FAILURE", RUN_A, completed_at="2026-09-29T22:00:00Z"),
-            _run("FAILURE", RUN_B, completed_at="2026-09-29T22:10:00Z"),
-            _run("SUCCESS", RUN_A, completed_at="2026-09-29T22:20:00Z"),
-            _run("SUCCESS", RUN_B, completed_at="2026-09-29T22:30:00Z"),
+            monkeypatch, _run("FAILURE", completed_at=T2), _run("SUCCESS", completed_at=T2)
         ) == ("red", False)
 
-    def test_tie_is_red_to_both(self, monkeypatch):
-        assert _both(
-            monkeypatch,
-            _run("FAILURE", RUN_A, completed_at=PASS_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT),
-        ) == ("red", False)
-
-    def test_foreign_repo_is_red_to_both(self, monkeypatch):
-        assert _both(
-            monkeypatch,
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT, slug="other/fork"),
-        ) == ("red", False)
+    def test_missing_timestamp_failure_is_red_to_both(self, monkeypatch):
+        assert _both(monkeypatch, _run("FAILURE"), _run("SUCCESS", completed_at=T2)) == (
+            "red",
+            False,
+        )
 
     def test_different_workflow_is_red_to_both(self, monkeypatch):
         assert _both(
             monkeypatch,
-            _run("FAILURE", RUN_A, completed_at=FAIL_AT),
-            _run("SUCCESS", RUN_B, completed_at=PASS_AT, workflow="Decoy"),
+            _run("FAILURE", completed_at=T1),
+            _run("SUCCESS", completed_at=T2, workflow="Decoy"),
+        ) == ("red", False)
+
+    def test_pending_other_check_is_pending_not_green(self, monkeypatch):
+        state, green = _both(
+            monkeypatch,
+            _run("FAILURE", completed_at=T1),
+            _run("SUCCESS", completed_at=T2),
+            _run(None, status="IN_PROGRESS", name="lint"),
+        )
+        assert (state, green) == ("pending", True)
+
+    def test_inflight_rerun_of_the_same_check_does_not_clear_its_failure(self, monkeypatch):
+        state, green = _both(
+            monkeypatch,
+            _run("FAILURE", completed_at=T1),
+            _run(None, status="IN_PROGRESS"),
+        )
+        assert state != "green" and green is False
+
+    def test_newer_skip_does_not_clear_a_failure_for_either_consumer(self, monkeypatch):
+        assert _both(
+            monkeypatch, _run("FAILURE", completed_at=T1), _run("SKIPPED", completed_at=T2)
         ) == ("red", False)
 
 
@@ -447,8 +328,8 @@ class TestPr2484Characterization:
     """ACCEPTANCE BAR. PR #2484's head carried three `pull_request` runs of CI.
     lint and test FAILED in runs 36638934761 and 36647810311 (a broken base), then
     PASSED in 36651350733 after the base was fixed. Every other CI job passed in all
-    three. Before #2607 the gate read `ci: red (lint, test)`. Run ids and completedAt
-    values are the real ones; the repo slug is synthetic."""
+    three. Before #2607 the gate read `ci: red (lint, test)`. The completedAt values
+    are the real ones; detailsUrl carries the real run ids on a synthetic slug."""
 
     R1, R2, R3 = 36638934761, 36647810311, 36651350733
 
@@ -468,19 +349,20 @@ class TestPr2484Characterization:
     ]
 
     def _rollup(self, rows):
-        return [_run(c, run, completed_at=at, name=n, workflow="CI") for n, run, c, at in rows]
+        out = []
+        for n, run, c, at in rows:
+            e = _run(c, completed_at=at, name=n)
+            e["detailsUrl"] = f"https://github.com/{REPO}/actions/runs/{run}/job/1"
+            out.append(e)
+        return out
 
     def test_real_shape_reads_green(self, monkeypatch):
-        state, green = _both(monkeypatch, *self._rollup(self.ROWS))
-        assert state == "green"
-        assert green is True
+        assert _both(monkeypatch, *self._rollup(self.ROWS)) == ("green", True)
 
-    def test_real_shape_reads_red_if_the_success_were_a_reattempt(self, monkeypatch):
-        """CONTROL: the same rows, but the passing lint/test attempts carry run R2's
-        id (a `gh run rerun` of R2). The newer-run rule must hold on the real shape,
-        not only on a two-row fixture."""
+    def test_real_shape_reads_red_if_the_last_run_had_failed(self, monkeypatch):
+        """CONTROL: flip run 3's `test` to FAILURE — the latest result decides, so red."""
         rows = [
-            (n, self.R2 if (run == self.R3 and n in ("lint", "test")) else run, c, at)
+            (n, run, "FAILURE" if (n == "test" and run == self.R3) else c, at)
             for n, run, c, at in self.ROWS
         ]
         state, _ = _both(monkeypatch, *self._rollup(rows))
