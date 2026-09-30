@@ -337,7 +337,7 @@ class CCInvocation:
     # Per-invocation override for CC's Bash sandbox root (CLAUDE_CODE_TMPDIR).
     # None → the shared default (~/.genesis/cc-tmp). Set by throwaway sessions
     # (e.g. the model-roster gauntlet) to isolate their tmp blast radius from
-    # live sessions policed by genesis-tmp-watchgod.
+    # the quota-capped cc-tmp that live sessions share.
     claude_code_tmpdir: str | None = None
     # When non-empty, the session's Bash is restricted to these command binaries
     # (enforced by scripts/bash_safety_hook.sh via the GENESIS_BASH_ALLOWLIST env
@@ -534,6 +534,14 @@ class CCOutput:
     # Collapsing the first two into () made "no report" indistinguishable from
     # "reported zero", which turned an absence of evidence into a claim.
     tools_used: tuple[str, ...] | None = None
+    # True when `cost_usd` is a SESSION-CUMULATIVE total rather than this call's
+    # cost. From CC 2.1.277 a resumed `-p` session restores its saved totals, so
+    # `total_cost_usd` (and `modelUsage`) are running totals while `usage` tokens
+    # stay per call. Set from the CC VERSION by the invoker's run paths
+    # (`CCInvoker._with_cost_semantics`) — the result itself carries no signal
+    # that survives a model switch. A caller that SUMS `cost_usd` across turns
+    # must record the difference, via `cc_sessions.record_turn_cost`.
+    cost_is_cumulative: bool = False
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
     # Nonzero means the event stream this output was built from is INCOMPLETE:

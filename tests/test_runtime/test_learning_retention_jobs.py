@@ -21,6 +21,7 @@ _EXPECTED = (
     "alert_events_prune",
     "deferred_work_prune",
     "graduation_events_prune",
+    "recall_traces_prune",
     "events_prune",
     "voice_hygiene",
 )

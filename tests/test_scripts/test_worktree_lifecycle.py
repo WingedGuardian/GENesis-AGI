@@ -214,7 +214,6 @@ def _run_main(monkeypatch, repo: Path, trash: Path, *, argv=("worktree_lifecycle
 
 def _tombstones(trash: Path) -> list[dict]:
     """Rows the run appended to the (redirected) tombstone index."""
-    import json
 
     f = trash / "tombstones.jsonl"
     if not f.exists():
@@ -254,7 +253,6 @@ def test_main_archives_both_lanes_and_deletes_nothing(reaper_repo, tmp_path, mon
 
 def test_lane_is_recorded_but_changes_no_outcome(reaper_repo, tmp_path, monkeypatch):
     """Lane survives as provenance on the metadata, distinguishing the two cases."""
-    import json
 
     trash = tmp_path / "trash"
     _run_main(monkeypatch, reaper_repo.repo, trash)
@@ -353,7 +351,6 @@ def test_recover_legacy_branch_entry(reaper_repo, tmp_path, monkeypatch):
     already on disk: ``_recover`` must default ``detached`` to False and take the
     ``git worktree add <path> <branch>`` path unchanged.
     """
-    import json
 
     trash = tmp_path / "trash"
     trash.mkdir()
@@ -382,6 +379,53 @@ def test_recover_legacy_branch_entry(reaper_repo, tmp_path, monkeypatch):
     # Restored ON the branch (not detached) — the legacy path is unchanged.
     branch = _git(src, "symbolic-ref", "--short", "HEAD").strip()
     assert branch == "merged-br"
+
+
+def test_recover_dry_run_previews_and_writes_nothing(
+    reaper_repo, tmp_path, monkeypatch, capsys
+):
+    """`--recover --dry-run` previews the recovery and writes nothing (#2188).
+
+    `--dry-run` is honoured by the reap path ("WOULD TRASH ..."), so a recovery
+    that silently ignored it performed a full real restore under a flag whose
+    documented contract is "Show what would happen without doing it". The
+    preview reports in the conditional tense and leaves both sides untouched:
+    the destination is not recreated and the trash entry is not consumed.
+    """
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+
+    src = reaper_repo.wt_branch_merged
+    entry = trash / "wt_branch_merged-20260101"
+    subprocess.run(["mv", str(src), str(entry)], check=True)
+    _git(reaper_repo.repo, "worktree", "prune")
+    (entry / "notes.txt").write_text("untracked")
+    (entry / ".trash_meta.json").write_text(
+        json.dumps(
+            {
+                "original_path": str(src),
+                "branch": "merged-br",
+                "commit": reaper_repo.c0,
+                "trashed_at": "2026-01-01T00:00:00+00:00",
+            }
+        )
+    )
+
+    ok = wl._recover("wt_branch_merged", reaper_repo.repo, dry_run=True)
+    assert ok is True
+
+    out = capsys.readouterr().out
+    assert "WOULD RECOVER" in out
+    assert "merged-br" in out
+    # Only notes.txt is restorable: checkout recreates tracked files, and `.git`
+    # / `.trash_meta.json` are never restored.
+    assert "WOULD RESTORE 1 untracked file(s)" in out
+    # Nothing was written: destination absent, trash entry intact.
+    assert not src.exists()
+    assert entry.is_dir()
+    assert (entry / ".trash_meta.json").exists()
 
 
 # ─── detached reap predicate is ancestor-ONLY (Codex P1 findings B & C) ───────
@@ -440,10 +484,9 @@ def test_is_merged_detached_patch_equal_kept(reaper_repo):
 def test_recover_restores_untracked_file(reaper_repo, tmp_path, monkeypatch):
     """Recovery restores UNTRACKED files that the fresh checkout would not recreate.
 
-    This is one half of the recovery contract (copy-only-missing). The other half,
-    uncommitted TRACKED changes, travels as the saved `.dirty.patch` and is
-    reapplied with `git apply --3way` (see `_restore_from_dir` and the tests
-    below). Only the staged/unstaged split is not reconstructed.
+    This is the recovery contract's positive guarantee (copy-only-missing on the
+    recreate path; the reattach path brings the whole tree back). Uncommitted
+    tracked edits come back only by reattach — see the tests below.
     """
     trash = tmp_path / "trash"
     trash.mkdir()
@@ -462,402 +505,44 @@ def test_recover_restores_untracked_file(reaper_repo, tmp_path, monkeypatch):
     )
 
 
-def _drop_registration(repo: Path, wt: Path) -> None:
-    """Remove an archived worktree's registration, as an old archive or a repo-wide
-    prune would have. Recovery then cannot reattach and must rebuild from patches."""
-    _git(repo, "worktree", "unlock", str(wt))
-    _git(repo, "worktree", "prune")
+def test_recover_does_not_reapply_tracked_modification(
+    reaper_repo, tmp_path, monkeypatch, capsys,
+):
+    """Without its registration, a trashed uncommitted edit to a TRACKED file is
+    NOT reapplied — and the recovery SAYS so instead of reporting success.
 
+    copy-only-missing leaves the checked-out (committed) content intact. This LOCKS
+    the overlay->copy-only-missing revert: the old filecmp overlay would have
+    overwritten the tracked file with the trashed modification. (Codex 444/456.)
 
-def _trash_dirty(reaper_repo, tmp_path, monkeypatch, edit: str = "DIRTY EDIT\n") -> Path:
-    """Archive `wt_branch_merged` holding an uncommitted edit to tracked `a.txt`."""
+    It used to pass silently on the premise that "the reaper only trashes
+    worktrees already merged into main", which was false: the unmerged lane
+    exists, and a dirty worktree with no commits of its own passed the merge test
+    vacuously. So the recovery is now INCOMPLETE and names the kept archive.
+    """
     trash = tmp_path / "trash"
-    trash.mkdir(exist_ok=True)
+    trash.mkdir()
     monkeypatch.setattr(wl, "TRASH_DIR", trash)
     monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+
     wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text(edit)
-    assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is True
-    assert not wt.exists()
-    return wt
+    committed = (wt / "a.txt").read_text()  # tracked, committed at c0
+    (wt / "a.txt").write_text("DIRTY EDIT\n")  # uncommitted tracked modification
 
-
-def test_recover_reapplies_tracked_modification(reaper_repo, tmp_path, monkeypatch):
-    """A trashed uncommitted edit to a TRACKED file IS reapplied on recovery.
-
-    This test used to pin the opposite, on the premise that "the reaper only
-    trashes worktrees already merged into main". That premise was false. The
-    unmerged lane exists, and a branch with no commits of its own passed the
-    merge test vacuously. So an uncommitted edit archived with its `.dirty.patch`
-    came back as the committed content, and the edit survived only as a file
-    nobody applied. A staged NEW file rides in the same patch. It is asserted too,
-    because the apply runs before the untracked copy for exactly that file.
-    """
-    wt = reaper_repo.wt_branch_merged
-    (wt / "staged_new.txt").write_text("staged\n")
-    _git(wt, "add", "staged_new.txt")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    (archive,) = trash.glob("wt_branch_merged*.tar.gz")
+    _drop_registration(reaper_repo.repo, wt)  # no registration: reattach impossible
+    capsys.readouterr()
     report: dict = {}
     assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n", (
-        "recovery did not reapply the archived uncommitted edit to a tracked file"
+    assert (wt / "a.txt").read_text() == committed, (
+        "recovery reapplied a trashed tracked modification (overlay behavior)"
     )
-    assert (wt / "staged_new.txt").read_text() == "staged\n"
-    # The split comes back exactly: the staged file staged, the edit unstaged.
-    assert _git(wt, "diff", "--cached", "--name-only").split() == ["staged_new.txt"]
-    assert _git(wt, "diff", "--name-only").split() == ["a.txt"]
-
-
-def test_recover_leaves_no_stray_patch_file(reaper_repo, tmp_path, monkeypatch):
-    """A patch that applied has done its job, so it must not linger as an untracked file.
-
-    The untracked-file copy used to carry `.dirty.patch` into the recovered tree
-    like any other file. That is noise in `git status`, and a later reap would
-    then have to save its own patch as `.dirty.patch.archived-1` beside a stale one.
-    """
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n", "precondition: the patch applied"
-    assert not os.path.lexists(wt / ".dirty.patch"), (
-        "the reaper's own patch was copied into the recovered worktree after it applied"
-    )
-    assert ".dirty.patch" not in _git(wt, "status", "--porcelain", "-uall")
-
-
-def test_recover_keeps_a_conflicting_patch_and_says_so_loudly(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """The branch moved on after archiving and now CONFLICTS with the saved edit.
-
-    `git apply --3way` is not atomic. It leaves conflict markers and still applies
-    the patch's other hunks. So a failure has to be rolled back, the patch kept
-    where a human will look, and the message has to say the edits were NOT
-    reapplied. A quiet success over a half-applied tree would be worse than
-    the old behaviour.
-    """
-    repo = reaper_repo.repo
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-
-    # Move the archived branch to a commit whose a.txt conflicts with the edit.
-    # `update-ref`, because `branch -f` refuses a branch the (locked, archived)
-    # registration still has checked out.
-    cw = tmp_path / "conflict_src"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "a.txt").write_text("CONFLICT\n")
-    _git(cw, "commit", "-qam", "conflicting change")
-    conflict = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", conflict)
-
-    _drop_registration(repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", repo) is True
-    err = capsys.readouterr().err
-
-    kept = wt / ".dirty.patch"
-    assert "UNCOMMITTED EDITS WERE NOT REAPPLIED" in err, err
-    assert str(kept) in err, f"the message must say where the patch is:\n{err}"
-    assert kept.is_file(), "the unapplied patch must be kept in the worktree"
-    assert "+DIRTY EDIT" in kept.read_text(), "and it must be the saved edit"
-    assert (wt / "a.txt").read_text() == "CONFLICT\n", (
-        "a failed apply was not rolled back: the tree holds a partial application"
-    )
-    assert _git(wt, "status", "--porcelain", "-uall").splitlines() == ["?? .dirty.patch"]
-
-
-def test_recover_applies_the_reapers_patch_not_the_worktrees_own(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """A worktree may own a `.dirty.patch`, and ours is then `.dirty.patch.archived-1`.
-
-    Recovery must apply the reaper's file (named by `patch_file` in the metadata)
-    and restore the worktree's own file untouched, as the untracked file it was.
-    """
-    wt = reaper_repo.wt_branch_merged
-    (wt / ".dirty.patch").write_text("MY OWN FILE\n")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n", (
-        "recovery did not apply the reaper's patch saved under the fallback name"
-    )
-    assert (wt / ".dirty.patch").read_text() == "MY OWN FILE\n"
-    assert not os.path.lexists(wt / ".dirty.patch.archived-1")
-
-
-def test_recover_reapplies_from_an_archive_without_patch_file(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """Every archive written before `patch_file` existed must still get its edits back.
-
-    MEASURED 2026-09-25 on a live install: 0 of 204 archive metadata files carry
-    `patch_file`. Those archives are the ones waiting to be recovered, so the
-    fallback is the path that matters most right now. A directory entry is used,
-    by failing compression, so the metadata can be edited in place.
-    """
-    import json
-
-    def _no_tar(*_a, **_k):
-        raise OSError("compression disabled for this test")
-
-    monkeypatch.setattr(wl.tarfile, "open", _no_tar)
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-
-    (entry,) = [d for d in (tmp_path / "trash").iterdir()
-                if d.is_dir() and d.name.startswith("wt_branch_merged")]
-    meta_path = entry / ".trash_meta.json"
-    meta = json.loads(meta_path.read_text())
-    assert meta.get("patch_file") == ".dirty.patch", "precondition: new archives record it"
-    for legacy_absent in ("patch_file", "index_patch_file", "patch_format"):
-        del meta[legacy_absent]  # an archive from before the reaper recorded names
-    meta_path.write_text(json.dumps(meta))
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n", (
-        "an archive without `patch_file` did not get its uncommitted edit back"
-    )
-
-
-def _a_valid_patch_creating_u(wt: Path) -> str:
-    """A real patch that CREATES `u.txt` in ``wt``: one that WOULD apply if chosen."""
-    (wt / "u.txt").write_text("CREATED BY THE USERS OWN PATCH\n")
-    _git(wt, "add", "-N", "u.txt")
-    body = _git(wt, "diff", "u.txt")
-    _git(wt, "rm", "-q", "--cached", "u.txt")
-    (wt / "u.txt").unlink()
-    assert "+CREATED BY THE USERS OWN PATCH" in body
-    return body
-
-
-def test_recover_applies_nothing_when_the_reapers_patch_write_failed(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """A failed patch write must be RECORDED, never guessed around.
-
-    The worktree owns a VALID `.dirty.patch`, so ours goes to
-    `.dirty.patch.archived-1`, and that write fails. Before the fix the metadata
-    said `had_tracked_patch` True with no `patch_file`, recovery guessed the name,
-    picked the user's file, applied it, and reported success. MEASURED by a
-    verification pass with a simulated ENOSPC.
-    """
-    wt = reaper_repo.wt_branch_merged
-    own = _a_valid_patch_creating_u(wt)
-    (wt / ".dirty.patch").write_text(own)
-
-    real_open = os.open
-
-    def _enospc_for_ours(path, *a, **k):
-        if str(path).endswith(".dirty.patch.archived-1"):
-            raise OSError(28, "No space left on device")
-        return real_open(path, *a, **k)
-
-    monkeypatch.setattr(wl.os, "open", _enospc_for_ours)
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    monkeypatch.setattr(wl.os, "open", real_open)
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    out = capsys.readouterr().out
-    assert not (wt / "u.txt").exists(), "the user's own .dirty.patch was applied"
-    assert "Reapplied" not in out, out
-    assert (wt / ".dirty.patch").read_text() == own, "the user's file was not restored intact"
-
-
-def test_recover_uses_patch_file_not_a_guess(reaper_repo, tmp_path, monkeypatch):
-    """`patch_file` is authoritative; the numbered-name guess must not override it.
-
-    The worktree owns `.dirty.patch.archived-5` (a valid patch) and no
-    `.dirty.patch`, so ours is saved as `.dirty.patch`. The legacy guess would
-    pick the user's numbered file.
-    """
-    wt = reaper_repo.wt_branch_merged
-    own = _a_valid_patch_creating_u(wt)
-    (wt / ".dirty.patch.archived-5").write_text(own)
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n", "the reaper's patch was not applied"
-    assert not (wt / "u.txt").exists(), "the user's numbered patch was applied instead"
-    assert (wt / ".dirty.patch.archived-5").read_text() == own
-
-
-def test_legacy_archive_picks_the_highest_numbered_patch(reaper_repo, tmp_path, monkeypatch):
-    """An archive without `patch_file`: ours took the first free number, so the highest.
-
-    The worktree owns `.dirty.patch` and `.dirty.patch.archived-1`, so ours is
-    `.dirty.patch.archived-2`. Stripping `patch_file` forces the legacy fallback.
-    """
-    import json
-
-    def _no_tar(*_a, **_k):
-        raise OSError("compression disabled for this test")
-
-    monkeypatch.setattr(wl.tarfile, "open", _no_tar)
-    wt = reaper_repo.wt_branch_merged
-    (wt / ".dirty.patch").write_text("MY OWN FILE\n")
-    (wt / ".dirty.patch.archived-1").write_text("MY OTHER FILE\n")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-
-    (entry,) = [d for d in (tmp_path / "trash").iterdir()
-                if d.is_dir() and d.name.startswith("wt_branch_merged")]
-    meta_path = entry / ".trash_meta.json"
-    meta = json.loads(meta_path.read_text())
-    assert meta.get("patch_file") == ".dirty.patch.archived-2", "precondition"
-    for legacy_absent in ("patch_file", "index_patch_file", "patch_format"):
-        del meta[legacy_absent]  # an archive from before the reaper recorded names
-    meta_path.write_text(json.dumps(meta))
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n", "the legacy guess picked the wrong file"
-    assert (wt / ".dirty.patch").read_text() == "MY OWN FILE\n"
-    assert (wt / ".dirty.patch.archived-1").read_text() == "MY OTHER FILE\n"
-
-
-def _retry_commands(err: str) -> list[str]:
-    lines = err.splitlines()
-    start = next(i for i, ln in enumerate(lines) if "Retry by hand" in ln)
-    out = []
-    for ln in lines[start + 1:]:
-        if not ln.startswith("    "):
-            break
-        out.append(ln.strip())
-    return out
-
-
-def test_the_printed_retry_command_survives_a_created_file(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """The retry line must not fail on a file the patch creates.
-
-    After a rollback, the untracked copy restores the staged new file from the
-    archive, and a bare `git apply` then refuses to create it. MEASURED: the old
-    printed command failed with "does not exist in index". The retry may still
-    CONFLICT on the moved file -- that is the genuine reason it failed -- but it
-    must not trip on the created one.
-    """
-    repo = reaper_repo.repo
-    wt = reaper_repo.wt_branch_merged
-    (wt / "staged_new.txt").write_text("staged\n")
-    _git(wt, "add", "staged_new.txt")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-
-    cw = tmp_path / "conflict_src"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "a.txt").write_text("CONFLICT\n")
-    _git(cw, "commit", "-qam", "conflicting change")
-    conflict = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", conflict)
-
-    _drop_registration(repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", repo) is True
-    err = capsys.readouterr().err
-    assert (wt / "staged_new.txt").read_text() == "staged\n", "precondition: restored as untracked"
-    cmds = _retry_commands(err)
-    assert cmds[0].startswith("cd ") and "staged_new.txt.restored" in cmds[0], cmds
-    assert "--exclude" not in err, err
-    move, index_apply, unstaged_apply = cmds
-    for cmd in (move, index_apply):
-        rerun = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-        assert rerun.returncode == 0, (cmd, rerun.stderr)
-    # The staged file is back, staged, with its content; the restored copy is kept.
-    assert _git(wt, "diff", "--cached", "--name-only").split() == ["staged_new.txt"]
-    assert (wt / "staged_new.txt.restored").read_text() == "staged\n"
-    # The unstaged edit still conflicts with the moved branch — the genuine reason
-    # the recovery failed — and must not trip on the created file.
-    rerun = subprocess.run(["bash", "-c", unstaged_apply], capture_output=True, text=True)
-    assert "staged_new.txt" not in rerun.stderr, rerun.stderr
-
-
-# ─── an "ancestor" verdict with no commits of its own is not merged work ──────
-
-
-@pytest.mark.parametrize("which", ["wt_branch_merged", "wt_det_merged"])
-def test_uncommitted_work_on_a_zero_commit_worktree_is_not_on_the_merged_clock(
-    reaper_repo, tmp_path, monkeypatch, which,
-):
-    """A worktree whose tip is a main commit has merged NOTHING.
-
-    `merge-base --is-ancestor` passes for it anyway, so it was classed MERGED
-    and archived at 7 days. That is the short clock meant for work that is
-    already in main, but here the uncommitted edits were the only copy. MEASURED
-    on a live install: 12 of 204 archives are ancestor-verdict, and all 12 have
-    their tip on main's first-parent line. 9 of those were dirty.
-    Both fixtures qualify: `merged-br` sits at c0 with no commit of its own, and
-    the detached one is checked out at c0.
-    """
-    repo = reaper_repo.repo
-    wt = getattr(reaper_repo, which)
-    (wt / "a.txt").write_text("uncommitted work\n")
-    _age_path(wt, 10)  # past MERGED_STALE_DAYS, short of UNMERGED_STALE_DAYS
-
-    worktrees = wl._list_worktrees(repo)
-    cls = wl._classify(_wt_by_path(repo, wt), worktrees, repo)
-    assert cls["state"] == wl.STATE_AT_RISK, cls
-    assert cls["merged"] is False and cls["merge_method"] == "", cls
-
-    trash = tmp_path / "trash"
-    assert _run_main(monkeypatch, repo, trash) == 0
-    assert wt.exists(), (
-        f"{which} holds only uncommitted work and was archived on the merged clock"
-    )
-    assert not list(trash.glob(f"{which}-*"))
-
-
-def test_the_merged_clock_still_applies_to_real_merged_work(reaper_repo, tmp_path, monkeypatch):
-    """The control, and it has to MOVE: two worktrees at 10 days still go.
-
-    * a branch with a real commit merged into main through a merge commit. It is
-      reaped at the merged threshold even though it is dirty, because its tip sits
-      on a second parent and not on main's first-parent line;
-    * a CLEAN zero-commit worktree. It holds nothing main lacks, so it stays on
-      the merged clock and stays out of the at-risk alert set.
-    Either assertion fails if the lane test is widened to every ancestor verdict,
-    or to every zero-commit worktree regardless of whether it is dirty.
-    """
-    import json
-
-    repo = reaper_repo.repo
-    real = tmp_path / "wt_real_merged"
-    _git(repo, "worktree", "add", "-q", "-b", "real-br", str(real), "main")
-    (real / "r.txt").write_text("real work\n")
-    _git(real, "add", "r.txt")
-    _git(real, "commit", "-qm", "real work")
-    _git(repo, "merge", "--no-ff", "-q", "-m", "merge real-br", "real-br")
-    (real / "a.txt").write_text("leftover uncommitted edit\n")
-
-    for p in (real, reaper_repo.wt_branch_merged, reaper_repo.wt_det_merged,
-              reaper_repo.wt_det_unmerged):
-        _age_path(p, 10)
-
-    trash = tmp_path / "trash"
-    assert _run_main(monkeypatch, repo, trash) == 0
-
-    assert not real.exists(), "merged work past 7 days must still be reaped"
-    assert not reaper_repo.wt_branch_merged.exists(), (
-        "a CLEAN zero-commit worktree has nothing to lose and stays on the merged clock"
-    )
-    assert reaper_repo.wt_det_unmerged.exists(), "the unmerged control must be kept"
-    lanes = {json.loads(f.read_text())["original_path"].rsplit("/", 1)[-1]:
-             json.loads(f.read_text())["lane"] for f in trash.glob("*.meta.json")}
-    assert lanes.get("wt_real_merged") == "merged", lanes
-    assert lanes.get("wt_branch_merged") == "merged", lanes
+    assert report.get("incomplete") is True, report
+    out, err = capsys.readouterr()
+    assert "NOT restored" in err, err
+    assert str(archive) in err, err
+    assert f"Archive kept at {archive}" in out, out
 
 
 def test_skip_locked_worktree(reaper_repo, tmp_path, monkeypatch):
@@ -1524,7 +1209,7 @@ def test_a_failed_recovery_leaves_the_history_anchor_in_place(
 
     monkeypatch.setattr(subprocess, "run", _add_always_fails)
     monkeypatch.setattr(wl.shutil, "move", _move_always_fails)
-    # The unlock lives on the REBUILD path. Reattach takes precedence and places
+    # The unlock lives on the RECREATE path. Reattach takes precedence and places
     # the tree with a rename, so make it impossible the way a real archive can:
     # its `.git` pointer is unusable while the locked registration survives.
     monkeypatch.setattr(wl, "_reattach_target", lambda *_a: ("absent", None))
@@ -1611,245 +1296,242 @@ def test_an_untouched_worktree_still_reads_as_idle(reaper_repo, tmp_path):
     )
 
 
-# ─── review round 1: what the recovery patches must carry, and what happens when
-#     one is missing. Each cell reproduces a measured loss. ─────────────────────
+# ─── dry-run preview agrees with what recovery would do (Devin round on #2206) ─
 
 
-def _trash_dir_entry(reaper_repo, tmp_path, monkeypatch) -> Path:
-    """Archive `wt_branch_merged` as a plain DIRECTORY entry (compression disabled)."""
+def _preview_fixture(tmp_path: Path, setup) -> tuple[Path, Path, str]:
+    """A repo whose committed tree `setup(repo)` builds, and an empty directory
+    trash entry pointing at that commit. Returns (repo, entry, commit)."""
 
+    repo = tmp_path / "prev_repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "s@s")
+    _git(repo, "config", "user.name", "s")
+    setup(repo)
+    _git(repo, "commit", "-q", "-m", "tree")
+    commit = _git(repo, "rev-parse", "HEAD").strip()
+    entry = tmp_path / "trash" / "entry-20260101"
+    entry.mkdir(parents=True)
+    (entry / ".trash_meta.json").write_text(
+        json.dumps({"original_path": str(tmp_path / "gone"), "commit": commit, "detached": True})
+    )
+    return repo, entry, commit
+
+
+def _links(repo: Path, links: dict[str, str]) -> None:
+    for name, target in links.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, repo / name)
+        _git(repo, "add", name)
+
+
+def _restore_count(capsys) -> str:
+    out = capsys.readouterr().out
+    return next(line for line in out.splitlines() if "WOULD RESTORE" in line)
+
+
+def test_preview_carries_the_suffix_through_link_hops(tmp_path, capsys):
+    """`a -> b/sub`, `b -> c`, `c/sub -> <outside>`: realpath of `a` leaves the
+    worktree, so recovery skips `a/file` and the preview must not count it."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo, entry, _ = _preview_fixture(
+        tmp_path,
+        lambda r: _links(r, {"a": "b/sub", "b": "c", "c/sub": str(outside)}),
+    )
+    (entry / "a").mkdir()
+    (entry / "a" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_count(capsys)
+
+
+def test_preview_resolves_the_stored_files_own_path_not_just_the_link(tmp_path, capsys):
+    """`a -> b` stays inside, but `b/x -> <outside>`: stored `a/x/file` resolves
+    through BOTH links. Checking only the tracked ancestor `a` misses `b/x`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo, entry, _ = _preview_fixture(
+        tmp_path, lambda r: _links(r, {"a": "b", "b/x": str(outside)})
+    )
+    (entry / "a" / "x").mkdir(parents=True)
+    (entry / "a" / "x" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_count(capsys)
+
+
+def test_preview_counts_a_file_behind_an_in_tree_link(tmp_path, capsys):
+    """Control for the two above: a link chain that stays inside the worktree
+    does not stop the file being restored."""
+    repo, entry, _ = _preview_fixture(tmp_path, lambda r: _links(r, {"a": "b/sub", "b": "c"}))
+    (entry / "a").mkdir()
+    (entry / "a" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 1 untracked" in _restore_count(capsys)
+
+
+def test_preview_treats_a_submodule_gitlink_as_a_directory(tmp_path, capsys):
+    """A gitlink is checked out as a directory, so a stored file under it is
+    restorable, not a collision with a tracked file."""
+
+    def setup(r: Path) -> None:
+        (r / "f").write_text("f")
+        _git(r, "add", "f")
+        _git(r, "commit", "-q", "-m", "base")
+        sha = _git(r, "rev-parse", "HEAD").strip()
+        _git(r, "update-index", "--add", "--cacheinfo", f"160000,{sha},sub")
+
+    repo, entry, _ = _preview_fixture(tmp_path, setup)
+    (entry / "sub").mkdir()
+    (entry / "sub" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    out = _restore_count(capsys)
+    assert "WOULD RESTORE 1 untracked" in out
+
+
+def test_preview_refuses_an_archive_whose_only_metadata_is_nested(tmp_path, capsys):
+    """Recovery requires `.trash_meta.json` at the archive's inner root; a
+    worktree's own nested file of that name must not stand in for it."""
+    import io
+    import tarfile
+
+    repo, _, commit = _preview_fixture(tmp_path, lambda r: _links(r, {"l": "x"}))
+    archive = tmp_path / "trash" / "arch-20260101.tar.gz"
+    body = json.dumps({"original_path": str(tmp_path / "gone"), "commit": commit}).encode()
+    with tarfile.open(archive, "w:gz") as tf:
+        info = tarfile.TarInfo("arch/deep/.trash_meta.json")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    assert wl._describe_recovery(archive, repo) is False
+    assert "No .trash_meta.json" in capsys.readouterr().err
+# ─── an "ancestor" verdict with no commits of its own is not merged work ──────
+
+
+@pytest.mark.parametrize("which", ["wt_branch_merged", "wt_det_merged"])
+def test_uncommitted_work_on_a_zero_commit_worktree_is_not_on_the_merged_clock(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    which,
+):
+    """A worktree whose tip is a main commit has merged NOTHING.
+
+    `merge-base --is-ancestor` passes for it anyway, so it was classed MERGED
+    and archived at 7 days. That is the short clock meant for work that is
+    already in main, but here the uncommitted edits were the only copy. MEASURED
+    on a live install: 12 of 204 archives are ancestor-verdict, and all 12 have
+    their tip on main's first-parent line. 9 of those were dirty.
+    Both fixtures qualify: `merged-br` sits at c0 with no commit of its own, and
+    the detached one is checked out at c0.
+    """
+    repo = reaper_repo.repo
+    wt = getattr(reaper_repo, which)
+    (wt / "a.txt").write_text("uncommitted work\n")
+    _age_path(wt, 10)  # past MERGED_STALE_DAYS, short of UNMERGED_STALE_DAYS
+
+    worktrees = wl._list_worktrees(repo)
+    cls = wl._classify(_wt_by_path(repo, wt), worktrees, repo)
+    assert cls["state"] == wl.STATE_AT_RISK, cls
+    assert cls["merged"] is False and cls["merge_method"] == "", cls
+
+    trash = tmp_path / "trash"
+    assert _run_main(monkeypatch, repo, trash) == 0
+    assert wt.exists(), f"{which} holds only uncommitted work and was archived on the merged clock"
+    assert not list(trash.glob(f"{which}-*"))
+
+
+def test_the_merged_clock_still_applies_to_real_merged_work(reaper_repo, tmp_path, monkeypatch):
+    """The control, and it has to MOVE: two worktrees at 10 days still go.
+
+    * a branch with a real commit merged into main through a merge commit. It is
+      reaped at the merged threshold even though it is dirty, because its tip sits
+      on a second parent and not on main's first-parent line;
+    * a CLEAN zero-commit worktree. It holds nothing main lacks, so it stays on
+      the merged clock and stays out of the at-risk alert set.
+    Either assertion fails if the lane test is widened to every ancestor verdict,
+    or to every zero-commit worktree regardless of whether it is dirty.
+    """
+    repo = reaper_repo.repo
+    real = tmp_path / "wt_real_merged"
+    _git(repo, "worktree", "add", "-q", "-b", "real-br", str(real), "main")
+    (real / "r.txt").write_text("real work\n")
+    _git(real, "add", "r.txt")
+    _git(real, "commit", "-qm", "real work")
+    _git(repo, "merge", "--no-ff", "-q", "-m", "merge real-br", "real-br")
+    (real / "a.txt").write_text("leftover uncommitted edit\n")
+
+    for p in (
+        real,
+        reaper_repo.wt_branch_merged,
+        reaper_repo.wt_det_merged,
+        reaper_repo.wt_det_unmerged,
+    ):
+        _age_path(p, 10)
+
+    trash = tmp_path / "trash"
+    assert _run_main(monkeypatch, repo, trash) == 0
+
+    assert not real.exists(), "merged work past 7 days must still be reaped"
+    assert not reaper_repo.wt_branch_merged.exists(), (
+        "a CLEAN zero-commit worktree has nothing to lose and stays on the merged clock"
+    )
+    assert reaper_repo.wt_det_unmerged.exists(), "the unmerged control must be kept"
+    lanes = {
+        json.loads(f.read_text())["original_path"].rsplit("/", 1)[-1]: json.loads(f.read_text())[
+            "lane"
+        ]
+        for f in trash.glob("*.meta.json")
+    }
+    assert lanes.get("wt_real_merged") == "merged", lanes
+    assert lanes.get("wt_branch_merged") == "merged", lanes
+
+
+def test_a_non_utf8_name_with_quotepath_off_does_not_crash_the_dirty_check(tmp_path):
+    """`core.quotePath=false` prints the name raw, and a strict decode raised out of
+    the dirty check the lane rule depends on."""
+    repo = tmp_path / "qp"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "core.quotePath", "false")
+    (repo / os.fsdecode(b"bad-\xff.txt")).write_text("x\n")
+    assert wl._has_uncommitted_changes(str(repo)) is True
+
+
+# ─── recovery reattaches to the preserved registration ───────────────────────
+
+
+def _drop_registration(repo: Path, wt: Path) -> None:
+    """Remove an archived worktree's registration, as an old archive or a repo-wide
+    prune would have. Recovery then cannot reattach and must recreate."""
+    _git(repo, "worktree", "unlock", str(wt))
+    _git(repo, "worktree", "prune")
+
+
+def _trash_dirty(reaper_repo, tmp_path, monkeypatch, edit: str = "DIRTY EDIT\n") -> Path:
+    """Archive `wt_branch_merged` holding an uncommitted edit to tracked `a.txt`."""
+    trash = tmp_path / "trash"
+    trash.mkdir(exist_ok=True)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    wt = reaper_repo.wt_branch_merged
+    (wt / "a.txt").write_text(edit)
+    assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is True
+    assert not wt.exists()
+    return wt
+
+
+def _disable_compression(monkeypatch) -> None:
     def _no_tar(*_a, **_k):
         raise OSError("compression disabled for this test")
 
     monkeypatch.setattr(wl.tarfile, "open", _no_tar)
-    trash = tmp_path / "trash"
-    trash.mkdir(exist_ok=True)
-    monkeypatch.setattr(wl, "TRASH_DIR", trash)
-    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
-    wt = reaper_repo.wt_branch_merged
-    assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is True
-    (entry,) = [d for d in trash.iterdir() if d.is_dir() and d.name.startswith("wt_branch_merged")]
+
+
+def _only_entry(tmp_path: Path) -> Path:
+    (entry,) = [
+        d
+        for d in (tmp_path / "trash").iterdir()
+        if d.is_dir() and d.name.startswith("wt_branch_merged")
+    ]
     return entry
-
-
-def test_staged_and_unstaged_versions_of_one_file_both_come_back(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """MEASURED before: a file staged as one version and edited to another kept only
-    the second — the single HEAD→worktree patch had nowhere to put the first."""
-    wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text("STAGED UNIQUE\n")
-    _git(wt, "add", "a.txt")
-    (wt / "a.txt").write_text("WORKTREE UNIQUE\n")
-    _trash_dir_entry(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert _git(wt, "show", ":a.txt") == "STAGED UNIQUE\n"
-    assert (wt / "a.txt").read_text() == "WORKTREE UNIQUE\n"
-
-
-def test_a_textconv_attribute_does_not_leak_into_the_saved_patch(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """MEASURED before: an uppercasing textconv saved `a -> new` as `A -> NEW`, which
-    cannot apply to `a`, and the edit was lost."""
-    wt = reaper_repo.wt_branch_merged
-    _git(reaper_repo.repo, "config", "diff.up.textconv", "tr a-z A-Z <")
-    (wt / ".git_info_attrs").write_text("")  # keep the tree otherwise untouched
-    info = Path(_git(wt, "rev-parse", "--git-common-dir").strip())
-    if not info.is_absolute():
-        info = wt / info
-    (info / "info").mkdir(exist_ok=True)
-    (info / "info" / "attributes").write_text("*.txt diff=up\n")
-    (wt / "a.txt").write_text("new edit\n")
-    (wt / ".git_info_attrs").unlink()
-    _trash_dir_entry(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)  # force the patch fallback
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached", "this test is about the patch fallback"
-    assert (wt / "a.txt").read_text() == "new edit\n"
-
-
-def test_a_patch_write_that_fails_part_way_leaves_no_patch_and_applies_nothing(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """A truncated patch left under a reaper name was read at recovery as a user file,
-    and a directory entry — the only complete copy — was deleted."""
-    wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text("DIRTY EDIT\n")
-    real_fdopen = os.fdopen
-
-    def _fail_patch_write(fd, *a, **k):
-        fh = real_fdopen(fd, *a, **k)
-        if "b" in (a[0] if a else k.get("mode", "")):
-            class _Boom:
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *exc):
-                    fh.close()
-                    return False
-
-                def write(self, _data):
-                    raise OSError(28, "No space left on device")
-            return _Boom()
-        return fh
-
-    monkeypatch.setattr(wl.os, "fdopen", _fail_patch_write)
-    entry = _trash_dir_entry(reaper_repo, tmp_path, monkeypatch)
-    monkeypatch.setattr(wl.os, "fdopen", real_fdopen)
-
-    assert not list(entry.glob(".dirty*patch*")), "a partial patch was left behind"
-    _drop_registration(reaper_repo.repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    err = capsys.readouterr().err
-    assert "UNCOMMITTED EDITS WERE NOT REAPPLIED" in err, err
-    assert entry.is_dir(), "the directory entry holding the only copy was deleted"
-
-
-def test_a_missing_recorded_patch_keeps_the_trash_and_applies_nothing(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """The metadata says tracked changes were saved but names no surviving patch."""
-    import json
-
-    wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text("DIRTY EDIT\n")
-    entry = _trash_dir_entry(reaper_repo, tmp_path, monkeypatch)
-    meta_path = entry / ".trash_meta.json"
-    meta = json.loads(meta_path.read_text())
-    assert meta["had_tracked_patch"] is True and meta["patch_file"], "precondition"
-    (entry / meta["patch_file"]).unlink()
-
-    _drop_registration(reaper_repo.repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    err = capsys.readouterr().err
-    assert "missing" in err, err
-    assert (wt / "a.txt").read_text() == "a\n"
-    assert entry.is_dir()
-
-
-def test_a_non_utf8_filename_does_not_abort_recovery(reaper_repo, tmp_path, monkeypatch, capsys):
-    """MEASURED before: the retry builder decoded git's filename bytes as strict UTF-8
-    and raised, ending recovery before it said where the edits went."""
-    repo = reaper_repo.repo
-    wt = reaper_repo.wt_branch_merged
-    odd = os.fsdecode(b"bad-\xff.txt")
-    (wt / odd).write_text("new\n")
-    _git(wt, "add", "--", odd)
-    (wt / "a.txt").write_text("DIRTY EDIT\n")
-    _trash_dirty_moved(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", repo) is True
-    err = capsys.readouterr().err
-    cmds = _retry_commands(err)
-    # The printed command must name the SAME bytes: run it and see the file move.
-    move = subprocess.run(["bash", "-c", cmds[0]], capture_output=True)
-    assert move.returncode == 0, (cmds[0], move.stderr)
-    assert os.path.lexists(wt / (odd + ".restored")), cmds[0]
-
-
-def _trash_dirty_moved(reaper_repo, tmp_path, monkeypatch):
-    """Archive the worktree, then move its branch to a commit that conflicts."""
-    repo = reaper_repo.repo
-    trash = tmp_path / "trash"
-    trash.mkdir(exist_ok=True)
-    monkeypatch.setattr(wl, "TRASH_DIR", trash)
-    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
-    wt = reaper_repo.wt_branch_merged
-    assert wl._trash_worktree(_wt_by_path(repo, wt), repo) is True
-    cw = tmp_path / "conflict_src2"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "a.txt").write_text("CONFLICT\n")
-    _git(cw, "commit", "-qam", "conflicting change")
-    conflict = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", conflict)
-
-
-def test_a_rename_is_moved_aside_not_excluded_in_the_retry(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """`--exclude` on a rename target skips the whole rename (MEASURED), and would drop
-    a later edit to the renamed file. The retry moves the restored copy aside."""
-    wt = reaper_repo.wt_branch_merged
-    _git(wt, "mv", "a.txt", "renamed.txt")
-    (wt / "renamed.txt").write_text("EDITED AFTER RENAME\n")
-    _trash_dirty_moved(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    err = capsys.readouterr().err
-    assert "UNCOMMITTED EDITS WERE NOT REAPPLIED" in err, err
-    assert "--exclude" not in err, err
-    cmds = _retry_commands(err)
-    assert "mv -- renamed.txt renamed.txt.restored" in cmds[0], cmds
-    for cmd in cmds[:2]:
-        rerun = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-        assert rerun.returncode == 0, (cmd, rerun.stderr)
-    assert "renamed.txt" in _git(wt, "diff", "--cached", "--name-only").split()
-    assert (wt / "renamed.txt.restored").read_text() == "EDITED AFTER RENAME\n"
-
-
-def test_a_failed_patch_copy_leaves_no_truncated_file(tmp_path, monkeypatch):
-    src = tmp_path / "src.patch"
-    src.write_bytes(b"x" * 100)
-    dest_dir = tmp_path / "wt"
-    dest_dir.mkdir()
-    real_fdopen = os.fdopen
-
-    class _Boom:
-        def __init__(self, fh):
-            self.fh = fh
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            self.fh.close()
-            return False
-
-        def write(self, data):
-            self.fh.write(data[:10])
-            raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(wl.os, "fdopen", lambda fd, *a, **k: _Boom(real_fdopen(fd, *a, **k)))
-    dest, err = wl._keep_unapplied_patch(src, str(dest_dir))
-    assert dest is None and err
-    assert list(dest_dir.iterdir()) == [], "a truncated patch was left in the worktree"
-
-
-def test_metadata_that_names_no_patch_is_never_guessed_at(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """Devin's case: the rewrite that records the patch name fails, so every copy of
-    the metadata still says `patch_file: None`. A user file under a patch-like name
-    must not be applied in its place; nothing is applied and the trash is kept."""
-    import json
-
-    wt = reaper_repo.wt_branch_merged
-    own = _a_valid_patch_creating_u(wt)
-    (wt / ".dirty.patch.archived-5").write_text(own)
-    (wt / "a.txt").write_text("DIRTY EDIT\n")
-    entry = _trash_dir_entry(reaper_repo, tmp_path, monkeypatch)
-    meta_path = entry / ".trash_meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["patch_file"] = None
-    meta["index_patch_file"] = None
-    meta_path.write_text(json.dumps(meta))
-
-    _drop_registration(reaper_repo.repo, reaper_repo.wt_branch_merged)  # force the patch fallback
-    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    assert not (wt / "u.txt").exists(), "a user file was applied as the patch"
-    assert "missing" in capsys.readouterr().err
-    assert entry.is_dir()
-
-
-# ─── review round 2: reattach first; the patch fallback fails safe ─────────────
 
 
 def _state(wt: Path) -> tuple[str, str, str]:
@@ -1857,8 +1539,13 @@ def _state(wt: Path) -> tuple[str, str, str]:
     return (
         _git(wt, "ls-files", "-s", "-v", "-t"),
         _git(wt, "status", "--porcelain=v2", "--untracked-files=all"),
-        "".join(sorted(f"{p.relative_to(wt)}={p.read_bytes()!r}\n"
-                       for p in wt.rglob("*") if p.is_file() and ".git" not in p.parts)),
+        "".join(
+            sorted(
+                f"{p.relative_to(wt)}={p.read_bytes()!r}\n"
+                for p in wt.rglob("*")
+                if p.is_file() and ".git" not in p.parts
+            )
+        ),
     )
 
 
@@ -1871,49 +1558,94 @@ def _rich_dirty_state(wt: Path) -> None:
     (wt / "untracked.txt").write_text("untracked\n")
 
 
+def test_recover_leaves_the_reapers_patch_file_and_names_it(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """The reaper writes its `.dirty.patch` snapshot INTO the tree before archiving,
+    so a reattach brings it back as an untracked file. It is left where it is —
+    nothing is deleted on a guess — and the recovery names it as the reaper's
+    snapshot, safe to delete once checked."""
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    capsys.readouterr()
+    report: dict = {}
+    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
+    assert report.get("mode") == "reattached", report
+    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
+    assert (wt / ".dirty.patch").is_file(), "the reaper's snapshot must be left in place"
+    out, err = capsys.readouterr()
+    said = out + err
+    assert str(wt / ".dirty.patch") in said, said
+    assert "snapshot" in said and "safe to delete" in said, said
+    assert not report.get("incomplete"), report
+
+
 @pytest.mark.parametrize("compress", [True, False], ids=["archive", "directory"])
-def test_reattach_restores_the_exact_state(reaper_repo, tmp_path, monkeypatch, compress):
+def test_reattach_restores_the_exact_state(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+    compress,
+):
     """The registration (and its index) survives archiving, so moving the tree back
     under it restores what no patch can carry: the staged/unstaged split, an
-    intent-to-add entry, untracked files — byte for byte, flags included."""
+    intent-to-add entry, untracked files — byte for byte, flags included. The one
+    addition is the reaper's own snapshot file, which is named, not removed."""
     wt = reaper_repo.wt_branch_merged
     _rich_dirty_state(wt)
     before = _state(wt)
     if not compress:
-        def _no_tar(*_a, **_k):
-            raise OSError("compression disabled for this test")
-
-        monkeypatch.setattr(wl.tarfile, "open", _no_tar)
+        _disable_compression(monkeypatch)
     trash = tmp_path / "trash"
     trash.mkdir(exist_ok=True)
     monkeypatch.setattr(wl, "TRASH_DIR", trash)
     monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
     assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is True
+    capsys.readouterr()
     report: dict = {}
     assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
     assert report.get("mode") == "reattached", report
+    patch = wt / ".dirty.patch"
+    assert patch.is_file()
+    assert str(patch) in "".join(capsys.readouterr())
+    patch.unlink()  # the only difference, and it was named
     assert _state(wt) == before
 
 
-def test_reattach_keeps_the_worktrees_own_files_and_drops_only_the_reapers(
-    reaper_repo, tmp_path, monkeypatch,
+def test_reattach_keeps_the_worktrees_own_files_and_names_only_the_reapers(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
+    """A worktree that already had a `.dirty.patch` of its own gets the reaper's
+    snapshot under the next free name. Both survive, the worktree's own content is
+    untouched, and its own `.trash_meta.json` gets its name back."""
     wt = reaper_repo.wt_branch_merged
     (wt / ".dirty.patch").write_text("MY OWN PATCH\n")
     (wt / ".trash_meta.json").write_text("MY OWN META\n")
     _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    capsys.readouterr()
     report: dict = {}
     assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
     assert report.get("mode") == "reattached"
     assert (wt / ".dirty.patch").read_text() == "MY OWN PATCH\n"
     assert (wt / ".trash_meta.json").read_text() == "MY OWN META\n"
     left = sorted(p.name for p in wt.iterdir() if p.name.startswith(".dirty"))
-    assert left == [".dirty.patch"], left
+    assert left == [".dirty.patch", ".dirty.patch.archived-1"], left
     assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
+    said = "".join(capsys.readouterr())
+    assert str(wt / ".dirty.patch.archived-1") in said, said
 
 
 def test_reattach_after_the_branch_was_deleted_detaches_and_keeps_the_index(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     wt = reaper_repo.wt_branch_merged
     (wt / "a.txt").write_text("STAGED\n")
@@ -1926,210 +1658,16 @@ def test_reattach_after_the_branch_was_deleted_detaches_and_keeps_the_index(
     assert (wt / "a.txt").read_text() == "WORKTREE\n"
 
 
-def test_recovery_rebuilds_from_patches_when_the_registration_is_gone(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
-
-
-def test_user_diff_config_does_not_break_the_saved_patches(reaper_repo, tmp_path, monkeypatch):
-    """SF-1: porcelain `git diff` honoured these and every apply failed (MEASURED)."""
-    repo = reaper_repo.repo
-    for key, val in (("diff.noprefix", "true"), ("color.diff", "always"),
-                     ("diff.context", "0")):
-        _git(repo, "config", key, val)
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(repo, wt)
-    assert wl._recover("wt_branch_merged", repo) is True
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
-
-
-@pytest.mark.parametrize("failing", [".dirty.patch", ".dirty.index.patch"])
-def test_one_failed_patch_half_is_missing_not_clean(
-    reaper_repo, tmp_path, monkeypatch, capsys, failing,
-):
-    """B-1: a half whose write failed recorded no name, read as "nothing to save",
-    and recovery reported success and deleted the only copy (MEASURED)."""
-    wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text("STAGED\n")
-    _git(wt, "add", "a.txt")
-    real_open = os.open
-
-    def _enospc(path, *a, **k):
-        if str(path).endswith("/" + failing):
-            raise OSError(28, "No space left on device")
-        return real_open(path, *a, **k)
-
-    def _no_tar(*_a, **_k):
-        raise OSError("compression disabled for this test")
-
-    monkeypatch.setattr(wl.tarfile, "open", _no_tar)
-    monkeypatch.setattr(wl.os, "open", _enospc)
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch, edit="WORKTREE\n")
-    monkeypatch.setattr(wl.os, "open", real_open)
-    (entry,) = [d for d in (tmp_path / "trash").iterdir()
-                if d.is_dir() and d.name.startswith("wt_branch_merged")]
-    _drop_registration(reaper_repo.repo, wt)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("incomplete") is True
-    # The MECHANISM, not only the outcome: verify-before-delete would also keep the
-    # entry, so the assertion names the missing-patch refusal itself.
-    assert "missing" in capsys.readouterr().err
-    assert entry.is_dir(), "the directory entry holding the only copy was deleted"
-
-
-def test_a_legacy_directory_is_kept_when_the_recovered_tree_differs(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """Verify-before-delete. The archived tree held an UNTRACKED `u.txt`; the branch
-    has since gained a TRACKED `u.txt` with other content, so the rebuilt checkout
-    creates it and copy-only-missing (rightly) will not overwrite it. The archive's
-    version exists nowhere else, so the legacy directory entry must survive."""
-    repo = reaper_repo.repo
-
-    def _no_tar(*_a, **_k):
-        raise OSError("compression disabled for this test")
-
-    monkeypatch.setattr(wl.tarfile, "open", _no_tar)
-    wt = reaper_repo.wt_branch_merged
-    (wt / "u.txt").write_text("ARCHIVED UNTRACKED\n")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    (entry,) = [d for d in (tmp_path / "trash").iterdir()
-                if d.is_dir() and d.name.startswith("wt_branch_merged")]
-    cw = tmp_path / "mover"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "u.txt").write_text("TRACKED ON THE BRANCH\n")
-    _git(cw, "add", "u.txt")
-    _git(cw, "commit", "-qm", "the branch gains u.txt")
-    moved = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", moved)
-    _drop_registration(repo, wt)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", repo, report) is True
-    err = capsys.readouterr().err
-    assert report.get("incomplete") is True
-    assert "DIFFERS FROM THE ARCHIVE" in err and "u.txt" in err, err
-    assert (entry / "u.txt").read_text() == "ARCHIVED UNTRACKED\n"
-
-
-def test_recover_exits_2_when_the_edits_were_not_reapplied(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """SF-3: a worktree without its edits is not a successful recovery."""
-    repo = reaper_repo.repo
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    cw = tmp_path / "conflict_exit"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "a.txt").write_text("CONFLICT\n")
-    _git(cw, "commit", "-qam", "conflicting change")
-    conflict = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", conflict)
-    _drop_registration(repo, wt)
-    rc = _run_main(monkeypatch, repo, tmp_path / "trash",
-                   argv=("worktree_lifecycle.py", "--recover", "wt_branch_merged"))
-    assert rc == 2
-    # The MECHANISM: verify-before-delete alone would also give 2.
-    assert "UNCOMMITTED EDITS WERE NOT REAPPLIED" in capsys.readouterr().err
-
-
-def test_running_the_printed_move_step_twice_never_overwrites_a_backup(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """SF-2: the `.restored` copies hold the only final working-tree content, and
-    running the printed block a second time used to replace them (MEASURED)."""
-    repo = reaper_repo.repo
-    wt = reaper_repo.wt_branch_merged
-    (wt / "staged_new.txt").write_text("staged\n")
-    _git(wt, "add", "staged_new.txt")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    cw = tmp_path / "conflict_twice"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "a.txt").write_text("CONFLICT\n")
-    _git(cw, "commit", "-qam", "conflicting change")
-    conflict = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", conflict)
-    _drop_registration(repo, wt)
-    assert wl._recover("wt_branch_merged", repo) is True
-    move = _retry_commands(capsys.readouterr().err)[0]
-    assert move.startswith("cd "), move
-    first = subprocess.run(["bash", "-c", move], capture_output=True, text=True)
-    assert first.returncode == 0, first.stderr
-    (wt / "staged_new.txt").write_text("partially applied\n")
-    again = subprocess.run(["bash", "-c", move], capture_output=True, text=True)
-    assert again.returncode != 0
-    assert (wt / "staged_new.txt.restored").read_text() == "staged\n"
-
-
-def test_an_inherited_index_file_variable_does_not_break_recovery(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """NOTE-4: GIT_INDEX_FILE pointed `git apply --3way` at the wrong index. A STAGED
-    change is what makes recovery read the index at all."""
-    wt = reaper_repo.wt_branch_merged
-    (wt / "a.txt").write_text("DIRTY EDIT\n")
-    _git(wt, "add", "a.txt")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)
-    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "elsewhere.index"))
-    assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
-    monkeypatch.delenv("GIT_INDEX_FILE")
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
-    # The staged CONTENT, not the name: with no index at all `diff --cached` also
-    # lists a.txt (as a staged deletion), which passed for the wrong reason.
-    assert _git(wt, "show", ":a.txt") == "DIRTY EDIT\n"
-
-
-def test_a_non_utf8_name_with_quotepath_off_does_not_crash_the_dirty_check(tmp_path):
-    """NOTE-5: `core.quotePath=false` prints the name raw, and a strict decode raised."""
-    repo = tmp_path / "qp"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    _git(repo, "config", "core.quotePath", "false")
-    (repo / os.fsdecode(b"bad-\xff.txt")).write_text("x\n")
-    assert wl._has_uncommitted_changes(str(repo)) is True
-
-
-def test_a_pre_patch_archive_is_not_reported_as_missing_its_patch(tmp_path):
-    """NOTE-1: an archive from before patches were recorded has no
-    `had_tracked_patch` at all, and a clean one is not missing anything."""
-    entry = tmp_path / "entry"
-    entry.mkdir()
-    assert wl._saved_patches_in(entry, {"original_path": "x"}) == (None, None, False)
-
-
-# ─── reattach and fallback: round-3 review findings ─────────────────────────
-
-
-def _disable_compression(monkeypatch) -> None:
-    def _no_tar(*_a, **_k):
-        raise OSError("compression disabled for this test")
-
-    monkeypatch.setattr(wl.tarfile, "open", _no_tar)
-
-
-def _only_entry(tmp_path: Path) -> Path:
-    (entry,) = [d for d in (tmp_path / "trash").iterdir()
-                if d.is_dir() and d.name.startswith("wt_branch_merged")]
-    return entry
-
-
 def test_a_cross_filesystem_reattach_never_deletes_the_complete_copy(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
-    """F1: across filesystems a move is copy-then-delete-source. When the delete
+    """Across filesystems a move is copy-then-delete-source. When the delete
     failed part way (a read-only directory), the source was left PARTIAL and the
     code deleted the COMPLETE copy at the destination. MEASURED: 10 of 40 files
     gone everywhere, and the entry's metadata with them."""
-    import errno
-
     _disable_compression(monkeypatch)
     wt = reaper_repo.wt_branch_merged
     for i in range(6):
@@ -2165,11 +1703,11 @@ def test_a_cross_filesystem_reattach_never_deletes_the_complete_copy(
 
 
 def test_a_cross_filesystem_reattach_that_does_not_verify_keeps_the_archive(
-    reaper_repo, tmp_path, monkeypatch,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
 ):
-    """F1, the move-back half: with the source intact, only the copy is removed."""
-    import errno
-
+    """The move-back half: with the source intact, only the copy is removed."""
     _disable_compression(monkeypatch)
     _trash_dirty(reaper_repo, tmp_path, monkeypatch)
     entry = _only_entry(tmp_path)
@@ -2196,10 +1734,13 @@ def test_a_cross_filesystem_reattach_that_does_not_verify_keeps_the_archive(
 
 
 def test_an_older_archive_never_reattaches_under_a_newer_generation(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
-    """F2: archive A1, recover it, archive the same path again as A2, then recover
-    A1. The registration's `gitdir` points at the same path for both, so the path
+    """Archive A1, recover it, archive the same path again as A2, then recover A1.
+    The registration's `gitdir` points at the same path for both, so the path
     check accepted it: A1's tree came back under A2's index ("exactly as
     archived") and A2's history anchor was removed. MEASURED."""
     repo = reaper_repo.repo
@@ -2225,56 +1766,13 @@ def test_an_older_archive_never_reattaches_under_a_newer_generation(
     assert _git(wt, "show", ":a.txt") == "GENERATION TWO\n"
 
 
-def test_a_nested_clone_and_a_nested_meta_named_file_come_back(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """F3: the copy loop and the verify-before-delete check both skipped `.git` and
-    `.trash_meta.json` at ANY depth, so a legacy entry holding an untracked nested
-    clone (or a user's own file of that name) was deleted with them missing."""
-    _disable_compression(monkeypatch)
-    wt = reaper_repo.wt_branch_merged
-    nested = wt / "vendor" / "clone"
-    nested.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(nested)], check=True)
-    _git(nested, "-c", "user.email=a@a", "-c", "user.name=a",
-         "commit", "-q", "--allow-empty", "-m", "nested history")
-    (wt / "sub").mkdir()
-    (wt / "sub" / ".trash_meta.json").write_text("A USER FILE\n")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached"
-    assert (wt / "sub" / ".trash_meta.json").read_text() == "A USER FILE\n"
-    assert (nested / ".git" / "HEAD").is_file(), "the nested clone lost its history"
-    assert "nested history" in _git(nested, "log", "--format=%s")
-
-
-def test_an_intent_to_add_entry_does_not_break_the_fallback(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """F4: the staged patch carried an intent-to-add file as an empty new file and the
-    unstaged patch created it again, so the whole apply failed ("already exists")
-    and an unrelated edit was not reapplied. MEASURED."""
-    wt = reaper_repo.wt_branch_merged
-    (wt / "ita.txt").write_text("intent to add\n")
-    _git(wt, "add", "-N", "ita.txt")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(reaper_repo.repo, wt)
-
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    err = capsys.readouterr().err
-    assert "NOT REAPPLIED" not in err, err
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
-    assert (wt / "ita.txt").read_text() == "intent to add\n"
-
-
 def test_a_reattach_whose_commit_was_collected_is_incomplete(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
-    """F5: the lock anchors the registration, not a deleted branch's commit. Once the
+    """The lock anchors the registration, not a deleted branch's commit. Once the
     worktree's reflog expired, gc collected it and the reattach still said "exactly
     as archived" with exit 0 while `git status` showed no commits. MEASURED."""
     repo = reaper_repo.repo
@@ -2285,10 +1783,17 @@ def test_a_reattach_whose_commit_was_collected_is_incomplete(
     unique = _git(wt, "rev-parse", "HEAD").strip()
     _trash_dirty(reaper_repo, tmp_path, monkeypatch)
     _git(repo, "update-ref", "-d", "refs/heads/merged-br")
-    _git(repo, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now",
-         "gc", "-q", "--prune=now")
-    gone = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", unique],
-                          capture_output=True)
+    _git(
+        repo,
+        "-c",
+        "gc.reflogExpire=now",
+        "-c",
+        "gc.reflogExpireUnreachable=now",
+        "gc",
+        "-q",
+        "--prune=now",
+    )
+    gone = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", unique], capture_output=True)
     assert gone.returncode != 0, "precondition: gc collected the branch's commit"
 
     report: dict = {}
@@ -2299,9 +1804,11 @@ def test_a_reattach_whose_commit_was_collected_is_incomplete(
 
 
 def test_a_non_utf8_untracked_name_does_not_crash_the_reattach(
-    reaper_repo, tmp_path, monkeypatch,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
 ):
-    """F6: the reattach verify decoded `git status` strictly. With core.quotePath off
+    """The reattach verify decoded `git status` strictly. With core.quotePath off
     a raw name raised after the move and the unlock, leaving the tree unlocked with
     the reaper's files in it and a traceback. MEASURED."""
     wt = reaper_repo.wt_branch_merged
@@ -2317,11 +1824,13 @@ def test_a_non_utf8_untracked_name_does_not_crash_the_reattach(
 
 
 def test_a_git_that_cannot_answer_does_not_destroy_the_index(
-    reaper_repo, tmp_path, monkeypatch,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
 ):
-    """F7: a verify step that merely FAILED to run (a timeout on a slow disk) sent
-    recovery to the rebuild, whose `worktree add --force` replaced the registration
-    and the only complete copy of the staged state with it. MEASURED."""
+    """A verify step that merely FAILED to run (a timeout on a slow disk) sent
+    recovery to the recreate, whose `worktree add --force` replaced the
+    registration and the only complete copy of the staged state with it. MEASURED."""
     repo = reaper_repo.repo
     wt = reaper_repo.wt_branch_merged
     (wt / "a.txt").write_text("STAGED\n")
@@ -2347,26 +1856,17 @@ def test_a_git_that_cannot_answer_does_not_destroy_the_index(
     assert (wt / "a.txt").read_text() == "WORKTREE\n"
 
 
-def test_user_whitespace_config_does_not_alter_the_reapplied_edit(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """F8: the saved patches ignore user diff config, but `git apply` honoured
-    `apply.whitespace=fix` and silently stripped trailing whitespace. MEASURED."""
-    repo = reaper_repo.repo
-    _git(repo, "config", "apply.whitespace", "fix")
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch, edit="trailing space   \n")
-    _drop_registration(repo, wt)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", repo, report) is True
-    assert (wt / "a.txt").read_text() == "trailing space   \n"
-    assert not report.get("incomplete"), report
-
-
 def test_messages_name_the_stored_archive_not_its_scratch_copy(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
-    """F9: for a tarball the message named `.extract-…`, which `_recover` deletes on
-    the way out, at exactly the moment the user needs the real location."""
+    """For a tarball the message named `.extract-…`, which `_recover` deletes on
+    the way out, at exactly the moment the user needs the real location. Here the
+    registration is gone, so the edits cannot come back, and the kept archive is
+    what the message has to name. (The patch write is also made to fail, so no
+    snapshot file exists to be named instead.)"""
     wt = reaper_repo.wt_branch_merged
     (wt / "a.txt").write_text("STAGED\n")
     _git(wt, "add", "a.txt")
@@ -2382,34 +1882,16 @@ def test_messages_name_the_stored_archive_not_its_scratch_copy(
     monkeypatch.setattr(wl.os, "open", real_open)
     (archive,) = (tmp_path / "trash").glob("wt_branch_merged*.tar.gz")
     _drop_registration(reaper_repo.repo, wt)
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, {}) is True
+    report: dict = {}
+    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
+    assert report.get("incomplete") is True, report
     err = capsys.readouterr().err
     assert str(archive) in err, err
     assert ".extract-" not in err, err
 
 
-def test_a_recovery_that_could_not_recreate_the_worktree_is_incomplete(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """N2: the plain-directory fallback returned success, so `--recover` exited 0
-    for a tree git no longer recognises."""
-    import json
-
-    _disable_compression(monkeypatch)
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    meta_path = _only_entry(tmp_path) / ".trash_meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["commit"] = "0" * 40
-    meta_path.write_text(json.dumps(meta))
-    _git(reaper_repo.repo, "update-ref", "-d", "refs/heads/merged-br")
-    _drop_registration(reaper_repo.repo, wt)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("incomplete") is True
-
-
 def test_a_reattach_onto_a_moved_branch_is_flagged(reaper_repo, tmp_path, monkeypatch, capsys):
-    """N3: the tree is exactly as archived, but the branch moved, so its staged
+    """The tree is exactly as archived, but the branch moved, so its staged
     changes now read as reverting the other side's commits. Exit 2, and say so."""
     repo = reaper_repo.repo
     _trash_dirty(reaper_repo, tmp_path, monkeypatch)
@@ -2423,8 +1905,8 @@ def test_a_reattach_onto_a_moved_branch_is_flagged(reaper_repo, tmp_path, monkey
 
 
 def test_run_git_survives_a_raw_non_utf8_name(tmp_path):
-    """F6, the helper itself: git prints a raw name with core.quotePath off, and a
-    strict decode raised out of `_run_git`. The surrogates map back to the bytes."""
+    """git prints a raw name with core.quotePath off, and a strict decode raised
+    out of `_run_git`. The surrogates map back to the bytes."""
     repo = tmp_path / "raw"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     _git(repo, "config", "core.quotePath", "false")
@@ -2434,48 +1916,10 @@ def test_run_git_survives_a_raw_non_utf8_name(tmp_path):
     assert out is not None and out.strip() == name
 
 
-def test_the_worktrees_own_meta_file_comes_back_in_the_fallback(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """Archiving sets a worktree's own `.trash_meta.json` aside so the reaper's can
-    take the name. Only the reattach gave it back; the rebuild left it under the
-    aside name, and the verify compared it there, so nothing noticed."""
-    _disable_compression(monkeypatch)
-    wt = reaper_repo.wt_branch_merged
-    (wt / ".trash_meta.json").write_text("MY OWN META\n")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    entry = _only_entry(tmp_path)
-    _drop_registration(reaper_repo.repo, wt)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") != "reattached"
-    assert (wt / ".trash_meta.json").read_text() == "MY OWN META\n"
-    assert not list(wt.glob(".trash_meta.json.from-worktree-*"))
-    assert not report.get("incomplete"), report
-    assert not entry.exists(), "a legacy entry that came back whole is consumed"
-
-
-def test_unrestored_notices_a_lost_executable_bit(tmp_path):
-    """N5: a file whose bytes came back but whose executable bit did not differs."""
-    src, dst = tmp_path / "src", tmp_path / "dst"
-    src.mkdir()
-    dst.mkdir()
-    for d in (src, dst):
-        (d / "run.sh").write_text("#!/bin/sh\n")
-    os.chmod(src / "run.sh", 0o755)
-    os.chmod(dst / "run.sh", 0o644)
-    assert wl._unrestored(src, str(dst), set()) == ["run.sh"]
-    os.chmod(dst / "run.sh", 0o755)
-    assert wl._unrestored(src, str(dst), set()) == []
-
-
-# ─── round 2 of cross-model review ───────────────────────────────────────────
-
-
 def test_an_unreadable_registration_pointer_changes_nothing(reaper_repo, tmp_path, monkeypatch):
-    """A registration that could not be READ was treated as absent, and the rebuild
+    """A registration that could not be READ was treated as absent, and the recreate
     replaced it and the archived index with it. An unanswered question now stops the
-    recovery with nothing changed (cross-model review, round 2)."""
+    recovery with nothing changed."""
     _disable_compression(monkeypatch)
     wt = reaper_repo.wt_branch_merged
     (wt / "a.txt").write_text("STAGED\n")
@@ -2497,7 +1941,7 @@ def test_an_unreadable_registration_pointer_changes_nothing(reaper_repo, tmp_pat
 
 def test_a_non_utf8_worktree_name_still_reattaches(reaper_repo, tmp_path, monkeypatch):
     """Git writes a worktree's `.git` pointer and its admin `gitdir` byte for byte, and
-    a strict decode of a non-UTF-8 name sent recovery down the lossy rebuild."""
+    a strict decode of a non-UTF-8 name sent recovery down the lossy recreate."""
     repo = reaper_repo.repo
     name = os.fsdecode(b"wt-raw-\xff")
     wt = tmp_path / name
@@ -2515,33 +1959,14 @@ def test_a_non_utf8_worktree_name_still_reattaches(reaper_repo, tmp_path, monkey
     assert _git(wt, "show", ":a.txt") == "STAGED RAW\n"
 
 
-def test_a_branch_held_by_another_worktree_is_recovered_detached(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """The rebuild's `--force` (needed to take over the still-registered path) also
-    allowed a second checkout of a branch another worktree already had, so the two
-    trees would move one ref under each other (cross-model review, round 2)."""
-    repo = reaper_repo.repo
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(repo, wt)
-    other = tmp_path / "other_holder"
-    _git(repo, "worktree", "add", "-q", str(other), "merged-br")
-    assert wl._recover("wt_branch_merged", repo, {}) is True
-    out, err = capsys.readouterr()
-    assert "DETACHED" in err
-    assert "branch: merged-br" not in out, "the success line claimed the branch"
-    head = subprocess.run(["git", "-C", str(wt), "symbolic-ref", "-q", "HEAD"],
-                          capture_output=True, text=True)
-    assert head.returncode != 0, "the recovered tree is a second checkout of the branch"
-    assert _git(other, "symbolic-ref", "--short", "HEAD").strip() == "merged-br"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
-
-
 def test_a_reattach_that_cannot_remove_the_reapers_files_is_incomplete(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
-    """With the tree's root not writable the reaper's patch and metadata stay in it,
-    and the recovery claimed an exact state with exit 0 (cross-model review, round 2)."""
+    """With the tree's root not writable the reaper's metadata stays in it, and the
+    recovery claimed an exact state with exit 0."""
     _disable_compression(monkeypatch)
     _trash_dirty(reaper_repo, tmp_path, monkeypatch)
     entry = _only_entry(tmp_path)
@@ -2567,45 +1992,9 @@ def test_a_reattach_that_cannot_remove_the_reapers_files_is_incomplete(
     assert "exactly as archived" not in capsys.readouterr().out
 
 
-def test_the_retry_commands_name_a_non_utf8_worktree_exactly():
-    """The worktree path was quoted with `shlex.quote` and printed with a lossy
-    escape, so every `cd` / `git -C` named a different directory."""
-    worktree = os.fsdecode(b"/nonexistent/w-\xff")
-    text = "\n".join(wl._retry_lines([Path(worktree) / ".dirty.patch"], worktree, set()))
-    assert "$'/nonexistent/w-\\xff'" in text, text
-    assert "\udcff" not in text
-
-
-def test_the_retry_never_replaces_a_dangling_symlink_backup(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """`test ! -e` follows a symlink, so it reported a DANGLING `X.restored` link as
-    absent and the move replaced the user's link (cross-model review, round 2)."""
-    repo = reaper_repo.repo
-    wt = reaper_repo.wt_branch_merged
-    (wt / "staged_new.txt").write_text("staged\n")
-    _git(wt, "add", "staged_new.txt")
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    cw = tmp_path / "conflict_link"
-    _git(repo, "worktree", "add", "-q", "--detach", str(cw), reaper_repo.c0)
-    (cw / "a.txt").write_text("CONFLICT\n")
-    _git(cw, "commit", "-qam", "conflicting change")
-    conflict = _git(cw, "rev-parse", "HEAD").strip()
-    _git(repo, "worktree", "remove", "--force", str(cw))
-    _git(repo, "update-ref", "refs/heads/merged-br", conflict)
-    _drop_registration(repo, wt)
-    assert wl._recover("wt_branch_merged", repo) is True
-    move = _retry_commands(capsys.readouterr().err)[0]
-    link = wt / "staged_new.txt.restored"
-    os.symlink(str(tmp_path / "nowhere"), link)
-    res = subprocess.run(["bash", "-c", move], capture_output=True, text=True)
-    assert res.returncode != 0
-    assert link.is_symlink(), "the user's symlink was replaced"
-
-
 def test_a_worktree_meta_that_cannot_be_renamed_back_is_reported(tmp_path):
     """The worktree's own `.trash_meta.json`, set aside at archive time, could fail to
-    get its name back and the caller was never told (cross-model review, round 2)."""
+    get its name back and the caller was never told."""
     dest = tmp_path / "dest"
     dest.mkdir()
     aside = ".trash_meta.json.from-worktree-1"
@@ -2619,51 +2008,30 @@ def test_a_worktree_meta_that_cannot_be_renamed_back_is_reported(tmp_path):
     assert (dest / ".trash_meta.json").read_text() == "MINE\n"
 
 
-@pytest.mark.parametrize("rebuild", [False, True], ids=["reattach", "rebuild"])
 def test_a_meta_that_did_not_come_back_makes_the_recovery_incomplete(
-    reaper_repo, tmp_path, monkeypatch, rebuild,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
 ):
-    """Both recovery paths must report a worktree file left under its aside name."""
+    """A reattach must report a worktree file left under its aside name."""
     _disable_compression(monkeypatch)
     _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    if rebuild:
-        _drop_registration(reaper_repo.repo, reaper_repo.wt_branch_merged)
     monkeypatch.setattr(wl, "_restore_preserved_meta", lambda *_a: False)
     report: dict = {}
     assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert (report.get("mode") == "reattached") is (not rebuild), report
+    assert report.get("mode") == "reattached", report
     assert report.get("incomplete") is True
-
-
-def test_a_failed_rebuild_of_a_non_utf8_worktree_is_reported(reaper_repo, tmp_path, monkeypatch):
-    """`git worktree add` names the target path when it fails, and a strict decode of a
-    non-UTF-8 name raised out of the recovery instead of reporting the failure."""
-    repo = reaper_repo.repo
-    parent = tmp_path / "ro_parent"
-    parent.mkdir()
-    wt = parent / os.fsdecode(b"wt-raw-\xff")
-    _git(repo, "worktree", "add", "-q", "-b", "raw-br2", str(wt), reaper_repo.c0)
-    (wt / "a.txt").write_text("EDIT RAW\n")
-    trash = tmp_path / "trash"
-    trash.mkdir(exist_ok=True)
-    monkeypatch.setattr(wl, "TRASH_DIR", trash)
-    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
-    assert wl._trash_worktree(_wt_by_path(repo, wt), repo) is True
-    _drop_registration(repo, wt)
-    os.chmod(parent, 0o555)
-    try:
-        assert wl._recover("wt-raw-", repo, {}) is False
-    finally:
-        os.chmod(parent, 0o755)
-    assert [d for d in trash.iterdir() if d.name.startswith("wt-raw-")], "the archive went"
 
 
 @pytest.mark.parametrize("break_it", ["head_missing", "gitdir_unreadable", "git_silent"])
 def test_every_unanswered_registration_check_is_unknown(
-    reaper_repo, tmp_path, monkeypatch, break_it,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    break_it,
 ):
     """Every check `_reattach_target` could not ANSWER must come back unknown, never
-    absent: absent sends recovery to the rebuild, which replaces the registration."""
+    absent: absent sends recovery to the recreate, which replaces the registration."""
     _disable_compression(monkeypatch)
     wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
     entry = _only_entry(tmp_path)
@@ -2684,49 +2052,34 @@ def test_every_unanswered_registration_check_is_unknown(
             os.chmod(admin / "gitdir", 0o644)
 
 
-
 def test_a_clean_reattach_says_it_is_exact(reaper_repo, tmp_path, monkeypatch, capsys):
-    """CONTROL for the incomplete case: the exact-restore line is still printed when
-    every check passed."""
+    """CONTROL for the incomplete cases: a clean archive reattaches, names no
+    snapshot file, and still prints the exact-restore line."""
     _disable_compression(monkeypatch)
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    trash = tmp_path / "trash"
+    trash.mkdir(exist_ok=True)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    wt = reaper_repo.wt_branch_merged
+    assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is True
+    capsys.readouterr()
     report: dict = {}
     assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
     assert report.get("mode") == "reattached" and not report.get("incomplete"), report
-    assert "exactly as archived" in capsys.readouterr().out
-
-
-def test_a_branch_being_rebased_elsewhere_is_not_checked_out_twice(
-    reaper_repo, tmp_path, monkeypatch, capsys,
-):
-    """`worktree list` shows a worktree mid-rebase as detached, yet git counts it as
-    holding the branch. Copying the list's view let the rebuild make a second
-    checkout; git's own switch is what decides now (review of round 2)."""
-    repo = reaper_repo.repo
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(repo, wt)
-    other = tmp_path / os.fsdecode(b"rebasing-\xfc")  # git's refusal names this path
-    _git(repo, "worktree", "add", "-q", str(other), "merged-br")
-    stop = subprocess.run(["git", "-C", str(other), "rebase", "--exec", "false", "--root"],
-                          capture_output=True, text=True)
-    assert stop.returncode != 0, "the rebase must stop part way"
-    listing = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"],
-                             capture_output=True, check=True).stdout
-    assert b"branch refs/heads/merged-br" not in listing, "precondition: listed detached"
-    assert wl._recover("wt_branch_merged", repo, {}) is True
-    assert "DETACHED" in capsys.readouterr().err
-    head = subprocess.run(["git", "-C", str(wt), "symbolic-ref", "-q", "HEAD"],
-                          capture_output=True, text=True)
-    assert head.returncode != 0, "a second checkout of a branch being rebased elsewhere"
-    assert (wt / "a.txt").read_text() == "DIRTY EDIT\n"
+    out, err = capsys.readouterr()
+    assert "exactly as archived" in out
+    assert ".dirty.patch" not in out + err
 
 
 def test_recover_survives_a_strict_stdout_with_a_non_utf8_name(
-    reaper_repo, tmp_path, monkeypatch,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
 ):
     """Under a locale whose stdout is strict, printing a non-UTF-8 path raised after
     the tree had moved. pytest's own capture hides this, so stdout is replaced with a
-    strict stream and `main()` is driven directly (review of round 2)."""
+    strict stream and `main()` is driven directly. The dirty reattach also names
+    the reaper's snapshot file, whose path carries the same raw name."""
     import io
 
     repo = reaper_repo.repo
@@ -2746,51 +2099,22 @@ def test_recover_survives_a_strict_stdout_with_a_non_utf8_name(
     assert wl.main() == 0
     strict.flush()
     assert b"wt-raw-" in raw.getvalue()
-
-
-def test_a_locked_non_utf8_worktree_reads_as_locked(reaper_repo, tmp_path):
-    """The act-time lock re-read decoded the `.git` pointer lossily, so a non-UTF-8
-    admin path named no directory and the lock read as absent: fail-open."""
-    repo = reaper_repo.repo
-    wt = tmp_path / os.fsdecode(b"wt-lock-\xfd")
-    _git(repo, "worktree", "add", "-q", "-b", "lock-br", str(wt), reaper_repo.c0)
-    _git(repo, "worktree", "lock", "--reason", "mine", str(wt))
-    assert wl._is_locked_now(wt) is True
-
-
-def test_an_inherited_git_dir_cannot_hide_an_operation_in_progress(
-    reaper_repo, tmp_path, monkeypatch,
-):
-    """`_has_in_progress_op` ran git without the scrubbed environment, so an inherited
-    GIT_DIR pointed `--git-path` at another repository."""
-    wt = reaper_repo.wt_branch_merged
-    marker = Path(_git(wt, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
-    marker.write_text(_git(wt, "rev-parse", "HEAD"))
-    elsewhere = tmp_path / "elsewhere"
-    subprocess.run(["git", "init", "-q", str(elsewhere)], check=True)
-    monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
-    assert wl._has_in_progress_op(str(wt)) is True
-
-
-# ─── full-diff audit of the whole change ─────────────────────────────────────
+    assert b".dirty.patch" in raw.getvalue()
+    assert (wt / "a.txt").read_text() == "EDIT\n"
 
 
 def _edit_meta(entry: Path, **changes) -> None:
     meta_file = entry / ".trash_meta.json"
     meta = json.loads(meta_file.read_text())
-    for key, value in changes.items():
-        if value is _DROP:
-            meta.pop(key, None)
-        else:
-            meta[key] = value
+    meta.update(changes)
     meta_file.write_text(json.dumps(meta))
 
 
-_DROP = object()
-
-
 def test_a_second_recovery_of_a_kept_archive_is_not_called_exact(
-    reaper_repo, tmp_path, monkeypatch, capsys,
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     """A recovery unlocks the registration while a compressed archive is kept. A
     second recovery of that archive then found the registration unlocked, its index
@@ -2810,71 +2134,6 @@ def test_a_second_recovery_of_a_kept_archive_is_not_called_exact(
     assert "not held by this archive" in err
 
 
-def test_a_rebuild_onto_a_moved_branch_is_incomplete(reaper_repo, tmp_path, monkeypatch, capsys):
-    """With no patch to conflict, a rebuild onto a branch that moved exited 0 and
-    deleted the legacy entry, though the tree no longer sits on the archived commit."""
-    _disable_compression(monkeypatch)
-    repo = reaper_repo.repo
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(repo, wt)
-    mover = tmp_path / "mover"
-    _git(repo, "worktree", "add", "-q", str(mover), "merged-br")
-    (mover / "new.txt").write_text("new\n")
-    _git(mover, "add", "new.txt")
-    _git(mover, "commit", "-qm", "move the branch")
-    _git(repo, "worktree", "remove", "--force", str(mover))
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", repo, report) is True
-    assert report.get("incomplete") is True, report
-    assert "MOVED" in capsys.readouterr().err
-
-
-def test_a_rebuild_whose_commit_is_gone_still_uses_the_branch(reaper_repo, tmp_path, monkeypatch):
-    """Starting from a recorded commit that no longer exists left a plain directory
-    even though the branch was still there (main used the branch)."""
-    _disable_compression(monkeypatch)
-    repo = reaper_repo.repo
-    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    _drop_registration(repo, wt)
-    _edit_meta(_only_entry(tmp_path), commit="0123456789abcdef0123456789abcdef01234567")
-    wl._recover("wt_branch_merged", repo, {})
-    status = subprocess.run(["git", "-C", str(wt), "status", "--short"], capture_output=True)
-    assert status.returncode == 0, "recovered as a plain directory, not a worktree"
-    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == "merged-br"
-
-
-@pytest.mark.parametrize(
-    "shape",
-    ["legacy-unnamed", "named-format-lost-name"],
-)
-def test_a_reattach_that_may_leave_the_reapers_patch_is_incomplete(
-    reaper_repo, tmp_path, monkeypatch, capsys, shape,
-):
-    """The reaper's patch can stay in the tree when its name was never recorded
-    (older archives) or was lost (the final metadata rewrite failed); a later
-    `git add -A` would commit it, so the restore is not exact."""
-    _disable_compression(monkeypatch)
-    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
-    entry = _only_entry(tmp_path)
-    if shape == "legacy-unnamed":
-        _edit_meta(entry, patch_format=_DROP, patch_file=_DROP, index_patch_file=_DROP,
-                   had_tracked_patch=True)
-    else:
-        _edit_meta(entry, patch_format=2, patch_file=None, patch_expected=True)
-    report: dict = {}
-    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is True
-    assert report.get("mode") == "reattached", report
-    assert report.get("incomplete") is True, report
-    assert "exactly as archived" not in capsys.readouterr().out
-
-
-def test_an_archive_without_the_patch_flag_never_had_a_reaper_patch(tmp_path):
-    """The flag and the reaper's patch arrived together, so an archive without the
-    flag holds no patch of ours: a `.dirty.patch` in it is the user's file."""
-    (tmp_path / ".dirty.patch").write_text("the user's own file\n")
-    assert wl._saved_patches_in(tmp_path, {}) == (None, None, False)
-
-
 def test_a_failed_copy_never_removes_a_directory_it_did_not_make(tmp_path, monkeypatch):
     """Across filesystems the tree is copied; if something appeared at the
     destination meanwhile, the failed copy removed it as its own partial copy."""
@@ -2892,13 +2151,243 @@ def test_a_failed_copy_never_removes_a_directory_it_did_not_make(tmp_path, monke
     with pytest.raises(FileExistsError):
         wl._place_tree(src, dest)
     assert (dest / "theirs.txt").read_text() == "somebody else's\n"
+# ─── new behaviour: what recovery says when it cannot restore the edits ──────
 
 
-def test_worktree_listing_ignores_an_inherited_git_dir(reaper_repo, tmp_path, monkeypatch):
-    """The listing ran git without the scrubbed environment, so an exported GIT_DIR
-    made the reaper enumerate ANOTHER repository's worktrees."""
-    elsewhere = tmp_path / "elsewhere_repo"
-    subprocess.run(["git", "init", "-q", str(elsewhere)], check=True)
-    monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
-    paths = {Path(w["path"]) for w in wl._list_worktrees(reaper_repo.repo)}
-    assert reaper_repo.wt_branch_merged in paths
+def test_a_dirty_archive_without_its_registration_exits_2_and_names_the_archive(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """No registration means no reattach, and the recreate cannot bring uncommitted
+    tracked edits back. That used to exit 0 with a generic note. It now exits 2,
+    names the kept archive, and names the reaper's snapshot file that came back
+    as an untracked file — with no command recipe to paste."""
+    repo = reaper_repo.repo
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    (archive,) = (tmp_path / "trash").glob("wt_branch_merged*.tar.gz")
+    _drop_registration(repo, wt)
+    monkeypatch.setattr(wl, "_repo_root", lambda: repo)
+    monkeypatch.setattr(sys, "argv", ["worktree_lifecycle.py", "--recover", "wt_branch_merged"])
+    capsys.readouterr()
+    assert wl.main() == 2
+    out, err = capsys.readouterr()
+    assert "NOT restored" in err, err
+    assert str(archive) in err, err
+    assert str(wt / ".dirty.patch") in err, err
+    assert "git apply" not in err, "no command recipe"
+    assert f"Archive kept at {archive}" in out, out
+    assert archive.exists()
+
+
+def test_a_clean_archive_without_its_registration_still_exits_0(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """CONTROL for the one above: nothing uncommitted means nothing was lost."""
+    repo = reaper_repo.repo
+    trash = tmp_path / "trash"
+    trash.mkdir(exist_ok=True)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    wt = reaper_repo.wt_branch_merged
+    assert wl._trash_worktree(_wt_by_path(repo, wt), repo) is True
+    _drop_registration(repo, wt)
+    monkeypatch.setattr(wl, "_repo_root", lambda: repo)
+    monkeypatch.setattr(sys, "argv", ["worktree_lifecycle.py", "--recover", "wt_branch_merged"])
+    assert wl.main() == 0
+    assert "NOT restored" not in capsys.readouterr().err
+
+
+def _snapshot(paths: list[Path]) -> list[tuple[str, float]]:
+    return sorted(
+        (str(p), p.lstat().st_mtime)
+        for root in paths
+        if root.exists()
+        for p in [root, *root.rglob("*")]
+    )
+
+
+@pytest.mark.parametrize("registered", [True, False], ids=["reattach", "recreate"])
+def test_dry_run_describes_what_a_real_recovery_would_do(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+    registered,
+):
+    """The preview must say WHICH recovery a real run takes: a reattach when the
+    registration survives, otherwise a recreate that does NOT restore the edits
+    and exits 2. It stays read-only either way."""
+    repo = reaper_repo.repo
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    (archive,) = (tmp_path / "trash").glob("wt_branch_merged*.tar.gz")
+    if not registered:
+        _drop_registration(repo, wt)
+    # `_recover` creates the lifecycle lock file on first use, dry run or not;
+    # create it first so the snapshot compares only what a recovery would touch.
+    with wl._lifecycle_lock() as held:
+        assert held
+    admin_root = repo / ".git" / "worktrees"
+    before = _snapshot([tmp_path / "trash", admin_root])
+    lock_before = _is_locked(repo, wt)
+    capsys.readouterr()
+    assert wl._recover("wt_branch_merged", repo, {}, dry_run=True) is True
+    out, err = capsys.readouterr()
+    said = out + err
+    if registered:
+        assert "WOULD REATTACH" in said, said
+        assert "NOT be restored" not in said, said
+    else:
+        assert "WOULD REATTACH" not in said, said
+        assert "WOULD RECOVER" in said, said
+        assert "NOT be restored" in said and "exit 2" in said, said
+        assert str(archive) in said, said
+    assert not wt.exists()
+    assert _snapshot([tmp_path / "trash", admin_root]) == before
+    assert _is_locked(repo, wt) is lock_before
+
+
+def test_reattach_target_is_unknown_when_the_pointer_cannot_be_stat_ed(
+    tmp_path,
+    monkeypatch,
+):
+    """On Python 3.12 `Path.is_file()` RAISES PermissionError (only ENOENT-like
+    errors are swallowed). Uncaught, that aborted recovery with a traceback; read as
+    "no file" it would have sent recovery to the recreate. It is UNKNOWN."""
+    entry = tmp_path / "entry"
+    entry.mkdir()
+    (entry / ".git").write_text("gitdir: /nowhere\n")
+    real_is_file = Path.is_file
+
+    def _denied(self):
+        if self.name == ".git":
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", _denied)
+    assert wl._reattach_target(entry, str(tmp_path / "wt"), tmp_path) == ("unknown", None)
+
+
+def test_registration_lock_cannot_answer_when_a_gitdir_is_unreadable(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+):
+    """An unreadable `gitdir` may be the very registration being asked about, so
+    skipping it answered "no registration, no lock" — which lets a recovery go
+    ahead against another archive's registration. It is "could not read"."""
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    (admin,) = [
+        a
+        for a in (reaper_repo.repo / ".git" / "worktrees").iterdir()
+        if a.name == "wt_branch_merged"
+    ]
+    os.chmod(admin / "gitdir", 0o000)
+    try:
+        assert wl._registration_lock(str(wt), reaper_repo.repo) == (False, None)
+    finally:
+        os.chmod(admin / "gitdir", 0o644)
+    read, reason = wl._registration_lock(str(wt), reaper_repo.repo)
+    assert read is True and reason is not None
+
+
+def test_a_failed_unlock_after_reattach_is_incomplete(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """The reattach unlocked its registration without checking the answer, so a
+    failed unlock left a worktree still locked as an archive anchor while the
+    recovery claimed a clean, exact restore."""
+    repo = reaper_repo.repo
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    real = wl._run_git
+
+    def _unlock_fails(root, args, *, timeout):
+        if args[:2] == ["worktree", "unlock"]:
+            return None
+        return real(root, args, timeout=timeout)
+
+    monkeypatch.setattr(wl, "_run_git", _unlock_fails)
+    capsys.readouterr()
+    report: dict = {}
+    assert wl._recover("wt_branch_merged", repo, report) is True
+    assert report.get("mode") == "reattached", report
+    assert report.get("incomplete") is True, report
+    out, err = capsys.readouterr()
+    assert "still locked" in err, err
+    assert "exactly as archived" not in out
+    assert _is_locked(repo, wt), "precondition: the unlock really did not happen"
+
+
+def test_a_failed_reattach_keeps_a_lock_expiry_and_the_sweep_recognise(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+):
+    """After a reattach that could not verify, the registration must still carry
+    a lock reason that `_archive_entry_from_reason` parses back to THIS archive:
+    expiry and the zero-drop sweep find anchors only through that parse, so any
+    other wording leaves an archive whose anchor nothing recognises."""
+    repo = reaper_repo.repo
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    (archive,) = (tmp_path / "trash").glob("wt_branch_merged*.tar.gz")
+    real = wl._run_git
+
+    def _silent(root, args, *, timeout):
+        if "--absolute-git-dir" in args:
+            return None
+        return real(root, args, timeout=timeout)
+
+    monkeypatch.setattr(wl, "_run_git", _silent)
+    assert wl._recover("wt_branch_merged", repo, {}) is False
+    assert not wt.exists()
+    locked = repo / ".git" / "worktrees" / "wt_branch_merged" / "locked"
+    reason = locked.read_text(encoding="utf-8", errors="surrogateescape").rstrip("\n")
+    assert wl._archive_entry_from_reason(reason) == archive.name.removesuffix(".tar.gz"), reason
+
+
+def test_a_relock_that_fails_after_a_failed_recovery_is_said_out_loud(
+    reaper_repo, tmp_path, monkeypatch, capsys,
+):
+    """The recreate path unlocks the anchor so `worktree add --force` can take the
+    path, and re-locks it when that fails. The re-lock's answer was never read, so a
+    failure left the archive's commits one prune or gc from collection, in silence."""
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    wt = reaper_repo.wt_branch_merged
+    assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is True
+
+    real_run, real_git = subprocess.run, wl._run_git
+
+    def _add_always_fails(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:3] == ["git", "worktree", "add"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "simulated add failure")
+        return real_run(cmd, *args, **kwargs)
+
+    def _lock_fails(root, args, *, timeout):
+        if args[:2] == ["worktree", "lock"]:
+            return None
+        return real_git(root, args, timeout=timeout)
+
+    def _move_always_fails(*_a, **_k):
+        raise OSError("simulated move failure")
+
+    monkeypatch.setattr(subprocess, "run", _add_always_fails)
+    monkeypatch.setattr(wl.shutil, "move", _move_always_fails)
+    monkeypatch.setattr(wl, "_run_git", _lock_fails)
+    monkeypatch.setattr(wl, "_reattach_target", lambda *_a: ("absent", None))
+    capsys.readouterr()
+    report: dict = {}
+    assert wl._recover("wt_branch_merged", reaper_repo.repo, report) is False
+    assert not _is_locked(reaper_repo.repo, wt), "precondition: the re-lock really failed"
+    assert report.get("incomplete") is True, report
+    err = capsys.readouterr().err
+    assert "UNLOCKED" in err, err

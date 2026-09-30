@@ -1390,8 +1390,12 @@ class BlindSpot(NamedTuple):
     the three fields below) is a verdict this module has already made, so a guard obeys
     a single boolean instead of re-deriving one from a string:
 
-    ``bounds_induced`` — a BOUND stopped this parse, as opposed to the pre-existing
-    ``untokenizable`` case. "Blind" is not one thing: every guard's behaviour for an
+    ``bounds_induced`` — the SEGMENTS CANNOT BE TRUSTED, so none are returned: a
+    BOUND stopped this parse, or (:data:`_BLIND_CONTINUATION`) the shell joins lines
+    the parser keeps apart. The name predates the second cause; what consumers act on
+    is the property both share — an empty segment list that means "not read", never
+    "not present". As opposed to the pre-existing ``untokenizable`` case, whose
+    segments are complete. "Blind" is not one thing: every guard's behaviour for an
     untokenizable command was already settled before the bounds existed, so a guard
     restoring what a bound took away must act on ``bounds_induced`` only. Widening to
     all three causes is a new over-block wearing the costume of a regression fix, and
@@ -1528,6 +1532,148 @@ _BLIND_UNCLASSIFIED_OPTION = BlindSpot(
     ),
 )
 
+#: A LINE CONTINUATION: an unescaped backslash immediately before a newline. The
+#: shell DELETES the pair and runs the two lines as one command; the parser splits
+#: there instead. So a verb on the far side of the split lands in a segment of its
+#: own, and a guard searching the segments for its operation finds none — while the
+#: shell runs it. MEASURED on the tree before this cause existed: four guards gave a
+#: continued command a different verdict from the same command on one line.
+#:
+#: REPORTED, NOT MODELLED. The obvious fix is to join the lines as the shell does,
+#: and an earlier attempt did: continuation groups, joined views, and readings for
+#: here-doc bodies and shifted quotes. Three review rounds each found new defects in
+#: that modelling, because a continuation's meaning depends on context the parser
+#: does not track (inside single quotes the shell keeps the pair; inside a `#`
+#: comment it ends the line). Refusing costs a rewrite; modelling cost a new defect
+#: per round.
+#:
+#: ``bounds_induced`` is True because the consequence is the one a bound has: the
+#: segments are not what the shell runs, so none are returned, and every consumer's
+#: bounds branch refuses when its own early exit says the command names its
+#: operation. Most guards reuse a refusal path they already had; the ones that used
+#: to act on a withheld parse's segments (a snapshot, a worktree target, an advisory)
+#: gained a small branch of their own, and the push guard recovers one fact
+#: (:func:`unresolved_verb_programs`).
+#:
+#: DETECTED ANYWHERE, quoted or not, and WITHOUT COUNTING the backslashes. Counting
+#: (an odd run joins, an even run is an escaped backslash and a real newline) is right
+#: only for the command as typed. One layer down — a payload handed to another shell,
+#: backticks, a heredoc fed to a shell — the outer layer halves the run first, so an
+#: even run joins there. Any backslash directly before a newline is therefore
+#: reported. That over-refuses a literal backslash inside single quotes and an even
+#: run at the top level; both are answered by the same one-line hint.
+#:
+#: NOT EVERY LINE BREAK THE SHELL ACTS ON IS A NEWLINE CHARACTER IN THE TEXT, so this
+#: detector does not claim to close the whole class; the remainder is tracked
+#: separately.
+#:
+#: COST, measured over 86,684 recorded commands on one install, both trees run through
+#: the real hooks against the same base: 373 commands (0.43%) are newly refused, each
+#: with this hint, and none moves toward allowing.
+_BLIND_CONTINUATION = BlindSpot(
+    bounds_induced=True,
+    cause=(
+        "continues a line with a trailing backslash, which the shell joins into one "
+        "command and this parser does not"
+    ),
+    hint=(
+        "put the command on one line, or split it into separate commands. If the "
+        "backslash is inside text you are writing (a message, a script body), write "
+        "that text to a file instead"
+    ),
+)
+
+#: Any run of backslashes directly before a newline — see :data:`_BLIND_CONTINUATION`
+#: for why the run is not counted. The lookbehind anchors each attempt at the START
+#: of a run, and that is load-bearing, not style: without it the engine retries from
+#: every backslash inside a long run, which is quadratic. MEASURED, 40,000 backslashes
+#: with no newline: 1.47 s unanchored, under 1 ms anchored — and this runs several
+#: times per call on a hook path, where a hook killed by its timeout does not refuse.
+_CONTINUATION_NL = re.compile(r"(?<!\\)\\+\n")
+
+
+def has_continuation(command: str) -> bool:
+    """Whether ``command`` contains a possible line continuation anywhere (see
+    :data:`_BLIND_CONTINUATION` for why neither quoting nor the run's length is
+    consulted)."""
+    return _CONTINUATION_NL.search(command) is not None
+
+
+def fold_continuations(text: str) -> str:
+    """``text`` with every backslash run before a newline deleted, and the newline.
+
+    A DECISION VIEW, never a verdict's parse input. It feeds :func:`mention_views`,
+    which only decides whether a command MENTIONS an operation, and
+    :func:`unresolved_verb_programs`, which can only ADD a refusal. Deleting the
+    whole run rather than the shell's exact reduction is deliberate: every reader of
+    this view also strips backslashes, so the difference cannot change a mention.
+    """
+    return _CONTINUATION_NL.sub("", text)
+
+
+def mention_views(command: str) -> tuple[str, ...]:
+    """The readings of ``command`` a guard's MENTION test must search.
+
+    A test for a verb in the raw text cannot see a verb the SHELL assembles from
+    pieces — quote removal, backslash removal, and line joining all run before the
+    word exists. When an early exit read the raw text, a command whose verb was
+    assembled that way never reached the parse, although the parse resolves it.
+
+    Returns the raw command, then the form with continuations folded, then that form
+    with quotes and backslashes removed (duplicates dropped). WIDEN-ONLY: the raw text
+    is always the first reading, so any pattern that matched before still matches.
+    For a MENTION test or token extraction, and nothing else; never parse it. Test a
+    mention with :func:`mentions`, which searches each reading separately.
+    """
+    folded = fold_continuations(command)
+    stripped = folded.replace('"', "").replace("'", "").replace("\\", "")
+    return tuple(dict.fromkeys((command, folded, stripped)))
+
+
+def mentions(command: str, *patterns: re.Pattern[str] | str) -> bool:
+    """Whether ONE reading of ``command`` matches every pattern (see :func:`mention_views`).
+
+    A ``str`` pattern is a substring test; a compiled pattern is searched.
+
+    Each reading is searched on its own, and every pattern must match in the same
+    one. The readings are alternatives, not consecutive text: a pattern spanning two
+    of them, or two patterns satisfied by different ones, describe text the shell
+    never assembles. MEASURED in review: a two-word pattern run over the readings
+    joined into one string matched the last word of one reading and the first word of
+    the next, and refused a command that removes nothing.
+    """
+    return any(
+        all((p in view) if isinstance(p, str) else bool(p.search(view)) for p in patterns)
+        for view in mention_views(command)
+    )
+
+
+def unresolved_verb_programs(command: str) -> frozenset[str]:
+    """The programs whose operation is named by an expansion, in EITHER reading.
+
+    For a consumer whose segments :func:`analyze_checked` withheld. A bounds-type
+    blind spot returns no segments, and with them the one per-segment fact the push
+    guard refuses on by itself: a dispatcher (``git``, ``gh``) whose verb the shell
+    builds, so the guard cannot tell which operation runs. Withholding it turned a
+    refusal into an allow — see :func:`analyze_checked`.
+
+    The ONE per-segment fact recovered from a withheld parse, deliberately. It can
+    only ADD a refusal. Recovering the others (snapshot targets, rewind warnings,
+    advisory targets) meant re-modelling the join, and review found a new defect in
+    that modelling each round; those consumers refuse or give a short note instead.
+    Reads the command as written and with continuations folded, and returns the
+    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a bound
+    contributes nothing, and the caller's own bounds branch has already refused.
+    """
+    programs: set[str] = set()
+    for text in dict.fromkeys((command, fold_continuations(command))):
+        segments, reason = _analyze_bounded(text)
+        if reason:
+            continue
+        programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
+    return frozenset(programs)
+
+
 #: THE OTHER HALF OF VERB POSITION IS DELIBERATELY NOT REPORTED, and the reason is
 #: measurement rather than oversight. When the PROGRAM ITSELF is built by the shell
 #: (``$PY x.py``, ``$SSH host …``), nothing about the segment is established — not
@@ -1575,6 +1721,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_OVER_LONG,
     _BLIND_UNRESOLVED_VERB,
     _BLIND_UNCLASSIFIED_OPTION,
+    _BLIND_CONTINUATION,
 )
 
 
@@ -1656,6 +1803,24 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
     2 of 45,956 real commands a reclassification and no change of verdict.
 
+    :data:`_BLIND_CONTINUATION` comes directly after the two bounds, and BEFORE
+    :func:`untokenizable`, for the same reason the bounds do: it is bounds-type, and
+    the discard guard acts on ``bounds_induced`` only, so a continued command that
+    was ALSO untokenizable would otherwise be handed the cause that guard ignores.
+    The bounds keep precedence because both are bounds-type — the verdict is the same —
+    and the bound's remedy is the one that must be acted on first.
+
+    WITHHOLDING SEGMENTS ALSO WITHHOLDS THE FACTS ON THEM, which is how an earlier
+    revision of this docstring came to claim the placement "never removes" a refusal
+    and was wrong. The push guard refused `git $V …` from the unresolved-verb flag on
+    the SEGMENT; a continuation elsewhere in the same command returned no segments,
+    and the refusal went with them. A consumer that acts on a per-segment fact must
+    therefore either recover it or refuse when the segments are withheld.
+    :func:`unresolved_verb_programs` recovers the push guard's, which can only add a
+    refusal. The others refuse on the blind spot itself or give a short text note:
+    recovering them meant re-modelling the join, which is what this blind spot exists
+    not to do, and review found a new defect in that modelling each round.
+
     :data:`_BLIND_UNRESOLVED_VERB` is reported LAST, which means it is reported only
     where this function previously returned None. That is a property worth stating
     rather than a rank: every command that already had a blind spot keeps the exact
@@ -1669,6 +1834,8 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_OVER_LONG
     if reason == "depth":
         return [], _BLIND_OVER_NESTED
+    if has_continuation(command):
+        return [], _BLIND_CONTINUATION
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
     hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
@@ -1796,7 +1963,121 @@ def _run_carrier_command_start(argv: list[str], i: int) -> tuple[int, bool] | No
     return None  # `uv run --flag` with no command after it
 
 
-def _strip_wrappers(argv: list[str]) -> list[str]:
+def _net_subshell_depth(src: str) -> int:
+    """Parens this segment's SOURCE opens minus those it closes, outside quotes.
+
+    Counted on the source text rather than on shlex tokens because tokens have
+    already lost their quotes: in ``(echo "a)"; git push)`` the quoted ``a)``
+    token looks exactly like a closer, cancels the opener, and the push is hidden
+    again — MEASURED on the first, token-based version. Here a paren inside single
+    quotes, double quotes, after a backslash, or inside a ``${...}`` expansion
+    (``${v:-)}``, ``${v//[(]/}``) is text, not an operator. A ``$(...)``
+    substitution opens and closes within itself, so it nets to zero.
+
+    This count only decides how many subshells are CARRIED into later segments.
+    It is not trusted to decide how many ``)`` a segment peels; see
+    _strip_wrappers.
+    """
+    depth = 0
+    brace = 0  # nesting of ${...}; only `${` nests, as in bash
+    in_single = in_double = False
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if in_single:
+            if c == "'":
+                in_single = False
+        elif c == "\\":
+            i += 1  # the next character is literal, in or out of double quotes
+        elif in_double:
+            if c == '"':
+                in_double = False
+        elif c == "'":
+            in_single = True
+        elif c == '"':
+            in_double = True
+        elif c == "$" and i + 1 < n and src[i + 1] == "{":
+            brace += 1
+            i += 1
+        elif brace:
+            if c == "}":
+                brace -= 1
+        elif c == "#" and (i == 0 or src[i - 1] in " \t\n;&|("):
+            # a comment runs to end of line; parens in it are text
+            nl = src.find("\n", i)
+            if nl < 0:
+                break
+            i = nl
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def _wrapper_takes_assignment(wrapper: str, word: str, options_done: bool) -> bool:
+    """Whether ``wrapper`` consumes ``word`` as an environment assignment.
+
+    Only ``env`` and ``sudo`` take assignments; every other wrapper here executes
+    a word containing ``=`` as its program (MEASURED in bash).
+
+    MEASURED against GNU env 9.4 and sudo 1.9.15 with a stub per candidate
+    program, reading which one ran:
+
+    * ``env`` takes every word containing ``=`` — ``=x``, ``A.B=1``, even a path
+      such as ``/opt/k=v/git`` — and ``--`` does not end that: ``env -- A=1 cmd``
+      runs cmd.
+    * ``sudo`` takes a word containing ``=`` unless it starts with ``=`` or ``/``:
+      ``sudo /opt/k=v/git push`` RUNS that path and ``sudo =x cmd`` runs ``=x``.
+      After ``--`` it takes none: ``sudo -- A=1 cmd`` runs ``A=1``.
+    """
+    if "=" not in word:
+        return False
+    if wrapper == "env":
+        return True
+    if wrapper == "sudo":
+        # sudo tests the word it RECEIVES, after bash expanded it, and this word
+        # is the one BEFORE expansion: `sudo ~/k=v/git` and `sudo $HOME/k=v/git`
+        # reach sudo as absolute paths and run them, while `sudo $X=1 cmd` with
+        # X=A reaches it as `A=1` and runs cmd (MEASURED). Which one an expansion
+        # produces is not knowable here, so the shape decides: a leading `~`, or
+        # an expansion in front of a `/`, is read as the path it almost always
+        # is; an expansion with no `/` before the `=` as the assignment.
+        if options_done or word[0] in "=/~":
+            return False
+        name = word.split("=", 1)[0]
+        if "$" in name or "`" in name:
+            return "/" not in name
+        return True
+    return False
+
+
+_SUBSCRIPT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\[[^\]]*\]$")
+
+
+def _is_prefix_assignment(tok: str) -> bool:
+    """Whether a command-position word is a bash prefix assignment.
+
+    ``NAME=value`` and ``NAME+=value``. The ``+=`` form was missing, so
+    ``FOO+=1 git push`` resolved its command to ``FOO+=1`` and every guard saw
+    no push at all — MEASURED, no decision from the push guard, including for a
+    push onto the default branch. bash runs the command with the variable set.
+    An ARRAY SUBSCRIPT (``a[0]=1 cmd``) is accepted too. bash prints "not a
+    valid identifier" for it and then RUNS the command anyway — MEASURED, bash
+    5.2. An earlier revision said the opposite: its probe piped the output through
+    ``head -1``, which kept the error line and discarded the proof that the
+    command ran.
+    """
+    if "=" not in tok:
+        return False
+    name = tok.split("=", 1)[0]
+    if name.endswith("+"):
+        name = name[:-1]
+    return name.isidentifier() or bool(_SUBSCRIPT_NAME.match(name))
+
+
+def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
     command, and peel the matching subshell-close `)` off the revealed argv.
@@ -1843,6 +2124,13 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
     i = 0
     open_parens = 0
     via_uv_tool = False  # reached the command through `uvx` / `uv tool run`
+    # Once a wrapper has been consumed, bash is no longer parsing the words
+    # that follow: `nohup A=b/git push` runs the program `A=b/git`, it does not
+    # assign A. So the PREFIX-assignment rule applies only before the first
+    # wrapper (MEASURED: applying it after `nohup` resolved that command to
+    # `push` and hid it). Assignment-taking wrappers (env, sudo) skip their own
+    # `=`-words inside the wrapper loop below.
+    after_wrapper = False
     opaque = False  # a uv tool-runner met an option of unknown arity
     while i < len(argv):
         tok = argv[i]
@@ -1856,8 +2144,13 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         if tok in _CMD_POSITION_WORDS:
             i += 1  # reserved word / brace-group opener at command position
             continue
-        if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
-            i += 1  # leading VAR=value assignment
+        if (
+            not after_wrapper
+            and "=" in tok
+            and not tok.startswith("-")
+            and _is_prefix_assignment(tok)
+        ):
+            i += 1  # leading VAR=value / VAR+=value assignment
             continue
         if _basename(tok) in _RUN_CARRIERS:
             found = _run_carrier_command_start(argv, i)
@@ -1869,6 +2162,16 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         spec = _WRAPPER_SPEC.get(_basename(tok))
         if spec is None:
             break
+        # A bare `time` at command position is the bash KEYWORD, not a program:
+        # bash keeps parsing a simple command after it, so `time A=1 git push`
+        # (and `time -p …`, `time -- …`, `time time …`) assigns A and runs git —
+        # MEASURED, bash 5.2. Only a `time` reached THROUGH a wrapper (`env time`,
+        # `nohup time`) is the external program, which executes a `=`-word.
+        # A `time` after a prefix assignment is also external in bash; resolving
+        # it as the keyword there over-gates (reveals a command that does not
+        # run), never hides one.
+        if not (tok == "time" and not after_wrapper):
+            after_wrapper = True
         if _basename(tok) == "uvx":
             via_uv_tool = True
         # `uvx` is the one wrapper whose CALLER can recover an unresolved
@@ -1879,14 +2182,21 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
         recoverable = _basename(tok) == "uvx"
         wrapper_at = i
         argflags, positional = spec
+        wrapper_name = _basename(tok)
         i += 1
+        # `--` ends OPTION parsing only. It does not end the wrapper's positional
+        # or assignment operands: `timeout -- 5 git push` still takes `5` as the
+        # duration and `env -- A=1 git push` still assigns A — MEASURED, both run
+        # git. Breaking out at `--` resolved those to `5` and `A=1`, hiding git.
+        options_done = False
         # consume the wrapper's own value-flags and leading positional args
         while i < len(argv):
             t = argv[i]
-            if t == "--":
+            if t == "--" and not options_done:
+                options_done = True
                 i += 1
-                break
-            if t.startswith("-"):
+                continue
+            if t.startswith("-") and not options_done:
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
                 elif recoverable and "=" not in t:
@@ -1905,7 +2215,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
                 else:
                     i += 1
                 continue
-            if "=" in t and t.split("=", 1)[0].isidentifier():
+            if _wrapper_takes_assignment(wrapper_name, t, options_done):
+                # `env` takes ANY word containing `=` as an assignment and runs
+                # what follows, before or after `--` — MEASURED, `env A.B=1 cmd`,
+                # `env 1X=1 cmd`, `env =x cmd` and `env -- A=1 cmd` all run cmd,
+                # so an identifier test left `env A.B=1 git push` hidden from
+                # every guard. `sudo` is narrower; see _wrapper_takes_assignment.
+                #
+                # ONLY for those wrappers. An earlier revision applied the rule to
+                # every wrapper, claiming the worst case was an over-gate. That was
+                # wrong, MEASURED in bash: `nohup`, `timeout`, `nice`, `command`,
+                # `time`, `stdbuf`, `setsid`, `chrt`, `ionice`, `exec` and `xargs`
+                # EXECUTE a word containing `=` — `nohup ./a=b/git push` runs git —
+                # so skipping it landed the resolver on `push` and HID the command.
                 i += 1
                 continue
             if positional > 0:
@@ -1917,6 +2239,19 @@ def _strip_wrappers(argv: list[str]) -> list[str]:
             i = wrapper_at  # leave the segment ON the carrier — see above
             break
     result = list(argv[i:])  # redirections are NOT stripped here (see docstring)
+    # Subshells left open by EARLIER segments close here too. `(export A=1; git
+    # push)` splits at `;` into `(export A=1` and `git push)`: this segment opened
+    # nothing, so without the carry its `)` stayed glued, the subcommand read as
+    # `push)`, and no guard saw a push. MEASURED: no decision.
+    #
+    # The peel is by TOKEN, so a QUOTED trailing `)` inside a still-open subshell
+    # is peeled too: `(echo x; git push origin 'HEAD:main)'; echo done)` pushes
+    # to `main)` and reads as `HEAD:main`. That misreads an argument in the
+    # over-gate direction, and it is kept on purpose. Letting the source text
+    # decide which `)` are quoted was tried and REMOVED: every way that reading
+    # goes wrong (`$'\''`, `${v:-{}`, nested quotes inside `"$(…)"`) left a real
+    # closer glued to the verb and hid the push — MEASURED in real bash.
+    open_parens += carried_open
     if open_parens and result:
         # Peel matching trailing `)` closers off the operand(s) carrying the
         # subshell close — up to the number of `(` openers consumed, scanning from
@@ -2803,12 +3138,19 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         return [], "length"
     out: list[Segment] = []
     truncated = False
+    # Subshells opened and not yet closed by earlier segments of this command. A
+    # `(` opener counts; a `)` closer (bare or glued) at the end of a segment
+    # closes. Counted on the segment SOURCE text outside quotes and comments, so a
+    # paren inside a quoted argument is never mistaken for a subshell.
+    carried_open = 0
     for seg in parse_segments(command):
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
-        argv = _strip_wrappers(_argv(seg.argv_src))
+        tokens = _argv(seg.argv_src)
+        argv = _strip_wrappers(tokens, carried_open)
+        carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
             Segment(

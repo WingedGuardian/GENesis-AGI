@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis import env
+from genesis.session_awareness.zero_drop_git import scrubbed_git_env
 
 from ..memory import mcp
 
@@ -39,8 +40,8 @@ _CODE_EXTS = frozenset({
 })
 
 # Directory names whose entire subtree is skipped (build/dep/churn/binary noise).
-# "worktrees" prunes ~/genesis/.claude/worktrees/* under the `repo` scope — those
-# are reachable via the `worktrees` scope (git-discovered) instead.
+# "worktrees" prunes standard worktree subdirectories; linked worktrees anywhere are
+# also dynamically pruned via git worktree list --porcelain in `_walk`.
 _PRUNE_DIRS = frozenset({
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
     ".ruff_cache", ".mypy_cache", ".cache", "dist", "build", ".next", ".turbo",
@@ -119,7 +120,8 @@ def _list_worktrees(repo_root: Path) -> list[Path]:
     try:
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, cwd=str(repo_root), timeout=10,
+            env=scrubbed_git_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return []
@@ -127,12 +129,13 @@ def _list_worktrees(repo_root: Path) -> list[Path]:
         return []
     paths: list[Path] = []
     is_first = True
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
+    for line_bytes in result.stdout.splitlines():
+        if line_bytes.startswith(b"worktree "):
+            path_bytes = line_bytes[len(b"worktree "):]
             if is_first:
                 is_first = False  # first entry is the main worktree — skip
             else:
-                paths.append(Path(line[len("worktree "):]))
+                paths.append(Path(os.fsdecode(path_bytes)))
     return paths
 
 
@@ -171,6 +174,7 @@ def _walk(
     file_type: str,
     name_glob: str,
     scan_budget: list[int],
+    prune_worktrees: set[Path] | None = None,
 ) -> list[dict]:
     """Return file records under ``root`` passing recency/type/glob filters.
 
@@ -193,8 +197,11 @@ def _walk(
                 return records
             try:
                 if e.is_dir(follow_symlinks=False):
+                    e_path = Path(e.path)
+                    if prune_worktrees and e_path.resolve() in prune_worktrees:
+                        continue
                     if e.name not in _PRUNE_DIRS:
-                        stack.append(Path(e.path))
+                        stack.append(e_path)
                     continue
                 if not e.is_file(follow_symlinks=False):
                     continue  # symlinks, sockets, fifos — skip
@@ -418,12 +425,25 @@ async def _impl_locate(
     skipped_roots: list[str] = []
     scan_budget = [0]
     records: list[dict] = []
+
+    # Dynamically obtain linked worktrees to prune them when scanning repo scope.
+    # When git is unavailable or fails, _list_worktrees returns [] (fail-open):
+    # repo scope scanning falls back to standard directory pruning without excluding linked worktrees,
+    # ensuring the locate MCP tool remains functional even without git.
+    if scope == "all":
+        prune_wts = {path.resolve() for label, path in roots if label.startswith("worktree:")}
+    elif scope == "repo":
+        prune_wts = {p.resolve() for p in _list_worktrees(env.repo_root())}
+    else:
+        prune_wts = set()
+
     for label, path in roots:
         if not path.is_dir():
             skipped_roots.append(_display(path))
             continue
         walked_roots.append(_display(path))
-        records.extend(_walk(label, path, cutoff, file_type, name, scan_budget))
+        prune_arg = prune_wts if label == "repo" else None
+        records.extend(_walk(label, path, cutoff, file_type, name, scan_budget, prune_worktrees=prune_arg))
 
     scan_truncated = scan_budget[0] >= _MAX_FILES_SCANNED
 

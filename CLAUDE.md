@@ -20,6 +20,7 @@ Use `codebase_navigate` MCP to explore.
   by `scripts/setup-local-config.sh`). Dashboard proxied host:5000 → container:5000.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: configured in `~/.genesis/config/genesis.yaml` (`github.user` / `github.public_repo`)
+- **Config sources**: where a setting is read from and what wins (secrets.env, genesis.yaml, `config/` overlays, env) → `docs/architecture/CONFIG_SOURCES.md`
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)
 - **Backups**: encrypted, every 6h via `genesis-backup.timer` (systemd user
   unit; enable deliberately after configuring) running `scripts/backup.sh` → your private
@@ -29,10 +30,13 @@ Use `codebase_navigate` MCP to explore.
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 - **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
 - **Temp files**: `~/tmp/` for transient files and any LARGE temp (downloads,
-  media, DB dumps, exports). NEVER write large files to `/tmp/` (a small
+  media, DB dumps, exports). NEVER write large files to `/tmp/` (often a small
   tmpfs/RAM) or `~/.genesis/cc-tmp/` — the latter is Claude Code's working temp
-  ("oxygen"), policed by the `genesis-tmp-watchgod` service, which **kills CC
-  sessions** when it fills. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  ("oxygen"), usually a quota-capped volume: filling it breaks EVERY session's temp at
+  once. The `genesis-tmp-watchgod` service guards whole disks and sweeps cc-tmp
+  of what ended sessions left behind (untouched 7 days, nothing holding it); it
+  never kills a session and never deletes live work — so nothing will clean up
+  a big file you park there in time. A CC session's `TMPDIR` points at `cc-tmp` by design;
   do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
@@ -46,7 +50,11 @@ NEVER use `nohup` or bare `python -m genesis serve` — a bare process holds
 the lock file and blocks the systemd unit.
 
 ```bash
-systemctl --user restart genesis-server          # Restart (NEVER nohup)
+scripts/deploy_code_only.sh                      # Deploy code: locked pull + restart (launch detached: see its header)
+scripts/deploy_code_only.sh pull                 # Locked pull, no restart; names what the server has not loaded
+scripts/deploy_code_only.sh restart              # Locked restart of the tree as it stands (launch detached)
+scripts/deploy_code_only.sh status               # What the server runs + a validation token (--verify <token> judges it)
+systemctl --user restart genesis-server          # Bare restart: bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server           # Check
 journalctl --user -u genesis-server -n 50        # Logs
 systemctl --user list-units 'genesis-*' --all    # All units
@@ -56,7 +64,8 @@ Other units: `genesis-bridge.service` (LEGACY fallback — full stack incl.
 Telegram, only when genesis-server is DOWN; it yields/exits 200 if the server
 lock is held, and must never run alongside the server — dual getUpdates
 pollers split updates and break approval buttons),
-`genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
+`genesis-tmp-watchgod.service` (whole-disk guardian + cc-tmp retention;
+`scripts/watchgod status`), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
@@ -91,7 +100,8 @@ pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS speci
 python3 scripts/pytest_lock_wait.py                # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
-systemctl --user restart genesis-server           # Restart server (NEVER nohup)
+scripts/deploy_code_only.sh                       # Deploy main: locked pull + restart (launch detached)
+systemctl --user restart genesis-server           # Bare restart, bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server            # Verify server running
 ```
 
@@ -224,7 +234,8 @@ Applies to every assertion — in conversation, and doubly in anything written t
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
   claim wears verified grammar and WILL be read as MEASURED/READ.
 - **Permanent-record discipline.** Never write an INFERRED claim into permanent record
-  (memory stores, follow-ups, specs, ledgers, evaluations, comments) in the grammar of a
+  (the surfaces are enumerated in the `genesis-development` skill,
+  `references/high-stakes-verification.md` §11) in the grammar of a
   fact — permanent record has no tone of voice; the next session builds on confident
   sentences. Status claims written to disk carry provenance + date ("per <artifact>, <date>").
 - **A surprising observation is a question, not an answer.** The pull to explain an anomaly
@@ -762,7 +773,12 @@ behind the writer, and 7 were a guard since removed.
   2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
   days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
-  what was learned. If it's not committed, it doesn't exist.
+  what was learned. If it's not committed, it doesn't exist. **If the session
+  wrote a NUMBER, or a DATED status claim, into permanent record, audit those
+  CLAIMS too** — re-derive them rather than re-reading them; a green suite
+  checks none of them, and a confident sentence in permanent record is read as
+  a measured one. The canonical surface list and the walk live in the
+  genesis-development skill, `references/high-stakes-verification.md` §11.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
   or (3) big enough to derail the session — or the user directs it.

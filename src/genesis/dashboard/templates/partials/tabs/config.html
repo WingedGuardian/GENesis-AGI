@@ -598,6 +598,28 @@
                                 :disabled="$store.genesisDashboard.secretsSaving"
                                 @click="$store.genesisDashboard.saveSecret(k.key)"
                                 x-text="$store.genesisDashboard.secretsSaving ? 'Saving...' : 'Save'"></button>
+                        <!-- Clearing is its OWN gesture, never an empty Save. The
+                             write protocol refuses an empty value (422), so removing
+                             an override has to be asked for explicitly — which is what
+                             makes an untouched field incapable of deleting anything.
+                             Shown for any key that HAS an unset state to fall back to.
+
+                             Deliberately NOT also gated on `k.status !== 'not_set'`:
+                             `_key_status` reports not_set for `KEY=`, `KEY=None` and
+                             `KEY=NA` as well as for a genuinely absent key, and those
+                             ARE assignments — they still sit in secrets.env shadowing
+                             genesis.yaml, which is the one-way door this whole
+                             mechanism exists to prevent. MEASURED: the server accepts
+                             a clear for that state and comments the line out, so a
+                             status-derived gate would hide the only repair path the
+                             dashboard has for it. Clearing an already-unset key is a
+                             harmless no-op. -->
+                        <template x-if="k.is_optional_override">
+                          <button style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid rgba(244,67,54,0.35); color:#F44336; background:transparent; cursor:pointer;"
+                                  :disabled="$store.genesisDashboard.secretsSaving"
+                                  @click="$store.genesisDashboard.clearSecret(k.key)"
+                                  title="Remove this override and fall back to genesis.yaml or the built-in default">Clear</button>
+                        </template>
                       </div>
                     </template>
                   </div>

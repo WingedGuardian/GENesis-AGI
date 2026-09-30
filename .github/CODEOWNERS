@@ -78,6 +78,7 @@
 /scripts/review_scope.py            @WingedGuardian
 /scripts/review_state.py            @WingedGuardian
 /scripts/review_deadline.py         @WingedGuardian
+/scripts/surface_handoffs.py        @WingedGuardian
 /scripts/surface_open_prs.py        @WingedGuardian
 /scripts/surface_pr_updates.py      @WingedGuardian
 /config/external_review.yaml            @WingedGuardian

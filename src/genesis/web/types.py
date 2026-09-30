@@ -28,7 +28,9 @@ class SearchResponse:
 
     query: str
     results: list[SearchResult] = field(default_factory=list)
-    backend_used: SearchBackend = SearchBackend.SEARXNG
+    # Set only by the backend that produced ``results``; None when every
+    # backend failed (a default here used to label total failures "searxng").
+    backend_used: SearchBackend | None = None
     fallback_used: bool = False
     error: str | None = None
 
