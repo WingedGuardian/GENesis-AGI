@@ -649,6 +649,7 @@ _KEEPS_HEAD_BRANCH = frozenset(
         "fetch",
         "for-each-ref",
         "grep",
+        "init",
         "log",
         "ls-files",
         "ls-remote",
@@ -671,11 +672,17 @@ _KEEPS_HEAD_BRANCH = frozenset(
         "tag",
     }
 )
-# Deliberately NOT here although most of their forms keep the branch: `stash`
-# (`git stash branch <name>` switches), `branch` (`git branch -M` renames the
-# current branch), `rebase` (`--abort` returns to the branch it started from).
-# Telling their forms apart would mean reading argv, which is what this set exists
-# to avoid; chained before a merge they are refused, and run separately they pass.
+# `init` creates or re-initializes a repository and never moves this one's HEAD;
+# a merge in a repository it creates is not a merge into this repository's branch.
+# `stash` is decided by one token, in `_moves_head`: only `git stash branch`
+# switches (MEASURED 2026-09-30: 0 of 24 stash segments in 288 historical merge
+# commands were that form, and treating every stash as a mover refused 14 of them).
+# Deliberately NOT here: `worktree` (`git worktree add <dir> live` into an empty
+# directory that already exists inside this checkout makes the branch read at hook
+# time the enclosing one, while the merge lands on `live`), `branch` (`git branch
+# -M` renames the current branch) and `rebase` (`--abort` returns to the branch it
+# started from). Telling their forms apart would mean modelling their argv; chained
+# before a merge they are refused, and run separately they pass.
 
 
 def _moves_head(seg) -> bool:
@@ -703,7 +710,14 @@ def _moves_head(seg) -> bool:
         return True
     if exe != "git":
         return False
-    return git_subcommand(getattr(seg, "argv", None) or []) not in _KEEPS_HEAD_BRANCH
+    argv = getattr(seg, "argv", None) or []
+    sub = git_subcommand(argv)
+    if sub == "stash":
+        # `git stash branch <name>` checks out a new branch; every other stash form
+        # leaves HEAD where it is. Any `branch` token counts, wherever it sits, so a
+        # value that happens to read "branch" refuses rather than slips through.
+        return "branch" in argv
+    return sub not in _KEEPS_HEAD_BRANCH
 
 
 def _mover_label(seg) -> str:

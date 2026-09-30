@@ -673,6 +673,7 @@ class TestBranchSwitchBeforeMerge:
             # Not checkout/switch at all, and each lands HEAD on another branch:
             "git rebase --onto main main live && git merge --ff-only feature",
             "git stash branch tmp && git merge feature",
+            "git stash -q branch tmp && git merge feature",  # the token, wherever it sits
             "git branch -M live && git merge --ff-only feature",
             "git bisect start && git merge feature",
             "gh pr checkout 5 && git merge feature",
@@ -774,6 +775,15 @@ class TestBranchSwitchBeforeMerge:
             "git check-attr -a base.txt && git merge feature",
             "git tag v1 && git cherry-pick abc123 && git merge feature",
             "git show-ref && git for-each-ref && git ls-tree HEAD && git merge feature",
+            # Every stash form but `stash branch` leaves HEAD put; the replay found 24
+            # stash segments chained before merges, none of them `stash branch`:
+            "git stash && git merge origin/main && git stash pop",
+            "git stash push -u -m wip && git merge feature",
+            "git stash list && git merge feature",
+            # `init` never moves an existing repository's HEAD (MEASURED on git 2.43:
+            # a re-init ignores -b / --initial-branch / init.defaultBranch):
+            "git init /tmp/scratch && git merge feature",
+            "git init -b main . && git merge feature",
             "git merge feature",
             "echo git checkout live && git merge feature",  # a mention, not a switch
         ],
