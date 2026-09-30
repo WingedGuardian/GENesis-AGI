@@ -247,7 +247,7 @@ def test_no_script_string_names_a_listed_reviewer():
 
     logins = [r.login for r in rf.REVIEWERS]
     hits = []
-    for path in sorted((_ROOT / "scripts").rglob("*.py")):
+    for path in sorted([*(_ROOT / "scripts").rglob("*.py"), *(_ROOT / "src").rglob("*.py")]):
         rel = path.relative_to(_ROOT).as_posix()
         if rel == "scripts/review_findings.py":
             continue

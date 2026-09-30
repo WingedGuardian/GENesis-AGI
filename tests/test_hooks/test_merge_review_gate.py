@@ -4402,7 +4402,7 @@ class TestReviewBodyVerdictBearing:
     NEL bodies parse (P2), and a seen finding survives an incomplete read (P1b)."""
 
     def test_github_actions_status_after_error_still_blocks(self, guard_module):
-        # github-actions[bot] is IN _REVIEW_BOTS but its CI comment carries no verdict
+        # github-actions[bot] is IN _review_bots() but its CI comment carries no verdict
         # marker; newer than the codex ERROR, it must NOT clear the finding.
         with patch.object(guard_module.subprocess, "run", return_value=_body_out([
             ("chatgpt-codex-connector[bot]", "Bot", _BODY_ERR),

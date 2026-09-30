@@ -834,17 +834,28 @@ def test_push_guard_with_old_tree_missing_review_findings_degrades_the_merge_gat
             "-c",
             "import sys; sys.path.insert(0, 'scripts/hooks'); import git_push_guard as g;"
             " sets, block = g._enforced_logins_or_block();"
+            # The REAL merge-side entry points, not only the helper: both findings
+            # scans and merge freshness must block and name the cause.
+            " scans = [g._check_inline_review_findings('1'), g._check_pr_review_findings('1')];"
+            " fresh = g._check_codex_reviewed_head('1');"
             " print(repr((sets, 'unimportable' in block, g._primary_reviewer_login(),"
-            " g._substitute_review_logins())))",
+            " g._substitute_review_logins(),"
+            " [b and 'unimportable' in m for b, m in scans],"
+            " fresh[0] and 'unimportable' in fresh[1])))",
         ],
         cwd=str(root),
         capture_output=True,
         text=True,
         timeout=60,
-        env={**os.environ, "HOME": str(tmp_path / "home_no_findings")},
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home_no_findings"),
+            "_TEST_GH_HEAD_SHA": "a" * 40,
+            "_TEST_GH_CODEX_REVIEWS": "",
+        },
     )
     assert probe.returncode == 0, probe.stderr
-    assert probe.stdout.strip() == "({}, True, None, ())"
+    assert probe.stdout.strip() == "({}, True, None, (), [True, True], True)"
 
 
 def test_push_guard_with_an_invalid_reviewer_list_degrades_the_merge_gate_only(tmp_path):
@@ -862,17 +873,28 @@ def test_push_guard_with_an_invalid_reviewer_list_degrades_the_merge_gate_only(t
             "-c",
             "import sys; sys.path.insert(0, 'scripts/hooks'); import git_push_guard as g;"
             " sets, block = g._enforced_logins_or_block();"
-            " print(repr((sets, 'exactly one reviewer must be primary' in block,"
-            " g._primary_reviewer_login(), g._substitute_review_logins())))",
+            # The REAL merge-side entry points, not only the helper: both findings
+            # scans and merge freshness must block and name the cause.
+            " scans = [g._check_inline_review_findings('1'), g._check_pr_review_findings('1')];"
+            " fresh = g._check_codex_reviewed_head('1');"
+            " cause = 'exactly one reviewer must be primary';"
+            " print(repr((sets, cause in block,"
+            " g._primary_reviewer_login(), g._substitute_review_logins(),"
+            " [b and cause in m for b, m in scans], fresh[0] and cause in fresh[1])))",
         ],
         cwd=str(root),
         capture_output=True,
         text=True,
         timeout=60,
-        env={**os.environ, "HOME": str(tmp_path / "home_bad_list")},
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home_bad_list"),
+            "_TEST_GH_HEAD_SHA": "a" * 40,
+            "_TEST_GH_CODEX_REVIEWS": "",
+        },
     )
     assert probe.returncode == 0, probe.stderr
-    assert probe.stdout.strip() == "({}, True, None, ())"
+    assert probe.stdout.strip() == "({}, True, None, (), [True, True], True)"
 
 
 def test_commit_guard_with_old_tree_missing_deadline_helper_fails_closed(tmp_path):
