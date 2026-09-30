@@ -372,3 +372,173 @@ def test_seeing_only_yourself_in_proc_is_blind(tmp_path):
     )
     r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     assert r.stdout.split() == ["BLIND", "VISIBLE"], r.stdout + r.stderr
+
+
+def test_standard_pressure_never_clears_the_code_intel_indexes(tmp_path):
+    """#2521 item 1: left to disk_reclaim.py's 95 % default, an ORANGE pass
+    on a >=95 % disk deleted the index DBs before RED. Only last-resort may."""
+    home = tmp_path / "home"
+    (home / "tmp").mkdir(parents=True)
+    log = tmp_path / "args"
+    fake = tmp_path / "fake_py"
+    fake.write_text(f'#!/usr/bin/env bash\necho "$*" >> "{log}"\n')
+    fake.chmod(0o755)
+    env = dict(os.environ, HOME=str(home), RECLAIM_LOCK=str(tmp_path / "lock"))
+    for tier in ("standard", "last-resort"):
+        subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\nVENV_PY='{fake}'\npressure_main {tier}"],
+                       env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=True)
+    std, lr = log.read_text().splitlines()
+    assert "--last-resort-above 101" in std
+    assert "--last-resort-above 0" in lr
+
+
+def _mountinfo(tmp_path: Path, mounts=(), readable: bool = True) -> dict:
+    """The env for a crafted mount table (TL_MOUNTINFO, /proc/self/mountinfo
+    format, field 5 octal-escaped like the kernel's). A separate filesystem and
+    a bind mount are both just ENTRIES here, which is the point: the table sees
+    what a device number cannot. readable=False leaves no file at all."""
+    f = tmp_path / "mountinfo"
+
+    def esc(m) -> str:
+        return (str(m).replace("\\", "\\134").replace(" ", "\\040")
+                .replace("\t", "\\011").replace("\n", "\\012"))
+
+    if readable:
+        f.write_text("".join(f"{i} 1 0:{i} / {esc(m)} rw - x x rw\n" for i, m in enumerate(["/", *mounts], 20)))
+    return dict(os.environ, TL_MOUNTINFO=str(f))
+
+
+def _hyg(call: str, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", "-c", f"source '{_HYGIENE}'\n{call}"], env=env,
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def test_prune_never_recurses_into_a_separate_filesystem(tmp_path):
+    """#2521 item 6: a direct child that is its own mount frees nothing here."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    mnt, plain = d / "downloads", d / "old_job"
+    mnt.mkdir()
+    plain.mkdir()
+    (mnt / "keep.bin").write_text("x")
+    for q in (mnt / "keep.bin", mnt, plain):
+        _age(q, 10)
+    r = _hyg(f"prune_tmp '{d}'", _mountinfo(tmp_path, [mnt.resolve()]))
+    assert mnt.exists() and (mnt / "keep.bin").exists(), r.stdout + r.stderr
+    assert "a separate filesystem" in r.stdout
+    assert not plain.exists(), "control: an ordinary old child is still pruned"
+
+
+def test_bg_sandbox_reap_never_recurses_into_a_separate_filesystem(tmp_path):
+    root = tmp_path / "bg-cc-sessions"
+    mnt, dead = root / "mounted", root / "dead"
+    mnt.mkdir(parents=True)
+    dead.mkdir()
+    for q in (mnt, dead):
+        _age(q, 2)
+    r = _hyg(f"reap_bg_sandboxes '{root}'", _mountinfo(tmp_path, [mnt.resolve()]))
+    assert mnt.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+    assert not dead.exists(), "control: an ordinary old sandbox is still reaped"
+
+
+def test_prune_spares_a_child_with_a_mount_inside_it(tmp_path):
+    """The mount is BELOW the child, which only the table can reveal."""
+    d = tmp_path / "tmp"
+    d.mkdir()
+    outer = d / "job"
+    (outer / "data").mkdir(parents=True)
+    _age(outer / "data", 10)
+    _age(outer, 10)
+    r = _hyg(f"prune_tmp '{d}'", _mountinfo(tmp_path, [(outer / "data").resolve()]))
+    assert outer.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+
+
+def test_bg_sandbox_reap_spares_a_mount_below_a_sandbox(tmp_path):
+    root = tmp_path / "bg-cc-sessions"
+    bound, dead = root / "bound", root / "dead"
+    (bound / "data").mkdir(parents=True)
+    dead.mkdir()
+    for q in (bound / "data", bound, dead):
+        _age(q, 2)
+    r = _hyg(f"reap_bg_sandboxes '{root}'", _mountinfo(tmp_path, [(bound / "data").resolve()]))
+    assert bound.exists() and "a separate filesystem" in r.stdout, r.stdout + r.stderr
+    assert not dead.exists()
+
+
+def test_an_unreadable_mount_table_refuses_every_prune_with_a_reason(tmp_path):
+    """#2570 premise check: with no table, nothing can be proven free of
+    mounts, so the WHOLE pass refuses and says why -- never a per-candidate
+    "spared" that reads like real mounts, and never a fallback that cannot
+    see a mount below a candidate."""
+    d = tmp_path / "tmp"
+    old = d / "old_job"
+    old.mkdir(parents=True)
+    _age(old, 10)
+    root = tmp_path / "bg-cc-sessions"
+    dead = root / "dead"
+    dead.mkdir(parents=True)
+    _age(dead, 2)
+    env = _mountinfo(tmp_path, readable=False)
+    r1 = _hyg(f"prune_tmp '{d}'", env)
+    r2 = _hyg(f"reap_bg_sandboxes '{root}'", env)
+    assert old.exists() and dead.exists(), r1.stdout + r2.stdout
+    assert "tmp prune SKIPPED: the mount table" in r1.stdout
+    assert "bg-cc sandbox reap SKIPPED: the mount table" in r2.stdout
+
+
+def test_the_daily_groom_leaves_the_indexes_to_the_guardians_red_pass():
+    """Review of #2521 item 1: the daily groom's disk_reclaim call must not
+    fall back to the 95 % last-resort default either."""
+    text = _HYGIENE.read_text()
+    main = text[text.index("\nmain() {"):]
+    call = main[main.index("disk_reclaim.py"):main.index("disk_reclaim_rc=$?")]
+    assert "--last-resort-above 101" in call
+
+
+def test_every_recursive_delete_goes_through_the_mount_guard():
+    """Review of #2570: the mount-table guard existed in two of four recursive
+    deleters, so the cc-tmp sweep and the sessions prune could follow a
+    same-device bind mount. Allowlist polarity: the ONLY recursive `rm` in the
+    guardian's scripts is the one inside remove_tree_one_fs, so a deleter
+    added later fails here until it uses the helper."""
+    import re
+
+    scripts = Path(__file__).resolve().parents[2] / "scripts"
+    lib = scripts / "lib"
+    files = [scripts / "disk_hygiene.sh", scripts / "tmp_watchgod.sh",
+             *(lib / n for n in ("tmp_liveness.sh", "disk_guardian.sh", "watchgod_oom.sh", "alert_queue.sh"))]
+    # Short (-r, -rf, -Rf) and long (--recursive) spellings, after any
+    # number of other flags (review of #2570: --recursive was missed).
+    rm_r = re.compile(r"(?<![\w-])rm\s+(?:-\S*\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?![\w-])")
+    # A comment starts at a # that opens the line or follows whitespace;
+    # `$#` and `${#arr[@]}` are code, and must not hide what follows them.
+    comment = re.compile(r"(?:^|\s)#.*$")
+    hits = []
+    for f in files:
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            code = comment.sub("", line)
+            if rm_r.search(code):
+                hits.append(f"{f.name}:{n}")
+    helper = scripts / "lib" / "tmp_liveness.sh"
+    body = helper.read_text()
+    start = body.index("remove_tree_one_fs() {")
+    end = body.index("\n}\n", start)
+    first = body[:start].count("\n") + 1
+    last = body[:end].count("\n") + 1
+    inside = [h for h in hits if h.startswith("tmp_liveness.sh:") and first <= int(h.split(":")[1]) <= last]
+    assert inside, "the helper itself must perform the removal"
+    assert sorted(set(hits) - set(inside)) == [], hits
+
+
+def test_the_recursive_delete_scan_sees_every_spelling():
+    """Control for the allowlist test: its detector must catch the spellings
+    a later deleter could use, or the allowlist passes vacuously."""
+    import re
+
+    rm_r = re.compile(r"(?<![\w-])rm\s+(?:-\S*\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?![\w-])")
+    comment = re.compile(r"(?:^|\s)#.*$")
+    for line in ('rm -rf -- "$x"', 'rm -f --recursive "$x"', 'rm --recursive "$x"',
+                 'n=${#arr[@]}; rm -Rf "$x"', '[ $# -gt 0 ] && rm -r "$x"'):
+        assert rm_r.search(comment.sub("", line)), line
+    for line in ('rm -f -- "$x"', '# rm -rf "$x"', 'echo x  # rm -rf "$x"', 'find . -delete'):
+        assert not rm_r.search(comment.sub("", line)), line
