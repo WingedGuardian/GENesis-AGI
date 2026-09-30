@@ -552,9 +552,9 @@ def test_fresh_catalog_spawns_no_regen(tmp_path, monkeypatch, capsys):
 def test_a_lone_token_of_a_multi_word_name_does_not_fire(tmp_path, monkeypatch, capsys):
     """"session" alone must not surface closing-session.
 
-    MEASURED 2026-09-30 on 6,796 replayed prompts: scoring each name token 2
+    MEASURED 2026-09-30 on 6,803 replayed prompts: scoring each name token 2
     put a catalog nudge on 28.5% of prompts, "session" -> closing-session alone
-    on 343 of them.
+    on 344 of them.
     """
     catalog_file = tmp_path / "skill_catalog.json"
     skill = {"name": "closing-session", "description": "drive PRs", "keywords": ["prs"],
@@ -603,3 +603,27 @@ def test_scattered_name_tokens_do_not_add_up_to_a_fire():
         skill = {"name": name, "keywords": []}
         score = _score_skill(skill, _extract_keywords(prompt), prompt)
         assert score < _MIN_SCORE, (name, prompt, score)
+
+
+def test_a_leading_path_is_not_mistaken_for_a_slash_command():
+    """Only a bare `/command` token is stripped; a path keeps its words."""
+    from skill_injection_hook import _prompt_for_matching
+
+    assert "api" in _prompt_for_matching("/api/v1/users returns 500")
+    assert "usr" in _prompt_for_matching("/usr/local/bin is full")
+    assert "claude" not in _prompt_for_matching("/claude-api prompt audit")
+    assert "prompt audit" in _prompt_for_matching("/claude-api prompt audit")
+
+
+def test_tagged_command_keeps_slash_prefixed_arguments():
+    """In the tagged form only the tags carry the command name; `/api build` in
+    the arguments is task text, not a second command."""
+    from skill_injection_hook import _prompt_for_matching
+
+    tagged = (
+        "<command-name>/claude-api</command-name>"
+        "<command-args>/api build</command-args>"
+    )
+    kept = _prompt_for_matching(tagged)
+    assert "/api build" in kept
+    assert "claude" not in kept

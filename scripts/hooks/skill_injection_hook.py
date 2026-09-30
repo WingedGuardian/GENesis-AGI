@@ -171,10 +171,10 @@ def _score_skill(
     # The WHOLE name in the prompt is a curated signal: it scores like a keyword.
     # Loose tokens of a multi-word name are not — together they score at most
     # 1, below `_MIN_SCORE`, so "closing the loop on this session" does not add
-    # up to closing-session. MEASURED 2026-09-30 by replaying 6,796 user prompts
+    # up to closing-session. MEASURED 2026-09-30 by replaying 6,803 user prompts
     # from one install's transcripts (compaction summaries and headless-judge
     # prompts excluded): scoring each name token 2 put a catalog nudge on 28.5%
-    # of prompts, "session" -> closing-session alone on 343 of them;
+    # of prompts, "session" -> closing-session alone on 344 of them;
     # `/claude-api` fired api-gateway on "api". A token distinctive enough to
     # fire alone belongs in the skill's `keywords:` frontmatter, the same rule
     # the docstring states for description prose.
@@ -209,7 +209,9 @@ def _score_skill(
 # unclosed tags is quadratic (MEASURED: 37.7s on 280 KB of them).
 _COMMAND_TAG = re.compile(r"<command-(?:name|message)>[^<]*</command-(?:name|message)>")
 _COMMAND_ARGS_MARKER = re.compile(r"</?command-args>")
-_LEADING_SLASH_COMMAND = re.compile(r"\A\s*/[\w:.-]+")
+# Only a bare command token: `/api/v1/users` is a path, not a command, and keeps
+# its words.
+_LEADING_SLASH_COMMAND = re.compile(r"\A\s*/[\w:.-]+(?=\s|\Z)")
 
 
 def _prompt_for_matching(prompt: str) -> str:
@@ -222,8 +224,11 @@ def _prompt_for_matching(prompt: str) -> str:
     (`/name args`) and the tagged form Claude Code records
     (`<command-name>/name</command-name>…<command-args>args</command-args>`).
     """
-    text = _COMMAND_ARGS_MARKER.sub(" ", _COMMAND_TAG.sub(" ", prompt))
-    return _LEADING_SLASH_COMMAND.sub(" ", text, count=1)
+    if _COMMAND_TAG.search(prompt):
+        # Tagged form: the name lives in the tags, so the arguments are kept
+        # whole even when they start with a `/` (`<command-args>/api build`).
+        return _COMMAND_ARGS_MARKER.sub(" ", _COMMAND_TAG.sub(" ", prompt))
+    return _LEADING_SLASH_COMMAND.sub(" ", prompt, count=1)
 
 
 @functools.lru_cache(maxsize=256)
@@ -241,10 +246,26 @@ def _lower(text: str) -> str:
     return text.lower()
 
 
+@functools.lru_cache(maxsize=4)
+def _words(text: str) -> frozenset[str]:
+    """Every lowercase alphanumeric word in the prompt, computed once per prompt."""
+    return frozenset(re.findall(r"[a-z0-9]+", _lower(text)))
+
+
 def _names_skill(name: str, text: str) -> bool:
     """True when the prompt names the skill as a phrase, in any separator."""
     pattern = _name_pattern(name)
-    return pattern is not None and pattern.search(_lower(text)) is not None
+    if pattern is None:
+        return False
+    # Every name token must be a word of the prompt before the phrase regex
+    # runs. The word set is built once per prompt, so a skill whose name is not
+    # present costs a set lookup rather than a full-text scan: without this the
+    # hook did one scan per multi-word skill (MEASURED: 426 ms on a 195 KB
+    # prompt with 67 skills, against ~50 ms with the gate).
+    tokens = name.lower().replace("-", " ").replace("_", " ").split()
+    if not set(tokens) <= _words(text):
+        return False
+    return pattern.search(_lower(text)) is not None
 
 
 def _extract_keywords(prompt: str) -> list[str]:
