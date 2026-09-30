@@ -3066,15 +3066,23 @@ def _findings_node(sha):
     return _node(body)
 
 
-def _signal(*nodes, force_push=None, replaced=None):
-    pushes = [{"createdAt": force_push, "beforeCommit": {"oid": replaced}}] if force_push else []
+def _signal(*nodes, moves=(), timeline_total=37):
+    """The GraphQL response shape, as GitHub really sends it: on a filtered
+    ``timelineItems`` connection ``totalCount`` counts the WHOLE timeline, while
+    ``filteredCount`` and the (first: 1) ``nodes`` reflect the type filter (MEASURED
+    2026-09-30, #2619: 7 vs 0). The default total is deliberately non-zero so a
+    reader of the wrong field fails. ``moves`` names the history-moving events."""
     return json.dumps(
         {
             "data": {
                 "repository": {
                     "pullRequest": {
                         "comments": {"totalCount": len(nodes), "nodes": list(nodes)},
-                        "timelineItems": {"totalCount": len(pushes), "nodes": pushes},
+                        "timelineItems": {
+                            "totalCount": timeline_total,
+                            "filteredCount": len(moves),
+                            "nodes": [{"__typename": m} for m in moves[:1]],
+                        },
                     }
                 }
             }
@@ -3088,14 +3096,16 @@ class TestCleanSignalAtHead:
     head within the PR's own commits, nothing Codex filed carries findings for the
     head, the comment is unedited (or Codex-edited), and no force-push came after it."""
 
-    def _setup(
-        self, monkeypatch, *nodes, reviews="", commits=(STALE, HEAD), force_push=None, replaced=None
-    ):
+    @pytest.fixture(autouse=True)
+    def _fresh_pass_reason(self):
+        _mod._FRESHNESS_PASS.clear()
+        yield
+        _mod._FRESHNESS_PASS.clear()
+
+    def _setup(self, monkeypatch, *nodes, reviews="", commits=(STALE, HEAD), moves=()):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", reviews)
-        monkeypatch.setenv(
-            "_TEST_GH_CODEX_SIGNAL", _signal(*nodes, force_push=force_push, replaced=replaced)
-        )
+        monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", _signal(*nodes, moves=moves))
         monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join(commits))
 
     def test_clean_comment_resolving_to_head_allows_and_binds_the_head(self, monkeypatch):
@@ -3129,36 +3139,73 @@ class TestCleanSignalAtHead:
         self._setup(monkeypatch, _findings_node(STALE), _clean_node(HEAD[:10]))
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_a_force_push_during_the_review_cannot_swap_in_a_lookalike(self, monkeypatch):
-        """Codex reviewed A; while it was still reviewing, a force-push replaced A with
-        A' sharing A's prefix. The push is BEFORE the signal's time, so the time check
-        passes it, but A (the replaced commit) joins the resolution list and the prefix
-        becomes ambiguous."""
-        reviewed = HEAD[:10] + ("0" if HEAD[10] != "0" else "1") + HEAD[11:]
-        assert reviewed != HEAD and reviewed.startswith(HEAD[:10])  # guard the fixture
-        self._setup(
-            monkeypatch,
-            _clean_node(HEAD[:10]),
-            commits=(STALE, HEAD),
-            force_push="2026-09-29T23:00:00Z",
-            replaced=reviewed,
+    @pytest.mark.parametrize(
+        "event",
+        [
+            "HeadRefForcePushedEvent",
+            "BaseRefChangedEvent",
+            "BaseRefForcePushedEvent",
+            "HeadRefRestoredEvent",
+        ],
+    )
+    def test_any_history_move_on_the_pr_voids_the_signal(self, monkeypatch, event):
+        """Each can drop the reviewed commit from the PR's list while a prefix
+        lookalike stays (a decoy tip even hides it from a force-push's
+        before-commit), so any of them voids the signal, whenever it happened."""
+        self._setup(monkeypatch, _clean_node(HEAD[:10]), moves=(event,))
+        assert _mod._check_codex_reviewed_head("1")[0] is True
+        self._setup(monkeypatch, _summary_node(HEAD[:7]), moves=(event, event, event))
+        assert _mod._check_codex_reviewed_head("1")[0] is True
+
+    def test_the_query_asks_for_every_history_moving_event(self):
+        for event in (
+            "HEAD_REF_FORCE_PUSHED_EVENT",
+            "BASE_REF_CHANGED_EVENT",
+            "BASE_REF_FORCE_PUSHED_EVENT",
+            "HEAD_REF_RESTORED_EVENT",
+        ):
+            assert event in _mod._CODEX_SIGNAL_QUERY
+
+    def test_the_whole_timeline_total_is_not_a_force_push_count(self, monkeypatch):
+        """Regression: the first version read ``totalCount``, which counts the WHOLE
+        timeline, so the signal was refused on nearly every real PR."""
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((STALE, HEAD)))
+        monkeypatch.setenv(
+            "_TEST_GH_CODEX_SIGNAL", _signal(_summary_node(HEAD[:7]), timeline_total=500)
         )
+        assert _mod._check_codex_reviewed_head("1")[0] is False
+
+    # FALSY non-integers on purpose: each would read as "no history moved" if the
+    # type check were weakened, so each would open the gate.
+    @pytest.mark.parametrize("count", [None, 0.0, False, "", [], -1])
+    def test_an_unreadable_history_count_blocks(self, monkeypatch, count):
+        self._setup(monkeypatch, _summary_node(HEAD[:7]))
+        raw = json.loads(_signal(_summary_node(HEAD[:7])))
+        raw["data"]["repository"]["pullRequest"]["timelineItems"]["filteredCount"] = count
+        monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(raw))
+        assert _mod._check_codex_reviewed_head("1")[0] is True
+
+    @pytest.mark.parametrize(
+        ("count", "nodes"),
+        [(0, [{"__typename": "HeadRefForcePushedEvent"}]), (2, []), (0, None)],
+    )
+    def test_disagreeing_or_missing_readings_block(self, monkeypatch, count, nodes):
+        """If the count ever stopped honouring the type filter, or the nodes went
+        missing, the two readings disagree and neither is trusted."""
+        self._setup(monkeypatch, _summary_node(HEAD[:7]))
+        raw = json.loads(_signal(_summary_node(HEAD[:7])))
+        raw["data"]["repository"]["pullRequest"]["timelineItems"].update(
+            filteredCount=count, nodes=nodes
+        )
+        monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(raw))
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
     def test_findings_naming_no_commit_veto(self, monkeypatch):
         body = "### 💡 Codex Review\n![P2 Badge](x) something"
         self._setup(monkeypatch, _clean_node(HEAD[:10]), _node(body))
         assert _mod._check_codex_reviewed_head("1")[0] is True
-
-    def test_a_force_push_after_the_signal_voids_it(self, monkeypatch):
-        """A short id is cheap to grind: a force-push after Codex spoke can swap the
-        reviewed commit for another sharing its prefix, which then resolves uniquely."""
-        self._setup(monkeypatch, _summary_node(HEAD[:7]), force_push="2026-09-30T01:00:00Z")
-        assert _mod._check_codex_reviewed_head("1")[0] is True
-
-    def test_a_force_push_before_the_signal_is_fine(self, monkeypatch):
-        self._setup(monkeypatch, _summary_node(HEAD[:7]), force_push="2026-09-29T23:00:00Z")
-        assert _mod._check_codex_reviewed_head("1")[0] is False
 
     def test_a_comment_edited_by_someone_else_does_not_speak_for_codex(self, monkeypatch):
         """An edit keeps the original author, so the author proves nothing about the body."""
@@ -3200,9 +3247,9 @@ class TestCleanSignalAtHead:
         truncated["data"]["repository"]["pullRequest"]["comments"]["totalCount"] = 150
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(truncated))
         assert _mod._check_codex_reviewed_head("1")[0] is True
-        pushes = json.loads(_signal(_clean_node(HEAD[:10])))
-        pushes["data"]["repository"]["pullRequest"]["timelineItems"]["totalCount"] = 150
-        monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(pushes))
+        no_timeline = json.loads(_signal(_clean_node(HEAD[:10])))
+        del no_timeline["data"]["repository"]["pullRequest"]["timelineItems"]
+        monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(no_timeline))
         assert _mod._check_codex_reviewed_head("1")[0] is True, "unseen force-pushes"
 
     def test_any_codex_review_object_at_head_means_completed_is_not_clean(self, monkeypatch):
@@ -3256,3 +3303,27 @@ class TestCleanSignalAtHead:
         _mod.check_pr_report("1")
         out = capsys.readouterr().out
         assert "codex-at-head  : ok (clean signal at head: summary)" in out
+
+    def test_report_never_reuses_a_pass_reason_from_another_head(self, monkeypatch, capsys):
+        """A push landing between the gate and the report's re-read must not inherit
+        the old head's pass reason."""
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
+        monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
+        _mod._FRESHNESS_PASS.update(reason="clean signal at head: summary", head=STALE)
+        monkeypatch.setattr(
+            _mod, "_check_codex_reviewed_head", lambda n, repo=None: (False, "", HEAD)
+        )
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_check_inline_review_findings",
+            lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+        )
+        _mod.check_pr_report("1")
+        out = capsys.readouterr().out
+        assert "clean signal at head" not in out

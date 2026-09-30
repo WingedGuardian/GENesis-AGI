@@ -5199,11 +5199,17 @@ def _codex_clean_signal_at_head(
       `💡` issue comment with no review object while the summary read Completed;
     - the comment is unedited or edited only by Codex (an edit keeps the original
       author, so the author proves nothing about the body);
-    - no force-push can have swapped the reviewed commit for another sharing its
-      prefix (a short id is cheap to grind): a force-push after Codex spoke (server
-      time on both sides) voids the signal, and every commit a force-push REPLACED
-      joins the resolution list, so a swap made while Codex was still reviewing
-      makes the prefix ambiguous.
+    - the PR's history has never moved under it: no force-push, no base change,
+      no base force-push, no head-branch restore. Each can drop the reviewed commit
+      from the PR's commit list while a commit sharing its prefix (a short id is
+      cheap to grind) stays, and the prefix would then resolve uniquely to it.
+      GraphQL names only a force-push's old TIP, not what it dropped under it, so
+      the dropped commit cannot be put back into the list. MEASURED 2026-09-30:
+      4 of 73 open PRs carry such an event (one base change, three restores) and
+      fall back to needing a Codex review object; none carries a force-push.
+      Residual, stated: a reviewed commit that reaches the BASE branch by another
+      route also leaves the list, with no event here; exploiting that needs a
+      deliberately ground prefix collision as well.
 
     Anything unreadable is None: the gate then blocks exactly as before.
     """
@@ -5218,13 +5224,10 @@ def _codex_clean_signal_at_head(
     evidence = _codex_signal_evidence(pr_num, repo=repo)
     if evidence is None:
         return None
-    codex = _CODEX_REVIEW_BOT.removesuffix("[bot]")  # GraphQL names an App by its slug
-    force_pushed_at = evidence["last_force_push"]
-    replaced = [oid for oid in evidence["replaced_commits"] if oid not in commits]
-    last_push = _iso_time(force_pushed_at) if force_pushed_at else None
-    if force_pushed_at and last_push is None:
+    if evidence["history_moved"]:
         return None
-    candidates: list[tuple[str, str, str]] = []
+    codex = _CODEX_REVIEW_BOT.removesuffix("[bot]")  # GraphQL names an App by its slug
+    candidates: list[tuple[str, str]] = []
     for c in evidence["comments"]:
         if c["login"] != codex or c["type"] != "Bot":
             continue
@@ -5242,25 +5245,12 @@ def _codex_clean_signal_at_head(
         if _CODEX_CLEAN_COMMENT_RE.search(body):
             m = _CODEX_REVIEWED_COMMIT_RE.search(body)
             if m:
-                candidates.append(("comment", m.group(1).lower(), c["created_at"]))
+                candidates.append(("comment", m.group(1).lower()))
         if summary:
             for m in _CODEX_SUMMARY_ROW_RE.finditer(body):
-                candidates.append(("summary", m.group(2).lower(), m.group(1)))
-    for kind, short, said_at in candidates:
-        spoke = _iso_time(said_at)
-        if spoke is None:
-            continue
-        # A force-push AFTER Codex spoke can have replaced the commit it reviewed with
-        # another sharing its prefix (a short id is cheap to grind); the reviewed
-        # commit then leaves the PR's list and the new head resolves uniquely.
-        if last_push is not None and last_push >= spoke:
-            continue
-        # Resolve against the PR's commits PLUS every commit a force-push replaced.
-        # The time check above compares against when Codex FINISHED; a force-push made
-        # while it was still reviewing could swap the reviewed commit for another
-        # sharing its prefix. With the replaced commit in the list, the two collide and
-        # the prefix is ambiguous, so it vouches for nothing.
-        resolved, error = _review_budget._resolve_sha(short, [*commits, *replaced])
+                candidates.append(("summary", m.group(2).lower()))
+    for kind, short in candidates:
+        resolved, error = _review_budget._resolve_sha(short, commits)
         if not error and resolved == head:
             return kind
     return None
@@ -5269,20 +5259,24 @@ def _codex_clean_signal_at_head(
 _CODEX_SIGNAL_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, "
     "name: $name) { pullRequest(number: $number) { comments(last: 100) { totalCount "
-    "nodes { createdAt body author { login __typename } editor { login } } } "
-    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 100) { totalCount "
-    "nodes { ... on HeadRefForcePushedEvent { createdAt beforeCommit { oid } } } } } } }"
+    "nodes { body author { login __typename } editor { login } } } "
+    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, BASE_REF_CHANGED_EVENT, "
+    "BASE_REF_FORCE_PUSHED_EVENT, HEAD_REF_RESTORED_EVENT], first: 1) { filteredCount "
+    "nodes { __typename } } } } }"
 )
 
 
 def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
-    """``{"comments": [...], "last_force_push": iso | None}`` for the clean-signal
-    check, or None when unreadable. ONE GraphQL read, because two facts the check
-    needs exist only there: a comment's ``editor`` (REST keeps the ORIGINAL author on
-    an edited comment, so the author says nothing about the body), and the PR's
-    force-push events with a SERVER-set time (a commit's own date is author-set).
-    MEASURED 2026-09-29: the force-push event reads identically through REST
-    ``issues/N/timeline`` (PR #65). More than 100 comments is None (fail closed).
+    """``{"comments": [...], "history_moved": bool}`` for the clean-signal check, or
+    None when unreadable. ONE GraphQL read, because a comment's ``editor`` exists only
+    there (REST keeps the ORIGINAL author on an edited comment, so the author says
+    nothing about the body). History moved when the type-filtered timeline has ANY
+    node. Two readings must agree, or the read is refused: the documented one (the
+    ``itemTypes`` filter on ``nodes``) and ``filteredCount``, whose schema text does
+    not say it honours ``itemTypes`` though it MEASURABLY does. Never ``totalCount``:
+    on a filtered connection it counts the WHOLE timeline (MEASURED 2026-09-30:
+    #2619 totalCount 7, filteredCount 0; #65 12 vs 1, matching its one REST
+    timeline force-push). More than 100 comments is None (fail closed).
     Tests inject ``_TEST_GH_CODEX_SIGNAL`` (the raw GraphQL response).
     """
     raw = os.environ.get("_TEST_GH_CODEX_SIGNAL")
@@ -5323,32 +5317,18 @@ def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
                     "login": author.get("login"),
                     "type": author.get("__typename"),
                     "editor": editor.get("login"),
-                    "created_at": node["createdAt"],
                     "body": node.get("body") or "",
                 }
             )
         timeline = pr["timelineItems"]
-        pushes = timeline["nodes"]
-        if timeline["totalCount"] > len(pushes):
+        count, nodes = timeline["filteredCount"], timeline["nodes"]
+        if type(count) is not int or count < 0 or not isinstance(nodes, list):
             return None
-        last_push = pushes[-1]["createdAt"] if pushes else None
-        replaced = [
-            str((p.get("beforeCommit") or {}).get("oid") or "").lower() for p in pushes
-        ]
+        if (count > 0) != bool(nodes):
+            return None  # the two readings disagree: trust neither
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return None
-    return {
-        "comments": rows,
-        "last_force_push": last_push,
-        "replaced_commits": [oid for oid in replaced if oid],
-    }
-
-
-def _iso_time(value: object) -> _dt.datetime | None:
-    try:
-        return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    return {"comments": rows, "history_moved": bool(nodes)}
 
 
 def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
@@ -6734,6 +6714,7 @@ def _check_codex_reviewed_head_core(
     clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo)
     if clean_kind:
         _FRESHNESS_PASS["reason"] = f"clean signal at head: {clean_kind}"
+        _FRESHNESS_PASS["head"] = head
         print(
             f"NOTE: PR #{pr_num} — Codex's clean {clean_kind} names head {head[:12]} "
             f"(its abbreviated id resolves uniquely to the head among the PR's commits, "
@@ -6751,9 +6732,11 @@ def _check_codex_reviewed_head_core(
         clean_note = (
             f"\nNOTE: Codex posted a clean re-review naming commit {clean_short}. It is "
             f"not accepted as a review of head {head[:12]} because that abbreviated commit "
-            f"id did not resolve uniquely to the head among this PR's own commits (or a "
-            f"Codex review object already sits at the head, or the commit list could not "
-            f"be read)."
+            f"id did not resolve uniquely to the head among this PR's own commits, or "
+            f"something else refused it: a Codex review object at the head, a Codex "
+            f"findings comment anywhere on the PR, a comment edited by someone other than "
+            f"Codex, a force-push, base change or branch restore on the PR, or a read "
+            f"that failed or was truncated."
         )
     if not reviewed:
         return (
@@ -12027,7 +12010,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
         _head = _pr_head_sha(pr_num, repo=repo)
         _head_l = _head.strip().lower() if _head else None
-        _pass_reason = _FRESHNESS_PASS.get("reason")
+        # Only for the head it vouched for: a push landing between the gate and this
+        # re-read must not inherit the old head's pass reason.
+        _pass_reason = (
+            _FRESHNESS_PASS.get("reason")
+            if _head_l is not None and _FRESHNESS_PASS.get("head") == _head_l
+            else None
+        )
         if _head_l is not None and _reviewed == _head_l:
             label = "ok (current)"
         elif _pass_reason:
