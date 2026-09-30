@@ -1489,8 +1489,8 @@ async def test_every_parked_item_in_one_file_is_named_in_one_alert(
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 1, alerts
     text = alerts[0]["title"] + alerts[0]["body"]
-    assert "example.com/first-item" in text and "example.com/second-item" in text
-    assert "SECRETQ" not in text
+    assert "example.com — line 1 (url#" in text and "example.com — line 3 (url#" in text, text
+    assert "SECRETQ" not in text and "first-item" not in text
     assert "2" in alerts[0]["title"]
 
 
@@ -1512,7 +1512,7 @@ async def test_a_later_scan_parking_another_item_alerts_again(
     await mon.check_once()
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 2, alerts
-    assert "second-item" in alerts[1]["title"] + alerts[1]["body"]
+    assert "example.com — line 3" in alerts[1]["title"] + alerts[1]["body"]
 
 
 # ── Review round 1 on #2447: alert identity ──────────────────────────────────
@@ -1533,7 +1533,7 @@ def _monitor_cfg(db, inbox_dir, invoker, sm, **overrides):
 
 
 @pytest.mark.asyncio
-async def test_items_sharing_a_redacted_label_are_counted_separately(
+async def test_items_sharing_a_host_and_path_are_counted_separately(
     db, inbox_dir, mock_invoker, mock_session_manager,
 ):
     """Codex + Devin: two presigned links to one path differ only in the query,
@@ -1549,7 +1549,7 @@ async def test_items_sharing_a_redacted_label_are_counted_separately(
     assert len(alerts) == 1, alerts
     assert "2 item" in alerts[0]["title"], alerts[0]["title"]
     body = alerts[0]["body"]
-    assert body.count("example.com/watch") == 2, body
+    assert body.count("example.com — line") == 2, body
     assert "AAAA" not in body and "BBBB" not in body
 
 
@@ -1569,16 +1569,18 @@ async def test_every_url_of_a_multi_item_batch_is_named(
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 1, alerts
     text = alerts[0]["body"]
-    assert "example.com/first-item" in text and "example.com/second-item" in text
+    assert "example.com — line 1 (url#" in text and "example.com — line 3 (url#" in text, text
     assert "2 item" in alerts[0]["title"], alerts[0]["title"]
     assert text.count("(url#") == 2, text
 
 
 @pytest.mark.asyncio
-async def test_opaque_path_segments_are_masked_in_the_alert(
+async def test_path_text_never_reaches_the_alert(
     db, inbox_dir, mock_invoker, mock_session_manager,
 ):
-    """Devin: a share link can carry its token in the PATH, not the query."""
+    """Devin: a share link can carry its token in the PATH, not the query.
+    No path or query text reaches the alert at all: each item is its host, its
+    line in the file and its url# id (#2533, after three masking heuristics)."""
     mock_invoker.run.return_value = _ok(_UNCOVERED)
     mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
     (inbox_dir / "Genesis.md").write_text(
@@ -1590,10 +1592,13 @@ async def test_opaque_path_segments_are_masked_in_the_alert(
     alerts = [a for a in _queued_alerts() if a.get("source") == "inbox"]
     assert len(alerts) == 1, alerts
     text = alerts[0]["title"] + alerts[0]["body"]
-    assert "a8F3kLm29QzX7pRtW4" not in text and "Xy7_Kp2" not in text
-    assert "AbCdEfGhIjKlMnOpQr" not in text
-    assert "- files.example.com/s/…/quarterly-report (url#" in text, text
-    assert "2026-09-26-notes" in text  # a dated slug is readable, not a token
+    for secret in ("a8F3kLm29QzX7pRtW4", "Xy7_Kp2", "AbCdEfGhIjKlMnOpQr",
+                   "quarterly-report", "2026-09-26-notes"):
+        assert secret not in text, (secret, text)
+    for expected in ("- files.example.com — line 1 (url#",
+                     "- share.example.com — line 3 (url#",
+                     "- api.example.com — line 5 (url#"):
+        assert expected in text, (expected, text)
 
 
 @pytest.mark.asyncio
@@ -1761,11 +1766,11 @@ async def test_retry_lane_storm_alert_does_not_repeat_every_scan(
         # Two URL-free notes batched together: the flattened text named only
         # the first note's first line.
         ("Look into the new retrieval paper\n\nCompare our reranker to theirs\n",
-         ["Look into the new retrieval paper", "Compare our reranker to theirs"]),
+         ["a note — line 1", "a note — line 3"]),
         # Two annotated items sharing one URL: URL extraction deduplicated them.
         ("https://example.com/shared-post why it matters for memory\n\n"
          "https://example.com/shared-post the pricing section\n",
-         ["example.com/shared-post", "example.com/shared-post"]),
+         ["example.com — line 1", "example.com — line 3"]),
     ],
 )
 async def test_every_logical_item_of_a_batch_gets_its_own_line(
@@ -1819,7 +1824,7 @@ async def test_a_failed_alert_enqueue_logs_what_stopped(
     errors = [r for r in caplog.records if r.levelname == "ERROR"
               and "parked-alert enqueue failed" in r.getMessage()]
     assert len(errors) == 1, [r.getMessage() for r in caplog.records]
-    assert "example.com/lost-item-7c1" in errors[0].getMessage()
+    assert "example.com — line 1" in errors[0].getMessage()
     assert "Genesis.md" in errors[0].getMessage()
 
 
@@ -1878,3 +1883,234 @@ async def test_offline_failure_keeps_a_row_below_a_lowered_cap(
     row = await inbox_items.get_by_id(db, "old")
     assert row["status"] == "failed", row
     assert row["retry_count"] == max_retries - 1, row
+
+
+def test_item_labels_never_carry_path_or_query_text():
+    """No part of a URL but its host reaches the label, whatever the path holds."""
+    content = "https://drive.example.com/d/1BxiMVs0XRA5nFMdKvB/edit?usp=sharing&tok=Z9\n"
+    lines = ["# notes", "https://drive.example.com/d/1BxiMVs0XRA5nFMdKvB/edit?usp=sharing&tok=Z9"]
+    (label,) = InboxMonitor._item_labels(content, lines)
+    assert label.startswith("drive.example.com — line 2 (url#"), label
+    for fragment in ("/d/", "1BxiMVs0", "edit", "usp", "tok", "Z9"):
+        assert fragment not in label, (fragment, label)
+
+
+@pytest.mark.parametrize(
+    ("content", "lines", "expected"),
+    [
+        # A short note that is a substring of an EARLIER line: exact match wins.
+        ("ai", ["# old", "ai is cool https://news.example.com/abc", "", "ai"], "line 4"),
+        # A URL that prefixes an earlier, longer URL: exact line wins.
+        ("https://x.example.com/post/123",
+         ["https://x.example.com/post/12345 read", "", "https://x.example.com/post/123"],
+         "line 3"),
+        # Identical text twice: the later copy is the new, parked one.
+        ("read later", ["read later", "", "read later"], "line 3"),
+        # The exact line is EARLIER than a later line that merely contains it:
+        # exact still wins over the later substring.
+        ("ai", ["# old", "ai", "", "ai is cool https://news.example.com/abc"], "line 2"),
+        # No exact line (the file was edited since): the LAST containing line.
+        ("https://x.example.com/a",
+         ["see https://x.example.com/a", "", "later https://x.example.com/a again"],
+         "line 3"),
+    ],
+)
+def test_the_line_found_is_the_item_not_an_earlier_lookalike(content, lines, expected):
+    """Internal review (#2533): a first-substring search sent the owner to an
+    earlier, different line, and the alert tells them to edit that line."""
+    (label,) = InboxMonitor._item_labels(content, lines)
+    assert f"— {expected} (" in label, label
+
+
+def test_items_sharing_an_annotation_each_get_their_own_line():
+    """Round 2 (#2533, Codex + Devin): two items that open with the same
+    annotation but carry different links were both sent to the later
+    annotation's line, because only the first line located the item."""
+    lines = ["read later", "https://a.example.com/1", "", "read later", "https://b.example.com/2"]
+    (first,) = InboxMonitor._item_labels("read later\nhttps://a.example.com/1", lines)
+    (second,) = InboxMonitor._item_labels("read later\nhttps://b.example.com/2", lines)
+    assert first.startswith("a.example.com — line 1 ("), first
+    assert second.startswith("b.example.com — line 4 ("), second
+
+
+def test_an_edited_annotation_falls_back_to_the_link_line():
+    """The whole block no longer matches (its annotation was edited since):
+    the link's own line locates it, not a lookalike annotation elsewhere."""
+    lines = ["read later", "https://a.example.com/1", "", "read later!", "https://b.example.com/2"]
+    (label,) = InboxMonitor._item_labels("read later\nhttps://b.example.com/2", lines)
+    assert label.startswith("b.example.com — line 5 ("), label
+
+
+def test_a_legacy_whole_file_row_locates_each_url_on_its_own_line():
+    """A legacy row can hold a whole file; each URL must point at its own line,
+    not all at the file's first line."""
+    content = "intro\nhttps://a.example.com/1\n\nhttps://b.example.com/2"
+    lines = content.split("\n")
+    labels = InboxMonitor._item_labels(content, lines, legacy=True)
+    assert labels[0].startswith("a.example.com — line 2 ("), labels
+    assert labels[1].startswith("b.example.com — line 4 ("), labels
+
+
+def test_notes_stay_distinguishable_when_the_file_cannot_be_read():
+    one = InboxMonitor._item_labels("look into retrieval", [])
+    two = InboxMonitor._item_labels("compare rerankers", [])
+    assert one != two and all("(note#" in label for label in one + two), (one, two)
+
+
+def test_a_schemeless_url_with_a_scheme_in_its_query_keeps_its_host():
+    (label,) = InboxMonitor._item_labels(
+        "example.com/r?u=https://other.example.com", ["example.com/r?u=https://other.example.com"],
+    )
+    assert label.startswith("example.com — line 1 ("), label
+
+
+def test_notes_sharing_a_first_line_get_distinct_ids():
+    """Round 3 (#2533, Codex): the note id hashed only the first line."""
+    (one,) = InboxMonitor._item_labels("Read this\nalpha", [])
+    (two,) = InboxMonitor._item_labels("Read this\nbeta", [])
+    assert one != two, one
+
+
+def test_a_multi_link_item_uses_its_own_block_not_an_earlier_lone_link():
+    """Round 3 (#2533, Codex): a line with several links located each link
+    separately, so an older line holding one of them alone won."""
+    lines = ["https://a.example.com/x", "", "compare https://a.example.com/x https://b.example.com/y"]
+    labels = InboxMonitor._item_labels(lines[2], lines)
+    assert all("— line 3 (" in label for label in labels), labels
+
+
+def test_identical_items_parked_together_get_distinct_lines_in_file_order():
+    """Round 3 (#2533, premise check): two parked items with identical text
+    were both sent to the last copy's line."""
+    claimed: set[int] = set()
+    lines = ["read later", "", "read later"]
+    second = InboxMonitor._item_labels("read later", lines, claimed=claimed)
+    first = InboxMonitor._item_labels("read later", lines, claimed=claimed)
+    assert "— line 3 (" in second[0] and "— line 1 (" in first[0], (first, second)
+
+
+@pytest.mark.asyncio
+async def test_the_flush_reads_each_inbox_file_once(db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch):
+    """Round 3 (#2533, Codex): the file was re-read once per parked batch."""
+    mon = _monitor_cfg(db, inbox_dir, mock_invoker, mock_session_manager)
+    f = inbox_dir / "Genesis.md"
+    f.write_text("https://a.example.com/1\n\nhttps://b.example.com/2\n")
+    reads: list[str] = []
+    real = Path.read_bytes
+
+    def counting(self):
+        reads.append(str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    mon._park_buffer = {}
+    for rid, text in (("r1", "https://a.example.com/1"), ("r2", "https://b.example.com/2")):
+        mon._alert_parked(str(f), reason="retries_exhausted", detail="d", item_id=rid, texts=[text])
+    resolved = mon._resolve_park_labels(str(f), mon._park_buffer[(str(f), "retries_exhausted")]["items"])
+    assert [p for p in reads if p == str(f)] == [str(f)]
+    assert "— line 1 (" in resolved["r1"][0] and "— line 3 (" in resolved["r2"][0], resolved
+
+
+def test_identical_rows_parked_in_one_file_get_lines_in_row_order(tmp_path):
+    """The earlier-parked row gets the earlier copy: rows are labelled newest
+    first, each taking the last line still free."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("read later\n\nread later\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"r1": {"texts": ["read later"], "legacy": False},
+             "r2": {"texts": ["read later"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 1 (" in resolved["r1"][0] and "— line 3 (" in resolved["r2"][0], resolved
+
+
+def test_a_loose_match_never_takes_a_line_from_an_exact_owner(tmp_path):
+    """Round 3 audit: a stale note matching a URL line by substring claimed it,
+    and the URL item still in the file lost its line."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://ai.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"r1": {"texts": ["https://ai.example.com/x"], "legacy": False},
+             "r2": {"texts": ["ai"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 1 (" in resolved["r1"][0], resolved
+
+
+def test_two_links_on_one_line_of_a_legacy_row_both_get_that_line():
+    """Round 3 audit: inside one legacy item, the first link's claim blocked a
+    second link on the same line."""
+    lines = ["compare https://a.example.com/1 https://b.example.com/2", "https://c.example.com/3"]
+    labels = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
+    assert [lbl.split(" (")[0] for lbl in labels] == [
+        "a.example.com — line 1", "b.example.com — line 1", "c.example.com — line 2"], labels
+
+
+def test_a_legacy_row_with_one_link_points_at_the_link_line():
+    lines = ["intro", "https://a.example.com/1"]
+    (label,) = InboxMonitor._item_labels("\n".join(lines), lines, legacy=True)
+    assert label.startswith("a.example.com — line 2 ("), label
+
+
+def test_a_claimed_block_reserves_every_line_it_covers(tmp_path):
+    """Round 4 (Codex): an older bare URL was sent to a line inside a newer
+    multi-line item that repeats it."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://a.example.com/x\n\nread later\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"old": {"texts": ["https://a.example.com/x"], "legacy": False},
+             "new": {"texts": ["read later\nhttps://a.example.com/x"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 3 (" in resolved["new"][0] and "— line 1 (" in resolved["old"][0], resolved
+
+
+def test_notes_differing_only_in_indentation_stay_distinct():
+    """Round 4 (Codex): stripping every line made two notes identical."""
+    lines = ["Example", "  indented", "", "Example", " indented"]
+    (label,) = InboxMonitor._item_labels("Example\n  indented", lines)
+    assert "— line 1 (" in label, label
+
+
+def test_a_copy_below_the_evaluated_prefix_is_never_the_parked_item(tmp_path):
+    """Round 4 (Devin): evaluation reads the first 50 KB; the locator read the
+    whole file and preferred a later copy beyond it."""
+    f = tmp_path / "Genesis.md"
+    filler = "x" * 100 + "\n"
+    # The blank line makes the late copy a valid item start, so only the
+    # 50 KB limit can exclude it.
+    f.write_text("https://a.example.com/x\n" + filler * 600 + "\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 1 (" in resolved["r"][0], resolved
+
+
+def test_line_numbers_count_only_real_newlines(tmp_path):
+    """Round 4 (Codex): a NEL or U+2028 inside prose shifted every later line."""
+    f = tmp_path / "Genesis.md"
+    f.write_bytes("some\u0085prose here\n\nhttps://a.example.com/x\n".encode("utf-8"))
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 3 (" in resolved["r"][0], resolved
+
+
+def test_a_one_line_item_never_matches_inside_a_larger_item(tmp_path):
+    """Round 4 audit: a bare URL matched the last line of an annotated item
+    and claimed it, so the two items swapped lines."""
+    f = tmp_path / "Genesis.md"
+    f.write_text("https://a.example.com/x\n\nread later\nhttps://a.example.com/x\n")
+    mon = InboxMonitor.__new__(InboxMonitor)
+    items = {"old": {"texts": ["read later\nhttps://a.example.com/x"], "legacy": False},
+             "new": {"texts": ["https://a.example.com/x"], "legacy": False}}
+    resolved = mon._resolve_park_labels(str(f), items)
+    assert "— line 3 (" in resolved["old"][0] and "— line 1 (" in resolved["new"][0], resolved
+
+
+@pytest.mark.parametrize("sep", ["\x85", "\x0c", " ", "\x0b"])
+def test_a_separator_ending_a_line_keeps_the_physical_numbers(tmp_path, sep):
+    """Round 4 audit: a separator at a line's end discarded the whole map."""
+    f = tmp_path / "Genesis.md"
+    f.write_bytes(f"some prose{sep}\n\nhttps://a.example.com/x\n".encode())
+    mon = InboxMonitor.__new__(InboxMonitor)
+    resolved = mon._resolve_park_labels(
+        str(f), {"r": {"texts": ["https://a.example.com/x"], "legacy": False}})
+    assert "— line 3 (" in resolved["r"][0], resolved

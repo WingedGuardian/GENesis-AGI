@@ -84,6 +84,55 @@ def test_web_processor_can_handle():
     assert not processor.can_handle("document.pdf")
 
 
+async def _process_wrapped(monkeypatch, tmp_path, body: str, key_name: str) -> str:
+    """Run WebProcessor on a page the fetcher wrapped under a fresh boundary key."""
+    from unittest.mock import AsyncMock
+
+    import genesis.security.sanitizer as sanitizer
+    from genesis.security.sanitizer import ContentSanitizer, ContentSource
+    from genesis.web.fetch import FetchResult, WebFetcher
+
+    monkeypatch.setattr(sanitizer, "_boundary_key", None)
+    monkeypatch.setattr("genesis.env.boundary_key_path", lambda: tmp_path / key_name)
+    wrapped = ContentSanitizer().wrap_content(body, ContentSource.WEB_FETCH)
+    result = FetchResult(url="https://example.com", text=wrapped, title="t", status_code=200)
+    monkeypatch.setattr(WebFetcher, "fetch", AsyncMock(return_value=result))
+    return (await WebProcessor().process("https://example.com")).text
+
+
+async def test_web_text_does_not_depend_on_the_boundary_key(monkeypatch, tmp_path):
+    """The ingest content hash is taken over this text, so a restored or regenerated
+    boundary key must not change it (#2572)."""
+    body = "A page long enough to skip the thin-content escalation. " * 20
+    first = await _process_wrapped(monkeypatch, tmp_path, body, "key-a")
+    second = await _process_wrapped(monkeypatch, tmp_path, body, "key-b")
+    assert first == second == body
+
+
+async def test_marker_shaped_text_inside_a_page_is_kept(monkeypatch, tmp_path):
+    body = "<external-content x>\n" + "Page text worth keeping around. " * 20 + "\n</external-content>"
+    assert await _process_wrapped(monkeypatch, tmp_path, body, "k") == body
+
+
+async def test_only_a_complete_fetch_wrapper_is_removed(monkeypatch):
+    """A lone opener or closer, or a pair whose ids differ, is page text."""
+    from unittest.mock import AsyncMock
+
+    from genesis.web.fetch import FetchResult, WebFetcher
+
+    filler = "Page text worth keeping around. " * 20
+    cases = [
+        '<external-content source="web_fetch" risk="0.6" id="0123456789abcdef">\n' + filler,
+        filler + '\n</external-content id="0123456789abcdef">',
+        '<external-content source="web_fetch" risk="0.6" id="0123456789abcdef">\n'
+        + filler + '\n</external-content id="fedcba9876543210">',
+    ]
+    for text in cases:
+        result = FetchResult(url="https://example.com", text=text, title="t", status_code=200)
+        monkeypatch.setattr(WebFetcher, "fetch", AsyncMock(return_value=result))
+        assert (await WebProcessor().process("https://example.com")).text == text
+
+
 # ─── YouTubeProcessor ───────────────────────────────────────────────────────
 
 
