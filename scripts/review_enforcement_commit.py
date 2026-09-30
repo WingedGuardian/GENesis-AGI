@@ -1106,12 +1106,21 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
             return None
         remote_names.add(name.strip())
         url = rest.rsplit(" (", 1)[0].strip()
-        # A remote with NO URL gives gh nothing to resolve. Any `remote.<name>.*`
-        # key makes git list the name, so one global key (say
-        # `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in every
-        # repository that has no remote (MEASURED: a bare `origin<TAB>` line). A
-        # URL git does know is listed on its own line, a push-only URL included,
-        # so skipping the empty one hides nothing.
+        # A remote whose listed URL is EMPTY gives gh nothing to resolve. The common
+        # cause: any `remote.<name>.*` key makes git list the name, so one global key
+        # (say `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in
+        # every repository that has no remote (MEASURED: a bare `origin<TAB>` line).
+        # It is not the only cause — an empty or whitespace-only `url`, a remote with
+        # only gh's own `gh-resolved` key, and an `insteadOf` rewrite that empties
+        # the URL all list the same way — and the skip covers every one, because the
+        # test is on the listed URL, not on how it came to be empty. A URL git does
+        # know is listed on its own line, a push-only URL included.
+        #
+        # Skipping it hides nothing ONLY because gh resolves a repository from this
+        # same `git remote -v` listing: MEASURED with gh 2.101 and git 2.43, gh
+        # answered "no git remotes found" in each of the states above. A gh that
+        # resolved from raw config instead would turn them into repositories this
+        # gate skips; re-check this premise when the gh version moves.
         if not url:
             continue
         if not _is_local_remote_url(url):

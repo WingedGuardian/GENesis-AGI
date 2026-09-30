@@ -563,6 +563,31 @@ def test_a_url_less_remote_from_global_config_is_not_github(monkeypatch, repo, t
     assert _guard._has_possibly_github_remote(str(repo), _guard.Deadline.after(5)) is False
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        '[remote "origin"]\n\turl = \n',
+        '[remote "origin"]\n\turl = "   "\n',
+        '[remote "origin"]\n\tgh-resolved = https://api.github.com/repos/o/r\n',
+        '[url ""]\n\tinsteadOf = https://github.com/o/r.git\n'
+        '[remote "origin"]\n\turl = https://github.com/o/r.git\n',
+    ],
+    ids=["empty-url", "whitespace-url", "gh-resolved-only", "insteadof-to-nothing"],
+)
+def test_every_remote_listed_with_an_empty_url_is_skipped(monkeypatch, repo, tmp_path, config):
+    """The skip keys on the LISTED URL, so every way of listing a remote with an
+    empty URL is covered, not only a stray key. gh resolves from the same listing
+    and finds nothing in each of these (measured with gh 2.101 / git 2.43), so the
+    no-PR exemption is right to engage."""
+    _global_git_config(monkeypatch, tmp_path, config)
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "remote", "-v"], capture_output=True, text=True, check=True
+    ).stdout
+    urls = [line.partition("\t")[2].rsplit(" (", 1)[0].strip() for line in listed.splitlines()]
+    assert urls and all(not u for u in urls), f"fixture must list only empty URLs: {listed!r}"
+    assert _guard._has_possibly_github_remote(str(repo), _guard.Deadline.after(5)) is False
+
+
 def test_a_push_only_github_url_from_global_config_still_counts(monkeypatch, repo, tmp_path):
     """CONTROL: a remote whose only URL is a push URL is listed on its own line, so
     skipping the URL-less line must not hide it."""
