@@ -63,7 +63,11 @@ these hold:
   snapshot may be gone rather than retrying;
 - relief is `live` (below), its configuration is valid, it has not deleted
   anything in the last 5 minutes, and its 5-minute settle stamp can be saved
-  BEFORE the delete.
+  BEFORE the delete;
+- one more create, tried after the refusal, age and space checks above, is
+  still refused by the pool (the settle stamp is saved only after that). If the pressure cleared in the meantime (an autoextend
+  landed, say), that create succeeds and the old snapshot is removed after it,
+  as in an ordinary rotation.
 
 This needs LVM's per-volume view, so it runs on LVM-thin pools only. On btrfs
 and dir pools delete-first never fires; pool relief (below) is the protection
@@ -164,9 +168,9 @@ Relief refuses to act on a configuration it cannot trust: a reserve outside
 string), or an empty `snapshots.prefix`. It sends one warning a day instead. Every relief alert is
 sent only if its "already alerted" stamp could be saved, so an unwritable state
 directory produces no alert storm. Relief also saves its 5-minute settle stamp
-BEFORE deleting, and re-reads the pool's identity right before deleting. If
-the stamp cannot be saved, or the pool is no longer the one it measured, it
-deletes nothing.
+BEFORE deleting, and re-measures the pool right before deleting. If the stamp
+cannot be saved, the pool is no longer the one it measured, or the shortfall
+has eased by then, it deletes nothing.
 
 ## Reading the state on the host
 

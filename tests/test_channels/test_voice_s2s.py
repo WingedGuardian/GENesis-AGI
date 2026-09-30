@@ -1298,7 +1298,7 @@ class TestRawSnippetRendering:
         out = await handler.handle("q", "sess", raw_snippets=True)
         assert "external-world knowledge" in out  # labeled external
         assert "<external-content" in out  # opening fence (carries attributes)
-        assert "</external-content>" in out  # closing fence — content is bounded
+        assert "</external-content id=" in out  # keyed closing fence — content is bounded
 
 
 # ─── Voice ACT: remember / remind tools (Step 2a, Design B) ──────────────────

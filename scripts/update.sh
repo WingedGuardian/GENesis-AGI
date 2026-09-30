@@ -625,7 +625,11 @@ _sync_deploy_targets() {
         # it too. The `+set` test distinguishes unset from empty; `:-` cannot.
         if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_unverified"
-        elif [ "$CC_SUPPRESSION_STATE" != "ok" ]; then
+        elif ! cc_suppression_clean; then
+            # `cc_suppression_clean` (scripts/lib/cc_version.sh) is ok|defaults:
+            # `defaults` = suppression verified, only set-if-absent container
+            # defaults were added — every existing install reports it once when a
+            # new default ships. It is not drift, so it must not degrade the deploy.
             HOST_CC_DEGRADED="${HOST_CC_DEGRADED:+$HOST_CC_DEGRADED,}cc_updater_suppression_${CC_SUPPRESSION_STATE}"
         else
             # `ok` HERE does not mean nothing happened. bootstrap.sh ran earlier

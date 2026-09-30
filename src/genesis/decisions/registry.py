@@ -192,8 +192,16 @@ def _load(text: str, where: str) -> Any:
         return yaml.load(text, Loader=_StrictLoader)  # noqa: S506 — SafeLoader subclass
     except RegistryError as exc:
         raise RegistryError(f"{where}: {exc}") from None
-    except (yaml.YAMLError, RecursionError) as exc:
-        raise RegistryError(f"{where} is not valid registry YAML: {exc}") from None
+    except Exception as exc:
+        # Deliberately broad. Parsing runs PyYAML's inherited constructors,
+        # and what they raise on bad input is not a closed set: a bad date
+        # gives ValueError, `!!timestamp nope` AttributeError, `!!bool abc`
+        # KeyError, besides YAMLError and RecursionError. Listing types was
+        # a denylist that each review extended; at this boundary ANY failure
+        # means the file is not a valid registry.
+        raise RegistryError(
+            f"{where} is not valid registry YAML: {type(exc).__name__}: {exc}"
+        ) from exc  # keep the cause: a bug in this loader's own constructors must stay traceable
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:

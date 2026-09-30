@@ -129,6 +129,28 @@ async def test_unreadable_ref_line_fails_the_whole_branch_leg(repo):
     assert "error" in out and "unparseable" in out["error"]
 
 
+async def test_the_lock_reason_is_recorded_verbatim_not_discarded(repo, tmp_path):
+    """The worker recognises a reaper ARCHIVE anchor by its lock reason, and
+    locking also clears the `prunable` marker (MEASURED on git 2.43), so a
+    listing that drops the `locked` line leaves an archived registration
+    indistinguishable from an unreadable worktree. Unlocked reads None, a bare
+    lock reads "", and a reason with spaces and a `;` survives intact."""
+    locked, bare, free = tmp_path / "locked", tmp_path / "bare", tmp_path / "free"
+    for p, b in ((locked, "l1"), (bare, "l2"), (free, "l3")):
+        _git(repo, "worktree", "add", "-q", "-b", b, str(p))
+    reason = "archived by the reaper -> locked-20260101; recover with --recover"
+    _git(repo, "worktree", "lock", "--reason", reason, str(locked))
+    _git(repo, "worktree", "lock", str(bare))
+
+    out = await list_worktrees(str(repo))
+    assert "error" not in out, out
+    by_path = {w["path"]: w for w in out["worktrees"]}
+    assert by_path[str(locked)]["locked"] == reason
+    assert by_path[str(bare)]["locked"] == ""
+    assert by_path[str(free)]["locked"] is None
+    assert by_path[str(repo)]["locked"] is None
+
+
 async def test_a_prunable_worktree_is_reported_as_prunable(repo, tmp_path):
     """MEASURED on git 2.43: deleting a worktree's DIRECTORY leaves the
     registration behind with a `prunable` marker, and `git -C <gone> status`

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # cc_settings_align.sh — recurring CONTAINER-side reconcile of Claude Code's
-# auto-updater suppression.
+# auto-updater suppression, plus the set-if-absent container settings defaults
+# (cc_reconcile_container_settings in scripts/lib/cc_version.sh — the same call
+# every other container path makes).
 #
 # WHY: CC's auto-updater is held off by two keys in the USER-level
 # ~/.claude/settings.json — DISABLE_AUTOUPDATER=1 and DISABLE_UPDATES=1 (the
@@ -22,7 +24,8 @@
 # a container-side filesystem write does not belong there.
 #
 # Exit codes: 0 ONLY when suppression was positively verified — the keys were
-# already correct, or were repaired (a repair is logged loudly; a REPEAT repair
+# already correct (with or without new set-if-absent defaults written, state
+# `defaults`), or were repaired (a repair is logged loudly; a REPEAT repair
 # across runs is the real "something on this machine keeps rewriting
 # settings.json" signal), or another run of THIS script already holds the lock
 # and is doing the work. Every other path exits non-zero, including the
@@ -173,12 +176,14 @@ fi
 # shellcheck source=/dev/null
 source "$CC_ENV"
 
-if ! declare -F cc_ensure_updater_suppressed >/dev/null 2>&1; then
-    # A rename or move upstream would otherwise leave this timer firing daily,
-    # green, and completely inert — for months, with unit state saying healthy.
-    echo "cc_settings_align: cc_ensure_updater_suppressed not defined in $CC_ENV — suppression NOT verified"
-    exit 3
-fi
+for _fn in cc_ensure_updater_suppressed cc_reconcile_container_settings; do
+    if ! declare -F "$_fn" >/dev/null 2>&1; then
+        # A rename or move upstream would otherwise leave this timer firing daily,
+        # green, and completely inert — for months, with unit state saying healthy.
+        echo "cc_settings_align: $_fn not defined in $CC_ENV — suppression NOT verified"
+        exit 3
+    fi
+done
 
 # Clear the state before the call so an OLDER cc_version.sh — one that defines
 # the function but does not set this variable — cannot be read as `ok` by the
@@ -188,7 +193,12 @@ unset CC_SUPPRESSION_STATE
 
 # Deliberately quiet on the common path: this runs on a timer, and a line per run
 # would train the operator to ignore the journal for this unit.
-cc_ensure_updater_suppressed || true
+# The SAME container reconcile every other container path runs (suppression keys
+# plus the set-if-absent container defaults, and the claude.ai sync check) —
+# without it this timer would heal only the two suppression keys, and an install
+# that predates a default would receive it only on its next deploy. No argument
+# selects the default settings path.
+cc_reconcile_container_settings || true
 
 if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then
     echo "cc_settings_align: cc_ensure_updater_suppressed did not set" \
@@ -208,6 +218,15 @@ _persist_outcome "${CC_SUPPRESSION_STATE}" || exit 3
 
 case "${CC_SUPPRESSION_STATE:-unverified}" in
     ok)
+        exit 0
+        ;;
+    defaults)
+        # Suppression was already correct; only set-if-absent defaults were added
+        # (the reconciler's line above names them). One line, exit 0: this happens
+        # once per install per new default, and again only if something deletes
+        # the key — neither drift in the suppression keys nor a reason to fail the
+        # unit. (An operator opts out with an explicit value, not by deleting.)
+        echo "cc_settings_align: suppression verified; new set-if-absent default(s) applied"
         exit 0
         ;;
     repaired)

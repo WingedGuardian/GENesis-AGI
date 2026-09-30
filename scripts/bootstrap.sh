@@ -333,15 +333,14 @@ if [ -f "$_cc_env" ]; then
     # not swallow the suppression outcome — this was the one caller with no
     # signal at all: `|| true` discarded the return code AND nothing read the
     # state, so bootstrap completed cleanly over a failed suppression check.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "  WARNING: CC auto-updater suppression not verified" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
-                 "the pin; the daily genesis-cc-settings-align timer will retry" \
-                 "and its unit goes red if it cannot"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list of
+    # good states: a reader that did not know a new state would warn falsely.
+    if ! cc_suppression_verified; then
+        echo "  WARNING: CC auto-updater suppression not verified" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+             "the pin; the daily genesis-cc-settings-align timer will retry" \
+             "and its unit goes red if it cannot"
+    fi
     cc_shadow_scan || true
 fi
 

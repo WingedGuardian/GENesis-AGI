@@ -950,13 +950,11 @@ if [ -f "$_cc_env" ]; then
     # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
     # warning suffices at this step — step 12 makes the authoritative call and
     # sets SETUP_WARNINGS if it still cannot verify.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "    WARNING: CC auto-updater suppression not verified yet" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list.
+    if ! cc_suppression_verified; then
+        echo "    WARNING: CC auto-updater suppression not verified yet" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
+    fi
 fi
 
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
@@ -1606,8 +1604,9 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
 fi
 
 # Seed user-level ~/.claude/settings.json with CC defaults: (1) suppress the
-# auto-updater, (2) Genesis's subagent-nesting depth, and (3) the claude.ai
-# skills/plugins sync opt-out (both keys). CC 2.1.217+ made nested
+# auto-updater, (2) Genesis's subagent-nesting depth and MCP description cap, and
+# (3) the claude.ai skills/plugins sync opt-out, each only where nothing of that
+# kind is synced yet (see cc_reconcile_container_settings). CC 2.1.217+ made nested
 # subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
 # (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
 # Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
@@ -1621,18 +1620,13 @@ _settings_file="$HOME/.claude/settings.json"
 #     scripts/lib/cc_version.sh — the SAME function the align path and the
 #     genesis-cc-settings-align timer re-run, so setup and steady state cannot
 #     drift apart);
-#   * the container-only subagent-nesting default is SET IF ABSENT, so a
-#     deliberate operator override (0 to disable, or higher) is preserved;
-#   * syncClaudeAiSkills / syncClaudeAiPlugins are SET IF ABSENT to false (CC
-#     2.1.275+ top-level booleans, hence the `top:` form): claude.ai account
-#     skills and plugins would otherwise sync into EVERY Claude Code session on
-#     this machine (user-level settings), outside the repo's review and
-#     skill-catalog paths. Note CC's own semantics for turning it off: skills
-#     ALREADY synced are moved to ~/.claude/skills/.trash at the next launch
-#     (deleted after cleanupPeriodDays; re-downloaded, not restored, on re-enable)
-#     — so on a machine that had synced them, this default retires them. An
-#     operator who wants the sync sets either key to true and this never touches
-#     it again.
+#   * the container defaults (subagent nesting, the MCP description cap, and the
+#     claude.ai skills/plugins sync opt-outs where nothing was synced when checked) are SET
+#     IF ABSENT, so a deliberate operator value is preserved. The list — and its
+#     rationale, including CC's trash-on-disable behaviour for synced skills and
+#     plugins — lives in scripts/lib/cc_version.sh (cc_reconcile_container_settings),
+#     because every container reconcile path runs the same function; this call is
+#     one of them, not the only one.
 # One call so BOTH policies share a single write contract (mode/xattr carry-over,
 # compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
 # it. Note what this does NOT claim: on a fresh install the file is still touched
@@ -1643,8 +1637,7 @@ _settings_file="$HOME/.claude/settings.json"
 # rewrites settings.json), not this ordering.
 # (The host VM's recovery `claude -p` is single-brain and never nests, so
 # host-setup.sh deliberately passes no nesting default.)
-if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2" \
-        "top:syncClaudeAiSkills=false" "top:syncClaudeAiPlugins=false"; then
+if cc_reconcile_container_settings "$_settings_file"; then
     # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
     # "verified" is finally true here. The nesting default is deliberately not
     # claimed on this line: on the python3-less create path it is NOT applied
@@ -1654,8 +1647,19 @@ if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAW
 else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
-    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"},"
-    echo "                   \"syncClaudeAiSkills\": false, \"syncClaudeAiPlugins\": false}"
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\","
+    # Only the sync opt-outs cc_reconcile_container_settings did NOT hold back: an
+    # opt-out withheld because something is already synced must not be suggested
+    # here either — pasting it would retire the synced items the check protected.
+    _sync_hint=""
+    for _pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
+        _k="${_pair#*:}"
+        case " ${CC_SYNC_OPTOUT_WITHHELD[*]:-} " in
+            *":${_k}:"*) continue ;;
+        esac
+        _sync_hint="${_sync_hint}, \"${_k}\": false"
+    done
+    echo "                            \"CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH\": \"${CC_MCP_DESCRIPTION_LIMIT:-8192}\"}${_sync_hint}}"
     setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 

@@ -85,7 +85,10 @@ NAMED GAPS, so this is not read as covering more than it does:
     19,607 gh-bearing ones) report a blind spot, and ZERO of those were
     bounds-induced. So the silence this closes is CONSTRUCTIBLE rather than
     observed, which is why the lock on it is structural
-    (``test_untokenizable_probe``) rather than a rate.
+    (``test_untokenizable_probe``) rather than a rate. That measurement predates
+    the parser reporting a LINE CONTINUATION as a bounds-type blind spot, which is
+    ordinary input; a continued command now gets a one-line note per command
+    instead of the once-per-session block (``_unreadable_listing_note``).
 """
 
 from __future__ import annotations
@@ -101,7 +104,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import field, read_payload, session_id, session_path, tool_input  # noqa: E402
 from hook_output import DEFAULT_BUDGET, emit_cost, print_json_bounded  # noqa: E402
-from shell_parse import BlindSpot, analyze_checked, gh_command  # noqa: E402
+from shell_parse import (  # noqa: E402
+    BlindSpot,
+    analyze_checked,
+    gh_command,
+    has_continuation,
+    mentions,
+)
 
 
 def _envelope(context: str) -> dict:
@@ -435,6 +444,33 @@ def _omission_line(dropped: int) -> str:
     )
 
 
+#: The verbs of every gh read that can come back capped: a listing (`list`, or its
+#: alias `ls`), a `search`, and `api`. On a command the parse could not read, a
+#: reading that names `gh` and one of these gets a one-line note. The test ONLY
+#: ADDS a note: it does not look for gh's grammar (options before the group, the
+#: method, which command a flag belongs to), because a text classifier of that
+#: grammar missed real reads in review each time it was narrowed (`gh --repo o/r pr
+#: list`, `gh api -X GET`, a field on a different command). The note is conditional
+#: prose, so on a write it costs one sentence. MEASURED over the 928 continued
+#: commands in 86,684 recorded ones: 115 get the note.
+_GH_READ_VERB = re.compile(r"\b(?:list|ls|search|api)\b")
+
+
+def _names_a_gh_read(command: str) -> bool:
+    return mentions(command, _GH_WORD, _GH_READ_VERB)
+
+
+def _unreadable_listing_note(blind: BlindSpot) -> str:
+    """One line for a command whose parse was withheld: its own cause and remedy, and
+    the one check that holds for every gh read, since no target was resolved."""
+    return (
+        f"[capped read] This command {blind.cause}, so I could not check the gh read "
+        f"in it for a default cap. If you will state a count or an absence from its "
+        f"output, get the count from something that reports a TOTAL. For the specific "
+        f"check: {blind.hint}."
+    )
+
+
 def _blind_advisory(blind: BlindSpot, *, found_any: bool) -> str:
     """Said when the parse could not see the whole command.
 
@@ -540,10 +576,28 @@ def _hits(command: str) -> tuple[list[tuple[str, str, int, bool]], object]:
 
 def _process(payload: dict) -> None:
     command = field(tool_input(payload), "command")
-    if not command or not _GH_WORD.search(command):
+    # The text the shell assembles, so a `gh` word split by a line continuation or
+    # by quotes still reaches the parse (`mentions` is widen-only).
+    if not command or not mentions(command, _GH_WORD):
         return
     sid = session_id(payload)
     found, blind = _hits(command)
+
+    # A LINE CONTINUATION is a bounds-type blind spot, so the parse has no segments
+    # and no target: say so for THIS command, in one line, whenever its text names a
+    # gh listing. Not recorded per session. The keyed blind block below is spent once
+    # per session, and a continuation is ordinary input, so MEASURED in review: after
+    # any continued `gh` command spent it, a later continued capped listing got no
+    # advisory at all. Re-parsing the join to find the target was tried instead, and
+    # review found a new defect in that modelling each round. The real bounds keep the
+    # keyed block: they are measured at 0 real commands, so spending it costs nothing.
+    if blind is not None and blind.bounds_induced and has_continuation(command):
+        if _names_a_gh_read(command):
+            print_json_bounded(
+                _envelope(_unreadable_listing_note(blind)),
+                text_keys=("hookSpecificOutput.additionalContext",),
+            )
+        return
 
     seen = _fired_keys(sid)
     pending: list[tuple[str, str]] = []

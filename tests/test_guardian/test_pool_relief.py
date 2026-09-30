@@ -245,6 +245,57 @@ class TestPass:
         )
         assert out == "pool_changed" and snaps.deleted == []
 
+    @pytest.mark.parametrize(
+        "eased",
+        [_lvm(90.0), _lvm(96.0, meta=50.0)],  # data recovered; both back above the reserves
+    )
+    @pytest.mark.asyncio
+    async def test_shortfall_eased_before_the_act(self, tmp_path, eased) -> None:
+        # Review: the re-check used to confirm the pool's identity only, so a
+        # shortfall that eased between the measurement and the delete (an
+        # autoextend landing) still deleted a snapshot — the lifeline, on a
+        # confirmed-healthy tick with nothing else left.
+        lifeline = f"guardian-20260101-000000{HEALTHY_SUFFIX}"
+        snaps = _Snaps({lifeline: OLD})
+        out, d = await _pass(_cfg(tmp_path), snaps, None, measures=[_lvm(98.0), eased])
+        assert out == "eased" and snaps.deleted == [] and lifeline in snaps.names
+        d.send.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("third", "expect_deleted", "expect_out"),
+        [
+            (_lvm(80.0), ["guardian-20260101-000000-pre-recovery"], "eased"),
+            (
+                _lvm(98.0),
+                ["guardian-20260101-000000-pre-recovery", "guardian-20260102-000000-pre-recovery"],
+                "deleted:guardian-20260102-000000-pre-recovery",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_fall_through_re_measures_first(
+        self, tmp_path, third, expect_deleted, expect_out,
+    ) -> None:
+        # Review (Devin, #2545): a failed delete can take minutes, and the pool
+        # can recover meanwhile. The fall-through to the next candidate acts on
+        # a fresh measurement, not the one taken before the first attempt.
+        first, second = "guardian-20260101-000000-pre-recovery", "guardian-20260102-000000-pre-recovery"
+        snaps = _Snaps({first: OLD, second: OLD + timedelta(days=1)}, fail={first})
+        out, _ = await _pass(
+            _cfg(tmp_path), snaps, None, measures=[_lvm(98.0), _lvm(98.0), third],
+        )
+        assert out == expect_out and snaps.deleted == expect_deleted
+
+    @pytest.mark.asyncio
+    async def test_still_short_at_the_act_deletes(self, tmp_path) -> None:
+        # The positive twin: a re-check that is still short goes ahead.
+        snaps = _Snaps({"guardian-20260101-000000-pre-recovery": OLD})
+        out, d = await _pass(_cfg(tmp_path), snaps, None, measures=[_lvm(98.0), _lvm(97.5)])
+        assert out.startswith("deleted") and snaps.deleted == ["guardian-20260101-000000-pre-recovery"]
+        # The alert reports the measurement the delete acted on, not the first.
+        body = d.send.await_args.args[0].body
+        assert "data 97.5%" in body and "98.0" not in body
+
     @pytest.mark.asyncio
     async def test_unwritable_state_stops_the_delete(self, tmp_path) -> None:
         snaps = _Snaps({"guardian-20260101-000000-pre-recovery": OLD})

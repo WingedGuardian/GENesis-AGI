@@ -1016,9 +1016,9 @@ verified: 640c4f2e3 2026-09-18
   item that exhausts its retries, or a file the retry-storm guard parks (at all
   three of its call sites), queues ONE durable owner alert per file and reason
   per scan, naming the file by its path inside the inbox folder; an exhausted
-  item's alert also names each parked logical item (URLs as host+path plus the
-  coverage-log `url#` id, query strings dropped, token-like path segments
-  masked), while a storm alert names the file only. The retry-lane storm site
+  item's alert also names each parked logical item by the URL's HOST, its LINE
+  in the file and the coverage-log `url#` id — never path or query text, which
+  can carry share tokens — while a storm alert names the file only. The retry-lane storm site
   abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
   does not spend a retry and leaves the row an ordinary retriable failure, so
   the same row is asked about again; with `resilience.parking_mode:
@@ -1479,6 +1479,8 @@ verified: 84c7259d 2026-08-31
     old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
     live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
     lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    One more create is tried after those reads: only a pool refusal then
+    deletes first (pressure cleared → ordinary create-first rotation).
     The settle is reserved before the delete. Healthy snapshots are never
     retention-evicted before a create. A refused refresh retries in ~1h
     (own `.last_healthy` marker) and alerts, throttled.
@@ -1487,7 +1489,8 @@ verified: 84c7259d 2026-08-31
     pre-recovery oldest first, then superseded healthy, the lifeline last;
     a failed delete falls through to the next unless the client timed out
     (outcome unknown → stop and alert); 5-minute settle stamped before
-    the delete (delete-first starts it too); pool identity re-checked first.
+    the delete (delete-first starts it too); a re-measure just before the
+    delete must show the same pool still short (eased → stop, `eased`).
     `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
     delete never falls through to the lifeline. Pool identity is incus's
     DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
