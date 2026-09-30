@@ -841,6 +841,8 @@ _ensure_server_down() {
     return 0
 }
 
+# Set only by _start_genesis_server's direct-start fallback; never inherited.
+_SERVER_DIRECT_PID=""
 _start_genesis_server() {
     # Use `restart` (NOT `start`): systemd's Restart=on-failure can resurrect a
     # STALE-code instance mid-update (a kill-based stop is seen as a failure and
@@ -862,7 +864,10 @@ _start_genesis_server() {
     # (systemd-started servers don't inherit our FDs; only this nohup path does.)
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
         {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
-    echo "  Started genesis-server in degraded mode (pid $!)"
+    # No unit tracks this process, so the no-change path's health probe waits on
+    # this pid instead of the unit's state.
+    _SERVER_DIRECT_PID=$!
+    echo "  Started genesis-server in degraded mode (pid $_SERVER_DIRECT_PID)"
     # Write marker so dashboard can detect degraded mode
     echo "nohup" > "$HOME/.genesis/server-start-mode"
 }
@@ -1199,20 +1204,26 @@ _server_health_ok() {
     # `active`/`activating` is never proof by itself: a crash-looping unit under
     # Restart=on-failure reads `activating` between attempts, so it waits out the
     # bound and reads "not back". Any other unit state (inactive, failed, or an
-    # unreadable empty answer) stops at once. A server booting slower than 180s
-    # also reads "not back": the side that reports a problem.
-    local waited=0 state
-    local limit="${_SERVER_HEALTH_WAIT_SECS:-180}" step="${_SERVER_HEALTH_POLL_SECS:-15}"
+    # unreadable empty answer) stops at once, unless _start_genesis_server fell
+    # back to a direct start: no unit tracks that process, so the wait follows its
+    # pid instead. A server booting slower than the bound reads "not back": the side
+    # that reports a problem. The bound is ELAPSED time ($SECONDS), so a transfer
+    # that hangs for its full --max-time counts against it too; the worst overrun is
+    # one poll step plus one transfer (the deadline is checked before the sleep).
+    local state
+    local deadline=$((SECONDS + ${_SERVER_HEALTH_WAIT_SECS:-180})) step="${_SERVER_HEALTH_POLL_SECS:-15}"
     while :; do
         curl -sf --max-time 20 http://localhost:5000/api/genesis/health > /dev/null 2>&1 && return 0
         state="$(systemctl --user is-active genesis-server.service 2>/dev/null || true)"
         case "$state" in
             active | activating | reloading) ;;
-            *) return 1 ;;
+            *)
+                [ -n "${_SERVER_DIRECT_PID:-}" ] && kill -0 "$_SERVER_DIRECT_PID" 2>/dev/null \
+                    || return 1
+                ;;
         esac
-        [ "$waited" -lt "$limit" ] || return 1
+        [ "$SECONDS" -lt "$deadline" ] || return 1
         sleep "$step"
-        waited=$((waited + step))
     done
 }
 # END deploy-outcome-probes

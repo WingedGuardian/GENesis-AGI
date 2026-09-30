@@ -90,8 +90,10 @@ def test_every_success_record_uses_marker_capable_variable() -> None:
     name the new HEAD while nothing is serving it. Those are not the same test:
     the P6 site used to pass `_OPERATOR_STOP`, which is only ever true when
     `WERE_RUNNING` was ENTIRELY empty — and `genesis-bridge` populates that array
-    too, so a bridge-up / server-down run satisfied the letter and wrote a bare
-    success row anyway. So assert the DERIVATION, not the variable name.
+    too, so a bridge-up / server-down run satisfied the letter while missing the
+    purpose. (Today that run rolls back at P6's health gate before any writer,
+    #2633; the derivation must still be right for when it does not.) So assert the
+    DERIVATION, not the variable name.
 
     Enumeration is by the HELPER NAME and spelling-agnostic: any quoting, any
     arity. A gate whose denominator is one spelling is a denylist.
@@ -227,8 +229,11 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     shim_dir.mkdir()
     calls = tmp_path / "curl_calls"
 
-    def healthy(unit_state: str, answers: list[int], wait: int = 2) -> tuple[bool, int]:
-        """<answers> are curl's exit codes, call by call (the last repeats)."""
+    def healthy(
+        unit_state: str, answers: list[int], wait: int = 10, direct_pid: str = ""
+    ) -> tuple[bool, int]:
+        """<answers> are curl's exit codes, call by call (the last repeats).
+        <direct_pid> stands for a process _start_genesis_server direct-started."""
         calls.write_text("")
         seq = " ".join(str(a) for a in answers)
         (shim_dir / "curl").write_text(
@@ -247,6 +252,7 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
                 "bash",
                 "-c",
                 f"_SERVER_HEALTH_WAIT_SECS={wait}\n_SERVER_HEALTH_POLL_SECS=1\n"
+                + (f"_SERVER_DIRECT_PID={direct_pid}\n" if direct_pid else "")
                 + block
                 + "\n_server_health_ok",
             ],
@@ -259,15 +265,47 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     assert healthy("active", [0]) == (True, 1)
     # Booting: a 503 (22) and a refused connection (7), then healthy — waited for.
     assert healthy("activating", [22, 7, 0]) == (True, 3)
-    # Starting forever (a crash loop reads `activating`): the bound ends it.
+    # Starting forever (a crash loop reads `activating`): the ELAPSED bound ends it,
+    # after a few attempts (the exact count depends on the clock, not a counter).
     ok, n = healthy("activating", [7], wait=2)
-    assert not ok and n == 3, n
+    assert not ok and 1 <= n <= 4, n
     # Any other unit state stops at once: no waiting on a stopped server.
     for state in ("inactive", "failed", "deactivating", ""):
         assert healthy(state, [7]) == (False, 1), f"unit state {state!r}"
     # 7 refused, 22 an HTTP error, 28 timed out — none reads as up.
     for rc in (7, 22, 28):
         assert healthy("inactive", [rc])[0] is False, rc
+    # A direct start (no unit): waited for while its process lives...
+    sleeper = subprocess.Popen(["sleep", "60"])
+    try:
+        assert healthy("inactive", [7, 7, 0], direct_pid=str(sleeper.pid)) == (True, 3)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    # ...and not at all once it is gone.
+    assert healthy("inactive", [7], direct_pid=str(sleeper.pid)) == (False, 1)
+    # A transfer that hangs counts against the bound: each attempt takes 3s here,
+    # so a 3s bound allows ONE attempt (a sleep-only counter would allow four).
+    slow = shim_dir / "slow-curl"
+    slow.write_text(f'#!/bin/sh\necho x >> "{calls}"\nsleep 3\nexit 28\n')
+    slow.chmod(0o755)
+    (shim_dir / "systemctl").write_text("#!/bin/sh\nprintf activating\nexit 0\n")
+    calls.write_text("")
+    r = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "_SERVER_HEALTH_WAIT_SECS=3\n_SERVER_HEALTH_POLL_SECS=1\n"
+            + f'curl() {{ "{slow}"; }}\n'
+            + block
+            + "\n_server_health_ok",
+        ],
+        capture_output=True,
+        text=True,
+        env=_clean_env(PATH=f"{shim_dir}:{os.environ['PATH']}"),
+    )
+    assert r.returncode != 0
+    assert len(calls.read_text().splitlines()) <= 2, calls.read_text()
 
     home = tmp_path / "home"
     root = tmp_path / "install"

@@ -112,10 +112,13 @@ A change at the success writers, outside the pre-stop window: every `success` ro
 (P6 and both no-change writers) builds its degraded value through
 `_success_degraded_subsystems`, so each can carry `genesis-server-not-restarted`.
 P6 decides it by whether genesis-server was in `WERE_RUNNING` (not by
-`_OPERATOR_STOP`, which a bridge-up/server-down run leaves false); the no-change
-path, which has no health loop, decides it by one health probe after the restart
-attempt (`_server_health_ok`, P6's per-attempt probe; unit state is not used,
-because a crash-looping unit reads `activating`). The no-change path writes a row
+`_OPERATOR_STOP`, which is true only when `WERE_RUNNING` is entirely empty). A
+bridge-only run does not reach P6's success writer at all today: its health gate
+checks genesis-server whenever `WERE_RUNNING` is non-empty, and rolls back. The
+no-change path, which has no health loop, decides it with `_server_health_ok`:
+P6's per-attempt probe, retried while the unit reports itself starting (or while a
+direct-started process lives), bounded by elapsed time at 180s. Unit state alone is
+not used, because a crash-looping unit reads `activating`. The no-change path writes a row
 only to persist a degradation, as before, and with the server down only over
 nothing-recorded or a prior `success` (an allowlist): any other latest status
 stays the latest. The no-change path and P6 read the last status through one
