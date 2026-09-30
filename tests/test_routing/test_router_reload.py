@@ -428,3 +428,57 @@ def test_reload_rebuilds_the_essential_coverage_map(tmp_path):
     router.reload_config(new_config)
 
     assert breakers._essential_sites == {"9_fact_extraction": ["prov_b"]}
+
+
+def test_coverage_survives_a_reload_with_no_essential_site(tmp_path):
+    """Through the router: reload a config with no essential site (the map
+    becomes None), then one with them. Coverage mode must come back."""
+    from genesis.routing.router import Router
+    from genesis.routing.types import ErrorCategory
+
+    essential = _make_config(sites={
+        "9_fact_extraction": CallSiteConfig(id="9_fact_extraction", chain=["prov_b"]),
+    })
+    breakers = CircuitBreakerRegistry(
+        essential.providers, state_file=tmp_path / "b.json", persist=False,
+        essential_sites={"9_fact_extraction": ["prov_b"]},
+    )
+    router = Router(
+        config=essential,
+        breakers=breakers,
+        cost_tracker=MagicMock(),
+        degradation=MagicMock(),
+        delegate=AsyncMock(),
+    )
+    router.reload_config(_make_config())  # no essential site
+    assert breakers._essential_sites is None, "fixture: the map must be dropped"
+
+    router.reload_config(essential)
+    assert breakers._essential_sites == {"9_fact_extraction": ["prov_b"]}
+    # Coverage mode is observable: with prov_b's breaker open the site reads
+    # uncovered. On the legacy check (no map) this list is always empty.
+    for _ in range(10):
+        breakers.get("prov_b").record_failure(ErrorCategory.TRANSIENT)
+    assert breakers.uncovered_essential_sites() == ["9_fact_extraction"]
+
+
+def test_a_bare_registry_stays_legacy_across_reloads(tmp_path):
+    """CONTROL: a registry built without a map is never put into coverage mode."""
+    from genesis.routing.router import Router
+
+    essential = _make_config(sites={
+        "9_fact_extraction": CallSiteConfig(id="9_fact_extraction", chain=["prov_b"]),
+    })
+    breakers = CircuitBreakerRegistry(
+        essential.providers, state_file=tmp_path / "b.json", persist=False
+    )
+    router = Router(
+        config=essential,
+        breakers=breakers,
+        cost_tracker=MagicMock(),
+        degradation=MagicMock(),
+        delegate=AsyncMock(),
+    )
+    router.reload_config(_make_config())
+    router.reload_config(essential)
+    assert breakers._essential_sites is None
