@@ -20,6 +20,11 @@ from genesis.knowledge.processors.youtube import (
 )
 from genesis.security.sanitizer import strip_boundary_markers
 
+
+def _body(text):
+    """A fetched page's text without its untrusted-content boundary markers."""
+    return strip_boundary_markers(text).strip("\n") if isinstance(text, str) else text
+
 # ─── host allowlist ─────────────────────────────────────────────────────────
 
 
@@ -378,7 +383,7 @@ async def test_a_failed_metadata_fetch_falls_back_to_the_page(web, monkeypatch):
 
     monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", fetch)
     out = await tool(url="https://youtu.be/abc123")
-    assert out["content"] == "page" and "unavailable" in out["youtube_error"]
+    assert _body(out["content"]) == "page" and "unavailable" in out["youtube_error"]
 
 
 async def test_a_lookalike_url_never_reaches_yt_dlp(web):
@@ -512,7 +517,7 @@ async def test_a_mixed_batch_overlays_transcripts_on_one_batch_call(web, monkeyp
     assert seen == [urls]
     assert [r["url"] for r in out["results"]] == urls
     assert out["results"][1]["backend_used"] == "yt-dlp"
-    assert out["results"][0]["text"] == "tf" and out["results"][2]["text"] == "tf"
+    assert _body(out["results"][0]["text"]) == "tf" and _body(out["results"][2]["text"]) == "tf"
 
 
 async def test_an_explicit_backend_batch_is_the_plain_batch_path(web, monkeypatch):
@@ -539,7 +544,7 @@ async def test_a_video_miss_keeps_the_batch_page_entry(web, monkeypatch):
     monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", fetch)
     out = await tool(urls=["https://youtu.be/abc123", "https://example.com/a"])
     first = out["results"][0]
-    assert first["text"] == "tf" and "unavailable" in first["youtube_error"]
+    assert _body(first["text"]) == "tf" and "unavailable" in first["youtube_error"]
 
 
 async def test_a_raising_youtube_fetch_keeps_the_batch(web, monkeypatch):
@@ -555,7 +560,7 @@ async def test_a_raising_youtube_fetch_keeps_the_batch(web, monkeypatch):
     monkeypatch.setattr(youtube_route.YouTubeProcessor, "fetch", boom)
     out = await tool(urls=["https://youtu.be/abc123", "https://example.com/a"])
     assert "yt-dlp exploded" in out["results"][0]["youtube_error"]
-    assert out["results"][1]["text"] == "tf"
+    assert _body(out["results"][1]["text"]) == "tf"
 
 
 async def test_a_url_the_batch_backend_omitted_is_an_error_not_a_misfile(web, monkeypatch):
@@ -579,8 +584,10 @@ async def test_a_url_the_batch_backend_omitted_is_an_error_not_a_misfile(web, mo
         "https://youtu.be/abc123",
         "https://example.com/b",
     ]
-    assert out["results"][1]["text"] == "B"
-    assert out["errors"] == [{"url": "https://example.com/a", "error": "page_not_found"}]
+    assert _body(out["results"][1]["text"]) == "B"
+    assert [{**e, "error": _body(e["error"])} for e in out["errors"]] == [
+        {"url": "https://example.com/a", "error": "page_not_found"}
+    ]
 
 
 async def test_a_batch_without_a_batch_backend_still_returns_transcripts(web, monkeypatch):
@@ -590,7 +597,7 @@ async def test_a_batch_without_a_batch_backend_still_returns_transcripts(web, mo
     _count_multi(monkeypatch, lambda urls: {"error": "Multi-URL fetch requires API_KEY_TINYFISH"})
     out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123"])
     assert [r["url"] for r in out["results"]] == ["https://youtu.be/abc123"]
-    assert out["errors"] == [
+    assert [{**e, "error": _body(e["error"])} for e in out["errors"]] == [
         {"url": "https://example.com/a", "error": "Multi-URL fetch requires API_KEY_TINYFISH"}
     ]
 
@@ -625,7 +632,7 @@ async def test_duplicate_urls_each_get_their_own_entry(web, monkeypatch):
         "https://example.com/a",
         "https://youtu.be/abc123",
     ]
-    assert [r.get("text") for r in out["results"][:2]] == ["page 0", "page 1"]
+    assert [_body(r.get("text")) for r in out["results"][:2]] == ["page 0", "page 1"]
     assert out.get("errors", []) == []
 
 
@@ -1109,7 +1116,7 @@ async def test_padded_and_schemeless_urls_still_match_their_batch_entries(web, m
     monkeypatch.setattr(web_tools, "_impl_web_fetch_multi", multi)
     out = await tool(urls=["  https://example.com/a ", "example.com/b", "https://youtu.be/abc123"])
     assert out.get("errors", []) == []
-    assert [r.get("text") for r in out["results"][:2]] == ["tf", "tf"]
+    assert [_body(r.get("text")) for r in out["results"][:2]] == ["tf", "tf"]
 
 
 async def test_the_overlay_path_is_capped_at_ten_urls_too(web, monkeypatch):
@@ -1145,7 +1152,7 @@ async def test_the_overlay_runs_against_the_real_batch_implementation(monkeypatc
     tool = getattr(web_tools.web_fetch, "fn", web_tools.web_fetch)
     out = await tool(urls=["  https://example.com/a ", "example.com/b", "https://youtu.be/abc123"])
     assert out.get("errors", []) == []
-    assert [r.get("text") for r in out["results"][:2]] == [
+    assert [_body(r.get("text")) for r in out["results"][:2]] == [
         "page for https://example.com/a", "page for https://example.com/b"]
     assert out["results"][2]["backend_used"] == "yt-dlp"
 
@@ -1158,7 +1165,7 @@ async def test_a_page_echoed_under_another_spelling_is_kept_not_dropped(web, mon
     _count_multi(monkeypatch, lambda urls: {"results": [
         {"url": "https://example.com/a/", "text": "A"}]})
     out = await tool(urls=["https://example.com/a", "https://youtu.be/abc123"])
-    assert any(r.get("text") == "A" for r in out["results"])
+    assert any(_body(r.get("text")) == "A" for r in out["results"])
     assert out["errors"][0]["url"] == "https://example.com/a"
     assert "no batch entry matched" in out["errors"][0]["error"]
 
@@ -1176,7 +1183,7 @@ async def test_a_crash_formatting_one_video_does_not_sink_the_batch(web, monkeyp
 
     monkeypatch.setattr(youtube_route, "_format", boom)
     out = await tool(urls=["https://youtu.be/abc123", "https://example.com/a"])
-    assert out["results"][0]["text"] == "tf" and "KeyError" in out["results"][0]["youtube_error"]
+    assert _body(out["results"][0]["text"]) == "tf" and "KeyError" in out["results"][0]["youtube_error"]
 
 
 async def test_a_failed_batch_call_still_reports_a_top_level_error(web, monkeypatch):
