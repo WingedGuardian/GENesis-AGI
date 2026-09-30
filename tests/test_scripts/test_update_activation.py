@@ -559,8 +559,11 @@ def test_every_cleared_path_is_one_the_dirty_gate_excuses():
 
 def test_disk_hygiene_prunes_old_backup_runs_only(tmp_path):
     text = HYGIENE.read_text()
-    start = text.index('if [ -d "$HOME/.genesis/premerge-backups" ]; then')
-    stanza = text[start : text.index("\n    fi\n", start) + 8]
+    start = text.index('if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups"')
+    stanza = (
+        f'. "{REPO_ROOT / "scripts" / "lib" / "tmp_liveness.sh"}"\n'
+        + text[start : text.index("\n    fi\n", start) + 8]
+    )
     base = tmp_path / ".genesis" / "premerge-backups"
     old = base / "20260101T000000Z-1"
     new = base / "20260920T000000Z-2"
