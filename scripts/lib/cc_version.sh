@@ -294,31 +294,28 @@ _cc_synced_entries() {
     ( shopt -s nullglob dotglob; _e=("$d"/*); echo "${#_e[@]}" )
 }
 
-# The withholding record: one claude.ai sync kind per line (the format #2561
-# introduced), naming each kind this install was seen syncing. Claude Code
-# empties <kind>/synced itself for an account that signs out, so without it the
-# next reconcile would read "nothing synced" and write `false`, and signing back
-# in would no longer resume sync (review, Devin #2579). Every doubt about the
-# record reads as "withhold", which leaves sync on: the status quo.
-_CC_SYNC_WITHHELD_FILE="${HOME:-/nonexistent}/.genesis/cc_sync_optout_withheld"
+# The withholding record #2561 wrote, one claude.ai sync kind per line. It is
+# no longer written: the decision now lives in settings.json itself (below). It
+# is still READ, because an install that ran #2561 may carry one, and a kind it
+# names was seen syncing. Every doubt about it reads as "cannot tell", which
+# withholds the opt-out: the status quo.
+_CC_SYNC_WITHHELD_FILE="${HOME:-}/.genesis/cc_sync_optout_withheld"
 
-# _cc_sync_record <check|add> <kind> — check: exit 0 if <kind> is recorded, 10 if
-# it provably is not (no record, or a well-formed record without it), anything
-# else if that cannot be established (unreadable, not a regular file, a dangling
-# link, an unexpected line, an empty file, an unsearchable directory, no python3,
-# or python itself failing). "Provably absent" gets its own code so that a
-# crash, which exits 1, cannot be read as absence (review). add: record <kind>
-# unless the record is one it cannot vouch for; exit 0 on success. Opened
-# non-blocking and judged on the descriptor, so a FIFO cannot hang it, and
-# replaced atomically, so a reader never sees half a record. The record is
-# HOME's, whatever claude_dir a caller passes; every caller today reconciles
-# HOME's own settings.
-_cc_sync_record() {
+# _cc_sync_legacy_record <kind> — exit 0 if the record names <kind>, 10 if it
+# provably does not (no record, or a well-formed record without it), anything
+# else if that cannot be established: an empty HOME, unreadable, not a regular
+# file, a dangling link, empty or unexpected content, larger than any real
+# record, an unsearchable directory, no python3, or python itself failing.
+# "Provably absent" has its own code so a crash, which exits 1, cannot pass for
+# it (review). Opened non-blocking and judged on the descriptor, so a FIFO
+# cannot hang it.
+_cc_sync_legacy_record() {
+    [ -n "${HOME:-}" ] || return 2
     command -v python3 >/dev/null 2>&1 || return 2
     local rc=0
     python3 -I -c '
-import os, stat, sys, tempfile
-mode, path, kind = sys.argv[1], sys.argv[2], sys.argv[3]
+import os, stat, sys
+path, kind = sys.argv[1], sys.argv[2]
 known = {"skills", "plugins"}
 def provably_absent():
     """Nothing, not even a dangling link, at the path, and the nearest existing
@@ -343,73 +340,52 @@ def provably_absent():
         except OSError:
             return False
         return os.path.isdir(p) and os.access(p, os.X_OK)
-def read():
-    """(kinds, trusted): kinds is a set, or None for no record."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return (None, provably_absent())
-    except OSError:
-        return (None, False)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return (None, False)
-        with os.fdopen(fd, encoding="utf-8") as f:
-            fd = None
-            lines = f.read().splitlines()
-    except Exception:
-        return (None, False)
-    finally:
-        if fd is not None:
-            os.close(fd)
-    if not lines or not set(lines) <= known:
-        return (None, False)
-    return (set(lines), True)
-kinds, trusted = read()
-if mode == "check":
-    if not trusted:
-        sys.exit(2)
-    sys.exit(0 if kinds and kind in kinds else 10)
-if not trusted:
-    sys.exit(1)
-if kinds and kind in kinds:
-    sys.exit(0)
-kinds = (kinds or set()) | {kind}
-d = os.path.dirname(path)
-tmp = None
 try:
-    os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".cc_sync_optout_withheld.")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write("".join(k + "\n" for k in sorted(kinds)))
-    os.replace(tmp, path)
-except Exception:
-    if tmp is not None:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-    sys.exit(1)
-' "$1" "$_CC_SYNC_WITHHELD_FILE" "$2" 2>/dev/null || rc=$?
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+except FileNotFoundError:
+    sys.exit(10 if provably_absent() else 2)
+except OSError:
+    sys.exit(2)
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        sys.exit(2)
+    # A real record is at most two short lines; anything longer is not one.
+    raw = os.read(fd, 4097)
+finally:
+    os.close(fd)
+try:
+    lines = raw.decode("utf-8").splitlines()
+except UnicodeDecodeError:
+    sys.exit(2)
+if len(raw) > 4096 or not lines or not set(lines) <= known:
+    sys.exit(2)
+sys.exit(0 if kind in lines else 10)
+' "$_CC_SYNC_WITHHELD_FILE" "$1" 2>/dev/null || rc=$?
     return "$rc"
 }
 
 # cc_resolve_container_defaults [claude_dir] — the set-if-absent defaults THIS
-# install should receive: CC_CONTAINER_SETTINGS_DEFAULTS always, plus each
-# claude.ai sync opt-out whose <kind>/synced directory is PROVABLY empty or missing
-# (see _cc_synced_entries) AND that the withholding record provably does not name.
-# Sets CC_CONTAINER_DEFAULTS_EFFECTIVE (array) and CC_SYNC_OPTOUT_WITHHELD (array
-# of `kind:key:reason`, reason `present`, `unreadable`, `seen` or
-# `record-unreadable`, for each opt-out held back). claude_dir defaults to
+# install should receive: CC_CONTAINER_SETTINGS_DEFAULTS always, plus one value
+# per claude.ai sync key, decided from what is synced. Sets
+# CC_CONTAINER_DEFAULTS_EFFECTIVE (array) and CC_SYNC_OPTOUT_WITHHELD (array of
+# `kind:key:reason` for each kind whose opt-out is held back; reason `present`,
+# `seen`, `unreadable` or `record-unreadable`). claude_dir defaults to
 # ~/.claude.
-#
-# Recorded only on POSITIVE proof (synced content present and the key not set
-# either way), so one bad read cannot become permanent and an operator's own
-# choice is not recorded. MEASURED on Claude Code 2.1.280: once sync has run,
-# <kind>/synced holds the account's `.bucket-<id>` marker and its `<id>/` folder
-# whatever the item count, so a syncing install is recorded on its first run.
+#   * <kind>/synced PROVABLY empty or missing (see _cc_synced_entries), and no
+#     #2561 record naming it: `false`, the opt-out.
+#   * synced content present, or a #2561 record naming the kind: `true`. Claude
+#     Code treats an absent key as on, so `true` changes nothing it does; it
+#     makes the decision durable. Claude Code empties <kind>/synced itself when
+#     the account signs out, and without the key set the next run would read
+#     that as "never synced" and turn sync off (review, Devin #2579).
+#   * anything that cannot be established (synced/ or the record unreadable):
+#     nothing written, so the key stays absent and sync stays on.
+# Every value is set-if-absent: an operator's own choice is never replaced.
+# MEASURED on Claude Code 2.1.280: once sync has run, <kind>/synced holds the
+# account's `.bucket-<id>` marker and its `<id>/` folder whatever the item
+# count, so a syncing install is decided on its first run.
 cc_resolve_container_defaults() {
-    local claude_dir="${1:-$HOME/.claude}" pair kind key n rec state
+    local claude_dir="${1:-$HOME/.claude}" pair kind key n rec
     CC_CONTAINER_DEFAULTS_EFFECTIVE=("${CC_CONTAINER_SETTINGS_DEFAULTS[@]}")
     CC_SYNC_OPTOUT_WITHHELD=()
     for pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
@@ -419,23 +395,20 @@ cc_resolve_container_defaults() {
         case "$n" in
             0)
                 rec=0
-                _cc_sync_record check "$kind" || rec=$?
+                _cc_sync_legacy_record "$kind" || rec=$?
                 case "$rec" in
                     10) CC_CONTAINER_DEFAULTS_EFFECTIVE+=("top:${key}=false") ;;
-                    0) CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:seen") ;;
+                    0)
+                        CC_CONTAINER_DEFAULTS_EFFECTIVE+=("top:${key}=true")
+                        CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:seen")
+                        ;;
                     *) CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:record-unreadable") ;;
                 esac
                 ;;
             unreadable) CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:unreadable") ;;
             *)
+                CC_CONTAINER_DEFAULTS_EFFECTIVE+=("top:${key}=true")
                 CC_SYNC_OPTOUT_WITHHELD+=("${kind}:${key}:present")
-                state="$(_cc_sync_key_state "$claude_dir/settings.json" "$key")"
-                if [ "$state" = "1" ] && ! _cc_sync_record add "$kind"; then
-                    echo "  WARNING: could not record that claude.ai ${kind} sync is in use" \
-                         "here ($_CC_SYNC_WITHHELD_FILE); if ${claude_dir}/${kind}/synced" \
-                         "later empties, as it does on sign-out, the next run holds it back" \
-                         "only if that record can be read" >&2
-                fi
                 ;;
         esac
     done
@@ -444,7 +417,7 @@ cc_resolve_container_defaults() {
 # cc_reconcile_container_settings [settings_file] — THE container-side settings
 # reconcile: suppression keys enforced, container defaults set if absent, via
 # cc_ensure_updater_suppressed (one atomic write), then a notice for each claude.ai
-# sync opt-out held back because something is already synced. Every container path
+# sync key it set or could not decide. Every container path
 # calls this rather than the reconciler directly, so none can forget the defaults
 # or the sync check (tests/test_scripts/test_cc_updater_suppression.py locks that).
 # Returns the reconciler's rc and leaves CC_SUPPRESSION_STATE exactly as it set it.
@@ -501,13 +474,14 @@ sys.exit(2 if not isinstance(v, bool) else (3 if v else 0))
 #   * a key present but NOT a boolean is warned about whatever else holds —
 #     Claude Code treats it as false, so sync is off, and a set-if-absent default
 #     never replaces it (review);
-#   * an opt-out this reconcile WROTE (named in CC_SUPPRESSION_WRITTEN, the
-#     reconciler's own verified write list) gets one NOTE, and only while the
-#     key still reads false: another writer may set it after the verified
-#     write (review, Codex #2579);
-#   * a withheld key that is still absent gets one NOTE naming both choices (a
-#     decision the operator has not made yet stays visible), and goes silent once
-#     they set it either way.
+#   * a value this reconcile WROTE (named in CC_SUPPRESSION_WRITTEN, the
+#     reconciler's own verified write list) gets one NOTE, worded from what the
+#     key reads NOW, since another writer may set it after the verified write
+#     (review, Codex #2579): `false` says sync is now off, `true` says it was
+#     kept on and how to turn it off;
+#   * a withheld key that is still absent (nothing could be written, or the
+#     write failed) gets one NOTE naming both choices on every run, until it
+#     is set either way.
 # Where the output is seen: install.sh's terminal; the daily settings timer's
 # journal; update.sh's own cc_ensure_local call, untrimmed — but on an existing
 # install the one-time written-now note comes from bootstrap's reconcile, whose
@@ -540,13 +514,20 @@ _cc_sync_optout_notice() {
                  "claude.ai ${kind} into this machine, set it to true." >&2
             continue
         fi
-        [ "$state" = "1" ] && [ -n "$reason" ] || continue
         case "$reason" in
             unreadable) what="whether ${sf%/*}/${kind}/synced holds synced ${kind} could not be read" ;;
-            seen) what="${kind} synced here before (${_CC_SYNC_WITHHELD_FILE}), and ${sf%/*}/${kind}/synced is empty now, as it is after signing out" ;;
+            seen) what="${kind} synced here before (${_CC_SYNC_WITHHELD_FILE})" ;;
             record-unreadable) what="whether ${kind} synced here before could not be read from ${_CC_SYNC_WITHHELD_FILE} (fix or remove that file to let this be decided again)" ;;
             *) what="synced content is present in ${sf%/*}/${kind}/synced" ;;
         esac
+        if [ "$written" = 1 ] && [ "$state" = "3" ]; then
+            echo "  NOTE: claude.ai ${kind} sync is kept ON here (\"${key}\": true in ${sf}):" \
+                 "${what}. Turning it off makes Claude Code hide them and move them to" \
+                 "${sf%/*}/${kind}/.trash at its next launch (re-downloaded, not restored, if" \
+                 "re-enabled). To turn it off, set it to false." >&2
+            continue
+        fi
+        [ "$state" = "1" ] && [ -n "$reason" ] || continue
         echo "  NOTE: claude.ai ${kind} sync is left ON here: ${what}. Turning it off makes" \
              "Claude Code hide them and move them to ${sf%/*}/${kind}/.trash at its next" \
              "launch (re-downloaded, not restored, if re-enabled). To turn it off anyway, set" \
