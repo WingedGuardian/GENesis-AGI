@@ -136,6 +136,32 @@ def test_a_non_ascii_header_is_still_a_401_not_a_500(app, monkeypatch):
     assert _check(app, "Bearer d\xe9sk", accept=_DESK_ACCEPT) == ("Invalid bearer token", 401)
 
 
+@pytest.mark.parametrize("token", ["tök", "é", "Ã©", "ðŸ”‘"])
+def test_a_non_ascii_token_is_unconfigured(app, monkeypatch, caplog, token):
+    """A non-ASCII token has several byte spellings, which let two configured
+    tokens alias; it is ignored (with a warning) rather than half-accepted."""
+    import genesis.env as env_mod
+
+    monkeypatch.setattr(env_mod, "_NON_ASCII_BEARER_WARNED", set())
+    monkeypatch.setenv(_BROAD, token)
+    assert bearer_token(_BROAD) == ""
+    assert _check(app, "Bearer x")[1] == 503
+    assert "non-ASCII" in caplog.text
+
+
+def test_non_ascii_tokens_cannot_alias_across_scopes(app, monkeypatch):
+    """Desk token "é" sent as UTF-8 is the same bytes as broad token "Ã©" sent as
+    latin-1. Neither may open anything, least of all a broad route."""
+    monkeypatch.setenv(_DESK, "é")
+    monkeypatch.setenv(_BROAD, "Ã©")
+    wire = {"HTTP_AUTHORIZATION": "Bearer " + "é".encode().decode("latin-1")}
+    with app.test_request_context(environ_overrides=wire):
+        broad = check_bearer_token("test surface")
+        desk = check_bearer_token("test surface", accept=_DESK_ACCEPT)
+    assert broad is not None, "the desk credential opened a broad route"
+    assert broad[1] == 503 and desk is not None and desk[1] == 503
+
+
 def test_an_empty_accept_is_refused_loudly(app):
     """A caller passing no names would otherwise get a 503 naming nothing."""
     with pytest.raises(ValueError):
@@ -253,6 +279,52 @@ def test_the_mcp_transport_never_accepts_the_desk_token(mcp_server, monkeypatch)
     over HTTP. The transport resolves only its own variable."""
     monkeypatch.setenv(_DESK, "desk-only")
     assert mcp_server._resolve_http_auth_token(None) == ""
+
+
+def _drive_mcp_guard(mcp_server, header: bytes | None, token: str = "tok") -> int:  # noqa: S107
+    """Run one HTTP request through the MCP transport's ASGI guard; return the status
+    it answers with (200 = passed through to the app)."""
+    import asyncio
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    guard = mcp_server._bearer_auth_middleware(token).cls(app)
+    headers = [] if header is None else [(b"authorization", header)]
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(guard({"type": "http", "headers": headers}, None, send))
+    return sent[0]["status"]
+
+
+@pytest.mark.parametrize(
+    "header,expected",
+    [
+        (b"Bearer tok", 200),
+        (b"Bearer nope", 401),
+        (None, 401),
+        # #2467: a bad credential is refused with 401, never a 500 from the guard.
+        ("Bearer tök".encode(), 401),
+        (b"Bearer \xff\xfe", 401),
+    ],
+)
+def test_the_mcp_guard_refuses_bad_credentials_with_401(mcp_server, header, expected):
+    assert _drive_mcp_guard(mcp_server, header) == expected
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1"])
+def test_the_mcp_guard_never_accepts_a_non_ascii_token(mcp_server, encoding):
+    assert _drive_mcp_guard(mcp_server, "Bearer tök".encode(encoding), token="tök") == 401
+
+
+def test_an_invalid_explicit_cli_token_never_falls_back_to_the_env(mcp_server, monkeypatch):
+    """An operator rotating credentials passes --auth-token; if it is invalid the
+    transport must stay unconfigured (startup refuses), not accept the old env token."""
+    monkeypatch.setenv(_BROAD, "old-env-token")
+    assert mcp_server._resolve_http_auth_token("tök") == ""
 
 
 # ── the boot warning names exactly the disabled surfaces ──────────────────────

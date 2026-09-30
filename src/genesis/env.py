@@ -275,8 +275,44 @@ def bearer_token(name: str) -> str:
     once disagreed, and a whitespace-only value became the literal MCP HTTP
     secret while the dashboard treated the same value as absent. A test locks
     every other raw read of these names out of ``src/`` and ``scripts/``.
+
+    A non-ASCII value is also unconfigured: see ``ascii_bearer``.
     """
-    return os.environ.get(name, "").strip()
+    return ascii_bearer(os.environ.get(name, "").strip(), name)
+
+
+_NON_ASCII_BEARER_WARNED: set[str] = set()
+
+
+def ascii_bearer(value: str, label: str) -> str:
+    """``value`` if it is ASCII, else ``""`` (unconfigured), warning once per label.
+
+    HTTP fixes no charset for header values, so a non-ASCII token has more than
+    one byte spelling (UTF-8, latin-1). Accepting several spellings lets two
+    different configured tokens match the same bytes: a desk token ``ö`` sent as
+    UTF-8 equals a broad token ``Ã¶`` sent as latin-1, which would open broad
+    routes to a desk client. With ASCII tokens there is exactly one spelling.
+    """
+    if value.isascii():
+        return value
+    if label not in _NON_ASCII_BEARER_WARNED:
+        _NON_ASCII_BEARER_WARNED.add(label)
+        logger.warning(
+            "%s contains non-ASCII characters and is ignored; bearer tokens must be ASCII",
+            label,
+        )
+    return ""
+
+
+def bearer_matches(presented: bytes, token: str) -> bool:
+    """Constant-time check that ``presented`` (the bytes after ``Bearer ``) is
+    ``token``. Configured tokens are ASCII (``ascii_bearer``), so there is one
+    byte spelling to compare; a non-ASCII token never matches."""
+    import hmac
+
+    if not token or not token.isascii():
+        return False
+    return hmac.compare_digest(presented, token.encode("ascii"))
 
 
 def memory_writebacks_off() -> bool:
