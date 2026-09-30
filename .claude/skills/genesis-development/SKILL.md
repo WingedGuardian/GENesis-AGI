@@ -8,6 +8,7 @@ description: >
   task modifying files under src/, .claude/, or tests/. Do NOT load for
   Genesis-as-tool work ("summarize this", "write a LinkedIn post",
   "research X") or general questions unrelated to Genesis internals.
+keywords: [genesis, worktree]
 consumer: cc_foreground
 phase: 10
 skill_type: workflow
@@ -156,8 +157,9 @@ sentence to catch yourself in.
 generator scans the directory — no registry to update), which looks like done.
 It is Level 1. The nudge that actually surfaces it scores **only** whole-word
 skill-NAME tokens and explicit frontmatter `keywords:` — description prose is
-deliberately not scored — so a skill whose name is a concept nobody types is
-indexed and silent. MEASURED 2026-09-02: `closing-session` scored **0.0** on
+deliberately not scored, and name words on the hook's `_NAME_TOKEN_STOPLIST`
+("genesis", "user", "plan", …) never score either — so a skill whose name is a
+concept nobody types is indexed and silent. MEASURED 2026-09-02: `closing-session` scored **0.0** on
 every one of its own trigger phrases ("work the open PR queue", "review and fix
 the open PRs") until `keywords:` was declared; with them, 4/4 trigger phrases
 fire and 3/3 unrelated prompts stay silent. Note the extractor drops tokens
@@ -173,10 +175,28 @@ the feature is fully active or the user explicitly cancels it.
 
 ### Architecture Review
 
-For medium-to-large Genesis work (3+ files, new components, wiring
-changes), dispatch a `genesis-architect` subagent before implementation
-to check dependencies, edge cases, and DRY violations. Small targeted
-changes skip this.
+Every FINALIZED plan gets exactly ONE `genesis-architect` review — premise
+check, scope drift, architecture — before it is presented for approval.
+The agent's Step 0.5/0.6 take the plan file as input; hand it the path.
+Revisions made in answer to that review do not re-trigger it. A plan too
+small to write down needs none. `/plan-ceo-review` and `/office-hours` are
+optional extras, if installed.
+
+### Skill invocation points
+
+Required steps at named moments. A skill marked "if installed" comes from an
+optional plugin (gstack, superpowers); where it is absent, skip it — there is
+no substitute checklist.
+
+- **A test fails unexpectedly** → this skill's "Debugging Discipline"
+  section first; plus `superpowers:systematic-debugging` or `/investigate`,
+  if installed.
+- **Before any done / fixed / passing claim** →
+  `superpowers:verification-before-completion`, if installed.
+- **An external tool or repo surfaces as a candidate** → the `evaluate`
+  skill; on an ADOPT verdict, `integrate-module`.
+- **A diff touches dashboard or other UI** → `/qa-only` or `/qa`, plus
+  `/design-review`, if installed.
 
 ### Plan documents carry a structured header
 

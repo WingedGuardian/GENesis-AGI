@@ -2961,7 +2961,12 @@ verified: 2ac29c19 2026-09-14
   scheduler — `skill_injection_hook._ensure_catalog_fresh` spawns a detached
   regen when the catalog is missing or >1h stale, `_CATALOG_MAX_AGE_S=3600`,
   serving the next prompt), consumed by the injection hook and by
-  autonomous-session resources. Skill refinement is
+  autonomous-session resources. The hook scores only whole-word skill-NAME
+  tokens and frontmatter `keywords:` (never description prose); everyday words
+  in `_NAME_TOKEN_STOPLIST` never score as name tokens, and a library skill in a
+  vendor plugin bundle (`skill-library/<vendor>/<bundle>/skills/<skill>`)
+  scores only when the prompt names that vendor (`_vendor_of`,
+  `_VENDOR_ALIASES`; the stoplist is skipped once it does). Skill refinement is
   propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
   review and never writes a skill file. Recording it as a tracked
   cognitive-file modification is DEFERRED — no ledger pre-image is captured
