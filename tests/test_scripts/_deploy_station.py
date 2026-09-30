@@ -88,9 +88,11 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         '  d="${UNIT_DIR:-${GENESIS_DEPLOY_ROOT:-}}"; [ "$d" = - ] || echo "$d"; exit 0\n'
         "fi\n"
         # `show -p InvocationID`: one id per activation, a new one after a restart
-        # ($INVOCATION overrides the first; "-" = systemd answers nothing).
+        # ($INVOCATION overrides the first, $INVOCATION_AFTER the one after a
+        # restart; "-" = systemd answers nothing).
         'if [[ " $* " == *" InvocationID "* ]]; then\n'
-        f'  if [ -f "{calls}.restarted_at" ]; then echo 22222222222222222222222222222222;\n'
+        f'  if [ -f "{calls}.restarted_at" ]; then '
+        'echo "${INVOCATION_AFTER:-22222222222222222222222222222222}";\n'
         '  else i="${INVOCATION:-11111111111111111111111111111111}"; [ "$i" = - ] || echo "$i"; fi; exit 0\n'
         "fi\n"
         'if [[ " $* " == *" ActiveEnterTimestamp "* ]]; then\n'
@@ -112,9 +114,11 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         '  else echo "${MAIN_PID:-1111}"; fi; exit 0\n'
         "fi\n"
         # A stop records the HEAD it found, so a test can tell whether it came
-        # before or after the fast-forward.
+        # before or after the fast-forward. $ON_STOP is shell run at the stop:
+        # something that changes the tree after the checks and before the merge.
         'if [[ " $* " == *" stop "* ]]; then\n'
         f'  git -C "${{GENESIS_DEPLOY_ROOT:-.}}" rev-parse HEAD > "{calls}.stop_head"\n'
+        '  [ -z "${ON_STOP:-}" ] || bash -c "$ON_STOP"\n'
         "fi\n"
         'if [[ " $* " == *" restart "* ]]; then\n'
         f'  echo "${{RESTARTED_AT:-$(date +%s)}}" > "{calls}.restarted_at"\n'
@@ -139,10 +143,12 @@ def install_fixture(
     name: str = "fixture",
     editable: bool = True,
     requires_python: str = "",
+    entry_points: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """What `pip install -e <source>` leaves behind, as importlib.metadata reads
-    it: a .dist-info with the project's requirements and a direct_url.json naming
-    the source. Put `site` on PYTHONPATH and the venv's python finds it first."""
+    it: a .dist-info with the project's requirements, its entry points
+    (entry_points.txt, one section per group) and a direct_url.json naming the
+    source. Put `site` on PYTHONPATH and the venv's python finds it first."""
     info = site / f"{name}-0.0.0.dist-info"
     info.mkdir(parents=True, exist_ok=True)
     lines = ["Metadata-Version: 2.1", f"Name: {name}", "Version: 0.0.0"]
@@ -150,6 +156,13 @@ def install_fixture(
         lines.append(f"Requires-Python: {requires_python}")
     lines += [f"Requires-Dist: {r}" for r in requires]
     (info / "METADATA").write_text("\n".join(lines) + "\n")
+    if entry_points:
+        (info / "entry_points.txt").write_text(
+            "".join(
+                f"[{group}]\n" + "".join(f"{k} = {v}\n" for k, v in eps.items()) + "\n"
+                for group, eps in entry_points.items()
+            )
+        )
     direct = {"url": source.resolve().as_uri()}
     direct["dir_info"] = {"editable": True} if editable else {}
     (info / "direct_url.json").write_text(json.dumps(direct))
@@ -239,8 +252,10 @@ def station(tmp_path):
                 "UNIT_ARGS",
                 "UNIT_DIR",
                 "INVOCATION",
+                "INVOCATION_AFTER",
                 "RESTART_RC",
                 "MAIN_PID",
+                "ON_STOP",
                 "SYNC_RC",
                 "PYTHONPATH",
                 "CDPATH",

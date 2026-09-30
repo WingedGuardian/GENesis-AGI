@@ -342,8 +342,12 @@ def test_an_unhealthy_restart_alerts_and_holds(station):
         # Nothing listens, or ownership cannot be read: never proven (Codex P1,
         # round 2 — there is no manifest fallback to fall through to).
         ("ownership cannot be established", {"PROBE_NONE": "1"}),
-        # The unit still reports the OLD pid, whose manifest it is.
-        ("old pid still reported", {"NEW_PID": "1111"}),
+        # systemd still reports the OLD invocation (and pid): the restart did not
+        # take effect, and the old process's manifest and socket are what answer.
+        (
+            "the invocation did not change",
+            {"NEW_PID": "1111", "INVOCATION_AFTER": "11111111111111111111111111111111"},
+        ),
     ],
 )
 def test_an_answer_from_another_server_is_not_a_healthy_deploy(station, case, extra):
@@ -359,6 +363,28 @@ def test_an_answer_from_another_server_is_not_a_healthy_deploy(station, case, ex
     alerts = _alerts(station)
     assert len(alerts) == 1 and "critical" in alerts[0].read_text(), (case, alerts)
     assert _git(station["root"], "rev-parse", "HEAD") == tip, "never revert the tree"
+
+
+def test_a_restarted_unit_that_reuses_the_old_pid_is_healthy(station):
+    """Codex, #2557 round 3: the kernel can hand the new process the pid the old
+    one had. A new systemd invocation is what proves the restart; comparing pids
+    failed the whole health window and paged critical on a healthy server."""
+    tip = _advance_upstream(station)
+    r = _run(station, env=dict(station["env"], NEW_PID="1111"))
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "Healthy" in r.stdout and "pid 1111" in r.stdout, r.stdout
+    assert not _alerts(station)
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+
+
+@pytest.mark.parametrize(("new_pid", "healthy"), [("2222", True), ("1111", False)])
+def test_with_no_readable_invocation_a_new_pid_stands_in(station, new_pid, healthy):
+    """When systemd gave no invocation id before the restart, only a changed pid
+    can show the restart happened."""
+    _advance_upstream(station)
+    env = dict(station["env"], INVOCATION="-", NEW_PID=new_pid, UNIT_STATE_LATER="failed")
+    r = _run(station, env=env)
+    assert (r.returncode == 0) is healthy, (r.stdout, r.stderr)
 
 
 def test_a_healthy_restart_reports_the_new_pid_and_no_alert(station):
@@ -560,6 +586,95 @@ def test_an_excused_file_changed_upstream_does_not_block_the_merge(station):
     assert r.returncode == 0, r.stderr
     assert _git(station["root"], "rev-parse", "HEAD") == tip
     assert (station["root"] / "AGENTS.md").read_text() == "new stats\n"
+
+
+def _late_collision(station, files: dict[str, str]) -> tuple[str, dict, object]:
+    """Upstream adds config/secrets.local.yaml (ignored here) plus *files*, and an
+    ignored copy of it appears at the stop, after the collision scan: git refuses
+    the merge. Returns HEAD before the run, the env, and the local file."""
+    root = station["root"]
+    (root / ".git" / "info").mkdir(exist_ok=True)
+    (root / ".git" / "info" / "exclude").write_text("secrets.local.yaml\n")
+    head = _git(root, "rev-parse", "HEAD")
+    _advance_upstream(
+        station, "a new config file", {"config/secrets.local.yaml": "upstream\n", **files}
+    )
+    local = root / "config" / "secrets.local.yaml"
+    env = dict(station["env"], ON_STOP=f"mkdir -p {root}/config && echo LOCAL > {local}")
+    return head, env, local
+
+
+def test_a_refused_merge_names_the_excused_files_it_reset(station):
+    """Devin, #2557: an excused file the range also changes is reset before the
+    fast-forward. When git then refuses the merge (an ignored file that appears
+    after the collision scan), "nothing merged" must not hide that reset: the
+    refusal names it, and pages nobody (the file regenerates, as update.sh treats
+    it)."""
+    root = station["root"]
+    (root / "AGENTS.md").write_text("rewritten by an indexer\n")
+    head, env, local = _late_collision(station, {"AGENTS.md": "new stats\n"})
+    r = _run(station, env=env)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "git refused the fast-forward" in r.stderr and "nothing merged" in r.stderr, r.stderr
+    assert "Reset to HEAD for it" in r.stderr and "AGENTS.md" in r.stderr, r.stderr
+    assert "Resetting AGENTS.md" in r.stdout, "each reset is named as it happens"
+    assert _git(root, "rev-parse", "HEAD") == head
+    assert local.read_text() == "LOCAL\n"
+    assert not _alerts(station)
+
+
+def test_a_staged_excused_file_and_a_refused_merge_page_nobody(station):
+    """The reset takes a staged edit too; the refusal still names it, and is still
+    a refusal, not a failure to page about."""
+    root = station["root"]
+    (root / "AGENTS.md").write_text("staged by hand\n")
+    _git(root, "add", "AGENTS.md")
+    (root / "AGENTS.md").write_text("and edited again\n")
+    head, env, _ = _late_collision(station, {"AGENTS.md": "new stats\n"})
+    r = _run(station, env=env)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "nothing merged" in r.stderr and "AGENTS.md" in r.stderr, r.stderr
+    assert _git(root, "rev-parse", "HEAD") == head
+    assert not _alerts(station)
+
+
+def test_a_locally_deleted_excused_file_does_not_block_the_merge(station):
+    """A deleted AGENTS.md is excused dirt; the reset simply restores it for the
+    merge, which then lands."""
+    root = station["root"]
+    (root / "AGENTS.md").unlink()
+    tip = _advance_upstream(station, "stats and code", {"AGENTS.md": "new stats\n"})
+    r = _run(station)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert _git(root, "rev-parse", "HEAD") == tip
+    assert (root / "AGENTS.md").read_text() == "new stats\n"
+    assert not _alerts(station)
+
+
+def test_a_run_killed_after_the_resets_names_them_in_the_alert(station):
+    """A run stopped between the resets and the merge (its transient unit stopped,
+    say) leaves the excused files reset: the exit alert must name them."""
+    import shutil
+
+    root = station["root"]
+    (root / "AGENTS.md").write_text("rewritten by an indexer\n")
+    _advance_upstream(
+        station, "stats and code", {"AGENTS.md": "new stats\n", "src/genesis/y.py": "y\n"}
+    )
+    real_git = shutil.which("git")
+    # The script's git: at the merge, SIGTERM the script (its parent) and fail.
+    _exec(
+        station["shims"] / "git",
+        "#!/bin/bash\n"
+        'for a in "$@"; do [ "$a" = merge ] && { kill -TERM "$PPID"; exit 1; }; done\n'
+        f'exec {real_git} "$@"\n',
+    )
+    r = _run(station)
+    assert r.returncode == 143, (r.returncode, r.stdout, r.stderr)
+    alerts = _alerts(station)
+    assert len(alerts) == 1, alerts
+    body = alerts[0].read_text()
+    assert "Reset to HEAD for the merge" in body and "AGENTS.md" in body, body
 
 
 def test_a_transitional_file_edited_locally_and_upstream_goes_to_update_sh(station):

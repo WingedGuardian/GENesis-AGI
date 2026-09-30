@@ -1,6 +1,6 @@
 """Which commit was the checkout at when genesis-server started?
 
-Usage: serving_commit.py <reflog> <boot-unix-seconds> <head-sha> <expiry-cutoff>
+Usage: serving_commit.py [--held] <reflog> <boot-unix-seconds> <head-sha> <expiry-cutoff>
 
   <reflog>  the checkout's HEAD reflog file (``<git-dir>/logs/HEAD``)
   <boot>    the unit's ActiveEnterTimestamp, unix seconds (``systemctl --user show
@@ -16,6 +16,10 @@ Prints the commit and exits 0, or prints ``unknown: <reason>`` and exits 1.
 
 This is the tree the server BOOTED from. A module the server imports later loads
 whatever is on disk at that moment, so a server can run a mix; callers say so.
+With ``--held`` it prints the boot commit and then every commit HEAD has held
+since, one per line, oldest first: any of them may have been imported from, and
+a later commit that restores the boot's files does not unload a module, so the
+two ends alone cannot say what the server runs.
 
 Each line of the reflog is ``<old> <new> <identity> <unix> <tz>\\t<message>``, one
 per move of HEAD, oldest first. The answer is the newest move before the boot,
@@ -67,7 +71,8 @@ def _moves(text: str) -> list[tuple[str, str, int]]:
     return moves
 
 
-def serving_commit(text: str, boot: int, head: str, cutoff: int) -> str:
+def _since_boot(text: str, boot: int, head: str, cutoff: int) -> list[str]:
+    """The boot commit, then the commit each later move of HEAD left it at."""
     if boot < cutoff:
         raise _Unknown(
             "the server booted before git's expiry cutoff for unreachable reflog "
@@ -97,13 +102,19 @@ def serving_commit(text: str, boot: int, head: str, cutoff: int) -> str:
     for i in range(at + 1, len(moves)):
         if moves[i][0] != moves[i - 1][1]:
             raise _Unknown("the reflog has a gap after the boot (pruned or expired entries)")
-    return moves[at][1]
+    # The chain is unbroken, so each move's NEW commit is every tree HEAD held.
+    return [new for _, new, _ in moves[at:]]
 
 
 def main(argv: list[str]) -> int:
+    held = len(argv) > 1 and argv[1] == "--held"
+    if held:
+        argv = argv[:1] + argv[2:]
     try:
         if len(argv) != 5:
-            raise _Unknown("usage: serving_commit.py <reflog> <boot-unix> <head> <expiry-cutoff>")
+            raise _Unknown(
+                "usage: serving_commit.py [--held] <reflog> <boot-unix> <head> <expiry-cutoff>"
+            )
         try:
             boot = int(argv[2])
         except ValueError as exc:
@@ -122,7 +133,8 @@ def main(argv: list[str]) -> int:
                 text = fh.read()
         except OSError as exc:
             raise _Unknown(f"cannot read the reflog ({exc.strerror})") from exc
-        print(serving_commit(text, boot, argv[3], cutoff))
+        commits = _since_boot(text, boot, argv[3], cutoff)
+        print("\n".join(commits) if held else commits[0])
         return 0
     except _Unknown as exc:
         print(f"unknown: {exc}")

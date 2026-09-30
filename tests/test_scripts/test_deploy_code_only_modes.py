@@ -314,6 +314,100 @@ def test_a_deploy_of_docs_or_hooks_neither_stops_nor_restarts(station):
     assert not _alerts(station)
 
 
+# ── runtime files held since the boot (Devin, #2557 round 3) ────────────────
+# The server imports src/ lazily, so any tree HEAD held since the boot can have
+# been loaded. A commit that restores the boot's files makes the two ends match
+# and leaves the imported module in memory: only the reflog's history shows it.
+def _booted_at(st, name: str, seconds: int) -> tuple[str, dict]:
+    """Pull a commit that sets widget.py, and boot the server a minute after it:
+    that commit is the boot commit. Returns it and the env naming that boot."""
+    sha = _advance_upstream(st, name, {"src/genesis/widget.py": f"v = {name!r}\n"})
+    r = _run(st, "pull", env=_env(st, GIT_COMMITTER_DATE=_later(st, seconds)))
+    assert r.returncode == 0, r.stderr
+    return sha, _env(st, BOOTED_AT=str(st["booted_at"] + seconds + 60))
+
+
+def _pull_at(st, env: dict, seconds: int) -> subprocess.CompletedProcess:
+    r = _run(st, "pull", env={**env, "GIT_COMMITTER_DATE": _later(st, seconds)})
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+@pytest.mark.parametrize(
+    "restore_pulled_first",
+    [False, True],
+    ids=["the-deploy-merges-the-restore", "the-restore-was-already-pulled"],
+)
+def test_a_detour_through_other_runtime_files_forces_the_restart(station, restore_pulled_first):
+    """Boot at A; a pull to B (the server may import B's widget.py); C restores A's
+    files. Every end-to-end comparison says nothing changed, and the server can
+    still run B's module. Already pulled, the restore leaves HEAD at the upstream
+    tip, so only the history since the boot shows the detour."""
+    a, env = _booted_at(station, "A", 60)
+    _advance_upstream(station, "B", {"src/genesis/widget.py": "v = 'B'\n"})
+    _pull_at(station, env, 180)
+    c = _advance_upstream(station, "C", {"src/genesis/widget.py": "v = 'A'\n"})
+    if restore_pulled_first:
+        _pull_at(station, env, 240)
+    assert _status(station, BOOTED_AT=env["BOOTED_AT"])["serving"] == a, (
+        "precondition: the boot commit is known, so the skip is live"
+    )
+    assert not _restarted(station)
+    r = _run(station, env={**env, "GIT_COMMITTER_DATE": _later(station, 300)})
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert _git(station["root"], "rev-parse", "HEAD") == c
+    assert "Nothing to deploy" not in r.stdout, r.stdout
+    assert _restarted(station), r.stdout
+
+
+def test_a_bracket_reads_invalid_after_a_detour_through_other_runtime_files(station):
+    a, env = _booted_at(station, "A", 60)
+    start = _status(station, BOOTED_AT=env["BOOTED_AT"])
+    assert start["serving"] == a and not start["bracket"].startswith("unknown"), start
+    _advance_upstream(station, "B", {"src/genesis/widget.py": "v = 'B'\n"})
+    _pull_at(station, env, 180)
+    _advance_upstream(station, "C", {"src/genesis/widget.py": "v = 'A'\n"})
+    back = _pull_at(station, env, 240)
+    assert "HEAD has held other runtime files" in back.stdout, (
+        "the pull's report must not say nothing changed: " + back.stdout
+    )
+    assert "Nothing the server loads" not in back.stdout, back.stdout
+    end = _status(station, BOOTED_AT=env["BOOTED_AT"])
+    assert end["serving"] == a, end
+    assert end["bracket"].startswith("unknown (since the boot"), end
+    assert not _verify(station, start["bracket"], BOOTED_AT=env["BOOTED_AT"])
+
+
+# ── a late ignored-file collision (Codex P1, #2557 round 3) ─────────────────
+def test_an_ignored_file_created_after_the_scan_is_not_overwritten(station):
+    """The collision scan runs before the stop; something that writes an ignored
+    file into the range's path between the two used to lose it to the
+    fast-forward (git overwrites ignored files by default). git itself refuses
+    now, and the stopped server goes back up on the unchanged tree."""
+    root = station["root"]
+    (root / ".git" / "info").mkdir(exist_ok=True)
+    (root / ".git" / "info" / "exclude").write_text("secrets.local.yaml\n")
+    head = _git(root, "rev-parse", "HEAD")
+    _advance_upstream(station, "adds it", {"config/secrets.local.yaml": "upstream\n"})
+    local = root / "config" / "secrets.local.yaml"
+    r = _run(
+        station,
+        env=_env(
+            station,
+            GIT_COMMITTER_DATE=_later(station),
+            ON_STOP=f"mkdir -p {root}/config && echo LOCAL > {local}",
+        ),
+    )
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert local.read_text() == "LOCAL\n", "the fast-forward overwrote an ignored local file"
+    assert _git(root, "rev-parse", "HEAD") == head
+    assert "git refused the fast-forward" in r.stderr, r.stderr
+    calls = _calls(station)
+    assert any("stop genesis-server" in c for c in calls), "precondition: the stop ran"
+    assert any("start genesis-server" in c for c in calls), "the stopped server stays down"
+    assert not _alerts(station), "a refusal changes nothing and pages nobody"
+
+
 # ── the dependency gate's remedy ────────────────────────────────────────────
 def test_an_incoming_dependency_change_names_update_sh_not_post_merge(station):
     head = _git(station["root"], "rev-parse", "HEAD")
@@ -942,6 +1036,60 @@ def test_an_ignored_file_inside_a_replaced_directory_still_refuses(station):
     assert r.returncode == 1, r.stdout
     assert "already exist here, untracked" in r.stderr, r.stderr
     assert local.read_text() == "MY SECRET\n"
+
+
+def test_status_fingerprints_the_user_config_overlays(station):
+    """Codex, #2557 round 3: the loaders prefer ~/.genesis/config/<name>.local.yaml
+    (where the dashboard's settings writes land) over the checkout's, and some
+    reread it live. An edit there during a validation must void the bracket."""
+    overlays = station["home"] / ".genesis" / "config"
+    overlays.mkdir(parents=True, exist_ok=True)
+    (overlays / "genesis.yaml").write_text("not an overlay: left out\n")
+    start = _status(station)
+    assert start["runtime-overrides"] == "none", start
+    overlay = overlays / "routing.local.yaml"
+    overlay.write_text("a: 1\n")
+    mid = _status(station)
+    assert mid["runtime-overrides"].startswith("1 files, "), mid
+    assert mid["bracket"].startswith("b1-"), mid
+    overlay.write_text("a: 2\n")
+    assert not _verify(station, mid["bracket"])
+
+
+def test_a_dangling_overlay_link_is_skipped_as_the_loader_skips_it(station):
+    """The loader reads an overlay only when is_file() holds, so a dangling link is
+    no input; it must not make every bracket read "unreadable"."""
+    overlays = station["home"] / ".genesis" / "config"
+    overlays.mkdir(parents=True, exist_ok=True)
+    (overlays / "gone.local.yaml").symlink_to(overlays / "missing.yaml")
+    (overlays / "real.yaml").write_text("a: 1\n")
+    (overlays / "linked.local.yaml").symlink_to(overlays / "real.yaml")
+    s = _status(station)
+    assert s["runtime-overrides"].startswith("1 files, "), (
+        "the live link counts, the dangling one not"
+    )
+    assert s["bracket"].startswith("b1-"), s
+
+
+def test_every_documented_validation_hold_uses_the_scripts_lock_path():
+    """Codex, #2557 round 3: the script locks ${GENESIS_HOME:-$HOME/.genesis}/locks;
+    a recipe that hardcodes ~/.genesis locks a different file on an install that
+    moves GENESIS_HOME, and the hold then serializes nothing."""
+    import re
+
+    root = SCRIPT.parent.parent
+    docs = [
+        SCRIPT,
+        root / ".claude" / "skills" / "genesis-development" / "SKILL.md",
+        root / "changelog.d" / "20260927020000-added-deploy-code-only.md",
+    ]
+    found = 0
+    for doc in docs:
+        for line in doc.read_text().splitlines():
+            for m in re.finditer(r"flock -s -w 7200 (\S+)", line):
+                found += 1
+                assert m.group(1).startswith('"${GENESIS_HOME:-$HOME/.genesis}/locks/'), (doc, line)
+    assert found >= 3, "every doc names the hold"
 
 
 def test_status_fingerprints_ignored_runtime_overrides(station):

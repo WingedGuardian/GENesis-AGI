@@ -47,7 +47,11 @@
 # restart add a Guardian pause (no false "Genesis down" alert or paid diagnosis)
 # and a health wait sized the way update.sh sizes its own. deploy skips the stop
 # and the restart when the files the server loads (src/, config/,
-# pyproject.toml) are the ones it booted from, before and after the merge.
+# pyproject.toml) are the ones it booted from, after the merge and at every
+# commit HEAD has held since the boot (the server imports src/ lazily, so a
+# pulled tree's module stays loaded after a later commit restores the files).
+# The fast-forward never overwrites a file git ignores: git refuses it at the
+# merge, as it refuses an untracked one.
 #
 # "The commit the server booted from" is read from HEAD's reflog at the unit's
 # start time (scripts/lib/serving_commit.py), and is "unknown" whenever the reflog
@@ -84,7 +88,7 @@
 # 0 the token holds, 1 it does not.
 #
 # Validating against the live server? Hold the lock SHARED for your whole run:
-#   flock -s -w 7200 ~/.genesis/locks/update.lock <your command>
+#   flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <your command>
 # and deploy BEFORE you take it (a deploy inside your own hold waits on itself).
 # A daemon your command leaves behind keeps holding the lock. While validators'
 # holds overlap, a waiting deploy can starve: flock grants a late shared request
@@ -94,14 +98,25 @@
 # bracket the run: take the `bracket:` token `status` prints at the start, and
 # run `status --verify <token>` at the end. The script decides; exit 0 is a
 # valid run. A token exists only when the server is up, its boot commit is known,
-# HEAD's runtime files are the ones it booted from (after a pull of code:
+# HEAD's runtime files are the ones it booted from and were at every commit HEAD
+# held since the boot (after a pull of code, even one a later commit undid:
 # restart first), and nothing under src/, config/ or pyproject.toml is edited
 # outside git; otherwise it prints "unknown (<why>)", which no token matches. It
 # covers the boot commit, the MainPID, systemd's invocation id (a pid can be
 # reused, an invocation cannot) and a fingerprint of the ignored runtime files
-# (a config/*.local.yaml, which git status never lists). HEAD may move over docs
-# or hooks without invalidating the run. Not covered: an uncommitted edit present
-# at boot and reverted since, which git keeps no record of.
+# (a config/*.local.yaml, which git status never lists) and of the user overlays
+# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs or
+# hooks without invalidating the run.
+# It is a TRIPWIRE, not a certificate: "valid" means none of those changes
+# happened, not that nothing the server runs changed. It cannot see, and reads
+# valid through: a change to the venv's installed packages (imported lazily
+# too); the other files the server reads from ~/.genesis/config (a user
+# outreach.yaml, genesis.yaml, modules/: only the *.local.yaml overlays are
+# fingerprinted); an edit under src/, config/ or pyproject.toml made and undone
+# without moving HEAD (by hand, a stash and its pop, a checkout of a file from
+# another commit), including one present at boot; and a reflog rewritten or backdated (`git reflog expire
+# --rewrite`, a move made with GIT_COMMITTER_DATE, a clock stepped back). Proving
+# what the server runs needs the server to report its own identity.
 
 set -euo pipefail
 
@@ -264,6 +279,7 @@ echo "  Lock held (exclusive): $LOCK_FILE"
 # no sign of it otherwise.
 _PHASE="checks"
 _ALERTED=""
+_RESET_NOTE=""
 _cleanup() {
     local rc=$?
     # A second signal during cleanup must not cut it short (skipping the marker
@@ -279,12 +295,16 @@ _cleanup() {
             _restarted_note=" genesis-server was stopped for this deploy and could NOT be started again: it is DOWN."
         fi
     fi
+    local _resets_note=""
+    if [ -n "${_RESET_NOTE:-}" ]; then
+        _resets_note=" Reset to HEAD for the merge, their local edits dropped (they regenerate):$_RESET_NOTE."
+    fi
     if [ "$rc" -ne 0 ] && [ -z "$_ALERTED" ] && [ "$_PHASE" != "checks" ]; then
         local _sha
         _sha="$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
         queue_alert critical deploy-code-only \
             "code-only deploy failed at phase $_PHASE ($_sha)" \
-            "The code-only deploy ($MODE) stopped at phase '$_PHASE'. The tree is at $_sha and was NOT reverted (by design).${_restarted_note} If the merge ran but no restart did, a running server still has the old code in memory and imports new files lazily. Converge by hand: journalctl --user -u genesis-server -n 50, then scripts/deploy_code_only.sh restart."
+            "The code-only deploy ($MODE) stopped at phase '$_PHASE'. The tree is at $_sha and was NOT reverted (by design).${_restarted_note}${_resets_note} If the merge ran but no restart did, a running server still has the old code in memory and imports new files lazily. Converge by hand: journalctl --user -u genesis-server -n 50, then scripts/deploy_code_only.sh restart."
     fi
     _guardian_resume
     _release_deploy_marker
@@ -413,6 +433,7 @@ _BASELINE_READ=""
 _read_baseline() {
     [ -z "$_BASELINE_READ" ] || return 0
     _SERVER_PID_BEFORE="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
+    _SERVER_INV_BEFORE="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"
     _MANIFEST_BEFORE="$(cat "$HOME/.genesis/bootstrap_manifest.json" 2>/dev/null || true)"
     _read_serving
     echo "  The server booted from ${SERVING:-an unknown commit ($SERVING_WHY)}."
@@ -613,43 +634,69 @@ _pull() {
     # requests against a mix of old and new modules until its restart. pull keeps
     # the server running by design, and reports the pending changes instead.
     # A range that leaves the server's files as it booted them (docs, hooks)
-    # needs neither the stop nor the restart.
+    # needs neither the stop nor the restart, but only if HEAD has held no other
+    # runtime files since the boot: a module the server imported from a pulled
+    # tree stays loaded after a later commit restores the files.
     if [ "$MODE" = deploy ]; then
         _read_baseline
-        if [ -n "$SERVING" ] && _runtime_same "$SERVING" "$_upstream"; then
-            echo "  Nothing the server loads changes in $_head..$_upstream: no stop, no restart."
+        if [ -n "$SERVING" ] && _runtime_held "$_upstream"; then
+            echo "  Nothing the server loads changes in $_head..$_upstream, nor since its boot: no stop, no restart."
         else
             _stop_for_deploy
         fi
     fi
-    _PHASE="merging"
+    # An excused file the range also changes is reset to HEAD so the merge can
+    # take upstream's copy. Both regenerate (the code-intel indexer rewrites
+    # AGENTS.md, the server the trigger cache), and update.sh discards them the
+    # same way before its merge, so no copy is kept: each reset is NAMED instead,
+    # here, in a refusal's message and in the exit alert, so none passes silently.
+    _reset=()
     for _f in AGENTS.md config/procedure_triggers.yaml; do
         if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
             && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_f" 2>/dev/null \
             && [ -n "$(_range_changed "$_f")" ]; then
-            git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
+            _reset+=("$_f")
         fi
+    done
+    # The tree's state before this run touches it, leaving out the files reset
+    # below: a merge git refuses counts as "nothing merged" only when HEAD and
+    # this status come back unchanged.
+    _status_outside_resets() {
+        local p excl=()
+        for p in "${_reset[@]}"; do excl+=(":(exclude,literal)$p"); done
+        git -C "$GENESIS_ROOT" status --porcelain -- . "${excl[@]}" 2>/dev/null
+    }
+    _status_before="$(_status_outside_resets)" || _status_before="unreadable before"
+    _PHASE="merging"
+    for _f in "${_reset[@]}"; do
+        echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
+        git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
+        _RESET_NOTE="$_RESET_NOTE $_f"
     done
     # Safe for this script to merge the tree it runs from: git REPLACES a changed
     # file rather than rewriting it in place, so bash keeps reading the old copy
     # (measured, git 2.43). update.sh copies itself to temp instead.
     # A merge git refuses (an untracked file in the way, say) leaves the tree
     # where it was: that is a refusal like the others, not a failure to alert on.
-    # "Where it was" means HEAD AND the working tree's status, so a merge that
-    # failed partway still alerts.
-    _status_before="$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null)" || _status_before="unreadable before"
-    if ! git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
-        _status_after="$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null)" || _status_after="unreadable after"
+    # "Where it was" means HEAD AND the working tree's status outside the resets,
+    # so a merge that failed partway still alerts.
+    # --no-overwrite-ignore: git overwrites an IGNORED file in the way by default.
+    # The collision scan above refuses early, while the server is untouched, but
+    # a file written between that scan and this merge (the server, another
+    # session) would be lost; with the flag git refuses it too, at the merge
+    # itself, leaving HEAD and the tree as they were (measured, git 2.43).
+    if ! git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
+        _status_after="$(_status_outside_resets)" || _status_after="unreadable after"
         if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null)" = "$_head" ] \
             && [ "$_status_after" = "$_status_before" ]; then
-            # Nothing changed. A server this run stopped goes back up on the same
-            # tree; only if that fails does the exit still alert.
+            # Nothing merged, and a server this run stopped goes back up on the
+            # same tree; only if that fails does the exit still alert.
             if [ -n "$_STOPPED" ]; then
                 echo "  Starting genesis-server again on the unchanged tree…"
                 systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
             fi
             [ -n "$_STOPPED" ] || _PHASE="checks"
-            die "git refused the fast-forward to $_upstream (see above) — nothing merged."
+            die "git refused the fast-forward to $_upstream (see above) — nothing merged.${_RESET_NOTE:+ Reset to HEAD for it, their local edits dropped (they regenerate):$_RESET_NOTE.}"
         fi
         exit 1
     fi
@@ -705,11 +752,12 @@ fi
 # every other path reads it here, server still alive.)
 _read_baseline
 # A deploy with nothing to deploy: the server is running, its boot commit is
-# known, and the files it loads are the same at HEAD (a merge of docs or hooks
-# only, or no merge at all). A restart would only cost an outage and end
-# in-flight dispatched sessions. The restart mode is there to force one.
-if [ "$MODE" = deploy ] && [ -z "$_STOPPED" ] && [ -n "$SERVING" ] && _runtime_same "$SERVING" "$SHA"; then
-    echo "  Nothing to deploy: the files the server loads are the ones it booted from ($SERVING)."
+# known, and the files it loads are the same at HEAD and at every commit HEAD
+# held since the boot (a merge of docs or hooks only, or no merge at all). A
+# restart would only cost an outage and end in-flight dispatched sessions. The
+# restart mode is there to force one.
+if [ "$MODE" = deploy ] && [ -z "$_STOPPED" ] && [ -n "$SERVING" ] && _runtime_held "$SHA"; then
+    echo "  Nothing to deploy: the files the server loads are the ones it booted from ($SERVING), and have been since."
     _sync_git_hooks
     echo "  Tree at $SHA; no restart."
     exit 0
@@ -737,17 +785,26 @@ _PHASE="restarted"
 # manifest cannot say either: it is written BEFORE the web server binds, and Flask
 # runs in a daemon thread, so a failed bind leaves the process up with its
 # manifest while something else answers. So the proof is the socket itself: the
-# unit is active with a NEW, nonzero MainPID, and every socket listening on the
-# health port is one of that pid's own descriptors (scripts/lib/port_owned_by.py,
-# which reads /proc and answers no whenever it cannot tell; its code was read at
-# startup). Prints the pid.
+# unit is active in a NEW activation with a nonzero MainPID, and every socket
+# listening on the health port is one of that pid's own descriptors
+# (scripts/lib/port_owned_by.py, which reads /proc and answers no whenever it
+# cannot tell; its code was read at startup). The activation, not the pid, is
+# what shows the restart happened: the kernel can give the new process the old
+# pid, but systemd never reuses an invocation id. Only when the old invocation
+# was unreadable does a changed pid stand in for it. Prints the pid.
 _HEALTH_PORT=5000
 _restarted_unit_serving() {
-    local state pid
+    local state pid inv
     state="$(systemctl --user is-active genesis-server 2>/dev/null || true)"
     [ "$state" = active ] || return 1
     pid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
-    [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
+    [ -n "$pid" ] && [ "$pid" != 0 ] || return 1
+    if [ -n "${_SERVER_INV_BEFORE:-}" ]; then
+        inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"
+        [ -n "$inv" ] && [ "$inv" != "$_SERVER_INV_BEFORE" ] || return 1
+    else
+        [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
+    fi
     python3 -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
     printf '%s\n' "$pid"
 }

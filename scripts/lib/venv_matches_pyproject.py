@@ -15,11 +15,15 @@ guesswork:
     parsed requirements (name, extras, specifier, URL and marker), not strings;
   - every BASE requirement whose marker applies to this interpreter is actually
     installed, at a version its specifier accepts (pre-releases allowed);
+  - the installed entry points EQUAL the pyproject's [project.scripts],
+    [project.gui-scripts] and [project.entry-points.*]: a console command or a
+    plugin gets its shim or its entry_points.txt line only from a reinstall;
   - this interpreter satisfies the incoming requires-python.
 
-Not compared: other pyproject fields that also need a reinstall (entry points,
-package discovery). None exist today; a change to one needs update.sh. Nor the
-project's own version: nothing reads the installed version (the version gate
+Not compared: package discovery. The editable install is a path entry to the
+source directory (a .pth, measured on a live install), so a package added under
+it imports without a reinstall; moving that directory would need update.sh. Nor
+the project's own version: nothing reads the installed version (the version gate
 reads pyproject.toml), and equality of the requirements already covers a bump
 that changes them.
 
@@ -94,6 +98,17 @@ def _differences(root: Path, pyproject: str) -> list[str]:
         want_python_set = SpecifierSet(project.get("requires-python", ""))
         want_python = str(want_python_set)
         base = [Requirement(s) for s in project.get("dependencies", [])]
+        # (group, name, target) as entry_points.txt records them.
+        tables = [
+            ("console_scripts", project.get("scripts") or {}),
+            ("gui_scripts", project.get("gui-scripts") or {}),
+            *(project.get("entry-points") or {}).items(),
+        ]
+        want_eps = {
+            (group, name, str(target).strip())
+            for group, table in tables
+            for name, target in table.items()
+        }
     except (
         tomllib.TOMLDecodeError,
         KeyError,
@@ -143,6 +158,13 @@ def _differences(root: Path, pyproject: str) -> list[str]:
         diffs.append(f"not installed: {k[0]} {k[2]} {k[4]}".rstrip())
     for k in sorted(have - want):
         diffs.append(f"installed but no longer required: {k[0]} {k[2]} {k[4]}".rstrip())
+    have_eps = {(ep.group, ep.name, ep.value.strip()) for ep in dist.entry_points}
+    for group, ep_name, target in sorted(want_eps - have_eps):
+        diffs.append(f"entry point not installed: [{group}] {ep_name} = {target}")
+    for group, ep_name, target in sorted(have_eps - want_eps):
+        diffs.append(
+            f"entry point installed but no longer declared: [{group}] {ep_name} = {target}"
+        )
 
     # Presence: equal metadata says the install DESCRIBES this tree, not that
     # what it installed is still there.

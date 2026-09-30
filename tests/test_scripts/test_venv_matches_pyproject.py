@@ -170,3 +170,50 @@ def test_an_unparsable_requires_python_cannot_tell(tmp_path):
     r = _gate(tmp_path, site, '[project]\nname = "fixture"\nrequires-python = "not a spec"\n')
     assert r.returncode == 2, (r.stdout, r.stderr)
     assert "Traceback" not in r.stderr
+
+
+# Entry points (Devin, #2557): a console command or plugin declared in the
+# pyproject gets its shim or its entry_points.txt line only from a reinstall, so
+# a code-only deploy of a change to one must be refused like a requirements change.
+_SCRIPTS = '\n[project.scripts]\ngenesis-x = "genesis.cli:main"\n'
+_PLUGIN = '\n[project.entry-points."genesis.plugins"]\nx = "genesis.x:Plugin"\n'
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "installed", "rc", "needle"),
+    [
+        (PYPROJECT_OK + _SCRIPTS, None, 1, "genesis-x"),
+        (PYPROJECT_OK + _SCRIPTS, {"console_scripts": {"genesis-x": "genesis.cli:main"}}, 0, ""),
+        (PYPROJECT_OK, {"console_scripts": {"genesis-x": "genesis.cli:main"}}, 1, "genesis-x"),
+        (
+            PYPROJECT_OK + _SCRIPTS,
+            {"console_scripts": {"genesis-x": "genesis.old:main"}},
+            1,
+            "genesis-x",
+        ),
+        (PYPROJECT_OK + _PLUGIN, None, 1, "genesis.plugins"),
+        (PYPROJECT_OK + _PLUGIN, {"genesis.plugins": {"x": "genesis.x:Plugin"}}, 0, ""),
+    ],
+    ids=[
+        "a-new-command",
+        "the-same-command",
+        "a-dropped-command",
+        "a-retargeted-command",
+        "a-new-plugin-group",
+        "the-same-plugin",
+    ],
+)
+def test_the_gate_compares_entry_points(tmp_path, pyproject, installed, rc, needle):
+    site = tmp_path / "site"
+    _install_fixture(site, tmp_path, entry_points=installed)
+    r = _gate(tmp_path, site, pyproject)
+    assert r.returncode == rc, (r.stdout, r.stderr)
+    assert needle in r.stdout, r.stdout
+
+
+def test_a_malformed_entry_point_table_cannot_tell(tmp_path):
+    site = tmp_path / "site"
+    _install_fixture(site, tmp_path)
+    r = _gate(tmp_path, site, PYPROJECT_OK + 'scripts = "not a table"\n')
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr

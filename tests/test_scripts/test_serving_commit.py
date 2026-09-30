@@ -36,7 +36,8 @@ def _g(repo: Path, *args: str, at: int | None = None) -> str:
 def repo(tmp_path):
     """Three commits at t=1000, 2000 and 3000 — A, B, C — each a move of HEAD."""
     r = tmp_path / "r"
-    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True)
+    r.mkdir()
+    _g(r, "init", "-q", "-b", "main")  # scrubbed: an inherited GIT_DIR would redirect it
     shas = {}
     for name, at in (("A", 1000), ("B", 2000), ("C", 3000)):
         (r / "f").write_text(name)
@@ -46,11 +47,14 @@ def repo(tmp_path):
     return r, shas
 
 
-def _read(r: Path, boot: int | str, cutoff: int | str = 0) -> subprocess.CompletedProcess:
+def _read(
+    r: Path, boot: int | str, cutoff: int | str = 0, *, held: bool = False
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [
             sys.executable,
             str(READER),
+            *(["--held"] if held else []),
             str(r / ".git/logs/HEAD"),
             str(boot),
             _g(r, "rev-parse", "HEAD"),
@@ -93,7 +97,8 @@ def test_a_detour_expired_as_a_pair_is_unknown_past_the_cutoff(tmp_path):
     answer is F; after it the file alone would say A, so a boot older than the
     cutoff is unknown."""
     r = tmp_path / "d"
-    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True)
+    r.mkdir()
+    _g(r, "init", "-q", "-b", "main")  # scrubbed: an inherited GIT_DIR would redirect it
     (r / "f").write_text("a")
     _g(r, "add", "f")
     _g(r, "commit", "-qm", "A", at=1000)
@@ -122,6 +127,37 @@ def test_a_reset_backwards_is_a_move_too(repo):
     _g(r, "reset", "-q", "--hard", shas["A"], at=4000)
     assert _read(r, 4500).stdout.strip() == shas["A"]
     assert _read(r, 3500).stdout.strip() == shas["C"]
+
+
+# --held: the boot commit, then every commit HEAD has held since. The server
+# imports src/ lazily, so any of them can be loaded; the two ends alone cannot say
+# (Devin, #2557 round 3).
+@pytest.mark.parametrize(
+    ("boot", "want"),
+    [(1500, ["A", "B", "C"]), (2500, ["B", "C"]), (9999, ["C"])],
+    ids=["two-moves-since", "one-move-since", "none-since"],
+)
+def test_held_is_the_boot_commit_then_every_commit_since(repo, boot, want):
+    r, shas = repo
+    out = _read(r, boot, held=True)
+    assert (out.returncode, out.stdout.split()) == (0, [shas[w] for w in want]), out
+
+
+def test_held_keeps_a_detour_the_tree_came_back_from(repo):
+    """Boot at C, a move to A, a move back to C: both ends are C, and A is the
+    commit only the history shows."""
+    r, shas = repo
+    _g(r, "reset", "-q", "--hard", shas["A"], at=4000)
+    _g(r, "reset", "-q", "--hard", shas["C"], at=5000)
+    out = _read(r, 3500, held=True)
+    assert out.stdout.split() == [shas["C"], shas["A"], shas["C"]], out
+    assert _read(r, 3500).stdout.strip() == shas["C"], "the default output is unchanged"
+
+
+def test_held_is_unknown_when_the_boot_commit_is(repo):
+    r, _ = repo
+    out = _read(r, 500, held=True)
+    assert out.returncode == 1 and out.stdout.startswith("unknown:"), out
 
 
 @pytest.mark.parametrize(
