@@ -94,6 +94,7 @@ try:
         has_trailing_override,
         mentions,
         split_segments,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -132,6 +133,21 @@ _CWD_UNKNOWN = object()
 # detect the same set of commits or the marker cleared drifts from the one
 # checked. Guarded by test_commit_pattern_matches_git_dash_c_and_dash_C.
 _COMMIT_PATTERN = re.compile(r"\bcommit\b")
+_GIT_WORD = re.compile(r"\bgit\b")
+
+#: A git command whose SUBCOMMAND the parse cannot read: a variable, a
+#: substitution or an escape stands where it goes, or an option before it that
+#: the parser cannot classify. It may be a commit, and nothing in its text says
+#: so, which is why the early exit below cannot be what lets it through. The
+#: push guard refuses the same shape for the same reason.
+_HIDDEN_GIT_VERB_MSG = (
+    "BLOCKED: this command runs git with a subcommand review enforcement cannot "
+    "read (a variable, a substitution or an escape stands where it goes, or an "
+    "option before it that the parser cannot classify), so it cannot tell "
+    "whether it commits.\n"
+    "To proceed: write the git subcommand out literally, and pass any option "
+    "the parser does not recognise after it or not at all."
+)
 
 
 def _commit_override(command: str, segs: list) -> str:
@@ -914,6 +930,258 @@ def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
     return match.group(1), number
 
 
+def _normalize_public_repo(value: str) -> str | None:
+    """A plain ``owner/repo``, or None. Mirrors ``git_push_guard._normalize_repo``;
+    ``test_canonical_public_repo_matches_the_push_guards_reading`` locks the two
+    readings of the config together."""
+    if not value or "$" in value or "`" in value:
+        return None
+    v = value.strip().split("://", 1)[-1]
+    parts = [p for p in v.split("/") if p]
+    if parts and parts[0] == "github.com":
+        parts = parts[1:]
+    if len(parts) != 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _canonical_public_repo() -> str | None:
+    """The configured public repo (``github.user``/``github.public_repo`` in
+    ``~/.genesis/config/genesis.yaml``) as ``owner/repo``, or None when it cannot
+    be determined. Same source, seam (``_TEST_CANONICAL_PUBLIC_REPO``) and result
+    as the push guard's ``_canonical_public_repo``; kept local because importing
+    that module would load the whole push guard onto the commit path."""
+    override = os.environ.get("_TEST_CANONICAL_PUBLIC_REPO")
+    if override is not None:
+        return _normalize_public_repo(override) if override.strip() else None
+    try:
+        import yaml  # lazy: the genesis venv has pyyaml; absence → None → engage.
+
+        with open(os.path.expanduser("~/.genesis/config/genesis.yaml")) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        gh = cfg.get("github") or {}
+        user = (gh.get("user") or "").strip()
+        repo = (gh.get("public_repo") or "").strip()
+        if user and repo:
+            return _normalize_public_repo(f"{user}/{repo}")
+    except Exception:  # noqa: BLE001 — undeterminable is None, and None engages.
+        return None
+    return None
+
+
+def _outside_public_repo(repo: str) -> bool:
+    """True only when ``repo`` is PROVABLY not the configured public repo.
+
+    An undeterminable public repo returns False — the budget still applies, which
+    is the direction the gate had before it was scoped (uncertain → engage).
+
+    Proof requires a different repository NAME, not merely a different slug. The
+    configured OWNER is the weak half of that config: the shipped example carries
+    a placeholder, setup can default it to a display name, and a contributor
+    install names its own fork. Any of those would otherwise read the real public
+    repo's PRs as "unrelated" and switch the budget off. Comparing names keeps a
+    same-named fork in scope, which is the conservative direction."""
+    canonical = _canonical_public_repo()
+    if canonical is None:
+        return False
+    target = str(repo).strip().lower().removesuffix(".git")
+    wanted = canonical.lower().removesuffix(".git")
+    return target != wanted and target.rsplit("/", 1)[-1] != wanted.rsplit("/", 1)[-1]
+
+
+#: Remote URL prefixes that are filesystem paths. gh resolves a repository only
+#: from remotes on a GitHub host, so a remote spelled like this can never yield a
+#: pull request. Deliberately a short closed set: any other spelling (including a
+#: bare relative path) is treated as possibly-GitHub, so a miss here keeps the
+#: pre-existing unknown result rather than dropping the budget.
+#:
+#: The set EXCLUDES two spellings that look like paths but carry a host: gh parses
+#: ``//host/owner/repo`` and ``file://host/owner/repo`` to that host (MEASURED on
+#: gh 2.100 — both resolved the public repo's PRs). Hence ``file:///`` (empty
+#: host) rather than ``file://``, and a lone leading ``/`` checked separately.
+_LOCAL_REMOTE_PREFIXES = ("./", "../", "file:///")
+
+
+def _is_local_remote_url(url: str) -> bool:
+    """Whether ``url`` is a filesystem path gh cannot resolve to any host."""
+    if url.startswith(_LOCAL_REMOTE_PREFIXES):
+        return True
+    return url.startswith("/") and not url.startswith("//")
+
+
+#: Git GLOBAL options the exemption tolerates before the subcommand: ``-c`` sets a
+#: config value for that one invocation; ``-C`` changes directory. Neither can
+#: point git at a repository other than the one the effective cwd resolves to,
+#: provided ``-C`` appears at most once (``_effective_diff_cwd`` reads the first).
+#: (A ``-c core.hooksPath=…`` hook could itself commit elsewhere; so could a
+#: repository's own hooks, on the base code too. That is arbitrary code the
+#: operator installed, outside what a pre-command check can model.)
+_EXEMPTION_GIT_GLOBALS = frozenset({"-c", "-C"})
+
+
+def _exemption_shape_ok(segs, command: str) -> bool:
+    """Whether the probed cwd is PROVABLY the repository this command commits in.
+
+    The remote probe below reads ``cwd`` at HOOK time. Every way to make the
+    commit land somewhere else — ``--git-dir``, ``GIT_DIR=`` prefixes or exports,
+    ``pushd``, ``env -C``, a second ``-C``, a wrapper, and any EARLIER segment
+    that changes the directory layout before the commit runs (``git worktree
+    add`` into the probed path, a ``cd`` that fails at run time under ``;`` or
+    ``||``) — would make a remote-less cwd prove nothing about the repository
+    actually committed to. That set is open, so this is an ALLOWLIST of one
+    shape that cannot do any of it; anything else keeps the unknown result.
+
+    Accepted: the whole command is ONE top-level ``git … commit …`` segment,
+    verb literal, raw text starting with ``git`` (so no env-assignment or
+    wrapper prefix was stripped), global options only ``-c <value>`` and at most
+    one ``-C <dir>``. A single segment has nothing that runs before it, which is
+    what closes the hook-time-versus-run-time gap — except process substitution,
+    whose body the parser leaves inside the segment, so that is refused by text. ``cd … && git commit`` in a
+    scratch repo therefore still asks, as it did before this scoping: that is a
+    known, fail-closed residue, and ``git -C <dir> commit`` is the form to use."""
+    if not segs or len(segs) != 1:
+        return False
+    seg = segs[0]
+    if seg.depth != 0 or seg.verb_unresolved or not seg.argv:
+        return False
+    # The one way a single parsed segment still runs a second command: process
+    # substitution. shell_parse leaves `<(…)`/`>(…)` bodies inside argv rather
+    # than emitting them as segments (its documented gap), while bash runs them.
+    # Tested on the RAW COMMAND: the segment's own ``raw`` has the `<`/`>`
+    # already stripped (MEASURED), so it cannot see the construct. A plain
+    # substring test is safe here: a false match only keeps unknown.
+    if "<(" in command or ">(" in command:
+        return False
+    if seg.argv[0] != "git" or not seg.raw.lstrip().startswith("git"):
+        return False
+    dash_c = 0
+    i = 1
+    while i < len(seg.argv) and seg.argv[i].startswith("-"):
+        opt = seg.argv[i]
+        if opt not in _EXEMPTION_GIT_GLOBALS or i + 1 >= len(seg.argv):
+            return False
+        dash_c += opt == "-C"
+        i += 2
+    if dash_c > 1:
+        return False
+    return git_subcommand(seg.argv) == "commit" and i < len(seg.argv) and seg.argv[i] == "commit"
+
+
+def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
+    """Whether ``cwd``'s repository has anything gh might resolve to GitHub.
+
+    Reads ``git remote -v``, which is also what gh reads, and which applies
+    ``url.<base>.insteadOf`` rewrites (MEASURED: a filesystem remote rewritten to
+    a GitHub URL is listed as the GitHub URL). Also reads the branch push/pull
+    targets: ``git push -u <url>`` leaves ``branch.<b>.remote`` set to a URL with
+    no remote defined, and that branch can have an open PR even though gh finds
+    no remote (MEASURED by audit). None = could not tell.
+
+    A branch target is USUALLY a remote NAME, not a URL: ``git clone <path>``
+    writes ``branch.<b>.remote=origin`` (MEASURED, git 2.43). A name is resolved
+    through the remotes ``git remote -v`` just listed, and it is possibly GitHub
+    exactly when one of that remote's URLs is — which the first loop has already
+    answered, so a name that resolves there adds nothing. Only a value that is
+    NOT a listed remote is classified as a URL/path in its own right; an unknown
+    name therefore stays possibly-GitHub, the conservative direction."""
+    try:
+        read = subprocess.run(
+            ["git", "-C", cwd, "remote", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=deadline.timeout(3.0),
+            check=False,
+        )
+        targets = subprocess.run(
+            [
+                "git",
+                "-C",
+                cwd,
+                "config",
+                "--get-regexp",
+                r"^(branch\..*\.(remote|pushremote)|remote\.pushdefault)$",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=deadline.timeout(3.0),
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 — could not tell; the caller keeps unknown.
+        return None
+    if read.returncode != 0:
+        return None
+    # `git config --get-regexp` exits 1 when nothing matches; anything else is an error.
+    if targets.returncode not in (0, 1) or (targets.returncode == 1 and targets.stdout.strip()):
+        return None
+    remote_names: set[str] = set()
+    for line in read.stdout.splitlines():
+        if not line.strip():
+            continue
+        name, sep, rest = line.partition("\t")
+        if not sep:
+            return None
+        remote_names.add(name.strip())
+        url = rest.rsplit(" (", 1)[0].strip()
+        # A remote whose listed URL is EMPTY gives gh nothing to resolve. The common
+        # cause: any `remote.<name>.*` key makes git list the name, so one global key
+        # (say `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in
+        # every repository that has no remote (MEASURED: a bare `origin<TAB>` line).
+        # It is not the only cause — an empty or whitespace-only `url`, a remote with
+        # only gh's own `gh-resolved` key, and an `insteadOf` rewrite that empties
+        # the URL all list the same way — and the skip covers every one, because the
+        # test is on the listed URL, not on how it came to be empty. A URL git does
+        # know is listed on its own line, a push-only URL included.
+        #
+        # Skipping it hides nothing ONLY because gh resolves a repository from this
+        # same `git remote -v` listing: MEASURED with gh 2.101 and git 2.43, gh
+        # answered "no git remotes found" in each of the states above. A gh that
+        # resolved from raw config instead would turn them into repositories this
+        # gate skips; re-check this premise when the gh version moves.
+        if not url:
+            continue
+        if not _is_local_remote_url(url):
+            return True
+    # Every listed remote's fetch AND push URL is a filesystem path by now.
+    for line in targets.stdout.splitlines():
+        if not line.strip():
+            continue
+        _key, sep, value = line.partition(" ")
+        value = value.strip()
+        if not sep or not value:
+            return None
+        # "." is the local repository itself. A listed remote NAME resolves to
+        # the URLs just classified, all local. A filesystem path is not GitHub.
+        # Anything else — an unlisted name or a URL — might be, so it counts.
+        if value == "." or value in remote_names:
+            continue
+        if not _is_local_remote_url(value):
+            return True
+    return False
+
+
+def _no_pr_possible_or_unknown(
+    cwd: str, deadline: Deadline, reason: str, segs, command: str
+) -> dict | None:
+    """After a failed PR lookup: None when gh cannot resolve any repository here.
+
+    A repository with nothing gh could resolve to GitHub (no remote or branch
+    target that might be GitHub, no ``GH_REPO``) gives gh no repository to find a pull
+    request in, so there is no budget to consult: a scratch or lab repo. The
+    claim is about what gh can resolve, not about GitHub at large, so it is only
+    made when the command provably commits in the probed repository
+    (``_exemption_shape_ok``). Any doubt keeps the unknown result, which asks in
+    the foreground and denies when dispatched."""
+    if os.environ.get("GH_REPO", "").strip():
+        return _unknown_budget(reason)
+    if any(os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")):
+        return _unknown_budget(reason)
+    if not _exemption_shape_ok(segs, command):
+        return _unknown_budget(reason)
+    if _has_possibly_github_remote(cwd, deadline) is False:
+        return None
+    return _unknown_budget(reason)
+
+
 #: This hook is registered in .claude/settings.json with `"timeout": 10`, and an
 #: overrun SIGKILLs it -- which FAILS OPEN: the commit proceeds with neither the
 #: budget check nor the review-current and depth checks that run after it. The
@@ -934,11 +1202,26 @@ def _branch_review_budget(
     *,
     budget_seconds: float = _COMMIT_BUDGET_LOOKUP_SECONDS,
     deadline: Deadline | None = None,
+    segs=None,
+    command: str = "",
 ) -> dict | None:
-    """The current branch PR's shared budget; None means a proven no-open-PR.
+    """The current branch PR's shared budget; None means no budget applies.
 
-    A read/import/identity failure is an ``unknown`` result, never the same as
-    no pull request. So is running out of time: one aggregate deadline covers
+    SCOPE: the budget belongs to an open PR on the configured PUBLIC repo, and to
+    nothing else. Two cases therefore return None, and only these two:
+
+    * the lookup failed, but the repository has no remote gh could resolve to
+      GitHub (no remote or branch target that might be GitHub — a target naming
+      a remote counts by that remote's URLs — and ``GH_REPO`` unset) and the
+      command provably commits in that repository — gh has no repository to find
+      a pull request in (``_no_pr_possible_or_unknown``; ``segs`` is the parsed
+      command, and None keeps the unknown result);
+    * the branch's open PR lives in a repository that is PROVABLY not the
+      configured public one (``_outside_public_repo``).
+
+    Everything else keeps the pre-existing direction. A read/import/identity
+    failure where a GitHub remote exists is an ``unknown`` result, never the same
+    as no pull request. So is running out of time: one aggregate deadline covers
     every network call here, and exhausting it asks a human rather than letting
     the harness kill the hook and allow the commit unchecked. Tests select a PR
     with ``_TEST_REVIEW_BUDGET_PR`` and feed the shared evaluator through its
@@ -963,6 +1246,8 @@ def _branch_review_budget(
         repo = os.environ.get("_TEST_REVIEW_BUDGET_REPO", "owner/repo")
         if not test_pr.isdigit():
             return _unknown_budget("commit_pr_identity_unknown")
+        if _outside_public_repo(repo):
+            return None
         remaining = lookup_deadline.remaining()
         result = review_budget.evaluate_pr(
             repo, test_pr, budget_seconds=max(0.0, remaining or 0.0)
@@ -972,30 +1257,40 @@ def _branch_review_budget(
         return result
 
     try:
-        pr_read = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "status",
-                "--json",
-                "number,state,url",
-            ],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            # Share the one deadline: a flat 8 here plus the evaluator's own
-            # serial calls is exactly what overran the harness window.
-            timeout=lookup_deadline.timeout(8.0),
-            check=False,
-        )
+        try:
+            pr_read = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "status",
+                    "--json",
+                    "number,state,url",
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                # Share the one deadline: a flat 8 here plus the evaluator's own
+                # serial calls is exactly what overran the harness window.
+                timeout=lookup_deadline.timeout(8.0),
+                check=False,
+            )
+        except (FileNotFoundError, PermissionError):
+            # gh could not be launched at all. Same question as a failed read.
+            return _no_pr_possible_or_unknown(
+                cwd, lookup_deadline, "commit_pr_gh_unavailable", segs, command
+            )
         if pr_read.returncode != 0:
-            return _unknown_budget("commit_pr_list_unreadable")
+            return _no_pr_possible_or_unknown(
+                cwd, lookup_deadline, "commit_pr_list_unreadable", segs, command
+            )
         identity = _current_branch_pr_identity(pr_read.stdout)
         if identity is None:
             return None
         if isinstance(identity, dict):
             return identity
         repo, number = identity
+        if _outside_public_repo(repo):
+            return None
         remaining = lookup_deadline.remaining()
         result = review_budget.evaluate_pr(
             repo, number, budget_seconds=max(0.0, remaining or 0.0)
@@ -1079,6 +1374,14 @@ def main() -> None:
     # identical to the invalidator's early-out, or a commit this gate checks can
     # leave that module's marker standing.
     if not mentions(command, _COMMIT_PATTERN):
+        # Nothing in the text names a commit, and one could still run: a git
+        # subcommand the shell builds says nothing about which it is. Asked only
+        # when the text names git, and answered by the parse, so an ordinary
+        # variable in an ARGUMENT is not refused. The invalidator's early exit is
+        # deliberately NOT widened to match: it runs after a command succeeds,
+        # and every command this branch catches is refused before it runs.
+        if mentions(command, _GIT_WORD) and "git" in unresolved_verb_programs(command):
+            _deny(_HIDDEN_GIT_VERB_MSG)
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through
@@ -1374,7 +1677,9 @@ def main() -> None:
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
     branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
-    cloud_budget = _branch_review_budget(cwd, branch, deadline=hook_budget)
+    cloud_budget = _branch_review_budget(
+        cwd, branch, deadline=hook_budget, segs=segs, command=command
+    )
     pending_round_approval = bool(
         cloud_budget is not None
         and (

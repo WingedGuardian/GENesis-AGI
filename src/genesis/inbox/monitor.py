@@ -30,6 +30,13 @@ from genesis.inbox.scanner import (
     segment_items,
 )
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
+from genesis.inbox.url_coverage import (  # the URL coverage gate (#2017), used below
+    _coverage_url_label,
+    _display_url,
+    _extract_coverage_input_urls,
+    _has_url_failures,
+    _uncovered_urls,
+)
 from genesis.observability.failure_details import failure_details
 from genesis.security import ContentSanitizer, ContentSource
 from genesis.util.tz import parse_utc_iso
@@ -57,21 +64,23 @@ class InboxPromptLoadError(RuntimeError):
 def _eval_disallowed_tools() -> list[str]:
     """Tools denied to the inbox-eval judge (runs skip_permissions on EXTERNAL input).
 
-    This is the reflection read-only denylist (``build_reflection_disallowed``)
-    MINUS ``Bash``. It denies file writes, the whole SPAWN class
+    This is the full reflection read-only denylist (``build_reflection_disallowed``),
+    ``Bash`` included. It denies shell access, file writes, the whole SPAWN class
     (Agent/Task/Workflow/Skill — a spawned child would escape with a fresh,
     unrestricted toolset), the user-scoped MCP servers, and every genesis MCP
     *write* (``memory_store`` / ``settings_update`` / ``follow_up_create`` / …),
     while KEEPING the reads the prompt needs (``memory_recall`` /
-    ``procedure_recall`` / genesis-health status reads) and the one write the
-    prompt still uses (``observation_write`` — the OPTIONAL ``user_signal`` digest).
+    ``procedure_recall`` / genesis-health status reads, and ``web_fetch``, which
+    fetches YouTube videos through yt-dlp in Python) and the one write the prompt
+    still uses (``observation_write`` — the OPTIONAL ``user_signal`` digest).
 
-    ``Bash`` is deliberately RETAINED: the prompt shells out to ``yt-dlp`` /
-    ``curl`` to fetch YouTube (and SSL-failing) inbox URLs. Relocating that fetch
-    into Python so ``Bash`` can also be denied is the remaining residual of
-    follow-up 727a3724 (the inbox judge's injection→RCE surface). Deriving from
-    ``build_reflection_disallowed`` (live per call) means a genesis MCP write
-    added in a future PR is auto-denied here with no code change.
+    ``Bash`` used to be retained only so the prompt could shell out to ``yt-dlp`` /
+    ``curl``; that fetch now lives behind ``web_fetch`` (follow-up d83569bf).
+    Deriving from ``build_reflection_disallowed`` (live per call) means a genesis
+    MCP write added in a future PR is auto-denied here with no code change. If
+    that registry enumeration fails, the denylist falls back to denying both MCP
+    servers wholesale (fail-closed): the judge then has no ``web_fetch`` and can
+    fetch only with the built-in WebFetch, so a YouTube item reports the gap.
 
     NOTE: the retained ``observation_write`` now STAMPS the session origin (WS-3):
     an eval-session write lands ``origin_class='external_untrusted'`` (like the
@@ -86,10 +95,9 @@ def _eval_disallowed_tools() -> list[str]:
     always-loaded L1 file; ``reflection`` context; several ego/sentinel raw-SQL
     reads). Closing that broader observation-content-surfacing surface (exclude/wrap
     external-origin content at the surfacing points) is tracked — see the
-    "external-origin observation content" follow-up. (The ``Bash``/fetch relocation
-    remains the open part of 727a3724, above.)
+    "external-origin observation content" follow-up.
     """
-    return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]
+    return SessionConfigBuilder().build_reflection_disallowed()
 
 
 # URL extraction now lives in scanner.py (canonical). Kept as a module-level
@@ -123,258 +131,6 @@ def _extract_bracket_directives(text: str) -> list[str]:
             seen.add(stripped)
             directives.append(stripped)
     return directives
-
-
-# Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
-# Tested against all 8 existing response files: 0 false positives, 0 false negatives.
-# Crucially, these do NOT include "ssl error" or "could not fetch" which appear
-# in SUCCESSFUL evaluations that worked around SSL via yt-dlp/curl.
-_URL_FAILURE_PATTERNS = [
-    "unfetchable",
-    "unreachable from this host",
-    "watch them yourself",
-    "cannot evaluate the video",
-    "cannot assess without content",
-    "could not be fetched",
-    "could not be accessed",
-    "i could not fetch",
-    "i could not access",
-]
-
-
-def _has_url_failures(response_text: str, input_content: str) -> bool:
-    """Detect unresolved URL fetch failures in a CC evaluation response.
-
-    Only triggers on definitive give-up language, not on error mentions
-    that may appear in successful workaround descriptions.
-    """
-    urls = _extract_coverage_input_urls(input_content)
-    if not urls:
-        return False
-    lower = response_text.lower()
-    return any(p in lower for p in _URL_FAILURE_PATTERNS)
-
-
-_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
-
-# A template placeholder, e.g. api.github.com/repos/{slug}. Requires a REAL
-# {...} pair: a lone trailing brace picked up from surrounding prose
-# ("see {https://example.com/secret-9f2}") must not exempt a live URL from
-# the whole gate.
-_PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
-
-# Coverage has a stricter grammar than general inbox discovery.  Both patterns
-# preserve every non-whitespace terminal character (ambiguous punctuation must
-# fail closed); the evidence side accepts only the evaluator's required Source
-# field, optionally enclosed in RFC-style angle brackets.
-#
-# DISCOVERY and VALIDATION are deliberately separate patterns. They differ in
-# exactly one place, because they are asked different questions.
-_COVERAGE_URL_VALUE_RE = re.compile(
-    r"(?:https?://[^\s<>]+)"
-    r"|"
-    r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>]+)",
-    re.IGNORECASE,
-)
-
-# DISCOVERY scans free-form prose, so it must know where a token ENDS. Its
-# bare-domain alternative therefore stops at `]`: without that, a markdown
-# link's TEXT (`[example.com/a](https://example.com/a)`) matches here and then
-# swallows `](https://...`, yielding one token spanning the label and the
-# target -- an identity no response can ever cite. A scheme'd URL keeps `]` so
-# an IPv6 authority (`https://[::1]:8443/p`) survives; a bare-domain form has
-# no authority brackets to preserve.
-#
-# VALIDATION (`_COVERAGE_URL_VALUE_RE`, used as a fullmatch above) must NOT
-# inherit that stop. Its input is a single already-delimited Source field, so
-# there is no surrounding prose to end at, and narrowing it would silently
-# reject a legitimate schemeless citation carrying a bracketed query parameter
-# (`example.com/s?f[0]=x`) -- the URL would then read as uncovered even though
-# the evaluator cited it exactly.
-_COVERAGE_INPUT_URL_RE = re.compile(
-    r"(?:https?://[^\s<>]+)"
-    r"|"
-    r"(?:(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/[^\s<>\]]+)",
-    re.IGNORECASE,
-)
-# A Source FIELD is a line whose only content before the label is Markdown
-# container syntax: blockquote and list markers, nested in any order (#2020;
-# `- > ` and `- - ` added in #2447 review). A bulleted multi-URL answer is the
-# natural shape for "one Source per URL", and rejecting it read every
-# correctly-cited URL as uncovered. The prefix is bounded to container syntax
-# on purpose: the label after any word is prose, and must not become field
-# evidence. Each alternative starts with a distinct character, so the repeat
-# cannot backtrack super-linearly.
-_SOURCE_FIELD_RE = re.compile(
-    r"^[ \t]*(?:>[ \t]*|(?:[-*+]|\d{1,9}[.)])[ \t]+)*"
-    r"\*\*Source:\*\*\s*(?P<source>\S(?:.*\S)?)\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def _extract_coverage_input_urls(text: str) -> list[str]:
-    """Discover input URLs without discarding identity-bearing characters."""
-    return list(dict.fromkeys(match.group(0) for match in _COVERAGE_INPUT_URL_RE.finditer(text)))
-
-
-# Prose punctuation that ends a sentence, and delimiters that come in pairs.
-# Used ONLY to render a coverage token for the prompt -- never to decide
-# coverage identity.
-_DISPLAY_TRIM_CHARS = ".,;:!?"
-_DISPLAY_PAIRS = {")": "(", "]": "[", "}": "{", '"': '"', "'": "'", "`": "`"}
-
-
-def _display_url(url: str) -> str:
-    """Render a lossless coverage token as the URL the writer meant.
-
-    The coverage grammar keeps every non-whitespace terminal character so the
-    GATE can fail closed on ambiguous punctuation. That is wrong for the
-    PROMPT: a markdown link or a quoted URL yields a token carrying its own
-    wrapper, and telling the model to fetch ``https://example.com/foo)`` asks
-    for a resource that does not exist.
-
-    Trimming here is STRUCTURAL, not a prose heuristic. A paired delimiter is
-    removed only when the remainder leaves it unmatched -- so a markdown
-    wrapper goes and a balanced ``/wiki/Foo_(bar)`` stays, and an IPv6
-    authority keeps its ``]`` because the ``[`` is still open. Sentence
-    punctuation is trimmed outright.
-
-    This runs on the presentation side only. ``_coverage_identity`` still
-    compares the untrimmed token, so nothing here can make a truncated sibling
-    vouch for an omitted URL.
-    """
-    candidate = url
-    unwrapped = False
-    while candidate:
-        last = candidate[-1]
-        if last in _DISPLAY_TRIM_CHARS:
-            candidate = candidate[:-1]
-            continue
-        opener = _DISPLAY_PAIRS.get(last)
-        if opener is None:
-            break
-        body = candidate[:-1]
-        # Symmetric delimiters (quotes) pair off; asymmetric ones nest.
-        unmatched = (
-            body.count(last) % 2 == 0
-            if opener == last
-            else body.count(opener) <= body.count(last)
-        )
-        if not unmatched:
-            break
-        candidate = body
-        unwrapped = True
-    # Sentence punctuation alone is NOT evidence of a wrapper. `/path;` and
-    # `/q?x=1!` are legal URLs, and round 3 established that such ambiguity
-    # must fail CLOSED -- trimming them for display would ask the evaluator
-    # for a DIFFERENT resource than the one the user saved, and the gate
-    # would then accept that answer. So a trim only stands when it removed a
-    # paired delimiter, which is structurally provable. Sentence punctuation
-    # is consumed only to reach one (`...x",` -> `...x`).
-    return candidate if unwrapped else url
-
-
-def _extract_source_urls(response_text: str) -> list[str]:
-    """Parse lossless coverage evidence from required ``**Source:**`` fields."""
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in _SOURCE_FIELD_RE.finditer(response_text):
-        value = match.group("source").strip()
-        if value.startswith("<") and value.endswith(">"):
-            value = value[1:-1]
-        if _COVERAGE_URL_VALUE_RE.fullmatch(value) and value not in seen:
-            seen.add(value)
-            urls.append(value)
-    return urls
-
-def _coverage_identity(url: str) -> str | None:
-    """Return the URL identity used by the citation-coverage gate.
-
-    Scheme and a single leading ``www.`` label are presentation variants. Host
-    case is insensitive. Everything else is identity-bearing: userinfo, port,
-    path, query, and fragment are preserved exactly, apart from trailing slashes.
-    Returning ``None`` keeps malformed authority-free URLs uncovered.
-    """
-    candidate = url if _SCHEME_RE.match(url) else f"//{url}"
-    try:
-        parsed = urlsplit(candidate)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        return None
-    if not hostname:
-        return None
-
-    hostname = hostname.lower().removeprefix("www.")
-    raw_authority = parsed.netloc
-    userinfo = raw_authority.rsplit("@", 1)[0] + "@" if "@" in raw_authority else ""
-    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
-    authority = userinfo + rendered_host
-    if port is not None:
-        authority += f":{port}"
-
-    identity = authority + parsed.path.rstrip("/")
-    pre_fragment = url.split("#", 1)[0]
-    if "?" in pre_fragment:
-        identity += f"?{parsed.query}"
-    if "#" in url:
-        identity += f"#{parsed.fragment}"
-    return identity
-
-
-def _coverage_url_label(url: str) -> str:
-    """Return a stable diagnostic id without copying URL credentials."""
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    return f"url#{digest}"
-
-
-def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
-    """Return input URLs not cited as complete parsed URL identities.
-
-    The response is first reduced to the URLs recognized by the canonical inbox
-    scanner. Comparing parsed identities makes prefixes, sibling hosts, Unicode
-    continuations, and legal URL delimiters different URLs by construction. It
-    also avoids the prior substring matcher's growing boundary rules and keeps
-    the scan linear in the number of extracted URLs.
-    """
-    urls = _extract_coverage_input_urls(input_content)
-    if not urls:
-        return []
-    response_identities = {
-        identity
-        for cited in _extract_source_urls(response_text)
-        if (identity := _coverage_identity(cited)) is not None
-    }
-    return [url for url in urls if not _PLACEHOLDER_RE.search(url)
-            and not _accepted_identities(url) & response_identities]
-
-
-def _accepted_identities(url: str) -> set[str]:
-    """Return the identities that count as citing THIS input URL.
-
-    Two renderings of one token, never a widened rule about URLs in general.
-    The prompt shows ``_display_url(url)`` while the gate discovered ``url``,
-    so a response that cites exactly what it was asked for must satisfy the
-    gate -- otherwise the item can never be covered by any compliant answer.
-    MEASURED 2026-09-14 over this install's corpus (284 stored baselines + 112
-    live inbox files, 18,119 tokens): 331 (1.83%) render differently, and 72
-    collapse two input tokens onto one prompt line. Without this, that 1.83%
-    would be a permanent floor under the shadow flag rate -- and the shadow
-    rate is precisely the signal the shadow->enforce decision is meant to read.
-
-    Scoping is what keeps this safe. The set is derived from ONE token, so a
-    truncated SIBLING still cannot vouch for it: given inputs ``/foo`` and
-    ``/foo:bar``, neither one's display form is the other's identity. That is
-    the guarantee the untrimmed comparison was introduced to provide, and it
-    is unchanged.
-
-    An empty set (both renderings unparseable) leaves the URL uncovered.
-    """
-    return {
-        identity
-        for candidate in (url, _display_url(url))
-        if (identity := _coverage_identity(candidate)) is not None
-    }
 
 
 _ACKNOWLEDGED_RE = re.compile(
@@ -1865,6 +1621,7 @@ class InboxMonitor:
             # (it forwards session_origin_from_env), so a delta forged here is
             # stamped external and barred by the user-model consumer gate.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
+            caller_tag="inbox.eval",
         )
 
     async def _set_drop_status(
@@ -2138,74 +1895,138 @@ class InboxMonitor:
             # line and collapses annotated items that share a URL (#2447
             # review). Unreadable storage falls back to the flattened text,
             # which for a legacy resume row can be the whole file: shown as one
-            # item. Legacy only; v2 rows always carry item boundaries.
-            items = inbox_items.stored_item_texts(row.get("batch_items")) or [content]
+            # item. Legacy only; v2 rows always carry item boundaries. The
+            # labels are resolved at flush, once per file (#2533 round 3).
+            items = inbox_items.stored_item_texts(row.get("batch_items"))
             self._alert_parked(
                 file_path, reason=reason, detail=detail, item_id=row_id,
-                labels=[", ".join(self._item_labels(text)) for text in items],
+                texts=items or [content], legacy=not items,
             )
 
     @staticmethod
-    def _mask_opaque_segments(path: str) -> str:
-        """Replace path segments that look like tokens or ids with ``…``.
+    def _item_labels(
+        content: str,
+        file_lines: list[str] | None = None,
+        *,
+        legacy: bool = False,
+        claimed: set[int] | None = None,
+        line_numbers: list[int] | None = None,
+    ) -> list[str]:
+        """Human handles for an item, safe for the owner's channel.
 
-        Share links often carry their secret in the PATH, not the query. A
-        segment is opaque when one of its ``-``/``_``-separated parts is at
-        least 12 characters and mixes letters with digits: a token or an id
-        (``a8F3kLm29QzX7pRtW4``, a document id), never a readable slug
-        (``quarterly-report``, ``2026-09-26-release-notes``). URL-safe base64
-        splits into short mixed parts at ``-``/``_`` (``Xy7_Kp2-Qw9_Rt4-Zm1``),
-        so a segment of 16+ characters with ANY mixed part is opaque too — at
-        the cost of masking a long slug with a version token (``v2-…``). A
-        heuristic: letters-only keys are masked when they are 16+ characters in
-        mixed case or any run is 20+; a lowercase letters-only token under 20, a
-        digits-only one, a short one, or one in the host name is shown.
+        Each URL is shown as its HOST, the LINE of the inbox file the item sits
+        on, and the coverage log's opaque ``url#`` id — never the path or
+        query. Share links carry secrets in both, and guessing which path text
+        is secret cannot be made complete: three masking heuristics in a row
+        each hid readable slugs or leaked token fragments under review
+        (#2447, #2533). The owner finds the item by its line; the ``url#`` id
+        matches the coverage log. The line is found from the item's whole
+        block of lines, so two items that share a URL, or an annotation, get
+        their own lines. If the file was edited since, the link's own line
+        locates it, then its first line: there an exact whole-line match wins
+        over a substring match, and the LAST
+        match wins among equals (a parked item is new text, appended below the
+        older items it may resemble: a short note like ``ai``, or a URL that
+        prefixes an earlier one). An item with no URL is a note on its line,
+        with a ``note#`` id (a hash of its whole text) for when the file can no
+        longer be read.
+
+        ``legacy`` marks the whole-file text of a legacy row: there each URL
+        locates itself. ``claimed`` holds lines other items parked in the same
+        file matched EXACTLY (whole block); they are skipped. Only an exact
+        block match claims a line, so two identical items never share one,
+        while a loose fallback match never takes a line from an exact owner.
         """
-        def mixed(part: str) -> bool:
-            return any(c.isdigit() for c in part) and any(c.isalpha() for c in part)
+        # ``file_lines`` are the scanner's logical lines (``splitlines``); the
+        # owner's editor counts physical ``\n`` lines, which ``line_numbers``
+        # maps them to (#2533 round 4: a NEL or U+2028 is a logical break only).
+        raw = [ln.rstrip() for ln in (file_lines or [])]
+        lines = [ln.strip() for ln in raw]
+        taken = claimed if claimed is not None else set()
 
-        def opaque(seg: str) -> bool:
-            parts = re.split(r"[-_]", seg)
-            return any(
-                (mixed(part) and (len(part) >= 12 or len(seg) >= 16))
-                # Letters-only keys (`ghp_`, `sk-proj-`, `AKIA…` shapes): mixed
-                # case at 16+, or any run of 20+, is no English word.
-                or (len(part) >= 16 and part.isalpha() and not part.islower()
-                    and not part.istitle())
-                or len(part) >= 20
-                for part in parts
-            )
+        def shown(n: int | None) -> int | None:
+            if n is None or not line_numbers or n > len(line_numbers):
+                return n
+            return line_numbers[n - 1]
 
-        return "/".join("…" if opaque(seg) else seg for seg in path.split("/"))
+        def last_free(candidates: list[int]) -> int | None:
+            free = [n for n in candidates if n not in taken]
+            return free[-1] if free else None
 
-    @classmethod
-    def _item_labels(cls, content: str) -> list[str]:
-        """Human handles for every URL in an item, safe for the owner's channel.
+        def line_of(needle: str) -> int | None:
+            if not needle:
+                return None
+            exact = last_free([n for n, text in enumerate(lines, 1) if text == needle])
+            if exact:
+                return exact
+            return last_free([n for n, text in enumerate(lines, 1) if needle in text])
 
-        Each URL as host+path — query, fragment and userinfo dropped, and opaque
-        path segments masked — because a presigned token is exactly why the
-        coverage log uses opaque ``url#`` ids. Each label carries that same
-        ``url#`` id (computed from the same extractor the coverage gate uses),
-        so two links that redact to one label stay distinguishable, and a URL
-        the coverage log names can be matched to its line. A row can hold several URLs
-        (``items_per_eval > 1`` batches several items into one row), so every
-        one is named. An item with no URL falls back to its first line.
-        """
+        block = [ln.rstrip() for ln in (content or "").splitlines() if ln.strip()]
+        first = block[0].strip() if block else ""
+        urls = _extract_coverage_input_urls(content or "")
+        # How segment_items shapes an item: the item's first line and a URL line
+        # are fully stripped, while inner lines keep their indentation, so two
+        # notes differing only in an inner line's indent stay distinct (round 4).
+        loose = {0} | ({len(block) - 1} if block and _extract_coverage_input_urls(block[-1]) else set())
+
+        ends_with_url = bool(block) and bool(_extract_coverage_input_urls(block[-1]))
+
+        def block_at(i: int) -> bool:
+            # Only where segment_items could have cut an item (round 4 audit): it
+            # starts at the file edge, after a blank line or after a URL line (a
+            # URL line always ends its item), and a note ends at a blank line or
+            # the file's end (prose followed by a URL would be that URL's
+            # annotation). A URL item always ends at its URL line.
+            if i > 0 and lines[i - 1] and not _extract_coverage_input_urls(lines[i - 1]):
+                return False
+            end = i + len(block)
+            if not ends_with_url and end < len(lines) and lines[end]:
+                return False
+            for j, b in enumerate(block):
+                f = raw[i + j]
+                if (f.strip() != b.strip()) if j in loose else (f != b):
+                    return False
+            return True
+
+        def block_start() -> int | None:
+            # The item is a contiguous run of file lines (scanner.segment_items),
+            # so its WHOLE text locates it (round 2). A candidate overlapping a
+            # block already claimed by another item is skipped (round 4).
+            if not block:
+                return None
+            starts = [
+                i + 1 for i in range(len(raw) - len(block) + 1)
+                if block_at(i) and not taken.intersection(range(i + 1, i + 1 + len(block)))
+            ]
+            return starts[-1] if starts else None
+
+        # One logical item, however many URLs its line holds: its whole block
+        # locates it; once edited, its link's own line, then its first line. A
+        # legacy row holding a whole file: each URL locates itself.
+        exact_line = None if legacy and urls else block_start()
+        if exact_line:
+            taken.update(range(exact_line, exact_line + len(block)))
+        item_line = (
+            None if legacy and urls
+            else exact_line or (line_of(urls[0]) if urls else None) or line_of(first)
+        )
         labels: list[str] = []
-        for url in _extract_coverage_input_urls(content or ""):
+        for url in urls:
             try:
-                parts = urlsplit(url if "://" in url else "//" + url)
-                shown = f"{parts.hostname or ''}{cls._mask_opaque_segments(parts.path)}"
-                shown = shown.rstrip("/") or "an unlabelled URL"
+                has_scheme = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", url) is not None
+                host = urlsplit(url if has_scheme else "//" + url).hostname or "a link"
             except ValueError:
-                shown = "an unparseable URL"
-            label = f"{shown} ({_coverage_url_label(url)})"
+                host = "an unparseable link"
+            number = shown(item_line or line_of(url))
+            where = f" — line {number}" if number else ""
+            label = f"{host}{where} ({_coverage_url_label(url)})"
             if label not in labels:
                 labels.append(label)
         if labels:
             return labels
-        first = (content or "").strip().splitlines()
-        return [first[0][:80] if first else "an empty item"]
+        note_id = "note#" + hashlib.sha256("\n".join(block).encode("utf-8")).hexdigest()[:12]
+        where = f" — line {shown(item_line)}" if item_line else ""
+        return [f"a note{where} ({note_id})"]
 
     def _alert_parked(
         self,
@@ -2215,6 +2036,8 @@ class InboxMonitor:
         detail: str,
         item_id: str | None = None,
         labels: list[str] | None = None,
+        texts: list[str] | None = None,
+        legacy: bool = False,
     ) -> None:
         """Record that part of a file stopped being evaluated; sent at scan end.
 
@@ -2223,13 +2046,56 @@ class InboxMonitor:
         id, never by their label: two presigned links to one path share a
         redacted label, and keying on it reported one item where two stopped
         (#2447 review). A call with no ``item_id`` parks the whole file.
+        ``texts`` are the row's item texts, labelled at flush (``labels``
+        given directly are used as they are).
         """
         buf = getattr(self, "_park_buffer", None)
         if buf is None:  # called outside check_once (tests, direct calls)
             self._park_buffer = buf = {}
         entry = buf.setdefault((file_path, reason), {"detail": detail, "items": {}})
         if item_id is not None:
-            entry["items"][item_id] = labels or ["an item"]
+            entry["items"][item_id] = (
+                {"texts": texts, "legacy": legacy} if texts else (labels or ["an item"])
+            )
+
+    def _resolve_park_labels(self, file_path: str, items: dict) -> dict[str, list[str]]:
+        """Labels for every item parked in one file, read from the file ONCE.
+
+        Labelled newest row first, each taking the last line not yet claimed,
+        so identical items get distinct lines in file order (#2533 round 3).
+        """
+        pending = [(rid, v) for rid, v in items.items() if isinstance(v, dict)]
+        if not pending:
+            return items
+        try:
+            # Exactly what the scanner evaluated: its read (first 50 KB, utf-8
+            # with replacement) and its line split. A copy of an item below the
+            # evaluated prefix is never the parked one (#2533 round 4).
+            text = read_content(Path(file_path))
+        except OSError:
+            text = ""
+        file_lines = text.splitlines()
+        # Physical line numbers, counted by "\n" as editors do.
+        # Built from the logical lines themselves, so it always has one entry
+        # per logical line (round 4 audit: a separator ending a line broke a
+        # map built from the physical side).
+        line_numbers: list[int] = []
+        number = 1
+        for segment in text.splitlines(keepends=True):
+            line_numbers.append(number)
+            if segment.endswith("\n"):
+                number += 1
+        claimed: set[int] = set()
+        resolved: dict[str, list[str]] = {}
+        for rid, v in reversed(pending):
+            resolved[rid] = [
+                ", ".join(self._item_labels(
+                    item, file_lines, legacy=v["legacy"], claimed=claimed,
+                    line_numbers=line_numbers,
+                ))
+                for item in reversed(v["texts"])
+            ][::-1]
+        return {rid: resolved.get(rid, v) for rid, v in items.items()}
 
     def _flush_park_alerts(self) -> None:
         """Queue one durable owner alert per (file, reason) parked this scan.
@@ -2257,7 +2123,8 @@ class InboxMonitor:
                     name = Path(file_path).relative_to(self._config.watch_path).as_posix()
                 except ValueError:
                     name = Path(file_path).name
-                items = entry["items"]
+                items = self._resolve_park_labels(file_path, entry["items"])
+                entry["items"] = items  # the failure log below reads the labels
                 # One line per LOGICAL item, not per row: a row holds several
                 # items when items_per_eval > 1, and the title counts them.
                 lines = [f"- {lbl}" for lbls in items.values() for lbl in lbls]
@@ -2307,7 +2174,9 @@ class InboxMonitor:
                     "Inbox parked-alert enqueue failed for %s (%s): %s",
                     file_path, reason,
                     "; ".join(
-                        lbl for lbls in entry.get("items", {}).values() for lbl in lbls
+                        lbl for rid, lbls in entry.get("items", {}).items()
+                        for lbl in (lbls if isinstance(lbls, list)
+                                    else [f"row {rid}: {len(lbls['texts'])} unlabelled item(s)"])
                     ) or entry.get("detail", ""),
                     exc_info=True,
                 )
@@ -2598,8 +2467,10 @@ class InboxMonitor:
                 )
 
             # Capability-build lane (non-fatal, no-op unless enabled + wired):
-            # consumes `build` verdicts into greenlight cards. Independent of
-            # follow-up creation — BUILD verdicts never become follow-ups.
+            # consumes `build` verdicts into greenlight cards. While it is live,
+            # BUILD verdicts never become follow-ups; when it is unwired or
+            # disabled, _create_follow_ups_from_eval surfaces them as follow-ups
+            # instead (see _BUILD_FALLBACK_MAP).
             if self._build_lane is not None:
                 try:
                     await self._build_lane.handle_eval(
@@ -2611,6 +2482,16 @@ class InboxMonitor:
                 except Exception:
                     logger.warning(
                         "Build-lane eval handling failed (non-fatal)",
+                        exc_info=True,
+                    )
+                # Runs even when handle_eval raised part-way: retirement keys on
+                # a candidate row EXISTING, so it retires exactly what the lane
+                # did consume and nothing it did not.
+                try:
+                    await self._retire_build_fallbacks_owned_by_lane(output_text)
+                except Exception:
+                    logger.warning(
+                        "Retiring lane-off BUILD fallback rows failed (non-fatal)",
                         exc_info=True,
                     )
 
@@ -2850,7 +2731,7 @@ class InboxMonitor:
             #
             # Where display and identity disagree (331 tokens, 1.83%) the gate
             # accepts EITHER rendering of that same token, so a compliant
-            # answer always clears. See `_accepted_identities` for why that is
+            # answer always clears. See `url_coverage._accepted_identities` for why that is
             # scoped per-token rather than a widened rule.
             urls = [_display_url(u) for u in _extract_coverage_input_urls(item.content)]
             urls = list(dict.fromkeys(u for u in urls if u))
@@ -3014,6 +2895,111 @@ class InboxMonitor:
         "bookmark": ("ego_judgment", "low", False, "tabled"),
     }
 
+    # BUILD (capability-build items) is deliberately ABSENT from _ACTION_MAP and
+    # stays in recommendation._SKIP_ACTIONS: while the build lane is live it owns
+    # the verdict's lifecycle (greenlight card -> task executor), and a follow-up
+    # as well would be a duplicate. But the lane is optional — unwired, or wired
+    # with ``enabled=False`` (its handle_eval then returns 0 without looking) — and
+    # in that state a BUILD verdict used to reach NO consumer at all: skipped here
+    # by is_actionable, ignored there by the disabled lane. So when the lane is not
+    # live, the verdict is surfaced here instead — mapped by the VERDICT, never by
+    # the action alone, because ``action: BUILD`` carries all three verdicts:
+    #   build            -> pinned user-owned follow-up (the greenlight decision)
+    #   needs_discussion -> pinned user-owned follow-up, labelled as a discussion
+    #   dont_build       -> tabled record (a veto is kept, never actionable work)
+    # A missing/invalid verdict (parsed as None) is malformed output: the live lane
+    # skips it too (BuildLane.handle_eval), so it creates nothing and logs WARNING.
+    _BUILD_FALLBACK_MAP: dict[str, tuple[str, str, bool, str, str]] = {
+        # verdict -> (strategy, priority, pinned, kind, content label)
+        "build": ("user_input_needed", "medium", True, "follow_up", "BUILD"),
+        "needs_discussion": (
+            "user_input_needed", "medium", True, "follow_up", "BUILD: NEEDS DISCUSSION",
+        ),
+        "dont_build": ("ego_judgment", "low", False, "tabled", "BUILD: DONT_BUILD"),
+    }
+
+    def _build_lane_live(self) -> bool:
+        """True only when a build lane is wired AND enabled (it will consume)."""
+        lane = self._build_lane
+        return lane is not None and bool(getattr(lane, "enabled", False))
+
+    @staticmethod
+    def _item_primary(title: str) -> str:
+        """Stable item identity: the tracking-normalized primary URL in the title,
+        else the lowercased title. The same derivation as BuildLane.item_key, so a
+        fallback row and a lane candidate name the same item."""
+        urls = extract_urls(title)
+        return normalize_url_line(urls[0]) if urls else title.strip().lower()
+
+    @staticmethod
+    def _build_fallback_dedup_key(primary: str, verdict: str) -> str:
+        """dedup_key of the lane-off BUILD fallback row for *primary* + *verdict*."""
+        basis = f"inbox_build_fallback|{primary}|verdict={verdict}"
+        return hashlib.sha256(basis.encode()).hexdigest()
+
+    async def _retire_build_fallbacks_owned_by_lane(self, evaluation_text: str) -> int:
+        """Retire lane-off BUILD fallback rows for items the live lane now owns.
+
+        A BUILD item evaluated while the lane was off got a fallback row (see
+        _BUILD_FALLBACK_MAP). Once the lane is enabled and the item is
+        re-evaluated, the lane records a build_candidate (and, for ``build``, a
+        greenlight card); left alone, the fallback would stay actionable as a
+        stale duplicate of that card.
+
+        Ownership is read from the candidate table, not from what handle_eval
+        returned, so every way the lane can hold an item is covered by the one
+        check: a candidate it created in this eval, a card or calibration row
+        from an earlier eval (handle_eval then skips it as already tracked), and
+        an insert race another writer won. The fallback rows of ALL three
+        verdicts for that item are retired — the lane now owns the item's
+        decision whatever the fallback had recorded. Rows are completed with a
+        note, never deleted; ones already taken up or closed are left alone.
+        """
+        if not self._build_lane_live():
+            return 0
+
+        from genesis.autonomy.build_lane import BuildLane
+        from genesis.db.crud import build_candidates, follow_ups
+        from genesis.inbox.recommendation import parse_recommendations
+
+        retired = 0
+        for rec in parse_recommendations(evaluation_text):
+            # Same filter as BuildLane.handle_eval: only these can be consumed.
+            if rec.verdict is None:
+                continue
+            title = (rec.item_title or "").strip()
+            if not title:
+                continue
+            candidate = await build_candidates.get_any_by_item_key(
+                self._db, BuildLane.item_key(title),
+            )
+            if not candidate:
+                continue
+            primary = self._item_primary(title)
+            keys = [
+                self._build_fallback_dedup_key(primary, verdict)
+                for verdict in self._BUILD_FALLBACK_MAP
+            ]
+            n = await follow_ups.retire_by_dedup_keys(
+                self._db,
+                keys,
+                note=(
+                    "Retired: the build lane is now live and owns this item "
+                    f"(build candidate {candidate.get('id', '?')}, verdict "
+                    f"{candidate.get('verdict', '?')}). This lane-off fallback "
+                    "would duplicate its greenlight/calibration record."
+                ),
+            )
+            if n:
+                logger.info(
+                    "Retired %d lane-off BUILD fallback row(s) for %r — the build "
+                    "lane now owns it",
+                    n,
+                    title,
+                )
+            retired += n
+        return retired
+
     async def _create_follow_ups_from_eval(
         self,
         evaluation_text: str,
@@ -3028,19 +3014,59 @@ class InboxMonitor:
         import hashlib
         import sqlite3
 
-        from genesis.db.crud import follow_ups
+        from genesis.autonomy.build_lane import BuildLane, build_spec_usable
+        from genesis.db.crud import build_candidates, follow_ups
         from genesis.inbox.recommendation import parse_recommendations
 
         recs = parse_recommendations(evaluation_text)
         created = 0
         source_name = ", ".join(Path(f).name for f in source_files)
 
+        build_lane_live = self._build_lane_live()
+
         for rec in recs:
-            if not rec.is_actionable:
+            action_key = rec.action.lower().replace("_", " ").strip()
+            build_fallback = action_key == "build" and not build_lane_live
+            if not rec.is_actionable and not build_fallback:
                 continue
 
-            action_key = rec.action.lower().replace("_", " ").strip()
-            mapping = self._ACTION_MAP.get(action_key)
+            title = rec.item_title or "Untitled"
+            label = rec.action.upper()
+            effective_verdict = rec.verdict
+            spec_downgraded = False
+            if build_fallback:
+                # The mirror of _retire_build_fallbacks_owned_by_lane: an item the
+                # lane already owns (a candidate from a period when it was live)
+                # keeps that record as its decision — the lane's own permanent
+                # dedup would skip it too — so disabling the lane afterwards must
+                # not re-ask it as a fallback beside the existing card.
+                lane_title = (rec.item_title or "").strip()
+                if lane_title and await build_candidates.get_any_by_item_key(
+                    self._db, BuildLane.item_key(lane_title),
+                ):
+                    logger.info(
+                        "Build lane not live, but %r already has a build candidate "
+                        "— no fallback row (the lane's record stands)",
+                        lane_title,
+                    )
+                    continue
+                if effective_verdict == "build" and not build_spec_usable(rec.build_spec):
+                    # Parity with BuildLane._handle_build: an unusable
+                    # build_spec fails closed to needs_discussion.
+                    effective_verdict = "needs_discussion"
+                    spec_downgraded = True
+                build_mapping = self._BUILD_FALLBACK_MAP.get(effective_verdict or "")
+                if build_mapping is None:
+                    logger.warning(
+                        "Build lane not live and BUILD recommendation for %r has "
+                        "no valid verdict — creating nothing (malformed eval)",
+                        title,
+                    )
+                    continue
+                *mapping_fields, label = build_mapping
+                mapping = tuple(mapping_fields)
+            else:
+                mapping = self._ACTION_MAP.get(action_key)
             if mapping is None:
                 logger.debug(
                     "Unmapped action '%s' — skipping follow-up",
@@ -3050,24 +3076,48 @@ class InboxMonitor:
 
             strategy, priority, pinned, kind = mapping
 
-            title = rec.item_title or "Untitled"
-            content = f"[{rec.action.upper()}] {title}: {rec.next_step}"
+            content = f"[{label}] {title}: {rec.next_step}"
             reason = (
                 f"Inbox evaluation {batch_id[:8]}: {source_name}. "
                 f"Confidence: {rec.confidence}. Effort: {rec.effort}."
             )
+            if build_fallback:
+                reason += (
+                    " Build lane not live — capability-build verdict recorded "
+                    f"here instead. Verdict: {rec.verdict}."
+                )
+                if spec_downgraded:
+                    reason += (
+                        " build_spec missing or incomplete — recorded as "
+                        "needs_discussion, as the build lane would."
+                    )
+                if rec.verdict_reason:
+                    reason += f" Verdict reason: {rec.verdict_reason}"
+                logger.info(
+                    "Build lane not live — BUILD verdict for %r (verdict=%s) "
+                    "routed to a %s row",
+                    title,
+                    effective_verdict,
+                    kind,
+                )
 
             # Dedup: skip if an identical recommendation already exists so that
             # re-evaluating the same URL (or overlapping drops) never piles up
             # duplicate follow-up rows. Key on the item's primary URL
             # (tracking-normalized) or title + the next_step.
-            urls_in_title = extract_urls(title)
-            primary = (
-                normalize_url_line(urls_in_title[0]) if urls_in_title else title.strip().lower()
-            )
-            dedup_key = hashlib.sha256(
-                f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}".encode()
-            ).hexdigest()
+            primary = self._item_primary(title)
+            if build_fallback:
+                # BUILD fallback keys on stable item identity + verdict, like
+                # BuildLane.item_key: next_step is LLM prose that is rephrased
+                # across evaluations (it would duplicate the decision), while a
+                # changed verdict IS a new decision and must not be deduped away.
+                # effective_verdict is a _BUILD_FALLBACK_MAP key here (checked above).
+                dedup_key = self._build_fallback_dedup_key(primary, effective_verdict)
+            else:
+                dedup_basis = (
+                    f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}"
+                )
+                dedup_key = hashlib.sha256(dedup_basis.encode()).hexdigest()
             if await follow_ups.exists_by_dedup_key(self._db, dedup_key):
                 logger.debug("Skipping duplicate inbox follow-up: %s", title)
                 continue
