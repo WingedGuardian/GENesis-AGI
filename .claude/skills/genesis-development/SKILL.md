@@ -3941,7 +3941,7 @@ The review-findings gate specifically:
    — **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR Major = 1.0
    each · Devin severe/critical (🔴/🟥) = 1.0 · Devin non-severe bug or security
    warning (🟡/🟨) = 0.5** (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`,
-   `_CR_BLOCKING_WEIGHT = 1.0`, `_DEVIN_MARKERS`) — but what a change can AFFORD
+   `_CR_BLOCKING_WEIGHT = 1.0`, `review_findings.DEVIN_MARKERS`) — but what a change can AFFORD
    depends on what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`).
 
    **Devin scores like Codex (owner ruling, 2026-09-24).** Its comments open

@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -123,6 +124,46 @@ class TestDevinSeverity:
         assert block, "a Devin severe bug must hit the always-fix floor in every lane"
         assert "always-fix floor" in msg
         assert "Wrapped shell removals remain invisible" in msg
+
+    def test_a_listed_badge_reviewer_is_scored_even_when_not_typed_a_bot(self, guard):
+        """GitHub does not always type an App's comment author a Bot. A listed
+        badge-parser reviewer's P1 still blocks then, while the same comment from an
+        unlisted non-Bot account is only surfaced (the authority hole the author
+        filter exists to close)."""
+        body = "**<sub><sub>![P1 Badge](x)</sub></sub>  A real defect**"
+        listed = _c(1, body, login="chatgpt-codex-connector[bot]", utype="User")
+        block, msg = _scan(guard, [listed])
+        assert block is True and "A real defect" in msg
+        stranger = _c(2, body, login="someone-else", utype="User")
+        block, _ = _scan(guard, [stranger])
+        assert block is False
+
+    def test_a_reviewer_added_to_the_list_has_its_findings_enforced(self, guard, monkeypatch):
+        """A2a round 1 (Codex P1 / Devin 🔴): a reviewer the list TRUSTS must be a
+        reviewer whose findings are READ. Bound to the Devin parser, its severe
+        finding hits the floor exactly as Devin's does."""
+        rf = sys.modules[guard.enforced_logins.__module__]
+        body = _devin_body("🔴", "Severe from an added reviewer")
+        # Control: before it is listed, the same finding is not scored.
+        block, _ = _scan(guard, [_c(1, body, login="acme-review[bot]")])
+        assert block is False
+        added = rf.Reviewer(login="acme-review[bot]", parser="devin-marker")
+        monkeypatch.setattr(rf, "REVIEWERS", (*rf.REVIEWERS, added))
+        block, msg = _scan(guard, [_c(1, body, login="acme-review[bot]")])
+        assert block and "always-fix floor" in msg
+
+    def test_an_unimportable_list_blocks_the_scan_instead_of_reading_nobody(
+        self, guard, monkeypatch
+    ):
+        """Fix-audit B-1: an empty scanner set would drop every finding to the
+        unscored channel — under `# stale-review-override`, which waives the
+        freshness block, nothing else would catch it."""
+        monkeypatch.setattr(guard, "_REVIEW_FINDINGS_ERROR", "review_findings is broken")
+        block, msg = _scan(guard, [_c(1, _devin_body("🔴", "Severe while the tree is broken"))])
+        assert block and "the hook tree is broken: review_findings is broken" in msg
+        # `# review-override` (force) still waives the scan, as it always has.
+        block, _ = _scan(guard, [], force=True)
+        assert block is False
 
     def test_critical_security_is_always_fix(self, guard):
         block, msg = _scan(

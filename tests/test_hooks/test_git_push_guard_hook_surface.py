@@ -117,6 +117,7 @@ class TestHookSurfaceMatcher:
             "scripts/review_scope.py",
             "scripts/review_state.py",
             "scripts/review_budget.py",
+            "scripts/review_findings.py",
             "scripts/external_review.py",
             "scripts/lib/gate_menu.py",
             "config/external_review.yaml",

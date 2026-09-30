@@ -6948,3 +6948,21 @@ class TestUncountedFindingsReachTheRow:
             blocked, _ = guard_module._check_inline_review_findings("5")
         assert blocked is False, "the scan itself must still not block on an uncounted finding"
         assert rc_report == 0, "the row's tail must be informational, never a verdict"
+
+
+def test_review_body_scan_blocks_when_the_reviewer_list_is_unimportable(
+    guard_module, monkeypatch
+):
+    """Fix-audit B-1, the review-body channel: with no reviewer list the scan cannot
+    tell a Codex verdict from anyone else's, so it blocks rather than walk to 'clean'."""
+    import json as _json
+
+    monkeypatch.setattr(guard_module, "_REVIEW_FINDINGS_ERROR", "review_findings is broken")
+    body = {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": "[P1] a real bug"}
+    with patch.object(
+        guard_module.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess([], 0, _json.dumps([body]), ""),
+    ):
+        block, msg = guard_module._check_pr_review_findings("1")
+    assert block and "the hook tree is broken: review_findings is broken" in msg

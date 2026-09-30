@@ -155,6 +155,63 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
         pass
     os._exit(2)
 
+# The per-reviewer severity parsers and the reviewer list live in a stdlib
+# sibling so every gate reads the SAME list, and so the round counter can read
+# findings with the same code this gate scores them with. Only the MERGE gate
+# needs them, so a missing or broken module (including a reviewer-list edit that
+# fails its import-time validation) must not take down every push and git command
+# this guard sees. It degrades to stubs that fail closed where they are read: each
+# findings scanner and freshness block, naming the error; no primary reviewer is
+# known, so no review is fresh; no substitute is offered; and a parser raises,
+# which `run_guard` turns into a block.
+_REVIEW_FINDINGS_ERROR: str | None = None
+try:
+    from review_findings import (  # noqa: E402
+        CR_HEADER_FIELD_RE as _CR_HEADER_FIELD_RE,
+    )
+    from review_findings import (
+        CR_SEVERITIES as _CR_SEVERITIES,
+    )
+    from review_findings import (
+        INLINE_P1_RE as _INLINE_P1_RE,
+    )
+    from review_findings import (
+        INLINE_P2_RE as _INLINE_P2_RE,
+    )
+    from review_findings import (
+        cr_severity as _cr_severity,
+    )
+    from review_findings import (
+        devin_finding as _devin_finding,
+    )
+    from review_findings import (
+        enforced_logins,
+        primary_reviewer_login,
+        substitute_reviewer_logins,
+    )
+except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate only.
+    _REVIEW_FINDINGS_ERROR = (
+        f"scripts/review_findings.py is unimportable ({type(_findings_exc).__name__}: "
+        f"{_findings_exc}); repair the hook tree"
+    )
+    _INLINE_P1_RE = _INLINE_P2_RE = _CR_HEADER_FIELD_RE = None  # type: ignore[assignment]
+    _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
+
+    def enforced_logins():  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def primary_reviewer_login():  # type: ignore[no-redef]
+        return None
+
+    def substitute_reviewer_logins():  # type: ignore[no-redef]
+        return ()
+
+    def _cr_severity(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _devin_finding(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
 # advisory to its documented default — never crash this module at load time.
@@ -1473,16 +1530,32 @@ _CLEAN_PATTERNS = [
     re.compile(r"VERDICT:\s*PASS", re.IGNORECASE),
 ]
 
-# Bot usernames that post automated reviews
-_REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
+
+def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
+    """``(sets, "")`` or ``({}, block message)``: which logins each finding scanner
+    reads, from the reviewer list (see `review_findings.enforced_logins`). When the
+    list's module could not be imported, a scanner cannot know whose findings it is
+    reading, so it BLOCKS rather than read none — after its own override check, so
+    `# review-override` still waives it."""
+    if _REVIEW_FINDINGS_ERROR:
+        return {}, (
+            f"the hook tree is broken: {_REVIEW_FINDINGS_ERROR}. Review findings cannot "
+            f"be attributed to their reviewers until it is, or append '# review-override'."
+        )
+    return enforced_logins(), ""
+
+
+def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
+    """The review-body verdict scan's authors: the Codex-badge reviewers, plus the CI
+    bot, whose comments are walked and skipped as non-verdicts."""
+    return sets.get("codex-badge", frozenset()) | {"github-actions[bot]"}
+
 
 # ── Inline review comments (pulls/N/comments — a DIFFERENT endpoint) ──
 # Codex posts its actual P1/P2 findings ONLY as inline review comments;
 # its review body is boilerplate. This endpoint was never scanned, so
 # the gate was blind to them (audited 2026-07-10: 173 findings across
 # 118 merged PRs passed unseen, 64 of them P1).
-_INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
-_INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
 
 # CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
 #   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
@@ -1490,29 +1563,7 @@ _INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
 # they pass the author filter — and then dropped, because neither badge pattern
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
 # a Major reported `inline-findings: ok`, indistinguishable from a clean one.
-_CODERABBIT_LOGINS = {"coderabbitai[bot]"}
-# The documented ladder. An unrecognised level is NON-BLOCKING (surfaced with a
-# canary) — a severity name this set has not seen must not silently start
-# blocking every PR the moment the vendor adds one.
-_CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
 _CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
-# ONE header field: an italic span carrying no interior underscore. Anchored
-# whole (`^…$`) so a field is recognised only as a complete span, never as a
-# substring found somewhere inside one.
-#
-# The 64-char bound is deliberately double the observed ceiling, not tight to
-# it. MEASURED across 124 real findings, the longest category field is
-# `📐 Maintainability & Code Quality` at EXACTLY 32 characters — so a 32-char
-# bound sits precisely on live data, and a vendor renaming one category one
-# character longer would push a genuine Critical into the non-blocking path.
-# The bound is a sanity check against runaway prose, not a filter doing real
-# work, so it costs nothing to give it real headroom.
-_CR_HEADER_FIELD_RE = re.compile(r"^_([^_\n]{1,64})_$")
-# A line that LOOKS like an attempted severity header — italic markers and a
-# field separator — used only to tell "not a header" apart from "a header this
-# code failed to parse". Conflating those two makes an unparsed finding print
-# as "below Major", a false statement about a level that was never read.
-_CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
 # CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
 # markdown rule, when they land near each other in the diff. Each segment is
 # its own finding with its own severity.
@@ -1531,8 +1582,9 @@ _CR_BLOCKING_WEIGHT = 1.0
 # surfaced, never scored, so a severe bug Devin raised could not stop a merge.
 # MEASURED 2026-09-24 over every Devin comment on the 33 open non-draft PRs:
 # 166 comments, each opening with `<!-- devin-review-comment {json} -->` and
-# then exactly one of the five markers below. Red is Devin's severe tier (a
-# severe bug, or a critical security finding on the red square), yellow its
+# then exactly one of the five markers in `review_findings.DEVIN_MARKERS`. Red
+# is Devin's severe tier (a severe bug, or a critical security finding on the
+# red square), yellow its
 # non-severe tier (a bug, or a security warning on the yellow square), and the
 # magnifier is informational. The strongest evidence for that reading is the
 # comments themselves: on a later count of 253 open-queue comments the marker
@@ -1544,18 +1596,9 @@ _CR_BLOCKING_WEIGHT = 1.0
 # surfaced as format drift and never scored. Guessing a severity from an
 # unknown marker would be worse than the blindness, and the vendor adding a
 # level must not silently start blocking every PR.
-_DEVIN_LOGINS = frozenset({"devin-ai-integration[bot]"})
-_DEVIN_META_PREFIX = "<!-- devin-review-comment "
 # Strength order among the copies of a duplicated finding. Compared only AFTER
 # each copy's scope is judged on its own anchor (see `_devin_disposition`).
 _DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
-_DEVIN_MARKERS: dict[str, str] = {
-    "🔴": "floor",  # severe bug
-    "🟥": "floor",  # critical security
-    "🟡": "minor",  # non-severe bug
-    "🟨": "minor",  # security warning
-    "🔍": "analysis",  # informational — asserts no defect
-}
 # Devin may WITHDRAW its own finding: a reply from the SAME bot login, in that
 # finding's thread, whose first line starts with this marker clears it (owner
 # ruling, 2026-09-24). Consulted for DEVIN findings only — Codex and CodeRabbit
@@ -1591,10 +1634,11 @@ _INLINE_P2_SCORE_WEIGHT = 0.5
 # property of the change; varying by INSTALL would be a property of the operator,
 # and only the second is what that sentence refuses. No config key is added.
 _INLINE_SCORE_BLOCK_THRESHOLDS = {"critical": 1.0, "standard": 2.0, "light": 3.0}
-_INLINE_REVIEW_BOTS = {
-    "chatgpt-codex-connector[bot]",
-    "github-advanced-security[bot]",
-}
+# Which accounts' inline comments are review output even when GitHub does not type
+# the author a Bot: the reviewers whose parser reads badges, plus CodeQL's
+# (surfaced, never scored). Derived from `review_findings.REVIEWERS` inside the
+# scan, never listed here: a second copy of reviewer logins is what drifts.
+_INLINE_REVIEW_PARSERS = ("codex-badge", "codeql")
 #: The template's distinctive sentence. A body that does not contain it is NOT
 #: this template and is never suppressed, however short it is — see the gate at
 #: the top of `_is_wrapper_review_body`, which exists because the residue test
@@ -1895,65 +1939,6 @@ def _safe_title(raw: str) -> str:
     return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
 
 
-def _cr_severity(body: str) -> tuple[str | None, bool]:
-    """Severity read from a CodeRabbit finding's header LINE. -> (level, header_seen)
-
-    Anchored to the header rather than searched for anywhere in the body, because
-    a review-bot comment is a CODE-BEARING DOCUMENT: it quotes the diff and embeds
-    ```suggestion``` blocks. `_` is simultaneously CodeRabbit's severity delimiter,
-    markdown emphasis, AND the snake_case separator, so a body-wide search for a
-    `_`-delimited severity word matches ordinary source. MEASURED against this
-    repo, a whole-body search matched `MAX_CRITICAL_ERRORS`, `def is_major_bump`,
-    the prose NEGATION `_not critical_`, the path `runtime_critical_path.py` —
-    152 such tokens — and, self-demonstratingly, this feature's own test fixture
-    `_CR_MAJOR_BODY`. A *Minor* finding quoting any one of them would have blocked
-    the merge and been reported as "Critical/Major": worse than the blindness it
-    replaces, since issue #1642 warns that poor precision trains reflex overrides.
-
-    Every field must be a COMPLETE italic span, so a line is accepted as a header
-    only if it is entirely one. Severity is read as the field's LAST word, never
-    by position — one observed finding omits the severity field entirely, and a
-    positional read would take the effort field ("Heavy lift") for a severity.
-    The emoji is deliberately not matched: only Minor and Major were ever observed
-    across 104 findings, so the emoji for Critical, Trivial and Info is unknown
-    here and guessing it would silently miss the most severe level.
-
-    `header_seen` separates "a CodeRabbit finding whose level we do not recognise"
-    from "a comment with no severity header at all". Neither blocks; only the
-    first is a canary worth printing. A line that LOOKS like a header but does
-    not fully parse counts as SEEN — reporting it as "below Major" would be a
-    false statement about a level this code never actually read.
-    """
-    for line in body.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        fields = [_CR_HEADER_FIELD_RE.match(f.strip()) for f in stripped.split("|")]
-        if not all(fields):
-            # Header-SHAPED but unparseable is a canary, not a clean miss.
-            return None, bool(_CR_HEADER_SHAPE_RE.match(stripped))
-        hits = []
-        for fld in fields:
-            words = fld.group(1).split()  # type: ignore[union-attr]
-            if words and words[-1].casefold() in _CR_SEVERITIES:
-                hits.append(words[-1].casefold())
-        if len(set(hits)) == 1 and hits:
-            # Exactly one DISTINCT level — including the unanimous-duplicate
-            # case (`_Business Critical_ | _🔴 Critical_`), where demoting a
-            # real Critical to the non-blocking canary would be the worse read.
-            return hits[0], True
-        if len(hits) > 1:
-            # Two severity-looking fields (`_Business Critical_ | _🟡 Minor_`)
-            # is a format this code cannot adjudicate. First-match-wins read
-            # that example as Critical — a false block; last-match-wins would
-            # hide a real Major behind a decorative trailing field. Neither
-            # guess is safe, so it is reported as unknown, the canary path
-            # (Codex P2, PR #1677).
-            return None, True
-        return None, True  # a header, but no field names a level we know
-    return None, False
-
-
 #: An opening or closing code fence: three-or-more backticks/tildes, then an
 #: optional info string. Captured separately because CommonMark's CLOSING rule
 #: depends on both — same character, at least as long, and no info string.
@@ -2138,46 +2123,6 @@ def _cr_findings(body: str) -> list[str]:
     return out or [body]
 
 
-def _devin_finding(body: str) -> tuple[str | None, str | None]:
-    """``(finding_id, severity_class)`` for a Devin inline comment.
-
-    ``severity_class`` is a value of ``_DEVIN_MARKERS`` ("floor" / "minor" /
-    "analysis"), or None when the comment is not in the recognised shape — no
-    leading metadata tag, unparseable metadata, or a marker outside the closed
-    set. None is FORMAT DRIFT: the caller surfaces it and never scores it.
-
-    ``finding_id`` is Devin's own id from the metadata, used to count a finding
-    ONCE however many times it was posted (measured: Devin sometimes posts one
-    finding twice, as two comments with one id). None when the metadata could
-    not be read.
-
-    Linear, no regex: this runs on a hook path whose deadline is a security
-    boundary, over third-party text, so a scan that can backtrack is a
-    fail-open waiting for a long enough body. `find`/`split` cannot.
-    """
-    text = body.lstrip()
-    if not text.startswith(_DEVIN_META_PREFIX):
-        return None, None
-    end = text.find("-->", len(_DEVIN_META_PREFIX))
-    if end < 0:
-        return None, None
-    finding_id: str | None = None
-    try:
-        meta = json.loads(text[len(_DEVIN_META_PREFIX) : end])
-    except Exception:
-        meta = None
-    if isinstance(meta, dict) and isinstance(meta.get("id"), str) and meta["id"]:
-        finding_id = meta["id"]
-    rest = text[end + 3 :].split(None, 1)
-    marker = rest[0] if rest else ""
-    if finding_id is None:
-        # Unreadable metadata is drift even when the marker looks familiar: the
-        # id is what dedup and reply-grouping rest on, and scoring a finding we
-        # cannot identify would let one post count twice.
-        return None, None
-    return finding_id, _DEVIN_MARKERS.get(marker)
-
-
 def _coderabbit_title(body: str) -> str:
     """The finding's title, which for CodeRabbit is not its first line.
 
@@ -2211,7 +2156,7 @@ def _coderabbit_title(body: str) -> str:
 # cannot create an inline review comment for it, so it puts the finding in the
 # review BODY under a collapsible section instead. NEITHER existing scan sees
 # these: `_check_inline_review_findings` reads `pulls/N/comments` (a different
-# endpoint entirely), and `_check_pr_review_findings` gates on `_REVIEW_BOTS`,
+# endpoint entirely), and `_check_pr_review_findings` gates on `_review_bots(...)`,
 # which does not contain CodeRabbit.
 #
 # MEASURED 2026-09-07, all 84 then-open non-draft PRs: 27 deduped findings
@@ -3117,6 +3062,9 @@ def _check_inline_review_findings(
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
+    scanner_sets, table_block = _enforced_logins_or_block()
+    if table_block:
+        return True, table_block
     # Paginate via the shared helper (findings beyond the first REST page must still
     # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
     # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
@@ -3160,6 +3108,12 @@ def _check_inline_review_findings(
         and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
     }
+    # The reviewer list decides which logins each parser reads (read ONCE per scan).
+    devin_logins = scanner_sets.get("devin-marker", frozenset())
+    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
+    inline_review_logins = frozenset().union(
+        *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
+    )
     devin_cleared: set[str] = set()
     # Groups a MAINTAINER answered. A group cleared only by Devin's own reply is
     # surfaced below rather than dropped: Devin's reviewer and its builder post
@@ -3169,7 +3123,7 @@ def _check_inline_review_findings(
     devin_maint_cleared: set[str] = set()
     devin_copies: dict[str, list[dict]] = {}
     for c in raw:
-        if c.get("reply_to") or (c.get("login") or "") not in _DEVIN_LOGINS:
+        if c.get("reply_to") or (c.get("login") or "") not in devin_logins:
             continue
         if c.get("type") != "Bot":
             continue
@@ -3300,8 +3254,8 @@ def _check_inline_review_findings(
         #
         # So an unrecognised author skips the matchers entirely and falls to the
         # unrecognised branch: SURFACED, never scored, never blocking.
-        parseable = utype == "Bot" or login in _INLINE_REVIEW_BOTS
-        if login in _DEVIN_LOGINS and utype == "Bot":
+        parseable = utype == "Bot" or login in inline_review_logins
+        if login in devin_logins and utype == "Bot":
             # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
             # Devin quotes guard output and code in its findings, so a body can
             # contain `![P1 Badge]` as QUOTED TEXT. Falling through to the badge
@@ -3387,7 +3341,7 @@ def _check_inline_review_findings(
                 devin_minor.append(title)
                 scored_at.append(("DVm", dv_path or ""))
             continue
-        if login in _CODERABBIT_LOGINS:
+        if login in coderabbit_logins:
             # Engagement is checked ONCE, for the whole comment, BEFORE severity —
             # not per-severity below. It used to sit inside the blocking branch, so
             # only Critical/Major honoured a maintainer reply while every Minor,
@@ -3595,7 +3549,7 @@ def _check_inline_review_findings(
             # merge clock; that trade is open, not settled.
             continue
         review_login = review.get("login") or ""
-        if review_login not in _CODERABBIT_LOGINS:
+        if review_login not in coderabbit_logins:
             # NOT a silent drop any more. An author this scan cannot parse still
             # gets NAMED, so the session knows the input exists.
             #
@@ -4238,6 +4192,9 @@ def _check_pr_review_findings(
             file=sys.stderr,
         )
         return False, ""
+    scanner_sets, table_block = _enforced_logins_or_block()
+    if table_block:
+        return True, table_block
 
     # Paginate via the shared helper (a review-body finding beyond the first REST
     # page must still gate). ``comments is None`` = the first page was unreadable;
@@ -4263,14 +4220,15 @@ def _check_pr_review_findings(
     # This closes the fail-open (Codex P1) where the old terminal clause
     # ``if is_clean or not blocking_matches: return clean`` let ANY marker-less
     # comment from a Bot-typed account (Dependabot, or github-actions — which is IN
-    # _REVIEW_BOTS) end the walk clean, silently clearing an earlier ERROR. Requiring
+    # _review_bots()) end the walk clean, silently clearing an earlier ERROR. Requiring
     # a recognized verdict marker closes BOTH the unrecognized-bot and the
     # recognized-but-non-verdict (status-comment) masking paths.
+    review_bots = _review_bots(scanner_sets)
     for c in reversed(comments):
         login = c.get("login") or ""
         body = c.get("body") or ""  # GitHub returns null body for deleted comments
         # Only recognized review bots set the verdict.
-        if login not in _REVIEW_BOTS:
+        if login not in review_bots:
             continue
         # Codex quota-exhausted messages are not a review.
         if "reached your Codex usage limits" in body and not any(
@@ -4318,7 +4276,15 @@ def _check_pr_review_findings(
 # (the review object's ``commit_id``) — NOT a short prefix from the body, which a
 # stale prefix (or a ground SHA sharing it) could satisfy. Waived by
 # '# review-override' (the conscious "merge without a current Codex review" case).
-_CODEX_REVIEW_BOT = "chatgpt-codex-connector[bot]"
+# WHICH reviewer merge freshness requires comes from the reviewer list
+# (`review_findings.REVIEWERS`): the one marked `primary`, Codex.
+def _primary_reviewer_login() -> str | None:
+    """The primary reviewer's REST login, or None when the list is unimportable.
+
+    None makes every lookup keyed on it find no review, so freshness blocks: a
+    reviewer list the gate could not load never counts as a review.
+    """
+    return primary_reviewer_login()
 
 
 def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
@@ -4515,12 +4481,13 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
     commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
     """
     records = _pr_review_records(pr_num, repo=repo)
-    if records is None:
+    primary = _primary_reviewer_login()
+    if records is None or primary is None:
         return None
     return [
         {"commit_id": r["commit_id"], "state": r["state"]}
         for r in records
-        if r["login"] == _CODEX_REVIEW_BOT
+        if r["login"] == primary
     ]
 
 
@@ -5177,6 +5144,9 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
         except Exception:
             return None
     latest: str | None = None
+    primary = _primary_reviewer_login()
+    if primary is None:
+        return None
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -5187,7 +5157,7 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
             continue
         if not isinstance(obj, dict):
             continue
-        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
+        if (obj.get("login") or "") != primary:
             continue
         # Require the GitHub-enforced Bot author type too — belt-and-suspenders against
         # a spoofed login string in an injected/malformed payload.
@@ -5247,6 +5217,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
             "scripts/review_state.py",  # escalation counter + review markers
             "scripts/review_budget.py",  # distinct-head policy evaluator
+            "scripts/review_findings.py",  # reviewer list + severity parsers
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
@@ -6489,6 +6460,18 @@ def _check_codex_reviewed_head_core(
             None,
         )
     head = head.strip().lower()
+    # An unimportable reviewer list would otherwise surface as "no Codex review
+    # found", sending the operator to re-request a review that cannot help.
+    if _REVIEW_FINDINGS_ERROR:
+        return (
+            True,
+            (
+                f"the hook tree is broken: {_REVIEW_FINDINGS_ERROR}. No review can be "
+                f"matched to its reviewer until it is. "
+                f"Retry, or append '# stale-review-override' to merge anyway."
+            ),
+            None,
+        )
     # This is the one place a head becomes authoritative on the NON-FORCED arm, so
     # it is where the changed-file memo gets bound to it. The pin-receipt gate has
     # already populated that memo against whatever the head was when IT asked; the
@@ -6620,7 +6603,11 @@ def _check_codex_reviewed_head_core(
 # reviewer; this exists for its outages. Both review automatically on every push
 # here (MEASURED 2026-09-24: of 33 open non-draft PRs, 25 carried a Devin or
 # CodeRabbit review at their current head, 4 a Codex one).
-_SUBSTITUTE_REVIEW_LOGINS: tuple[str, ...] = ("devin-ai-integration[bot]", "coderabbitai[bot]")
+# WHICH reviewers may stand in comes from the reviewer list: every one that is
+# not primary and not `surface_only` (Devin and CodeRabbit). A list the gate could
+# not load offers no substitute at all.
+def _substitute_review_logins() -> tuple[str, ...]:
+    return substitute_reviewer_logins()
 
 
 def _substitute_reviewers_at_head(
@@ -6636,15 +6623,16 @@ def _substitute_reviewers_at_head(
     record is a thread-reply wrapper rather than a review of the head (see the
     measurement at the skip). Any other state, CHANGES_REQUESTED included,
     counts: freshness asks only that a review EXISTS at head; what it found is the
-    findings scans' job. ``reviewers_at_head`` is in ``_SUBSTITUTE_REVIEW_LOGINS``
-    order and holds only those fixed logins, so it is safe to print raw.
+    findings scans' job. ``reviewers_at_head`` is in ``_substitute_review_logins()``
+    order and holds only logins the reviewer list validated against GitHub's
+    login alphabet, so it is safe to print raw.
     """
     records = _pr_review_records(pr_num, repo=repo)
-    if records is None:
+    if records is None or _REVIEW_FINDINGS_ERROR:
         return None
     at_head: list[str] = []
     elsewhere: list[tuple[str, str]] = []
-    for login in _SUBSTITUTE_REVIEW_LOGINS:
+    for login in _substitute_review_logins():
         for r in records:
             if r["login"] != login or r["state"] in ("DISMISSED", "PENDING"):
                 continue
@@ -11779,7 +11767,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         label = "BLOCK — " + msg.splitlines()[0]
         # Say when an owner-approved stand-in exists, through the SAME lookup the
         # merge gate uses, so the report can never offer a substitute the gate
-        # would refuse. Only fixed logins from `_SUBSTITUTE_REVIEW_LOGINS` reach
+        # would refuse. Only logins from `_substitute_review_logins()` reach
         # this raw row — never reviewer-controlled text.
         _sub_head = _pr_head_sha(pr_num, repo=repo)
         if _sub_head:
