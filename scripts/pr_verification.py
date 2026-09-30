@@ -13,25 +13,50 @@ USAGE
 
     python3 scripts/pr_verification.py print-schema
     python3 scripts/pr_verification.py close --pr 2273 \\
-        --verdict pass-mechanical --evidence-file ~/.genesis/output/prv-2273.json
+        --evidence-file ~/.genesis/output/prv-2273.json
     python3 scripts/pr_verification.py close --pr 1573 \\
-        --verdict cannot-verify --note "needs an install with no graph engine" \\
+        --note "needs an install with no graph engine" \\
         --evidence-file ~/.genesis/output/prv-1573.json
 
-THE FOUR VERDICTS (owner standing ruling, 2026-09-26), and which write each takes:
+THE VERDICT IS DERIVED FROM THE DOCUMENT, not chosen. The four verdicts are the
+owner's standing ruling (2026-09-26); which one a document supports is decided by
+``genesis.session_awareness.pr_evidence.derive``, a decision tree that gives every
+valid document exactly one:
 
-  pass-mechanical          CLOSES the row. The claim holds, measured.
-  pass-with-measured-gaps  CLOSES the row, with the gaps named in scope_limits.
-  fail-intent              LEAVES IT OPEN. The merged change does not do what it
-                           claimed. Bring it to the USER as a conversation — never
-                           an automatic rollback — and file the defect.
-  cannot-verify            LEAVES IT OPEN. The attempt could not reach a verdict
-                           here; --note names the precondition a later validator
-                           needs.
+  a claim failed at MEASURED or READ    -> fail-intent            LEAVES IT OPEN
+  a claim failed at INFERRED            -> cannot-verify          LEAVES IT OPEN
+  nothing passing at MEASURED or READ   -> cannot-verify          LEAVES IT OPEN
+  no gaps                               -> pass-mechanical        CLOSES the row
+  otherwise                             -> pass-with-measured-gaps CLOSES the row
 
-A non-closing verdict is not a failure of this tool; it is the tool working. The
-obligation survives because the work is not done, and the note is what stops the
-next validator re-deriving why.
+Gaps are the declared ``scope_limits`` plus the ones the document implies: no
+negative control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named
+SUSPECTED FAILURE for each claim that failed only at INFERRED.
+
+EACH CLAIM is ``pass``, ``fail`` or ``unverified``. ``unverified`` goes with tier
+NOT_VERIFIABLE_HERE and only with it; the model refuses either without the other,
+so a claim nobody could check is never recorded as a pass or as a failure. A
+failure is gated by tier like a pass: only one at MEASURED or READ is fail-intent,
+the outcome that goes to the user.
+
+WHY DERIVED. An earlier version took ``--verdict`` from the caller and policed it
+with eight refusal rules. MEASURED across 176 enumerated documents: 88.6% had
+exactly one legal verdict, so asking only created a chance to be refused, and 2.8%
+had NO legal verdict — the rules contradicted each other, twice, one fix apart.
+A tree cannot contradict itself.
+
+What the caller still decides:
+
+  --park     Only on a document that derives pass-with-measured-gaps: records
+             cannot-verify instead, because something was established but nothing
+             MATERIAL was. A failure can never be parked — it goes to the USER as a
+             conversation, never an automatic rollback, and the defect gets filed.
+  --note     Required whenever the row stays open (fail-intent, cannot-verify): it
+             is the whole value of an open row, the thing that stops the next
+             validator re-deriving why. Refused when the row closes.
+  --verdict  OPTIONAL. An expectation checked for equality with the outcome; a
+             mismatch refuses with "document derives X". Worth passing: it catches a
+             document that does not say what you think it says.
 
 "I DID NOT GET TO IT" IS NOT ``cannot-verify``. The test is whether you could have
 done it with the access and the time you had. If yes it is not-yet-done: leave the
@@ -42,30 +67,14 @@ WHERE THE DATABASE IS, and the trap that costs a confusing run: ``genesis_db_pat
 resolves RELATIVE TO THE REPO ROOT, so running this from a linked worktree points
 it at that worktree's ``data/genesis.db``, which does not exist — the tool then
 correctly reports "no database" while the real ledger sits in the main checkout.
-Run it from the main checkout, or pass ``--db-path``. MEASURED while building this;
-the failure is silent in the sense that the message is true and the diagnosis is
-not the one you would guess.
+Run it from the main checkout, or pass ``--db-path``.
 
-EVIDENCE. ``print-schema`` emits a fill-in template; the shape is validated before
-anything is read from the database, and :func:`assess` then decides whether the
-document EARNS the verdict asked of it. That split is deliberate: shape is about the
-document being well formed, sufficiency is about it establishing something.
-
-Three fields are required for a reason worth stating: a closed row cannot be amended
-through this tool, so a mispasted document — right shape, wrong row — would be
-permanent and undetectable. ``repo`` and ``pr`` together ARE the row's key, and the
-document has to name both halves or it can be pointed at a different repository's
-obligation at the same PR number; ``merge_commit`` names which artifact was checked,
-because ``deploy.method`` alone cannot answer that. ``--repo`` is only a
-disambiguator for when several repositories hold an open row for one PR, and a
-``--repo`` that contradicts the document is refused rather than allowed to win.
-
-EVERY RULE A DOCUMENT MUST SATISFY LIVES IN :func:`assess`, as a numbered
-enumeration, and that is a direct answer to a review round: seven findings on this
-file, six of them the same shape — *nothing checks X about the document*. They were
-six rather than one because the rules were distributed across a shape validator, the
-CLI and the writer, so the SET was written down nowhere and a missing rule was
-invisible instead of conspicuous.
+THE ROW KEY. The document names its row — ``repo`` and ``pr`` — and ``--pr`` must
+match it. That second copy is deliberate: a closed row cannot be amended through
+this tool, so a typo INSIDE the document (``"pr": 2257`` in a document about #2273)
+would otherwise close the wrong row permanently. Two independent sources is the
+point. There is no ``--repo``: the document names the repository, and the row must
+be OPEN for exactly that ``(repo, pr)``.
 
 DEPLOYMENT IS NOT ESTABLISHED BY ANCESTRY, which is why ``deploy.method`` exists at
 all. MEASURED on PR #2257: ``gh pr view --json mergeCommit`` named a commit
@@ -79,10 +88,11 @@ negative verdict.
 
 EXIT CODES. 0 wrote (or dry-ran); 1 the ledger declined (no such open row, a race,
 an absent or quarantined database); 2 the request was malformed (bad evidence, a
-missing note, a PR mismatch); 3 refused on policy (a failing claim in the document).
-Deliberately meaningful, which is why this is a separate script rather than a
-subcommand of ``repo_pulse_worker.py``: that module's documented contract is that
-its exit code is always 0. Issue filed to revisit the split.
+missing or discarded note, a PR mismatch, a --verdict/--park the document does not
+support); 3 refused on policy (a failing claim under any other --verdict, or --park
+on a failure). Deliberately meaningful, which is why this is a separate script
+rather than a subcommand of ``repo_pulse_worker.py``: that module's documented
+contract is that its exit code is always 0.
 """
 
 from __future__ import annotations
@@ -98,383 +108,68 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-#: Evidence tiers, in the vocabulary CLAUDE.md's evidence rule already uses, so a
-#: validator is not asked to learn a second one.
-TIERS = ("MEASURED", "INFERRED", "READ", "NOT_VERIFIABLE_HERE")
+from genesis.session_awareness.pr_evidence import (  # noqa: E402
+    MAX_EVIDENCE_BYTES,
+    SUSPECTED_FAILURE,
+    TIERS,
+    Decision,
+    EvidenceDocument,
+    EvidenceError,
+    Refusal,
+    decide,
+    parse_evidence,
+    reason_for,
+)
 
-#: How deployment was established. ``ancestry`` is listed last and is the weakest.
-DEPLOY_METHODS = ("behaviour", "content", "ancestry")
-
-#: Per-CLAIM verdicts — whether that one claim held. Distinct from the four
-#: SESSION verdicts, which are the judgement ACROSS claims.
-CLAIM_VERDICTS = ("pass", "fail")
-
-#: Serialised-evidence ceiling. The column is untyped TEXT and SQLite enforces no
-#: length, so an unbounded document is a decision rather than a budget. This is a
-#: stated one: 256 KiB is four times GitHub's PR-body cap, which is the largest
-#: single artifact a validator would quote. An over-cap document is REFUSED rather
-#: than cut, because a truncated evidence record still looks complete.
-MAX_EVIDENCE_BYTES = 256 * 1024
+__all__ = [
+    "MAX_EVIDENCE_BYTES",
+    "SCHEMA_TEMPLATE",
+    "TIERS",
+    "EvidenceError",
+    "build_reason",
+    "main",
+    "resolve_repo",
+    "validate_evidence",
+]
 
 
-class EvidenceError(ValueError):
-    """The evidence document does not satisfy the shape. The message names the field."""
+def validate_evidence(doc: object) -> EvidenceDocument:
+    """Return the validated document, or raise :class:`EvidenceError` naming each field.
 
-
-def validate_evidence(doc: object) -> dict:
-    """Return *doc* unchanged if it is a well-formed evidence document.
-
-    Raises :class:`EvidenceError` naming the offending field otherwise. Shape
-    errors raise rather than coerce: a validator that mistyped a tier has a bug,
-    and quietly accepting it would put an unlabelled claim into permanent record,
-    which is the one thing the tier field exists to prevent.
+    A thin name over :func:`parse_evidence` so the shape rule has ONE home — the
+    strict model in ``genesis.session_awareness.pr_evidence``, which a second writer
+    can import where it could never import this script.
     """
-    if not isinstance(doc, dict):
-        raise EvidenceError(f"evidence must be a JSON object, got {type(doc).__name__}")
-
-    pr = doc.get("pr")
-    if not isinstance(pr, int) or isinstance(pr, bool):
-        raise EvidenceError(
-            "evidence.pr must be the integer PR number this document verifies — a "
-            "closed row cannot be amended, so a mispasted document would be permanent"
-        )
-    repo = doc.get("repo")
-    if isinstance(repo, str) and repo != repo.strip() and repo.strip():
-        # Refused rather than stripped, and named explicitly: compared against the open
-        # set, a padded slug fails membership and the refusal prints two spellings that
-        # look identical on a terminal. Silently trimming would be the other failure —
-        # a coercion inside the one check that exists to be exact.
-        raise EvidenceError(
-            f"evidence.repo has leading or trailing whitespace ({repo!r}). It is half "
-            f"of the ledger row's key and is compared exactly, so it is refused rather "
-            f"than trimmed — a padded slug looks identical to a correct one"
-        )
-    if not isinstance(repo, str) or not repo.strip():
-        raise EvidenceError(
-            "evidence.repo must be the 'owner/name' this document verifies. The row's "
-            "key is (repo, pr_number) and the document has to name BOTH halves of it, "
-            "or a document written for one repository closes another repository's "
-            "obligation at the same PR number — permanently, since a closed row cannot "
-            "be amended through this tool"
-        )
-    if not str(doc.get("merge_commit") or "").strip():
-        raise EvidenceError(
-            "evidence.merge_commit must name the commit that was verified — 'which "
-            "artifact did you check' is the question deploy.method cannot answer"
-        )
-
-    deploy = doc.get("deploy")
-    if not isinstance(deploy, dict):
-        raise EvidenceError("evidence.deploy must be an object with 'method' and 'detail'")
-    if deploy.get("method") not in DEPLOY_METHODS:
-        raise EvidenceError(
-            f"evidence.deploy.method must be one of {list(DEPLOY_METHODS)}, "
-            f"got {deploy.get('method')!r}"
-        )
-    if not str(deploy.get("detail") or "").strip():
-        raise EvidenceError(
-            "evidence.deploy.detail must say HOW deployment was established — the "
-            "method name alone is not evidence"
-        )
-
-    claims = doc.get("claims")
-    if not isinstance(claims, list) or not claims:
-        raise EvidenceError("evidence.claims must be a non-empty list")
-    for i, claim in enumerate(claims):
-        if not isinstance(claim, dict):
-            raise EvidenceError(
-                f"evidence.claims[{i}] must be an object, got {type(claim).__name__}"
-            )
-        for field in ("claim", "measurement"):
-            if not str(claim.get(field) or "").strip():
-                raise EvidenceError(f"evidence.claims[{i}].{field} must be non-empty")
-        if claim.get("verdict") not in CLAIM_VERDICTS:
-            raise EvidenceError(
-                f"evidence.claims[{i}].verdict must be one of {list(CLAIM_VERDICTS)}, "
-                f"got {claim.get('verdict')!r}"
-            )
-        if claim.get("tier") not in TIERS:
-            raise EvidenceError(
-                f"evidence.claims[{i}].tier must be one of {list(TIERS)}, got {claim.get('tier')!r}"
-            )
-
-    for field in ("controls", "scope_limits"):
-        entries = doc.get(field, [])
-        if not isinstance(entries, list):
-            raise EvidenceError(f"evidence.{field} must be a list when present")
-        # Both lists are read as prose by a human and by the closing-verdict floors
-        # below, which test them with str(x).strip(). A nested object or a null would
-        # therefore pass the floor as the truthy text "{}" or "None" — the floor would
-        # be satisfied by something that names nothing.
-        for i, entry in enumerate(entries):
-            if not isinstance(entry, str) or not entry.strip():
-                raise EvidenceError(
-                    f"evidence.{field}[{i}] must be a non-empty string, got "
-                    f"{entry!r} — these entries are the record a later reader acts on"
-                )
-
-    findings = doc.get("findings", [])
-    if not isinstance(findings, list):
-        raise EvidenceError("evidence.findings must be a list when present")
-    for i, finding in enumerate(findings):
-        if not isinstance(finding, dict):
-            raise EvidenceError(
-                f"evidence.findings[{i}] must be an object, got {type(finding).__name__}"
-            )
-        for field in ("summary", "disposition"):
-            if not str(finding.get(field) or "").strip():
-                raise EvidenceError(
-                    f"evidence.findings[{i}].{field} must be non-empty — an "
-                    f"undispositioned finding is a drop wearing a record"
-                )
-    return doc
+    return parse_evidence(doc)
 
 
-def failed_claims(doc: dict) -> list[str]:
-    """Claim texts whose verdict is ``fail``.
+def build_reason(doc: EvidenceDocument, decision: Decision) -> str:
+    """The generated ``closed_reason``: verdict, tier census, and the gaps or failures."""
+    return reason_for(doc, decision)
 
-    Non-empty refuses a CLOSING verdict whatever the headline says: a document can
-    carry a failing claim under a passing verdict, and the row must not be
-    discharged on it. The right verdict in that case is ``fail-intent``.
+
+def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
+    """Return *repo* if ``(repo, pr_number)`` is an OPEN obligation, else raise LookupError.
+
+    The document names the repository, so nothing is chosen here — only CHECKED.
+    Before the document named it, a ``--repo`` flag did, unchecked, and it closed a
+    DIFFERENT repository's obligation with this PR's evidence at exit 0, permanently
+    (MEASURED end-to-end on an earlier draft). "Nothing open for this PR" and "that
+    repo is not among the open ones" are different facts, so they read differently.
     """
-    return [
-        str(c.get("claim"))
-        for c in doc.get("claims", [])
-        if isinstance(c, dict) and c.get("verdict") == "fail"
-    ]
-
-
-def unverifiable_claims(doc: dict) -> list[str]:
-    """Claim texts at tier ``NOT_VERIFIABLE_HERE``.
-
-    Non-empty refuses ``pass-mechanical``: a row stamped a clean mechanical pass
-    while carrying a claim nothing established is a false record, and the whole
-    reason the tier exists is to make that visible.
-    """
-    return [
-        str(c.get("claim"))
-        for c in doc.get("claims", [])
-        if isinstance(c, dict) and c.get("tier") == "NOT_VERIFIABLE_HERE"
-    ]
-
-
-def assess(
-    doc: dict, *, verdict: str, closing: bool, pr: int, repo_override: str | None
-) -> tuple[int, str] | None:
-    """Every rule a document must satisfy to support *verdict*, in ONE enumeration.
-
-    Returns ``(exit_code, message)`` on refusal and ``None`` when the document earns
-    the verdict. Pure: it touches no database, so the entire policy surface is
-    testable without one.
-
-    WHY THIS IS ONE FUNCTION. An external review round produced seven findings on
-    this file, six of them the same shape — *"nothing checks X about the document"*.
-    They were six rather than one because the document's rules were distributed:
-    shape in :func:`validate_evidence`, binding half in the CLI and half in the
-    writer, sufficiency as three ad-hoc branches added one incident at a time. Each
-    rule therefore had to be remembered independently and the SET was written down
-    nowhere, so a missing rule was invisible rather than conspicuous. Here the next
-    missing rule is a gap in a numbered list.
-
-    TWO POLARITIES, deliberately. Rules 3-6 are a CEILING — certain contents
-    disqualify certain verdicts. Rules 7-8 are a FLOOR — a closing verdict must
-    positively establish something. The original code had only the ceiling, and that is
-    precisely how it failed: every disqualifying shape anyone had thought of was
-    refused, and a document whose claims were EVERY ONE of them NOT_VERIFIABLE_HERE
-    satisfied all of them and closed the row having established nothing. A denylist
-    can only ever refuse the cases its author imagined.
-    """
-    # 1 — BINDING. The row's key is (repo, pr_number) and the document names both, so
-    # it cannot be mispasted onto a different row. What makes a silent mis-bind
-    # permanent is that a closed row cannot be amended through this tool.
-    if doc["pr"] != pr:
-        return 2, (
-            f"the evidence document says it verifies PR #{doc['pr']} but --pr is {pr}. "
-            f"A closed row cannot be amended, so this mismatch is refused rather than "
-            f"resolved in your favour."
-        )
-    if repo_override and repo_override != doc["repo"]:
-        return 2, (
-            f"--repo says {repo_override!r} and the evidence document says "
-            f"{doc['repo']!r}. Refused rather than picking one: the DOCUMENT is the "
-            f"record, and --repo exists only to disambiguate when several repositories "
-            f"hold an open row for this PR. Drop --repo, or correct the document."
-        )
-
-    failures = failed_claims(doc)
-    unverifiable = unverifiable_claims(doc)
-
-    # 2 — the headline does not overrule the document's own contents. A document can
-    # carry a failing claim under a passing verdict.
-    #
-    # NOT gated on `closing`, and an adversarial audit is why. Gated, a document with a
-    # MEASURED failing claim could be filed as 'cannot-verify' — which parks the row
-    # and never prints the standing-ruling escalation below, so a measured failure
-    # becomes a PR nobody could verify. A failure is a failure whatever the headline
-    # says; the only verdict it supports is 'fail-intent'. This makes rules 2 and 5
-    # exact converses: a failing claim implies fail-intent, and fail-intent implies a
-    # failing claim.
-    if failures and verdict != "fail-intent":
-        return 3, (
-            f"REFUSING '{verdict}' — {len(failures)} claim(s) have verdict 'fail':\n"
-            + "".join(f"  FAILED: {c}\n" for c in failures)
-            + "A failing claim does not discharge the obligation, and it is not a gap "
-            "or an unreachable check either. The verdict for this document is "
-            "'fail-intent': the row stays open, you bring it to the user as a "
-            "conversation, and the defect gets filed."
-        )
-
-    # 3 — 'pass-mechanical' means CLEAN; an unverifiable claim makes it not that.
-    if unverifiable and verdict == "pass-mechanical":
-        return 2, (
-            f"{len(unverifiable)} claim(s) are tier NOT_VERIFIABLE_HERE, so this is "
-            f"not a clean mechanical pass. Use 'pass-with-measured-gaps' if the rest "
-            f"holds and these are the named gaps, or 'cannot-verify' if nothing "
-            f"material was established:\n"
-            + "".join(f"  NOT VERIFIABLE HERE: {c}\n" for c in unverifiable).rstrip()
-        )
-
-    # 4 — 'pass-with-measured-gaps' means the gaps are measured AND NAMED. Without a
-    # floor the verdict degrades to "pass, and I gestured at some gaps" — and rules 3
-    # and 6 actively ROUTE validators onto this verdict, so the tool would be steering
-    # them into an unamendable record with the gaps missing.
-    if verdict == "pass-with-measured-gaps" and not [
-        g for g in doc.get("scope_limits", []) if str(g).strip()
-    ]:
-        return 2, (
-            "'pass-with-measured-gaps' requires at least one entry in "
-            "evidence.scope_limits — the verdict's whole content is WHICH gaps, and a "
-            "closed row cannot be amended to add them later. Name them"
-            # Only offer pass-mechanical when rule 3 would actually accept it. With an
-            # unverifiable claim present it would not, and a refusal that routes onto a
-            # verdict the next rule refuses is how a validator ends up cycling.
-            + ("." if unverifiable else ", or use 'pass-mechanical' if there are none.")
-        )
-
-    # 5 and 6 — a NON-closing verdict is bound to the document too. The row stays open
-    # either way, so this is not about protecting the ledger from a false closure: it
-    # is that the row is what the NEXT validator reads, and a 'fail-intent' whose every
-    # claim passed, or a 'cannot-verify' where everything was in fact verified, is a
-    # headline its own evidence contradicts.
-    if verdict == "fail-intent" and not failures:
-        return 2, (
-            "'fail-intent' requires at least one claim with verdict 'fail' — that "
-            "verdict says the merged change does not do what it claimed, and the claim "
-            "it failed is the substance of it. If nothing failed but you could not "
-            "finish, the verdict is 'cannot-verify'."
-        )
-    # 6 is the exact COMPLEMENT of rule 8, not an independent floor, and an
-    # adversarial audit caught the difference as a BLOCKER. Written as "requires a
-    # NOT_VERIFIABLE_HERE claim", it deadlocked a document whose claims were all
-    # INFERRED — a tier the skill explicitly blesses: rule 8 refused every closing
-    # verdict and pointed at 'cannot-verify', and this rule refused 'cannot-verify' and
-    # pointed back at a passing one. All four verdicts exited 2, the row was left
-    # looking NEVER ATTEMPTED, and the only way out was to relabel the tier. An
-    # enumeration that pays a validator to falsify the one field validate_evidence
-    # exists to protect is worse than no enumeration.
-    #
-    # So the predicate is the one that matches the verdict's meaning: 'cannot-verify'
-    # is refused only when the document establishes EVERYTHING, because that is the one
-    # case where a passing verdict is available. Anything less than fully established —
-    # inferred, unreachable, partial — is exactly what the verdict is for.
-    if verdict == "cannot-verify" and all(
-        c.get("verdict") == "pass" and c.get("tier") in ("MEASURED", "READ") for c in doc["claims"]
-    ):
-        return 2, (
-            "'cannot-verify' says this install could not reach the answer, but every "
-            "claim in this document is passing and at tier MEASURED or READ — it "
-            "reached all of them. Use 'pass-mechanical', or "
-            "'pass-with-measured-gaps' if there are gaps to name."
-        )
-
-    # 7 — a control, for the CLEAN pass only. An arm that had to come out the other
-    # way, and did. Without one a verification cannot separate "the change did this"
-    # from "this was already true" — which is how two of three findings in this tool's
-    # own pilot round turned out to be false. Scoped to pass-mechanical on purpose:
-    # "claim X has no control" is a legitimate MEASURED GAP, and
-    # pass-with-measured-gaps is the verdict for a document carrying one, so demanding
-    # a control there would leave no verdict for the honest case. Rule 4 still forces
-    # that gap to be named.
-    if verdict == "pass-mechanical" and not [c for c in doc.get("controls", []) if str(c).strip()]:
-        return 2, (
-            "'pass-mechanical' requires at least one entry in evidence.controls — the "
-            "arm that had to come out the other way, and did. Without a control a "
-            "clean pass cannot distinguish the change working from the property already "
-            "holding. Name one, or use 'pass-with-measured-gaps' with the missing "
-            "control named in scope_limits."
-        )
-
-    # 8 — THE FLOOR, and the rule whose absence was the defect. At least one claim has
-    # to be both passing AND at a tier that establishes things. INFERRED does not
-    # count: CLAUDE.md's own rule is that an inferred claim never enters permanent
-    # record in the grammar of a fact, and a discharged obligation is permanent record.
-    # LAST on purpose — every rule above can name the offending claim or the verdict
-    # that fits, and this one can only say that nothing was established, so it runs
-    # once the specific diagnoses have had their turn.
-    if closing and not [
-        c
-        for c in doc["claims"]
-        if c.get("verdict") == "pass" and c.get("tier") in ("MEASURED", "READ")
-    ]:
-        return 2, (
-            "REFUSING a closing verdict — not one claim is both passing and at tier "
-            "MEASURED or READ, so this document would discharge the obligation while "
-            "establishing nothing. That is the single state this ledger exists to make "
-            "impossible. An INFERRED-only or NOT_VERIFIABLE_HERE-only verification is "
-            "'cannot-verify': the row stays open with your note and the next validator "
-            "inherits what you found instead of starting over."
-        )
-
-    return None
-
-
-def build_reason(*, verdict: str, doc: dict) -> str:
-    """The ``closed_reason`` for a CLOSING verdict: the verdict plus a tier census.
-
-    Generated here rather than typed by the caller so the record cannot drift into
-    however each validator happens to phrase it.
-    """
-    tiers = [str(c.get("tier")) for c in doc.get("claims", []) if isinstance(c, dict)]
-    census = ", ".join(f"{tiers.count(t)} {t}" for t in TIERS if t in tiers)
-    return f"{verdict.upper()} — {len(tiers)} claim(s): {census}"
-
-
-def resolve_repo(open_repos: list[str], pr_number: int, given: str | None) -> str:
-    """The repo whose OPEN row this write targets.
-
-    ``--repo`` is CHECKED against the open set rather than trusted. Unchecked it
-    closed a DIFFERENT repository's obligation with this PR's evidence, at exit 0,
-    permanently — MEASURED end-to-end on an earlier draft, with the real row left
-    open so nothing surfaced the mistake. ``(repo, pr_number)`` is the row identity
-    precisely because two repos can each hold a PR #12, and the flag exists only as
-    the escape hatch for the ambiguity refusal below, which made it the one path
-    with no check.
-    """
-    # NOTHING open for this PR is a different fact from "that repo is not among the
-    # candidates", and it is checked FIRST because it is the more likely one and its
-    # message is the accurate one. The evidence document now always names a repo, so
-    # `given` is effectively always set — before that, this branch was reached by
-    # falling through, which is how the two facts came to share one ordering.
     if not open_repos:
         raise LookupError(
             f"no OPEN row for PR #{pr_number} — it may be discharged already, or "
             f"never opened. Run `python3 scripts/repo_pulse_worker.py "
             f"--verification-backlog` to see the open set."
         )
-    if given:
-        if given not in open_repos:
-            raise LookupError(
-                f"no OPEN row for {given}#{pr_number}. Open rows for PR #{pr_number}: "
-                f"{', '.join(open_repos)}. Run "
-                f"`python3 scripts/repo_pulse_worker.py --verification-backlog`."
-            )
-        return given
-    if len(open_repos) > 1:
+    if repo not in open_repos:
         raise LookupError(
-            f"PR #{pr_number} is open for several repos ({', '.join(open_repos)}) — "
-            f"pass --repo to say which."
+            f"no OPEN row for {repo}#{pr_number} (the repository the evidence document "
+            f"names). Open rows for PR #{pr_number}: {', '.join(open_repos)}. If the "
+            f"document names the wrong repository, correct the document."
         )
-    return open_repos[0]
+    return repo
 
 
 SCHEMA_TEMPLATE = {
@@ -488,14 +183,14 @@ SCHEMA_TEMPLATE = {
     "claims": [
         {
             "claim": "what the PR said it would do",
-            "verdict": "pass | fail",
+            "verdict": "pass | fail | unverified (unverified iff tier NOT_VERIFIABLE_HERE)",
             "tier": "MEASURED | INFERRED | READ | NOT_VERIFIABLE_HERE",
             "measurement": "the number with its denominator, or the artifact + location",
         }
     ],
     "controls": [
-        "the arm that had to come out the OTHER way, and did — without one a "
-        "verification is a story"
+        "the arm that had to come out the other way, and did — without one the "
+        "document derives pass-with-measured-gaps, never pass-mechanical"
     ],
     "scope_limits": ["what this install could not reach, named"],
     "findings": [{"summary": "what you found", "disposition": "issue #N | note | none"}],
@@ -505,11 +200,9 @@ SCHEMA_TEMPLATE = {
 async def _write(
     *,
     db_path: str,
-    repo: str | None,
-    pr_number: int,
-    verdict: str,
+    doc: EvidenceDocument,
+    decision: Decision,
     note: str | None,
-    doc: dict,
     payload: str,
     dry_run: bool,
 ) -> int:
@@ -537,6 +230,7 @@ async def _write(
     # the context manager, not just the call.
     from genesis.db.connection import connect_aiosqlite_rw
 
+    pr_number = doc.pr
     try:
         async with connect_aiosqlite_rw(resolved, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
@@ -560,37 +254,49 @@ async def _write(
 
             open_repos = await crud.open_repos_for_pr(db, pr_number=pr_number)
             try:
-                # The document names its repo (validate_evidence requires it), so
-                # that is what gets resolved; --repo is only a disambiguator and
-                # assess() has already refused the case where the two disagree. The
-                # membership check inside resolve_repo is therefore what enforces the
-                # binding — no second rule has to remember it.
-                target = resolve_repo(open_repos, pr_number, repo or doc["repo"])
+                target = resolve_repo(open_repos, pr_number, doc.repo)
             except LookupError as exc:
                 print(f"pr_verification: {exc}", file=sys.stderr)
                 return 1
 
-            closing = verdict in crud.PASS_VERDICTS
-            reason = build_reason(verdict=verdict, doc=doc) if closing else None
+            verdict = decision.verdict
+            reason = build_reason(doc, decision)
+            # An open row keeps the VALIDATOR'S words as its note, first: the backlog
+            # shows the note on one line, and a generated prefix would push the part
+            # a human wrote out of view. The derivation is not lost — the verdict is
+            # its own column and the document is stored whole. The one exception is
+            # a park, which is a judgment the note must own up to.
+            attempt_note = None
+            if not decision.closing:
+                attempt_note = str(note).strip()
+                # A suspected failure is named AHEAD of the note: the backlog shows
+                # one line, and a suspicion that lives only in the stored document
+                # reads there exactly like an unreachable precondition.
+                suspected = [g for g in decision.derivation.gaps if g.startswith(SUSPECTED_FAILURE)]
+                if suspected:
+                    attempt_note = "; ".join(suspected) + " — " + attempt_note
+                if decision.parked:
+                    attempt_note = "PARKED (nothing material established) — " + attempt_note
 
             if dry_run:
                 print("pr_verification: DRY RUN — nothing written.")
                 print(f"  target   : {target}#{pr_number}")
                 print(
-                    f"  verdict  : {verdict}  ({'CLOSES the row' if closing else 'row STAYS OPEN'})"
+                    f"  verdict  : {verdict}  "
+                    f"({'CLOSES the row' if decision.closing else 'row STAYS OPEN'})"
                 )
-                if closing:
+                if decision.closing:
                     print(f"  reason   : {reason}")
                 else:
-                    print(f"  note     : {note}")
-                print(f"  evidence : {len(payload)} bytes")
+                    print(f"  note     : {attempt_note}")
+                print(f"  evidence : {len(payload.encode('utf-8'))} bytes")
                 return 0
 
             from datetime import datetime
 
             now = datetime.now(UTC).isoformat()
 
-            if closing:
+            if decision.closing:
                 changed = await crud.close_verification(
                     db,
                     repo=target,
@@ -609,7 +315,7 @@ async def _write(
                         file=sys.stderr,
                     )
                     return 1
-                print(f"pr_verification: CLOSED {target}#{pr_number} — {verdict} at {now}")
+                print(f"pr_verification: CLOSED {target}#{pr_number} — {reason} at {now}")
                 return 0
 
             outcome = await crud.record_attempt(
@@ -617,7 +323,7 @@ async def _write(
                 repo=target,
                 pr_number=pr_number,
                 verdict=verdict,
-                note=str(note),
+                note=attempt_note,
                 now=now,
                 evidence=payload,
             )
@@ -637,10 +343,41 @@ async def _write(
                     "  This is a FAILED verification: bring it to the user as a "
                     "conversation (never an automatic rollback) and file the defect."
                 )
+            elif any(g.startswith(SUSPECTED_FAILURE) for g in decision.derivation.gaps):
+                for g in decision.derivation.gaps:
+                    if g.startswith(SUSPECTED_FAILURE):
+                        print(f"  {g}")
+                print(
+                    "  A failure was SUSPECTED but not established. Measure it if you "
+                    "can; until then it is a named gap on an open row, not a finding."
+                )
             return 0
     except DatabaseIntegrityError as exc:
         print(f"pr_verification: refusing to write — {exc}", file=sys.stderr)
         return 1
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    # json.loads keeps the LAST of two equal keys without a word, so a document with
+    # "verdict" twice records whichever the author wrote second. Refuse instead.
+    out: dict[str, object] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _DuplicateKey(
+                f"the evidence document repeats the key {key!r} in one object; JSON "
+                f"would keep only the last one silently, so it is refused"
+            )
+        out[key] = value
+    return out
+
+
+def _refuse(message: str, code: int) -> int:
+    print(f"pr_verification: {message}", file=sys.stderr)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -654,25 +391,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     close = sub.add_parser("close", help="record a validation against an OPEN obligation")
-    close.add_argument("--pr", type=int, required=True, help="PR number")
     close.add_argument(
-        "--verdict",
-        choices=crud.VERDICTS,
+        "--pr",
+        type=int,
         required=True,
-        help="the session verdict; the two pass-* verdicts close the row, the other "
-        "two record an attempt and leave it open",
-    )
-    close.add_argument(
-        "--note",
-        default=None,
-        help="required for fail-intent and cannot-verify: why the verification could "
-        "not be completed, or what failed",
-    )
-    close.add_argument(
-        "--repo",
-        default=None,
-        help="OWNER/REPO — needed only when the same PR number is open for several "
-        "repos; it is checked against the open set, never trusted",
+        help="PR number — must equal the document's own 'pr' (a deliberate second copy "
+        "that catches a typo inside the document)",
     )
     close.add_argument(
         "--evidence-file",
@@ -681,11 +405,27 @@ def main(argv: list[str] | None = None) -> int:
         "Write it OUTSIDE the repo tree, e.g. under ~/.genesis/output/",
     )
     close.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="resolve the target and render the record without writing anything",
+        "--verdict",
+        choices=crud.VERDICTS,
+        default=None,
+        help="OPTIONAL expectation: refused unless the document derives this verdict",
     )
-    close.add_argument("--db-path", default=None, help="genesis.db path")
+    close.add_argument(
+        "--park",
+        action="store_true",
+        help="record cannot-verify for a document that derives pass-with-measured-gaps, "
+        "because nothing MATERIAL was established (needs --note; never on a failure)",
+    )
+    close.add_argument(
+        "--note",
+        default=None,
+        help="required whenever the row stays open: why the verification could not be "
+        "completed, or what failed",
+    )
+    close.add_argument(
+        "--dry-run", action="store_true", help="show what would be written, write nothing"
+    )
+    close.add_argument("--db-path", default=None, help="override the database path")
 
     args = parser.parse_args(argv)
 
@@ -693,90 +433,67 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(SCHEMA_TEMPLATE, indent=2))
         return 0
 
-    closing = args.verdict in crud.PASS_VERDICTS
-
-    if not closing and not str(args.note or "").strip():
-        print(
-            f"pr_verification: --verdict {args.verdict} requires --note. The row stays "
-            f"OPEN, and the note is the whole value of that: it is what stops the next "
-            f"validator re-deriving why this could not be finished.\n"
-            f"  And if you COULD have finished it with the access and time you had, "
-            f"this is not cannot-verify — it is not-yet-done. Leave the row alone.",
-            file=sys.stderr,
-        )
-        return 2
-    if closing and str(args.note or "").strip():
-        print(
-            f"pr_verification: --note is only recorded for a non-closing verdict, and "
-            f"would be silently discarded under {args.verdict}. A closing record's prose "
-            f"belongs in the evidence document (scope_limits / findings).",
-            file=sys.stderr,
-        )
-        return 2
-
     path = Path(args.evidence_file).expanduser()
     try:
         raw = path.read_bytes()
+    except FileNotFoundError:
+        return _refuse(f"cannot read evidence file {path}: it does not exist", 2)
     except OSError as exc:
-        print(f"pr_verification: cannot read evidence file: {exc}", file=sys.stderr)
-        return 2
+        return _refuse(f"cannot read evidence file {path}: {exc}", 2)
     if len(raw) > MAX_EVIDENCE_BYTES:
-        print(
-            f"pr_verification: evidence document is {len(raw)} bytes, over the "
-            f"{MAX_EVIDENCE_BYTES}-byte cap — REFUSED rather than cut, because a "
-            f"truncated evidence record still looks complete. Quote less, or link out.",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        doc = validate_evidence(json.loads(raw.decode("utf-8")))
-    except UnicodeDecodeError as exc:
-        print(f"pr_verification: evidence file is not UTF-8: {exc}", file=sys.stderr)
-        return 2
-    except json.JSONDecodeError as exc:
-        print(f"pr_verification: evidence file is not valid JSON: {exc}", file=sys.stderr)
-        return 2
-    except EvidenceError as exc:
-        print(f"pr_verification: {exc}", file=sys.stderr)
-        return 2
-
-    refusal = assess(
-        doc,
-        verdict=args.verdict,
-        closing=closing,
-        pr=args.pr,
-        repo_override=args.repo,
-    )
-    if refusal is not None:
-        code, message = refusal
-        print(f"pr_verification: {message}", file=sys.stderr)
-        return code
-
-    # The cap is enforced on the bytes that get STORED, not the bytes that were read.
-    # json.dumps(indent=2) re-serialises, and pretty-printing a document that fits
-    # under the cap on disk can carry it over — so checking only the file would let an
-    # over-cap record into the column the cap exists to bound.
-    payload = json.dumps(doc, indent=2, sort_keys=True)
-    if len(payload.encode("utf-8")) > MAX_EVIDENCE_BYTES:
-        print(
-            f"pr_verification: the evidence document serialises to "
-            f"{len(payload.encode('utf-8'))} bytes, over the {MAX_EVIDENCE_BYTES}-byte "
-            f"cap. REFUSED rather than cut, because a truncated evidence record still "
+        return _refuse(
+            f"evidence file is {len(raw)} bytes, over the {MAX_EVIDENCE_BYTES}-byte "
+            f"cap — REFUSED rather than cut, because a truncated evidence record still "
             f"looks complete.",
-            file=sys.stderr,
+            2,
         )
-        return 2
+    try:
+        doc = validate_evidence(json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates))
+    except UnicodeDecodeError as exc:
+        return _refuse(f"evidence file is not UTF-8: {exc}", 2)
+    except json.JSONDecodeError as exc:
+        return _refuse(f"evidence file is not valid JSON: {exc}", 2)
+    except _DuplicateKey as exc:
+        return _refuse(str(exc), 2)
+    except EvidenceError as exc:
+        return _refuse(f"the evidence document is malformed:\n{exc}", 2)
+
+    if doc.pr != args.pr:
+        return _refuse(
+            f"the evidence document says it verifies PR #{doc.pr} but --pr is "
+            f"{args.pr}. A closed row cannot be amended, so this mismatch is refused "
+            f"rather than resolved in your favour — correct whichever one is wrong.",
+            2,
+        )
+
+    result = decide(doc, park=args.park, asserted=args.verdict, note=args.note)
+    if isinstance(result, Refusal):
+        return _refuse(result.message, result.code)
+
+    # The cap is enforced on the bytes that get STORED, not the bytes that were read:
+    # the canonical re-serialisation can be larger than the file, and checking only
+    # the file would let an over-cap record into the column the cap exists to bound.
+    # The CRUD enforces the same cap again, because it owns the column.
+    # ensure_ascii=False: the escaped form spends up to 12 bytes on one non-ASCII
+    # character, which would refuse an honest document for its alphabet.
+    payload = json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
+    size = len(payload.encode("utf-8"))
+    if size > MAX_EVIDENCE_BYTES:
+        return _refuse(
+            f"the evidence document serialises to {size} bytes, over the "
+            f"{MAX_EVIDENCE_BYTES}-byte cap. REFUSED rather than cut, because a "
+            f"truncated evidence record still looks complete.",
+            2,
+        )
 
     from genesis.env import genesis_db_path
 
     return asyncio.run(
         _write(
             db_path=args.db_path or str(genesis_db_path()),
-            repo=args.repo,
-            pr_number=args.pr,
-            verdict=args.verdict,
-            note=args.note,
             doc=doc,
+            decision=result,
+            note=args.note,
             payload=payload,
             dry_run=args.dry_run,
         )

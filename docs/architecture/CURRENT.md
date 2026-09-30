@@ -1769,7 +1769,8 @@ verified: 788dd9a9 2026-09-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (LIVE, producer AND consumer — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic, consumer
+  manual-invoke only — nothing dispatches a validator yet — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -1782,7 +1783,12 @@ verified: 788dd9a9 2026-09-06
   `20260906234824_pr_verifications` migration docstring for the full
   New-Store-Gate justification. The CONSUMER is the **validator session**
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
-  skill and its readers on `repo_pulse_worker.py`). Only a PASS verdict discharges
+  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  validator's evidence document by `session_awareness/pr_evidence.py` (a strict
+  pydantic model plus a total decision tree), never asserted by the caller — a
+  caller-asserted design policed by refusal rules produced documents with no legal
+  verdict twice. Any second writer (an MCP tool is the anticipated one) must go
+  through that module; it lives in `src/` so it can. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is

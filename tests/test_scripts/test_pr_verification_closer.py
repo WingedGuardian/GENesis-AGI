@@ -2,19 +2,23 @@
 
 The invariants, each one bought by a measured defect rather than imagined:
 
-* ``--repo`` is CHECKED against the open set. Unchecked, an earlier draft closed a
-  DIFFERENT repository's obligation with this PR's evidence at exit 0, permanently,
-  leaving the real row open so nothing surfaced the mistake.
-* The evidence document names the PR it verifies and the commit it checked, and a
-  mismatch against ``--pr`` is refused. A closed row cannot be amended, so a
-  mispasted document would be permanent and undetectable.
-* A closing verdict is refused when any claim FAILED, and ``pass-mechanical`` is
-  refused when any claim is ``NOT_VERIFIABLE_HERE`` — a row stamped a clean pass
-  over a claim nothing established is a false record.
-* A non-closing verdict REQUIRES a note and leaves the row OPEN; a closing verdict
-  refuses a note rather than discarding it.
+* The verdict is DERIVED from the document (``pr_evidence.derive``); the caller
+  cannot assert one the claims do not support. An earlier caller-asserted design
+  had documents with NO legal verdict, twice, one fix apart.
+* The document names its row — ``repo`` and ``pr`` — and the row must be OPEN for
+  exactly that pair. An earlier ``--repo`` flag, unchecked, closed a DIFFERENT
+  repository's obligation at exit 0, permanently. ``--pr`` must still equal the
+  document's ``pr``: a deliberate second copy that catches a typo inside the
+  document, which a closed row could never be amended to undo.
+* A non-closing outcome REQUIRES a note and leaves the row OPEN; a closing outcome
+  refuses a note rather than discarding it. ``--park`` is the one judgment bit, and a
+  failure can never be parked.
 * Every refusal names which state it found, and the exit codes are distinct:
   1 the ledger declined, 2 the request was malformed, 3 refused on policy.
+
+The policy itself (totality, the strict model) is tested in
+``tests/test_session_awareness/test_pr_evidence.py``; this file tests the CLI's
+plumbing of it end to end against a real migrated database.
 
 Install-agnostic: synthetic slugs, ``tmp_path`` databases built from the real
 migrations, no network, no live services.
@@ -63,13 +67,13 @@ def _doc(**over) -> dict:
 
 
 def _doc_for(verdict: str, **over) -> dict:
-    """A document whose CLAIMS match *verdict*, which the closer now requires.
+    """A document whose CLAIMS derive *verdict*.
 
-    Rules 5 and 6 of :func:`assess` bind a non-closing verdict to the claim outcomes:
-    ``fail-intent`` needs a failed claim, ``cannot-verify`` needs one nothing could
-    establish. Deriving the document from the verdict keeps each test honest about
-    what it exercises, instead of reaching for a passing fixture under a verdict its
-    own contents contradict — which is the incoherence those two rules exist to stop.
+    The verdict is derived from the claims (``pr_evidence.derive``), so a test that
+    wants a non-closing outcome builds the document that produces it: a MEASURED
+    failure for ``fail-intent``, a claim nobody could check (``unverified`` at
+    NOT_VERIFIABLE_HERE) for ``cannot-verify``. Building from the verdict keeps each
+    test honest about what it exercises.
     """
     if verdict == "fail-intent":
         over.setdefault(
@@ -89,7 +93,7 @@ def _doc_for(verdict: str, **over) -> dict:
             [
                 {
                     "claim": "it degrades cleanly where no graph engine is installed",
-                    "verdict": "pass",
+                    "verdict": "unverified",
                     "tier": "NOT_VERIFIABLE_HERE",
                     "measurement": "this install has one; nothing here reaches that path",
                 }
@@ -240,6 +244,8 @@ def test_all_four_tiers_validate():
     for tier in _prv.TIERS:
         doc = _doc()
         doc["claims"][0]["tier"] = tier
+        if tier == "NOT_VERIFIABLE_HERE":
+            doc["claims"][0]["verdict"] = "unverified"
         assert _prv.validate_evidence(doc) is not None
 
 
@@ -259,12 +265,6 @@ def test_an_explicit_repo_in_the_open_set_is_used():
     assert _prv.resolve_repo([REPO, OTHER], 7, OTHER) == OTHER
 
 
-def test_an_ambiguous_pr_number_refuses_and_names_both():
-    with pytest.raises(LookupError) as exc:
-        _prv.resolve_repo([REPO, OTHER], 7, None)
-    assert REPO in str(exc.value) and OTHER in str(exc.value) and "--repo" in str(exc.value)
-
-
 def test_no_open_row_refuses_and_points_at_the_backlog_reader():
     with pytest.raises(LookupError) as exc:
         _prv.resolve_repo([], 7, None)
@@ -272,27 +272,7 @@ def test_no_open_row_refuses_and_points_at_the_backlog_reader():
     assert "--verification-backlog" in str(exc.value)
 
 
-def test_a_single_open_repo_needs_no_flag():
-    assert _prv.resolve_repo([REPO], 7, None) == REPO
-
-
 # ── the verdict/note couplings, all before any read ──────────────────────
-
-
-@pytest.mark.parametrize("verdict", ["fail-intent", "cannot-verify"])
-def test_a_non_closing_verdict_without_a_note_is_refused(tmp_path, capsys, verdict):
-    rc = _run(tmp_path, _doc(), "--verdict", verdict)
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "--note" in err
-    assert "not-yet-done" in err, "the message must name the abuse it prevents"
-
-
-@pytest.mark.parametrize("verdict", ["pass-mechanical", "pass-with-measured-gaps"])
-def test_a_closing_verdict_refuses_a_note_rather_than_discarding_it(tmp_path, capsys, verdict):
-    rc = _run(tmp_path, _doc(), "--verdict", verdict, "--note", "would be dropped")
-    assert rc == 2
-    assert "silently discarded" in capsys.readouterr().err
 
 
 def test_a_pr_mismatch_between_flag_and_document_is_refused(tmp_path, capsys):
@@ -300,27 +280,6 @@ def test_a_pr_mismatch_between_flag_and_document_is_refused(tmp_path, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "#999" in err and "7" in err
-
-
-def test_a_failing_claim_refuses_a_closing_verdict(tmp_path, capsys):
-    doc = _doc(
-        claims=[
-            {
-                "claim": "the hourly no-op is logged",
-                "verdict": "fail",
-                "tier": "MEASURED",
-                "measurement": "exited 75 and logged nothing on 3 of 3 runs",
-            }
-        ]
-    )
-    rc = _run(tmp_path, doc, "--verdict", "pass-mechanical")
-    assert rc == 3
-    err = capsys.readouterr().err
-    assert "REFUSING 'pass-mechanical'" in err, (
-        "rule 2 is no longer gated on `closing`, so it names the verdict it refused "
-        "rather than the class — a failing claim rules out three of the four"
-    )
-    assert "fail-intent" in err, "it must name the verdict that IS correct here"
 
 
 def test_a_failing_claim_is_fine_under_fail_intent(tmp_path):
@@ -341,37 +300,6 @@ def test_a_failing_claim_is_fine_under_fail_intent(tmp_path):
     assert _row(tmp_path / "genesis.db")["status"] == "open"
 
 
-def test_an_unverifiable_claim_refuses_a_clean_mechanical_pass(tmp_path, capsys):
-    doc = _doc()
-    doc["claims"][0]["tier"] = "NOT_VERIFIABLE_HERE"
-    rc = _run(tmp_path, doc, "--verdict", "pass-mechanical")
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "NOT_VERIFIABLE_HERE" in err
-    assert "pass-with-measured-gaps" in err and "cannot-verify" in err
-
-
-def test_a_document_that_establishes_NOTHING_cannot_close_a_row(tmp_path, capsys):
-    """THE acceptance bar for the floor, and an INVERSION of what this file asserted
-    one round ago — the old test pinned this exact document CLOSING the row.
-
-    Every claim NOT_VERIFIABLE_HERE, one named gap, and the row was discharged. It
-    satisfied every disqualifying rule that existed because all of them were a
-    denylist: no failing claim, and the unverifiable check only ever guarded
-    ``pass-mechanical``. So the obligation was marked handled on a document whose own
-    contents say nothing was established — the single state this ledger exists to
-    make impossible."""
-    db = tmp_path / "genesis.db"
-    _seed(db)
-    doc = _doc(scope_limits=["needs a box with no graph engine"])
-    doc["claims"][0]["tier"] = "NOT_VERIFIABLE_HERE"
-    assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 2
-    err = capsys.readouterr().err
-    assert "establishing nothing" in err
-    assert "cannot-verify" in err, "the refusal must name the verdict that DOES fit"
-    assert _row(db)["status"] == "open", "the obligation is not discharged"
-
-
 def test_measured_gaps_closes_when_something_WAS_established(tmp_path):
     """The other direction, or the floor is just a ban on the verdict. One claim
     measured, one beyond this install's reach, the gap named: that is precisely what
@@ -382,7 +310,7 @@ def test_measured_gaps_closes_when_something_WAS_established(tmp_path):
     doc["claims"].append(
         {
             "claim": "it degrades cleanly where no graph engine is installed",
-            "verdict": "pass",
+            "verdict": "unverified",
             "tier": "NOT_VERIFIABLE_HERE",
             "measurement": "this install has one; nothing here reaches that path",
         }
@@ -401,6 +329,8 @@ def test_the_floor_rejects_a_tier_that_establishes_nothing(tmp_path, tier):
     _seed(tmp_path / "genesis.db")
     doc = _doc(scope_limits=["named"])
     doc["claims"][0]["tier"] = tier
+    if tier == "NOT_VERIFIABLE_HERE":
+        doc["claims"][0]["verdict"] = "unverified"
     assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 2
 
 
@@ -537,6 +467,8 @@ def test_dry_run_writes_nothing_and_renders_the_record(tmp_path, capsys):
     assert _run(tmp_path, _doc(), "--verdict", "pass-mechanical", "--dry-run") == 0
     out = capsys.readouterr().out
     assert "DRY RUN" in out and "CLOSES the row" in out
+    # The reason that WOULD be written, so a dry run previews the record, not a label.
+    assert "reason   : PASS-MECHANICAL — 1 claim(s): 1 MEASURED" in out
     assert _row(db)["status"] == "open", "nothing written"
 
 
@@ -646,46 +578,13 @@ def test_a_database_with_no_table_at_all_is_reported_distinctly(tmp_path, capsys
 # ── the survivors a mutation sweep found, and the untested seams ─────────
 
 
-def test_the_repo_flag_is_bound_END_TO_END_not_just_in_the_helper(tmp_path, capsys):
-    """A sweep MEASURED that `resolve_repo(open_repos, pr_number, None)` — ignoring
-    `--repo` entirely — passed all 98 tests. The helper had unit coverage; the
-    PLUMBING from argv to the helper had none, on the exact seam whose regression
-    closed a different repository's obligation."""
-    db = tmp_path / "genesis.db"
-    _seed(db)  # only REPO holds an open row for PR 7
-    # --repo AGREEING with the document, and holding no open row: this is the original
-    # BLOCKER's path, and the membership check inside resolve_repo is what refuses it.
-    rc = _run(tmp_path, _doc(repo=OTHER), "--verdict", "pass-mechanical", "--repo", OTHER)
-    assert rc == 1, "a --repo that holds no open row must be refused"
-    err = capsys.readouterr().err
-    assert OTHER in err and REPO in err, "the refusal must name the real candidates"
-    assert _row(db)["status"] == "open", "the real row must be untouched"
-
-
-def test_a_repo_flag_that_CONTRADICTS_the_document_is_refused(tmp_path, capsys):
-    """The other half of the binding, and the reason the document names its repo at
-    all. Before that field existed a document about one repository could be pointed
-    at another's open row by a single flag, at exit 0, unamendably. Now the two have
-    to agree and neither silently wins."""
-    db = tmp_path / "genesis.db"
-    _seed(db)
-    rc = _run(tmp_path, _doc(), "--verdict", "pass-mechanical", "--repo", OTHER)
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert OTHER in err and REPO in err
-    assert "DOCUMENT is the record" in err
-    assert _row(db)["status"] == "open"
-
-
 def test_a_document_naming_the_WRONG_repo_cannot_close_a_row(tmp_path, capsys):
-    """THE gap a mutation sweep found, and it is the mis-bind the P1 was about.
+    """THE mis-bind round 1's P1 was about, and a gap a mutation sweep found once.
 
-    Deleting `or doc["repo"]` from the row resolution left all 150 tests passing.
-    Both sibling tests pass --repo explicitly, so assess()'s disagreement rule caught
-    them before the resolution seam was reached — and with exactly one repo holding an
-    open row, resolve_repo auto-selects it, so the document's repo never had to
-    matter. This is the case with NO flag at all: the document names one repository,
-    a different one holds the only open row, and the write must not land."""
+    With exactly one repository holding an open row for the PR, an earlier resolver
+    auto-selected it, so the document's repo never had to matter and ignoring it left
+    every test green. The document names one repository, a different one holds the
+    only open row, and the write must not land."""
     db = tmp_path / "genesis.db"
     _seed(db)  # REPO#7 is the only open row
     rc = _run(tmp_path, _doc(repo=OTHER), "--verdict", "pass-mechanical")
@@ -696,21 +595,11 @@ def test_a_document_naming_the_WRONG_repo_cannot_close_a_row(tmp_path, capsys):
 
 
 def test_the_document_alone_selects_the_row_with_no_repo_flag(tmp_path):
-    """--repo becomes a disambiguator rather than the binding. The positive direction
-    matters: if the document's repo were ignored, every test above would still pass
-    while the binding did nothing."""
+    """The positive direction of the binding: the document's repo selects its own row.
+    Without it, refusing everything would pass the test above."""
     db = tmp_path / "genesis.db"
     _seed(db)
     assert _run(tmp_path, _doc(), "--verdict", "pass-mechanical") == 0
-    assert _row(db)["status"] == "closed"
-
-
-def test_the_repo_flag_reaches_the_helper_when_it_IS_valid(tmp_path):
-    """The other direction — without this, refusing everything would pass the test
-    above and the flag would be inert."""
-    db = tmp_path / "genesis.db"
-    _seed(db)
-    assert _run(tmp_path, _doc(), "--verdict", "pass-mechanical", "--repo", REPO) == 0
     assert _row(db)["status"] == "closed"
 
 
@@ -747,34 +636,6 @@ def test_a_lost_attempt_race_is_reported_and_exits_1(tmp_path, capsys, monkeypat
     assert "missing" in capsys.readouterr().err
 
 
-def test_the_reason_census_counts_EVERY_claim_not_just_the_first(tmp_path):
-    """A sweep MEASURED that computing the census over `claims[:1]` passed all 56
-    tests: every fixture had one claim, so a truncating census was indistinguishable
-    from a correct one."""
-    doc = _doc(
-        claims=[
-            {"claim": "a", "verdict": "pass", "tier": "MEASURED", "measurement": "m"},
-            {"claim": "b", "verdict": "pass", "tier": "MEASURED", "measurement": "m"},
-            {"claim": "c", "verdict": "pass", "tier": "INFERRED", "measurement": "m"},
-            {"claim": "d", "verdict": "pass", "tier": "READ", "measurement": "m"},
-        ]
-    )
-    reason = _prv.build_reason(verdict="pass-mechanical", doc=doc)
-    assert "4 claim(s)" in reason
-    assert "2 MEASURED" in reason and "1 INFERRED" in reason and "1 READ" in reason
-
-
-def test_measured_gaps_requires_its_gaps_to_be_named(tmp_path, capsys):
-    """The verdict's whole content is WHICH gaps, and the tool's own refusal message
-    routes validators onto this verdict — so without a floor it steers them into an
-    unamendable record with the gaps missing."""
-    _seed(tmp_path / "genesis.db")
-    rc = _run(tmp_path, _doc(scope_limits=[]), "--verdict", "pass-with-measured-gaps")
-    assert rc == 2
-    assert "scope_limits" in capsys.readouterr().err
-    assert _row(tmp_path / "genesis.db")["status"] == "open"
-
-
 @pytest.mark.parametrize("gaps", [[""], ["   "]])
 def test_blank_gap_entries_do_not_satisfy_the_floor(tmp_path, gaps):
     _seed(tmp_path / "genesis.db")
@@ -805,65 +666,6 @@ def test_the_prose_lists_reject_anything_that_names_nothing(tmp_path, capsys, fi
     _seed(tmp_path / "genesis.db")
     assert _run(tmp_path, _doc(**{field: bad}), "--verdict", "pass-mechanical") == 2
     assert f"evidence.{field}[0]" in capsys.readouterr().err
-
-
-def test_a_clean_mechanical_pass_requires_a_control(tmp_path, capsys):
-    """Without a control a verification cannot separate the change working from the
-    property already holding. MEASURED in this tool's own pilot round: two of three
-    would-be findings were false, and a control is what caught both."""
-    _seed(tmp_path / "genesis.db")
-    assert _run(tmp_path, _doc(controls=[]), "--verdict", "pass-mechanical") == 2
-    assert "evidence.controls" in capsys.readouterr().err
-
-
-def test_measured_gaps_still_closes_with_no_control_when_the_gap_is_named(tmp_path):
-    """Scoped to pass-mechanical on purpose. "Claim X has no control" is a legitimate
-    measured gap, and if the control were demanded here too the honest document would
-    have no verdict left — the refusals would route validators to a dead end."""
-    db = tmp_path / "genesis.db"
-    _seed(db)
-    doc = _doc(controls=[], scope_limits=["no control available for the timing claim"])
-    assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 0
-    assert _row(db)["status"] == "closed"
-
-
-def test_fail_intent_requires_a_claim_that_actually_FAILED(tmp_path, capsys):
-    """The row stays open either way, so this is not about a false closure: the row is
-    what the next validator reads, and a fail-intent whose every claim passed is a
-    headline its own evidence contradicts."""
-    _seed(tmp_path / "genesis.db")
-    rc = _run(tmp_path, _doc(), "--verdict", "fail-intent", "--note", "n")
-    assert rc == 2
-    assert "cannot-verify" in capsys.readouterr().err, "name the verdict that fits"
-
-
-def test_the_cap_is_enforced_on_the_bytes_that_get_STORED(tmp_path, capsys):
-    """The read check alone was not the cap. json.dumps(indent=2) re-serialises, so a
-    document that fits on disk can cross the cap on the way into the column the cap
-    exists to bound — measured here at roughly 2.3x for many short list entries."""
-    _seed(tmp_path / "genesis.db")
-    doc = _doc(scope_limits=["a"] * 40000)
-    raw = json.dumps(doc)
-    inflated = json.dumps(doc, indent=2, sort_keys=True)
-    assert len(raw) < _prv.MAX_EVIDENCE_BYTES < len(inflated.encode()), (
-        "the fixture must sit BETWEEN the two sizes or it tests the old check"
-    )
-    assert _run(tmp_path, doc, "--verdict", "pass-mechanical") == 2
-    assert "serialises to" in capsys.readouterr().err
-
-
-def test_assess_needs_no_database_at_all():
-    """The whole policy surface is a pure function, which is the point of collecting
-    it: the rules can be exercised without a ledger, and the writer is left with only
-    the writing."""
-    assert (
-        _prv.assess(_doc(), verdict="pass-mechanical", closing=True, pr=7, repo_override=None)
-        is None
-    )
-    code, message = _prv.assess(
-        _doc(), verdict="pass-mechanical", closing=True, pr=8, repo_override=None
-    )
-    assert code == 2 and "#7" in message
 
 
 # ── the attempt record's lifecycle (round 1, cause B) ────────────────────
@@ -945,34 +747,6 @@ def test_an_INFERRED_only_document_still_cannot_CLOSE_a_row(tmp_path, verdict):
     assert _run(tmp_path, doc, "--verdict", verdict) == 2
 
 
-def test_cannot_verify_is_refused_when_the_document_reached_EVERYTHING(tmp_path, capsys):
-    """Rule 6's remaining job, now stated as the complement of the floor: the verdict is
-    wrong only when every claim is passing and measured or read, because that is the one
-    case where a passing verdict is available."""
-    _seed(tmp_path / "genesis.db")
-    rc = _run(tmp_path, _doc(), "--verdict", "cannot-verify", "--note", "n")
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "reached all of them" in err
-    assert "pass-mechanical" in err, "name the verdict that fits"
-
-
-def test_a_MEASURED_FAILURE_cannot_be_parked_as_cannot_verify(tmp_path, capsys):
-    """Rule 2 ungated from `closing`. Gated, loosening rule 6 for the BLOCKER above
-    would have let a measured failure be filed as cannot-verify — parking the row and
-    never printing the standing-ruling escalation, so a PR that demonstrably broke its
-    claim would read as one nobody could check."""
-    db = tmp_path / "genesis.db"
-    _seed(db)
-    rc = _run(tmp_path, _doc_for("fail-intent"), "--verdict", "cannot-verify", "--note", "n")
-    assert rc == 3, "a failing claim is a policy refusal, not a malformed request"
-    err = capsys.readouterr().err
-    assert "fail-intent" in err
-    assert "not a gap or an unreachable check either" in err
-    assert _row(db)["status"] == "open"
-    assert _row(db)["verdict"] is None, "nothing was recorded"
-
-
 def test_fail_intent_is_the_one_verdict_a_failing_claim_DOES_support(tmp_path):
     """The converse, or rule 2 is just a ban. Rules 2 and 5 are exact converses now:
     a failing claim implies fail-intent, and fail-intent implies a failing claim."""
@@ -980,27 +754,6 @@ def test_fail_intent_is_the_one_verdict_a_failing_claim_DOES_support(tmp_path):
     _seed(db)
     assert _run(tmp_path, _doc_for("fail-intent"), "--verdict", "fail-intent", "--note", "n") == 0
     assert _row(db)["verdict"] == "fail-intent"
-
-
-def test_the_gaps_refusal_does_not_route_onto_a_verdict_rule_3_refuses(tmp_path, capsys):
-    """A refusal is a routing instruction. With an unverifiable claim present,
-    'use pass-mechanical if there are none' sends the validator at a verdict the next
-    rule refuses — which is how a validator ends up cycling between two messages."""
-    _seed(tmp_path / "genesis.db")
-    doc = _doc(scope_limits=[])
-    doc["claims"][0]["tier"] = "NOT_VERIFIABLE_HERE"
-    assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 2
-    err = capsys.readouterr().err
-    assert "evidence.scope_limits" in err
-    assert "pass-mechanical" not in err, "do not offer a verdict rule 3 will refuse"
-
-
-def test_the_gaps_refusal_DOES_offer_pass_mechanical_when_it_would_be_accepted(tmp_path, capsys):
-    """The control arm — otherwise the clause could be deleted outright and the test
-    above would still pass."""
-    _seed(tmp_path / "genesis.db")
-    assert _run(tmp_path, _doc(scope_limits=[]), "--verdict", "pass-with-measured-gaps") == 2
-    assert "pass-mechanical" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("bad", ["owner/repo ", " owner/repo", "owner/repo\n"])
@@ -1020,3 +773,290 @@ def test_a_non_string_repo_is_refused(tmp_path, capsys, bad):
     _seed(tmp_path / "genesis.db")
     assert _run(tmp_path, _doc(repo=bad), "--verdict", "pass-mechanical") == 2
     assert "evidence.repo" in capsys.readouterr().err
+
+
+# ── round 3: the derived-verdict contract, end to end ────────────────────
+
+
+def _all_nvh(**over) -> dict:
+    d = _doc(**over)
+    d["claims"][0]["tier"] = "NOT_VERIFIABLE_HERE"
+    d["claims"][0]["verdict"] = "unverified"
+    return d
+
+
+def test_the_resolver_only_CHECKS_the_repo_the_document_names():
+    """Nothing is chosen any more, so there is nothing to disambiguate: the named repo
+    is either an open row or refused, and the two refusals say different things."""
+    assert _prv.resolve_repo([REPO, OTHER], 7, REPO) == REPO
+    with pytest.raises(LookupError) as exc:
+        _prv.resolve_repo([OTHER], 7, REPO)
+    assert REPO in str(exc.value) and OTHER in str(exc.value)
+    with pytest.raises(LookupError) as exc:
+        _prv.resolve_repo([], 7, REPO)
+    assert "no OPEN row for PR #7" in str(exc.value)
+
+
+def test_two_repos_open_at_one_pr_number_the_document_picks_its_own(tmp_path):
+    """What --repo used to exist for. The document names the row, so the other
+    repository's obligation at the same number is left alone."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    _seed(db, repo=OTHER)
+    assert _run(tmp_path, _doc()) == 0
+    assert _row(db)["status"] == "closed"
+    assert _row(db, repo=OTHER)["status"] == "open", "the other repository is untouched"
+
+
+def test_the_repo_flag_no_longer_exists(tmp_path):
+    """Removed, not ignored: a flag accepted and dropped would read as a binding that
+    was applied."""
+    _seed(tmp_path / "genesis.db")
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, _doc(), "--repo", REPO)
+    assert exc.value.code == 2
+
+
+def test_no_verdict_flag_is_needed_the_document_decides(tmp_path):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc()) == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("closed", "pass-mechanical")
+
+
+def test_the_formerly_DEAD_document_now_closes_with_its_gap_named(tmp_path):
+    """The round-2 deadlock at the local head: one MEASURED passing claim, no
+    controls, no scope limits — refused under all four verdicts. It now derives
+    pass-with-measured-gaps, and the missing control is the named gap."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(controls=[], scope_limits=[])) == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("closed", "pass-with-measured-gaps")
+    assert "no negative control" in row["closed_reason"]
+
+
+def test_a_document_that_establishes_NOTHING_cannot_close_a_row(tmp_path, capsys):
+    """Round 1's P1, now by construction: every claim NOT_VERIFIABLE_HERE derives
+    cannot-verify, so it needs a note and stays open — and asserting a pass is a
+    mismatch, not a closure."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _all_nvh(scope_limits=["needs a box with no graph engine"])
+    assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 2
+    assert "derives cannot-verify" in capsys.readouterr().err
+    assert _row(db)["status"] == "open"
+    assert _run(tmp_path, doc, "--note", "needs a box with no graph engine") == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("open", "cannot-verify")
+
+
+@pytest.mark.parametrize("verdict", ["fail-intent", "cannot-verify"])
+def test_an_open_outcome_without_a_note_is_refused(tmp_path, capsys, verdict):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc_for(verdict)) == 2
+    err = capsys.readouterr().err
+    assert "--note" in err
+    if verdict == "cannot-verify":
+        assert "not-yet-done" in err, "the message must name the abuse it prevents"
+    else:
+        # A measured failure is never "not-yet-done": telling its holder to leave the
+        # row alone would bury the one outcome that must reach the user.
+        assert "what failed" in err and "not-yet-done" not in err
+
+
+@pytest.mark.parametrize("controls", [["a control"], []])
+def test_a_closing_outcome_refuses_a_note_rather_than_discarding_it(tmp_path, capsys, controls):
+    """Both closing verdicts: with a control the document derives pass-mechanical,
+    without one pass-with-measured-gaps."""
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(controls=controls), "--note", "would be dropped") == 2
+    assert "silently discarded" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "asserted", ["pass-mechanical", "pass-with-measured-gaps", "cannot-verify"]
+)
+def test_a_FAILURE_under_any_other_verdict_is_a_policy_refusal(tmp_path, capsys, asserted):
+    """Exit 3, whichever way the verdict tries to route around the failure — into a
+    closure, or into a quiet parked row that skips the conversation."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    rc = _run(tmp_path, _doc_for("fail-intent"), "--verdict", asserted, "--note", "n")
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "derives fail-intent" in err
+    assert "FAILED: the timer fires hourly" in err, "name the claim that failed"
+    assert _row(db)["verdict"] is None, "nothing was recorded"
+
+
+def test_a_failure_can_NEVER_be_parked(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc_for("fail-intent"), "--park", "--note", "n") == 3
+    assert "never parked" in capsys.readouterr().err
+    assert _row(db)["verdict"] is None
+
+
+def test_an_unverifiable_claim_is_a_named_GAP_not_a_clean_pass(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc()
+    doc["claims"].append(
+        {
+            "claim": "degrades cleanly with no graph engine",
+            "verdict": "unverified",
+            "tier": "NOT_VERIFIABLE_HERE",
+            "measurement": "not reachable here",
+        }
+    )
+    assert _run(tmp_path, doc, "--verdict", "pass-mechanical") == 2
+    err = capsys.readouterr().err
+    assert "derives pass-with-measured-gaps" in err
+    assert "NOT VERIFIABLE HERE: degrades cleanly" in err, "name the gap"
+    assert _run(tmp_path, doc) == 0
+    assert _row(db)["verdict"] == "pass-with-measured-gaps"
+
+
+@pytest.mark.parametrize("asserted", ["cannot-verify", "fail-intent", "pass-with-measured-gaps"])
+def test_a_fully_established_document_refuses_every_other_verdict(tmp_path, capsys, asserted):
+    """The complement of the floor: everything measured, controlled and gap-free is
+    pass-mechanical, and no assertion can make it anything else."""
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(), "--verdict", asserted, "--note", "n") == 2
+    assert "derives pass-mechanical" in capsys.readouterr().err
+
+
+def test_park_records_cannot_verify_and_OWNS_UP_to_it_in_the_note(tmp_path):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc(controls=[])  # derives pass-with-measured-gaps
+    assert _run(tmp_path, doc, "--park", "--note", "the measured claim was trivial") == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("open", "cannot-verify")
+    assert row["last_attempt_note"].startswith("PARKED")
+    assert "the measured claim was trivial" in row["last_attempt_note"]
+
+
+def test_park_is_refused_on_a_clean_pass(tmp_path, capsys):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(), "--park", "--note", "n") == 2
+    assert "no gaps to park on" in capsys.readouterr().err
+
+
+def test_the_cap_is_enforced_on_the_bytes_that_get_STORED(tmp_path, capsys):
+    """json.dumps(indent=2) re-serialises, so a document that fits on disk can cross
+    the cap on the way into the column the cap exists to bound."""
+    _seed(tmp_path / "genesis.db")
+    doc = _doc(scope_limits=["a"] * 40000)
+    raw = json.dumps(doc)
+    inflated = json.dumps(doc, indent=2, sort_keys=True)
+    assert len(raw) < _prv.MAX_EVIDENCE_BYTES < len(inflated.encode()), (
+        "the fixture must sit BETWEEN the two sizes or it tests the old check"
+    )
+    assert _run(tmp_path, doc) == 2
+    assert "serialises to" in capsys.readouterr().err
+
+
+def test_the_reason_census_counts_EVERY_claim_and_names_the_gaps(tmp_path):
+    """A mutation that censused only the first claim once passed every test."""
+    from genesis.session_awareness import pr_evidence as pe
+
+    doc = _doc(controls=[])
+    doc["claims"].append({"claim": "b", "verdict": "pass", "tier": "READ", "measurement": "file:1"})
+    model = _prv.validate_evidence(doc)
+    reason = _prv.build_reason(model, pe.decide(model))
+    assert "2 claim(s)" in reason
+    assert "1 MEASURED" in reason and "1 READ" in reason
+    assert "gaps: no negative control" in reason
+
+
+# ── round 3 audit: the claim vocabulary and the refusal routing, end to end ──
+
+
+def test_an_INFERRED_failure_stays_open_as_a_SUSPICION_not_a_finding(tmp_path, capsys):
+    """A failure nobody established is not taken to the user as one, and it never
+    closes a row: it derives cannot-verify with the suspicion named."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc()
+    doc["claims"].append(
+        {
+            "claim": "the retry backs off",
+            "verdict": "fail",
+            "tier": "INFERRED",
+            "measurement": "the log spacing looks flat, not measured",
+        }
+    )
+    assert _run(tmp_path, doc, "--note", "measure the retry spacing") == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("open", "cannot-verify")
+    # Named ON THE ROW, ahead of the note — the backlog shows only the note line.
+    assert row["last_attempt_note"] == (
+        "SUSPECTED FAILURE (INFERRED): the retry backs off — measure the retry spacing"
+    )
+    out = capsys.readouterr().out
+    assert "SUSPECTED FAILURE (INFERRED): the retry backs off" in out
+    assert "conversation" not in out
+
+
+@pytest.mark.parametrize(
+    ("verdict", "tier"), [("pass", "NOT_VERIFIABLE_HERE"), ("unverified", "MEASURED")]
+)
+def test_an_incoherent_claim_is_refused_at_the_CLI(tmp_path, capsys, verdict, tier):
+    _seed(tmp_path / "genesis.db")
+    doc = _doc()
+    doc["claims"][0].update(verdict=verdict, tier=tier)
+    assert _run(tmp_path, doc) == 2
+    assert "evidence.claims[0]" in capsys.readouterr().err
+
+
+def test_asserting_cannot_verify_on_a_gaps_document_names_PARK(tmp_path, capsys):
+    """Audit round 3: the mismatch said "change the document", when the move the
+    validator wanted was --park."""
+    _seed(tmp_path / "genesis.db")
+    doc = _doc(controls=[])
+    assert _run(tmp_path, doc, "--verdict", "cannot-verify", "--note", "n") == 2
+    assert "--park" in capsys.readouterr().err
+    assert _run(tmp_path, doc, "--verdict", "cannot-verify", "--park", "--note", "n") == 0
+
+
+def test_a_duplicate_key_is_refused_not_last_one_wins(tmp_path, capsys):
+    """json.loads keeps the LAST of two equal keys silently."""
+    _seed(tmp_path / "genesis.db")
+    path = tmp_path / "dup.json"
+    text = json.dumps(_doc())
+    path.write_text(text[:-1] + ', "pr": 7}')
+    rc = _prv.main(
+        [
+            "close",
+            "--pr",
+            "7",
+            "--evidence-file",
+            str(path),
+            "--db-path",
+            str(tmp_path / "genesis.db"),
+        ]
+    )
+    assert rc == 2
+    assert "repeats the key 'pr'" in capsys.readouterr().err
+
+
+def test_a_pr_beyond_the_integer_range_is_a_named_refusal(tmp_path, capsys):
+    """10**30 reached the driver and raised OverflowError — a traceback."""
+    _seed(tmp_path / "genesis.db")
+    big = 2**63
+    assert _run(tmp_path, _doc(pr=big), pr=big) == 2
+    assert "evidence.pr" in capsys.readouterr().err
+
+
+def test_non_ASCII_evidence_is_stored_as_written_not_escaped(tmp_path):
+    """The escaped form spends up to 12 bytes per character against the size cap."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc()
+    doc["claims"][0]["measurement"] = "latence mesurée: 12 ms — ✓"
+    assert _run(tmp_path, doc) == 0
+    stored = _row(db)["evidence"]
+    assert "mesurée" in stored and "\\u" not in stored

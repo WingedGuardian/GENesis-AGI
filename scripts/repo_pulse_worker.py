@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -31,7 +34,10 @@ if str(SRC_DIR) not in sys.path:
 
 
 def _print_verification_backlog(db_path: str | None) -> None:
-    """The pr_verifications day-one reader: open obligations, oldest merge first.
+    """The pr_verifications day-one reader: open obligations in BACKLOG order —
+    never-attempted rows first, then parked ones, oldest merge first within each
+    (``list_open``'s ORDER BY; a validator should reach an untouched row before one a
+    colleague already tried).
 
     Read-only, no worker run, no debounce — usable while the Wave-3 validator
     session (the eventual consumer) does not exist yet. Prints one line per
@@ -88,7 +94,15 @@ def _print_verification_backlog(db_path: str | None) -> None:
             db.row_factory = aiosqlite.Row
             return await verif_crud.list_open(db), await verif_crud.counts(db)
 
-    rows, histogram = _asyncio.run(_read())
+    # Exit 0 is this module's contract, and a file that is not a database raised
+    # straight through it — a traceback and exit 1 (MEASURED; issue #2603). An
+    # unreadable database is a state of its own, distinct from "no database" and
+    # "no rows", so it is reported as one.
+    try:
+        rows, histogram = _asyncio.run(_read())
+    except (sqlite3.Error, OSError) as exc:
+        print(f"pr_verifications: database unreadable at {resolved} — {exc}")
+        return
     if not histogram:
         print("pr_verifications: no rows (table empty or pre-migration)")
         return
@@ -112,7 +126,7 @@ def _print_verification_backlog(db_path: str | None) -> None:
             note = (row.get("last_attempt_note") or "").strip()
             tries = row.get("attempt_count") or 0
             print(
-                f"      ATTEMPTED {tries}x  {row['verdict']}{'  — ' + note[:120] if note else ''}"
+                f"      ATTEMPTED {tries}x  {row['verdict']}{'  — ' + _clip(note, 120, row['pr_number']) if note else ''}"
             )
     # `list_open` has its own row cap, so the lines above can be a SUBSET while
     # the histogram below reports the true total — printing both without saying
@@ -122,23 +136,36 @@ def _print_verification_backlog(db_path: str | None) -> None:
     open_total = histogram.get("open", 0)
     if len(rows) < open_total:
         print(
-            f"  <listed the {len(rows)} oldest of {open_total} open row(s); "
+            f"  <listed the first {len(rows)} of {open_total} open row(s) in backlog "
+            f"order — never-attempted first, then parked, oldest merge first within "
+            f"each; "
             f"{open_total - len(rows)} not shown — close some, or query "
             f"pr_verifications directly for the full set>"
         )
     print(f"pr_verifications: {open_total} open, {histogram.get('closed', 0)} closed ({resolved})")
     print(
-        "  close one: python3 scripts/pr_verification.py close --pr <N> --verdict "
-        "<pass-mechanical|pass-with-measured-gaps|fail-intent|cannot-verify> "
-        "--evidence-file <doc.json>   "
+        "  close one: python3 scripts/pr_verification.py close --pr <N> "
+        "--evidence-file <doc.json> [--note <why>]  (the verdict is derived from the "
+        "document; run `pr_verification.py print-schema` for a template)   "
         "(--verification-log --pr <N> shows what was decided, on any row)"
     )
 
 
-#: Characters of one evidence document a scoped read prints before clipping. The
-#: document is capped at 256 KiB by the writer, which is far more than belongs in a
-#: terminal; this is the reading budget, and a clip SAYS it clipped.
-_EVIDENCE_SHOW = 8000
+def _clip(text: str, limit: int, pr_number: object) -> str:
+    """Return *text*, or its first *limit* characters with a marker SAYING it was cut.
+
+    A one-line census has a width, so a long note or reason is shortened there — but
+    silently shortened text still looks complete, which is how a reader acts on half a
+    reason. The marker states how much is missing and names the read that shows it
+    whole (a scoped ``--verification-log --pr N`` prints the row unclipped).
+    """
+    if len(text) <= limit:
+        return text
+    return (
+        f"{text[:limit]}…(+{len(text) - limit} chars — "
+        f"--verification-log --pr {pr_number} shows it whole)"
+    )
+
 
 #: Rows one `--verification-log` run will show. Named rather than inline so the
 #: truncation disclosure below cannot drift from the value it describes.
@@ -157,8 +184,9 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
 
     The counterpart to the backlog. Without it the evidence column is write-only —
     MEASURED before this shipped: nothing in ``src/`` or ``scripts/`` ever SELECTed
-    it, while the daily retention timer deletes closed rows at 45 days. A record
-    nothing can read is not a record.
+    it, while the daily retention timer deletes closed rows after 180 days
+    (``prune_repo_pulse.py --verification-days``, default 180; ``disk_hygiene.sh``
+    passes no override). A record nothing can read is not a record.
 
     Read-only, no worker run, no debounce — same contract and same guards as the
     backlog reader above, including the built-not-interpolated ``mode=ro`` URI.
@@ -202,7 +230,15 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
                 return await verif_crud.list_for_pr(db, pr_number=pr_number)
             return await verif_crud.list_closed(db, limit=_LOG_LIMIT, pr_number=None)
 
-    rows = _asyncio.run(_read())
+    # This module's documented contract is exit 0 unless argument parsing fails, and a
+    # corrupt or unreadable file raised straight through it — exit 1 and a traceback
+    # (MEASURED on a file that is not a database). The read failing is a STATE worth
+    # reporting as itself, distinct from "no database" and "no rows".
+    try:
+        rows = _asyncio.run(_read())
+    except (sqlite3.Error, OSError) as exc:
+        print(f"pr_verifications: database unreadable at {resolved} — {exc}")
+        return
     if not rows:
         if pr_number is not None:
             print(
@@ -217,75 +253,50 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
             )
         return
 
-    for row in rows:
-        # A NULL verdict is stated, never blanked: it means the row was closed
-        # before verdicts existed, or by the deterministic docs-path exemption —
-        # not that a validator reached no conclusion.
-        closed = row.get("status") == "closed"
-        if closed:
-            verdict = row.get("verdict") or "<no verdict — auto-exempt by path, or pre-verdict>"
-            print(
-                f"CLOSED  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
-                f"{str(row.get('closed_at') or '')[:19]}  {verdict}"
-            )
-            reason = (row.get("closed_reason") or "").strip()
-            if reason:
-                print(f"        reason  : {reason[:160]}")
-        else:
-            # An OPEN row reached here only from a scoped read, and it is open BECAUSE a
-            # verdict was recorded that does not discharge the obligation. Say which,
-            # and how many attempts it has cost — the escalation signal.
-            verdict = row.get("verdict") or "<never attempted>"
-            print(
-                f"OPEN    {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
-                f"{str(row.get('last_attempt_at') or row.get('merged_at') or '')[:19]}  "
-                f"{verdict}"
-            )
-            note = (row.get("last_attempt_note") or "").strip()
-            if note:
-                print(f"        note    : {note[:160]}")
-            if row.get("attempt_count"):
-                print(f"        attempts: {row['attempt_count']}")
-        evidence = row.get("evidence")
-        if not evidence:
-            print("        evidence: none recorded")
-        elif pr_number is None:
-            # An unscoped listing can carry 500 rows; printing every document would
-            # bury the census this mode exists to give. The pointer is the affordance.
-            print(
-                f"        evidence: {len(evidence)} bytes "
-                f"— read it with --verification-log --pr {row['pr_number']}"
-            )
-        else:
-            # A SCOPED read is someone asking what was concluded, so show it. Without
-            # this the column was written by the validator and read by nobody, and a
-            # daily retention timer deletes closed rows at 45 days — the whole reason
-            # this reader ships in the same change as the writer.
-            print(f"        evidence: {len(evidence)} bytes")
-            body = evidence
-            if len(body) > _EVIDENCE_SHOW:
-                body = (
-                    body[:_EVIDENCE_SHOW]
-                    + f"\n<CLIPPED at {_EVIDENCE_SHOW} of {len(evidence)} chars — "
-                    f"query pr_verifications.evidence for the whole document>"
-                )
-            for line in body.splitlines():
-                print(f"          {line}")
-    # A listing whose length EQUALS its cap is a truncated read, and printing the
-    # count alone lets a reader take it for a total — the same omission the backlog
-    # reader states with both numbers. Say so rather than letting the two disagree
-    # in silence.
     if pr_number is not None:
-        # A scoped read covers OPEN rows too, so a closed-only count here told a
-        # reader a parked obligation was discharged — the line directly above it said
-        # OPEN. Count each status; list_for_pr is unlimited (one row per repository
-        # holding that number), so there is no cap to disclose.
+        # A SCOPED read is someone asking what the record SAYS about one obligation,
+        # so it prints the rows themselves: every column, the evidence document parsed
+        # back into structure, nothing clipped and nothing relabelled. Two review
+        # rounds found defects in the formatted version of this path — a closed-only
+        # count printed under a row reading OPEN, silent clips, a cap notice for a
+        # query with no cap — and a faithful dump has no formatting to get wrong.
+        for row in rows:
+            record = dict(row)
+            evidence = record.get("evidence")
+            if isinstance(evidence, str):
+                # A stored string that is not JSON is still the record: keep it as is.
+                with contextlib.suppress(ValueError):
+                    record["evidence"] = json.loads(evidence)
+            print(json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True, default=str))
         n_open = sum(1 for r in rows if r.get("status") != "closed")
         print(
             f"pr_verifications: {len(rows)} row(s) for PR #{pr_number} — "
             f"{n_open} open, {len(rows) - n_open} closed ({resolved})"
         )
         return
+
+    # UNSCOPED: the census of discharged obligations, one line per row.
+    for row in rows:
+        # A NULL verdict is stated, never blanked: it means the row was closed
+        # before verdicts existed, or by the deterministic docs-path exemption —
+        # not that a validator reached no conclusion.
+        verdict = row.get("verdict") or "<no verdict — auto-exempt by path, or pre-verdict>"
+        print(
+            f"CLOSED  {row.get('repo') or '<unknown repo>'}#{row['pr_number']}  "
+            f"{str(row.get('closed_at') or '')[:19]}  {verdict}"
+        )
+        reason = (row.get("closed_reason") or "").strip()
+        if reason:
+            print(f"        reason  : {_clip(reason, 160, row['pr_number'])}")
+        evidence = row.get("evidence")
+        if evidence:
+            # A census can carry 500 rows; printing every document would bury it.
+            print(
+                f"        evidence: {len(evidence)} chars "
+                f"— read it with --verification-log --pr {row['pr_number']}"
+            )
+        else:
+            print("        evidence: none recorded")
     # A listing whose length EQUALS its cap is a truncated read, and printing the
     # count alone lets a reader take it for a total — the same omission the backlog
     # reader states with both numbers. Say so rather than letting the two disagree
@@ -329,7 +340,8 @@ def main() -> None:
         "--verification-log",
         action="store_true",
         help="list CLOSED obligations with the verdict and evidence a validator "
-        "recorded, and exit — read-only. Pair with --pr to scope to one PR",
+        "recorded, and exit — read-only. With --pr, prints EVERY row for that PR as "
+        "JSON, open ones included (a parked or failed attempt stays open)",
     )
     parser.add_argument(
         "--pr",

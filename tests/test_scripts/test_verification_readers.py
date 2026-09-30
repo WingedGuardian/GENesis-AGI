@@ -108,9 +108,11 @@ def test_a_scoped_read_finds_a_row_beyond_the_page(tmp_path, capsys):
     _build(db, closed=_w._LOG_LIMIT + 11)
     _w._print_verification_log(str(db), 1)  # PR 1 is the OLDEST closure
     out = capsys.readouterr().out
-    assert "#1 " in out or "#1\n" in out or "#1" in out
     assert "no closed rows" not in out
-    assert "pass-mechanical" in out
+    # The ROW, not the footer: "#1" alone was satisfied by the footer's "PR #1".
+    (record,) = _scoped_records(out)
+    assert record["pr_number"] == 1
+    assert record["verdict"] == "pass-mechanical"
 
 
 def test_a_capped_read_says_it_was_capped(tmp_path, capsys):
@@ -161,18 +163,6 @@ def test_a_null_verdict_is_STATED_not_blanked(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "auto-exempt by path" in out
     assert "evidence: none recorded" in out
-
-
-def test_the_verdict_and_evidence_are_surfaced(tmp_path, capsys):
-    """The D3 obligation: the reader must show what the writer wrote, or the
-    evidence column is write-only and a retention timer deletes it unread."""
-    db = tmp_path / "genesis.db"
-    _build(db, closed=1)
-    _w._print_verification_log(str(db), 1)
-    out = capsys.readouterr().out
-    assert "pass-mechanical" in out
-    assert "evidence:" in out and "bytes" in out
-    assert "reason  :" in out
 
 
 def test_no_matching_closed_row_is_distinguishable_from_an_empty_table(tmp_path, capsys):
@@ -257,17 +247,6 @@ def test_the_backlog_advertises_the_close_command(tmp_path, capsys):
 # ── the evidence column is READ, not just counted (round 1, cause C) ──────
 
 
-def test_a_scoped_read_prints_the_evidence_DOCUMENT(tmp_path, capsys):
-    """A byte count proves the write happened and says nothing about what was
-    concluded, which left the column write-only for the purpose it exists for. A
-    scoped read is someone asking what was decided, so the document is shown."""
-    db = tmp_path / "genesis.db"
-    _build(db, closed=1)
-    _w._print_verification_log(str(db), 1)
-    out = capsys.readouterr().out
-    assert '"x": 1' in out or '"x":1' in out, "the document's contents must appear"
-
-
 def test_an_unscoped_read_points_at_the_document_instead_of_printing_it(tmp_path, capsys):
     """The other direction. An unscoped listing can carry 500 rows, and printing every
     document would bury the census this mode exists to give — so it names the command
@@ -281,38 +260,6 @@ def test_an_unscoped_read_points_at_the_document_instead_of_printing_it(tmp_path
     # vacuous — it could never have appeared even if the document were printed. An
     # adversarial audit caught it; the control now names what is actually stored.
     assert '{"x":1}' not in out
-
-
-def test_a_clipped_document_SAYS_it_was_clipped(tmp_path, capsys):
-    """A silently truncated evidence record still looks complete — the same failure the
-    writer refuses an over-cap document to avoid."""
-    db = tmp_path / "genesis.db"
-
-    async def go() -> None:
-        from genesis.db.crud import pr_verifications as crud
-
-        async with aiosqlite.connect(str(db)) as conn:
-            conn.row_factory = aiosqlite.Row
-            await build_pr_verifications(conn)
-            await conn.commit()
-            await crud.open_verification(
-                conn, repo=REPO, pr_number=5, pr_title="t", merged_at=NOW, now=NOW
-            )
-            await crud.close_verification(
-                conn,
-                repo=REPO,
-                pr_number=5,
-                verdict="pass-mechanical",
-                reason="r",
-                evidence="z" * (_w._EVIDENCE_SHOW + 500),
-                now=NOW,
-            )
-
-    asyncio.run(go())
-    _w._print_verification_log(str(db), 5)
-    out = capsys.readouterr().out
-    assert "CLIPPED at" in out
-    assert str(_w._EVIDENCE_SHOW + 500) in out, "the real size must be stated"
 
 
 # ── a flag that is silently ignored misreports the run ───────────────────
@@ -342,22 +289,6 @@ def test_pr_WITH_the_log_flag_is_accepted(tmp_path, monkeypatch):
     assert _w.main() is None
 
 
-def test_a_scoped_read_renders_a_PARKED_row_as_OPEN(tmp_path, capsys):
-    """A mutation sweep measured this unpinned: rendering an open row as CLOSED left
-    every test green. It is the one line that tells a reader the obligation is NOT
-    discharged, so printing the wrong word there is the worst thing this reader can
-    do — a parked fail-intent would read as settled."""
-    db = tmp_path / "genesis.db"
-    _build(db, open_rows=1, parked=True)
-    _w._print_verification_log(str(db), 1)
-    out = capsys.readouterr().out
-    assert out.startswith("OPEN") or "\nOPEN " in out
-    assert "CLOSED" not in out, "an undischarged obligation must never read as closed"
-    assert "cannot-verify" in out
-    assert "needs another install entirely" in out
-    assert "attempts: 1" in out
-
-
 def test_a_scoped_read_COUNTS_a_parked_row_as_open(tmp_path, capsys):
     """Round-2 finding: the footer said '1 closed row(s) shown' directly under a line
     reading OPEN. A reader gets two answers about whether the obligation is pending."""
@@ -368,3 +299,246 @@ def test_a_scoped_read_COUNTS_a_parked_row_as_open(tmp_path, capsys):
     assert "1 open, 0 closed" in out
     assert "closed row(s) shown" not in out, "the closed-only footer is for unscoped reads"
     assert "CAPPED read" not in out
+
+
+# ── round 3: the scoped read is the RECORD, unclipped and unrelabelled ─────
+
+
+def _scoped_records(out: str) -> list[dict]:
+    """Parse the JSON objects a scoped read prints (everything but the footer)."""
+    import json
+
+    body = out[: out.rindex("pr_verifications:")]
+    decoder, pos, records = json.JSONDecoder(), 0, []
+    while True:
+        while pos < len(body) and body[pos].isspace():
+            pos += 1
+        if pos >= len(body):
+            return records
+        obj, pos = decoder.raw_decode(body, pos)
+        records.append(obj)
+
+
+def test_a_scoped_read_prints_the_row_itself_with_the_evidence_as_STRUCTURE(tmp_path, capsys):
+    """The formatted version of this path drew defects in two review rounds; the
+    record has no formatting to get wrong. Evidence comes back as an object, not a
+    string of escaped JSON."""
+    db = tmp_path / "genesis.db"
+    _build(db, closed=1)
+    _w._print_verification_log(str(db), 1)
+    (record,) = _scoped_records(capsys.readouterr().out)
+    assert record["status"] == "closed"
+    assert record["verdict"] == "pass-mechanical"
+    assert record["closed_reason"] == "r"
+    assert record["evidence"] == {"x": 1}
+
+
+def test_a_scoped_read_shows_a_PARKED_row_as_OPEN_with_its_attempt(tmp_path, capsys):
+    """An undischarged obligation must never read as closed; a mutation that printed
+    CLOSED here once left every test green."""
+    db = tmp_path / "genesis.db"
+    _build(db, open_rows=1, parked=True)
+    _w._print_verification_log(str(db), 1)
+    out = capsys.readouterr().out
+    (record,) = _scoped_records(out)
+    assert record["status"] == "open"
+    assert record["verdict"] == "cannot-verify"
+    assert record["last_attempt_note"] == "needs another install entirely"
+    assert record["attempt_count"] == 1
+    assert "1 open, 0 closed" in out
+
+
+def test_a_scoped_read_never_clips_a_large_document(tmp_path, capsys):
+    """The scoped read is where fidelity matters, so nothing is cut there at all."""
+    db = tmp_path / "genesis.db"
+    big = {"claims": ["z" * 50_000]}
+
+    async def go() -> None:
+        import json
+
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await build_pr_verifications(conn)
+            await conn.commit()
+            await crud.open_verification(
+                conn, repo=REPO, pr_number=5, pr_title="t", merged_at=NOW, now=NOW
+            )
+            await crud.close_verification(
+                conn,
+                repo=REPO,
+                pr_number=5,
+                verdict="pass-mechanical",
+                reason="r",
+                evidence=json.dumps(big),
+                now=NOW,
+            )
+
+    asyncio.run(go())
+    _w._print_verification_log(str(db), 5)
+    (record,) = _scoped_records(capsys.readouterr().out)
+    assert record["evidence"] == big, "every character, structurally intact"
+
+
+def test_a_scoped_read_keeps_a_non_JSON_evidence_string_verbatim(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+
+    async def go() -> None:
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await build_pr_verifications(conn)
+            await conn.commit()
+            await crud.open_verification(
+                conn, repo=REPO, pr_number=6, pr_title="t", merged_at=NOW, now=NOW
+            )
+            await crud.close_verification(
+                conn,
+                repo=REPO,
+                pr_number=6,
+                verdict="pass-mechanical",
+                reason="r",
+                evidence="not json {",
+                now=NOW,
+            )
+
+    asyncio.run(go())
+    assert _w._print_verification_log(str(db), 6) is None, "the always-exit-0 contract"
+    (record,) = _scoped_records(capsys.readouterr().out)
+    assert record["evidence"] == "not json {"
+
+
+# ── a census clip SAYS it clipped, and says where the rest is ────────────
+
+
+def test_the_backlog_note_clip_is_DECLARED(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    long_note = "precondition: " + "x" * 300
+
+    async def go() -> None:
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await build_pr_verifications(conn)
+            await conn.commit()
+            await crud.open_verification(
+                conn, repo=REPO, pr_number=8, pr_title="t", merged_at=NOW, now=NOW
+            )
+            await crud.record_attempt(
+                conn, repo=REPO, pr_number=8, verdict="cannot-verify", note=long_note, now=NOW
+            )
+
+    asyncio.run(go())
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    assert f"(+{len(long_note) - 120} chars — --verification-log --pr 8 shows it whole)" in out
+
+
+def test_a_short_note_carries_no_clip_marker(tmp_path, capsys):
+    """The other direction, or the marker is unconditional noise."""
+    db = tmp_path / "genesis.db"
+    _build(db, open_rows=1, parked=True)
+    _w._print_verification_backlog(str(db))
+    assert "chars —" not in capsys.readouterr().out
+
+
+def test_the_backlog_cap_notice_describes_BACKLOG_order_not_age(tmp_path, capsys, monkeypatch):
+    """list_open puts never-attempted rows before parked ones, so 'the oldest N' was
+    false the moment a parked row existed."""
+    db = tmp_path / "genesis.db"
+    _build(db, open_rows=3, parked=True)
+    from genesis.db.crud import pr_verifications as crud
+
+    real = crud.list_open
+
+    async def capped(conn, *a, **k):
+        return (await real(conn, *a, **k))[:1]
+
+    monkeypatch.setattr(crud, "list_open", capped)
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    assert "in backlog order" in out
+    assert "oldest of" not in out
+
+
+def test_the_log_reader_keeps_the_exit_0_contract_on_a_CORRUPT_database(tmp_path, capsys):
+    """MEASURED: a file that is not a database raised straight through this reader —
+    exit 1 and a traceback, against the module's always-exit-0 contract. An unreadable
+    database is its own state, reported as itself."""
+    db = tmp_path / "genesis.db"
+    db.write_bytes(b"this is not a sqlite database at all, just bytes" * 4)
+    assert _w._print_verification_log(str(db), None) is None
+    assert _w._print_verification_log(str(db), 1) is None
+    out = capsys.readouterr().out
+    assert out.count("database unreadable") == 2
+
+
+def test_the_BACKLOG_reader_keeps_the_exit_0_contract_on_a_CORRUPT_database(tmp_path, capsys):
+    """Issue #2603: the backlog reader had the log reader's defect — a traceback and
+    exit 1 on a file that is not a database."""
+    db = tmp_path / "genesis.db"
+    db.write_bytes(b"this is not a sqlite database at all, just bytes" * 4)
+    assert _w._print_verification_backlog(str(db)) is None
+    out = capsys.readouterr().out
+    assert "database unreadable" in out
+    assert "no rows" not in out, "unreadable is its own state, not an empty table"
+
+
+# ── the unscoped census: the real verdict, and a declared reason clip ──────
+
+
+def _close_one(db: Path, *, pr_number: int, reason: str, verdict: str = "pass-with-measured-gaps"):
+    async def go() -> None:
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await build_pr_verifications(conn)
+            await conn.commit()
+            await crud.open_verification(
+                conn, repo=REPO, pr_number=pr_number, pr_title="t", merged_at=NOW, now=NOW
+            )
+            await crud.close_verification(
+                conn,
+                repo=REPO,
+                pr_number=pr_number,
+                verdict=verdict,
+                reason=reason,
+                evidence='{"x":1}',
+                now=NOW,
+            )
+
+    asyncio.run(go())
+
+
+def test_the_census_prints_the_verdict_the_row_CARRIES(tmp_path, capsys):
+    """Lost with the round-3 test rewrite; a mutation printing a constant survived."""
+    db = tmp_path / "genesis.db"
+    _close_one(db, pr_number=4, reason="r")
+    _w._print_verification_log(str(db), None)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("CLOSED")]
+    assert len(lines) == 1
+    assert lines[0].endswith("pass-with-measured-gaps")
+    assert "owner/repo#4" in lines[0]
+
+
+def test_the_census_reason_clip_is_DECLARED(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    reason = "PASS-WITH-MEASURED-GAPS — gaps: " + "y" * 400
+    _close_one(db, pr_number=11, reason=reason)
+    _w._print_verification_log(str(db), None)
+    out = capsys.readouterr().out
+    assert f"(+{len(reason) - 160} chars — --verification-log --pr 11 shows it whole)" in out
+    assert reason not in out, "the census line is the clipped one"
+
+
+def test_a_short_census_reason_is_printed_whole_and_unmarked(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _close_one(db, pr_number=12, reason="short reason")
+    _w._print_verification_log(str(db), None)
+    out = capsys.readouterr().out
+    assert "reason  : short reason\n" in out
+    assert "shows it whole" not in out, "no clip marker on a reason that fits"

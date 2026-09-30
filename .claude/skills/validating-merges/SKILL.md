@@ -75,8 +75,9 @@ and record what you concluded with
 ```bash
 python3 scripts/pr_verification.py print-schema > ~/.genesis/output/prv-<N>.json
 #   ... fill it in ...
-python3 scripts/pr_verification.py close --pr <N> --verdict <one of the four> \
-    --evidence-file ~/.genesis/output/prv-<N>.json [--note "..."] [--dry-run]
+python3 scripts/pr_verification.py close --pr <N> \
+    --evidence-file ~/.genesis/output/prv-<N>.json [--note "..."] [--dry-run] \
+    [--verdict <what you expect>] [--park]
 ```
 
 Read back what was decided, and on what evidence, with
@@ -101,20 +102,40 @@ count says anything about the other.
 
 ## The four verdicts
 
-Never pass/fail. Every PR gets exactly one of these (standing ruling):
+Never pass/fail. Every PR gets exactly one of these (standing ruling) — and **you do
+not choose it: the tool DERIVES it from your evidence document**, so the verdict
+always says what the evidence says:
 
-| `--verdict` | meaning | the row | the route |
+| derived when | verdict | the row | the route |
 |---|---|---|---|
-| `pass-mechanical` | the claim holds, measured | **CLOSED** | nothing owed |
-| `pass-with-measured-gaps` | holds, with gaps named in `scope_limits` | **CLOSED** | file the gaps if reachable |
-| `fail-intent` | the merged change does not do what it claimed | **stays OPEN** | to the USER, as a conversation |
-| `cannot-verify` | the attempt could not reach a verdict here | **stays OPEN** | see the filing rule below |
+| a claim FAILED at `MEASURED` or `READ` | `fail-intent` | **stays OPEN** | to the USER, as a conversation |
+| a claim failed only at `INFERRED` | `cannot-verify` | **stays OPEN** | measure it — a suspicion is not a finding |
+| nothing passing at `MEASURED` or `READ` | `cannot-verify` | **stays OPEN** | see the filing rule below |
+| established, controlled, no gap | `pass-mechanical` | **CLOSED** | nothing owed |
+| established, with any gap | `pass-with-measured-gaps` | **CLOSED** | file the gaps if reachable |
+
+A **gap** is anything you declared in `scope_limits`, plus what the document implies:
+no negative control, any claim at `NOT_VERIFIABLE_HERE`, any claim at `INFERRED`, and
+a named `SUSPECTED FAILURE (INFERRED)` for each claim that failed only at `INFERRED`.
+A failure is gated by tier exactly as a pass is: only an ESTABLISHED one goes to the
+user as `fail-intent`.
+They are named in the closed row's reason, so a row that did not close mechanical
+says why — and a suspected failure, which never closes a row, is written at the head
+of the open row's note, so the backlog shows it rather than your note alone.
+
+Your judgment enters in exactly one place. **`--park`** turns a document that
+derives `pass-with-measured-gaps` into `cannot-verify`: something was established,
+but nothing MATERIAL was — the measured claim is trivial next to what could not be
+reached. It is refused on anything else, and above all on a failure: **a failure is
+never parked.** `--verdict` is optional and worth passing: it states what you
+EXPECT, and if the document derives something else the tool refuses with
+"document derives X" — which catches a document that does not say what you think.
 
 **A FAIL-intent never triggers an automatic rollback** (standing ruling). It goes
 to the user as a conversation. The row stays open because the obligation is not
 discharged until the fix lands — and you are not the one who fixes it.
 
-The two non-closing verdicts **require `--note`**, and the note is the whole point
+A non-closing outcome **requires `--note`**, and the note is the whole point
 of the row staying open: it is what stops the next validator re-deriving why this
 could not be finished. It surfaces inline in the backlog as
 `ATTEMPTED 2x cannot-verify — <note>`, so a parked row announces itself. Parked
@@ -122,11 +143,9 @@ rows also sort LAST in the backlog, behind never-attempted work — they are
 typically the oldest, and an oldest-first reader would otherwise let them starve
 the work you can actually do.
 
-Three refusals the tool enforces, so you do not have to remember them: a closing
-verdict is refused when any claim in the document has `verdict: fail` (that
-document's verdict is `fail-intent`); `pass-mechanical` is refused when any claim
-is tier `NOT_VERIFIABLE_HERE` (use `pass-with-measured-gaps`, or `cannot-verify`);
-and a closing verdict refuses `--note` rather than silently discarding it.
+A closing outcome refuses `--note` rather than silently discarding it — a closed
+row's prose belongs in the evidence document's `findings`, which does not change the
+verdict. (`scope_limits` would: every entry is a gap.)
 
 ---
 
@@ -148,8 +167,11 @@ RESOURCE.**
   has and nobody has reason to get; an event that may never occur. → **Genuinely
   unverifiable. Do NOT file.** An unactionable issue burns whoever picks it up,
   and the repo already routes "cannot be picked up" to `tabled` rather than to
-  issues. Record it **on the row** — `--verdict cannot-verify --note "<the
-  precondition>"` — which leaves the obligation open and annotated, so the next
+  issues. Record it **on the row** — mark the claim verdict `unverified`, tier
+  `NOT_VERIFIABLE_HERE`, and pass
+  `--note "<the precondition>"`; a document with nothing else established derives
+  `cannot-verify`, and one with only trivial measurements can be `--park`ed. That
+  leaves the obligation open and annotated, so the next
   validator on any install sees `ATTEMPTED … cannot-verify — <your note>` in the
   backlog and re-checks it once the precondition is reachable, instead of
   re-deriving your conclusion from scratch.
@@ -221,8 +243,8 @@ to run the experiment: one three-week-old PR yielded 19 real production events,
 giving n=19 for both of its claims from a single query — the strongest evidence
 of three pilots and the cheapest to obtain. A one-day-old scheduled job gave
 n=37 runs. A hook PR had no production samples at all and needed synthetic
-probes. So oldest-merge-first (which the backlog reader already does) is right
-for a second reason: old rows are not a wall, they are the tier where the
+probes. So oldest merge first — the backlog's order within each group, after
+never-attempted rows are put ahead of parked ones — is right for a second reason: old rows are not a wall, they are the tier where the
 experiment already ran.
 
 ---
@@ -261,15 +283,17 @@ control tells those apart. A verification with no control is a story.
 
 ## Evidence: what the record has to carry
 
-The evidence document is validated by `scripts/pr_verification.py`; its shape was
-derived from pilot validations rather than designed, because each pilot broke a
-field the obvious version would have had:
+The evidence document is validated by a strict model
+(`genesis.session_awareness.pr_evidence`): every prose field must be a non-blank
+string, an unknown key is refused rather than dropped, and the refusal names the
+exact field path. Its shape was derived from pilot validations rather than designed,
+because each pilot broke a field the obvious version would have had:
 
-- **`repo` + `pr`** — the ledger row's KEY, both halves. A document naming only
-  its PR number can be pointed at a different repository's open row for the same
-  number, and a closed row cannot be amended, so that mis-bind would be permanent
-  and invisible. `--repo` is a disambiguator, never the binding; if it contradicts
-  the document the write is refused rather than resolved either way.
+- **`repo` + `pr`** — the ledger row's KEY, both halves. The document names the
+  row it verifies, and the row must be OPEN for exactly that pair; a closed row
+  cannot be amended, so a mis-bind would be permanent. `--pr` must ALSO equal the
+  document's `pr` — a deliberate second copy, because a typo inside the document
+  would otherwise close the wrong row with nothing to catch it.
 - **`deploy.method` + detail** — because ancestry lies (above). HOW deployment
   was established travels with the row.
 - **`claims[]` with a per-claim TIER** (`MEASURED` / `INFERRED` / `READ` /
@@ -277,46 +301,35 @@ field the obvious version would have had:
   binary. One PR's two declared claims resolved into four sub-claims across three
   tiers; a single verdict would have been true of some of it and false of the
   rest. An INFERRED claim is one you composed from two measured facts — label it,
-  never promote it.
+  never promote it. Each claim's verdict is `pass`, `fail` or `unverified`, and
+  `unverified` goes with `NOT_VERIFIABLE_HERE` and only with it: the model refuses
+  either without the other, so a claim nobody could check is never written down as
+  a pass or as a failure.
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
-  a vacuous one without them. **Required for `pass-mechanical`.** Not for
-  `pass-with-measured-gaps`: "this claim has no control" is a legitimate measured
-  gap, and demanding one there would leave the honest document no verdict at all.
-- **`scope_limits[]`** — what this install could not reach, named. Required for
-  `pass-with-measured-gaps`, whose entire content is WHICH gaps.
+  a vacuous one without them. A document with none can still close, but never as
+  `pass-mechanical`: "no negative control" becomes a named gap.
+- **`scope_limits[]`** — what this install could not reach, named. Each one is a
+  gap, so any entry makes the outcome `pass-with-measured-gaps`.
 - **`findings[]`, each with a DISPOSITION** — an undispositioned finding is a
   drop wearing a record, and the validator refuses one.
 
-**THE FLOOR: at least one claim must be passing AND at tier `MEASURED` or `READ`
-before any verdict can close a row.** `INFERRED` does not count — an inferred claim
-never enters permanent record in the grammar of a fact, and a discharged obligation
-is permanent record. This exists because the first version of the closer had only
-disqualifying rules, and a document whose claims were EVERY ONE of them
-`NOT_VERIFIABLE_HERE` satisfied all of them and closed the row having established
-nothing. If that is your document, the verdict is `cannot-verify`: the row stays
-open, your note travels with it, and the next validator inherits what you found.
+**Nothing closes a row unless something was established** — at least one claim
+passing at `MEASURED` or `READ`. `INFERRED` does not count: an inferred claim never
+enters permanent record in the grammar of a fact, and a discharged obligation is
+permanent record. A document that establishes nothing derives `cannot-verify`: the
+row stays open, your note travels with it, and the next validator inherits what you
+found.
 
-A **non-closing** verdict is bound to the claims too, as exact converses:
-
-- **A failing claim means `fail-intent`, and nothing else.** A document with a
-  measured failure is refused under every other verdict — including
-  `cannot-verify`, because parking a measured failure skips the conversation the
-  standing ruling requires.
-- **`cannot-verify` is refused only when the document reached EVERYTHING** — every
-  claim passing and at `MEASURED` or `READ`, which is the one case where a passing
-  verdict is available. Inferred, unreachable or partial is exactly what it is for.
-
-That second rule is stated as the complement of the floor on purpose. Written the
-obvious way — "requires a `NOT_VERIFIABLE_HERE` claim" — it left a document whose
-claims were all `INFERRED` with no legal verdict at all: every one of the four
-refused, and the two refusals pointed at each other. The only way out was to
-relabel the tier, which is the tool paying you to falsify the one field it exists
-to protect. If you ever find a document the tool will not accept under ANY verdict,
-that is a defect in the tool — file it; do not edit the evidence to fit.
-
-The row stays open either way, so none of this is about protecting the ledger from
-a false closure: the row is what the next validator reads, and a verdict its own
-evidence contradicts is worse than no verdict.
+**Why the verdict is derived rather than chosen**, because the obvious version was
+built first and failed instructively. It took the verdict from the validator and
+policed it with a growing list of refusal rules, and twice, one fix apart, the rules
+contradicted each other: a document whose claims were all `INFERRED`, and later one
+with a single measured claim and no control, were each refused under ALL FOUR
+verdicts, with the refusals pointing at each other. The only way out was to relabel
+a tier — the tool paying you to falsify the one field it exists to protect. A
+derived verdict cannot do that: every valid document has exactly one, by
+construction. If you ever find a document the tool will not accept at all, that is
+a defect in the tool — file it; do not edit the evidence to fit.
 
 ---
 
