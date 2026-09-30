@@ -94,6 +94,7 @@ try:
         has_trailing_override,
         mentions,
         split_segments,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -132,6 +133,21 @@ _CWD_UNKNOWN = object()
 # detect the same set of commits or the marker cleared drifts from the one
 # checked. Guarded by test_commit_pattern_matches_git_dash_c_and_dash_C.
 _COMMIT_PATTERN = re.compile(r"\bcommit\b")
+_GIT_WORD = re.compile(r"\bgit\b")
+
+#: A git command whose SUBCOMMAND the parse cannot read: a variable, a
+#: substitution or an escape stands where it goes, or an option before it that
+#: the parser cannot classify. It may be a commit, and nothing in its text says
+#: so, which is why the early exit below cannot be what lets it through. The
+#: push guard refuses the same shape for the same reason.
+_HIDDEN_GIT_VERB_MSG = (
+    "BLOCKED: this command runs git with a subcommand review enforcement cannot "
+    "read (a variable, a substitution or an escape stands where it goes, or an "
+    "option before it that the parser cannot classify), so it cannot tell "
+    "whether it commits.\n"
+    "To proceed: write the git subcommand out literally, and pass any option "
+    "the parser does not recognise after it or not at all."
+)
 
 
 def _commit_override(command: str, segs: list) -> str:
@@ -1106,6 +1122,23 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
             return None
         remote_names.add(name.strip())
         url = rest.rsplit(" (", 1)[0].strip()
+        # A remote whose listed URL is EMPTY gives gh nothing to resolve. The common
+        # cause: any `remote.<name>.*` key makes git list the name, so one global key
+        # (say `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in
+        # every repository that has no remote (MEASURED: a bare `origin<TAB>` line).
+        # It is not the only cause — an empty or whitespace-only `url`, a remote with
+        # only gh's own `gh-resolved` key, and an `insteadOf` rewrite that empties
+        # the URL all list the same way — and the skip covers every one, because the
+        # test is on the listed URL, not on how it came to be empty. A URL git does
+        # know is listed on its own line, a push-only URL included.
+        #
+        # Skipping it hides nothing ONLY because gh resolves a repository from this
+        # same `git remote -v` listing: MEASURED with gh 2.101 and git 2.43, gh
+        # answered "no git remotes found" in each of the states above. A gh that
+        # resolved from raw config instead would turn them into repositories this
+        # gate skips; re-check this premise when the gh version moves.
+        if not url:
+            continue
         if not _is_local_remote_url(url):
             return True
     # Every listed remote's fetch AND push URL is a filesystem path by now.
@@ -1341,6 +1374,14 @@ def main() -> None:
     # identical to the invalidator's early-out, or a commit this gate checks can
     # leave that module's marker standing.
     if not mentions(command, _COMMIT_PATTERN):
+        # Nothing in the text names a commit, and one could still run: a git
+        # subcommand the shell builds says nothing about which it is. Asked only
+        # when the text names git, and answered by the parse, so an ordinary
+        # variable in an ARGUMENT is not refused. The invalidator's early exit is
+        # deliberately NOT widened to match: it runs after a command succeeds,
+        # and every command this branch catches is refused before it runs.
+        if mentions(command, _GIT_WORD) and "git" in unresolved_verb_programs(command):
+            _deny(_HIDDEN_GIT_VERB_MSG)
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through

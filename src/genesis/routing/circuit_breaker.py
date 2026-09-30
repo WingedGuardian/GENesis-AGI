@@ -390,7 +390,10 @@ class CircuitBreakerRegistry:
         # has no available provider. When absent (e.g. unit tests that build a
         # bare registry), compute_degradation_level falls back to the legacy
         # provider-count behavior. See genesis.routing.essential.
-        self._essential_sites = essential_sites or {}
+        # None and {} are DIFFERENT: None is "no map" (legacy); {} is a map in
+        # which every present essential site is blocked by configuration, which
+        # is still coverage mode (nothing uncovered, so NORMAL).
+        self._essential_sites = essential_sites
         self._breakers: dict[str, CircuitBreaker] = {}
         self.load_state()
 
@@ -707,6 +710,17 @@ class CircuitBreakerRegistry:
         """
         return any(self._provider_available(p) for p in chain)
 
+    def refresh_essential_sites(self, essential_sites: dict[str, list[str]] | None) -> None:
+        """Replace the essential map after a routing reload.
+
+        Only a registry that was BUILT with a map is refreshed: a bare or
+        standalone registry stays on the legacy check, as it was constructed.
+        Without this, a map built while an overlay blocked every essential site
+        (``{}``, coverage mode, NORMAL) would outlive the fix until a restart.
+        """
+        if self._essential_sites is not None:
+            self._essential_sites = essential_sites
+
     def uncovered_essential_sites(self) -> list[str]:
         """Essential cloud sites that currently have NO available provider
         (breaker not OPEN and key present).
@@ -716,7 +730,7 @@ class CircuitBreakerRegistry:
         surfaces agree on what 'critical' means.
         """
         uncovered: list[str] = []
-        for site, providers in self._essential_sites.items():
+        for site, providers in (self._essential_sites or {}).items():
             if not any(self._provider_available(p) for p in providers):
                 uncovered.append(site)
         return uncovered
@@ -749,7 +763,7 @@ class CircuitBreakerRegistry:
         if ollama_providers and ollama_down == len(ollama_providers):
             return DegradationLevel.LOCAL_COMPUTE_DOWN
 
-        if self._essential_sites:
+        if self._essential_sites is not None:
             if self.uncovered_essential_sites():
                 return DegradationLevel.ESSENTIAL
             return DegradationLevel.NORMAL
@@ -757,8 +771,8 @@ class CircuitBreakerRegistry:
         # Legacy provider-count fallback (no essential map injected). In a
         # correctly-configured install the essential map is always present
         # (build_essential_provider_map), so reaching here in production means it
-        # came back empty (a misconfig that essential.py already logs at build
-        # time) and degradation is now the count-based heuristic that can
+        # found NO essential site at all (a misconfig that essential.py already
+        # logs at build time) and degradation is now the count-based heuristic that can
         # false-alarm "all paid down => ESSENTIAL". Surface it ONCE per instance
         # so the fallback is never silent; bare unit-test registries legitimately
         # hit this and warn once, which is harmless.
@@ -766,7 +780,7 @@ class CircuitBreakerRegistry:
             logger.warning(
                 "Degradation is running the LEGACY provider-count fallback: no "
                 "essential-site map was injected. In production this means "
-                "build_essential_provider_map returned empty (a misconfiguration) "
+                "build_essential_provider_map found no essential site (a misconfiguration) "
                 "and coverage-based degradation is disabled — cloud degradation may "
                 "false-alarm. Verify the essential provider config."
             )

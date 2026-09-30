@@ -414,7 +414,8 @@ unset TMUX
 # express (sourcing only ever overlays).
 _CC_LEVERS="GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
 GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS \
-GENESIS_CC_PERMISSION_MODE GENESIS_CC_SLOT_OAUTH"
+GENESIS_CC_PERMISSION_MODE GENESIS_CC_SLOT_OAUTH \
+GENESIS_CC_WEB_OVERRIDE"
 
 # The pre-source environment, so a re-read can restore this exact baseline
 # instead of whatever the previous read left behind. Normally EMPTY: an SSH
@@ -1221,6 +1222,28 @@ else
     # ${_TMPDIR_UNSET} would be unbound.)
     _TMPDIR_UNSET="unset TMPDIR CLAUDE_CODE_TMPDIR && "
 fi
+# The WebSearch override (plugins/genesis-web-override) for interactive slots
+# only: GENESIS_CC_WEB_OVERRIDE=1 in cc-slot.env turns on Claude Code's function
+# hooks for this pane and loads the plugin from this checkout with --plugin-dir,
+# so it runs the code the checkout holds and nothing outside a slot loads it.
+# Decided in BOTH directions, like the temp pins: with the lever off the pane
+# unsets the flag itself, because a new session inherits the tmux SERVER's env
+# and omitting a pin is not the same as having no value. Dispatched sessions do
+# not come through this door; genesis.cc.child_env pins the flag to 0 for them.
+# Reaches NEW slots only: `-A` attaches an existing session as it was created.
+_FUNCTION_HOOKS_PIN=()
+_FUNCTION_HOOKS_UNSET="unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS && "
+_WEB_OVERRIDE_ARGS=""
+if [ "${GENESIS_CC_WEB_OVERRIDE:-}" = "1" ]; then
+    if [ -d "$GENESIS_ROOT/plugins/genesis-web-override" ]; then
+        _FUNCTION_HOOKS_PIN=(-e "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1")
+        _FUNCTION_HOOKS_UNSET=""
+        _WEB_OVERRIDE_ARGS="--plugin-dir $(printf '%q' "$GENESIS_ROOT/plugins/genesis-web-override") "
+    else
+        echo "cc-slot: warning: GENESIS_CC_WEB_OVERRIDE=1 but $GENESIS_ROOT/plugins/genesis-web-override" \
+             "is missing; this slot starts without it" >&2
+    fi
+fi
 # The pane command is re-parsed by a fresh shell, so quote both paths before
 # interpolating them into its command string. `%q` preserves checkout paths
 # containing spaces, shell metacharacters, or newlines.
@@ -1231,5 +1254,6 @@ exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
+    "${_FUNCTION_HOOKS_PIN[@]}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

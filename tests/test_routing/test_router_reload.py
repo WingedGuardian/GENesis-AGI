@@ -403,3 +403,28 @@ def test_reload_config_invalidates_floor_provider_cache(monkeypatch):
     )
     router.reload_config(_make_config())
     assert called["n"] == 1
+
+
+def test_reload_rebuilds_the_essential_coverage_map(tmp_path):
+    """Which essential sites are blocked comes from the config, so a reload
+    after an overlay is fixed must restore their coverage, not keep the map
+    built while they were blocked."""
+    from genesis.routing.router import Router
+
+    old_config = _make_config()
+    breakers = CircuitBreakerRegistry(
+        old_config.providers, state_file=tmp_path / "b.json", persist=False, essential_sites={}
+    )
+    router = Router(
+        config=old_config,
+        breakers=breakers,
+        cost_tracker=MagicMock(),
+        degradation=MagicMock(),
+        delegate=AsyncMock(),
+    )
+    new_config = _make_config(sites={
+        "9_fact_extraction": CallSiteConfig(id="9_fact_extraction", chain=["prov_b"]),
+    })
+    router.reload_config(new_config)
+
+    assert breakers._essential_sites == {"9_fact_extraction": ["prov_b"]}

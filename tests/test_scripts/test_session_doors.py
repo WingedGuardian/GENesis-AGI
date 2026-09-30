@@ -1733,3 +1733,61 @@ class TestBypassTempDirIsValidatedNotAssumed:
         assert "if _cc_resolve_tmpdir; then" in body, (
             "the slot path no longer calls the shared resolution"
         )
+
+
+class TestWebOverrideLever:
+    """GENESIS_CC_WEB_OVERRIDE=1 in ~/.genesis/cc-slot.env gives a NEW slot the
+    WebSearch override: Claude Code's function-hooks flag pinned on, and the
+    plugin loaded from this checkout with --plugin-dir. Dispatched sessions never
+    come through this door; CCInvoker pins the flag to 0 (genesis.cc.child_env).
+
+    Decided in both directions. A new session's env comes from the tmux SERVER
+    (measured above), so leaving the flag out of the create line would hand the
+    pane whatever a server started earlier holds; with the lever off the pane
+    unsets it instead (review: a removed lever kept the override on).
+    """
+
+    @staticmethod
+    def _lever(run, value: str | None) -> None:
+        env_file = run.home / ".genesis" / "cc-slot.env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("" if value is None else f"GENESIS_CC_WEB_OVERRIDE={value}\n")
+
+    @staticmethod
+    def _plugin(run) -> Path:
+        d = run.checkout / "plugins" / "genesis-web-override"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_on_pins_the_flag_and_loads_the_plugin_from_the_checkout(self, door):
+        run, log, _sessions, _listing, _panes = door
+        plugin = self._plugin(run)
+        self._lever(run, "1")
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        assert "-e CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1" in line, line
+        assert line.index("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=") < line.index(" LANG="), line
+        assert f"claude --plugin-dir {plugin} " in line, line
+        assert "unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS" not in line, line
+
+    @pytest.mark.parametrize("value", [None, "0", "yes"])
+    def test_anything_but_1_unsets_the_flag_in_the_pane(self, door, value):
+        run, log, _sessions, _listing, _panes = door
+        self._plugin(run)
+        self._lever(run, value)
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        assert "-e CLAUDE_CODE_ENABLE_FUNCTION_HOOKS" not in line, line
+        assert "unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS && " in line, line
+        assert "--plugin-dir" not in line, line
+
+    def test_on_without_the_plugin_warns_and_starts_without_it(self, door):
+        run, log, _sessions, _listing, _panes = door
+        self._lever(run, "1")
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        assert "GENESIS_CC_WEB_OVERRIDE=1 but" in result.stderr, result.stderr
+        line = _new_session_line(log)
+        assert "--plugin-dir" not in line and "unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS && " in line, line

@@ -47,10 +47,7 @@ async def _write_and_read_origin(monkeypatch, origin_env: str | None) -> str:
             obs_id = await tools["observation_write"].fn(
                 content="the user prefers Rust",
                 source="inbox_evaluation",
-                # user_signal: an untrusted session may no longer write a
-                # reserved type such as user_model_delta at all
-                # (tests/test_security/test_untrusted_observation_lock.py).
-                type="user_signal",
+                type="user_model_delta",
             )
             assert obs_id and obs_id != "duplicate_skipped"
             cursor = await real_db.execute(

@@ -16,6 +16,7 @@ retrieved from — always known at retrieval time, unlike the per-item store-tim
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 
 from genesis.security.sanitizer import (
@@ -473,6 +474,11 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         "surplus_scheduler",
         "task_executor",
         "wal_health_monitor",
+        # Root Tailscale watchdog's events, read by the awareness tick
+        # (resilience/tailscale_watchdog_events.py). The observation carries
+        # only Genesis-authored text and a validated IPv4 address: the watchdog
+        # never reads a peer's hostname, which another tailnet member chooses.
+        "tailscale_watchdog_monitor",
         # Follow-up hygiene watchdog (awareness/loop.py _FU_WATCHDOG_SOURCE) — a
         # Genesis-authored infrastructure alert, in-server first-party monitoring.
         # (It embeds a truncated follow-up snippet; that snippet's own hygiene is
@@ -567,86 +573,47 @@ _CHANNEL_STAMPED_OBS_SOURCES: frozenset[str] = frozenset({"retrospective", "cc_d
 #: intake finding: ``intake:<IntakeSource.value>``.
 _INTAKE_SOURCE_PREFIX = "intake:"
 
-#: Observation TYPES Genesis's own pipelines write and then act on: reflection
-#: escalations and summaries, questions, self-assessments, ego escalations and
-#: dispatch outcomes, update and version notices, infrastructure alerts,
-#: user-model deltas, detected tasks, skill proposals, provider failures. An
-#: UNTRUSTED session may not write them through ``observation_write``: many of
-#: their readers select, count, dedupe or resolve by type with no origin filter,
-#: so a forged row would steer or suppress that pipeline.
-#:
-#: ``tests/test_security/test_untrusted_observation_lock.py`` derives every type
-#: a reader keys on (raw SQL, and every literal passed to the observations CRUD
-#: helpers) and fails until each is in this set or in its short list of types an
-#: untrusted session may write. Polarity is allowlist: an unclassified new type
-#: fails CI rather than passing silently.
-RESERVED_OBSERVATION_TYPES: frozenset[str] = frozenset(
-    {
-        "cc_cap_empty_event",
-        "cc_version_available",
-        "cc_version_baseline",
-        "conversation_pivot",
-        "escalation_to_user_ego",
-        "execution_outcome",
-        "genesis_update_available",
-        "genesis_update_failed",
-        "genesis_version_baseline",
-        "github_account_activity",
-        "infrastructure_alert",
-        "init_degradation",
-        "learning_regression",
-        "light_escalation_pending",
-        "light_escalation_resolved",
-        "light_reflection",
-        "micro_reflection",
-        "pending_question",
-        "provider_failure",
-        # Passed through a variable (reflection/scheduler.py _already_ran_this_week),
-        # which the derived test cannot see: a forged row would skip the weekly run.
-        "quality_calibration",
-        "quality_drift",
-        "reflection_observation",
-        "reflection_output",
-        "reflection_summary",
-        "self_assessment",
-        "skill_proposal",
-        "task_detected",
-        "user_model_delta",
-    }
-)
 
-#: Pipeline SOURCES that readers key on but that are not in the provenance
-#: registries above (which decide an observation's origin and are deliberately
-#: not widened here). An untrusted session may not claim these either.
-_RESERVED_EXTRA_OBS_SOURCES: frozenset[str] = frozenset(
-    {"error"},  # awareness/signals.py writes it as a signal source
-)
+#: Prefix put on the type, source and category of every observation an UNTRUSTED
+#: session writes through ``observation_write``. Genesis's own readers select by
+#: exact type/source/category (escalations, update notices, alerts, detected
+#: tasks, user-model deltas, …), so a namespaced row can never be taken for a
+#: pipeline's row, whatever name the session chose. Nothing is refused: the
+#: row still lands, under a name that says where it came from.
+UNTRUSTED_OBS_PREFIX = "untrusted:"
+
+#: Substrings that readers match with ``LIKE '%x%'`` on these columns. A
+#: namespaced value has each one broken with a hyphen, so no substring reader
+#: matches it either. ``tests/test_security/test_untrusted_observation_namespace.py``
+#: derives every LIKE pattern from the source tree and fails on one this list
+#: does not cover.
+_LIKE_READER_SUBSTRINGS: tuple[str, ...] = ("reflection", "triage")
+
+#: The highest priority an untrusted row may carry: ``critical`` pages the user
+#: on Telegram (``outreach/scheduler.py``) whatever the type.
+_UNTRUSTED_MAX_PRIORITY = "high"
 
 
-def untrusted_observation_refusal(source: str, type_: str) -> str | None:
-    """Why an UNTRUSTED session may not write this observation, or ``None``.
+def _break_like_substrings(value: str) -> str:
+    for word in _LIKE_READER_SUBSTRINGS:
+        value = re.sub(re.escape(word), word[:2] + "-" + word[2:], value, flags=re.IGNORECASE)
+    return value
 
-    Applies only to writes from a session whose origin is not owner/first-party
-    (the caller checks that). Refuses a reserved type, and any ``source`` that
-    names a Genesis pipeline: the first-party, external-pipeline, user-content
-    and channel-stamped registries above, plus the ego-redirect and intake
-    prefixes. Those sources are what readers key on to trust a row, so an
-    untrusted session claiming one would impersonate that pipeline.
+
+def namespace_untrusted_observation(
+    *, source: str, type_: str, category: str | None, priority: str
+) -> tuple[str, str, str | None, str]:
+    """``(source, type, category, priority)`` for a write from an untrusted session.
+
+    Each name gets :data:`UNTRUSTED_OBS_PREFIX`, with any substring a LIKE reader
+    matches broken, and ``critical`` drops to ``high``. Applied only to writes
+    from a session whose origin is not owner/first-party (the caller checks).
     """
-    src = (source or "").strip().lower()
-    kind = (type_ or "").strip().lower()
-    if kind in RESERVED_OBSERVATION_TYPES:
-        return f"observation type {type_!r} is reserved for Genesis's own pipelines"
-    if (
-        src in _FIRST_PARTY_OBS_SOURCES
-        or src in _EXTERNAL_OBS_SOURCES
-        or src in _USER_CONTENT_OBS_SOURCES
-        or src in _CHANNEL_STAMPED_OBS_SOURCES
-        or src in _RESERVED_EXTRA_OBS_SOURCES
-        or src.startswith((_EGO_REDIRECT_SOURCE_PREFIX, _INTAKE_SOURCE_PREFIX))
-    ):
-        return f"observation source {source!r} names a Genesis pipeline"
-    return None
+    def ns(value: str) -> str:
+        return UNTRUSTED_OBS_PREFIX + _break_like_substrings(value or "")
+
+    capped = _UNTRUSTED_MAX_PRIORITY if (priority or "").strip().lower() == "critical" else priority
+    return ns(source), ns(type_), (ns(category) if category else category), capped
 
 
 def _intake_observation_origin(source: str) -> str | None:

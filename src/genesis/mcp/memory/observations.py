@@ -9,8 +9,8 @@ from genesis.db.crud import observations
 from genesis.memory.provenance import (
     ORIGIN_FIRST_PARTY,
     ORIGIN_OWNER,
+    namespace_untrusted_observation,
     session_origin_from_env,
-    untrusted_observation_refusal,
 )
 
 from ..memory import mcp
@@ -37,17 +37,19 @@ async def observation_write(
 ) -> str:
     """Write processed reflection/observation. Returns observation_id.
 
-    A session running over untrusted content may not write a reserved type or
-    claim a Genesis pipeline's source (see ``untrusted_observation_refusal``).
+    From a session running over untrusted content, the row is stored with
+    ``untrusted:`` in front of its type, source and category, and ``critical``
+    priority becomes ``high`` (``provenance.namespace_untrusted_observation``),
+    so it can never pass for one of Genesis's own pipeline rows.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
     origin = session_origin_from_env() or ORIGIN_FIRST_PARTY
     if origin not in (ORIGIN_OWNER, ORIGIN_FIRST_PARTY):
-        refusal = untrusted_observation_refusal(source, type)
-        if refusal:
-            raise ValueError(f"observation_write refused: {refusal}")
+        source, type, category, priority = namespace_untrusted_observation(
+            source=source, type_=type, category=category, priority=priority,
+        )
     result = await observations.create(
         memory_mod._db,
         id=str(uuid.uuid4()),

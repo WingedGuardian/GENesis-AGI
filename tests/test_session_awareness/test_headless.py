@@ -69,6 +69,7 @@ async def test_ok_returns_stdout_and_isolated_env(tmp_path, monkeypatch):
     """Zero exit → ok + stdout; child env carries GENESIS_CC_SESSION=1 and
     never GENESIS_SESSION_ORIGIN (WS-3 pop invariant)."""
     monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "should-never-leak")
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS", "1")
     fake = _fake_claude(
         tmp_path,
         """
@@ -78,6 +79,7 @@ async def test_ok_returns_stdout_and_isolated_env(tmp_path, monkeypatch):
             "result": "hi",
             "cc": os.environ.get("GENESIS_CC_SESSION"),
             "origin": os.environ.get("GENESIS_SESSION_ORIGIN"),
+            "fh": os.environ.get("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"),
         }))
         """,
     )
@@ -88,6 +90,7 @@ async def test_ok_returns_stdout_and_isolated_env(tmp_path, monkeypatch):
     payload = json.loads(res["stdout"])
     assert payload["cc"] == "1"
     assert payload["origin"] is None
+    assert payload["fh"] == "0"  # dispatched pins (genesis.cc.child_env)
 
 
 @pytest.mark.asyncio

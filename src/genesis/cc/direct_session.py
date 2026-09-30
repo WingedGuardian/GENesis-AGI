@@ -1674,6 +1674,7 @@ class DirectSessionRunner:
             strict_mcp_config=strict_mcp,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
             roster_eligible=roster_eligible,
+            caller_tag=f"direct_session.{request.profile}",
             **routing,
         )
 

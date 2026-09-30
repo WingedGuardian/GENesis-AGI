@@ -1,7 +1,8 @@
 ---
 name: youtube-fetch
 description: >
-  Fetches YouTube video metadata and transcripts using yt-dlp. Activate
+  Fetches YouTube video metadata and transcripts (genesis web_fetch MCP
+  tool first, yt-dlp via Bash as the fallback). Activate
   when the user shares a YouTube URL (youtube.com, youtu.be), asks to
   'fetch this video', 'get the transcript', 'what does this video say',
   'summarize this YouTube video', or references video content that needs
@@ -12,13 +13,28 @@ description: >
 
 ## Overview
 
-This skill retrieves YouTube video content (metadata and transcripts)
-using yt-dlp. WebFetch does not work reliably for YouTube (dynamic
-content, SSL issues). yt-dlp is the reliable alternative.
+This skill retrieves YouTube video content (metadata and transcripts).
+CC's built-in WebFetch only gets the page shell, not what the video says
+(a PreToolUse hook blocks it for YouTube).
 
-**Prerequisite:** `yt-dlp` must be installed (`pip install yt-dlp`).
+**Primary path — the genesis `web_fetch` MCP tool.** Call
+`mcp__genesis-health__web_fetch` with the video URL (or `urls=[...]` for a
+batch). For a YouTube video it runs yt-dlp in Python and returns the title,
+channel, description and transcript, choosing captions in the video's own
+language (manual over automatic), with a
+`Transcript source` line and a `caption` field giving the track and its
+provenance. It needs no shell, so it also works in background sessions. The
+video text arrives inside `<external-content>` markers, because captions and
+descriptions are written by whoever uploaded the video. If it reports
+`youtube_error`, read the error; the rest of the result is the page's title and
+description. In a `urls=[...]` batch, a video's entry is its transcript result
+when yt-dlp succeeds and the ordinary page entry when it does not.
 
-## Workflow
+**Fallback — yt-dlp via Bash** (foreground sessions only), when `web_fetch` is
+unavailable or you need a specific track. The workflow below is that fallback.
+`yt-dlp` is a Genesis dependency, installed in the venv.
+
+## Workflow (Bash fallback)
 
 1. Ensure yt-dlp is available (install if needed):
    ```
@@ -113,7 +129,6 @@ content, SSL issues). yt-dlp is the reliable alternative.
    Avoid `--sub-langs all`: it requests every translation pair the video exposes,
    which is hundreds to thousands of tracks.
 
-7. If SSL errors occur, add `--no-check-certificate`.
 
 ## Output Format
 
@@ -146,7 +161,8 @@ variable across a batch will clean the wrong file.
 ### Single Video
 **Input:** "What does this video talk about? https://youtu.be/abc123"
 
-**Action:** Run steps 1-4, return metadata + cleaned transcript.
+**Action:** Call `web_fetch` with the URL; return its metadata and transcript.
+(Bash fallback: steps 1-4.)
 
 ### Batch
 **Input:** User provides 4 YouTube URLs for research compilation.

@@ -496,6 +496,16 @@ verified: 18e41e1e1 2026-09-23
   empty, and the pane command unsets them itself: this script ends in
   `exec tmux`, which STARTS the server every later slot inherits from, and
   omitting a pin is not the same as having no value.
+  The `GENESIS_CC_WEB_OVERRIDE` cc-slot lever is decided the same way in both
+  directions: set to `1`, a new slot pins `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`
+  and loads `plugins/genesis-web-override` from the checkout with `--plugin-dir`
+  (Claude Code's `WebSearch` answered by the Genesis chain); otherwise the pane
+  unsets the flag. Every dispatched `claude -p` child pins it to `0` instead,
+  through `genesis.cc.child_env.pin_dispatched_env`, because Claude Code falls
+  back to a server-side default when it is unset.
+  `tests/test_cc/test_child_env.py` finds the spawn sites from the source (a
+  `claude -p` argv, or the dispatched marker) and fails on one that skips the
+  pin; an argv built at run time is outside what it can see.
   Recovering a slot that is alive but running no claude — detecting it, and
   rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
@@ -517,9 +527,13 @@ verified: 18e41e1e1 2026-09-23
   the canonical `build_mcp_config("none")` (the old hand-counted `parents[2]` path pointed
   at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
   *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
-  `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
-  `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
-  `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
+  `build_reflection_disallowed`, `Bash` included, keeping the reads it needs plus the optional
+  `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
+  Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
+  `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; the video text is returned inside the keyed untrusted-content boundary, and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
+  MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
+  judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
   memory-provenance work): `observation_write` stamps the session origin
   (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and BOTH
@@ -531,16 +545,15 @@ verified: 18e41e1e1 2026-09-23
   rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
   pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
   — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
-  stamping is in the follow-up). (3) The write side is locked too: `observation_write`
-  from an untrusted session refuses a reserved type (`provenance.RESERVED_OBSERVATION_TYPES`:
-  reflection escalations/summaries, questions, self-assessments, ego escalations and dispatch
-  outcomes, update notices, infrastructure alerts, user-model deltas, detected tasks, …) and
-  any source a Genesis pipeline owns (the provenance source registries plus the
-  ego-redirect/intake prefixes). A derived test enumerates the type/source LITERALS readers
-  key on (raw SQL, and every argument to the observations CRUD helpers, mapped through their
-  signatures) and fails on an unclassified one; a literal held in a variable is not seen.
-  While the inbox judge still has `Bash` (on main, before #2568) the lock is defense in depth
-  for it, not a boundary.
+  stamping is in the follow-up). (3) Writes are namespaced too: `observation_write` from an
+  untrusted session stores the row with `untrusted:` in front of its type, source and category
+  (substrings that LIKE readers match, such as `reflection` and `triage`, are broken) and caps
+  `critical` at `high` (`provenance.namespace_untrusted_observation`). Nothing is refused, so
+  gateway `task_detected` and the inbox judge's `user_signal` still land; no exact-name reader
+  can take them for a pipeline's row. The user-ego world snapshot reads
+  `untrusted:user_signal` and renders it inside the untrusted-content boundary. A test derives
+  every LIKE pattern readers apply to these columns (raw SQL and the CRUD `*_like`/`source_prefix`
+  keywords) and fails if one matches a namespaced value.
   **WS-3 observation write-provenance + laundering-critical read exclusions (PR-1, built
   2026-08-22):** origin is now definite at the WRITE boundary — the CRUD chokepoint
   (`db/crud/observations.py` `create()`/`upsert()` → `derive_observation_origin`) classifies
@@ -1778,7 +1791,8 @@ verified: 788dd9a9 2026-09-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (LIVE, producer only — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic, consumer
+  manual-invoke only — nothing dispatches a validator yet — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -1789,9 +1803,24 @@ verified: 788dd9a9 2026-09-06
   `get_actionable`, morning report via `get_pending`) would surface these as
   actionable work, and they are a ledger for a validator, not work — see the
   `20260906234824_pr_verifications` migration docstring for the full
-  New-Store-Gate justification. The CONSUMER (the Wave-3 validator session) does
-  not exist yet; today's reader is
-  `scripts/repo_pulse_worker.py --verification-backlog`. `doc_paths.is_doc_path`
+  New-Store-Gate justification. The CONSUMER is the **validator session**
+  (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
+  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  validator's evidence document by `session_awareness/pr_evidence.py` (a strict
+  pydantic model plus a total decision tree), never asserted by the caller — a
+  caller-asserted design policed by refusal rules produced documents with no legal
+  verdict twice. Any second writer (an MCP tool is the anticipated one) must go
+  through that module; it lives in `src/` so it can. Only a PASS verdict discharges
+  an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
+  nobody could verify says why instead of looking untouched. The one non-obvious
+  invariant, because the obvious one is false: a PASS verdict implies the row is
+  closed, but **NOT** the converse — a closed row may carry no verdict at all, and
+  most do, because the docs-path exemption discharges rows a validator never
+  looked at. `status` means "obligation discharged"; only `verdict` says a
+  validator concluded anything. The verdict vocabulary and column names live with
+  the code (`crud/pr_verifications.py`) rather than here, since a four-value set
+  invented before the tool had run once is the kind of detail this map should not
+  be the second copy of. `doc_paths.is_doc_path`
   is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
   import `scripts/`), held in parity by
   `tests/test_session_awareness/test_doc_paths.py`.
@@ -2929,7 +2958,12 @@ verified: f24c15e9 2026-09-05
   the default-route link `AdministrativeState=configured`, so the posture check
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
-  docs/reference/network-resilience.md).
+  docs/reference/network-resilience.md). The root Tailscale watchdog
+  (`genesis-tailscale-watchdog.timer`) is reported by its unit-file state only
+  (`tailscale_watchdog_unit_state`, beside `tailscaled_loaded`, which gates the
+  `tailscale_watchdog_absent` posture rule); its `/run` file is event data for the
+  awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
+  the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
