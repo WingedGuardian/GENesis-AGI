@@ -606,7 +606,11 @@ build_spec:                # REQUIRED for verdict: build — omit otherwise
 - `intended_paths` should stay within capability trees (modules, skills,
   MCP tools, tests, docs). A build that needs core-subsystem changes is
   `needs_discussion`, not `build`.
-- BUILD items never create follow-ups — the build lane owns their lifecycle.
+- When the build lane is live it owns BUILD items (greenlight card or
+  calibration row) and no follow-up is created. When the lane is off, the
+  verdict is recorded as a follow-up instead — so the verdict you write is
+  what the user sees either way: `build` becomes a build request to decide,
+  `needs_discussion` a discussion item, `dont_build` a non-actionable record.
 - `dont_build` and `needs_discussion` items still get the full evaluation
   sections; the verdict fields ride on top, they don't replace analysis.
 

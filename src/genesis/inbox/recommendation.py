@@ -73,8 +73,10 @@ class Recommendation:
     tool_momentum: str | None = None
     tool_activity: str | None = None
     tool_maturity: str | None = None
-    # Capability-build verdict (only for capability-notepad drops; the build
-    # lane consumes these — follow-up creation ignores them)
+    # Capability-build verdict (only for capability-notepad drops). The live
+    # build lane consumes these; when the lane is unwired or disabled,
+    # InboxMonitor._create_follow_ups_from_eval records them as follow-ups
+    # instead (is_actionable stays False either way — see _SKIP_ACTIONS).
     verdict: str | None = None
     verdict_reason: str | None = None
     build_spec: dict | None = None

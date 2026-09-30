@@ -12,4 +12,7 @@
   valid verdict creates nothing and logs a warning. Rows are deduplicated per
   item and verdict: a re-evaluation that merely rephrases the next step adds
   nothing, while a changed verdict is recorded. With the lane live, nothing
-  changes.
+  changes. If you enable the lane later, an item's still-pending follow-up is
+  closed with a note once the lane takes that item over (when the item is next
+  re-evaluated), because the lane's greenlight card replaces it; and an item
+  the lane already holds gets no follow-up if the lane is later disabled.

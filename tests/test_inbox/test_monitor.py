@@ -3739,3 +3739,89 @@ async def test_rephrased_next_step_does_not_duplicate_build_fallback(monitor, db
             source_files=["Capabilities.md"],
         )
     assert len(await _build_follow_ups(db)) == 1
+
+
+async def _widget_candidate(db, verdict: str = "build") -> None:
+    from genesis.autonomy.build_lane import BuildLane
+    from genesis.db.crud import build_candidates
+
+    await build_candidates.create(
+        db,
+        id=f"cand-{verdict}",
+        item_key=BuildLane.item_key("Widget Skill"),
+        item_title="Widget Skill",
+        source_file="Capabilities.md",
+        verdict=verdict,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_lane_off_fallback_skips_item_the_lane_already_owns(monitor, db, lane):
+    """Mirror of the retirement: an item carded while the lane was live keeps
+    the lane's record after the lane is disabled — no fallback beside it."""
+    await _widget_candidate(db)
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-9",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_covers_already_tracked_items_and_only_pending_rows(monitor, db):
+    """The lane skips an item it already tracks (handle_eval creates nothing),
+    yet it still owns it — retirement keys on the candidate existing, so it
+    fires anyway. Every verdict's fallback row is retired while still pending;
+    a row the user moved (here: blocked) is left alone."""
+    from genesis.db.crud import follow_ups
+
+    for i, verdict in enumerate(("needs_discussion", "dont_build", "build")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(verdict),
+            batch_id=f"batch-build-10{i}",
+            source_files=["Capabilities.md"],
+        )
+    rows = await db.execute(
+        "SELECT id, content FROM follow_ups WHERE source = 'inbox_evaluation' ORDER BY rowid"
+    )
+    ids = {r["content"].split("]")[0] + "]": r["id"] for r in await rows.fetchall()}
+    assert set(ids) == {"[BUILD: NEEDS DISCUSSION]", "[BUILD: DONT_BUILD]", "[BUILD]"}
+    await follow_ups.update_status(
+        db, ids["[BUILD]"], status="blocked", blocked_reason="user parked it",
+    )
+
+    await _widget_candidate(db, verdict="needs_discussion")  # tracked earlier
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    retired = await monitor._retire_build_fallbacks_owned_by_lane(_build_eval("build"))
+
+    assert retired == 2
+    for label in ("[BUILD: NEEDS DISCUSSION]", "[BUILD: DONT_BUILD]"):
+        row = await follow_ups.get_by_id(db, ids[label])
+        assert row["status"] == "completed"
+        assert "build lane" in row["resolution_notes"].lower()
+    assert (await follow_ups.get_by_id(db, ids["[BUILD]"]))["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_retirement_is_inert_when_lane_not_live_or_item_unowned(monitor, db):
+    from genesis.db.crud import follow_ups
+
+    await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-11",
+        source_files=["Capabilities.md"],
+    )
+    # Lane not live: nothing retired even though a candidate exists.
+    await _widget_candidate(db)
+    monitor.set_build_lane(SimpleNamespace(enabled=False))
+    assert await monitor._retire_build_fallbacks_owned_by_lane(_build_eval("build")) == 0
+    # Lane live but a DIFFERENT item is evaluated: its (absent) candidate owns nothing.
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    other = _build_eval("build").replace("Widget Skill", "Gadget Skill")
+    assert await monitor._retire_build_fallbacks_owned_by_lane(other) == 0
+    assert len(await follow_ups.get_actionable(db)) == 1

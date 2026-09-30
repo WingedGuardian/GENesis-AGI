@@ -2259,7 +2259,7 @@ class InboxMonitor:
             # consumes `build` verdicts into greenlight cards. While it is live,
             # BUILD verdicts never become follow-ups; when it is unwired or
             # disabled, _create_follow_ups_from_eval surfaces them as follow-ups
-            # instead (see _BUILD_FALLBACK_MAPPING).
+            # instead (see _BUILD_FALLBACK_MAP).
             if self._build_lane is not None:
                 try:
                     await self._build_lane.handle_eval(
@@ -2271,6 +2271,16 @@ class InboxMonitor:
                 except Exception:
                     logger.warning(
                         "Build-lane eval handling failed (non-fatal)",
+                        exc_info=True,
+                    )
+                # Runs even when handle_eval raised part-way: retirement keys on
+                # a candidate row EXISTING, so it retires exactly what the lane
+                # did consume and nothing it did not.
+                try:
+                    await self._retire_build_fallbacks_owned_by_lane(output_text)
+                except Exception:
+                    logger.warning(
+                        "Retiring lane-off BUILD fallback rows failed (non-fatal)",
                         exc_info=True,
                     )
 
@@ -2702,6 +2712,83 @@ class InboxMonitor:
         lane = self._build_lane
         return lane is not None and bool(getattr(lane, "enabled", False))
 
+    @staticmethod
+    def _item_primary(title: str) -> str:
+        """Stable item identity: the tracking-normalized primary URL in the title,
+        else the lowercased title. The same derivation as BuildLane.item_key, so a
+        fallback row and a lane candidate name the same item."""
+        urls = extract_urls(title)
+        return normalize_url_line(urls[0]) if urls else title.strip().lower()
+
+    @staticmethod
+    def _build_fallback_dedup_key(primary: str, verdict: str) -> str:
+        """dedup_key of the lane-off BUILD fallback row for *primary* + *verdict*."""
+        basis = f"inbox_build_fallback|{primary}|verdict={verdict}"
+        return hashlib.sha256(basis.encode()).hexdigest()
+
+    async def _retire_build_fallbacks_owned_by_lane(self, evaluation_text: str) -> int:
+        """Retire lane-off BUILD fallback rows for items the live lane now owns.
+
+        A BUILD item evaluated while the lane was off got a fallback row (see
+        _BUILD_FALLBACK_MAP). Once the lane is enabled and the item is
+        re-evaluated, the lane records a build_candidate (and, for ``build``, a
+        greenlight card); left alone, the fallback would stay actionable as a
+        stale duplicate of that card.
+
+        Ownership is read from the candidate table, not from what handle_eval
+        returned, so every way the lane can hold an item is covered by the one
+        check: a candidate it created in this eval, a card or calibration row
+        from an earlier eval (handle_eval then skips it as already tracked), and
+        an insert race another writer won. The fallback rows of ALL three
+        verdicts for that item are retired — the lane now owns the item's
+        decision whatever the fallback had recorded. Rows are completed with a
+        note, never deleted; ones already taken up or closed are left alone.
+        """
+        if not self._build_lane_live():
+            return 0
+
+        from genesis.autonomy.build_lane import BuildLane
+        from genesis.db.crud import build_candidates, follow_ups
+        from genesis.inbox.recommendation import parse_recommendations
+
+        retired = 0
+        for rec in parse_recommendations(evaluation_text):
+            # Same filter as BuildLane.handle_eval: only these can be consumed.
+            if rec.verdict is None:
+                continue
+            title = (rec.item_title or "").strip()
+            if not title:
+                continue
+            candidate = await build_candidates.get_any_by_item_key(
+                self._db, BuildLane.item_key(title),
+            )
+            if not candidate:
+                continue
+            primary = self._item_primary(title)
+            keys = [
+                self._build_fallback_dedup_key(primary, verdict)
+                for verdict in self._BUILD_FALLBACK_MAP
+            ]
+            n = await follow_ups.retire_by_dedup_keys(
+                self._db,
+                keys,
+                note=(
+                    "Retired: the build lane is now live and owns this item "
+                    f"(build candidate {candidate.get('id', '?')}, verdict "
+                    f"{candidate.get('verdict', '?')}). This lane-off fallback "
+                    "would duplicate its greenlight/calibration record."
+                ),
+            )
+            if n:
+                logger.info(
+                    "Retired %d lane-off BUILD fallback row(s) for %r — the build "
+                    "lane now owns it",
+                    n,
+                    title,
+                )
+            retired += n
+        return retired
+
     async def _create_follow_ups_from_eval(
         self,
         evaluation_text: str,
@@ -2716,8 +2803,8 @@ class InboxMonitor:
         import hashlib
         import sqlite3
 
-        from genesis.autonomy.build_lane import build_spec_usable
-        from genesis.db.crud import follow_ups
+        from genesis.autonomy.build_lane import BuildLane, build_spec_usable
+        from genesis.db.crud import build_candidates, follow_ups
         from genesis.inbox.recommendation import parse_recommendations
 
         recs = parse_recommendations(evaluation_text)
@@ -2737,6 +2824,21 @@ class InboxMonitor:
             effective_verdict = rec.verdict
             spec_downgraded = False
             if build_fallback:
+                # The mirror of _retire_build_fallbacks_owned_by_lane: an item the
+                # lane already owns (a candidate from a period when it was live)
+                # keeps that record as its decision — the lane's own permanent
+                # dedup would skip it too — so disabling the lane afterwards must
+                # not re-ask it as a fallback beside the existing card.
+                lane_title = (rec.item_title or "").strip()
+                if lane_title and await build_candidates.get_any_by_item_key(
+                    self._db, BuildLane.item_key(lane_title),
+                ):
+                    logger.info(
+                        "Build lane not live, but %r already has a build candidate "
+                        "— no fallback row (the lane's record stands)",
+                        lane_title,
+                    )
+                    continue
                 if effective_verdict == "build" and not build_spec_usable(rec.build_spec):
                     # Parity with BuildLane._handle_build: an unusable
                     # build_spec fails closed to needs_discussion.
@@ -2792,21 +2894,19 @@ class InboxMonitor:
             # re-evaluating the same URL (or overlapping drops) never piles up
             # duplicate follow-up rows. Key on the item's primary URL
             # (tracking-normalized) or title + the next_step.
-            urls_in_title = extract_urls(title)
-            primary = (
-                normalize_url_line(urls_in_title[0]) if urls_in_title else title.strip().lower()
-            )
+            primary = self._item_primary(title)
             if build_fallback:
                 # BUILD fallback keys on stable item identity + verdict, like
                 # BuildLane.item_key: next_step is LLM prose that is rephrased
                 # across evaluations (it would duplicate the decision), while a
                 # changed verdict IS a new decision and must not be deduped away.
-                dedup_basis = f"inbox_build_fallback|{primary}|verdict={effective_verdict}"
+                # effective_verdict is a _BUILD_FALLBACK_MAP key here (checked above).
+                dedup_key = self._build_fallback_dedup_key(primary, effective_verdict)
             else:
                 dedup_basis = (
                     f"inbox_evaluation|{primary}|{(rec.next_step or '').strip().lower()}"
                 )
-            dedup_key = hashlib.sha256(dedup_basis.encode()).hexdigest()
+                dedup_key = hashlib.sha256(dedup_basis.encode()).hexdigest()
             if await follow_ups.exists_by_dedup_key(self._db, dedup_key):
                 logger.debug("Skipping duplicate inbox follow-up: %s", title)
                 continue

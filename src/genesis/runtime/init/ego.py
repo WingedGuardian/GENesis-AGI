@@ -42,9 +42,11 @@ def _is_non_actionable_infra_event(subsystem: str, event_type: str) -> bool:
     ``providers/cc.invocation_failed`` (one event per failed CC invocation) is
     gated for a sharper reason: the reactive cycle it would wake is itself a CC
     invocation, so during a CLI/network/provider outage each failure would
-    trigger another doomed call and another event. The event still reaches
-    ``health_errors`` and proactive health context; only the reactive wake-up
-    is dropped.
+    trigger another doomed call and another event. The event is still
+    persisted and visible through ``health_errors``; only the reactive wake-up
+    is dropped. It has no proactive-context projection: ProviderEscalation,
+    the listener that turns provider trouble into observations, reads only
+    ``breaker.tripped`` (and the reflex ingest only task/job failures).
     """
     if subsystem == "providers" and event_type == "cc.invocation_failed":
         return True

@@ -846,3 +846,50 @@ async def test_an_empty_string_session_id_normalizes_to_null(db):
     row = await follow_ups.get_by_id(db, fid)
     assert row["source_session"] is None
 
+
+
+# ── retire_by_dedup_keys: superseded-owner retirement (inbox BUILD fallback) ──
+
+
+async def test_retire_by_dedup_keys_completes_pending_rows_with_note(db):
+    """pending rows matching a key are completed, note appended, never deleted;
+    both lanes (follow_up and tabled) and pinned rows are covered."""
+    pinned = await follow_ups.create(db, **_BASE, pinned=True, dedup_key="k-pin")
+    plain = await follow_ups.create(db, **_BASE, dedup_key="k-plain")
+    tabled = await follow_ups.create(db, **_BASE, kind="tabled", dedup_key="k-tab")
+    await follow_ups.update_notes(db, pinned, resolution_notes="earlier note")
+
+    n = await follow_ups.retire_by_dedup_keys(
+        db, ["k-pin", "k-plain", "k-tab"], note="Retired: owner moved",
+    )
+    assert n == 3
+    for fid in (pinned, plain, tabled):
+        row = await follow_ups.get_by_id(db, fid)
+        assert row is not None
+        assert row["status"] == "completed"
+        assert row["completed_at"]
+        assert "Retired: owner moved" in row["resolution_notes"]
+    assert "earlier note" in (await follow_ups.get_by_id(db, pinned))["resolution_notes"]
+
+
+async def test_retire_by_dedup_keys_leaves_moved_and_unmatched_rows(db):
+    """Any row someone moved off pending (blocked/failed/in_progress/scheduled/
+    completed) and a row with a different key are left exactly as they were."""
+    moved = {}
+    for i, status in enumerate(("blocked", "failed", "in_progress", "scheduled")):
+        fid = await follow_ups.create(db, **_BASE, dedup_key=f"k{i}")
+        await follow_ups.update_status(db, fid, status=status)
+        moved[fid] = status
+    done = await follow_ups.create(db, **_BASE, dedup_key="k-done")
+    await follow_ups.update_status(db, done, status="completed", resolution_notes="user did it")
+    other = await follow_ups.create(db, **_BASE, dedup_key="other")
+
+    n = await follow_ups.retire_by_dedup_keys(
+        db, [*(f"k{i}" for i in range(4)), "k-done", ""], note="Retired",
+    )
+    assert n == 0
+    for fid, status in moved.items():
+        assert (await follow_ups.get_by_id(db, fid))["status"] == status
+    assert (await follow_ups.get_by_id(db, done))["resolution_notes"] == "user did it"
+    assert (await follow_ups.get_by_id(db, other))["status"] == "pending"
+    assert await follow_ups.retire_by_dedup_keys(db, [], note="x") == 0
