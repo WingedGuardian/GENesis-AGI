@@ -508,6 +508,12 @@ caller (MEASURED 2026-09-25).
 - MCP config per session (`--mcp-config`)
 - Session resume (`--resume`)
 - Bare mode (`--bare`)
+- Function hooks, early access (`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`): opt-in for
+  interactive slots only, where the `GENESIS_CC_WEB_OVERRIDE` cc-slot lever loads
+  `plugins/genesis-web-override` with `--plugin-dir` to answer `WebSearch` with the
+  Genesis chain. Every dispatched session is pinned to `0`
+  (`src/genesis/cc/child_env.py`). Measured facts it rests on are in
+  `.claude/docs/web-tools-guide.md`; re-checked on every pin bump (checklist item 9).
 - Turn limits (`--max-turns`) and strict MCP config (`--strict-mcp-config`) for Guardian diagnosis
 - PreToolUse / PostToolUse / SessionStart / Stop / UserPromptSubmit hooks
 
@@ -732,7 +738,15 @@ When a new CC version is released, run through this:
    the session simply relays the gate's options in its own words again — the
    pre-2026-09 behaviour, and the exact thing the mechanism exists to stop. Nothing
    blocks and nothing errors, because by design no gate reads this back.
-9. **Update this document** with findings.
+9. **Re-run the WebSearch override against the candidate** (`plugins/genesis-web-override`,
+   a function-hook plugin; early access, so its API can move in any release). In a
+   scratch cwd: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude -p --model haiku
+   --plugin-dir <repo>/plugins/genesis-web-override --debug-file <f> "Use WebSearch once …"`
+   with genesis-health connected, and confirm the debug log shows
+   `resolved by a hooks module (result)` and no `does not match its output shape`.
+   A shape Claude Code stops accepting reaches the model as a tool error, not as
+   the built-in search, so this is the one place the regression shows.
+10. **Update this document** with findings.
 
 ---
 

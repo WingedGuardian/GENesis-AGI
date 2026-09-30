@@ -564,6 +564,22 @@ def test_build_env_strips_claudecode(invoker):
         assert env["HOME"] == "/home/test"
 
 
+def test_build_env_pins_function_hooks_off(invoker):
+    """A dispatched session never runs plugin JS modules: an opt-in inherited
+    from the server's env is overridden to 0 (genesis.cc.child_env)."""
+    with patch.dict("os.environ", {"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"}):
+        env = invoker._build_env()
+    assert env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+
+
+def test_build_env_pins_function_hooks_off_when_unset(invoker, monkeypatch):
+    """Unset is not off: Claude Code falls back to a server-side default, so
+    the pin must be written even when nothing was inherited."""
+    monkeypatch.delenv("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS", raising=False)
+    env = invoker._build_env()
+    assert env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+
+
 def test_build_env_sets_anthropic_base_url(invoker):
     inv = CCInvocation(prompt="hello", anthropic_base_url="http://localhost:8100")
     env = invoker._build_env(inv)
