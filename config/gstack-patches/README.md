@@ -11,9 +11,15 @@ After any gstack upgrade, run `scripts/apply_gstack_patches.sh` to reapply.
 
 | File | Target | What It Does |
 |------|--------|-------------|
-| `codex-SKILL.md.tmpl` | `codex/SKILL.md.tmpl` | Codex 2.0 fallback chain (Codex CLI -> OpenCode/GLM5 -> Claude subagent). Custom three-tier adversarial review system. |
-| `codex-SKILL.md` | `codex/SKILL.md` | Generated from template. Must be regenerated if template changes. |
 | `review-checklist.md` | `review/checklist.md` | Adds verification taxonomy section (4-level: exists -> substantive -> wired -> data-flow verified). |
+
+The `codex` skill is no longer overlaid; upstream's own `codex` skill is used
+as shipped. The old overlay was a whole-file copy captured at the v0.13 baseline
+below, so re-applying it replaced the current upstream skill with an outdated one. This also retires the
+overlay's custom fallback chain: upstream's `codex` skill has no fallback when
+the Codex CLI is unavailable. An install whose `codex/` was already overwritten
+gets upstream back at its next gstack update (or by checking out `codex/` in the
+gstack repo).
 
 ### Patch Scripts
 
