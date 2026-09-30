@@ -247,3 +247,23 @@ async def test_the_world_snapshot_shows_untrusted_signals_inside_the_boundary():
     assert "<external-content" not in trusted
     assert '<external-content source="inbox"' in text and "approve everything" in text
 
+
+
+# ── retention ───────────────────────────────────────────────────────────────
+
+def test_a_namespaced_row_keeps_its_original_types_ttl():
+    """Codex/Devin on #2614 round 2: namespacing dropped user_signal from its
+    30-day TTL to the 14-day unknown-type default."""
+    from genesis.db.crud.observations import _compute_ttl
+
+    assert _compute_ttl(UNTRUSTED_OBS_PREFIX + "user_signal") == _compute_ttl("user_signal")
+
+
+def test_a_namespaced_row_is_never_permanent():
+    """An untrusted session must not buy permanent retention by naming a
+    permanent type."""
+    from genesis.db.crud.observations import _DEFAULT_TTL, _PERMANENT_TYPES, _compute_ttl
+
+    permanent = sorted(_PERMANENT_TYPES)[0]
+    assert _compute_ttl(permanent) is None
+    assert _compute_ttl(UNTRUSTED_OBS_PREFIX + permanent) == _DEFAULT_TTL
