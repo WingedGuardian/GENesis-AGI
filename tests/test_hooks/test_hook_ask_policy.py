@@ -602,6 +602,46 @@ def test_the_guard_bounds_whatever_decision_it_is_given(monkeypatch) -> None:
     assert _decision(json.loads(out)) == "ask"
 
 
+def test_a_broken_output_helper_still_delivers_the_decision(monkeypatch) -> None:
+    """A helper that is present but broken (a syntax error mid-deploy) raises
+    something other than ImportError. Uncaught, the guard would exit with no
+    decision, which Claude Code does not treat as blocking, so the access would
+    run unprompted. The decision must still be printed."""
+    import types
+
+    guard = private_module(
+        "secrets_env_access_guard_broken", _HOOKS / "secrets_env_access_guard.py"
+    )
+    broken = types.ModuleType("hook_output")
+
+    def _raise(name):
+        raise SyntaxError("simulated broken helper")
+
+    broken.__getattr__ = _raise  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hook_output", broken)
+
+    def ask_decide(action, reason, detail="", payload=None, ask_key=None):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": "credentials",
+            }
+        }
+
+    monkeypatch.setattr(guard, "decide", ask_decide)
+    monkeypatch.setattr(guard, "touches_secrets", lambda **kw: True)
+    monkeypatch.setattr(
+        guard, "read_payload", lambda: {"tool_name": "Bash", "tool_input": {"command": "cat s"}}
+    )
+    monkeypatch.setattr(guard, "tool_input", lambda p: p.get("tool_input", {}))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert guard.main() == 0
+    assert _decision(json.loads(buf.getvalue().strip())) == "ask"
+
+
 @pytest.mark.parametrize(
     "seam",
     [

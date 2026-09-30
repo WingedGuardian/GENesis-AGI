@@ -176,6 +176,11 @@ def main() -> int:
     # the harness's output cap is persisted instead of read, which would lose
     # the ask and let the access through ungated. Only the free text is trimmed;
     # the envelope (the decision itself) always survives.
+    # ANY failure of the output helper (missing, or present but broken, e.g. a
+    # syntax error mid-deploy) must still deliver the decision: an uncaught
+    # error here exits non-zero with no stdout, which Claude Code does not
+    # treat as blocking, so the access would proceed with no prompt. The plain
+    # print stays small because the notes are already clipped at their source.
     try:
         from hook_output import print_json_bounded
 
@@ -186,7 +191,7 @@ def main() -> int:
                 "hookSpecificOutput.additionalContext",
             ),
         )
-    except ImportError:
+    except Exception:  # noqa: BLE001 - the decision must be delivered regardless
         print(json.dumps(decision))
     return 0
 
