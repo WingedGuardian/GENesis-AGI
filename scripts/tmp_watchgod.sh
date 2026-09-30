@@ -568,6 +568,12 @@ sweep_cc_tmp() {
     return 0
 }
 
+# The last outcome of each sweep kind in THIS daemon run. A page that is
+# retried after the attempt stamp was written (the alert queue was down) must
+# repeat what the sweep did -- a refusal most of all -- rather than claim it
+# "already ran" (review finding on #2570, round 4).
+declare -gA _WG_LAST_SWEEP=()
+
 maybe_sweep_cc_tmp() {
     # $1 = hourly | pressure. Rate-limited by a mode-scoped stamp per kind, so
     # an observe-mode sweep never uses up the first acting one. The stamp limits
@@ -580,11 +586,12 @@ maybe_sweep_cc_tmp() {
         every=$CC_SWEEP_INTERVAL_S; age=$CC_SWEEP_AGE_MIN
     fi
     if ! _wg_due "cc_sweep_${kind}" "$every"; then
-        _WG_LEVER_SWEEP="cc-tmp sweep already ran within the last ${every} s"
+        _WG_LEVER_SWEEP="cc-tmp sweep last attempted within ${every} s: ${_WG_LAST_SWEEP[$kind]:-its outcome is not known to this daemon run}"
         return 0
     fi
     _wg_stamp "cc_sweep_${kind}"
     sweep_cc_tmp "$age" "$kind"
+    _WG_LAST_SWEEP[$kind]="$_WG_LEVER_SWEEP"
 }
 
 # /proc/<pid>/io counts a process's writes to EVERY filesystem, so the list a

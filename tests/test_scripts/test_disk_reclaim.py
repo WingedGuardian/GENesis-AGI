@@ -7,6 +7,7 @@ the remediation registry relies on to escalate a stuck disk.
 
 import fcntl
 import importlib.util
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -360,3 +361,16 @@ def test_a_table_without_the_root_entry_is_unreadable(tmp_path, text):
     info = tmp_path / "mountinfo"
     info.write_text(text)
     assert _READ_MOUNTS(info) is None
+
+
+def test_mount_points_keep_raw_bytes_whatever_the_locale(tmp_path):
+    """Review of #2570 round 4: a mount point is raw filename bytes. Decoding
+    the table as locale text (latin-1 here, simulated because this box has no
+    such locale) and re-encoding as UTF-8 turned b"caf\\xe9" into b"caf\\xc3\\xa9",
+    so the real mount stopped matching and its cache could be cleared."""
+    name = os.fsencode(tmp_path) + b"/caf\xe9"
+    info = tmp_path / "mountinfo"
+    info.write_bytes(b"20 1 0:20 / / rw - x x rw\n21 1 0:21 / " + name + b" rw - x x rw\n")
+    with patch.object(Path, "read_text", lambda self, *a, **k: self.read_bytes().decode("latin-1")):
+        mounts = _READ_MOUNTS(info)
+    assert Path(os.fsdecode(name)) in mounts

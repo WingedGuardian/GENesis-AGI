@@ -1167,7 +1167,12 @@ def test_the_sweep_counts_only_units_it_removed(box, cctmp):
 def _mountinfo(box, mounts) -> Path:
     """A crafted /proc/self/mountinfo for TL_MOUNTINFO (field 5 = mount point)."""
     f = box["tmp"] / "mountinfo"
-    f.write_text("".join(f"{i} 1 0:{i} / {m} rw - x x rw\n" for i, m in enumerate(mounts, 20)))
+
+    def esc(m) -> str:  # the kernel's octal escapes for field 5
+        return (str(m).replace("\\", "\\134").replace(" ", "\\040")
+                .replace("\t", "\\011").replace("\n", "\\012"))
+
+    f.write_text("".join(f"{i} 1 0:{i} / {esc(m)} rw - x x rw\n" for i, m in enumerate(mounts, 20)))
     return f
 
 
@@ -1211,3 +1216,14 @@ def test_the_sweep_spares_sessions_inside_a_mounted_project(box, cctmp):
     _run(box, f"export TL_MOUNTINFO='{mi}'; sweep_cc_tmp 10080 test")
     assert (s / "data").exists(), "a session inside a mounted project is never deleted"
     assert "it is, or holds, a separate mount" in _log(box)
+
+
+def test_a_retried_page_repeats_a_refused_sweep(box, cctmp):
+    """Review of #2570 round 4: when the first page could not be queued, the
+    retry came after the sweep's attempt stamp and said it "already ran",
+    hiding that it had REFUSED. The retry repeats the last outcome."""
+    r = _run(box, f"export TL_MOUNTINFO='{box['tmp'] / 'no-such-table'}'\n"
+                  "maybe_sweep_cc_tmp pressure\nmaybe_sweep_cc_tmp pressure\n"
+                  'printf "LEVER=%s\\n" "$_WG_LEVER_SWEEP"')
+    lever = [ln for ln in r.stdout.splitlines() if ln.startswith("LEVER=")][-1]
+    assert "last attempted" in lever and "REFUSED to run (mount table unreadable)" in lever, lever

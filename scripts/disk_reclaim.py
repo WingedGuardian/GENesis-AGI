@@ -213,16 +213,20 @@ def _mount_points(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[Path] 
     rule as the shell guard's mount_targets; review finding on #2570). The
     caller refuses rather than guessing.
     """
+    # BYTES end to end: the kernel writes raw filename bytes, and only
+    # os.fsdecode maps them to the Path the rest of the code compares. Decoding
+    # as locale text and re-encoding as UTF-8 changed non-ASCII names under a
+    # non-UTF-8 filesystem encoding, so a real mount stopped matching (review
+    # finding on #2570, round 4).
     try:
-        text = mountinfo.read_text(errors="surrogateescape")
+        data = mountinfo.read_bytes()
     except OSError:
         return None
     out = []
-    for line in text.split("\n"):
-        fields = line.split(" ")
+    for line in data.split(b"\n"):
+        fields = line.split(b" ")
         if len(fields) > 4:
-            raw = fields[4].encode("utf-8", "surrogateescape")
-            out.append(Path(os.fsdecode(_unescape_octal(raw))))
+            out.append(Path(os.fsdecode(_unescape_octal(fields[4]))))
     if Path("/") not in out:
         return None
     return out
