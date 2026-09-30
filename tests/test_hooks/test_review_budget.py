@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT / "scripts"))
 
@@ -826,3 +828,38 @@ def test_an_errors_payload_or_a_missing_page_flag_is_never_evidence(monkeypatch)
         got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
         assert got["status"] == "unknown", (error, got)
         assert error in got["errors"], (error, got)
+
+
+@pytest.mark.parametrize("stalled_to", [100.0, 19.9], ids=["past-deadline", "just-short"])
+def test_a_stall_before_the_call_is_a_timeout_never_a_traceback_or_a_doomed_call(
+    monkeypatch, stalled_to
+):
+    """Codex P2 on #2594, and the case next to it. The read's deadline is taken,
+    then the process stalls before the call is issued. Past the deadline that
+    raised out of `evaluate_pr` (which catches only the aggregate-budget stop,
+    and the CLI calls it with no handler); just short of it, a call too small to
+    finish went out. Both must read as a timed-out read, with no call issued.
+    """
+    _no_seams(monkeypatch)
+    ticks = {"n": 0}
+
+    def clock():
+        # Call 1 creates the read deadline at t=0; call 2 is the one reading
+        # that decides the call, after the stall. (No caller budget, so the
+        # aggregate deadline never reads the clock.)
+        ticks["n"] += 1
+        return 0.0 if ticks["n"] == 1 else stalled_to
+
+    calls = []
+
+    def runner(argv, *, timeout):
+        calls.append((argv, timeout))
+        return 1, "", "must not be reached"
+
+    got = rb.evaluate_pr(
+        "owner/repo", 7, runner=runner, external_identity_templates=(), monotonic=clock
+    )
+    assert got["status"] == "unknown", got
+    assert "graphql_read_timeout" in got["errors"], got
+    assert calls == [], calls
+    assert ticks["n"] == 2, "the call decision must rest on exactly one clock reading"

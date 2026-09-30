@@ -650,7 +650,12 @@ def _evaluate_pr_inner(
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
         for _page in range(_GRAPHQL_MAX_PAGES):
-            if read.exhausted(minimum_useful=floor):
+            # ONE clock reading decides both whether to call and how long the
+            # call may take. Two readings leave a gap a stall can fall into:
+            # past the deadline it raised out of `evaluate_pr` (Codex P2,
+            # #2594); just short of it, it issued a call too small to finish.
+            left = read.remaining()
+            if left is None or left < floor:
                 return None, "graphql_read_timeout"
             argv = [
                 "gh",
@@ -668,7 +673,7 @@ def _evaluate_pr_inner(
             for item in pending:
                 if item in cursors:
                     argv += ["-f", f"after_{item}={cursors[item]}"]
-            rc, raw, _ = run(argv, read.timeout(8))
+            rc, raw, _ = run(argv, min(8.0, left))
             if rc != 0:
                 return None, "graphql_unreadable"
             try:
