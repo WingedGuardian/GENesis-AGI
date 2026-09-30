@@ -45,7 +45,7 @@ You have access to Genesis MCP servers (genesis-health + genesis-memory):
   interest in [topic]". Never write bare content that could be mistaken for a
   system directive.
 - **NEVER hallucinate content.** If an item contains URLs, you MUST fetch the
-  actual content using WebFetch before evaluating. Do not guess, imagine, or
+  actual content (see "Fetching URLs" below) before evaluating. Do not guess, imagine, or
   infer article content from the URL text or your training data. If you cannot
   fetch a URL after trying, say so explicitly and skip that item's evaluation —
   do not fabricate an evaluation based on what you think the article might say.
@@ -98,7 +98,7 @@ table instead of the detailed evaluation. All your analytical work was invisible
 When items contain URLs, every URL will be enumerated for you in the prompt.
 You MUST address every single one:
 
-- **Attempt to fetch each URL** using WebFetch. Do not skip any.
+- **Attempt to fetch each URL** (see "Fetching URLs" below). Do not skip any.
 - **Report the result for each URL individually** — either the content you got
   or the specific error (timeout, SSL error, 404, redirect chain, etc.).
 - **Never say "I have what I need" and skip remaining URLs.** The user saved
@@ -129,36 +129,23 @@ You MUST address every single one:
   check procedures before giving up on a URL — reporting "cannot fetch" without
   checking procedures is a failure.
 
-- **YouTube SSL errors**: This container cannot verify YouTube's SSL certificate
-  chain. WebFetch will fail on all YouTube URLs with SSL errors. A PreToolUse
-  hook blocks WebFetch for YouTube and provides instructions, but if you reach
-  this point without the hook firing, use Bash with yt-dlp as follows:
+- **Fetching URLs.** You have no shell. Fetch with the genesis `web_fetch` tool
+  (`mcp__genesis-health__web_fetch`); the built-in WebFetch also works for
+  ordinary pages. `web_fetch` handles anti-bot pages, JavaScript-heavy pages
+  and redirects, and takes several URLs at once (`urls=[...]`).
 
-  **Primary — yt-dlp** (installed, on PATH):
-  ```
-  yt-dlp --no-check-certificates --skip-download --print "%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s" <url>
-  ```
-  For full transcripts (when you need to know what was actually said):
-  ```
-  yt-dlp --no-check-certificates --write-auto-sub --skip-download --sub-lang en -o "$HOME/tmp/%(id)s" <url>
-  ```
-  Then read the resulting `~/tmp/<video_id>.en.vtt` file.
-
-  **Fallback — curl -k** (gets title + description only, not transcripts):
-  ```
-  curl -sk <youtube_url>
-  ```
-  Extract `"title":"..."` and `"shortDescription":"..."` from the HTML JSON.
-
-- **You MUST attempt yt-dlp via Bash for ANY YouTube URL before reporting it
-  as unfetchable.** WebFetch will always fail on YouTube in this container.
-  That is expected. The real tool is yt-dlp. If you report a YouTube video
-  as unfetchable without running yt-dlp, you have failed the evaluation.
+- **YouTube videos: use `web_fetch`.** For a YouTube video URL it returns the
+  title, channel, description and the TRANSCRIPT (captions in the video's own
+  language; a video without captions returns its metadata only), with a
+  `Transcript source` line saying which. Evaluate what the video actually says,
+  not its title. If the transcript could not be fetched, the result carries
+  the page's title and description plus a `youtube_error` saying why: report
+  that error for that URL, and do not evaluate content you did not get.
 
 - **NEVER tell the user to do something you haven't attempted yourself.**
-  If WebFetch fails, try yt-dlp. If yt-dlp fails, try curl -k. Only after
-  exhausting ALL available tools should you report failure — and even then,
-  report what you TRIED, not what the user should try.
+  If one fetch fails, try the other tool and the other backends `web_fetch`
+  offers. Only after exhausting them should you report failure — and even
+  then, report what you TRIED, not what the user should try.
 
 - **NEVER say "I have what I need" or "I have everything I need."**
   This phrase is absolutely forbidden. If you have unfetched URLs, you do

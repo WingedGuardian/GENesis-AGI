@@ -27,11 +27,11 @@ from genesis.db.schema._tables import TABLES
 from genesis.session_awareness import repo_pulse_gh as gh_mod
 from genesis.session_awareness import repo_pulse_worker as rpw
 from genesis.session_awareness.repo_pulse_config import DEFAULTS
+from tests.test_session_awareness.conftest import build_pr_verifications
 
 M58 = importlib.import_module("genesis.db.migrations.0058_session_charters")
 M62 = importlib.import_module("genesis.db.migrations.0062_repo_pulse")
 M84 = importlib.import_module("genesis.db.migrations.0084_repo_pulse_target_kind")
-MIG = importlib.import_module("genesis.db.migrations.20260906234824_pr_verifications")
 
 MERGED = "2026-09-06T10:00:00Z"
 REPO = "owner/repo"
@@ -55,7 +55,7 @@ async def db_path(tmp_path) -> Path:
         await M58.up(db)
         await M62.up(db)
         await M84.up(db)
-        await MIG.up(db)
+        await build_pr_verifications(db)
         await db.execute(TABLES["follow_ups"])
         await db.commit()
     yield path
@@ -379,7 +379,7 @@ async def test_the_next_tick_recovers_every_stranded_pr(pulse_root, tmp_path, mo
     assert first["status"] == "failed"
     # the server restarts and the migration lands
     async with aiosqlite.connect(str(path)) as db:
-        await MIG.up(db)
+        await build_pr_verifications(db)
         await db.commit()
     pulse_crud._tables_verified = False
     files = _files({80: {"files": ["src/x.py"]}, 81: {"files": ["docs/d.md"]}})

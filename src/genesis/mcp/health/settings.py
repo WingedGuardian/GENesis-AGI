@@ -306,6 +306,24 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,  # re-read every reaper pass
     ),
+    "youtube_fetch": SettingsDomain(
+        name="youtube_fetch",
+        description=(
+            "YouTube fetch (yt-dlp, behind web_fetch and knowledge ingestion) — "
+            "`tls`: verify | auto_fallback | off. auto_fallback (default) verifies "
+            "certificates and retries a call once unverified ONLY on a "
+            "certificate-verification error, logged at warning and flagged "
+            "tls_verified=false in the result; verify never skips; off always skips. "
+            "Unverified calls carry no cookies or config-file options. "
+            "`audio_max_minutes` (default 120; knowledge ingestion only, web_fetch "
+            "never transcribes audio): the audio-transcription fallback for "
+            "a captionless video runs only up to this length (0 = never). Read fresh "
+            "per fetch — takes effect immediately, no restart."
+        ),
+        config_filename="youtube_fetch.yaml",
+        readonly=False,
+        needs_restart=False,  # read per fetch
+    ),
     "mcp_staleness_guard": SettingsDomain(
         name="mcp_staleness_guard",
         description=(
@@ -1383,6 +1401,23 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_youtube_fetch(changes: dict) -> list[str]:
+    """Validate the YouTube fetch lever (see
+    genesis.knowledge.processors.youtube_config)."""
+    from genesis.knowledge.processors.youtube_config import TLS_MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key == "audio_max_minutes":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append("'audio_max_minutes' must be a non-negative integer")
+        elif key != "tls":
+            errors.append(f"Unknown key '{key}'. Valid: tls, audio_max_minutes")
+        elif value not in TLS_MODES:
+            errors.append(f"'tls' must be one of {', '.join(TLS_MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_mcp_staleness_guard(changes: dict) -> list[str]:
     """Validate MCP stale-code-guard lever changes (see
     genesis.observability.mcp_staleness_guard_config)."""
@@ -2092,6 +2127,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "youtube_fetch": _validate_youtube_fetch,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "worktree_ownership": _validate_worktree_ownership,
     "voice_act": _validate_voice_act,
