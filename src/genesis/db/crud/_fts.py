@@ -12,9 +12,13 @@ when the AND query returned zero — it never changes a query that already hit.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 
 def fts5_term(value: object) -> str | None:
@@ -144,3 +148,132 @@ async def fetch_fts(
     retry = list(params)
     retry[match_index] = alt
     return await db.execute_fetchall(sql, retry)
+
+
+# ---------------------------------------------------------------------------
+# BM25-inert term pruning for top-level disjunctions.
+#
+# FTS5's built-in bm25 computes a per-phrase IDF of
+# ``log((N - n + 0.5) / (n + 0.5))`` and CLAMPS it to 1e-6 when that is <= 0,
+# i.e. whenever the phrase occurs in at least half the rows (n >= N/2). Such a
+# phrase contributes essentially nothing to any row's rank — MEASURED on a
+# 100,481-row corpus: a lone ``memory`` (in every row) or ``genesis`` (51% of
+# rows) ranks at about -2e-6, where ``infrastructure`` (32%) ranks at -1.39 —
+# but OR-ing it into a MATCH still forces FTS5 to materialise and bm25-score
+# every row it touches before ``ORDER BY rank LIMIT`` can cut. On this corpus
+# the structural tag tokens (``memory``, ``class``, ``fact``, ``wing``) sit in
+# 98–100% of rows, so a single such term in a disjunction turns a selective
+# query into a scan-and-score of the whole corpus.
+#
+# Dropping an inert term from a TOP-LEVEL disjunction is rank-neutral up to
+# that ~1e-6-per-phrase contribution: the only rows it loses are rows that
+# matched nothing else, and those carried a ~0 score below every row that did.
+# It is NOT neutral inside an AND (there an always-true operand narrows the
+# set when removed), so callers must apply this only to OR-joined operands.
+# ---------------------------------------------------------------------------
+
+# Document frequencies drift slowly (a common term does not become rare in an
+# hour), so they are cached per process. The TTL bounds how long a term that
+# crossed the N/2 line keeps its old classification — the only consequence of
+# staleness is a slower (still correct) query or a pruned term whose bm25
+# weight is near the clamp either way.
+_DF_TTL_S = 3600.0
+_DF_CACHE_MAX = 20_000  # bound on distinct cached terms (≈ a few MB worst case)
+_df_cache: dict[tuple[str, str], tuple[int, float]] = {}
+_total_cache: dict[str, tuple[int, float]] = {}
+
+
+def _reset_df_cache() -> None:
+    """Clear the document-frequency cache (tests; the cache is process-global)."""
+    _df_cache.clear()
+    _total_cache.clear()
+
+
+# A corpus-size move larger than this fraction since the frequencies were
+# cached drops them all (see ``_fts_total_rows``). 1%: at 100k rows that is
+# 1,000 rows — far below the shift needed to move a term across the N/2 line
+# by more than a sliver, and far above day-to-day store churn.
+_DF_INVALIDATE_FRACTION = 0.01
+
+
+async def _fts_total_rows(db: aiosqlite.Connection, table: str, now: float) -> int:
+    """The CURRENT row count, read live on every call.
+
+    ``<table>_docsize`` holds exactly one row per indexed document and counts in
+    ~1ms where ``count(*)`` on the FTS table itself scans (~90ms at 100k rows).
+    It is an FTS5 shadow table that only exists with the default
+    ``columnsize=1``; fall back to the direct count if it is absent.
+
+    Reading it live is what bounds df-cache staleness: a bulk delete or insert
+    that moves the corpus size by more than ``_DF_INVALIDATE_FRACTION`` since
+    the frequencies were cached drops every cached frequency for the table, so
+    a term that stopped being inert is re-measured on the next call instead of
+    being pruned on counts up to ``_DF_TTL_S`` old. (Balanced delete+insert
+    churn that leaves the size unchanged is still bounded only by the TTL.)
+    """
+    try:
+        rows = await db.execute_fetchall(f"SELECT count(*) FROM {table}_docsize")  # noqa: S608
+    except Exception:
+        rows = await db.execute_fetchall(f"SELECT count(*) FROM {table}")  # noqa: S608
+    total = int(rows[0][0]) if rows else 0
+    hit = _total_cache.get(table)
+    if hit is not None:
+        cached_total = hit[0]
+        moved = abs(total - cached_total) > _DF_INVALIDATE_FRACTION * max(cached_total, 1)
+        if moved or now - hit[1] >= _DF_TTL_S:
+            for key in [k for k in _df_cache if k[0] == table]:
+                del _df_cache[key]
+            _total_cache[table] = (total, now)
+    else:
+        _total_cache[table] = (total, now)
+    return total
+
+
+async def drop_bm25_inert_terms(
+    db: aiosqlite.Connection,
+    terms: list[str],
+    *,
+    table: str = "memory_fts",
+) -> list[str]:
+    """Return ``terms`` minus those FTS5's bm25 treats as inert (df >= N/2).
+
+    ``terms`` must be already-sanitised bare terms (``fts5_term`` output) that
+    the caller is about to OR-join at the TOP level of a MATCH expression — see
+    the module note above for why this is rank-neutral there and wrong inside
+    an AND. The document frequency of each term is measured by FTS5 itself
+    (``MATCH`` on the term), so tokenisation and stemming are exactly the
+    engine's — no Python re-implementation of the porter stemmer to drift.
+
+    May return an empty list when every term is inert; the caller then drops
+    the whole disjunction (it could only ever add ~0-scored rows). Fails OPEN:
+    any lookup error returns ``terms`` unchanged, since this is purely a cost
+    optimisation and the unpruned query is the pre-existing behaviour.
+    """
+    if not terms:
+        return terms
+    now = time.monotonic()
+    try:
+        total = await _fts_total_rows(db, table, now)
+        if total <= 0:
+            return terms
+        kept: list[str] = []
+        for term in terms:
+            key = (table, term)
+            hit = _df_cache.get(key)
+            if hit is None or now - hit[1] >= _DF_TTL_S:
+                rows = await db.execute_fetchall(
+                    f"SELECT count(*) FROM {table} WHERE {table} MATCH ?",  # noqa: S608
+                    (term,),
+                )
+                df = int(rows[0][0]) if rows else 0
+                if len(_df_cache) >= _DF_CACHE_MAX:
+                    _df_cache.clear()
+                _df_cache[key] = (df, now)
+            else:
+                df = hit[0]
+            if df * 2 < total:
+                kept.append(term)
+        return kept
+    except Exception:
+        logger.debug("bm25-inert term lookup failed — keeping all terms", exc_info=True)
+        return terms

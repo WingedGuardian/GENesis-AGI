@@ -50,26 +50,24 @@ briefing:
   max_age_s: 600
 
 snapshots:
-  # Non-healthy snapshots kept by delete-before-create (the latest healthy is
-  # exempt and rotated separately): 2 = healthy lifeline + newest pre-recovery.
+  # Non-healthy (pre-recovery) snapshots kept by prune and by delete-before-
+  # create. Healthy rollback snapshots are never counted or pruned here; they
+  # are rotated separately.
   retention: 2
   prefix: "guardian-"
   take_pre_recovery: false
   # Daily 'healthy' snapshot while state is HEALTHY — the offline
   # SNAPSHOT_ROLLBACK lifeline. Rotated create-then-delete, so it stays one
-  # day old only while the pool accepts the create; when the POOL refuses it
+  # day old only while the pool accepts the create. When the POOL refuses it
   # (the storage_pool high tier, or LVM's own autoextend threshold), the
-  # measured runway says the pool is under pressure, and the lifeline is over
-  # a day old, rotation deletes the old one FIRST. A full-but-stable pool keeps
-  # its lifeline. A refused refresh retries in ~1h and alerts (throttled by
-  # storage_pool.realert_hours). Set false to disable.
+  # lifeline is over a day old, AND (LVM-thin only) the snapshots measurably
+  # hold >= 1 GiB (or 1%) no live volume maps, rotation deletes the old one
+  # FIRST. A pool full of live data keeps its lifeline. A refused refresh retries in ~1h and alerts
+  # (throttled by storage_pool.realert_hours). Set false to disable.
   healthy_enabled: true
-  # Age at which pool-pressure relief (early stage) may delete the lifeline.
-  # Only under pressure: a long outage never costs the rollback target.
-  lifeline_max_age_hours: 48
   max_pool_usage_pct: 80
-  # Age-prune backstop: delete guardian-* snapshots older than this many days,
-  # except the latest healthy (the rollback lifeline). Catches stale
+  # Age-prune backstop: delete non-healthy guardian snapshots older than this
+  # many days (healthy rollback snapshots are never pruned). Catches stale
   # guardian-pre-recovery snapshots that retention alone can protect
   # indefinitely as the "newest".
   max_age_days: 14
@@ -98,20 +96,16 @@ storage_pool:
   pool_used_high_pct: 85
   pool_used_crit_pct: 92
   realert_hours: 6
-  # Pressure RELIEF — acts on MEASURED growth, not the tiers above (which only
-  # alert). Frees guardian-owned space when the pool would fill within the
-  # horizons. Runbook: docs/reference/thin-pool-recovery.md.
+  # Pressure RELIEF — the tiers above only alert. When free data or metadata
+  # space drops to its reserve, relief deletes ONE guardian-owned snapshot per
+  # pass (pre-recovery first, the rollback lifeline last), never anything
+  # else, and never grows the pool. Runbook: docs/reference/thin-pool-recovery.md.
   #   "live" | "alert_only" | "off"   (invalid → alert_only; env
-  #   GUARDIAN_POOL_RELIEF_DISABLED=1 also forces alert_only)
+  #   GUARDIAN_POOL_RELIEF_DISABLED=1 also forces alert_only). alert_only and
+  #   off also stop delete-first rotation.
   relief_mode: "live"
-  early_horizon_hours: 48    # extend (LVM opt-in), pre-recovery + >48h lifeline
-  urgent_horizon_hours: 24   # any guardian snapshot, lifeline last
-  burst_multiplier: 2.0
-  min_reserve_pct: 3.0         # data reserve floor, % of the pool
-  min_meta_reserve_pct: 10.0   # metadata reserve floor, % of the metadata LV
-  history_sample_interval_s: 300
-  history_max_samples: 2016
-  extend_keep_free_mib: 512
+  min_reserve_pct: 3.0         # data reserve, % of the pool
+  min_meta_reserve_pct: 10.0   # metadata reserve, % of the metadata LV
 
 # Guardian-side RAM tiered alert (E-rest PR-E1). The container's own RAM alert
 # (infra:container_memory_high) dies exactly when it thrashes/OOMs; the guardian

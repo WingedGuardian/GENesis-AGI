@@ -269,13 +269,13 @@ class TestGatherHostProfile:
             "vg_free_bytes",
             "pool_used_pct",
             "detail",
-            # Pool-pressure relief (revisited: all five land in METRICS via
-            # collectors/host.py's allowlist — sizes change on every extend,
-            # and the identity fields add nothing drift should hash on today).
+            # Pool relief (revisited: pool_name was already a FACT, set by
+            # _host_storage_pool from the same detection; the other three land
+            # in METRICS via collectors/host.py's allowlist — the size changes
+            # on every pool grow, and the LVM identity adds nothing drift
+            # should hash on today).
             "pool_size_bytes",
-            "metadata_size_bytes",
             "pool_name",
             "vg_name",
             "thinpool_lv",
-            "thinpool_profile",
         }

@@ -35,7 +35,10 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   that is what clears the commit gate's depth check; code-reviewer inline for a
   small focused fix (the Adaptive Review Protocol below is authoritative, and
   dispatching a full adversarial pass on a one-line change is not the bar) —
-  and then it is DONE with that item. It does not wait for Codex, and it
+  and then it is DONE with that item. Where its effect can be observed here, a
+  wrong run can be undone, and it is not on the never-run list, it is seen
+  working BEFORE the PR opens ("Verify BEFORE the PR" below). It does not wait
+  for Codex, and it
   carries no review loop — the obligations under "When to DRIVE a Merge" below
   pass to the closing session along with the PR; they do not lapse.
 - **A closing session owns the open-PR queue**, whichever session built each
@@ -322,6 +325,101 @@ next session reads a confident sentence as a measured one. Those surfaces are
 ENUMERABLE, which makes the check mechanical rather than a mood.
 `references/high-stakes-verification.md` §11 carries the canonical surface list
 and the walk; do not keep a second copy of that list here.
+
+### Verify BEFORE the PR, when this install can show it (standing user rule, 2026-09-24)
+
+You build on a long-lived install, so **when the change's effect can
+be observed here AND a wrong run can be undone, see it work before you open the
+PR.** Review then looks at a change that works, not at its first attempt to run.
+Put what you ran and what you saw under the PR's `## Testing` section. The `E2E:`
+line keeps its meaning: the check to run AFTER the merge. For a hook that is still
+needed, because a pre-PR run tests the worktree copy, not the merged copy the
+harness fires.
+
+**Which copy actually ran is the whole question. Check it; never assume it.**
+- A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
+  payload on stdin, runs the branch's copy of that file. The harness, and the
+  worktree's own `.claude/hooks/genesis-hook`, run MAIN's copy by default (see
+  "The Gate Machinery" below). `GENESIS_HOOK_DEV_LOCAL=1` on that ONE launcher
+  call switches it, and stderr announces the switch. Never set it session-wide or
+  in `settings.json`: your own commits and pushes would then run under the gate
+  you are still editing.
+- Which `genesis` package a Python file imports depends on the file. MEASURED
+  2026-09-25: from the worktree root, `import genesis` resolves to the MAIN tree
+  through the editable install. But more than twenty scripts and hooks put their
+  own tree's `src` on `sys.path`; run from a worktree they load the BRANCH's
+  package, whose database path then resolves inside the worktree, where no
+  database exists, while Qdrant is still the live one. Read the file's imports
+  before running it, and print `genesis.__file__` when in doubt.
+- So runtime code (`src/genesis/**`) is verified by tests, or by the options
+  `references/worktrees.md` lists for runtime checks, never by a live run,
+  until there is a supported way to run a branch in the live runtime.
+- Say in the PR which copy ran and what it touched.
+
+**Only a run you can undo qualifies.** A script that deletes, prunes,
+restores, deploys to the host, pushes, posts or sends a message, or writes to any
+live store (the database, Qdrant, the graph engine) does NOT run before it
+merges. A `--dry-run` flag is not an exception by itself: `restore.sh --dry-run`
+still takes the live update and backup-restore locks, runs `git pull --rebase` on
+the backup repository, and overwrites `~/.genesis/restore_status.json` on exit.
+Run a dry-run only after reading that mode's code and finding that it writes
+nothing. Do not improvise isolation: `GENESIS_HOME` moves neither
+the database nor Qdrant, and many files hard-code `~/.genesis`. Tests are how such
+a script is verified.
+
+**Never run on the live install before it merges:** a branch's migration, privacy,
+egress or credential handling, anything that loosens a gate other sessions rely
+on, and anything whose verification needs days or a machine the owner does not
+control. Test a migration in a pytest fixture, and patch EVERY store it touches on
+the migration MODULE itself. The suite-wide fixture patches
+`genesis.env.genesis_db_path`, but data migrations import that name directly
+(`from genesis.env import genesis_db_path`), so do not rely on that fixture to
+isolate a migration: patch the migration module's own names. A migration can
+also reach live Qdrant and write under `~/.genesis`.
+`d0008_reconcile_memory_cross_store`, for
+example, deletes the Qdrant points it judges to be ghosts. Its test patches the
+module's `genesis_db_path`, `get_client` and `_export_path`:
+`tests/test_db/test_d0008_reconcile_memory_cross_store.py` is the pattern to
+copy.
+
+NEW behaviour on a risky surface (memory, graph, database) ships behind a
+shadow flag, and the session never flips it: the owner does, after verifying.
+Entity adjudication is the house example. `config/entity_adjudication.yaml` ships
+it in `propose_only`, so a merge is recorded as a proposal. The owner reviews and
+approves proposals and applies the approved ones (`entity_adjudication_approve`,
+then `entity_adjudication_apply`) without changing the mode. Switching to `live`
+is a separate decision: it applies only approved backlog rows, but from then on
+it applies each new merge verdict with no approval step.
+
+**Iterate with the owner.** When acceptance needs the owner's hands (a device, a
+chat channel, another machine they use, or something only they can see), do not
+open the PR on a guess. Tell them exactly what to try and what they should see,
+ask through `AskUserQuestion`, fix what they report, and re-ask while it blocks.
+Open the PR once they confirm it works. Waiting on the owner here is the design,
+not a stall: no review round could have caught what they are about to see.
+- **Do not dispatch work whose acceptance needs the owner's hands.** No
+  dispatched path is known to hold a change for the owner's test today.
+  - The autonomy executor pushes a completed code task's branch and opens a
+    draft PR for a build-lane task that passes its scope gate. It then deletes the
+    worktree and the local branch, so there is nothing left to test locally
+    (#2421).
+  - The executor's code steps have no MCP write except `observation_write`, so
+    `follow_up_create` is not available to them (#2422).
+  - A `direct_session_run` session's tools depend on its profile, and the
+    profiles differ in what they allow. Read the chosen profile's definition
+    (the built-ins in `src/genesis/cc/direct_session.py`, plus any install
+    overlay in `genesis.cc.profile_overlay`) before assuming the session can commit
+    code, keep a worktree, or record anything.
+  If a dispatched session finds an owner test is owed anyway, it states what to
+  try and what they should see in its final output. For an executor task that
+  output is read through `task_detail`, and it reaches no notification. A
+  follow-up row that a dispatched session creates (on a profile that allows it)
+  lands on the hidden tabled lane, so its `reason` must say it awaits the owner's
+  test in a foreground session.
+- **The owner says they cannot test it this session, or the session ends
+  before they confirm:** a `follow_up_create` row naming the owner test still
+  owed and where the code is (branch, worktree path, head SHA). Never write the
+  change up as verified.
 
 ### Acceptance Bar + Measured Rate — the primary methodology
 
@@ -1166,6 +1264,24 @@ specific, credible, MEASURED reason — the risk is that severe, or that frequen
 *"For safety"* and *"defense in depth"* are not reasons. Neither is having just
 been bitten once: an n=1 incident earns a COUNTER, not a gate.
 
+**Persisted state inside a guard needs its own justification, separate from
+the decision to refuse.** Before a guard or gate grows a marker, cache or
+counter that one invocation writes and a later one reads (a telemetry counter
+no guard decision reads is observability, not guard state), show why the answer
+cannot be derived at the moment it is needed from state that already exists,
+and enumerate the lifecycle the state adds — write, read, retire, validate,
+scope — because each stage is a defect site. Where a derivation exists, a second
+should-fix-or-worse finding in machinery the change adds means delete it, not
+harden it; where none exists, narrow the lifecycle. Approval records are out of
+scope for deletion. MEASURED on the gate-menu feature at comparable size: the
+persisted-marker layer drew roughly 15 should-fix-or-worse findings against
+roughly 3 in the half it served (179 vs 155 non-comment lines, per #2027's PR
+body); the marker designs were closed (#1863, #1999) and the counter-based one
+merged (#2027). This prices the cost of STATE, not the case for gating; the
+New-Store Gate below asks the neighbouring question (why a NEW store rather than
+an existing one), and the `genesis-architect` agent's Step 0.7 asks this one at
+review time.
+
 **Fail-open is not an automatic defect — but say WHICH question you are
 answering, because there are two and they get opposite defaults.** (1) The
 VERDICT question: when a guard evaluates successfully, should its design be an
@@ -1726,6 +1842,18 @@ Four rules follow, each cheap:
   positive is one confirmation, a miss is the pre-existing status quo — which
   is what lets the trigger stay broad instead of clever. Measured prompt rate
   after widening: 0.43% of ~19k real commands.
+
+  **SUPERSEDED for the git-operation net by owner ruling 2026-09-08 (re-checked
+  against the code 2026-09-27).** That net no longer asks in any session type:
+  the commit gate and the push guard REFUSE an unreadable command that names a
+  gated operation, with a message giving the cause and a rewrite the session can
+  perform — both cite the ruling at their blind branch. The reasoning here still
+  prices the TRIGGER (a broad predicate remains right); what changed is the cost
+  of a false positive, now an agent rewrite rather than a human confirmation. So
+  wherever this passage and the paragraphs below say `ask` for that net, read
+  "refuse with an actionable message". A line continuation joined the same path
+  when the parser began REPORTING it as a blind spot (`_BLIND_CONTINUATION`)
+  instead of modelling the join: refused, never parsed around.
 
   This does NOT loosen the fail-closed mandate above, and the two are easy to
   read as contradicting each other. Rule (b) is scoped to the git-operation
@@ -2335,8 +2463,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   blocked. An empty result from your own query is "my query found nothing", never "no
   findings exist". Freshness is a SEPARATE gate, and it is NOT a blanket
   reviewed-SHA-equals-HEAD rule: for a hook-surface or otherwise non-trivial delta a
-  current Codex review must COVER head (reviews-API `commit_id == head`, or a clean Codex
-  re-review comment naming head), but a trivial NON-hook delta may still merge on a stale
+  current Codex review must COVER head (reviews-API `commit_id == head`; a clean Codex
+  re-review COMMENT does not count, see the Pre-Merge Gate), but a trivial NON-hook delta may still merge on a stale
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
 
@@ -3027,8 +3155,8 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   git command. `cd "$VAR" && git commit` fails closed with a *branch-verification*
   message, which reads like a branch problem and is not: use a literal path.
 - **Worktree removal is not yours to do.** `git worktree remove` is blocked;
-  `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
-  unchanged worktrees on a daily timer. Leave a dead worktree alone.
+  `scripts/worktree_lifecycle.py` owns it: it archives stale worktrees on a
+  daily timer and never deletes them (archive retention is off, #2504). Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`).
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**
@@ -3282,7 +3410,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 
 | Change type | Deploy path |
 |---|---|
-| Runtime code | `git pull` + server restart (update.sh does both) |
+| Runtime code | `scripts/deploy_code_only.sh`, or `update.sh` for dependency, unit or host changes. Modes: `deploy` (the default: a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or a venv that does not match the pyproject, and stands the Guardian and watchdog down); `pull` (the same pull, no restart: it reports every change the running server has not loaded, and the next step); `restart`; `status`. Launch `deploy` and `restart` DETACHED as a transient unit (`systemd-run --user`, the command is in the script's header): a session's background job dies with the session (#2101). **Validators sample, they don't chase:** deploys need not be 1:1 with merges. Validate `main` at a cadence, and on a failure bisect the merged range; per-PR CI already covers per-merge granularity. Validating against the live server? Hold `flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery) and not a bare `git pull`, so bracket the run and let the script judge it: keep the `bracket:` token `scripts/deploy_code_only.sh status` prints at the start (from a worktree it reports the main checkout), and run `scripts/deploy_code_only.sh status --verify <token>` at the end; exit 0 is a valid run. A token exists only when the server's boot commit is known, HEAD's runtime files (`src/`, `config/`, `pyproject.toml`) are the ones it booted from and were at every commit HEAD held since the boot (after a `pull` of code, even one a later commit undid: restart first — the server imports lazily, so the detour's modules stay loaded), and nothing there is edited outside git; otherwise it reads `unknown (<why>)`, which no token matches. It covers a restart (boot commit, MainPID, systemd invocation id) and an edit to an ignored override such as a `config/*.local.yaml` or to a user overlay in `~/.genesis/config`; HEAD may move over docs or hooks. It is a tripwire, not a certificate: it cannot see, and reads valid through, a change to the venv's installed packages, the other files the server reads from `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an edit undone without moving HEAD (a stash and its pop included), and a rewritten or backdated reflog. A daemon your command leaves behind keeps holding the lock, and overlapping holds can starve a waiting deploy (flock grants a late shared request ahead of a queued exclusive one) |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
@@ -3649,14 +3777,17 @@ findings below, a gated `gh pr merge`:
   TOCTOU defense); the `--check-pr` command supplies this;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
-  **Clean-comment freshness:** a *clean* Codex re-review is posted as an ISSUE
-  COMMENT ("Codex Review: Didn't find any major issues. … **Reviewed commit:**
-  `<sha>`"), not a review object, so the reviews API never sees it. The gate now
-  ALSO accepts that clean comment when its `Reviewed commit` sha names the current
-  head — so a genuinely-clean re-review no longer false-blocks (it used to force a
-  `# stale-review-override`). Fail-closed: the clean marker alone never vouches; a
-  parseable `Reviewed commit` sha at head is required, and the comment must be
-  authored by the Codex bot.
+  **A clean re-review COMMENT does not satisfy this gate.** A *clean* Codex
+  re-review is posted as an ISSUE COMMENT ("Codex Review: Didn't find any major
+  issues. … **Reviewed commit:** `<sha>`"), not a review object, and it names the
+  commit only by an abbreviated id. An abbreviated id identifies no commit — the head
+  it would be compared with is whatever the branch's author pushed — so freshness
+  rests on the reviews API's full `commit_id` alone. The gate still READS the clean
+  comment and says so in its block message. When Codex's only word on the head is a
+  clean comment, the routes that work are an owner-approved `# substitute-review` on a
+  Devin or CodeRabbit review at that exact head, or a conscious
+  `# stale-review-override` (which on the hook surface also needs fallback evidence). (Until 2026-09-27 the gate accepted
+  a prefix match as freshness; that was reverted because the prefix binds nothing.)
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
   substantiality) is provably review-trivial (docs-only / a small single-file
@@ -3948,8 +4079,8 @@ The review-findings gate specifically:
 4. **An ABSENT review BLOCKS — it does not merge on CI alone.**
    `_check_codex_reviewed_head` returns a block for `if not reviewed`, whatever
    the reason for the absence (quota, never triggered, still running). The only
-   things that clear it are a review at head, a clean re-review comment naming
-   head, a provably review-trivial delta since a stale review, a conscious
+   things that clear it are a review object at head (a clean re-review COMMENT
+   does not count), a provably review-trivial delta since a stale review, a conscious
    `# stale-review-override` — except on a hook-surface PR, where that sigil also
    requires the exact base-and-head fallback-review evidence described above — or
    an owner-approved `# substitute-review` resting on a Devin or CodeRabbit review

@@ -44,16 +44,10 @@ from genesis.guardian.pool import (
 logger = logging.getLogger(__name__)
 
 _AUTOEXTEND_PROFILE_NAME = "genesis-thinpool"
-# Public: pool_pressure's partial extend reads these to tell when dmeventd's
-# own autoextend cannot fire (it needs a FULL percent step of VG free, and
-# does nothing at all when less is available).
-AUTOEXTEND_PROFILE_NAME = _AUTOEXTEND_PROFILE_NAME
-AUTOEXTEND_THRESHOLD_PCT = 80
-AUTOEXTEND_PERCENT = 20
 _AUTOEXTEND_PROFILE = (
     "activation {\n"
-    f"\tthin_pool_autoextend_threshold={AUTOEXTEND_THRESHOLD_PCT}\n"
-    f"\tthin_pool_autoextend_percent={AUTOEXTEND_PERCENT}\n"
+    "\tthin_pool_autoextend_threshold=80\n"
+    "\tthin_pool_autoextend_percent=20\n"
     "}\n"
 )
 

@@ -1,9 +1,31 @@
 #!/bin/bash
 # Genesis pre-commit hook — block secrets, large files, and warn on direct-to-main
-# Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
+# Portable copy: lives in scripts/hooks/, installed by scripts/hooks/sync-hooks.sh
 
 # Block direct commits to main — use a feature branch
 current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+
+# Block commits on `live`, the local integration branch: it is REBUILT from
+# origin/main plus the candidate branches in ~/.genesis/deploy_manifest.json, and
+# the rebuild writes its commits with `git commit-tree`, which runs no hooks. A
+# commit made here by hand is one the planned rebuild engine (not built yet)
+# will refuse as unknown. There is
+# deliberately no override: the change belongs on a branch. Applies only where
+# the manifest exists, so an install's own branch that happens to be named
+# `live` is left alone. (This covers `git commit`; cherry-pick, revert and
+# rebase run no pre-commit hook.)
+if [ "$current_branch" = "live" ] && [ -f "$HOME/.genesis/deploy_manifest.json" ]; then
+    echo ""
+    echo "BLOCKED: Commit on 'live', the local integration branch."
+    echo ""
+    echo "'live' is rebuilt from origin/main plus the candidate branches listed in"
+    echo "~/.genesis/deploy_manifest.json. Commit on a feature branch instead"
+    echo "(git worktree add --no-track .claude/worktrees/<name> -b <scope>/<desc> origin/main),"
+    echo "then add that branch as a candidate and rebuild."
+    echo ""
+    exit 1
+fi
+
 if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
     if [ "${GENESIS_ALLOW_MAIN_COMMIT:-}" = "1" ]; then
         echo "OVERRIDE: Direct commit to '$current_branch' allowed (GENESIS_ALLOW_MAIN_COMMIT=1)."

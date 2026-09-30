@@ -496,6 +496,16 @@ verified: 18e41e1e1 2026-09-23
   empty, and the pane command unsets them itself: this script ends in
   `exec tmux`, which STARTS the server every later slot inherits from, and
   omitting a pin is not the same as having no value.
+  The `GENESIS_CC_WEB_OVERRIDE` cc-slot lever is decided the same way in both
+  directions: set to `1`, a new slot pins `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`
+  and loads `plugins/genesis-web-override` from the checkout with `--plugin-dir`
+  (Claude Code's `WebSearch` answered by the Genesis chain); otherwise the pane
+  unsets the flag. Every dispatched `claude -p` child pins it to `0` instead,
+  through `genesis.cc.child_env.pin_dispatched_env`, because Claude Code falls
+  back to a server-side default when it is unset.
+  `tests/test_cc/test_child_env.py` finds the spawn sites from the source (a
+  `claude -p` argv, or the dispatched marker) and fails on one that skips the
+  pin; an argv built at run time is outside what it can see.
   Recovering a slot that is alive but running no claude — detecting it, and
   rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
@@ -517,9 +527,13 @@ verified: 18e41e1e1 2026-09-23
   the canonical `build_mcp_config("none")` (the old hand-counted `parents[2]` path pointed
   at a nonexistent `src/config/no_mcp.json`). The inbox judge denies every genesis MCP
   *write* (`memory_store`/`settings_update`/`follow_up_create`/…) via
-  `build_reflection_disallowed` minus `Bash`, keeping the reads it needs plus the optional
-  `observation_write`. RESIDUALS on the inbox judge: (1) `Bash` — STILL retained for the
-  `yt-dlp`/`curl` YouTube-fetch path (injection→RCE surface, open — follow-up 727a3724);
+  `build_reflection_disallowed`, `Bash` included, keeping the reads it needs plus the optional
+  `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
+  Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
+  `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; the video text is returned inside the keyed untrusted-content boundary, and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
+  MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
+  judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
   memory-provenance work): `observation_write` stamps the session origin
   (`session_origin_from_env`) so an eval-session write lands `external_untrusted`, and BOTH
@@ -1008,9 +1022,21 @@ verified: 640c4f2e3 2026-09-18
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
   identity remain exact. Coverage
-  ships in SHADOW (`url_coverage_mode`, `config/inbox_monitor.yaml`): it computes
-  its verdict and logs only stable opaque URL ids, acting on nothing until
-  compliance under the `**Source:**` prompt has been measured. Follow-up and
+  is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
+  `shadow` observes without acting): an uncovered URL re-queues its item
+  through the bounded retry lane, logging only stable opaque URL ids. It
+  shipped shadow and was flipped on measurement — 0 of the first 42 evaluations
+  under the `**Source:**` contract would have re-queued. Parking is visible: an
+  item that exhausts its retries, or a file the retry-storm guard parks (at all
+  three of its call sites), queues ONE durable owner alert per file and reason
+  per scan, naming the file by its path inside the inbox folder; an exhausted
+  item's alert also names each parked logical item by the URL's HOST, its LINE
+  in the file and the coverage-log `url#` id — never path or query text, which
+  can carry share tokens — while a storm alert names the file only. The retry-lane storm site
+  abandons only URL-failure rows. An approval that ends unanswered (`approval_ended:`)
+  does not spend a retry and leaves the row an ordinary retriable failure, so
+  the same row is asked about again; with `resilience.parking_mode:
+  live`, a network outage (`CCNetworkOfflineError`) does not spend retries. Follow-up and
   build-lane durable writes finish before the completed baseline commits, so a
   cancellation cannot permanently hide their absence. On restart every
   pre-dispatch `pending` row is atomically returned to the bounded retry lane;
@@ -1138,7 +1164,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: d0627c854 2026-09-11
+verified: 246808153 2026-09-24
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1171,9 +1197,36 @@ verified: d0627c854 2026-09-11
   `cc_sessions.satellite_id` (added via `_migrate_add_columns`, not the base
   `CREATE TABLE` — mirrors `last_extracted_*`) persists the device for the optional
   `per_device` scope; default `global`.
-- **dashboard/**: Flask blueprint at `/genesis` (~45 route modules);
+- **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
   thread detects degraded-but-alive Flask; web terminal.
+  **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
+  keep rediscovering.** Exactly two `before_request` hooks exist, and between
+  them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
+  pages only, returning None for any `/api/` or `/v1/` path;
+  `auth.check_api_mutation_auth` is app-level and returns None for
+  GET/HEAD/OPTIONS. So a dashboard password does protect the blueprint's HTML
+  pages — that gate is structural and it does refuse an unauthenticated page
+  GET — except `/genesis/monitor`, which the standalone host registers directly
+  on the app (`hosting/standalone.py`), outside the blueprint, and serves to
+  anyone (a static shell whose data comes from the open API reads below). It
+  protects the MUTATION routes only while the `GENESIS_DASHBOARD_API_AUTH` kill
+  switch is on (the default); set to off, `check_api_mutation_auth` returns
+  before any credential check. And **no request hook gates an API read on any
+  install, configured or not.** A GET under the API prefixes (`/api/genesis/`
+  and `/api/t/`) is therefore anonymous unless its own handler adds a
+  predicate, and only a small minority do (`routes/references.py` is one: its
+  `_auth_or_403` does refuse an anonymous caller once a password is set).
+  API read protection is per-handler or absent — never structural.
+  `is_authenticated()` returns True
+  when no password is set, so such a predicate is INERT on a passwordless
+  install by design (nothing is narrowed for an operator who chose not to
+  configure a credential). The `/v1/*` bearer predicates are the opposite and
+  should not be generalised from: `auth.check_bearer_token` fails CLOSED with a
+  503 when `GENESIS_MCP_HTTP_TOKEN` is unset, password or not. Network
+  isolation is the primary control — see
+  `SECURITY.md`, which is authoritative for the threat model. Consult this
+  before concluding a route is protected because a password exists.
 - **mcp/**: 5 Genesis MCP servers (health, memory, outreach, recon,
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
@@ -1185,7 +1238,13 @@ verified: d0627c854 2026-09-11
   `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
   OpenAI-compatible surface that routes each turn through `ModelRouter` on two
   lanes rather than spawning a CC subprocess, so a desktop client holds no model
-  credential. Bearer-authed with `GENESIS_MCP_HTTP_TOKEN`; text-only, and an
+  credential. Bearer-authed with `GENESIS_DESK_TOKEN`, which opens this route
+  and no other `/v1` route or the MCP transport, so the credential a desktop
+  client holds cannot execute tools, write memory or start Claude Code; the
+  broad `GENESIS_MCP_HTTP_TOKEN` is still accepted here during a transition.
+  A client that ALSO calls a `/v1/voice/*` route (e.g. `tool_call` for memory
+  recall) still needs the broad token there; voice has no scoped token yet.
+  All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
 - **browser/**: profile/state layer only (persistent
@@ -1340,7 +1399,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 33b49a10 2026-09-26
+verified: 84c7259d 2026-08-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1395,9 +1454,11 @@ verified: 33b49a10 2026-09-26
   stands the whole check cycle down beside the indefinite `maintenance_file`. This
   is the *capability* a deploy uses to pause the Guardian across the server restart
   — instead of escalating to `confirmed_dead` and firing a false down/recovered
-  alert — so that a paused restart is silent; the `scripts/update.sh` caller that
-  actually writes the pause across its stop/restart lands as a separate change (a
-  deploy on the old caller simply runs unpaused, as today). The TTL means a deploy
+  alert — so that a paused restart is silent. The container-side caller is
+  `scripts/lib/guardian_pause.sh` (`_guardian_pause`/`_guardian_resume` plus a lease
+  renewer that holds no lock and, once its parent is gone, stops at its next wake
+  instead of pausing again), sourced by
+  `scripts/update.sh`, which arms the resume on its EXIT trap. The TTL means a deploy
   killed before its `resume` self-heals rather than muting the watchdog. During
   stand-down the heartbeat carries a `standdown` marker so `probe_guardian` reports
   DEGRADED (alive, not watching) rather than HEALTHY. Distinct from the container
@@ -1422,34 +1483,50 @@ verified: 33b49a10 2026-09-26
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
   `decide_alert` hysteresis. Read-only `disk-status`/`ram-status` verbs expose
   the same measurement to the container.
-- **Pool-pressure RELIEF** (`pool_pressure.py`) runs every tick, BEFORE
-  `_check_cycle`. The tick is a oneshot, though, so during an outage's
-  diagnosis relief runs about hourly, not every 30s. The tiers above only
-  alert, and a thin pool once filled to 100% under six-hourly CRITICALs.
-  - It keeps a bounded `pool_history.jsonl` (7d).
-  - It derives the measured runway: the worst SUSTAINED slope over 2h/6h/24h
-    (growth must show in both halves of a window, so one-off steps never count).
-    Data and metadata each get a burst reserve, where a burst includes a rise
-    across a delayed tick.
-  - Relief acts only after config validation, with the throttle stamp persisted
-    first and the pool re-read unchanged.
-  - It frees ONE guardian-owned thing per tick in two stages:
-    - early (<48h): extend the LVM pool, then pre-recovery snapshots, then a
-      lifeline older than 48h;
-    - urgent (<24h, or below the reserve): any `guardian-` snapshot, lifeline
-      last.
-  - The extend applies only with the `genesis-thinpool` opt-in profile, at or
-    above the autoextend threshold, and when VG free is below one autoextend step
-    (where dmeventd refuses). It is recorded in the provisioning ledger as
-    `pool_extend`.
-  - One action per tick, then a history-interval settle (btrfs frees
-    asynchronously). At most one extend a day.
-  - Companion change in `snapshots.py`: `mark_healthy` rotates delete-first when
-    the POOL refused the create AND `current_pressure()` agrees there is
-    pressure. A full-but-stable pool keeps its lifeline. A refused refresh
-    retries in ~1h, with a throttled alert.
-  - Levers: `storage_pool.relief_mode` and `GUARDIAN_POOL_RELIEF_DISABLED`.
-  - Runbook: `docs/reference/thin-pool-recovery.md`.
+- **Pool RELIEF** (`pool_relief.py`) runs every tick, BEFORE `_check_cycle`
+  (during an outage's diagnosis that is about hourly, since the tick is a
+  oneshot). The tiers above only alert, and a thin pool once filled to 100%
+  under six-hourly CRITICALs because the space was held by the guardian's own
+  healthy snapshot. Two layers now free guardian-owned space:
+  - `snapshots.mark_healthy` rotates **delete-first** when the pool refused
+    the create on a real measurement of a NAMED pool, the lifeline is ≥23h
+    old, AND LVM measures the healthy snapshots hold ≥ max(1 GiB, 1%) that no
+    live volume maps (`pool.snapshot_only_bytes`: pool used − Σ live mapped, a
+    lower bound; stateless). LVM-thin only; on btrfs/dir relief is the guard.
+    One more create is tried after those reads: only a pool refusal then
+    deletes first (pressure cleared → ordinary create-first rotation).
+    The settle is reserved before the delete. Healthy snapshots are never
+    retention-evicted before a create. A refused refresh retries in ~1h
+    (own `.last_healthy` marker) and alerts, throttled.
+  - relief deletes ONE guardian snapshot per pass when free data ≤
+    `min_reserve_pct` (3%) or free metadata ≤ `min_meta_reserve_pct` (10%):
+    pre-recovery oldest first, then superseded healthy, the lifeline last;
+    a failed delete falls through to the next unless the client timed out
+    (outcome unknown → stop and alert); 5-minute settle stamped before
+    the delete (delete-first starts it too); a re-measure just before the
+    delete must show the same pool still short (eased → stop, `eased`).
+    `safe_to_snapshot` refuses a new snapshot inside the reserve; a failed
+    delete never falls through to the lifeline. Pool identity is incus's
+    DECLARED `lvm.vg_name` / `lvm.thinpool_name` (`pool.parse_pool_backend`);
+    only lvm (thin), btrfs and dir are measured — others are undetected. Unable to measure, read or name the pool for 1h →
+    daily WARNING. Rollback (healthy) snapshots have ONE deletion chokepoint,
+    `SnapshotManager.delete_healthy` (plain `delete` refuses them): allowed
+    only with a just-created replacement or THIS tick's probe-confirmed
+    HEALTHY (`check._probe_confirmed_healthy`: the last `signal_history`
+    entry is from this tick and `all_alive` — NOT the state, which also
+    reaches HEALTHY with the container down via auto-reset/unpause); the
+    daily healthy refresh uses the same verdict. Relief runs a pre-cycle pass (non-healthy only) and a post-cycle
+    pass (healthy allowed when the probe said HEALTHY); prune and pre-create
+    retention never delete a healthy snapshot; a retention eviction defers
+    delete-first. The snapshot gate shares relief's admission rule
+    (`unactionable`) and trusts only validated tiers/reserves.
+  - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
+    `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
+    (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an
+    unmeasured or ambiguous pool (unknown backend, several thin pools).
+  - Levers: `storage_pool.relief_mode` (`live`/`alert_only`/`off`) and
+    `GUARDIAN_POOL_RELIEF_DISABLED=1`. Runbook:
+    `docs/reference/thin-pool-recovery.md`.
 - **Container-swap invariant reconciler** (`swap_watch.py`) runs every tick:
   re-asserts `limits.memory.swap=true` (incus config) and live-activates the
   cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the
@@ -1483,6 +1560,17 @@ modules: [awareness, perception, reflection, attention, session_awareness,
 verified: 788dd9a9 2026-09-06
 ```
 
+- **Peer-handoff surface (2026-09-26)**: a SessionStart hook
+  (`scripts/surface_handoffs.py` → `session_awareness/handoffs.py`) counts the
+  `*.md` handoffs another install left in a configured directory
+  (`config/handoffs.yaml` `dir`, unset = OFF) that have no local handled record
+  and no `<name>-REPLY.md` sibling at least as new, and tells FOREGROUND sessions they exist — as
+  untrusted claims to verify, never with their content, never dispatching work.
+  Read-only on the shared directory; handled state is local
+  (`~/.genesis/handoffs/handled.json`, namespaced by the configured directory and
+  keyed to name + content hash, so a rewritten handoff resurfaces). The hook's scan
+  runs in a forked worker under a hard deadline (`SCAN_TIMEOUT_S`) — a hung mount
+  reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
   `upstream-pr-steward` campaign's own owner notifications — the ones it already
@@ -1695,7 +1783,8 @@ verified: 788dd9a9 2026-09-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (LIVE, producer only — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic, consumer
+  manual-invoke only — nothing dispatches a validator yet — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -1706,9 +1795,24 @@ verified: 788dd9a9 2026-09-06
   `get_actionable`, morning report via `get_pending`) would surface these as
   actionable work, and they are a ledger for a validator, not work — see the
   `20260906234824_pr_verifications` migration docstring for the full
-  New-Store-Gate justification. The CONSUMER (the Wave-3 validator session) does
-  not exist yet; today's reader is
-  `scripts/repo_pulse_worker.py --verification-backlog`. `doc_paths.is_doc_path`
+  New-Store-Gate justification. The CONSUMER is the **validator session**
+  (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
+  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  validator's evidence document by `session_awareness/pr_evidence.py` (a strict
+  pydantic model plus a total decision tree), never asserted by the caller — a
+  caller-asserted design policed by refusal rules produced documents with no legal
+  verdict twice. Any second writer (an MCP tool is the anticipated one) must go
+  through that module; it lives in `src/` so it can. Only a PASS verdict discharges
+  an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
+  nobody could verify says why instead of looking untouched. The one non-obvious
+  invariant, because the obvious one is false: a PASS verdict implies the row is
+  closed, but **NOT** the converse — a closed row may carry no verdict at all, and
+  most do, because the docs-path exemption discharges rows a validator never
+  looked at. `status` means "obligation discharged"; only `verdict` says a
+  validator concluded anything. The verdict vocabulary and column names live with
+  the code (`crud/pr_verifications.py`) rather than here, since a four-value set
+  invented before the tool had run once is the kind of detail this map should not
+  be the second copy of. `doc_paths.is_doc_path`
   is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
   import `scripts/`), held in parity by
   `tests/test_session_awareness/test_doc_paths.py`.
@@ -2366,7 +2470,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 
 ```yaml subsystem-map
 entry: routing-providers
-modules: [routing, providers]
+modules: [routing, providers, decisions]
 verified: ee9ebf85c 2026-09-05
 ```
 
@@ -2527,6 +2631,13 @@ verified: ee9ebf85c 2026-09-05
 - A load-time guard warns if an `openrouter` provider flagged `free: true` points
   at a non-`:free` (paid) slug — the openrouter-free billing blind spot
   (`_detect_mislabeled_free_openrouter`, config-only, visibility not gating).
+- **decisions/**: the decision question registry (`config/decisions.yaml`),
+  the bounded-choice counterpart of the routing call sites. Each site declares
+  a `choice` / `score` / `noul` question and what it `consumes`. Only a
+  `threshold` consumer needs calibration, and it must also declare a
+  `dead_band` and `tie_rule`, so `DecisionSpec.gate()` abstains near the cut
+  instead of taking a branch a retry could reverse. DECLARED ONLY: no runtime
+  caller reads the registry yet.
 
 ## 12. Platform & data
 
@@ -2848,7 +2959,10 @@ verified: f24c15e9 2026-09-05
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open
-  to "no deploy". `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  to "no deploy". A marker or state-file holder counts only while it is running and
+  not a zombie (`_marker_holder_live`, mirrored in `scripts/lib/deploy_marker.sh`);
+  a reused pid still reads as live until the marker records a start tick (#2535).
+  `secrets_path()` is repo-relative unless SECRETS_PATH set.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.

@@ -629,7 +629,7 @@ class TestTopLevelDefaults:
         s.parent.mkdir(parents=True, exist_ok=True)
         s.write_text(json.dumps({"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}}))
         r = self._call(tmp_path, "top:syncClaudeAiPlugins=false")
-        assert "STATE=repaired" in r.stdout
+        assert "STATE=defaults" in r.stdout, "suppression was intact; only a default was added"
         assert json.loads(s.read_text())["syncClaudeAiPlugins"] is False
         assert "syncClaudeAiPlugins" in r.stderr, "the write must be reported, not silent"
         assert "MISSING" not in r.stderr, "a defaults-only write is not a suppression repair"
@@ -897,25 +897,227 @@ class TestCallerWiring:
         src = (_REPO_ROOT / "scripts" / "cc_align_host.sh").read_text()
         assert "cc_ensure_updater_suppressed" not in src
 
-    def test_install_sh_passes_the_nesting_default_through_one_call(self) -> None:
-        src = (_REPO_ROOT / "scripts" / "install.sh").read_text()
-        # One call, one atomic write: the env nesting default AND the two
-        # top-level sync opt-outs. The sync keys MUST use the `top:` form — as
-        # env KEY=VALUE they would land as the string "false" inside `env`,
-        # where CC never reads them, and the opt-out would silently not exist.
-        call = (
-            'cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2" \\\n'
-            '        "top:syncClaudeAiSkills=false" "top:syncClaudeAiPlugins=false"'
+    def test_the_shared_container_defaults_resolve_to_every_key(self) -> None:
+        """CC_CONTAINER_SETTINGS_DEFAULTS is EXECUTED, not grepped: sourcing the
+        library and printing the array is the only reading that says what callers
+        actually receive (a grep passes on an array defined but later emptied).
+        The claude.ai sync opt-outs are deliberately NOT in it — they are decided
+        per install (TestClaudeAiSyncOptOut)."""
+        out = subprocess.run(
+            ["bash", "-c", f'set -u; source "{_LIB}"; printf "%s\\n" "${{CC_CONTAINER_SETTINGS_DEFAULTS[@]}}"'],
+            capture_output=True, text=True, check=True, timeout=60,
+        ).stdout.split()
+        assert out == [
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2",
+            "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192",
+        ], out
+
+    @staticmethod
+    def _limit(override: str) -> tuple[str, str]:
+        r = subprocess.run(
+            ["bash", "-c", f'source "{_LIB}"; echo "$CC_MCP_DESCRIPTION_LIMIT"'],
+            capture_output=True, text=True, check=True, timeout=60,
+            env={"PATH": "/usr/bin:/bin", "CC_MCP_DESCRIPTION_LIMIT": override},
         )
-        assert call in src, "install.sh must pass all three set-if-absent defaults in one call"
-        assert '"syncClaudeAiSkills=false"' not in src, "sync opt-out passed in env form"
-        # The real invariant is not how often the key is NAMED (a comment and a
-        # manual-fix hint legitimately mention it) but that install.sh no longer
-        # opens its OWN read-modify-write of the settings file.
-        assert 'python3 - "$_settings_file"' not in src, (
+        return r.stdout.strip(), r.stderr
+
+    @pytest.mark.parametrize("override", ["abc", "8192x", "", "-1", "0", "08", "00"])
+    def test_a_non_numeric_description_limit_override_falls_back(self, override: str) -> None:
+        out, err = self._limit(override)
+        assert out == "8192", (override, out)
+        if override:
+            assert "CC_MCP_DESCRIPTION_LIMIT" in err, "a fallback is announced, never silent"
+
+    @pytest.mark.parametrize("override", ["1", "204", "2047"])
+    def test_a_limit_below_claude_codes_own_default_falls_back(self, override: str) -> None:
+        """Below 2,048 the key would cut descriptions SHORTER than CC does with no
+        key at all — Genesis's own tools included."""
+        out, err = self._limit(override)
+        assert out == "8192", (override, out)
+        assert "below" in err and "2048" in err, err
+
+    @pytest.mark.parametrize("override", ["2048", "8192", "16384", "123456789012345678901234"])
+    def test_a_valid_description_limit_override_is_kept(self, override: str) -> None:
+        """The other half of the validation: a legitimate override must survive.
+        (A mutation that always forced 8192 would pass every fallback test.)"""
+        out, err = self._limit(override)
+        assert out == override, (override, out, err)
+        # Nothing at all on stderr: a value too long for shell arithmetic must not
+        # reach `[ -lt ]`, which would print "integer expression expected".
+        assert err.strip() == "", err
+
+    def test_every_container_reconcile_path_goes_through_the_one_chokepoint(
+        self, tmp_path: Path
+    ) -> None:
+        """The defaults reach EXISTING installs, not only fresh clones.
+
+        They used to ride install.sh alone — the first-run installer, not the
+        deploy path. Every CONTAINER path now calls cc_reconcile_container_settings,
+        which resolves the defaults (including the per-install claude.ai sync check)
+        and calls the reconciler; no container path calls the reconciler itself, so
+        none can forget the defaults or the sync check. The host deliberately uses
+        neither.
+        """
+        import re
+
+        def calls(path: Path, name: str) -> list[str]:
+            """Every line that INVOKES `name`, in any shell spelling: bare,
+            `if`/`if !`, `$(...)`, after `&&`/`||`/`;`. A word boundary that also
+            refuses `_` and `-` keeps `_cc_ensure_updater_suppressed_inner` out."""
+            word = re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])")
+            folded = path.read_text().replace("\\\n", " ")
+            return [
+                ln.strip() for ln in folded.splitlines()
+                if word.search(ln)
+                and not ln.lstrip().startswith("#")
+                and not re.search(rf"(?<![\w-]){re.escape(name)}\s*\(\)", ln)  # a definition
+                and "declare -F" not in ln
+                and "for _fn in" not in ln
+                and not ln.lstrip().startswith("echo")
+            ]
+
+        # Self-check: the matcher must see the spellings a regression would use.
+        probe = tmp_path / "probe_spellings.sh"
+        probe.write_text(
+            "if cc_ensure_updater_suppressed; then :; fi\n"
+            "if ! cc_ensure_updater_suppressed \"$f\"; then :; fi\n"
+            "x=$(cc_ensure_updater_suppressed)\n"
+            "true && cc_ensure_updater_suppressed || true\n"
+            "_cc_ensure_updater_suppressed_inner \"$@\"\n"
+        )
+        assert len(calls(probe, "cc_ensure_updater_suppressed")) == 4
+
+        container = {
+            "install.sh": _REPO_ROOT / "scripts" / "install.sh",
+            "cc_settings_align.sh": _REPO_ROOT / "scripts" / "cc_settings_align.sh",
+            "cc_version.sh (cc_ensure_local)": _LIB,
+        }
+        for label, path in container.items():
+            assert calls(path, "cc_reconcile_container_settings"), (
+                f"{label}: does not reconcile through cc_reconcile_container_settings — "
+                "an install that runs this path never receives the defaults"
+            )
+        # EVERY shell script on disk, not a hand-picked list: a new container path
+        # added next year that calls the reconciler directly fails here. The only
+        # permitted direct callers are the host leg and the chokepoint itself.
+        scripts = sorted((_REPO_ROOT / "scripts").rglob("*.sh"))
+        assert len(scripts) > 10, "enumeration found too few scripts to be trusted"
+        for path in scripts:
+            if path.name in ("host-setup.sh", "cc_version.sh"):
+                continue
+            direct = calls(path, "cc_ensure_updater_suppressed")
+            assert not direct, (
+                f"{path.relative_to(_REPO_ROOT)} calls the reconciler directly, "
+                f"skipping the container chokepoint: {direct}"
+            )
+        # In the library, the ONLY direct call is the chokepoint's own.
+        lib_direct = calls(_LIB, "cc_ensure_updater_suppressed")
+        assert lib_direct == [
+            'cc_ensure_updater_suppressed "$sf" "${CC_CONTAINER_DEFAULTS_EFFECTIVE[@]}" || rc=$?'
+        ], lib_direct
+        host_calls = calls(_REPO_ROOT / "scripts" / "host-setup.sh", "cc_ensure_updater_suppressed")
+        assert host_calls, "host-setup.sh: no reconciler call found (test would pass vacuously)"
+        for call in host_calls:
+            assert "CC_CONTAINER_SETTINGS_DEFAULTS" not in call, (
+                f"host-setup.sh must NOT pass container defaults: {call}"
+            )
+        assert not calls(_REPO_ROOT / "scripts" / "host-setup.sh", "cc_reconcile_container_settings"), (
+            "host-setup.sh must NOT run the container reconcile"
+        )
+        # install.sh must not open its OWN read-modify-write of the settings file.
+        assert 'python3 - "$_settings_file"' not in (
+            _REPO_ROOT / "scripts" / "install.sh"
+        ).read_text(), (
             "install.sh must not run a second read-modify-write on settings.json — "
             "it doubles the lost-update window and duplicates the write contract"
         )
+
+    def test_cc_ensure_local_delivers_the_defaults_to_an_existing_install(
+        self, tmp_path: Path
+    ) -> None:
+        """Behavioural: the deploy path (cc_ensure_local, run by bootstrap.sh and
+        update.sh) seeds the defaults into a PRE-EXISTING correct settings file and
+        reports `defaults`, not `repaired` — so an existing install is not recorded
+        as a degraded deploy. npm is absent from the harness PATH, so the version
+        align skips and only the settings reconcile runs."""
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps(
+            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, "theme": "dark"}
+        ))
+        r = _run(tmp_path, 'cc_ensure_local || true; echo "STATE=$CC_SUPPRESSION_STATE"')
+        assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
+        data = json.loads(s.read_text())
+        assert data["theme"] == "dark"
+        assert data["env"]["CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH"] == "8192"
+        assert data["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "2"
+        assert data["syncClaudeAiSkills"] is False and data["syncClaudeAiPlugins"] is False
+        # Second deploy: nothing absent any more -> untouched, `ok`.
+        r2 = _run(tmp_path, 'cc_ensure_local || true; echo "STATE=$CC_SUPPRESSION_STATE"')
+        assert "STATE=ok" in r2.stdout, (r2.stdout, r2.stderr)
+
+    _STATES = ("ok", "defaults", "repaired", "failed", "contended", "unverified")
+
+    @staticmethod
+    def _block(path: Path, start: str, end: str) -> str:
+        """The REAL reader text between two anchors, so the test executes what the
+        script executes rather than a copy of it."""
+        src = path.read_text()
+        i = src.index(start)
+        j = src.index(end, i)
+        return src[i:j]
+
+    def _run_block(self, tmp_path: Path, block: str, state: str) -> subprocess.CompletedProcess:
+        (tmp_path / "home").mkdir(exist_ok=True)
+        script = (
+            f'set -u; source "{_LIB}"; CC_SUPPRESSION_STATE={state}; '
+            f'HOST_CC_DEGRADED=""\n{block}\necho "DEGRADED=$HOST_CC_DEGRADED"'
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=60,
+            env={"HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"},
+        )
+
+    @pytest.mark.parametrize("script", ["bootstrap.sh", "install.sh"])
+    def test_setup_readers_warn_only_when_suppression_is_not_verified(
+        self, tmp_path: Path, script: str
+    ) -> None:
+        """bootstrap.sh / install.sh step 7 run AS WRITTEN against every state:
+        `ok`, `defaults` and `repaired` are verified (no warning); the rest warn.
+        A reader that did not know `defaults` would warn on every existing
+        install's first deploy after a new default — the regression a reviewer
+        showed the grep-level test could not see."""
+        block = self._block(
+            _REPO_ROOT / "scripts" / script, "if ! cc_suppression_verified; then", "\n    fi\n"
+        ) + "\n    fi\n"
+        for state in self._STATES:
+            r = self._run_block(tmp_path, block, state)
+            warned = "WARNING" in r.stdout
+            assert warned == (state not in {"ok", "defaults", "repaired"}), (script, state, r.stdout)
+
+    def test_update_sh_records_degradation_only_for_real_drift(self, tmp_path: Path) -> None:
+        """update.sh's suppression fold run AS WRITTEN: `ok` and `defaults` record
+        nothing; `repaired` and the failure states are recorded as degraded."""
+        block = self._block(
+            _REPO_ROOT / "scripts" / "update.sh",
+            'if [ -z "${CC_SUPPRESSION_STATE+set}" ]; then',
+            "        cc_shadow_scan || true",
+        )
+        for state in self._STATES:
+            r = self._run_block(tmp_path, block, state)
+            degraded = r.stdout.strip().splitlines()[-1]
+            if state in {"ok", "defaults"}:
+                assert degraded == "DEGRADED=", (state, r.stdout, r.stderr)
+            else:
+                assert degraded == f"DEGRADED=cc_updater_suppression_{state}", (state, r.stdout)
+
+    def test_the_state_predicates_are_the_single_definition(self) -> None:
+        """No reader may hand-list good states again (that is how `defaults` was
+        nearly missed); the predicates own the meaning."""
+        for script in ("bootstrap.sh", "install.sh", "update.sh"):
+            src = (_REPO_ROOT / "scripts" / script).read_text()
+            assert "ok|defaults|repaired" not in src and "ok|repaired" not in src, script
+            assert '!= "ok"' not in src, script
 
 
 class TestSettingsAlignUnit:
@@ -1014,11 +1216,57 @@ class TestSettingsAlignScriptRuns:
         r = subprocess.run(["bash", "-n", str(self._SCRIPT)], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
 
+    # "Already correct" includes the shared container defaults: the timer passes
+    # CC_CONTAINER_SETTINGS_DEFAULTS, so a file holding only the two suppression
+    # keys is an install that has not yet received them.
+    _CORRECT = {
+        "env": {
+            "DISABLE_AUTOUPDATER": "1",
+            "DISABLE_UPDATES": "1",
+            "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2",
+            "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH": "8192",
+        },
+        "syncClaudeAiSkills": False,
+        "syncClaudeAiPlugins": False,
+    }
+
     def test_exits_zero_and_quiet_when_already_correct(self, tmp_path: Path) -> None:
-        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        home = self._seed(tmp_path, self._CORRECT)
         r = self._run_script(home)
         assert r.returncode == 0, r.stdout + r.stderr
         assert r.stdout.strip() == "", "a timer that logs every run trains you to ignore it"
+
+    def test_an_existing_install_receives_the_defaults_once_then_goes_quiet(
+        self, tmp_path: Path
+    ) -> None:
+        """The deploy-path property on the TIMER: tick 1 seeds the defaults
+        (exit 0, one line, never 'MISSING'); tick 2 is silent. A set-if-absent
+        default can be written at most once, so the repeat-repair escalation can
+        never fire on it."""
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        first = self._run_script(home)
+        assert first.returncode == 0, first.stdout + first.stderr
+        assert "MISSING" not in first.stdout, first.stdout
+        assert "default(s) applied" in first.stdout, first.stdout
+        data = json.loads((home / ".claude" / "settings.json").read_text())
+        assert data["env"]["CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH"] == "8192"
+        assert data["syncClaudeAiSkills"] is False
+        second = self._run_script(home)
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert second.stdout.strip() == "", f"tick 2 must be quiet: {second.stdout!r}"
+
+    def test_a_real_repair_after_a_defaults_tick_is_a_first_repair(self, tmp_path: Path) -> None:
+        """`defaults` is persisted as the last outcome; a later genuine repair must
+        not be mistaken for the SECOND consecutive one (which fails the unit)."""
+        home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}})
+        assert self._run_script(home).returncode == 0  # defaults tick
+        s = home / ".claude" / "settings.json"
+        data = json.loads(s.read_text())
+        data["env"].pop("DISABLE_UPDATES")
+        s.write_text(json.dumps(data))
+        r = self._run_script(home)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "SECOND consecutive" not in r.stdout, r.stdout
 
     def test_repairs_and_exits_zero(self, tmp_path: Path) -> None:
         home = self._seed(tmp_path, {"env": {"DISABLE_AUTOUPDATER": "1"}})
@@ -1394,14 +1642,20 @@ class TestVerifiedByConstruction:
             )
         return d
 
-    def test_a_defaults_only_write_reports_repaired_not_ok(self, tmp_path: Path) -> None:
-        """A run that MODIFIED the file must not report `ok` (= untouched).
+    def test_a_defaults_only_write_reports_defaults_not_ok_or_repaired(self, tmp_path: Path) -> None:
+        """A run that MODIFIED the file must not report `ok` (= untouched) —
+        and a defaults-only write must not report `repaired` either.
 
-        Before this contract, a write that filled only set-if-absent defaults
-        produced rc 0 with EMPTY stdout -- byte-identical to "already correct,
-        nothing written" -- so the caller reported `ok` for a run that wrote.
-        host-setup gates its created-as-root chown handback on `repaired`, so
-        the collapse had a consumer-visible cost, not just a naming one.
+        Before the first contract, a write that filled only set-if-absent
+        defaults produced rc 0 with EMPTY stdout — byte-identical to "already
+        correct, nothing written" — so the caller reported `ok` for a run that
+        wrote. It then reported `repaired`, which update.sh records as a
+        DEGRADED deploy; once the container defaults are passed on every deploy,
+        every existing install would log one false degradation per new default.
+        `defaults` is the third answer: wrote, and nothing was wrong.
+        (host-setup's created-as-root chown handback keys on `repaired`; it
+        passes no defaults, and a defaults-only write can never create the file —
+        an absent file means absent suppression keys, which is `repaired`.)
         """
         s = _settings(tmp_path)
         s.parent.mkdir(parents=True, exist_ok=True)
@@ -1411,7 +1665,10 @@ class TestVerifiedByConstruction:
             'cc_ensure_updater_suppressed "" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=9" || true; '
             'echo "STATE=${CC_SUPPRESSION_STATE:-unset}"',
         )
-        assert "STATE=repaired" in r.stdout, (r.stdout, r.stderr)
+        assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
+        assert not (tmp_path / "home" / ".genesis" / "cc_suppression_outcome").exists(), (
+            "a defaults-only write must not leave the breadcrumb update.sh reads as degradation"
+        )
         assert "set-if-absent default(s) applied" in r.stderr
         assert "MISSING" not in r.stderr, (
             "a defaults-only write must not cry 'suppression was MISSING' -- "
@@ -1885,15 +2142,20 @@ class TestVerifiedByConstruction:
         # mkstemp it protects. A handler registered afterwards leaves the same
         # window open.
         src = _LIB.read_text(encoding="utf-8")
-        assert "signal.signal(signal.SIGTERM" in src, (
+        # Scoped to the reconciler's own program: the library has other temp
+        # writes (the sync withholding record holds only kind names, not
+        # settings), and a whole-file index would compare against the wrong one.
+        imports = "import json, os, random, shutil, signal, stat, sys, tempfile, time"
+        assert src.count(imports) == 1, "the reconciler program could not be located"
+        block = src[src.index(imports):]
+        assert "signal.signal(signal.SIGTERM" in block, (
             "no SIGTERM handler — the `except BaseException` cleanup arm cannot "
             "run, because a default-disposition SIGTERM raises nothing"
         )
-        assert src.index("signal.signal(signal.SIGTERM") < src.index("tempfile.mkstemp"), (
+        assert block.index("signal.signal(signal.SIGTERM") < block.index("tempfile.mkstemp"), (
             "the SIGTERM handler is installed after the temp file is created — "
             "the unprotected window is exactly the one being closed"
         )
-        assert "import json, os, random, shutil, signal, stat, sys, tempfile, time" in src
 
     def test_a_create_whose_write_did_not_land_reports_failed(self, tmp_path: Path) -> None:
         """Sabotaged mv: the rename 'succeeds' but the content never arrives.
@@ -2247,3 +2509,491 @@ class TestConsumersReadTheChannel:
             "this channel explicitly refuse"
         )
 
+
+
+class TestClaudeAiSyncOptOut:
+    """The claude.ai sync opt-outs are decided PER INSTALL (owner ruling
+    2026-09-25). Turning sync off on an install that is already syncing makes CC
+    hide the synced skills/plugins and move them to <kind>/.trash at the next
+    launch, and the only opt-out would be acting BEFORE the update — so an opt-out
+    is written only where that kind has nothing synced, and otherwise withheld
+    with a notice. Driven through cc_ensure_local, the real deploy-path caller."""
+
+    _CALL = 'cc_ensure_local || true; echo "STATE=${CC_SUPPRESSION_STATE:-unset}"'
+
+    @staticmethod
+    def _seed(tmp_path: Path, extra: dict | None = None) -> Path:
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(json.dumps(
+            {"env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"}, **(extra or {})}
+        ))
+        return s
+
+    @staticmethod
+    def _synced(tmp_path: Path, kind: str, n: int = 1) -> Path:
+        d = tmp_path / "home" / ".claude" / kind / "synced"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (d / f"item{i}").mkdir()
+        return d
+
+    def test_nothing_synced_gets_both_opt_outs(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] is False and data["syncClaudeAiPlugins"] is False, data
+        assert "sync is left ON" not in r.stderr, r.stderr
+        assert r.stderr.count("sync is now OFF here") == 2, "writing each opt-out is announced"
+
+    def test_an_empty_synced_dir_counts_as_nothing_synced(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills", n=0)
+        _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is False
+
+    def test_synced_skills_keep_skills_sync_on(self, tmp_path: Path) -> None:
+        """An install already syncing skills keeps syncing, and the decision is
+        written down as `true` so a later sign-out cannot undo it."""
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills", n=2)
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] is True, data
+        assert data["syncClaudeAiPlugins"] is False, "the other kind is decided on its own"
+        assert data["env"]["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] == "2", "env defaults still land"
+        assert "NOTE: claude.ai skills sync is kept ON here" in r.stderr, r.stderr
+        assert "synced content is present in" in r.stderr, "no item count it cannot back"
+        assert "To turn it off, set it to false" in r.stderr, "the notice names the opt-out"
+        assert "plugins sync is kept ON" not in r.stderr, r.stderr
+        assert "plugins sync is now OFF here" in r.stderr, r.stderr
+
+    def test_synced_plugins_keep_plugins_sync_on(self, tmp_path: Path) -> None:
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "plugins")
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiPlugins"] is True
+        assert data["syncClaudeAiSkills"] is False
+        assert "NOTE: claude.ai plugins sync is kept ON here" in r.stderr, r.stderr
+
+    def test_keeping_sync_on_is_announced_once(self, tmp_path: Path) -> None:
+        self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        assert "skills sync is kept ON" in _run(tmp_path, self._CALL).stderr
+        again = _run(tmp_path, self._CALL).stderr
+        assert "skills sync is kept ON" not in again and "left ON" not in again, again
+
+    def test_a_failed_write_keeps_the_notice_repeating(self, tmp_path: Path) -> None:
+        """If nothing could be written (here: a reconciler stub that writes
+        nothing), the key stays absent and the undecided note repeats."""
+        self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        stub = "cc_ensure_updater_suppressed() { return 1; }; "
+        for _ in range(2):
+            r = _run(tmp_path, stub + "cc_reconcile_container_settings || true")
+            assert "skills sync is left ON" in r.stderr, r.stderr
+
+    @pytest.mark.parametrize("choice", [True, False])
+    def test_an_explicit_operator_choice_silences_the_notice(self, tmp_path: Path, choice: bool) -> None:
+        s = self._seed(tmp_path, {"syncClaudeAiSkills": choice})
+        self._synced(tmp_path, "skills")
+        r = _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is choice, "never overwritten"
+        assert "skills sync is left ON" not in r.stderr, r.stderr
+
+    def test_an_unreadable_synced_dir_is_treated_as_holding_skills(self, tmp_path: Path) -> None:
+        """Guessing "empty" for a directory it cannot list would retire whatever is
+        in it; the safe reading is "something is synced"."""
+        if os.geteuid() == 0:
+            pytest.skip("root reads any directory; the unreadable case cannot be built")
+        s = self._seed(tmp_path)
+        d = self._synced(tmp_path, "skills")
+        d.chmod(0)
+        try:
+            r = _run(tmp_path, self._CALL)
+        finally:
+            d.chmod(0o755)
+        assert "syncClaudeAiSkills" not in json.loads(s.read_text())
+        assert "holds synced skills could not be read" in r.stderr, r.stderr
+
+    def test_an_unsearchable_parent_is_not_read_as_nothing_synced(self, tmp_path: Path) -> None:
+        """Review (Devin, #2561): `[ -e skills/synced ]` is false for EACCES as well
+        as ENOENT, so a skills/ the reconcile cannot search read a full synced/ as
+        missing and wrote the opt-out. Missing now counts only when the nearest
+        existing ancestor is searchable."""
+        if os.geteuid() == 0:
+            pytest.skip("root searches any directory; the unsearchable case cannot be built")
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        parent = tmp_path / "home" / ".claude" / "skills"
+        parent.chmod(0)
+        try:
+            r = _run(tmp_path, self._CALL)
+        finally:
+            parent.chmod(0o755)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data, "an unverified synced/ must not be read as empty"
+        assert data["syncClaudeAiPlugins"] is False, "a kind whose absence IS provable still gets it"
+        assert "holds synced skills could not be read" in r.stderr, r.stderr
+
+    def test_a_fifo_settings_file_does_not_hang_the_notice(self, tmp_path: Path) -> None:
+        """The reconciler already declines a settings.json that is not a regular
+        file, but the sync notice runs after it and opened the same path; on a
+        FIFO that open blocked (review, the unnamed sibling of the record case)."""
+        s = _settings(tmp_path)
+        s.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(s)
+        self._synced(tmp_path, "skills")  # a withheld kind, so the notice reads the file
+        r = _run(tmp_path, self._CALL)  # a hang raises TimeoutExpired here
+        assert "not a regular file" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+        assert "skills sync is left ON" in r.stderr, "an unreadable file still gets the note"
+        assert "now OFF" not in r.stderr, "nothing was written, so nothing is announced"
+
+    @pytest.mark.parametrize("value", ["true", None, 1])
+    def test_a_non_boolean_value_is_reported_with_nothing_synced(self, tmp_path: Path, value) -> None:
+        """Review (Devin + Codex, #2561): the type check lived inside the withheld
+        loop, so with nothing synced a preserved non-boolean (which CC reads as
+        false) went unreported."""
+        s = self._seed(tmp_path, {"syncClaudeAiSkills": value})
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] == value, "set-if-absent never replaces it"
+        assert '"syncClaudeAiSkills" in' in r.stderr and "is not true/false" in r.stderr, r.stderr
+        assert r.stderr.count("is not true/false") == 1, "only the non-boolean key is flagged"
+
+    def test_a_withheld_opt_out_still_reports_defaults_not_degraded(self, tmp_path: Path) -> None:
+        """Holding one key back is not a failure: the deploy reads `defaults`."""
+        self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        r = _run(tmp_path, self._CALL)
+        assert "STATE=defaults" in r.stdout, (r.stdout, r.stderr)
+
+    def test_the_settings_timer_applies_the_same_rule(self, tmp_path: Path) -> None:
+        """The chokepoint itself, called the way cc_settings_align.sh calls it (the
+        script's own run is covered by TestSettingsAlignScriptRuns)."""
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "plugins")
+        r = _run(tmp_path, 'cc_reconcile_container_settings || true; echo "STATE=$CC_SUPPRESSION_STATE"')
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiPlugins"] is True and data["syncClaudeAiSkills"] is False
+        assert "plugins sync is kept ON" in r.stderr
+
+    def test_the_measured_account_layout_keeps_sync_on_with_zero_items(self, tmp_path: Path) -> None:
+        """MEASURED on Claude Code 2.1.280: once sync has run, <kind>/synced holds a
+        `.bucket-<id>` marker and an `<id>/` folder whatever the item count —
+        plugins/synced has both with zero plugins synced. So a syncing install is
+        decided (`true`) on its first run, even with no items."""
+        s = self._seed(tmp_path)
+        for kind, inner in (("skills", "manifest.json"), ("plugins", ".marketplaces.json")):
+            d = tmp_path / "home" / ".claude" / kind / "synced"
+            (d / "acct").mkdir(parents=True)
+            (d / ".bucket-acct").write_text("")
+            (d / "acct" / inner).write_text("{}")
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] is True and data["syncClaudeAiPlugins"] is True, data
+        assert r.stderr.count("sync is kept ON") == 2, r.stderr
+        assert "now OFF" not in r.stderr, r.stderr
+
+    def test_writing_the_opt_out_is_announced_once(self, tmp_path: Path) -> None:
+        """Turning sync off is never silent: the reconcile that writes an opt-out
+        says so, and later runs (the key now present) do not repeat it."""
+        s = self._seed(tmp_path)
+        r = _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is False
+        assert "claude.ai skills sync is now OFF here" in r.stderr, r.stderr
+        assert "claude.ai plugins sync is now OFF here" in r.stderr, r.stderr
+        again = _run(tmp_path, self._CALL)
+        assert "now OFF" not in again.stderr, "announced on the run that wrote it, only"
+
+    def test_no_note_when_the_write_was_not_ours(self, tmp_path: Path) -> None:
+        """Review: 'written' comes from the reconciler's own verified write list,
+        not a before/after re-read. A reconciler that fails while something else
+        sets the key (here: a stub writing `true`, then returning 1) must not be
+        announced as Genesis turning sync off."""
+        s = self._seed(tmp_path)
+        stub = (
+            'cc_ensure_updater_suppressed() { python3 -c "import json,sys; p=sys.argv[1]; '
+            'd=json.load(open(p)); d[\'syncClaudeAiSkills\']=True; json.dump(d,open(p,\'w\'))" '
+            f'"{s}"; return 1; }}; '
+        )
+        r = _run(tmp_path, stub + 'cc_reconcile_container_settings; echo "rc=$?"')
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is True
+        assert "rc=1" in r.stdout, (r.stdout, r.stderr)
+        assert "now OFF" not in r.stderr, r.stderr
+
+    @staticmethod
+    def _record(tmp_path: Path) -> Path:
+        return tmp_path / "home" / ".genesis" / "cc_sync_optout_withheld"
+
+    def test_signing_out_after_syncing_never_turns_sync_off(self, tmp_path: Path) -> None:
+        """Review (Devin, #2579): Claude Code empties <kind>/synced when the account
+        signs out, so a stateless check read the next run as "never synced" and
+        wrote `false`, and signing back in no longer resumed sync. A kind seen
+        syncing is now decided in settings itself (`true`), which a sign-out
+        cannot undo, and no record of Genesis's own is written."""
+        s = self._seed(tmp_path)
+        d = self._synced(tmp_path, "skills")
+        _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is True
+        shutil.rmtree(d)  # what Claude Code does for an account no longer signed in
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] is True, "sign-out must not turn skills sync off"
+        assert data["syncClaudeAiPlugins"] is False, "the kind never seen syncing still gets it"
+        assert "now OFF" not in r.stderr, r.stderr
+        self._synced(tmp_path, "skills")  # signed back in; sync repopulates
+        _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is True
+        assert not self._record(tmp_path).exists(), "the separate record is never written"
+
+    def test_a_record_left_by_2561_decides_its_kinds_on(self, tmp_path: Path) -> None:
+        """#2561 wrote a record naming each kind it withheld. A kind it names was
+        seen syncing, so it is decided `true` even with nothing synced now; the
+        record itself is left as it was."""
+        s = self._seed(tmp_path)
+        rec = self._record(tmp_path)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text("skills\n")
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert data["syncClaudeAiSkills"] is True and data["syncClaudeAiPlugins"] is False, data
+        assert "skills synced here before" in r.stderr, r.stderr
+        assert rec.read_text() == "skills\n", "the record is only ever read"
+
+    @pytest.mark.parametrize(
+        "content",
+        # "oversized": its first 4097 bytes end exactly on a line, so only the
+        # size cap, not a torn last line, can reject it.
+        ["", "junk\n", "skills\nplugins\nother\n", "skills\n" * 7 + "plugins\n" * 506 + "skills\n"],
+        ids=["empty", "garbled", "unexpected-line", "oversized"],
+    )
+    def test_a_record_it_cannot_vouch_for_decides_nothing(
+        self, tmp_path: Path, content: str
+    ) -> None:
+        """An empty, garbled, unexpected or oversized record is not "nothing was
+        withheld": no key is written, which leaves sync on."""
+        s = self._seed(tmp_path)
+        rec = self._record(tmp_path)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text(content)
+        r = _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+        assert r.stderr.count("could not be read") == 2, r.stderr
+        assert rec.read_text() == content
+
+    @pytest.mark.parametrize("where", ["record", "genesis_dir"])
+    def test_a_dangling_link_is_not_proof_of_no_record(self, tmp_path: Path, where: str) -> None:
+        """Review (#2579): opening a dangling link fails with ENOENT, which the
+        first version read as "no record" and wrote `false`. The record, or the
+        ~/.genesis it lives in, may be a link to a volume that is not mounted."""
+        s = self._seed(tmp_path)
+        rec = self._record(tmp_path)
+        if where == "record":
+            rec.parent.mkdir(parents=True, exist_ok=True)
+            rec.symlink_to(tmp_path / "gone" / "cc_sync_optout_withheld")
+        else:
+            rec.parent.symlink_to(tmp_path / "unmounted")
+        _run(tmp_path, self._CALL)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+
+    def test_a_failing_python_is_not_read_as_no_record(self, tmp_path: Path) -> None:
+        """Review (#2579): "provably absent" shared exit 1 with a crashing
+        interpreter, so a python3 that fails for the record program wrote
+        `false`. Absence now has its own code; anything else decides nothing."""
+        s = self._seed(tmp_path)
+        rec = self._record(tmp_path)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text("skills\n")
+        bindir = _minimal_bin(tmp_path)
+        real = os.path.realpath(bindir / "python3")
+        (bindir / "python3").unlink()
+        (bindir / "python3").write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *provably_absent*) exit 1 ;; esac\n'
+            f'exec {real} "$@"\n'
+        )
+        (bindir / "python3").chmod(0o755)
+        _run(tmp_path, self._CALL, path_dir=bindir)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+
+    # Every shape that can sit at the record path, read with nothing synced: what
+    # the skills key must end up as (True, False, or None for "not written"). The
+    # record is only ever read, so each cell also checks it is left as it was.
+    _RECORD_SHAPES = {
+        "absent": False,
+        "regular_naming_skills": True,
+        "symlink_to_regular_naming_skills": True,
+        "symlinked_genesis_dir_naming_skills": True,
+        "regular_naming_plugins_only": False,
+        "symlink_to_directory": None,
+        "dangling_symlink": None,
+        "fifo": None,
+        "directory": None,
+    }
+
+    @pytest.mark.parametrize("shape", sorted(_RECORD_SHAPES))
+    def test_every_record_shape_is_read_in_the_safe_direction(
+        self, tmp_path: Path, shape: str
+    ) -> None:
+        expected = self._RECORD_SHAPES[shape]
+        s = self._seed(tmp_path)
+        rec = self._record(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        if shape == "symlinked_genesis_dir_naming_skills":
+            rec.parent.symlink_to(elsewhere)
+        else:
+            rec.parent.mkdir(parents=True, exist_ok=True)
+        if shape in ("regular_naming_skills", "symlinked_genesis_dir_naming_skills"):
+            rec.write_text("skills\n")
+        elif shape == "regular_naming_plugins_only":
+            rec.write_text("plugins\n")
+        elif shape == "symlink_to_regular_naming_skills":
+            (elsewhere / "record").write_text("skills\n")
+            rec.symlink_to(elsewhere / "record")
+        elif shape == "symlink_to_directory":
+            rec.symlink_to(elsewhere)
+        elif shape == "dangling_symlink":
+            rec.symlink_to(tmp_path / "gone" / "record")
+        elif shape == "fifo":
+            os.mkfifo(rec)
+        elif shape == "directory":
+            rec.mkdir()
+        before = os.lstat(rec) if shape != "absent" else None
+        _run(tmp_path, self._CALL)  # a blocking open raises TimeoutExpired here
+        data = json.loads(s.read_text())
+        if expected is None:
+            assert "syncClaudeAiSkills" not in data, data
+        else:
+            assert data["syncClaudeAiSkills"] is expected, data
+        if before is None:
+            assert not rec.exists() and not rec.is_symlink(), "no record is ever created"
+        else:
+            after = os.lstat(rec)
+            assert (after.st_mode, after.st_ino, after.st_mtime_ns) == (
+                before.st_mode, before.st_ino, before.st_mtime_ns,
+            ), "the record is only ever read"
+
+    def test_an_empty_home_is_not_proof_of_no_record(self, tmp_path: Path) -> None:
+        """With HOME empty the record path would resolve under `/`, which is
+        searchable, so absence there proves nothing about this install's record."""
+        r = _run(tmp_path, 'HOME=""; rc=0; _cc_sync_legacy_record skills || rc=$?; echo "rc=$rc"')
+        assert "rc=2" in r.stdout, (r.stdout, r.stderr)
+
+    def test_an_unreadable_record_decides_nothing(self, tmp_path: Path) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root reads any file; the unreadable case cannot be built")
+        s = self._seed(tmp_path)
+        rec = self._record(tmp_path)
+        rec.parent.mkdir(parents=True, exist_ok=True)
+        rec.write_text("skills\n")
+        rec.chmod(0)
+        try:
+            _run(tmp_path, self._CALL)
+        finally:
+            rec.chmod(0o644)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+
+    def test_an_unsearchable_record_directory_decides_nothing(self, tmp_path: Path) -> None:
+        """EACCES is not ENOENT: a record that cannot be looked for may exist."""
+        if os.geteuid() == 0:
+            pytest.skip("root searches any directory; the unsearchable case cannot be built")
+        s = self._seed(tmp_path)
+        g = self._record(tmp_path).parent
+        g.mkdir(parents=True, exist_ok=True)
+        g.chmod(0)
+        try:
+            _run(tmp_path, self._CALL)
+        finally:
+            g.chmod(0o755)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data and "syncClaudeAiPlugins" not in data, data
+
+    def test_an_unreadable_synced_dir_is_not_decided_and_a_choice_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        """An unreadable synced/ decides nothing (one bad read must not become a
+        setting), and an operator's own value is never replaced."""
+        if os.geteuid() == 0:
+            pytest.skip("root reads any directory; the unreadable case cannot be built")
+        s = self._seed(tmp_path, {"syncClaudeAiPlugins": False})
+        d = self._synced(tmp_path, "skills")
+        self._synced(tmp_path, "plugins")
+        d.chmod(0)
+        try:
+            _run(tmp_path, self._CALL)
+        finally:
+            d.chmod(0o755)
+        data = json.loads(s.read_text())
+        assert "syncClaudeAiSkills" not in data, data
+        assert data["syncClaudeAiPlugins"] is False, "an operator's false is kept over synced content"
+
+    def test_kept_on_is_announced_only_while_the_key_reads_true(self, tmp_path: Path) -> None:
+        """The "kept ON" note is worded from what the key reads now. A reconciler
+        that reports the key written while another writer removed it (a stub here)
+        must not claim `"key": true` is in the file; the key is absent, so the
+        undecided note is what the operator sees."""
+        s = self._seed(tmp_path)
+        self._synced(tmp_path, "skills")
+        stub = 'cc_ensure_updater_suppressed() { CC_SUPPRESSION_WRITTEN="syncClaudeAiSkills"; return 0; }; '
+        r = _run(tmp_path, stub + "cc_reconcile_container_settings")
+        assert "syncClaudeAiSkills" not in json.loads(s.read_text())
+        assert "kept ON" not in r.stderr, r.stderr
+        assert "skills sync is left ON" in r.stderr, r.stderr
+
+    def test_a_true_set_by_another_writer_is_not_announced_as_off(self, tmp_path: Path) -> None:
+        """Review (Codex, #2579): the note checked only that the key was a boolean,
+        so a `true` written by another writer after the reconciler's verified write
+        was announced as sync OFF. It is announced only while the key reads false."""
+        s = self._seed(tmp_path)
+        stub = (
+            'cc_ensure_updater_suppressed() { python3 -c "import json,sys; p=sys.argv[1]; '
+            'd=json.load(open(p)); d[\'syncClaudeAiSkills\']=True; json.dump(d,open(p,\'w\'))" '
+            f'"{s}"; CC_SUPPRESSION_WRITTEN="syncClaudeAiSkills"; return 0; }}; '
+        )
+        r = _run(tmp_path, stub + "cc_reconcile_container_settings")
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] is True
+        assert "now OFF" not in r.stderr, r.stderr
+
+    def test_an_operators_own_false_is_not_announced_as_ours(self, tmp_path: Path) -> None:
+        self._seed(tmp_path, {"syncClaudeAiSkills": False})
+        r = _run(tmp_path, self._CALL)
+        assert "skills sync is now OFF" not in r.stderr, r.stderr
+        assert "plugins sync is now OFF" in r.stderr, "the kind it did write is announced"
+
+    @pytest.mark.parametrize("value", [None, "true", 1])
+    def test_a_non_boolean_value_is_flagged_not_silenced(self, tmp_path: Path, value) -> None:
+        """CC treats any non-boolean as false, so the sync is OFF: saying nothing
+        would hide that synced items are about to be trashed."""
+        s = self._seed(tmp_path, {"syncClaudeAiSkills": value})
+        self._synced(tmp_path, "skills")
+        r = _run(tmp_path, self._CALL)
+        assert json.loads(s.read_text())["syncClaudeAiSkills"] == value, "never overwritten"
+        assert "is not true/false" in r.stderr, r.stderr
+        assert "skills sync is left ON" not in r.stderr
+
+    def test_the_install_hint_omits_a_withheld_opt_out(self, tmp_path: Path) -> None:
+        """install.sh's manual-fix hint must not suggest the key the check held
+        back — pasting it would retire what the check protected. Runs the REAL
+        block from install.sh, not a copy."""
+        src = (_REPO_ROOT / "scripts" / "install.sh").read_text()
+        start = src.index('    _sync_hint=""')
+        end = src.index("\n", src.index("CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH", start))
+        block = src[start:end]
+        for withheld, expect_skills in (("", True), ("skills:syncClaudeAiSkills:present", False)):
+            arr = f'("{withheld}")' if withheld else "()"
+            r = subprocess.run(
+                ["bash", "-c", f'set -u; source "{_LIB}"; CC_SYNC_OPTOUT_WITHHELD={arr}\n{block}'],
+                capture_output=True, text=True, timeout=60,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+            )
+            assert r.returncode == 0, r.stderr
+            assert ('"syncClaudeAiSkills": false' in r.stdout) is expect_skills, r.stdout
+            assert '"syncClaudeAiPlugins": false' in r.stdout, r.stdout
+            assert r.stdout.rstrip().endswith("}"), r.stdout  # the hint still closes its object
