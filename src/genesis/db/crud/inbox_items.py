@@ -689,7 +689,13 @@ async def get_handled_batch_content(
     *,
     max_retries: int = 3,
 ) -> list[str]:
-    """Return exact batch blocks that are completed or retry-exhausted."""
+    """Return exact batch blocks that are completed or retry-exhausted.
+
+    A ``superseded`` row is never handled, whatever its retry_count: its
+    snapshot was replaced before it was evaluated. (While supersession was
+    written as ``failed``, a row at the retry cap was counted here, so its
+    never-evaluated items were dropped from later deltas.)
+    """
     cursor = await db.execute(
         """SELECT batch_items FROM inbox_items
            WHERE file_path = ?

@@ -112,12 +112,15 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
                 "fail. Apply this migration with foreign_keys=OFF."
             )
 
-    # Capture every explicit index and trigger on the live table so none is
-    # lost to the DROP (autoindexes have NULL sql and are recreated by the
-    # PRIMARY KEY), and every view: ALTER TABLE ... RENAME reparses the whole
-    # schema, and a view naming inbox_items (directly or through another view)
-    # fails that reparse while the table is absent. Views hold no data, so all
-    # of them are dropped and recreated in their original creation order.
+    # Capture every explicit index on the live table so none is lost to the
+    # DROP (autoindexes have NULL sql and are recreated by the PRIMARY KEY), and
+    # EVERY view and trigger in the schema: ALTER TABLE ... RENAME reparses the
+    # whole schema, and a view or trigger naming inbox_items — directly, through
+    # another view, or from a trigger attached to some other table — fails that
+    # reparse while the table is absent. Dropping a view also drops its INSTEAD
+    # OF triggers. Neither holds data, so all of them are dropped first and
+    # recreated after the rename in creation order (views before triggers, since
+    # a trigger may name a view).
     cursor = await db.execute(
         "SELECT name, sql FROM sqlite_master WHERE type='view' AND sql IS NOT NULL ORDER BY rowid"
     )
@@ -128,10 +131,10 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
     )
     live_indexes = [r[0] for r in await cursor.fetchall()]
     cursor = await db.execute(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' "
-        "AND tbl_name='inbox_items' AND sql IS NOT NULL"
+        "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL "
+        "ORDER BY rowid"
     )
-    live_triggers = [r[0] for r in await cursor.fetchall()]
+    live_triggers = list(await cursor.fetchall())
 
     await db.execute("DROP TABLE IF EXISTS inbox_items_new")
     await db.execute(
@@ -160,6 +163,9 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
         f"SELECT rowid, {collist} FROM inbox_items"
     )
 
+    for name, _sql in reversed(live_triggers):
+        quoted = name.replace('"', '""')
+        await db.execute(f'DROP TRIGGER IF EXISTS "{quoted}"')
     for name, _sql in reversed(live_views):
         quoted = name.replace('"', '""')
         await db.execute(f'DROP VIEW "{quoted}"')
@@ -171,7 +177,7 @@ async def _rebuild(db: aiosqlite.Connection, *, status_values: str) -> None:
         await db.execute(stmt)
     for _name, stmt in live_views:
         await db.execute(stmt)
-    for stmt in live_triggers:
+    for _name, stmt in live_triggers:
         await db.execute(stmt)
 
 

@@ -218,6 +218,41 @@ async def test_install_local_trigger_survives_rebuild():
 
 
 @pytest.mark.asyncio
+async def test_trigger_on_another_table_referencing_inbox_items_survives():
+    """A trigger attached elsewhere but naming inbox_items in its body must not
+    abort the RENAME reparse, and must still work after the rebuild."""
+    db = await _make_legacy_db()
+    await db.execute("CREATE TABLE audit (id TEXT)")
+    await db.execute(
+        "CREATE TRIGGER audit_to_inbox AFTER INSERT ON audit BEGIN "
+        "INSERT INTO inbox_items (id, file_path, content_hash, created_at) "
+        "VALUES (NEW.id, '/t', 'h', 't'); END"
+    )
+    await M.up(db)
+    await db.execute("INSERT INTO audit VALUES ('via-trigger')")
+    cur = await db.execute("SELECT status FROM inbox_items WHERE id = 'via-trigger'")
+    assert (await cur.fetchone())[0] == "pending"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_instead_of_trigger_on_view_survives_rebuild():
+    """Dropping a view drops its INSTEAD OF triggers; they must come back."""
+    db = await _make_legacy_db()
+    await db.execute("CREATE VIEW inbox_v AS SELECT id, file_path FROM inbox_items")
+    await db.execute(
+        "CREATE TRIGGER inbox_v_ins INSTEAD OF INSERT ON inbox_v BEGIN "
+        "INSERT INTO inbox_items (id, file_path, content_hash, created_at) "
+        "VALUES (NEW.id, NEW.file_path, 'h', 't'); END"
+    )
+    await M.up(db)
+    await db.execute("INSERT INTO inbox_v (id, file_path) VALUES ('via-view', '/v')")
+    cur = await db.execute("SELECT file_path FROM inbox_items WHERE id = 'via-view'")
+    assert (await cur.fetchone())[0] == "/v"
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_views_on_inbox_items_survive_rebuild():
     """RENAME reparses the whole schema; a view naming inbox_items (directly or
     through another view) must not abort the migration, and must work after."""

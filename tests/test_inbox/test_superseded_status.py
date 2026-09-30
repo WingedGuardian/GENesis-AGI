@@ -108,6 +108,38 @@ async def test_get_all_known_lone_superseded_row_leaves_file_unknown(db):
 
 
 @pytest.mark.asyncio
+async def test_superseded_row_at_retry_cap_is_not_handled_batch_content(db):
+    """Behaviour change: a parked row at the retry cap that gets superseded was
+    counted as 'handled' while supersession wrote 'failed', so its never-evaluated
+    items were dropped from later deltas. It is no longer handled."""
+    await inbox_items.create(
+        db,
+        id="p1",
+        file_path=_FILE,
+        content_hash="h",
+        status="processing",
+        created_at=_T0,
+        batch_items="https://example.com/never-evaluated",
+        error_message=f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-1",
+        retry_count=3,
+    )
+    # Control: a genuinely retry-exhausted failed row IS handled.
+    await inbox_items.create(
+        db,
+        id="f1",
+        file_path=_FILE,
+        content_hash="h",
+        status="failed",
+        created_at=_T0,
+        batch_items="https://example.com/exhausted",
+        retry_count=3,
+    )
+    await inbox_items.supersede_parked_rows(db, _FILE, processed_at=_T1)
+    handled = await inbox_items.get_handled_batch_content(db, _FILE, max_retries=3)
+    assert handled == ["https://example.com/exhausted"]
+
+
+@pytest.mark.asyncio
 async def test_superseded_row_is_never_a_retry_candidate(db):
     await _parked(db, "p1")
     await inbox_items.supersede_parked_rows(db, _FILE, processed_at=_T1)

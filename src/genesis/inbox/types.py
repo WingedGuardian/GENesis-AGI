@@ -12,6 +12,7 @@ class ItemStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(frozen=True)
