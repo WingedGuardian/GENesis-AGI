@@ -1510,7 +1510,7 @@ def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
     renderings differ would be permanently uncoverable -- a floor under the
     shadow flag rate, which is the signal the enforce decision reads.
     """
-    from genesis.inbox.monitor import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
 
     source = '"https://example.com/q?x=1",'
     assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
@@ -1530,7 +1530,7 @@ def test_ambiguous_sentence_punctuation_is_never_trimmed_for_display():
     that answer, which is the silent loss this whole gate exists to prevent.
     A trim only stands when it removed a paired delimiter.
     """
-    from genesis.inbox.monitor import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
 
     for ambiguous in ("https://example.com/path;", "https://example.com/q?x=1!"):
         assert _display_url(ambiguous) == ambiguous
@@ -1545,7 +1545,7 @@ def test_a_truncated_sibling_still_cannot_vouch_for_another_url():
     resources; neither one's display form is the other's identity, so citing
     one must leave the other uncovered.
     """
-    from genesis.inbox.monitor import _uncovered_urls
+    from genesis.inbox.url_coverage import _uncovered_urls
 
     source = "https://example.com/foo\nhttps://example.com/foo:bar"
 
@@ -1564,7 +1564,7 @@ def test_bare_domain_label_does_not_swallow_the_link_target():
     can ever cite. Asserted on the extractor directly: the display layer
     trims the trailing `)` and would mask a regression here.
     """
-    from genesis.inbox.monitor import _extract_coverage_input_urls
+    from genesis.inbox.url_coverage import _extract_coverage_input_urls
 
     assert _extract_coverage_input_urls("[example.com/a](https://example.com/a)") == [
         "example.com/a",
@@ -1580,7 +1580,7 @@ def test_evidence_validation_keeps_bracketed_query_params():
     bracketed query parameter, and the URL would read as uncovered even
     though the evaluator cited it exactly.
     """
-    from genesis.inbox.monitor import _extract_coverage_input_urls, _extract_source_urls
+    from genesis.inbox.url_coverage import _extract_coverage_input_urls, _extract_source_urls
 
     cited = "example.com/s?f[0]=x"
     assert _extract_source_urls(f"**Source:** {cited}") == [cited]
@@ -3545,6 +3545,303 @@ async def test_baseline_guard_delta_only_new_items(
     assert "article-3" in delta
     assert "article-1" not in delta
     assert "article-2" not in delta
+
+
+# ── BUILD verdict fallback: never silently dropped when the lane is not live ──
+
+
+_VALID_BUILD_SPEC = (
+    "build_spec:\n"
+    "  requirements: [\"Add widget\"]\n"
+    "  steps: [\"write widget.py\"]\n"
+    "  success_criteria: [\"widget imports\"]\n"
+    "  risks: [\"none material\"]\n"
+    "  intended_paths: [\"src/genesis/skills/widget/\"]\n"
+)
+
+
+def _build_eval(
+    verdict: str | None,
+    next_step: str = "Build the widget skill",
+    *,
+    build_spec: bool | None = None,
+) -> str:
+    """``build_spec`` defaults to present iff the verdict is ``build``."""
+    verdict_lines = (
+        f'verdict: {verdict}\nverdict_reason: "Stated reason for the verdict"\n'
+        if verdict is not None
+        else ""
+    )
+    if build_spec is None:
+        build_spec = verdict == "build"
+    if build_spec:
+        verdict_lines += _VALID_BUILD_SPEC
+    return (
+        "# Inbox Evaluation\n\n"
+        "## 1. Widget Skill\n\n"
+        "### Recommendation\n\n"
+        "```yaml\n"
+        "action: BUILD\n"
+        f'next_step: "{next_step}"\n'
+        "effort: Small\n"
+        "scope: V4\n"
+        "confidence: high\n"
+        "architecture_impact: extends\n"
+        f"{verdict_lines}"
+        "```\n"
+    )
+
+
+async def _build_follow_ups(db) -> list[dict]:
+    cur = await db.execute(
+        "SELECT content, reason, strategy, priority, pinned, kind "
+        "FROM follow_ups WHERE source = 'inbox_evaluation' ORDER BY rowid"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+_LANE_CASES = [
+    pytest.param(None, id="lane-unwired"),
+    pytest.param(SimpleNamespace(enabled=False), id="lane-disabled"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_build_verdict_becomes_pinned_follow_up_when_lane_not_live(monitor, db, lane):
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-1",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD] Widget Skill")
+    assert row["strategy"] == "user_input_needed"
+    assert row["priority"] == "medium"
+    assert row["pinned"] == 1
+    assert row["kind"] == "follow_up"
+    assert "Stated reason for the verdict" in row["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_needs_discussion_verdict_is_a_discussion_not_a_build_task(monitor, db, lane):
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("needs_discussion"),
+        batch_id="batch-build-2",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD: NEEDS DISCUSSION] Widget Skill")
+    assert not row["content"].startswith("[BUILD] ")
+    assert row["strategy"] == "user_input_needed"
+    assert row["pinned"] == 1
+    assert row["kind"] == "follow_up"
+    assert "Stated reason for the verdict" in row["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_dont_build_veto_is_recorded_never_actionable(monitor, db, lane):
+    """A veto must not become pinned build work; it is kept as a tabled record."""
+    from genesis.db.crud import follow_ups
+
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("dont_build", next_step="Use the existing capability"),
+        batch_id="batch-build-3",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD: DONT_BUILD] Widget Skill")
+    assert row["kind"] == "tabled"
+    assert row["pinned"] == 0
+    assert row["strategy"] == "ego_judgment"
+    assert "Stated reason for the verdict" in row["reason"]
+    actionable = " ".join(r["content"] for r in await follow_ups.get_actionable(db))
+    assert "Widget Skill" not in actionable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_missing_build_verdict_creates_nothing(monitor, db, lane, caplog):
+    """A BUILD block with no valid verdict is malformed: the live lane skips it
+    too (build_lane.handle_eval: verdict None -> continue). Loud, not a task."""
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    with caplog.at_level("WARNING", logger="genesis.inbox.monitor"):
+        created = await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(None),
+            batch_id="batch-build-4",
+            source_files=["Capabilities.md"],
+        )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+    assert any("no valid verdict" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["build", "needs_discussion", "dont_build", None])
+async def test_live_build_lane_gets_no_fallback_follow_up(monitor, db, verdict):
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval(verdict),
+        batch_id="batch-build-5",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+
+
+@pytest.mark.asyncio
+async def test_changed_build_verdict_is_not_deduped_away(monitor, db):
+    """Same item + same next_step but a NEW verdict must still surface."""
+    for i, verdict in enumerate(("needs_discussion", "build")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(verdict, next_step="Review Widget Skill"),
+            batch_id=f"batch-build-6{i}",
+            source_files=["Capabilities.md"],
+        )
+    contents = [r["content"] for r in await _build_follow_ups(db)]
+    assert len(contents) == 2
+    assert contents[0].startswith("[BUILD: NEEDS DISCUSSION]")
+    assert contents[1].startswith("[BUILD] ")
+    # Re-evaluating with the SAME verdict still dedups.
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build", next_step="Review Widget Skill"),
+        batch_id="batch-build-6x",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_build_verdict_without_usable_spec_is_a_discussion(monitor, db, lane):
+    """Parity with BuildLane._handle_build: an unusable build_spec fails closed
+    to needs_discussion, never a pinned build request."""
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build", build_spec=False),
+        batch_id="batch-build-7",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    assert rows[0]["content"].startswith("[BUILD: NEEDS DISCUSSION] Widget Skill")
+    assert "build_spec" in rows[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_rephrased_next_step_does_not_duplicate_build_fallback(monitor, db):
+    """The LLM rephrases next_step across evaluations; the fallback dedups on
+    stable item identity + verdict (as BuildLane.item_key excludes next_step)."""
+    for i, step in enumerate(("Build the widget skill", "Implement a widget skill")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval("build", next_step=step),
+            batch_id=f"batch-build-8{i}",
+            source_files=["Capabilities.md"],
+        )
+    assert len(await _build_follow_ups(db)) == 1
+
+
+async def _widget_candidate(db, verdict: str = "build") -> None:
+    from genesis.autonomy.build_lane import BuildLane
+    from genesis.db.crud import build_candidates
+
+    await build_candidates.create(
+        db,
+        id=f"cand-{verdict}",
+        item_key=BuildLane.item_key("Widget Skill"),
+        item_title="Widget Skill",
+        source_file="Capabilities.md",
+        verdict=verdict,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_lane_off_fallback_skips_item_the_lane_already_owns(monitor, db, lane):
+    """Mirror of the retirement: an item carded while the lane was live keeps
+    the lane's record after the lane is disabled — no fallback beside it."""
+    await _widget_candidate(db)
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-9",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_covers_already_tracked_items_and_only_pending_rows(monitor, db):
+    """The lane skips an item it already tracks (handle_eval creates nothing),
+    yet it still owns it — retirement keys on the candidate existing, so it
+    fires anyway. Every verdict's fallback row is retired while still pending;
+    a row the user moved (here: blocked) is left alone."""
+    from genesis.db.crud import follow_ups
+
+    for i, verdict in enumerate(("needs_discussion", "dont_build", "build")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(verdict),
+            batch_id=f"batch-build-10{i}",
+            source_files=["Capabilities.md"],
+        )
+    rows = await db.execute(
+        "SELECT id, content FROM follow_ups WHERE source = 'inbox_evaluation' ORDER BY rowid"
+    )
+    ids = {r["content"].split("]")[0] + "]": r["id"] for r in await rows.fetchall()}
+    assert set(ids) == {"[BUILD: NEEDS DISCUSSION]", "[BUILD: DONT_BUILD]", "[BUILD]"}
+    await follow_ups.update_status(
+        db, ids["[BUILD]"], status="blocked", blocked_reason="user parked it",
+    )
+
+    await _widget_candidate(db, verdict="needs_discussion")  # tracked earlier
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    retired = await monitor._retire_build_fallbacks_owned_by_lane(_build_eval("build"))
+
+    assert retired == 2
+    for label in ("[BUILD: NEEDS DISCUSSION]", "[BUILD: DONT_BUILD]"):
+        row = await follow_ups.get_by_id(db, ids[label])
+        assert row["status"] == "completed"
+        assert "build lane" in row["resolution_notes"].lower()
+    assert (await follow_ups.get_by_id(db, ids["[BUILD]"]))["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_retirement_is_inert_when_lane_not_live_or_item_unowned(monitor, db):
+    from genesis.db.crud import follow_ups
+
+    await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-11",
+        source_files=["Capabilities.md"],
+    )
+    # Lane not live: nothing retired even though a candidate exists.
+    await _widget_candidate(db)
+    monitor.set_build_lane(SimpleNamespace(enabled=False))
+    assert await monitor._retire_build_fallbacks_owned_by_lane(_build_eval("build")) == 0
+    # Lane live but a DIFFERENT item is evaluated: its (absent) candidate owns nothing.
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    other = _build_eval("build").replace("Widget Skill", "Gadget Skill")
+    assert await monitor._retire_build_fallbacks_owned_by_lane(other) == 0
+    assert len(await follow_ups.get_actionable(db)) == 1
 
 
 # ── Review round 1 on #2447: an invalidated approval at the retry cap ────────

@@ -38,6 +38,55 @@ Browser for interaction. ATS APIs for job listings.
 when the task needs it; the tool's automatic chain handles ordinary fallback.
 Foreground-only CC tools remain useful for a quick lookup or AI-processed fetch.
 
+### Optional: answer CC `WebSearch` with Genesis (`genesis-web-override`)
+
+An opt-in Claude Code plugin in `plugins/genesis-web-override/` intercepts the
+built-in `WebSearch`, main session and subagents alike, and answers it with the
+Genesis `web_search` chain. It falls back to the built-in on any failure: Genesis
+down, the MCP server not connected, the call refused by the session's permission
+mode, an error, or zero results. It also falls back on any call that sets
+`allowed_domains` or `blocked_domains`, which the Genesis chain honours on one
+backend only. `WebFetch` is not touched: Claude Code leaves cross-host redirects
+to the model on purpose.
+
+**Turn it on for interactive slots:** add `GENESIS_CC_WEB_OVERRIDE=1` to
+`~/.genesis/cc-slot.env`. Each slot created after that gets
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` (Claude Code's early-access function hooks)
+and loads the plugin from this checkout with `--plugin-dir`, so a `git pull`
+reaches it at the next slot start and nothing outside a slot loads it. Remove the
+line to turn it off: new slots then unset the flag. An existing slot keeps what it
+started with until it is recreated, and relaunching `claude` by hand inside a slot
+runs without the plugin.
+
+Dispatched sessions never run it. These all pin
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` (`src/genesis/cc/child_env.py`), CCInvoker
+at its last launch gate, after every env merge:
+
+- CCInvoker;
+- the headless judge;
+- the experimentation router;
+- the dashboard's update sessions;
+- the guardian's recovery session on the host;
+- remote sessions started over SSH. Claude Code
+resolves the flag as the env var if set, otherwise a server-side default, so
+unset is not the same as off. Do not put the flag in a `settings.json` `env`
+block: Claude Code applies that over the inherited environment, including a
+dispatched session's.
+
+What an answered call skips, because the plugin answers instead of the built-in:
+the built-in's own permission check and its PreToolUse hooks (the advisory
+`web_tools_gate.py` nudge), and its per-session search cap. The permission check
+runs on `mcp__genesis-health__web_search` instead, since the plugin calls it
+through the normal tool pipeline. The flag is not specific to this plugin: it
+turns on hook modules for every enabled plugin that ships them.
+
+Two limits. Claude Code checks the answer against `WebSearch`'s output schema
+after the plugin returns, so a shape a later Claude Code stops accepting reaches
+the model as a tool error rather than the built-in search: re-checked on every pin
+bump (`docs/reference/cc-compatibility.md`, update checklist). And the Genesis call
+has no timer of its own; a stalled `web_search` stalls the search for as long as
+the MCP call runs.
+
 ## GitHub Search — "I need to find repos, code, or libraries"
 
 When searching for open-source projects, implementation patterns, or

@@ -146,6 +146,16 @@ async def _check_wal_health(db) -> None:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
+async def _record_tailscale_watchdog_events(db) -> None:
+    """Best-effort: never raises into the tick (see resilience.tailscale_watchdog_events)."""
+    try:
+        from genesis.resilience.tailscale_watchdog_events import record_new_events
+
+        await record_new_events(db)
+    except Exception:
+        logger.debug("tailscale watchdog event check skipped", exc_info=True)
+
+
 async def _persist_health_alerts(db) -> None:
     """WS-2 M10: reconcile the durable ``alert_events`` open-set from live health.
 
@@ -591,6 +601,17 @@ _INFRA_POSTURE_DETAIL = {
         "scripts/bootstrap.sh (installs + enables the watchdog timer via "
         "lib/network_resilience.sh)"
     ),
+    "tailscale_watchdog_absent": (
+        "tailscaled is installed but genesis-tailscale-watchdog.timer is not "
+        "enabled (missing, or its install or enable failed) — a stuck Tailscale "
+        "tunnel is never auto-healed or reported, and SSH over Tailscale stays "
+        "dead until a manual `systemctl restart tailscaled`. Re-run "
+        "scripts/bootstrap.sh (lib/network_resilience.sh installs and enables "
+        "it). If it is meant to be off, set NETWD_TS_MODE=off in a drop-in on "
+        "genesis-tailscale-watchdog.service and leave the timer enabled: the "
+        "installer re-enables a disabled timer, and a unit installed in "
+        "/etc/systemd/system cannot be masked"
+    ),
     "cc_tmp_shared_fs": (
         "the Claude Code scratch dir (~/.genesis/cc-tmp) shares a filesystem "
         "with the container root — a runaway temp write can fill the root disk "
@@ -696,6 +717,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("networkd_keepconfig_missing")
         if network.get("network_watchdog_enabled") is False:
             missing.append("network_watchdog_absent")
+    # Independent of networkd: wherever tailscaled is installed, its watchdog
+    # should be. A mask, where one exists (masked before install), is
+    # deliberate; the durable off switch is a NETWD_TS_MODE=off drop-in, which
+    # leaves the timer enabled. Unknown (None) stays silent.
+    ts_state = network.get("tailscale_watchdog_unit_state")
+    if (
+        network.get("tailscaled_loaded") is True
+        and isinstance(ts_state, str)
+        and ts_state not in ("enabled", "masked", "masked-runtime")
+    ):
+        missing.append("tailscale_watchdog_absent")
     # Storage plane: cc-tmp blast-radius isolation (EFFECTIVE-state fact from
     # collectors/container.py::collect_storage). Gated on an lxc container —
     # the remedy is a dedicated incus volume, which only exists on a container
@@ -3611,6 +3643,10 @@ class AwarenessLoop:
                     # Conservative threshold; self-resolves when a cycle lands.
                     await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
+                # The root Tailscale watchdog writes only its own /run file; its
+                # events become observations here. Every tick, so a failed
+                # restart pages within ~5 minutes.
+                await _record_tailscale_watchdog_events(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
                 # and clears within the hour must still leave a durable incident

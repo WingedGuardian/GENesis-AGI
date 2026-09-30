@@ -209,3 +209,18 @@ async def test_route_call_cancel_group_kills_and_reraises(monkeypatch):
     with _pytest.raises(asyncio.CancelledError):
         await task
     assert killpg_calls and killpg_calls[0][0] == 77778
+
+
+async def test_route_call_pins_function_hooks_off(monkeypatch):
+    """The router is a dispatched claude child: it carries the shared pins
+    (genesis.cc.child_env), so an inherited opt-in cannot reach it."""
+    captured = {}
+
+    async def fake_exec(*args, **kw):
+        captured["env"] = kw["env"]
+        return _FakeProc(out=b"ok")
+
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS", "1")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await CCCliRouter("haiku").route_call("gen", [{"role": "user", "content": "U"}])
+    assert captured["env"]["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
