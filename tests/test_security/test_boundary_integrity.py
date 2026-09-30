@@ -95,6 +95,21 @@ def test_the_id_depends_on_the_install_key(tmp_path, monkeypatch):
     assert _split(_wrap("same"))[0] != first
 
 
+def test_a_key_file_with_spaces_inside_is_not_used(tmp_path, monkeypatch, caplog):
+    """bytes.fromhex accepts spaces between byte pairs; the key file must be exactly
+    64 hex characters, like the backup checks, so the two never disagree."""
+    import hashlib
+    import hmac
+
+    key_file = tmp_path / "boundary_key"
+    key_file.write_text(" ".join(["ab"] * 32))
+    monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_file)
+    monkeypatch.setattr(sanitizer_mod, "_boundary_key", None)
+    spaced_id = hmac.new(bytes.fromhex("ab" * 32), b"web_fetch\0x", hashlib.sha256).hexdigest()[:16]
+    assert _split(_wrap("x"))[0] != spaced_id
+    assert "per-process key" in caplog.text
+
+
 def test_the_key_is_created_once_private_and_reused(tmp_path, monkeypatch):
     key_file = tmp_path / "k" / "boundary_key"
     monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_file)
@@ -156,6 +171,38 @@ def test_a_lone_surrogate_wraps_instead_of_raising(lone):
     text = f"snippet {lone} tail"
     assert _split(_wrap(text, ContentSource.WEB_SEARCH))[1] == text
     assert _wrap(text) == _wrap(text)
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized"])
+def test_a_non_regular_or_oversized_key_path_falls_back_without_blocking(tmp_path, monkeypatch, kind):
+    """A FIFO at the key path used to block the first wrap forever (#2572)."""
+    import os
+    import threading
+
+    key_path = tmp_path / "boundary_key"
+    if kind == "fifo":
+        os.mkfifo(key_path)
+    elif kind == "directory":
+        key_path.mkdir()
+    else:  # a valid key followed by padding past the size bound
+        key_path.write_text("ab" * 32 + " " * 4096)
+    monkeypatch.setattr("genesis.env.boundary_key_path", lambda: key_path)
+    monkeypatch.setattr(sanitizer_mod, "_boundary_key", None)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(_wrap("x")), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "wrapping blocked on the key path"
+    wrap_id, body = _split(result[0])
+    assert body == "x"
+    if kind == "oversized":
+        import hashlib
+        import hmac
+
+        padded_key_id = hmac.new(
+            bytes.fromhex("ab" * 32), b"web_fetch\0x", hashlib.sha256
+        ).hexdigest()[:16]
+        assert wrap_id != padded_key_id, "an oversized key file was accepted"
 
 
 def test_the_opening_marker_states_the_rule():
