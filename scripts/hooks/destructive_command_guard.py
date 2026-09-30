@@ -220,8 +220,13 @@ _COMMAND_OPENERS = frozenset(
 # and here it is not. Same shape as `protected_paths_guard`'s guarded import.
 try:  # noqa: SIM105
     from shell_parse import analyze_checked as _analyze_checked
+    from shell_parse import mentions as _mentions
 except Exception:  # noqa: BLE001 — degraded, never permissive
     _analyze_checked = None
+
+    def _mentions(command: str, *patterns) -> bool:
+        """No resolver: the raw text is the only reading, as before this existed."""
+        return all(p.search(command) for p in patterns)
 
 # The launchers the RESOLVER refuses to model. The shells are deliberately NOT
 # here: the resolver recovers `sh -c "…"` into real segments (MEASURED:
@@ -285,7 +290,7 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
         return (
             f"this command cannot be read ({blind.cause}) and it names a "
             f"removal, so the guard cannot verify what would be deleted. "
-            f"Re-issue it in a form the parser can read."
+            f"To proceed: {blind.hint}."
         ), True
     for seg in segs:
         # PER SEGMENT, like `protected_paths_guard` and `git_push_guard`: refuse
@@ -298,7 +303,9 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
         # rm-bearing command that merely CONTAINED a carrier anywhere — MEASURED
         # as a large over-block of ordinary multi-step work.
         if seg.exe in _UNMODELLABLE_CARRIERS and (
-            _RM_CARRIER_WORD.search(seg.raw)
+            # The view, so a word split by quotes or backslashes inside the
+            # payload still names rm to the shell that runs it (widen-only).
+            _mentions(seg.raw, _RM_CARRIER_WORD)
             or _OPAQUE_CARRIER_PAYLOAD.search(seg.raw)
         ):
             return (
@@ -945,7 +952,12 @@ def main() -> int:
         # SURVIVE the whole suite for exactly that reason — behaviourally null,
         # not an untested mechanism. The property moved; the constant that
         # carries it is `_RM_CARRIER_WORD`, and that one is mutation-pinned.
-        if not cmd or not _RM_WORD.search(cmd):
+        #
+        # Both prefilters read `_mentions`, each reading of the text the shell
+        # would assemble after quote removal and line joining, so a word the shell
+        # builds from pieces reaches the resolver the way its plain spelling does.
+        # Widen-only.
+        if not cmd or not _mentions(cmd, _RM_WORD):
             return 0
 
         # THE RESOLVER DECIDES CARRIERS, not a name list over flat tokens.
@@ -975,7 +987,7 @@ def main() -> int:
         # carrier pre-pass has no business with, not one nothing could read.
         carrier_reason, analysed = (
             _resolver_carrier_refusal(cmd)
-            if _RM_CARRIER_WORD.search(cmd)
+            if _mentions(cmd, _RM_CARRIER_WORD)
             else (None, True)
         )
         if carrier_reason:

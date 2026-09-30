@@ -76,6 +76,7 @@ from shell_parse import (  # noqa: E402
     _GH_FLAG_TABLE,
     analyze_checked,
     gh_command,
+    mentions,
 )
 
 #: Cheap prefilter, same reasoning as `capped_read_advisory._GH_WORD`: this runs
@@ -335,24 +336,28 @@ def _advisory(reasons: list[str], closes: int) -> str:
     )
 
 
-def _process(payload: dict) -> None:
-    cmd = (tool_input(payload) or {}).get("command") or ""
-    if not cmd or not _GH_WORD.search(cmd):
-        return
-    segments, _blind = analyze_checked(cmd)
-    # THE BLIND FLAG IS DELIBERATELY NOT CONSULTED, and an earlier comment here
-    # claimed the opposite -- that a blind parse means silence. It did not, and
-    # the two blind spots are why. The BOUNDS one returns no segments, so
-    # silence is automatic and needs no flag. The UNTOKENIZABLE one still
-    # returns segments, and `gh pr close 'unterminated` is among them -- a
-    # genuine close attempt that a flag check would silence.
-    #
-    # So reading `_blind` would LOSE real closes to buy nothing, since the case
-    # it would catch is already silent. Advising on what DID parse is right for
-    # an advisory: a spurious note costs a sentence, where a fail-closed guard
-    # in the same position must refuse, because for it a spurious ALLOW costs a
-    # bypass. `_LIMIT` already tells the reader that silence is not evidence,
-    # which covers whatever the parser could not reach.
+#: The three close spellings this hook covers, named in the text of a command it could
+#: not parse: `pr close`, a `closePullRequest` mutation, a `state=closed` field. Only
+#: decides whether that command gets a one-line note. MEASURED over 86,684 recorded
+#: commands: a bare `close` substring put the note on 30 continued commands, 29 of them
+#: PR bodies and review replies whose prose says "close"; these spellings leave 1.
+_CLOSE_WORD = re.compile(r"\bpr\s+close\b|closePullRequest|state=closed")
+
+
+def _unreadable_note(blind) -> str:
+    """The short note for a command the parse could not read (built from the blind
+    spot's own cause and remedy, so it is true for every bounds-type cause)."""
+    return (
+        f"NOTE: this command {blind.cause}, so I could not check whether it closes a "
+        "pull request; it mentions a close. If it does: closing a PR is the user's "
+        "decision unless you are the session reviving it (genesis-development, "
+        "'Never RETIRE a PR you are not the one reviving'). For the specific check: "
+        f"{blind.hint}."
+    )
+
+
+def _scan(segments: list) -> tuple[list[str], int]:
+    """The close reasons and the number of closing steps in ONE reading."""
     reasons: list[str] = []
     closes = 0
     for seg in segments:
@@ -384,16 +389,49 @@ def _process(payload: dict) -> None:
         closes += 1
         if why not in reasons:
             reasons.append(why)
+    return reasons, closes
+
+
+def _process(payload: dict) -> None:
+    cmd = (tool_input(payload) or {}).get("command") or ""
+    if not cmd or not mentions(cmd, _GH_WORD):
+        return
+    segments, blind = analyze_checked(cmd)
+    # THE BLIND FLAG IS NOT A REASON FOR SILENCE. The UNTOKENIZABLE blind spot
+    # still returns segments, and `gh pr close 'unterminated` is among them -- a
+    # genuine close attempt a flag check would silence. A BOUNDS-TYPE one returns
+    # none, which used to be harmless because the bounds are measured at 0 of
+    # 45,956 real commands; a line continuation is also bounds-type and is
+    # ordinary input, and its segments are not what the shell runs. Re-parsing the
+    # join to find the close was tried, and review found a new defect in that
+    # modelling each round (a close after a comment, a close counted once per
+    # reading). So a continued command that names a close gets a SHORT note from
+    # the text alone, and no count. Over-long or over-nested commands take this
+    # branch too; the note names each one's own cause.
+    if blind is not None and blind.bounds_induced:
+        if mentions(cmd, _CLOSE_WORD):
+            _emit(_unreadable_note(blind))
+        return
+    reasons, closes = _scan(segments)
+    # Advising on what DID parse is right for an advisory: a spurious note costs a
+    # sentence, where a fail-closed guard in the same position must refuse,
+    # because for it a spurious ALLOW costs a bypass. `_LIMIT` already tells the
+    # reader that silence is not evidence, which covers whatever the parser could
+    # not reach.
     if reasons:
-        print_json_bounded(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": _advisory(reasons, closes),
-                }
-            },
-            text_keys=("hookSpecificOutput.additionalContext",),
-        )
+        _emit(_advisory(reasons, closes))
+
+
+def _emit(context: str) -> None:
+    print_json_bounded(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": context,
+            }
+        },
+        text_keys=("hookSpecificOutput.additionalContext",),
+    )
 
 
 def main() -> int:

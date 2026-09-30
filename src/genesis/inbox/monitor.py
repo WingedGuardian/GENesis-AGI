@@ -2138,74 +2138,138 @@ class InboxMonitor:
             # line and collapses annotated items that share a URL (#2447
             # review). Unreadable storage falls back to the flattened text,
             # which for a legacy resume row can be the whole file: shown as one
-            # item. Legacy only; v2 rows always carry item boundaries.
-            items = inbox_items.stored_item_texts(row.get("batch_items")) or [content]
+            # item. Legacy only; v2 rows always carry item boundaries. The
+            # labels are resolved at flush, once per file (#2533 round 3).
+            items = inbox_items.stored_item_texts(row.get("batch_items"))
             self._alert_parked(
                 file_path, reason=reason, detail=detail, item_id=row_id,
-                labels=[", ".join(self._item_labels(text)) for text in items],
+                texts=items or [content], legacy=not items,
             )
 
     @staticmethod
-    def _mask_opaque_segments(path: str) -> str:
-        """Replace path segments that look like tokens or ids with ``…``.
+    def _item_labels(
+        content: str,
+        file_lines: list[str] | None = None,
+        *,
+        legacy: bool = False,
+        claimed: set[int] | None = None,
+        line_numbers: list[int] | None = None,
+    ) -> list[str]:
+        """Human handles for an item, safe for the owner's channel.
 
-        Share links often carry their secret in the PATH, not the query. A
-        segment is opaque when one of its ``-``/``_``-separated parts is at
-        least 12 characters and mixes letters with digits: a token or an id
-        (``a8F3kLm29QzX7pRtW4``, a document id), never a readable slug
-        (``quarterly-report``, ``2026-09-26-release-notes``). URL-safe base64
-        splits into short mixed parts at ``-``/``_`` (``Xy7_Kp2-Qw9_Rt4-Zm1``),
-        so a segment of 16+ characters with ANY mixed part is opaque too — at
-        the cost of masking a long slug with a version token (``v2-…``). A
-        heuristic: letters-only keys are masked when they are 16+ characters in
-        mixed case or any run is 20+; a lowercase letters-only token under 20, a
-        digits-only one, a short one, or one in the host name is shown.
+        Each URL is shown as its HOST, the LINE of the inbox file the item sits
+        on, and the coverage log's opaque ``url#`` id — never the path or
+        query. Share links carry secrets in both, and guessing which path text
+        is secret cannot be made complete: three masking heuristics in a row
+        each hid readable slugs or leaked token fragments under review
+        (#2447, #2533). The owner finds the item by its line; the ``url#`` id
+        matches the coverage log. The line is found from the item's whole
+        block of lines, so two items that share a URL, or an annotation, get
+        their own lines. If the file was edited since, the link's own line
+        locates it, then its first line: there an exact whole-line match wins
+        over a substring match, and the LAST
+        match wins among equals (a parked item is new text, appended below the
+        older items it may resemble: a short note like ``ai``, or a URL that
+        prefixes an earlier one). An item with no URL is a note on its line,
+        with a ``note#`` id (a hash of its whole text) for when the file can no
+        longer be read.
+
+        ``legacy`` marks the whole-file text of a legacy row: there each URL
+        locates itself. ``claimed`` holds lines other items parked in the same
+        file matched EXACTLY (whole block); they are skipped. Only an exact
+        block match claims a line, so two identical items never share one,
+        while a loose fallback match never takes a line from an exact owner.
         """
-        def mixed(part: str) -> bool:
-            return any(c.isdigit() for c in part) and any(c.isalpha() for c in part)
+        # ``file_lines`` are the scanner's logical lines (``splitlines``); the
+        # owner's editor counts physical ``\n`` lines, which ``line_numbers``
+        # maps them to (#2533 round 4: a NEL or U+2028 is a logical break only).
+        raw = [ln.rstrip() for ln in (file_lines or [])]
+        lines = [ln.strip() for ln in raw]
+        taken = claimed if claimed is not None else set()
 
-        def opaque(seg: str) -> bool:
-            parts = re.split(r"[-_]", seg)
-            return any(
-                (mixed(part) and (len(part) >= 12 or len(seg) >= 16))
-                # Letters-only keys (`ghp_`, `sk-proj-`, `AKIA…` shapes): mixed
-                # case at 16+, or any run of 20+, is no English word.
-                or (len(part) >= 16 and part.isalpha() and not part.islower()
-                    and not part.istitle())
-                or len(part) >= 20
-                for part in parts
-            )
+        def shown(n: int | None) -> int | None:
+            if n is None or not line_numbers or n > len(line_numbers):
+                return n
+            return line_numbers[n - 1]
 
-        return "/".join("…" if opaque(seg) else seg for seg in path.split("/"))
+        def last_free(candidates: list[int]) -> int | None:
+            free = [n for n in candidates if n not in taken]
+            return free[-1] if free else None
 
-    @classmethod
-    def _item_labels(cls, content: str) -> list[str]:
-        """Human handles for every URL in an item, safe for the owner's channel.
+        def line_of(needle: str) -> int | None:
+            if not needle:
+                return None
+            exact = last_free([n for n, text in enumerate(lines, 1) if text == needle])
+            if exact:
+                return exact
+            return last_free([n for n, text in enumerate(lines, 1) if needle in text])
 
-        Each URL as host+path — query, fragment and userinfo dropped, and opaque
-        path segments masked — because a presigned token is exactly why the
-        coverage log uses opaque ``url#`` ids. Each label carries that same
-        ``url#`` id (computed from the same extractor the coverage gate uses),
-        so two links that redact to one label stay distinguishable, and a URL
-        the coverage log names can be matched to its line. A row can hold several URLs
-        (``items_per_eval > 1`` batches several items into one row), so every
-        one is named. An item with no URL falls back to its first line.
-        """
+        block = [ln.rstrip() for ln in (content or "").splitlines() if ln.strip()]
+        first = block[0].strip() if block else ""
+        urls = _extract_coverage_input_urls(content or "")
+        # How segment_items shapes an item: the item's first line and a URL line
+        # are fully stripped, while inner lines keep their indentation, so two
+        # notes differing only in an inner line's indent stay distinct (round 4).
+        loose = {0} | ({len(block) - 1} if block and _extract_coverage_input_urls(block[-1]) else set())
+
+        ends_with_url = bool(block) and bool(_extract_coverage_input_urls(block[-1]))
+
+        def block_at(i: int) -> bool:
+            # Only where segment_items could have cut an item (round 4 audit): it
+            # starts at the file edge, after a blank line or after a URL line (a
+            # URL line always ends its item), and a note ends at a blank line or
+            # the file's end (prose followed by a URL would be that URL's
+            # annotation). A URL item always ends at its URL line.
+            if i > 0 and lines[i - 1] and not _extract_coverage_input_urls(lines[i - 1]):
+                return False
+            end = i + len(block)
+            if not ends_with_url and end < len(lines) and lines[end]:
+                return False
+            for j, b in enumerate(block):
+                f = raw[i + j]
+                if (f.strip() != b.strip()) if j in loose else (f != b):
+                    return False
+            return True
+
+        def block_start() -> int | None:
+            # The item is a contiguous run of file lines (scanner.segment_items),
+            # so its WHOLE text locates it (round 2). A candidate overlapping a
+            # block already claimed by another item is skipped (round 4).
+            if not block:
+                return None
+            starts = [
+                i + 1 for i in range(len(raw) - len(block) + 1)
+                if block_at(i) and not taken.intersection(range(i + 1, i + 1 + len(block)))
+            ]
+            return starts[-1] if starts else None
+
+        # One logical item, however many URLs its line holds: its whole block
+        # locates it; once edited, its link's own line, then its first line. A
+        # legacy row holding a whole file: each URL locates itself.
+        exact_line = None if legacy and urls else block_start()
+        if exact_line:
+            taken.update(range(exact_line, exact_line + len(block)))
+        item_line = (
+            None if legacy and urls
+            else exact_line or (line_of(urls[0]) if urls else None) or line_of(first)
+        )
         labels: list[str] = []
-        for url in _extract_coverage_input_urls(content or ""):
+        for url in urls:
             try:
-                parts = urlsplit(url if "://" in url else "//" + url)
-                shown = f"{parts.hostname or ''}{cls._mask_opaque_segments(parts.path)}"
-                shown = shown.rstrip("/") or "an unlabelled URL"
+                has_scheme = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", url) is not None
+                host = urlsplit(url if has_scheme else "//" + url).hostname or "a link"
             except ValueError:
-                shown = "an unparseable URL"
-            label = f"{shown} ({_coverage_url_label(url)})"
+                host = "an unparseable link"
+            number = shown(item_line or line_of(url))
+            where = f" — line {number}" if number else ""
+            label = f"{host}{where} ({_coverage_url_label(url)})"
             if label not in labels:
                 labels.append(label)
         if labels:
             return labels
-        first = (content or "").strip().splitlines()
-        return [first[0][:80] if first else "an empty item"]
+        note_id = "note#" + hashlib.sha256("\n".join(block).encode("utf-8")).hexdigest()[:12]
+        where = f" — line {shown(item_line)}" if item_line else ""
+        return [f"a note{where} ({note_id})"]
 
     def _alert_parked(
         self,
@@ -2215,6 +2279,8 @@ class InboxMonitor:
         detail: str,
         item_id: str | None = None,
         labels: list[str] | None = None,
+        texts: list[str] | None = None,
+        legacy: bool = False,
     ) -> None:
         """Record that part of a file stopped being evaluated; sent at scan end.
 
@@ -2223,13 +2289,56 @@ class InboxMonitor:
         id, never by their label: two presigned links to one path share a
         redacted label, and keying on it reported one item where two stopped
         (#2447 review). A call with no ``item_id`` parks the whole file.
+        ``texts`` are the row's item texts, labelled at flush (``labels``
+        given directly are used as they are).
         """
         buf = getattr(self, "_park_buffer", None)
         if buf is None:  # called outside check_once (tests, direct calls)
             self._park_buffer = buf = {}
         entry = buf.setdefault((file_path, reason), {"detail": detail, "items": {}})
         if item_id is not None:
-            entry["items"][item_id] = labels or ["an item"]
+            entry["items"][item_id] = (
+                {"texts": texts, "legacy": legacy} if texts else (labels or ["an item"])
+            )
+
+    def _resolve_park_labels(self, file_path: str, items: dict) -> dict[str, list[str]]:
+        """Labels for every item parked in one file, read from the file ONCE.
+
+        Labelled newest row first, each taking the last line not yet claimed,
+        so identical items get distinct lines in file order (#2533 round 3).
+        """
+        pending = [(rid, v) for rid, v in items.items() if isinstance(v, dict)]
+        if not pending:
+            return items
+        try:
+            # Exactly what the scanner evaluated: its read (first 50 KB, utf-8
+            # with replacement) and its line split. A copy of an item below the
+            # evaluated prefix is never the parked one (#2533 round 4).
+            text = read_content(Path(file_path))
+        except OSError:
+            text = ""
+        file_lines = text.splitlines()
+        # Physical line numbers, counted by "\n" as editors do.
+        # Built from the logical lines themselves, so it always has one entry
+        # per logical line (round 4 audit: a separator ending a line broke a
+        # map built from the physical side).
+        line_numbers: list[int] = []
+        number = 1
+        for segment in text.splitlines(keepends=True):
+            line_numbers.append(number)
+            if segment.endswith("\n"):
+                number += 1
+        claimed: set[int] = set()
+        resolved: dict[str, list[str]] = {}
+        for rid, v in reversed(pending):
+            resolved[rid] = [
+                ", ".join(self._item_labels(
+                    item, file_lines, legacy=v["legacy"], claimed=claimed,
+                    line_numbers=line_numbers,
+                ))
+                for item in reversed(v["texts"])
+            ][::-1]
+        return {rid: resolved.get(rid, v) for rid, v in items.items()}
 
     def _flush_park_alerts(self) -> None:
         """Queue one durable owner alert per (file, reason) parked this scan.
@@ -2257,7 +2366,8 @@ class InboxMonitor:
                     name = Path(file_path).relative_to(self._config.watch_path).as_posix()
                 except ValueError:
                     name = Path(file_path).name
-                items = entry["items"]
+                items = self._resolve_park_labels(file_path, entry["items"])
+                entry["items"] = items  # the failure log below reads the labels
                 # One line per LOGICAL item, not per row: a row holds several
                 # items when items_per_eval > 1, and the title counts them.
                 lines = [f"- {lbl}" for lbls in items.values() for lbl in lbls]
@@ -2307,7 +2417,9 @@ class InboxMonitor:
                     "Inbox parked-alert enqueue failed for %s (%s): %s",
                     file_path, reason,
                     "; ".join(
-                        lbl for lbls in entry.get("items", {}).values() for lbl in lbls
+                        lbl for rid, lbls in entry.get("items", {}).items()
+                        for lbl in (lbls if isinstance(lbls, list)
+                                    else [f"row {rid}: {len(lbls['texts'])} unlabelled item(s)"])
                     ) or entry.get("detail", ""),
                     exc_info=True,
                 )
