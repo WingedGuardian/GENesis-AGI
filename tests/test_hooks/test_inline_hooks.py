@@ -933,30 +933,25 @@ class TestWebFetchHookAllowedUrls:
 class TestWebFetchHookErrorMessages:
     """Verify YouTube block message contains actionable guidance."""
 
-    def test_suggests_yt_dlp(self, webfetch_hook_command: str) -> None:
-        """Error message suggests yt-dlp as alternative."""
+    def test_points_at_the_genesis_web_fetch_tool(self, webfetch_hook_command: str) -> None:
+        """The block names the tool that returns the transcript (a session may have no Bash)."""
         result = run_hook(
             webfetch_hook_command,
             {"url": "https://www.youtube.com/watch?v=test"},
         )
         assert result.returncode == 2
-        assert "yt-dlp" in result.stderr
+        assert "mcp__genesis-health__web_fetch" in result.stderr
+        assert "transcript" in result.stderr.lower()
 
-    def test_mentions_ssl(self, webfetch_hook_command: str) -> None:
-        """Error message explains the SSL root cause."""
+    def test_no_shell_or_certificate_workaround(self, webfetch_hook_command: str) -> None:
+        """Measured 2026-09-27: YouTube TLS verifies here; the old SSL premise and the
+        yt-dlp-via-Bash writes to /tmp are gone from the message."""
         result = run_hook(
             webfetch_hook_command,
             {"url": "https://www.youtube.com/watch?v=test"},
         )
-        assert "SSL" in result.stderr
-
-    def test_shows_transcript_example(self, webfetch_hook_command: str) -> None:
-        """Error message includes transcript extraction example."""
-        result = run_hook(
-            webfetch_hook_command,
-            {"url": "https://www.youtube.com/watch?v=test"},
-        )
-        assert "write-auto-sub" in result.stderr or "transcript" in result.stderr.lower()
+        for stale in ("SSL", "yt-dlp", "/tmp", "no-check-certificate"):
+            assert stale not in result.stderr, stale
 
 
 # ---------------------------------------------------------------------------

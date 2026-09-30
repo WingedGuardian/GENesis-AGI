@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 import tempfile
 from dataclasses import dataclass
 
@@ -173,6 +174,8 @@ _PERIMETER_BLOCK_THRESHOLD = 0.6
 # guarantee: the reader is a model, and a model reads an entity-spelled or
 # look-alike marker as the marker itself.
 _WRAP_ID_CHARS = 16
+_KEY_FILE_MAX_BYTES = 256  # 64 hex characters plus slack
+_KEY_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _boundary_key: bytes | None = None
 
 
@@ -203,10 +206,20 @@ def _load_boundary_key() -> bytes:
                 os.link(tmp, path)
         finally:
             os.unlink(tmp)
-        rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(rfd) as fh:
-            key = bytes.fromhex(fh.read().strip())
-    except (OSError, ValueError):
+        # Non-blocking and regular-file only: a FIFO at this path would otherwise
+        # block the first wrap in the process indefinitely. The read is bounded.
+        rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(rfd, "rb") as fh:
+            info = os.fstat(fh.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"{path} is not a regular file")
+            if info.st_size > _KEY_FILE_MAX_BYTES:
+                raise OSError(f"{path} is larger than a boundary key")
+            text = fh.read(_KEY_FILE_MAX_BYTES).decode("ascii").strip()
+            if not _KEY_HEX_RE.fullmatch(text):
+                raise ValueError(f"{path} does not hold a boundary key")
+            key = bytes.fromhex(text)
+    except (OSError, ValueError, UnicodeDecodeError):
         logger.warning("Content-boundary key unavailable; using a per-process key", exc_info=True)
     if len(key) != 32:
         logger.warning("Content-boundary key at %s is not usable; using a per-process key", path)

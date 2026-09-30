@@ -294,6 +294,10 @@ dg_floor_tier() {
     # Tier from free space alone ($1 free MB of $2 total MB, and btrfs
     # unallocated $3 / metadata % $4, "-" when unknown).
     local free="$1" total="$2" unalloc="${3:--}" meta="${4:--}" pct red_mb
+    # total 0 = size unknown (unreadable), or a filesystem under 1 MiB, which
+    # the guardian's whole-MB unit cannot measure. Neither is judged: a tier
+    # needs a size. The watched filesystems (/, cc-tmp, /tmp) are all far
+    # above that floor.
     (( total > 0 )) || { echo green; return; }
     pct=$(( free * 100 / total ))
     red_mb=$(( total * DG_RED_PCT / 100 ))
@@ -307,6 +311,10 @@ dg_floor_tier() {
     # are unaffected: there 3 % is far below the line anyway.
     local orange_mb=$(( total * DG_ORANGE_PCT / 100 ))
     (( red_mb > orange_mb * 3 / 4 )) && red_mb=$(( orange_mb * 3 / 4 ))
+    # Integer division rounds that cap to 0 on a filesystem under ~25 MB, and
+    # `free < 0` is never true — a completely full one stayed ORANGE (review
+    # finding, #2521 item 2). 1 MB is the floor.
+    (( red_mb < 1 )) && red_mb=1
     if (( free < red_mb )); then echo red; return; fi
     if [[ "$unalloc" =~ ^[0-9]+$ && "$meta" =~ ^[0-9]+$ ]] \
             && (( unalloc < DG_UNALLOC_RED_MB && meta >= DG_META_RED_PCT )); then
