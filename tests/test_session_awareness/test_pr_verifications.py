@@ -985,3 +985,22 @@ async def test_an_attempt_without_a_document_does_not_inherit_the_previous_one(d
     assert row["verdict"] == "cannot-verify"
     assert row["evidence"] is None, "an older attempt's document must not wear the new verdict"
     assert row["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_list_open_puts_an_established_FAILURE_ahead_of_everything(db):
+    """Codex round 3: fail-intent sorted with cannot-verify, behind every untouched
+    row, so a capped backlog could drop the one open state that is a finding."""
+    await _open(db, 90, merged="2026-09-09T00:00:00Z")  # newest, will FAIL
+    await _open(db, 91, merged="2026-09-01T00:00:00Z")  # oldest, will be parked
+    await _open(db, 92, merged="2026-09-05T00:00:00Z")  # untouched
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=90, verdict="fail-intent", note="timer missed 3/37", now=NOW
+    )
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=91, verdict="cannot-verify", note="needs another install", now=NOW
+    )
+    rows = await verif_crud.list_open(db)
+    assert [r["pr_number"] for r in rows] == [90, 92, 91], "failed, untouched, parked"
+    capped = await verif_crud.list_open(db, limit=1)
+    assert [r["pr_number"] for r in capped] == [90], "no cap may hide a failure"

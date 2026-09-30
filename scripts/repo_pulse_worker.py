@@ -35,9 +35,10 @@ if str(SRC_DIR) not in sys.path:
 
 def _print_verification_backlog(db_path: str | None) -> None:
     """The pr_verifications day-one reader: open obligations in BACKLOG order —
-    never-attempted rows first, then parked ones, oldest merge first within each
-    (``list_open``'s ORDER BY; a validator should reach an untouched row before one a
-    colleague already tried).
+    FAILED rows first, then never-attempted, then parked ones, oldest merge first
+    within each (``list_open``'s ORDER BY: an established failure is a finding the user
+    must see, so no cap may hide it; after that a validator should reach an untouched
+    row before one a colleague already tried).
 
     Read-only, no worker run, no debounce — usable while the Wave-3 validator
     session (the eventual consumer) does not exist yet. Prints one line per
@@ -137,7 +138,7 @@ def _print_verification_backlog(db_path: str | None) -> None:
     if len(rows) < open_total:
         print(
             f"  <listed the first {len(rows)} of {open_total} open row(s) in backlog "
-            f"order — never-attempted first, then parked, oldest merge first within "
+            f"order — failed first, then never-attempted, then parked, oldest merge first within "
             f"each; "
             f"{open_total - len(rows)} not shown — close some, or query "
             f"pr_verifications directly for the full set>"
@@ -309,6 +310,18 @@ def _print_verification_log(db_path: str | None, pr_number: int | None) -> None:
     print(f"pr_verifications: {len(rows)} closed row(s) shown ({resolved})")
 
 
+def _pr_number(text: str) -> int:
+    """A PR number SQLite can bind. Out of range is an argument error (exit 2, the one
+    nonzero this module allows), not an OverflowError from the driver mid-read."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if not 0 < value <= 2**63 - 1:
+        raise argparse.ArgumentTypeError(f"PR number out of range: {value}")
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trigger", default="manual", choices=["session_start", "manual"])
@@ -329,14 +342,15 @@ def main() -> None:
         default=None,
         help="override the cursor-less enumeration window (config default: 7)",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--verification-backlog",
         action="store_true",
-        help="list OPEN post-merge verification obligations (never-attempted "
-        "first, oldest merge first within each group) and exit — no worker run, "
-        "no debounce, read-only",
+        help="list OPEN post-merge verification obligations (failed first, then "
+        "never-attempted, then parked; oldest merge first within each) and exit — no "
+        "worker run, no debounce, read-only",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--verification-log",
         action="store_true",
         help="list CLOSED obligations with the verdict and evidence a validator "
@@ -345,7 +359,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pr",
-        type=int,
+        type=_pr_number,
         default=None,
         help="scope --verification-log to a single PR number",
     )

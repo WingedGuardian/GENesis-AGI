@@ -32,6 +32,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     StringConstraints,
@@ -47,8 +48,11 @@ __all__ = [
     "DEPLOY_METHODS",
     "ESTABLISHING_TIERS",
     "MAX_EVIDENCE_BYTES",
+    "NOTE_PREFIXED_GAPS",
+    "NOT_DEPLOYED",
     "NO_CONTROL_GAP",
     "SUSPECTED_FAILURE",
+    "UNDEPLOYED_FAILURE",
     "TIERS",
     "Decision",
     "Derivation",
@@ -93,6 +97,19 @@ NO_CONTROL_GAP = "no negative control"
 #: either: it keeps the row OPEN, named, until someone measures it.
 SUSPECTED_FAILURE = "SUSPECTED FAILURE (INFERRED)"
 
+#: The gap named when ``deploy.established`` is false: nothing measured on a tree
+#: that was not shown to carry the merge says anything about the merge, so the row
+#: stays OPEN whatever the claims say.
+NOT_DEPLOYED = "DEPLOYMENT NOT ESTABLISHED"
+
+#: The gap prefix for a claim that FAILED on a tree not shown to carry the merge.
+#: Not fail-intent — the failure may be the stale tree's — but never dropped either.
+UNDEPLOYED_FAILURE = "FAILED WHERE DEPLOYMENT WAS NOT ESTABLISHED"
+
+#: Gaps that keep a row open AND must be visible on the backlog's one line, so the
+#: CLI writes them ahead of the validator's note rather than only into the document.
+NOTE_PREFIXED_GAPS = (NOT_DEPLOYED, UNDEPLOYED_FAILURE, SUSPECTED_FAILURE)
+
 #: Prose: any non-blank string, whitespace-trimmed. Never a coerced number, bool,
 #: null or object — the exact values ``str(x).strip()`` used to wave through.
 Text = Annotated[StrictStr, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -106,9 +123,18 @@ _CONFIG = ConfigDict(extra="forbid")
 
 
 class Deploy(BaseModel):
+    """HOW deployment was checked, and WHETHER it was established.
+
+    ``established`` is required and structured because :func:`derive` gates on it:
+    a claim measured on a checkout that does not carry the merge proves nothing
+    about the merge, and when the outcome lived only in ``detail`` prose the
+    verdict could not see it, so a stale-tree measurement could close a row
+    permanently (Codex, round 3)."""
+
     model_config = _CONFIG
 
     method: Literal["behaviour", "content", "ancestry"]
+    established: StrictBool
     detail: Text
 
 
@@ -229,11 +255,17 @@ def derive(doc: EvidenceDocument) -> Derivation:
 
     ::
 
+        deploy.established is false                   -> cannot-verify          (open)
         a claim failed at MEASURED or READ            -> fail-intent            (open)
         a claim failed at INFERRED                    -> cannot-verify          (open)
         no claim passing at MEASURED or READ          -> cannot-verify          (open)
         no gaps                                       -> pass-mechanical        (closes)
         otherwise                                     -> pass-with-measured-gaps (closes)
+
+    Deployment is checked FIRST: nothing measured on a tree not shown to carry the
+    merge can discharge it or accuse it, so an unestablished deployment derives
+    ``cannot-verify`` with :data:`NOT_DEPLOYED` named, and each failed claim is kept
+    as an :data:`UNDEPLOYED_FAILURE` gap rather than dropped.
 
     A failure is gated by tier exactly as a pass is. ``fail-intent`` goes to the user
     as a conversation, so it needs an ESTABLISHED failure; one that was only inferred
@@ -249,6 +281,14 @@ def derive(doc: EvidenceDocument) -> Derivation:
     gap, and now it says so. ``pass-mechanical`` therefore means established,
     controlled, and nothing left out, by construction.
     """
+    if not doc.deploy.established:
+        undeployed = [
+            f"{UNDEPLOYED_FAILURE} ({c.tier}): {c.claim}" for c in doc.claims if c.verdict == "fail"
+        ]
+        gaps = [f"{NOT_DEPLOYED} ({doc.deploy.method}): {doc.deploy.detail}", *undeployed]
+        gaps += list(doc.scope_limits)
+        return Derivation("cannot-verify", gaps=tuple(gaps), failed=())
+
     failed = tuple(
         c.claim for c in doc.claims if c.verdict == "fail" and c.tier in ESTABLISHING_TIERS
     )
@@ -367,6 +407,13 @@ def decide(
                 " If nothing MATERIAL was established, that is what --park records: "
                 "re-run with --park and a --note saying why."
             )
+        elif any(g.startswith(NOT_DEPLOYED) for g in d.gaps):
+            # The tempting wrong fix is flipping `established`; name the right one.
+            advice = (
+                " Deployment was not established, so no claim here can discharge or "
+                "accuse the merge: deploy it and re-measure. Never set established to "
+                "reach a verdict."
+            )
         elif asserted == "fail-intent" and any(g.startswith(SUSPECTED_FAILURE) for g in d.gaps):
             # The tempting wrong fix is relabelling the tier; name the right one.
             advice = (
@@ -393,16 +440,31 @@ def decide(
         else f"this document derives {verdict}"
     )
     suspected = tuple(g for g in d.gaps if g.startswith(SUSPECTED_FAILURE))
+    undeployed = tuple(g for g in d.gaps if g.startswith((NOT_DEPLOYED, UNDEPLOYED_FAILURE)))
     if not closing and not note_text:
         if verdict == "fail-intent":
             why = (
                 "record what failed and what the user needs to know — this row is the "
                 "record the conversation with them starts from."
             )
+        elif undeployed and doc.deploy.method == "ancestry":
+            why = (
+                "ancestry is never a negative verdict — a stacked PR lands inside its "
+                "parent's squash, unreachable by ancestry while fully deployed. Check "
+                "by content or behaviour first; record this only if those fail too."
+                + _listing("gap", undeployed)
+            )
+        elif undeployed:
+            why = (
+                "say what stands between this tree and the merge. If you can deploy it "
+                "and re-run, that is not cannot-verify — it is not-yet-done: leave the "
+                "row alone." + _listing("gap", undeployed)
+            )
         elif suspected:
             why = (
                 "say what would settle the suspicion — how to MEASURE it. The row "
-                "stays open with the suspicion named ahead of your note." + _listing("", suspected)
+                "stays open with the suspicion named ahead of your note."
+                + _listing("gap", suspected)
             )
         else:
             why = (

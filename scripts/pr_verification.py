@@ -23,11 +23,15 @@ owner's standing ruling (2026-09-26); which one a document supports is decided b
 ``genesis.session_awareness.pr_evidence.derive``, a decision tree that gives every
 valid document exactly one:
 
+  deploy.established is false           -> cannot-verify          LEAVES IT OPEN
   a claim failed at MEASURED or READ    -> fail-intent            LEAVES IT OPEN
   a claim failed at INFERRED            -> cannot-verify          LEAVES IT OPEN
   nothing passing at MEASURED or READ   -> cannot-verify          LEAVES IT OPEN
   no gaps                               -> pass-mechanical        CLOSES the row
   otherwise                             -> pass-with-measured-gaps CLOSES the row
+
+Deployment comes first: ``deploy.established`` is required, and false derives
+cannot-verify (row OPEN, "DEPLOYMENT NOT ESTABLISHED" named) whatever the claims say.
 
 Gaps are the declared ``scope_limits`` plus the ones the document implies: no
 negative control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named
@@ -100,6 +104,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import sys
 from datetime import UTC
 from pathlib import Path
@@ -110,6 +115,8 @@ if str(SRC_DIR) not in sys.path:
 
 from genesis.session_awareness.pr_evidence import (  # noqa: E402
     MAX_EVIDENCE_BYTES,
+    NOT_DEPLOYED,
+    NOTE_PREFIXED_GAPS,
     SUSPECTED_FAILURE,
     TIERS,
     Decision,
@@ -178,6 +185,7 @@ SCHEMA_TEMPLATE = {
     "merge_commit": "<sha of the artifact you actually verified>",
     "deploy": {
         "method": "behaviour | content | ancestry",
+        "established": True,
         "detail": "HOW deployment was established — ancestry is never a negative verdict",
     },
     "claims": [
@@ -231,6 +239,10 @@ async def _write(
     from genesis.db.connection import connect_aiosqlite_rw
 
     pr_number = doc.pr
+    # Set the moment a writer COMMITS. Anything that fails after that (the success
+    # print, the connection's close) must not be reported as "nothing recorded" —
+    # a retry would then meet a closed row and a message that contradicts it.
+    committed: str | None = None
     try:
         async with connect_aiosqlite_rw(resolved, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
@@ -261,20 +273,20 @@ async def _write(
 
             verdict = decision.verdict
             reason = build_reason(doc, decision)
-            # An open row keeps the VALIDATOR'S words as its note, first: the backlog
-            # shows the note on one line, and a generated prefix would push the part
-            # a human wrote out of view. The derivation is not lost — the verdict is
-            # its own column and the document is stored whole. The one exception is
-            # a park, which is a judgment the note must own up to.
+            # An open row's note is the validator's own words, with two kinds of
+            # generated prefix. The gaps in NOTE_PREFIXED_GAPS (deployment not
+            # established, a failure measured there, a suspected failure) go AHEAD of
+            # it: the backlog shows one line, and a reason that lived only in the
+            # stored document would read there exactly like an ordinary precondition.
+            # A long prefix can push the validator's words past the backlog's clip;
+            # the clip marker names the read that shows them whole. And a park, which
+            # is a judgment the note must own up to.
             attempt_note = None
             if not decision.closing:
                 attempt_note = str(note).strip()
-                # A suspected failure is named AHEAD of the note: the backlog shows
-                # one line, and a suspicion that lives only in the stored document
-                # reads there exactly like an unreachable precondition.
-                suspected = [g for g in decision.derivation.gaps if g.startswith(SUSPECTED_FAILURE)]
-                if suspected:
-                    attempt_note = "; ".join(suspected) + " — " + attempt_note
+                visible = [g for g in decision.derivation.gaps if g.startswith(NOTE_PREFIXED_GAPS)]
+                if visible:
+                    attempt_note = "; ".join(visible) + " — " + attempt_note
                 if decision.parked:
                     attempt_note = "PARKED (nothing material established) — " + attempt_note
 
@@ -315,6 +327,7 @@ async def _write(
                         file=sys.stderr,
                     )
                     return 1
+                committed = f"CLOSED {target}#{pr_number} as {verdict}"
                 print(f"pr_verification: CLOSED {target}#{pr_number} — {reason} at {now}")
                 return 0
 
@@ -334,6 +347,7 @@ async def _write(
                     file=sys.stderr,
                 )
                 return 1
+            committed = f"{verdict} recorded on {target}#{pr_number}, row still OPEN"
             print(
                 f"pr_verification: {target}#{pr_number} STAYS OPEN — {verdict} recorded "
                 f"at {now}. The obligation is not discharged."
@@ -343,10 +357,17 @@ async def _write(
                     "  This is a FAILED verification: bring it to the user as a "
                     "conversation (never an automatic rollback) and file the defect."
                 )
-            elif any(g.startswith(SUSPECTED_FAILURE) for g in decision.derivation.gaps):
-                for g in decision.derivation.gaps:
-                    if g.startswith(SUSPECTED_FAILURE):
-                        print(f"  {g}")
+                return 0
+            gaps = decision.derivation.gaps
+            for g in gaps:
+                if g.startswith(NOTE_PREFIXED_GAPS):
+                    print(f"  {g}")
+            if any(g.startswith(NOT_DEPLOYED) for g in gaps):
+                print(
+                    "  Deployment was not established, so nothing measured here is a "
+                    "finding about the PR. Deploy the merge and re-run."
+                )
+            elif any(g.startswith(SUSPECTED_FAILURE) for g in gaps):
                 print(
                     "  A failure was SUSPECTED but not established. Measure it if you "
                     "can; until then it is a named gap on an open row, not a finding."
@@ -354,6 +375,28 @@ async def _write(
             return 0
     except DatabaseIntegrityError as exc:
         print(f"pr_verification: refusing to write — {exc}", file=sys.stderr)
+        return 1
+    except (sqlite3.Error, OSError) as exc:
+        if committed:
+            # The write landed; only reporting it failed. Saying otherwise sends the
+            # validator to retry against a row that has already changed.
+            print(
+                f"pr_verification: the write COMMITTED ({committed}), but finishing "
+                f"the run failed — {type(exc).__name__}: {exc}. Do not re-run; read "
+                f"the row with `repo_pulse_worker.py --verification-log --pr "
+                f"{pr_number}`.",
+                file=sys.stderr,
+            )
+            return 0
+        # A lock held past busy_timeout, a malformed file, a full disk: the ledger
+        # declined, which is exit 1 by this tool's contract — not a traceback. Each
+        # writer commits in one statement, and none had committed, so nothing was
+        # written.
+        print(
+            f"pr_verification: the ledger declined the write — {type(exc).__name__}: "
+            f"{exc}. Nothing was recorded.",
+            file=sys.stderr,
+        )
         return 1
 
 

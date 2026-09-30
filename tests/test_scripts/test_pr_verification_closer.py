@@ -49,7 +49,11 @@ def _doc(**over) -> dict:
         "repo": REPO,
         "pr": 7,
         "merge_commit": "deadbeef1234",
-        "deploy": {"method": "content", "detail": "present in the deployed file"},
+        "deploy": {
+            "method": "content",
+            "established": True,
+            "detail": "present in the deployed file",
+        },
         "claims": [
             {
                 "claim": "the timer fires hourly",
@@ -165,7 +169,7 @@ def test_print_schema_emits_a_document_its_own_validator_shape_accepts(capsys):
         "scope_limits",
         "findings",
     }
-    assert set(tpl["deploy"]) == {"method", "detail"}
+    assert set(tpl["deploy"]) == {"method", "established", "detail"}
     assert set(tpl["claims"][0]) == {"claim", "verdict", "tier", "measurement"}
     assert "repo" in tpl, (
         "the template is what a validator fills in, and repo is now REQUIRED — "
@@ -187,8 +191,9 @@ def test_a_well_formed_document_validates():
         ({"pr": "7"}, "evidence.pr"),
         ({"pr": True}, "evidence.pr"),
         ({"merge_commit": "  "}, "evidence.merge_commit"),
-        ({"deploy": {"method": "vibes", "detail": "x"}}, "deploy.method"),
-        ({"deploy": {"method": "content", "detail": " "}}, "deploy.detail"),
+        ({"deploy": {"method": "vibes", "established": True, "detail": "x"}}, "deploy.method"),
+        ({"deploy": {"method": "content", "established": True, "detail": " "}}, "deploy.detail"),
+        ({"deploy": {"method": "content", "detail": "x"}}, "deploy.established"),
         ({"deploy": "nope"}, "evidence.deploy"),
         ({"claims": []}, "claims"),
         ({"claims": "nope"}, "claims"),
@@ -1060,3 +1065,79 @@ def test_non_ASCII_evidence_is_stored_as_written_not_escaped(tmp_path):
     assert _run(tmp_path, doc) == 0
     stored = _row(db)["evidence"]
     assert "mesurée" in stored and "\\u" not in stored
+
+
+def test_an_UNDEPLOYED_document_stays_open_with_deployment_named_on_the_row(tmp_path, capsys):
+    """Codex round 3 P1, end to end: a clean MEASURED pass on a tree that does not
+    carry the merge must not close the obligation, and the backlog line must say why."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc()
+    doc["deploy"] = {
+        "method": "content",
+        "established": False,
+        "detail": "the changed file on this checkout predates the merge",
+    }
+    assert _run(tmp_path, doc, "--verdict", "pass-mechanical") == 2
+    assert _row(db)["status"] == "open"
+    assert _run(tmp_path, doc, "--note", "deploy main, then re-run") == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("open", "cannot-verify")
+    assert row["last_attempt_note"] == (
+        "DEPLOYMENT NOT ESTABLISHED (content): the changed file on this checkout "
+        "predates the merge — deploy main, then re-run"
+    )
+    out = capsys.readouterr().out
+    assert "Deployment was not established" in out and "Deploy the merge" in out
+
+
+def test_a_SQLite_write_failure_is_exit_1_not_a_traceback(tmp_path, capsys, monkeypatch):
+    """Codex round 3: a lock past busy_timeout or a malformed file raised straight
+    out of asyncio.run() instead of the documented ledger-declined exit code."""
+    import sqlite3
+
+    _seed(tmp_path / "genesis.db")
+    from genesis.db.crud import pr_verifications as crud
+
+    async def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(crud, "close_verification", locked)
+    assert _run(tmp_path, _doc()) == 1
+    err = capsys.readouterr().err
+    assert "ledger declined the write" in err and "database is locked" in err
+    assert _row(tmp_path / "genesis.db")["status"] == "open"
+
+
+def test_print_schema_template_carries_a_real_established_bool(capsys):
+    assert _prv.main(["print-schema"]) == 0
+    tpl = json.loads(capsys.readouterr().out)
+    assert tpl["deploy"]["established"] is True
+
+
+def test_a_failure_AFTER_the_commit_reports_committed_not_nothing_recorded(
+    tmp_path, capsys, monkeypatch
+):
+    """Fresh review of round 4: the write-failure catch also covered code that runs
+    after the commit, so a failure there said "Nothing was recorded" (exit 1) about a
+    row that had closed — and a retry then met a closed row."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+
+    import builtins
+
+    real_print = builtins.print
+
+    def failing_print(*a, **k):
+        if a and str(a[0]).startswith("pr_verification: CLOSED"):
+            raise OSError("broken pipe")
+        return real_print(*a, **k)
+
+    monkeypatch.setattr(builtins, "print", failing_print)
+    rc = _run(tmp_path, _doc())
+    monkeypatch.setattr(builtins, "print", real_print)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "the write COMMITTED (CLOSED owner/repo#7 as pass-mechanical)" in err
+    assert "Nothing was recorded" not in err
+    assert _row(db)["status"] == "closed"

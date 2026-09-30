@@ -542,3 +542,57 @@ def test_a_short_census_reason_is_printed_whole_and_unmarked(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "reason  : short reason\n" in out
     assert "shows it whole" not in out, "no clip marker on a reason that fits"
+
+
+def test_the_two_reader_modes_are_MUTUALLY_EXCLUSIVE(tmp_path, monkeypatch):
+    """Codex round 3: both flags together silently ran the backlog and dropped the
+    requested log and its --pr scope."""
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "repo_pulse_worker.py",
+            "--verification-backlog",
+            "--verification-log",
+            "--pr",
+            "1",
+            "--db-path",
+            str(tmp_path / "x.db"),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _w.main()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("bad", [str(2**63), "0", "-4", "seven"])
+def test_an_unbindable_pr_is_an_ARGUMENT_error_not_an_overflow(tmp_path, monkeypatch, bad):
+    """Codex round 3: 2**63 reached the driver and raised OverflowError mid-read,
+    outside both the argument-error exit and the sqlite3.Error handler."""
+    db = tmp_path / "genesis.db"
+    _build(db, closed=1)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["repo_pulse_worker.py", "--verification-log", "--pr", bad, "--db-path", str(db)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        _w.main()
+    assert exc.value.code == 2
+
+
+def test_the_largest_bindable_pr_is_accepted(tmp_path, monkeypatch, capsys):
+    """The control arm: the bound is the driver's, not an arbitrary smaller one."""
+    db = tmp_path / "genesis.db"
+    _build(db, closed=1)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "repo_pulse_worker.py",
+            "--verification-log",
+            "--pr",
+            str(2**63 - 1),
+            "--db-path",
+            str(db),
+        ],
+    )
+    assert _w.main() is None
+    assert "no rows for PR" in capsys.readouterr().out

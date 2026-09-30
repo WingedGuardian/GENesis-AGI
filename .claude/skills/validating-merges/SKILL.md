@@ -108,6 +108,7 @@ always says what the evidence says:
 
 | derived when | verdict | the row | the route |
 |---|---|---|---|
+| `deploy.established` is false | `cannot-verify` | **stays OPEN** | deploy it and re-run — usually not-yet-done |
 | a claim FAILED at `MEASURED` or `READ` | `fail-intent` | **stays OPEN** | to the USER, as a conversation |
 | a claim failed only at `INFERRED` | `cannot-verify` | **stays OPEN** | measure it — a suspicion is not a finding |
 | nothing passing at `MEASURED` or `READ` | `cannot-verify` | **stays OPEN** | see the filing rule below |
@@ -139,7 +140,8 @@ A non-closing outcome **requires `--note`**, and the note is the whole point
 of the row staying open: it is what stops the next validator re-deriving why this
 could not be finished. It surfaces inline in the backlog as
 `ATTEMPTED 2x cannot-verify — <note>`, so a parked row announces itself. Parked
-rows also sort LAST in the backlog, behind never-attempted work — they are
+rows also sort LAST in the backlog, behind never-attempted work (a `fail-intent`
+row sorts FIRST: it is a finding, and no cap may hide it) — parked rows are
 typically the oldest, and an oldest-first reader would otherwise let them starve
 the work you can actually do.
 
@@ -244,7 +246,8 @@ giving n=19 for both of its claims from a single query — the strongest evidenc
 of three pilots and the cheapest to obtain. A one-day-old scheduled job gave
 n=37 runs. A hook PR had no production samples at all and needed synthetic
 probes. So oldest merge first — the backlog's order within each group, after
-never-attempted rows are put ahead of parked ones — is right for a second reason: old rows are not a wall, they are the tier where the
+failed rows lead and never-attempted rows are put ahead of parked ones — is right
+for a second reason: old rows are not a wall, they are the tier where the
 experiment already ran.
 
 ---
@@ -294,8 +297,12 @@ because each pilot broke a field the obvious version would have had:
   cannot be amended, so a mis-bind would be permanent. `--pr` must ALSO equal the
   document's `pr` — a deliberate second copy, because a typo inside the document
   would otherwise close the wrong row with nothing to catch it.
-- **`deploy.method` + detail** — because ancestry lies (above). HOW deployment
-  was established travels with the row.
+- **`deploy.method` + `established` + detail** — because ancestry lies (above).
+  HOW deployment was checked travels with the row, and `established` is the
+  structured outcome the verdict gates on: `false` derives `cannot-verify` whatever
+  the claims say, since nothing measured on a tree that does not carry the merge
+  says anything about the merge. A failure measured there is kept as a named gap,
+  never taken to the user as `fail-intent`.
 - **`claims[]` with a per-claim TIER** (`MEASURED` / `INFERRED` / `READ` /
   `NOT_VERIFIABLE_HERE`) — because a declaration DECOMPOSES and the row is
   binary. One PR's two declared claims resolved into four sub-claims across three

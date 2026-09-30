@@ -20,12 +20,22 @@ from genesis.session_awareness import pr_evidence as pe
 REPO = "owner/repo"
 
 
-def _raw(claims=(("pass", "MEASURED"),), controls=("a control",), scope_limits=(), **over):
+def _raw(
+    claims=(("pass", "MEASURED"),),
+    controls=("a control",),
+    scope_limits=(),
+    established=True,
+    **over,
+):
     doc = {
         "repo": REPO,
         "pr": 7,
         "merge_commit": "deadbeef1234",
-        "deploy": {"method": "content", "detail": "present in the deployed file"},
+        "deploy": {
+            "method": "content",
+            "established": established,
+            "detail": "present in the deployed file",
+        },
         "claims": [
             {"claim": f"claim {i}", "verdict": v, "tier": t, "measurement": "m"}
             for i, (v, t) in enumerate(claims)
@@ -59,6 +69,12 @@ def _enumerate():
             for controls in ((), ("a control",)):
                 for scope in ((), ("a named gap",)):
                     yield claims, controls, scope
+
+
+def _enumerate_deployed():
+    """The whole space again with deployment NOT established — every one of these
+    must stay open, whatever its claims say."""
+    yield from _enumerate()
 
 
 # ── the acceptance bar: total by construction ───────────────────────────────
@@ -451,3 +467,93 @@ def test_asserting_fail_intent_on_a_suspicion_advises_measuring_not_relabelling(
     assert isinstance(r, pe.Refusal) and r.code == 2
     assert "Never relabel a tier" in r.message
     assert "change the document if it is wrong" not in r.message
+
+
+# ── deployment gates the verdict (Codex round 3, P1) ────────────────────────
+
+
+def test_an_UNDEPLOYED_document_never_closes_and_never_accuses():
+    """Every coherent document, with deployment not established: each derives
+    cannot-verify with the deployment gap FIRST, each failure is kept as a named
+    gap rather than dropped or escalated, and the writer accepts it with a note."""
+    n = 0
+    for claims, controls, scope in _enumerate_deployed():
+        doc = _doc(claims=claims, controls=controls, scope_limits=scope, established=False)
+        d = pe.derive(doc)
+        assert d.verdict == "cannot-verify" and d.failed == ()
+        assert d.gaps[0].startswith(pe.NOT_DEPLOYED)
+        fails = sum(1 for v, _ in claims if v == "fail")
+        assert sum(g.startswith(pe.UNDEPLOYED_FAILURE) for g in d.gaps) == fails
+        assert isinstance(pe.decide(doc, note="deploy first"), pe.Decision)
+        for asserted in pe.PASS_VERDICTS:
+            assert isinstance(pe.decide(doc, asserted=asserted), pe.Refusal)
+        n += 1
+    assert n == 476
+
+
+def test_deploy_established_is_REQUIRED_and_strictly_boolean():
+    for bad in ("true", 1, None):
+        raw = _raw()
+        raw["deploy"]["established"] = bad
+        with pytest.raises(pe.EvidenceError) as exc:
+            pe.parse_evidence(raw)
+        assert "evidence.deploy.established" in str(exc.value)
+    raw = _raw()
+    del raw["deploy"]["established"]
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(raw)
+    assert "evidence.deploy.established" in str(exc.value)
+
+
+def test_an_undeployed_note_refusal_names_deployment_and_not_yet_done():
+    r = pe.decide(_doc(established=False))
+    assert isinstance(r, pe.Refusal)
+    assert pe.NOT_DEPLOYED in r.message and "not-yet-done" in r.message
+
+
+def test_replay_codex_4140860459_stale_tree_cannot_close():
+    """P1: a passing MEASURED claim gathered on a tree without the merge closed the
+    obligation, because derive() never looked at deploy."""
+    doc = _doc(established=False)
+    assert pe.derive(doc).verdict == "cannot-verify"
+    assert isinstance(pe.decide(doc, asserted="pass-mechanical"), pe.Refusal)
+
+
+def test_an_undeployed_failure_keeps_its_TIER():
+    """Fresh review of round 4: an INFERRED and a MEASURED failure on a stale tree
+    rendered identically, losing which one was only a suspicion."""
+    d = pe.derive(_doc(claims=(("fail", "MEASURED"), ("fail", "INFERRED")), established=False))
+    assert f"{pe.UNDEPLOYED_FAILURE} (MEASURED): claim 0" in d.gaps
+    assert f"{pe.UNDEPLOYED_FAILURE} (INFERRED): claim 1" in d.gaps
+
+
+def test_a_stale_tree_mismatch_says_deploy_never_flip_established():
+    """Fresh review of round 4: "change the document" invited flipping established
+    to reach a verdict — the tier-relabel temptation, one field over."""
+    doc = _doc(claims=(("fail", "MEASURED"),), established=False)
+    for asserted in ("fail-intent", "pass-mechanical"):
+        r = pe.decide(doc, asserted=asserted, note="n")
+        assert isinstance(r, pe.Refusal)
+        assert "Never set established" in r.message
+        assert "change the document if it is wrong" not in r.message
+
+
+def test_a_negative_ANCESTRY_probe_is_told_to_confirm_by_content_or_behaviour():
+    """Ancestry is never a negative verdict (a stacked PR lands inside its parent's
+    squash); the advice must not treat an ancestry miss as deployment's absence."""
+    raw = _raw(established=False)
+    raw["deploy"]["method"] = "ancestry"
+    r = pe.decide(pe.parse_evidence(raw))
+    assert isinstance(r, pe.Refusal)
+    assert "content or behaviour" in r.message and "never a negative verdict" in r.message
+    other = pe.decide(_doc(established=False))
+    assert "content or behaviour" not in other.message
+
+
+def test_no_refusal_listing_renders_an_empty_label():
+    for doc in (
+        _doc(established=False),
+        _doc(claims=(("pass", "MEASURED"), ("fail", "INFERRED"))),
+    ):
+        r = pe.decide(doc)
+        assert isinstance(r, pe.Refusal) and "\n  : " not in r.message

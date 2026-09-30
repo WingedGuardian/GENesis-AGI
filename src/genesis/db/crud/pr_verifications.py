@@ -441,7 +441,12 @@ async def list_closed(
 
 
 async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]:
-    """Open obligations — NEVER-ATTEMPTED first, then oldest merge first.
+    """Open obligations — FAILED first, then NEVER-ATTEMPTED, then PARKED;
+    oldest merge first within each.
+
+    ``fail-intent`` leads because it is the one open state that is a finding: it
+    goes to the user, and an open row is its only durable record, so a capped
+    window must never be able to drop it behind untouched work (Codex, round 3).
 
     Oldest-first within each group because the backlog's point is what has
     waited longest. The group split is newer and exists because this store now
@@ -454,9 +459,9 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
     review caught this; the class did not exist before the attempt record did,
     so the ordering is part of that change rather than an unrelated fix.
 
-    ``verdict IS NOT NULL`` is the discriminator and it is exact on an open row:
-    a PASS verdict closes the row, so the only way an OPEN row carries a verdict
-    is a recorded non-closing attempt.
+    The verdict is the discriminator and it is exact on an open row: a PASS
+    verdict closes the row, so an OPEN row carries a verdict only after a recorded
+    non-closing attempt — ``fail-intent`` or ``cannot-verify``.
 
     Assumes a Row factory. Empty pre-migration — and on a pre-migration database
     the ordering degrades to plain oldest-first rather than failing, because the
@@ -466,7 +471,8 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
         return []
     lim = max(1, min(int(limit), 2000))
     order = (
-        "verdict IS NOT NULL ASC, merged_at ASC"
+        "CASE WHEN verdict = 'fail-intent' THEN 0 WHEN verdict IS NULL THEN 1 "
+        "ELSE 2 END ASC, merged_at ASC"
         if await _verdict_columns_available(db)
         else "merged_at ASC"
     )
