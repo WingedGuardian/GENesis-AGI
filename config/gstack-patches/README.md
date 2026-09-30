@@ -13,13 +13,11 @@ After any gstack upgrade, run `scripts/apply_gstack_patches.sh` to reapply.
 |------|--------|-------------|
 | `review-checklist.md` | `review/checklist.md` | Adds verification taxonomy section (4-level: exists -> substantive -> wired -> data-flow verified). |
 
-The `codex` skill is no longer overlaid; upstream's own `codex` skill is used
-as shipped. The old overlay was a whole-file copy captured at the v0.13 baseline
-below, so re-applying it replaced the current upstream skill with an outdated one. This also retires the
-overlay's custom fallback chain: upstream's `codex` skill has no fallback when
-the Codex CLI is unavailable. An install whose `codex/` was already overwritten
-gets upstream back at its next gstack update (or by checking out `codex/` in the
-gstack repo).
+Genesis no longer ships a `codex` overlay: the upstream gstack `codex` skill is
+used as-is. The old overlay was a whole-file copy captured at the v0.13 baseline
+below, so re-applying it replaced the current upstream skill with an outdated
+one. An install that customises its `codex` skill maintains that customisation
+locally.
 
 ### Patch Scripts
 
