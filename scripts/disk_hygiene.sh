@@ -464,6 +464,16 @@ main() {
             || echo "reconcile ghost-export prune exited $?"
     fi
 
+    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
+    # update.sh saves local edits to the tracked ephemeral files it discards before
+    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
+    # run. Written once and never touched again, so a directory's mtime is its age.
+    if [ -d "$HOME/.genesis/premerge-backups" ]; then
+        find "$HOME/.genesis/premerge-backups" -mindepth 1 -maxdepth 1 -type d \
+            -mtime +45 -exec rm -rf {} + 2>/dev/null \
+            || echo "premerge-backups prune exited $?"
+    fi
+
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env.
     #

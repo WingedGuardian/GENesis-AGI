@@ -1050,4 +1050,14 @@ jobs:
         # skipif and attaches no client: it drives the real picker over a pipe
         # with a fake tmux on PATH, so there is no runner capability it can miss
         # and no runtime-skip path to lose a coin-flip on.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23476
+        #
+        # The deploy-checkout lib branch adds two test files that do not exist on
+        # main, so each delta is its FULL collected count, and edits seven others
+        # count-neutrally (each re-measured, branch == main):
+        #   pytest tests/test_scripts/test_deploy_checkout.py --collect-only -q
+        #     -> 32 tests collected
+        #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
+        #     -> 20 tests collected
+        # So the floor is 23476 + 52 = 23528. No new test carries a skipif, so
+        # the ceiling does not move.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23528

@@ -106,6 +106,35 @@ is robustness (a hung fetch no longer extends an outage), not a downtime rewrite
   keep their own restart/exit semantics; the stop still precedes the merge.
 - `bash -n` clean; the 3 BEGIN/END marker blocks stay intact and isolated.
 
+## Later additions to the pre-stop window (2026-09-30)
+
+Four steps now share the window this reorder opened, and each keeps its rule: a
+failure before the stop exits with nothing stopped and nothing changed, never
+through the rollback trap.
+
+- **The deployable-checkout checks run first of all**, before the lock, the
+  rollback tag and the backup. They are the shared ones in
+  `scripts/lib/deploy_checkout.sh`, lifted from `deploy_code_only.sh`, which calls
+  the same functions. A linked worktree, a bare repository, a detached HEAD or a
+  branch other than `$DEPLOY_BRANCH` is refused before any state is touched.
+- **The fetched head is pinned** from the tracking ref an explicit refspec
+  writes, and the merge takes that commit. `FETCH_HEAD` is not used: every fetch
+  rewrites it, and other sessions fetch in the same checkout.
+- **Incoming additions that would overwrite a local untracked or ignored file are
+  refused** (`genesis_range_collisions`, over the range from the merge base). The
+  merge also passes `--no-overwrite-ignore`, but git 2.43 honours that only on a
+  fast-forward; a true 3-way merge overwrites the file, and a rollback's
+  `reset --hard` then deletes it. So the scan, before the stop, is the protection;
+  the flag covers a file that appears during the stop on a fast-forward.
+- **Local edits to the ephemeral files are backed up** (`ephemeral-prestop-backup`)
+  between the fetch and `_write_state "fetching"` — every dirty one, because a
+  rollback's `reset --hard` discards any of them. The clear before the merge
+  touches only the files the incoming range changes, plus any with a STAGED edit
+  (git keeps an unstaged edit to any other file through the merge, but a true
+  3-way merge refuses on any index change), and discards a file's edits only when a backup of
+  its current content exists. After the stop, the merge is also checked against
+  the branch the run started on.
+
 ## New test — phase-order lock
 
 `tests/test_scripts/test_update_phase_order.py` (extraction-style, reads the

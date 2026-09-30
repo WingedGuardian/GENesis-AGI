@@ -2972,7 +2972,9 @@ verified: 2ac29c19 2026-09-14
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
-  `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
+  edits under `~/.genesis/premerge-backups/` first — so the block must live in
+  the commit).
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
