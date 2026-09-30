@@ -175,3 +175,15 @@ def test_bare_403_still_permanent():
     # Unchanged: no entitlement marker, no quota keyword → PERMANENT.
     assert classify_error(403, "") == ErrorCategory.PERMANENT
     assert classify_error(403, "access denied") == ErrorCategory.PERMANENT
+
+
+def test_compute_delay_caps_an_overflowing_backoff():
+    """1e300 ** 2 overflows before min() can cap it; the cap is the answer."""
+    from genesis.routing.retry import compute_delay
+    from genesis.routing.types import RetryPolicy
+
+    policy = RetryPolicy(
+        max_retries=5, base_delay_ms=500, max_delay_ms=30000,
+        backoff_multiplier=1.0e300, jitter_pct=0.0, max_total_s=None,
+    )
+    assert compute_delay(policy, 3) == 30.0

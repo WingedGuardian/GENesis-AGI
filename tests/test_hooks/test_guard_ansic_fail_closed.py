@@ -1073,10 +1073,11 @@ class TestAcceptanceCorpus:
         )
 
     def test_legit_ansic_commit_message_not_net_blocked(self, tmp_path):
-        # An ANSI-C message is the canonical way to embed an apostrophe. The
-        # commit segment IS parsed, so the blind-spot net must stand down and
-        # leave the verdict to the real review/branch rules — which may well
-        # block for their own reasons. Assert only that the NET did not decide.
+        # An ANSI-C message is a common way to embed an apostrophe. The escaped
+        # quote now counts as text the shell builds, so the commit gate refuses it
+        # through that blind spot, whose message names the file remedy (`-F`).
+        # Assert only that the untokenizable NET did not decide: its generic text
+        # would give no remedy for this shape.
         cmd = f"{GIT} {COMMIT} -m $'fix: it\\'s done'"
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
         assert "could not be parsed safely" not in (r.stdout + r.stderr)
@@ -1096,29 +1097,21 @@ class TestAcceptanceCorpus:
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
-    def test_decoy_segment_still_reaches_a_human(self, tmp_path):
-        """DOCUMENTED RESIDUE — a shape this net does not close.
+    def test_decoy_segment_is_refused(self, tmp_path):
+        """FORMERLY DOCUMENTED RESIDUE, now closed, and flipped here deliberately.
 
-        Closing this class needs per-occurrence accounting of every gated flag
-        against parsed segment spans: more argv-to-effect modelling, which is the
-        non-convergent tail this design deliberately avoids. Same accepted bucket
-        as eval / dynamic construction (2026-08-12 decision).
-
-        The human it reaches is the push/PR-create EGRESS approval, which the
-        2026-09-08 ruling left untouched — not the blind-spot prompt, which is
-        retired. The net never fires here: analyze() does resolve a push
-        segment, so the ordinary push gate owns this verdict.
-
-        The mechanism is deliberately NOT written out here. This repository is
-        public and the shape is not closed, so an explanation of why the guard
-        misses it would narrow the search for anyone reading. The assertion stays
-        — it locks the residue so a future fix flips it deliberately rather than
-        silently — and whoever does that work can derive the reason from the
-        code in a minute. Private detail lives in the tracked follow-ups below.
+        This cell used to assert that the push guard did NOT block this shape,
+        locking a residue the net could not close without per-occurrence flag
+        accounting. It is closed from a different direction: an escaped quote
+        inside ``$'…'`` now counts as text the shell builds (it is syntax to any
+        shell that reads the text again), so the parse is withheld as a
+        bounds-type blind spot and the guard refuses a command that names a
+        gated operation. No argv-to-effect modelling was added.
         """
         cmd = f"{GIT} {PUSH} origin main && x=$'a\\'b<<PWN'\n{GIT} {PUSH} origin evil {FORCE}\nPWN"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", r.stdout + r.stderr
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert "decodes before it runs" in r.stderr, r.stderr
 
     @pytest.mark.parametrize(
         "label,cmd_tpl",
@@ -1460,7 +1453,10 @@ class TestNetDoesNotDowngradeHardBlocks:
         # win, the net's own generic text IS the right message. Without this,
         # the two `_NET_GENERIC not in` assertions would also pass against a
         # guard whose net had been deleted outright.
-        cmd = f"echo $'don\\'t {PUSH} yet' > /dev/null"
+        # Unparseable through an unmatched apostrophe rather than an escape: an
+        # escaped quote inside $'…' is now built text, reported by an earlier
+        # cause with its own message, so it could no longer arm the net.
+        cmd = f"echo don't {PUSH} yet > /dev/null"
         r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
         assert _decision(r) == "block", r.stdout + r.stderr
         assert _NET_GENERIC in r.stderr, (
@@ -1592,6 +1588,14 @@ class TestVerbPositionIsUnestablished:
     @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB + _HIDDEN_GH_VERB)
     def test_a_shell_built_verb_is_reported_as_a_blind_spot(self, name, cmd):
         segs, blind = sp.analyze_checked(cmd)
+        if sp.has_built_escape(cmd):
+            # A verb decoded from an escape is the bounds-type built-escape blind
+            # spot, which outranks this cause the way a line continuation does. Its
+            # segments are withheld, so the per-segment fact must stay recoverable.
+            assert blind is sp._BLIND_BUILT_ESCAPE, f"{name}: {blind!r}"
+            assert segs == []
+            assert sp.unresolved_verb_programs(cmd), f"{name}: the hidden verb was lost"
+            return
         assert blind is sp._BLIND_UNRESOLVED_VERB, (
             f"{name}: the parse resolved a verb bash never runs and reported "
             f"{blind!r}. A guard reading the empty gated-segment list cannot "

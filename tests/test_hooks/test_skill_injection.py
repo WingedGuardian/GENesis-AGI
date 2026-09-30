@@ -142,11 +142,15 @@ def test_score_skill_name_match_is_whole_word():
     from skill_injection_hook import _MIN_SCORE, _score_skill
 
     skill = {"name": "aws-lambda", "description": "serverless functions", "keywords": []}
-    assert _score_skill(skill, ["aws"]) == 2.0
-    assert _score_skill(skill, ["aws"]) >= _MIN_SCORE
-    assert _score_skill(skill, ["lambda"]) == 2.0
+    # One token of a multi-word name is supporting evidence, below the threshold.
+    assert _score_skill(skill, ["aws"]) == 1.0
+    assert _score_skill(skill, ["aws"]) < _MIN_SCORE
+    assert _score_skill(skill, ["lambda"]) == 1.0
     assert _score_skill(skill, ["awesome"]) == 0.0
     assert _score_skill(skill, ["awe"]) == 0.0
+    # The whole name, as a phrase in any separator, fires.
+    assert _score_skill(skill, ["aws", "lambda"], "deploy it with aws lambda") >= _MIN_SCORE
+    assert _score_skill(skill, ["aws", "lambda"], "use the aws-lambda skill") >= _MIN_SCORE
 
 
 def test_score_skill_not_diluted_by_long_prompt():
@@ -543,3 +547,83 @@ def test_fresh_catalog_spawns_no_regen(tmp_path, monkeypatch, capsys):
     out = _run_main(monkeypatch, capsys, catalog_file, _LONG_SELENIUM_PROMPT)
     assert "[Skill]" in out
     assert not popen_calls
+
+
+def test_a_lone_token_of_a_multi_word_name_does_not_fire(tmp_path, monkeypatch, capsys):
+    """"session" alone must not surface closing-session.
+
+    MEASURED 2026-09-30 on 6,803 replayed prompts: scoring each name token 2
+    put a catalog nudge on 28.5% of prompts, "session" -> closing-session alone
+    on 344 of them.
+    """
+    catalog_file = tmp_path / "skill_catalog.json"
+    skill = {"name": "closing-session", "description": "drive PRs", "keywords": ["prs"],
+             "tier": 1, "path": ".claude/skills/closing-session"}
+    _write_catalog(catalog_file, tier1=[skill])
+
+    quiet = _run_main(monkeypatch, capsys, catalog_file, "did you see the failed direct session alert")
+    assert "closing-session" not in quiet
+    named = _run_main(monkeypatch, capsys, catalog_file, "run a closing session over the queue")
+    assert "closing-session" in named
+    keyword = _run_main(monkeypatch, capsys, catalog_file, "which prs are blocked right now")
+    assert "closing-session" in keyword
+
+
+def test_a_slash_command_name_is_not_read_as_task_intent(tmp_path, monkeypatch, capsys):
+    """`/claude-api prompt audit` split into "api" and fired a TDD nudge plus an
+    unrelated api-gateway skill. The command NAME is dropped; its ARGS are kept."""
+    catalog_file = tmp_path / "skill_catalog.json"
+    gateway = {"name": "api", "description": "API gateway", "keywords": [],
+               "tier": 2, "path": "lib/api"}
+    _write_catalog(catalog_file, tier2=[gateway])
+
+    for prompt in (
+        "/claude-api prompt audit",
+        "<command-message>claude-api</command-message>\n<command-name>/claude-api</command-name>\n"
+        "<command-args>prompt audit</command-args>",
+    ):
+        out = _run_main(monkeypatch, capsys, catalog_file, prompt)
+        assert "TDD" not in out, prompt
+        assert "[Skill]" not in out, prompt
+
+    # The ARGUMENTS still count: intent typed after the command is real intent.
+    args_out = _run_main(monkeypatch, capsys, catalog_file, "/claude-api build an api client")
+    assert "TDD" in args_out
+
+
+def test_scattered_name_tokens_do_not_add_up_to_a_fire():
+    """Loose tokens of one name score at most 1 in total, whatever their count."""
+    from skill_injection_hook import _MIN_SCORE, _extract_keywords, _score_skill
+
+    for name, prompt in (
+        ("closing-session", "closing the loop on this session"),
+        ("aws-lambda", "lambda functions on aws"),
+        ("use-case-specification", "the specification for this case"),
+    ):
+        skill = {"name": name, "keywords": []}
+        score = _score_skill(skill, _extract_keywords(prompt), prompt)
+        assert score < _MIN_SCORE, (name, prompt, score)
+
+
+def test_a_leading_path_is_not_mistaken_for_a_slash_command():
+    """Only a bare `/command` token is stripped; a path keeps its words."""
+    from skill_injection_hook import _prompt_for_matching
+
+    assert "api" in _prompt_for_matching("/api/v1/users returns 500")
+    assert "usr" in _prompt_for_matching("/usr/local/bin is full")
+    assert "claude" not in _prompt_for_matching("/claude-api prompt audit")
+    assert "prompt audit" in _prompt_for_matching("/claude-api prompt audit")
+
+
+def test_tagged_command_keeps_slash_prefixed_arguments():
+    """In the tagged form only the tags carry the command name; `/api build` in
+    the arguments is task text, not a second command."""
+    from skill_injection_hook import _prompt_for_matching
+
+    tagged = (
+        "<command-name>/claude-api</command-name>"
+        "<command-args>/api build</command-args>"
+    )
+    kept = _prompt_for_matching(tagged)
+    assert "/api build" in kept
+    assert "claude" not in kept

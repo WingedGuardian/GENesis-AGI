@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from genesis.inbox.monitor import _has_url_failures, _uncovered_urls
+from genesis.inbox.url_coverage import _has_url_failures, _uncovered_urls
 
 # ---------------------------------------------------------------------------
 # _has_url_failures — heuristic detection
@@ -752,7 +752,7 @@ class TestSourceFieldInsideMarkdownContainers:
 
     @pytest.mark.parametrize("prefix", ["- see ", "> per the ", "- - note: "])
     def test_prose_inside_a_container_is_still_prose(self, prefix):
-        from genesis.inbox.monitor import _SOURCE_FIELD_RE
+        from genesis.inbox.url_coverage import _SOURCE_FIELD_RE
 
         line = f"{prefix}**Source:** https://lnkd.in/p/eYssnmfd\n"
         assert _SOURCE_FIELD_RE.search(line) is None
@@ -765,6 +765,6 @@ class TestSourceFieldInsideMarkdownContainers:
             "eYssnmfd is where it came from, but I did not open it.\n"
         )
         # This asserts the FIELD parser specifically does not claim the line.
-        from genesis.inbox.monitor import _SOURCE_FIELD_RE
+        from genesis.inbox.url_coverage import _SOURCE_FIELD_RE
 
         assert _SOURCE_FIELD_RE.search(response) is None

@@ -450,6 +450,124 @@ def _json_lines(raw: str, source: str) -> tuple[list[dict[str, Any]] | None, str
     return rows, None
 
 
+#: Every GraphQL connection is read 100 nodes at a time (the API maximum) and
+#: followed by cursor. The page bound turns a runaway PR into ``unknown`` rather
+#: than an unbounded serial walk under the commit hook's deadline: 50 pages is
+#: 5,000 reviews or comments, against a MEASURED maximum of 94 reviews on one PR
+#: over the 300 most recent (2026-09-29). Commits and files keep their own REST
+#: ceilings below, which stop the walk long before this does.
+_GRAPHQL_MAX_PAGES = 50
+
+#: The whole of ONE read (every page of it), not one call. Each page keeps the
+#: 8s cap a REST ``--paginate`` process had for its entire walk, so without this
+#: a many-page read could run to 50 x 8s. MEASURED 2026-09-29: a 1,971-file PR
+#: pages 20 times in 13.2s (the old REST files walk took 7.4s). 20s leaves such
+#: a PR readable and holds the worst case for the whole lookup (two reads plus
+#: the rename fallback) to 48s, under the 60s the push guard is registered for
+#: -- where an overrun is a SIGKILL that lets the command through. A PR too
+#: large to read in time is ``unknown``, exactly as the REST walk hitting its
+#: 8s cap was.
+_GRAPHQL_READ_SECONDS = 20.0
+
+#: One connection per REST endpoint the lookup used to call, projected to the
+#: fields ``evaluate_evidence`` reads and nothing more.
+_GRAPHQL_CONNECTIONS = {
+    "reviews": (
+        "reviews(first: 100, after: $after_reviews) { pageInfo { hasNextPage endCursor } "
+        "nodes { state author { login __typename } commit { oid } } }"
+    ),
+    "comments": (
+        "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
+        "nodes { body author { login __typename } } }"
+    ),
+    "files": (
+        "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
+        "nodes { path changeType } }"
+    ),
+    "commits": (
+        "commits(first: 100, after: $after_commits) { pageInfo { hasNextPage endCursor } "
+        "nodes { commit { oid } } }"
+    ),
+}
+
+#: A changed file GraphQL reports this way had an earlier path, and GraphQL does
+#: not expose it. The earlier path decides the hook surface (a file renamed OUT of
+#: it is still a gate change), so a PR carrying one falls back to the REST files
+#: read, which does.
+_GRAPHQL_PATH_CHANGING = frozenset({"RENAMED", "COPIED"})
+
+
+def _graphql_query(names: Sequence[str]) -> str:
+    params = "".join(f", $after_{name}: String" for name in names)
+    fields = " ".join(_GRAPHQL_CONNECTIONS[name] for name in names)
+    return (
+        f"query($owner: String!, $name: String!, $number: Int!{params}) "
+        "{ repository(owner: $owner, name: $name) { pullRequest(number: $number) "
+        f"{{ headRefOid {fields} }} }} }}"
+    )
+
+
+def _graphql_author(author: object) -> tuple[str | None, str | None]:
+    """The REST ``user.login`` / ``user.type`` pair for a GraphQL author.
+
+    GraphQL names a GitHub App by its bare app slug; REST, and every login
+    constant in the hooks, carries a ``[bot]`` suffix. MEASURED 2026-09-29:
+    ``chatgpt-codex-connector`` in GraphQL is ``chatgpt-codex-connector[bot]`` in
+    REST. Keyed on ``__typename == "Bot"``, so a human whose login happens to
+    match a bot slug is never promoted. A deleted account is ``None`` in GraphQL
+    (REST substitutes a ``ghost`` user); both carry no reviewer identity.
+    """
+    if author is None:
+        return None, None
+    if not isinstance(author, dict):
+        raise ValueError("author")
+    login, kind = author.get("login"), author.get("__typename")
+    if not isinstance(login, str) or not isinstance(kind, str):
+        raise ValueError("author")
+    if kind == "Bot" and not login.endswith("[bot]"):
+        login = f"{login}[bot]"
+    return login, kind
+
+
+def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]:
+    """Convert one page of nodes to the REST row shapes. Raises ValueError."""
+    if not isinstance(nodes, list):
+        raise ValueError(name)
+    rows: list[dict[str, Any]] = []
+    path_changed = False
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError(name)
+        if name == "reviews":
+            login, _ = _graphql_author(node.get("author"))
+            commit = node.get("commit")
+            if commit is not None and not isinstance(commit, dict):
+                raise ValueError(name)
+            rows.append(
+                {
+                    "login": login,
+                    "commit_id": (commit or {}).get("oid"),
+                    "state": node.get("state"),
+                }
+            )
+        elif name == "comments":
+            login, kind = _graphql_author(node.get("author"))
+            rows.append({"login": login, "type": kind, "body": node.get("body")})
+        elif name == "files":
+            path = node.get("path")
+            if not isinstance(path, str):
+                raise ValueError(name)
+            if node.get("changeType") in _GRAPHQL_PATH_CHANGING:
+                path_changed = True
+            rows.append({"filename": path, "previous_filename": None})
+        else:
+            commit = node.get("commit")
+            if not isinstance(commit, dict):
+                raise ValueError(name)
+            rows.append({"sha": commit.get("oid")})
+    return rows, path_changed
+
+
 def _evaluate_pr_inner(
     repo: str,
     pr: int | str,
@@ -507,55 +625,135 @@ def _evaluate_pr_inner(
         except Exception:
             return 1, "", "runner_failed"
 
-    test_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD")
-    if test_head is None:
-        rc, head_raw, _ = run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                repo,
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ],
-            6,
-        )
-        if rc != 0:
-            return _unknown("head_unreadable")
-        test_head = head_raw.strip()
+    repo_owner, _, repo_name = repo.partition("/")
 
-    endpoints = (
-        (
-            "reviews",
-            "_TEST_GH_CODEX_REVIEWS",
-            [
+    def snapshot(names: Sequence[str]) -> tuple[dict[str, Any] | None, str | None]:
+        """The PR head plus every page of the named connections, in ONE query.
+
+        It replaced five REST reads (head, reviews, issue comments, files,
+        commits) plus a second head read and a re-read of the mutable two.
+        MEASURED 2026-09-29, old vs new ``evaluate_pr`` over all 70 open PRs:
+        identical results on every one; old median 5.21s / p90 5.98s / max
+        10.78s, new median 1.54s / p90 1.80s / max 2.33s -- against the 7.5s the
+        commit hook allows. A lookup past that budget reads as ``unknown``, which
+        asks in the foreground and denies a dispatched session; how often the
+        old path hit it was not counted (a same-day run under the budget saw 0
+        of 70, an earlier one showed a p90 above it).
+
+        Every page re-reads ``headRefOid``; a head that moves between pages is
+        the same race the final head read below exists to catch.
+        """
+        rows: dict[str, list[dict[str, Any]]] = {item: [] for item in names}
+        cursors: dict[str, str] = {}
+        pending = list(names)
+        head: str | None = None
+        path_changed = False
+        read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
+        for _page in range(_GRAPHQL_MAX_PAGES):
+            # ONE clock reading decides both whether to call and how long the
+            # call may take. Two readings leave a gap a stall can fall into:
+            # past the deadline it raised out of `evaluate_pr` (Codex P2,
+            # #2594); just short of it, it issued a call too small to finish.
+            left = read.remaining()
+            if left is None or left < floor:
+                return None, "graphql_read_timeout"
+            argv = [
                 "gh",
                 "api",
-                f"repos/{repo}/pulls/{pr}/reviews?per_page={_PAGE_SIZE}",
-                "--paginate",
-                "--jq",
-                ".[] | {login: .user.login, commit_id: .commit_id, state: .state}",
-            ],
-        ),
-        (
-            "comments",
-            "_TEST_GH_CODEX_COMMENTS",
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/issues/{pr}/comments?per_page={_PAGE_SIZE}",
-                "--paginate",
-                "--jq",
-                ".[] | {login: .user.login, type: .user.type, body: .body}",
-            ],
-        ),
-        (
-            "files",
-            "_TEST_REVIEW_BUDGET_FILES",
+                "graphql",
+                "-f",
+                f"query={_graphql_query(pending)}",
+                "-f",
+                f"owner={repo_owner}",
+                "-f",
+                f"name={repo_name}",
+                "-F",
+                f"number={pr}",
+            ]
+            for item in pending:
+                if item in cursors:
+                    argv += ["-f", f"after_{item}={cursors[item]}"]
+            rc, raw, _ = run(argv, min(8.0, left))
+            if rc != 0:
+                return None, "graphql_unreadable"
+            try:
+                payload = json.loads(raw)
+                # gh exits non-zero on an `errors` response, including one that
+                # carries partial `data` (MEASURED 2026-09-29). Checked here too,
+                # so partial evidence can never be counted if that ever changes.
+                if payload.get("errors"):
+                    return None, "graphql_errors"
+                data = payload["data"]["repository"]["pullRequest"]
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+                return None, "graphql_malformed"
+            if not isinstance(data, dict):
+                return None, "graphql_malformed"
+            page_head = data.get("headRefOid")
+            if not isinstance(page_head, str):
+                return None, "graphql_malformed"
+            if head is None:
+                head = page_head
+            elif page_head != head:
+                return None, "head_changed_during_evaluation"
+            following: list[str] = []
+            for item in pending:
+                connection = data.get(item)
+                if not isinstance(connection, dict):
+                    return None, f"{item}_malformed"
+                try:
+                    page_rows, changed = _graphql_rows(item, connection.get("nodes"))
+                except ValueError:
+                    return None, f"{item}_malformed"
+                rows[item].extend(page_rows)
+                path_changed = path_changed or changed
+                info = connection.get("pageInfo")
+                if not isinstance(info, dict):
+                    return None, f"{item}_malformed"
+                more = info.get("hasNextPage")
+                if not isinstance(more, bool):
+                    return None, f"{item}_malformed"
+                if more:
+                    cursor = info.get("endCursor")
+                    if not isinstance(cursor, str) or not cursor:
+                        return None, f"{item}_malformed"
+                    cursors[item] = cursor
+                    following.append(item)
+            if not following:
+                return {"head": head, "path_changed": path_changed, **rows}, None
+            pending = following
+        return None, f"{pending[0]}_response_truncated"
+
+    # Each seam short-circuits its own read, as each REST call's seam did, so a
+    # test that supplies every input issues no call at all.
+    seams = {
+        "reviews": "_TEST_GH_CODEX_REVIEWS",
+        "comments": "_TEST_GH_CODEX_COMMENTS",
+        "files": "_TEST_REVIEW_BUDGET_FILES",
+        "commits": "_TEST_REVIEW_BUDGET_COMMITS",
+    }
+    test_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD")
+    needed = [item for item, env_name in seams.items() if os.environ.get(env_name) is None]
+    first: dict[str, Any] | None = None
+    if needed or test_head is None:
+        first, error = snapshot(needed)
+        if error or first is None:
+            return _unknown(error or "graphql_unreadable", current_head=test_head or "")
+        if test_head is None:
+            test_head = str(first["head"]).strip()
+
+    fetched: dict[str, list[dict[str, Any]]] = {}
+    for item, env_name in seams.items():
+        raw = os.environ.get(env_name)
+        if raw is None:
+            fetched[item] = list((first or {}).get(item) or [])
+            continue
+        rows, error = _json_lines(raw, item)
+        if error:
+            return _unknown(error, current_head=test_head)
+        fetched[item] = rows or []
+
+    if first is not None and "files" in needed and first.get("path_changed"):
+        rc, raw, _ = run(
             [
                 "gh",
                 "api",
@@ -564,84 +762,46 @@ def _evaluate_pr_inner(
                 "--jq",
                 ".[] | {filename: .filename, previous_filename: .previous_filename}",
             ],
-        ),
-        (
-            "commits",
-            "_TEST_REVIEW_BUDGET_COMMITS",
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/pulls/{pr}/commits?per_page={_PAGE_SIZE}",
-                "--paginate",
-                "--jq",
-                ".[] | {sha: .sha}",
-            ],
-        ),
-    )
-    fetched: dict[str, list[dict[str, Any]]] = {}
-    for name, env_name, argv in endpoints:
-        raw = os.environ.get(env_name)
-        if raw is None:
-            rc, raw, _ = run(argv, 8)
-            if rc != 0:
-                return _unknown(f"{name}_unreadable", current_head=test_head)
-        rows, error = _json_lines(raw, name)
+            8,
+        )
+        if rc != 0:
+            return _unknown("files_unreadable", current_head=test_head)
+        rows, error = _json_lines(raw, "files")
         if error:
             return _unknown(error, current_head=test_head)
-        fetched[name] = rows or []
+        fetched["files"] = rows or []
 
-    # Both REST endpoints have documented hard response ceilings. Landing
-    # exactly on one cannot prove the evidence is complete, even with
-    # ``--paginate``, so the budget is unknown rather than under-counted or
-    # misclassified as an ordinary PR.
+    # Both connections carry the REST endpoints' hard response ceilings. Landing
+    # exactly on one cannot prove the evidence is complete, so the budget is
+    # unknown rather than under-counted or misclassified as an ordinary PR.
     if len(fetched["commits"]) >= MAX_PR_COMMITS_RESPONSE:
         return _unknown("commits_response_truncated", current_head=test_head)
     if len(fetched["files"]) >= MAX_PR_FILES_RESPONSE:
         return _unknown("files_response_truncated", current_head=test_head)
 
+    # The final read pins the head AND the mutable evidence: a review or a
+    # confirmation comment posted after the first read but before the head check
+    # leaves the head unchanged while the snapshot under-counts the budget. One
+    # query re-reads both and the snapshots must agree -- the race window
+    # shrinks to the last call rather than the whole fetch block. (Neither API
+    # offers a point-in-time read; this narrows, not closes, it.)
     final_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD_AFTER")
     if final_head is None and os.environ.get("_TEST_REVIEW_BUDGET_HEAD") is not None:
         final_head = test_head
-    if final_head is None:
-        rc, head_raw, _ = run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                repo,
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ],
-            6,
-        )
-        if rc != 0:
-            return _unknown("final_head_unreadable", current_head=test_head)
-        final_head = head_raw.strip()
+    mutable = [item for item in ("reviews", "comments") if item in needed]
+    second: dict[str, Any] | None = None
+    if final_head is None or mutable:
+        second, error = snapshot(mutable)
+        if error or second is None:
+            if error == "graphql_unreadable":
+                error = "final_head_unreadable"
+            return _unknown(error or "final_head_unreadable", current_head=test_head)
+        if final_head is None:
+            final_head = str(second["head"]).strip()
     if final_head != test_head:
         return _unknown("head_changed_during_evaluation", current_head=final_head)
-
-    # The head check alone does not pin the MUTABLE evidence: a review or a
-    # confirmation comment posted after the fetches but before the head read
-    # leaves the head unchanged while the snapshot under-counts the budget.
-    # Re-read the two mutable endpoints and require the snapshots to agree —
-    # the race window shrinks to the last call rather than the whole fetch
-    # block. (REST offers no point-in-time read; this narrows, not closes, it.)
-    for name, env_name, argv in endpoints:
-        if name not in ("reviews", "comments"):
-            continue
-        raw = os.environ.get(env_name)
-        if raw is None:
-            rc, raw, _ = run(argv, 8)
-            if rc != 0:
-                return _unknown(f"{name}_unreadable", current_head=test_head)
-        rows, error = _json_lines(raw, name)
-        if error:
-            return _unknown(error, current_head=test_head)
-        if (rows or []) != fetched[name]:
+    for item in mutable:
+        if (second or {}).get(item) != fetched[item]:
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 
     commit_heads: list[str] = []

@@ -35,16 +35,18 @@ SEED_PROCEDURES = [
     {
         "id": _id("youtube_content_fetch"),
         "task_type": "youtube_content_fetch",
-        "principle": "YouTube WebFetch is unreliable in this environment. Use yt-dlp instead.",
+        "principle": (
+            "Fetch YouTube videos with the genesis web_fetch MCP tool: it returns "
+            "metadata and the transcript. CC's built-in WebFetch gets only the page shell."
+        ),
         "steps": [
-            "Use yt-dlp instead of WebFetch for YouTube URLs",
-            "For metadata: yt-dlp --skip-download --print '%(title)s|||%(uploader)s|||%(description)s' URL",
-            "For transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o '~/tmp/%(id)s' URL",
-            "Read the VTT file at ~/tmp/VIDEO_ID.en.vtt for full transcript",
-            "If SSL issues recur: add --no-check-certificate flag",
+            "Call mcp__genesis-health__web_fetch with the video URL (urls=[...] for several)",
+            "Read the Transcript source line: which caption track was used (and its provenance)",
+            "If the result has youtube_error, report that error; the rest is only the page title and description",
+            "Foreground sessions only, if web_fetch is unavailable: the youtube-fetch skill's yt-dlp via Bash fallback",
         ],
-        "tools_used": ["Bash", "Read"],
-        "context_tags": ["youtube", "video", "transcript", "ssl", "content-fetch"],
+        "tools_used": ["mcp__genesis-health__web_fetch"],
+        "context_tags": ["youtube", "video", "transcript", "content-fetch"],
         "activation_tier": "CORE",
         "tool_trigger": ["WebFetch"],
         "draft": 0,

@@ -19,6 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from genesis.cc import roster
+from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
@@ -31,6 +32,7 @@ from genesis.cc.exceptions import (
     CCTimeoutError,
 )
 from genesis.cc.types import (
+    PROBE_CALLER_TAG,
     CCInvocation,
     CCModel,
     CCOutput,
@@ -690,7 +692,10 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
     try:
         from genesis.runtime import GenesisRuntime
 
-        bus = getattr(GenesisRuntime.instance(), "_event_bus", None)
+        # peek(), never instance(): observability must not construct a blank
+        # runtime singleton that later bootstrap/health code would mistake for
+        # a started one.
+        bus = getattr(GenesisRuntime.peek(), "_event_bus", None)
         if bus is None:
             return
         from genesis.observability.types import Severity, Subsystem
@@ -705,6 +710,137 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
         )
     except Exception:
         logger.debug("cc.bg_truncated event emit failed", exc_info=True)
+
+
+# ``cc.invocation_failed`` coalescing. A burst of identical failures (a rate
+# limit hitting every caller of one lane, a network outage parking every
+# dispatch) would otherwise emit one event per call. One event per
+# (error_class, caller_tag, routed model) per window keeps the signal while bounding the
+# volume; the count swallowed in between rides on the NEXT emitted event
+# (``coalesced``), so the omission is declared, never silent. Untagged calls
+# (caller_tag None) are never coalesced: they share no identity to key on.
+# 60s: short enough that a recurring failure re-surfaces within a minute, long
+# enough to collapse one incident's fan-out burst into one row.
+_FAILURE_EVENT_COALESCE_S = 60.0
+# (error_class, caller_tag, roster_model) -> [monotonic time of last emit,
+# suppressed since]. Keyed on a small closed set (exception classes x call-site
+# tags x roster models) — bounded.
+_failure_event_state: dict[tuple[str, str | None, str], list[float]] = {}
+
+
+def _runtime_event_bus():
+    """The runtime singleton's event bus, or None (tests, early startup).
+
+    Uses ``peek()`` so a failure before the runtime exists never constructs a
+    blank singleton as a side effect of reporting it.
+    """
+    from genesis.runtime import GenesisRuntime
+
+    return getattr(GenesisRuntime.peek(), "_event_bus", None)
+
+
+def _reset_failure_event_state() -> None:
+    """Clear the coalescing window (tests)."""
+    _failure_event_state.clear()
+
+
+async def _emit_invocation_failed_event(
+    exc: CCError,
+    invocation: CCInvocation,
+    *,
+    streaming: bool,
+    roster_model: str = "",
+) -> None:
+    """Fire a ``cc.invocation_failed`` observability event for a raised CCError.
+
+    Called from ``CCInvoker.run`` / ``run_streaming`` on the way out of a failed
+    invocation, immediately before the error is re-raised — so every CC call
+    site gets one central failure signal without each caller emitting its own.
+    Rate-limit / quota errors are WARNING (expected, self-recovering); every
+    other CCError is ERROR. A liveness probe's EXPECTED answer (a rate-limit /
+    quota error while the home model is still limited) is skipped; any other
+    probe failure is a malfunction and is emitted. Coalescing applies only to
+    TAGGED callers — an untagged call has no identity to key on, and pooling
+    unrelated subsystems under ``(class, None)`` would hide one behind another.
+    The routed roster model is part of the key and the payload: one caller tag
+    can reach native Claude and a peer endpoint, and those are separate outages.
+    Same bus resolution as ``_emit_bg_truncation_event``: no-ops when the
+    runtime/bus is absent and never raises — observability must not mask the
+    real error the caller is about to receive.
+    """
+    is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+    key: tuple[str, str | None, str] | None = None
+    prev_state: list[float] | None = None
+    try:
+        if invocation.caller_tag == PROBE_CALLER_TAG and is_limit:
+            return
+        bus = _runtime_event_bus()
+        if bus is None:
+            return
+        error_class = type(exc).__name__
+        # A call pre-stamped with peer overrides but roster_eligible=False (e.g.
+        # the fallback probe of a peer) is reported native by apply_active, yet
+        # the subprocess targets the peer: attribute and key it to the peer.
+        if roster_model in ("", roster.CLAUDE) and (
+            invocation.model_id_override or invocation.anthropic_base_url
+        ):
+            roster_model = invocation.model_id_override or "routed"
+        coalesced = 0
+        if invocation.caller_tag is not None:
+            key = (error_class, invocation.caller_tag, roster_model)
+            now = time.monotonic()
+            prev_state = _failure_event_state.get(key)
+            if prev_state is not None and now - prev_state[0] < _FAILURE_EVENT_COALESCE_S:
+                prev_state[1] += 1
+                key = None  # suppressed: nothing to roll back
+                return
+            coalesced = int(prev_state[1]) if prev_state is not None else 0
+            # Claimed BEFORE the await so concurrent failures coalesce instead of
+            # racing to emit; rolled back below if the emit itself fails.
+            _failure_event_state[key] = [now, 0]
+
+        from genesis.observability.session_context import get_session_id
+        from genesis.observability.types import Severity, Subsystem
+
+        severity = Severity.WARNING if is_limit else Severity.ERROR
+        # The exception TEXT is deliberately not carried: CC errors are built
+        # from raw CLI stderr/stdout (see _classify_error), which is unbounded
+        # and can echo arbitrary tool output, and this event is persisted to
+        # the events table. Metadata only; the length marks the omission, and
+        # the caller receives the full error via the re-raise.
+        # The coalesced count is ALSO in the message, because health_errors
+        # returns the message but not the details.
+        message = (
+            f"CC invocation failed ({error_class}) for {invocation.caller_tag or 'untagged caller'}"
+        )
+        if roster_model and roster_model != roster.CLAUDE:
+            message += f" via {roster_model}"
+        if coalesced:
+            message += f" (+{coalesced} similar failure(s) coalesced in the prior window)"
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            severity,
+            "cc.invocation_failed",
+            message,
+            error_class=error_class,
+            error_text_omitted_chars=len(str(exc)),
+            streaming=streaming,
+            model=str(invocation.model),
+            roster_model=roster_model,
+            session_id=get_session_id(),
+            caller_tag=invocation.caller_tag,
+            coalesced=coalesced,
+        )
+    except Exception:
+        # The emit failed: do not leave a window open for an event that never
+        # landed. Restore the prior state (keeping its suppressed count) so the
+        # next failure retries the bus instead of being coalesced away.
+        if key is not None:
+            if prev_state is None:
+                _failure_event_state.pop(key, None)
+            else:
+                _failure_event_state[key] = prev_state
+        logger.debug("cc.invocation_failed event emit failed", exc_info=True)
 
 
 def cc_span_settings_path() -> str | None:
@@ -1340,6 +1476,9 @@ class CCInvoker:
         # The genesis_session_context.py hook skips identity injection when set,
         # preventing double injection (identity is in the system prompt arg).
         env["GENESIS_CC_SESSION"] = "1"
+        # Shared dispatched-session pins (function hooks off, beating the
+        # server-side default a rollout would flip).
+        pin_dispatched_env(env)
         # Propagate Genesis session_id to child CC + MCP server processes
         # so eval hooks can attribute recall events to specific sessions.
         from genesis.observability.session_context import get_session_id
@@ -1514,6 +1653,9 @@ class CCInvoker:
         """
         if inv.bash_allowlist:
             _assert_hardening_present(env, tuple(inv.bash_allowlist))
+        # Re-applied here, after every merge (env_overrides, the login fallback),
+        # so no later layer can turn function hooks back on (review).
+        pin_dispatched_env(env)
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
@@ -1712,7 +1854,29 @@ class CCInvoker:
             logger.debug("network preflight check errored — proceeding", exc_info=True)
 
     async def run(self, invocation: CCInvocation) -> CCOutput:
-        """Run a dispatched CC session (traced).
+        """Run a dispatched CC session (traced; see ``_run_traced``).
+
+        Any ``CCError`` — the pre-spawn network preflight's included — emits a
+        ``cc.invocation_failed`` event and is then re-raised unchanged.
+        ``CancelledError`` is a BaseException, not a CCError, so it propagates
+        untouched and emits nothing. Roster routing is resolved HERE (it never
+        raises) so the failure event names the routed model, not only the
+        requested tier.
+        """
+        invocation, roster_model = roster.apply_active(invocation)
+        try:
+            return await self._run_traced(invocation, roster_model)
+        except CCError as exc:
+            await _emit_invocation_failed_event(
+                exc,
+                invocation,
+                streaming=False,
+                roster_model=roster_model,
+            )
+            raise
+
+    async def _run_traced(self, invocation: CCInvocation, roster_model: str) -> CCOutput:
+        """Run an already-roster-routed CC session (traced).
 
         Opens a ``cc.session`` span spanning the whole subprocess lifetime so
         (a) the active trace context is injected into the child env (see
@@ -1720,7 +1884,6 @@ class CCInvoker:
         and (b) any LLM/operation spans share one trace. Best-effort — a no-op
         when capture is disabled.
         """
-        invocation, roster_model = roster.apply_active(invocation)
         await self._network_preflight(invocation)
         with start_span(
             "cc.session",
@@ -1950,8 +2113,26 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
-        """Run CC with stream-json output (traced — see run() for span rationale)."""
+        """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
         invocation, roster_model = roster.apply_active(invocation)
+        try:
+            return await self._run_streaming_traced(invocation, roster_model, on_event)
+        except CCError as exc:
+            await _emit_invocation_failed_event(
+                exc,
+                invocation,
+                streaming=True,
+                roster_model=roster_model,
+            )
+            raise
+
+    async def _run_streaming_traced(
+        self,
+        invocation: CCInvocation,
+        roster_model: str,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+    ) -> CCOutput:
+        """Run an already-roster-routed stream-json session (traced — see _run_traced)."""
         await self._network_preflight(invocation)
         with start_span(
             "cc.session",

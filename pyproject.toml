@@ -67,6 +67,10 @@ dependencies = [
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
+    "yt-dlp[default]>=2026.08.19",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
+                                    # behind the web_fetch MCP tool). The `default` extra brings the
+                                    # JavaScript challenge solver (yt-dlp-ejs) at the exact version this
+                                    # yt-dlp release pins, installed locally: never fetched at run time.
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
     "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
