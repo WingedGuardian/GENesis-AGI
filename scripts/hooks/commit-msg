@@ -72,17 +72,29 @@ fi
 # name a user or a host.
 FP_FILE="${GENESIS_RELEASE_FINGERPRINTS:-$HOME/.genesis/release-fingerprints.txt}"
 
-# The interpreter: the Genesis venv's, found the way .claude/hooks/genesis-hook
-# finds it (this checkout, then the main worktree), because the pre-push review
-# runs under it and a regex can compile under one Python version and not another
-# (atomic groups arrived in 3.11). A system python3 is the fallback. There is no
+# The interpreter: the Genesis venv's, in the order .claude/hooks/genesis-hook
+# picks it for the pre-push review — the main checkout's first, then this
+# checkout's; this checkout's first only under GENESIS_HOOK_DEV_LOCAL=1, the
+# launcher's switch to a worktree's own hook tree — because a regex can compile
+# under one Python version and not another (atomic groups arrived in 3.11), so
+# two checks run under different Pythons can disagree about the same
+# fingerprint. A system python3 is the fallback. There is no
 # grep fallback: grep is another regex dialect, and emulating Python in it was
 # where the divergences lived. A checkout with this hook installed has built a
 # Python venv (bootstrap does that before it installs the hooks), so with no
 # usable Python the check says it could not run, and the commit proceeds.
 _fp_python=""
 _fp_common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || _fp_common=""
-for _fp_root in "$(git rev-parse --show-toplevel 2>/dev/null)" "${_fp_common%/.git}"; do
+_fp_top="$(git rev-parse --show-toplevel 2>/dev/null)" || _fp_top=""
+# Trusted only if it looks like a Genesis checkout, as genesis-hook requires: a
+# --separate-git-dir clone's common dir has no checkout beside it.
+_fp_main="${_fp_common%/.git}"
+[ -n "$_fp_main" ] && [ -d "$_fp_main/scripts" ] || _fp_main=""
+_fp_order=("$_fp_main" "$_fp_top")
+if [ "${GENESIS_HOOK_DEV_LOCAL:-}" = "1" ]; then
+    _fp_order=("$_fp_top" "$_fp_main")
+fi
+for _fp_root in "${_fp_order[@]}"; do
     if [ -n "$_fp_root" ] && [ -x "$_fp_root/.venv/bin/python" ]; then
         _fp_python="$_fp_root/.venv/bin/python"
         break
@@ -157,8 +169,7 @@ PY
     if [ -n "$_fp_undecodable" ]; then
         echo ""
         echo "WARNING: the release-fingerprint file is not all UTF-8 text (line ${_fp_undecodable% })."
-        echo "  Those lines are still checked here, byte for byte; the pre-push review cannot"
-        echo "  read such a file. Values are not shown."
+        echo "  Those lines are still checked, byte for byte. Values are not shown."
     fi
     _fp_literal="$(printf '%s\n' "$_fp_out" | sed -n 's/^literal //p' | tr '\n' ' ')"
     if [ -n "$_fp_literal" ]; then

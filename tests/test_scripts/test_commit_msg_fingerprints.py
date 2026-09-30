@@ -77,9 +77,12 @@ def _blocked_lines(r: subprocess.CompletedProcess) -> set[int]:
     return {int(ln.split()[1]) for ln in r.stdout.splitlines() if ln.startswith("  line ")}
 
 
-def _prepush_lines(msg: str, fingerprints: str, tmp_path: Path) -> set[int]:
+def _prepush_lines(msg: str, fingerprints: str | bytes, tmp_path: Path) -> set[int]:
     fp = tmp_path / "prepush-fingerprints.txt"
-    fp.write_text(fingerprints)
+    if isinstance(fingerprints, bytes):
+        fp.write_bytes(fingerprints)
+    else:
+        fp.write_text(fingerprints)
     lines = msg.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
@@ -114,6 +117,11 @@ _PARITY_CASES = {
     ),
     "crlf-file": (f"# comment\r\n{GOOD}\r\n", f"fix: {GOOD}\n"),
     "no-trailing-newline": (f"# comment\n{GOOD}", f"fix: {GOOD}\n"),
+    # Lines that used to stop a reader outright, beside one ordinary fingerprint:
+    # both readers must still flag the ordinary one.
+    "repeat-count-overflow": (f"x{{4294967296}}\n{GOOD}", f"fix: ok\n\n{GOOD}\n"),
+    "nesting-recursion": ("(" * 1500 + "a" + ")" * 1500 + f"\n{GOOD}", f"fix: ok\n\n{GOOD}\n"),
+    "non-utf8-line": (b"# caf\xe9\n\xff\xfe x\n" + GOOD.encode() + b"\n", f"fix: ok\n\n{GOOD}\n"),
 }
 
 
@@ -177,8 +185,8 @@ def test_a_line_that_breaks_the_compiler_does_not_switch_the_rest_off(bad_line, 
 
 
 def test_a_non_utf8_comment_line_is_still_reported(tmp_path):
-    """The pre-push reader cannot open a file with any non-UTF-8 byte, comments
-    included, so the hook names such a line even though it is not a pattern."""
+    """A non-UTF-8 byte anywhere in the file is worth fixing, comments included,
+    so the hook names such a line even though it is not a pattern."""
     fps = b"# caf\xe9 notes\n" + GOOD.encode() + b"\n"
     r = _run(f"fix: {GOOD}\n", fps, tmp_path)
     assert r.returncode == 1 and _blocked_lines(r) == {1}, r.stdout + r.stderr
@@ -333,6 +341,7 @@ def test_a_linked_worktree_uses_the_main_checkouts_venv(tmp_path):
     )
     wt = tmp_path / "wt"
     subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    (main / "scripts").mkdir()
     (main / ".venv" / "bin").mkdir(parents=True)
     marker = tmp_path / "venv_used"
     venv_python = main / ".venv" / "bin" / "python"
@@ -359,9 +368,9 @@ def test_a_linked_worktree_uses_the_main_checkouts_venv(tmp_path):
     assert marker.exists(), "the main checkout's venv interpreter was not the one that ran"
 
 
-def test_a_worktree_with_its_own_venv_uses_it_first(tmp_path):
-    """The same order as .claude/hooks/genesis-hook: this checkout's venv before
-    the main checkout's."""
+def _two_venv_worktree(tmp_path, dev_local, main_has_scripts=True):
+    """A main checkout and a linked worktree, each with its own venv whose
+    interpreter records that it ran; the hook runs from the worktree."""
     main = tmp_path / "main"
     main.mkdir()
     subprocess.run(["git", "init", "-q", str(main)], check=True)
@@ -371,6 +380,8 @@ def test_a_worktree_with_its_own_venv_uses_it_first(tmp_path):
     )
     wt = tmp_path / "wt"
     subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    if main_has_scripts:
+        (main / "scripts").mkdir()
     for root, name in ((main, "main_used"), (wt, "wt_used")):
         (root / ".venv" / "bin").mkdir(parents=True)
         py = root / ".venv" / "bin" / "python"
@@ -380,17 +391,40 @@ def test_a_worktree_with_its_own_venv_uses_it_first(tmp_path):
     fp.write_text(f"{GOOD}\n")
     msg = tmp_path / "COMMIT_EDITMSG"
     msg.write_text(f"fix: {GOOD}\n")
-    r = subprocess.run(
-        ["/bin/bash", str(HOOK), str(msg)],
-        capture_output=True,
-        text=True,
-        cwd=wt,
-        env={
-            "PATH": _bin_without_python(tmp_path),
-            "LC_ALL": "C.UTF-8",
-            "HOME": str(tmp_path),
-            "GENESIS_RELEASE_FINGERPRINTS": str(fp),
-        },
+    env = {
+        "PATH": _bin_without_python(tmp_path),
+        "LC_ALL": "C.UTF-8",
+        "HOME": str(tmp_path),
+        "GENESIS_RELEASE_FINGERPRINTS": str(fp),
+    }
+    if dev_local:
+        env["GENESIS_HOOK_DEV_LOCAL"] = "1"
+    return subprocess.run(
+        ["/bin/bash", str(HOOK), str(msg)], capture_output=True, text=True, cwd=wt, env=env
     )
+
+
+def test_a_worktree_with_its_own_venv_still_uses_the_main_checkouts(tmp_path):
+    """The same order as .claude/hooks/genesis-hook, which runs the pre-push
+    review: the main checkout's venv before this checkout's, so both checks read
+    the fingerprints under the same Python even when the worktree's is older."""
+    r = _two_venv_worktree(tmp_path, dev_local=False)
+    assert r.returncode == 1 and "BLOCKED" in r.stdout, r.stdout + r.stderr
+    assert (tmp_path / "main_used").exists() and not (tmp_path / "wt_used").exists()
+
+
+def test_dev_local_uses_the_worktrees_venv_first(tmp_path):
+    """GENESIS_HOOK_DEV_LOCAL=1 is the launcher's switch to a worktree's own hook
+    tree and venv; the commit hook follows it the same way."""
+    r = _two_venv_worktree(tmp_path, dev_local=True)
+    assert r.returncode == 1 and "BLOCKED" in r.stdout, r.stdout + r.stderr
+    assert (tmp_path / "wt_used").exists() and not (tmp_path / "main_used").exists()
+
+
+def test_a_main_root_that_is_not_a_genesis_checkout_is_not_trusted(tmp_path):
+    """genesis-hook trusts the main checkout only when it has a scripts/ directory
+    (a --separate-git-dir clone's common dir has no checkout beside it); the
+    commit hook applies the same test, so it falls through to this checkout's venv."""
+    r = _two_venv_worktree(tmp_path, dev_local=False, main_has_scripts=False)
     assert r.returncode == 1 and "BLOCKED" in r.stdout, r.stdout + r.stderr
     assert (tmp_path / "wt_used").exists() and not (tmp_path / "main_used").exists()
