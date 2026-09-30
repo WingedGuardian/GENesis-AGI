@@ -80,13 +80,12 @@ def _eval_disallowed_tools() -> list[str]:
     autonomy dispatcher's ``task_detected`` pickup — via
     ``immunity.is_trusted_for_privileged_write``, so a forged
     ``user_model_delta`` / ``task_detected`` is rejected at the point of privileged
-    consumption. PARTIAL, NOT the whole vector: the digest types this tool writes
-    (``user_signal`` / ``architecture_insight``) are still surfaced UNFILTERED into
-    LLM context by other consumers (``essential_knowledge._recent_decisions`` → the
-    always-loaded L1 file; ``reflection`` context; several ego/sentinel raw-SQL
-    reads). Closing that broader observation-content-surfacing surface (exclude/wrap
-    external-origin content at the surfacing points) is tracked — see the
-    "external-origin observation content" follow-up. (The ``Bash``/fetch relocation
+    consumption. The tool itself refuses a reserved type or a Genesis pipeline's
+    source from an untrusted session (``provenance.untrusted_observation_refusal``),
+    so the rows this judge can write THROUGH THE TOOL are ordinary ones such as
+    ``user_signal``. While this judge keeps ``Bash`` that is defense in depth, not
+    a boundary: a shell can write the database directly. L1 (``essential_knowledge``)
+    and reflection context filter on origin. (The ``Bash``/fetch relocation
     remains the open part of 727a3724, above.)
     """
     return [t for t in SessionConfigBuilder().build_reflection_disallowed() if t != "Bash"]

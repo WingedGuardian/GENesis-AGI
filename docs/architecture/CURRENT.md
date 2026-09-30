@@ -531,7 +531,16 @@ verified: 18e41e1e1 2026-09-23
   rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
   pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
   — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
-  stamping is in the follow-up).
+  stamping is in the follow-up). (3) The write side is locked too: `observation_write`
+  from an untrusted session refuses a reserved type (`provenance.RESERVED_OBSERVATION_TYPES`:
+  reflection escalations/summaries, questions, self-assessments, ego escalations and dispatch
+  outcomes, update notices, infrastructure alerts, user-model deltas, detected tasks, …) and
+  any source a Genesis pipeline owns (the provenance source registries plus the
+  ego-redirect/intake prefixes). A derived test enumerates the type/source LITERALS readers
+  key on (raw SQL, and every argument to the observations CRUD helpers, mapped through their
+  signatures) and fails on an unclassified one; a literal held in a variable is not seen.
+  While the inbox judge still has `Bash` (on main, before #2568) the lock is defense in depth
+  for it, not a boundary.
   **WS-3 observation write-provenance + laundering-critical read exclusions (PR-1, built
   2026-08-22):** origin is now definite at the WRITE boundary — the CRUD chokepoint
   (`db/crud/observations.py` `create()`/`upsert()` → `derive_observation_origin`) classifies
