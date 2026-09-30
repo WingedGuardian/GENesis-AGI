@@ -5092,7 +5092,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
 # "Swish!", "You're on a roll.", "Keep them coming!", … — VARIES, so anchor ONLY on the
 # stable prefix) and carries a "**Reviewed commit:** `<sha>`" line with a 10-char
 # ABBREVIATED sha. Both must be present for the comment to be REPORTED; it never vouches
-# for a commit (see ``_latest_codex_clean_comment_sha``).
+# for a commit by itself (see ``_codex_clean_signal_at_head``).
 _CODEX_CLEAN_COMMENT_RE = re.compile(
     r"Codex Review:\s*Didn'?t find any major issues", re.IGNORECASE
 )
@@ -5101,41 +5101,47 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
 )
 
 
-def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """The ABBREVIATED commit sha from Codex's most recent CLEAN issue-comment, or None.
+#: Codex's PR summary comment: ONE comment, edited in place, whose table shows the
+#: latest review of each kind. MEASURED 2026-09-29 on the live queue:
+#: ``| 📝 **Code Review** | ✅ **Completed** <relative-time …>…</relative-time> | `<7hex>` | <trigger> |``.
+#: The status also reads ``🔄 **Running** since …`` and ``⚠️ **Failed**``; only
+#: Completed counts, and only the Code Review row (a security review is another kind).
+_CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+_CODEX_SUMMARY_ROW_RE = re.compile(
+    r"^\|\s*📝\s*\*\*Code Review\*\*\s*\|\s*✅\s*\*\*Completed\*\*\s*"
+    r"<relative-time datetime=\"([^\"]+)\"[^|\n]*\|"
+    r"\s*`([0-9a-fA-F]{7,40})`\s*\|",
+    re.MULTILINE,
+)
+#: A Codex issue comment that CARRIES findings rather than reporting none. MEASURED
+#: 2026-09-29: on 2 of 339 PRs with Codex activity (#1833, #2390) Codex posted its
+#: P1/P2 findings as an ISSUE comment (`### 💡 Codex Review` + severity badges, each
+#: finding linking `/blob/<full sha>/…`) and left NO review object, while its summary
+#: row still read Completed. So "no review object" alone does not mean "clean".
+_CODEX_FINDINGS_COMMENT_RE = re.compile(r"!\[P\d Badge\]|💡 Codex Review")
+#: pulls/N/commits stops at 250. Landing on it cannot prove the list is complete, so
+#: a short sha resolved against it could be ambiguous with a commit it never saw.
+_PR_COMMITS_CEILING = 250
 
-    DIAGNOSTIC ONLY — this value must never satisfy a gate. Codex posts a clean
-    RE-review as an ISSUE COMMENT, not a review object, and names the commit only by an
-    abbreviated id. An abbreviated id does not identify a commit: the head it is compared
-    against is whatever the branch's author pushed, so "the head starts with this prefix"
-    is not "this head was reviewed". Freshness therefore rests on the reviews API's full
-    ``commit_id`` alone (``_latest_codex_reviewed_sha``), and the freshness gate reads this
-    only to explain its block. An earlier version accepted a prefix match as freshness on
-    the argument that the head was a fixed value; the author controls that value, so the
-    argument did not hold.
 
-    Reads ``issues/N/comments``; for a comment authored by the Codex bot (login AND
-    ``user.type == "Bot"``) it requires BOTH the clean marker AND a parseable
-    ``Reviewed commit: <sha>`` line (fail-closed to None). Returns a lowercased prefix
-    (>=7 hex). Comments come oldest-first, so the last match wins. Tests inject via
-    ``_TEST_GH_CODEX_COMMENTS`` (one JSON object per line: ``{login, type, body}``).
-    Fail-safe: None on any API/parse error.
-    """
-    raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
+def _pr_commit_shas(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Every commit of the PR (full lowercase oids), or None when unreadable or at the
+    endpoint's 250-commit ceiling. Tests inject ``_TEST_GH_PR_COMMITS`` (one sha per
+    line; empty = no commits). Read only on the would-block path."""
+    raw = os.environ.get("_TEST_GH_PR_COMMITS")
     if raw is None:
         try:
             result = subprocess.run(
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
                     "--paginate",
                     "--jq",
-                    ".[] | {login: .user.login, type: .user.type, body: .body}",
+                    ".[].sha",
                 ],
                 capture_output=True,
                 text=True,
-                # See the merge-path timeout budget note in main(): fail-safe → None.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -5143,34 +5149,196 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
             raw = result.stdout
         except Exception:
             return None
-    latest: str | None = None
-    primary = _primary_reviewer_login()
-    if primary is None:
+    shas = [line.strip().lower() for line in (raw or "").splitlines() if line.strip()]
+    if len(shas) >= _PR_COMMITS_CEILING or not all(re.fullmatch(r"[0-9a-f]{40}", s) for s in shas):
         return None
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line:
+    return shas
+
+
+def _codex_clean_signal_at_head(
+    pr_num: str, head: str, repo: str | None = None, why: dict | None = None
+) -> str | None:
+    """``"comment"`` / ``"summary"`` when Codex said it finished at ``head`` clean, else None.
+
+    Codex posts NO review object when it finds nothing. Its word on a clean head is a
+    comment: a clean re-review ("Codex Review: Didn't find any major issues … Reviewed
+    commit: `<10hex>`"), or a ``✅ Completed`` row in its PR summary comment (on PR
+    open, often the only signal: #2418). Both name the commit by an ABBREVIATED id,
+    and an abbreviated id alone identifies no commit (#2487). So a signal counts
+    only when ALL hold:
+
+    - the comment is authored by the configured Codex login with ``type == "Bot"``;
+    - its id resolves UNIQUELY, against THIS PR's own commit list, to a commit EQUAL
+      to ``head`` — a second PR commit sharing the prefix makes it ambiguous and it
+      does not count, and a commit outside the PR cannot resolve at all;
+    - NO Codex review object exists at ``head`` in any state (dismissed included),
+      and NO Codex issue comment on the PR carries findings — Codex usually files
+      findings as a review object, but MEASURED on 2 of 339 PRs it posted them as a
+      `💡` issue comment with no review object while the summary read Completed;
+    - the comment is unedited or edited only by Codex (an edit keeps the original
+      author, so the author proves nothing about the body);
+    - the PR's history has never moved under it: no force-push, no base change,
+      no base force-push, no head-branch restore. Each can drop the reviewed commit
+      from the PR's commit list while a commit sharing its prefix (a short id is
+      cheap to grind) stays, and the prefix would then resolve uniquely to it.
+      GraphQL names only a force-push's old TIP, not what it dropped under it, so
+      the dropped commit cannot be put back into the list. MEASURED 2026-09-30:
+      4 of 73 open PRs carry such an event (one base change, three restores) and
+      fall back to needing a Codex review object; none carries a force-push.
+      Residual, stated: a reviewed commit that reaches the BASE branch by another
+      route also leaves the list, with no event here; exploiting that needs a
+      deliberately ground prefix collision as well.
+
+    Anything unreadable is None: the gate then blocks exactly as before. When a
+    clean signal WAS seen and refused, ``why`` (if given) receives ``signal`` (what
+    was seen), ``reason`` (why it did not count) and ``permanent`` (True when no
+    later clean signal on this PR can count either), so the block can say so
+    rather than send the reader to re-request a review that cannot help.
+    """
+    note = why if why is not None else {}
+    primary = _primary_reviewer_login()
+    if _review_budget is None or primary is None:
+        return None
+    evidence = _codex_signal_evidence(pr_num, repo=repo)
+    if evidence is None:
+        note["reason"] = "Codex's comments on this PR could not be read in full"
+        return None
+    codex = primary.removesuffix("[bot]")  # GraphQL names an App by its slug
+    candidates: list[tuple[str, str]] = []
+    findings = False
+    for c in evidence["comments"]:
+        if c["login"] != codex or c["type"] != "Bot":
             continue
+        body = c["body"]
+        summary = _CODEX_SUMMARY_MARKER in body
+        # Findings delivered as an issue comment veto the signal, at ANY commit: no
+        # gate scores that channel yet, so a clean signal on a later head must not
+        # walk past findings filed there on an earlier one (2 of 339 PRs, measured).
+        if not summary and _CODEX_FINDINGS_COMMENT_RE.search(body):
+            findings = True
+            continue
+        # An edit keeps the original author, so only an unedited comment, or one Codex
+        # itself edited (it rewrites its summary in place), speaks for Codex.
+        if c["editor"] not in (None, codex):
+            continue
+        if _CODEX_CLEAN_COMMENT_RE.search(body):
+            m = _CODEX_REVIEWED_COMMIT_RE.search(body)
+            if m:
+                candidates.append(("comment", m.group(1).lower()))
+        if summary:
+            for m in _CODEX_SUMMARY_ROW_RE.finditer(body):
+                candidates.append(("summary", m.group(2).lower()))
+    if not candidates:
+        return None  # nothing clean was said; there is nothing to explain
+    kind, short = candidates[-1]
+    note["signal"] = f"{kind} naming commit {short}"
+    if findings:
+        note["reason"] = "a Codex findings comment sits on this PR, and no gate scores that channel yet"
+        note["permanent"] = True
+        return None
+    if evidence["history_moved"]:
+        note["reason"] = (
+            "this PR's history moved (a force-push, base change, base force-push or "
+            "branch restore), so a short id can no longer be bound to the head"
+        )
+        note["permanent"] = True
+        return None
+    reviews = _codex_reviews(pr_num, repo=repo)
+    if reviews is None:
+        note["reason"] = "Codex's reviews on this PR could not be read"
+        return None
+    if any((r.get("commit_id") or "").lower() == head for r in reviews):
+        note["reason"] = "a Codex review object (dismissed or pending) sits at the head"
+        return None
+    commits = _pr_commit_shas(pr_num, repo=repo)
+    if not commits:
+        note["reason"] = "this PR's commit list could not be read in full"
+        return None
+    for kind, short in candidates:
+        resolved, error = _review_budget._resolve_sha(short, commits)
+        if not error and resolved == head:
+            note.clear()
+            return kind
+    note["reason"] = (
+        "its abbreviated id does not resolve uniquely to the head among this PR's "
+        "commits (it names an older commit, or is ambiguous)"
+    )
+    return None
+
+
+_CODEX_SIGNAL_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, "
+    "name: $name) { pullRequest(number: $number) { comments(last: 100) { totalCount "
+    "nodes { body author { login __typename } editor { login } } } "
+    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, BASE_REF_CHANGED_EVENT, "
+    "BASE_REF_FORCE_PUSHED_EVENT, HEAD_REF_RESTORED_EVENT], first: 1) { filteredCount "
+    "nodes { __typename } } } } }"
+)
+
+
+def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
+    """``{"comments": [...], "history_moved": bool}`` for the clean-signal check, or
+    None when unreadable. ONE GraphQL read, because a comment's ``editor`` exists only
+    there (REST keeps the ORIGINAL author on an edited comment, so the author says
+    nothing about the body). History moved when the type-filtered timeline has ANY
+    node. Two readings must agree, or the read is refused: the documented one (the
+    ``itemTypes`` filter on ``nodes``) and ``filteredCount``, whose schema text does
+    not say it honours ``itemTypes`` though it MEASURABLY does. Never ``totalCount``:
+    on a filtered connection it counts the WHOLE timeline (MEASURED 2026-09-30:
+    #2619 totalCount 7, filteredCount 0; #65 12 vs 1, matching its one REST
+    timeline force-push). More than 100 comments is None (fail closed).
+    Tests inject ``_TEST_GH_CODEX_SIGNAL`` (the raw GraphQL response).
+    """
+    raw = os.environ.get("_TEST_GH_CODEX_SIGNAL")
+    if raw is None:
+        owner, _, name = (repo or "{owner}/{repo}").partition("/")
         try:
-            obj = json.loads(line)
+            result = subprocess.run(
+                [
+                    "gh", "api", "graphql",
+                    "-f", f"query={_CODEX_SIGNAL_QUERY}",
+                    "-F", f"owner={owner}",
+                    "-F", f"name={name}",
+                    "-F", f"number={pr_num}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
         except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if (obj.get("login") or "") != primary:
-            continue
-        # Require the GitHub-enforced Bot author type too — belt-and-suspenders against
-        # a spoofed login string in an injected/malformed payload.
-        if (obj.get("type") or "") != "Bot":
-            continue
-        body = obj.get("body") or ""
-        if not _CODEX_CLEAN_COMMENT_RE.search(body):
-            continue
-        m = _CODEX_REVIEWED_COMMIT_RE.search(body)
-        if not m:
-            continue  # clean marker but no parseable sha → does not vouch (fail-closed)
-        latest = m.group(1).strip().lower()
-    return latest
+            return None
+    try:
+        payload = json.loads(raw or "")
+        if payload.get("errors"):
+            return None
+        pr = payload["data"]["repository"]["pullRequest"]
+        comments = pr["comments"]
+        if comments["totalCount"] > len(comments["nodes"]):
+            return None
+        rows = []
+        for node in comments["nodes"]:
+            author = node.get("author") or {}
+            editor = node.get("editor") or {}
+            rows.append(
+                {
+                    "login": author.get("login"),
+                    "type": author.get("__typename"),
+                    "editor": editor.get("login"),
+                    "body": node.get("body") or "",
+                }
+            )
+        timeline = pr["timelineItems"]
+        count, nodes = timeline["filteredCount"], timeline["nodes"]
+        if type(count) is not int or count < 0 or not isinstance(nodes, list):
+            return None
+        if (count > 0) != bool(nodes):
+            return None  # the two readings disagree: trust neither
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        return None
+    return {"comments": rows, "history_moved": bool(nodes)}
 
 
 # ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
@@ -6378,6 +6546,12 @@ def _classify_base_advance_delta(
     return "inline"
 
 
+#: Why the last freshness check PASSED, when that is something other than a review
+#: object at head. Read by the ``--check-pr`` row so the report states the gate's own
+#: reason instead of re-deriving it from a second read that could disagree.
+_FRESHNESS_PASS: dict[str, str] = {}
+
+
 def _check_codex_reviewed_head_core(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
@@ -6409,6 +6583,7 @@ def _check_codex_reviewed_head_core(
     ``--match-head-commit`` so a push landing between this check and the merge
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
+    _FRESHNESS_PASS.clear()
     if force:
         # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
         # touches the enforcement-hook surface — recorded fallback-review
@@ -6488,23 +6663,41 @@ def _check_codex_reviewed_head_core(
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
         return False, "", head
-    # The review-object path can't vouch for the current head (Codex has no review, or
-    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT, not a review
-    # object, and it names its commit only by an abbreviated id. That id identifies no
-    # commit — the head is whatever the branch's author pushed — so it NEVER satisfies
-    # this gate. Only a review object whose full ``commit_id`` equals the head vouches
-    # (or, via the caller, an owner-approved substitute at that exact head). The comment
-    # is still read, on this would-block path only, so the block can say it was seen
-    # and name the route that works.
-    clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
-    clean_note = ""
-    if clean_short and head.startswith(clean_short):
-        clean_note = (
-            f"\nNOTE: Codex posted a clean re-review naming commit {clean_short}. A clean "
-            f"re-review arrives as a comment carrying only an abbreviated commit id, which "
-            f"does not identify the commit, so it is not accepted as a review of head "
-            f"{head[:12]}."
+    # Codex posts no review object when it finds nothing; its word on a clean head is
+    # a comment naming an abbreviated id. That counts only when the id resolves
+    # UNIQUELY within this PR's own commits to the head and no Codex review object
+    # sits at the head (#2418; the resolution is what answers #2487's objection that
+    # a prefix alone binds nothing). The merge stays bound to this head.
+    refused: dict = {}
+    clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo, why=refused)
+    if clean_kind:
+        _FRESHNESS_PASS["reason"] = f"clean signal at head: {clean_kind}"
+        _FRESHNESS_PASS["head"] = head
+        print(
+            f"NOTE: PR #{pr_num} — Codex's clean {clean_kind} names head {head[:12]} "
+            f"(its abbreviated id resolves uniquely to the head among the PR's commits, "
+            f"and nothing Codex filed says otherwise) — accepted as a current review.",
+            file=sys.stderr,
         )
+        return False, "", head
+    # Neither a review object nor a resolvable clean signal vouches for the head.
+    # When a clean signal WAS seen, say which and why it did not count; when no later
+    # clean signal can count either, say that too, so the reader is not sent to
+    # re-request a review that cannot clear this.
+    clean_note = ""
+    if refused.get("signal"):
+        clean_note = (
+            f"\nNOTE: Codex's clean {refused['signal']} was read but not accepted as a "
+            f"review of head {head[:12]}: {refused.get('reason', 'it did not qualify')}."
+        )
+        if refused.get("permanent"):
+            clean_note += (
+                " That holds for every clean signal on this PR, so a finding-free Codex "
+                "re-review (which posts no review object) cannot clear this block. What "
+                "can: '# substitute-review' with the owner's approval, "
+                "'# stale-review-override', or a Codex review that posts a review object "
+                "at the head (only a review WITH findings does)."
+            )
     if not reviewed:
         return (
             True,
@@ -11787,8 +11980,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
         _head = _pr_head_sha(pr_num, repo=repo)
         _head_l = _head.strip().lower() if _head else None
+        # Only for the head it vouched for: a push landing between the gate and this
+        # re-read must not inherit the old head's pass reason.
+        _pass_reason = (
+            _FRESHNESS_PASS.get("reason")
+            if _head_l is not None and _FRESHNESS_PASS.get("head") == _head_l
+            else None
+        )
         if _head_l is not None and _reviewed == _head_l:
             label = "ok (current)"
+        elif _pass_reason:
+            label = f"ok ({_pass_reason})"
         elif _reviewed is None or _head is None:
             # A transiently-failed re-read must NOT read as "current" (Codex P2
             # #1373): the enforcement gate already passed, but the report must not

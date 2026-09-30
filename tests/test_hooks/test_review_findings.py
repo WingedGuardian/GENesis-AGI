@@ -174,6 +174,14 @@ def test_an_unimportable_list_is_an_error_not_an_empty_review_list(guard, monkey
     assert guard._codex_reviews("1") is None
 
 
+def test_a_clean_signal_is_never_accepted_without_the_list(guard, monkeypatch):
+    """The clean-signal check reads the primary from the list too: with the list
+    unavailable it must refuse, not fall back to a hardcoded login."""
+    monkeypatch.setattr(guard, "primary_reviewer_login", lambda: None)
+    monkeypatch.setattr(guard, "_codex_signal_evidence", lambda *a, **k: pytest.fail("read"))
+    assert guard._codex_clean_signal_at_head("1", H) is None
+
+
 def test_substitutes_come_from_the_list(guard, monkeypatch):
     _reviews(
         monkeypatch,

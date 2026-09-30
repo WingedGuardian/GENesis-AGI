@@ -1510,7 +1510,7 @@ def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
     renderings differ would be permanently uncoverable -- a floor under the
     shadow flag rate, which is the signal the enforce decision reads.
     """
-    from genesis.inbox.monitor import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
 
     source = '"https://example.com/q?x=1",'
     assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
@@ -1530,7 +1530,7 @@ def test_ambiguous_sentence_punctuation_is_never_trimmed_for_display():
     that answer, which is the silent loss this whole gate exists to prevent.
     A trim only stands when it removed a paired delimiter.
     """
-    from genesis.inbox.monitor import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
 
     for ambiguous in ("https://example.com/path;", "https://example.com/q?x=1!"):
         assert _display_url(ambiguous) == ambiguous
@@ -1545,7 +1545,7 @@ def test_a_truncated_sibling_still_cannot_vouch_for_another_url():
     resources; neither one's display form is the other's identity, so citing
     one must leave the other uncovered.
     """
-    from genesis.inbox.monitor import _uncovered_urls
+    from genesis.inbox.url_coverage import _uncovered_urls
 
     source = "https://example.com/foo\nhttps://example.com/foo:bar"
 
@@ -1564,7 +1564,7 @@ def test_bare_domain_label_does_not_swallow_the_link_target():
     can ever cite. Asserted on the extractor directly: the display layer
     trims the trailing `)` and would mask a regression here.
     """
-    from genesis.inbox.monitor import _extract_coverage_input_urls
+    from genesis.inbox.url_coverage import _extract_coverage_input_urls
 
     assert _extract_coverage_input_urls("[example.com/a](https://example.com/a)") == [
         "example.com/a",
@@ -1580,7 +1580,7 @@ def test_evidence_validation_keeps_bracketed_query_params():
     bracketed query parameter, and the URL would read as uncovered even
     though the evaluator cited it exactly.
     """
-    from genesis.inbox.monitor import _extract_coverage_input_urls, _extract_source_urls
+    from genesis.inbox.url_coverage import _extract_coverage_input_urls, _extract_source_urls
 
     cited = "example.com/s?f[0]=x"
     assert _extract_source_urls(f"**Source:** {cited}") == [cited]
