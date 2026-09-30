@@ -557,6 +557,80 @@ def test_a_secrets_compound_is_not_approved_by_this_hook() -> None:
     assert "hooks.asks.secrets_env" in _hso(doc)["additionalContext"]
 
 
+def test_a_huge_malformed_policy_cannot_lose_the_ask() -> None:
+    """An output over the harness's cap is persisted instead of read, which
+    would drop the ASK and let the access through ungated. A 20,000-character
+    unknown key and non-boolean value must still yield a parseable ask within
+    the budget."""
+    hook_output = private_module("hook_output_budget", _HOOKS / "hook_output.py")
+    policy_value = "k" * 20000 + "=off,secrets_env=" + "x" * 20000
+    rc, out = _secrets_guard(_SECRETS_COMPOUND, policy_value)
+    assert rc == 0
+    assert hook_output.utf16_len(out) <= hook_output.DEFAULT_BUDGET
+    doc = json.loads(out)
+    assert _decision(doc) == "ask", out[:300]
+
+
+def test_the_guard_bounds_whatever_decision_it_is_given(monkeypatch) -> None:
+    """The output bound is the guard's own, independent of how the notes were
+    built: a decision whose reason is far over the cap still prints as a
+    parseable ask within the budget."""
+    guard = private_module("secrets_env_access_guard_bound", _HOOKS / "secrets_env_access_guard.py")
+    hook_output = private_module("hook_output_budget3", _HOOKS / "hook_output.py")
+
+    def huge_decide(action, reason, detail="", payload=None, ask_key=None):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": "r" * 50000,
+            }
+        }
+
+    monkeypatch.setattr(guard, "decide", huge_decide)
+    monkeypatch.setattr(guard, "touches_secrets", lambda **kw: True)
+    monkeypatch.setattr(
+        guard, "read_payload", lambda: {"tool_name": "Bash", "tool_input": {"command": "cat s"}}
+    )
+    monkeypatch.setattr(guard, "tool_input", lambda p: p.get("tool_input", {}))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert guard.main() == 0
+    out = buf.getvalue().strip()
+    assert hook_output.utf16_len(out) <= hook_output.DEFAULT_BUDGET
+    assert _decision(json.loads(out)) == "ask"
+
+
+@pytest.mark.parametrize(
+    "seam",
+    [
+        "k" * 20000 + "=off,secrets_env=" + "x" * 20000,  # unknown key + non-boolean value
+        "k" * 20000 + "=on," + "k" * 20000 + "=off",  # duplicate seam key
+    ],
+)
+def test_notes_quote_only_a_clip(monkeypatch, seam) -> None:
+    """Layer 1, at its own boundary: a NOTE quotes a clipped key or value,
+    never the whole operator-written text, independent of the output bound."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", seam)
+    policy.drain_notes()
+    assert policy.ask_suppressed(_KEY) is False
+    notes = policy.drain_notes()
+    assert notes and len(notes) < 1000, len(notes)
+
+
+def test_a_huge_command_cannot_lose_the_ask() -> None:
+    """The command text reaches the decision too. It is already cut short
+    upstream (the guard quotes a bounded subject), so this pins that existing
+    cut end to end rather than either layer this change adds."""
+    hook_output = private_module("hook_output_budget2", _HOOKS / "hook_output.py")
+    command = "cat ~/genesis/secrets.env # " + "y" * 30000
+    rc, out = _secrets_guard(command, "")
+    assert rc == 0
+    assert hook_output.utf16_len(out) <= hook_output.DEFAULT_BUDGET
+    assert _decision(json.loads(out)) == "ask"
+
+
 def test_the_secrets_compound_asks_with_no_policy() -> None:
     """Control: the same command, no policy declared, asks."""
     rc, out = _secrets_guard(_SECRETS_COMPOUND, "")

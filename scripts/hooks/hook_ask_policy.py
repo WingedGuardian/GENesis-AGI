@@ -170,7 +170,7 @@ def _from_seam(raw: str) -> dict[str, object]:
             continue
         if key in parsed:
             _note(
-                f"{_SEAM} declares {key} more than once — which value wins is not "
+                f"{_SEAM} declares {_clip(key, 40)} more than once — which value wins is not "
                 f"decidable, so every ask stays ENABLED."
             )
             return {}
@@ -321,10 +321,12 @@ def ask_suppressed(key: str) -> bool:
     # suppresses nothing (closed set), and the module's contract is that it SAYS
     # so: a prompt that keeps appearing with no word about why is the
     # silent-discard this module exists to avoid.
-    unknown = sorted(str(k) for k in declared if k not in KEYS)
+    unknown = sorted(
+        str(k) if len(str(k)) <= 40 else str(k)[:37] + "..." for k in declared if k not in KEYS
+    )
     if unknown:
         _note(
-            f"hooks.asks in {_CONFIG_PATH} names {', '.join(unknown)}, which is not "
+            f"hooks.asks in {_CONFIG_PATH} names {_clip(', '.join(unknown), 200)}, which is not "
             f"a prompt this install can turn off (known: {', '.join(sorted(KEYS))}). "
             f"Ignored — those prompts stay ENABLED."
         )
@@ -336,7 +338,7 @@ def ask_suppressed(key: str) -> bool:
     value = declared[key]
     if isinstance(value, bool):
         return not value  # `off`/`false` → suppressed; `on`/`true` → ask
-    shown = "empty (a key with no value)" if value is None else repr(value)
+    shown = "empty (a key with no value)" if value is None else _clip(value)
     _note(
         f"hooks.asks.{key} in {_CONFIG_PATH} is {shown}, which is not a boolean — "
         f"use `off` to silence this ask or `on` to keep it. Keeping it ENABLED."

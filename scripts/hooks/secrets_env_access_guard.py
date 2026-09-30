@@ -114,9 +114,7 @@ def main() -> int:
     ti = tool_input(payload)
 
     paths = [ti[f] for f in _PATH_FIELDS if isinstance(ti.get(f), str)]
-    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(
-        ti.get("pattern"), str
-    ):
+    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(ti.get("pattern"), str):
         paths.append(ti["pattern"])
     command = ti.get("command") if isinstance(ti.get("command"), str) else ""
 
@@ -174,7 +172,22 @@ def main() -> int:
         )
     except TypeError:
         decision = decide("access secrets.env", reason, detail=subject, payload=payload)
-    print(json.dumps(decision))
+    # Bounded: the decision carries operator-written NOTEs, and a payload over
+    # the harness's output cap is persisted instead of read, which would lose
+    # the ask and let the access through ungated. Only the free text is trimmed;
+    # the envelope (the decision itself) always survives.
+    try:
+        from hook_output import print_json_bounded
+
+        print_json_bounded(
+            decision,
+            text_keys=(
+                "hookSpecificOutput.permissionDecisionReason",
+                "hookSpecificOutput.additionalContext",
+            ),
+        )
+    except ImportError:
+        print(json.dumps(decision))
     return 0
 
 
