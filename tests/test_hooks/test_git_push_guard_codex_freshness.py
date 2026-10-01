@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -3133,8 +3134,6 @@ class TestCleanSignalAtHead:
         assert _mod._commit_at_prefix(short) is None
 
     def test_commit_at_prefix_live_path_handles_errors_and_valid_result(self, monkeypatch):
-        import subprocess
-
         monkeypatch.delenv("_TEST_GH_COMMIT_AT_PREFIX", raising=False)
         responses = iter(
             [
