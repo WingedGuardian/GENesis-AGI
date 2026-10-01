@@ -73,6 +73,7 @@ try:
         analyze_checked,
         has_trailing_override,
         is_pytest_invocation,
+        mentions,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -336,8 +337,13 @@ def main() -> None:
     # verdicts are BLOCK and ALLOW; it cannot ask. For a guard with no third option,
     # softening an axis is not "a lighter verdict", it is a silent permit, and the
     # sibling layer that was supposed to cover the softened case did not.
-    # Cost of refusing both: 0 of 45,956 real commands reach either bound.
-    if blind is not None and blind.bounds_induced and "pytest" in cmd:
+    # Cost of refusing both bounds: 0 of 45,956 real commands reach either. A line
+    # continuation is ordinary input and takes this branch too — its cost is
+    # measured at `shell_parse._BLIND_CONTINUATION`.
+    # `mentions`, not the raw text: a line continuation is a bounds-type blind
+    # spot too, and when it falls inside the word the raw text no longer spells the
+    # name — the one case where this branch fires without it.
+    if blind is not None and blind.bounds_induced and mentions(cmd, "pytest"):
         print(
             f"BLOCKED: this command {blind.cause}, so this guard cannot check whether "
             f"the pytest run inside it is targeted — and an untargeted full-suite run "

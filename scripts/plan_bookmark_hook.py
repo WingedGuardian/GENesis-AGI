@@ -42,11 +42,16 @@ _ARCH_REVIEW = (
     "catching real issues, not ceremony."
 )
 
+# #2424: step 1 names `.claude/worktrees/` because that is the documented
+# location (.claude/skills/genesis-development/references/worktrees.md).
+# It is a recommendation, not detection: nothing here matches worktree paths
+# or runs git, so git availability cannot change this hook's behaviour.
 _EXECUTION_PROTOCOL = (
     "EXECUTION PROTOCOL — You MUST follow these steps IN ORDER before "
     "writing any code:\n"
-    "1. CREATE WORKTREE — git worktree add .claude/worktrees/<scope>-<desc> "
-    "-b <scope>/<desc>. Work inside the worktree. NEVER commit to main.\n"
+    "1. CREATE WORKTREE — git worktree add --no-track .claude/worktrees/<scope>-<desc> "
+    "-b <scope>/<desc> origin/main. Work inside the worktree. NEVER commit to "
+    "main.\n"
     # "STATE CONFIDENCE - explicit percentages for each part of the plan" used to
     # be step 2 here. It was a PLAN-level instruction delivered at PostToolUse,
     # i.e. after the plan had already been shown and approved - the wrong-moment

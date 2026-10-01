@@ -583,7 +583,10 @@ async def count_unique_work_commits(
 
 
 async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
-    """Every worktree of this repo as ``{path, branch, detached, prunable}``.
+    """Every worktree of this repo as ``{path, branch, detached, prunable, locked}``.
+
+    ``locked`` is None for an unlocked worktree, else the lock reason ("" for a
+    bare lock).
 
     ``--porcelain`` records are blank-line separated; a detached worktree has
     no ``branch`` line.
@@ -622,6 +625,7 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
                 "branch": None,
                 "detached": False,
                 "prunable": None,
+                "locked": None,
             }
         elif line.startswith("branch refs/heads/"):
             current["branch"] = line[len("branch refs/heads/") :]
@@ -629,7 +633,14 @@ async def list_worktrees(root: str, *, runner: Runner | None = None) -> dict:
             current["detached"] = True
         elif line.startswith("prunable"):
             current["prunable"] = line[len("prunable") :].strip() or "prunable"
-        elif line.strip() and not line.startswith(("HEAD ", "bare", "locked", "branch ")):
+        elif line == "locked" or line.startswith("locked "):
+            # The lock REASON, kept verbatim ("" for a bare lock). The worker
+            # needs it to recognise a reaper ARCHIVE anchor: locking clears the
+            # `prunable` marker, so without the reason an archived registration
+            # is indistinguishable from an unreadable worktree and is held
+            # forever. `-z` emits the reason raw, so no unquoting is needed.
+            current["locked"] = line[len("locked ") :] if line != "locked" else ""
+        elif line.strip() and not line.startswith(("HEAD ", "bare", "branch ")):
             # A record shape we do not recognise. The two sibling enumerators
             # have counted these from the start and this one did not, so a
             # format change here would have SHRUNK the listing rather than

@@ -81,7 +81,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "(`graph_expansion.mode` off/shadow/live + neighbor caps) and the "
             "entity lane (PR-2, off/shadow for now), and the Voyage reranker on "
             "the recall tools (`reranker.mode` off/live, default live; kill via "
-            "GENESIS_MEMORY_RERANK_OFF). Read live per recall by "
+            "GENESIS_MEMORY_RERANK_OFF), and `proactive.trace` on/off (the "
+            "per-recall retrieval trace, default on). Read live per recall by "
             "genesis.memory.graph_expansion (no restart); shadow only emits "
             "eval_events metrics, live appends linked neighbors after the "
             "organic results."
@@ -213,9 +214,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="pr_watch",
         description=(
             "PR-watch inline surface — master `enabled` plus lookback/resurface/"
-            "max_surface knobs. Mirrors the upstream-pr-steward campaign's own "
-            "owner notifications into foreground CC sessions as a one-line nudge, "
-            "so a tracked-PR status change missed on Telegram still reaches the "
+            "max_surface knobs. Mirrors the GitHub-steward owner notifications "
+            "(written by recon/account_activity.py and the github-activity-digest "
+            "campaign) into foreground CC sessions as a one-line nudge, so a "
+            "tracked-PR status change missed on Telegram still reaches the "
             "user next session. Read live by the SessionStart hook — takes effect "
             "next session start. Hook kill switch: GENESIS_PR_WATCH_DISABLED=1."
         ),
@@ -304,6 +306,24 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="cc_foreground_reaper.yaml",
         readonly=False,
         needs_restart=False,  # re-read every reaper pass
+    ),
+    "youtube_fetch": SettingsDomain(
+        name="youtube_fetch",
+        description=(
+            "YouTube fetch (yt-dlp, behind web_fetch and knowledge ingestion) — "
+            "`tls`: verify | auto_fallback | off. auto_fallback (default) verifies "
+            "certificates and retries a call once unverified ONLY on a "
+            "certificate-verification error, logged at warning and flagged "
+            "tls_verified=false in the result; verify never skips; off always skips. "
+            "Unverified calls carry no cookies or config-file options. "
+            "`audio_max_minutes` (default 120; knowledge ingestion only, web_fetch "
+            "never transcribes audio): the audio-transcription fallback for "
+            "a captionless video runs only up to this length (0 = never). Read fresh "
+            "per fetch — takes effect immediately, no restart."
+        ),
+        config_filename="youtube_fetch.yaml",
+        readonly=False,
+        needs_restart=False,  # read per fetch
     ),
     "mcp_staleness_guard": SettingsDomain(
         name="mcp_staleness_guard",
@@ -933,14 +953,20 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
 
     _validate_positive_int(section, "check_interval_seconds", errors)
     _validate_positive_int(section, "timeout_s", errors)
+    # #1953: these two were never bounded here, and 0 is harmful for both —
+    # items_per_eval=0 divides a drop into nothing, max_retries=0 parks on the
+    # first miss. config.py floors them too, for the paths this never sees.
+    _validate_positive_int(section, "items_per_eval", errors)
+    _validate_positive_int(section, "max_retries", errors)
 
-    if "batch_size" in section:
-        try:
-            val = int(section["batch_size"])
-            if val < 1 or val > 10:
-                errors.append("inbox_monitor.batch_size must be 1-10")
-        except (ValueError, TypeError):
-            errors.append("inbox_monitor.batch_size must be an integer")
+    # Same integer rule as every other numeric key here (#2447 review): the
+    # hand-written int() branch accepted `true` and 2.7 and raised on inf.
+    if _validate_int(section, "batch_size", errors) and not (
+        1 <= int(section["batch_size"]) <= 10
+    ):
+        errors.append("inbox_monitor.batch_size must be 1-10")
+    # 0 means "no cooldown", so the floor is 0, not 1 (config.py agrees).
+    _validate_int(section, "evaluation_cooldown_seconds", errors, minimum=0)
 
     valid_models = VALID_MODEL_NAMES
     model = section.get("model")
@@ -1376,6 +1402,23 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_youtube_fetch(changes: dict) -> list[str]:
+    """Validate the YouTube fetch lever (see
+    genesis.knowledge.processors.youtube_config)."""
+    from genesis.knowledge.processors.youtube_config import TLS_MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key == "audio_max_minutes":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append("'audio_max_minutes' must be a non-negative integer")
+        elif key != "tls":
+            errors.append(f"Unknown key '{key}'. Valid: tls, audio_max_minutes")
+        elif value not in TLS_MODES:
+            errors.append(f"'tls' must be one of {', '.join(TLS_MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_mcp_staleness_guard(changes: dict) -> list[str]:
     """Validate MCP stale-code-guard lever changes (see
     genesis.observability.mcp_staleness_guard_config)."""
@@ -1670,6 +1713,18 @@ def _validate_memory_recall(changes: dict) -> list[str]:
         if key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
+        elif key == "proactive":
+            # Only the trace kill switch is writable here; the rest of the
+            # proactive section (engine enable, per-profile budgets) stays
+            # file-edited until it gets its own validation.
+            if not isinstance(value, dict):
+                errors.append("'proactive' must be a mapping like {trace: off}")
+                continue
+            for sub_key, sub_value in value.items():
+                if sub_key != "trace":
+                    errors.append(f"Unknown key 'proactive.{sub_key}'. Valid: trace")
+                elif not (isinstance(sub_value, bool) or sub_value in ("on", "off")):
+                    errors.append(f"'proactive.trace' must be on/off or a boolean; got {sub_value!r}")
         elif key in section_modes:
             if not isinstance(value, dict):
                 errors.append(f"'{key}' must be a mapping like {{mode: shadow}}")
@@ -1697,7 +1752,8 @@ def _validate_memory_recall(changes: dict) -> list[str]:
                     errors.append(f"Unknown key '{key}.{sub_key}'")
         else:
             errors.append(
-                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker"
+                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker, "
+                "proactive"
             )
     return errors
 
@@ -2072,6 +2128,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "youtube_fetch": _validate_youtube_fetch,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "worktree_ownership": _validate_worktree_ownership,
     "voice_act": _validate_voice_act,
@@ -2122,14 +2179,37 @@ def _validate_float_range(
 
 
 def _validate_positive_int(d: dict, key: str, errors: list[str]) -> None:
+    _validate_int(d, key, errors, minimum=1)
+
+
+def _validate_int(d: dict, key: str, errors: list[str], *, minimum: int = 1) -> bool:
+    """Append an error unless ``d[key]`` is an integer >= ``minimum``.
+
+    Returns True only when the key is present AND valid, so a caller can add
+    its own further bounds without re-parsing.
+    """
     if key not in d:
-        return
+        return False
+    raw = d[key]
+    # int() alone was too forgiving: `true` became 1, 2.7 became 2 and was
+    # reported "applied", and inf raised OverflowError out of the validator.
+    # Same rule as the inbox config loader, so what this accepts is what the
+    # loader keeps (#2447 review): no bools, no fractions; 4.0 and "4" are ints.
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        errors.append(f"{key} must be an integer, got {raw!r}")
+        return False
     try:
-        val = int(d[key])
-        if val <= 0:
-            errors.append(f"{key} must be a positive integer, got {val}")
-    except (ValueError, TypeError):
-        errors.append(f"{key} must be an integer, got {d[key]!r}")
+        val = int(raw)
+    except (ValueError, TypeError, OverflowError):
+        errors.append(f"{key} must be an integer, got {raw!r}")
+        return False
+    if val < minimum:
+        errors.append(
+            f"{key} must be a positive integer, got {val}" if minimum == 1
+            else f"{key} must be an integer >= {minimum}, got {val}"
+        )
+        return False
+    return True
 
 
 # ── Tool implementations ──────────────────────────────────────────────

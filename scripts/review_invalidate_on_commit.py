@@ -57,11 +57,18 @@ from review_state import clear_all_markers, clear_marker  # noqa: E402
 # NOTHING → every marker stays valid for its TTL = the bypass). Detection degrades
 # to a strict regex; resolution degrades to clearing the candidate set.
 try:
-    from shell_parse import analyze_checked, git_subcommand  # noqa: E402
+    from shell_parse import analyze_checked, git_subcommand, mentions  # noqa: E402
 
     _PARSE_OK = True
 except Exception:  # pragma: no cover - defensive
     _PARSE_OK = False
+
+    def mentions(command: str, *patterns) -> bool:  # type: ignore[misc]
+        """No parser module: the raw text is the only reading there is."""
+        return all(
+            (p in command) if isinstance(p, str) else bool(p.search(command)) for p in patterns
+        )
+
 
 try:
     from review_enforcement_commit import (  # noqa: E402
@@ -189,9 +196,12 @@ def _over_clear(command: str, payload: dict, segs: list | None = None) -> None:
 def main() -> None:
     payload = read_payload()
 
-    # Cheap early-out: no "commit" token anywhere → definitely not a commit.
+    # Cheap early-out: no "commit" token anywhere → definitely not a commit. Read
+    # through `mentions`, identically to the checker's early-out: a word the
+    # shell assembles from pieces is not spelled in the raw text, and an early exit
+    # here would leave the marker valid for a commit that happened.
     command = field(payload, "command")
-    if not _COMMIT_PATTERN.search(command):
+    if not mentions(command, _COMMIT_PATTERN):
         sys.exit(0)
 
     # Confirm a REAL executed `git commit` segment before clearing anything — the

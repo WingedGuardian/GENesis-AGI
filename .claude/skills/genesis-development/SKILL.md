@@ -1843,6 +1843,18 @@ Four rules follow, each cheap:
   is what lets the trigger stay broad instead of clever. Measured prompt rate
   after widening: 0.43% of ~19k real commands.
 
+  **SUPERSEDED for the git-operation net by owner ruling 2026-09-08 (re-checked
+  against the code 2026-09-27).** That net no longer asks in any session type:
+  the commit gate and the push guard REFUSE an unreadable command that names a
+  gated operation, with a message giving the cause and a rewrite the session can
+  perform — both cite the ruling at their blind branch. The reasoning here still
+  prices the TRIGGER (a broad predicate remains right); what changed is the cost
+  of a false positive, now an agent rewrite rather than a human confirmation. So
+  wherever this passage and the paragraphs below say `ask` for that net, read
+  "refuse with an actionable message". A line continuation joined the same path
+  when the parser began REPORTING it as a blind spot (`_BLIND_CONTINUATION`)
+  instead of modelling the join: refused, never parsed around.
+
   This does NOT loosen the fail-closed mandate above, and the two are easy to
   read as contradicting each other. Rule (b) is scoped to the git-operation
   blind-spot net — a guard whose trigger is deliberately broad and whose false
@@ -2451,8 +2463,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   blocked. An empty result from your own query is "my query found nothing", never "no
   findings exist". Freshness is a SEPARATE gate, and it is NOT a blanket
   reviewed-SHA-equals-HEAD rule: for a hook-surface or otherwise non-trivial delta a
-  current Codex review must COVER head (reviews-API `commit_id == head`, or a clean Codex
-  re-review comment naming head), but a trivial NON-hook delta may still merge on a stale
+  current Codex review must COVER head (reviews-API `commit_id == head`, or a clean
+  Codex signal whose abbreviated id RESOLVES to the head, see the Pre-Merge Gate),
+  but a trivial NON-hook delta may still merge on a stale
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
 
@@ -3130,6 +3143,17 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 - **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
   heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
   Run gate-adjacent steps as separate calls.
+- **A secrets.env access that did NOT prompt may have been silenced, or may
+  have escaped the guard.** The guard matches only some access paths, so an
+  unprompted access proves nothing by itself. An install may set
+  `hooks.asks.secrets_env: off` in `~/.genesis/config/genesis.yaml`, which
+  removes the credentials guard's prompt: the hook then emits no decision, only
+  a context note naming the setting. That note is what proves a silenced
+  access; with no note, assume the access went past the guard unseen. It
+  approves nothing; other hooks and Claude Code's own permissions still decide
+  the command, and a dispatched session is still denied. `secrets_env` is the
+  ONLY key. The push / PR-open prompt has none on purpose: it is where code
+  leaves the machine, so it stays a decision on every install.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
@@ -3143,8 +3167,8 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   git command. `cd "$VAR" && git commit` fails closed with a *branch-verification*
   message, which reads like a branch problem and is not: use a literal path.
 - **Worktree removal is not yours to do.** `git worktree remove` is blocked;
-  `scripts/worktree_lifecycle.py` owns it, with a 7-day trash bin, and reaps
-  unchanged worktrees on a daily timer. Leave a dead worktree alone.
+  `scripts/worktree_lifecycle.py` owns it: it archives stale worktrees on a
+  daily timer and never deletes them (archive retention is off, #2504). Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`).
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**
@@ -3398,7 +3422,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 
 | Change type | Deploy path |
 |---|---|
-| Runtime code | `git pull` + server restart (update.sh does both) |
+| Runtime code | `scripts/deploy_code_only.sh`, or `update.sh` for dependency, unit or host changes. Modes: `deploy` (the default: a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or a venv that does not match the pyproject, and stands the Guardian and watchdog down); `pull` (the same pull, no restart: it reports every change the running server has not loaded, and the next step); `restart`; `status`. Launch `deploy` and `restart` DETACHED as a transient unit (`systemd-run --user`, the command is in the script's header): a session's background job dies with the session (#2101). **Validators sample, they don't chase:** deploys need not be 1:1 with merges. Validate `main` at a cadence, and on a failure bisect the merged range; per-PR CI already covers per-merge granularity. Validating against the live server? Hold `flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery) and not a bare `git pull`, so bracket the run and let the script judge it: keep the `bracket:` token `scripts/deploy_code_only.sh status` prints at the start (from a worktree it reports the main checkout), and run `scripts/deploy_code_only.sh status --verify <token>` at the end; exit 0 is a valid run. A token exists only when the server's boot commit is known, HEAD's runtime files (`src/`, `config/`, `pyproject.toml`, and the scripts it keeps imported, `_RUNTIME_RELOAD_SCRIPTS` in `scripts/lib/deploy_status.sh`) are the ones it booted from and were at every commit HEAD held since the boot (after a `pull` of code, even one a later commit undid: restart first — the server imports lazily, so the detour's modules stay loaded), and nothing there is edited outside git; otherwise it reads `unknown (<why>)`, which no token matches. It covers a restart (boot commit, MainPID, systemd invocation id) and an edit to an ignored override such as a `config/*.local.yaml` or to a user overlay in `~/.genesis/config`, and a change at HEAD to a script the server runs afresh (`_RUNTIME_FRESH_SCRIPTS`: voids the token, needs no restart); HEAD may move over docs, or hooks and scripts the server never runs. It is a tripwire, not a certificate: it cannot see, and reads valid through, a change to the venv's installed packages, the other files the server reads from `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an edit undone without moving HEAD (a stash and its pop included), and a rewritten or backdated reflog. A daemon your command leaves behind keeps holding the lock, and overlapping holds can starve a waiting deploy (flock grants a late shared request ahead of a queued exclusive one) |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
@@ -3765,14 +3789,30 @@ findings below, a gated `gh pr merge`:
   TOCTOU defense); the `--check-pr` command supplies this;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
-  **Clean-comment freshness:** a *clean* Codex re-review is posted as an ISSUE
-  COMMENT ("Codex Review: Didn't find any major issues. … **Reviewed commit:**
-  `<sha>`"), not a review object, so the reviews API never sees it. The gate now
-  ALSO accepts that clean comment when its `Reviewed commit` sha names the current
-  head — so a genuinely-clean re-review no longer false-blocks (it used to force a
-  `# stale-review-override`). Fail-closed: the clean marker alone never vouches; a
-  parseable `Reviewed commit` sha at head is required, and the comment must be
-  authored by the Codex bot.
+  **A clean Codex signal counts only when its id RESOLVES to the head.** Codex posts
+  NO review object when it finds nothing; its word on a clean head is a comment — a
+  clean re-review ("Codex Review: Didn't find any major issues. … **Reviewed
+  commit:** `<sha>`") or a `✅ Completed` Code Review row in its PR summary comment
+  (on PR open, often the only signal: #2418). Both name the commit by an ABBREVIATED
+  id, and a prefix that merely MATCHES the head binds nothing — the head is whatever
+  the branch's author pushed (#2487). So the gate resolves the id against the PR's
+  OWN commit list and accepts it only when it resolves UNIQUELY to a commit equal to
+  the head, the comment is the Codex Bot's, and no Codex review object (any state)
+  sits at the head, no Codex issue comment on the PR carries findings (Codex
+  usually files findings as a review object, but MEASURED on 2 of 339 PRs it posted
+  them as a `💡` issue comment with none), the comment is unedited or Codex-edited,
+  and the PR's history has never moved under it: ANY force-push, base change, base
+  force-push or head-branch restore on the PR refuses every clean signal on it, whenever
+  it happened (each can drop the reviewed commit from the list while a lookalike
+  sharing its short id, which is cheap to grind, stays). A second PR commit sharing
+  the prefix, a commit outside the PR, an unreadable or 250-capped commit list: all
+  block. The block message says which clean signal it read and why it was refused,
+  and when no later clean signal on the PR can count either (history moved, or a
+  findings comment sits on the PR) it says a finding-free re-review cannot help.
+  `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
+  the signal does not resolve, the routes are an owner-approved `# substitute-review`
+  on another reviewer's review at that exact head, or a conscious
+  `# stale-review-override` (which on the hook surface also needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
   substantiality) is provably review-trivial (docs-only / a small single-file
@@ -3885,7 +3925,8 @@ findings below, a gated `gh pr merge`:
   the review-context gates. Both were false of this one sigil.
 - **`# substitute-review` is the NARROW Codex stand-in** (owner standing order,
   2026-09-24). When Codex has not reviewed the head, a NON-dismissed,
-  NON-pending Devin or CodeRabbit review whose `commit_id` is EXACTLY the head
+  NON-pending review by another GitHub App reviewer (any, such as Devin or
+  CodeRabbit, except the PR's own workflow bot and CodeQL) whose `commit_id` is EXACTLY the head
   satisfies the Codex freshness check. The owner approves each use IN
   CONVERSATION before you add the sigil — the sigil is the record of that yes, so
   never add it without asking (owner ruling 2026-09-24, which replaced a native
@@ -3926,7 +3967,7 @@ The review-findings gate specifically:
    — **Codex P1 = 1.0 · Codex P2 = 0.5 · CodeRabbit Critical OR Major = 1.0
    each · Devin severe/critical (🔴/🟥) = 1.0 · Devin non-severe bug or security
    warning (🟡/🟨) = 0.5** (`_CR_BLOCKING_SEVERITIES = {"critical", "major"}`,
-   `_CR_BLOCKING_WEIGHT = 1.0`, `_DEVIN_MARKERS`) — but what a change can AFFORD
+   `_CR_BLOCKING_WEIGHT = 1.0`, `review_findings.DEVIN_MARKERS`) — but what a change can AFFORD
    depends on what it costs to be wrong (`_INLINE_SCORE_BLOCK_THRESHOLDS`).
 
    **Devin scores like Codex (owner ruling, 2026-09-24).** Its comments open
@@ -4064,11 +4105,12 @@ The review-findings gate specifically:
 4. **An ABSENT review BLOCKS — it does not merge on CI alone.**
    `_check_codex_reviewed_head` returns a block for `if not reviewed`, whatever
    the reason for the absence (quota, never triggered, still running). The only
-   things that clear it are a review at head, a clean re-review comment naming
-   head, a provably review-trivial delta since a stale review, a conscious
+   things that clear it are a review object at head, a clean Codex signal whose id
+   resolves uniquely to the head (see above), a provably review-trivial delta since a
+   stale review, a conscious
    `# stale-review-override` — except on a hook-surface PR, where that sigil also
    requires the exact base-and-head fallback-review evidence described above — or
-   an owner-approved `# substitute-review` resting on a Devin or CodeRabbit review
+   an owner-approved `# substitute-review` resting on another reviewer's review
    at that exact head.
    ⚠ This item previously read "no review comments at all (quota exhausted) →
    merge allowed on CI alone", which is FALSE and contradicted the Pre-Merge Gate
