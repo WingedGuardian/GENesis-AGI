@@ -576,3 +576,9 @@ def test_a_coderabbit_source_footer_is_not_a_header():
     trivial = CR_TRIVIAL + "\n\n_Source: Linters/SAST tools_"
     assert rf.is_finding(RABBIT, trivial) is False
     assert rf.is_finding(RABBIT, CR_MAJOR + "\n\n_Source: Learnings_") is True
+
+
+def test_an_unreadable_entry_after_a_trivial_one_still_counts():
+    """Only the `_Source:` footer is skipped; a later entry whose header has no
+    readable severity is drift, and drift counts."""
+    assert rf.is_finding(RABBIT, CR_TRIVIAL + "\n\n_⚠️ Potential issue_\n\n**Wrong.**") is True

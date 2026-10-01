@@ -291,6 +291,7 @@ def devin_finding(body: str) -> tuple[str | None, str | None]:
 # 2026-10-01 over 368 PRs: 0 unreadable Codex, Devin or CodeRabbit comments.
 INLINE_P3_RE = re.compile(r"!\[P3 Badge\]")
 CR_INFORMATIONAL = frozenset({"trivial", "info"})
+_CR_SOURCE_FOOTER_RE = re.compile(r"_Source: [^_]+_")
 # CodeRabbit puts findings it could not anchor inline into its review BODY. The
 # nitpick section is informational; these two carry findings. Bounded prefix for
 # the section's emoji, so the scan stays linear on a third-party body.
@@ -347,10 +348,10 @@ def is_finding(login: str, body: str) -> bool:
         if not line.strip():
             continue
         level, seen = cr_severity(line)
-        if not seen or (level is None and "|" not in line):
-            # A lone italic line with no severity is a footer such as
-            # `_Source: Linters/SAST tools_`, not a header (MEASURED 2026-10-01:
-            # 47 of 915 CodeRabbit comments carry one).
+        if not seen or _CR_SOURCE_FOOTER_RE.fullmatch(line.strip()):
+            # `_Source: Linters/SAST tools_` is a footer, not a header (MEASURED
+            # 2026-10-01: every no-severity italic line in 917 CodeRabbit comments
+            # is one of these). Any other unreadable header still counts.
             continue
         headers += 1
         if level not in CR_INFORMATIONAL:
