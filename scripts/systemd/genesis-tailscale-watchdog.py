@@ -726,10 +726,11 @@ def run_once(ctx: Ctx) -> int:
         nonlocal events, heal_count
         # Blind: the status could not be read, or there were suspects and not
         # one of them could be judged (scan limits, or every ping hanging), or
-        # every peer entry was malformed and nothing was judged at all.
-        judged = counters["probed"] - counters["unjudged"]
+        # every peer entry was malformed — and NOTHING vouched a verdict at
+        # all. A fresh handshake judged "ok" without a ping is still a judged
+        # tunnel, so unjudged/malformed peers beside it do not count as blind.
         waiting = counters["skipped"] + counters["unjudged"] + counters["malformed_peers"]
-        blind = action in BLIND_ACTIONS or (waiting > 0 and judged == 0)
+        blind = action in BLIND_ACTIONS or (waiting > 0 and not evidence)
         if event is not None:
             events = (events + [event])[-MAX_EVENTS:]
             if event["action"] == "healed":
@@ -840,17 +841,24 @@ def run_once(ctx: Ctx) -> int:
     after_props = unit_props(ctx, "tailscaled", *_IDENTITY)
     after_scan = _identity(after_props)
     if judged_daemon is None:
-        # The identity could not be read at scan start: only a post-scan read
-        # showing the same start time on an active unit vouches for the
-        # verdicts. A failed read or a moved start voids them: an unseen
-        # restart would let "offline" or "ok" verdicts resolve an open alert
-        # about a daemon that is gone.
-        if (
-            after_props is None
-            or judged_start is None
-            or _start_time(after_props) != judged_start
-            or after_props.get("ActiveState") != "active"
-        ):
+        # The identity could not be read at scan start: the verdicts stand only
+        # when a post-scan read still vouches for the daemon they describe —
+        # the same InvocationID, or the same start time on an active unit.
+        # A failed read or no matching marker voids them: an unseen restart
+        # would let "offline" or "ok" verdicts resolve an open alert about a
+        # daemon that is gone.
+        vouched = (
+            after_props is not None
+            and after_props.get("ActiveState") == "active"
+            and (
+                (
+                    unit.get("InvocationID")
+                    and after_props.get("InvocationID") == unit["InvocationID"]
+                )
+                or (judged_start is not None and _start_time(after_props) == judged_start)
+            )
+        )
+        if not vouched:
             return void("tailscaled's identity is unreadable, so the verdicts cannot be vouched for")
     elif after_scan is not None and not same_daemon(judged_daemon, after_scan):
         return void("tailscaled restarted or stopped during the scan")
