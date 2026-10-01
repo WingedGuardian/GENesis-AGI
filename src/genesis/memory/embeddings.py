@@ -1,13 +1,17 @@
 """Embedding provider with configurable backend chains.
 
-Two chain configurations for split read/write paths:
-  Storage (writes): Ollama → DeepInfra → DashScope (cost-optimized, local first)
-  Recall (reads):   DeepInfra → DashScope → Ollama (latency-optimized, cloud first)
+Two chain configurations for split read/write paths. Both lead with the
+cloud backend; they differ only in the rate tier:
+  Storage (writes): DeepInfra → Ollama (ordinary tier)
+  Recall (reads):   DeepInfra → Ollama (priority tier — deadline-bound)
+Ollama is the fallback rung in both, so a cloud outage degrades rather than fails.
 
-All backends use qwen3-embedding at 1024 dimensions for vector space
-compatibility. Cache keys are text-based (SHA256 of "qwen3-embedding:{text}"),
-NOT provider-dependent — two instances sharing the same L2 diskcache dir
-see each other's entries.
+Every chain is confined to ONE vector space (see CANONICAL_VECTOR_SPACE):
+DeepInfra and the local Ollama model are both Qwen3-Embedding-0.6B at 1024-d,
+and DashScope (a different model) is only used where it is the sole backend.
+Cache keys are text-based (SHA256 of "<space prefix>:{text}"), NOT
+provider-dependent within a space — two instances sharing the same L2 diskcache
+dir see each other's entries, and never another space's.
 
 Two-level cache: L1 in-process dict (fast, per-process) backed by
 L2 diskcache on disk (shared across all MCP server processes).
@@ -96,11 +100,75 @@ class EmbeddingUnavailableError(Exception):
     """Raised when all embedding backends are unavailable."""
 
 
+# ---------------------------------------------------------------------------
+# Vector-space identity
+# ---------------------------------------------------------------------------
+# Two backends are interchangeable ONLY if they produce vectors in the same
+# coordinate space — the same model weights at the same output dimension.
+# Matching dimension alone proves nothing: two different 1024-d models place the
+# same text at unrelated coordinates, so a vector written by one and queried by
+# the other scores as noise, and nothing raises. Every backend therefore names
+# its space, and a chain is only ever built from backends that share ONE.
+#
+# The canonical space is Qwen3-Embedding-0.6B at 1024-d, which the local Ollama
+# model (``qwen3-embedding:0.6b*``) and the DeepInfra model
+# (``Qwen/Qwen3-Embedding-0.6B``) both are. DashScope's ``text-embedding-v4`` is
+# a DIFFERENT model whose compatibility with the 0.6B space has never been
+# validated, so it names its own space and is never mixed into a canonical
+# chain.
+CANONICAL_VECTOR_SPACE = "qwen3-embedding-0.6b@1024"
+
+# Cache keys are prefixed with the provider's vector space, so a vector cached
+# by one space can never be served to a provider in another. The keys used to
+# be "qwen3-embedding:{text}" for EVERY backend, which let a DashScope fallback
+# vector be cached under the same key a Qwen3 provider reads. Those legacy
+# entries are deliberately NOT reused (a one-time cold cache is the price of
+# never serving a foreign-space vector); they expire on the L2 TTL.
+_EMPTY_CHAIN_CACHE_PREFIX = "no-backends"
+
+_LOGGED_EXCLUSIONS: set[tuple[str | None, tuple[str, ...]]] = set()
+
+
+def _ollama_vector_space(model: str) -> str:
+    # The Ollama library tag ("qwen3-embedding:0.6b-fp16") and a pull straight
+    # from the upstream repo ("hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0") are
+    # the same weights; both must count, or DeepInfra is dropped from the chain
+    # for an install that is in fact in the canonical space.
+    m = model.strip().lower()
+    if m.startswith("qwen3-embedding:0.6b") or "qwen3-embedding-0.6b" in m:
+        return CANONICAL_VECTOR_SPACE
+    return f"ollama:{model}"
+
+
+def _dashscope_vector_space(model: str, dimensions: int) -> str:
+    # Its own space, never the canonical one: see CANONICAL_VECTOR_SPACE.
+    return f"dashscope:{model}@{dimensions}"
+
+
+def _deepinfra_vector_space(model: str) -> str:
+    if model.strip().lower() == "qwen/qwen3-embedding-0.6b":
+        return CANONICAL_VECTOR_SPACE
+    return f"deepinfra:{model}"
+
+
+def backend_vector_space(backend: object) -> str | None:
+    """The backend's declared vector space, or None if it declares none.
+
+    Only a non-empty ``str`` counts: test doubles built on ``MagicMock`` answer
+    every attribute lookup with another mock, and an empty string names nothing.
+    ``EmbeddingProvider`` refuses a backend for which this returns None.
+    """
+    space = getattr(backend, "vector_space", None)
+    return space if isinstance(space, str) and space.strip() else None
+
+
 class EmbeddingBackend(Protocol):
     """Protocol for embedding backends in the provider chain."""
 
     @property
     def name(self) -> str: ...
+    @property
+    def vector_space(self) -> str: ...
     async def embed(self, text: str) -> list[float]: ...
     async def is_available(self) -> bool: ...
 
@@ -136,6 +204,10 @@ class OllamaBackend:
     @property
     def name(self) -> str:
         return "ollama_embedding"
+
+    @property
+    def vector_space(self) -> str:
+        return _ollama_vector_space(self._model)
 
     async def embed(self, text: str) -> list[float]:
         last_exc: Exception | None = None
@@ -229,6 +301,10 @@ class DeepInfraBackend:
     def name(self) -> str:
         return "deepinfra_embedding"
 
+    @property
+    def vector_space(self) -> str:
+        return _deepinfra_vector_space(self._model)
+
     async def embed(self, text: str) -> list[float]:
         payload: dict[str, object] = {"model": self._model, "input": [text]}
         if self._service_tier:
@@ -271,13 +347,19 @@ class DashScopeBackend:
     Uses text-embedding-v4 with explicit dimensions=1024 for vector space
     compatibility. NOTE: text-embedding-v4 may run the 8B variant —
     validate cosine similarity with local 0.6B before trusting as fallback.
+    Until that is done it declares its own vector space, so ``build_chain``
+    never mixes it into a Qwen3 chain; it is used only where it is the ONLY
+    configured backend family, and then consistently for writes and reads.
     """
+
+    DEFAULT_MODEL = "text-embedding-v4"
+    DEFAULT_DIMENSIONS = 1024
 
     def __init__(
         self,
         api_key: str,
-        model: str = "text-embedding-v4",
-        dimensions: int = 1024,
+        model: str = DEFAULT_MODEL,
+        dimensions: int = DEFAULT_DIMENSIONS,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._api_key = api_key
@@ -288,6 +370,10 @@ class DashScopeBackend:
     @property
     def name(self) -> str:
         return "dashscope_embedding"
+
+    @property
+    def vector_space(self) -> str:
+        return _dashscope_vector_space(self._model, self._dimensions)
 
     async def embed(self, text: str) -> list[float]:
         resp = await self._client.post(
@@ -317,7 +403,8 @@ class DashScopeBackend:
 class EmbeddingProvider:
     """Embedding provider with backend chain and two-level cache.
 
-    Backend chain order: Ollama (if enabled) → DeepInfra → DashScope.
+    Backend chain order is set by ``build_chain``; every backend in one
+    provider must share a vector space (a mixed chain raises ValueError).
     If all backends fail, raises EmbeddingUnavailableError.
     Caller (MemoryStore) falls to FTS5-only and queues for later embedding.
     """
@@ -331,6 +418,43 @@ class EmbeddingProvider:
         cache_dir: Path | None = _DEFAULT_CACHE_DIR,
     ) -> None:
         self._backends = backends if backends is not None else self._build_default_chain()
+        # One provider = one vector space. A chain that mixes spaces would
+        # write whichever model answered into a collection queried by another,
+        # which corrupts retrieval silently, so it is refused outright rather
+        # than logged: it can only come from a caller assembling backends by
+        # hand, and that is a programming error, not a runtime condition.
+        #
+        # Declaring a space is MANDATORY, with no exemption. An earlier version
+        # skipped backends that declared none, so an undeclared backend could
+        # sit beside a Qwen3 one and write its own model's vectors into the same
+        # collection, and every undeclared provider shared one cache namespace.
+        # Test doubles declare a space like any other backend.
+        undeclared = [
+            getattr(b, "name", repr(b))
+            for b in self._backends
+            if not backend_vector_space(b)
+        ]
+        if undeclared:
+            msg = (
+                f"EmbeddingProvider backends {undeclared} declare no vector space; "
+                "every backend must name the space its vectors are in"
+            )
+            raise ValueError(msg)
+        spaces = {backend_vector_space(b) for b in self._backends}
+        if len(spaces) > 1:
+            msg = (
+                "EmbeddingProvider backends span more than one vector space "
+                f"({sorted(s for s in spaces if s)}); a chain must use one "
+                "embedding model"
+            )
+            raise ValueError(msg)
+        self._vector_space: str | None = next(iter(spaces), None)
+        # An empty chain can never produce (or cache) a vector, so its prefix is
+        # never used to store anything; it only has to be well-defined.
+        self._cache_prefix = self._vector_space or _EMPTY_CHAIN_CACHE_PREFIX
+        # The backend that produced the most recent remote vector. Observed, not
+        # inferred from chain order: a fallback rung answers during an outage.
+        self._last_backend: EmbeddingBackend | None = None
         self._cache: dict[str, tuple[list[float], float]] = {}
         self._cache_ttl: float = 86400.0  # 24 hours
         self._cache_max: int = 2048
@@ -388,13 +512,57 @@ class EmbeddingProvider:
 
     @staticmethod
     def build_chain(
-        *, ollama_first: bool = True, priority_tier: bool = False
+        *,
+        ollama_first: bool = False,
+        priority_tier: bool = False,
+        fresh_collection: bool = False,
     ) -> list[EmbeddingBackend]:
         """Build backend chain with configurable priority order.
 
         Args:
-            ollama_first: If True, Ollama leads (storage/write path).
-                         If False, cloud leads (recall/read path).
+            ollama_first: If True, Ollama leads. If False (the DEFAULT),
+                         cloud leads and Ollama is the fallback rung.
+                         The default used to be True, on the reasoning that a
+                         write has no deadline so the slower local backend is
+                         free. It is not free: local embedding is inference, and
+                         on a GPU-less host every write burns cores the rest of
+                         the system is contending for. MEASURED 2026-09-26
+                         through this chain, 20 calls each: Ollama p50 2395.8ms
+                         / p95 2952.9ms, DeepInfra p50 207.8ms / p95 399.0ms —
+                         11.5x at p50. FIFTEEN callers construct an
+                         EmbeddingProvider with no explicit chain and so inherit
+                         this value — six in ``src/`` and nine in ``scripts/``,
+                         the highest-traffic being
+                         ``scripts/genesis_mcp_server.py``, which is the
+                         provider behind ``memory_store`` / ``reference_store``
+                         / ``knowledge_ingest`` for every session. That is why
+                         the DEFAULT is what had to move rather than one call
+                         site. They are NOT all write paths, and an earlier
+                         revision said they were: the procedural novelty gate
+                         and the session-awareness drift lane embed queries, and
+                         the standalone memory MCP used this one provider for
+                         ``memory_recall`` too until it was given a separate
+                         priority-tier recall provider like the runtime's.
+            (vector space): whatever the order, the chain only ever contains
+                         backends in ONE vector space — by default the space of
+                         the backend that led the pre-flip storage order (Ollama
+                         if enabled, else the first cloud backend; see
+                         ``fresh_collection`` for the exception), because that is
+                         the space the existing corpus was written in. The
+                         cloud-first flip therefore reorders backends WITHIN
+                         that space; it never changes which model writes. A
+                         backend in another space (today: DashScope beside any
+                         Qwen3 backend) is left out and logged, not appended.
+                         That anchor is INFERRED from configuration, not read
+                         from the collection: nothing records which space a
+                         collection was written in (issue #2502 tracks a
+                         recorded per-collection marker checked at startup).
+            fresh_collection: True ONLY for a caller writing into a brand-new,
+                         EMPTY collection (the LongMemEval ephemeral store).
+                         There is no corpus to match, so the chain anchors to
+                         the leader of the requested order instead of the
+                         historical storage leader. Never set it for a live
+                         collection: it would let the order choose the model.
             priority_tier: If True, the DeepInfra backend requests the paid
                          priority scheduling tier (1.5x rate). Defaults to
                          False so no caller is billed the premium implicitly —
@@ -423,6 +591,7 @@ class EmbeddingProvider:
             ollama_backends.append(OllamaBackend(url=ollama_url(), model=model))
 
         cloud_backends: list[EmbeddingBackend] = []
+        excluded_desc: list[str] = []
         di_key = deepinfra_api_key()
         if di_key:
             cloud_backends.append(
@@ -432,13 +601,66 @@ class EmbeddingProvider:
                 )
             )
         ds_key = dashscope_api_key()
+        ds_space = (
+            _dashscope_vector_space(
+                DashScopeBackend.DEFAULT_MODEL, DashScopeBackend.DEFAULT_DIMENSIONS,
+            )
+            if ds_key
+            else None
+        )
+
+        # The spaces the configured backends produce, in the historical storage
+        # order (local, then DeepInfra, then DashScope) and in the order this
+        # caller asked for. Computed BEFORE DashScope is constructed so an
+        # excluded DashScope never builds an HTTP client (several callers build
+        # a provider per call).
+        local_spaces = [b.vector_space for b in ollama_backends]
+        cloud_spaces = [b.vector_space for b in cloud_backends] + (
+            [ds_space] if ds_space else []
+        )
+        historical_spaces = local_spaces + cloud_spaces
+        requested_spaces = (
+            local_spaces + cloud_spaces if ollama_first else cloud_spaces + local_spaces
+        )
+
+        # The anchor is the ONE space the chain may contain.
+        #   Default (an existing collection): the space of the historical
+        #   storage leader, because that is the space the corpus was written
+        #   in. Order is a per-caller preference; the space is a property of
+        #   the collection and must not depend on it — otherwise the storage
+        #   and recall chains could disagree on the model.
+        #   fresh_collection=True (a brand-new, EMPTY collection): there is no
+        #   corpus to match, so the chain anchors to the leader of the order
+        #   the caller asked for.
+        spaces_for_anchor = requested_spaces if fresh_collection else historical_spaces
+        anchor = spaces_for_anchor[0] if spaces_for_anchor else None
+
         if ds_key:
-            cloud_backends.append(DashScopeBackend(api_key=ds_key))
+            if ds_space == anchor:
+                cloud_backends.append(DashScopeBackend(api_key=ds_key))
+            else:
+                excluded_desc.append(f"dashscope_embedding ({ds_space})")
 
         if ollama_first:
-            chain = ollama_backends + cloud_backends
+            ordered = ollama_backends + cloud_backends
         else:
-            chain = cloud_backends + ollama_backends
+            ordered = cloud_backends + ollama_backends
+
+        chain = [b for b in ordered if b.vector_space == anchor]
+        excluded_desc += [
+            f"{b.name} ({b.vector_space})" for b in ordered if b.vector_space != anchor
+        ]
+        # Once per process per distinct exclusion: several callers build a
+        # provider per call, and the configuration does not change between them.
+        exclusion_key = (anchor, tuple(excluded_desc))
+        if excluded_desc and exclusion_key not in _LOGGED_EXCLUSIONS:
+            _LOGGED_EXCLUSIONS.add(exclusion_key)
+            logger.warning(
+                "Embedding chain excludes %s: vector space differs from the "
+                "corpus space %s (mixing models in one collection corrupts "
+                "retrieval)",
+                excluded_desc, anchor,
+            )
 
         if not chain:
             logger.warning(
@@ -450,8 +672,8 @@ class EmbeddingProvider:
 
     @staticmethod
     def _build_default_chain() -> list[EmbeddingBackend]:
-        """Build default backend chain (Ollama first — storage/write path)."""
-        return EmbeddingProvider.build_chain(ollama_first=True)
+        """Build the default backend chain (cloud first, Ollama as fallback)."""
+        return EmbeddingProvider.build_chain(ollama_first=False)
 
     @property
     def tracker(self) -> ProviderActivityTracker | None:
@@ -461,7 +683,21 @@ class EmbeddingProvider:
     # -- Cache layer (unchanged from original) --
 
     def _cache_key(self, text: str) -> str:
-        return hashlib.sha256(f"qwen3-embedding:{text}".encode()).hexdigest()
+        return hashlib.sha256(f"{self._cache_prefix}:{text}".encode()).hexdigest()
+
+    @property
+    def vector_space(self) -> str | None:
+        """The single vector space every backend in this chain produces."""
+        return self._vector_space
+
+    @property
+    def last_backend(self) -> EmbeddingBackend | None:
+        """The backend that produced this provider's most recent remote vector.
+
+        None until the first remote call succeeds. Per instance, so per
+        process: another process's provider has its own.
+        """
+        return self._last_backend
 
     def _cache_get(self, text: str) -> list[float] | None:
         key = self._cache_key(text)
@@ -597,6 +833,7 @@ class EmbeddingProvider:
                     )
                 # Reset failure counter on success
                 self._consecutive_backend_failures[backend.name] = 0
+                self._last_backend = backend
                 if errors:
                     # Log fallback event if primary failed
                     failed_names = [name for name, _ in errors]

@@ -32,7 +32,7 @@ VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
 # Keep in lockstep with sync-hooks.sh HOOKS_TO_SYNC, check_hook_versions.sh,
 # and update_hook_versions.sh.
-TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push)
+TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push pre-merge-commit)
 
 cd "$REPO_ROOT" || { echo "ERROR: cannot cd to repo root $REPO_ROOT" >&2; exit 1; }
 

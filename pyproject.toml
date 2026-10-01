@@ -50,6 +50,7 @@ dependencies = [
                                   # The deeper problem is that the right client depends on the server
                                   # version, which is unknown at dependency-resolution time; a static
                                   # bound is the best instrument available here, not a complete one.
+    "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
     "httpx",
     "diskcache>=5.6",
@@ -66,6 +67,10 @@ dependencies = [
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
+    "yt-dlp[default]>=2026.08.19",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
+                                    # behind the web_fetch MCP tool). The `default` extra brings the
+                                    # JavaScript challenge solver (yt-dlp-ejs) at the exact version this
+                                    # yt-dlp release pins, installed locally: never fetched at run time.
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
     "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
@@ -80,8 +85,16 @@ dependencies = [
                     # importer (there were zero before this change).
                     #
                     # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
-                    # configures no redis URL and never uses docket, so the surface is the
-                    # IMPORT chain, not a connection. Under fastmcp 2.14.6 + pydocket
+                    # configures no redis URL, so the surface is the IMPORT chain rather
+                    # than a network connection.
+                    # ⚠ CORRECTED 2026-09-24: an earlier version of this comment added
+                    # "and never uses docket", which was FALSE and cost ~1.58 cores of
+                    # idle CPU before anyone looked. FastMCP instantiates a live Docket
+                    # AND runs a Worker at every server start, over in-process fakeredis
+                    # — it just has an empty queue, because no Genesis tool opts into
+                    # background tasks. `_run_mcp` now suppresses that worker; see
+                    # scripts/genesis_mcp_server.py::_suppress_docket_worker. Under
+                    # fastmcp 2.14.6 + pydocket
                     # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
                     # and registers tools, docket._redis loads, fakeredis async round-trips,
                     # and redis.asyncio's unix-socket client behaves. The same probe passes

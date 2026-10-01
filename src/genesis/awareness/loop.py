@@ -146,6 +146,16 @@ async def _check_wal_health(db) -> None:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
 
 
+async def _record_tailscale_watchdog_events(db) -> None:
+    """Best-effort: never raises into the tick (see resilience.tailscale_watchdog_events)."""
+    try:
+        from genesis.resilience.tailscale_watchdog_events import record_new_events
+
+        await record_new_events(db)
+    except Exception:
+        logger.debug("tailscale watchdog event check skipped", exc_info=True)
+
+
 async def _persist_health_alerts(db) -> None:
     """WS-2 M10: reconcile the durable ``alert_events`` open-set from live health.
 
@@ -591,6 +601,17 @@ _INFRA_POSTURE_DETAIL = {
         "scripts/bootstrap.sh (installs + enables the watchdog timer via "
         "lib/network_resilience.sh)"
     ),
+    "tailscale_watchdog_absent": (
+        "tailscaled is installed but genesis-tailscale-watchdog.timer is not "
+        "enabled (missing, or its install or enable failed) — a stuck Tailscale "
+        "tunnel is never auto-healed or reported, and SSH over Tailscale stays "
+        "dead until a manual `systemctl restart tailscaled`. Re-run "
+        "scripts/bootstrap.sh (lib/network_resilience.sh installs and enables "
+        "it). If it is meant to be off, set NETWD_TS_MODE=off in a drop-in on "
+        "genesis-tailscale-watchdog.service and leave the timer enabled: the "
+        "installer re-enables a disabled timer, and a unit installed in "
+        "/etc/systemd/system cannot be masked"
+    ),
     "cc_tmp_shared_fs": (
         "the Claude Code scratch dir (~/.genesis/cc-tmp) shares a filesystem "
         "with the container root — a runaway temp write can fill the root disk "
@@ -696,6 +717,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("networkd_keepconfig_missing")
         if network.get("network_watchdog_enabled") is False:
             missing.append("network_watchdog_absent")
+    # Independent of networkd: wherever tailscaled is installed, its watchdog
+    # should be. A mask, where one exists (masked before install), is
+    # deliberate; the durable off switch is a NETWD_TS_MODE=off drop-in, which
+    # leaves the timer enabled. Unknown (None) stays silent.
+    ts_state = network.get("tailscale_watchdog_unit_state")
+    if (
+        network.get("tailscaled_loaded") is True
+        and isinstance(ts_state, str)
+        and ts_state not in ("enabled", "masked", "masked-runtime")
+    ):
+        missing.append("tailscale_watchdog_absent")
     # Storage plane: cc-tmp blast-radius isolation (EFFECTIVE-state fact from
     # collectors/container.py::collect_storage). Gated on an lxc container —
     # the remedy is a dedicated incus volume, which only exists on a container
@@ -2239,8 +2271,14 @@ async def _publish_repo_bundle_if_due() -> None:
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
 # suppress the first alert for a slot.
-_last_slot_alert_at: dict[str, float] = {}
-_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour
+# pid-key -> (last alert monotonic time, priority it was sent at). The priority
+# rides along because the cooldown must NOT swallow an ESCALATION: a WARN
+# ("high") at minute 0 used to silence the CRIT that crossed ten minutes later
+# for the rest of the hour — and CRIT is the tier that actually reaches
+# Telegram. With the tree denominator this is a live shape, not a theoretical
+# one: a session that starts a heavy job can cross WARN->CRIT within one window.
+_last_slot_alert_at: dict[str, tuple[float, str]] = {}
+_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour (per severity step)
 
 
 async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
@@ -2271,10 +2309,20 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
     # lifetime); an entry older than the cooldown no longer suppresses anything,
     # so dropping it is behaviour-neutral and prevents slow growth on a
     # long-running server.
-    for k in [k for k, t in _last_slot_alert_at.items() if now - t >= _SLOT_ALERT_COOLDOWN_S]:
+    for k in [k for k, v in _last_slot_alert_at.items() if now - v[0] >= _SLOT_ALERT_COOLDOWN_S]:
         del _last_slot_alert_at[k]
     for slot in slots:
-        rss = slot.get("rss_mb", 0.0)
+        # `rss_mb` is the slot's WHOLE TREE (claude + Serena + the MCP fleet).
+        # Comparing the threshold against the root process alone — which is what
+        # this did before — meant the alert could not fire in the regime it
+        # exists for: the root stays ~0.8 GB while the tree balloons.
+        # `or`, not a .get default, on BOTH keys: a present-None survives a
+        # default, and `rss` is compared outside the inner try, where a None
+        # raises out of a function whose contract is "never raises into the
+        # tick". Defensive — no production caller passes rows today (the one
+        # call site enumerates live slots).
+        rss = slot.get("rss_mb") or 0.0
+        proc_rss = slot.get("proc_rss_mb") or rss
         if rss < SLOT_RSS_WARN_MB:
             continue
         # Key the cooldown by PID (unique per process), never the slot label: rows
@@ -2286,15 +2334,22 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         pid = slot.get("pid")
         key = f"pid:{pid}"
         label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
+        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         last = _last_slot_alert_at.get(key)
-        if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
+        # Within the window a repeat at the SAME (or lower) severity stays
+        # suppressed; an escalation high -> critical always re-alerts, since
+        # critical is the tier that reaches Telegram.
+        if (
+            last is not None
+            and (now - last[0]) < _SLOT_ALERT_COOLDOWN_S
+            and not (priority == "critical" and last[1] == "high")
+        ):
             continue
         if db is None:
             continue  # can't write the observation now; retry next tick
-        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         # Consumed only once we can actually write (after the db-None guard), and
         # set before the await so a failed create still suppresses per-tick retries.
-        _last_slot_alert_at[key] = now
+        _last_slot_alert_at[key] = (now, priority)
         try:
             await observations.create(
                 db,
@@ -2303,9 +2358,14 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 type="infrastructure_alert",
                 content=(
                     f"CC {label} (pid {pid}) is using "
-                    f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
-                    f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting {label}."
+                    f"{rss / 1024:.1f} GB RAM across its whole process tree "
+                    f"({proc_rss / 1024:.1f} GB in the claude process itself, the rest "
+                    f"in its Serena and MCP children) — warn "
+                    f"{SLOT_RSS_WARN_MB // 1024} GB, crit {SLOT_RSS_CRIT_MB // 1024} GB. "
+                    f"A single Claude Code session may be leaking — or may be "
+                    f"running a legitimately memory-heavy job (the tree counts "
+                    f"anything the session started). Check {label}'s process "
+                    f"tree before restarting it."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),
@@ -3583,6 +3643,10 @@ class AwarenessLoop:
                     # Conservative threshold; self-resolves when a cycle lands.
                     await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
+                # The root Tailscale watchdog writes only its own /run file; its
+                # events become observations here. Every tick, so a failed
+                # restart pages within ~5 minutes.
+                await _record_tailscale_watchdog_events(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
                 # and clears within the hour must still leave a durable incident
