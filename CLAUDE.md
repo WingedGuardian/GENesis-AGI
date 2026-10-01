@@ -20,6 +20,7 @@ Use `codebase_navigate` MCP to explore.
   by `scripts/setup-local-config.sh`). Dashboard proxied host:5000 → container:5000.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: configured in `~/.genesis/config/genesis.yaml` (`github.user` / `github.public_repo`)
+- **Config sources**: where a setting is read from and what wins (secrets.env, genesis.yaml, `config/` overlays, env) → `docs/architecture/CONFIG_SOURCES.md`
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)
 - **Backups**: encrypted, every 6h via `genesis-backup.timer` (systemd user
   unit; enable deliberately after configuring) running `scripts/backup.sh` → your private
@@ -29,10 +30,13 @@ Use `codebase_navigate` MCP to explore.
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 - **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
 - **Temp files**: `~/tmp/` for transient files and any LARGE temp (downloads,
-  media, DB dumps, exports). NEVER write large files to `/tmp/` (a small
+  media, DB dumps, exports). NEVER write large files to `/tmp/` (often a small
   tmpfs/RAM) or `~/.genesis/cc-tmp/` — the latter is Claude Code's working temp
-  ("oxygen"), policed by the `genesis-tmp-watchgod` service, which **kills CC
-  sessions** when it fills. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  ("oxygen"), usually a quota-capped volume: filling it breaks EVERY session's temp at
+  once. The `genesis-tmp-watchgod` service guards whole disks and sweeps cc-tmp
+  of what ended sessions left behind (untouched 7 days, nothing holding it); it
+  never kills a session and never deletes live work — so nothing will clean up
+  a big file you park there in time. A CC session's `TMPDIR` points at `cc-tmp` by design;
   do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
@@ -46,7 +50,11 @@ NEVER use `nohup` or bare `python -m genesis serve` — a bare process holds
 the lock file and blocks the systemd unit.
 
 ```bash
-systemctl --user restart genesis-server          # Restart (NEVER nohup)
+scripts/deploy_code_only.sh                      # Deploy code: locked pull + restart (launch detached: see its header)
+scripts/deploy_code_only.sh pull                 # Locked pull, no restart; names what the server has not loaded
+scripts/deploy_code_only.sh restart              # Locked restart of the tree as it stands (launch detached)
+scripts/deploy_code_only.sh status               # What the server runs + a validation token (--verify <token> judges it)
+systemctl --user restart genesis-server          # Bare restart: bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server           # Check
 journalctl --user -u genesis-server -n 50        # Logs
 systemctl --user list-units 'genesis-*' --all    # All units
@@ -56,7 +64,8 @@ Other units: `genesis-bridge.service` (LEGACY fallback — full stack incl.
 Telegram, only when genesis-server is DOWN; it yields/exits 200 if the server
 lock is held, and must never run alongside the server — dual getUpdates
 pollers split updates and break approval buttons),
-`genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
+`genesis-tmp-watchgod.service` (whole-disk guardian + cc-tmp retention;
+`scripts/watchgod status`), `genesis-watchdog.timer`
 (health check), `genesis-backup.timer` (6h encrypted backup via
 `scripts/backup.sh`), `genesis-disk-hygiene.timer` (daily worktree reaping, cache reclaim, `~/tmp`
 prune, and label-aware attention-snapshot GC; see `scripts/disk_hygiene.sh`),
@@ -66,6 +75,11 @@ gateway, so the host recovery brain never lags a pin bump between updates; see
 `genesis-cc-settings-align.timer` (daily CONTAINER-side re-assert of CC's
 auto-updater suppression in `~/.claude/settings.json`, because the align path
 only helps a box that actually runs an align; see `scripts/cc_settings_align.sh`),
+`genesis-graph-project.timer` (hourly rebuild of the memory-graph projection
+that the FalkorDB store reads — the staleness BOUND, since that store's
+`invalidate()` is a no-op and nothing else refreshes it; a clean no-op on
+installs with no graph engine, so it is enabled everywhere; see
+`scripts/graph_project_runner.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
@@ -86,7 +100,8 @@ pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS speci
 python3 scripts/pytest_lock_wait.py                # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
-systemctl --user restart genesis-server           # Restart server (NEVER nohup)
+scripts/deploy_code_only.sh                       # Deploy main: locked pull + restart (launch detached)
+systemctl --user restart genesis-server           # Bare restart, bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server            # Verify server running
 ```
 
@@ -97,8 +112,10 @@ Pick the tool by the question (full matrix + freshness model:
 **Serena** (Python LSP) for symbols/references/rename — **always live**, the
 default for "who calls X / what breaks if I change Z"; **codebase-memory-mcp**
 for architecture/graph; **GitNexus** for deep blast-radius/flows/coupling —
-**snapshot-based, so `gitnexus analyze` first** when freshness matters (it
-drifts after pulling merged PRs). Prefer these over manual reads for dependency
+**snapshot-based**. From the main checkout, refresh with
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters.
+Linked worktrees are deliberately not indexed; use Serena for live branch truth.
+GitNexus also drifts after pulling merged PRs. Prefer these over manual reads for dependency
 questions; none is a mandatory pre-edit gate.
 
 ## Skill Library
@@ -137,6 +154,19 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
 
 ## Design Principles
 
+- **Adopt before you build** — Default order is ADOPT > ADAPT > build. "Build"
+  needs a specific stated reason, and *"nothing adoptable exists"* is a claim
+  that requires a LOGGED SEARCH, not an impression. Compare **user-visible
+  capability**, never architectural depth: "ours is more sophisticated" is a
+  reason to UPGRADE, never a reason to build — and the `evaluate` skill's
+  Overlap Comparison table exists precisely to replace the sentence "we already
+  have this". Genesis's own job is the **brain**: cognition, memory, judgment.
+  Tools that touch the outside world get adopted and wrapped in glue, and the
+  safety and due diligence go INTO that glue rather than into reimplementing the
+  component. State time-to-capability for every option — hours-to-adopt versus
+  weeks-to-build is a first-class factor beside cost and quality. Run
+  `/evaluate` when any candidate tool surfaces; the disposition is the user's
+  call, not one to preempt.
 - **Flexibility > lock-in** — Adapter patterns, generic interfaces, pluggable
   components. Every external dependency should be swappable.
 - **LLM-first solutions** — Code handles structure (timeouts, validation, event
@@ -204,7 +234,8 @@ Applies to every assertion — in conversation, and doubly in anything written t
   hedged out loud — "I think", "unverified, but"), or **ASSUMED** (say so). An unmarked
   claim wears verified grammar and WILL be read as MEASURED/READ.
 - **Permanent-record discipline.** Never write an INFERRED claim into permanent record
-  (memory stores, follow-ups, specs, ledgers, evaluations, comments) in the grammar of a
+  (the surfaces are enumerated in the `genesis-development` skill,
+  `references/high-stakes-verification.md` §11) in the grammar of a
   fact — permanent record has no tone of voice; the next session builds on confident
   sentences. Status claims written to disk carry provenance + date ("per <artifact>, <date>").
 - **A surprising observation is a question, not an answer.** The pull to explain an anomaly
@@ -243,6 +274,37 @@ For plans, fixes, architecture decisions, or any non-trivial change:
   documented rationale for why it can't reach 90%)
 
 Applies to both CC sessions and Genesis autonomy decisions.
+
+## Instrument For The Answer, Not The Alarm
+
+*Trigger, mechanical:* you are about to build or deploy something whose job is
+to OBSERVE an event you cannot cheaply re-trigger — an intermittent failure, a
+race, a corruption, a scheduled job — **and whose next occurrence costs the
+USER an outage, a recovery, or lost data.** Routine reversible work, and
+anything you can redo yourself, is out of scope.
+
+The test is not "will this detect it?" It is: **"when this fires exactly once,
+will I have the answer — or only the news?"** If the honest answer is "I'll
+know it happened, then I'll investigate", it is not built yet.
+
+- **Capture IDENTITY at the moment, not just occurrence** — which pid, caller,
+  command, resolved AT the event; the actor may be gone a millisecond later. A
+  log that proves *when* and not *who* buys another occurrence.
+- **Deploy every independent layer you can afford** — independent meaning
+  *different failure modes*. The narrow exception to "no speculative changes":
+  you are buying observation, not committing a fix.
+- **"Not installed" and "permission denied" are starting points, not
+  verdicts** — ask whether a different uid, host, or namespace grants it,
+  *within authority you already hold*. Reaching for privilege or a host you
+  were not given is a question for the user, never a way around the limit.
+
+**The sentence to catch yourself in:** *"if this doesn't tell us, we'll add
+more next time"* — said out loud, the cost lands on the next failure, which
+someone else absorbs. Instance: an instrument for a recurring data-corruption
+investigation proved *when* each occurrence happened and never *what* caused
+it; two rounds were spent re-watching the same failure, each costing a
+recovery. Enumeration and control arms are not restated here —
+`genesis-development`, high-stakes-verification §9 and §10 own them.
 
 ## Memory System — Layer Model
 
@@ -457,62 +519,13 @@ because the preview reads as ordinary furniture at the top of a window.
 The size threshold is undocumented and **moves between CC versions** — treat
 the wrapper itself as the signal, never a byte count.
 `scripts/hooks/hook_output.py` is the single home of the measured cap;
-**route any new model-facing stdout through it.** That instruction is now
-ENFORCED rather than advisory: `tests/test_scripts/test_hook_output_contract.py`
-enumerates every hook wired **in `.claude/settings.json`** to `SessionStart` /
-`UserPromptSubmit` / `UserPromptExpansion` — the three events whose bare stdout
-the model reads, DERIVED by AST from `hook_output.py`'s own `BARE_STDOUT_EVENTS`
-so the gate keeps no copy to drift — and fails
-unless each one either routes through the writer or carries a stated, measured
-reason it cannot reach the cap. Polarity is ALLOWLIST: a hook wired next year
-with unbounded output fails by construction, which a known-bad-pattern scan could
-not do. A STRUCTURAL exemption may only cite a bound **configuration cannot
-change** — a hardcoded slice or an in-code clamp, never a config DEFAULT, since a
-`.local.yaml` overlay can raise a default.
-
-There is a SECOND, weaker category, kept so that describing only the first does
-not overstate the gate: `_MEASURED_PENDING_ROUTING` is for a hook that is NOT
-structurally bounded and has simply never been observed filing. It is **empty** —
-its only ever member now routes through the writer and bounds each surface by
-meaning. The category stays because the next hook with that shape needs a
-labelled place to sit; a row filed under "structurally bounded" is a false claim
-rather than visible debt.
-
-Two rules from that work, because both are the kind you get wrong while
-believing otherwise. **A size bound must be measured in the unit the harness
-bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
-not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
-rather than trying one huge value. A bound on MEANING (is this token a word?)
-stays in codepoints; say which you are writing. And **a bound must not decide
-eligibility** — filtering what gets rendered is not a judgement about whether the
-work is worth doing, and conflating them silently skipped recall for a whole
-class of prompt. Detail lives with the code, in
-`.claude/docs/proactive-memory-hook.md`.
-
-Three limits, so it is not read as total coverage. Hooks wired in a user-level
-`~/.claude/settings.json` or a `settings.local.json` are outside the repo and
-invisible to it. An exemption still skips the PRINT SCAN — every row now carries
-a checker, but it re-runs a NECESSARY CONDITION of the row's claim, never a
-verification of it: a checker shows a constant or pattern still EXISTS, not that
-it still BINDS the output. Which is why the table stays small and why ROUTING a
-hook through the writer still beats adding a row. And the detector's
-enumeration is bounded, not total: it covers `print`, `builtins.print`,
-`file=None`, `file=sys.stdout`/`__stdout__`, and `sys.stdout[.buffer].write`,
-but NOT `os.write(1, …)`, an aliased handle, a rebound `print`, or a subprocess
-inheriting stdout. That list grew four times under review; treat it as the
-spellings checked so far rather than a closed set.
-
-Hooks on the OTHER events reach the model through JSON `additionalContext`, the
-same persistence path with a different failure mode — an oversized advisory must
-lose prose, never its `permissionDecision`, which is what `print_json_bounded`
-protects. They are out of the gate's scope today, deliberately, rather than
-exempted in bulk.
-
-The hourly `context_injection_monitor` watches the harness's own filings
-independently of every emitter's arithmetic, so this class cannot go quiet
-again — and its record is the evidence that the chokepoint works: of 849 filings
-on this install, 842 were one emitter that stopped filing the day it was moved
-behind the writer, and 7 were a guard since removed.
+**route any new model-facing stdout through it** — a contract test enforces
+this for every hook wired in `.claude/settings.json` to `SessionStart`,
+`UserPromptSubmit` or `UserPromptExpansion`. Hooks on other events reach the
+model through JSON `additionalContext`; emit those with `print_json_bounded`, so
+an oversized advisory loses prose and never its `permissionDecision`. How the
+gate works, its exemption categories, and the unit rules for size bounds:
+`.claude/docs/proactive-memory-hook.md` → "Hook output contract".
 
 ## Traps
 
@@ -553,17 +566,20 @@ behind the writer, and 7 were a guard since removed.
   whether one was requested. It reads published reviews only, so "never triggered"
   and "triggered, still running" are the SAME output; if you have not just requested
   one, request one rather than reading that line as proof nobody did.
-  **Codex is not the only reviewer that can block you.** CodeRabbit reviews on its
-  own schedule, and an unresolved **Critical or Major** inline finding on a file in
-  the PR diff blocks a merge by itself — the always-fix floor, which stops a Codex
-  **P1** the same way, in EVERY lane, before any score is consulted. Unless the
-  configured documentation-path exclusion applies.
+  **Codex is not the only reviewer that can block you.** CodeRabbit and Devin
+  review on their own schedules. An unresolved CodeRabbit **Critical or Major**, or
+  a Devin **severe bug / critical security** finding, on a file in the PR diff
+  blocks a merge by itself — the always-fix floor, which stops a Codex **P1** the
+  same way, in EVERY lane, before any score is consulted; a Devin non-severe
+  finding weighs like a P2. Unless the configured documentation-path exclusion
+  applies. When Codex is out, an owner-approved `# substitute-review` lets another
+  reviewer's review at the exact head stand in for Codex (any GitHub App reviewer,
+  such as Devin or CodeRabbit, except a bot the PR's own workflow drives and CodeQL)
+  — ask the owner in conversation each time; the sigil records the yes.
   Maintainer-replied findings and findings on files outside the PR diff do not
   score; under the shipped `doc_findings: skip`, documentation findings do not
-  score either. Until 2026-09-10 CodeRabbit was
-  named in no instruction file in this repo, so sessions read `codex-at-head: ok` as
-  "review is clear" and were surprised by the score. Read the `inline-findings` row,
-  not just the Codex row.
+  score either. `codex-at-head: ok` is not "review is clear": read the
+  `inline-findings` row, not just the Codex row.
   **Below the floor, how much a change can afford depends on its LANE** — a
   consequence class computed from the diff, not chosen by the author. Two P2s
   block a `critical` change (enforcement hooks, `.github/**`, api/migration
@@ -612,6 +628,18 @@ behind the writer, and 7 were a guard since removed.
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
   second question to satisfy the tool. Every time, no exceptions.
+- **Diagnosis before fixes.** Always pause to tell the user the diagnosis
+  before rushing to fixes — unless they tell you not to, or the matter is
+  time-urgent.
+- **A question you need answered gets ASKED, and carries what it takes to
+  answer it.** Prose questions in the body of a message get missed, so ask
+  through `AskUserQuestion` — and RE-ASK when one goes unanswered and still
+  blocks. A question you restate each turn and never force is a status line,
+  not a question. Carry the facts the decision turns on: state verified now
+  (not recalled from a plan or a ledger row — those go stale), what each option
+  costs, and the cost of deciding nothing. An option whose description doesn't
+  say what it costs is a label. Same obligation on any channel asking for a
+  decision — a dispatched session's report, a PR comment.
 - **Plan mode by default** for any task with 3+ steps or architectural
   decisions. If something goes sideways — STOP and re-plan. A plan-mode
   document under `~/.claude/plans/` that will outlive one session opens with
@@ -619,10 +647,29 @@ behind the writer, and 7 were a guard since removed.
   trackers it executes) — format and rationale in the genesis-development
   skill, `references/plan-docs.md`. Task-executor plans (`/task`,
   `TASK_INTAKE.md`) keep their own section contract and are out of scope.
+  **A plan that
+  proposes new source files carries an `## Adopt / Adapt / Build` verdict** —
+  the `evaluate` skill's vocabulary (`ADOPT | WATCH | IGNORE | ADAPT`), naming
+  what was searched, what was found, and hours-to-capability for each option.
+  One line is enough when building is right (`BUILD — cognitive core, no
+  external substitute, searched: <terms>`); the point is that the question gets
+  asked BEFORE the effort, which is the only moment it is cheap to answer.
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
-  discretionary fan-out. An instruction conflicting with an enforced project rule
+  discretionary fan-out. **An INTERRUPTED STREAM is not discretionary either:**
+  when the user throws a new topic at you mid-stream, do NOT silently set aside
+  what you were doing to chase it. Ask whether a subagent can carry it forward —
+  scoped, safe, needing no user decision — and if so dispatch one with a
+  SELF-CONTAINED prompt (it cannot see the conversation), say so in one line,
+  then engage the new topic. If it cannot be handed off — it needs an approval,
+  or you are mid-edit in a shared file — put a ledger row on it FIRST, or on a
+  client with no ledger name it in your reply per the zero-drop fallback below.
+  Either way the stream has an owner before your attention moves — zero-drop
+  catches a drop, this prevents one. (User, 2026-09-08: *"I'm able to distract
+  you… you'll just put it down, walk away, and we'll go down our tangent and
+  never come back to it."*)
+  An instruction conflicting with an enforced project rule
   gets named out loud rather than silently obeyed — then the user decides; this
   file does not outrank the user. That does NOT extend to the standing approval
   gates, which no instruction waives: refuse, and say so (Traps: autonomous-CLI,
@@ -688,7 +735,12 @@ behind the writer, and 7 were a guard since removed.
   2026-09-04: finished, tested code sat unpushed on a local branch for 1.5
   days because it was recorded only in a plan file nothing reads back.)
 - **Session wrap-up**: structured handoff — what changed, what's pending,
-  what was learned. If it's not committed, it doesn't exist.
+  what was learned. If it's not committed, it doesn't exist. **If the session
+  wrote a NUMBER, or a DATED status claim, into permanent record, audit those
+  CLAIMS too** — re-derive them rather than re-reading them; a green suite
+  checks none of them, and a confident sentence in permanent record is read as
+  a measured one. The canonical surface list and the walk live in the
+  genesis-development skill, `references/high-stakes-verification.md` §11.
 - **Where deferred work goes.** Bias = FIX NOW; defer only if the work is (1) blocked
   on an unmet precondition (incl. an unmade design decision), (2) gated on time/data,
   or (3) big enough to derail the session — or the user directs it.
@@ -724,9 +776,29 @@ behind the writer, and 7 were a guard since removed.
   either way? Ask. Filing itself needs no per-instance approval: a bug you found while
   reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
   the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
-  One limit stays absolute: a **security** defect — an unpatched bypass, a
-  credential exposure, anything exploitable — is NEVER filed publicly before it
-  is fixed, no matter who owns it. Everything else — who may file, the command,
+  One limit stays absolute, and it turns on **who gains**: a security defect —
+  one whose disclosure hands someone a capability they do not already have — is
+  NEVER filed publicly before it is fixed, no matter who owns it. Credential
+  exposure, an auth or privilege bypass, anything reachable by a party with LESS
+  access than it grants.
+  **A fail-open in a local development guard is USUALLY not that** — apply the
+  test, never the label, because the bare word "bypass" is what misroutes it.
+  Those hooks run only where an install wires them, and whoever can trigger one
+  already has commit access to that checkout. For a guard on the REVIEW chain
+  the worst case is typically an under-reviewed change reaching a PR that still
+  waits on maintainer approval — the state of any PR authored without them; a
+  guard protecting something else (local data, backups, repo routing) has its
+  own worst case — name it, never inherit this one. **The exception that the
+  test catches and the label does not:** a guard whose job is to stop a SECRET
+  or PRIVATE DATA reaching a public surface is security-class however local it
+  is — a branch on a public repo is public the moment it is pushed, merged or
+  not, and this repo's own leak incident was install IPs and personal emails,
+  not keys. So name the
+  adversary and what they gain before withholding; if the answer is "us, and
+  nothing we already lacked", file it. And verify the CHAIN rather than the
+  wording — a deny message naming "secrets" describes what the FLAG does to
+  git's hook chain, not which of this install's controls stand in that path.
+  Everything else — who may file, the command,
   labels, dispatched sessions, the time-gated case — is in
   `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
   filing your first.

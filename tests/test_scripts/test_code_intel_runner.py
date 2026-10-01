@@ -217,6 +217,32 @@ def test_repeated_failures_euthanize(tmp_path):
         )
 
 
+def test_rc4_consumes_cbm_and_requeues_gitnexus_leg(tmp_path):
+    """cbm done + gitnexus leg incomplete: the combined marker must not be
+    discarded whole — cbm's work is consumed AND a gitnexus-only marker is
+    requeued, so the skipped/failed leg survives a cleared condition."""
+    _seed_marker(tmp_path, tools="both", mode="fast")
+    _run_runner(tmp_path, entry_rc=4)
+    listed = _markers(tmp_path)
+    assert len(listed) == 1
+    assert listed[0].split("\t")[2] == "gitnexus"
+    assert listed[0].split("\t")[4] == "0"  # requeue is not a failure penalty
+
+
+def test_rc5_consumes_gitnexus_and_requeues_cbm_leg(tmp_path):
+    """gitnexus done + cbm leg skipped: consume gitnexus, requeue cbm-only —
+    and never stamp the shared full-success clock for cbm work that did not
+    run."""
+    h = _seed_marker(tmp_path, tools="both", mode="fast")
+    _run_runner(tmp_path, entry_rc=5)
+    listed = _markers(tmp_path)
+    assert len(listed) == 1
+    assert listed[0].split("\t")[2] == "cbm"
+    with _db(tmp_path) as db:
+        row = db.execute("SELECT last_full FROM repo_state WHERE hash=?", (h,)).fetchone()
+        assert row is None or row[0] is None  # cbm never ran — no full stamp
+
+
 # ── escalation ─────────────────────────────────────────────────────────────
 
 

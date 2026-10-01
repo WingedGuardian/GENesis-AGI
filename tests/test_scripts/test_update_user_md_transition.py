@@ -148,8 +148,11 @@ def test_steady_state_untracked_is_noop(scratch):
 
 
 def _ephemeral_dirty_re() -> str:
-    match = re.search(r"^EPHEMERAL_DIRTY_RE='(.*)'$", UPDATE_SH.read_text(), re.MULTILINE)
-    assert match, "EPHEMERAL_DIRTY_RE assignment missing in update.sh"
+    # Defined once in the lib that update.sh and restore.sh share, so every
+    # deploy path excuses exactly the same paths.
+    lib = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
+    match = re.search(r"^EPHEMERAL_DIRTY_RE='(.*)'$", lib.read_text(), re.MULTILINE)
+    assert match, "EPHEMERAL_DIRTY_RE assignment missing in scripts/lib/deploy_marker.sh"
     return match.group(1)
 
 

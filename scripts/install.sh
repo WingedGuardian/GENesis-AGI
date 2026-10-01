@@ -24,7 +24,7 @@
 #   CC_VERSION             — Claude Code version to install (default from scripts/lib/cc_version.sh)
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
-#   NODE_MAJOR             — Node.js major version (default: 20)
+#   NODE_MAJOR             — Node.js major version (default: 22)
 #   GENESIS_INSTALL_STRICT — exit nonzero on any smoke failure/setup warning (default: 0; used by CI)
 
 set -euo pipefail
@@ -482,12 +482,18 @@ if ! command -v jq &>/dev/null; then
     echo "    + jq installed"
 fi
 
-# Node.js version check — returns 0 if installed version >= 20
-# Node 18 EOL'd Sep 2025. Node 20 is current LTS.
+# Node.js version check — the floor of the pinned Claude Code release (>= 22,
+# see scripts/lib/cc_version.sh) raised to the pinned GitNexus engine range
+# (^22.18.0 || >=24.11.0, see scripts/lib/gitnexus_version.sh) so an install does
+# not strand GitNexus on a Node its pin refuses.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
-    local ver; ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${ver:-0}" -ge 20 ] 2>/dev/null
+    local ver; ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
+    local major="${ver%%.*}" minor="${ver#*.}"; minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    { [[ "$major" -eq 22 && "$minor" -ge 18 ]] \
+        || [[ "$major" -eq 24 && "$minor" -ge 11 ]] \
+        || [[ "$major" -gt 24 ]]; } 2>/dev/null
 }
 
 # Install Node.js with full fallback chain: pkg-mgr → NodeSource → nvm
@@ -524,7 +530,7 @@ _install_node() {
 }
 
 # Node.js (REQUIRED — Claude Code will not run without it)
-NODE_MAJOR="${NODE_MAJOR:-20}"
+NODE_MAJOR="${NODE_MAJOR:-22}"
 if _node_version_ok; then
     echo "    . Node.js $(node --version)"
 else
@@ -534,7 +540,7 @@ else
     else
         echo ""
         echo "    ERROR: Node.js ${NODE_MAJOR}.x install failed by all methods."
-        echo "    Claude Code requires Node.js >= 20. Install manually, then re-run:"
+        echo "    Claude Code requires Node.js >= 22. Install manually, then re-run:"
         echo "      Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash - && sudo apt-get install -y nodejs"
         echo "      AL2023/RHEL:   curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo bash - && sudo dnf install -y nodejs"
         echo "      Universal:     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
@@ -645,28 +651,78 @@ done
 # Code intelligence tools (optional — enhance Claude Code sessions)
 echo "    Installing code intelligence tools..."
 
-# Always re-runs the upstream installer: it is idempotent and pulls the latest
-# release, so existing installs are upgraded in place.
-# --skip-config: the installer would otherwise register the RAW binary in
-# ~/.claude/.mcp.json, bypassing our 2G-capped launcher (_register_mcp below
-# registers the capped wrapper instead).
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui --skip-config 2>/dev/null \
-    && echo "    + codebase-memory-mcp installed/upgraded" \
-    || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
+# The kill-switch path resolves through the ONE shared site — an override via
+# CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
+# and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
+# through to an install the machine may have disabled.
+_cbm_disable=""
+if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
+    # shellcheck source=lib/cbm_disable_file.sh
+    . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+    _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
+fi
+if [ -z "$_cbm_disable" ]; then
+    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
+else
+    # The pin, the digest and the install itself live in ONE place, shared with
+    # bootstrap.sh, so the commit and its digest cannot drift apart.
+    # shellcheck source=lib/cbm_installer.sh
+    . "$SCRIPT_DIR/lib/cbm_installer.sh"
+    _cbm_rc=0
+    genesis_cbm_install || _cbm_rc=$?
+    case "$_cbm_rc" in
+        0) echo "    + codebase-memory-mcp installed/upgraded" ;;
+        1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
+        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
+        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
+        *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
+    esac
+fi
 
-if _node_version_ok; then
-    # Exact pin to 1.6.8 — only ship versions we've actually verified. 1.6.8
-    # (stable): `analyze` works; text search (FTS) degrades gracefully when the
-    # LadybugDB extension is absent. The prior 1.6.4-rc line crashed `analyze`
-    # silently. Re-verify before bumping further.
-    if ! command -v gitnexus &>/dev/null; then
-        npm install -g gitnexus@1.6.8 2>/dev/null \
-            && echo "    + GitNexus installed ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus unavailable (optional)"
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=lib/gitnexus_version.sh
+    if source "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null \
+            && declare -F genesis_gitnexus_ensure_pin >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
+    fi
+fi
+if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+    echo "    NOTE: GitNexus pin metadata unavailable — GitNexus skipped (optional)"
+elif ! genesis_gitnexus_node_supported; then
+    echo "    NOTE: GitNexus ${GENESIS_GITNEXUS_VERSION} requires Node ^22.18.0 or >=24.11.0; found $(node --version 2>/dev/null || echo unavailable) — skipped"
+else
+    # Exact, shared pin — GitNexus index storage formats can change between
+    # releases.  Installing an older binary after a newer rebuild makes the
+    # otherwise-healthy index unreadable.  Bump only after index + query E2E.
+    if ! genesis_gitnexus_resolve_binary >/dev/null; then
+        _gitnexus_action="installed"
     else
-        npm install -g gitnexus@1.6.8 2>/dev/null \
-            && echo "    + GitNexus pin enforced ($(gitnexus --version 2>/dev/null))" \
-            || echo "    NOTE: GitNexus pin enforcement skipped (already at 1.6.8 or failed)"
+        _gitnexus_action="aligned"
+    fi
+    if genesis_gitnexus_ensure_pin; then
+        echo "    + GitNexus ${_gitnexus_action} ($(genesis_gitnexus_installed_version 2>/dev/null))"
+    else
+        _gitnexus_rc=$?
+        if [ "$_gitnexus_rc" -eq 2 ]; then
+            echo "    NOTE: newer GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) left installed; refusing automatic downgrade to ${GENESIS_GITNEXUS_VERSION}"
+        elif [ "$_gitnexus_rc" -eq 3 ]; then
+            echo "    NOTE: unrecognized GitNexus version output left installed; refusing unsafe replacement with ${GENESIS_GITNEXUS_VERSION}"
+        else
+            echo "    NOTE: GitNexus pin enforcement failed (wanted ${GENESIS_GITNEXUS_VERSION})"
+        fi
+    fi
+    if genesis_gitnexus_resolve_binary >/dev/null && ! genesis_gitnexus_installed_is_pinned; then
+        echo "    NOTE: stale GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) remains on disk but will not be registered or indexed"
     fi
 fi
 
@@ -745,7 +801,7 @@ else
 fi
 
 if [ -n "$HOOKS_DST" ]; then
-    for hook in pre-commit pre-push; do
+    for hook in pre-commit pre-push pre-merge-commit; do
         if [ -f "$HOOKS_SRC/$hook" ]; then
             cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
             chmod +x "$HOOKS_DST/$hook"
@@ -778,14 +834,18 @@ CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
-# Watchgod config — 500MB budget, 150MB sacred ground
+# Watchgod config. The watchgod (scripts/tmp_watchgod.sh) guards whole
+# filesystems and measures cc-tmp's real capacity itself — statvfs plus the
+# btrfs quota on the volume — so the only thing it needs from here is where
+# cc-tmp lives. The v1 keys this block used to write (a 500 MB budget, a
+# "sacred ground", a hand-propagated volume capacity) are gone with the budget
+# they served. Install-local overrides — observe mode, thresholds, extra
+# watched paths — belong in watchgod.local.conf, which nothing regenerates.
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
 WEOF
-echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "    + CC temp: ${CC_TMP_DIR}"
 
 # Auto-cd to genesis on login so Claude Code finds the project (slash
 # commands, hooks, .claude/settings.json all depend on cwd = project root)
@@ -890,13 +950,11 @@ if [ -f "$_cc_env" ]; then
     # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
     # warning suffices at this step — step 12 makes the authoritative call and
     # sets SETUP_WARNINGS if it still cannot verify.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "    WARNING: CC auto-updater suppression not verified yet" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list.
+    if ! cc_suppression_verified; then
+        echo "    WARNING: CC auto-updater suppression not verified yet" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
+    fi
 fi
 
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
@@ -914,17 +972,23 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
     # can't spawn CC regardless; a later bootstrap.sh re-renders the units with
     # the correct path once CC is present.
     _cc_path="$(command -v claude 2>/dev/null || true)"
+    # The npm prefix is needed in BOTH branches: it is the bin dir that actually
+    # receives `npm install -g` (gitnexus, and claude itself when cc_ensure_local
+    # installs it). When _install_node fell back to nvm, that prefix is the nvm
+    # bin — while a pinned claude already on PATH (e.g. /usr/local/bin) answers
+    # `command -v` first, and rendering only claude's dir leaves GitNexus
+    # invisible to the units forever. (guarded so a missing npm can't abort
+    # under set -e)
+    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
     if [ -n "$_cc_path" ]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # Installed above but not on this (non-interactive) shell's PATH — a user
-        # npm prefix whose PATH export only fires in interactive shells. Resolve
-        # where npm placed it, matching cc_ensure_local's own target (guarded so
-        # a missing npm can't abort under set -e).
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
+    fi
+    if [ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]; then
+        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
@@ -1021,15 +1085,35 @@ if command -v claude &>/dev/null; then
     # (a re-run installer must re-point a stale registration, not skip it).
     # shellcheck source=lib/mcp_register.sh
     . "$SCRIPT_DIR/lib/mcp_register.sh"
-    command -v gitnexus &>/dev/null && \
-        _register_mcp "gitnexus" "user" "gitnexus" "mcp"
+    [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
+        _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
     # Via the repo launcher (NOT the bare binary): wraps the server in a
     # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
     # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    command -v codebase-memory-mcp &>/dev/null && \
+    if command -v codebase-memory-mcp &>/dev/null; then
+        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
+        # does not start anything, and the launcher is fail-closed on the sentinel
+        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
+        # writing the registration while disabled cannot run the server.
+        #
+        # Skipping preserved the exact drift this helper exists to repair: a
+        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
+        # binary survives untouched, bypasses the launcher entirely, and starts the
+        # uncapped raw server in the next session — and stays uncapped after the
+        # sentinel is removed until somebody runs this again.
         _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
+        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
+            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
+        fi
+    fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+    # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
+    # repos. Registered under a Genesis-owned name, not the generic `grep`, so
+    # an operator's own grep server is never touched.
+    # No API key and no local binary, so nothing to gate on `command -v`: it is
+    # a remote endpoint. User scope so worktree sessions get it too.
+    _register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 fi
 
 # Queue initial code intelligence indexing — write an index-request marker for
@@ -1319,9 +1403,10 @@ fi
 # No daemon-reload here: the unconditional one above covers this block, and
 # nothing writes into $SYSTEMD_USER_DIR between the two.
 #
-# Failing to arm this is SURFACED rather than skipped in silence. cc-tmp filling
-# is what kills CC sessions and this unit is what watches it, so an install that
-# quietly ends with temp protection off is the failure mode worth shouting about
+# Failing to arm this is SURFACED rather than skipped in silence. A full disk (or
+# a full cc-tmp quota) breaks every session at once and this unit is what watches
+# for it, so an install that quietly ends with that guard off is the failure mode
+# worth shouting about
 # — and it is how the bug above stayed hidden. This is also the only place in
 # the repo that enables this unit, so nothing retries a failure here.
 if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
@@ -1518,8 +1603,10 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
     echo "    + Suppressed CC native installer prompt (npm-only)"
 fi
 
-# Seed user-level ~/.claude/settings.json with two CC defaults: (1) suppress the
-# auto-updater, and (2) Genesis's subagent-nesting depth. CC 2.1.217+ made nested
+# Seed user-level ~/.claude/settings.json with CC defaults: (1) suppress the
+# auto-updater, (2) Genesis's subagent-nesting depth and MCP description cap, and
+# (3) the claude.ai skills/plugins sync opt-out, each only where nothing of that
+# kind is synced yet (see cc_reconcile_container_settings). CC 2.1.217+ made nested
 # subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
 # (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
 # Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
@@ -1533,8 +1620,13 @@ _settings_file="$HOME/.claude/settings.json"
 #     scripts/lib/cc_version.sh — the SAME function the align path and the
 #     genesis-cc-settings-align timer re-run, so setup and steady state cannot
 #     drift apart);
-#   * the container-only subagent-nesting default is SET IF ABSENT, so a
-#     deliberate operator override (0 to disable, or higher) is preserved.
+#   * the container defaults (subagent nesting, the MCP description cap, and the
+#     claude.ai skills/plugins sync opt-outs where nothing was synced when checked) are SET
+#     IF ABSENT, so a deliberate operator value is preserved. The list — and its
+#     rationale, including CC's trash-on-disable behaviour for synced skills and
+#     plugins — lives in scripts/lib/cc_version.sh (cc_reconcile_container_settings),
+#     because every container reconcile path runs the same function; this call is
+#     one of them, not the only one.
 # One call so BOTH policies share a single write contract (mode/xattr carry-over,
 # compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
 # it. Note what this does NOT claim: on a fresh install the file is still touched
@@ -1545,7 +1637,7 @@ _settings_file="$HOME/.claude/settings.json"
 # rewrites settings.json), not this ordering.
 # (The host VM's recovery `claude -p` is single-brain and never nests, so
 # host-setup.sh deliberately passes no nesting default.)
-if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
+if cc_reconcile_container_settings "$_settings_file"; then
     # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
     # "verified" is finally true here. The nesting default is deliberately not
     # claimed on this line: on the python3-less create path it is NOT applied
@@ -1555,7 +1647,19 @@ if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAW
 else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
-    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\","
+    # Only the sync opt-outs cc_reconcile_container_settings did NOT hold back: an
+    # opt-out withheld because something is already synced must not be suggested
+    # here either — pasting it would retire the synced items the check protected.
+    _sync_hint=""
+    for _pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
+        _k="${_pair#*:}"
+        case " ${CC_SYNC_OPTOUT_WITHHELD[*]:-} " in
+            *":${_k}:"*) continue ;;
+        esac
+        _sync_hint="${_sync_hint}, \"${_k}\": false"
+    done
+    echo "                            \"CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH\": \"${CC_MCP_DESCRIPTION_LIMIT:-8192}\"}${_sync_hint}}"
     setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 

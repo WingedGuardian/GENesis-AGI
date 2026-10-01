@@ -277,6 +277,39 @@ def test_a_valid_token_is_not_refused_by_the_auth_layer(app_with_every_v1_bluepr
     )
 
 
+# Routes the desk-scoped token may open (#2442). ALLOWLIST polarity: every /v1
+# route not under one of these prefixes MUST refuse the desk token, so a route
+# added later is held to the narrow scope without anyone remembering to list it.
+_DESK_SCOPED_PREFIXES = ("/v1/desk/",)
+
+
+def test_the_desk_token_opens_the_desk_routes_and_nothing_else(
+    app_with_every_v1_blueprint, monkeypatch,
+):
+    """The desk credential lives in a desktop client's config file, usually in
+    plaintext on another machine. It must not reach tool execution, memory
+    writes, or the route that starts a Claude Code subprocess."""
+    monkeypatch.setenv("GENESIS_DESK_TOKEN", "desk-scoped-token")
+    client = app_with_every_v1_blueprint.test_client()
+    client.environ_base["HTTP_AUTHORIZATION"] = "Bearer desk-scoped-token"
+
+    leaked, desk_refused, desk_seen = [], [], 0
+    for path, method in _v1_rules(app_with_every_v1_blueprint):
+        resp = client.open(path, method=method, json={})
+        if path.startswith(_DESK_SCOPED_PREFIXES):
+            desk_seen += 1
+            if resp.status_code == 401:
+                desk_refused.append(f"{method} {path}")
+        elif resp.status_code != 401 or "Invalid bearer token" not in resp.get_data(as_text=True):
+            leaked.append(f"{method} {path} -> {resp.status_code}")
+
+    # Guard-the-guard: without a desk route in the enumeration, the "desk opens"
+    # half is vacuous and only the refusal half is being tested.
+    assert desk_seen, "no /v1/desk/ route was enumerated"
+    assert not desk_refused, "the desk token was refused by its own route: " + "; ".join(desk_refused)
+    assert not leaked, "the desk-scoped token opened a route outside its scope: " + "; ".join(leaked)
+
+
 def test_an_unimportable_registration_target_fails_this_contract(monkeypatch):
     """The fail-closed assert must be able to FIRE, not just exist.
 

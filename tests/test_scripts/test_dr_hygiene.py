@@ -102,10 +102,11 @@ def test_restore_confirm_eof_dies():
 
 
 def test_restore_integrity_check_guarded():
-    """N6: the integrity_check command-substitution is `|| true`-guarded so a
-    hard sqlite3 error can't abort before the warn."""
+    """N6: a hard staged integrity-check error dies explicitly before swap."""
     text = _RESTORE.read_text()
-    assert 'PRAGMA integrity_check;" 2>&1 | head -1) || true' in text
+    assert 'PRAGMA integrity_check;" 2>&1)' in text
+    assert "staged integrity_check could not complete" in text
+    assert text.index('PRAGMA integrity_check;" 2>&1)') < text.index('mv "$_DB_STAGE" "$DB_FILE"')
 
 
 # ── live behavior ────────────────────────────────────────────────────

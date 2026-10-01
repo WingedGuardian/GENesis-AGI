@@ -23,7 +23,7 @@ description: "Use when the user wants to know what will break if they change som
 4. Assess risk and report to user
 ```
 
-> If "Index is stale" → run `npx gitnexus analyze` in terminal.
+> If "Index is stale" → refresh through `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` only from the main checkout; in a linked worktree, use Serena for live branch truth.
 
 ## Checklist
 

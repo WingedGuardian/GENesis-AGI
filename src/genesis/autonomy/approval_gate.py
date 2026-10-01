@@ -512,17 +512,25 @@ class AutonomousCliApprovalGate:
           ``cli_approve_all`` — would hand Genesis control of the operator's
           keyboard and mouse alongside whatever the owner actually meant to
           approve. Desktop authority is never granted in a batch.
+        - Blocked-task unblocks. Each answers ONE specific blocker question on
+          ONE task; a blanket tap would release every blocked task at once, and
+          the card cannot say what question it is answering. Registered here
+          when the type was minted rather than when a producer lands, because
+          this set is a DENYLIST with no allowlist — an unregistered type is
+          swept BY DEFAULT, so "add it later" is a gap that opens silently.
         """
         from genesis.autonomy.contributor_worklog_config import (
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
         )
         from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
+        from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
 
         excluded = {
             EMAIL_GATE_ACTION_TYPE,
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
             DESKTOP_GATE_ACTION_TYPE,
+            TASK_UNBLOCK_ACTION_TYPE,
         }
         pending = await self._approval_manager.get_pending()
         count = 0
@@ -551,14 +559,22 @@ class AutonomousCliApprovalGate:
         whose card cannot say what it is granting.
         """
         from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
+        from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
+
+        # Excluding a type from approve_all_pending is not enough on its own.
+        # A `cli_approve_all:<request_id>` callback resolves the TRIGGERING row
+        # through THIS path first, and only then runs the filtered sweep -- so a
+        # type the sweep skips is still approved when it is the row that
+        # triggered the sweep. The exclusion has to exist at both ends, which is
+        # why desktop is already here.
+        refuse_generic = {DESKTOP_GATE_ACTION_TYPE, TASK_UNBLOCK_ACTION_TYPE}
 
         row = await self.get_request(request_id)
-        if row is not None and row.get("action_type") == DESKTOP_GATE_ACTION_TYPE:
+        if row is not None and row.get("action_type") in refuse_generic:
             logger.warning(
-                "Refusing to resolve desktop-takeover approval %s via the generic "
-                "per-item path (%s) — desktop consent has its own surface",
-                request_id,
-                resolved_by,
+                "Refusing to resolve %s approval %s via the generic per-item "
+                "path (%s) — this type has its own consent surface",
+                row.get("action_type"), request_id, resolved_by,
             )
             return False
         return await self._approval_manager.resolve(

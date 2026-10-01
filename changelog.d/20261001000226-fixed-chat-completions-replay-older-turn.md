@@ -1,0 +1,1 @@
+- The OpenAI-compatible chat-completions endpoint now returns HTTP 400 when a request does not end in a usable user message (empty, image-only or malformed content, or a trailing non-user entry), instead of falling back to an earlier user message from the history and running that instruction again.

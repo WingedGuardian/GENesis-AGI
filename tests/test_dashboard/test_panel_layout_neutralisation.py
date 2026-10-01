@@ -294,8 +294,12 @@ def test_components_css_answers_the_viewport_lock(prop, expected):
         "pins the page root, and restating its value leaves the page unscrollable"
     )
     assert important, (
-        f"`{prop}` must carry `!important` — the vendor rule sets it on the same "
-        "selector, so equal specificity is not enough"
+        f"`{prop}` must carry `!important` — not because the cascade needs it, "
+        "but because this is what ships and dropping it is a change to make "
+        "deliberately. MEASURED from the live CSSOM: the vendor declarations are "
+        "NOT important, and components.css loads later at equal specificity, so "
+        "a plain answer already wins. An earlier version of this message said "
+        "equal specificity was not enough, which is false"
     )
     assert value != VENDOR_ROOT[prop], (
         f"the answer restates the vendor's own `{prop}: {value}`, which answers "

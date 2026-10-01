@@ -322,7 +322,9 @@ GitHub failure by retargeting a PR that was fine.
 | `codex-at-head` | `BLOCK` | Covers BOTH "no Codex review found" and "review is stale" — they are different situations with the same remedy shape. The detail lines say which, and carry the `git log <reviewed>..<head>` command. Push any pending fix, comment `@codex review`, wait. |
 | `codex-at-head` | `ok (STALE review of <sha>, delta since is trivial)` | A **PASS**, not a block — the delta since the review is trivial. **Except on the hook surface**, which gets no leniency at all. |
 | `codex-at-head` | `ok (freshness label unverified — re-read failed)` | **The one to watch.** It says `ok`, but the report is explicitly declining to assert the head was reviewed — the re-read failed. The gate passed; the claim did not. Re-run before treating freshness as established. |
-| `codex-at-head` | `ok (clean comment at head)` | A pass on a different basis: a clean Codex issue-comment at head, with the review object absent or stale. |
+| `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: Codex said it finished clean at this head (a clean re-review comment, or a Completed row in its PR summary), the comment's short id resolves uniquely to the head among the PR's own commits, no Codex issue comment on the PR carries findings, the comment is unedited or edited only by Codex (it rewrites its summary in place, so the normal summary pass is Codex-edited), and the PR has no force-push, base change, base force-push or branch restore. The merge stays bound to this head. |
+| `codex-at-head` | `BLOCK` with a `NOTE: Codex's clean <comment\|summary> naming commit … was read but not accepted` line | Codex's clean signal was seen but did not qualify; the note says why. If it also says a finding-free re-review **cannot clear this block** (the PR's history moved, or a Codex findings comment sits on it), do not re-request Codex expecting a clean pass. Either way: if another reviewer's review exists at the exact head, ask the owner and merge with `# substitute-review`. |
+| `codex-at-head` | `BLOCK — … — substitute available: <reviewer> reviewed this head` | Codex has not covered the head, but another reviewer has (any GitHub App reviewer except the PR's own workflow bot and CodeQL). Ask the owner in conversation first; with their yes, merge with `# substitute-review`, which records it. The gate keeps the base check and the head binding and refuses in a dispatched session. Asking is not optional, and the gate cannot check that you did, so the obligation is yours. |
 | `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. |
 | `scheduled-claude` | `n/a (scoped to the public repo only)` | Neither pass nor block — the gate does not apply to this repo. |
 | `scheduled-claude` | `ok (<kind> carried from <anc>, <check> green at head)` | A pass on a CARRIED-FORWARD review. It is not a review made at head; do not describe it as one. |
@@ -363,11 +365,31 @@ sibling you did not look for.
 unanswered finding blocks the gate even when the code is already fixed —
 observed on PR #1541. A reasoned rejection is a valid resolution; silence is not.
 
-**The 3-round escalation cap is evaluated BEFORE dispatching the next review**,
-never after reading its findings. It counts CROSS-MODEL rounds only; internal
-subagent reviews never advance it. The cap CONSUMES standing approval — a prior
-"keep going until it's green" is void once it fires. Post the round ledger and
-get a fresh decision.
+**The round budget is evaluated BEFORE dispatching the next review**, never
+after reading its findings. A ROUND is a distinct head on the PR that drew
+findings from a GitHub App reviewer (before the cutover in
+`scripts/review_budget.py`, a head Codex reviewed) — that word is reserved for it;
+a clean review confirms a head and adds no round. Your own internal subagent audits are
+AUDIT PASSES: they advance nothing, and no counter sees them, so never report a
+round number you did not get from `scripts/review_budget.py`. Reaching the
+budget CONSUMES standing approval — a prior "keep going until it's green" is
+void once it fires. Post the round ledger and get a fresh decision.
+
+**ROUND 4 IS TERMINAL** (owner ruling, 2026-09-25). There is no ordinary round
+5. At four rounds the decision is not "another round": it is to MERGE
+with the outstanding issues accepted and filed, or to SEND IT BACK for rework. A
+fifth round exists only by explicit user approval, re-asked every round, and
+each of those is terminal in the same way. On the gate-surface lane the same
+ladder is compressed to two rounds, each carrying two ordinary rounds' work.
+
+Two caveats a closing session needs, because both are live today. The MECHANISM
+still permits round 5+ under per-request approval — aligning it is tracked work,
+so until then this paragraph and the approval prompts are what carry the rule.
+And a SECOND, local non-convergence streak (cap 3) exists alongside the
+round budget. They are independent gates: the streak's cap-3 hard
+stop blocks commits whatever the round count, and the round
+budget gates review requests and fix commits whatever the streak. Neither
+overrides the other; only the budget's rounds are numbered as rounds.
 
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.

@@ -393,6 +393,24 @@ def test_max_tokens_is_clamped_not_rejected(client):
     assert cap["kwargs"]["max_tokens"] == 8192
 
 
+@pytest.mark.parametrize("small", [1, 4, 15])
+def test_sub_floor_max_tokens_is_refused_before_routing(client, small):
+    """A budget this small can come back EMPTY from a thinking-suppressed lane,
+    and an empty completion is answered as a 502 — a request that could never
+    succeed, reported as a server failure the client retries. Refuse it as the
+    caller's error instead, and never spend a provider call on it."""
+    resp, cap = _post(client, body={**BODY, "max_tokens": small})
+    assert resp.status_code == 400
+    assert "at least 16" in resp.get_json()["error"]["message"]
+    assert cap == {}, "a sub-floor request still reached the router"
+
+
+def test_the_floor_itself_is_accepted(client):
+    resp, cap = _post(client, body={**BODY, "max_tokens": 16})
+    assert resp.status_code == 200
+    assert cap["kwargs"]["max_tokens"] == 16
+
+
 @pytest.mark.parametrize("bad", ["many", 0, -5, 1.5e400])
 def test_invalid_max_tokens_is_400(client, bad):
     resp, _ = _post(client, body={**BODY, "max_tokens": bad})
@@ -745,7 +763,7 @@ def test_non_integral_token_limits_are_refused(client, value):
     spawn.assert_not_called()
     # Assert the REASON, not just the refusal. False and 0.1 were already 400
     # before this fix — they fall through int() to 0 and trip the pre-existing
-    # "at least 1" floor — so a status-only assertion says nothing about the
+    # "at least 16" floor — so a status-only assertion says nothing about the
     # type guard for two of these five values.
     message = resp.get_json()["error"]["message"]
     assert "integer" in message or "whole number" in message, message

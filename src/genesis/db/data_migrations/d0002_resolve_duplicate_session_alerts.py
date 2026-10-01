@@ -19,6 +19,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import genesis_db_path
 
 requires_operator = False
@@ -32,7 +33,7 @@ _NOTES = (
 
 
 def migrate() -> dict:
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
         cur = db.execute(
             "UPDATE observations SET resolved = 1, resolved_at = ?, "

@@ -15,6 +15,7 @@ import pytest
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
 from genesis.cc.types import CCOutput
+from genesis.db.crud.prompt_versions import compute_prompt_hash
 from genesis.db.schema import create_all_tables
 from genesis.inbox.monitor import InboxMonitor, _extract_urls, _is_acknowledged
 from genesis.inbox.types import InboxConfig
@@ -46,6 +47,13 @@ def _success_output(
         "**Source:** https://example.com/first\n"
         "**Source:** https://example.com/second\n"
         "**Source:** https://www.linkedin.com/posts/foo-share-123-1G81/\n"
+        "**Source:** https://example.com\n"
+        "**Source:** https://example.com/one\n"
+        "**Source:** https://example.com/two\n"
+        "**Source:** https://example.com/current\n"
+        "**Source:** https://example.com/item-0\n"
+        "**Source:** https://example.com/item-1\n"
+        "**Source:** https://example.com/item-2\n"
     ),
 ) -> CCOutput:
     return CCOutput(
@@ -123,7 +131,7 @@ def clock() -> _FakeClock:
 
 
 @pytest.fixture
-def monitor(db, mock_invoker, mock_session_manager, config, writer, clock, tmp_path):
+def monitor(db, mock_invoker, mock_session_manager, config, writer, clock):
     return InboxMonitor(
         db=db,
         invoker=mock_invoker,
@@ -131,7 +139,6 @@ def monitor(db, mock_invoker, mock_session_manager, config, writer, clock, tmp_p
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,  # no INBOX_EVALUATE.md → uses fallback
     )
 
 
@@ -196,20 +203,20 @@ async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, d
 
 @pytest.mark.asyncio
 async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, mock_invoker, caplog):
-    """The SHIPPED default, and the contrast with the test above.
+    """Shadow mode, the contrast with the test above: compute, log, act on nothing.
 
-    The coverage gate is NEW — `main` carries no such check — and a replay over
-    the completed-evaluation corpus says enforcing it would flag roughly half of
-    legacy-shaped responses on day one, into a retry path that parks a whole
-    file after max_retries with no user notification. That would trade a
-    silent-loss bug for a silent-stall one. So the gate computes its verdict,
-    says so in the log, and acts on nothing until compliance has been measured.
+    Shadow was the shipped default until compliance was measured (0 of 42
+    evaluations under the **Source:** contract would have re-queued); enforce is
+    the default now. Shadow stays one config line away, so it must keep doing
+    exactly this.
     """
+    import dataclasses
     import logging
 
     from genesis.db.crud import inbox_items
 
-    assert monitor._config.url_coverage_mode == "shadow", "the shipped default must be shadow"
+    assert monitor._config.url_coverage_mode == "enforce", "the shipped default"
+    monitor._config = dataclasses.replace(monitor._config, url_coverage_mode="shadow")
 
     f = inbox_dir / "links.md"
     f.write_text("https://example.com/one-thing?token=shadow-secret")
@@ -291,9 +298,13 @@ async def test_fully_covered_urls_complete_normally(monitor, inbox_dir, db, mock
 
     f = inbox_dir / "links.md"
     f.write_text("https://example.com/one-thing https://other.org/two-thing")
+    # The coverage contract is a **Source:** field per input URL (prose slugs
+    # stopped counting when the gate moved to parsed-identity matching).
     mock_invoker.run.return_value = _success_output(
-        "# Inbox Evaluation\n\n## 1. one-thing\nGood piece.\n\n"
-        "## 2. two-thing\nAlso solid.\n" + "x" * 300
+        "# Inbox Evaluation\n\n## 1. one-thing\n"
+        "**Source:** https://example.com/one-thing\nGood piece.\n\n"
+        "## 2. two-thing\n**Source:** https://other.org/two-thing\n"
+        "Also solid.\n" + "x" * 300
     )
 
     await monitor.check_once()
@@ -1117,21 +1128,6 @@ async def test_message_queue_entry_created(monitor, inbox_dir, db):
 
 
 @pytest.mark.asyncio
-async def test_system_prompt_loaded(monitor, tmp_path):
-    prompt_file = tmp_path / "INBOX_EVALUATE.md"
-    prompt_file.write_text("Custom system prompt here")
-    monitor._system_prompt = None  # reset cache
-    prompt = monitor._load_system_prompt()
-    assert prompt == "Custom system prompt here"
-
-
-@pytest.mark.asyncio
-async def test_system_prompt_fallback(monitor):
-    prompt = monitor._load_system_prompt()
-    assert "inbox evaluation" in prompt.lower()  # fallback mentions inbox evaluation
-
-
-@pytest.mark.asyncio
 async def test_missing_watch_path(db, mock_invoker, mock_session_manager, tmp_path):
     config = InboxConfig(watch_path=tmp_path / "nonexistent")
     mon = InboxMonitor(
@@ -1198,7 +1194,6 @@ async def test_cooldown_skips_recently_evaluated(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "doc.md"
     f.write_text("version 1")
@@ -1253,7 +1248,6 @@ async def test_cooldown_defers_without_dropping_modification(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "doc.md"
 
@@ -1294,6 +1288,7 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
         watch_path=inbox_dir,
         batch_size=5,
         evaluation_cooldown_seconds=0,
+        url_coverage_mode="shadow",
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
@@ -1303,7 +1298,6 @@ async def test_e2e_url_repaste_different_tracking_not_reevaluated(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "Genesis.md"
     base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
@@ -1344,6 +1338,7 @@ async def test_phantom_modified_within_cooldown_advances_hash(
         watch_path=inbox_dir,
         batch_size=5,
         evaluation_cooldown_seconds=3600,
+        url_coverage_mode="shadow",
     )
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
@@ -1353,7 +1348,6 @@ async def test_phantom_modified_within_cooldown_advances_hash(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "Genesis.md"
     base = "https://www.linkedin.com/posts/foo-share-123-1G81/"
@@ -1516,7 +1510,7 @@ def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
     renderings differ would be permanently uncoverable -- a floor under the
     shadow flag rate, which is the signal the enforce decision reads.
     """
-    from genesis.inbox.monitor import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
 
     source = '"https://example.com/q?x=1",'
     assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
@@ -1536,7 +1530,7 @@ def test_ambiguous_sentence_punctuation_is_never_trimmed_for_display():
     that answer, which is the silent loss this whole gate exists to prevent.
     A trim only stands when it removed a paired delimiter.
     """
-    from genesis.inbox.monitor import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
 
     for ambiguous in ("https://example.com/path;", "https://example.com/q?x=1!"):
         assert _display_url(ambiguous) == ambiguous
@@ -1551,7 +1545,7 @@ def test_a_truncated_sibling_still_cannot_vouch_for_another_url():
     resources; neither one's display form is the other's identity, so citing
     one must leave the other uncovered.
     """
-    from genesis.inbox.monitor import _uncovered_urls
+    from genesis.inbox.url_coverage import _uncovered_urls
 
     source = "https://example.com/foo\nhttps://example.com/foo:bar"
 
@@ -1570,7 +1564,7 @@ def test_bare_domain_label_does_not_swallow_the_link_target():
     can ever cite. Asserted on the extractor directly: the display layer
     trims the trailing `)` and would mask a regression here.
     """
-    from genesis.inbox.monitor import _extract_coverage_input_urls
+    from genesis.inbox.url_coverage import _extract_coverage_input_urls
 
     assert _extract_coverage_input_urls("[example.com/a](https://example.com/a)") == [
         "example.com/a",
@@ -1586,7 +1580,7 @@ def test_evidence_validation_keeps_bracketed_query_params():
     bracketed query parameter, and the URL would read as uncovered even
     though the evaluator cited it exactly.
     """
-    from genesis.inbox.monitor import _extract_coverage_input_urls, _extract_source_urls
+    from genesis.inbox.url_coverage import _extract_coverage_input_urls, _extract_source_urls
 
     cited = "example.com/s?f[0]=x"
     assert _extract_source_urls(f"**Source:** {cited}") == [cited]
@@ -1824,7 +1818,6 @@ async def test_acknowledged_no_file_written(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Acknowledged\nNoted: this file is user-specific context."
@@ -1861,7 +1854,6 @@ async def test_acknowledged_stores_evaluated_content(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Acknowledged\nNoted: context absorbed."
@@ -1897,7 +1889,6 @@ async def test_ambiguous_note_gets_response(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     mock_invoker.run.return_value = _success_output(
         "**Classification:** Question\n"
@@ -1937,7 +1928,6 @@ async def test_no_hard_eval_limit(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
     f = inbox_dir / "notepad.md"
 
@@ -2197,11 +2187,18 @@ async def test_resume_pass_invalidates_row_when_file_changed(
     ]
     # Must have exactly two rows: the invalidated original and a fresh one
     assert len(rows) == 2, f"expected original (invalidated) + fresh row, got {len(rows)}: {rows}"
-    # First row: invalidated due to content change — status=failed with
-    # the approval_invalidated: prefix
-    assert rows[0]["status"] == "failed"
+    # First row: invalidated due to content change — status=superseded (not
+    # a failure) with the approval_invalidated: reason kept for audit
+    assert rows[0]["status"] == "superseded"
     assert "approval_invalidated:" in (rows[0]["error_message"] or "")
     assert "content changed" in (rows[0]["error_message"] or "")
+    # Supersession is not an evaluation attempt: no retry burned.
+    retry_row = await (
+        await db.execute(
+            "SELECT retry_count FROM inbox_items WHERE id = ?", (rows[0]["id"],),
+        )
+    ).fetchone()
+    assert retry_row[0] == 0
     # Second row: new row for the modified content, distinct content_hash
     assert rows[1]["content_hash"] != rows[0]["content_hash"]
     # The fresh row hits the dispatcher too → landed in processing state
@@ -2336,6 +2333,9 @@ async def test_resume_does_not_reroute_across_scans(
     assert req.approval_key_stable is True
     assert req.api_call_site_id is None
     assert req.context is None
+    system_message = req.messages[0]["content"]
+    assert system_message == req.cli_invocation.system_prompt
+    assert monitor._prompt_hash == compute_prompt_hash(system_message)
 
 
 @pytest.mark.asyncio
@@ -3234,9 +3234,13 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
     db,
 ):
     """When the approval row is missing entirely (approval_manager
-    returns None), the inbox row must be invalidated with the
-    APPROVAL_INVALIDATED_PREFIX marker so the next scan re-detects the
-    file as new."""
+    returns None), the item must come back for a fresh approval.
+
+    Until #2447 this was pinned as "the row is invalidated with the
+    APPROVAL_INVALIDATED_PREFIX marker so the next scan re-detects the file".
+    That marker stranded the item whenever a completed sibling held the file's
+    hash, so an ended approval now leaves the row an ordinary retriable
+    failure (``approval_ended:``) and the SAME row is asked about again."""
     from genesis.db.crud import inbox_items
 
     pending_decision = AutonomousDispatchDecision(
@@ -3271,14 +3275,14 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
             ).fetchall()
         )
     ]
-    # At least one row should be failed+invalidated.  The next scan may
-    # also have created a fresh row for the re-detected file.
-    failed = [r for r in rows if r["status"] == "failed"]
-    assert len(failed) >= 1
-    assert any(
-        (r["error_message"] or "").startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
-        for r in failed
-    )
+    # One row, never invalidated, asked about again under a new request.
+    assert len(rows) == 1, rows
+    assert not (rows[0]["error_message"] or "").startswith(
+        inbox_items.APPROVAL_INVALIDATED_PREFIX
+    ), rows[0]
+    assert rows[0]["error_message"] == "awaiting_approval:req-gone-1", rows[0]
+    assert rows[0]["retry_count"] == 0, rows[0]
+    gone_dispatcher.route.assert_awaited_once()
 
 
 def test_passes_coherence_check_valid():
@@ -3433,7 +3437,7 @@ async def test_baseline_guard_survives_file_clear(
     # items_per_eval=3 pins this test's original single-batch scenario (the
     # default is now 1); the guard under test is baseline-vs-file-clear, not
     # batch grouping.
-    config = InboxConfig(watch_path=inbox_dir, batch_size=1, items_per_eval=3)
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1, items_per_eval=3, url_coverage_mode="shadow")
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
         db=db,
@@ -3442,7 +3446,6 @@ async def test_baseline_guard_survives_file_clear(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
 
     original_content = "Numenta\n\nhttps://example.com/article-1\n\nhttps://example.com/article-2\n"
@@ -3510,7 +3513,7 @@ async def test_baseline_guard_delta_only_new_items(
     from genesis.inbox.monitor import _compute_new_content
 
     clock = _FakeClock()
-    config = InboxConfig(watch_path=inbox_dir, batch_size=1)
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1, url_coverage_mode="shadow")
     writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
     mon = InboxMonitor(
         db=db,
@@ -3519,7 +3522,6 @@ async def test_baseline_guard_delta_only_new_items(
         config=config,
         writer=writer,
         clock=clock,
-        prompt_dir=tmp_path,
     )
 
     mock_invoker.run.return_value = _success_output(
@@ -3550,3 +3552,426 @@ async def test_baseline_guard_delta_only_new_items(
     assert "article-3" in delta
     assert "article-1" not in delta
     assert "article-2" not in delta
+
+
+# ── BUILD verdict fallback: never silently dropped when the lane is not live ──
+
+
+_VALID_BUILD_SPEC = (
+    "build_spec:\n"
+    "  requirements: [\"Add widget\"]\n"
+    "  steps: [\"write widget.py\"]\n"
+    "  success_criteria: [\"widget imports\"]\n"
+    "  risks: [\"none material\"]\n"
+    "  intended_paths: [\"src/genesis/skills/widget/\"]\n"
+)
+
+
+def _build_eval(
+    verdict: str | None,
+    next_step: str = "Build the widget skill",
+    *,
+    build_spec: bool | None = None,
+) -> str:
+    """``build_spec`` defaults to present iff the verdict is ``build``."""
+    verdict_lines = (
+        f'verdict: {verdict}\nverdict_reason: "Stated reason for the verdict"\n'
+        if verdict is not None
+        else ""
+    )
+    if build_spec is None:
+        build_spec = verdict == "build"
+    if build_spec:
+        verdict_lines += _VALID_BUILD_SPEC
+    return (
+        "# Inbox Evaluation\n\n"
+        "## 1. Widget Skill\n\n"
+        "### Recommendation\n\n"
+        "```yaml\n"
+        "action: BUILD\n"
+        f'next_step: "{next_step}"\n'
+        "effort: Small\n"
+        "scope: V4\n"
+        "confidence: high\n"
+        "architecture_impact: extends\n"
+        f"{verdict_lines}"
+        "```\n"
+    )
+
+
+async def _build_follow_ups(db) -> list[dict]:
+    cur = await db.execute(
+        "SELECT content, reason, strategy, priority, pinned, kind "
+        "FROM follow_ups WHERE source = 'inbox_evaluation' ORDER BY rowid"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+_LANE_CASES = [
+    pytest.param(None, id="lane-unwired"),
+    pytest.param(SimpleNamespace(enabled=False), id="lane-disabled"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_build_verdict_becomes_pinned_follow_up_when_lane_not_live(monitor, db, lane):
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-1",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD] Widget Skill")
+    assert row["strategy"] == "user_input_needed"
+    assert row["priority"] == "medium"
+    assert row["pinned"] == 1
+    assert row["kind"] == "follow_up"
+    assert "Stated reason for the verdict" in row["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_needs_discussion_verdict_is_a_discussion_not_a_build_task(monitor, db, lane):
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("needs_discussion"),
+        batch_id="batch-build-2",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD: NEEDS DISCUSSION] Widget Skill")
+    assert not row["content"].startswith("[BUILD] ")
+    assert row["strategy"] == "user_input_needed"
+    assert row["pinned"] == 1
+    assert row["kind"] == "follow_up"
+    assert "Stated reason for the verdict" in row["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_dont_build_veto_is_recorded_never_actionable(monitor, db, lane):
+    """A veto must not become pinned build work; it is kept as a tabled record."""
+    from genesis.db.crud import follow_ups
+
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("dont_build", next_step="Use the existing capability"),
+        batch_id="batch-build-3",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    row = rows[0]
+    assert row["content"].startswith("[BUILD: DONT_BUILD] Widget Skill")
+    assert row["kind"] == "tabled"
+    assert row["pinned"] == 0
+    assert row["strategy"] == "ego_judgment"
+    assert "Stated reason for the verdict" in row["reason"]
+    actionable = " ".join(r["content"] for r in await follow_ups.get_actionable(db))
+    assert "Widget Skill" not in actionable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_missing_build_verdict_creates_nothing(monitor, db, lane, caplog):
+    """A BUILD block with no valid verdict is malformed: the live lane skips it
+    too (build_lane.handle_eval: verdict None -> continue). Loud, not a task."""
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    with caplog.at_level("WARNING", logger="genesis.inbox.monitor"):
+        created = await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(None),
+            batch_id="batch-build-4",
+            source_files=["Capabilities.md"],
+        )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+    assert any("no valid verdict" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["build", "needs_discussion", "dont_build", None])
+async def test_live_build_lane_gets_no_fallback_follow_up(monitor, db, verdict):
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval(verdict),
+        batch_id="batch-build-5",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+
+
+@pytest.mark.asyncio
+async def test_changed_build_verdict_is_not_deduped_away(monitor, db):
+    """Same item + same next_step but a NEW verdict must still surface."""
+    for i, verdict in enumerate(("needs_discussion", "build")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(verdict, next_step="Review Widget Skill"),
+            batch_id=f"batch-build-6{i}",
+            source_files=["Capabilities.md"],
+        )
+    contents = [r["content"] for r in await _build_follow_ups(db)]
+    assert len(contents) == 2
+    assert contents[0].startswith("[BUILD: NEEDS DISCUSSION]")
+    assert contents[1].startswith("[BUILD] ")
+    # Re-evaluating with the SAME verdict still dedups.
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build", next_step="Review Widget Skill"),
+        batch_id="batch-build-6x",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_build_verdict_without_usable_spec_is_a_discussion(monitor, db, lane):
+    """Parity with BuildLane._handle_build: an unusable build_spec fails closed
+    to needs_discussion, never a pinned build request."""
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build", build_spec=False),
+        batch_id="batch-build-7",
+        source_files=["Capabilities.md"],
+    )
+    rows = await _build_follow_ups(db)
+    assert created == 1
+    assert rows[0]["content"].startswith("[BUILD: NEEDS DISCUSSION] Widget Skill")
+    assert "build_spec" in rows[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_rephrased_next_step_does_not_duplicate_build_fallback(monitor, db):
+    """The LLM rephrases next_step across evaluations; the fallback dedups on
+    stable item identity + verdict (as BuildLane.item_key excludes next_step)."""
+    for i, step in enumerate(("Build the widget skill", "Implement a widget skill")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval("build", next_step=step),
+            batch_id=f"batch-build-8{i}",
+            source_files=["Capabilities.md"],
+        )
+    assert len(await _build_follow_ups(db)) == 1
+
+
+async def _widget_candidate(db, verdict: str = "build") -> None:
+    from genesis.autonomy.build_lane import BuildLane
+    from genesis.db.crud import build_candidates
+
+    await build_candidates.create(
+        db,
+        id=f"cand-{verdict}",
+        item_key=BuildLane.item_key("Widget Skill"),
+        item_title="Widget Skill",
+        source_file="Capabilities.md",
+        verdict=verdict,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", _LANE_CASES)
+async def test_lane_off_fallback_skips_item_the_lane_already_owns(monitor, db, lane):
+    """Mirror of the retirement: an item carded while the lane was live keeps
+    the lane's record after the lane is disabled — no fallback beside it."""
+    await _widget_candidate(db)
+    if lane is not None:
+        monitor.set_build_lane(lane)
+    created = await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-9",
+        source_files=["Capabilities.md"],
+    )
+    assert created == 0
+    assert await _build_follow_ups(db) == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_covers_already_tracked_items_and_only_pending_rows(monitor, db):
+    """The lane skips an item it already tracks (handle_eval creates nothing),
+    yet it still owns it — retirement keys on the candidate existing, so it
+    fires anyway. Every verdict's fallback row is retired while still pending;
+    a row the user moved (here: blocked) is left alone."""
+    from genesis.db.crud import follow_ups
+
+    for i, verdict in enumerate(("needs_discussion", "dont_build", "build")):
+        await monitor._create_follow_ups_from_eval(
+            evaluation_text=_build_eval(verdict),
+            batch_id=f"batch-build-10{i}",
+            source_files=["Capabilities.md"],
+        )
+    rows = await db.execute(
+        "SELECT id, content FROM follow_ups WHERE source = 'inbox_evaluation' ORDER BY rowid"
+    )
+    ids = {r["content"].split("]")[0] + "]": r["id"] for r in await rows.fetchall()}
+    assert set(ids) == {"[BUILD: NEEDS DISCUSSION]", "[BUILD: DONT_BUILD]", "[BUILD]"}
+    await follow_ups.update_status(
+        db, ids["[BUILD]"], status="blocked", blocked_reason="user parked it",
+    )
+
+    await _widget_candidate(db, verdict="needs_discussion")  # tracked earlier
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    retired = await monitor._retire_build_fallbacks_owned_by_lane(_build_eval("build"))
+
+    assert retired == 2
+    for label in ("[BUILD: NEEDS DISCUSSION]", "[BUILD: DONT_BUILD]"):
+        row = await follow_ups.get_by_id(db, ids[label])
+        assert row["status"] == "completed"
+        assert "build lane" in row["resolution_notes"].lower()
+    assert (await follow_ups.get_by_id(db, ids["[BUILD]"]))["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_retirement_is_inert_when_lane_not_live_or_item_unowned(monitor, db):
+    from genesis.db.crud import follow_ups
+
+    await monitor._create_follow_ups_from_eval(
+        evaluation_text=_build_eval("build"),
+        batch_id="batch-build-11",
+        source_files=["Capabilities.md"],
+    )
+    # Lane not live: nothing retired even though a candidate exists.
+    await _widget_candidate(db)
+    monitor.set_build_lane(SimpleNamespace(enabled=False))
+    assert await monitor._retire_build_fallbacks_owned_by_lane(_build_eval("build")) == 0
+    # Lane live but a DIFFERENT item is evaluated: its (absent) candidate owns nothing.
+    monitor.set_build_lane(SimpleNamespace(enabled=True))
+    other = _build_eval("build").replace("Widget Skill", "Gadget Skill")
+    assert await monitor._retire_build_fallbacks_owned_by_lane(other) == 0
+    assert len(await follow_ups.get_actionable(db)) == 1
+
+
+# ── Review round 1 on #2447: an invalidated approval at the retry cap ────────
+
+
+def _inbox_alerts():
+    from genesis.env import alert_queue_root
+    from genesis.guardian.alert.queue import list_queued
+
+    return [e for _p, e in list_queued(alert_queue_root()) if e.get("source") == "inbox"]
+
+
+async def _seed_expiring_row(db, inbox_dir, *, request_id, retry_count):
+    from genesis.db.crud import inbox_items
+
+    f, _h = await _seed_parked_row(
+        db, inbox_dir, request_id=request_id,
+        content="https://example.com/expiring-item\n",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET retry_count = ?, batch_items = ? WHERE id = ?",
+        (
+            retry_count,
+            inbox_items.serialize_batch_items(["https://example.com/expiring-item"]),
+            f"row-{request_id}",
+        ),
+    )
+    await db.commit()
+    return f
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["expired", "cancelled", None])
+async def test_approval_ending_on_the_last_retry_does_not_strand_the_item(
+    monitor, inbox_dir, db, terminal,
+):
+    """Devin (severe) on #2447: an approval that ended unanswered spent a retry.
+    On the last one the row reached the cap, its hash became the file's known
+    hash, and the unchanged file was never evaluated again. An approval ending
+    is not the item failing: the row keeps its retries, stays retriable, and
+    the same row is asked about again.
+    ``None`` is an approval the manager no longer has."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-new",
+    )
+    approvals = {} if terminal is None else {"req-end": {"id": "req-end", "status": terminal}}
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision, approval_by_id=approvals,
+    )
+    await _seed_expiring_row(
+        db, inbox_dir, request_id="req-end",
+        retry_count=monitor._config.max_retries - 1,
+    )
+    await monitor.check_once()
+
+    rows = {r["id"]: dict(r) for r in await (await db.execute(
+        "SELECT id, status, retry_count, error_message FROM inbox_items"
+    )).fetchall()}
+    # The item is not stranded: the SAME row keeps its retries and carries the
+    # item into a new approval request.
+    assert list(rows) == ["row-req-end"], rows
+    row = rows["row-req-end"]
+    assert row["retry_count"] == monitor._config.max_retries - 1, row
+    assert row["error_message"] == "awaiting_approval:req-new", row
+    monitor._autonomous_dispatcher.route.assert_awaited_once()
+    assert _inbox_alerts() == []
+
+
+@pytest.mark.asyncio
+async def test_failed_approval_lookup_leaves_the_row_parked(monitor, inbox_dir, db):
+    """Internal review of #2447: a lookup that RAISED used to leave the status
+    at None, which reads as "approval missing" — the row was ended while its
+    request was still pending, and the orphan guard then re-sent it."""
+    decision = AutonomousDispatchDecision(mode="blocked", reason="approval requested")
+    # A pending site row lets the orphan guard actually run, so the
+    # cancel assertion below can fail.
+    dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[{
+            "id": "req-live", "status": "pending",
+            "_context": {"subsystem": "inbox", "policy_id": "inbox_evaluation"},
+        }],
+    )
+
+    async def _boom(_request_id):
+        raise RuntimeError("approvals table locked")
+
+    dispatcher.approval_gate.approval_manager.get_by_id = _boom
+    monitor._autonomous_dispatcher = dispatcher
+    await _seed_expiring_row(db, inbox_dir, request_id="req-live", retry_count=0)
+    await monitor.check_once()
+
+    row = await (await db.execute(
+        "SELECT status, error_message FROM inbox_items WHERE id = 'row-req-live'"
+    )).fetchone()
+    assert (row["status"], row["error_message"]) == (
+        "processing", "awaiting_approval:req-live",
+    ), dict(row)
+    dispatcher.approval_gate.approval_manager.cancel.assert_not_called()
+    dispatcher.route.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ended_approval_stays_retriable_after_the_cap_is_lowered(
+    monitor, inbox_dir, db,
+):
+    """Codex (#2447 round 3): a row parked for approval under a higher cap can
+    carry a retry count at or above a LOWERED cap. When its approval ends it
+    must still come back, not land at the cap where nothing retries it."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested", approval_request_id="req-new",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        approval_by_id={"req-end": {"id": "req-end", "status": "expired"}},
+    )
+    await _seed_expiring_row(
+        db, inbox_dir, request_id="req-end",
+        retry_count=monitor._config.max_retries + 2,  # counted under an older, higher cap
+    )
+    await monitor.check_once()
+    row = await (await db.execute(
+        "SELECT retry_count, error_message FROM inbox_items WHERE id = 'row-req-end'"
+    )).fetchone()
+    assert row["retry_count"] == monitor._config.max_retries - 1, dict(row)
+    assert row["error_message"] == "awaiting_approval:req-new", dict(row)
