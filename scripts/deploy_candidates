@@ -1,0 +1,97 @@
+#!/bin/bash
+# deploy_candidates — the entry to the engine of `live`, the local integration
+# branch (scripts/deploy_candidates.py; its header documents every command).
+#
+# Usage: scripts/deploy_candidates add <branch> --owner <who> [--pr N] [--owner-approved]
+#        scripts/deploy_candidates drop <branch> [--no-rebuild] [--wait N]
+#        scripts/deploy_candidates rebuild [--wait N]
+#        scripts/deploy_candidates list | status
+#        scripts/deploy_candidates adopt <new-branch> --owner <who>
+#
+# This shell is thin on purpose. For the commands that move the checkout
+# (rebuild, and drop, which rebuilds) it takes, the way deploy_code_only.sh does:
+#   update.lock EXCLUSIVE and QUEUING (--wait N seconds, default 7200, or
+#     GENESIS_DEPLOY_LOCK_WAIT), so a rebuild never lands inside update.sh, a
+#     deploy or a validation's shared hold;
+#   the deploy marker, so the watchdog defers instead of restarting the server
+#     in the middle of a checkout move.
+# Then it runs the engine as a CHILD, passing the lock's fd (which the engine
+# checks) and EPHEMERAL_DIRTY_RE from scripts/lib/deploy_marker.sh, the one
+# definition of which tracked files a deploy may find dirty. Every other command
+# runs the engine directly, with no lock.
+#
+# drop, list and status work from a plain shell (`env -i bash scripts/deploy_candidates
+# drop <branch>`): HOME is resolved from passwd when unset, and the engine needs
+# only python3's standard library, git and flock. That is the repair path for a
+# candidate whose hook blocks every session.
+#
+# Exit codes: the engine's (0 done, 1 refused or failed, 2 usage), plus 200 when
+# update.lock is still held after the wait; 130 and 143 when interrupted.
+
+set -euo pipefail
+
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
+fi
+export HOME
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+_SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/deploy_marker.sh
+. "$_SELF_DIR/lib/deploy_marker.sh"
+export DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE"
+
+LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
+LOCK_HELD_RC=200
+WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
+
+# --wait belongs to this shell; everything else goes to the engine as given.
+args=()
+needs_lock=""
+cmd="${1:-}"
+case "$cmd" in
+    rebuild|drop) needs_lock=1 ;;
+esac
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --wait)
+            [ -n "$needs_lock" ] || die "--wait belongs to rebuild and drop."
+            WAIT_S="${2:?--wait needs a number of seconds}"; shift 2 ;;
+        --no-rebuild)
+            needs_lock=""; args+=("$1"); shift ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+case "$WAIT_S" in
+    ''|*[!0-9]*) die "the lock wait must be a whole number of seconds (got: $WAIT_S)" ;;
+esac
+
+if [ -z "$needs_lock" ]; then
+    exec python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}"
+fi
+
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec {_UPDATE_LOCK_FD}>"$LOCK_FILE"
+if ! flock -w "$WAIT_S" "$_UPDATE_LOCK_FD"; then
+    echo "ERROR: $LOCK_FILE still held after ${WAIT_S}s — update.sh, a deploy, a restore or a" >&2
+    echo "       validation hold (flock -s) is running. Nothing changed; retry when it ends." >&2
+    exit "$LOCK_HELD_RC"
+fi
+
+trap '_release_deploy_marker' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+_marker_rc=0
+_acquire_deploy_marker || _marker_rc=$?
+if [ "$_marker_rc" -eq 2 ]; then
+    die "cannot write the deploy marker $DEPLOY_MARKER_FILE — without it the watchdog could restart genesis-server mid-rebuild. Nothing changed."
+elif [ "$_marker_rc" -ne 0 ]; then
+    die "a live deploy (pid $DEPLOY_MARKER_HOLDER) holds the deploy marker $DEPLOY_MARKER_FILE — a dashboard update or a restore is running. Nothing changed."
+fi
+
+rc=0
+DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}" || rc=$?
+exit "$rc"
