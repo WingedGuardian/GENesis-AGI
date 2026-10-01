@@ -201,6 +201,26 @@ class StoragePoolConfig:
     # (threshold 80%) grows metadata first when it can.
     min_meta_reserve_pct: float = 10.0
 
+    # --- EARLY relief from the MEASURED growth rate (pool_runway.py) ---------
+    # The reserve above is a floor. Relief also acts EARLY when the pool's
+    # measured growth would fill data or metadata within early_horizon_hours.
+    # Early relief has less authority than the reserve: it may delete
+    # pre-recovery and superseded healthy snapshots, and the rollback lifeline
+    # only once it is older than lifeline_max_age_hours (an old lifeline has
+    # diverged the most) and, on LVM, measured holding space. A young lifeline
+    # is only ever taken by the reserve rule. 0 disables early relief. An
+    # invalid value in these keys disables early relief and the extend only.
+    early_horizon_hours: float = 48.0
+    lifeline_max_age_hours: float = 48.0
+    # Pool history: one sample per interval, the newest max_samples kept
+    # (2016 x 5 min = 7 days).
+    history_sample_interval_s: int = 300
+    history_max_samples: int = 2016
+    # LVM partial extend (pool_extend.py; autoextend's own trigger, not the
+    # rate): left unallocated in the VG (or twice the metadata LV, if larger)
+    # so the metadata LV can still grow.
+    extend_keep_free_mib: int = 512
+
 
 @dataclass
 class MemoryTiersConfig:

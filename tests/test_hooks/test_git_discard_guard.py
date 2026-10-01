@@ -1589,9 +1589,11 @@ def test_an_untokenizable_clean_mentioning_command_is_still_ALLOWED():
     None:` left the whole suite green while re-introducing an over-block on the
     measured ~15% of real clean-mentioning commands that merely fail to tokenize
     (an apostrophe in a commit message is the common case). The fixture asserts its
-    own blindness KIND, so it cannot quietly start testing the other path.
+    own blindness KIND, so it cannot quietly start testing the other path. (It
+    once used an escaped quote inside $'…'; that is now built text, a bounds-type
+    cause, and the kind check below is what caught the switch.)
     """
-    cmd = """git commit -m $'don\\'t clean' && git status"""
+    cmd = "git commit -m x  # don't clean the tree"
     _segs, blind = shell_parse.analyze_checked(cmd)
     assert blind is not None and not blind.bounds_induced, (
         "fixture must be untokenizable-but-not-bounds-induced, or it proves nothing"

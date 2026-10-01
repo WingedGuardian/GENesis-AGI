@@ -640,6 +640,21 @@ async def _impl_session_ledger_update(
         return {"error": f"Failed to update ledger item: {exc}"}
 
 
+async def _impl_session_address(session_ids: list[str]) -> dict:
+    """Resolve session ids (or unique prefixes) to their SendMessage names."""
+    ids = [s for s in (session_ids or []) if isinstance(s, str) and s.strip()]
+    if not ids:
+        return {"error": "session_ids is required"}
+    try:
+        from genesis.session_awareness.peer_address_cli import lookup
+
+        # The database only expands a prefix; a full id resolves without it.
+        return {"results": await lookup(_get_db(), ids)}
+    except Exception as exc:
+        logger.error("session_address failed", exc_info=True)
+        return {"error": f"Failed to resolve session address: {exc}"}
+
+
 # ---------------------------------------------------------------------------
 # MCP tool decorators
 # ---------------------------------------------------------------------------
@@ -753,3 +768,24 @@ async def session_ledger_update(
         text=text or None,
         evidence=evidence or None,
     )
+
+
+@mcp.tool()
+async def session_address(session_ids: list[str]) -> dict:
+    """Which SendMessage name each Claude Code session id answers to.
+
+    Genesis prints session UUIDs (charters, ledgers, the [Concurrent] lines);
+    SendMessage needs the peer NAME, which ListAgents prints without the UUID.
+    This joins them through Claude Code's own session registry, and answers
+    only when exactly one live process holds that session. Otherwise the
+    status says why: not-reachable (with each registry entry's reason),
+    ambiguous, unnamed, registry-format-changed, or unresolved-prefix.
+    shared_name means another live session has the same name, so address it
+    with the [ref] ListAgents shows. pane is a tmux location, not an identity.
+    name and pane are the peer's own raw registry text; display is the
+    allowlisted form, and the only one safe to repeat into another context.
+
+    Args:
+        session_ids: full session ids, or unique prefixes of ones Genesis knows.
+    """
+    return await _impl_session_address(session_ids)

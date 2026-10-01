@@ -84,6 +84,13 @@ class TestBuildRemoteCommandMaxTurns:
         cmd = self._adapter()._build_remote_command("sonnet", "high")
         assert "--max-turns 25" in cmd
 
+    def test_remote_session_runs_with_function_hooks_off(self):
+        """The remote claude is a dispatched session like any other
+        (genesis.cc.child_env): the flag is an env assignment on its command,
+        after the cd so the cd guard is unchanged."""
+        cmd = self._adapter()._build_remote_command("sonnet", "high")
+        assert "&& CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0 /usr/local/bin/claude -p" in cmd, cmd
+
     def test_explicit_max_turns_passes_through(self):
         cmd = self._adapter()._build_remote_command("sonnet", "high", 80)
         assert "--max-turns 80" in cmd

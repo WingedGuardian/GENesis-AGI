@@ -9,6 +9,7 @@ description: >
   to be retrieved. Also activate when processing multiple YouTube URLs
   in batch. Do NOT use for non-YouTube video platforms, local video
   files, or audio-only podcast URLs.
+keywords: [youtube, youtu]
 ---
 
 ## Overview

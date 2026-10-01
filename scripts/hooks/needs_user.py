@@ -53,6 +53,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import session_id as _payload_session_id  # noqa: E402
 from secret_scrub import scrub  # noqa: E402
 
+try:  # noqa: E402
+    from hook_ask_policy import ask_suppressed, drain_notes, suppressed_reason
+except Exception:  # noqa: BLE001 — version skew must fall back to the PROMPT.
+    # The other two imports are bare on purpose: without them the guard cannot
+    # judge at all, and its caller degrades to blocking. This one is different —
+    # its absence means "this install declared no local ask policy", which is
+    # exactly the public default. Falling back to asking is the same verdict a
+    # clone with no config file gets, so a half-deployed hook tree costs an extra
+    # prompt rather than a silenced one.
+    def ask_suppressed(key: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def suppressed_reason(key: str, detail: str = "") -> str:  # type: ignore[misc]
+        return ""
+
+    def drain_notes() -> str:  # type: ignore[misc]
+        return ""
+
+
 #: Stamped on every Genesis-dispatched (autonomous/headless) session by
 #: ``cc/invoker.py``. A user-launched foreground session does not carry it.
 #: Same detector ``git_push_guard._is_dispatched`` uses — deliberately not
@@ -124,7 +143,14 @@ def _record(action: str, detail: str, session: str) -> bool:
         return False
 
 
-def decide(action: str, reason: str, detail: str = "", payload: dict | None = None) -> dict:
+def decide(
+    action: str,
+    reason: str,
+    detail: str = "",
+    payload: dict | None = None,
+    *,
+    ask_key: str | None = None,
+) -> dict:
     """Verdict for an action that requires the user, plus the record when unattended.
 
     Args:
@@ -134,6 +160,13 @@ def decide(action: str, reason: str, detail: str = "", payload: dict | None = No
                 for a human deciding in one glance, not for a log.
         detail: optional specifics (the command, the path). SCRUBBED before it is
                 recorded; pass the real thing.
+        ask_key: the ``hook_ask_policy`` key naming THIS prompt, if an install is
+                allowed to turn it off locally. Omitted (the default) means the
+                prompt is not suppressible at all, which is why every existing
+                call site keeps its behaviour unchanged. The check sits INSIDE
+                this function, after the dispatched branch, for the same reason
+                the recording does: a caller cannot honour the policy and forget
+                the ordering, and no local config can reach the dispatched deny.
         payload: the full CC hook payload. ALWAYS pass it. The session id is the
                 other half of the dedupe identity, and it arrives on the payload
                 under the current contract — an earlier revision read
@@ -145,15 +178,41 @@ def decide(action: str, reason: str, detail: str = "", payload: dict | None = No
                 would have been invisible: fewer alerts looks like fewer problems.
 
     Returns a PreToolUse payload:
-      * foreground  -> ``ask``   (a person can answer)
-      * dispatched  -> ``deny``  AND a critical observation is recorded first
+      * dispatched              -> ``deny``   AND a critical observation first
+      * foreground, ask_key off -> NO decision, only ``additionalContext``
+                                   naming the local policy
+      * foreground              -> ``ask``    (a person can answer)
+
+    "Off" is not an ``allow``. An allow would override Claude Code's own
+    permission prompt for the whole Bash command, so a compound that touches the
+    credentials AND does something else would be approved by a setting that was
+    only about the credentials prompt. With no decision, this hook simply stops
+    objecting; other hooks and the native permission settings decide.
+
+    The dispatched branch is checked FIRST and takes no argument from the local
+    policy. A background session is denied because nobody can answer, not because
+    the prompt is enabled — so turning the prompt off must not turn the block off
+    with it, and the ordering here is what makes that structural rather than
+    remembered.
     """
     if not is_dispatched():
+        suppressed = ask_key is not None and ask_suppressed(ask_key)
+        # A misconfigured policy announces itself in the payload: Claude Code
+        # discards an exit-0 hook's stderr.
+        notes = drain_notes() if ask_key is not None else ""
+        if suppressed:
+            note = suppressed_reason(ask_key, action)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": f"{note}\n\n{notes}" if notes else note,
+                }
+            }
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "ask",
-                "permissionDecisionReason": reason,
+                "permissionDecisionReason": f"{reason}\n\n{notes}" if notes else reason,
             }
         }
 

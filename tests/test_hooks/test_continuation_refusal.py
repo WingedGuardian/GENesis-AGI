@@ -530,7 +530,14 @@ def test_a_continued_worktree_mention_is_refused_without_a_guessed_target(sandbo
 def test_a_launcher_next_to_a_mention_borrows_no_target_from_another_reading(sandbox):
     """The launcher fallback still reads targets from TEXT, over each mention reading
     separately; read as one joined string, the word after a mention at the end of
-    one reading was taken from the start of the next."""
+    one reading was taken from the start of the next.
+
+    The VERDICT changed with the unread-target refusal, the invariant did not. This
+    command used to run only because the phrase ended the text: the same command
+    with any word after the phrase (`... remove doc'`) was already refused, with that
+    word read as the target. A carrier next to a mention with no readable target is
+    now refused consistently, and the refusal still borrows no target from anywhere
+    — it names none."""
     home, repo = sandbox
     res = _run(
         _HOOKS_DIR / "worktree_cwd_guard.py",
@@ -538,7 +545,9 @@ def test_a_launcher_next_to_a_mention_borrows_no_target_from_another_reading(san
         home,
         repo,
     )
-    assert res.returncode == 0, (res.stdout + res.stderr)[:400]
+    assert res.returncode == 2, (res.stdout + res.stderr)[:400]
+    assert "cannot read which worktree" in res.stderr, res.stderr[:400]
+    assert "Cannot remove worktree '" not in res.stderr, res.stderr[:400]
 
 
 def test_the_tmux_note_survives_a_continuation(sandbox):

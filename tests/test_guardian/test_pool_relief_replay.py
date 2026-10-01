@@ -61,6 +61,7 @@ class FakeHost:
         self.snaps: dict[str, datetime] = {}
         self.max_data_pct = 0.0
         self.creates_refused = 0
+        self.extended_bytes = 0
 
     # -- the pool model -------------------------------------------------
     def used(self) -> float:
@@ -107,10 +108,22 @@ class FakeHost:
                 "metadata_percent": "40.00",
                 "lv_size": str(self.size),
                 "lv_name": "IncusThinPool",
+                "lv_metadata_size": str(84 * 1024**2),
+                "lv_profile": self.profile or "",
             }
             return 0, json.dumps({"report": [{"lv": [row]}]}), ""
+        if cmd == "vgs" and "vg_extent_size" in a:
+            return 0, f"  {_EXTENT}\n", ""
         if cmd == "vgs":
             return 0, f"  {self.vg_free}\n", ""
+        if cmd == "lvextend":
+            # `lvextend -L +<bytes>b vg/lv`: LVM grows by whole extents from VG free.
+            grow = int(a[a.index("-L") + 1].lstrip("+").rstrip("b"))
+            assert grow % _EXTENT == 0 and grow <= self.vg_free, (grow, self.vg_free)
+            self.size += grow
+            self.vg_free -= grow
+            self.extended_bytes += grow
+            return 0, "", ""
         if cmd == "incus" and a[1] == "snapshot":
             verb = a[2]
             if verb == "list":
@@ -177,6 +190,7 @@ async def _simulate(host: FakeHost, cfg: GuardianConfig, days: float, *, relief:
             if relief:
                 await check_pool_relief(
                     cfg, dispatcher, snapshots, now=host.now, healthy_confirmed=True,
+                    run=host.run,
                 )
             await _maintain_snapshots(cfg, snapshots, is_healthy=True, dispatcher=dispatcher)
             host.max_data_pct = max(host.max_data_pct, host.data_pct())
@@ -234,6 +248,9 @@ async def test_delete_first_rotation_alone_prevents_the_fill(tmp_path) -> None:
     cfg = _config(tmp_path)
     with (
         patch("genesis.guardian.pool_relief.plan_order", return_value=[]),
+        # The LVM extend would lift the pool back under LVM's refusal line and
+        # unjam rotation on its own; off here, so this layer stands alone.
+        patch("genesis.guardian.pool_extend.plan_extend", return_value=None),
     ):
         await _simulate(host, cfg, days=10, relief=True)
     assert host.creates_refused > 0  # guard-the-guard: the jam really happened
@@ -243,10 +260,14 @@ async def test_delete_first_rotation_alone_prevents_the_fill(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_relief_alone_prevents_the_fill(tmp_path) -> None:
     """Relief as an independent layer: rotation stuck create-first (profile
-    ON so LVM refuses, as it did)."""
+    ON so LVM refuses, as it did), and the LVM extend off (it would unjam
+    rotation by itself; see test_extend_unjams_rotation)."""
     host = _incident_host()
     cfg = _config(tmp_path)
-    with patch.object(SnapshotManager, "_stale_lifeline", AsyncMock(return_value=None)):
+    with (
+        patch.object(SnapshotManager, "_stale_lifeline", AsyncMock(return_value=None)),
+        patch("genesis.guardian.pool_extend.plan_extend", return_value=None),
+    ):
         await _simulate(host, cfg, days=10, relief=True)
     assert host.creates_refused > 0  # guard-the-guard: rotation really jammed
     assert host.max_data_pct < 100.0, host.max_data_pct
@@ -324,3 +345,63 @@ async def test_stable_but_full_pool_keeps_its_lifeline(
     # Refusals are loud but throttled (realert_hours), not hourly.
     refused = [c for c in dispatcher.send.await_args_list if "NOT refreshed" in c.args[0].title]
     assert 1 <= len(refused) <= 5 * 24 / cfg.storage_pool.realert_hours + 1
+
+
+def _titles(dispatcher: AsyncMock) -> list[str]:
+    return [c.args[0].title for c in dispatcher.send.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_early_relief_acts_well_before_the_reserve(tmp_path) -> None:
+    """Rotation jammed create-first (as it was), extend off: the measured
+    growth makes relief act while the pool still has room. Control arm: with
+    early relief off, only the reserve acts, near full."""
+    peaks = {}
+    for horizon in (0.0, 48.0):
+        host = _incident_host()
+        cfg = _config(tmp_path / f"h{horizon:g}")
+        cfg.storage_pool.early_horizon_hours = horizon
+        with (
+            patch.object(SnapshotManager, "_stale_lifeline", AsyncMock(return_value=None)),
+            patch("genesis.guardian.pool_extend.plan_extend", return_value=None),
+        ):
+            dispatcher = await _simulate(host, cfg, days=10, relief=True)
+        assert host.creates_refused > 0  # guard-the-guard: rotation really jammed
+        peaks[horizon] = (host.max_data_pct, _titles(dispatcher))
+    reserve_peak, reserve_titles = peaks[0.0]
+    early_peak, early_titles = peaks[48.0]
+    assert reserve_peak >= 96.0, reserve_peak  # the control really ran near full
+    assert "Guardian freed pool space early" not in reserve_titles
+    assert early_peak < 93.0, early_peak
+    assert "Guardian freed pool space early" in early_titles
+    assert "Guardian freed pool space" not in early_titles  # never reached the reserve
+
+
+@pytest.mark.asyncio
+async def test_extend_unjams_rotation(tmp_path) -> None:
+    """The measured 3.9 GiB of VG free that LVM's 20% step could never use is
+    put to work at LVM's own threshold, keeping the metadata headroom, once.
+    That lifts the pool back under LVM's refusal line, so the healthy rotation
+    is never refused (the incident's first link), even with delete-first off."""
+    host = _incident_host()
+    free0 = host.vg_free
+    cfg = _config(tmp_path)
+    with patch.object(SnapshotManager, "_stale_lifeline", AsyncMock(return_value=None)):
+        dispatcher = await _simulate(host, cfg, days=10, relief=True)
+    keep = max(cfg.storage_pool.extend_keep_free_mib * 1024**2, 2 * 84 * 1024**2)
+    assert host.extended_bytes >= free0 - keep - _EXTENT, host.extended_bytes
+    assert host.vg_free >= keep
+    assert _titles(dispatcher).count("Guardian extended the thin pool") == 1
+    assert host.creates_refused == 0
+    assert host.max_data_pct <= 80.5, host.max_data_pct
+
+
+@pytest.mark.asyncio
+async def test_no_profile_means_no_extend(tmp_path) -> None:
+    """Negative control: without the install's autoextend profile the VG
+    space is not relief's to spend."""
+    host = _incident_host(profile=None)
+    cfg = _config(tmp_path)
+    with patch.object(SnapshotManager, "_stale_lifeline", AsyncMock(return_value=None)):
+        await _simulate(host, cfg, days=6, relief=True)
+    assert host.extended_bytes == 0

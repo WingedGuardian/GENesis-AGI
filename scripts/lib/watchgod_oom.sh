@@ -2,7 +2,7 @@
 # OOM event capture for scripts/tmp_watchgod.sh — SOURCED by it, never run.
 # Moved here verbatim from tmp_watchgod.sh (watchgod v2) to keep the daemon
 # under the 1000-line cap; behaviour and tests (test_watchgod_oom.py) unchanged.
-# Uses the daemon's log() and queue_alert(), and its HOME-derived paths.
+# Uses the daemon's log() and queue_alert_try(), and its HOME-derived paths.
 
 # ── OOM event capture (best-effort, cgroup v2) ───────────────
 # A cgroup OOM kill silently collapses a CC session (tmux `exec claude` → claude
@@ -162,10 +162,41 @@ check_oom_events() {
     #                 resolution must page and re-anchor, because the fallback
     #                 window would return pre-baseline records that could
     #                 otherwise "account" for a post-startup kill.
+    #
+    # An OPTIONAL sixth field, `owed=<from>-<to>`, is present only while a page
+    # is owed (#2514): a decision to page whose enqueue FAILED (a full disk is
+    # the likely cause). The decision is never re-made — the counter, deficit
+    # and cursor have already moved, and re-running the reconciliation would
+    # count the same records twice — only the DELIVERY is retried, at the start
+    # of every tick, before the counter is read. Success clears it. Absent
+    # whenever nothing is owed, so every other spec is unchanged. Limit, stated:
+    # the spec lives in the daemon's memory, so a watchgod restart while a page
+    # is owed drops it (the snapshot in OOM_LOG and the WARN log line remain).
     local prev_spec="$1" prev prev_local prev_deficit prev_deficit_ts prev_drain
-    prev="${prev_spec%%:*}"
+    local base_spec="$prev_spec" owed_from="" owed_to="" owed_retry_failed=0
+    # Parsed on its own, before and independent of the other fields' validation,
+    # so a malformed counter or an empty late-arm spec still keeps what is owed.
+    if [[ "$prev_spec" =~ ^(.*):owed=([0-9]+)-([0-9]+)$ ]]; then
+        base_spec="${BASH_REMATCH[1]}"
+        owed_from="${BASH_REMATCH[2]}"
+        owed_to="${BASH_REMATCH[3]}"
+    fi
+    if [[ -n "$owed_to" ]]; then
+        if queue_alert_try emergency "watchgod:oom" "cgroup OOM kill(s) detected (delayed page)" \
+            "OOM kill(s) in the container cgroup (oom_kill ${owed_from}->${owed_to}). This page is late: the first enqueue failed; which units were killed is in the watchgod log at that time. A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
+            "watchgod:oom:${owed_to}"; then
+            log INFO "delayed OOM page queued (oom_kill ${owed_from}->${owed_to})"
+            owed_from=""
+            owed_to=""
+        else
+            owed_retry_failed=1
+        fi
+    fi
+    local owed_suffix=""
+    [[ -n "$owed_to" ]] && owed_suffix=":owed=${owed_from}-${owed_to}"
+    prev="${base_spec%%:*}"
     local _r1="" _r2="" _r3="" _r4=""
-    [[ "$prev_spec" == *:* ]] && _r1="${prev_spec#*:}"
+    [[ "$base_spec" == *:* ]] && _r1="${base_spec#*:}"
     prev_local="${_r1%%:*}"
     [[ "$_r1" == *:* ]] && _r2="${_r1#*:}"
     prev_deficit="${_r2%%:*}"
@@ -181,8 +212,8 @@ check_oom_events() {
     [[ "$prev_deficit_ts" =~ ^[0-9]+$ ]] || prev_deficit_ts=0
     [[ "$prev_drain" == "1" ]] || prev_drain=0
     local cur loc_oom now_epoch
-    cur=$(_read_oom_kill) || { printf '%s' "$prev_spec"; return 0; }
-    [[ "$cur" =~ ^[0-9]+$ ]] || { printf '%s' "$prev_spec"; return 0; }
+    cur=$(_read_oom_kill) || { printf '%s' "${base_spec}${owed_suffix}"; return 0; }
+    [[ "$cur" =~ ^[0-9]+$ ]] || { printf '%s' "${base_spec}${owed_suffix}"; return 0; }
     loc_oom=$(_read_oom_local_trigger) || loc_oom=""
     [[ "$loc_oom" =~ ^[0-9]+$ ]] || loc_oom=""
     now_epoch=$(date +%s)
@@ -286,9 +317,29 @@ check_oom_events() {
             elif [[ -z "$loc_oom" || -z "$prev_local" ]]; then
                 _why="trigger unverifiable (memory.events.local unreadable); killed unit(s): ${_oom_who}"
             fi
-            queue_alert emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
-                "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}; ${_why}). A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
-                "watchgod:oom:${cur}"
+            # A page still owed from an earlier tick whose retry failed THIS
+            # tick is folded in, so one page names both ranges. (When the retry
+            # succeeded, owed is already clear and this page stands alone.)
+            local _from="$prev" _earlier=""
+            if (( owed_retry_failed == 1 )) && [[ -n "$owed_to" ]]; then
+                _from="$owed_from"
+                _earlier=" Includes earlier kill(s) oom_kill ${owed_from}->${owed_to} whose page could not be queued then."
+            fi
+            if queue_alert_try emergency "watchgod:oom" "cgroup OOM kill(s) detected" \
+                "${n} process(es) OOM-killed in the container cgroup (oom_kill ${prev}->${cur}; ${_why}).${_earlier} A CC session vanishing with no crash message is often this. Snapshot: ${OOM_LOG}" \
+                "watchgod:oom:${cur}"; then
+                owed_from=""
+                owed_to=""
+            else
+                # Decided, not delivered: owe it. Never re-decide (see owed=
+                # in the spec comment); every later tick retries delivery.
+                # Logged once per decided page (retries do not reach here), and
+                # WITH the attribution: the delayed page cannot carry it, so it
+                # points the operator here (Devin review of #2706).
+                log WARN "OOM page could not be queued (oom_kill ${prev}->${cur}; ${_why}); retrying every poll"
+                owed_from="$_from"
+                owed_to="$cur"
+            fi
         fi
         # The deficit clock only restarts when the deficit GROWS; retirements
         # keep the original timestamp so a shrinking deficit cannot live
@@ -342,7 +393,9 @@ check_oom_events() {
     # verification: carry the last known local baseline forward (the tick
     # itself still pages — the current value is unknown — and a jump observed
     # once the file is readable again correctly reads as a container trigger).
-    printf '%s' "${cur}:${loc_oom:-$prev_local}:${prev_deficit}:${prev_deficit_ts}:${prev_drain}"
+    owed_suffix=""
+    [[ -n "$owed_to" ]] && owed_suffix=":owed=${owed_from}-${owed_to}"
+    printf '%s' "${cur}:${loc_oom:-$prev_local}:${prev_deficit}:${prev_deficit_ts}:${prev_drain}${owed_suffix}"
 }
 
 _oom_persist_cursor() {

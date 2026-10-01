@@ -95,6 +95,7 @@ class CompactionEngine:
         self,
         *,
         context_builder: EgoContextBuilder,
+        ego_source: str,
         context_weights: dict[str, str] | None = None,
         focus_id: str | None = None,
     ) -> str:
@@ -113,6 +114,13 @@ class CompactionEngine:
         focus_id:
             Optional target ID from the focus selector (e.g., goal_id).
             Forwarded to the context builder for focused sections.
+        ego_source:
+            Source tag of the ego this context is for (the value it writes
+            to ``ego_cycles.ego_source``, e.g. ``"user_ego_cycle"``). Scopes
+            "Your Previous Assessment" to that ego's own last cycle — two
+            egos share ``ego_cycles``, so an unscoped read hands each ego
+            whichever ego ran last. Required, with no unscoped default, so a
+            new caller cannot silently reintroduce that cross-ego read.
         """
         sections: list[str] = []
 
@@ -135,18 +143,26 @@ class CompactionEngine:
         if computed_focus:
             sections.append(f"## Current System State\n{computed_focus}\n")
 
-        # Ego's own previous assessment — from last cycle's ego_cycles
-        # record. Provides continuity without self-reinforcing loops
+        # Ego's own previous assessment — from THIS ego's last ego_cycles
+        # record (both egos write to that table, so the read is scoped by
+        # ego_source). Provides continuity without self-reinforcing loops
         # (this is read-only context, not persisted to ego_state).
         try:
-            recent = await ego_crud.list_recent_cycles(self._db, limit=1)
+            recent = await ego_crud.list_recent_cycles(
+                self._db, limit=1, ego_source=ego_source,
+            )
             if recent and recent[0].get("focus_summary"):
                 prev_assessment = recent[0]["focus_summary"]
                 sections.append(
                     f"## Your Previous Assessment\n{prev_assessment}\n"
                 )
         except Exception:
-            pass  # Non-critical — skip if unavailable
+            # Non-critical (the section is skipped), but never silent: a
+            # failed read must not look like "no previous assessment".
+            logger.warning(
+                "Previous-assessment read failed (ego_source=%s)",
+                ego_source, exc_info=True,
+            )
 
         # Fresh situational context from the context builder.
         # Enforce _ALWAYS_SECTIONS before passing to builder — single guard

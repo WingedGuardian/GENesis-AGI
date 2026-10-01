@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-29: 65 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-09-29: 66 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1050,4 +1050,33 @@ jobs:
         # skipif and attaches no client: it drives the real picker over a pipe
         # with a fake tmux on PATH, so there is no runner capability it can miss
         # and no runtime-skip path to lose a coin-flip on.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23476
+        #
+        # The update success-records branch adds one test file that does not
+        # exist on main (its delta is its FULL count) and grows one other:
+        #   pytest tests/test_scripts/test_update_success_records.py --collect-only -q
+        #     -> 10 tests collected
+        #   test_update_tier2_baseline.py goes 5 -> 8 (unreadable history, no
+        #   history table, and no interpreter for the reader are each a new case).
+        # test_update_rollback_recovery.py is edited count-neutrally (8 == 8).
+        # So that floor is 23476 + 13 = 23489.
+        #
+        # The deploy-checkout lib branch adds three test files that do not exist on
+        # main, so each delta is its FULL collected count, and edits seven others
+        # count-neutrally (each re-measured, branch == main):
+        #   pytest tests/test_scripts/test_deploy_checkout.py --collect-only -q
+        #     -> 36 tests collected
+        #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
+        #     -> 28 tests collected
+        #   pytest tests/test_scripts/test_update_checkout_moved.py --collect-only -q
+        #     -> 29 tests collected
+        # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
+        # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
+        # does not move.
+        #
+        # UNION with the deploy-guidance PR (#2101): it changes one existing test
+        # file, tests/test_hooks/test_bash_timeout_guidance.py, which collects 3
+        # tests on main and 27 here, so its DELTA is +24 (measured against main,
+        # after the last test-adding edit, not against an earlier state of the
+        # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
+        # ceiling does not move. Floor: 23582 + 24 = 23606.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23606

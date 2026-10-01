@@ -21,19 +21,32 @@ Two layers stop that incident, and this module is the second:
    waits ``_SETTLE`` before the next action, so each effect is re-measured
    first (btrfs frees a deleted subvolume asynchronously).
 
+Relief also acts EARLY, from the pool's MEASURED growth (``pool_runway``):
+when data or metadata would fill within ``early_horizon_hours``. Early relief
+has less authority than the reserve. It may take pre-recovery snapshots,
+superseded healthy ones, and the rollback lifeline only once it is older than
+``lifeline_max_age_hours``; a young lifeline is only ever taken at the
+reserve. A rate read from step-shaped samples can be wrong, so a wrong one may
+cost an expendable snapshot, never the one recovery needs.
+
 Relief only ever deletes snapshots with the names the guardian generates
-(``SnapshotManager.list_snapshot_meta_strict``). It never grows the pool, and
-never deletes anything else; if the pool keeps filling after every guardian
-snapshot is gone, it says so in a CRITICAL alert.
+(``SnapshotManager.list_snapshot_meta_strict``), and never deletes anything
+else; if the pool keeps filling after every guardian snapshot is gone, it says
+so in a CRITICAL alert. Its one other mutation is ``pool_extend``: growing an
+LVM thin pool that carries the install's autoextend profile into VG space
+LVM's own autoextend cannot use, never while metadata is what runs short.
+After a successful extend VG free is down to the keep, so it does not extend
+again until space is added; a failed one backs off 24h.
 
 Fail-closed rules (each one a review finding):
 
 * an invalid configuration → alert-only, one warning a day;
 * an undetected or ambiguous pool (unknown backend, several thin pools in the
   VG) → no action, and a WARNING once that has lasted an hour;
-* the pool is re-measured immediately before the delete: it must be the same,
-  still-nameable pool AND still at or below a reserve (eased → ``eased``,
-  nothing deleted); the alert then reports that fresh measurement;
+* the pool is re-measured immediately before every mutation: it must be the
+  same, still-nameable pool AND still under pressure, at a level that still
+  allows the target (eased → ``eased``, nothing deleted); the alert then
+  reports that fresh measurement;
 * a delete that fails falls through to the next snapshot in the plan, so one
   undeletable snapshot cannot pin relief; still at most one delete per pass;
 * the settle stamp is persisted BEFORE the delete — if it cannot be written,
@@ -46,13 +59,27 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from genesis.guardian.pool import StoragePoolStatus
+from genesis.guardian.pool_runway import (
+    HISTORY_FILE,
+    PoolSample,
+    Runway,
+    _bad_num,
+    compute_runway,
+    early_allowed,
+    early_lifeline_ok,
+    early_reason,
+    gap_threshold,
+    load_history,
+    record_sample,
+    sample_from_status,
+    validate_early_config,
+)
 from genesis.guardian.snapshots import HEALTHY_SUFFIX
 from genesis.util.atomic import atomic_write_text
 
@@ -97,15 +124,7 @@ def validate_relief_config(config) -> str | None:
     cfg = config.storage_pool
 
     def num(name: str, lo: float, hi: float) -> str | None:
-        v = getattr(cfg, name)
-        if (
-            isinstance(v, bool)
-            or not isinstance(v, (int, float))
-            or not math.isfinite(v)
-            or not lo <= v <= hi
-        ):
-            return f"storage_pool.{name}={v!r} (expected a number in [{lo}, {hi}])"
-        return None
+        return _bad_num(cfg, name, lo, hi)
 
     if not isinstance(cfg.enabled, bool):
         # _build_sub does not coerce: `enabled: "false"` is a truthy string.
@@ -191,10 +210,19 @@ async def _send(dispatcher, severity, title: str, body: str) -> None:
 
 
 def pool_key(status: StoragePoolStatus) -> str | None:
-    """Stable identity of the measured pool, or None when unknown."""
+    """Stable identity of the measured pool, or None when unknown.
+
+    LVM pools are named by VG and thin-pool LV. A btrfs/dir pool has neither,
+    so its backing source is part of the identity: a pool recreated on other
+    storage under the same incus name must not share history or pass a
+    pre-delete re-check as the same pool (review).
+    """
     if not status.pool_name:
         return None
-    return f"{status.pool_name}|{status.vg_name or ''}|{status.thinpool_lv or ''}"
+    key = f"{status.pool_name}|{status.vg_name or ''}|{status.thinpool_lv or ''}"
+    if not status.vg_name and status.pool_source:
+        key = f"{key}|{status.pool_source}"
+    return key
 
 
 def _ambiguous_pool(status: StoragePoolStatus) -> bool:
@@ -225,12 +253,7 @@ def unactionable(status: StoragePoolStatus) -> tuple[str, str] | None:
     return None
 
 
-def shortfall(status: StoragePoolStatus, cfg) -> str | None:
-    """Why the pool is at or below a reserve (the reason text), or None.
-
-    Equality counts: the reserve exists to absorb one burst, so a pool with
-    exactly the reserve left has none to spare.
-    """
+def _data_short(status: StoragePoolStatus, cfg) -> str | None:
     data_pct = status.data_pct if status.data_pct is not None else status.pool_used_pct
     if data_pct is not None:
         free_pct = 100.0 - data_pct
@@ -239,6 +262,10 @@ def shortfall(status: StoragePoolStatus, cfg) -> str | None:
                 f"free data space {free_pct:.1f}% is at or below the "
                 f"{cfg.min_reserve_pct:g}% reserve"
             )
+    return None
+
+
+def _meta_short(status: StoragePoolStatus, cfg) -> str | None:
     if status.metadata_pct is not None:
         free_meta = 100.0 - status.metadata_pct
         if free_meta <= cfg.min_meta_reserve_pct:
@@ -247,6 +274,81 @@ def shortfall(status: StoragePoolStatus, cfg) -> str | None:
                 f"{cfg.min_meta_reserve_pct:g}% reserve"
             )
     return None
+
+
+def shortfall(status: StoragePoolStatus, cfg) -> str | None:
+    """Why the pool is at or below a reserve (the reason text), or None.
+
+    Equality counts: the reserve exists to absorb one burst, so a pool with
+    exactly the reserve left has none to spare.
+    """
+    return _data_short(status, cfg) or _meta_short(status, cfg)
+
+
+# Two levels of pressure. RESERVE (at or below a reserve) may free any
+# guardian snapshot, the rollback lifeline last. EARLY (the measured growth
+# fills the pool within early_horizon_hours) has less authority: a young
+# lifeline is never its target, because a rate read from step-shaped samples
+# can be wrong and the lifeline is the one snapshot recovery needs.
+LEVEL_RESERVE = "reserve"
+LEVEL_EARLY = "early"
+_NO_RUNWAY = Runway(None, None, None, None)
+
+
+@dataclass(frozen=True)
+class Pressure:
+    level: str | None  # LEVEL_RESERVE, LEVEL_EARLY or None
+    reason: str | None
+    runway: Runway
+
+
+def runway_for(status: StoragePoolStatus, cfg, history: list[PoolSample], now: datetime) -> Runway:
+    """The runway of ``status`` against ``history``; unknown on any error."""
+    try:
+        sample = sample_from_status(status, now, pool_key(status))
+        if sample is None:
+            return _NO_RUNWAY
+        return compute_runway(history, sample, gap_threshold(cfg.history_sample_interval_s))
+    except Exception:
+        logger.warning("pool runway computation failed", exc_info=True)
+        return _NO_RUNWAY
+
+
+def assess(
+    status: StoragePoolStatus, cfg, history: list[PoolSample], now: datetime, *, early: bool = True,
+) -> Pressure:
+    """The ONE pressure rule for the decision and every pre-mutation re-check.
+
+    ``early`` False (an invalid early-level configuration) leaves only the
+    reserve rule.
+    """
+    runway = runway_for(status, cfg, history, now) if early else _NO_RUNWAY
+    reason = shortfall(status, cfg)
+    if reason is not None:
+        return Pressure(LEVEL_RESERVE, reason, runway)
+    reason = early_reason(runway, cfg.early_horizon_hours) if early else None
+    if reason is not None:
+        return Pressure(LEVEL_EARLY, reason, runway)
+    return Pressure(None, None, runway)
+
+
+def extend_plan(status: StoragePoolStatus, cfg, p: Pressure) -> int | None:
+    """Bytes the LVM partial extend would grow the pool by now, or None.
+
+    Autoextend's own trigger (``pool_extend.plan_extend``), not the growth
+    estimate: a thin pool cannot shrink, so this never hangs on a rate
+    (review). The one pressure input is metadata: the extend grows only the
+    data LV, so it never spends the pass while metadata is short at its
+    reserve or by its measured growth.
+    """
+    from genesis.guardian.pool_extend import plan_extend
+
+    if _meta_short(status, cfg) is not None:
+        return None
+    meta_only = Runway(None, None, p.runway.meta_rate, p.runway.meta_hours)
+    if early_reason(meta_only, cfg.early_horizon_hours) is not None:
+        return None
+    return plan_extend(status, cfg.extend_keep_free_mib)
 
 
 def _numbers(status: StoragePoolStatus) -> str:
@@ -265,16 +367,20 @@ def _numbers(status: StoragePoolStatus) -> str:
 
 
 async def _recheck_before_delete(
-    config, status: StoragePoolStatus, cfg,
-) -> tuple[str | None, StoragePoolStatus | None]:
-    """Re-measure immediately before the delete: ``(stop, fresh)``.
+    config, status: StoragePoolStatus, cfg, history: list[PoolSample], now: datetime,
+    *, early: bool = True, extend: bool = False,
+) -> tuple[str | None, StoragePoolStatus | None, Pressure | None]:
+    """Re-measure immediately before a mutation: ``(stop, fresh, pressure)``.
 
-    ``stop`` is None — go ahead, with ``fresh`` the measurement to report —
-    only when the pool is still the one the decision was made on AND it is
-    still at or below a reserve: a shortfall that eased in between (an
-    autoextend landing, space freed elsewhere) is no longer a reason to
-    delete (review). Otherwise ``stop`` is ``"pool_changed"`` (unmeasurable
-    now, or a different pool) or ``"eased"``.
+    ``stop`` is None — go ahead, with ``fresh`` the measurement to report and
+    ``pressure`` its assessment — only when the pool is still the one the
+    decision was made on AND it is still under pressure: a shortfall that
+    eased in between (an autoextend landing, space freed elsewhere) is no
+    longer a reason to act (review). Otherwise ``stop`` is ``"pool_changed"``
+    (unmeasurable now, or a different pool) or ``"eased"``. The caller checks
+    that its target is still allowed at the fresh level. With ``extend`` the
+    pool need not be under pressure (the extend has autoextend's own trigger,
+    which the caller re-plans from ``fresh``); identity must still hold.
     """
     from genesis.guardian.pool import measure_storage_pool
 
@@ -282,14 +388,15 @@ async def _recheck_before_delete(
         again = await measure_storage_pool(config)
     except Exception:
         logger.warning("pre-delete pool re-check failed", exc_info=True)
-        return "pool_changed", None
+        return "pool_changed", None, None
     key = pool_key(status)
     if key is None or unactionable(again) is not None or pool_key(again) != key:
-        return "pool_changed", None
-    if shortfall(again, cfg) is None:
+        return "pool_changed", None, None
+    p = assess(again, cfg, history, now, early=early)
+    if p.level is None and not extend:
         logger.info("pool relief: the shortfall eased before the delete (%s)", _numbers(again))
-        return "eased", None
-    return None, again
+        return "eased", None, None
+    return None, again, p
 
 
 # --- planning ------------------------------------------------------------------
@@ -323,6 +430,167 @@ def plan_delete(snaps: list[SnapshotInfo]) -> str | None:
     """The ONE guardian snapshot relief deletes next, or None."""
     order = plan_order(snaps)
     return order[0] if order else None
+
+
+def _record_history(config, status: StoragePoolStatus, now: datetime) -> list[PoolSample]:
+    """Record this measurement in the bounded pool history; return the history."""
+    cfg = config.storage_pool
+    path = config.state_path / HISTORY_FILE
+    try:
+        sample = sample_from_status(status, now, pool_key(status))
+        if sample is None:
+            return load_history(path)
+        return record_sample(
+            path,
+            sample,
+            min_interval_s=cfg.history_sample_interval_s,
+            max_samples=cfg.history_max_samples,
+        )
+    except Exception:
+        logger.warning("pool history update failed", exc_info=True)
+        return []
+
+
+def _describe(status: StoragePoolStatus, p: Pressure) -> str:
+    """Every figure the decision used, for an alert body."""
+    numbers = _numbers(status)
+    if p.runway.data_rate is not None or p.runway.meta_rate is not None:
+        numbers = f"{numbers}; {p.runway.describe()}"
+    return numbers
+
+
+# After a failed or unconfirmed extend, wait before trying again: the space is
+# permanent, and a wedged LVM must not be retried on every settle.
+_EXTEND_BACKOFF_HOURS = 24
+
+
+def _backed_off(state: dict, key: str, now: datetime, hours: float) -> bool:
+    """An extend backoff is still running. Unlike ``_due``, a stamp in the
+    FUTURE (the clock stepped back) keeps it running: retrying a permanent
+    mutation early is not the safe direction (review)."""
+    raw = state.get(key)
+    if not raw:
+        return False
+    try:
+        last = datetime.fromisoformat(raw)
+        return last > now or now - last < timedelta(hours=hours)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _maybe_extend(
+    config, dispatcher, status: StoragePoolStatus, p: Pressure, grow: int,
+    history: list[PoolSample], state_path: Path, state: dict, now: datetime, run,
+    fresh_out: dict | None = None,
+) -> str | None:
+    """Run the LVM partial extend (pool_extend). Returns an outcome that ends
+    the pass, or None to go on to snapshot deletion.
+
+    Only as this pass's single action: the settle is stamped right before
+    ``lvextend``, after a re-measure shows the same pool and a fresh plan, and
+    the extend never exceeds that fresh plan (review). An unreadable extent
+    size stamps nothing and relief goes on to delete (retrying the read after
+    an hour). A re-measure that shows a changed pool, or no plan, ends the pass
+    (``extend_stopped``): the delete path would stop on the same re-measure.
+    The alert reports the fresh measurement.
+    """
+    from genesis.guardian.alert.base import AlertSeverity
+    from genesis.guardian.pool_extend import (
+        GUARD_STOP,
+        TIMED_OUT,
+        autoextend_reason,
+        extend_thinpool,
+    )
+
+    cfg = config.storage_pool
+    if _backed_off(state, "extend_backoff", now, _EXTEND_BACKOFF_HOURS):
+        return None
+    if _backed_off(state, "extend_read_backoff", now, 1):
+        return None
+    seen = {"status": status, "p": p, "plan_gone_under_pressure": False}
+
+    async def before_mutation() -> int | None:
+        stop, fresh, fp = await _recheck_before_delete(
+            config, status, cfg, history, now, extend=True,
+        )
+        if stop is not None:
+            return None
+        fresh_grow = extend_plan(fresh, cfg, fp)
+        if fresh_grow is None:
+            # The extend no longer applies (metadata went short, the profile
+            # was withdrawn), but the pool may still need relief: that must
+            # not be suppressed by the extend (review).
+            seen["plan_gone_under_pressure"] = fp.level is not None
+            if fresh_out is not None and fp.level is not None:
+                # The caller relieves on THIS measurement, which may be early
+                # pressure the pass did not see when it started (review).
+                fresh_out["status"], fresh_out["p"] = fresh, fp
+            return None
+        if not _stamp(state_path, state, "last_action", now):
+            return None
+        seen["status"], seen["p"] = fresh, fp
+        return fresh_grow
+
+    if run is None:
+        from genesis.guardian._subprocess import run_subprocess as run
+    ok, attempted, detail = await extend_thinpool(status, grow, run, before_mutation)
+    if attempted:
+        # Every issued mutation of the host's storage is recorded where the
+        # provisioning flow records its own (the owner-visible audit trail),
+        # verified or not: a timed-out extend may well have landed.
+        try:
+            from genesis.guardian.provisioning.ledger import ProvisioningLedger
+
+            ProvisioningLedger(config.state_dir).record_action(
+                "pool_extend", f"{status.vg_name}/{status.thinpool_lv}: {detail}", ok, ok,
+            )
+        except Exception:
+            logger.warning("could not record the pool extend in the ledger", exc_info=True)
+    # Report what the mutation acted on: the fresh re-measure (review).
+    reason = seen["p"].reason or autoextend_reason(seen["status"])
+    numbers = _describe(seen["status"], seen["p"])
+    if ok:
+        await _send(
+            dispatcher,
+            AlertSeverity.CRITICAL,
+            "Guardian extended the thin pool",
+            f"{reason}. {numbers}. {detail}, into VG space LVM's autoextend could not "
+            "use. A thin pool cannot shrink: grow the VM disk to restore autoextend "
+            "headroom (docs/reference/thin-pool-recovery.md).",
+        )
+        return "extended"
+    if detail == GUARD_STOP:
+        if seen["plan_gone_under_pressure"]:
+            return None  # go on to snapshot relief; it re-measures before deleting
+        return "extend_stopped"
+    if not attempted:
+        # An unreadable extent size: no mutation, so relief goes on to delete;
+        # the read is retried in an hour, not on every pass (review).
+        _stamp(state_path, state, "extend_read_backoff", now)
+        logger.warning("pool extend skipped before the mutation: %s", detail)
+        return None
+    _stamp(state_path, state, "extend_backoff", now)
+    if detail == TIMED_OUT:
+        # The pool may have grown; nothing else is done until a fresh pass
+        # re-measures (the settle is already stamped).
+        await _send(
+            dispatcher,
+            AlertSeverity.CRITICAL,
+            "Guardian extend outcome unknown",
+            f"{reason}. {numbers}. {detail}. No snapshot is deleted this pass; the "
+            "next pass re-measures (sudo lvs <vg> shows the pool size).",
+        )
+        return "extend_indeterminate"
+    if _throttled(state_path, state, "extend_failed", now, cfg.realert_hours):
+        await _send(
+            dispatcher,
+            AlertSeverity.WARNING,
+            "Guardian could not extend the thin pool",
+            f"{reason}. {numbers}. {detail}. Not retried for "
+            f"{_EXTEND_BACKOFF_HOURS}h; freeing guardian snapshots instead if the "
+            "pool is short.",
+        )
+    return None
 
 
 # --- entry points ----------------------------------------------------------------
@@ -413,6 +681,7 @@ async def check_pool_relief(
     now: datetime | None = None,
     healthy_confirmed: bool = False,
     alert_when_deferred: bool = True,
+    run=None,
 ) -> str:
     """One relief pass. Returns what it did (for logs/tests).
 
@@ -469,18 +738,49 @@ async def check_pool_relief(
         return await _cannot_act(state_path, state, now, dispatcher, *blocked)
     if state.pop("cannot_act_since", None) is not None:
         _save_state(state_path, state)
-    reason = shortfall(status, cfg)
-    if reason is None:
+    early_problem = validate_early_config(config)
+    early_ok = early_problem is None
+    if not early_ok and _throttled(state_path, state, "early_invalid_config", now, 24):
+        await _send(
+            dispatcher,
+            AlertSeverity.WARNING,
+            "Early pool relief off",
+            f"Invalid configuration: {early_problem}. Early relief and the LVM extend "
+            "are off until it is fixed; the reserve and delete-first rotation still run.",
+        )
+    history = _record_history(config, status, now) if early_ok else []
+    p = assess(status, cfg, history, now, early=early_ok)
+    grow = extend_plan(status, cfg, p) if early_ok else None
+    if p.level is None and grow is None:
         return "ok"
-    numbers = _numbers(status)
+    early = p.level == LEVEL_EARLY
+    severity = AlertSeverity.WARNING if early else AlertSeverity.CRITICAL
 
     if mode == "alert_only":
-        if _throttled(state_path, state, "would_act", now, cfg.realert_hours):
+        if p.level is None:
+            # An extend is an action and alert_only never acts, but the
+            # operator should hear that relief would have grown the pool.
+            if _throttled(state_path, state, "would_extend", now, cfg.realert_hours):
+                from genesis.guardian.pool_extend import autoextend_reason
+
+                await _send(
+                    dispatcher,
+                    AlertSeverity.WARNING,
+                    "Pool at LVM's autoextend threshold — relief is alert-only",
+                    f"{autoextend_reason(status)}. {_describe(status, p)}. Relief would grow "
+                    "the pool into that VG space now, but storage_pool.relief_mode / "
+                    "GUARDIAN_POOL_RELIEF_DISABLED keeps it off.",
+                )
+            return "alert_only"
+        # Keyed per level: an early WARNING must not mute the reserve's
+        # CRITICAL for realert_hours (review).
+        if _throttled(state_path, state, f"would_act_{p.level}", now, cfg.realert_hours):
             await _send(
                 dispatcher,
-                AlertSeverity.CRITICAL,
-                "Pool short of space — relief is alert-only",
-                f"{reason}. {numbers}. Relief would delete guardian snapshots now, but "
+                severity,
+                "Pool filling — relief is alert-only" if early
+                else "Pool short of space — relief is alert-only",
+                f"{p.reason}. {_describe(status, p)}. Relief would act now, but "
                 "storage_pool.relief_mode / GUARDIAN_POOL_RELIEF_DISABLED keeps it off.",
             )
         return "alert_only"
@@ -488,12 +788,28 @@ async def check_pool_relief(
     if not _due(state, "last_action", now, _SETTLE.total_seconds() / 3600.0):
         return "settling"
 
+    if grow is not None:
+        fresh_out: dict = {}
+        extended = await _maybe_extend(
+            config, dispatcher, status, p, grow, history, state_path, state, now, run,
+            fresh_out=fresh_out,
+        )
+        if extended is not None:
+            return extended
+        if fresh_out:
+            status, p = fresh_out["status"], fresh_out["p"]
+            early = p.level == LEVEL_EARLY
+            severity = AlertSeverity.WARNING if early else AlertSeverity.CRITICAL
+    if p.level is None:
+        return "ok"
+    reason, numbers = p.reason, _describe(status, p)
+
     meta = await snapshots.list_snapshot_meta_strict()
     if meta is None:
-        if _throttled(state_path, state, "list_failed", now, cfg.realert_hours):
+        if _throttled(state_path, state, f"list_failed_{p.level}", now, cfg.realert_hours):
             await _send(
                 dispatcher,
-                AlertSeverity.CRITICAL,
+                severity,
                 "Pool short of space — cannot list snapshots",
                 f"{reason}. {numbers}. `incus snapshot list` failed, so the guardian "
                 "cannot tell what it could free. Check incus on the host.",
@@ -502,11 +818,14 @@ async def check_pool_relief(
     order = plan_order([SnapshotInfo(n, c, n.endswith(HEALTHY_SUFFIX)) for n, c in meta])
     # meta is newest-first, so the first healthy name is the rollback lifeline.
     lifeline = next((n for n, _ in meta if n.endswith(HEALTHY_SUFFIX)), None)
+    lifeline_created = next((c for n, c in meta if n == lifeline), None)
+    held_for_recovery = False
     if not healthy_confirmed and any(n.endswith(HEALTHY_SUFFIX) for n in order):
         order = [n for n in order if not n.endswith(HEALTHY_SUFFIX)]
-        if not order:
-            if not alert_when_deferred:
-                return "healthy_deferred"
+        held_for_recovery = True
+        if not order and not alert_when_deferred:
+            return "healthy_deferred"
+        if not order and not early:
             if _throttled(state_path, state, "lifeline_protected", now, cfg.realert_hours):
                 await _send(
                     dispatcher,
@@ -518,7 +837,44 @@ async def check_pool_relief(
                     "this persists (docs/reference/thin-pool-recovery.md).",
                 )
             return "lifeline_protected"
-    if not order:
+
+    # Only measured when early relief is what decides (it costs host
+    # subprocesses). At the reserve it stays False: a pass that eases to early
+    # before its delete then stops rather than take the lifeline (review).
+    lifeline_ok = early and lifeline in order and await early_lifeline_ok(
+        status, snapshots, lifeline_created, now, cfg.lifeline_max_age_hours,
+    )
+
+    def allowed(level: str) -> list[str]:
+        if level == LEVEL_RESERVE:
+            return order
+        return early_allowed(order, lifeline, lifeline_ok)
+
+    targets = allowed(p.level)
+    if not targets:
+        if early:
+            if held_for_recovery:
+                why = (
+                    "The rollback snapshots are kept while the container is not "
+                    "healthy, because recovery may need them."
+                )
+            else:
+                why = (
+                    "Early relief frees only pre-recovery snapshots, superseded healthy "
+                    "ones and a rollback lifeline older than "
+                    f"{cfg.lifeline_max_age_hours:g}h that LVM shows holding space, and "
+                    "none qualifies."
+                )
+            if _throttled(state_path, state, "early_no_target", now, cfg.realert_hours):
+                await _send(
+                    dispatcher,
+                    AlertSeverity.WARNING,
+                    "Pool filling — nothing the guardian may free yet",
+                    f"{reason}. {numbers}. {why} Relief acts on the reserve if the pool "
+                    "gets there; growing the pool or freeing space now avoids that "
+                    "(docs/reference/thin-pool-recovery.md).",
+                )
+            return "early_no_target"
         if _throttled(state_path, state, "no_target", now, cfg.realert_hours):
             await _send(
                 dispatcher,
@@ -531,17 +887,28 @@ async def check_pool_relief(
             )
         return "no_target"
 
-    stop, fresh = await _recheck_before_delete(config, status, cfg)
+    async def recheck(target: str) -> tuple[str | None, str, str, bool]:
+        """Re-measure; stop unless ``target`` is still allowed at the fresh level."""
+        stop, fresh, fp = await _recheck_before_delete(
+            config, status, cfg, history, now, early=early_ok,
+        )
+        if stop is not None:
+            return stop, "", "", False
+        if target not in allowed(fp.level):
+            # Eased from the reserve to early pressure, and this target (a young
+            # lifeline) is not early relief's to take.
+            return "eased", "", "", False
+        return None, fp.reason, _describe(fresh, fp), fp.level == LEVEL_EARLY
+
+    stop, reason, numbers, early = await recheck(targets[0])
     if stop is not None:
         return stop
-    # Report what the delete acts on, not the earlier decision's figures.
-    reason, numbers = shortfall(fresh, cfg), _numbers(fresh)
     if not _stamp(state_path, state, "last_action", now):
         # The settle stamp could not persist: deleting now would let the next
         # tick delete again at once. Stop; the tier alerts still report.
         return "state_unwritable"
     failed: list[str] = []
-    for target in order:
+    for target in targets:
         if failed and target == lifeline:
             # Never fall through TO the lifeline: an earlier failure may be the
             # daemon still deleting another snapshot (a re-delete while one is
@@ -552,10 +919,9 @@ async def check_pool_relief(
             # The failed delete can have taken minutes (incus's client waits),
             # long enough for the pool to recover. Every delete, not only the
             # first, acts on a measurement taken just before it (review).
-            stop, fresh = await _recheck_before_delete(config, status, cfg)
+            stop, reason, numbers, early = await recheck(target)
             if stop is not None:
                 return stop
-            reason, numbers = shortfall(fresh, cfg), _numbers(fresh)
         # A snapshot whose delete keeps failing (busy LV, an export in flight)
         # must not pin relief to it forever: fall through to the next one, but
         # still free at most ONE per pass. A failure is only DEFINITE once a
@@ -595,8 +961,9 @@ async def check_pool_relief(
         failed_note = f" (deleting {', '.join(failed)} failed first)" if failed else ""
         await _send(
             dispatcher,
-            AlertSeverity.CRITICAL,
-            "Guardian freed pool space",
+            # Taking the rollback lifeline is CRITICAL at either level (review).
+            AlertSeverity.WARNING if early and target != lifeline else AlertSeverity.CRITICAL,
+            "Guardian freed pool space early" if early else "Guardian freed pool space",
             f"{reason}. {numbers}. Deleted guardian snapshot {target}{failed_note}.{lifeline_note}",
         )
         return f"deleted:{target}"

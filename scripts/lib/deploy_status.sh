@@ -13,9 +13,36 @@
 #   _SERVING_COMMIT_PY   the source of scripts/lib/serving_commit.py, read at
 #                        the caller's start so a merge cannot swap it mid-run
 #
-# The paths the server loads: the editable install imports src/ from disk,
-# startup reads config/, and pyproject.toml is the install's own metadata.
-_RUNTIME_PATHS=(src config pyproject.toml)
+# The files under scripts/ the server itself consumes, in two kinds, each with
+# the call site that consumes it. tests/test_scripts/
+# test_deploy_status_runtime_scripts.py fails when src/genesis references a
+# scripts/ file, in the shapes that test parses, that is neither listed here nor
+# exempted there with a reason.
+#
+# Imported once and kept, so a new copy loads only with a restart:
+_RUNTIME_RELOAD_SCRIPTS=(
+    scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
+    scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
+)
+# Read or run afresh on every use, so a new copy is live at once, no restart:
+_RUNTIME_FRESH_SCRIPTS=(
+    scripts/disk_reclaim.py               # run by autonomy/remediation.py
+    scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
+    scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
+    # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
+    # guard through this launcher in the server, and reads its exit code.
+    .claude/hooks/genesis-hook
+)
+# The paths the server LOADS: the editable install imports src/ from disk,
+# startup reads config/, pyproject.toml is the install's own metadata, plus the
+# scripts it keeps imported. This list decides the deploy's restart-skip
+# (_runtime_held) and the pending report; adding a path can only make the
+# deploy skip a restart LESS often.
+_RUNTIME_PATHS=(src config pyproject.toml "${_RUNTIME_RELOAD_SCRIPTS[@]}")
+# Everything a validation's result can depend on: what it loads, plus the
+# scripts it runs afresh. runtime-edits, runtime-overrides and the bracket read
+# this; nothing here asks for a restart.
+_OBSERVED_PATHS=("${_RUNTIME_PATHS[@]}" "${_RUNTIME_FRESH_SCRIPTS[@]}")
 
 _git_ro() { git --no-optional-locks -C "$GENESIS_ROOT" "$@"; }
 
@@ -81,8 +108,8 @@ _read_serving() {
 
 # _runtime_same <a> <b>: do two commits hold the same files under what the
 # server loads? Exit 0 same, 1 different, 2 cannot tell. A commit that changes
-# only docs or hooks needs no restart, and does not change what a validation
-# runs against.
+# only docs, or hooks and scripts the server does not keep imported, needs no
+# restart (the bracket still sees one the server runs afresh).
 _runtime_same() {
     local rc=0
     _git_ro diff --quiet "$1" "$2" -- "${_RUNTIME_PATHS[@]}" 2>/dev/null || rc=$?
@@ -162,7 +189,7 @@ _report_pending() {
                 return 0
             fi
         fi
-        echo "  Nothing the server loads (src/, config/, pyproject.toml) has changed since then."
+        echo "  Nothing the server loads (src/, config/, pyproject.toml, the scripts it keeps imported) has changed since then."
         return 0
     fi
     echo "  PENDING: the running server has not loaded these changes. It imports src/ lazily,"
@@ -172,13 +199,13 @@ _report_pending() {
     echo "  (launch it detached; the header of the script has the command)."
 }
 
-# Uncommitted edits to what the server loads: a tracked edit or an untracked
-# module there runs without moving HEAD. Prints "none", the first paths, or
-# "unreadable".
+# Uncommitted edits to what the server loads or runs: a tracked edit or an
+# untracked module there runs without moving HEAD. Prints "none", the first
+# paths, or "unreadable".
 _runtime_edits() {
     local st
     st="$(_git_ro status --porcelain --no-renames --untracked-files=all \
-        -- "${_RUNTIME_PATHS[@]}" 2>/dev/null)" || { echo unreadable; return 0; }
+        -- "${_OBSERVED_PATHS[@]}" 2>/dev/null)" || { echo unreadable; return 0; }
     if [ -z "$st" ]; then
         echo none
     else
@@ -207,7 +234,7 @@ _USER_OVERLAY_DIR="$HOME/.genesis/config"
 _runtime_overrides() {
     local raw list hashes overlays=""
     raw="$(_git_ro ls-files -z --others --ignored --exclude-standard \
-        -- "${_RUNTIME_PATHS[@]}" 2>/dev/null | tr '\0' '\n')" || { echo unreadable; return 0; }
+        -- "${_OBSERVED_PATHS[@]}" 2>/dev/null | tr '\0' '\n')" || { echo unreadable; return 0; }
     if [ -d "$_USER_OVERLAY_DIR" ]; then
         overlays="$(find -L "$_USER_OVERLAY_DIR" -maxdepth 1 -name '*.local.yaml' -type f \
             2>/dev/null)" || { echo unreadable; return 0; }
@@ -235,14 +262,18 @@ _runtime_overrides() {
 # Otherwise it is "unknown (<why>)", which no token equals. The same token at the
 # end means nothing the server runs changed: no restart (boot commit, MainPID,
 # systemd invocation, which a reused pid cannot fake), no change to the runtime
-# files (HEAD may move over docs or hooks), no edit to an ignored override or a
-# user overlay. A TRIPWIRE, not a certificate: what the header of
+# files (HEAD may move over docs, or hooks the server never runs), no change at
+# HEAD to a script the
+# server runs afresh (_RUNTIME_FRESH_SCRIPTS: a pull of one voids the token but
+# needs no restart), no edit to an ignored override or a user overlay. A
+# TRIPWIRE, not a certificate: a fresh script changed and restored within the
+# validation reads valid, and so does what the header of
 # deploy_code_only.sh lists as unseen (the venv's packages, the non-overlay
 # files in ~/.genesis/config, an edit undone without moving HEAD, a rewritten or
 # backdated reflog) reads valid.
 # Sets BRACKET, or empty with BRACKET_WHY. Expects _read_serving to have run.
 _bracket() {
-    local mainpid inv edits overrides rc=0
+    local mainpid inv edits overrides fresh rc=0
     BRACKET=""
     BRACKET_WHY=""
     if [ -z "$SERVING" ]; then
@@ -257,6 +288,9 @@ _bracket() {
     [ "$edits" = none ] || { BRACKET_WHY="uncommitted runtime edits: $edits"; return 0; }
     overrides="$(_runtime_overrides)"
     [ "$overrides" != unreadable ] || { BRACKET_WHY="the ignored runtime overrides are unreadable"; return 0; }
+    # The scripts run afresh count as they stand at HEAD, not as at the boot.
+    fresh="$(_git_ro ls-tree -r HEAD -- "${_RUNTIME_FRESH_SCRIPTS[@]}" 2>/dev/null)" \
+        || { BRACKET_WHY="the scripts the server runs cannot be read at HEAD"; return 0; }
     _runtime_held HEAD || rc=$?
     case "$rc" in
         0) ;;
@@ -269,7 +303,7 @@ _bracket() {
             return 0 ;;
         *) BRACKET_WHY="cannot compare the runtime files HEAD has held since the boot with the boot commit's"; return 0 ;;
     esac
-    BRACKET="b1-$(printf '%s\n' "$SERVING" "$mainpid" "$inv" "$overrides" | sha256sum | cut -c1-24)"
+    BRACKET="b1-$(printf '%s\n' "$SERVING" "$mainpid" "$inv" "$overrides" "$fresh" | sha256sum | cut -c1-24)"
 }
 
 # `status [--verify <token>]`. Prints the fields a human reads and the bracket;

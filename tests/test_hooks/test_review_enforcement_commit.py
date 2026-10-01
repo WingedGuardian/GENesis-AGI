@@ -313,6 +313,91 @@ def test_live_repo_identity_unreadable_fails_closed(
     assert mod._live_integration_repo(str(not_a_repo)) is True
 
 
+def _stall_common_dir_probe(tmp_path: Path) -> dict[str, str]:
+    """PATH with a `git` that hangs ONLY on `rev-parse --git-common-dir`.
+
+    That flag is read by nothing else on the commit path, so the stall lands on
+    the live-branch repository-identity probes and nowhere else; every other git
+    call reaches the real binary."""
+    real_git = shutil.which("git")
+    assert real_git
+    fake_bin = tmp_path / "stallbin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  [ "$a" = "--git-common-dir" ] && exec sleep 30\n'
+        "done\n"
+        f'exec {real_git} "$@"\n'
+    )
+    fake_git.chmod(0o755)
+    return {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+
+def test_live_identity_probes_are_bounded_by_the_hook_deadline(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    # The hook is registered with a 10-second timeout and a harness kill lets the
+    # commit through. Two identity probes with their own 5-second caps could spend
+    # the whole window; drawn from the hook's one deadline, a stalled probe ends
+    # as a refusal inside it.
+    hook = _hook_inside(repo)
+    _live_with_manifest(repo, home)
+    started = time.monotonic()
+    res = _run_hook(
+        f"cd {repo} && git commit -m wip",
+        repo,
+        home,
+        hook=hook,
+        extra_env=_stall_common_dir_probe(tmp_path),
+    )
+    elapsed = time.monotonic() - started
+    # Time first: that is the defect. Unbounded, the gate still refuses, but only
+    # after both probes time out, past the harness's 10-second kill.
+    assert elapsed < 9.5, f"hook took {elapsed:.1f}s"
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "deadline expired during subprocess" in res.stderr
+
+
+@pytest.mark.parametrize("left", [1.0, -1.0])
+def test_an_identity_probe_gets_only_the_budget_that_is_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, left: float
+) -> None:
+    # The end-to-end test above cannot tell this apart from a fixed 5-second cap:
+    # its FIRST probe starts with ~9 seconds left, so a timeout at 5 seconds still
+    # ends inside the window. What the deadline adds is the probe that starts
+    # LATE, with less than 5 seconds left (or none), which must get only that.
+    from tests.conftest import private_module
+
+    mod = private_module("rec_probe_budget", _HOOK)
+    monkeypatch.setenv("PATH", _stall_common_dir_probe(tmp_path)["PATH"])
+    started = time.monotonic()
+    with pytest.raises(mod.DeadlineExpired):
+        mod._git_common_dir(str(tmp_path), deadline=started + left)
+    assert time.monotonic() - started < 3.0
+
+
+def test_the_stalling_git_leaves_an_ordinary_commit_alone(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    # Control for the test above: with no manifest the identity probes never run,
+    # so the same stalling git costs nothing and the reviewed commit is allowed.
+    # The stall is therefore in the probes, not anywhere else on the path.
+    hook = _hook_inside(repo)
+    _mark(repo, home)
+    started = time.monotonic()
+    res = _run_hook(
+        f"cd {repo} && git commit -m wip",
+        repo,
+        home,
+        hook=hook,
+        extra_env=_stall_common_dir_probe(tmp_path),
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert time.monotonic() - started < 9.5
+
+
 def test_commit_on_a_live_branch_without_a_manifest_is_ordinary(repo: Path, home: Path) -> None:
     # No deploy manifest = no integration branch: a branch that merely happens
     # to be named `live` is an ordinary branch.

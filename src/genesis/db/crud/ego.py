@@ -153,12 +153,29 @@ async def list_recent_cycles(
     db: aiosqlite.Connection,
     *,
     limit: int = 10,
+    ego_source: str | None = None,
 ) -> list[dict]:
-    """Most recent cycles, newest first."""
-    cursor = await db.execute(
-        "SELECT * FROM ego_cycles ORDER BY created_at DESC, id DESC LIMIT ?",
-        (limit,),
-    )
+    """Most recent cycles, newest first.
+
+    ``ego_source=None`` (the default) returns cycles from every ego — the
+    all-ego view the dashboard shows. Pass an ego's source tag (e.g.
+    ``"user_ego_cycle"``) to read only that ego's cycles. A filtered read
+    matches the tag exactly, so legacy rows written before ``ego_source``
+    was recorded (empty string or NULL) are excluded: their ego is unknown,
+    and attributing one to either ego is the defect this filter exists to
+    prevent.
+    """
+    if ego_source is None:
+        cursor = await db.execute(
+            "SELECT * FROM ego_cycles ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM ego_cycles WHERE ego_source = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (ego_source, limit),
+        )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
@@ -290,17 +307,38 @@ async def list_cycle_outcomes(
     db: aiosqlite.Connection,
     *,
     limit: int = 10,
+    ego_source: str | None = None,
 ) -> list[dict]:
-    """List recent cycle outcomes (newest first)."""
-    cursor = await db.execute(
-        """SELECT cycle_id, focus_type, focus_id, num_proposals,
-                  num_dispatches, assessment, signals_consumed,
-                  perception_rationale, perceive_cost_usd, created_at
-           FROM ego_cycle_outcomes
-           ORDER BY created_at DESC
-           LIMIT ?""",
-        (limit,),
-    )
+    """List recent cycle outcomes (newest first).
+
+    ``ego_source=None`` returns every ego's outcomes. Pass an ego's source
+    tag to read only that ego's: ``ego_cycle_outcomes`` has no ego column,
+    so ownership comes from the cycle row (``cycle_id`` ->
+    ``ego_cycles.ego_source``). Outcomes whose cycle is untagged or missing
+    are excluded from a scoped read, exactly as in ``list_recent_cycles``.
+    """
+    if ego_source is None:
+        cursor = await db.execute(
+            """SELECT cycle_id, focus_type, focus_id, num_proposals,
+                      num_dispatches, assessment, signals_consumed,
+                      perception_rationale, perceive_cost_usd, created_at
+               FROM ego_cycle_outcomes
+               ORDER BY created_at DESC, cycle_id DESC
+               LIMIT ?""",
+            (limit,),
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT o.cycle_id, o.focus_type, o.focus_id, o.num_proposals,
+                      o.num_dispatches, o.assessment, o.signals_consumed,
+                      o.perception_rationale, o.perceive_cost_usd, o.created_at
+               FROM ego_cycle_outcomes o
+               JOIN ego_cycles c ON c.id = o.cycle_id
+               WHERE c.ego_source = ?
+               ORDER BY o.created_at DESC, o.cycle_id DESC
+               LIMIT ?""",
+            (ego_source, limit),
+        )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
