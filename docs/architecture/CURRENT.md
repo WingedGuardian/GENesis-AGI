@@ -481,6 +481,31 @@ verified: 18e41e1e1 2026-09-23
   COALESCEs content columns; a writer distinguishes "read fine, nothing to
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
+  **Each tag also carries the peer's address** —
+  `[Concurrent | <model> | a1b2c3d4 -> genesis-7f (cc-2:@1.%1)]`, the name
+  `SendMessage` takes and its tmux pane — resolved by
+  `session_awareness/peer_address.py`, the ONLY reader of Claude Code's own
+  session registry (`$CLAUDE_CONFIG_DIR` or `~/.claude`, then `sessions/<pid>.json`).
+  It picks candidates as Claude Code's own peer lookup does (the entries for
+  that session id, following a session moved into a background job, and skipping
+  spare, parked and socketless entries), then answers only when exactly one is
+  live: the same pid domain (machine id plus PID namespace), a running process,
+  and a matching start time, which is what rejects a recycled pid. Where Claude
+  Code would fall back to probing a socket it cannot otherwise verify, this
+  never opens one and says `(not reachable)` instead; with two live candidates
+  it says `(ambiguous)`, and a registry field of the wrong type gives
+  `(registry format changed)` — never a guess, because the registry keeps
+  dead and resumed entries and a name or first-entry join is wrong. Names
+  and panes are peer-written, so they are allowlisted and omitted WHOLE, never
+  cut — a shortened name is a wrong address; the tool and `--json` results
+  carry the same allowlisted form. An address is the same user's own claim, not
+  an authenticated identity: the registry is a directory any process of that user
+  can write, so read it as the hint `ListAgents` gives. Registry files are opened
+  non-blocking without following symlinks, so a FIFO or link named like an entry
+  cannot hang the per-prompt hook. The same lookup is
+  `python -m genesis session-address <id>` (whose `--check` compares it with
+  `claude agents --json`, Claude Code's supported listing) and the
+  `session_address` MCP tool.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux

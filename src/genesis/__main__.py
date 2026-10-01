@@ -53,6 +53,10 @@ def main() -> None:
     from genesis.session_awareness import handoffs_cli
     handoffs_cli.add_parser(sub)
 
+    # Session id -> SendMessage peer name: genesis session-address <id>...
+    from genesis.session_awareness import peer_address_cli
+    peer_address_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -65,7 +69,7 @@ def main() -> None:
 
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
-    elif args.command in ("contribute", "eval", "restore", "handoffs"):
+    elif args.command in ("contribute", "eval", "restore", "handoffs", "session-address"):
         sys.exit(args.func(args))
     else:
         parser.print_help()
