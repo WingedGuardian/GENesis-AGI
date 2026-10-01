@@ -51,12 +51,20 @@ def plan_extend(status: StoragePoolStatus, keep_free_mib: int) -> int | None:
         return None
     if status.data_pct is None or status.data_pct < AUTOEXTEND_THRESHOLD_PCT:
         return None
+    # Relief skips the extend while metadata is short, which it can only judge
+    # from a known metadata %: unknown is not "not short" (review).
+    if status.metadata_pct is None:
+        return None
     if not status.vg_free_bytes or not status.pool_size_bytes:
+        return None
+    # The keep-free space is sized from the metadata LV; an unknown size would
+    # read as 0 and spend the headroom the metadata LV needs to grow (review).
+    if not status.metadata_size_bytes:
         return None
     step = status.pool_size_bytes * AUTOEXTEND_PERCENT // 100
     if status.vg_free_bytes >= step:
         return None
-    keep = max(keep_free_mib * 1024**2, 2 * (status.metadata_size_bytes or 0))
+    keep = max(keep_free_mib * 1024**2, 2 * status.metadata_size_bytes)
     grow = status.vg_free_bytes - keep
     return grow if grow >= _GIB else None
 
@@ -100,7 +108,7 @@ async def extend_thinpool(
     )
     try:
         extent = int(float(out.strip().split()[0])) if rc == 0 and out.strip() else 0
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, OverflowError):
         extent = 0
     if extent <= 0:
         return False, False, f"could not read the extent size of VG {vg}: {(err or out)[:160]}"

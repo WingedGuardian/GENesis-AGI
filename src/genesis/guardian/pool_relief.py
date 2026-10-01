@@ -71,6 +71,8 @@ from genesis.guardian.pool_runway import (
     Runway,
     _bad_num,
     compute_runway,
+    early_allowed,
+    early_lifeline_ok,
     early_reason,
     gap_threshold,
     load_history,
@@ -208,10 +210,19 @@ async def _send(dispatcher, severity, title: str, body: str) -> None:
 
 
 def pool_key(status: StoragePoolStatus) -> str | None:
-    """Stable identity of the measured pool, or None when unknown."""
+    """Stable identity of the measured pool, or None when unknown.
+
+    LVM pools are named by VG and thin-pool LV. A btrfs/dir pool has neither,
+    so its backing source is part of the identity: a pool recreated on other
+    storage under the same incus name must not share history or pass a
+    pre-delete re-check as the same pool (review).
+    """
     if not status.pool_name:
         return None
-    return f"{status.pool_name}|{status.vg_name or ''}|{status.thinpool_lv or ''}"
+    key = f"{status.pool_name}|{status.vg_name or ''}|{status.thinpool_lv or ''}"
+    if not status.vg_name and status.pool_source:
+        key = f"{key}|{status.pool_source}"
+    return key
 
 
 def _ambiguous_pool(status: StoragePoolStatus) -> bool:
@@ -421,47 +432,6 @@ def plan_delete(snaps: list[SnapshotInfo]) -> str | None:
     return order[0] if order else None
 
 
-def lifeline_aged(created: datetime | None, now: datetime, cap_hours: float) -> bool:
-    """The lifeline is older than the age cap; an unknown age, or a cap of 0,
-    never is."""
-    return cap_hours > 0 and created is not None and now - created > timedelta(hours=cap_hours)
-
-
-def early_allowed(order: list[str], lifeline: str | None, lifeline_ok: bool) -> list[str]:
-    """What EARLY relief may delete: ``order`` minus the rollback lifeline,
-    unless ``lifeline_ok`` (see ``_early_lifeline_ok``)."""
-    if lifeline is None or lifeline_ok:
-        return list(order)
-    return [n for n in order if n != lifeline]
-
-
-async def _early_lifeline_ok(
-    status: StoragePoolStatus, snapshots, lifeline_created: datetime | None,
-    now: datetime, cap_hours: float,
-) -> bool:
-    """May EARLY relief take the rollback lifeline?
-
-    Only once it is older than the cap (it has diverged the most by then).
-    On LVM-thin, also only when LVM measures that the healthy snapshots hold
-    space no live volume maps: the same evidence delete-first rotation
-    requires, so a lifeline delete-first kept because it holds little is not
-    deleted anyway, for nothing (review). btrfs/dir have no such measurement;
-    age alone decides there.
-    """
-    if not lifeline_aged(lifeline_created, now, cap_hours):
-        return False
-    if not (status.vg_name and status.thinpool_lv):
-        return True
-    holds = getattr(snapshots, "lifeline_holds_space", None)
-    if holds is None:
-        return False
-    try:
-        return await holds() is not None
-    except Exception:
-        logger.warning("lifeline space measurement failed", exc_info=True)
-        return False
-
-
 def _record_history(config, status: StoragePoolStatus, now: datetime) -> list[PoolSample]:
     """Record this measurement in the bounded pool history; return the history."""
     cfg = config.storage_pool
@@ -494,9 +464,24 @@ def _describe(status: StoragePoolStatus, p: Pressure) -> str:
 _EXTEND_BACKOFF_HOURS = 24
 
 
+def _backed_off(state: dict, key: str, now: datetime, hours: float) -> bool:
+    """An extend backoff is still running. Unlike ``_due``, a stamp in the
+    FUTURE (the clock stepped back) keeps it running: retrying a permanent
+    mutation early is not the safe direction (review)."""
+    raw = state.get(key)
+    if not raw:
+        return False
+    try:
+        last = datetime.fromisoformat(raw)
+        return last > now or now - last < timedelta(hours=hours)
+    except (TypeError, ValueError):
+        return False
+
+
 async def _maybe_extend(
     config, dispatcher, status: StoragePoolStatus, p: Pressure, grow: int,
     history: list[PoolSample], state_path: Path, state: dict, now: datetime, run,
+    fresh_out: dict | None = None,
 ) -> str | None:
     """Run the LVM partial extend (pool_extend). Returns an outcome that ends
     the pass, or None to go on to snapshot deletion.
@@ -518,11 +503,11 @@ async def _maybe_extend(
     )
 
     cfg = config.storage_pool
-    if not _due(state, "extend_backoff", now, _EXTEND_BACKOFF_HOURS):
+    if _backed_off(state, "extend_backoff", now, _EXTEND_BACKOFF_HOURS):
         return None
-    if not _due(state, "extend_read_backoff", now, 1):
+    if _backed_off(state, "extend_read_backoff", now, 1):
         return None
-    seen = {"status": status, "p": p}
+    seen = {"status": status, "p": p, "plan_gone_under_pressure": False}
 
     async def before_mutation() -> int | None:
         stop, fresh, fp = await _recheck_before_delete(
@@ -531,7 +516,17 @@ async def _maybe_extend(
         if stop is not None:
             return None
         fresh_grow = extend_plan(fresh, cfg, fp)
-        if fresh_grow is None or not _stamp(state_path, state, "last_action", now):
+        if fresh_grow is None:
+            # The extend no longer applies (metadata went short, the profile
+            # was withdrawn), but the pool may still need relief: that must
+            # not be suppressed by the extend (review).
+            seen["plan_gone_under_pressure"] = fp.level is not None
+            if fresh_out is not None and fp.level is not None:
+                # The caller relieves on THIS measurement, which may be early
+                # pressure the pass did not see when it started (review).
+                fresh_out["status"], fresh_out["p"] = fresh, fp
+            return None
+        if not _stamp(state_path, state, "last_action", now):
             return None
         seen["status"], seen["p"] = fresh, fp
         return fresh_grow
@@ -565,6 +560,8 @@ async def _maybe_extend(
         )
         return "extended"
     if detail == GUARD_STOP:
+        if seen["plan_gone_under_pressure"]:
+            return None  # go on to snapshot relief; it re-measures before deleting
         return "extend_stopped"
     if not attempted:
         # An unreadable extent size: no mutation, so relief goes on to delete;
@@ -792,11 +789,17 @@ async def check_pool_relief(
         return "settling"
 
     if grow is not None:
+        fresh_out: dict = {}
         extended = await _maybe_extend(
             config, dispatcher, status, p, grow, history, state_path, state, now, run,
+            fresh_out=fresh_out,
         )
         if extended is not None:
             return extended
+        if fresh_out:
+            status, p = fresh_out["status"], fresh_out["p"]
+            early = p.level == LEVEL_EARLY
+            severity = AlertSeverity.WARNING if early else AlertSeverity.CRITICAL
     if p.level is None:
         return "ok"
     reason, numbers = p.reason, _describe(status, p)
@@ -838,7 +841,7 @@ async def check_pool_relief(
     # Only measured when early relief is what decides (it costs host
     # subprocesses). At the reserve it stays False: a pass that eases to early
     # before its delete then stops rather than take the lifeline (review).
-    lifeline_ok = early and lifeline in order and await _early_lifeline_ok(
+    lifeline_ok = early and lifeline in order and await early_lifeline_ok(
         status, snapshots, lifeline_created, now, cfg.lifeline_max_age_hours,
     )
 

@@ -65,6 +65,9 @@ class StoragePoolStatus:
     # install's opt-in to growing the pool into VG free space).
     metadata_size_bytes: int | None = None
     thinpool_profile: str | None = None
+    # btrfs/dir only: the pool's backing source (incus `source`), part of the
+    # pool's identity there, since it has no VG or thin-pool LV.
+    pool_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -494,6 +497,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
             pool_used_pct=df_used[0] if df_used else None,
             pool_size_bytes=df_used[1] if df_used else None,
             pool_name=pool_name,
+            pool_source=backend.source,
             detail=f"non-lvm pool {pool_name}",
         )
 
@@ -533,7 +537,7 @@ async def measure_storage_pool(config: GuardianConfig) -> StoragePoolStatus:
     if rc == 0 and out.strip():
         try:
             vg_free_bytes = int(float(out.strip().split()[0]))
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, OverflowError):
             vg_free_bytes = None
 
     return StoragePoolStatus(

@@ -638,3 +638,79 @@ async def test_the_extend_alert_reports_the_fresh_measurement(tmp_path) -> None:
     _, d = await _pass(cfg, _Snaps({}), _stranded(), measures=[_stranded(), fresh])
     body = d.send.await_args.args[0].body
     assert "data 86.5%" in body and "VG free 3.0G" in body
+
+
+# --- review round 3 ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_metadata_size_refuses_the_extend(tmp_path) -> None:
+    # Codex (round 3, P1): an unreadable lv_metadata_size read as 0 and could
+    # spend the headroom the metadata LV needs.
+    cfg = _cfg(tmp_path)
+    run = _Run()
+    out, _ = await _pass(cfg, _Snaps({PRE: AGED}), _stranded(data=98.0, metadata_size_bytes=None),
+                         run=run)
+    assert not run.extended and out == f"deleted:{PRE}"
+
+
+@pytest.mark.asyncio
+async def test_a_vanished_extend_plan_under_pressure_still_relieves(tmp_path) -> None:
+    # Codex (round 3, P1): the profile disappears while data is at 98%; the
+    # extend no longer applies, but the pass must go on to free a snapshot.
+    cfg = _cfg(tmp_path)
+    run = _Run()
+    snaps = _Snaps({PRE: AGED})
+    gone = _stranded(data=98.0, thinpool_profile=None)
+    out, _ = await _pass(cfg, snaps, _stranded(data=98.0),
+                         measures=[_stranded(data=98.0), gone, gone], run=run)
+    assert not run.extended and out == f"deleted:{PRE}"
+
+
+def test_non_lvm_pool_identity_includes_its_source() -> None:
+    # Codex (round 3, P2): every btrfs/dir pool keyed as "<name>||", so a pool
+    # recreated on other storage shared the old one's history.
+    from genesis.guardian.pool_relief import pool_key
+
+    a = StoragePoolStatus(detected=True, pool_used_pct=50.0, pool_name="default",
+                          pool_source="/dev/sdb1")
+    b = StoragePoolStatus(detected=True, pool_used_pct=50.0, pool_name="default",
+                          pool_source="/var/lib/incus/disks/default.img")
+    assert pool_key(a) != pool_key(b)
+    lvm = _lvm(50.0, pool_source="vg0")
+    assert pool_key(lvm) == KEY  # LVM identity unchanged
+
+
+# --- class audit before round 4 ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_metadata_pct_refuses_the_extend(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    run = _Run()
+    out, _ = await _pass(cfg, _Snaps({PRE: AGED}), _stranded(data=98.0, meta=None), run=run)
+    assert not run.extended and out == f"deleted:{PRE}"
+
+
+@pytest.mark.asyncio
+async def test_fresh_early_pressure_found_by_the_extend_recheck_relieves_now(tmp_path) -> None:
+    # The pass started with an extend only (no pressure); the re-measure shows
+    # metadata growing short, so the extend no longer applies and early relief
+    # acts on that fresh reading in the same pass.
+    cfg = _cfg(tmp_path)
+    _seed(cfg, data_at=lambda h: 0.85, meta_at=lambda h: 0.60 + 0.02 * h)
+    run = _Run()
+    snaps = _Snaps({PRE: AGED})
+    calm = _stranded(meta=60.0)
+    short = _stranded(meta=84.0)
+    out, _ = await _pass(cfg, snaps, calm, measures=[calm, short, short], run=run)
+    assert not run.extended and out == f"deleted:{PRE}"
+
+
+@pytest.mark.asyncio
+async def test_a_clock_stepped_back_keeps_the_extend_backoff(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    await _pass(cfg, _Snaps({}), _stranded(), run=_Run(lvextend_rc=5))
+    run = _Run()
+    await _pass(cfg, _Snaps({}), _stranded(), run=run, now=T0 - timedelta(hours=3))
+    assert not run.extended

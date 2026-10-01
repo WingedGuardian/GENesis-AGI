@@ -182,7 +182,8 @@ there with a CRITICAL "extend outcome unknown", and the next pass re-measures.
 Every issued `lvextend`, successful or not, is also recorded in the guardian's
 provisioning ledger (`ledger.json` in the state dir) as `pool_extend`, beside
 the disk grows; it does not count against their rate caps.
-It assumes the profile holds 80/20 and that dmeventd monitors the pool (host
+It never extends on a reading it cannot complete: an unknown metadata size or
+metadata % refuses the extend. It assumes the profile holds 80/20 and that dmeventd monitors the pool (host
 provisioning sets both).
 
 ### What it never does

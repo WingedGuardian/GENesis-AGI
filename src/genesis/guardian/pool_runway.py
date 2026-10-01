@@ -134,7 +134,8 @@ def _num(raw) -> float | None:
     if raw is None or isinstance(raw, bool):
         return None
     val = float(raw)
-    return val if val == val and abs(val) != float("inf") else None
+    # Byte counts and sizes: a negative or non-finite value is corruption.
+    return val if val == val and abs(val) != float("inf") and val >= 0 else None
 
 
 def _parse_line(line: str) -> PoolSample | None:
@@ -362,3 +363,47 @@ def validate_early_config(config) -> str | None:
             "of history, too little for any growth rate"
         )
     return None
+
+
+# --- what the early level may take -------------------------------------------------
+
+
+def lifeline_aged(created: datetime | None, now: datetime, cap_hours: float) -> bool:
+    """The lifeline is older than the age cap; an unknown age, or a cap of 0,
+    never is."""
+    return cap_hours > 0 and created is not None and now - created > timedelta(hours=cap_hours)
+
+
+def early_allowed(order: list[str], lifeline: str | None, lifeline_ok: bool) -> list[str]:
+    """What EARLY relief may delete: ``order`` minus the rollback lifeline,
+    unless ``lifeline_ok`` (see ``early_lifeline_ok``)."""
+    if lifeline is None or lifeline_ok:
+        return list(order)
+    return [n for n in order if n != lifeline]
+
+
+async def early_lifeline_ok(
+    status: StoragePoolStatus, snapshots, lifeline_created: datetime | None,
+    now: datetime, cap_hours: float,
+) -> bool:
+    """May EARLY relief take the rollback lifeline?
+
+    Only once it is older than the cap (it has diverged the most by then).
+    On LVM-thin, also only when LVM measures that the healthy snapshots hold
+    space no live volume maps: the same evidence delete-first rotation
+    requires, so a lifeline delete-first kept because it holds little is not
+    deleted anyway, for nothing (review). btrfs/dir have no such measurement;
+    age alone decides there.
+    """
+    if not lifeline_aged(lifeline_created, now, cap_hours):
+        return False
+    if not (status.vg_name and status.thinpool_lv):
+        return True
+    holds = getattr(snapshots, "lifeline_holds_space", None)
+    if holds is None:
+        return False
+    try:
+        return await holds() is not None
+    except Exception:
+        logger.warning("lifeline space measurement failed", exc_info=True)
+        return False

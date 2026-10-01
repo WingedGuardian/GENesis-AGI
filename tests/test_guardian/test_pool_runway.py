@@ -456,3 +456,17 @@ def test_the_gap_rate_survives_the_next_pass() -> None:
     # ...but not forever: once the reading is a whole gap past the last sample.
     later = _s(60 + 31, 0.82)
     assert not compute_runway(hist, later).data_rate
+
+
+def test_negative_history_values_are_corruption(tmp_path) -> None:
+    p = tmp_path / "h.jsonl"
+    p.write_text(json.dumps({"ts": T0.isoformat(), "pool": POOL, "data_used": -5.0,
+                             "data_size": 10}) + "\n")
+    (s,) = load_history(p)
+    assert s.data_used is None
+
+
+@pytest.mark.asyncio
+async def test_an_infinite_extent_size_is_not_a_crash() -> None:
+    ok, attempted, _ = await extend_thinpool(_pool(), 5 * _GB, _Run(extent="  inf\n"), _yes)
+    assert (ok, attempted) == (False, False)

@@ -283,4 +283,7 @@ class TestGatherHostProfile:
             # identity like vg_name/thinpool_lv above).
             "metadata_size_bytes",
             "thinpool_profile",
+            # btrfs/dir identity (relief history + re-check): a METRIC like
+            # the LVM identity fields above.
+            "pool_source",
         }
