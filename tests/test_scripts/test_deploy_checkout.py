@@ -362,6 +362,44 @@ def test_an_unlistable_range_returns_2(ranged):
     assert _collisions(root, base, "0" * 40) == (2, [])
 
 
+# ── genesis_checkout_unmoved ────────────────────────────────────────────────
+
+
+def _unmoved(root: Path, head: str, branch: str) -> tuple[bool, str, str]:
+    r = _bash(
+        f'if genesis_checkout_unmoved "{root}" "{head}" "{branch}"; then v=SAME; else v=MOVED; fi\n'
+        'echo "$v[$_now_head][$_now_branch]"'
+    )
+    assert r.returncode == 0, r.stderr
+    m = re.search(r"(SAME|MOVED)\[(.*)\]\[(.*)\]", r.stdout)
+    return m.group(1) == "SAME", m.group(2), m.group(3)
+
+
+def test_unmoved_matches_only_the_exact_branch_and_commit(repos):
+    root = repos["primary"]
+    head = _git(root, "rev-parse", "HEAD")
+    assert _unmoved(root, head, "main") == (True, head, "main")
+    # Same commit, another branch: moved.
+    _git(root, "checkout", "-q", "-b", "elsewhere")
+    assert _unmoved(root, head, "main") == (False, head, "elsewhere")
+    # Same commit, detached: moved, and the branch reads empty.
+    _git(root, "checkout", "-q", "--detach", "HEAD")
+    assert _unmoved(root, head, "main") == (False, head, "")
+    # Back on main with a new commit: moved, and the new commit is reported.
+    _git(root, "checkout", "-q", "main")
+    _git(root, "commit", "-q", "--allow-empty", "-m", "theirs")
+    new = _git(root, "rev-parse", "HEAD")
+    assert _unmoved(root, head, "main") == (False, new, "main")
+
+
+def test_unmoved_refuses_an_empty_expectation_or_an_unreadable_checkout(repos, tmp_path):
+    root = repos["primary"]
+    head = _git(root, "rev-parse", "HEAD")
+    assert _unmoved(root, "", "main")[0] is False
+    assert _unmoved(root, head, "")[0] is False
+    assert _unmoved(tmp_path / "not-a-repo", head, "main") == (False, "", "")
+
+
 # ── the two callers ─────────────────────────────────────────────────────────
 
 

@@ -71,9 +71,15 @@ def _fetch_block() -> str:
 
 
 def _merge_assertion_block() -> str:
+    """From the merge-result capture through the assertion: the capture decides
+    UPDATE_OWN_HEAD, which the assertion compares against."""
     text = UPDATE.read_text()
-    start = text.index('if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD')
-    return text[start : text.index("\nfi\n", start) + 4]
+    start = text.index('_merged_head="$(git -C "$GENESIS_ROOT" rev-parse')
+    check = text.index('if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD')
+    return (
+        'VALIDATED_HEAD="${VALIDATED_HEAD:-}"\nUPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
+        + text[start : text.index("\nfi\n", check) + 4]
+    )
 
 
 _STUBS = """

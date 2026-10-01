@@ -101,6 +101,11 @@ genesis_untracked_node() {
 # base (`...`), so on a fast-forward it is exactly <from>..<to>, and on a diverged
 # branch it is what the incoming side changes. A path the local side still
 # tracks is git's own to merge, so only untracked ones count.
+# NOT covered: a path git INVENTS during the merge. In a file/directory conflict
+# the ort strategy moves the local file aside to `<path>~HEAD` (or `~<branch>`),
+# and an ignored file already sitting at that name is overwritten. Only incoming
+# path names are scanned, so a name git makes up is not; plain update.sh merges
+# had the same exposure before this scan existed.
 # Prints the colliding paths, one per line. Returns 0 when there are none, 1 when
 # there are, 2 when the range cannot be listed.
 genesis_range_collisions() {
@@ -134,4 +139,17 @@ genesis_range_collisions() {
     done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$from...$to" 2>/dev/null)
     printf '%s' "$collisions"
     [ -z "$collisions" ]
+}
+
+# Is <root> still on <branch> at exactly <head> (a full commit id)? Another
+# session or editor can switch the branch or commit while a deploy runs, and
+# every later git step would then act on THEIR checkout. Sets _now_head and
+# _now_branch (empty for a detached HEAD) so the caller can say what moved. An
+# unreadable HEAD reads as moved: refusing is the safe side.
+genesis_checkout_unmoved() {
+    local root="$1" head="$2" branch="$3"
+    _now_head="$(git -C "$root" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    _now_branch="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    [ -n "$_now_head" ] && [ -n "$head" ] && [ "$_now_head" = "$head" ] \
+        && [ -n "$branch" ] && [ "$_now_branch" = "$branch" ]
 }

@@ -117,9 +117,20 @@ through the rollback trap.
   `scripts/lib/deploy_checkout.sh`, lifted from `deploy_code_only.sh`, which calls
   the same functions. A linked worktree, a bare repository, a detached HEAD or a
   branch other than `$DEPLOY_BRANCH` is refused before any state is touched.
-- **The fetched head is pinned** from the tracking ref an explicit refspec
-  writes, and the merge takes that commit. `FETCH_HEAD` is not used: every fetch
-  rewrites it, and other sessions fetch in the same checkout.
+- **The fetched head is pinned** from a per-run ref (`refs/genesis/update/<pid>`)
+  that the same fetch writes beside the tracking ref, read once and deleted at once.
+  The merge takes that commit. Neither `FETCH_HEAD` nor the tracking ref decides the
+  pin: other sessions fetch in the same checkout and rewrite both.
+- **The checkout must not move under the run.** `ORIGINAL_BRANCH` is the branch
+  the checks validated, not a later re-read. `genesis_checkout_unmoved` re-checks
+  branch and commit before the rollback tag (the pre-update backup can take
+  minutes), and `checkout-unmoved` re-checks them, plus "no new tracked edit",
+  before the clears and again just before the merge. `_do_rollback` resets only
+  from `UPDATE_OWN_HEAD`, the commit this run's merge produced. At the rollback
+  commit there is nothing to undo, so it skips the reset; on any other branch or
+  commit it leaves the checkout alone and reports the rollback incomplete. One case
+  is still open: an uncommitted edit made on the same branch after the merge is
+  lost to a post-merge reset (#2679).
 - **Incoming changes that would overwrite a local untracked or ignored file are
   refused** (`genesis_range_collisions`, over the range from the merge base, every
   change but a deletion: an incoming MODIFICATION of a path the local branch
@@ -129,7 +140,9 @@ through the rollback trap.
   fast-forward; a true 3-way merge overwrites the file, and a rollback's
   `reset --hard` then deletes it. So the scan is the protection: before the stop,
   and again as the last step before the merge (`late-collision-scan`), where a hit
-  rolls back with HEAD unmoved, which leaves an untracked file where it is.
+  rolls back with HEAD unmoved: the rollback resets nothing, so the file stays.
+  Paths git invents in a file/directory conflict (`<path>~HEAD`) are not scanned
+  (#2678).
 - **Local edits to the ephemeral files are backed up** (`ephemeral-prestop-backup`)
   between the fetch and `_write_state "fetching"` — every dirty one, because a
   rollback's `reset --hard` discards any of them. The clear before the merge

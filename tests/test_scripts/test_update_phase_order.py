@@ -94,8 +94,11 @@ def test_pre_stop_fetch_is_post_merge_gated(text):
     """The hoisted fetch must be inside an ``if [[ "$POST_MERGE" == "false" ]]``
     so the --post-merge CC-conflict re-entry (code already merged) skips it."""
     f = _idx(text, FETCH)
-    preamble = text[max(0, f - 300) : f]
-    assert '[[ "$POST_MERGE" == "false" ]]' in preamble, "pre-stop fetch must be POST_MERGE-gated"
+    # The nearest gate opener before the fetch, with no column-0 `fi` closing it
+    # in between: the fetch sits INSIDE that block, however long the comments.
+    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]; then', 0, f)
+    assert gate != -1, "pre-stop fetch must be POST_MERGE-gated"
+    assert "\nfi\n" not in text[gate:f], "the POST_MERGE gate closes before the fetch"
 
 
 def test_fetch_failure_cleans_up_and_exits_without_rollback(text):
