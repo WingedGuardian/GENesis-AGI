@@ -38,8 +38,17 @@ async def db():
     await conn.close()
 
 
+#: Stamp a little further back than asked. Ages are `CAST(julianday('now') - jd
+#: AS INTEGER)`, and SQLite's 'now' has millisecond resolution: a run stamped
+#: exactly N days before Python's now, then read in the same millisecond, ages
+#: as N-1. MEASURED: 9,876 of 20,000 back-to-back reads came out one day short
+#: with no margin, 0 of 20,000 with 60s. No test stamps within a minute of an
+#: integer threshold, so the margin moves no verdict.
+_STAMP_MARGIN = timedelta(seconds=60)
+
+
 def _ago(days: float) -> str:
-    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    return (datetime.now(UTC) - timedelta(days=days) - _STAMP_MARGIN).isoformat()
 
 
 async def _run(
