@@ -238,6 +238,40 @@ def test_fingerprint_missing_file_skips(clean_diff, tmp_path):
     assert r.ok is True
 
 
+_FP_DIFF = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+see tok_private here\n"
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        b"x{4294967296}",  # re.compile raises OverflowError, not re.error
+        b"(" * 1500 + b"a" + b")" * 1500,  # RecursionError
+        b"\xff\xfe not utf-8",  # a strict decode raises before any pattern compiles
+        b"# caf\xe9 notes",  # the same, on a comment line
+    ],
+    ids=["repeat-count-overflow", "nesting-recursion", "non-utf8-pattern", "non-utf8-comment"],
+)
+def test_one_bad_fingerprint_line_does_not_switch_the_rest_off(bad_line, tmp_path):
+    """Each of these lines used to raise out of _check_fingerprints, and the
+    pre-push review swallows the exception and drops the whole fingerprint scan.
+    The ordinary fingerprint beside it must still block."""
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_bytes(bad_line + b"\ntok_private\n")
+    r = sanitize.scan_diff(_FP_DIFF, fingerprint_file=fp)
+    assert any(f.kind == FindingKind.FINGERPRINT for f in r.blocking()), r.findings
+
+
+def test_a_pattern_that_cannot_compile_matches_as_literal_text(tmp_path):
+    """Control for the fallback: the bad line is matched as its own literal text."""
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_bytes(b"x{4294967296}\n")
+    diff = _FP_DIFF.replace("tok_private", "x{4294967296}")
+    assert any(
+        f.kind == FindingKind.FINGERPRINT
+        for f in sanitize.scan_diff(diff, fingerprint_file=fp).blocking()
+    )
+
+
 def test_empty_diff_ok():
     r = sanitize.scan_diff("")
     assert r.ok is True

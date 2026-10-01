@@ -4,8 +4,8 @@
 # Idempotent: lines already present are skipped. Adds new lines for hashes
 # that don't yet exist in the file.
 #
-# Run this whenever you modify a tracked hook (post-commit, pre-commit,
-# pre-push) and need to record the new version. The pre-commit gate
+# Run this whenever you modify a tracked hook (TRACKED_HOOKS below) and need
+# to record the new version. The pre-commit gate
 # (scripts/check_hook_versions.sh) will refuse to commit a hook change
 # without a corresponding entry here.
 #
@@ -23,7 +23,7 @@ VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
 # Hooks we track. Keep in lockstep with check_hook_versions.sh,
 # check_hook_versions_complete.sh, and sync-hooks.sh HOOKS_TO_SYNC.
-TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push)
+TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push pre-merge-commit)
 
 if [[ ! -f "$VERSIONS_FILE" ]]; then
     echo "ERROR: $VERSIONS_FILE not found." >&2

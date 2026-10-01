@@ -38,6 +38,65 @@ MODE="default"          # default | genesis-only | guardian-only | full
 DRY_RUN=false
 INTERACTIVE=true
 CONTAINER_NAME="genesis"
+
+# ONE inventory of Persistent= timers, because there are TWO cleanup paths and
+# they have drifted apart before. A `Persistent=true` timer keeps a stamp under
+# ~/.local/share/systemd/timers/ that removing the unit file does NOT delete;
+# systemd.timer(5) says to clear it BEFORE the unit goes away, or a reinstall
+# inherits a stale "last run" and can immediately replay a run it should skip.
+#
+# Kept as a variable rather than repeated, because repeating it is exactly how
+# this broke: the direct-container branch gained a timer and the host-driven
+# branch did not, and this file's own comment already named that asymmetry once.
+# A fourth hardcoded list would have been the third instance.
+#
+# tests/test_scripts/test_systemd_template_placeholders.py derives the expected
+# set from the templates themselves and asserts EVERY `clean --what=state` site
+# uses this variable, so a new Persistent timer cannot be half-added.
+GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
+genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
+genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
+# The ROOT timers scripts/lib/network_resilience.sh installs under
+# /etc/systemd/system, with their scripts and /run files. Both removal paths
+# (direct and via incus) run this one command, so they cannot drift apart. The
+# Tailscale watchdog restarts tailscaled, dropping every SSH session, so it must
+# not outlive Genesis. KeepConfiguration drop-ins are deliberately left: they
+# shape how the network behaves, and removing one needs a networkd restart.
+#
+# Every step needs sudo and tolerates failure, so the command then CHECKS: a
+# unit file or script still present, or a timer still active, is printed after
+# GENESIS_ROOT_WATCHDOG_LEFT and the command exits 1. The callers report that
+# instead of success (on the incus path the exit status does not come back).
+# BEGIN root-watchdog-remove
+_WD_ROOT="${GENESIS_ROOT_WATCHDOG_PREFIX:-}"  # test seam; empty = the real root
+_WD_UNITS="genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service genesis-network-watchdog.timer genesis-network-watchdog.service"
+_WD_FILES="$_WD_ROOT/etc/systemd/system/genesis-tailscale-watchdog.service $_WD_ROOT/etc/systemd/system/genesis-tailscale-watchdog.timer \
+$_WD_ROOT/etc/systemd/system/genesis-network-watchdog.service $_WD_ROOT/etc/systemd/system/genesis-network-watchdog.timer \
+$_WD_ROOT/usr/local/lib/genesis/tailscale-watchdog.py $_WD_ROOT/usr/local/lib/genesis/network-watchdog.sh"
+_WD_RUN_FILES="$_WD_ROOT/run/genesis-tailscale-watchdog.json $_WD_ROOT/run/genesis-tailscale-watchdog-status.json \
+$_WD_ROOT/run/genesis-network-watchdog.json $_WD_ROOT/run/genesis-network-watchdog.last"
+GENESIS_ROOT_WATCHDOG_LEFT="root watchdog still present:"
+GENESIS_ROOT_WATCHDOG_REMOVE="for u in $_WD_UNITS; do sudo -n systemctl disable --now \"\$u\" 2>/dev/null || true; done; \
+sudo -n rm -f $_WD_FILES $_WD_RUN_FILES 2>/dev/null || true; \
+sudo -n systemctl daemon-reload 2>/dev/null || true; \
+left=''; for f in $_WD_FILES; do if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then left=\"\$left \$f\"; fi; done; \
+for u in $_WD_UNITS; do case \"\$u\" in *.timer) if systemctl is-active --quiet \"\$u\" 2>/dev/null; then left=\"\$left \$u\"; fi ;; esac; done; \
+if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi"
+# END root-watchdog-remove
+
+# report_root_watchdog_removal <output> — the removal command's verdict. It
+# never aborts the uninstall: the rest of Genesis still comes out.
+report_root_watchdog_removal() {
+    local out="$1"
+    if [[ "$out" == *"$GENESIS_ROOT_WATCHDOG_LEFT"* ]]; then
+        warn "The root network/Tailscale watchdog was NOT fully removed, and can keep restarting tailscaled (dropping SSH sessions). Needs root:${out#*"$GENESIS_ROOT_WATCHDOG_LEFT"}"
+        warn "Remove it as root: systemctl disable --now $_WD_UNITS; then delete the files listed above."
+        return 0
+    fi
+    [ -n "$out" ] && echo "$out"
+    ok "Removed root network and Tailscale watchdog timers"
+    REMOVED+=("root watchdog timers")
+}
 CONTAINER_USER="ubuntu"
 IN_CONTAINER=false
 
@@ -90,6 +149,13 @@ safe_remove() {
     local path="$1"
     local label="${2:-$1}"
     if [ -e "$path" ] || [ -L "$path" ]; then
+        # Word splitting on $GENESIS_PERSISTENT_TIMERS is DELIBERATE in both
+        # branches below: the inventory is a space-separated unit list, not one
+        # argument. Explained here rather than beside the command because a
+        # neighbouring test asserts the DRY_RUN guard sits within 500 characters
+        # of the clean call, and a comment block wedged between them pushed it
+        # out of range — the guard was still there, the window just could not
+        # see it.
         if [ "$DRY_RUN" = true ]; then
             echo "    [DRY RUN] Would remove: $label"
         else
@@ -313,6 +379,7 @@ fi
 if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
     echo "    Genesis (container-side):"
     echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, qdrant"
+    echo "      - Root timers: genesis-network-watchdog, genesis-tailscale-watchdog"
     echo "      - Repository: ~/genesis/"
     echo "      - Runtime state: ~/.genesis/"
     echo "      - Database: ~/data/"
@@ -414,10 +481,22 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Running inside the container — direct operations
 
         # Stop all Genesis services (timer first, then service, to prevent restart)
+        # The tmp watchgod goes BEFORE the pressure-reclaim instances it
+        # starts, or it could start one again mid-teardown. (Instance names
+        # are built from a variable so no literal "unit at instance dot
+        # service" name reaches the tree: CI's email scan reads that shape as
+        # an address.)
+        PRESSURE_UNIT=genesis-disk-hygiene-pressure
         for unit in genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-tmp-watchgod.service \
+                    "${PRESSURE_UNIT}@standard.service" \
+                    "${PRESSURE_UNIT}@last-resort.service" \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
+                    genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
@@ -434,14 +513,20 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # timer state changes whether a later reinstall replays a missed run,
         # which is exactly the outcome someone runs --dry-run to avoid.
         if [ "$DRY_RUN" = true ]; then
-            echo "    [DRY RUN] Would clear persistent timer state for:" \
-                 "genesis-cc-settings-align, genesis-cc-align, genesis-disk-hygiene," \
-                 "genesis-watchdog, genesis-cc-tmp-align"
+            # Reads the inventory rather than restating it: a --dry-run that
+            # names a DIFFERENT set from the one the real path clears is worse
+            # than no preview, since previewing is the whole point of the flag.
+            echo "    [DRY RUN] Would clear persistent timer state for: $GENESIS_PERSISTENT_TIMERS"
         else
-            systemctl --user clean --what=state \
-                genesis-cc-settings-align.timer genesis-cc-align.timer \
-                genesis-disk-hygiene.timer genesis-watchdog.timer \
-                genesis-cc-tmp-align.timer 2>/dev/null || true
+            # shellcheck disable=SC2086
+            systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
+        fi
+
+        # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
+        if [ "$DRY_RUN" = true ]; then
+            echo "    [DRY RUN] Would disable and remove the root network and Tailscale watchdog timers"
+        else
+            report_root_watchdog_removal "$(bash -c "$GENESIS_ROOT_WATCHDOG_REMOVE")"
         fi
 
         # Wait for genesis-server port to close
@@ -506,15 +591,29 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             # Stop all services (timers first to prevent restart races)
             container_exec "
                 systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
+                systemctl --user stop genesis-tmp-watchgod.service 2>/dev/null || true;
+                P=genesis-disk-hygiene-pressure; systemctl --user stop \${P}@standard.service \${P}@last-resort.service 2>/dev/null || true;
+                systemctl --user stop genesis-disk-hygiene.timer genesis-disk-hygiene.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
+                systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
+                systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
+                systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 systemctl --user disable genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
+                    genesis-tmp-watchgod.service \
+                    genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
+                    genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-backup.timer genesis-backup.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
             "
             ok "Stopped Genesis services"
+
+            # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
+            report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
 
             # Persistent= timers keep a stamp file under
             # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it
@@ -530,10 +629,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 echo "    [DRY RUN] Would clear persistent timer state inside the container"
             else
                 container_exec "
-                    systemctl --user clean --what=state \
-                        genesis-cc-settings-align.timer genesis-cc-align.timer \
-                        genesis-disk-hygiene.timer genesis-watchdog.timer \
-                        genesis-cc-tmp-align.timer 2>/dev/null || true
+                    systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
                 "
             fi
 

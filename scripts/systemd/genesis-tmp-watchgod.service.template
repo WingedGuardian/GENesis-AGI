@@ -1,5 +1,5 @@
 [Unit]
-Description=Genesis /tmp watchgod — dual-zone temp protection
+Description=Genesis tmp watchgod — whole-disk guardian, cc-tmp retention, OOM capture
 After=default.target
 
 [Service]

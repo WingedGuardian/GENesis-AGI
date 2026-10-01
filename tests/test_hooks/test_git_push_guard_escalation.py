@@ -62,7 +62,12 @@ def test_ordinary_standing_authorization_ends_after_four_heads(monkeypatch):
     _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
     decision, reason = _decision()
     assert decision == "ask"
-    assert "standing authorization ended after four" in reason
+    # Derived, not spelled: the message interpolates the constant, so a hardcoded
+    # "four" here would just relocate the drift this change removed into the test.
+    assert (
+        f"standing authorization ended after {_mod._review_budget.STANDING_REVIEWED_HEAD_LIMIT}"
+        in reason
+    )
 
 
 def test_round_six_and_later_are_strongly_discouraged(monkeypatch):
@@ -71,6 +76,133 @@ def test_round_six_and_later_are_strongly_discouraged(monkeypatch):
     assert decision == "ask"
     assert "strongly discouraged" in reason
     assert "narrow or redesign" in reason
+
+
+@pytest.mark.parametrize("heads", [4, 5])
+def test_the_prompt_names_the_terminal_decision_at_and_past_four_heads(monkeypatch, heads):
+    """The prompt the OWNER reads at the decision must frame round 4 as terminal.
+
+    This exists because the two assertions above could not see it. They pin
+    "strongly discouraged" and "narrow or redesign", both of which live only in the
+    `count >= 5` branch and both of which survived the rewrite that added the
+    terminal framing — so stripping that framing left this file GREEN (MEASURED
+    2026-09-25 by mutation). The four-head case, which IS the terminal boundary, had
+    no assertion on its text at all, and it is the branch that used to read
+    "Approve this single round-5 request" as though a fifth round were ordinary.
+
+    Both values are checked because `strongly_discouraged` is `count >= 5`: 4 takes
+    the fall-through branch and 5 the discouraged one. The RULE ("there is no
+    ordinary round 5") belongs only at exactly four heads — at five it is false —
+    while the DECISION (merge or send back) must be named at both.
+    """
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:heads]])
+    decision, reason = _decision()
+    assert decision == "ask"
+    if heads == 4:
+        assert "ROUND 4 IS TERMINAL" in reason, (
+            "at the four-head boundary the prompt must state the terminal rule; "
+            "without it the owner is asked to approve round 5 as if it were ordinary"
+        )
+    else:
+        # Past the boundary the rule's own sentence is FALSE: "there is no
+        # ordinary round 5" told to someone already holding five reviewed heads
+        # (Devin, #2382). The decision is named instead, as at the commit gate.
+        assert "no ordinary round" not in reason, (
+            "a five-head prompt must not deny that a fifth round happened"
+        )
+        assert "past the terminal boundary" in reason
+    # The decision it names, not merely the label — a caller has to be told what
+    # the two choices ARE, which is the half the old wording omitted entirely.
+    assert "MERGE" in reason and "SEND IT BACK" in reason
+    assert "does not carry forward" in reason or "never carries forward" in reason
+
+
+def test_an_unmarked_request_inside_the_gate_budget_is_not_told_it_is_terminal(monkeypatch):
+    """The gate lane still holds one round open, and the prompt must not foreclose it.
+
+    At exactly GATE_DISCOVERY_ROUND_LIMIT heads with the current head unreviewed and
+    no confirmation yet requested, `evaluate_pr` returns `confirmation_exempt` and
+    `reason="gate_confirmation"` — the PR is WITHIN budget and one exact-head marked
+    dispatch is free. An UNMARKED request still asks, because it is indistinguishable
+    from another discovery round, and the first version of this fix answered that ask
+    with the terminal decision. Naming merge-or-send-back forecloses the options the
+    evaluator is holding open, which makes it a terminality claim even though it
+    avoids the literal "there is no round N+1" sentence.
+    """
+    _evidence(
+        monkeypatch,
+        [(h, "COMMENTED") for h in HEADS[:2]],
+        head=HEADS[2],
+        files=("scripts/review_budget.py",),
+    )
+    decision, reason = _decision()
+    assert decision == "ask", "an unmarked request is still gated"
+    assert "STILL BUDGETED" in reason
+    assert "cannot see the current head's marker" in reason
+    # It must not assert WHY: an opaque body (--body-file, editor) lands here too,
+    # and a request that really does carry the marker must not be told it does not.
+    assert "the body is opaque here" in reason
+    # The terminal decision must be ABSENT: the budget is not spent.
+    assert "SEND IT BACK for rework" not in reason, (
+        "the confirmation round is still available; do not name the terminal decision"
+    )
+    assert "MERGE with the outstanding issues" not in reason
+
+
+def test_a_marker_cannot_license_a_sibling_request_in_the_exempt_state(monkeypatch):
+    """The compound deny must hold in the ONE state where a marker is honoured.
+
+    Requests are judged on PRE-command state, so in a compound command every marked
+    request reads `confirmation_exempt` alike — which is why the guard rejects
+    compounds at `len(triggers) > 1` BEFORE any budget lookup or exemption. This test
+    pins that ordering in the state that actually matters: `count ==
+    GATE_DISCOVERY_ROUND_LIMIT` on gate-surface files, with the exact-head marker
+    present in both bodies. The two existing compound-deny tests both use ordinary
+    files at 3 and 4 heads, so neither reaches the exempt path at all — without this
+    one, a future reordering that consulted the exemption first would license the
+    sibling request and no test would notice.
+    """
+    _evidence(
+        monkeypatch,
+        [(h, "COMMENTED") for h in HEADS[:2]],
+        head=HEADS[2],
+        files=("scripts/review_budget.py",),
+    )
+    marked = (
+        "gh pr comment 1372 --repo owner/repo --body "
+        f'"@codex review {_mod._review_budget.confirmation_marker(HEADS[2])}"'
+    )
+    decision, reason = _decision(f"{marked} && {marked}")
+    assert decision == "deny", "an exact-head marker must not license a sibling request"
+    assert "multiple review requests" in reason
+
+
+def test_the_gate_surface_prompt_states_the_terminal_decision(monkeypatch):
+    """The gate lane's ask returns BEFORE the ordinary notice, so it needs its own.
+
+    `_review_budget_message` checks `gate_surface` first and returns, which means a
+    gate-surface PR never reaches the `ROUND 4 IS TERMINAL` text below it — even
+    though `evaluate_pr` sets `strongly_discouraged` for it at `count >= 2`. So the
+    first version of the terminal framing reached 2 of this repo's 6 protected
+    approval branches and this one was not among them.
+
+    It asserts the DECISION only, not a round number: the live mechanism still
+    grants one exact-head confirmation dispatch at the gate limit, so a claim that
+    no further round exists would be false here today.
+    """
+    _evidence(
+        monkeypatch,
+        [(h, "COMMENTED") for h in HEADS[:3]],
+        head=HEADS[3],
+        files=("scripts/review_budget.py",),
+    )
+    decision, reason = _decision()
+    assert decision == "ask"
+    assert "review-gate surface" in reason, "expected the gate-lane branch, not the ordinary one"
+    assert "MERGE with the outstanding issues accepted and filed" in reason
+    assert "SEND IT BACK for rework" in reason
+    # The number comes from the evaluator, not from prose that can drift past it.
+    assert f"{_mod._review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery rounds" in reason
 
 
 def test_dismissed_reviews_count_but_duplicate_heads_count_once(monkeypatch):
@@ -120,6 +252,35 @@ def test_gate_surface_allows_one_exact_head_confirmation(monkeypatch):
     )
 
 
+def test_terminal_notice_is_only_reachable_at_exactly_four_heads():
+    """The four-head NOTICE is rendered by the fall-through, which is reached only
+    while the count sits between the standing limit and the discouraged threshold.
+    That is exactly four heads only because the two constants are adjacent; widen
+    the gap and the NOTICE's "no ordinary round 5" is rendered at five heads again."""
+    rb = _mod._review_budget
+    assert rb.STRONGLY_DISCOURAGED_REVIEWED_HEADS == rb.STANDING_REVIEWED_HEAD_LIMIT + 1
+
+
+def test_gate_prompt_at_exactly_the_limit_does_not_say_past_it(monkeypatch):
+    """At exactly GATE_DISCOVERY_ROUND_LIMIT heads with the exemption spent, the
+    budget is at its end, not past it — "past its 2 discovery rounds" at 2 heads is
+    the off-by-one this prompt exists to remove (adversarial audit, #2382)."""
+    marker = _mod._review_budget.confirmation_marker(HEADS[2])
+    _evidence(
+        monkeypatch,
+        [(HEADS[0], "COMMENTED"), (HEADS[1], "COMMENTED")],
+        head=HEADS[2],
+        files=("scripts/review_budget.py",),
+        comments=(("owner", "User", marker),),
+    )
+    decision, reason = _decision(
+        f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'"
+    )
+    assert decision == "ask"
+    assert "past its" not in reason
+    assert "at the end of its" in reason
+
+
 def test_gate_confirmation_marker_prevents_a_repeat_exemption(monkeypatch):
     marker = _mod._review_budget.confirmation_marker(HEADS[2])
     _evidence(
@@ -167,9 +328,7 @@ def test_shell_expanded_body_cannot_claim_confirmation_exemption(monkeypatch):
         files=("scripts/review_budget.py",),
     )
     marker = _mod._review_budget.confirmation_marker(HEADS[2])
-    decision, _ = _decision(
-        f'gh pr comment 1372 --repo owner/repo --body "$BODY {marker}"'
-    )
+    decision, _ = _decision(f'gh pr comment 1372 --repo owner/repo --body "$BODY {marker}"')
     assert decision == "ask"
 
 

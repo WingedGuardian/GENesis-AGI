@@ -252,6 +252,8 @@ def _success_output(
         "**Source:** https://example.com/first\n"
         "**Source:** https://example.com/second\n"
         "**Source:** https://example.com/article\n"
+        "**Source:** https://example.com\n"
+        "**Source:** https://example.com/tool\n"
     ),
 ) -> CCOutput:
     return CCOutput(
@@ -778,7 +780,8 @@ async def test_modified_file_only_sends_delta(
 
     # Reset and add new content
     mock_invoker.run.reset_mock()
-    mock_invoker.run.return_value = _success_output("eval of second")
+    mock_invoker.run.return_value = _success_output("eval of second\n**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n")
     f.write_text("https://example.com/first\n\nhttps://example.com/second\n")
     result2 = await monitor.check_once()
     assert result2.batches_dispatched == 1
@@ -861,7 +864,8 @@ async def test_bracket_directive_renders_on_second_delta_eval(
     assert result1.batches_dispatched == 1
 
     mock_invoker.run.reset_mock()
-    mock_invoker.run.return_value = _success_output("eval of second")
+    mock_invoker.run.return_value = _success_output("eval of second\n**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n")
     f.write_text(
         "[If it's in here, default to building it]\n"
         "https://example.com/first\n\n"

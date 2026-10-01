@@ -37,37 +37,64 @@ class CCBudgetTracker:
         self._threshold = throttle_threshold_pct
         self._clock = clock or (lambda: datetime.now(UTC))
 
-    async def record_session_start(self, session_type: str, priority: int) -> None:
-        """Record that a CC session was started (writes to cc_sessions)."""
-        import uuid
-
-        now = self._clock().isoformat()
-        try:
-            await self._db.execute(
-                """INSERT INTO cc_sessions
-                   (id, session_type, model, started_at, last_activity_at, status, source_tag)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), session_type, "sonnet", now, now, "active", f"priority_{priority}"),
-            )
-            await self._db.commit()
-        except Exception:
-            logger.error(
-                "CC budget record FAILED: session_type=%s priority=%d",
-                session_type, priority, exc_info=True,
-            )
+    # record_session_start was DELETED (2026-09-04): a fourth, raw-SQL
+    # creation path into cc_sessions with a hardcoded model and no closer —
+    # its rows (source_tag='priority_<n>') stayed 'active' forever. Its only
+    # caller was its own test. _count_recent_sessions below counts rows the
+    # REAL creation paths write (SessionManager, registration, adoption), so
+    # the budget needs no private recorder. Legacy priority_* rows on
+    # existing installs remain excluded from extraction by the
+    # _EXCLUDED_SOURCE_TAG_PREFIXES classification.
 
     async def _count_recent_sessions(self) -> int:
-        """Count sessions started in the last hour (active or completed).
+        """Count sessions started in the last hour that CONSUMED a CC start.
+
+        Counted: active, completed, expired, checkpointed. NOT failed — see
+        the comment on the predicate below, which carries the measurement.
 
         Voice conversation rows (source_tag='voice') are transcript-index
         entries, not CC invocations — they must not consume the budget or
         trigger throttling.
         """
+        # The cutoff is built in PYTHON, so both sides of the comparison below
+        # are ISO-8601 with a 'T' and the lexical compare is correct. This is
+        # the counterexample to the julianday() conversions elsewhere in this
+        # subsystem: those were wrong because their cutoff came from SQLite's
+        # datetime(), which renders a SPACE where the stored value has 'T'.
+        # Either generate both sides here or push both through julianday() —
+        # never mix the two.
         cutoff = (self._clock() - timedelta(hours=1)).isoformat()
         cursor = await self._db.execute(
             """SELECT COUNT(*) FROM cc_sessions
-               WHERE started_at > ? AND status IN ('active', 'completed', 'expired')
-                 AND source_tag != 'voice'""",
+               WHERE started_at > ?
+                 -- 'checkpointed' is REQUIRED by this PR: the new dead-pid
+                 -- fast path can checkpoint a row ~31 minutes after it
+                 -- started, inside this 1-hour window, where previously the
+                 -- only route to that status was the 24h gate. Omitting it
+                 -- would undercount real starts.
+                 --
+                 -- 'failed' is deliberately NOT counted, and this is the
+                 -- interesting half. MEASURED on the live table: at
+                 -- 2026-09-21T04 this predicate reads 0 without it and 20
+                 -- with it — twenty rows, all 'failed', in one hour. At the
+                 -- default max_sessions_per_hour=20 that is usage 1.00, which
+                 -- `get_status` turns into RATE_LIMITED and `should_throttle`
+                 -- turns into "refuse everything at or above reflection
+                 -- priority". Failures are correlated, so counting them makes
+                 -- a CC failure cascade automatically suppress the background
+                 -- cognition that might diagnose it — backwards, and against
+                 -- the standing rule that cost tracking is observability and
+                 -- never automatic control.
+                 AND status IN ('active', 'completed', 'expired', 'checkpointed')
+                 -- COALESCE for CONSISTENCY with the four sibling predicates
+                 -- in db/crud/cc_sessions.py, not to fix a live defect: the
+                 -- column is `TEXT NOT NULL DEFAULT 'foreground'`
+                 -- (db/schema/_tables.py), so a NULL is impossible here and
+                 -- MEASURED 0 of 5,023 live rows carry one. `NULL != 'voice'`
+                 -- would evaluate to NULL rather than true, so if the
+                 -- constraint were ever relaxed this predicate would silently
+                 -- drop those rows from the budget.
+                 AND COALESCE(source_tag, '') != 'voice'""",
             (cutoff,),
         )
         row = await cursor.fetchone()

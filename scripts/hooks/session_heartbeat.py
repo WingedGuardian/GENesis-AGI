@@ -79,6 +79,19 @@ def _connect_with_deadline(
     """Open a read connection whose lock wait and query work share a deadline."""
     import sqlite3
 
+    if deadline is not None and deadline - time.monotonic() <= 0:
+        return None
+    # Admission fence at this module's connect chokepoint (fail-closed): a
+    # fenced database reads as "could not read" (None), which every caller's
+    # three-valued contract already preserves correctly. `remaining` is
+    # computed AFTER the fence check so its cost is charged to the deadline.
+    try:
+        from db_admission_check import database_is_fenced
+
+        if database_is_fenced(db_uri):
+            return None
+    except Exception:
+        return None
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         return None
@@ -129,9 +142,11 @@ def sanitize_detail(text: str | None, limit: int) -> str:
         return ""
     # Strip the characters the TAG GRAMMAR owns, not only the bracket pair.
     # Brackets alone stop a forged LINE; the grammar is
-    # `[Concurrent | <src> <model> | <id>] <topic> - <digest>`, so a peer value
-    # containing "|" still forges an extra FIELD inside the surviving line --
-    # including the id position, which a reader attributes to the tag itself.
+    # `[Concurrent | <src> <model> | <id> -> <address>] <topic> - <digest>`, so a
+    # peer value containing "|" still forges an extra FIELD inside the surviving
+    # line -- including the id position, which a reader attributes to the tag
+    # itself. (The address is not passed through here: a name is an address, so
+    # session_awareness.peer_address allowlists it and omits it whole, never cuts.)
     # Substituted rather than deleted so the text stays readable.
     flattened = _WHITESPACE_RUN.sub(" ", text.translate(_TAG_GRAMMAR_CHARS)).strip()
     if limit <= 1:

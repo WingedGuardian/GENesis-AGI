@@ -137,12 +137,26 @@ IPs, hostnames, absolute home paths, identifiers, or raw install metrics (row
 counts and spend leak usage scale — state proportions instead). Nothing gates this
 path; `gh issue create` appears nowhere in `scripts/hooks/git_push_guard.py`.
 
-**Security defects never go public first.** An unpatched authentication bypass,
-credential exposure, injection path, or anything otherwise exploitable is not filed
-publicly while unfixed — publishing hands a working lead to anyone reading, against
-installs running the vulnerable code right now. Keep it local, fix it, then file.
-The privacy scan does not catch this: it looks for install-specific data, not for
-dangerous technical disclosure.
+**Security defects never go public first, and the test is WHO GAINS.** A defect
+is security-class when disclosure hands someone a capability they do not already
+have — an authentication or privilege bypass, a credential exposure, an injection
+path, anything reachable by a party with LESS access than it grants. Those are not
+filed publicly while unfixed: publishing hands a working lead to anyone reading,
+against installs running the vulnerable code right now. Keep it local, fix it,
+then file. The privacy scan does not catch this: it looks for install-specific
+data, not for dangerous technical disclosure.
+
+**Apply that test rather than the word "bypass".** A fail-open in a LOCAL
+development guard usually fails it: the hook runs only where an install wires it,
+whoever can trigger it already has commit access to that checkout, and the worst
+case is typically an under-reviewed change reaching a PR that still waits on
+maintainer approval — the state of any PR authored without those hooks. The
+earlier catch-all ("anything otherwise exploitable") swept in most of what this
+repo builds and withheld filable findings. The exception the test catches and the
+label does not: a guard whose job is stopping a secret or private data from
+reaching a public surface is security-class however local it is, because a branch
+on a public repo is public the moment it is pushed, merged or not. Borderline?
+Ask. CLAUDE.md, "Where deferred work goes", is the authority.
 
 If the script refuses (exit 2), the work stays a local `follow_up_create` row until
 a maintainer carries it across. That is a known gap, not a workaround.
