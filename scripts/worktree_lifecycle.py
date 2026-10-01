@@ -238,6 +238,44 @@ def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def _run_git_bytes(repo_root: Path, args: list[str], *, timeout: float) -> bytes | None:
+    """`_run_git` without decoding: stdout as bytes on success, None on failure.
+
+    For NUL-delimited output, where text mode is wrong twice over: its newline
+    translation rewrites a carriage return INSIDE a path, so the parsed name is
+    not the file on disk.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True,
+            cwd=str(repo_root), timeout=timeout, env=_git_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+class _ProbeFailed(Exception):
+    """A strict activity probe could not get an answer from git.
+
+    Raised only when the caller asked for ``strict``: at archive time an
+    unanswered probe must not read as "idle", while classification degrades to
+    the mtime walk as it always has.
+    """
+
+
+#: Wall-clock seconds the nested-repository probes may spend in one scan, across
+#: every worktree. Depth alone does not bound them: each level can report many
+#: nested repositories, and each is one more `git status`. Reset by `main`.
+_NESTED_PROBE_BUDGET_S = 300.0
+_nested_probe_seconds_left = _NESTED_PROBE_BUDGET_S
+
+
+def _reset_nested_probe_budget() -> None:
+    global _nested_probe_seconds_left
+    _nested_probe_seconds_left = _NESTED_PROBE_BUDGET_S
+
+
 def _nested_worktrees_under(wt_path: Path, repo_root: Path) -> list[str]:
     """Registered worktrees living INSIDE ``wt_path``, read fresh from git.
 
@@ -416,7 +454,9 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     return worktrees
 
 
-def _git_activity_time(worktree_path: str, _depth: int = 0) -> float:
+def _git_activity_time(
+    worktree_path: str, _depth: int = 0, *, strict: bool = False, timeout: float = 60,
+) -> float:
     """Activity git can see that a shallow mtime walk cannot. 0.0 if unknown.
 
     ONE signal: the mtimes behind the paths git reports as changed (see
@@ -432,23 +472,43 @@ def _git_activity_time(worktree_path: str, _depth: int = 0) -> float:
 
     Failures are absorbed and contribute 0.0, because this only ever RAISES the
     measured activity: a git call that fails degrades to the old mtime answer
-    rather than making a worktree look more idle than it is.
+    rather than making a worktree look more idle than it is. That is right for
+    classification, where the archive step re-checks. The archive step itself
+    passes ``strict``: there a failure raises `_ProbeFailed`, because an
+    unanswered probe must hold the worktree, not read as idle.
     """
     newest = 0.0
     root = Path(worktree_path)
+
+    # A NESTED repository also counts its own HEAD and reflog: a checkout or
+    # commit inside it leaves its status clean, and the parent shows only
+    # ` M <gitlink>` (MEASURED). These are when HEAD MOVED here, not when the
+    # commit was made, so they do not have the commit-timestamp problem above.
+    # Not applied at the top level, where every worktree's reflog is written
+    # when it is created.
+    if _depth > 0:
+        moved = _run_git(root, ["rev-parse", "--git-path", "HEAD", "--git-path", "logs/HEAD"], timeout=timeout)
+        if moved is None and strict:
+            raise _ProbeFailed(f"cannot resolve the git dir of {root}")
+        for rel in (moved or "").splitlines():
+            with contextlib.suppress(OSError):
+                newest = max(newest, (root / rel).stat().st_mtime)
 
     # `-uall` so an untracked file deep in the tree counts; `--porcelain=v1`
     # pins the format, whose first 3 columns are status + a space. `-z` because
     # without it git C-quotes any path holding unusual bytes
     # (`"deep-\377/f.txt"` under the default `core.quotePath`), and a quoted
     # name is not a path on disk. With `-z` paths are raw and NUL-separated, and
-    # a rename or copy is TWO fields: destination, then source.
-    dirty = _run_git(
-        root, ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none"], timeout=60,
+    # a rename or copy is TWO fields: destination, then source. Read as BYTES so
+    # no newline translation can rewrite a carriage return inside a path.
+    dirty = _run_git_bytes(
+        root, ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none"], timeout=timeout,
     )
-    if not dirty:
+    if dirty is None:
+        if strict:
+            raise _ProbeFailed(f"git status failed in {root}")
         return newest
-    fields = dirty.split("\0")
+    fields = dirty.split(b"\0")
     i = examined = 0
     while i < len(fields) and examined < _DIRTY_SCAN_CAP:
         entry = fields[i]
@@ -459,17 +519,17 @@ def _git_activity_time(worktree_path: str, _depth: int = 0) -> float:
         # The source of a rename or copy is the next field. Reading it as an
         # entry of its own could only add a stray reading, never lower the
         # answer, so this is format correctness rather than a safety bound.
-        if "R" in status or "C" in status:
+        if b"R" in status or b"C" in status:
             if i < len(fields):
                 paths.append(fields[i])
             i += 1
         examined += 1
         for rel in paths:
-            newest = max(newest, _path_activity(root, root / rel, _depth))
+            newest = max(newest, _path_activity(root, root / os.fsdecode(rel), _depth, strict=strict))
     return newest
 
 
-def _path_activity(root: Path, path: Path, depth: int) -> float:
+def _path_activity(root: Path, path: Path, depth: int, *, strict: bool = False) -> float:
     """The newest mtime that shows a change to ``path``. 0.0 if none is readable.
 
     Three readings, because a change does not always move the path's own mtime:
@@ -482,12 +542,15 @@ def _path_activity(root: Path, path: Path, depth: int) -> float:
       above the worktree root;
     * a NESTED REPOSITORY (a submodule, or an untracked clone) is reported only
       by its top directory, whose mtime does not move when a file inside it is
-      edited, so its own status is read, to a depth bound. Optional locks are
-      off for every git call here (`_git_env`), or that status would itself move
-      the nested `.git` directory's mtime.
+      edited, so its own status and HEAD are read, to a depth bound and within
+      the scan-wide time budget. Optional locks are off for every git call here
+      (`_git_env`), or that status would itself move the nested `.git`
+      directory's mtime. With the budget spent, classification stops descending
+      and a ``strict`` probe raises, so the archive step holds the worktree.
 
     Every reading only raises the answer.
     """
+    global _nested_probe_seconds_left
     newest = 0.0
     with contextlib.suppress(OSError):
         newest = path.lstat().st_mtime
@@ -499,9 +562,22 @@ def _path_activity(root: Path, path: Path, depth: int) -> float:
             break
         except OSError:
             continue
-    with contextlib.suppress(OSError):
-        if depth < _SUBMODULE_DEPTH_CAP and not path.is_symlink() and (path / ".git").exists():
-            newest = max(newest, _git_activity_time(str(path), depth + 1))
+    try:
+        nested = depth < _SUBMODULE_DEPTH_CAP and not path.is_symlink() and (path / ".git").exists()
+    except OSError:
+        nested = False
+    if nested:
+        if _nested_probe_seconds_left <= 0:
+            if strict:
+                raise _ProbeFailed("the nested-repository probe budget is spent")
+            return newest
+        started = time.monotonic()
+        try:
+            newest = max(newest, _git_activity_time(
+                str(path), depth + 1, strict=strict, timeout=min(60.0, _nested_probe_seconds_left),
+            ))
+        finally:
+            _nested_probe_seconds_left -= time.monotonic() - started
     return newest
 
 
@@ -516,7 +592,7 @@ _DIRTY_SCAN_CAP = 2000
 _SUBMODULE_DEPTH_CAP = 3
 
 
-def _last_activity_time(worktree_path: str) -> float:
+def _last_activity_time(worktree_path: str, *, strict: bool = False) -> float:
     """Most recent evidence of activity in the worktree.
 
     THE SHALLOW WALK IS UNSOUND ALONE, which is why git is consulted too. It
@@ -557,7 +633,7 @@ def _last_activity_time(worktree_path: str) -> float:
         except OSError:
             continue
 
-    return max(latest, _git_activity_time(worktree_path))
+    return max(latest, _git_activity_time(worktree_path, strict=strict))
 
 
 class _SkipNetwork(Exception):
@@ -1320,9 +1396,12 @@ def _trash_worktree(
     # unmerged lane with the old age and was archived seconds after it was made.
     # `main` passes its lane's threshold; a caller that names none skips this.
     if min_idle_days is not None:
+        # STRICT: an unanswered git probe raises here instead of falling back to
+        # the shallow walk, because this is the last check before the archive
+        # and the walk alone cannot see an edit made after classification.
         try:
-            idle_days = (time.time() - _last_activity_time(str(wt_path))) / 86400
-        except OSError as e:  # removed or unreadable since the check above
+            idle_days = (time.time() - _last_activity_time(str(wt_path), strict=True)) / 86400
+        except (OSError, _ProbeFailed) as e:  # removed, unreadable, or git could not answer
             _log(f"SKIP {wt_path}: cannot re-read its activity time: {e}")
             return False
         if idle_days < min_idle_days:
@@ -3118,6 +3197,7 @@ def main() -> int:
                              "(gh pr list). Faster, and can only ever under-report "
                              "a branch as unmerged — never the reverse")
     args = parser.parse_args()
+    _reset_nested_probe_budget()  # one budget per scan, however the script is driven
     # A path is decoded with surrogateescape (see `_run_git`), so a worktree name
     # that is not UTF-8 carries a surrogate into every log line naming it, and a
     # strict stream — which a pipe or the systemd journal is under a UTF-8
