@@ -20,6 +20,15 @@ from genesis.cc.types import CCOutput
 from genesis.eval import gauntlet as G
 from genesis.eval import gauntlet_regression as GR
 from genesis.eval.types import EvalRunSummary, EvalTrigger, ScoredOutput, TaskCategory
+from genesis.util import run_lock
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_run_locks(tmp_path, monkeypatch):
+    """Keep the gauntlet's run locks off the live ~/.genesis/locks and ~/tmp:
+    a test must neither leave lock files there nor contend with a real run."""
+    monkeypatch.setattr(run_lock, "lock_dir", lambda: tmp_path / "run-locks")
+    monkeypatch.setattr(run_lock, "legacy_dir", lambda: tmp_path / "run-locks-legacy")
 
 
 def _cc_output(*, via_proxy: bool = False, exit_code: int = 0) -> CCOutput:

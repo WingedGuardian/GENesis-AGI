@@ -32,8 +32,6 @@ from selection/failover.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import fcntl
 import hashlib
 import json
 import logging
@@ -63,6 +61,7 @@ from genesis.eval.types import (
 )
 from genesis.util import pytest_lock
 from genesis.util.proc_kill import kill_process_group, reap_bounded
+from genesis.util.run_lock import acquire_run_lock, release_run_lock
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -189,24 +188,19 @@ def _safe(name: str) -> str:
 
 
 def _acquire_lock(model_name: str):
-    """Non-blocking per-model advisory lock (CLI vs scheduled mutual exclusion)."""
-    lock_path = Path.home() / "tmp" / f".gauntlet-{_safe(model_name)}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")  # noqa: SIM115 — held for the run, closed in _release_lock
+    """Non-blocking per-model advisory lock (CLI vs scheduled mutual exclusion),
+    ``~/.genesis/locks/gauntlet-<model>.lock``."""
+    safe = _safe(model_name)
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return acquire_run_lock(f"gauntlet-{safe}.lock", legacy_name=f".gauntlet-{safe}.lock")
     except BlockingIOError as e:
-        fh.close()
         raise GauntletBusyError(
             f"another gauntlet run for {model_name!r} is already in progress"
         ) from e
-    return fh
 
 
-def _release_lock(fh) -> None:
-    with contextlib.suppress(Exception):
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+def _release_lock(lock) -> None:
+    release_run_lock(lock)
 
 
 def _release_late_lock(future: asyncio.Future) -> None:
