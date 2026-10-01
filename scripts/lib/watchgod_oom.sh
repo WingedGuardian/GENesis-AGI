@@ -333,7 +333,10 @@ check_oom_events() {
             else
                 # Decided, not delivered: owe it. Never re-decide (see owed=
                 # in the spec comment); every later tick retries delivery.
-                [[ -z "$owed_to" ]] && log WARN "OOM page could not be queued (oom_kill ${_from}->${cur}); retrying every poll"
+                # Logged once per decided page (retries do not reach here), and
+                # WITH the attribution: the delayed page cannot carry it, so it
+                # points the operator here (Devin review of #2706).
+                log WARN "OOM page could not be queued (oom_kill ${prev}->${cur}; ${_why}); retrying every poll"
                 owed_from="$_from"
                 owed_to="$cur"
             fi

@@ -1278,3 +1278,21 @@ def test_owed_page_survives_a_contained_kill_tick(tmp_path):
     assert spec.startswith("5:") and spec.endswith(":owed=2-3"), spec
     wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
     assert "contained in [" in wg_log, wg_log  # the kill really was the contained path
+
+
+def test_unqueued_page_logs_who_was_killed(tmp_path):
+    # The delayed page cannot carry the journal attribution, and it points the
+    # operator at the watchgod log, so the log line must name the units.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 4)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "3:0:0:0:0"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": "worker.service: Failed with result 'oom-kill'."},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert out.stdout.split("B=")[1].strip().endswith(":owed=3-4"), out.stdout
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    line = next(ln for ln in wg_log.splitlines() if "could not be queued" in ln)
+    assert "worker.service" in line, line
