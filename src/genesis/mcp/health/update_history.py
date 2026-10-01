@@ -5,10 +5,17 @@ is written by ``scripts/update.sh`` on every update attempt (success,
 failure, or rollback), but nothing read from it until this tool existed.
 
 This is a pure read-only tool. Returns the most recent N entries plus a
-computed success rate over that window. If the table hasn't been created
-yet (migration not run, or on a fresh install before the first update),
-returns a clear ``note`` explaining the state rather than a silent
-empty object.
+computed success rate over that window. Entries are ordered by true
+instant (``datetime(started_at)``, not lexicographic text) and each entry
+carries the explicit deploy facts from
+``genesis.observability.deploy_record.row_facts``: ``code_applied``,
+``activation_applied``, and ``server_restarted`` — the last distinguishing
+a ``success`` row whose ``degraded_subsystems`` records
+``genesis-server-not-restarted`` from a plain live success. The top-level
+``server_not_restarted_count`` tallies those rows. If the table hasn't
+been created yet (migration not run, or on a fresh install before the
+first update), returns a clear ``note`` explaining the state rather than
+a silent empty object.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import aiosqlite
 
 from genesis.env import db_busy_timeout_ms
 from genesis.mcp.health import mcp  # noqa: E402
+from genesis.observability.deploy_record import row_facts
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +114,7 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
                 "       status, rollback_tag, failure_reason, "
                 "       degraded_subsystems, started_at, completed_at "
                 "FROM update_history "
-                "ORDER BY started_at DESC "
+                "ORDER BY datetime(started_at) DESC "
                 "LIMIT ?",
                 (limit,),
             )
@@ -130,6 +138,7 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
             "degraded_subsystems": row[8],
             "started_at": row[9],
             "completed_at": row[10],
+            **row_facts(row[5], row[8]).as_dict(),
         }
         for row in rows
     ]
@@ -143,6 +152,9 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
     return {
         "count": len(entries),
         "success_rate": success_rate,
+        "server_not_restarted_count": sum(
+            1 for e in entries if e["server_restarted"] is False
+        ),
         "entries": entries,
         **base_meta,
     }
@@ -155,8 +167,10 @@ async def update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
     Reads the update_history table written by scripts/update.sh. Each
     entry records an update attempt — success, failure, or rolled_back
     — with before/after versions, timing, and failure context when
-    applicable. Use this to diagnose update issues or verify recent
-    update history.
+    applicable. Each entry also carries deploy facts — code_applied,
+    activation_applied, server_restarted — so a success row whose server
+    did not restart is not read as a plain live success. Use this to
+    diagnose update issues or verify recent update history.
 
     Args:
         limit: number of entries to return (1-100, default 10).
