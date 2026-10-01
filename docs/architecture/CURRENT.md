@@ -341,9 +341,61 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 18e41e1e1 2026-09-23
+verified: b49995d7a 2026-09-26
 ```
 
+- **A gh-capable dispatch is REFUSED unless an operator armed it** — and until
+  2026-09-26 "disabled" was an accident, not a decision. The `steward` profile is
+  the only shipped one granted `gh` in its Bash allowlist, and it had never run
+  (MEASURED: 0 rows in `cc_sessions`, against community-responder 257 / campaign
+  167 / interact 154), which was the ONLY thing keeping it inert: `campaign_create`
+  validates the profile against `VALID_PROFILES` (which contains it), the campaign
+  runner passes the row's `session_profile` straight into
+  `DirectSessionRunner.spawn()`, and the EGO honours a model-authored `profile`
+  from its brief on the same basis — so one row, or one proposal, was the whole
+  distance between dormant and running.
+  **ONE PREDICATE, `profile_dispatch_refusal`, with three callers.** `spawn()`
+  raises on it (the boundary, at the chokepoint all 8 dispatch call sites funnel
+  through, in the method that attaches the Bash allowlist at the one place in the
+  tree it is attached). `campaign_create` consults it so an operator gets the
+  answer where they asked, instead of a recurring job failure — `_tick_wrapper`
+  catches a tick's exception and records a job failure, so the refusal was
+  observable but badly delivered. And the ego's `_select_dispatch_profile`
+  consults it, because a refusal is PERMANENT until config changes while
+  `revert_failed_dispatch` has no attempt counter: honouring a refused name would
+  re-dispatch and re-fail once per sweep forever.
+  **Keyed on the CAPABILITY, not the profile name**: it asks whether the requested
+  profile's allowlist contains `gh`, so a profile an install registers through
+  `genesis.cc.profile_overlay` is covered by construction —
+  `ProfileOverlayContext.add_profile` writes into the very dict the predicate
+  reads. **The honest scope, because the first draft overstated it:** a profile
+  that DECLARES `gh` cannot be dispatched unarmed. A profile with Bash and NO
+  allowlist entry is not gated and gets no gh seal either — the allowlist is a
+  RESTRICTION on Bash, never a grant — so "the capability cannot be acquired by
+  any other route" is false and is not claimed.
+  Lever: `cc_steward` (`config/cc_steward.yaml` + `cc/steward_config.py`, modes
+  `off|live`, **default `off`**) + `GENESIS_CC_STEWARD_DISABLED` kill switch (`== "1"`
+  exactly). Every damage path degrades to `off`: an unquoted `mode: off` (YAML-1.1
+  boolean) degrades SILENTLY while a garbage value WARNS, and `enabled` must be the
+  literal boolean `True` — a truthiness test there was a MEASURED fail-open, since
+  `enabled: "false"` is a non-empty string and left the lever LIVE while the
+  operator believed they had disarmed it.
+  **No `observe` rung**: it would have to mean "reads but never writes", which a
+  first-token allowlist cannot enforce (`gh pr comment` is as reachable as
+  `gh pr view`) — that arrives with a subcommand allowlist.
+  **What arming grants is an INSTALL question, and no text here asserts an answer.**
+  An earlier draft told the session it was unauthenticated; that was false on its
+  own branch, because removing the credential from the gh seal is a separate change
+  and until it lands an armed session authenticates as the operator. All four
+  operator-facing texts now carry the command that settles it —
+  `GH_CONFIG_DIR=~/.genesis/gh-sealed GH_TOKEN="" gh auth status` — and the prompt
+  instructs behaviour correct either way. A test enforces that none of them
+  re-asserts a posture.
+  **Filesystem reads are denied on this profile** (`Read`/`Glob`/`Grep`, via
+  `_NO_FILE_READ`). `Write` was blocked and `Read` was not, with
+  `skip_permissions=True` and an allowed `outreach_send` — so attacker-authored
+  pull-request text could have had the session read an owner-readable credential
+  file and send it onward. No environment pin closes that; tool scope does.
 - **The slot door heals a bare slot — by CONSENT, never silently**
   (`scripts/cc-slot.sh`, the block above every latch; probe:
   `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —

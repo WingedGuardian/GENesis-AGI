@@ -118,6 +118,22 @@ async def _impl_campaign_create(
             f"Must be one of: {', '.join(sorted(VALID_PROFILES))}"
         }
 
+    # ADVISORY, NOT THE BOUNDARY. The gate lives at `DirectSessionRunner.spawn()`
+    # so every dispatch path is covered; this is the same predicate asked at the
+    # surface a HUMAN is standing at, because the answer is otherwise delivered
+    # badly. A campaign whose profile is refused still gets created, ticks on its
+    # cron, and fails inside `_tick_wrapper` — which logs and records a job
+    # failure. Observable, but the operator asked a question here and got
+    # "success", then learns the truth from a recurring failure elsewhere.
+    #
+    # Refusing at creation is also what keeps the row from existing at all, so
+    # there is nothing to reap when the operator changes their mind.
+    from genesis.cc.direct_session import profile_dispatch_refusal
+
+    refusal = profile_dispatch_refusal(profile)
+    if refusal is not None:
+        return {"error": refusal}
+
     db = _db
     own_db = False
     if db is None:
