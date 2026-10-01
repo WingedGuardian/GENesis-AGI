@@ -40,26 +40,39 @@ ESSENTIAL_CLOUD_SITES: frozenset[str] = frozenset(
 )
 
 
-def build_essential_provider_map(config: RoutingConfig) -> dict[str, list[str]]:
+def build_essential_provider_map(config: RoutingConfig) -> dict[str, list[str]] | None:
     """Map each present essential cloud site → its provider chain.
 
     Logs a warning (rather than silently skipping) if an expected essential id
     is absent from the routing config — a rename/removal must not quietly drop
     a site from the coverage check.
+
+    Returns None when NO essential site is present at all, which puts the
+    registry on the legacy provider-count check. When sites are present but
+    every one is blocked, the map is empty but NOT None: coverage mode stays
+    on, with nothing uncovered, rather than letting the legacy heuristic raise
+    a degradation over sites the configuration itself turned off.
     """
     result: dict[str, list[str]] = {}
+    present = 0
     call_sites = getattr(config, "call_sites", {}) or {}
     for site in ESSENTIAL_CLOUD_SITES:
         cs = call_sites.get(site)
-        if cs is None:
+        present += cs is not None
+        # A site with NO providers is BLOCKED by configuration (an API-only
+        # site whose providers are all disabled, or one a rejected overlay
+        # blocked), not uncovered by an outage. Counting it as uncovered would
+        # raise system-wide ESSENTIAL degradation and shed every other routed
+        # site over one config line, so it is skipped the way a missing site is.
+        if cs is None or not cs.chain:
             logger.warning(
-                "Essential cloud site %r not found in routing config — "
-                "degradation coverage check will skip it",
+                "Essential cloud site %r %s — degradation coverage check will skip it",
                 site,
+                "not found in routing config" if cs is None else "has no providers (blocked)",
             )
             continue
         result[site] = list(cs.chain)
-    if not result:
+    if not present:
         # All essential ids absent → the registry would silently fall back to
         # legacy provider-count degradation, re-introducing the false-alarm this
         # set exists to prevent. Make that loud, not silent.
@@ -70,4 +83,5 @@ def build_essential_provider_map(config: RoutingConfig) -> dict[str, list[str]]:
             "likely renamed; update ESSENTIAL_CLOUD_SITES.",
             len(ESSENTIAL_CLOUD_SITES),
         )
+        return None
     return result

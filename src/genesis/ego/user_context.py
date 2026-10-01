@@ -500,9 +500,10 @@ class UserEgoContextBuilder:
                 from genesis.ego.world_snapshot import build as build_snapshot
 
                 snapshot = await build_snapshot(self._db)
-                rendered = snapshot.render()
-                # Count non-empty lines as content proxy
-                items = len([ln for ln in rendered.split("\n") if ln.strip()])
+                # Count the snapshot's entries, not rendered lines: a signal
+                # wrapped as untrusted content renders as three lines.
+                items = (len(snapshot.goals) + len(snapshot.upcoming_events)
+                         + len(snapshot.active_contacts) + len(snapshot.user_signals))
                 return f"## User's World\n{items} items in world snapshot.\n"
             except Exception:
                 return "## User's World\n*Snapshot not available.*\n"

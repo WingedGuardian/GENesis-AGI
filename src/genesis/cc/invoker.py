@@ -8,6 +8,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -18,6 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from genesis.cc import roster
+from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
@@ -30,6 +32,7 @@ from genesis.cc.exceptions import (
     CCTimeoutError,
 )
 from genesis.cc.types import (
+    PROBE_CALLER_TAG,
     CCInvocation,
     CCModel,
     CCOutput,
@@ -46,6 +49,44 @@ from genesis.util.proc_kill import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# From CC 2.1.277 a headless resume RESTORES the CC session's saved totals — its
+# changelog: a resume no longer starts "the session's cost and usage totals at
+# zero; headless sessions now save their totals at exit". So a resumed `-p` call
+# reports `total_cost_usd` (and `modelUsage`) as running totals for the whole CC
+# session, while `usage` tokens stay per call. MEASURED on 2.1.280 across a
+# resumed haiku -> haiku -> sonnet session: totals 0.0383 -> 0.0421 -> 0.1475,
+# the earlier model's entry carried over, the session id unchanged. Nothing in the
+# result itself marks the change: `num_turns` is 1 every call, there is no version
+# field, and the switched-to model's own entry starts at this call's tokens — so
+# the VERSION, which is what defines the behaviour, is the signal.
+_CC_CUMULATIVE_COST_SINCE = (2, 1, 277)
+_CC_VERSION_RE = re.compile(r"\s*(\d+)\.(\d+)\.(\d+)")
+# After a failed `claude --version` read, how long before the same binary is
+# asked again. The read sits on the turn path (CCInvoker._cc_version), so a CLI
+# that HANGS on --version would otherwise hold every reply for the full 15 s
+# timeout; with this, at most one reply per 10 minutes pays it. A transient
+# failure recovers within the same window, and a replaced binary is a new key
+# and is read at once.
+_CC_VERSION_RETRY_S = 600.0
+
+
+def parse_cc_version(text: str) -> tuple[int, int, int] | None:
+    """Parse the leading ``X.Y.Z`` of ``claude --version`` output, else None."""
+    m = _CC_VERSION_RE.match(text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def cost_is_cumulative_for(version: tuple[int, int, int] | None) -> bool:
+    """Whether a CC of this version reports a resumed session's running totals.
+
+    True on a FRESH session too, which is harmless: its first running total is
+    its own cost, and ``cc_sessions.record_turn_cost`` keys its cursor by CC
+    session, so a new session is never diffed against an old one. An unknown
+    version reads as False — the additive reading CC used before 2.1.277.
+    """
+    return version is not None and version >= _CC_CUMULATIVE_COST_SINCE
 
 
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
@@ -651,7 +692,10 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
     try:
         from genesis.runtime import GenesisRuntime
 
-        bus = getattr(GenesisRuntime.instance(), "_event_bus", None)
+        # peek(), never instance(): observability must not construct a blank
+        # runtime singleton that later bootstrap/health code would mistake for
+        # a started one.
+        bus = getattr(GenesisRuntime.peek(), "_event_bus", None)
         if bus is None:
             return
         from genesis.observability.types import Severity, Subsystem
@@ -666,6 +710,137 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
         )
     except Exception:
         logger.debug("cc.bg_truncated event emit failed", exc_info=True)
+
+
+# ``cc.invocation_failed`` coalescing. A burst of identical failures (a rate
+# limit hitting every caller of one lane, a network outage parking every
+# dispatch) would otherwise emit one event per call. One event per
+# (error_class, caller_tag, routed model) per window keeps the signal while bounding the
+# volume; the count swallowed in between rides on the NEXT emitted event
+# (``coalesced``), so the omission is declared, never silent. Untagged calls
+# (caller_tag None) are never coalesced: they share no identity to key on.
+# 60s: short enough that a recurring failure re-surfaces within a minute, long
+# enough to collapse one incident's fan-out burst into one row.
+_FAILURE_EVENT_COALESCE_S = 60.0
+# (error_class, caller_tag, roster_model) -> [monotonic time of last emit,
+# suppressed since]. Keyed on a small closed set (exception classes x call-site
+# tags x roster models) — bounded.
+_failure_event_state: dict[tuple[str, str | None, str], list[float]] = {}
+
+
+def _runtime_event_bus():
+    """The runtime singleton's event bus, or None (tests, early startup).
+
+    Uses ``peek()`` so a failure before the runtime exists never constructs a
+    blank singleton as a side effect of reporting it.
+    """
+    from genesis.runtime import GenesisRuntime
+
+    return getattr(GenesisRuntime.peek(), "_event_bus", None)
+
+
+def _reset_failure_event_state() -> None:
+    """Clear the coalescing window (tests)."""
+    _failure_event_state.clear()
+
+
+async def _emit_invocation_failed_event(
+    exc: CCError,
+    invocation: CCInvocation,
+    *,
+    streaming: bool,
+    roster_model: str = "",
+) -> None:
+    """Fire a ``cc.invocation_failed`` observability event for a raised CCError.
+
+    Called from ``CCInvoker.run`` / ``run_streaming`` on the way out of a failed
+    invocation, immediately before the error is re-raised — so every CC call
+    site gets one central failure signal without each caller emitting its own.
+    Rate-limit / quota errors are WARNING (expected, self-recovering); every
+    other CCError is ERROR. A liveness probe's EXPECTED answer (a rate-limit /
+    quota error while the home model is still limited) is skipped; any other
+    probe failure is a malfunction and is emitted. Coalescing applies only to
+    TAGGED callers — an untagged call has no identity to key on, and pooling
+    unrelated subsystems under ``(class, None)`` would hide one behind another.
+    The routed roster model is part of the key and the payload: one caller tag
+    can reach native Claude and a peer endpoint, and those are separate outages.
+    Same bus resolution as ``_emit_bg_truncation_event``: no-ops when the
+    runtime/bus is absent and never raises — observability must not mask the
+    real error the caller is about to receive.
+    """
+    is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+    key: tuple[str, str | None, str] | None = None
+    prev_state: list[float] | None = None
+    try:
+        if invocation.caller_tag == PROBE_CALLER_TAG and is_limit:
+            return
+        bus = _runtime_event_bus()
+        if bus is None:
+            return
+        error_class = type(exc).__name__
+        # A call pre-stamped with peer overrides but roster_eligible=False (e.g.
+        # the fallback probe of a peer) is reported native by apply_active, yet
+        # the subprocess targets the peer: attribute and key it to the peer.
+        if roster_model in ("", roster.CLAUDE) and (
+            invocation.model_id_override or invocation.anthropic_base_url
+        ):
+            roster_model = invocation.model_id_override or "routed"
+        coalesced = 0
+        if invocation.caller_tag is not None:
+            key = (error_class, invocation.caller_tag, roster_model)
+            now = time.monotonic()
+            prev_state = _failure_event_state.get(key)
+            if prev_state is not None and now - prev_state[0] < _FAILURE_EVENT_COALESCE_S:
+                prev_state[1] += 1
+                key = None  # suppressed: nothing to roll back
+                return
+            coalesced = int(prev_state[1]) if prev_state is not None else 0
+            # Claimed BEFORE the await so concurrent failures coalesce instead of
+            # racing to emit; rolled back below if the emit itself fails.
+            _failure_event_state[key] = [now, 0]
+
+        from genesis.observability.session_context import get_session_id
+        from genesis.observability.types import Severity, Subsystem
+
+        severity = Severity.WARNING if is_limit else Severity.ERROR
+        # The exception TEXT is deliberately not carried: CC errors are built
+        # from raw CLI stderr/stdout (see _classify_error), which is unbounded
+        # and can echo arbitrary tool output, and this event is persisted to
+        # the events table. Metadata only; the length marks the omission, and
+        # the caller receives the full error via the re-raise.
+        # The coalesced count is ALSO in the message, because health_errors
+        # returns the message but not the details.
+        message = (
+            f"CC invocation failed ({error_class}) for {invocation.caller_tag or 'untagged caller'}"
+        )
+        if roster_model and roster_model != roster.CLAUDE:
+            message += f" via {roster_model}"
+        if coalesced:
+            message += f" (+{coalesced} similar failure(s) coalesced in the prior window)"
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            severity,
+            "cc.invocation_failed",
+            message,
+            error_class=error_class,
+            error_text_omitted_chars=len(str(exc)),
+            streaming=streaming,
+            model=str(invocation.model),
+            roster_model=roster_model,
+            session_id=get_session_id(),
+            caller_tag=invocation.caller_tag,
+            coalesced=coalesced,
+        )
+    except Exception:
+        # The emit failed: do not leave a window open for an event that never
+        # landed. Restore the prior state (keeping its suppressed count) so the
+        # next failure retries the bus instead of being coalesced away.
+        if key is not None:
+            if prev_state is None:
+                _failure_event_state.pop(key, None)
+            else:
+                _failure_event_state[key] = prev_state
+        logger.debug("cc.invocation_failed event emit failed", exc_info=True)
 
 
 def cc_span_settings_path() -> str | None:
@@ -831,6 +1006,13 @@ class CCInvoker:
         self._last_was_error = False
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
+        # `claude --version` per binary FILE identity — see _cc_version. Per
+        # instance, never module-global: a module cache would let one invoker's
+        # answer (or a test's) stand in for another's binary.
+        self._cc_versions: dict[tuple[str, int, int], tuple[int, int, int]] = {}
+        self._cc_version_failed_at: dict[tuple[str, int, int], float] = {}
+        self._cc_version_warned: set[tuple[str, int, int] | str] = set()
+        self._clock: Callable[[], float] = time.monotonic  # injectable for tests
 
         # Advisory check — warn early if the CLI binary is not findable.
         resolved = shutil.which(claude_path)
@@ -843,6 +1025,78 @@ class CCInvoker:
                 "~/.npm-global/bin is on PATH.",
                 claude_path,
             )
+
+    async def _cc_version(self) -> tuple[int, int, int] | None:
+        """The version of the CC binary this invoker runs, or None if unreadable.
+
+        Keyed by the resolved file's (path, inode, mtime), so an update that
+        replaces the binary under a running server is read afresh, and read once
+        per file otherwise. A failed read is not cached for good — one bad moment
+        must not pin a long-lived server to the additive path — but it is not
+        retried for ``_CC_VERSION_RETRY_S`` either, and it warns once per file.
+
+        Runs via ``subprocess.run`` in a thread rather than the asyncio spawner,
+        which tests patch to impersonate a CC run. The 15 s bound: this runs on
+        the turn path after the answer is in hand, so a CLI that hangs on
+        ``--version`` holds that reply until the bound (``claude --version``
+        measured 25 ms on 2.1.280). The retry cooldown limits that to one reply
+        per window; the answer itself is never lost, only its cost reading
+        degrades to additive.
+        """
+        resolved = shutil.which(self._claude_path)
+        if not resolved:
+            self._warn_version_once(self._claude_path, "binary not found")
+            return None
+        real = os.path.realpath(resolved)
+        try:
+            st = os.stat(real)
+        except OSError as exc:
+            self._warn_version_once(real, f"stat failed: {exc}")
+            return None
+        key = (real, st.st_ino, st.st_mtime_ns)
+        cached = self._cc_versions.get(key)
+        if cached is not None:
+            return cached
+        failed_at = self._cc_version_failed_at.get(key)
+        if failed_at is not None and self._clock() - failed_at < _CC_VERSION_RETRY_S:
+            return None
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [resolved, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._cc_version_failed_at[key] = self._clock()
+            self._warn_version_once(key, f"{type(exc).__name__}: {exc}")
+            return None
+        version = parse_cc_version(proc.stdout) if proc.returncode == 0 else None
+        if version is None:
+            self._cc_version_failed_at[key] = self._clock()
+            self._warn_version_once(
+                key, f"exit {proc.returncode}, stdout {proc.stdout.strip()[:80]!r}"
+            )
+            return None
+        self._cc_versions[key] = version
+        return version
+
+    def _warn_version_once(self, key: tuple[str, int, int] | str, why: str) -> None:
+        if key in self._cc_version_warned:
+            return
+        self._cc_version_warned.add(key)
+        logger.warning(
+            "Could not read the CC version (%s) — recording resumed-turn cost "
+            "ADDITIVELY, which over-counts on CC 2.1.277+ (cost is display-only)",
+            why,
+        )
+
+    async def _with_cost_semantics(self, output: CCOutput) -> CCOutput:
+        """Stamp whether ``output.cost_usd`` is a running total (see
+        ``cost_is_cumulative_for``). The one place the flag is set."""
+        return replace(output, cost_is_cumulative=cost_is_cumulative_for(await self._cc_version()))
 
     @property
     def working_dir(self) -> str | None:
@@ -1210,7 +1464,8 @@ class CCInvoker:
         # prompts safely.
         return args
 
-    # CC's Bash sandbox root — persistent disk, managed by tmp_watchgod.
+    # CC's Bash sandbox root — persistent disk; tmp_watchgod sweeps what ended
+    # sessions leave behind.
     _CC_SANDBOX_TMPDIR = Path.home() / ".genesis" / "cc-tmp"
 
     def _build_env(self, inv: CCInvocation | None = None) -> dict[str, str]:
@@ -1221,6 +1476,9 @@ class CCInvoker:
         # The genesis_session_context.py hook skips identity injection when set,
         # preventing double injection (identity is in the system prompt arg).
         env["GENESIS_CC_SESSION"] = "1"
+        # Shared dispatched-session pins (function hooks off, beating the
+        # server-side default a rollout would flip).
+        pin_dispatched_env(env)
         # Propagate Genesis session_id to child CC + MCP server processes
         # so eval hooks can attribute recall events to specific sessions.
         from genesis.observability.session_context import get_session_id
@@ -1315,8 +1573,8 @@ class CCInvoker:
         # failures break the Bash tool for entire sessions.
         # A per-invocation override isolates blast radius: e.g. the model-roster
         # gauntlet points its throwaway CC sessions at a separate sandbox so a
-        # fixture that fills it can't trip genesis-tmp-watchgod into SIGKILLing a
-        # LIVE foreground/background session sharing the default cc-tmp.
+        # fixture that fills it can't exhaust the quota-capped default cc-tmp that
+        # every LIVE foreground/background session's temp shares.
         env["CLAUDE_CODE_TMPDIR"] = str(
             (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
             or self._CC_SANDBOX_TMPDIR
@@ -1326,7 +1584,7 @@ class CCInvoker:
         # sandbox isolation above: without it a headless session's *subprocess*
         # temp (e.g. the gauntlet agent running the fixture's pytest, whose
         # tmp_path defaults under $TMPDIR) still lands in the inherited cc-tmp and
-        # can trip genesis-tmp-watchgod. For the default sandbox both resolve to
+        # can fill the shared volume. For the default sandbox both resolve to
         # cc-tmp (unchanged); for an override (gauntlet) TMPDIR follows it off
         # cc-tmp.
         env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
@@ -1395,6 +1653,9 @@ class CCInvoker:
         """
         if inv.bash_allowlist:
             _assert_hardening_present(env, tuple(inv.bash_allowlist))
+        # Re-applied here, after every merge (env_overrides, the login fallback),
+        # so no later layer can turn function hooks back on (review).
+        pin_dispatched_env(env)
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
@@ -1593,7 +1854,29 @@ class CCInvoker:
             logger.debug("network preflight check errored — proceeding", exc_info=True)
 
     async def run(self, invocation: CCInvocation) -> CCOutput:
-        """Run a dispatched CC session (traced).
+        """Run a dispatched CC session (traced; see ``_run_traced``).
+
+        Any ``CCError`` — the pre-spawn network preflight's included — emits a
+        ``cc.invocation_failed`` event and is then re-raised unchanged.
+        ``CancelledError`` is a BaseException, not a CCError, so it propagates
+        untouched and emits nothing. Roster routing is resolved HERE (it never
+        raises) so the failure event names the routed model, not only the
+        requested tier.
+        """
+        invocation, roster_model = roster.apply_active(invocation)
+        try:
+            return await self._run_traced(invocation, roster_model)
+        except CCError as exc:
+            await _emit_invocation_failed_event(
+                exc,
+                invocation,
+                streaming=False,
+                roster_model=roster_model,
+            )
+            raise
+
+    async def _run_traced(self, invocation: CCInvocation, roster_model: str) -> CCOutput:
+        """Run an already-roster-routed CC session (traced).
 
         Opens a ``cc.session`` span spanning the whole subprocess lifetime so
         (a) the active trace context is injected into the child env (see
@@ -1601,7 +1884,6 @@ class CCInvoker:
         and (b) any LLM/operation spans share one trace. Best-effort — a no-op
         when capture is disabled.
         """
-        invocation, roster_model = roster.apply_active(invocation)
         await self._network_preflight(invocation)
         with start_span(
             "cc.session",
@@ -1801,6 +2083,7 @@ class CCInvoker:
             raise err
 
         output = self._parse_output(stdout.decode(errors="replace"), invocation, elapsed)
+        output = await self._with_cost_semantics(output)
         if _stderr_bg_truncated(stderr.decode(errors="replace")):
             output = replace(output, bg_truncated=True)
             logger.warning(
@@ -1830,8 +2113,26 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
-        """Run CC with stream-json output (traced — see run() for span rationale)."""
+        """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
         invocation, roster_model = roster.apply_active(invocation)
+        try:
+            return await self._run_streaming_traced(invocation, roster_model, on_event)
+        except CCError as exc:
+            await _emit_invocation_failed_event(
+                exc,
+                invocation,
+                streaming=True,
+                roster_model=roster_model,
+            )
+            raise
+
+    async def _run_streaming_traced(
+        self,
+        invocation: CCInvocation,
+        roster_model: str,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+    ) -> CCOutput:
+        """Run an already-roster-routed stream-json session (traced — see _run_traced)."""
         await self._network_preflight(invocation)
         with start_span(
             "cc.session",
@@ -2292,6 +2593,7 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            output = await self._with_cost_semantics(output)
             # () is a real report ("the runtime watched and saw no tool_use"),
             # distinct from None ("nothing watched"). A `if tools_seen:` guard
             # here would silently downgrade the former to the latter on every
@@ -2523,12 +2825,18 @@ class CCInvoker:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
-        # modelUsage lists EVERY model the session touched, including CC's
-        # auxiliary haiku calls (title/topic generation) — and dict order is
+        # modelUsage lists EVERY model the session touched, and dict order is
         # not tier order. Taking the first key false-positived downgrade
-        # detection whenever an auxiliary call was listed before the main
-        # model (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session).
-        # The MAIN conversation model is the highest tier present.
+        # detection whenever another model was listed before the main one
+        # (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session, where the
+        # haiku row was CC's auxiliary title/topic call). CC 2.1.277 dropped
+        # that auxiliary row from `-p` output (measured 2026-09-22), but the
+        # dict still carries SUBAGENT models — a sonnet session that spawns a
+        # haiku subagent lists both. Taking the highest tier is right for a
+        # FRESH call. It is NOT right for a RESUMED one on 2.1.277+: resume
+        # restores every earlier model's entry (measured 2026-09-26 across a
+        # haiku -> sonnet switch), so a higher tier used earlier in the session
+        # wins over this call's own model — issue #2391.
         model_name = (
             max(
                 model_usage,
@@ -2540,6 +2848,9 @@ class CCInvoker:
             if model_usage
             else str(inv.model)
         )
+        # `cost_is_cumulative` is NOT decided here: the result carries no signal
+        # for it (see _CC_CUMULATIVE_COST_SINCE), so the run paths stamp it from
+        # the CC version via _with_cost_semantics.
         downgraded = self._detect_downgrade(inv.model, model_name)
         if downgraded:
             logger.warning(

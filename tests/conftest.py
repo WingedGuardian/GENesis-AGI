@@ -429,6 +429,26 @@ def _isolate_alert_queue(tmp_path):
         "genesis.env.alert_queue_root",
         lambda: tmp_path / "alerts" / "queue",
     )
+    # The awareness tick also reads the root Tailscale watchdog's /run file and
+    # asks systemd about its timer; a real event or a real timer on the test
+    # machine must not become an observation.
+    mp.setenv("GENESIS_TSWD_STATE_FILE", str(tmp_path / "no-tailscale-watchdog.json"))
+    mp.setenv("GENESIS_TSWD_SYSTEMCTL", "/bin/false")
+    yield
+    mp.undo()
+
+
+# ── Safety: prevent tests from creating the REAL content-boundary key ───────
+@pytest.fixture(autouse=True)
+def _isolate_boundary_key(tmp_path):
+    """Point the sanitizer's per-install boundary key at tmp and drop the cached
+    key, so no test creates or reads ``~/.genesis/boundary_key`` and each test
+    starts from a known state. Fixture-owned ``MonkeyPatch``, as above."""
+    import genesis.security.sanitizer as sanitizer
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.env.boundary_key_path", lambda: tmp_path / "boundary_key")
+    mp.setattr(sanitizer, "_boundary_key", None)
     yield
     mp.undo()
 

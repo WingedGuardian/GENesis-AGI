@@ -404,6 +404,19 @@ def test_only_a_real_state_field_counts(command, fires):
             True,
             id="an-explicit-PATCH-closes",
         ),
+        # `-i` is a value flag under `pr checks --interval` but the valueless
+        # `--include` under `api`. A union-only post-path scan consumed `-X`
+        # as `-i`'s value and lost the PATCH entirely (Devin Review, #2256).
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -i -X PATCH " + _F + " state=closed",
+            True,
+            id="include-flag-does-not-eat-the-method",
+        ),
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -i -X PATCH",
+            False,
+            id="include-flag-no-field-is-still-a-read",
+        ),
     ],
 )
 def test_the_request_method_decides_whether_anything_is_written(command, fires):
@@ -468,6 +481,13 @@ def test_the_api_group_and_the_field_key_are_read_by_position(command, fires):
         pytest.param(
             "gh api repos/o/r/pulls/5 -X PATCH " + _F + " state=closed --help",
             id="api-help",
+        ),
+        # `-i` is the valueless `--include` under `api`; a union-only scan
+        # would consume this `--help` as `-i`'s value and let a help-only
+        # command look like a close (same defect as the `-X` swallow).
+        pytest.param(
+            "gh api repos/o/r/pulls/5 -i --help -X PATCH " + _F + " state=closed",
+            id="help-after-valueless-include",
         ),
     ],
 )

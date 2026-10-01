@@ -816,6 +816,112 @@ def test_new_guard_with_old_tree_missing_native_approval_fails_closed(tmp_path, 
     assert message in res.stderr
 
 
+def test_push_guard_with_old_tree_missing_review_findings_degrades_the_merge_gate_only(
+    tmp_path,
+):
+    """The reviewer list and severity parsers are needed by the MERGE gate alone.
+    A tree without them must not take down every git command (exit 1 would run the
+    command; exit 2 would block all of them), and every merge-side reader must fail
+    closed naming the cause: the scanners block, no primary is known (so freshness
+    blocks), and no substitute is offered."""
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_findings.py").unlink()
+    res = _run(root, "hooks/git_push_guard.py", "git status", tmp_path / "home_no_findings")
+    assert res.returncode == 0, res.stderr
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts/hooks'); import git_push_guard as g;"
+            " sets, block = g._enforced_logins_or_block();"
+            # The REAL merge-side entry points, not only the helper: both findings
+            # scans and merge freshness must block and name the cause.
+            " scans = [g._check_inline_review_findings('1'), g._check_pr_review_findings('1')];"
+            " fresh = g._check_codex_reviewed_head('1');"
+            " print(repr((sets, 'unimportable' in block, g._primary_reviewer_login(),"
+            " g.is_substitute_candidate('acme-review[bot]', 'Bot'),"
+            " [b and 'unimportable' in m for b, m in scans],"
+            " fresh[0] and 'unimportable' in fresh[1])))",
+        ],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home_no_findings"),
+            "_TEST_GH_HEAD_SHA": "a" * 40,
+            "_TEST_GH_CODEX_REVIEWS": "",
+        },
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "({}, True, None, False, [True, True], True)"
+
+
+_UNPRINTABLE = (
+    "class Unprintable(Exception):\n"
+    "    def __str__(self):\n"
+    "        raise RuntimeError('str raised')\n"
+    "    __repr__ = __str__\n"
+    "raise Unprintable()\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("module_text", "type_name", "hidden"),
+    [
+        pytest.param(
+            'raise ValueError("the primary must be listed with the codex-badge parser")\n',
+            "ValueError",
+            "codex-badge parser",
+            id="invariant-violation",
+        ),
+        # Codex P2 (#2683): rendering an exception whose __str__ raises would throw
+        # while the guard imports, exit 1, and disengage every gate in it.
+        pytest.param(_UNPRINTABLE, "Unprintable", "str raised", id="unprintable-exception"),
+    ],
+)
+def test_push_guard_with_a_broken_review_findings_degrades_the_merge_gate_only(
+    tmp_path, module_text, type_name, hidden
+):
+    """A review_findings that raises at import must fail the merge gate closed and
+    leave every other git command alone. The message names the exception's TYPE
+    only — never its text, which can itself raise."""
+    root = _tree(tmp_path, poisoned=False)
+    (root / "scripts" / "review_findings.py").write_text(module_text, encoding="utf-8")
+    res = _run(root, "hooks/git_push_guard.py", "git status", tmp_path / "home_bad_list")
+    assert res.returncode == 0, res.stderr
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'scripts/hooks'); import git_push_guard as g;"
+            " sets, block = g._enforced_logins_or_block();"
+            # The REAL merge-side entry points, not only the helper: both findings
+            # scans and merge freshness must block and name the cause.
+            " scans = [g._check_inline_review_findings('1'), g._check_pr_review_findings('1')];"
+            " fresh = g._check_codex_reviewed_head('1');"
+            f" cause = 'scripts/review_findings.py is unimportable ({type_name})';"
+            f" hidden = {hidden!r};"
+            " print(repr((sets, cause in block and hidden not in block,"
+            " g._primary_reviewer_login(), g.is_substitute_candidate('acme-review[bot]', 'Bot'),"
+            " [b and cause in m for b, m in scans], fresh[0] and cause in fresh[1])))",
+        ],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home_bad_list"),
+            "_TEST_GH_HEAD_SHA": "a" * 40,
+            "_TEST_GH_CODEX_REVIEWS": "",
+        },
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "({}, True, None, False, [True, True], True)"
+
+
 def test_commit_guard_with_old_tree_missing_deadline_helper_fails_closed(tmp_path):
     root = _tree(tmp_path, poisoned=False)
     (root / "scripts" / "review_deadline.py").unlink()

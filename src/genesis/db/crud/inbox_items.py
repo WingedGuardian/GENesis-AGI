@@ -20,6 +20,13 @@ AWAITING_APPROVAL_PREFIX = "awaiting_approval:"
 # invalidated-failed rows with still-awaiting rows.
 APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
 
+# Prefix marking a row whose approval request ENDED without an answer (expired,
+# cancelled, or no longer known to the approval manager). Deliberately NOT the
+# invalidated prefix: the item was never evaluated and its content is still
+# wanted, so the row stays an ordinary retriable failure the retry lane re-asks
+# about, with its retry budget untouched (#2447 review).
+APPROVAL_ENDED_PREFIX = "approval_ended:"
+
 # Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
 # call is about to run / is running).  The resume pass flips a parked row from
 # ``awaiting_approval:`` to ``dispatching:`` via ``claim_for_dispatch`` BEFORE
@@ -80,6 +87,17 @@ def _handled_items_from_storage(stored: object) -> list[str]:
     # A legacy one-line batch is one unambiguous item. Multiple lines may be a
     # single annotated item or several items whose blank boundary was erased.
     return [stored] if "\n" not in stored and "\r" not in stored else []
+
+
+def stored_item_texts(stored: object) -> list[str]:
+    """The logical item texts a row's ``batch_items`` holds, where storage can
+    say them unambiguously; ``[]`` for blank, corrupt or ambiguous legacy data.
+
+    Public name for :func:`_handled_items_from_storage`, for callers outside
+    this module that need item boundaries (an alert naming each parked item)
+    rather than the flattened batch text.
+    """
+    return _handled_items_from_storage(stored)
 
 
 async def create(
@@ -684,9 +702,14 @@ async def get_handled_batch_content(
            WHERE file_path = ?
              AND batch_items IS NOT NULL AND TRIM(batch_items) != ''
              AND (status = 'completed'
-                  OR (status = 'failed' AND retry_count >= ?))
+                  OR (status = 'failed' AND retry_count >= ?
+                      -- An invalidated row was never evaluated: counting it as
+                      -- handled silently subtracted its lines from every
+                      -- future delta (review N1, 2026-09-26).
+                      AND (error_message IS NULL
+                           OR error_message NOT LIKE ? || '%')))
            ORDER BY created_at ASC, rowid ASC""",
-        (file_path, max_retries),
+        (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
     )
     handled: list[str] = []
     for row in await cursor.fetchall():
@@ -694,9 +717,47 @@ async def get_handled_batch_content(
     return handled
 
 
+async def mark_failed_keeping_retries(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    error_message: str,
+    processed_at: str | None = None,
+    retriable_below: int | None = None,
+) -> bool:
+    """Fail a row WITHOUT spending its retry budget, in one UPDATE.
+
+    :func:`update_status` increments ``retry_count`` on ``failed`` unless the
+    caller supplies a value, and supplying one means reading the row first. A
+    failure that is not the item's fault (the network was down) must neither
+    spend a retry nor depend on that read succeeding.
+
+    ``retriable_below`` (the active ``max_retries``) additionally keeps the row
+    RETRIABLE: its count is lowered to ``retriable_below - 1`` when it already
+    sits at or above that cap. A row whose count predates a LOWERED cap would
+    otherwise land at the cap, where nothing retries it and its never-evaluated
+    content counts as handled (#2447 review).
+    """
+    if retriable_below is None:
+        sql = """UPDATE inbox_items
+           SET status = 'failed', processed_at = ?, error_message = ?
+           WHERE id = ?"""
+        params: tuple = (processed_at, error_message, id)
+    else:
+        sql = """UPDATE inbox_items
+           SET status = 'failed', processed_at = ?, error_message = ?,
+               retry_count = MIN(retry_count, ?)
+           WHERE id = ?"""
+        params = (processed_at, error_message, max(retriable_below - 1, 0), id)
+    cursor = await db.execute(sql, params)
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def mark_file_failures_abandoned(
     db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
     reason: str = "content removed before retry",
+    error_like: str | None = None,
 ) -> int:
     """Mark a file's retriable failed rows as approval-invalidated (abandoned).
 
@@ -707,16 +768,25 @@ async def mark_file_failures_abandoned(
     forever; flipping them to the ``approval_invalidated:<reason>`` prefix
     excludes them from :func:`get_retriable_failure_files` /
     :func:`get_retriable_failed_rows`. Returns the number of rows updated.
+
+    ``error_like`` (a SQL LIKE pattern) narrows the abandon to one failure
+    class. The retry-storm park passes ``'partial_url_failure%'``: a storm of URL
+    failures is no reason to ABANDON a crashed CC call, a restart requeue or a
+    corruption row in the same file (review, 2026-09-26). Those rows stay
+    retriable, but the file-level storm guard still skips the file until its
+    exhausted URL rows leave the 48-hour window, so they are delayed, not lost.
     """
-    cursor = await db.execute(
-        """UPDATE inbox_items
+    sql = """UPDATE inbox_items
            SET error_message = ? || ?
            WHERE file_path = ? AND status = 'failed' AND retry_count < ?
              AND (error_message IS NULL
-                  OR error_message NOT LIKE ? || '%')""",
-        (APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
-         APPROVAL_INVALIDATED_PREFIX),
-    )
+                  OR error_message NOT LIKE ? || '%')"""
+    params: list = [APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
+                    APPROVAL_INVALIDATED_PREFIX]
+    if error_like is not None:
+        sql += " AND error_message LIKE ?"
+        params.append(error_like)
+    cursor = await db.execute(sql, tuple(params))
     await db.commit()
     return cursor.rowcount
 

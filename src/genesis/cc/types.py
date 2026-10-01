@@ -312,6 +312,12 @@ def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
 VALID_MODEL_NAMES: frozenset[str] = frozenset(m.value for m in CCModel)
 VALID_EFFORT_NAMES: frozenset[str] = frozenset(e.value for e in EffortLevel)
 
+#: ``CCInvocation.caller_tag`` value marking a liveness probe. Its rate-limit /
+#: quota failures are the expected "not back yet" answer, so the invoker emits
+#: no ``cc.invocation_failed`` event for THOSE; any other probe failure (a
+#: timeout, a missing binary) is a malfunction and is emitted.
+PROBE_CALLER_TAG = "probe"
+
 
 @dataclass(frozen=True)
 class CCInvocation:
@@ -337,7 +343,7 @@ class CCInvocation:
     # Per-invocation override for CC's Bash sandbox root (CLAUDE_CODE_TMPDIR).
     # None → the shared default (~/.genesis/cc-tmp). Set by throwaway sessions
     # (e.g. the model-roster gauntlet) to isolate their tmp blast radius from
-    # live sessions policed by genesis-tmp-watchgod.
+    # the quota-capped cc-tmp that live sessions share.
     claude_code_tmpdir: str | None = None
     # When non-empty, the session's Bash is restricted to these command binaries
     # (enforced by scripts/bash_safety_hook.sh via the GENESIS_BASH_ALLOWLIST env
@@ -410,6 +416,14 @@ class CCInvocation:
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
     session_key: str | None = None
+    # Observability label naming the call site that dispatched this invocation
+    # (e.g. "ego.cycle", "inbox.eval", "direct_session.<profile>"). Carried on the
+    # ``cc.invocation_failed`` event so a failure is attributable to its caller,
+    # and used as part of that event's coalescing key. PROBE_CALLER_TAG marks a
+    # liveness probe whose expected rate-limit/quota failures are NOT emitted
+    # (other probe failures are). None → untagged: always emitted, never
+    # coalesced. Never changes control flow.
+    caller_tag: str | None = None
     # WS-3 session-level provenance. When set, CCInvoker._build_env stamps
     # GENESIS_SESSION_ORIGIN so the session's memory MCP writes carry this
     # origin_class (memory.provenance.session_origin_from_env). Set it ONLY at
@@ -534,6 +548,14 @@ class CCOutput:
     # Collapsing the first two into () made "no report" indistinguishable from
     # "reported zero", which turned an absence of evidence into a claim.
     tools_used: tuple[str, ...] | None = None
+    # True when `cost_usd` is a SESSION-CUMULATIVE total rather than this call's
+    # cost. From CC 2.1.277 a resumed `-p` session restores its saved totals, so
+    # `total_cost_usd` (and `modelUsage`) are running totals while `usage` tokens
+    # stay per call. Set from the CC VERSION by the invoker's run paths
+    # (`CCInvoker._with_cost_semantics`) — the result itself carries no signal
+    # that survives a model switch. A caller that SUMS `cost_usd` across turns
+    # must record the difference, via `cc_sessions.record_turn_cost`.
+    cost_is_cumulative: bool = False
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
     # Nonzero means the event stream this output was built from is INCOMPLETE:

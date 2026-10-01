@@ -254,6 +254,31 @@ class TestUnifiedCycle:
         assert invocation.append_system_prompt is True
         assert invocation.skip_permissions is True
 
+    @pytest.mark.parametrize(
+        ("source_tag", "expected"),
+        [("user_ego_cycle", "user_ego.cycle"), ("genesis_ego_cycle", "genesis_ego.cycle")],
+    )
+    async def test_cycle_caller_tag_names_the_ego(
+        self, ego_session, mock_invoker, source_tag, expected,
+    ):
+        """The two egos must not share a cc.invocation_failed tag: the event would
+        not say which failed, and one would be coalesced behind the other."""
+        ego_session._source_tag = source_tag
+        await ego_session.run_unified_cycle([_make_signal()])
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert invocation.caller_tag == expected
+
+    async def test_gate_caller_tag_names_the_ego(self, ego_session, mock_invoker):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await ego_session._run_gate_cc("prompt", label="Reconcile")
+        invocation = mock_invoker.run.call_args_list[-1][0][0]
+        assert invocation.caller_tag == "genesis_ego.gate.reconcile"
+
+    def test_realist_caller_tag_names_the_ego(self, ego_session):
+        # The realist call site builds its tag through the same helper.
+        ego_session._source_tag = "user_ego_cycle"
+        assert ego_session._cc_caller_tag("realist") == "user_ego.realist"
+
     async def test_model_override(self, ego_session, mock_invoker):
         """model_override takes precedence over config default."""
         await ego_session.run_unified_cycle(

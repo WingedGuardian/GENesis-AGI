@@ -91,3 +91,13 @@ def test_sets_are_nonoverlapping_exceptions_as_designed():
     # single place naming all five relationships.
     assert sp._REPARSE_CARRIERS <= dcg._COMMAND_CARRIERS
     assert dcg._NESTED_SHELLS <= dcg._COMMAND_CARRIERS
+
+
+def test_the_worktree_guard_shell_list_matches_the_parsers():
+    """The worktree guard treats a shell that reads its program from somewhere the
+    parser does not (a pipe, a here-string, a process substitution) as a carrier.
+    It keeps its own
+    copy of the shell names rather than reaching into the parser's private set, so
+    this pins the copy to the set the parser flattens `-c` payloads for."""
+    assert frozenset(sp._NESTED) == wcg._SHELLS
+    assert wcg._SHELLS == dcg._NESTED_SHELLS

@@ -20,7 +20,8 @@ Design (see plan Phase 6):
   returned ``CCOutput`` with tests-still-red or a mutated protected surface is a
   genuine FAIL.
 - Throwaway sessions are isolated: no MCP (``profile="none"``), a dedicated Bash
-  sandbox tmpdir (so genesis-tmp-watchgod can't SIGKILL a live session), and a
+  sandbox tmpdir (so a fixture cannot fill the cc-tmp volume live sessions
+  share), and a
   per-model file lock so a manual run and the scheduled job can't interleave.
 
 Results are recorded via the shared ``eval/db.py`` (dataset ``"gauntlet"``,
@@ -233,7 +234,7 @@ async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
     than something it inherits: a foreign fixture has its own rootdir, so the
     genesis ``tests/conftest.py`` redirect never loads for it (see
     ``genesis.util.tmp.should_redirect_pytest_basetemp``). Without an explicit
-    basetemp its tmp would follow ``$TMPDIR`` — the watchgod-policed cc-tmp in a
+    basetemp its tmp would follow ``$TMPDIR`` — the quota-capped cc-tmp in a
     CC session, and pytest's default, commonly a small tmpfs ``/tmp``, anywhere
     else.
 

@@ -51,6 +51,7 @@ _HOST_MODULES = (
     "genesis.guardian.bundle_watch",       # --bundle-status
     "genesis.guardian.memory_watch",       # --ram-status
     "genesis.guardian.grow_capacity",      # provisioning verbs
+    "genesis.guardian.pool_relief",        # lazily imported by check each tick
     "genesis.guardian.provisioning.flow",
     "genesis.guardian.provisioning.ledger",
     "genesis.guardian.provisioning.expand",
