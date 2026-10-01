@@ -2849,8 +2849,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   dispatch evidence, never approval or review evidence. Once present, a repeated request
   needs fresh approval. A review after that confirmation, or any further discovery
   request, also needs fresh approval. Because a CLEAN confirmation adds no round, the
-  confirmation is SPENT once Codex has reviewed any head after the last round (or one
-  was requested for it): from then on every request and fix commit asks.
+  marker itself is the one-shot token: once a marker exists for any head other than the
+  current one, the confirmation is SPENT and every later request and fix commit asks. A
+  head that drew findings itself is a round, never a fix to confirm, so it gets no free
+  request. (Residual, by owner ruling: an approved UNMARKED request that comes back
+  clean leaves the marked one unspent.)
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.

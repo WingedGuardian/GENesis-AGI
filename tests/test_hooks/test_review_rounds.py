@@ -66,7 +66,13 @@ def _cm(body, *, login=CODEX, kind="Bot", when=AFTER):
 
 
 def _ev(
-    *, head=H5, reviews=(), comments=(), files=("src/x.py",), commits=COMMITS, cutover=CUT,
+    *,
+    head=H5,
+    reviews=(),
+    comments=(),
+    files=("src/x.py",),
+    commits=COMMITS,
+    cutover=CUT,
     templates=(),
 ):
     return rb.evaluate_evidence(
@@ -321,19 +327,6 @@ def test_the_gate_lanes_confirmation_is_granted_once():
     assert first["commit_approval_required"] is False
 
 
-def test_a_clean_confirmation_spends_it_at_that_head_and_every_later_one():
-    """Clean reviews add no round, so without the spent check a clean confirmation
-    would leave the count at the limit and grant a fresh one at every new head:
-    an unapproved third round on the gate lane (architect review, 2026-10-01)."""
-    reviewed = _gate(H3, _rv(CODEX, H3))
-    assert reviewed["confirmation_exempt"] is False
-    assert reviewed["approval_required"] is True
-    assert reviewed["commit_approval_required"] is True
-    later = _gate(H4, _rv(CODEX, H3))
-    assert later["confirmation_exempt"] is False
-    assert later["approval_required"] is True and later["commit_approval_required"] is True
-
-
 def test_a_requested_confirmation_spends_it_for_later_heads():
     marker = _cm(rb.confirmation_marker(H3), login="a-maintainer", kind="User")
     at_h3 = _gate(H3, comments=(marker,))
@@ -464,18 +457,6 @@ def test_the_row_reads_the_evaluator_when_unpinned(guard, monkeypatch):
 # -- fixes from the fresh-context audit (2026-10-01) ----------------------------
 
 
-def test_a_confirmation_on_a_head_later_force_pushed_away_is_still_spent():
-    """The spent rule reads TIMES: a confirmation head amended out of the PR has no
-    commit-list position, and must not hand out a fresh confirmation."""
-    gone = "f" * 40
-    reviewed = _gate(H3, _rv(CODEX, gone, when=LATER))
-    assert reviewed["confirmation_exempt"] is False
-    assert reviewed["approval_required"] is True and reviewed["commit_approval_required"] is True
-    marker = _cm(rb.confirmation_marker(gone), login="a-maintainer", kind="User", when=LATER)
-    asked = _gate(H3, comments=(marker,))
-    assert asked["confirmation_exempt"] is False and asked["commit_approval_required"] is True
-
-
 def test_a_rereview_of_the_round_head_itself_does_not_spend_it():
     got = _gate(H3, _rv(DEVIN, H2, when=LATER), _rv(CODEX, H2, when=LATER))
     assert got["confirmation_exempt"] is True
@@ -485,7 +466,12 @@ def test_a_deleted_author_identity_report_still_counts_before_cutover():
     """Legacy equivalence: main matched the identity template on every comment
     body, including one whose author was deleted."""
     template = "external report head={head}"
-    deleted = {"login": None, "type": None, "body": f"external report head={H2}", "created_at": BEFORE}
+    deleted = {
+        "login": None,
+        "type": None,
+        "body": f"external report head={H2}",
+        "created_at": BEFORE,
+    }
     got = _ev(comments=(deleted,), templates=(template,))
     assert got["reviewed_heads"] == [H2]
 
@@ -521,19 +507,60 @@ def test_a_late_clean_review_of_an_older_live_head_does_not_spend_it():
     assert got["confirmation_exempt"] is True and got["commit_approval_required"] is False
 
 
-def test_a_later_rereview_of_a_round_head_does_not_hide_an_orphaned_confirmation():
-    gone = "f" * 40
-    got = _rounds_h1_h3(_rv(CODEX, gone, when=T3), _rv(RABBIT, H3, CR_MAJOR, when=T4))
+# -- the marker rule (owner ruling 2026-10-01, after round 1 of #2720) ---------
+# The confirmation is spent once a marker exists for a head other than the
+# current one. No ordering of reviews by commit position or time is consulted.
+
+
+def _marker(sha, when=AFTER):
+    return _cm(rb.confirmation_marker(sha), login="a-maintainer", kind="User", when=when)
+
+
+def test_a_marker_for_a_force_pushed_away_head_spends_it():
+    got = _gate(H3, comments=(_marker("f" * 40),))
     assert got["confirmation_exempt"] is False and got["commit_approval_required"] is True
 
 
-def test_an_orphaned_clean_comment_spends_it_by_its_prefix():
-    clean = _clean("fffffff", when=T3)
-    got = _rounds_h1_h3(comments=(clean,))
+def test_no_free_confirmation_on_a_head_that_is_itself_a_round():
+    got = _gate(H2)  # round two drew findings on the current head: fix it first
+    assert got["count"] == 2 and got["confirmation_exempt"] is False
+    assert got["approval_required"] is True
+
+
+def test_a_clean_review_without_a_marker_does_not_spend_it():
+    """The documented residual: an owner-approved UNMARKED request at round two that
+    comes back clean leaves one marked confirmation still free."""
+    got = _gate(H4, _rv(CODEX, H3))
+    assert got["confirmation_exempt"] is True
+
+
+def test_spent_never_reads_ordering():
+    """Devin 🔴 / Codex P2 on #2720: reviews landing out of order, or a head later
+    in the commit list, must not change whether the confirmation was used."""
+    late = _rounds_h1_h3(_rv(CODEX, H2, when=T4), _rv(CODEX, "f" * 40, when=T4))
+    assert late["confirmation_exempt"] is True
+
+
+def test_a_bundled_coderabbit_comment_counts_its_major_behind_a_trivial():
+    bundled = CR_TRIVIAL + "\n\n" + CR_MAJOR
+    assert rf.is_finding(RABBIT, bundled) is True
+    assert rf.is_finding(RABBIT, CR_TRIVIAL + "\n\n" + CR_TRIVIAL) is False
+    assert _count(reviews=(_rv(RABBIT, H1, bundled),)) == 1
+
+
+def test_the_trend_ignores_a_force_pushed_round_it_cannot_place():
+    got = _ev(reviews=(_rv(CODEX, "f" * 40, P2, P2, P2), _rv(DEVIN, H1, _devin("🟡"))))
+    assert got["count"] == 2 and got["trend"] is None
+
+
+def test_the_fix_commit_after_a_clean_marked_confirmation_asks():
+    """Fix-code audit, round 2 of #2720: the confirmed head's own confirmation is
+    spent once the primary reviewed it, so the next fix commit asks."""
+    got = _gate(H3, _rv(CODEX, H3), comments=(_marker(H3),))
     assert got["confirmation_exempt"] is False and got["commit_approval_required"] is True
 
 
-def test_an_orphaned_confirmation_in_the_same_second_still_spends_it():
-    gone = "f" * 40
-    got = _rounds_h1_h3(_rv(CODEX, gone, when=T2))
-    assert got["confirmation_exempt"] is False
+def test_a_coderabbit_source_footer_is_not_a_header():
+    trivial = CR_TRIVIAL + "\n\n_Source: Linters/SAST tools_"
+    assert rf.is_finding(RABBIT, trivial) is False
+    assert rf.is_finding(RABBIT, CR_MAJOR + "\n\n_Source: Learnings_") is True

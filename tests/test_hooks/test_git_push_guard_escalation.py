@@ -597,7 +597,8 @@ def test_a_clean_confirmation_spends_the_gate_lanes_one_free_request(monkeypatch
         "allow",
         "",
     )
-    _evidence(monkeypatch, head=HEADS[3], files=gate)
+    posted = (("a-maintainer", "User", _mod._review_budget.confirmation_marker(HEADS[2])),)
+    _evidence(monkeypatch, head=HEADS[3], files=gate, comments=posted)
     _app_reviews(monkeypatch, *rounds, (CODEX, HEADS[2], False))
     marker = _mod._review_budget.confirmation_marker(HEADS[3])
     decision, _ = _decision(

@@ -337,8 +337,25 @@ def is_finding(login: str, body: str) -> bool:
         return INLINE_P3_RE.search(body) is None
     if fmt.parser == "devin-marker":
         return devin_finding(body)[1] != "analysis"
-    level, _seen = cr_severity(body)
-    return level not in CR_INFORMATIONAL
+    # CodeRabbit can bundle several findings into one comment, each under its own
+    # header line (the merge gate splits them in `_cr_findings`). Read every
+    # header, not only the first: a Trivial header ahead of a Major one must not
+    # hide the Major. Any header that is not informational, or that cannot be
+    # read, counts; a comment with no header at all counts too.
+    headers = 0
+    for line in body.split("\n"):
+        if not line.strip():
+            continue
+        level, seen = cr_severity(line)
+        if not seen or (level is None and "|" not in line):
+            # A lone italic line with no severity is a footer such as
+            # `_Source: Linters/SAST tools_`, not a header (MEASURED 2026-10-01:
+            # 47 of 915 CodeRabbit comments carry one).
+            continue
+        headers += 1
+        if level not in CR_INFORMATIONAL:
+            return True
+    return headers == 0
 
 
 def body_finding_count(login: str, body: str) -> int:

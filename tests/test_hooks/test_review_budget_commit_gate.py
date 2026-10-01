@@ -865,8 +865,8 @@ def test_post_cutover_rounds_from_another_app_gate_the_fix_commit(monkeypatch, r
 
 
 def test_a_spent_gate_confirmation_makes_the_next_fix_ask(monkeypatch, repo, home):
-    """Round two's fix lands freely; once the primary has reviewed a later head
-    (clean or not) the one confirmation is spent and a further commit asks."""
+    """Round two's fix lands freely; once the marked confirmation request for that
+    head was posted, the one confirmation is spent and a further commit asks."""
     _evidence(monkeypatch, 0, gate=True, head=HEADS[2])
     _app_rounds(monkeypatch, HEADS[:2])
     _mark(repo, home)
@@ -881,5 +881,11 @@ def test_a_spent_gate_confirmation_makes_the_next_fix_ask(monkeypatch, repo, hom
     }
     _evidence(monkeypatch, 0, gate=True, head=HEADS[3])
     _app_rounds(monkeypatch, HEADS[:2], extra=(clean,))
+    # The session's marked confirmation request for the previous head.
+    marker = __import__("review_budget").confirmation_marker(HEADS[2])
+    monkeypatch.setenv(
+        "_TEST_GH_CODEX_COMMENTS",
+        _jsonl([{"login": "a-maintainer", "type": "User", "body": marker}]),
+    )
     _mark(repo, home)
     assert _decision(_run('git commit -m "one more"', repo, home)) == "ask"

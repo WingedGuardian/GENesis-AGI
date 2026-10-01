@@ -392,26 +392,13 @@ def evaluate_evidence(
     legacy: set[str] = set()  # the old rule's heads, before cutover
     confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
-    # For the gate lane's spent rule on a head a force-push REMOVED, which has no
-    # commit-list position to compare: when each round head was FIRST
-    # established, and (head or short-SHA prefix, time) of every confirmation or
-    # request marker. A later re-review of a round head must not move the cut-off.
-    round_first: dict[str, datetime] = {}
-    events: list[tuple[str, datetime | None]] = []
 
-    def note_round(sha: str, when: datetime | None) -> None:
-        if when is not None and (sha not in round_first or when < round_first[sha]):
-            round_first[sha] = when
-
-    def confirm(sha: str, when: datetime | None, before: bool) -> None:
+    def confirm(sha: str, before: bool) -> None:
         confirmed.add(sha)
-        events.append((sha, when))
         if before:
             legacy.add(sha)
-            note_round(sha, when)
 
-    def add_round(sha: str, login: str, findings: int, when: datetime | None) -> None:
-        note_round(sha, when)
+    def add_round(sha: str, login: str, findings: int) -> None:
         entry = found.setdefault(sha, {"findings": 0, "reviewers": []})
         entry["findings"] += findings
         if login not in entry["reviewers"]:
@@ -450,7 +437,7 @@ def evaluate_evidence(
             return _unknown("malformed_review_head", current_head=head)
         before = when is None or when < cut
         if primary:
-            confirm(sha, when, before)
+            confirm(sha, before)
         elif when is None:
             # Only a test seam omits the time; a non-primary review cannot be
             # placed on either side of the cutover, and dropping it undercounts.
@@ -470,7 +457,7 @@ def evaluate_evidence(
         findings = sum(1 for b in top_level if review_findings.is_finding(login, b))
         findings += review_findings.body_finding_count(login, body)
         if findings:
-            add_round(sha, login, findings, when)
+            add_round(sha, login, findings)
         elif not top_level and review_findings.declares_findings(login, body):
             # Its body says it posted findings and no top-level comment
             # survives: they were deleted, which must not read as a clean review.
@@ -494,13 +481,12 @@ def evaluate_evidence(
         # not on who wrote it, so a deleted author's comment still counts for both.
         for marker in _CONFIRMATION_RE.finditer(body):
             confirmation_heads.add(marker.group(1).lower())
-            events.append((marker.group(1).lower(), when))
         for pattern in identities:
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
                 if error:
                     return _unknown(error, current_head=head)
-                confirm(resolved or "", when, before)
+                confirm(resolved or "", before)
         if login is None or author_type is None:
             continue  # deleted author: never the primary
         if not isinstance(login, str) or not isinstance(author_type, str):
@@ -514,20 +500,18 @@ def evaluate_evidence(
             resolved, error = _resolve_sha(match.group(1), commits)
             if error == "unresolved_review_head" and not before:
                 # After cutover a clean comment only confirms a head, and a commit
-                # no longer in the PR can never be the current one. It still
-                # spends the gate lane's confirmation (by its prefix).
-                events.append((match.group(1).lower(), when))
+                # no longer in the PR can never be the current one.
                 continue
             if error:
                 return _unknown(error, current_head=head)
-            confirm(resolved or "", when, before)
+            confirm(resolved or "", before)
             continue
         is_findings, sha = review_findings.codex_comment_finding_head(body)
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
-            confirm(sha, when, False)
-            add_round(sha, login, 1, when)
+            confirm(sha, False)
+            add_round(sha, login, 1)
 
     paths: list[str] = []
     for item in changed_files:
@@ -559,36 +543,27 @@ def evaluate_evidence(
         }
         for sha in sorted(round_heads, key=lambda s: (order.get(s, -1), s))
     ]
-    newest = max((order.get(sha, -1) for sha in round_heads), default=-1)
-    # The gate lane grants ONE confirmation after its last round. Clean reviews
-    # add no round, so without this a clean confirmation would leave the count at
-    # the limit and grant another one at every later head. It is spent once the
-    # primary reviewed a head after the last round, or a confirmation was asked
-    # for one (the current head's own marker is `confirmation_requested`).
-    confirmation_spent = any(
-        order.get(sha, -1) > newest for sha in confirmed | (confirmation_heads - {head})
+    # The gate lane grants ONE confirmation request after its last round, and the
+    # guard admits it only when the request carries the exact-head marker. That
+    # marker is the one-shot token: a marker for any head other than the current
+    # one means the confirmation was used. Clean reviews add no round, so without
+    # this a clean confirmation would leave the count at the limit and re-grant
+    # the exemption at every new head. Read as a set, never by ordering events:
+    # three reviews in a row found defects in rules that inferred it from
+    # commit positions or timestamps (owner ruling 2026-10-01).
+    # The current head's own confirmation is spent too once the primary has
+    # reviewed it: a fix commit on top of a confirmed head is past the budget.
+    confirmation_spent = bool(confirmation_heads - {head}) or (
+        confirmation_requested and current_reviewed
     )
-    # A head a force-push removed has no position. For those alone, compare
-    # TIMES: a confirmation or request for an orphaned head that came at or after
-    # the newest round was established spends it too. Heads still in the PR keep
-    # the position rule above, so reviewers running at different speeds cannot
-    # spend it early.
-    if round_first:
-        last = max(round_first.values())
-        confirmation_spent = confirmation_spent or any(
-            when is not None
-            and when >= last
-            and ref != head
-            and not any(sha.startswith(ref) for sha in commits)
-            and not any(sha.startswith(ref) for sha in round_heads)
-            for ref, when in events
-        )
     confirmation_exempt = (
         gate_surface
         and count == GATE_DISCOVERY_ROUND_LIMIT
         and not current_reviewed
         and not confirmation_requested
         and not confirmation_spent
+        # A head that already drew findings is a round, not a fix to confirm.
+        and head not in round_heads
     )
     if gate_surface:
         request_approval = count >= GATE_DISCOVERY_ROUND_LIMIT and not confirmation_exempt
@@ -607,7 +582,9 @@ def evaluate_evidence(
         discouraged = count >= STRONGLY_DISCOURAGED_REVIEWED_HEADS
         reason = "ordinary_limit" if request_approval else "within_ordinary_limit"
 
-    scored = [r["findings"] for r in rounds if r["findings"] is not None]
+    # Live rounds only: a head a force-push removed has no position, so its place
+    # in this order (and so in the trend) would be a guess.
+    scored = [r["findings"] for r in rounds if r["findings"] is not None and r["head"] in order]
     trend = None
     if len(scored) >= 2:
         trend = (
