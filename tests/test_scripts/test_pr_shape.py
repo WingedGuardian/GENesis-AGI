@@ -20,8 +20,11 @@ def _diff(path: str, body: list[str], old: str | None = None) -> str:
 
 
 def _hunk(lines: list[str], start: int = 1, count: int | None = None) -> list[str]:
-    n = count if count is not None else len(lines)
-    return [f"@@ -{start},{n} +{start},{n} @@", *lines]
+    if count is not None:
+        return [f"@@ -{start},{count} +{start},{count} @@", *lines]
+    old = sum(1 for ln in lines if not ln or ln[0] in "- ")
+    new = sum(1 for ln in lines if not ln or ln[0] in "+ ")
+    return [f"@@ -{start},{old} +{start},{new} @@", *lines]
 
 
 def test_three_added_lines_count_three():
@@ -127,6 +130,103 @@ def test_malformed_hunk_recorded_unparseable():
     diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ nonsense @@\n+a = 1\n"
     result = ps.count_diff(diff)
     assert result["excluded"] == {"x.py": "unparseable"}
+
+
+def test_prefixed_lines_inside_hunk_are_content():
+    # `+++counter` and a `---` YAML separator inside a hunk are content, not
+    # headers — counted, and the hunk keeps consuming until its counts run out.
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-a\n"
+        "+++counter\n"
+        " b\n"
+        "@@ -5,3 +5,2 @@\n"
+        "-old\n"
+        "--- yaml separator\n"
+        "+x\n"
+        " c\n"
+        "@@ -9,0 +9,1 @@\n"
+        "+after\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {}
+    # added: ++counter, x, after; removed: a, old, -- yaml separator
+    assert result["counted"] == 6
+    assert result["by_file"] == {"x.py": 6}
+
+
+def test_header_count_mismatch_unparseable():
+    # Fewer body lines than the header declares: counts remain at the next
+    # `diff --git` / EOF.
+    truncated = _diff("x.py", ["@@ -1,5 +1,5 @@", "+a = 1"])
+    assert ps.count_diff(truncated)["excluded"] == {"x.py": "unparseable"}
+    # More body lines than declared: a count goes negative.
+    overflow = _diff("x.py", ["@@ -1,1 +1,1 @@", "+a = 1", "+b = 2"])
+    assert ps.count_diff(overflow)["excluded"] == {"x.py": "unparseable"}
+
+
+def test_empty_context_line_tolerated():
+    diff = _diff("x.py", ["@@ -1,2 +1,3 @@", "", "+x = 1", " y = 2"])
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {}
+    assert result["counted"] == 1
+
+
+def test_quoted_path_with_space_excluded_as_prose():
+    diff = (
+        'diff --git "a/docs/my page.md" "b/docs/my page.md"\n'
+        '--- "a/docs/my page.md"\n'
+        '+++ "b/docs/my page.md"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+# Heading\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {"docs/my page.md": "prose"}
+
+
+def test_quoted_octal_path_decoded():
+    diff = (
+        'diff --git "a/src/caf\\303\\251.py" "b/src/caf\\303\\251.py"\n'
+        '--- "a/src/caf\\303\\251.py"\n'
+        '+++ "b/src/caf\\303\\251.py"\n'
+        "@@ -0,0 +1,1 @@\n"
+        "+x = 1\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["by_file"] == {"src/café.py": 1}
+
+
+def test_deleted_file_keyed_by_old_path():
+    diff = (
+        "diff --git a/gone.py b/gone.py\n"
+        "deleted file mode 100644\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-a = 1\n"
+        "-b = 2\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {}
+    assert result["by_file"] == {"gone.py": 2}
+
+
+def test_unicode_separator_inside_line_stays_one_line():
+    diff = _diff("x.py", ["@@ -0,0 +1,1 @@", "+x = 1  y = 2"])
+    result = ps.count_diff(diff)
+    assert result["counted"] == 1
+
+
+def test_parse_shape_empty_then_nonempty():
+    assert ps.parse_shape("Shape:\nShape: real explanation") == "real explanation"
+
+
+def test_parse_shape_fence_mismatch_does_not_close():
+    body = "```\n~~~\nShape: hidden\n```\nShape: shown"
+    assert ps.parse_shape(body) == "shown"
 
 
 def test_random_diffs_never_raise_and_count_nonnegative():
