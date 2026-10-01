@@ -1,14 +1,16 @@
 """Dedicated on-disk location for LARGE temporary files.
 
 Genesis routes its working temp (Claude Code's sandbox, the genesis-server systemd
-unit, etc.) to ``~/.genesis/cc-tmp`` via ``TMPDIR`` — a small, budget-policed folder
-the ``genesis-tmp-watchgod`` service cleans and, when it fills, reclaims by **killing
-idle CC sessions**. So code that produces a LARGE temp file (audio/video downloads,
+unit, etc.) to ``~/.genesis/cc-tmp`` via ``TMPDIR`` — a quota-capped volume every
+session's temp shares, so filling it breaks all of them at once. The
+``genesis-tmp-watchgod`` service only sweeps what ENDED sessions left there (untouched
+for 7 days, nothing holding it); nothing reclaims a big file parked there in time.
+So code that produces a LARGE temp file (audio/video downloads,
 git worktrees, eval artifacts, DB dumps) must NOT use the default temp dir — it would
 land in cc-tmp (or, off the unit, ``/tmp`` which is tmpfs/RAM).
 
 Per the ``tmp_filesystem_limit`` procedure, large temp goes to ``~/tmp`` — an on-disk
-dir that is not watchgod-budgeted. Pass :func:`big_tmp_dir` as the ``dir=`` argument to
+dir on the main disk, outside cc-tmp's quota. Pass :func:`big_tmp_dir` as the ``dir=`` argument to
 ``tempfile.NamedTemporaryFile`` / ``mkdtemp`` / ``TemporaryDirectory``. Do NOT override
 the process ``TMPDIR`` to achieve this — that breaks Claude Code (it assumes
 ``TMPDIR``/``CLAUDE_CODE_TMPDIR`` consistency) and violates the procedure.
@@ -40,9 +42,9 @@ def should_redirect_pytest_basetemp(
 
     pytest's ``tmp_path``/``basetemp`` default to ``<TMPDIR>/pytest-of-<user>/``.
     On a Genesis install ``TMPDIR`` is ``~/.genesis/cc-tmp`` (set for CC sessions
-    by ``scripts/cc-slot.sh``), the budget-policed dir the ``genesis-tmp-watchgod``
-    service reacts to — so an un-redirected suite dumps hundreds of MB there and
-    trips the watchgod.
+    by ``scripts/cc-slot.sh``), the quota-capped volume every live session's temp
+    shares — so an un-redirected suite dumps hundreds of MB there, into the one
+    place whose filling breaks every session at once.
 
     Redirect ONLY when BOTH hold (else ``False`` — leave pytest's default AND do
     no filesystem work):

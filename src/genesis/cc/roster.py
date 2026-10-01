@@ -54,6 +54,16 @@ _ROSTER_MODEL_ENV_VARS = (
     "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
+#: SWITCH, not a model slot — deliberately outside the tuple above (those are
+#: set to the model id; this is set to "1"). CC 2.1.251 demoted
+#: CLAUDE_CODE_SUBAGENT_MODEL to a default that agent-definition ``model:``
+#: frontmatter outranks, so a ``model: sonnet`` agent spawned mid-failover
+#: would ask the peer endpoint for an alias it cannot resolve. CC 2.1.257's
+#: _FORCE switch restores override semantics; measured against the 2.1.280
+#: binary ("Workflow agent model X ignored: CLAUDE_CODE_SUBAGENT_MODEL_FORCE
+#: is set"). Unknown-var inert on older CC, so setting it is always safe.
+_SUBAGENT_MODEL_FORCE_VAR = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
+
 
 def apply_routing_env(
     env: dict[str, str],
@@ -93,9 +103,11 @@ def apply_routing_env(
     if model_id:
         for _var in _ROSTER_MODEL_ENV_VARS:
             env[_var] = model_id
+        env[_SUBAGENT_MODEL_FORCE_VAR] = "1"
     else:
         for _var in _ROSTER_MODEL_ENV_VARS:
             env.pop(_var, None)
+        env.pop(_SUBAGENT_MODEL_FORCE_VAR, None)
     return env
 
 

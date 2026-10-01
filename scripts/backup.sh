@@ -231,8 +231,9 @@ _send_telegram() {
 }
 
 # Large intermediate files (the multi-hundred-MB SQLite .dump) must NOT land in the
-# inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the watchgod-policed
-# "oxygen" folder — filling it kills CC sessions); for the 6h timer unit it is /tmp (tmpfs/RAM).
+# inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the quota-capped
+# "oxygen" volume — filling it breaks every CC session's temp); for the 6h timer unit
+# it is /tmp (often tmpfs/RAM).
 # Route them to a dedicated on-disk dir, per the tmp_filesystem_limit procedure ("use ~/tmp
 # for large temporary files"). We do NOT export TMPDIR — only the big files move; everything
 # else (and Claude Code) keeps its normal TMPDIR.

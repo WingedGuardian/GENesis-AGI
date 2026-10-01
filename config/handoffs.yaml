@@ -1,0 +1,18 @@
+# Peer handoffs — read live by the surface_handoffs SessionStart hook and by
+# `python -m genesis handoffs` (this file + ~/.genesis/config/handoffs.local.yaml).
+#
+# What it does: when another install delivers a written handoff (a *.md file)
+# into a directory this install can read, the next FOREGROUND session is told
+# how many are unhandled — as untrusted claims to verify, never instructions,
+# and never with their content. Nothing is dispatched from a handoff.
+#
+# Handled state is recorded LOCALLY in ~/.genesis/handoffs/handled.json, never
+# in the handoff directory. A sibling `<name>-REPLY.md` also counts as handled.
+# Mark one handled with:
+#   python -m genesis handoffs mark <id> --note "<what you verified / decided>"
+#
+# OFF by default: leave `dir` unset here and set it in your local overlay, e.g.
+#   dir: ~/path/to/shared/handoffs
+# Kill switch (stdlib-cheap, checked before any config read):
+#   GENESIS_HANDOFFS_DISABLED=1
+dir: null

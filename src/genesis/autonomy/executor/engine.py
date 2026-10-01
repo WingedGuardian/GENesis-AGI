@@ -141,6 +141,9 @@ class CCSessionExecutor:
         self._pause_events: dict[str, asyncio.Event] = {}
         self._paused_tasks: set[str] = set()
         self._worktree_paths: dict[str, Path] = {}
+        # Where each task was cut from (None = unresolved). Also persisted as
+        # the `base_branch` / `base_sha` outputs so a restart keeps it.
+        self._bases: dict[str, _worktree.BaseRef | None] = {}
         self._semaphore_released: set[str] = set()  # tracks tasks whose semaphore was released during pause
 
     # =================================================================
@@ -1222,12 +1225,52 @@ class CCSessionExecutor:
 
     async def _create_worktree(self, task_id: str) -> Path:
         """Create a git worktree for code task isolation."""
+        base = await self._resolve_and_record_base(task_id)
         wt_path = await _worktree.create_worktree(
-            task_id, _REPO_ROOT, _WORKTREE_BASE,
+            task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
         )
         self._worktree_paths[task_id] = wt_path
         await self._set_output(task_id, "worktree_path", str(wt_path))
         return wt_path
+
+    async def _resolve_and_record_base(self, task_id: str) -> _worktree.BaseRef | None:
+        """Resolve the remote default branch once per worktree creation.
+
+        Its commit is the cut point and the scope gate's diff base, and its
+        name is the PR base, so the three cannot disagree. Unresolved (None)
+        keeps the previous behaviour for all three. Both outputs are written
+        either way: an empty value clears one left by an earlier creation of
+        this task, which a restart would otherwise read back."""
+        base = await _worktree.resolve_base(_REPO_ROOT)
+        self._bases[task_id] = base
+        await self._set_output(task_id, "base_branch", base.name if base else "")
+        await self._set_output(task_id, "base_sha", base.sha if base else "")
+        if base is None:
+            logger.warning(
+                "origin/HEAD unresolved for task %s; cutting from HEAD and "
+                "comparing against local main, as before", task_id,
+            )
+        return base
+
+    async def _base_for(self, task_id: str) -> _worktree.BaseRef | None:
+        """The base recorded for this task: in memory, else from the persisted
+        outputs (a restart), else None. Both halves are required."""
+        if task_id in self._bases:
+            return self._bases[task_id]
+        from genesis.db.crud import task_states
+
+        task = await task_states.get_by_id(self._db, task_id)
+        raw = (task or {}).get("outputs") or ""
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        name, sha = parsed.get("base_branch"), parsed.get("base_sha")
+        if isinstance(name, str) and name and isinstance(sha, str) and sha:
+            return _worktree.BaseRef(name=name, sha=sha)
+        return None
 
     async def _recover_worktree(
         self, task_id: str, task: dict,
@@ -1262,8 +1305,9 @@ class CCSessionExecutor:
 
         # Worktree gone but branch might still exist — recreate
         try:
+            base = await self._resolve_and_record_base(task_id)
             wt_path = await _worktree.create_worktree(
-                task_id, _REPO_ROOT, _WORKTREE_BASE,
+                task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
             )
             self._worktree_paths[task_id] = wt_path
             await self._set_output(task_id, "worktree_path", str(wt_path))
@@ -1361,6 +1405,7 @@ class CCSessionExecutor:
 
     async def _cleanup_worktree(self, task_id: str) -> None:
         """Remove worktree if one was created for this task."""
+        self._bases.pop(task_id, None)
         wt_path = self._worktree_paths.pop(task_id, None)
         if wt_path is None:
             return
@@ -1542,6 +1587,9 @@ class CCSessionExecutor:
             result = await open_draft_pr(
                 worktree_path=wt_path,
                 branch=branch,
+                # The branch the scope gate diffed against, so the PR carries
+                # exactly what the gate evaluated.
+                base=(b.name if (b := await self._base_for(task_id)) else "main"),
                 title=build_pr_title(description or f"build task {task_id}"),
                 body=build_pr_body(
                     task_id=task_id,
@@ -1645,8 +1693,16 @@ class CCSessionExecutor:
                     blocked_paths=status_out.strip().splitlines()[:20],
                 )
             else:
-                # 2. Committed diff vs the branch point.
-                rc, base = await _git("merge-base", "HEAD", "main")
+                # 2. Committed diff vs the branch point: the commit the task
+                #    branch was cut from, recorded at the cut, so the gate sees
+                #    exactly the task's own commits. A commit, not a ref: a ref
+                #    can be moved from inside the task's worktree (refs are
+                #    shared), which would narrow this diff. A task with no
+                #    recorded base (resolution failed, or it predates this)
+                #    keeps the previous comparison against local `main`.
+                recorded = await self._base_for(task_id)
+                base_ref = recorded.sha if recorded else "main"
+                rc, base = await _git("merge-base", "HEAD", base_ref)
                 if rc != 0:
                     result = ScopeGateResult(
                         allowed=False, reason=f"merge-base failed: {base[:200]}",

@@ -144,6 +144,48 @@ def _load_uncached() -> dict[str, Any]:
     return merged
 
 
+def config_is_readable() -> bool:
+    """Did the graphstore config parse cleanly? ``False`` means it did not.
+
+    `load_config()` deliberately ABSORBS a parse failure and returns DEFAULTS,
+    because every read path here degrades toward networkx and a broken file
+    must never take reads down with it. That is right for READERS and wrong for
+    anything deciding whether to ACT: `DEFAULTS["enabled"]` is True, so a
+    corrupted overlay looks exactly like an operator who enabled the backend.
+
+    MEASURED consequence before this existed: an operator corrupting
+    `graphstore.local.yaml` while trying to write `enabled: false` got the
+    defaults, and the hourly projector read that as consent and kept rebuilding
+    — the operator's intent inverted by a typo, silently.
+
+    So this answers the question `load_config` cannot: not "what is the
+    config" but "do we actually know what the config is". Callers that only
+    READ can keep ignoring it; callers that DO something should not.
+
+    Re-reads the files rather than caching a flag beside `_CACHE`: this runs
+    once an hour from a scheduled job, not on a recall path, and a second
+    stat-and-parse is cheaper than a second piece of cache state that can go
+    stale independently of the one it shadows.
+    """
+    base_path = _base_path()
+    try:
+        loaded = yaml.safe_load(base_path.read_text()) or {}
+    except FileNotFoundError:
+        # ABSENT is not CORRUPT. A fresh install has no file and the defaults
+        # are the intended answer; refusing here would make "no config" mean
+        # "do nothing", which is a different and wrong reading.
+        return True
+    except Exception:
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    try:
+        merge_local_overlay(loaded, base_path)
+    except Exception:
+        return False
+    return True
+
+
 def effective_mode() -> str:
     """The store to use: ``networkx`` or ``falkordb``.
 

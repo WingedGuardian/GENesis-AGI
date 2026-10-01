@@ -49,16 +49,19 @@ class CCStatus(IntEnum):
 
 
 class TmpPressureStatus(IntEnum):
-    """CC temp directory pressure from watchgod tiers.
+    """CC temp pressure from the watchgod's ``cc_tmp`` tier (green/yellow/orange/red).
 
-    Mapped from watchgod cc_tmp tier (green/yellow/orange/red).
-    Budget is configurable per-install (~/.genesis/config/watchgod.conf),
-    so tiers are relative to the configured budget, not absolute sizes.
+    Since watchgod v2 that tier is the FREE-SPACE ("floor") tier of the
+    filesystem cc-tmp lives on — the smaller of statvfs and its btrfs quota —
+    not a budget. Time-to-full is deliberately NOT in it: an ordinary large
+    download projecting "full in an hour" must not shed call sites.
+    Thresholds (scripts/lib/disk_guardian.sh, overridable in watchgod.conf)
+    are fractions of free space, the RED one floored at 3 GiB on big disks.
     """
-    CRITICAL = 0   # Red:   >90% or sacred ground breached
-    HIGH = 1       # Orange: 75-90%
-    MODERATE = 2   # Yellow: 50-75%
-    NORMAL = 3     # Green:  <50%
+    CRITICAL = 0   # Red:    free < max(3 %, 3 GiB), capped at 3/4 of the Orange line
+    HIGH = 1       # Orange: free < 8 %
+    MODERATE = 2   # Yellow: free < 15 %
+    NORMAL = 3     # Green
 
 
 class NetworkStatus(IntEnum):

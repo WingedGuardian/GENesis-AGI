@@ -116,8 +116,6 @@ apply_overlay() {
     inc_applied
 }
 
-apply_overlay "$PATCHES_DIR/codex-SKILL.md.tmpl" "$GSTACK_DIR/codex/SKILL.md.tmpl" "Codex 2.0 template"
-apply_overlay "$PATCHES_DIR/codex-SKILL.md"      "$GSTACK_DIR/codex/SKILL.md"      "Codex 2.0 skill"
 apply_overlay "$PATCHES_DIR/review-checklist.md"  "$GSTACK_DIR/review/checklist.md" "Review checklist"
 
 # 2. Safety frontmatter patch (ship + land-and-deploy)
