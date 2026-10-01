@@ -1,0 +1,1 @@
+- Fixed the CC pin-receipts advisory on pull requests to compare against the PR's own base commit; pushes, the weekly schedule and manual runs keep using the merge-base with `main`. CONTRIBUTING now states that stacked PRs are not supported yet.

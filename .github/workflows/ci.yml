@@ -662,19 +662,28 @@ jobs:
           # Attacker-controlled text: passed via env, NEVER interpolated into
           # `run`. Same handling the leak-detector job uses for PR_BASE_SHA.
           PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          # merge-base, NOT HEAD^1: parent count is not a reliable "this is the
-          # merge ref" signal, and scripts/ci/leak_scan_added_lines.py rejects
-          # that inference for the same reason.
+          # PR events compare against the PR's own base commit; push/schedule/
+          # dispatch use merge-base with origin/main. merge-base, NOT HEAD^1:
+          # parent count is not a reliable "this is the merge ref" signal, and
+          # scripts/ci/leak_scan_added_lines.py rejects that inference for the
+          # same reason.
           #
           # BOTH commands are guarded. Under `set -e` an unresolvable origin/main
-          # (or no common ancestor) would kill the step and turn this job RED —
-          # in a job whose entire justification is that it cannot fail. An empty
-          # base is handled by the checker itself: advisory mode reports "no base
-          # SHA to compare against" and exits 0.
-          git fetch --no-tags --quiet origin main || true
-          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          # (or no common ancestor, or an event SHA not present in this checkout)
+          # would kill the step and turn this job RED — in a job whose entire
+          # justification is that it cannot fail. An empty base is handled by the
+          # checker itself: advisory mode reports "no base SHA to compare
+          # against" and exits 0.
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
+            base="$PR_BASE_SHA"
+          else
+            git fetch --no-tags --quiet origin main || true
+            base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          fi
           python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
 
   test:

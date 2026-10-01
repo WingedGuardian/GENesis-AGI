@@ -1,13 +1,16 @@
 """CI trigger contract for .github/workflows/ci.yml (#2735).
 
-Loads ci.yml with PyYAML (no network) and asserts the stacked-PR contract:
-  * pull_request fires whatever the base branch (no branches filter),
-  * `edited` is a listed activity type (a retarget re-runs CI),
-  * every job skips an `edited` event that changed no base (title/body edits
-    must not re-run the suite),
-  * push-to-main / schedule / workflow_dispatch are untouched, and
-  * no job step diffs against a literal `origin/main` where the PR base could
-    be another branch — remaining uses are allowlisted with a reason.
+Loads ci.yml with PyYAML (no network) and asserts the current contract:
+  * pull_request targets `main` only — stacked PRs are NOT supported and get
+    no CI (a PR based on another branch is blocked by the merge gate anyway),
+  * `edited` is not a listed activity type — a retarget or title/body edit
+    does not re-run CI, so a passing verdict cannot be silently erased,
+  * push-to-main / schedule / workflow_dispatch are untouched,
+  * the cc-pin-receipts advisory compares against the PR's own base commit on
+    pull_request events and falls back to merge-base with origin/main on
+    push/schedule/dispatch, and
+  * no other job step diffs against a literal `origin/main` where the PR base
+    could differ — remaining uses are allowlisted with a reason.
 """
 
 from __future__ import annotations
@@ -37,41 +40,53 @@ def _run_text(job: dict) -> str:
     return "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
 
 
-def test_pull_request_has_no_base_branch_filter():
-    pr = _pull_request(_load())
-    assert "branches" not in pr or pr["branches"] == ["**"]
+def _env_text(job: dict) -> str:
+    return "\n".join(
+        str(v)
+        for step in job.get("steps", [])
+        for v in (step.get("env") or {}).values()
+    )
 
 
-def test_pull_request_types_include_edited():
-    types = _pull_request(_load()).get("types", [])
-    for t in ("opened", "synchronize", "reopened", "edited"):
-        assert t in types, f"pull_request.types missing {t!r}: {types}"
+def test_pull_request_targets_main_only():
+    assert _pull_request(_load()).get("branches") == ["main"]
 
 
-def test_edited_runs_only_on_base_change():
-    """Every job carries an if: that excludes `edited` events lacking
-    `changes.base` — a title/body edit must not re-run the suite."""
-    for name, job in _load()["jobs"].items():
-        cond = str(job.get("if", ""))
-        assert "github.event.changes.base" in cond, (
-            f"job {name!r} has no base-change guard for `edited` events: {cond!r}"
-        )
+def test_pull_request_types_exclude_edited():
+    types = _pull_request(_load()).get("types") or []
+    assert "edited" not in types
 
 
-def test_push_main_and_schedule_unchanged():
+def test_push_schedule_dispatch_unchanged():
     on = _on_block(_load())
-    assert on["push"]["branches"] == ["main"]
-    assert "schedule" in on
+    assert on["push"] == {"branches": ["main"]}
+    assert on["schedule"] == [{"cron": "0 6 * * 1"}]
     assert "workflow_dispatch" in on
+
+
+def test_cc_pin_uses_pr_base_sha():
+    """The cc-pin-receipts advisory uses the PR's own base commit on
+    pull_request events, falling back to merge-base origin/main elsewhere."""
+    job = _load()["jobs"]["cc-pin-receipts"]
+    assert "github.event.pull_request.base.sha" in _env_text(job)
+    run = _run_text(job)
+    assert "PR_BASE_SHA" in run
+    assert "merge-base origin/main" in run
 
 
 def test_no_job_hardcodes_main_as_pr_base():
     """A literal `origin/main` in a step script must be a non-PR fallback.
 
-    PR diff bases are the PR's own base branch; a stacked PR diffs against its
-    parent branch. Each remaining literal use is allowlisted with its reason.
+    On pull_request events the comparison base is the PR's own base commit;
+    `origin/main` is only legitimate on push/schedule/dispatch, where the PR
+    base SHA does not exist. Each remaining literal use is allowlisted with
+    its reason.
     """
     allowlist = {
+        "cc-pin-receipts": (
+            "origin/main only on push/schedule/dispatch; PR events use the "
+            "PR base SHA"
+        ),
         "migration-check": (
             "origin/main is reached only when PR_BASE_SHA (a pull_request event "
             "field, base-branch-relative) and PUSH_BEFORE_SHA are both absent — "
