@@ -165,10 +165,21 @@ _GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
 
 def _git_env() -> dict[str, str]:
-    """The environment with git's repository-location overrides removed."""
+    """The environment with git's repository-location overrides removed, and
+    git's optional locks off.
+
+    The locks matter because this script MEASURES mtimes. `git status` takes an
+    `index.lock` to refresh the index opportunistically, which moves the mtime
+    of the `.git` directory it runs in. For a repository nested inside a
+    worktree that directory is inside the tree, where the activity walk reads
+    it, so the reaper's own probe made an idle worktree read as active on every
+    later run (MEASURED: 20.0, 0.0, 0.0 days across three probes). Inherited by
+    the git processes a status spawns for submodules.
+    """
     env = dict(os.environ)
     for var in _GIT_LOCATION_VARS:
         env.pop(var, None)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     return env
 
 
@@ -405,12 +416,12 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     return worktrees
 
 
-def _git_activity_time(worktree_path: str) -> float:
+def _git_activity_time(worktree_path: str, _depth: int = 0) -> float:
     """Activity git can see that a shallow mtime walk cannot. 0.0 if unknown.
 
-    ONE signal: the mtimes of paths git reports as modified or untracked. That
-    is someone EDITING, at any depth, which is exactly what the walk below
-    cannot see.
+    ONE signal: the mtimes behind the paths git reports as changed (see
+    `_path_activity`). That is someone EDITING, at any depth, which is exactly
+    what the walk below cannot see.
 
     NOT the HEAD commit timestamp, which is the obvious second signal and was
     tried first. It answers the wrong question -- when the COMMIT was made, not
@@ -427,43 +438,82 @@ def _git_activity_time(worktree_path: str) -> float:
     root = Path(worktree_path)
 
     # `-uall` so an untracked file deep in the tree counts; `--porcelain=v1`
-    # pins the format, whose first 3 columns are status + a space.
-    dirty = _run_git(root, ["status", "--porcelain=v1", "-uall"], timeout=60)
-    if dirty:
-        for line in dirty.splitlines()[:_DIRTY_SCAN_CAP]:
-            if len(line) < 4:
-                continue
-            rel = line[3:]
-            # A rename reads "R  old -> new"; the NEW path is the one on disk.
-            if " -> " in rel:
-                rel = rel.split(" -> ", 1)[1]
-            path = root / rel.strip('"')
-            try:
-                newest = max(newest, path.lstat().st_mtime)
-                continue
-            except OSError:
-                pass
-            # A DELETED path has no mtime of its own, but unlinking it updated
-            # its directory's. Take the nearest ancestor that still exists,
-            # stopping at the worktree root, or a deletion below the shallow walk
-            # leaves the worktree looking as idle as it was before the change.
-            for parent in path.parents:
-                if root not in parent.parents:
-                    break
-                try:
-                    newest = max(newest, parent.lstat().st_mtime)
-                    break
-                except OSError:
-                    continue
+    # pins the format, whose first 3 columns are status + a space. `-z` because
+    # without it git C-quotes any path holding unusual bytes
+    # (`"deep-\377/f.txt"` under the default `core.quotePath`), and a quoted
+    # name is not a path on disk. With `-z` paths are raw and NUL-separated, and
+    # a rename or copy is TWO fields: destination, then source.
+    dirty = _run_git(
+        root, ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none"], timeout=60,
+    )
+    if not dirty:
+        return newest
+    fields = dirty.split("\0")
+    i = examined = 0
+    while i < len(fields) and examined < _DIRTY_SCAN_CAP:
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, paths = entry[:2], [entry[3:]]
+        # The source of a rename or copy is the next field. Reading it as an
+        # entry of its own could only add a stray reading, never lower the
+        # answer, so this is format correctness rather than a safety bound.
+        if "R" in status or "C" in status:
+            if i < len(fields):
+                paths.append(fields[i])
+            i += 1
+        examined += 1
+        for rel in paths:
+            newest = max(newest, _path_activity(root, root / rel, _depth))
     return newest
 
 
-#: Bound on the dirty-path scan. A worktree with more changed paths than this is
-#: self-evidently active, so the cap cannot make one look idle — the commit
-#: timestamp above is already in hand, and every path examined only raises the
-#: answer. Bounded because a first-run worktree can report tens of thousands of
-#: untracked paths and this runs per worktree.
+def _path_activity(root: Path, path: Path, depth: int) -> float:
+    """The newest mtime that shows a change to ``path``. 0.0 if none is readable.
+
+    Three readings, because a change does not always move the path's own mtime:
+
+    * the path's own mtime shows an EDIT;
+    * its nearest existing ancestor directory's mtime shows a CREATION, DELETION
+      or RENAME, which change the directory's entries. A deleted path has no
+      mtime at all, and a renamed file keeps its old one (MEASURED), so without
+      this a change below the shallow walk left the worktree looking idle. Never
+      above the worktree root;
+    * a NESTED REPOSITORY (a submodule, or an untracked clone) is reported only
+      by its top directory, whose mtime does not move when a file inside it is
+      edited, so its own status is read, to a depth bound. Optional locks are
+      off for every git call here (`_git_env`), or that status would itself move
+      the nested `.git` directory's mtime.
+
+    Every reading only raises the answer.
+    """
+    newest = 0.0
+    with contextlib.suppress(OSError):
+        newest = path.lstat().st_mtime
+    for parent in path.parents:
+        if parent != root and root not in parent.parents:
+            break
+        try:
+            newest = max(newest, parent.lstat().st_mtime)
+            break
+        except OSError:
+            continue
+    with contextlib.suppress(OSError):
+        if depth < _SUBMODULE_DEPTH_CAP and not path.is_symlink() and (path / ".git").exists():
+            newest = max(newest, _git_activity_time(str(path), depth + 1))
+    return newest
+
+
+#: Bound on the dirty-path scan, because a first-run worktree can report tens of
+#: thousands of untracked paths and this runs per worktree. It is a real limit:
+#: git sorts its output by path, so in a worktree with more changed paths than
+#: this, a recent change that sorts past the bound is not seen.
 _DIRTY_SCAN_CAP = 2000
+
+#: How many levels of nested repository `_path_activity` descends. Each level is
+#: one more `git status`; the bound keeps a deeply nested tree from multiplying it.
+_SUBMODULE_DEPTH_CAP = 3
 
 
 def _last_activity_time(worktree_path: str) -> float:
@@ -1190,6 +1240,7 @@ def _trash_name_taken(trash_path: Path) -> bool:
 def _trash_worktree(
     wt: dict, repo_root: Path, *, dry_run: bool = False,
     lane: str = "merged", merge_method: str = "",
+    min_idle_days: float | None = None,
 ) -> bool:
     """Move a worktree to the trash directory.
 
@@ -1199,6 +1250,11 @@ def _trash_worktree(
     expires only ``"merged"`` archives recorded with no uncommitted changes, and
     keeps every other case (``"unmerged"``, absent, unreadable, or
     ``had_uncommitted_changes`` not False) indefinitely.
+
+    ``min_idle_days`` is the lane's staleness threshold. When given, the age is
+    re-read right before archiving and a worktree touched since classification
+    is skipped. Like the process, lock and dirtiness re-checks, this is skipped
+    under ``dry_run``, so a dry run can list a worktree a real run would skip.
 
     Returns True if trashed (or would be trashed in dry-run).
     """
@@ -1258,6 +1314,23 @@ def _trash_worktree(
     if lane == "merged" and _has_uncommitted_changes(str(wt_path)):
         _log(f"SKIP {wt_path}: uncommitted changes appeared between classification and reap")
         return False
+    # AND RE-READ THE AGE, in both lanes. The classification read it before the
+    # merge verdict, which can wait on the network for up to 30 seconds, and the
+    # whole scan runs before any archive, so an edit in between reached the
+    # unmerged lane with the old age and was archived seconds after it was made.
+    # `main` passes its lane's threshold; a caller that names none skips this.
+    if min_idle_days is not None:
+        try:
+            idle_days = (time.time() - _last_activity_time(str(wt_path))) / 86400
+        except OSError as e:  # removed or unreadable since the check above
+            _log(f"SKIP {wt_path}: cannot re-read its activity time: {e}")
+            return False
+        if idle_days < min_idle_days:
+            _log(
+                f"SKIP {wt_path}: activity {idle_days:.1f}d ago, inside the "
+                f"{min_idle_days:g}-day window it was classified past"
+            )
+            return False
     # AND refuse to move a worktree that CONTAINS another registered worktree.
     # Moving the parent relocates the nested tree's files out from under git; a
     # later prune then drops the nested worktree's per-worktree HEAD, which for a
@@ -3175,6 +3248,7 @@ def main() -> int:
             r, repo_root, dry_run=args.dry_run,
             lane="merged" if r["merged"] else "unmerged",
             merge_method=r["merge_method"],
+            min_idle_days=MERGED_STALE_DAYS if r["merged"] else UNMERGED_STALE_DAYS,
         )
 
     # Republish AFTER acting. The pre-flight publish above is for crash-safety;
