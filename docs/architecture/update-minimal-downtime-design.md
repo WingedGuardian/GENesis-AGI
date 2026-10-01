@@ -132,9 +132,16 @@ through the rollback trap.
   with a non-forced checkout. Any other move is left alone. Dependencies and
   services come back only on the pre-update code (the original branch at the
   rollback commit, no foreign tracked edit); otherwise the rollback reports itself
-  incomplete. Two cases are still open: an uncommitted edit made on the same branch
-  after the merge is lost to a post-merge reset (#2679), and the watchdog restarts
-  a server the rollback held down within one tick (#2718).
+  incomplete. Before the reset of this run's own merge,
+  `_save_tracked_changes_before_reset` snapshots every uncommitted tracked change
+  (someone may have edited after the merge) with `git stash create`, kept as
+  `refs/genesis/rollback-save/<UTC>-<pid>` (pruned by disk hygiene after 45 days).
+  It refuses the reset when the reset would destroy what the snapshot cannot hold:
+  an `assume-unchanged` edit, or an untracked or ignored file where the reset
+  writes (the shared collision scan in its `direct` form). A refused or failed
+  reset keeps the migrated database with the merged code (#2679). One case is
+  still open: the watchdog restarts a server the rollback held down within one
+  tick (#2718).
 - **Incoming changes that would overwrite a local untracked or ignored file are
   refused** (`genesis_range_collisions`, over the range from the merge base, every
   change but a deletion: an incoming MODIFICATION of a path the local branch

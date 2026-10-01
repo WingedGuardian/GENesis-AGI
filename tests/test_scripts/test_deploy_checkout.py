@@ -257,9 +257,9 @@ def ranged(tmp_path: Path) -> tuple[Path, str, str]:
     return root, base, incoming
 
 
-def _collisions(root: Path, frm: str, to: str) -> tuple[int, list[str]]:
+def _collisions(root: Path, frm: str, to: str, mode: str = "") -> tuple[int, list[str]]:
     r = _bash(
-        f'rc=0; out="$(genesis_range_collisions "{root}" "{frm}" "{to}")" || rc=$?\n'
+        f'rc=0; out="$(genesis_range_collisions "{root}" "{frm}" "{to}" {mode})" || rc=$?\n'
         'printf "RC=%s\\n%s\\n" "$rc" "$out"'
     )
     assert r.returncode == 0, r.stderr
@@ -360,6 +360,42 @@ def test_an_incoming_modification_of_a_tracked_file_is_not_a_collision(ranged):
 def test_an_unlistable_range_returns_2(ranged):
     root, base, _ = ranged
     assert _collisions(root, base, "0" * 40) == (2, [])
+
+
+def test_direct_mode_sees_what_a_reset_to_an_ancestor_writes(tmp_path):
+    """A rollback resets HEAD to an ANCESTOR, where the merge-base form of the
+    range is empty. Direct mode diffs the two commits themselves, so an untracked
+    file where the reset would restore a tracked one is a collision."""
+    root = tmp_path / "r"
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    (root / "old.py").write_text("tracked in the ancestor\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "c1")
+    ancestor = _git(root, "rev-parse", "HEAD")
+    _git(root, "rm", "-q", "old.py")
+    _git(root, "commit", "-qm", "c2 removes old.py")
+    (root / "old.py").write_text("someone's untracked file\n")
+    assert _collisions(root, "HEAD", ancestor) == (0, []), "control: merge-base form is blind"
+    assert _collisions(root, "HEAD", ancestor, "direct") == (1, ["old.py"])
+    (root / "old.py").unlink()
+    assert _collisions(root, "HEAD", ancestor, "direct") == (0, [])
+
+
+def test_direct_mode_sees_a_tracked_file_replaced_by_a_directory(tmp_path):
+    """keep.txt is the same in both commits (in no diff between them) and still in
+    the index, but the working tree holds a directory of untracked files there:
+    a reset would delete them restoring the file."""
+    root = tmp_path / "r"
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    (root / "keep.txt").write_text("tracked\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "c1")
+    ancestor = _git(root, "rev-parse", "HEAD")
+    _git(root, "commit", "-q", "--allow-empty", "-m", "c2")
+    (root / "keep.txt").unlink()
+    (root / "keep.txt").mkdir()
+    (root / "keep.txt" / "notes").write_text("PRECIOUS\n")
+    assert _collisions(root, "HEAD", ancestor, "direct") == (1, ["keep.txt"])
 
 
 # ── genesis_checkout_unmoved ────────────────────────────────────────────────

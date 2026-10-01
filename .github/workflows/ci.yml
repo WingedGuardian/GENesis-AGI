@@ -1072,4 +1072,8 @@ jobs:
         # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
         # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
         # does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23582
+        #
+        # The rollback-save branch (#2679) grows test_update_checkout_moved.py
+        # from 29 to 39 and test_deploy_checkout.py from 36 to 38 (the collision
+        # scan's direct mode), so the floor is 23582 + 10 + 2 = 23594.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23594
