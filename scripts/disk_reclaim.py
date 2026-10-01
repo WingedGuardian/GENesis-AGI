@@ -13,10 +13,13 @@ Tiers, cleared in order until the disk is comfortable:
   LAST_RESORT — the code-intel index DBs. Deleting these turns every later
                 "incremental" index into a full 0->100 rebuild, which read-
                 saturates the container and storms it (2026-07 incident). So
-                they are cleared ONLY at >= ``--last-resort-above`` PCT (default
-                95, well past the medium gate), and clearing one drops an
-                index-request marker so the rebuild runs idle-gated via the
-                code-intel runner, never as an unthrottled reactive spawn.
+                they are cleared ONLY at >= ``--last-resort-above`` PCT, and
+                clearing one drops an index-request marker so the rebuild runs
+                idle-gated via the code-intel runner, never as an unthrottled
+                reactive spawn. The default is 101 (never): only a caller that
+                names a threshold clears them, and the one that does is the
+                disk guardian's RED pass (``disk_hygiene.sh --pressure
+                last-resort``, which passes 0).
   SYSTEM      — best-effort, needs sudo + write access to /var. Silently
                 skipped when unavailable (e.g. inside the hardened systemd
                 service, which runs with NoNewPrivileges + ProtectSystem=strict).
@@ -30,7 +33,9 @@ Usage:
     disk_reclaim.py                         # dry-run (report only) — default
     disk_reclaim.py --apply                 # clear CHEAP tier
     disk_reclaim.py --apply --if-above 90   # also clear MEDIUM tier if >= 90%
-    disk_reclaim.py --apply --last-resort-above 95  # also clear index DBs if >= 95%
+    disk_reclaim.py --apply --last-resort-above 0   # also clear index DBs (the
+                                                    #   guardian's RED pass; never
+                                                    #   cleared without the flag)
 
 Note: ~/.genesis/output is intentionally NOT touched — those are generated
 deliverables (not regenerable cache), managed by the user, not this tool.
@@ -393,10 +398,11 @@ def main() -> int:
     parser.add_argument("--if-above", type=float, default=101.0, metavar="PCT",
                         help="Also clear MEDIUM tier when disk usage >= PCT "
                              "(default 101 = never)")
-    parser.add_argument("--last-resort-above", type=float, default=95.0, metavar="PCT",
+    parser.add_argument("--last-resort-above", type=float, default=101.0, metavar="PCT",
                         help="Also clear LAST_RESORT tier (code-intel index DBs) "
-                             "when disk usage >= PCT (default 95). Clearing one "
-                             "drops an index-request marker for an idle rebuild.")
+                             "when disk usage >= PCT (default 101 = never). "
+                             "Clearing one drops an index-request marker for an "
+                             "idle rebuild.")
     parser.add_argument("--fail-above", type=float, default=101.0, metavar="PCT",
                         help="Exit non-zero if usage is still >= PCT after "
                              "applying (signals 'cleaned but still critical' to "

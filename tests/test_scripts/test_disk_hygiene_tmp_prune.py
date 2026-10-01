@@ -375,7 +375,7 @@ def test_seeing_only_yourself_in_proc_is_blind(tmp_path):
 
 
 def test_standard_pressure_never_clears_the_code_intel_indexes(tmp_path):
-    """#2521 item 1: left to disk_reclaim.py's 95 % default, an ORANGE pass
+    """#2521 item 1: left to disk_reclaim.py's then-95 % default, an ORANGE pass
     on a >=95 % disk deleted the index DBs before RED. Only last-resort may."""
     home = tmp_path / "home"
     (home / "tmp").mkdir(parents=True)
@@ -487,8 +487,9 @@ def test_an_unreadable_mount_table_refuses_every_prune_with_a_reason(tmp_path):
 
 
 def test_the_daily_groom_leaves_the_indexes_to_the_guardians_red_pass():
-    """Review of #2521 item 1: the daily groom's disk_reclaim call must not
-    fall back to the 95 % last-resort default either."""
+    """Review of #2521 item 1: the daily groom's disk_reclaim call pins the
+    last-resort threshold explicitly rather than relying on the script's
+    default (95 % until #2567 made it 101)."""
     text = _HYGIENE.read_text()
     main = text[text.index("\nmain() {"):]
     call = main[main.index("disk_reclaim.py"):main.index("disk_reclaim_rc=$?")]
