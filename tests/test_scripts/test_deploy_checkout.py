@@ -381,23 +381,6 @@ def test_direct_mode_sees_what_a_reset_to_an_ancestor_writes(tmp_path):
     assert _collisions(root, "HEAD", ancestor, "direct") == (0, [])
 
 
-def test_direct_mode_sees_a_tracked_file_replaced_by_a_directory(tmp_path):
-    """keep.txt is the same in both commits (in no diff between them) and still in
-    the index, but the working tree holds a directory of untracked files there:
-    a reset would delete them restoring the file."""
-    root = tmp_path / "r"
-    _git(tmp_path, "init", "-q", "-b", "main", str(root))
-    (root / "keep.txt").write_text("tracked\n")
-    _git(root, "add", ".")
-    _git(root, "commit", "-qm", "c1")
-    ancestor = _git(root, "rev-parse", "HEAD")
-    _git(root, "commit", "-q", "--allow-empty", "-m", "c2")
-    (root / "keep.txt").unlink()
-    (root / "keep.txt").mkdir()
-    (root / "keep.txt" / "notes").write_text("PRECIOUS\n")
-    assert _collisions(root, "HEAD", ancestor, "direct") == (1, ["keep.txt"])
-
-
 # ── genesis_checkout_unmoved ────────────────────────────────────────────────
 
 

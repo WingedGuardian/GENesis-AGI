@@ -107,12 +107,9 @@ genesis_untracked_node() {
 # path names are scanned, so a name git makes up is not; plain update.sh merges
 # had the same exposure before this scan existed.
 # With a 4th argument `direct`, the paths are what changes between <from> and <to>
-# themselves (two-dot, no merge base): what a hard reset to <to> from <from> would
-# write. update.sh's rollback uses it, where <to> is an ancestor of <from> and the
-# merge-base form is therefore empty. Direct mode also scans every tracked path
-# that is missing or has changed type in the working tree (a file replaced by a
-# directory, say): the reset restores those too, deleting whatever untracked or
-# ignored content sits there, and the index-skip below does not apply to them.
+# themselves (two-dot, no merge base): what a reset from <from> to <to> writes.
+# update.sh's rollback uses it, where <to> is an ancestor of <from> and the
+# merge-base form is therefore empty.
 # Prints the colliding paths, one per line. Returns 0 when there are none, 1 when
 # there are, 2 when the range cannot be listed.
 genesis_range_collisions() {
@@ -125,17 +122,11 @@ genesis_range_collisions() {
     # server is stopped, so the index is read ONCE and those paths skip the two
     # per-path git calls below. An unreadable index leaves the set empty: every
     # path then takes the full check, which is slower, never less safe.
-    local -A tracked=() seen=()
-    [ "${4:-}" = direct ] || while IFS= read -r -d '' t; do
+    local -A tracked=()
+    while IFS= read -r -d '' t; do
         tracked["$t"]=1
     done < <(git -C "$root" ls-files -z 2>/dev/null)
-    if [ "${4:-}" = direct ]; then
-        git -C "$root" diff --no-renames --name-only --diff-filter=DT HEAD >/dev/null 2>&1 \
-            || return 2
-    fi
     while IFS= read -r -d '' f; do
-        [ -n "${seen[$f]:-}" ] && continue
-        seen["$f"]=1
         [ -n "${tracked[$f]:-}" ] && continue
         if genesis_untracked_node "$root" "$f"; then
             collisions+="$f"$'\n'
@@ -151,10 +142,7 @@ genesis_range_collisions() {
                 break
             fi
         done
-    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "${spec[@]}" 2>/dev/null
-             if [ "${4:-}" = direct ]; then
-                 git -C "$root" diff -z --no-renames --name-only --diff-filter=DT HEAD 2>/dev/null
-             fi)
+    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "${spec[@]}" 2>/dev/null)
     printf '%s' "$collisions"
     [ -z "$collisions" ]
 }

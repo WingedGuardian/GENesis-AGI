@@ -132,14 +132,21 @@ through the rollback trap.
   with a non-forced checkout. Any other move is left alone. Dependencies and
   services come back only on the pre-update code (the original branch at the
   rollback commit, no foreign tracked edit); otherwise the rollback reports itself
-  incomplete. Before the reset of this run's own merge,
-  `_save_tracked_changes_before_reset` snapshots every uncommitted tracked change
-  (someone may have edited after the merge) with `git stash create`, kept as
-  `refs/genesis/rollback-save/<UTC>-<pid>` (pruned by disk hygiene after 45 days).
-  It refuses the reset when the reset would destroy what the snapshot cannot hold:
-  an `assume-unchanged` edit, or an untracked or ignored file where the reset
-  writes (the shared collision scan in its `direct` form). A refused or failed
-  reset keeps the migrated database with the merged code (#2679). One case is
+  incomplete. The reset of this run's own merge is `git reset --keep`, never
+  `--hard` (#2679): someone may have edited after the merge. `--keep` rewrites only
+  the paths that differ between HEAD and the rollback tag, refuses, moving nothing,
+  when one of them carries a local change (assume-unchanged, skip-worktree, mode
+  and type changes included), and leaves every other path's edits in place. git
+  judges each path as it writes it, so there is no window between a check and
+  the reset. Before it: the index and worktree are recorded best-effort with
+  `git stash create` as `refs/genesis/rollback-save/<UTC>-<pid>` (the staged state
+  is the one thing `--keep` drops; pruned by disk hygiene after 45 days); a backed-up
+  ephemeral edit the range touches is cleared; the shared collision scan in its
+  `direct` form refuses an untracked or ignored file where the reset writes
+  (`--keep` overwrites an ignored one); and the index is refreshed, since `--keep`
+  would read a file rewritten with identical bytes as modified. A refused or failed
+  reset keeps the migrated database with the merged code. A foreign edit that
+  survives the reset still blocks the restart (the rule above). One case is
   still open: the watchdog restarts a server the rollback held down within one
   tick (#2718).
 - **Incoming changes that would overwrite a local untracked or ignored file are
@@ -149,20 +156,20 @@ through the rollback trap.
   conflict too). The
   merge also passes `--no-overwrite-ignore`, but git 2.43 honours that only on a
   fast-forward; a true 3-way merge overwrites the file, and a rollback's
-  `reset --hard` then deletes it. So the scan is the protection: before the stop,
+  reset then deletes it. So the scan is the protection: before the stop,
   and again as the last step before the merge (`late-collision-scan`), where a hit
   rolls back with HEAD unmoved: the rollback resets nothing, so the file stays.
   Paths git invents in a file/directory conflict (`<path>~HEAD`) are not scanned
   (#2678).
 - **Local edits to the ephemeral files are backed up** (`ephemeral-prestop-backup`)
   between the fetch and `_write_state "fetching"` — every dirty one, because a
-  rollback's `reset --hard` discards any of them. The clear before the merge
+  rollback clears any of them its range touches. The clear before the merge
   touches only the files the incoming range changes, plus any with a STAGED edit
   (git keeps an unstaged edit to any other file through the merge, but a true
   3-way merge refuses on any index change), and discards a file's edits only when a backup of
   its current content exists. `_do_rollback` saves any dirty ephemeral file whose
   current edits have no backup (a `--post-merge` run, or an edit made after the
-  backup) before its `reset --hard`. After the stop, the merge is also checked
+  backup) before its reset, and clears one only when such a backup exists. After the stop, the merge is also checked
   against the branch the run started on.
 
 ## Success records name a server that did not come back (2026-09-30)

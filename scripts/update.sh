@@ -355,7 +355,7 @@ fi
 # ── Dirty-tree guard ─────────────────────────────────────
 # Abort before touching anything if tracked files are modified.
 # Untracked files (^??) are excluded — merge/reset never touches them.
-# git reset --hard in _do_rollback would silently discard uncommitted work.
+# A modified file the update changes would also make _do_rollback's reset refuse.
 #
 # Pure redeploy-decision helper (facts in → reason string out; no git/ssh) so
 # the guardian-redeploy matrix is unit-testable. Emits a non-empty reason to
@@ -846,7 +846,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
     # Paths the incoming side adds or changes that already exist here untracked or IGNORED.
     # git overwrites an ignored file without asking, and on a true 3-way merge
     # `--no-overwrite-ignore` (on the merge below) does not stop it (measured, git
-    # 2.43); a rollback's `reset --hard` then deletes the file, because the rollback
+    # 2.43); a rollback's reset then deletes the file, because the rollback
     # tag does not track it. Refused here, while nothing has stopped. The scan is the
     # shared lib's, the one deploy_code_only.sh runs.
     _coll_rc=0
@@ -918,8 +918,8 @@ _ephemeral_backup_is_current() {
         && cmp -s "$dest/index.patch" <(git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p")
 }
 
-# Called by _do_rollback just before its `reset --hard`, which discards edits to
-# every tracked file. The pre-stop backup can be missing (a --post-merge run takes
+# Called by _do_rollback before its reset, which may clear an ephemeral file's
+# edit (_ephemeral_clear_before_reset). The pre-stop backup can be missing (a --post-merge run takes
 # none) or stale (an indexer rewrote AGENTS.md after it), so each dirty ephemeral
 # file whose CURRENT edits are not already saved is backed up under <root>/rollback.
 # Never fails: a rollback must go ahead, so a failed backup is named, not fatal.
@@ -940,42 +940,88 @@ _ephemeral_backup_before_reset() {
     return 0
 }
 
-# Make the rollback's `reset --hard "$ROLLBACK_TAG"` safe for work that is not
-# this run's. Another session can edit the checkout after the merge, and those
-# edits are nobody's to throw away. Returns non-zero, saying why, whenever the
-# reset would destroy something it could not save; the caller then does not
-# reset, because a rollback left undone is recoverable and a lost edit is not.
-#   - Tracked changes (staged and unstaged edits, deletions, staged new files,
-#     a file replaced by a directory, symlink and mode changes) are captured with
-#     `git stash create`, which snapshots index and worktree as one commit without
-#     touching either or the shared stash list, and kept by a named ref,
-#     refs/genesis/rollback-save/<UTC>-<pid>. `git stash apply --index <sha>`
-#     restores every one of them (all measured, git 2.43). Disk hygiene prunes
-#     these refs after 45 days, like the backup runs.
-#   - An edit hidden behind `assume-unchanged` is invisible to that snapshot and
-#     the reset reverts it, so one present refuses.
-#   - An untracked or ignored file at a path the reset WRITES (one the rollback
-#     tag tracks and HEAD does not) would be overwritten: refuses too.
+# The rollback undoes this run's merge with `git reset --keep "$ROLLBACK_TAG"`,
+# never `--hard`: another session can edit the checkout after the merge, and those
+# edits are nobody's to throw away. --keep rewrites only the paths that differ
+# between HEAD and the tag, and refuses, moving nothing, when any of them carries
+# a local change: staged or unstaged, behind assume-unchanged or skip-worktree, a
+# mode or type change, an untracked file where it writes. Every other path keeps
+# its edits in place. git checks each path itself during the reset, so an edit
+# made at any moment before it is kept or makes it refuse; no earlier check can
+# go stale. (Measured, git 2.43; the git-reset manual's "undo a merge or pull
+# inside a dirty working tree".) A refusal leaves the merged code, the edit and
+# the migrated database in place for a person to sort out: a rollback left
+# undone is recoverable, a lost edit is not.
+#
+# What --keep does not protect is handled before it:
+#   - an IGNORED file at a path the reset writes is overwritten (measured), so the
+#     shared collision scan refuses first (_rollback_reset_collision_free);
+#   - the index: a staged change on an untouched path becomes unstaged (its
+#     content stays). A snapshot of index and worktree is kept first, best-effort
+#     (_save_tracked_changes_before_reset);
+#   - the ephemeral files an indexer rewrites would make every rollback over them
+#     refuse, so an edit the range touches is cleared once a current backup of it
+#     exists (_ephemeral_clear_before_reset), exactly as before the merge.
+
+# Best-effort record of the checkout's uncommitted tracked changes, index state
+# included: `git stash create` snapshots index and worktree as one commit without
+# touching either or the shared stash list, kept by a named ref
+# refs/genesis/rollback-save/<UTC>-<pid> (disk hygiene prunes these after 45
+# days, like the backup runs). `git stash apply --index <sha>` restores it. The
+# reset no longer depends on it, so a failure is reported and never blocks. One
+# thing only it holds: content that exists in the index alone (staged, then
+# changed or deleted on disk), which --keep drops with the staged state. When git
+# cannot snapshot (an intent-to-add or unmerged entry elsewhere), that content
+# survives only as an unreachable object until gc.
 _save_tracked_changes_before_reset() {
-    local root="$1" rc=0 sha ref p line tag
-    mkdir -p "$root" && chmod 700 "$root" || return 1
-    # Lists go to files, not process substitutions, so a failed listing is seen.
-    git -C "$GENESIS_ROOT" ls-files -v -z > "$root/index-flags.z" 2>/dev/null || return 1
-    while IFS= read -r -d '' line; do
-        tag="${line%% *}" p="${line#* }"
-        case "$tag" in [a-z]) ;; *) continue ;; esac
-        if [ "$(if [ -L "$GENESIS_ROOT/$p" ]; then
-                    printf '%s' "$(readlink -- "$GENESIS_ROOT/$p")" | git -C "$GENESIS_ROOT" hash-object --stdin
-                else
-                    git -C "$GENESIS_ROOT" hash-object -- "$p"
-                fi 2>/dev/null || echo unreadable)" \
-            != "$(git -C "$GENESIS_ROOT" rev-parse -q --verify "HEAD:$p" 2>/dev/null || echo absent)" ]; then
-            echo "  $p is marked assume-unchanged and differs from HEAD; the reset would revert it unsaved."
-            return 1
+    local root="$1" rc=0 sha ref err=""
+    git -C "$GENESIS_ROOT" diff --quiet HEAD 2>/dev/null || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -ne 1 ]; then
+        echo "  NOTE: cannot read the checkout's status; no snapshot of uncommitted changes was taken."
+        return 0
+    fi
+    mkdir -p "$root" 2>/dev/null && chmod 700 "$root" 2>/dev/null && err="$root/stash-create.err"
+    if ! sha="$(git -C "$GENESIS_ROOT" stash create "update.sh rollback save, $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>"${err:-/dev/null}")" \
+        || [ -z "$sha" ]; then
+        # e.g. an intent-to-add or unmerged entry, which git cannot snapshot.
+        echo "  NOTE: git could not snapshot the uncommitted changes${err:+: $(tr '\n' ' ' < "$err" 2>/dev/null)}"
+        return 0
+    fi
+    ref="refs/genesis/rollback-save/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if ! git -C "$GENESIS_ROOT" update-ref "$ref" "$sha" 2>/dev/null; then
+        echo "  NOTE: could not keep the snapshot of uncommitted changes (${sha:0:12}) under $ref."
+        return 0
+    fi
+    [ -n "$err" ] && printf 'ref %s\ncommit %s\nrestore: git -C %s stash apply --index %s\n' \
+        "$ref" "$sha" "$GENESIS_ROOT" "$sha" > "$root/rollback-save.txt" 2>/dev/null || true
+    echo "  Recorded the checkout's uncommitted tracked changes (index included) as $ref (${sha:0:12})."
+    echo "  The reset keeps them in place; to restore the staged state too: git -C \"$GENESIS_ROOT\" stash apply --index $sha"
+    return 0
+}
+
+# Clear an ephemeral file's local edit before the reset, but only when the reset
+# would otherwise refuse over it (the range HEAD..tag touches it) AND a current
+# backup of exactly that edit exists. Anything else is left for --keep to judge.
+_ephemeral_clear_before_reset() {
+    local root="$1" p
+    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
+        _ephemeral_is_dirty "$p" || continue
+        git -C "$GENESIS_ROOT" diff --quiet HEAD "$ROLLBACK_TAG" -- "$p" 2>/dev/null && continue
+        if _ephemeral_backup_is_current "$p" "$root" \
+            || _ephemeral_backup_is_current "$p" "$root/late" \
+            || _ephemeral_backup_is_current "$p" "$root/rollback"; then
+            git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
+                || echo "  WARNING: could not clear the backed-up edit to $p; the reset will refuse over it."
         fi
-    done < "$root/index-flags.z"
-    # The shared scan in its direct form: what the reset to the rollback tag
-    # writes, as opposed to what a merge brings in.
+    done
+    return 0
+}
+
+# The shared scan in its direct form: an untracked or ignored file at a path the
+# reset to the rollback tag writes. Returns non-zero, naming the paths, when the
+# reset must not run.
+_rollback_reset_collision_free() {
     local coll="" coll_rc=0
     coll="$(genesis_range_collisions "$GENESIS_ROOT" HEAD "$ROLLBACK_TAG" direct)" || coll_rc=$?
     if [ "$coll_rc" -eq 1 ]; then
@@ -985,30 +1031,13 @@ _save_tracked_changes_before_reset() {
         echo "  cannot list what the reset to $ROLLBACK_TAG would write."
         return 1
     fi
-    git -C "$GENESIS_ROOT" diff --quiet HEAD 2>/dev/null || rc=$?
-    [ "$rc" -eq 0 ] && return 0
-    [ "$rc" -eq 1 ] || return 1
-    local err="$root/stash-create.err"
-    if ! sha="$(git -C "$GENESIS_ROOT" stash create "update.sh rollback save, $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>"$err")" \
-        || [ -z "$sha" ]; then
-        # e.g. an intent-to-add or unmerged entry: git cannot snapshot it, and
-        # the reset would delete it, so this refuses.
-        echo "  git could not snapshot the uncommitted changes: $(tr '\n' ' ' < "$err" 2>/dev/null)"
-        return 1
-    fi
-    ref="refs/genesis/rollback-save/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    git -C "$GENESIS_ROOT" update-ref "$ref" "$sha" 2>/dev/null || return 1
-    printf 'ref %s\ncommit %s\nrestore: git -C %s stash apply --index %s\n' \
-        "$ref" "$sha" "$GENESIS_ROOT" "$sha" > "$root/rollback-save.txt" 2>/dev/null || true
-    echo "  Saved the checkout's uncommitted tracked changes before the rollback as $ref (${sha:0:12})."
-    echo "  Restore them with: git -C \"$GENESIS_ROOT\" stash apply --index $sha  (they were made against the merged code, so expect conflicts)"
     return 0
 }
 
 if [[ "$POST_MERGE" == "false" ]]; then
     # EVERY dirty one is saved, not only those the merge will clear: a rollback
-    # (`reset --hard` to the rollback tag) discards local edits to any tracked
-    # file, and it can happen after the stop, where a backup would be too late.
+    # clears an ephemeral edit its range touches (_ephemeral_clear_before_reset),
+    # and it can happen after the stop, where a backup would be too late.
     for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
         _ephemeral_is_dirty "$_eph" || continue
         if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT"; then
@@ -1595,17 +1624,32 @@ _do_rollback() {
             else
                 echo "  WARNING: the ephemeral-file backup helper is not defined; the reset may discard local edits."
             fi
-            # Every OTHER uncommitted tracked change is saved too (someone may
-            # have edited after the merge), and if that fails the reset does not
-            # run: services then stay down on the merged tree (restart_ok below),
-            # which a person can sort out; a discarded edit could not be.
-            if ! declare -F _save_tracked_changes_before_reset >/dev/null \
-                || ! _save_tracked_changes_before_reset "$EPHEMERAL_BACKUP_ROOT"; then
-                echo "  CRITICAL: could not make the reset safe for the checkout's uncommitted work, so the merge was NOT rolled back."
+            # Then the index and every other uncommitted change is recorded
+            # (best-effort), the ephemeral edits the reset would refuse over are
+            # cleared (each only with a current backup), and the reset is
+            # `--keep`: git itself refuses, moving nothing, when a path it writes
+            # carries a local change, and leaves every other path's edits in
+            # place. A refusal leaves the merged tree and services stay down on
+            # it (restart_ok below), which a person can sort out; a discarded
+            # edit could not be.
+            if declare -F _save_tracked_changes_before_reset >/dev/null; then
+                _save_tracked_changes_before_reset "$EPHEMERAL_BACKUP_ROOT" || true
+            fi
+            if declare -F _ephemeral_clear_before_reset >/dev/null; then
+                _ephemeral_clear_before_reset "$EPHEMERAL_BACKUP_ROOT" || true
+            fi
+            if ! declare -F _rollback_reset_collision_free >/dev/null \
+                || ! _rollback_reset_collision_free; then
+                echo "  CRITICAL: the reset to $ROLLBACK_TAG would overwrite a file it does not own, so the merge was NOT rolled back."
                 checkout_ok=false
                 code_kept=true
-            elif ! git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1; then
-                echo "  CRITICAL: failed to reset $ORIGINAL_BRANCH to $ROLLBACK_TAG"
+            # --keep does not refresh the index: a file rewritten with identical
+            # bytes (an indexer, a touch) would read as modified and refuse the
+            # reset. The refresh updates only the cached stat data; a real edit,
+            # assume-unchanged included, still refuses (measured, git 2.43).
+            elif ! { git -C "$GENESIS_ROOT" update-index -q --refresh >/dev/null 2>&1 || true
+                     git -C "$GENESIS_ROOT" reset -q --keep "$ROLLBACK_TAG" 2>&1; }; then
+                echo "  CRITICAL: git refused to reset $ORIGINAL_BRANCH to $ROLLBACK_TAG (its reason is above: usually local changes to a file this update changed, kept as they are; or another git operation in progress), so the merge was NOT rolled back."
                 checkout_ok=false
                 code_kept=true
             fi
@@ -1650,6 +1694,7 @@ _do_rollback() {
     # Restore the pre-update DB — but ONLY if migrations actually ran this update.
     # Rolling back the code without the DB would leave the old code running
     # against a migrated (newer) schema. If no migration ran, the DB is untouched.
+    # BEGIN rollback-db-decision (extracted by tests/test_scripts/test_update_checkout_moved.py)
     local db_ok=true
     if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then
         if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then
@@ -1684,6 +1729,7 @@ _do_rollback() {
             db_ok=false
         fi
     fi
+    # END rollback-db-decision
 
     # Reload systemd in case unit templates changed during the failed update's
     # bootstrap. NOTE: rollback restores CODE, DEPS, and (if migrated) the DB —

@@ -1074,6 +1074,8 @@ jobs:
         # does not move.
         #
         # The rollback-save branch (#2679) grows test_update_checkout_moved.py
-        # from 29 to 39 and test_deploy_checkout.py from 36 to 38 (the collision
-        # scan's direct mode), so the floor is 23582 + 10 + 2 = 23594.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23594
+        # from 29 to 64 (the `reset --keep` rollback, its parametrized index-flag
+        # cases and the database decision) and test_deploy_checkout.py from 36 to
+        # 37 (the collision scan's direct mode), counted by --collect-only after
+        # the last test edit: the floor is 23582 + 35 + 1 = 23618.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23618
