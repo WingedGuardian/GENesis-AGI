@@ -104,7 +104,7 @@ def _rollback_guard(root: Path, own_head: str, merge_attempted: bool = False) ->
         "_ephemeral_backup_before_reset() { echo BACKUP-BEFORE-RESET; }\n"
         "guard() {\n"
         + _block("rollback-code-guard")
-        + '    echo "ACTION=$code_action OK=$checkout_ok"\n}\nguard\n'
+        + '    echo "ACTION=$code_action OK=$checkout_ok RESTART=$restart_ok"\n}\nguard\n'
     )
 
 
@@ -115,21 +115,39 @@ def _verdict(r: subprocess.CompletedProcess) -> tuple[str, str]:
     return m.group(1), m.group(2)
 
 
+def _restarts(r: subprocess.CompletedProcess) -> bool:
+    """Whether the guard lets services restart from the checkout."""
+    m = re.search(r"RESTART=(\w+)", r.stdout)
+    assert m, r.stdout
+    return m.group(1) == "true"
+
+
 def test_a_failure_before_the_merge_resets_nothing_and_keeps_new_edits(repo, tmp_path):
     """This run never moved HEAD, so there is nothing to undo — and an edit made
-    meanwhile by someone else must survive (a reset would destroy it)."""
+    meanwhile by someone else must survive (a reset would destroy it). That edit
+    is code nobody validated, so services are NOT restarted on it either."""
     tag = _git(repo, "rev-parse", "pre-update-test")
     (repo / "code.py").write_text("someone else's edit\n")
     r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
-    assert _verdict(r) == ("none", "true")
+    assert _verdict(r) == ("none", "false")
+    assert not _restarts(r)
     assert (repo / "code.py").read_text() == "someone else's edit\n"
     assert "BACKUP-BEFORE-RESET" not in r.stdout
+    assert "services are NOT restarted" in r.stdout and "code.py" in r.stdout
+
+
+def test_a_clean_failure_before_the_merge_restarts_on_the_old_code(repo, tmp_path):
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
+    assert _verdict(r) == ("none", "true")
+    assert _restarts(r)
 
 
 def test_a_failure_after_the_merge_resets_this_runs_merge(repo, tmp_path):
     merged = _merge_like_commit(repo)
     r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
     assert _verdict(r) == ("reset", "true")
+    assert _restarts(r)
     assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
     assert (repo / "code.py").read_text() == "x = 1\n"
     assert "BACKUP-BEFORE-RESET" in r.stdout, "ephemeral edits are saved before the reset"
@@ -144,11 +162,29 @@ def test_a_switched_branch_is_left_exactly_as_it_is(repo, tmp_path):
     (repo / "code.py").write_text("work on other\n")
     r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
     assert _verdict(r) == ("moved", "false")
+    assert not _restarts(r), "never restart services on someone else's branch"
     assert _git(repo, "symbolic-ref", "--short", "HEAD") == "other"
     assert (repo / "code.py").read_text() == "work on other\n"
     assert _git(repo, "rev-parse", "main") == merged, "main was not reset either"
     assert "the checkout moved after this update merged" in r.stdout
     assert "reset $ORIGINAL_BRANCH" not in r.stdout and "reset main" not in r.stdout
+
+
+def test_a_clean_switch_after_the_merge_is_switched_back_and_rolled_back(repo, tmp_path):
+    """A plain branch switch with nothing uncommitted: switch back (non-forced),
+    then undo this run's own merge and restart on the old code. The other branch
+    keeps its commits."""
+    merged = _merge_like_commit(repo)
+    _git(repo, "checkout", "-q", "other")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "their work")
+    theirs = _git(repo, "rev-parse", "other")
+    r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
+    assert _verdict(r) == ("reset", "true")
+    assert _restarts(r)
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "main"
+    assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
+    assert _git(repo, "rev-parse", "other") == theirs, "their branch keeps its commits"
+    assert "switched back to main" in r.stdout
 
 
 def test_a_commit_made_on_top_of_the_merge_is_not_reset_away(repo, tmp_path):
@@ -158,36 +194,101 @@ def test_a_commit_made_on_top_of_the_merge_is_not_reset_away(repo, tmp_path):
     theirs = _git(repo, "rev-parse", "HEAD")
     r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
     assert _verdict(r) == ("moved", "false")
+    assert not _restarts(r)
     assert _git(repo, "rev-parse", "HEAD") == theirs
 
 
-def test_a_detached_head_or_a_missing_tag_is_treated_as_moved(repo, tmp_path):
+def test_a_detached_head_is_switched_back_and_a_missing_tag_is_moved(repo, tmp_path):
     merged = _merge_like_commit(repo)
-    _git(repo, "checkout", "-q", "--detach", "HEAD")
-    assert _verdict(_run(_rollback_guard(repo, own_head=merged), tmp_path)) == ("moved", "false")
-    _git(repo, "checkout", "-q", "main")
+    # Detached at a commit that is not ours, with main still at our merge: a
+    # clean switch, so main is checked out again and our merge rolled back.
+    _git(repo, "checkout", "-q", "--detach", "HEAD~1")
+    r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
+    assert _verdict(r) == ("reset", "true")
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "main"
+    # No rollback target at all: never reset blind, never restart.
+    merged = _merge_like_commit(repo)
     _git(repo, "tag", "-d", "pre-update-test")
     r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
     assert _verdict(r) == ("moved", "false"), "no rollback target: never reset blind"
+    assert not _restarts(r)
     assert _git(repo, "rev-parse", "HEAD") == merged
 
 
-@pytest.mark.parametrize("move", ["switch", "commit"])
-def test_a_checkout_moved_before_any_merge_is_untouched_not_incomplete(repo, tmp_path, move):
-    """This run never merged (its own head is still the rollback commit), so a move
-    is someone else's: left alone, reported as such, and NOT an incomplete
-    rollback whose advice would be to reset their work away."""
+def test_a_commit_before_any_merge_is_left_alone_and_not_restarted_on(repo, tmp_path):
+    """This run never merged, so a commit on top is someone else's: left alone,
+    never reset away, and services are NOT restarted on that unvalidated code —
+    an incomplete rollback, with no advice to reset their work."""
     tag = _git(repo, "rev-parse", "pre-update-test")
-    if move == "switch":
-        _git(repo, "checkout", "-q", "other")
-    else:
-        _git(repo, "commit", "-q", "--allow-empty", "-m", "theirs")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "theirs")
     before = _git(repo, "rev-parse", "HEAD")
     r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
-    assert _verdict(r) == ("untouched", "true")
+    assert _verdict(r) == ("untouched", "false")
+    assert not _restarts(r)
     assert _git(repo, "rev-parse", "HEAD") == before
     assert "This run never changed the code" in r.stdout
-    assert "reset" not in r.stdout.lower()
+    assert "reset" not in r.stdout.lower().replace("not restarted", "")
+
+
+def test_a_switch_before_any_merge_is_switched_back_and_restarted_on_the_old_code(repo, tmp_path):
+    """The P1 case: a branch switched before the merge used to restart services on
+    the other branch. A clean switch is reversed (non-forced) and services restart
+    on the pre-update commit; the other branch is untouched."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "checkout", "-q", "other")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "feature work")
+    theirs = _git(repo, "rev-parse", "other")
+    r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
+    assert _verdict(r) == ("none", "true")
+    assert _restarts(r)
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "main"
+    assert _git(repo, "rev-parse", "HEAD") == tag
+    assert _git(repo, "rev-parse", "other") == theirs
+
+
+def test_a_switch_back_never_overwrites_an_ignored_file(repo, tmp_path):
+    """The original branch tracks a file the other branch de-tracked and ignores
+    (the shape of this repo's de-tracked settings files). A plain checkout would
+    replace the local ignored copy without asking (measured, git 2.43); the switch
+    back must refuse instead, keep the file, and not restart."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "checkout", "-q", "other")
+    _git(repo, "rm", "-q", "--cached", "code.py")
+    (repo / ".gitignore").write_text("code.py\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "de-track code.py")
+    (repo / "code.py").write_text("PRECIOUS local copy\n")
+    r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
+    assert (repo / "code.py").read_text() == "PRECIOUS local copy\n"
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "other"
+    assert _verdict(r) == ("untouched", "false")
+    assert not _restarts(r)
+    assert "Did not switch back to main" in r.stdout
+
+
+def test_no_switch_back_when_the_original_branch_moved_on(repo, tmp_path):
+    """Someone committed on main AND switched away: main is no longer this run's
+    state, so switching back would restart on their commit. Left as found."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "theirs on main")
+    _git(repo, "checkout", "-q", "other")
+    r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
+    assert _verdict(r) == ("untouched", "false")
+    assert not _restarts(r)
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "other"
+
+
+def test_a_switch_with_uncommitted_work_is_not_switched_back_or_restarted_on(repo, tmp_path):
+    """Their uncommitted edit is in the way: no switch (it would carry or clash
+    with their edit), no restart on their branch, rollback incomplete."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "checkout", "-q", "other")
+    (repo / "code.py").write_text("their uncommitted work\n")
+    r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
+    assert _verdict(r) == ("untouched", "false")
+    assert not _restarts(r)
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "other"
+    assert (repo / "code.py").read_text() == "their uncommitted work\n"
 
 
 def test_an_interrupted_merge_with_merge_head_is_aborted(repo, tmp_path):
@@ -208,6 +309,7 @@ def test_an_interrupted_merge_with_merge_head_is_aborted(repo, tmp_path):
     assert (repo / ".git" / "MERGE_HEAD").exists(), "fixture: a merge must be in progress"
     r = _run(_rollback_guard(repo, own_head=tag, merge_attempted=True), tmp_path)
     assert _verdict(r) == ("none", "true")
+    assert _restarts(r)
     assert not (repo / ".git" / "MERGE_HEAD").exists()
     assert (repo / "code.py").read_text() == "x = 'main'\n"
 
@@ -217,11 +319,13 @@ def test_an_interrupted_merge_that_left_tracked_changes_is_reported_not_reset(re
     (repo / "code.py").write_text("half-written\n")
     r = _run(_rollback_guard(repo, own_head=tag, merge_attempted=True), tmp_path)
     assert _verdict(r) == ("none", "false")
-    assert "code.py" in r.stdout
+    assert not _restarts(r)
+    assert "the merge was interrupted" in r.stdout and "code.py" in r.stdout
     assert (repo / "code.py").read_text() == "half-written\n", "never reset: may be someone's edit"
-    # Control: the same edit with no merge attempted is simply kept, no alarm.
+    # Control: with no merge attempted the edit is not called an interrupted
+    # merge (it is still not restarted on: see the first test).
     r = _run(_rollback_guard(repo, own_head=tag), tmp_path)
-    assert _verdict(r) == ("none", "true")
+    assert "the merge was interrupted" not in r.stdout
 
 
 def test_a_moved_checkout_keeps_the_migrated_database():
@@ -236,6 +340,21 @@ def test_a_moved_checkout_keeps_the_migrated_database():
     assert migrated < moved < restore
     branch = body[moved : body.index("elif", moved)]
     assert "db_ok=false" in branch and "cp " not in branch
+
+
+def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
+    """The guard's verdict must actually gate the two steps that would boot the
+    checkout: the dependency reinstall and the service restarts."""
+    text = _text()
+    start = text.index("_do_rollback() {")
+    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
+    guard_end = body.index("# END rollback-code-guard")
+    pip = body.index('"$VENV_DIR/bin/pip" install', guard_end)
+    assert 'if [ "$restart_ok" = "true" ] \\\n' in body[guard_end:pip]
+    loop = body.index('for svc in "${WERE_RUNNING[@]}"; do', guard_end)
+    gate = body.rindex('if [ "$restart_ok" = "true" ]; then', guard_end, loop)
+    assert "\n    fi\n" not in body[gate:loop]
+    assert body.count('for svc in "${WERE_RUNNING[@]}"; do') == 1
 
 
 def test_the_closing_banner_does_not_claim_a_rollback_that_did_not_happen():

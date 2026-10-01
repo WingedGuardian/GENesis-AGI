@@ -1327,6 +1327,30 @@ _do_rollback() {
     elif [ -n "$rb_commit" ] && [ "$own_head" = "$rb_commit" ]; then
         code_action=untouched
     fi
+    # Someone SWITCHED branches (rather than committing on ours): if our branch
+    # still points where this run left it and nothing uncommitted is in the way,
+    # switch back with a NON-forced checkout. git refuses rather than overwrite a
+    # tracked edit or an untracked file, and --no-overwrite-ignore makes it refuse
+    # rather than overwrite an IGNORED file too, which a plain checkout replaces
+    # without asking (both measured, git 2.43). The other branch keeps its
+    # commits. Then decide again from the original branch.
+    local ob_tip=""
+    if { [ "$code_action" = "untouched" ] || [ "$code_action" = "moved" ]; } \
+        && [ -n "$rb_commit" ] && [ "$_now_branch" != "$ORIGINAL_BRANCH" ]; then
+        ob_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/heads/$ORIGINAL_BRANCH^{commit}" 2>/dev/null || true)"
+        if { [ "$ob_tip" = "$rb_commit" ] || [ "$ob_tip" = "$own_head" ]; } \
+            && left="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" && [ -z "$left" ] \
+            && git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
+            echo "  The checkout had been switched to ${_now_branch:-a detached HEAD}; switched back to $ORIGINAL_BRANCH (that branch keeps its commits)."
+            if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$ORIGINAL_BRANCH"; then
+                code_action=none
+            elif genesis_checkout_unmoved "$GENESIS_ROOT" "$own_head" "$ORIGINAL_BRANCH"; then
+                code_action=reset
+            fi
+        else
+            echo "  Did not switch back to $ORIGINAL_BRANCH (uncommitted tracked edits, $ORIGINAL_BRANCH moved on, or git refused to overwrite a file); left as found."
+        fi
+    fi
     case "$code_action" in
         none)
             echo "  The checkout is still at $ROLLBACK_TAG on $ORIGINAL_BRANCH: no code to roll back."
@@ -1345,6 +1369,7 @@ _do_rollback() {
             ;;
         untouched)
             echo "  This run never changed the code. The checkout was moved by someone else (now ${_now_branch:-a detached HEAD} at ${_now_head:0:12}) and is left as it is."
+            checkout_ok=false
             ;;
         reset)
             # The reset discards edits to every tracked file. Save the ephemeral
@@ -1367,11 +1392,33 @@ _do_rollback() {
             checkout_ok=false
             ;;
     esac
+    # Services come back ONLY on the code they were running before the update:
+    # the original branch at the rollback commit, with no foreign tracked edit on
+    # top. Anything else is code nobody validated, so nothing is reinstalled or
+    # restarted from it, and the rollback is reported incomplete. (The watchdog
+    # can still restart a stopped server from the checkout after the rollback ends;
+    # a durable hold it honours is not built yet.)
+    local restart_ok=false left_rc=0
+    left=""
+    if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$ORIGINAL_BRANCH"; then
+        left="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" || left_rc=$?
+        [ "$left_rc" -eq 0 ] && [ -z "$left" ] && restart_ok=true
+    fi
+    if [ "$restart_ok" != "true" ]; then
+        echo "  CRITICAL: the checkout is not the pre-update code ($ROLLBACK_TAG on $ORIGINAL_BRANCH, unmodified), so services are NOT restarted from it."
+        if [ "$left_rc" -ne 0 ]; then
+            echo "    (working-tree status unreadable)"
+        elif [ -n "$left" ]; then
+            printf '%s\n' "$left" | sed 's/^/    changed: /'
+        fi
+        checkout_ok=false
+    fi
     # END rollback-code-guard
 
     # Re-sync dependencies against the rolled-back code
     local pip_ok=true
-    if ! "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1; then
+    if [ "$restart_ok" = "true" ] \
+        && ! "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1; then
         echo "  CRITICAL: pip install failed during rollback"
         pip_ok=false
     fi
@@ -1421,15 +1468,20 @@ _do_rollback() {
     # on disk so the restart below uses a consistent unit.
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # Restart services with old code
-    for svc in "${WERE_RUNNING[@]}"; do
-        if [ "$svc" = "genesis-server" ]; then
-            _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
-        else
-            systemctl --user start "$svc.service" 2>/dev/null || \
-                echo "  CRITICAL: failed to restart $svc"
-        fi
-    done
+    # Restart services with old code — only when the guard above verified it IS
+    # the old code.
+    if [ "$restart_ok" = "true" ]; then
+        for svc in "${WERE_RUNNING[@]}"; do
+            if [ "$svc" = "genesis-server" ]; then
+                _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
+            else
+                systemctl --user start "$svc.service" 2>/dev/null || \
+                    echo "  CRITICAL: failed to restart $svc"
+            fi
+        done
+    elif [ "${#WERE_RUNNING[@]}" -gt 0 ]; then
+        echo "  NOT restarted: ${WERE_RUNNING[*]}. Put the checkout back on the pre-update code (or finish the other session's work), then start them."
+    fi
 
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
         echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
@@ -1534,7 +1586,9 @@ _write_state "merging"
 # the clears and the merge below would act on THEIR work: refuse instead. Run
 # before the clears (so a refusal leaves the tree as it was found) and again
 # just before the merge. This run has not moved HEAD yet, so _do_rollback has
-# nothing to reset: it restarts the services and leaves the checkout alone.
+# nothing to reset. It switches a cleanly switched branch back, restarts the
+# services only on the pre-update code with no foreign tracked edit, and otherwise
+# leaves them down and reports the rollback incomplete.
 # BEGIN checkout-unmoved (extracted by tests/test_scripts/test_update_activation.py)
 _checkout_unmoved_or_roll_back() {
     local dirty="" dirty_rc=0 own_head="${UPDATE_OWN_HEAD:-}"

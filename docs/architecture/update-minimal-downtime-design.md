@@ -127,10 +127,14 @@ through the rollback trap.
   minutes), and `checkout-unmoved` re-checks them, plus "no new tracked edit",
   before the clears and again just before the merge. `_do_rollback` resets only
   from `UPDATE_OWN_HEAD`, the commit this run's merge produced. At the rollback
-  commit there is nothing to undo, so it skips the reset; on any other branch or
-  commit it leaves the checkout alone and reports the rollback incomplete. One case
-  is still open: an uncommitted edit made on the same branch after the merge is
-  lost to a post-merge reset (#2679).
+  commit there is nothing to undo, so it skips the reset. A clean branch switch
+  (the original branch still at this run's state, nothing uncommitted) is reversed
+  with a non-forced checkout. Any other move is left alone. Dependencies and
+  services come back only on the pre-update code (the original branch at the
+  rollback commit, no foreign tracked edit); otherwise the rollback reports itself
+  incomplete. Two cases are still open: an uncommitted edit made on the same branch
+  after the merge is lost to a post-merge reset (#2679), and the watchdog restarts
+  a server the rollback held down within one tick (#2718).
 - **Incoming changes that would overwrite a local untracked or ignored file are
   refused** (`genesis_range_collisions`, over the range from the merge base, every
   change but a deletion: an incoming MODIFICATION of a path the local branch

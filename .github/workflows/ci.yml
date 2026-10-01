@@ -1059,7 +1059,7 @@ jobs:
         #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
         #     -> 28 tests collected
         #   pytest tests/test_scripts/test_update_checkout_moved.py --collect-only -q
-        #     -> 23 tests collected
-        # So the floor is 23476 + 87 = 23563. No new test carries a skipif, so
+        #     -> 29 tests collected
+        # So the floor is 23476 + 93 = 23569. No new test carries a skipif, so
         # the ceiling does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23563
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23569

@@ -17,12 +17,15 @@
   on, fails the update.
 - **`update.sh` never resets a checkout someone else is using.** If another session
   or editor switches the branch, commits, or edits a tracked file while an update
-  runs, the update refuses before it merges: during the pre-update backup, nothing
-  has stopped yet; after the stop, it restarts the services and leaves the
-  checkout as it found it. Its rollback resets only the merge it made itself. When
-  the checkout has moved off that state, the rollback leaves it alone, restarts
-  the services and reports the rollback as incomplete. The old rollback checked the
-  original branch out and hard-reset it, which could destroy that work.
+  runs, the update refuses before it merges. During the pre-update backup nothing
+  has stopped yet; after the stop, the rollback takes over. That rollback resets
+  only the merge it made itself. A plain branch switch with nothing uncommitted is
+  switched back without force, and the other branch keeps its commits. Any other
+  move is left exactly as it is. Services are reinstalled and restarted only on the
+  pre-update code; otherwise the rollback reports itself incomplete and says what
+  is in the way. The old rollback checked the original branch out and hard-reset
+  it, which could destroy that work, and could restart services on code nobody
+  had validated.
 - **`update.sh` no longer overwrites a local ignored file that the update starts
   tracking.** Before any service stops, it lists the files the incoming commits
   add or change and refuses, naming them, if any already exist locally as untracked or
