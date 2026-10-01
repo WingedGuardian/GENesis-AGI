@@ -424,6 +424,10 @@ class TestWiredIntoTheMergePath:
             ),
         )
         monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", HEAD)
+        # The review-request gate derives the repo with `gh repo view` unless
+        # pinned: unauthenticated (a CI runner) that read fails, `evaluate_pr` is
+        # never called, and the test silently measures the degrade path again.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "owner/repo")
         monkeypatch.setenv(
             "_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps({"sha": h}) for h in heads)
         )

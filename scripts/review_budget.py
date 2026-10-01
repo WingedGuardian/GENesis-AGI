@@ -51,7 +51,7 @@ STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
 #: the old rule, so no pull request's count moved at that instant; evidence
 #: after it is counted by the new one. MEASURED 2026-10-01: the new rule alone
 #: would have put 26 of 68 open PRs at the terminal round, against 14.
-ROUND_RULE_CUTOVER_ISO = "2026-10-01T13:00:00+00:00"
+ROUND_RULE_CUTOVER_ISO = "2026-10-01T15:19:00+00:00"
 
 #: The two real choices at a terminal round, in the words the owner reads AT the
 #: approval dialog. SINGLE-SOURCED here because BOTH gates state it — the push
@@ -428,9 +428,12 @@ def evaluate_evidence(
             continue
         if not isinstance(login, str):
             return _unknown("malformed_review_record", current_head=head)
-        if item.get("state") == "PENDING":
-            continue
         primary = login == primary_login
+        if item.get("state") == "PENDING" and not primary:
+            # The old rule counted every primary review, pending included; keep it
+            # for the legacy count. A pending review has no time, so it is placed
+            # before the cutover and never opens a round under the new rule.
+            continue
         if not primary and (
             not review_findings.is_app_login(login)
             or login in review_findings.WORKFLOW_BOTS
@@ -469,8 +472,11 @@ def evaluate_evidence(
         if findings:
             add_round(sha, login, findings, when)
         elif not top_level and review_findings.declares_findings(login, body):
-            # Its body says it posted findings and none survive: they were
-            # deleted, which must not read as a clean review.
+            # Its body says it posted findings and no top-level comment
+            # survives: they were deleted, which must not read as a clean review.
+            # Partial deletion is not caught (MEASURED 2026-10-01: declared count
+            # equals surviving comments on 552 of 554 reviews, and one exception
+            # is a live PR, so a strict comparison would wedge it unverified).
             return _unknown("review_findings_deleted", current_head=head)
 
     confirmation_heads: set[str] = set()

@@ -178,6 +178,12 @@ def test_a_codex_findings_comment_before_cutover_keeps_the_old_rule():
 # -- inputs that must never read as fewer rounds -----------------------------
 
 
+def test_a_pending_primary_review_keeps_its_old_rule_count():
+    """The old rule counted every primary review, pending included."""
+    assert _count(reviews=(_rv(CODEX, H1, when=None, state="PENDING"),)) == 1
+    assert _count(reviews=(_rv(DEVIN, H1, _devin("🔴"), when=None, state="PENDING"),)) == 0
+
+
 def test_a_review_without_a_commit_is_unknown():
     got = _ev(reviews=(_rv(DEVIN, None, _devin("🟡")),))
     assert got["status"] == "unknown" and "malformed_review_head" in got["errors"]
