@@ -580,12 +580,27 @@ def test_a_MERGED_archive_that_held_uncommitted_changes_is_kept(repo, tmp_path, 
     assert (str(a["path"]) in _registered(repo)) is (not expires)
 
 
-def test_the_REAL_reaper_records_uncommitted_changes_and_that_archive_is_kept(repo, tmp_path):
-    """The flag comes from the reaper itself, not a hand-written fixture."""
+def test_the_REAL_reaper_records_uncommitted_changes_and_that_archive_is_kept(
+    repo, tmp_path, monkeypatch
+):
+    """The flag comes from the reaper itself, not a hand-written fixture.
+
+    A dirty worktree is classified onto the unmerged lane, and the archive step
+    re-checks dirtiness for the merged lane, so a MERGED archive records
+    uncommitted changes only when a write lands after that re-check, or when the
+    archive predates the rule. The edit is made in exactly that window, as a real
+    write, so the flag is still the reaper's own reading.
+    """
     wt = tmp_path / "realdirty"
     _git(repo, "worktree", "add", "-q", "--detach", str(wt))
-    (wt / "seed.txt").write_text("edited, never committed\n")
     rec = next(x for x in wl._list_worktrees(repo) if x["path"] == str(wt))
+    real_nested = wl._nested_worktrees_under
+
+    def write_after_the_recheck(wt_path, repo_root):
+        (wt / "seed.txt").write_text("edited, never committed\n")
+        return real_nested(wt_path, repo_root)
+
+    monkeypatch.setattr(wl, "_nested_worktrees_under", write_after_the_recheck)
     assert wl._trash_worktree(rec, repo, lane="merged") is True
     entry = next(p for p in wl.TRASH_DIR.glob("realdirty-*.tar.gz"))
     name = entry.name[: -len(".tar.gz")]
