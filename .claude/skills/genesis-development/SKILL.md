@@ -3944,23 +3944,30 @@ findings below, a gated `gh pr merge`:
   commit:** `<sha>`") or a `✅ Completed` Code Review row in its PR summary comment
   (on PR open, often the only signal: #2418). Both name the commit by an ABBREVIATED
   id, and a prefix that merely MATCHES the head binds nothing — the head is whatever
-  the branch's author pushed (#2487). So the gate resolves the id against the PR's
-  OWN commit list and accepts it only when it resolves UNIQUELY to a commit equal to
-  the head, the comment is the Codex Bot's, and no Codex review object (any state)
-  sits at the head, no Codex issue comment on the PR carries findings (Codex
-  usually files findings as a review object, but MEASURED on 2 of 339 PRs it posted
-  them as a `💡` issue comment with none), the comment is unedited or Codex-edited,
-  and the PR's history has never moved under it: ANY force-push, base change, base
-  force-push or head-branch restore on the PR refuses every clean signal on it, whenever
-  it happened (each can drop the reviewed commit from the list while a lookalike
-  sharing its short id, which is cheap to grind, stays). A second PR commit sharing
-  the prefix, a commit outside the PR, an unreadable or 250-capped commit list: all
-  block. The block message says which clean signal it read and why it was refused,
-  and when no later clean signal on the PR can count either (history moved, or a
-  findings comment sits on the PR) it says a finding-free re-review cannot help.
-  `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
-  the signal does not resolve, the routes are an owner-approved `# substitute-review`
-  on another reviewer's review at that exact head, or a conscious
+  the branch's author pushed (#2487). So the gate resolves the id repo-wide via
+  `GET repos/{owner}/{repo}/commits/{short}` and accepts it only when GitHub resolves
+  it to exactly the PR head; a 422 (ambiguous or unknown) refuses it. Matching the
+  head implies the commit is the PR's. The comment must be the Codex Bot's, no Codex
+  review object (any state) may sit at the head, and no Codex issue comment on the PR
+  may carry findings (Codex usually files findings as a review object, but MEASURED
+  on 2 of 339 PRs it posted them as a `💡` issue comment with none). Any non-Codex edit
+  or deleted edit revision on any Codex comment permanently refuses clean signals;
+  the block names the editor when available. History veto is head-side only:
+  force-push, head-branch deletion or restoration. Base-side events are retired
+  because a commit leaves the PR list only when the head is rewritten or the commit
+  enters the base; merges require the default base, whose ruleset prevents force-push
+  and deletion, so a base-reachable commit remains resolvable and its prefix 422s.
+  A branch or tag exactly named after a short id can shadow GitHub's commit lookup
+  (which uses git name-guessing rules); measured `pull/2720/head` and `main` resolve.
+  Creating a shadow ref needs base-repo push rights, held only by the owner, and no
+  hex-named ref exists; fork authors cannot create one. A deleted comment leaves no
+  trace in the API. The block message says which clean signal it read and why it was
+  refused, and when no later clean signal can count it says a finding-free re-review
+  cannot help. `--check-pr` labels a pass from the gate's own record for its verified
+  head; a subsequent head move is stated without relabeling the original pass, while
+  merge-with stays bound to that verified head. When the signal does not resolve,
+  the routes are an owner-approved `# substitute-review` on another reviewer's review
+  at that exact head, or a conscious
   `# stale-review-override` (which on the hook surface also needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`

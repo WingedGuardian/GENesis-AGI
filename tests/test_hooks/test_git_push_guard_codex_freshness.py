@@ -39,6 +39,14 @@ HEAD = "0cd13afeb51025af5dc7bd24df1ffa57cd2babab"
 STALE = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 
+def _lookup(monkeypatch, mapping):
+    monkeypatch.setenv("_TEST_GH_COMMIT_AT_PREFIX", json.dumps(mapping))
+
+
+def _resolving(*shas):
+    return {sha[:n]: sha for sha in shas for n in (7, 10)}
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_codex_comments(monkeypatch):
     """Default: NO Codex issue-comments, so the clean-comment freshness fallback in
@@ -1270,6 +1278,7 @@ class TestCheckPrReportFreshnessLabel:
     review is STALE-but-trivial — the structured stdout would mislead consumers."""
 
     def _run_report(self, monkeypatch, capsys, reviews, compare):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", reviews)
         monkeypatch.setenv("_TEST_GH_COMPARE", compare)
@@ -1293,7 +1302,10 @@ class TestCheckPrReportFreshnessLabel:
             compare=_compare_json("ahead", [_code_file(additions=3)]),
         )
         assert "codex-at-head" in out
-        assert "STALE review" in out
+        assert (
+            f"codex-at-head  : ok (STALE review of {STALE[:12]}, delta since is trivial)"
+            in out
+        )
         assert "ok (current)" not in out
 
     def test_current_labeled_current(self, monkeypatch, capsys):
@@ -1303,7 +1315,7 @@ class TestCheckPrReportFreshnessLabel:
             reviews=_reviews_jsonl(HEAD),
             compare=_compare_json("identical"),
         )
-        assert "ok (current)" in out
+        assert "codex-at-head  : ok (current)" in out
 
     def test_the_scheduled_row_renders_its_per_cause_tail(self, monkeypatch, capsys):
         """The canonical report printed only line 0 of the scheduled-review message.
@@ -1398,17 +1410,67 @@ class TestReportFreshnessUnreadable:
         assert "ok (current)" not in out
 
 
+class TestReportFreshnessHeadMovement:
+    def _stub_other_gates(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
+        monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
+        monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))
+        monkeypatch.setattr(_mod, "_check_pin_receipts", lambda n, repo=None: (False, "ok"))
+        monkeypatch.setattr(_mod, "_check_e2e_plan", lambda n, repo=None: (False, "ok"))
+        monkeypatch.setattr(_mod, "_scheduled_gate_applies", lambda repo: False)
+        monkeypatch.setattr(
+            _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_check_inline_review_findings",
+            lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+        )
+
+        def pass_head(n, repo=None):
+            _mod._FRESHNESS_PASS.update(head=HEAD, reason="current")
+            return False, "", HEAD
+
+        monkeypatch.setattr(_mod, "_check_codex_reviewed_head", pass_head)
+
+    def test_moved_head_is_reported_without_relabeling_or_unbinding(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+        self._stub_other_gates(monkeypatch)
+        moved = "1" * 40
+        monkeypatch.setattr(_mod, "_pr_head_sha", lambda n, repo=None: moved)
+        result = _mod.check_pr_report("5")
+        out = capsys.readouterr().out
+        assert result == 0
+        assert f"HEAD MOVED to {moved[:12]}" in out
+        assert f"bound to {HEAD[:12]}" in out
+        assert f"--match-head-commit {HEAD}" in out
+
+    def test_unreadable_moved_head_read_is_named_without_changing_verdict(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+        self._stub_other_gates(monkeypatch)
+        monkeypatch.setattr(_mod, "_pr_head_sha", lambda n, repo=None: None)
+        result = _mod.check_pr_report("5")
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "current head could not be re-read" in out
+        assert "verified at " + HEAD[:12] in out
+
+
 class TestCleanCommentFreshness:
     """_check_codex_reviewed_head — a clean Codex comment satisfies freshness ONLY when
-    its abbreviated id RESOLVES uniquely, among the PR's own commits, to the head, and
+    its abbreviated id RESOLVES repo-wide to exactly the head, and
     no Codex review object sits at the head (#2418). A prefix that merely MATCHES the
     head binds nothing (#2487), so every test in this class that leaves the PR commit
-    list empty (the conftest default) still blocks — the resolution is what vouches.
+    lookup empty (the conftest default) still blocks — the resolution is what vouches.
     The signal is still read on the block path, to explain the block."""
 
     def test_no_review_object_and_clean_comment_at_head_still_blocks(self, monkeypatch):
-        """A clean comment naming the head, whose id cannot be bound (here: the PR's
-        commit list is unreadable), blocks, and the block says what it saw and why."""
+        """A clean comment naming the head, whose id cannot be bound, blocks and
+        the block says what it saw and why."""
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", _signal(_clean_node(HEAD[:10])))
@@ -1417,7 +1479,7 @@ class TestCleanCommentFreshness:
         assert "no codex review" in msg.lower()
         # The block explains itself, and names the route that does work.
         assert f"clean comment naming commit {HEAD[:10]} was read but not accepted" in msg
-        assert "commit list could not be read" in msg
+        assert "does not resolve uniquely to the head" in msg
         assert "# substitute-review" in msg
 
     def test_stale_review_object_and_clean_comment_at_head_still_blocks(self, monkeypatch):
@@ -1442,8 +1504,8 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", other_head)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))  # reviewed HEAD, not other
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", _signal(_clean_node(HEAD[:10])))
-        # Both commits are in the PR, so the prefix is ambiguous and binds nothing.
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((HEAD, other_head)))
+        # The repo-wide resolver reports the shared prefix as ambiguous (HTTP 422).
+        _lookup(monkeypatch, {HEAD[:10]: None})
         monkeypatch.setattr(_mod, "_classify_post_review_delta", lambda r, h, repo: "substantial")
         monkeypatch.setattr(_mod, "_pr_base_sha", lambda n, repo=None: None)
         block, msg, head = _mod._check_codex_reviewed_head("1")
@@ -1464,7 +1526,7 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", _signal(_clean_node(STALE[:10])))  # not head
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((STALE, HEAD)))
+        _lookup(monkeypatch, _resolving(STALE, HEAD))
         block, msg, _ = _mod._check_codex_reviewed_head("1")
         assert block is True and "no codex review" in msg.lower()
         # A comment naming a DIFFERENT commit is reported for what it is: it names an
@@ -1478,7 +1540,7 @@ class TestCleanCommentFreshness:
             "_TEST_GH_CODEX_SIGNAL",
             _signal(_node("Codex Review: Didn't find any major issues. Swish!")),
         )
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((STALE, HEAD)))
+        _lookup(monkeypatch, _resolving(STALE, HEAD))
         block, msg, _ = _mod._check_codex_reviewed_head("1")
         assert block is True  # fail-closed: marker alone never vouches
         assert "was read but not accepted" not in msg  # nothing bindable was said
@@ -1488,7 +1550,7 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
         body = f"### 💡 Codex Review\n![P1 Badge](x) bug\n\n**Reviewed commit:** `{HEAD[:10]}`"
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", _signal(_node(body)))
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((STALE, HEAD)))
+        _lookup(monkeypatch, _resolving(STALE, HEAD))
         block, _, _ = _mod._check_codex_reviewed_head("1")
         assert block is True
 
@@ -1498,8 +1560,8 @@ class TestCleanCommentFreshness:
         monkeypatch.setenv(
             "_TEST_GH_CODEX_SIGNAL", _signal(_clean_node(HEAD[:10], login="attacker", kind="User"))
         )
-        # The commit list WOULD bind the prefix, so only the author check refuses it.
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((STALE, HEAD)))
+        # The lookup WOULD bind the prefix, so only the author check refuses it.
+        _lookup(monkeypatch, _resolving(STALE, HEAD))
         block, msg, _ = _mod._check_codex_reviewed_head("1")
         assert block is True
         # A non-Codex author's comment is not even reported.
@@ -2938,7 +3000,15 @@ class TestEveryStatementIsCountedAndEveryUnscopedRowShown:
 SPOKE = "2026-09-30T00:36:00Z"
 
 
-def _node(body, *, login="chatgpt-codex-connector", kind="Bot", editor=None, created=SPOKE):
+def _node(
+    body,
+    *,
+    login="chatgpt-codex-connector",
+    kind="Bot",
+    editor=None,
+    created=SPOKE,
+    edits=(),
+):
     """One comment node of the clean-signal GraphQL read (GraphQL names an App by its
     bare slug, without REST's `[bot]` suffix)."""
     return {
@@ -2946,6 +3016,19 @@ def _node(body, *, login="chatgpt-codex-connector", kind="Bot", editor=None, cre
         "body": body,
         "author": {"login": login, "__typename": kind},
         "editor": {"login": editor} if editor else None,
+        "userContentEdits": {
+            "totalCount": len(edits),
+            "nodes": [
+                {
+                    "editor": {"login": login} if login else None,
+                    "deletedAt": deleted_at,
+                }
+                for edit in edits
+                for login, deleted_at in (
+                    edit if isinstance(edit, tuple) else (edit, None),
+                )
+            ],
+        },
     }
 
 
@@ -2958,7 +3041,8 @@ def _clean_node(short, **kw):
 
 
 def _summary_node(short, *, status="✅ **Completed**", review="📝 **Code Review**",
-                  completed=SPOKE, editor="chatgpt-codex-connector", **kw):
+                  completed=SPOKE, editor="chatgpt-codex-connector",
+                  edits=("chatgpt-codex-connector",), **kw):
     """Codex's PR summary comment, the real shape measured 2026-09-29 (Codex itself
     edits it in place, so its editor is Codex)."""
     body = (
@@ -2967,7 +3051,7 @@ def _summary_node(short, *, status="✅ **Completed**", review="📝 **Code Revi
         f"| {review} | {status} <relative-time datetime=\"{completed}\">"
         f"{completed}</relative-time> | `{short}` | PR opened |\n"
     )
-    return _node(body, editor=editor, **kw)
+    return _node(body, editor=editor, edits=edits, **kw)
 
 
 def _findings_node(sha):
@@ -3006,9 +3090,9 @@ def _signal(*nodes, moves=(), timeline_total=37):
 
 class TestCleanSignalAtHead:
     """#2418: Codex posts NO review object when it finds nothing, so its word on a clean
-    head is a comment. It counts only when the abbreviated id resolves UNIQUELY to the
-    head within the PR's own commits, nothing Codex filed carries findings for the
-    head, the comment is unedited (or Codex-edited), and no force-push came after it."""
+    head is a comment. It counts only when the abbreviated id resolves repo-wide to
+    exactly the head, nothing Codex filed carries findings for the head, no Codex
+    comment has a foreign edit, and no head-side history move came after it."""
 
     @pytest.fixture(autouse=True)
     def _fresh_pass_reason(self):
@@ -3016,16 +3100,81 @@ class TestCleanSignalAtHead:
         yield
         _mod._FRESHNESS_PASS.clear()
 
-    def _setup(self, monkeypatch, *nodes, reviews="", commits=(STALE, HEAD), moves=()):
+    def _setup(self, monkeypatch, *nodes, reviews="", resolves=(STALE, HEAD), moves=()):
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", reviews)
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", _signal(*nodes, moves=moves))
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join(commits))
+        _lookup(monkeypatch, _resolving(*resolves))
+
+    def test_commit_at_prefix_reads_the_mapping_seam(self, monkeypatch):
+        _lookup(monkeypatch, {HEAD[:7]: HEAD.upper()})
+        assert _mod._commit_at_prefix(HEAD[:7]) == HEAD
+
+    @pytest.mark.parametrize(
+        ("raw", "short"),
+        [
+            (json.dumps({"0cd13af": None}), HEAD[:7]),
+            (json.dumps({"other": HEAD}), HEAD[:7]),
+            ("", HEAD[:7]),
+            ("not json", HEAD[:7]),
+            (json.dumps({HEAD[:7]: "not-a-full-sha"}), HEAD[:7]),
+        ],
+    )
+    def test_commit_at_prefix_mapping_failures_return_none(self, monkeypatch, raw, short):
+        monkeypatch.setenv("_TEST_GH_COMMIT_AT_PREFIX", raw)
+        assert _mod._commit_at_prefix(short) is None
+
+    @pytest.mark.parametrize("short", ["abcdef", "ghijklmn"])
+    def test_commit_at_prefix_rejects_invalid_short_without_call(self, monkeypatch, short):
+        monkeypatch.delenv("_TEST_GH_COMMIT_AT_PREFIX", raising=False)
+        monkeypatch.setattr(
+            _mod.subprocess, "run", lambda *args, **kwargs: pytest.fail("unexpected gh call")
+        )
+        assert _mod._commit_at_prefix(short) is None
+
+    def test_commit_at_prefix_live_path_handles_errors_and_valid_result(self, monkeypatch):
+        import subprocess
+
+        monkeypatch.delenv("_TEST_GH_COMMIT_AT_PREFIX", raising=False)
+        responses = iter(
+            [
+                subprocess.CompletedProcess([], 1, "", "No commit found for SHA"),
+                TimeoutError("timed out"),
+                subprocess.CompletedProcess([], 0, HEAD.upper() + "\n", ""),
+            ]
+        )
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            result = next(responses)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        assert _mod._commit_at_prefix(HEAD[:10]) is None
+        assert _mod._commit_at_prefix(HEAD[:10]) is None
+        assert _mod._commit_at_prefix(HEAD[:10]) == HEAD
+        assert all(
+            any(f"commits/{HEAD[:10]}" in argument for argument in args)
+            for args, _ in calls
+        )
+        assert all(call[1]["timeout"] == _mod._gh_timeout(6) for call in calls)
 
     def test_clean_comment_resolving_to_head_allows_and_binds_the_head(self, monkeypatch):
         self._setup(monkeypatch, _clean_node(HEAD[:10]))
         block, _, head = _mod._check_codex_reviewed_head("1")
         assert block is False and head == HEAD
+
+    def test_prefix_not_matching_head_is_never_looked_up(self, monkeypatch):
+        self._setup(monkeypatch, _summary_node(STALE[:7]))
+        monkeypatch.setattr(
+            _mod,
+            "_commit_at_prefix",
+            lambda *args, **kwargs: pytest.fail("non-head prefix was looked up"),
+        )
+        assert _mod._check_codex_reviewed_head("1")[0] is True
 
     def test_completed_summary_row_resolving_to_head_allows(self, monkeypatch):
         """The PR-open case #2418 names: a summary row is the only signal."""
@@ -3057,35 +3206,33 @@ class TestCleanSignalAtHead:
         "event",
         [
             "HeadRefForcePushedEvent",
-            "BaseRefChangedEvent",
-            "BaseRefForcePushedEvent",
+            "HeadRefDeletedEvent",
             "HeadRefRestoredEvent",
         ],
     )
-    def test_any_history_move_on_the_pr_voids_the_signal(self, monkeypatch, event):
-        """Each can drop the reviewed commit from the PR's list while a prefix
-        lookalike stays (a decoy tip even hides it from a force-push's
-        before-commit), so any of them voids the signal, whenever it happened."""
+    def test_any_head_history_move_voids_the_signal(self, monkeypatch, event):
+        """Each head-side event can replace history beneath a previously posted signal."""
         self._setup(monkeypatch, _clean_node(HEAD[:10]), moves=(event,))
         assert _mod._check_codex_reviewed_head("1")[0] is True
         self._setup(monkeypatch, _summary_node(HEAD[:7]), moves=(event, event, event))
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_the_query_asks_for_every_history_moving_event(self):
+    def test_the_query_asks_for_head_side_history_only(self):
         for event in (
             "HEAD_REF_FORCE_PUSHED_EVENT",
-            "BASE_REF_CHANGED_EVENT",
-            "BASE_REF_FORCE_PUSHED_EVENT",
+            "HEAD_REF_DELETED_EVENT",
             "HEAD_REF_RESTORED_EVENT",
         ):
             assert event in _mod._CODEX_SIGNAL_QUERY
+        assert "BASE_REF_CHANGED_EVENT" not in _mod._CODEX_SIGNAL_QUERY
+        assert "BASE_REF_FORCE_PUSHED_EVENT" not in _mod._CODEX_SIGNAL_QUERY
 
     def test_the_whole_timeline_total_is_not_a_force_push_count(self, monkeypatch):
         """Regression: the first version read ``totalCount``, which counts the WHOLE
         timeline, so the signal was refused on nearly every real PR."""
         monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "")
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "\n".join((STALE, HEAD)))
+        _lookup(monkeypatch, _resolving(STALE, HEAD))
         monkeypatch.setenv(
             "_TEST_GH_CODEX_SIGNAL", _signal(_summary_node(HEAD[:7]), timeline_total=500)
         )
@@ -3124,13 +3271,102 @@ class TestCleanSignalAtHead:
     def test_a_comment_edited_by_someone_else_does_not_speak_for_codex(self, monkeypatch):
         """An edit keeps the original author, so the author proves nothing about the body."""
         self._setup(monkeypatch, _clean_node(HEAD[:10], editor="someone"))
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+        assert "edited by someone" in msg
+        assert "cannot clear this block" in msg
+
+    def test_hidden_human_edit_permanently_vetoes_summary(self, monkeypatch):
+        self._setup(
+            monkeypatch,
+            _summary_node(
+                HEAD[:7],
+                edits=("chatgpt-codex-connector", "mallory", "chatgpt-codex-connector"),
+            ),
+        )
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+        assert "edited by mallory" in msg
+        assert "cannot clear this block" in msg
+
+    def test_deleted_revision_permanently_vetoes_signal(self, monkeypatch):
+        self._setup(
+            monkeypatch,
+            _summary_node(
+                HEAD[:7],
+                edits=(("chatgpt-codex-connector", "2026-01-01T00:00:00Z"),),
+            ),
+        )
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+        assert "edit revision deleted" in msg
+
+    def test_ghost_editor_permanently_vetoes_signal(self, monkeypatch):
+        self._setup(monkeypatch, _summary_node(HEAD[:7], edits=(None,)))
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+        assert "unknown account" in msg
+        assert "cannot clear this block" in msg
+
+    def test_foreign_only_clean_comment_keeps_permanent_refusal_note(self, monkeypatch):
+        self._setup(
+            monkeypatch,
+            _summary_node(HEAD[:7], edits=("mallory",)),
+        )
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+        assert "summary by Codex was read but not accepted" in msg
+        assert "edited by mallory" in msg
+        assert "cannot clear this block" in msg
+
+    def test_foreign_findings_comment_vetoes_clean_summary(self, monkeypatch):
+        edited_findings = _node(
+            _findings_node(HEAD)["body"],
+            editor="chatgpt-codex-connector",
+            edits=("mallory",),
+        )
+        self._setup(monkeypatch, edited_findings, _summary_node(HEAD[:7]))
+        block, msg, _ = _mod._check_codex_reviewed_head("1")
+        assert block is True
+        assert "edited by mallory" in msg
+        assert "cannot clear this block" in msg
+
+    def test_truncated_user_content_edits_fail_closed(self, monkeypatch):
+        self._setup(monkeypatch, _summary_node(HEAD[:7]))
+        raw = json.loads(_signal(_summary_node(HEAD[:7])))
+        comment = raw["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]
+        comment["userContentEdits"]["totalCount"] = 60
+        monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(raw))
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_an_ambiguous_prefix_within_the_pr_blocks(self, monkeypatch):
-        """Two PR commits share the prefix: it identifies neither, so it vouches for none."""
-        twin = HEAD[:10] + ("0" if HEAD[10] != "0" else "1") + HEAD[11:]
-        assert twin != HEAD and twin.startswith(HEAD[:10])  # guard the fixture
-        self._setup(monkeypatch, _clean_node(HEAD[:10]), commits=(twin, HEAD))
+    def test_codex_only_clean_summary_edits_are_accepted(self, monkeypatch):
+        self._setup(monkeypatch, _summary_node(HEAD[:7]))
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+
+    def test_base_advance_pass_records_its_reason(self, monkeypatch):
+        self._setup(monkeypatch, reviews=_reviews_jsonl(STALE))
+        monkeypatch.setattr(
+            _mod, "_classify_post_review_delta", lambda reviewed, head, repo: "substantial"
+        )
+        monkeypatch.setattr(_mod, "_pr_base_sha", lambda n, repo=None: "a" * 40)
+        monkeypatch.setattr(
+            _mod,
+            "_classify_base_advance_delta",
+            lambda reviewed, head, base, repo: "inline",
+        )
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
+        assert _mod._FRESHNESS_PASS["head"] == HEAD
+        assert (
+            _mod._FRESHNESS_PASS["reason"]
+            == f"STALE review of {STALE[:12]}, base-advance delta inline"
+        )
+
+    def test_an_ambiguous_prefix_repo_wide_blocks(self, monkeypatch):
+        """A repo-wide 422 on an ambiguous prefix refuses the signal."""
+        self._setup(monkeypatch, _clean_node(HEAD[:10]), resolves=())
+        _lookup(monkeypatch, {HEAD[:10]: None})
         block, _, head = _mod._check_codex_reviewed_head("1")
         assert block is True and head is None
 
@@ -3138,19 +3374,14 @@ class TestCleanSignalAtHead:
         self._setup(monkeypatch, _summary_node(STALE[:7]))
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_a_prefix_of_a_commit_outside_the_pr_blocks(self, monkeypatch):
-        self._setup(monkeypatch, _clean_node(HEAD[:10]), commits=(STALE,))
+    def test_a_prefix_resolving_to_another_commit_blocks(self, monkeypatch):
+        self._setup(monkeypatch, _clean_node(HEAD[:10]), resolves=())
+        _lookup(monkeypatch, {HEAD[:10]: STALE})
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_an_unreadable_commit_list_blocks(self, monkeypatch):
+    def test_an_unreadable_lookup_blocks(self, monkeypatch):
         self._setup(monkeypatch, _clean_node(HEAD[:10]))
-        monkeypatch.setattr(_mod, "_pr_commit_shas", lambda n, repo=None: None)
-        assert _mod._check_codex_reviewed_head("1")[0] is True
-
-    def test_a_commit_list_at_the_endpoint_ceiling_blocks(self, monkeypatch):
-        """At 250 the list may be truncated, so a unique match proves nothing."""
-        many = tuple(f"{i:040x}" for i in range(_mod._PR_COMMITS_CEILING - 1)) + (HEAD,)
-        self._setup(monkeypatch, _clean_node(HEAD[:10]), commits=many)
+        monkeypatch.setattr(_mod, "_commit_at_prefix", lambda short, repo=None: None)
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
     def test_unreadable_or_truncated_signal_evidence_blocks(self, monkeypatch):
@@ -3194,14 +3425,10 @@ class TestCleanSignalAtHead:
         )
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_without_the_resolver_nothing_is_accepted(self, monkeypatch):
-        self._setup(monkeypatch, _clean_node(HEAD[:10]))
-        monkeypatch.setattr(_mod, "_review_budget", None)
-        assert _mod._check_codex_reviewed_head("1")[0] is True
-
     def test_report_labels_a_clean_signal_pass_honestly(self, monkeypatch, capsys):
         """The report states the gate's OWN pass reason, never 'current' (no review
         object is at head) nor 'freshness label unverified'."""
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
         self._setup(monkeypatch, _summary_node(HEAD[:7]))
         monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))

@@ -1,0 +1,1 @@
+- Merge-gate clean Codex signals now bind repo-wide to the verified head, base retargets no longer void a signal, and any untrusted comment edit history permanently refuses it with the editor named. Freshness reports use the gate's recorded pass reason and say when the head moves afterward.
