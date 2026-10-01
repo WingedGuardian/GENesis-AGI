@@ -45,7 +45,13 @@ def extract_last_user_message(messages: object) -> str | None:
     newest = next(
         (
             m for m in reversed(messages)
-            if not (isinstance(m, dict) and m.get("role") in _INSTRUCTION_ROLES)
+            # isinstance first: a JSON list/object role is unhashable, and set
+            # membership on it would raise instead of treating it as malformed.
+            if not (
+                isinstance(m, dict)
+                and isinstance(m.get("role"), str)
+                and m.get("role") in _INSTRUCTION_ROLES
+            )
         ),
         None,
     )

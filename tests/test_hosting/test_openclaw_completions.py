@@ -858,6 +858,20 @@ class TestNewestUserTurnOnly:
         )
         assert out == "the question"
 
+    @pytest.mark.parametrize("role", [[], {}, ["system"]])
+    def test_unhashable_role_is_malformed_not_a_crash(self, role):
+        """A JSON list/object role cannot be looked up in a set; it is malformed."""
+        assert self._extract({"role": role, "content": "x"}) is None
+
+    def test_route_returns_400_for_unhashable_role(self, client, mock_rt):
+        with patch("genesis.runtime.GenesisRuntime") as MockRT:
+            MockRT.instance.return_value = mock_rt
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"messages": [*self._HISTORY_PREFIX, {"role": [], "content": "x"}]},
+            )
+        assert resp.status_code == 400
+
     def test_route_returns_400_for_unusable_newest_turn(self, client, mock_rt):
         with patch("genesis.runtime.GenesisRuntime") as MockRT:
             MockRT.instance.return_value = mock_rt
