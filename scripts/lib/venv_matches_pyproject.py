@@ -74,6 +74,7 @@ is checked by its own version only, as pip's resolver would have left it.
 
 from __future__ import annotations
 
+import os
 import sys
 import tomllib
 from pathlib import Path
@@ -123,16 +124,21 @@ def _incoming_root(doc: dict, root: Path) -> Path:
     where = find.get("where")
     if not (isinstance(where, list) and len(where) == 1 and isinstance(where[0], str) and where[0]):
         raise _CannotTell(f"incoming pyproject.toml: {shape} (packages.find.where = {where!r})")
+    # The incoming tree is not checked out yet when a deploy asks, so nothing below
+    # the checkout root may be looked up on disk: a symlink there belongs to the OLD
+    # tree, and following it can name the installed root while the incoming commit
+    # lays out another (round-1 review). Only the root itself is resolved (it is the
+    # same directory before and after the merge); `where` is joined lexically, the
+    # way site.py joins a .pth line, and _installed_roots reads the .pth the same way.
     try:
-        want = (root / where[0]).resolve()
+        base = root.resolve()
     except (OSError, ValueError) as exc:
-        raise _CannotTell(
-            f"incoming pyproject.toml: packages.find.where {where[0]!r}: {exc}"
-        ) from exc
+        raise _CannotTell(f"cannot resolve the checkout root {root}: {exc}") from exc
+    want = Path(os.path.normpath(base / where[0]))
     # A `where` that is the checkout itself ("." or "./") is installed through a
     # finder, not a path line (measured, setuptools 84), so a reinstall would
     # never produce the .pth this gate compares.
-    if want == root.resolve():
+    if want == base:
         raise _CannotTell(
             f"incoming pyproject.toml: {shape} (packages.find.where names the checkout "
             "itself, which setuptools installs through a finder)"
@@ -140,9 +146,21 @@ def _incoming_root(doc: dict, root: Path) -> Path:
     return want
 
 
-def _installed_roots(dist) -> tuple[set[Path], str]:
+def _installed_roots(dist, root: Path) -> tuple[set[Path], str]:
     """The directories the install's editable .pth files put on sys.path, and a
-    reason when they name no root (a finder, or no editable .pth recorded)."""
+    reason when they name no root (a finder, or no editable .pth recorded).
+
+    Each line is joined and normalised LEXICALLY, as site.addpackage does
+    (os.path.join + os.path.abspath), never resolved: a symlink inside the checkout
+    belongs to the tree as it stands, and the incoming root is compared by name
+    (_incoming_root). A line that names the checkout through the path the caller
+    gave is rebased onto the resolved checkout root, so a checkout reached through a
+    symlinked parent still compares equal to itself."""
+    given = os.path.normpath(os.path.abspath(root))
+    try:
+        base = str(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise _CannotTell(f"cannot resolve the checkout root {root}: {exc}") from exc
     editable = [
         f for f in dist.files or [] if f.name.startswith("__editable__") and f.name.endswith(".pth")
     ]
@@ -166,9 +184,12 @@ def _installed_roots(dist) -> tuple[set[Path], str]:
             if line.startswith(("import ", "import\t")):
                 return set(), f"the install's {pth.name} loads a finder, not a package root"
             try:
-                roots.add((pth.parent / line.rstrip()).resolve())
-            except (OSError, ValueError) as exc:
-                raise _CannotTell(f"cannot resolve {line!r} in the install's {pth}: {exc}") from exc
+                named = os.path.normpath(os.path.join(pth.parent, line.rstrip()))
+            except (TypeError, ValueError) as exc:
+                raise _CannotTell(f"cannot read {line!r} in the install's {pth}: {exc}") from exc
+            if given != base and (named == given or named.startswith(given + os.sep)):
+                named = base + named[len(given) :]
+            roots.add(Path(named))
     return roots, ""
 
 
@@ -266,7 +287,7 @@ def _differences(root: Path, pyproject: str) -> tuple[list[str], str]:
     elif not installed_from or Path(installed_from).resolve() != root.resolve():
         diffs.append(f"{name} is installed from {installed_from or url}, not {root}")
     if want_root is not None and direct.get("dir_info", {}).get("editable"):
-        have_roots, no_root = _installed_roots(dist)
+        have_roots, no_root = _installed_roots(dist, root)
         if no_root:
             diffs.append(
                 f"package root: {no_root}, and the incoming pyproject lays out {want_root}"

@@ -368,6 +368,38 @@ def test_a_checkout_reached_through_a_symlink_is_the_same_root(tmp_path):
     assert r.returncode == 0, (r.stdout, r.stderr)
 
 
+def test_a_pth_naming_the_checkout_by_its_symlinked_path_is_the_same_root(tmp_path):
+    """The other spelling: the .pth names the checkout through the symlink the deploy
+    was given. Read lexically, it is rebased onto the resolved checkout root, so the
+    same directory still compares equal."""
+    real = tmp_path / "real"
+    (real / "src").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    site = tmp_path / "site"
+    _install_fixture(site, real)
+    (site / "__editable__.fixture-0.0.0.pth").write_text(str(link / "src") + "\n")
+    r = _gate(link, site, PYPROJECT_OK)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+
+
+def test_a_symlink_in_the_old_tree_does_not_stand_in_for_the_incoming_root(tmp_path):
+    """Round-1 review (Devin, Codex): the deploy asks before it merges, so a symlink
+    in the checkout belongs to the OLD tree. Here the old tree has `alias -> src`,
+    the install's .pth names src, and the incoming pyproject sets where = alias
+    (the incoming commit replaces the symlink with a package directory). Resolving
+    `alias` against the old tree gives src and would pass; after the merge the
+    server would still import src. The root is compared by name, so it is refused."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "alias").symlink_to(tmp_path / "src", target_is_directory=True)
+    site = tmp_path / "site"
+    _install_fixture(site, tmp_path, pth="src")
+    r = _gate(tmp_path, site, _layout('where = ["alias"]'), raw=True)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "package root" in r.stdout, r.stdout
+    assert str(tmp_path.resolve() / "alias") in r.stdout, r.stdout
+
+
 def test_an_uncertifiable_layout_still_prints_the_other_differences(tmp_path):
     """Exit 2 for the layout, and the dependency difference is still reported:
     the refusal is an inventory, not the first reason found."""
