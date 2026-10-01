@@ -136,7 +136,7 @@
                       <span style="font-size:0.7rem; color:var(--color-text-secondary);">Status</span><br>
                       <span style="font-size:0.9rem;"
                             :style="($store.genesisDashboard.updateStatus.last_update.status === 'success' && $store.genesisDashboard.updateStatus.last_update.server_restarted === false) ? 'color:#ffb74d' : ($store.genesisDashboard.updateStatus.last_update.status === 'success' ? 'color:#81c784' : 'color:#ef9a9a')"
-                            x-text="($store.genesisDashboard.updateStatus.last_update.status === 'success' && $store.genesisDashboard.updateStatus.last_update.server_restarted === false) ? 'success — server not restarted' : $store.genesisDashboard.updateStatus.last_update.status"></span>
+                            x-text="($store.genesisDashboard.updateStatus.last_update.status === 'success' && $store.genesisDashboard.updateStatus.last_update.server_restarted === false) ? 'success — server not restarted' : ($store.genesisDashboard.updateStatus.last_update.status + ($store.genesisDashboard.updateStatus.last_update.reconciled ? ' (reconciled)' : ''))"></span>
                     </div>
                     <div>
                       <span style="font-size:0.7rem; color:var(--color-text-secondary);">Version</span><br>

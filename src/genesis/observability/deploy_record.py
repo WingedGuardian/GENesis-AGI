@@ -13,13 +13,14 @@ explicit facts so readers don't have to re-derive them:
 - ``code_applied`` — the row claims the deploy ran (``status == 'success'``).
 - ``activation_applied`` — the row counts as a full activation baseline
   (checkouts/migrations/host redeploy; deliberately the same condition).
-- ``server_restarted`` — whether the health probe saw the server restart;
-  ``False`` only on a success row carrying the not-restarted marker, ``None``
-  on any non-success row (the row makes no claim either way).
+- ``server_restarted`` — ``False`` when ``update.sh`` recorded the
+  not-restarted marker, ``None`` otherwise: a row without the marker carries
+  no positive restart evidence (pre-#2625 writers could leave the server
+  down without recording it), so no claim is made either way.
 
-``server_restarted`` is evidence from ``update.sh``'s health probe, not proof
-of the commit currently running — a later restart clears the condition without
-writing a new row. Stdlib-only leaf: no genesis imports.
+``server_restarted`` is evidence from ``update.sh``'s health probe — a history
+row never proves which commit the server is running; that comes from the
+server's own boot identity (a follow-up). Stdlib-only leaf: no genesis imports.
 """
 
 from __future__ import annotations
@@ -56,6 +57,10 @@ def row_facts(status: str | None, degraded: str | None) -> RowFacts:
         return RowFacts(
             code_applied=True,
             activation_applied=True,
-            server_restarted=NOT_RESTARTED_MARKER not in degraded_markers(degraded),
+            server_restarted=(
+                False
+                if NOT_RESTARTED_MARKER in degraded_markers(degraded)
+                else None
+            ),
         )
     return RowFacts(code_applied=False, activation_applied=False, server_restarted=None)

@@ -60,6 +60,7 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
         return {
             "count": 0,
             "success_rate": None,
+            "server_not_restarted_count": 0,
             "entries": [],
             "note": f"Genesis database not found at {_DB_PATH}",
             **base_meta,
@@ -76,6 +77,7 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
         return {
             "count": 0,
             "success_rate": None,
+            "server_not_restarted_count": 0,
             "entries": [],
             "note": (
                 f"Genesis database at {_DB_PATH} was refused by the admission "
@@ -100,6 +102,7 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
                 return {
                     "count": 0,
                     "success_rate": None,
+                    "server_not_restarted_count": 0,
                     "entries": [],
                     "note": (
                         "update_history table not yet created — run "

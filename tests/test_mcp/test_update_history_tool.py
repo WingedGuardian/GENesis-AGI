@@ -92,6 +92,7 @@ class TestUpdateHistoryRecent:
 
         assert result["count"] == 0
         assert result["success_rate"] is None
+        assert result["server_not_restarted_count"] == 0
         assert result["entries"] == []
         assert "not found" in result["note"].lower()
 
@@ -106,6 +107,7 @@ class TestUpdateHistoryRecent:
         result = await _impl_update_history_recent()
         assert result["count"] == 0
         assert result["success_rate"] is None
+        assert result["server_not_restarted_count"] == 0
         assert result["entries"] == []
         assert "update_history" in result["note"]
 
@@ -132,6 +134,8 @@ class TestUpdateHistoryRecent:
         assert result["entries"][0]["status"] == "success"
         assert result["entries"][0]["old_tag"] == "v0.3.0"
         assert result["entries"][0]["new_tag"] == "v0.3.1"
+        # No not-restarted marker → no restart claim (no positive evidence).
+        assert result["entries"][0]["server_restarted"] is None
 
     @pytest.mark.asyncio
     async def test_mixed_status_success_rate(self, tmp_db) -> None:

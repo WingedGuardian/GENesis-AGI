@@ -102,6 +102,17 @@ def test_not_restarted_success_reports_server_restarted_false(tmp_db):
     assert last["server_restarted"] is False
 
 
+def test_plain_success_makes_no_restart_claim(tmp_db):
+    """No marker → no restart evidence (pre-#2625 writers could omit it)."""
+    _seed(tmp_db, [
+        {"id": "s", "status": "success",
+         "started_at": "2026-04-10T12:00:00+00:00"},
+    ])
+    last = _status(tmp_db)["last_update"]
+    assert last["status"] == "success"
+    assert last["server_restarted"] is None
+
+
 def test_reconciled_row_keeps_facts_from_stored_status(tmp_db):
     """A failed row reconciled to success (its commit landed) must not gain a
     server_restarted claim — the stored row was 'failed', so it stays None."""

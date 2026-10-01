@@ -33,3 +33,6 @@ def test_backup_tab_surfaces_not_restarted_success():
     ).read_text()
     assert "server not restarted" in html
     assert "server_restarted === false" in html
+    # A failed row reconciled to success must be labelled, not plain green.
+    assert "reconciled" in html
+    assert " (reconciled)" in html

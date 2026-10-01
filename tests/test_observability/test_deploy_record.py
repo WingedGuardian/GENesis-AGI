@@ -12,8 +12,9 @@ from genesis.observability.deploy_record import (
 @pytest.mark.parametrize(
     ("status", "degraded", "expected"),
     [
-        ("success", None, (True, True, True)),
-        ("success", "", (True, True, True)),
+        # No marker → no positive restart evidence, so no claim (None).
+        ("success", None, (True, True, None)),
+        ("success", "", (True, True, None)),
         ("success", NOT_RESTARTED_MARKER, (True, True, False)),
         (
             "success",
@@ -21,7 +22,7 @@ from genesis.observability.deploy_record import (
             (True, True, False),
         ),
         # Exact-token semantics: a longer token must NOT match.
-        ("success", "genesis-server-not-restarted-extra", (True, True, True)),
+        ("success", "genesis-server-not-restarted-extra", (True, True, None)),
         ("failed", None, (False, False, None)),
         ("failed", NOT_RESTARTED_MARKER, (False, False, None)),
         ("rolled_back", None, (False, False, None)),
