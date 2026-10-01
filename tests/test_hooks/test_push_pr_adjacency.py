@@ -240,8 +240,13 @@ def test_a_timeout_is_none(monkeypatch) -> None:
 
 
 
-def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys, command="git push"):
-    """Drive main() with a push payload from a real repo on `feat/x`."""
+def _run_guard_on_push(
+    monkeypatch, tmp_path, fake: FakeRun, capsys, command="git push", git_config=()
+):
+    """Drive main() with a push payload from a real repo on `feat/x`.
+
+    ``git_config`` is extra ``git config`` argument lists applied after init,
+    for tests that need real remotes rather than a stubbed URL set."""
     repo = tmp_path / "repo"
     repo.mkdir()
     for args in (
@@ -249,6 +254,7 @@ def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys, command="gi
         ["config", "user.email", "t@example.invalid"],
         ["config", "user.name", "T"],
         ["checkout", "--quiet", "-b", "feat/x"],
+        *[["config", *kv] for kv in git_config],
     ):
         subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=30)
     (repo / "f.txt").write_text("x\n")
@@ -270,25 +276,104 @@ def _run_guard_on_push(monkeypatch, tmp_path, fake: FakeRun, capsys, command="gi
     return rc, out.out, out.err
 
 
-def test_a_republished_branch_with_no_open_pr_asks_instead_of_sliding(
-    monkeypatch, tmp_path, capsys
+# ─── _no_pr_block_applies: the block is scoped, and fails toward NOT blocking ──
+
+
+PUBLIC_URL = "https://github.com/owner/repo"
+
+
+def test_the_block_applies_on_the_configured_public_repo(monkeypatch) -> None:
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    assert gpg._no_pr_block_applies({PUBLIC_URL}) is True
+    # Every spelling of the same remote is the same destination.
+    assert gpg._no_pr_block_applies({"git@github.com:owner/repo.git"}) is True
+
+
+@pytest.mark.parametrize(
+    ("urls", "why"),
+    [
+        ({"https://github.com/owner/genesis-backups"}, "the private backups repo"),
+        ({"https://github.com/owner/GENesis-Voice"}, "the voice repo"),
+        ({"https://github.com/someone-else/repo"}, "someone else's fork"),
+        ({"https://github.com/owner/repo-other"}, "a same-owner sibling repo"),
+        ({"https://ghe.example.com/owner/repo"}, "the same name on another host"),
+        ({PUBLIC_URL, "https://github.com/owner/private-fork"}, "a fan-out that is not ALL public"),
+    ],
+)
+def test_the_block_does_not_apply_off_the_public_repo(monkeypatch, urls, why: str) -> None:
+    """The hook is registered on `Bash` with no cwd scoping, so it fires in
+    whatever repo a session has wandered into. "This branch has no open PR" is
+    an ordinary state everywhere except the one repo whose `ci.yml` and leak
+    detector trigger on `pull_request` — blocking elsewhere refuses routine work
+    for a reason that does not exist there."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    assert gpg._no_pr_block_applies(urls) is False, why
+
+
+def test_the_scope_is_the_push_destination_not_the_checkout(monkeypatch) -> None:
+    """A checkout whose gh repo IS the public repo, pushing to a private fork
+    (`branch.<name>.pushRemote` / `remote.pushDefault`), must not be blocked:
+    it is the destination that decides whether CI ever sees the branch. The
+    decision must not consult gh at all — patch it to explode."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+
+    def _boom(*a, **k):
+        raise AssertionError("the scope decision must not call gh")
+
+    monkeypatch.setattr(gpg, "_base_repo_identity", _boom)
+    assert gpg._no_pr_block_applies({"https://github.com/owner/private-fork"}) is False
+    assert gpg._no_pr_block_applies({PUBLIC_URL}) is True
+
+
+def test_an_undeterminable_canonical_repo_does_not_block(monkeypatch) -> None:
+    """THE fail-direction test, and the one that is the OPPOSITE of the sibling
+    gate. `_scheduled_gate_applies` enforces when the repo is unknown, because
+    skipping would be an evasion path on a MERGE a human is standing over. This
+    refuses a PUSH, in every session, for a hygiene property — so an unreadable
+    config must not wedge ordinary work everywhere with no way through."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
+    assert gpg._no_pr_block_applies({PUBLIC_URL}) is False
+
+
+def test_unresolvable_push_urls_do_not_block(monkeypatch) -> None:
+    """Same direction, other input: no push URL could be resolved."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    assert gpg._no_pr_block_applies(set()) is False
+
+
+@pytest.fixture
+def on_the_public_repo(monkeypatch):
+    """Configure the PUBLIC repo through the real seam. The scoping comparison
+    runs for real; a test that wants the block must also push to PUBLIC_URL."""
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+
+
+def test_a_republished_branch_with_no_open_pr_is_BLOCKED(
+    monkeypatch, tmp_path, capsys, on_the_public_repo
 ) -> None:
     """The re-push relaxation is earned by first-push approval; a PR-less
-    public branch does not get to keep it silently."""
+    public branch does not get to keep it.
+
+    This asserted an ASK until 2026-09-25. PR-less public branches kept
+    accumulating under the ask — 2 of 60 on 2026-09-25, both after the previous
+    cleanup — so on the public repo it is now a block. A dispatched session never
+    reaches this arm: `_is_dispatched()` denies every non-force push earlier.
+    """
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
-    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
-    assert rc == 0
-    doc = json.loads(out)
-    decision = doc["hookSpecificOutput"]["permissionDecision"]
-    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
-    assert decision == "ask", (rc, out, err)
-    assert "NO OPEN PR" in reason and "leak scan" in reason
+    assert rc == 2, (rc, out, err)
+    assert "NO OPEN PR" in err and "leak detector" in err
+    assert "gh pr create" in err, "the block must name the way out, not just refuse"
+    assert not out.strip(), (
+        "a block writes to stderr and returns 2; emitting hook JSON as well would "
+        "hand Claude Code a permission decision that contradicts the exit code"
+    )
 
 
 def test_a_republished_branch_with_an_open_pr_stays_silent(monkeypatch, tmp_path, capsys) -> None:
@@ -308,12 +393,14 @@ def test_a_republished_branch_with_an_open_pr_stays_silent(monkeypatch, tmp_path
         assert doc["hookSpecificOutput"]["permissionDecision"] != "ask", out
 
 
-def test_an_unanswerable_pr_lookup_keeps_the_silent_allow(monkeypatch, tmp_path, capsys) -> None:
+def test_an_unanswerable_pr_lookup_keeps_the_silent_allow(
+    monkeypatch, tmp_path, capsys, on_the_public_repo
+) -> None:
     """None is the status quo, by design: a hygiene prompt must not be
     manufactured by a network blip on an already-approved branch."""
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
-    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: None)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
@@ -392,6 +479,104 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
     assert "CLOSES a pull request" in reason, reason
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --head feat/x --title t --body b && git push",
+        "git push && gh pr create --title t --body b",
+        "git push && gh pr create --dry-run --title t --body b",
+        "git push && gh pr create --head=feat/x --title t --body b",
+    ],
+)
+def test_a_same_command_pr_create_does_NOT_exempt(
+    monkeypatch, tmp_path, capsys, on_the_public_repo, command: str
+) -> None:
+    """There is no create exemption, and these rows are why.
+
+    A create in the same command does supply the PR the block demands — that
+    premise is true — but WHETHER it will is not decidable from argv. Two rounds
+    of narrowing proved it: `bool(create_segs)` exempted a create for a different
+    branch, and binding it to head/base/repo then drew four more findings — a
+    glued flag, a `--dry-run` that creates nothing, a create that FAILS and leaves
+    the `&&` push to run anyway, and a configured merge base. Each fix created the
+    surface for the next.
+
+    So the compound blocks. The rows below include the exact spellings that defeated
+    the previous design, as the regression record: if someone reintroduces an
+    exemption, these are the cases it has to survive, and the simplest way to
+    survive them is not to have one.
+
+    The cost is close to nothing, which the sibling test measures directly: a FIRST
+    push is not a republish, so the ordinary push-then-create flow never reaches
+    this arm.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys, command=command)
+    assert rc == 2, (command, rc, out, err)
+    assert "NO OPEN PR" in err, (command, err)
+
+
+def test_the_ordinary_push_then_create_flow_is_UNAFFECTED(
+    monkeypatch, tmp_path, capsys, on_the_public_repo
+) -> None:
+    """The cost measurement for the test above, and the reason dropping the
+    exemption is cheap rather than a regression.
+
+    The arm only runs when `push_allow_reason` is set, i.e. the branch is already
+    on the remote. A FIRST push is not a republish, so the prescribed flow —
+    publish a new branch, then open its PR — never reaches the block at all,
+    whatever the create looks like.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys,
+        command="git push -u origin HEAD && gh pr create --title t --body b",
+    )
+    assert rc != 2, (rc, out, err)
+    assert "NO OPEN PR" not in err, err
+
+
+def test_the_block_does_not_fire_off_the_public_repo_end_to_end(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The scoping decision driven through main(), not just the predicate.
+
+    Same command and same measured zero as the blocking test; only the push
+    destination differs. Without this, a unit test of `_no_pr_block_applies` could pass
+    while nothing wired it into the decision."""
+    fake = FakeRun()
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(
+        gpg, "_remote_push_urls",
+        lambda *a, **k: {"https://github.com/owner/genesis-backups"},
+    )
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
+    assert rc == 0, (rc, out, err)
+    assert "BLOCKED" not in err, err
+    # Off the public repo the pre-existing ASK is kept, unchanged — the cut
+    # changes behaviour on the public repo only.
+    doc = json.loads(out)
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
+    assert "NO OPEN PR" in doc["hookSpecificOutput"]["permissionDecisionReason"], out
+
+
 def test_an_ordinary_repush_with_an_open_pr_is_still_silent(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -416,7 +601,9 @@ def test_an_ordinary_repush_with_an_open_pr_is_still_silent(
 
 
 @pytest.mark.parametrize("cmd", ["git push -n", "git push --dry-run", "git push -un"])
-def test_a_dry_run_keeps_its_silence(monkeypatch, tmp_path, capsys, cmd) -> None:
+def test_a_dry_run_keeps_its_silence(
+    monkeypatch, tmp_path, capsys, cmd, on_the_public_repo
+) -> None:
     """A dry run publishes NOTHING, so it cannot create the unchecked-branch
     state this prompt reports.
 
@@ -426,7 +613,7 @@ def test_a_dry_run_keeps_its_silence(monkeypatch, tmp_path, capsys, cmd) -> None
     """
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
-    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
@@ -438,21 +625,19 @@ def test_a_dry_run_keeps_its_silence(monkeypatch, tmp_path, capsys, cmd) -> None
         assert doc["hookSpecificOutput"]["permissionDecision"] != "ask", out
 
 
-def test_a_real_push_still_asks(monkeypatch, tmp_path, capsys) -> None:
-    """The control for the dry-run skip: without it the prompt must still fire,
+def test_a_real_push_is_still_stopped(monkeypatch, tmp_path, capsys, on_the_public_repo) -> None:
+    """The control for the dry-run skip: without it the block must still fire,
     or the exclusion has silently disabled the whole check."""
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
-    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
     rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
-    assert rc == 0
-    doc = json.loads(out)
-    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
-    assert "NO OPEN PR" in doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert rc == 2, (rc, out, err)
+    assert "NO OPEN PR" in err
 
 
 def test_a_full_result_window_is_unanswerable_not_absent(monkeypatch) -> None:
@@ -590,3 +775,67 @@ def test_every_spelling_of_one_remote_compares_equal(monkeypatch, url) -> None:
     _script_pr_list(fake, [_pr(7)])
     monkeypatch.setattr(gpg.subprocess, "run", fake)
     assert gpg._open_pr_count_for_branch("feat/x", push_urls={url}) == 1
+
+
+def test_an_undeclared_public_repo_keeps_the_ask(monkeypatch, tmp_path, capsys) -> None:
+    """No declared public repo: the block cannot scope, so it must not fire —
+    but the push must not go SILENT either. It keeps main's ask."""
+    fake = FakeRun()
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys)
+    assert rc == 0, (rc, out, err)
+    doc = json.loads(out)
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
+
+
+@pytest.mark.parametrize(
+    ("git_config", "blocked"),
+    [
+        # Control: the branch pushes to origin, which IS the public repo.
+        ((("remote.origin.url", PUBLIC_URL),), True),
+        # pushRemote sends it to a private fork: the checkout is public, the
+        # destination is not, and the destination decides.
+        (
+            (
+                ("remote.origin.url", PUBLIC_URL),
+                ("remote.fork.url", "https://github.com/owner/private-fork"),
+                ("branch.feat/x.pushRemote", "fork"),
+            ),
+            False,
+        ),
+        # remote.pushDefault does the same for every branch.
+        (
+            (
+                ("remote.origin.url", PUBLIC_URL),
+                ("remote.fork.url", "https://github.com/owner/private-fork"),
+                ("remote.pushDefault", "fork"),
+            ),
+            False,
+        ),
+    ],
+)
+def test_the_scope_follows_the_real_push_destination(
+    monkeypatch, tmp_path, capsys, on_the_public_repo, git_config, blocked
+) -> None:
+    """Real remotes, real `_remote_push_urls`: nothing between git config and the
+    scope decision is stubbed except the PR count. Scoping on origin's URLs
+    instead of the destination's turns the fork rows into blocks."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys, git_config=git_config
+    )
+    if blocked:
+        assert rc == 2 and "NO OPEN PR" in err, (rc, out, err)
+    else:
+        assert rc == 0 and "BLOCKED" not in err, (rc, out, err)

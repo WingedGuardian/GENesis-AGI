@@ -286,7 +286,10 @@ def _documented_arity(help_text: str) -> dict[str, str]:
 #: able to eat a wrapped command as any binary (`exec -a name cmd`). Their
 #: authority is bash's own `help`, and for `time` that distinction is load
 #: bearing: `/usr/bin/time` is a DIFFERENT program from the shell keyword.
-_SHELL_BUILTINS = frozenset({"command", "exec"})
+#: `builtin` joined when it became a transparent prefix in `_WRAPPER_SPEC`: left
+#: out, `shutil.which` found no file and the case skipped, so the lock never
+#: checked the new entry (and the skip broke the CI skip ceiling by one).
+_SHELL_BUILTINS = frozenset({"builtin", "command", "exec"})
 #: `time` is deliberately in NEITHER path, and the reason is that it is two
 #: different tools wearing one name. Bash's `time` is a reserved word whose only
 #: option is `-p`; `/usr/bin/time` is a separate program with `-o`/`-f`, which is

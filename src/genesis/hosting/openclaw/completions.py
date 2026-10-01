@@ -39,11 +39,13 @@ import logging
 import threading
 import time
 import uuid
+from concurrent.futures import wait as futures_wait
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
 from genesis.cc.types import ChannelType
 from genesis.dashboard.auth import check_bearer_token
+from genesis.hosting.openai_messages import extract_last_user_message
 
 logger = logging.getLogger("genesis.hosting.openclaw")
 
@@ -52,6 +54,11 @@ blueprint = Blueprint("openclaw_completions", __name__)
 # Concurrency limiter — prevents unbounded CC subprocess spawning.
 # Each request holds the semaphore for the duration of the CC invocation.
 _MAX_CONCURRENT = 3
+# How long a caller may wait for a result, and how often the wait re-checks
+# that the loop which must produce it is still alive. The poll interval is
+# what bounds slot occupancy after a shutdown, not the timeout.
+_RESULT_TIMEOUT_S = 300
+_LIVENESS_POLL_S = 5.0
 _semaphore = threading.Semaphore(_MAX_CONCURRENT)
 
 
@@ -78,10 +85,32 @@ def chat_completions():
         return jsonify({"error": "Genesis not ready", "type": "error"}), 503
 
     conversation_loop = current_app.config.get("OPENCLAW_CONVERSATION_LOOP")
-    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
-    if conversation_loop is None or event_loop is None:
+    if conversation_loop is None:
         # Fallback: ConversationLoop not initialized (e.g., DB unavailable)
         return jsonify({"error": "ConversationLoop not available", "type": "error"}), 503
+
+    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
+    # READINESS, not existence -- and the two bad states fail differently, so
+    # neither is the "500" it is tempting to assume. MEASURED through the real
+    # route rather than reasoned about:
+    #   stopped, not closed -> run_coroutine_threadsafe returns a PENDING
+    #     future, so `future.result(timeout=300)` below blocks for the FULL
+    #     five minutes while holding one of only _MAX_CONCURRENT (3) slots.
+    #     Three such requests starve the endpoint for everyone else.
+    #   closed              -> run_coroutine_threadsafe raises RuntimeError,
+    #     but inside _stream_response, whose own `except Exception` runs after
+    #     Flask has already committed 200. The caller gets 200 and a generic
+    #     apology, never an error status.
+    # Both also leave the just-created coroutine un-awaited. is_running() is
+    # False for BOTH states, which is why it is the check.
+    #
+    # No getattr fallback: defaulting a missing is_running to True is a
+    # fail-OPEN on the one attribute this gate exists to read. Every asyncio
+    # loop has it, and so does a MagicMock, so the default could only ever
+    # fire for an object that is not a loop -- exactly the case that must not
+    # be waved through.
+    if event_loop is None or not event_loop.is_running():
+        return jsonify({"error": "event loop not running", "type": "error"}), 503
 
     data = request.get_json(force=True, silent=True) or {}
     messages = data.get("messages", [])
@@ -112,6 +141,55 @@ def chat_completions():
     )
 
 
+def _result_while_loop_lives(future, event_loop, timeout=_RESULT_TIMEOUT_S, poll=_LIVENESS_POLL_S):
+    """``future.result(timeout)``, abandoned early if the loop that must run it stops.
+
+    A plain ``future.result(timeout=300)`` waits the FULL timeout even once the
+    loop has stopped and the coroutine can therefore never run -- holding one of
+    only ``_MAX_CONCURRENT`` slots for five minutes. Three of those starve the
+    endpoint for everyone while nothing is being computed.
+
+    The submission-time check above cannot close this on its own: the loop can
+    stop at any point AFTER a successful submission, which no pre-flight can
+    see. So the wait is split into short polls and gives up as soon as the loop
+    is gone, which is what actually frees the slot.
+
+    Raising RuntimeError rather than returning None deliberately: the caller's
+    ``except Exception`` already maps that to the same client-visible answer,
+    and keeping the two unready states one kind of failure means a future
+    reader cannot handle one and forget the other.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"no result within {timeout}s")
+
+        # futures.wait, NOT future.result(timeout=...). MEASURED on 3.12:
+        # concurrent.futures.TimeoutError, asyncio.TimeoutError and builtins
+        # TimeoutError are the SAME object, so result() cannot distinguish "the
+        # slice expired" from "the coroutine itself raised TimeoutError". An
+        # earlier version of this used result() and caught TimeoutError: when
+        # the coroutine raised one while the loop was still alive, the liveness
+        # branch was skipped, the loop went round, and the now-FINISHED future
+        # re-raised instantly -- 29,689 spins in two seconds, a pegged core and
+        # a held slot for the whole timeout. Exactly the starvation this
+        # function exists to prevent. wait() reports readiness and never
+        # re-raises, so the two cases stay separable.
+        done, _ = futures_wait([future], timeout=min(poll, remaining))
+        if done:
+            return future.result()
+
+        if not event_loop.is_running():
+            if not future.cancel():
+                # cancel() fails only when the future already FINISHED, which
+                # here means the result landed between the wait expiring and
+                # this call. Discarding it would report an error while the real
+                # answer sat in hand.
+                return future.result()
+            raise RuntimeError("event loop stopped while the request was in flight")
+
+
 def _stream_response(conversation_loop, event_loop, user_message, session_key, completion_id):
     """Generator: invoke ConversationLoop, yield SSE chunks.
 
@@ -140,6 +218,14 @@ def _stream_response(conversation_loop, event_loop, user_message, session_key, c
         return
 
     try:
+        # Re-check readiness HERE, at submission, not only in the view. Flask
+        # runs this generator AFTER the view returns, so the preflight check
+        # upstream is arbitrarily stale by now and shutdown can land in the
+        # gap. Submitting against a stopped loop is the expensive failure:
+        # run_coroutine_threadsafe accepts it, returns a PENDING future, and
+        # the wait below holds one of _MAX_CONCURRENT slots until it expires.
+        if not event_loop.is_running():
+            raise RuntimeError("event loop stopped before submission")
         future = asyncio.run_coroutine_threadsafe(
             conversation_loop.handle_message(
                 user_message,
@@ -149,7 +235,7 @@ def _stream_response(conversation_loop, event_loop, user_message, session_key, c
             event_loop,
         )
         # Block until CC finishes (buffered response)
-        response_text = future.result(timeout=300)
+        response_text = _result_while_loop_lives(future, event_loop)
     except TimeoutError:
         logger.error("OpenClaw CC invocation timed out for session %s", session_key[:16], exc_info=True)
         response_text = None
@@ -208,24 +294,8 @@ def _stream_response(conversation_loop, event_loop, user_message, session_key, c
     yield "data: [DONE]\n\n"
 
 
-def _extract_last_user_message(messages: list) -> str | None:
-    """Extract the text of the most recent user message.
-
-    Handles both string content and OpenAI multimodal content arrays
-    (``[{"type": "text", "text": "..."}]``).  Returns None if no valid
-    user message is found.
-    """
-    for m in reversed(messages):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        content = m.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(content, list):
-            # Multimodal: extract first text block
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text.strip():
-                        return text
-    return None
+# Moved to genesis.hosting.openai_messages so that any future surface accepting
+# the OpenAI request shape reads it through the same parser rather than copying
+# this one. Re-exported under the original private name so existing callers and
+# tests keep working.
+_extract_last_user_message = extract_last_user_message

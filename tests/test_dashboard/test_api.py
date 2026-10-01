@@ -477,6 +477,7 @@ def test_routing_config_read_includes_call_sites(client):
             default_paid=True,
             never_pays=False,
             retry_profile="background",
+            dispatch="dual",
         ),
     }
     mock_router = MagicMock()
@@ -496,6 +497,50 @@ def test_routing_config_read_includes_call_sites(client):
     assert "autonomous_executor_reasoning" in data["call_sites"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["openrouter-sonnet"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
+
+
+def test_routing_config_read_shows_the_running_dispatch_not_the_file(client):
+    """After a refused reload the router keeps its previous config, while a fresh
+    load of the broken file falls back to the base. The editor must show the
+    dispatch that is actually running, not the one on disk."""
+    mock_cfg = SimpleNamespace(disabled_providers={}, providers={})
+    mock_cfg.call_sites = {
+        "31_site": SimpleNamespace(
+            chain=[], default_paid=False, never_pays=False,
+            retry_profile="default", dispatch="cli",
+        ),
+        "32_site": SimpleNamespace(
+            chain=[], default_paid=False, never_pays=False,
+            retry_profile="default", dispatch="api",
+        ),
+    }
+    mock_router = MagicMock()
+    mock_router._daily_budget = None
+    mock_router.config = mock_cfg
+    mock_router.breakers = {}
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+    on_disk = {
+        "call_sites": {
+            "31_site": {"dispatch": "dual", "cc_model": "Sonnet"},
+            "32_site": {"chain": []},
+        }
+    }
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch("genesis.routing.config._load_effective", return_value=(None, on_disk)),
+    ):
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/routing/config")
+
+    assert resp.status_code == 200
+    sites = resp.get_json()["call_sites"]
+    assert sites["31_site"]["dispatch"] == "cli"
+    assert sites["31_site"]["cc_model"] == "Sonnet"
+    # Nothing on disk names a dispatch here; the running mode is still shown.
+    assert sites["32_site"]["dispatch"] == "api"
 
 
 def test_routing_config_read_surfaces_daily_budget_counters(client):
@@ -679,8 +724,40 @@ def test_routing_config_reload_endpoint(client):
     assert resp.status_code == 200
     assert resp.get_json() == {"ok": True, "dlq_orphans_expired": 0}
     load_config.assert_called_once()
+    # An operator-initiated reload of a broken overlay must be REFUSED, keeping
+    # the running config, not quietly swapped for the base config the boot path
+    # falls back to.
+    assert load_config.call_args.kwargs.get("strict_overlay") is True
     mock_router.reload_config.assert_called_once_with(fake_config)
     mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
+
+
+def test_routing_reload_refuses_an_unparseable_overlay(client, tmp_path):
+    """The real strict loader, against the shipped base: an overlay that is not
+    YAML is refused with a 400 and the running config is kept, the same way
+    boot refuses it."""
+    from unittest.mock import AsyncMock
+
+    import genesis.routing.config as routing_config
+
+    broken = tmp_path / "model_routing.local.yaml"
+    broken.write_text("providers: [unclosed\n")
+    mock_router = MagicMock()
+    mock_router.scan_dlq_orphans_after_reload = AsyncMock(return_value=0)
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch.object(routing_config, "_local_path_for", lambda _path: broken),
+    ):
+        MockRT.instance.return_value = mock_rt
+        resp = client.post("/api/genesis/routing/reload")
+
+    assert resp.status_code == 400
+    assert resp.get_json() == {"error": "Config parse failed"}
+    mock_router.reload_config.assert_not_called()
 
 
 def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):

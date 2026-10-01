@@ -36,6 +36,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_output import HOOK_STDOUT_CAP, BoundedStdout, emit_cost, utf16_len  # noqa: E402
 
+
+def _db_is_fenced(db_path) -> bool:
+    """Admission fence, fail-closed: unknown state reads as fenced.
+
+    Session-context blocks are advisory; a quarantined database degrades each
+    block to its own empty state rather than being opened (the 2026-09-18
+    incident class).
+    """
+    try:
+        from db_admission_check import database_is_fenced
+
+        return database_is_fenced(db_path)
+    except Exception:
+        return True
+
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
 _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
@@ -1195,7 +1210,7 @@ def _emit_body() -> tuple[str, str, str] | None:
             import aiosqlite
 
             _db_path_l0 = Path.home() / "genesis" / "data" / "genesis.db"
-            if _db_path_l0.exists():
+            if _db_path_l0.exists() and not _db_is_fenced(_db_path_l0):
 
                 async def _load_l0():
                     async with aiosqlite.connect(str(_db_path_l0), timeout=2) as db:
@@ -1665,7 +1680,7 @@ def _load_inflight_block() -> str:
         import aiosqlite
 
         db_path = Path.home() / "genesis" / "data" / "genesis.db"
-        if not db_path.exists():
+        if not db_path.exists() or _db_is_fenced(db_path):
             return ""
         repo_root = Path.home() / "genesis"
         plans_dir = Path.home() / ".claude" / "plans"
@@ -2020,7 +2035,7 @@ def _load_charter_db(session_id: str, db_path: Path | None) -> tuple[dict | None
         import aiosqlite
 
         db_file = db_path or _charter_db_path()
-        if not db_file.exists():
+        if not db_file.exists() or _db_is_fenced(db_file):
             return None, []
 
         async def _run() -> tuple[dict | None, list[dict]]:

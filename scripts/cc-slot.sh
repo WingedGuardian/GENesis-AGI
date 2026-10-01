@@ -16,6 +16,84 @@
 
 set -euo pipefail
 
+_session_exists() {
+    # Silent existence test. `has-session` answers "absent" by ERRORING, and a
+    # tmux error is recorded in the SERVER's message log -- MEASURED on tmux
+    # 3.4: +1 `can't find session` entry per absent probe, readable with
+    # `show-messages`. All three probes asked on paths where absent is the
+    # ANSWER rather than a fault (the free-slot search exits by failing; the two
+    # pre-create checks are absent on every first connection to a slot), so
+    # three entries accumulated on every ordinary login.
+    #
+    # CORRECTING WHAT THIS COMMENT USED TO SAY, because it is load-bearing and
+    # it was wrong: it claimed the error is "painted on every attached client's
+    # status line", and that the `2>/dev/null` on the old call sites therefore
+    # did nothing. MEASURED and REFUTED 2026-09-25 -- with a client attached
+    # through a pty, three absent probes added three log entries and ZERO bytes
+    # to that client's stream, while a `display-message` control on the same
+    # client painted at row 24 in black-on-yellow, 1/1. For an ssh
+    # RemoteCommand door the issuing client has no session, so tmux routes the
+    # error to that client's own stderr -- where `2>/dev/null` did suppress it.
+    # The same claim is in the lobby door's fix (#2298) and is equally wrong
+    # there; it is corrected in this change's changelog too.
+    #
+    # So the win here is smaller than first written, and still worth having: no
+    # per-login server-log noise, and no erroring probe on a path where absent
+    # is the expected answer -- an error whose destination depends on the
+    # invocation shape (from inside a pane the same command writes to the pane).
+    #
+    # `-f` filters server-side and MEASURED never errors: a missing name exits 0
+    # with no output, a present one exits 0 with the name, and neither adds a
+    # message. So the answer is the OUTPUT, not the status -- do not "simplify"
+    # this to `if tmux list-sessions -f ...`, which is true either way.
+    #
+    # The `#{==:...}` comparison is exact, which is load-bearing and is what the
+    # old `-t "="` guards were for: a bare `-t` is prefix-matched by tmux, so
+    # cc-1 would falsely read as existing whenever only cc-10 did.
+    #
+    # Deliberately NOT lobby-door.sh's `list-sessions | grep -xF` spelling,
+    # though the two are equivalent in verdict. This one stays NAME-ADDRESSED:
+    # the name is in argv, where the door's own test harness can see which
+    # session is being asked about. A bare listing piped into grep moves that
+    # question inside this script, and the harness's TOCTOU simulation -- a slot
+    # that must read absent to the selection loop and present to the rebuild
+    # guard, reproducing a concurrent launch -- cannot express itself against a
+    # name-blind probe. It also has no pipe, so `pipefail` and the SIGPIPE
+    # hazard that shaped the lobby door's version do not arise here at all.
+    # Unifying the two spellings is worth doing, but not inside a bugfix that
+    # touches a login path: tracked in #2305.
+    #
+    # `$1` is interpolated into a tmux FORMAT string, so a name carrying `}` or
+    # `,` would change the filter's meaning rather than be compared. Safe here
+    # because every caller passes `cc-<digits>`: SESSION_PREFIX is the literal
+    # `cc`, and SLOT is either a counter or is rejected unless it matches
+    # ^[1-9][0-9]*$. That is a property of the CALLERS, not of this helper --
+    # a future caller passing a user-supplied name needs to re-check it.
+    # An EMPTY successful query means absent. A FAILED query does not, and
+    # collapsing the two is how a correctness bug hides behind a cosmetic one.
+    # `list-sessions -f` and `#{==:a,b}` are both documented on tmux 3.4 (this
+    # box), but `has-session` predates them, so on an older tmux the filtered
+    # query errors while the server is perfectly healthy. Swallowing that would
+    # answer "absent" for EVERY name: manual mode would hand out an occupied
+    # slot, and a reattach would be pushed through the capacity gate it exists
+    # to bypass -- which can DENY the login, or reclaim another session, instead
+    # of attaching to the slot that is sitting right there.
+    #
+    # So fall back to the exact legacy probe, which every tmux has. It is the
+    # thing this helper replaced, and that is fine here: it runs only when the
+    # filtered query has already failed, where answering CORRECTLY matters more
+    # than the log entry it costs. When there is no server at all, has-session
+    # fails too and "absent" is then the right answer, not a swallowed error.
+    local _found
+    if _found=$(tmux list-sessions -F '#{session_name}' \
+                    -f "#{==:#{session_name},$1}" 2>/dev/null); then
+        [[ -n "$_found" ]]
+    else
+        tmux has-session -t "=$1" 2>/dev/null
+    fi
+}
+
+
 # Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
 # HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
 # to the passwd entry for the current uid (same source Path.home() uses); fail
@@ -299,9 +377,14 @@ if [[ "$MODE_ARG" == "manual" ]]; then
         done <<<"$slot_map"
     fi
     SLOT=1
-    # '=' forces exact-name match: a bare -t is prefix-matched by tmux, so
-    # cc-1 would falsely read as existing whenever only cc-10 does.
-    while tmux has-session -t "=${SESSION_PREFIX}-${SLOT}" 2>/dev/null; do
+    # Exact-name match matters here: a bare `-t` is prefix-matched by tmux, so
+    # cc-1 would falsely read as existing whenever only cc-10 does. The helper's
+    # `#{==:...}` filter gives the same exactness the old `-t "="` did, silently.
+    #
+    # This loop exits by the probe FAILING, i.e. "this slot is free" -- the
+    # success path. With has-session that made allocating ANY slot add an entry
+    # to the server's message log, every time.
+    while _session_exists "${SESSION_PREFIX}-${SLOT}"; do
         SLOT=$((SLOT + 1))
     done
 else
@@ -331,7 +414,8 @@ unset TMUX
 # express (sourcing only ever overlays).
 _CC_LEVERS="GENESIS_CC_SYSTEM_RESERVE_MB GENESIS_CC_PER_SESSION_MB \
 GENESIS_CC_OOM_FLOOR_MB GENESIS_CC_EMERGENCY_SLOTS \
-GENESIS_CC_PERMISSION_MODE GENESIS_CC_SLOT_OAUTH"
+GENESIS_CC_PERMISSION_MODE GENESIS_CC_SLOT_OAUTH \
+GENESIS_CC_WEB_OVERRIDE"
 
 # The pre-source environment, so a re-read can restore this exact baseline
 # instead of whatever the previous read left behind. Normally EMPTY: an SSH
@@ -624,9 +708,11 @@ _cap_fail_open() {
 # lengthen the interval the design is built to keep short. See "ADMIT BEFORE
 # DESTROYING" below for why the RAM floor is the only check that qualifies.
 #
-# Manual/dashboard mode reaches here too but allocated a slot with NO existing
-# session, so the has-session guard makes this a structural no-op there — only
-# the hostname door (which targets a FIXED name) can meet an existing session.
+# Manual/dashboard mode reaches here too, and the explicit MODE_ARG gate below
+# — not the existence probe — is what keeps it out. It is NOT a structural
+# no-op: relying on the earlier availability probe still being true is the
+# TOCTOU described at that gate, and TestRebuildIsHostnameModeOnly exists
+# because of it.
 #
 # Safety rests on three MEASURED properties (tmux 3.4, scratch -L server):
 #   1. Within one server, session ids are never reused ($1 killed, recreate ->
@@ -698,7 +784,7 @@ _s2_liveness() {
 # and an affirmative answer KILLS a session someone just created. Gate on the mode
 # explicitly rather than on a stale probe; manual mode falls through to `-A`, which
 # simply attaches to whatever is there.
-if [[ "$MODE_ARG" != "manual" ]] && tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
+if [[ "$MODE_ARG" != "manual" ]] && _session_exists "${SESSION_NAME}"; then
     _s2_snap1=$(_s2_snapshot)
     _s2_verdict=$(_s2_liveness "$_s2_snap1")
     _s2_srv1=$(printf '%s\n' "$_s2_snap1" | sed -n '1p' | cut -d'|' -f1)
@@ -895,7 +981,7 @@ existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
 
 # Reattaching to existing session — always allow ('=' = exact-name match)
 _SESSION_EXISTS=0
-if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
+if _session_exists "$SESSION_NAME"; then
     _SESSION_EXISTS=1  # bypass cap check; also skips the OAuth gate below —
                        # attach does NOT re-run the pane command, so any token
                        # injection would be moot (and would waste a probe).
@@ -1173,6 +1259,28 @@ if [ -n "${GENESIS_ROOT:-}" ] && [ -x "${GENESIS_ROOT}/scripts/fleet_entry_guard
     "${GENESIS_ROOT}/scripts/fleet_entry_guard.sh" "slot-${SLOT}" >/dev/null 2>&1 || true
 fi
 
+# The WebSearch override (plugins/genesis-web-override) for interactive slots
+# only: GENESIS_CC_WEB_OVERRIDE=1 in cc-slot.env turns on Claude Code's function
+# hooks for this pane and loads the plugin from this checkout with --plugin-dir,
+# so it runs the code the checkout holds and nothing outside a slot loads it.
+# Decided in BOTH directions, like the temp pins: with the lever off the pane
+# unsets the flag itself, because a new session inherits the tmux SERVER's env
+# and omitting a pin is not the same as having no value. Dispatched sessions do
+# not come through this door; genesis.cc.child_env pins the flag to 0 for them.
+# Reaches NEW slots only: `-A` attaches an existing session as it was created.
+_FUNCTION_HOOKS_PIN=()
+_FUNCTION_HOOKS_UNSET="unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS && "
+_WEB_OVERRIDE_ARGS=""
+if [ "${GENESIS_CC_WEB_OVERRIDE:-}" = "1" ]; then
+    if [ -d "$GENESIS_ROOT/plugins/genesis-web-override" ]; then
+        _FUNCTION_HOOKS_PIN=(-e "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1")
+        _FUNCTION_HOOKS_UNSET=""
+        _WEB_OVERRIDE_ARGS="--plugin-dir $(printf '%q' "$GENESIS_ROOT/plugins/genesis-web-override") "
+    else
+        echo "cc-slot: warning: GENESIS_CC_WEB_OVERRIDE=1 but $GENESIS_ROOT/plugins/genesis-web-override" \
+             "is missing; this slot starts without it" >&2
+    fi
+fi
 # The pane command is re-parsed by a fresh shell, so quote both paths before
 # interpolating them into its command string. `%q` preserves checkout paths
 # containing spaces, shell metacharacters, or newlines.
@@ -1183,5 +1291,6 @@ exec tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
+    "${_FUNCTION_HOOKS_PIN[@]}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude ${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

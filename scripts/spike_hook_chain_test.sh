@@ -29,6 +29,7 @@ WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 POST_COMMIT="$WORKTREE_ROOT/scripts/hooks/post-commit"
 OFFER_HOOK="$WORKTREE_ROOT/scripts/contribution_offer_hook.py"
 AUDIT_HELPER="$WORKTREE_ROOT/scripts/hooks/emit_bugfix_audit.py"
+ADMISSION_SHIM="$WORKTREE_ROOT/scripts/hooks/db_admission_check.py"
 
 # --- Setup ---
 mkdir -p "$GENESIS_HOME" "$TEST_REPO"
@@ -41,7 +42,15 @@ git config user.name "Spike Tester"
 mkdir -p .git/hooks
 cp "$POST_COMMIT" .git/hooks/post-commit
 cp "$AUDIT_HELPER" .git/hooks/emit_bugfix_audit.py  # audit helper must be colocated
+# The helper's own imports must be colocated too — it consults the admission
+# fence via a SIBLING import, and sys.path[0] for the installed copy is
+# .git/hooks. Mirrors HELPERS_TO_SYNC in sync-hooks.sh.
+cp "$ADMISSION_SHIM" .git/hooks/db_admission_check.py
 chmod +x .git/hooks/post-commit .git/hooks/emit_bugfix_audit.py
+# ...and the shim resolves `src` RELATIVE TO ITSELF, which in this throwaway
+# repo does not exist. Without this it fails closed, the helper skips, and
+# Tests 1 and 4 lose the bugfix_committed observation they assert on.
+export PYTHONPATH="$WORKTREE_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # Create a minimal observations table in the test DB
 sqlite3 "$GENESIS_DB_PATH" "CREATE TABLE observations (
@@ -60,7 +69,13 @@ sqlite3 "$GENESIS_DB_PATH" "CREATE TABLE observations (
     resolution_notes TEXT,
     created_at TEXT NOT NULL,
     expires_at TEXT,
-    content_hash TEXT
+    content_hash TEXT,
+    -- The helper's INSERT carries origin_class (added by the observation
+    -- write-provenance work); this fixture was never updated to match, so
+    -- every bugfix_committed insert failed with 'no column named
+    -- origin_class' and the five observation-count assertions below have
+    -- been failing since — independently of the admission fence.
+    origin_class TEXT
 );
 CREATE INDEX idx_obs_source_hash ON observations(source, content_hash);"
 

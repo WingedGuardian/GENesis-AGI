@@ -1518,63 +1518,320 @@ def test_an_unreadable_draft_names_the_type_not_the_path(tmp_path, capsys):
     assert "FileNotFoundError" in err
 
 
-def test_no_refusal_this_pr_owns_interpolates_a_bare_exception(tmp_path):
-    """Catch a REGRESSION of the two refusals this change rewrote.
+# The allowlist of interpolations that provably cannot carry a filesystem path.
+# Each entry is an AST SHAPE, not a variable name, because a name says nothing
+# about what it holds. Anything not matching one of these must have its whole
+# message routed through `_redact_home`.
+#
+# Adding to this list is a decision someone can argue with in review. Adding a
+# new unwrapped interpolation without touching it is not possible, which is the
+# entire difference between this and the denylist it replaces.
+# ── the emitter guard ────────────────────────────────────────────────────────
+#
+# WHY THE GUARD POINTS HERE AND NOT AT `Refused(...)`.
+#
+# The first version of this change guarded the CONSTRUCTORS: every interpolation
+# inside a `Refused()` message had to be provably path-free or the message had
+# to be wrapped. An adversarial audit measured what that covered, and the answer
+# was thirteen of eighteen leak shapes ACCEPTED — `"x: " + str(exc)`,
+# `"%s" % proc.stderr`, `"{}".format(exc.filename)`, a message built on the line
+# before, a keyword argument, an aliased or dotted constructor. Every one of
+# those is a different way to build a string, and there is no end to them.
+#
+# Worse, two live leaks reached stderr without constructing a `Refused` at all:
+# the generic `ERROR: {exc}` handler (reproduced: an unreadable lock file put an
+# absolute home path on stderr, the same path #2152 had just hardened one line
+# earlier), and the `gh issue create` TIMEOUT cause, whose `TimeoutExpired`
+# renders the whole argv including a `--body-file` path under the home.
+#
+# So the guard was pointed at the other end. Strings are produced in an OPEN
+# set of ways and consumed by a CLOSED set of five `print` calls. Redaction now
+# happens at those five, and this checks that it stays that way. A new refusal
+# written next year in a spelling nobody anticipated is covered, because it has
+# to come out of one of these.
 
-    SCOPE, stated because the first version of this docstring overclaimed and a
-    reviewer took it at face value: the matcher keys on ONE spelling — an
-    f-string interpolating the NAME `exc` inside a `Refused()` call. That is
-    denylist polarity. It does NOT see `Refused(f"...{proc.stderr}...")`, of
-    which there are three, nor `_warn(f"...{exc}")` in the generic handlers,
-    which never touch the `Refused` constructor at all. `gh` stderr routinely
-    carries a path under the operator's home, so those are the same leak class
-    and they are FILED, not covered here.
 
-    What this does bind: reverting either rewritten site to `{exc}` fails it.
+def _emitter_offenders(source: str) -> list[tuple[int, str]]:
+    """Every `print(...)` whose first argument is neither a plain constant nor
+    routed through `_redact_home(...)`.
 
-    It is scoped to the refusals this change introduces or rewrites, and the
-    pre-existing ones are exempted BY MESSAGE rather than by line number, with
-    the reason recorded, so the exemption is a decision someone can argue with
-    rather than a silent hole:
+    THE ONE AND ONLY implementation of this check. An earlier version had the
+    test call a near-copy of its own loop, which meant the copy proved the
+    predicate worked while nothing proved the real guard USED it — replacing
+    the guard's verdict with `pass` left twelve tests green. Both the
+    real-module assertion and the synthetic cases below call this function, so
+    there is nothing to drift.
 
-      * `_gh_json` / duplicate-check — JSONDecodeError, which carries no path.
-      * `create_issue` timeout — SubprocessError, whose text is our own argv.
-      * the privacy-scanner import — ImportError, a module name.
-      * `_lock_path` — REAL, and the worst of them: it interpolates `base`,
-        which IS Path.home()/.genesis/locks, so it writes a home path to
-        stderr outright. Pre-existing, out of this PR's scope by the
-        keep-the-PR-the-PR rule, and FILED rather than dropped.
-
-    A new refusal added later, in a block this test does cover, fails here.
+    SCOPE, stated rather than implied, because an enumeration that looks total
+    and is not is how the first version of this guard went wrong. It matches
+    `print(...)` BY NAME. It would not see `sys.stdout.write(...)`, an aliased
+    or rebound `print`, `os.write(1, ...)`, or a subprocess inheriting stdout.
+    MEASURED against the module today: five `print` calls and no other path to
+    a user-visible stream -- the one `os.write` is a temp-file descriptor for
+    the scanned body, not an output stream. Treat this as the spellings checked
+    so far, not a closed set; the denominator cell below is what notices if the
+    walk stops finding them.
     """
-    src = _SCRIPT.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    lines = src.splitlines()
-    exempt_markers = (
-        "unparseable JSON",
-        "did not complete",
-        "per-install lock directory",
-        "cannot import the privacy scanner",
-    )
-    offenders = []
+    offenders: list[tuple[int, str]] = []
+    tree = ast.parse(source)
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Refused"):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print"):
             continue
-        span = " ".join(lines[node.lineno - 1 : (node.end_lineno or node.lineno)])
-        if any(m in span for m in exempt_markers):
+        if not node.args:
             continue
-        for arg in node.args:
-            for sub in ast.walk(arg):
-                if (
-                    isinstance(sub, ast.FormattedValue)
-                    and isinstance(sub.value, ast.Name)
-                    and sub.value.id == "exc"
-                ):
-                    offenders.append(node.lineno)
+        first = node.args[0]
+        if isinstance(first, ast.Constant):
+            continue
+        if (
+            isinstance(first, ast.Call)
+            and isinstance(first.func, ast.Name)
+            and first.func.id == "_redact_home"
+        ):
+            continue
+        offenders.append((node.lineno, ast.unparse(first)[:90]))
+    return offenders
+
+
+def test_every_emitter_routes_through_the_redactor():
+    """The closed set, checked against the real module."""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    offenders = _emitter_offenders(src)
     assert not offenders, (
-        f"Refused() interpolates a bare exception at line(s) {sorted(set(offenders))} "
-        "— an OSError carries a filename; render type(exc).__name__ instead"
+        "print() reaches a user-visible stream without redaction:\n"
+        + "\n".join(f"  line {ln}: {expr}" for ln, expr in offenders)
+        + "\n\nWrap the argument in _redact_home(...). It is idempotent, so "
+        "wrapping something already redacted upstream is harmless."
     )
+
+
+def test_the_emitter_guard_has_a_denominator():
+    """A derived set can be a SUBSET and pass forever. If the walk breaks,
+    `offenders` is empty for the wrong reason and the cell above goes quiet."""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    prints = [
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "print"
+    ]
+    assert len(prints) >= 5, (
+        f"only {len(prints)} print() calls found — the extraction is broken, so "
+        "an empty offender list proves nothing"
+    )
+
+
+def test_the_emitter_guard_rejects_what_it_should():
+    """The VERDICT, not just the predicate.
+
+    Every case is a spelling the replaced constructor-guard accepted. If any of
+    these returns no offender, the polarity has inverted back.
+    """
+    cases = {
+        "bare exception": 'print(f"failed: {exc}")',
+        "concatenation": 'print("failed: " + str(exc))',
+        "percent format": 'print("failed: %s" % proc.stderr)',
+        "str.format": 'print("at {}".format(exc.filename))',
+        "a name built earlier": 'msg = f"at {p}"\nprint(msg)',
+        "stderr stream": 'print(f"at {p}", file=sys.stderr)',
+        "a method call": 'print(f"at {path.resolve()}")',
+    }
+    missed = [label for label, src in cases.items() if not _emitter_offenders(src)]
+    assert not missed, f"the guard admitted an unredacted emitter: {missed}"
+
+
+def test_the_emitter_guard_admits_what_it_should():
+    """A guard that rejects everything is a broken parser, and it would pass
+    the cell above for the wrong reason."""
+    cases = {
+        "wrapped": 'print(_redact_home(f"failed: {exc}"))',
+        "wrapped to stderr": 'print(_redact_home(msg), file=sys.stderr)',
+        "a plain constant": 'print("nothing to see")',
+        "no arguments": "print()",
+    }
+    wrongly = {label: _emitter_offenders(src) for label, src in cases.items() if _emitter_offenders(src)}
+    assert not wrongly, f"the guard rejected a safe emitter: {wrongly}"
+
+
+def test_neutering_the_guards_verdict_is_caught():
+    """The failure that made the previous guard worthless, pinned.
+
+    Its verdict was never exercised: the test asserted on an accumulator the
+    real loop never wrote to, so replacing `offenders.append(...)` with `pass`
+    left every guard cell green. Here the rejection cells call the SAME
+    function the real-module cell calls, so a verdict that stops recording
+    fails them — which is what this asserts, on the function itself.
+    """
+    assert _emitter_offenders('print(f"{exc}")'), "the verdict must record an offender"
+    assert not _emitter_offenders('print("plain")'), "and must not invent one"
+
+
+def test_the_redactor_replaces_the_home_prefix_and_keeps_the_rest():
+    """The substitution is the point: dropping the path would lose the
+    diagnostic, which is why these sites were not fixed the way #2152 was."""
+    home = str(Path.home())
+    text = f"open {home}/tmp/draft.md: not a directory"
+    out = fti._redact_home(text)
+    assert home not in out, out
+    assert out == "open ~/tmp/draft.md: not a directory", out
+
+
+def test_the_redactor_leaves_a_root_home_alone(monkeypatch):
+    """A home of `/` would otherwise turn every absolute path into nonsense,
+    and such an install has no account name in it to protect."""
+    monkeypatch.setattr(fti.Path, "home", staticmethod(lambda: Path("/")))
+    text = "open /etc/hosts: permission denied"
+    assert fti._redact_home(text) == text
+
+
+def test_the_redactor_never_raises_when_home_is_unresolvable(monkeypatch):
+    """A refusal must not fail while trying to make itself safe."""
+
+    def boom():
+        raise RuntimeError("could not resolve home")
+
+    monkeypatch.setattr(fti.Path, "home", staticmethod(boom))
+    assert fti._redact_home("some text") == "some text"
+
+
+def test_the_redactor_does_not_eat_a_different_account_or_a_url():
+    """Anchored substitution, bound.
+
+    MEASURED with a bare `str.replace` and a home of `/home/jay`:
+    `cannot read /home/jayson/keys/id_rsa` became `cannot read ~son/keys/...`.
+    That half-destroys ANOTHER account's name and names a file that does not
+    exist — worse than the leak, in the one direction that costs a debugging
+    round. A URL containing the same characters was mangled identically.
+    """
+    real = str(Path.home())
+    cases = [
+        (f"cannot read {real}son/keys/id_rsa", f"{real}son", "a sibling account"),
+        (f"see https://example.invalid{real}/docs/x", f"{real}/docs", "a url"),
+        (f"open /var{real}/tmp/b.md failed", f"/var{real}", "a different mount"),
+    ]
+    for text, must_survive, label in cases:
+        out = fti._redact_home(text)
+        assert must_survive in out, f"{label}: substitution was not anchored — {out}"
+    # ...and the real thing is still redacted, or the cell above passes by
+    # simply doing nothing.
+    assert fti._redact_home(f"open {real}/tmp/b.md failed") == "open ~/tmp/b.md failed"
+    assert fti._redact_home(f"open {real} failed") == "open ~ failed"
+
+
+def test_the_redactor_handles_a_path_ending_a_sentence():
+    """`gh` writes diagnostics as sentences.
+
+    The first anchored version required a separator or end-of-string after the
+    home, so `failed to read <home>.` kept the period out of the boundary and
+    the account name went into the refusal unredacted. Terminal punctuation
+    ends a token too — but only when whitespace or the end follows it, or
+    `<home>.config` (a different directory) would be rewritten.
+    """
+    real = str(Path.home())
+    for text in (f"failed to read {real}.", f"see {real}. Next", f"under {real}!", f"q {real}?"):
+        out = fti._redact_home(text)
+        assert real not in out, f"a path ending a sentence leaked: {out}"
+        assert "~" in out, out
+    # The control that stops the boundary from being widened into a bug.
+    for text in (f"dir {real}.config/x", f"sib {real}son/keys"):
+        assert fti._redact_home(text) == text, f"a different directory was rewritten: {text}"
+
+
+def test_the_boundary_tradeoff_is_asymmetric_on_purpose():
+    """Almost every byte is legal in a POSIX path, so nothing in the text can
+    prove where one ends. Erring one way MANGLES a valid diagnostic; erring the
+    other LEAKS the account name. Leaking is worse, so ambiguity resolves toward
+    redaction — and both halves of that choice are pinned here, because a later
+    reader will otherwise "fix" one side and silently break the other.
+
+    MEASURED: an earlier boundary treated `:`, `;`, `,`, `'`, `"` and `)` as
+    always-terminating, and rewrote six of twelve near-miss shapes — `<home>:2`
+    became `~:2`, naming a path that does not exist.
+    """
+    real = str(Path.home())
+    # Punctuation that occurs INSIDE real directory names terminates only when
+    # whitespace or the end follows it.
+    for text in (f"read {real}:2 failed", f"read {real};x failed", f"read {real},v failed"):
+        assert fti._redact_home(text) == text, f"a real sibling was rewritten: {text}"
+    # Quote and paren always terminate — ACCEPTED as the lossy side, because
+    # diagnostics quote paths and requiring whitespace after the quote would
+    # miss that and leak.
+    for text in (f"open '{real}': denied", f'q "{real}" x', f"see ({real})"):
+        out = fti._redact_home(text)
+        assert real not in out, f"a quoted path leaked: {out}"
+
+
+def test_the_emitter_guard_rejects_a_call_that_is_not_the_redactor():
+    """The guard admits a wrapped emitter by the wrapper's NAME. A cell that
+    only ever wraps with `_redact_home` cannot tell that from admitting any
+    call at all."""
+    assert _emitter_offenders('print(scrub(f"at {p}"))'), (
+        "only _redact_home may satisfy the guard"
+    )
+    assert _emitter_offenders('print(str(exc))'), "a bare conversion is not redaction"
+    assert not _emitter_offenders('print(_redact_home(f"at {p}"))')
+
+
+def test_the_redactor_is_idempotent():
+    """`cause` reaches `_reconcile_uncertain_create` already redacted from the
+    create path and is redacted again on the way out. That is only safe if a
+    second pass is a no-op -- a normalising helper applied twice is exactly the
+    shape that bites."""
+    home = str(Path.home())
+    once = fti._redact_home(f"open {home}/a/b.md failed")
+    assert fti._redact_home(once) == once, once
+
+
+def test_an_import_error_naming_a_module_file_is_redacted():
+    """MEASURED, and it corrects the note that exempted this site as carrying
+    only "a module name": an ImportError of the `cannot import name X from Y`
+    form renders the module's absolute __file__."""
+    home = str(Path.home())
+    text = (
+        "cannot import name 'scan_prose' from 'genesis.contribution.sanitize' "
+        f"({home}/genesis/src/genesis/contribution/sanitize.py)"
+    )
+    out = fti._redact_home(text)
+    assert home not in out, out
+    assert "~/genesis/src" in out, out
+
+
+def test_a_gh_failure_does_not_write_a_home_path_to_the_refusal():
+    """End to end through the real `_gh_json`, with the shape `gh` actually
+    produces: a config-load error naming an absolute path under the home."""
+    home = str(Path.home())
+
+    def run(argv):
+        return _proc(
+            returncode=1,
+            stderr=f"failed to load config: open {home}/.config/gh/config.yml: not a directory",
+        )
+
+    with pytest.raises(fti.Refused) as excinfo:
+        fti._gh_json(run, ["gh", "repo", "view", "--json", "nameWithOwner"])
+    msg = str(excinfo.value)
+    assert home not in msg, f"the refusal leaked the home path: {msg}"
+    assert "~/.config/gh/config.yml" in msg, f"the diagnostic was lost: {msg}"
+
+
+def test_a_failed_create_does_not_echo_the_draft_path_from_the_home():
+    """`create_issue` puts the caller-supplied --body-file into argv, and `gh`
+    echoes it back on failure. The draft routinely lives under the home."""
+    home = str(Path.home())
+    body_path = f"{home}/tmp/drafts/body.md"
+
+    def run(argv):
+        joined = " ".join(argv)
+        if "issue create" in joined:
+            return _proc(returncode=1, stderr=f"could not read {body_path}")
+        # The duplicate check reads NDJSON, one object per line -- an empty
+        # listing is no lines at all, not "[]".
+        return _proc(stdout="")
+
+    with pytest.raises((fti.Refused, fti.Indeterminate)) as excinfo:
+        fti.create_issue("Org/Repo", "a title", body_path, ["area:other"], run)
+    msg = str(excinfo.value)
+    assert home not in msg, f"the refusal leaked the draft path: {msg}"
+
+
 # --- the sentinel contract, which nothing bound ------------------------------
 #
 # _INFRASTRUCTURE_DETAILS is a cross-MODULE string contract: the sentinels are

@@ -8,6 +8,7 @@ hook in that worktree. Fixed by resolving the main worktree via
 `git rev-parse --git-common-dir` (no pipe). These tests lock that in.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -90,13 +91,15 @@ def _make_main_and_worktree(tmp_path):
     return main, wt
 
 
-def _invoke(root, *, dev_local=False):
+def _invoke(root, *, dev_local=False, cwd=None, extra_env=None):
     env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOOK_DEV_LOCAL"}
     if dev_local:
         env["GENESIS_HOOK_DEV_LOCAL"] = "1"
+    env.update(extra_env or {})
     return subprocess.run(
         [str(root / ".claude" / "hooks" / "genesis-hook"), "probe.py"],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+        cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -161,6 +164,144 @@ def test_ambient_git_dir_env_ignored_for_hook_discovery(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "MAIN", f"ambient GIT_DIR leaked into discovery: {proc.stdout!r}"
+
+
+def test_ambient_git_env_is_scrubbed_for_the_LAUNCHED_HOOK_too(tmp_path):
+    """The mirror of the discovery test above, one layer down — and the layer that
+    was missing until 2026-09-17.
+
+    Scrubbing for the launcher's own ``git rev-parse`` protects WHICH script runs.
+    It says nothing about what that script's OWN git queries see: until the
+    ``exec`` line scrubbed as well, a launched hook inherited the ambient
+    ``GIT_DIR``/``GIT_WORK_TREE`` and resolved a foreign repository despite being
+    handed an explicit cwd. All four shared decision inputs the enforcement hooks
+    read were MEASURED to fail OPEN that way (see
+    ``tests/test_hooks/test_git_env_scrub.py``).
+
+    Asserted on the CHILD's own view, not on the launcher's text: the variables
+    must be absent from the hook's environment, and its git must resolve the
+    worktree it was invoked in rather than the foreign repo the poison names.
+    """
+    _main, wt = _make_main_and_worktree(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    genv = {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=foreign, check=True, env=genv)
+
+    # The probe reports what the CHILD sees. Run through the default (main-tree)
+    # path so this exercises the same resolution a real session uses.
+    (_main / "scripts" / "probe.py").write_text(
+        "import json, os, subprocess\n"
+        "top = subprocess.run(['git', 'rev-parse', '--show-toplevel'],\n"
+        "                     capture_output=True, text=True)\n"
+        "print(json.dumps({\n"
+        "    'git_env': sorted(k for k in os.environ if k.startswith('GIT_')),\n"
+        "    'toplevel': top.stdout.strip(),\n"
+        "}))\n"
+    )
+    poison = {
+        "GIT_DIR": str(foreign / ".git"),
+        "GIT_WORK_TREE": str(foreign),
+        "GIT_INDEX_FILE": str(foreign / ".git" / "index"),
+    }
+
+    proc = _invoke(wt, cwd=wt, extra_env=poison)
+    assert proc.returncode == 0, proc.stderr
+    seen = json.loads(proc.stdout)
+
+    leaked = sorted(set(poison) & set(seen["git_env"]))
+    assert not leaked, f"ambient git env reached the launched hook: {leaked}"
+    assert Path(seen["toplevel"]).resolve() == wt.resolve(), (
+        f"the launched hook resolved a foreign repository: {seen['toplevel']!r}"
+    )
+
+    # Control: the same poison DOES redirect a child the launcher did not scrub,
+    # so a pass above is the scrub working rather than an inert fixture.
+    unscrubbed = subprocess.run(
+        [sys.executable, str(_main / "scripts" / "probe.py")],
+        cwd=str(wt), capture_output=True, text=True, env={**os.environ, **poison},
+    )
+    assert unscrubbed.returncode == 0, unscrubbed.stderr
+    assert Path(json.loads(unscrubbed.stdout)["toplevel"]).resolve() == foreign.resolve(), (
+        "the poisoned environment did not redirect an unscrubbed child — the "
+        "assertions above would pass vacuously"
+    )
+
+
+def test_the_launcher_passes_git_config_vars_THROUGH_to_the_launched_hook(tmp_path):
+    """The deliberate NON-scrub, asserted on the child rather than on the array.
+
+    The location variables above are removed; NO git config channel may be, and
+    that split is load-bearing rather than an oversight. Two measured reasons.
+
+    All four config channels are PROTECTED config, which is the only place git
+    reads ``safe.directory`` from. MEASURED 2026-09-20 with that key supplied
+    only through ``GIT_CONFIG_COUNT`` — how a container or CI supplies it —
+    scrubbing the channel makes git refuse with rc=129 and empty stdout, which
+    the review gates read as "nothing staged" over real staged work.
+
+    And the launcher scrubs for every launched hook, one of which —
+    ``git_push_guard`` — PREDICTS what a ``git push`` will do:
+    ``_push_config_is_simple`` is an allowlist over the user's effective config,
+    where a broadening value makes it return False and PROMPT. MEASURED through
+    that real function, with a control that moves: with
+    ``push.default = matching`` in ``~/.gitconfig`` it returns False (prompts)
+    when the config is visible and True — ALLOWS SILENTLY — once the config is
+    scrubbed away. A guard that predicts a command's effect has to see what that
+    command will see.
+
+    ``tests/test_hooks/test_git_env_scrub.py`` pins the same rule from the other
+    end, by asserting those names are absent from the launcher's array. This is
+    the BEHAVIOURAL half: the array could be right while the ``exec`` line
+    scrubbed them some other way, and only the child's own environment can tell
+    the difference.
+    """
+    _main, wt = _make_main_and_worktree(tmp_path)
+    (_main / "scripts" / "probe.py").write_text(
+        "import json, os\n"
+        "print(json.dumps(sorted(k for k in os.environ if k.startswith('GIT_'))))\n"
+    )
+
+    passthrough = {
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+        "GIT_CONFIG_SYSTEM": str(tmp_path / "gitconfig"),
+        # The INJECTION channels too, and for a second measured reason: a
+        # container or CI supplies `safe.directory` this way, and that key is
+        # readable only from protected config. Scrubbing it makes git refuse
+        # under a uid mismatch with empty stdout, which the gates read as
+        # "nothing staged".
+        #
+        # WELL-FORMED on purpose. `GIT_CONFIG_COUNT=1` without a matching
+        # KEY_0/VALUE_0 makes EVERY git command fail, which breaks the
+        # launcher's own discovery and fails this test for a reason that has
+        # nothing to do with passthrough — a fixture that does not build the
+        # shape it claims. (That degrades safely: discovery failing makes the
+        # launcher run its OWN scripts, the same fallback a separate-git-dir
+        # checkout takes.)
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "*",
+        "GIT_CONFIG_PARAMETERS": "'safe.directory=*'",
+    }
+    proc = _invoke(wt, cwd=wt, extra_env={**passthrough, "GIT_DIR": str(tmp_path / "decoy")})
+    assert proc.returncode == 0, proc.stderr
+    seen = set(json.loads(proc.stdout))
+
+    missing = sorted(set(passthrough) - seen)
+    assert not missing, (
+        f"the launcher stripped {missing} on the way to the hook. That re-introduces "
+        "a MEASURED fail-open: git_push_guard stops seeing the user's effective push "
+        "config and a broadening push.default becomes a silent allow."
+    )
+    # Control: the location scrub is still working in the SAME invocation, so a
+    # pass above is the asymmetry rather than a launcher that scrubs nothing.
+    assert "GIT_DIR" not in seen, (
+        "GIT_DIR survived — this test would pass vacuously against a launcher "
+        "whose scrub had stopped working altogether"
+    )
 
 
 def test_separate_git_dir_falls_back_to_own_scripts(tmp_path):
