@@ -76,12 +76,18 @@ $_WD_ROOT/usr/local/lib/genesis/tailscale-watchdog.py $_WD_ROOT/usr/local/lib/ge
 _WD_RUN_FILES="$_WD_ROOT/run/genesis-tailscale-watchdog.json $_WD_ROOT/run/genesis-tailscale-watchdog-status.json \
 $_WD_ROOT/run/genesis-network-watchdog.json $_WD_ROOT/run/genesis-network-watchdog.last"
 GENESIS_ROOT_WATCHDOG_LEFT="root watchdog still present:"
+GENESIS_ROOT_WATCHDOG_DONE="root watchdog removal done"
+# Every .service is checked with is-active too, not only the .timer units: a
+# oneshot still running (its `disable --now` failed) is just as much left
+# behind. The DONE marker distinguishes "ran to the end" from silence on the
+# incus/su path, where a transport failure prints nothing and returns 0.
 GENESIS_ROOT_WATCHDOG_REMOVE="for u in $_WD_UNITS; do sudo -n systemctl disable --now \"\$u\" 2>/dev/null || true; done; \
 sudo -n rm -f $_WD_FILES $_WD_RUN_FILES 2>/dev/null || true; \
 sudo -n systemctl daemon-reload 2>/dev/null || true; \
 left=''; for f in $_WD_FILES; do if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then left=\"\$left \$f\"; fi; done; \
-for u in $_WD_UNITS; do case \"\$u\" in *.timer) if systemctl is-active --quiet \"\$u\" 2>/dev/null; then left=\"\$left \$u\"; fi ;; esac; done; \
-if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi"
+for u in $_WD_UNITS; do if systemctl is-active --quiet \"\$u\" 2>/dev/null; then left=\"\$left \$u\"; fi; done; \
+if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi; \
+echo \"$GENESIS_ROOT_WATCHDOG_DONE\""
 # END root-watchdog-remove
 
 # report_root_watchdog_removal <output> — the removal command's verdict. It
@@ -93,7 +99,10 @@ report_root_watchdog_removal() {
         warn "Remove it as root: systemctl disable --now $_WD_UNITS; then delete the files listed above."
         return 0
     fi
-    [ -n "$out" ] && echo "$out"
+    if [[ "$out" != *"$GENESIS_ROOT_WATCHDOG_DONE"* ]]; then
+        warn "Could not verify the root network/Tailscale watchdog removal — the removal command produced no verdict (on the container path this means 'incus exec' or 'su' failed before it ran). Check as root: systemctl is-active $_WD_UNITS; ls $_WD_FILES"
+        return 0
+    fi
     ok "Removed root network and Tailscale watchdog timers"
     REMOVED+=("root watchdog timers")
 }

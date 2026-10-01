@@ -448,7 +448,7 @@ async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer)
             ),
         )
         return 0
-    if not timer or timer.get("UnitFileState") != "enabled":
+    if not timer or timer.get("UnitFileState") not in ("enabled", "enabled-runtime"):
         return 0  # turned off (the caller withdrew its alerts) or unknown
     if timer.get("ServiceActiveState") in ("activating", "active"):
         return 0  # a long run is still in progress

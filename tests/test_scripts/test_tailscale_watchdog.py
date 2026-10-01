@@ -1284,3 +1284,93 @@ def test_the_judged_daemon_is_read_before_the_status_it_vouches_for(tmp_path):
         i for i, c in enumerate(world.calls) if c[1] == "show" and "InvocationID" in c
     )
     assert first_identity < verbs.index("status")
+
+
+# ── issue #2645: rare-state edges ────────────────────────────────────────
+
+
+def test_an_unreadable_initial_identity_voids_verdicts_after_a_hidden_restart(tmp_path):
+    """The InvocationID was unreadable at scan start, tailscaled restarted
+    mid-scan, and the old code skipped the post-scan comparison entirely: an
+    "ok"/"offline" verdict about the dead daemon could resolve an open alert."""
+    world = World({"a": peer(A, age=30)})
+    world.unit["InvocationID"] = ""  # unreadable at scan start; start still is
+    real = world.run
+
+    def operator_restarts_it(argv, timeout, **kw):
+        if argv[1] == "status":  # restart lands between the two identity reads
+            world.unit["InvocationID"] = "inv-operator"
+            world.unit["ActiveEnterTimestampMonotonic"] = str(int(world.mono * 1e6))
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path)
+    c.run = operator_restarts_it
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"], s["present_complete"]) == (
+        "daemon-changed",
+        {},
+        False,
+    )
+
+
+def test_an_unreadable_initial_identity_keeps_verdicts_a_readable_start_vouches_for(tmp_path):
+    """The InvocationID stays unreadable all run, but the start time matches
+    before and after the scan: nothing restarted, so the verdicts stand. The
+    no-restart behaviour is kept: a stuck peer is reported but not healed."""
+    world = World({"a": peer(A), "b": peer(B, age=30)})
+    world.stuck(A)
+    world.unit["InvocationID"] = ""
+    tw.run_once(ctx(world, tmp_path))
+    s = state(tmp_path)
+    assert s["evidence"] == {A: "stuck", B: "ok"}
+    assert s["last_action"] == "stuck"
+    assert world.restarts() == 0
+
+
+def test_an_initial_identity_with_no_readable_start_voids_the_evidence(tmp_path):
+    world = World({"a": peer(A, age=30)})
+    world.unit["InvocationID"] = ""
+    world.unit["ActiveEnterTimestampMonotonic"] = ""  # nothing to compare
+    tw.run_once(ctx(world, tmp_path))
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"]) == ("daemon-changed", {})
+
+
+def test_a_failed_read_during_the_restart_poll_is_not_settled(tmp_path):
+    """`unit_props(...) or {}` has no Job and no transitional state, so the old
+    poll loop exited at once on a failed read and recorded `unverified`. Now it
+    keeps polling until the window ends."""
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.restart = (0, {"InvocationID": "inv-2"})
+    real = world.run
+    calls = {"n": 0}
+
+    def flaky_poll(argv, timeout, **kw):
+        if argv[1] == "show" and "Job" in argv:
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                return 1, ""  # the mid-poll read fails
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path)
+    c.run = flaky_poll
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert s["last_action"] == "healed"
+    assert calls["n"] > 3  # it polled past the failed reads
+
+
+def test_a_scan_where_every_peer_is_malformed_counts_as_blind(tmp_path):
+    """A schema change that breaks every entry reset `blind_runs` each run:
+    `waiting` did not count malformed peers, so `judged == 0` never held."""
+    world = World({"bad": {"Active": True, "LastHandshake": 5, "TailscaleIPs": [B]}})
+    c = ctx(world, tmp_path)
+    for expected in (1, 2, 3):
+        s = tick(world, c)
+        assert (s["last_action"], s["malformed_peers"], s["blind_runs"]) == (
+            "incomplete",
+            1,
+            expected,
+        )

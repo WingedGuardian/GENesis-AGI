@@ -832,6 +832,13 @@ async def collect_network(
     facts["tailscale_watchdog_unit_state"] = await _run_cmd(
         "systemctl", "show", "genesis-tailscale-watchdog.timer", "-p", "UnitFileState", "--value"
     )
+    # The service's unit-file state too: the installer respects a masked
+    # service as an operator off switch (lib/network_resilience.sh), which the
+    # timer's state alone cannot show. Usually "static" (a oneshot with no
+    # [Install]); "masked"/"masked-runtime" = deliberately off.
+    facts["tailscale_watchdog_service_unit_state"] = await _run_cmd(
+        "systemctl", "show", "genesis-tailscale-watchdog.service", "-p", "UnitFileState", "--value"
+    )
 
     # Watchdog heal telemetry is volatile (heal_count/timestamps move), so it is
     # a METRIC — never hashed. Absent file → key omitted (no drift churn).

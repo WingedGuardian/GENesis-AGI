@@ -722,10 +722,16 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # deliberate; the durable off switch is a NETWD_TS_MODE=off drop-in, which
     # leaves the timer enabled. Unknown (None) stays silent.
     ts_state = network.get("tailscale_watchdog_unit_state")
+    # A masked SERVICE is the installer's own respected off switch too (a unit
+    # masked before it was ever installed): the watchdog is deliberately off,
+    # not absent — same contract as a masked timer.
+    ts_service = network.get("tailscale_watchdog_service_unit_state")
+    service_masked = isinstance(ts_service, str) and ts_service.startswith("masked")
     if (
         network.get("tailscaled_loaded") is True
         and isinstance(ts_state, str)
         and ts_state not in ("enabled", "masked", "masked-runtime")
+        and not service_masked
     ):
         missing.append("tailscale_watchdog_absent")
     # Storage plane: cc-tmp blast-radius isolation (EFFECTIVE-state fact from
