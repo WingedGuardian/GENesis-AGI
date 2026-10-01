@@ -1,0 +1,1 @@
+- **The desk endpoint refuses output budgets under 16 tokens.** `/v1/desk/chat/completions` used to accept `max_tokens` as low as 1, and at budgets that small the fast lane's thinking-suppressed model can return nothing, which the endpoint reports as a 502 the client then retries. Such a request now gets a 400 that names the minimum, and no provider call is spent on it.

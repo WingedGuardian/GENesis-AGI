@@ -43,6 +43,13 @@ from hook_output import HOOK_STDOUT_CAP, emit_cost  # noqa: E402
 _SID = "aaaabbbb-cccc-dddd-eeee-ffff00002222"
 
 
+@pytest.fixture(autouse=True)
+def _no_live_registry(monkeypatch):
+    """Keep the peer renderer off the machine's real session registry (a dev box
+    has one and CI does not); the widest-block test sets its own suffix."""
+    monkeypatch.setattr(pmh, "_peer_addresses", lambda *a, **k: {})
+
+
 # ---------------------------------------------------------------------------
 # 1. the keyword window — the root
 # ---------------------------------------------------------------------------
@@ -450,6 +457,24 @@ def test_the_safety_directive_always_has_room(tmp_path, capsys) -> None:
     assert writer.cut is None, "the peer block must never exhaust the budget"
 
 
+def _widest_address() -> str:
+    """The longest suffix peer_address.render can produce, from the real renderer.
+
+    Every part at its allowlist maximum: a 48-character name, a pane with a
+    32-character session and six-digit window and pane ids, and the shared-name
+    flag. Built by calling render rather than typed here, so a wider allowlist
+    widens this test with it.
+    """
+    from genesis.session_awareness import peer_address as pa
+
+    widest = pa.Resolution(
+        "x", "ok", name="x" * 48, pane="s" * 32 + ":@999999.%999999", shared_name=True
+    )
+    text = pa.render(widest)
+    assert "x" * 48 in text and ":@999999.%999999" in text, text  # nothing was dropped
+    return text
+
+
 def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
     """The arithmetic behind the claim above, MEASURED not derived.
 
@@ -481,13 +506,16 @@ def test_the_widest_possible_peer_block_leaves_room_for_the_directive() -> None:
         }
         collected = _Collect()
         orig_get, orig_count = hb.get_active_sync, hb.count_active_sync
+        orig_addr = pmh._peer_addresses
         hb.get_active_sync = lambda *a, _r=row, **k: [dict(_r) for _ in range(pmh._MAX_PEERS_SHOWN)]
         hb.count_active_sync = lambda *a, **k: 500
+        pmh._peer_addresses = lambda ids, *a, **k: {i: _widest_address() for i in ids}
         pmh._OUT = collected
         try:
             pmh._heartbeat_read_and_inject(Path(__file__), _SID)
         finally:
             hb.get_active_sync, hb.count_active_sync = orig_get, orig_count
+            pmh._peer_addresses = orig_addr
             pmh._OUT = None
 
         peers = [ln for ln in collected.lines if ln.startswith("[Concurrent |")]

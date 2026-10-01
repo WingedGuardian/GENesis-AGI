@@ -48,7 +48,7 @@ import uuid
 
 from flask import Blueprint, current_app, jsonify, request
 
-from genesis.dashboard.auth import check_bearer_token
+from genesis.dashboard.auth import check_bearer_token, presented_bearer_is
 
 logger = logging.getLogger("genesis.dashboard.desk_api")
 
@@ -107,6 +107,19 @@ _MAX_BODY_BYTES = 256 * 1024
 _DEFAULT_MAX_TOKENS = 400
 _MAX_MAX_TOKENS = 8192
 
+# The smallest output budget this endpoint accepts. Below it a turn can come back
+# EMPTY, which the handler must answer as a 502 — a request that cannot succeed,
+# dressed as a server failure the client will retry. MEASURED through the routed
+# path (LiteLLMDelegate, reasoning_effort=disable): the thinking-suppressed
+# gemini lane on desk_fast returned no text at max_tokens 1 and 4 and a single
+# quote character at 5, while 8 and above returned text. 16 is that floor with
+# headroom: an earlier direct-API measurement on the same model saw 12 tokens
+# spent before any text at a 16-token budget. Refused, not raised: the caller
+# asked for a size we cannot deliver, and saying so is a 400 it can act on.
+# Measured on that one model only; the desk_primary hops were not measured, so
+# the floor narrows the empty-turn case rather than ruling it out.
+_MIN_MAX_TOKENS = 16
+
 # One desktop client, occasionally two lanes at once. The bound is not about this
 # endpoint's own cost: provider rate gates serialize process-wide, and the chains
 # here are shared with dozens of Genesis call sites, so an unbounded desk client
@@ -114,6 +127,28 @@ _MAX_MAX_TOKENS = 8192
 # Flask thread on the same app that serves the dashboard and health probes.
 _MAX_CONCURRENT = 4
 _semaphore = threading.Semaphore(_MAX_CONCURRENT)
+
+
+_broad_token_noticed = threading.Event()
+
+
+def _note_broad_token_on_desk() -> None:
+    """Once per process: say so when a desk client authenticated with the BROAD token.
+
+    The broad token is still honoured here so nothing breaks on update, but a
+    transition nothing announces never ends — the client keeps holding a
+    credential that can execute tools, write memory and start Claude Code.
+    Called only after the request is authorized, so it never alters a verdict.
+    """
+    if _broad_token_noticed.is_set() or presented_bearer_is("GENESIS_DESK_TOKEN"):
+        return
+    _broad_token_noticed.set()
+    logger.warning(
+        "A desk client authenticated with GENESIS_MCP_HTTP_TOKEN, which also opens "
+        "tool execution, memory writes and the Claude Code route. Set "
+        "GENESIS_DESK_TOKEN and give the client that instead — it opens only "
+        "/v1/desk/chat/completions."
+    )
 
 
 def _err(message: str, status: int, kind: str = "invalid_request_error"):
@@ -246,8 +281,8 @@ def _sampling_from(data: dict) -> tuple[dict, str | None]:
         max_tokens = int(raw)
     except (TypeError, ValueError, OverflowError):
         return {}, "max_tokens must be an integer"
-    if max_tokens < 1:
-        return {}, "max_tokens must be at least 1"
+    if max_tokens < _MIN_MAX_TOKENS:
+        return {}, f"max_tokens must be at least {_MIN_MAX_TOKENS}"
     kwargs: dict = {"max_tokens": min(max_tokens, _MAX_MAX_TOKENS)}
 
     temperature = data.get("temperature")
@@ -339,10 +374,18 @@ def _route_and_wait(
 @desk_api_bp.route("/v1/desk/chat/completions", methods=["POST"])
 def desk_chat_completions():
     """Route one desktop-assistant turn through Genesis and answer OpenAI-shaped."""
-    denied = check_bearer_token("desk brain API")
+    # The desk-scoped token opens THIS route and nothing else (#2442), so a
+    # desktop client never has to hold the credential for tool execution,
+    # memory writes or the Claude Code route. The broad token is still honoured
+    # here during the transition, so existing clients keep working on update.
+    denied = check_bearer_token(
+        "desk brain API",
+        accept=("GENESIS_DESK_TOKEN", "GENESIS_MCP_HTTP_TOKEN"),
+    )
     if denied:
         message, status = denied
         return _err(message, status)
+    _note_broad_token_on_desk()
 
     # Two checks, and the second is the one that actually bounds memory.
     #

@@ -389,7 +389,7 @@ async def campaign_create(
         model: LLM model for session ticks (sonnet/opus/haiku).
         effort: LLM effort level (low/medium/high).
         profile: DirectSession profile — any registered profile, e.g.
-            observe/research/interact/campaign/steward/automaton-brain.
+            observe/research/interact/campaign/automaton-brain.
         pre_checks: List of pre-check names to run before each tick.
         max_daily_cost_usd: Budget cap per day.
         initial_state: Initial campaign state dict.

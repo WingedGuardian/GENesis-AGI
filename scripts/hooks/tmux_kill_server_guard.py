@@ -32,7 +32,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import read_payload, tool_input  # noqa: E402
-from shell_parse import analyze, untokenizable  # noqa: E402
+from shell_parse import (  # noqa: E402
+    analyze,
+    mentions,
+    rewrites_before_running,
+    untokenizable,
+)
 
 _ADVICE = (
     "ADVISORY: this runs `tmux kill-server` with no explicit socket binding "
@@ -101,6 +106,16 @@ def _command_word_and_binding(argv: list[str]) -> tuple[str | None, bool]:
 def _advisory(command: str) -> str | None:
     if untokenizable(command):
         return None
+    # A line continuation splits the command where the shell joins it, and an escape
+    # the shell decodes builds text the parse cannot read (both are
+    # `rewrites_before_running`), so the verb can be missing from the segments and
+    # the advice never fires. The binding
+    # (-S/-L) cannot be read from a command the parser splits wrongly either, so a
+    # continued command whose assembled text names the operation gets the advice as
+    # it stands — advisory-only, so the worst case is one unneeded note — rather than
+    # a re-parse of the join.
+    if rewrites_before_running(command) and mentions(command, "tmux", "kill-server"):
+        return _ADVICE
     for seg in analyze(command):
         if seg.exe != "tmux":
             continue

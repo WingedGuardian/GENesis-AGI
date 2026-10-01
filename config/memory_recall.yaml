@@ -53,6 +53,11 @@ proactive:
   # Master on/off for the endpoint's engine (the hook falls back to FTS5-only
   # when off or unreachable). enabled: false = kill switch.
   enabled: true
+  # on | off — per-recall retrieval trace (one `recall_trace` eval_events row
+  # per proactive recall: which retriever found each candidate, fused/rerank/
+  # final scores, injected-vs-dropped). Written off the request path, kept 14
+  # days. Read live; off stops new rows.
+  trace: on
   profiles:
     cc_hook:
       # on | off — Voyage rerank on the per-prompt hook path (user decision

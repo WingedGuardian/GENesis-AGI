@@ -204,6 +204,11 @@ class TestReactiveDomainGate:
     def test_providers_all_exhausted_is_filtered(self):
         assert ego._is_non_actionable_infra_event("providers", "all_exhausted") is True
 
+    def test_providers_cc_invocation_failed_is_filtered(self):
+        # A CC failure event must not wake a reactive ego cycle that itself
+        # needs CC — during an outage that is a self-retriggering loop.
+        assert ego._is_non_actionable_infra_event("providers", "cc.invocation_failed") is True
+
     def test_other_routing_event_stays_actionable(self):
         # A different routing ERROR (e.g. a future degradation alert) is not gated.
         assert ego._is_non_actionable_infra_event("routing", "budget.exceeded") is False

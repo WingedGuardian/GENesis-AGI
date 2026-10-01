@@ -4,7 +4,10 @@
 # Run by the genesis-disk-hygiene.timer systemd unit (also runnable by hand).
 # Best-effort steps — one failing must not skip the others:
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
-#      (trash-bin with 7-day recovery; frees space when trash purges)
+#      (archives into ~/.genesis/worktree-trash; first releases session-claim
+#      locks whose process is gone — GENESIS_WORKTREE_STALE_CLAIM_RELEASE=0
+#      disables that. Archive retention (--expire-trash) is deliberately NOT
+#      run here: it stays off until it has a content-verified predicate, #2504)
 #   2. Reclaim regenerable caches          → scripts/disk_reclaim.py
 #      (cheap tier always; medium/reindex tier only when disk >= 90%)
 #   3. Reap orphaned background-CC sandboxes (~/tmp/bg-cc-sessions, 24h)
@@ -68,18 +71,172 @@ if [ ! -x "$VENV_PY" ]; then
     VENV_PY="$(command -v python3 || true)"
 fi
 
-# prune_tmp DIR — delete direct children of DIR older than 7d, EXCLUDING
+# shellcheck source=scripts/lib/tmp_liveness.sh
+. "$SCRIPT_DIR/lib/tmp_liveness.sh"
+
+# prune_tmp DIR [AGE_MIN] — delete direct children of DIR not modified for more
+# than AGE_MIN minutes (default: the historical `-mtime +7`), EXCLUDING
 # bg-cc-sessions (reaped at 24h below). Direct-children-only so a fresh file
 # deep inside a kept dir can't be orphaned; whole one-off job dirs go atomically.
 # CLAUDE.md: large one-off jobs legitimately live in ~/tmp, so be conservative —
 # a >7d entry is safely dead (backup.sh's mktemp files self-clean well before).
+#
+# A child some process still holds OPEN is spared whatever its age. Age alone
+# cannot see a download or unpack that started days ago and is still running,
+# and the pressure mode below prunes at 2 days, where that stops being
+# hypothetical. The liveness signal and its limits (same-uid only, and a writer
+# that closes between files is invisible) are documented in tmp_liveness.sh.
 prune_tmp() {
-    local tmp_dir="${1:-$HOME/tmp}"
+    local tmp_dir="${1:-$HOME/tmp}" age_min="${2:-}"
     [ -d "$tmp_dir" ] || return 0
-    find "$tmp_dir" -mindepth 1 -maxdepth 1 \
-        ! -name bg-cc-sessions \
-        -mtime +7 \
-        -exec rm -rf {} + 2>/dev/null || echo "tmp prune exited $?"
+    # CANONICAL: /proc reports resolved paths (see sweep_cc_tmp).
+    tmp_dir="$(cd -P -- "$tmp_dir" 2>/dev/null && pwd -P)" || return 0
+    local -a age_pred=(-mtime +7) recent_pred=(-mtime -8)
+    if [[ "$age_min" =~ ^[0-9]+$ ]]; then
+        age_pred=(-mmin "+$age_min")
+        recent_pred=(-mmin "-$age_min")
+    fi
+    local snap child mounts
+    if ! liveness_visible; then
+        echo "tmp prune SKIPPED: no other process is visible in /proc, so nothing can be proven unused"
+        return 0
+    fi
+    if ! mounts="$(mount_targets "$tmp_dir")"; then
+        echo "tmp prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
+    snap="$(live_open_paths)"
+    while IFS= read -r -d '' child; do
+        # A child that is, or holds, a mount (a separately mounted or
+        # bind-mounted ~/tmp/downloads) frees nothing here; never recurse into
+        # it (#2521 item 6). The table lists every mount, same device or not.
+        if tree_holds_mount "$child" "$mounts" 1; then
+            echo "tmp prune: sparing $child (a separate filesystem)"
+            continue
+        fi
+        if [ -d "$child" ] && dir_has_live_writer "$child" "$snap"; then
+            echo "tmp prune: sparing $child (held open by a live process)"
+            continue
+        fi
+        if [ ! -d "$child" ] && path_is_held "$child" "$snap"; then
+            echo "tmp prune: sparing $child (held open by a live process)"
+            continue
+        fi
+        # A directory's OWN mtime moves only when direct children are added or
+        # removed, so a tree written deep inside (a session scratchpad under
+        # ~/tmp/claude-<uid>/) looks old while it is in daily use. Judge it by
+        # the newest thing anywhere inside it.
+        if [ -d "$child" ] && [ -n "$(find "$child" -mindepth 1 "${recent_pred[@]}" -print -quit 2>/dev/null)" ]; then
+            echo "tmp prune: sparing $child (modified inside the window)"
+            continue
+        fi
+        # The ONLY way a tree is removed: remove_tree_one_fs re-checks the
+        # table this pass read at its start (not a fresh read).
+        remove_tree_one_fs "$child" "$mounts" 1 || echo "tmp prune failed or spared $child"
+    done < <(find "$tmp_dir" -mindepth 1 -maxdepth 1 \
+                ! -name bg-cc-sessions "${age_pred[@]}" -print0 2>/dev/null)
+}
+
+# reap_bg_sandboxes DIR — remove per-session background-CC sandboxes (DIR/<id>)
+# untouched for 24 h. 24 h is well past any live session (the Genesis-controlled
+# max timeout is 2 h), but a surviving child of an ended session can still run
+# in or hold one, so each is spared when a live process holds it or uses it as
+# its cwd — and the whole reap is refused when liveness is blind, like every
+# other deleter here (review finding).
+reap_bg_sandboxes() {
+    local dir="$1" snap d mounts
+    [ -d "$dir" ] || return 0
+    dir="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
+    if ! liveness_visible; then
+        echo "bg-cc sandbox reap SKIPPED: no other process is visible in /proc"
+        return 0
+    fi
+    if ! mounts="$(mount_targets "$dir")"; then
+        echo "bg-cc sandbox reap SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
+    snap="$(live_open_paths)"
+    while IFS= read -r -d '' d; do
+        if tree_holds_mount "$d" "$mounts" 1; then
+            echo "bg-cc sandbox reap: sparing $d (a separate filesystem)"
+            continue
+        fi
+        if dir_has_live_writer "$d" "$snap"; then
+            echo "bg-cc sandbox reap: sparing $d (held open or in use by a live process)"
+            continue
+        fi
+        remove_tree_one_fs "$d" "$mounts" 1 || echo "bg-cc sandbox reap failed or spared $d"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -print0 2>/dev/null)
+}
+
+# reclaim_lock / reclaim_unlock — serialize the steps that DELETE (cache
+# reclamation, sandbox reaping, the ~/tmp prune) across the daily groom and
+# both pressure instances. systemd serializes starts of ONE unit only, so
+# pressure@standard, pressure@last-resort and the daily unit could otherwise
+# traverse and delete the same trees at once (review finding).
+#
+# reclaim_lock WAIT_S waits at most WAIT_S seconds: 0 = held (or the lock file
+# cannot even be opened because the disk is full — then reclaim runs
+# unserialized, since freeing space beats ordering); 1 = another reclaim still
+# holds it. Every wait is bounded so it fits inside the caller's systemd
+# timeout; each caller decides what a timeout means (pressure_main, main).
+RECLAIM_LOCK="${RECLAIM_LOCK:-$HOME/.genesis/disk_hygiene_reclaim.lock}"
+reclaim_lock() {
+    local wait_s="${1:-60}"
+    if ! { exec 8>"$RECLAIM_LOCK"; } 2>/dev/null; then
+        echo "reclaim lock unavailable ($RECLAIM_LOCK) — running unserialized"
+        return 0
+    fi
+    flock -w "$wait_s" 8 && return 0
+    return 1
+}
+reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
+
+# pressure_main [--last-resort] — the reclaim subset the tmp watchgod runs when
+# the disk itself is in trouble (its ORANGE tier; RED adds --last-resort). Only
+# the steps that FREE space, and each one more aggressive than the daily run:
+# caches regardless of the usage gate, ~/tmp at 2 days instead of 7, and at RED
+# the code-intel indexes too. Deliberately NOT the worktree reaper (it moves
+# worktrees to a trash bin, which frees nothing until the purge) nor any of the
+# database retention prunes (they free megabytes and take the DB lock).
+#
+# Started as a systemd template unit (genesis-disk-hygiene-pressure@<tier>)
+# so it runs under the same sandbox as the daily groom; reclaim_lock keeps it
+# from overlapping the other instance or the daily run. The watchgod never
+# deletes anything itself.
+pressure_main() {
+    local last_resort="${1:-}"
+    # The standard (ORANGE) pass pins --last-resort-above past 100 %. That is
+    # disk_reclaim.py's own default now (#2567), but it stays explicit: an
+    # ORANGE pass that inherited the old 95 % default deleted the code-intel
+    # indexes before RED ever fired (review finding, #2521 item 1). Only the
+    # last-resort (RED) pass clears them.
+    local -a reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 101)
+    # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
+    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+        reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 0)
+    fi
+    echo "=== genesis-disk-hygiene PRESSURE ${last_resort:-} $(date -u +%FT%TZ) ==="
+    # Standard waits up to one watchgod re-trigger interval and then yields —
+    # the reclaim already running is doing this work. Last-resort (RED) waits
+    # briefly and then runs regardless: at RED, freeing space beats ordering.
+    if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
+        reclaim_lock "${RECLAIM_WAIT_S:-120}" \
+            || echo "reclaim lock still held after ${RECLAIM_WAIT_S:-120}s — last-resort runs unserialized"
+    elif ! reclaim_lock "${RECLAIM_WAIT_S:-600}"; then
+        echo "another reclaim is still running after ${RECLAIM_WAIT_S:-600}s — skipping this standard pass"
+        echo "=== genesis-disk-hygiene PRESSURE done ==="
+        return 0
+    fi
+    echo "--- cache reclamation (usage gate off) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" "${reclaim[@]}" \
+        || echo "disk_reclaim exited $?"
+    echo "--- background CC sandbox reaping ---"
+    reap_bg_sandboxes "$HOME/tmp/bg-cc-sessions"
+    echo "--- ~/tmp age prune (>2d, live writers spared) ---"
+    prune_tmp "$HOME/tmp" 2880
+    reclaim_unlock
+    echo "=== genesis-disk-hygiene PRESSURE done ==="
 }
 
 # prune_mcp_spawn DIR — remove ~/.genesis/mcp-spawn/<slot> files whose recorded
@@ -135,6 +292,13 @@ main() {
         exit 1
     fi
 
+    case "${1:-}" in
+        --pressure) pressure_main "${2:-}"; return 0 ;;
+        "") ;;
+        *) echo "disk_hygiene: unknown argument '$1' (usage: disk_hygiene.sh [--pressure [--last-resort]])" >&2
+           return 2 ;;
+    esac
+
     echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
 
     # BEFORE the reaper, deliberately. This is the wall-clock floor for the
@@ -150,12 +314,32 @@ main() {
     "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
         || echo "zero_drop_worker exited $?"
 
+    # Stale claims BEFORE the reaper, so a worktree whose claiming session died
+    # is judged on its merits tonight rather than pinned for another day. The
+    # claim module decides staleness; a lock it did not write is never touched.
+    echo "--- stale worktree-claim release ---"
+    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
+        || echo "worktree_lifecycle --release-stale-claims exited $?"
+
     echo "--- worktree reaping ---"
     "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
 
+    # The deleting steps take the shared reclaim lock. A pressure run holding
+    # it is already reclaiming, so after a bounded wait (inside this unit's
+    # 1200s timeout) the daily pass skips them rather than time out and lose
+    # every retention prune below.
+    local reclaim_locked=1
+    if ! reclaim_lock "${RECLAIM_WAIT_S:-180}"; then
+        reclaim_locked=0
+        echo "--- reclaim steps SKIPPED: a pressure reclaim still holds the lock ---"
+    fi
+    if [ "$reclaim_locked" -eq 1 ]; then
     echo "--- cache reclamation ---"
+    # --last-resort-above 101: the code-intel indexes are cleared only by the
+    # guardian's RED (last-resort) pass, never by the daily groom on a disk
+    # that happens to be at 95 % (review finding on #2521 item 1).
     "$VENV_PY" "$REPO_DIR/scripts/disk_reclaim.py" --apply --if-above 90 \
-        --fail-above 95 || disk_reclaim_rc=$?
+        --fail-above 95 --last-resort-above 101 || disk_reclaim_rc=$?
     if [ "$disk_reclaim_rc" -ne 0 ]; then
         echo "disk_reclaim exited $disk_reclaim_rc"
     fi
@@ -166,14 +350,12 @@ main() {
     # 24h is well past any live session: the Genesis-controlled max timeout is
     # 7200s/2h (CCInvocation.timeout_s); DirectSessionRequest defaults to 3600s/1h.
     echo "--- background CC sandbox reaping ---"
-    BG_CC_SANDBOX_DIR="$HOME/tmp/bg-cc-sessions"
-    if [ -d "$BG_CC_SANDBOX_DIR" ]; then
-        find "$BG_CC_SANDBOX_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +1440 \
-            -exec rm -rf {} + 2>/dev/null || echo "bg-cc-sandbox reap exited $?"
-    fi
+    reap_bg_sandboxes "$HOME/tmp/bg-cc-sessions"
 
     echo "--- ~/tmp age prune (>7d) ---"
     prune_tmp "$HOME/tmp"
+    reclaim_unlock
+    fi
 
     echo "--- mcp-spawn identity prune (dead-pid slots) ---"
     prune_mcp_spawn "$HOME/.genesis/mcp-spawn"
@@ -238,16 +420,25 @@ main() {
     # instead of the margin that made it unnecessary — a directory is pruned
     # only when it contains NO file modified inside the window. Costs one extra
     # stat pass over ~160 candidate dirs, once a day.
-    if [ -d "$HOME/.genesis/sessions" ]; then
-        find "$HOME/.genesis/sessions" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null |
-            while IFS= read -r _sess_dir; do
-                # -print -quit: stop at the FIRST recent file; no need to walk
-                # the rest of the directory to know it must be kept.
-                if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
-                    continue
-                fi
-                rm -rf "$_sess_dir" || echo "sessions prune failed for $_sess_dir"
-            done
+    # Same guarded removal as every other recursive deleter: a session
+    # directory that is, or holds, a mount is spared (review finding on #2570
+    # -- --one-file-system alone misses a same-device bind mount). CANONICAL
+    # root, like prune_tmp: the mount table holds resolved paths, so a
+    # symlinked ancestor would hide a mount below a session directory.
+    if ! _sess_root="$(cd -P -- "$HOME/.genesis/sessions" 2>/dev/null && pwd -P)"; then
+        :
+    elif ! _sess_mounts="$(mount_targets "$_sess_root")"; then
+        echo "sessions prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+    else
+        while IFS= read -r -d '' _sess_dir; do
+            # -print -quit: stop at the FIRST recent file; no need to walk
+            # the rest of the directory to know it must be kept.
+            if [ -n "$(find "$_sess_dir" -type f -mtime -60 -print -quit 2>/dev/null)" ]; then
+                continue
+            fi
+            remove_tree_one_fs "$_sess_dir" "$_sess_mounts" 1 \
+                || echo "sessions prune failed or spared $_sess_dir"
+        done < <(find "$_sess_root" -mindepth 1 -maxdepth 1 -type d -mtime +60 -print0 2>/dev/null)
     fi
     echo "--- entity merge-journal reversibility retention prune (>180d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_entity_merge_journal.py" --days 180 \
@@ -272,6 +463,23 @@ main() {
             \( -name 'memory_reconcile_ghost_export-*.jsonl' -o -name 'd0008_ghost_export.jsonl' \) \
             -mtime +45 -delete 2>/dev/null \
             || echo "reconcile ghost-export prune exited $?"
+    fi
+
+    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
+    # update.sh saves local edits to the tracked ephemeral files it discards before
+    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
+    # run. Written once and never touched again, so a directory's mtime is its age.
+    # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
+    # which spares a tree that is or holds a mount), over the CANONICAL root.
+    if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then
+        :
+    elif ! _pmb_mounts="$(mount_targets "$_pmb_root")"; then
+        echo "premerge-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+    else
+        while IFS= read -r -d '' _pmb_dir; do
+            remove_tree_one_fs "$_pmb_dir" "$_pmb_mounts" 1 \
+                || echo "premerge-backups prune failed or spared $_pmb_dir"
+        done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
     fi
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"

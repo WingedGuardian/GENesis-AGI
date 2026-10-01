@@ -161,6 +161,42 @@ def _push_remote(cmd: str) -> str | None:
     return None
 
 
+def _repo_redirected(cmd: str) -> bool:
+    """Whether ANY push in the command publishes from a repository this hook
+    cannot locate — one selected by ``--git-dir`` / ``--work-tree`` or a
+    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` assignment.
+
+    ``_effective_cwd`` below models ``cd`` and ``git -C`` only, so on such a push
+    this hook would diff the checkout the command ran IN while git published the
+    one it was pointed AT, and report clean for commits it never read.
+
+    Pushes are found with the shared, wrapper-aware parser — the same resolution
+    the push guard gates on — so ``env GIT_DIR=… git push``, ``sudo git
+    --git-dir=… push`` and ``/usr/bin/git --git-dir=… push`` are all seen, and
+    every push segment is checked rather than the first. The redirect rules
+    themselves live in ``git_repo_selection``, shared with the push guard.
+
+    Imported here rather than at module top: this hook is an advisory whose
+    contract is "any error → silent exit 0", and ``main`` enforces that with one
+    broad handler around this call.
+    """
+    from git_repo_selection import seg_redirects_repo, seg_sets_repo_env, unreadable_mention
+    from shell_parse import analyze_checked, git_subcommand, split_segments
+
+    persistent = False
+    for raw in split_segments(cmd):
+        if unreadable_mention(raw):
+            return True  # the parser could not read it; say so rather than guess
+        segs, _ = analyze_checked(raw)
+        for seg in segs:
+            is_push = seg.exe == "git" and git_subcommand(seg.argv) == "push"
+            if is_push and (persistent or seg_redirects_repo(seg)):
+                return True
+            if seg_sets_repo_env(seg):
+                persistent = True
+    return False
+
+
 def _effective_cwd(cmd: str, payload_cwd: str | None) -> str | None:
     """The directory the ``git push`` actually runs in.
 
@@ -268,6 +304,33 @@ def main() -> None:
         payload = read_payload()
         cmd = field(payload, "command")
         if not cmd:
+            return
+        # Checked BEFORE `_push_remote`, whose own parser recognises only a
+        # literal `git` command word: a push behind a wrapper (`env`, `sudo`, a
+        # path to git) would otherwise return early with neither a scan nor this
+        # notice. `_repo_redirected` finds pushes with the shared parser.
+        if _repo_redirected(cmd):
+            # Say so rather than scan the wrong repository. An advisory cannot
+            # fail closed by blocking, so the honest failure is a loud one: the
+            # session is told the scan did not run, instead of being handed a
+            # clean result for commits it never looked at.
+            json.dump(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": (
+                            "[Pre-push privacy review] ⚠️ NOT SCANNED. This push is "
+                            "pointed at a repository by --git-dir / --work-tree or "
+                            "a GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR assignment, "
+                            "so this hook cannot tell which repository's commits it "
+                            "publishes. Check that repository's outgoing diff for "
+                            "private data yourself, or push from inside it (cd, or "
+                            "git -C) so the scan can run."
+                        ),
+                    }
+                },
+                sys.stdout,
+            )
             return
         remote = _push_remote(cmd)
         if remote is None:

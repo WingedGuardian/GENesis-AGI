@@ -643,3 +643,719 @@ class TestKillRuleFileScope:
         )
         assert result.returncode == 2
         assert "no-unguarded-kill" in result.stderr
+
+
+class TestBashSurface:
+    """Bash command text is linted too — but ONLY by rules that opt in.
+
+    Origin (2026-09-06): a session wrote a script that POSTed straight to a
+    provider endpoint and it never passed through Write/Edit at all — it arrived
+    as a heredoc and a ``python3 -c``. A linter wired only to the file-writing
+    tools cannot see that shape, so the rule it violated was unenforceable in
+    the exact form the violation took.
+
+    The opt-in (``check_bash: true``) is the other half: a rule's patterns are
+    written against source, and applying all of them to shell text would trade a
+    known hole for an unmeasured false-positive surface. These tests pin BOTH
+    directions — the opted-in rule fires, a non-opted one stays out.
+    """
+
+    # Split so this file does not itself contain a matching literal — the rule
+    # excludes tests/, but a fixture that cannot be grepped for is also a
+    # fixture that cannot be accidentally copied into production.
+    _ENDPOINT = "https://openrouter.ai/api/v1/" + "chat/completions"
+    _KILLPG = "os.killpg(0, 9)"  # matched by no-unguarded-kill, which does NOT opt in
+
+    def test_heredoc_writing_a_provider_call_is_blocked(self):
+        """The origin incident's actual shape: content reaching disk via Bash."""
+        cmd = f"cat > /tmp/probe.py <<'EOF'\nimport urllib.request\nurllib.request.urlopen('{self._ENDPOINT}')\nEOF\npython3 /tmp/probe.py"
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 2
+        assert "no-raw-provider-calls" in result.stderr
+
+    def test_inline_python_provider_call_is_blocked(self):
+        cmd = f"python3 -c \"import urllib.request; urllib.request.urlopen('{self._ENDPOINT}')\""
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 2
+
+    def test_curl_provider_call_is_blocked(self):
+        result = _run_linter(
+            {"tool_name": "Bash", "tool_input": {"command": f"curl -X POST {self._ENDPOINT}"}}
+        )
+        assert result.returncode == 2
+
+    def test_ordinary_command_is_untouched(self):
+        result = _run_linter(
+            {"tool_name": "Bash", "tool_input": {"command": "git status && pytest tests/ -q"}}
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_provider_name_without_an_endpoint_does_not_fire(self):
+        """Talking about a provider is not calling one — the rule matches the
+        API path, never the credential or the vendor name (60 files under src/
+        read API_KEY_*; matching on that would be a false-positive disaster).
+        """
+        result = _run_linter(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "grep -rn openrouter config/model_routing.yaml"},
+            }
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_escape_hatch_works_on_a_command(self):
+        cmd = f"curl {self._ENDPOINT}  # behavioral-lint: ignore no-raw-provider-calls"
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 0, result.stderr
+
+    def test_non_opted_in_rule_does_not_reach_bash(self):
+        """THE boundary test. no-unguarded-kill is severity=block and matches
+        this text on the Write path, but it never declared check_bash — so a
+        command carrying it must pass. If this starts failing, every rule has
+        silently leaked onto Bash and the opt-in is decorative.
+        """
+        cmd = f"python3 -c 'import os; {self._KILLPG}'"
+        result = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert result.returncode == 0, result.stderr
+
+    def test_same_text_on_the_write_path_still_blocks(self):
+        """The control for the test above: the rule is live, just not on Bash."""
+        result = _run_linter({"content": self._KILLPG, "file_path": "scripts/thing.py"})
+        assert result.returncode == 2
+        assert "no-unguarded-kill" in result.stderr
+
+    def test_write_path_is_unchanged_by_the_bash_addition(self):
+        """Content still wins when both are somehow present, and excludes still
+        apply on the Write path (a Bash payload has no file_path, so it cannot).
+        """
+        blocked = _run_linter({"content": self._ENDPOINT, "file_path": "scripts/probe.py"})
+        assert blocked.returncode == 2
+        allowed = _run_linter(
+            {"content": self._ENDPOINT, "file_path": "src/genesis/routing/config.py"}
+        )
+        assert allowed.returncode == 0, allowed.stderr
+
+
+class TestBashAuditFindings:
+    """Regressions from an adversarial audit of the Bash widening (2026-09-06)."""
+
+    _ENDPOINT = "https://api.x.ai/v1/" + "chat/completions"
+
+    def test_escape_hatch_must_be_a_trailing_comment(self):
+        """A substring test over a whole COMMAND is a bypass, not a hatch.
+
+        On the Write path `content` is one file's body, so a substring is right.
+        On Bash it is a whole compound command, so any mention anywhere disarmed
+        the rule for everything else on the line — and the natural way to trip it
+        is to DOCUMENT the hatch, which is a plausible accident rather than an
+        attack. MEASURED: the two commands below exited 0 against a block rule.
+        """
+        for cmd in (
+            f"git commit -m 'doc the behavioral-lint: ignore no-raw-provider-calls hatch' && curl -X POST {self._ENDPOINT}",
+            f"rg 'behavioral-lint: ignore no-raw-provider-calls' && curl {self._ENDPOINT}",
+        ):
+            assert (
+                _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}}).returncode == 2
+            )
+
+    def test_trailing_comment_hatch_still_works(self):
+        """The control: the advertised form must keep working."""
+        cmd = f"curl {self._ENDPOINT}  # behavioral-lint: ignore no-raw-provider-calls"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 0, r.stderr
+
+    def test_searching_for_an_endpoint_is_not_calling_one(self):
+        """A regex cannot tell `rg '<endpoint>'` from `curl '<endpoint>'`.
+
+        Blocking the search lands hardest on the audit and review sessions that
+        most need to grep for provider usage — so a single read-only invocation
+        with nothing chained onto it is exempt.
+        """
+        for cmd in (
+            "rg -n 'generativelanguage.googleapis.com/v1/models/x:generateContent' src/",
+            f"grep -rn '{self._ENDPOINT}' config/",
+            f"git log -S'{self._ENDPOINT}' --oneline",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, f"{cmd!r} -> {r.stderr}"
+
+    def test_a_search_cannot_smuggle_a_call(self):
+        """THE boundary: the exemption is for a search, not for anything starting
+        with a search verb. Chaining must forfeit it.
+        """
+        cmd = f"rg -n endpoint src/ && curl -X POST {self._ENDPOINT}"
+        assert _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}}).returncode == 2
+
+    def test_bare_host_no_longer_blocks_a_grep(self):
+        """Gemini and NVIDIA were host-only patterns; every other one requires an
+        API path. A host alone cannot distinguish a call from a mention.
+        """
+        for cmd in (
+            "grep -rn integrate.api.nvidia.com config/",
+            "rg -n generativelanguage.googleapis.com docs/",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, f"{cmd!r} -> {r.stderr}"
+
+    def test_a_redirect_forfeits_the_search_exemption(self):
+        """`cat`/`grep` become WRITES the moment a redirect or heredoc appears.
+
+        This is the acceptance bar for the exemption itself: an earlier revision
+        listed `cat` as read-only, and `cat > probe.py <<'EOF' … EOF` — the origin
+        incident's literal shape — went green. A filter that improves the fire
+        rate by blinding the rule to the case it exists for has made it worse.
+        """
+        endpoint = "https://api.x.ai/v1/" + "chat/completions"
+        cmd = f"cat > /tmp/p.py <<'EOF'\nimport urllib.request\nurllib.request.urlopen('{endpoint}')\nEOF"
+        assert _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}}).returncode == 2
+
+    def test_those_two_providers_still_block_a_real_call(self):
+        """The control for the test above — narrowing must not blind the rule."""
+        for cmd in (
+            "curl -X POST https://integrate.api.nvidia.com/v1/chat/completions -d @p.json",
+            "curl -X POST 'https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent'",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_openai_responses_endpoint_is_blocked(self):
+        """External finding: the OpenAI rule matched (chat/)?completions but not
+        the official POST /v1/responses endpoint."""
+        for cmd in (
+            "curl -X POST https://api.openai.com/v1/responses -d @in.json",
+            "curl -X POST https://api.openai.com/v1/chat/completions -d @in.json",
+            "curl -X POST https://api.openai.com/v1/completions -d @in.json",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_find_exec_is_not_a_search(self):
+        """External finding: `find` carries no chain token yet executes an
+        arbitrary command — it was never a read-only verb."""
+        cmd = f"find . -exec curl -X POST {self._ENDPOINT} {{}} +"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_newline_is_a_command_separator(self):
+        """A line feed separates commands just like `;` — a search on one line
+        must not exempt the call on the next."""
+        cmd = f"rg needle src/\ncurl -X POST {self._ENDPOINT}"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_background_operator_is_not_a_search(self):
+        """Devin SEC finding, #1826: `&` backgrounds the search while a second
+        command runs — `grep x & curl <endpoint>` is not one invocation."""
+        cmd = f"grep needle src/ & curl -X POST {self._ENDPOINT}"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_rg_exec_flags_are_not_a_search(self):
+        """Devin SEC finding, #1826: `rg --pre`/`--hostname-bin` run a program —
+        a search verb carrying an executor flag is `find -exec` in disguise."""
+        for cmd in (
+            f'rg --pre "curl -X POST {self._ENDPOINT}" needle src/',
+            f'rg --hostname-bin="curl -X POST {self._ENDPOINT}" needle src/',
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_git_search_subcommands_are_not_exempt_from_executor_flags(self):
+        """CodeRabbit Major, #1826: `_EXEC_FLAGS` was tested only inside the
+        `_READ_ONLY_VERBS` branch, so the `git` branch returned True for any
+        `git log|grep|show|diff|blame` regardless of its flags.
+
+        `git grep --open-files-in-pager=<cmd>` runs <cmd> on every matched
+        file, which is the same class as `find -exec` and `rg --pre`. The
+        short form is the half a long-option table misses: `-O` attaches its
+        value with no `=`, so an `a == f or a.startswith(f + "=")` test cannot
+        match it however many spellings the table lists.
+        """
+        for cmd in (
+            f'git grep --open-files-in-pager="curl -X POST {self._ENDPOINT}" needle',
+            f'git grep -O"curl -X POST {self._ENDPOINT}" needle',
+            # ABBREVIATION: git accepts any unambiguous prefix, so a literal
+            # flag table can only ever list one spelling. MEASURED: --op=,
+            # --ope=, --open= and --open-files= all RUN the program; --o= is
+            # refused as ambiguous with --or, so --op is the floor.
+            f'git grep --op="curl -X POST {self._ENDPOINT}" needle',
+            f'git grep --open-files="curl -X POST {self._ENDPOINT}" needle',
+            # BUNDLING: -O may end any short cluster, and -n is the flag a
+            # real grep would already carry.
+            f'git grep -nO"curl -X POST {self._ENDPOINT}" needle',
+            # ...and the cluster is not only LETTERS. git grep's context
+            # options are DIGITS, and the first version of this pattern wrote
+            # [A-Za-z]* having measured only -nO and -inO. MEASURED by marker
+            # file in a scratch repo: -2O<script> and -i2O<script> both
+            # EXECUTE, and neither matched. Found by a reviewer, one round
+            # after the commit that claimed to close bundling.
+            f'git grep -2O"curl -X POST {self._ENDPOINT}" needle',
+            f'git grep -i2O"curl -X POST {self._ENDPOINT}" needle',
+            # QUOTED: the guard reads the command as typed, the shell hands
+            # the tool a de-quoted argv — a bare .split() leaves the quote
+            # attached and every table misses it.
+            f'git grep "--open-files-in-pager=curl -X POST {self._ENDPOINT}" needle',
+            f'rg "--pre" "curl -X POST {self._ENDPOINT}" needle',
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+    def test_ordinary_git_searches_stay_exempt(self):
+        """The control for the test above, and the reason it is not a blunt
+        `git`-is-never-read-only rule: a plain search must still be exempt, or
+        the fix has bought its coverage by disabling the exemption."""
+        for cmd in (
+            "git log --oneline -S'api.openai.com/v1/chat/completions'",
+            "git grep -n 'api.openai.com/v1/chat/completions'",
+            "git show HEAD --stat",
+            # MEASURED: `-O` is NOT one flag. On diff/show it names an
+            # ORDERFILE — `git diff -O/nonexistent HEAD~1` answers "fatal:
+            # failed to read orderfile" — and only `git grep -O<pager>`
+            # executes. A blanket `-O` test would trade the fail-open above
+            # for a fail-closed on these.
+            #
+            # These two CARRY A BLOCKED LITERAL on purpose. Without one the
+            # linter returns 0 whether or not the exemption applies, so the
+            # fixture passes with the scoping REMOVED and pins nothing —
+            # measured, and it is how the first version of this control was
+            # vacuous.
+            f"git diff -Osome-orderfile -G'{self._ENDPOINT}' HEAD~1",
+            f"git show -Osome-orderfile -S'{self._ENDPOINT}'",
+            # After a bare `--` every argument is a PATH, and a repository may
+            # legitimately hold a file whose name looks like a flag. MEASURED
+            # in a scratch repo with a tracked `-Onotes`: `git grep needle --
+            # -Onotes` searches it and executes NOTHING, while `git grep
+            # -O<script> needle` executes. Without the boundary the matcher
+            # sees the path, revokes the exemption, and hard-blocks a real
+            # search — landing on the audit sessions that most need to grep
+            # for provider usage (Devin finding, #1826).
+            f"git grep '{self._ENDPOINT}' -- -Onotes",
+            f"git grep '{self._ENDPOINT}' -- --pre-release-notes.md",
+            # `-e` and `-f` take the REST of the token as their argument, so an
+            # `O` after one is inside a pattern, not an option. MEASURED:
+            # `git grep -e2O<endpoint>` searches and executes nothing, while
+            # the widened digit class matched it and blocked the search — a
+            # false block introduced one commit earlier by widening without
+            # modelling which short options consume their remainder.
+            f"git grep -e2O{self._ENDPOINT}",
+            f"git grep -f2O{self._ENDPOINT}",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, f"{cmd!r} was wrongly blocked"
+
+    def test_input_process_substitution_is_not_a_search(self):
+        """`<(cmd)` runs an arbitrary subcommand as the search's stdin — same
+        class as `find -exec`, reached through `_CHAINS`."""
+        cmd = f"rg needle <(curl -X POST {self._ENDPOINT})"
+        r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        assert r.returncode == 2
+
+    def test_explicit_port_and_embeddings_endpoints_are_blocked(self):
+        """A provider call is still a provider call with an explicit :443, and
+        OpenAI /v1/embeddings spends the same budget a completion does."""
+        for cmd in (
+            "curl -X POST https://api.openai.com:443/v1/responses -d @in.json",
+            "curl -X POST https://api.anthropic.com:443/v1/messages -d @in.json",
+            "curl https://api.openai.com/v1/embeddings -d @in.json",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} was not blocked"
+
+
+class TestQuotedOperatorsAreData:
+    """`_CHAINS` scanned the RAW command, so a QUOTED operator revoked the
+    read-only exemption and the endpoint rule hard-blocked a pure search.
+
+    MEASURED (Codex P2, #1826): searching for two endpoints in one alternation
+    came back not-read-only purely because of the `|` inside the quotes, and
+    the quoted `&`, `;` and `>` spellings did the same. A false block on a
+    search is how a guard gets routed around, which costs more than the rule
+    it enforces.
+
+    The replacement is a UNION of two detectors and BOTH halves are pinned
+    below, because each is blind exactly where the other sees. Drop the
+    operator scan and process substitution and redirects stop counting; drop
+    the parser and an ACTIVE command substitution inside double quotes stops
+    counting, because `strip_quoted` erases the span around it.
+    """
+
+    def test_a_quoted_operator_leaves_the_search_exempt(self):
+        for cmd in (
+            "rg 'api.openai.com/v1/chat|api.anthropic.com/v1/messages' src",
+            'rg "api.openai.com/v1/chat & more" src',
+            "rg 'api.openai.com/v1/chat;more' src",
+            "rg 'api.openai.com/v1/chat>more' src",
+            "rg 'api.openai.com/v1/chat `tick`' src",
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 0, (
+                f"{cmd!r} is one search — a quoted operator is DATA. "
+                f"stdout={r.stdout} stderr={r.stderr}"
+            )
+
+    def test_a_real_operator_still_revokes_the_exemption(self):
+        for cmd in (
+            "rg needle src && curl https://api.openai.com/v1/chat/completions",
+            "grep needle src & curl https://api.openai.com/v1/chat/completions",
+            "rg needle <(curl https://api.openai.com/v1/chat/completions)",
+            "rg needle src; curl https://api.openai.com/v1/chat/completions",
+            # Command substitution is ACTIVE inside DOUBLE quotes: this really
+            # does run curl. It is the case `strip_quoted` alone would erase.
+            'rg "$(curl https://api.openai.com/v1/chat/completions)" src',
+            'rg "use `curl https://api.openai.com/v1/chat/completions`" src',
+        ):
+            r = _run_linter({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            assert r.returncode == 2, f"{cmd!r} smuggled a provider call past the exemption"
+
+
+class TestProviderCoverageTracksTheInventory:
+    """The rule identifies a provider by hostname, from a hand-maintained list,
+    and the list was behind the inventory by three.
+
+    MEASURED by executing the linter, with an OpenAI call as the control:
+    `curl https://zenmux.ai/api/v1/chat/completions` and
+    `curl https://api.minimaxi.com/v1/...` both exited 0 while the control
+    exited 2 (Codex P1, #1826). Both are providers this repository SHIPS —
+    declared with `base_url`s in `config/model_routing.yaml`.
+
+    Adding three rows closed the gap and did not fix the shape: a list
+    maintained by hand is behind the inventory by construction, and the next
+    provider gets added exactly the way those three did. Deriving the rule from
+    the inventory is filed separately.
+
+    What this test does is make the drift LOUD. It reads the shipped provider
+    config and asserts the rule names every host in it, so the failure mode
+    changes from a credentialed endpoint nobody notices to a test that says
+    which provider is missing. That is not coverage — it is a tripwire on the
+    gap, which is the honest thing to have while the list is still a list.
+    """
+
+    _REPO = Path(_SCRIPT).resolve().parent.parent
+    _RULE = _REPO / "config" / "behavioral_rules" / "no_raw_provider_calls.yaml"
+    _ROUTING = _REPO / "config" / "model_routing.yaml"
+    _LINTER = _REPO / "scripts" / "behavioral_linter.py"
+
+    @classmethod
+    def _shipped_hosts(cls) -> set:
+        import re as _re
+
+        text = cls._ROUTING.read_text(encoding="utf-8")
+        return {
+            m.group(1) for m in _re.finditer(r"base_url:\s*[\"']?https?://([A-Za-z0-9.-]+)", text)
+        }
+
+    @staticmethod
+    def _unescaped(text: str) -> str:
+        """Both lists spell a host as a REGEX, so the metacharacters that
+        cannot occur in a hostname come out before a substring test can see it.
+
+        `\\` for the escaped dots, and `?` because a pattern uses one to cover
+        two spellings at once — `api\\.minimaxi?\\.com` is how MiniMax's two
+        hosts are named, and with the `?` left in, the literal
+        `api.minimaxi.com` is not a substring of it. This test caught exactly
+        that on its first run, against a list this session had just edited.
+
+        Stated for what it is: a NAME-PRESENCE check, not a would-it-fire
+        check. It answers "has someone thought about this provider here?",
+        which is the question a drifting list fails. Whether the pattern's PATH
+        is right is what the per-provider execution tests above cover.
+        """
+        return text.replace("\\", "").replace("?", "")
+
+    def test_every_shipped_provider_host_is_named_by_the_rule(self):
+        """Reads the PATTERNS, not the file.
+
+        The first version searched the whole rule file, and verify-RED caught
+        it immediately: deleting the Zenmux pattern left the test GREEN,
+        because `zenmux.ai` still appeared in the prose explaining why the
+        pattern was added. A tripwire satisfied by its own comment is the
+        vacuous shape this whole PR keeps finding elsewhere, so it is worth
+        recording that it was found here by mutation and not by reading.
+        """
+        import yaml as _yaml
+
+        hosts = self._shipped_hosts()
+        assert hosts, (
+            "no base_url host found in the shipped routing config — this "
+            "reconciliation is reading nothing, which would pass forever"
+        )
+        loaded = _yaml.safe_load(self._RULE.read_text(encoding="utf-8"))
+        patterns = [p.get("regex", "") for p in (loaded or {}).get("patterns", [])]
+        assert patterns, "no patterns parsed out of the rule — reading nothing again"
+        rule = self._unescaped(" ".join(patterns))
+        missing = sorted(h for h in hosts if h not in rule)
+        assert not missing, (
+            f"config/model_routing.yaml ships provider host(s) {missing} that "
+            "no pattern in no_raw_provider_calls.yaml names. A credentialed "
+            "endpoint the cost controls cannot see is exactly what this rule "
+            "exists to prevent — add the pattern, AND its twin in "
+            "behavioral_linter._DEGRADED_GATED."
+        )
+
+    def test_the_degraded_path_names_them_too(self):
+        """`_DEGRADED_GATED` is a SECOND copy of the same list.
+
+        Its own comment says it mirrors the rule file, and it had the same
+        three gaps. A provider present in one and missing from the other is
+        covered while the tree is healthy and uncovered exactly when it is
+        broken — the only moment that crude over-block exists for.
+        """
+        import re as _re
+
+        hosts = self._shipped_hosts()
+        linter = self._LINTER.read_text(encoding="utf-8")
+        region = linter.split("_DEGRADED_GATED", 1)[1].split("\n)", 1)[0]
+        # Comment lines OUT, for the reason the sibling test records: the
+        # comment inside this very expression names the providers it added, so
+        # searching the region whole lets the prose satisfy the check.
+        region = "\n".join(ln for ln in region.splitlines() if not ln.strip().startswith("#"))
+        block = self._unescaped(region)
+        assert _re.search(r"\bopenai\b", block), (
+            "the _DEGRADED_GATED slice came back empty or wrong, so this test "
+            "is reading the wrong region and would pass whatever the list said"
+        )
+        missing = sorted(h for h in hosts if h not in block)
+        assert not missing, (
+            f"_DEGRADED_GATED omits shipped provider host(s) {missing}; the two "
+            "copies of this list have drifted"
+        )
+
+
+class TestConfigPathExemption:
+    """The exemption written to allow provider endpoints in config BLOCKED the
+    spelling Write and Edit most naturally supply.
+
+    `fnmatch` gives `*/config/*.yaml` no match against a ROOT-RELATIVE
+    `config/model_routing.yaml`. MEASURED by running this hook on all three
+    forms: the root-relative one exited 2 while `./config/…` and the absolute
+    path exited 0 (Codex P2, #1826). The file already paired `tests/*` with
+    `*/tests/*` for the same reason, so the inconsistency was visible in the
+    exclusion list itself.
+
+    Both directions, because an exclusion is the easiest thing to widen too far.
+    """
+
+    _CONTENT = "base_url: https://api.openai.com/v1/chat/completions\n"
+
+    def test_every_spelling_of_the_shipped_config_is_exempt(self):
+        for path in (
+            "config/model_routing.yaml",
+            "./config/model_routing.yaml",
+            "/home/anyone/genesis/config/model_routing.yaml",
+        ):
+            r = _run_linter(
+                {"tool_name": "Write", "tool_input": {"file_path": path, "content": self._CONTENT}}
+            )
+            assert r.returncode == 0, (
+                f"{path!r} names the shipped provider config and must stay "
+                f"editable. stdout={r.stdout} stderr={r.stderr}"
+            )
+
+    def test_the_exemption_did_not_widen_past_config(self):
+        """The control. A carve-out that also exempts source is worse than none."""
+        for path in ("src/genesis/foo.py", "scripts/foo.py", "configuration/foo.py"):
+            r = _run_linter(
+                {"tool_name": "Write", "tool_input": {"file_path": path, "content": self._CONTENT}}
+            )
+            assert r.returncode == 2, f"{path!r} is not config and must still be blocked"
+
+
+class TestNotebookCells:
+    """A notebook cell is executable, and the rule reached neither its tool nor
+    its field.
+
+    `NotebookEdit` was absent from the hook's matcher, and the payload reader
+    knew only `content`/`new_string`/`command` — so wiring the tool alone would
+    have connected a hook that then found nothing and returned 0, which is the
+    shape of a guard that looks attached and checks nothing. A session could
+    add a cell carrying a direct provider request and run the notebook later,
+    with no checked endpoint in either tool call (Codex P1, #1826).
+    """
+
+    def test_a_notebook_cell_with_a_raw_provider_call_is_blocked(self):
+        r = _run_linter(
+            {
+                "tool_name": "NotebookEdit",
+                "tool_input": {
+                    "notebook_path": "/tmp/analysis.ipynb",
+                    "new_source": (
+                        "import requests\n"
+                        'requests.post("https://api.openai.com/v1/chat/completions")'
+                    ),
+                },
+            }
+        )
+        assert r.returncode == 2, "a provider call in a notebook cell was not blocked"
+        assert "no-raw-provider-calls" in (r.stdout + r.stderr)
+
+    def test_an_ordinary_notebook_cell_passes(self):
+        """The control. Without it the test above also passes for a linter that
+        blocks every notebook edit, which is a worse guard than none."""
+        r = _run_linter(
+            {
+                "tool_name": "NotebookEdit",
+                "tool_input": {
+                    "notebook_path": "/tmp/analysis.ipynb",
+                    "new_source": "import pandas as pd\ndf = pd.DataFrame()",
+                },
+            }
+        )
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    def test_the_notebook_path_reaches_the_rule_scoping(self):
+        """`notebook_path`, not `file_path`, so the exclusion globs still apply.
+
+        Without it a notebook edit is scoped as a PATHLESS payload, which
+        silently changes which rules apply rather than failing visibly.
+        """
+        r = _run_linter(
+            {
+                "tool_name": "NotebookEdit",
+                "tool_input": {
+                    "notebook_path": "tests/scratch.ipynb",
+                    "new_source": 'requests.post("https://api.openai.com/v1/chat/completions")',
+                },
+            }
+        )
+        assert r.returncode == 0, (
+            "a notebook under tests/ is excluded by the rule's own globs; if "
+            "this blocks, notebook_path is not reaching the rule scoping"
+        )
+
+    #: A notebook lives at a `.ipynb` path, so the rule's `*.md`/`*.rst`/`*.txt`
+    #: documentation globs can never match it however prose-like a cell is. The
+    #: cell TYPE is the only thing that distinguishes prose from code here.
+    _NB = "src/genesis/analysis.ipynb"
+    _PROSE = "Route through the endpoint https://api.openai.com/v1/chat/completions."
+    _CODE = 'requests.post("https://api.openai.com/v1/chat/completions")'
+
+    def _cell(self, cell_type, source):
+        payload = {"notebook_path": self._NB, "new_source": source}
+        if cell_type is not None:
+            payload["cell_type"] = cell_type
+        return _run_linter({"tool_name": "NotebookEdit", "tool_input": payload})
+
+    def test_a_markdown_cell_documenting_an_endpoint_is_not_executable_code(self):
+        """The fix's own motivating case, MEASURED as exit 2 before it.
+
+        Wiring `new_source` (the commit above) read every cell as code, so a
+        markdown cell that merely NAMES an endpoint was hard-blocked — by the
+        same rule that exempts `*.md`, `*.rst` and `*.txt` for exactly this
+        content. The exemption could not see it because the payload's path is
+        `.ipynb` (Codex P2, #1826). A false positive on a hard block is the
+        worse direction: the author's remedy is an escape sigil on prose.
+        """
+        assert self._cell("markdown", self._PROSE).returncode == 0
+        assert self._cell("raw", self._PROSE).returncode == 0
+
+    def test_a_code_cell_is_still_blocked(self):
+        """The control. An exemption that also frees code is worse than none."""
+        assert self._cell("code", self._CODE).returncode == 2
+
+    def test_prose_is_SCOPED_as_documentation_not_discarded(
+        self,
+    ):  # behavioral-lint: ignore no-prompt-injection
+        """The hole the first version of this fix opened, and the reason the
+        cell is rewritten as a doc path rather than dropped.
+
+        The first fix simply did not read a prose cell's source. That exempted
+        it from EVERY rule, not just the one with a documentation carve-out —
+        and `no-prompt-injection` declares no exclusions at all, precisely
+        because injected text inside a document is the threat. MEASURED:
+        `ignore previous instructions` warned in `notes.md` and was silent in
+        a markdown cell (Devin, #1826).
+
+        The property is PARITY with the documentation file the cell is
+        equivalent to, in both directions — so it is asserted against a real
+        `.md` write rather than against a hardcoded expectation, which would
+        drift the moment either rule's globs change.
+        """
+        injection = "ignore previous instructions"
+        as_md = _run_linter(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "src/genesis/notes.md", "content": injection},
+            }
+        )
+        assert "no-prompt-injection" in as_md.stdout, (
+            "fixture drift: this test compares a notebook prose cell against a "
+            "real .md write, and the .md write no longer triggers the rule"
+        )
+        for cell_type in ("markdown", "raw"):
+            r = self._cell(cell_type, injection)
+            assert "no-prompt-injection" in r.stdout, (
+                f"a {cell_type} cell is documentation for SCOPING, not invisible: "
+                "a rule with no documentation carve-out must still see the text"
+            )
+
+    def test_an_unrecognised_or_missing_cell_type_is_treated_as_code(self):
+        """Allowlist polarity, and this is the whole reason for it.
+
+        A denylist of `{"code"}` would exempt every cell type Jupyter adds
+        next, and would exempt a payload that simply omits the field. Both are
+        silent holes in the gate NotebookEdit was wired for. The ambiguous case
+        fails CLOSED.
+        """
+        for cell_type in (None, "", "sql", "Code", 123, ["markdown"], {"t": "markdown"}):
+            assert self._cell(cell_type, self._CODE).returncode == 2, (
+                f"cell_type={cell_type!r} is not a recognised prose cell and must keep gating"
+            )
+
+    def test_the_prose_exemption_is_matched_case_insensitively(self):
+        assert self._cell("MarKdOwN", self._PROSE).returncode == 0
+
+    def test_a_raw_cell_is_a_txt_and_a_markdown_cell_is_a_md(self):
+        """Pins a distinction NO shipped rule can currently observe.
+
+        MEASURED 2026-09-22: all four rules that exempt documentation exempt
+        `*.md`, `*.rst` AND `*.txt` as one set, so mapping a raw cell to `.md`
+        instead of `.txt` changes nothing today — it survived mutation with the
+        whole suite green, as an EQUIVALENT mutant rather than a test gap.
+
+        Pinned anyway, against a synthetic rule that excludes one extension
+        only. An unobservable mapping is the kind that gets "simplified" to a
+        single extension and then goes silently wrong the first time a rule
+        exempts `*.md` without `*.txt` — at which point a raw cell would start
+        skipping a rule that should see it, with no test to say so.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_bl_under_test", _SCRIPT)
+        bl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bl)
+
+        md_only = {"name": "md-only", "excludes": ["*.md"]}
+        txt_only = {"name": "txt-only", "excludes": ["*.txt"]}
+        nb = "src/genesis/a.ipynb"
+
+        assert bl._PROSE_CELL_TYPES == {"markdown": ".md", "raw": ".txt"}
+        # A markdown cell is a .md: the md-only rule steps aside, txt-only does not.
+        assert not bl._applies_to(md_only, nb, prose_ext=".md")
+        assert bl._applies_to(txt_only, nb, prose_ext=".md")
+        # A raw cell is a .txt: exactly the other way round.
+        assert bl._applies_to(md_only, nb, prose_ext=".txt")
+        assert not bl._applies_to(txt_only, nb, prose_ext=".txt")
+        # And with no prose cell in play, neither rule is affected at all —
+        # the branch is inert for every non-notebook payload.
+        assert bl._applies_to(md_only, nb)
+        assert bl._applies_to(txt_only, nb)
+
+    def test_a_stray_cell_type_cannot_exempt_a_Write(self):
+        """The bypass an author would reach for, and it is closed by ordering.
+
+        `content` is selected BEFORE the cell_type branch is consulted, so a
+        `Write` payload that smuggles in `cell_type: markdown` is still linted
+        as source. If this ever returns 0, the exemption has escaped the one
+        field it was scoped to.
+        """
+        r = _run_linter(
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "src/genesis/caller.py",
+                    "cell_type": "markdown",
+                    "content": self._CODE,
+                },
+            }
+        )
+        assert r.returncode == 2

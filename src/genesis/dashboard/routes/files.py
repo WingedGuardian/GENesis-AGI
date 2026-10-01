@@ -85,16 +85,351 @@ def _sanitize_relpath(relpath: str | None) -> list[str]:
     return segments
 
 
+#: SQLite databases and the sidecars a live connection keeps beside them.
+#:
+#: These must never be opened by a file route, and the reason is not privacy —
+#: it is that OPENING ONE CORRUPTS IT. POSIX releases every record lock a process
+#: holds on a file the moment that process closes ANY descriptor to it, not
+#: merely the descriptor that took the lock. SQLite's unix VFS defers its own
+#: closes to defend against this but cannot see a descriptor opened by other
+#: code in the same process — and these routes run inside genesis-server, which
+#: holds SQLite's locks on the live database.
+#:
+#: So a single read drops the server's lock. The next short-lived opener then
+#: takes an exclusive lock, concludes it is the last connection, checkpoints its
+#: partial view into the main file and unlinks the -wal/-shm, while the server
+#: keeps writing through descriptors whose directory entries are gone. MEASURED:
+#: an in-process open/close of a live ``-shm`` took its locks 2 -> 0, and the
+#: same mechanism malformed a production database in under two minutes.
+#:
+#: NOT AN AUTH QUESTION. An authenticated read performs the identical open and
+#: drops the identical locks — the owner browsing data/ in the dashboard's own
+#: Files tab would do it. Authentication changes who can trigger it, never what
+#: it does, so the block belongs on the FILE, not on the caller.
+#:
+#: NOTHING HERE OPENS OR STATS THE CALLER'S PATH, and that constraint is the
+#: design rather than an implementation detail. It was learned the expensive way.
+#: Earlier revisions added an identity check (comparing inodes against
+#: ``/proc/self/fd``) and a content probe (reading the SQLite magic). The content
+#: probe OPENED the live database inside the server — the exact operation this
+#: guard exists to prevent — and was reachable whenever the identity check failed
+#: open, which it does when ``/proc`` is unreadable and when the configured
+#: database has no extension. Review REPRODUCED the consequence: a second process
+#: acquired the previously-blocked write lock immediately after that probe
+#: closed. A guard whose fallback performs the harm is worse than a guard with a
+#: known gap, so both layers were removed rather than patched again.
+#:
+#: What remains cannot misfire, because it never touches the file:
+#:   1. the CONFIGURED database path and everything beside it — read from config
+#:      rather than guessed, so it covers the main database under any name
+#:      including no extension at all, plus every sidecar;
+#:   2. a name-suffix rule, for databases living elsewhere.
+#:
+#: STATED GAP, because pretending otherwise is what produced the removed code: a
+#: database OUTSIDE the data directory under a name the suffix rule does not
+#: recognise is NOT covered. MEASURED by walking the three allowed roots and
+#: reading the SQLite magic — **211 SQLite files, 22 of them uncovered**, and
+#: that is a LOWER bound because the walk skipped ``.git``/``.venv`` and
+#: swallowed permission errors. The managed browser profile's ``Cookies``,
+#: ``History`` and ``Web Data`` are three of the 22, not the whole of it; an
+#: earlier draft of this note said three, which understated the gap by a factor
+#: of seven. A HARDLINK to the configured database defeats BOTH rules and is a
+#: 23rd shape the enumeration cannot see at all.
+#:
+#: Closing that needs a registry of the databases the server actually opens,
+#: which two independent reviewers converged on and which is tracked separately.
+#: It is deliberately NOT approximated here with a third heuristic.
+#:
+#: Accepted cost, stated: an archived database copy matching a suffix is blocked
+#: even though opening one cannot affect the live file's locks. These are binary
+#: files a text route would mangle anyway.
+
+#: Bound on the rename guard's directory walk. A rename is a rare, interactive
+#: operation, so the cost only ever lands on a human who asked for it; the bound
+#: exists so a pathological tree cannot stall a request thread, not to save time
+#: on the common case.
+_RENAME_SCAN_MAX_ENTRIES = 20_000
+
+#: Latch so an unreadable database config warns ONCE per process rather than on
+#: every request. Measured: 50 requests produced 50 warnings, each with a full
+#: traceback — which buries the signal it exists to raise.
+_identity_failure_logged = False
+
+_SQLITE_DB_SUFFIXES = (".db", ".db3", ".sqlite", ".sqlite3")
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-wal2", "-shm", "-journal")
+#: SQLite's multi-database master journal: ``<db>-mj<8 hex><8 hex>``.
+_MASTER_JOURNAL_RE = re.compile(r"-mj[0-9a-f]{4,}$", re.IGNORECASE)
+
+
+def _is_sqlite_artifact(name: str) -> bool:
+    """Is *name* a SQLite database, or a sidecar of one?
+
+    Name-based and therefore incomplete by construction — see the note above.
+    Covers databases outside the configured data directory; the authoritative
+    check for the configured one is :func:`_in_configured_database_area`.
+    """
+    lowered = name.lower()
+    lowered = _MASTER_JOURNAL_RE.sub("", lowered)
+    for sidecar in _SQLITE_SIDECAR_SUFFIXES:
+        if lowered.endswith(sidecar):
+            lowered = lowered[: -len(sidecar)]
+            break
+    return lowered.endswith(_SQLITE_DB_SUFFIXES)
+
+
+def _configured_db_identity() -> tuple[Path | None, Path | None]:
+    """Resolve the configured database once: ``(db_path, area)``.
+
+    ``area`` is the directory whose whole contents are refused, or None when
+    directory-scoping would be too broad to apply (see below). ``db_path`` is
+    None when config cannot be read at all.
+
+    THIS TOUCHES THE FILESYSTEM. ``Path.resolve()`` is realpath — it walks and
+    stats every component. An earlier revision of this module claimed the
+    configured-area check was "pure path arithmetic"; MEASURED, it is 265.5 us
+    per call against 30.3 us for the arithmetic alone. That is why the result is
+    computed ONCE and handed to the rename walk rather than recomputed per
+    child, where it cost ~5.3s at the 20,000-entry scan bound.
+
+    DIRECTORY-SCOPING IS ONLY APPLIED WHERE IT IS MEANINGFUL: when the
+    database's parent lies STRICTLY INSIDE an allowed root. Anywhere else,
+    refusing "everything beside the database" refuses an entire allowed root:
+
+    * ``~/genesis/genesis.db`` — the parent IS a root, so everything beside it
+      is everything in that root.
+    * ``~/genesis.db`` — the parent is an ANCESTOR of all three roots, so it
+      denies all of them at once. Review (Devin) found this one after the first
+      was fixed, which is the tell: the first fix answered the INSTANCE
+      (``parent == root``) and left the class. The predicate below answers the
+      class, so a third arrangement of the same shape cannot appear.
+
+    Where scoping does not apply, ``area`` is None and the database's sidecars
+    are covered by an ANCHORED name prefix instead.
+
+    A RELATIVE configured path is resolved, not refused, and that is deliberate.
+    ``genesis.env.genesis_db_path`` returns the configured value unresolved, and
+    the server opens the database by resolving that same relative value from
+    that same working directory — and THIS CODE RUNS IN THAT PROCESS. So
+    ``resolve()`` here names the same file the server has open, by construction.
+    An earlier revision of this function refused relative paths as "meaningless";
+    review EXECUTED it and found the opposite: identity went ``(None, None)``,
+    the name rule missed a database called ``store``, and ``_is_allowed``
+    returned True FOR THE LIVE DATABASE — turning a 403 into a fail-open on the
+    one file this module exists to protect.
+
+    Failing to establish identity returns ``(None, None)`` and is LOGGED rather
+    than silent. The name rule still runs behind it, so this declines to add a
+    reason rather than opening anything — but an install whose config cannot be
+    read is running with the authoritative half of this guard switched off, and
+    that should not be discoverable only by reading the source.
+    """
+    global _identity_failure_logged
+    try:
+        from genesis.env import genesis_db_path
+
+        db_path = genesis_db_path().resolve()
+    except Exception:
+        # resolve() is inside the try on purpose: it can raise OSError on a
+        # symlink loop or an unreadable component, and an earlier revision left
+        # it outside, so the documented "(None, None) on failure" contract
+        # became a 500 out of every route.
+        if not _identity_failure_logged:
+            _identity_failure_logged = True
+            logger.warning(
+                "file routes: configured database path unreadable — the name "
+                "rule is now the only database check, so a database under an "
+                "unrecognised name is NOT protected. Logged once per process.",
+                exc_info=True,
+            )
+        return (None, None)
+
+    parent = db_path.parent
+    strictly_inside_a_root = any(
+        parent != root.resolve() and parent.is_relative_to(root.resolve())
+        for root in _ALLOWED_ROOTS
+    )
+    area: Path | None = parent if strictly_inside_a_root else None
+    return (db_path, area)
+
+
+def _in_configured_database_area(
+    resolved: Path, identity: tuple[Path | None, Path | None] | None = None
+) -> bool:
+    """Is *resolved* the configured database, or anything beside it?
+
+    The one AUTHORITATIVE check here: the path comes from config, not from a
+    guess about names, so it covers the main database under any spelling —
+    including the extensionless form ``genesis.env`` explicitly supports — and
+    every sidecar it keeps in the same directory, present or future.
+
+    Directory-scoped where it can be. A database keeps company: ``-wal``,
+    ``-shm``, ``-journal``, master journals, pre-restore copies. Enumerating
+    those by name is the approach that kept coming up short, and a dedicated
+    data directory holds nothing a file browser needs to open anyway.
+
+    Pass *identity* to reuse one resolution across many calls; the rename walk
+    does, because resolving per child is what made it slow.
+    """
+    db_path, area = identity if identity is not None else _configured_db_identity()
+    if db_path is None:
+        return False
+    if resolved == db_path:
+        return True
+    if area is not None:
+        return resolved.is_relative_to(area)
+    # The database sits directly in an allowed root, so "the directory beside
+    # it" is the whole root and cannot be refused wholesale. Cover its sidecars
+    # by their own name — NOT a new guess about what a database looks like, but
+    # the configured name plus whatever SQLite appends to it.
+    #
+    # ANCHORED on the separator, and that is not fussiness. A bare
+    # `startswith(db_path.name)` matches every CONTINUATION of the name: with a
+    # database called `x`, review EXECUTED it and found `xyz.txt`,
+    # `xtra-notes.md` and `xylophone.py` all blocked — the same over-blocking
+    # the directory exemption above exists to undo, reintroduced three lines
+    # later and spread across a whole allowed root. Every real sidecar is
+    # `<name>-wal`, `<name>-shm`, `<name>-journal`, `<name>-mj<hex>` or a
+    # `<name>.`-prefixed copy, so anchoring loses none of them.
+    if resolved.parent != db_path.parent:
+        return False
+    return resolved.name == db_path.name or resolved.name.startswith(
+        (db_path.name + "-", db_path.name + ".")
+    )
+
+
+def _contains_live_database(directory: Path) -> bool:
+    """Does *directory* hold a database, directly or in a subdirectory?
+
+    Used by the rename guard: moving a directory relocates its contents without
+    ever opening them, so the leaf-name checks in :func:`_is_allowed` cannot see
+    it. Walks rather than globbing one level, because ``data/`` could be renamed
+    by way of its parent.
+
+    Bounded at ``_RENAME_SCAN_MAX_ENTRIES`` and fails CLOSED on the bound: a
+    directory too large to scan is refused rather than waved through, since the
+    only thing being refused is a rename the operator can perform another way.
+
+    Uses ``os.scandir`` rather than ``Path.rglob``. That is not a style choice:
+    ``rglob`` SILENTLY OMITS directories it cannot descend into, so this function
+    could return False having never looked at part of the tree while its
+    docstring claimed to fail closed. Review named the case — if the server holds
+    ``tree/private/live.db`` and ``private`` loses search permission, renaming
+    ``tree`` was permitted and relocated a live database. An unreadable subtree
+    now refuses, which is what "fails closed" has to mean.
+
+    Classifies children by NAME only, and deliberately does not open or read
+    them. An earlier revision consulted ``/proc/self/fd`` per child — O(entries x
+    descriptors), measured at ~6s for 5,000 files against 300 descriptors on a
+    request thread — and then read each one's header, which meant a rename
+    request could itself drop the server's locks. Walking a directory is not a
+    reason to touch every file in it.
+
+    The configured-database identity is resolved ONCE, before the walk, and
+    reused for every child. Resolving it per child is realpath per child —
+    MEASURED at 265.5 us, i.e. ~5.3s at the entry bound — which is the same
+    per-child-filesystem-work mistake in a cheaper disguise, in the function
+    whose own docstring condemns it.
+    """
+    identity = _configured_db_identity()
+    seen = 0
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        # Iterate the scandir handle DIRECTLY rather than materialising it with
+        # `list(it)` first. The bound below is what makes this safe on a hostile
+        # tree, and a bound checked after the allocation is not a bound: review
+        # (Devin) pointed out that a directory of a million entries built a
+        # million `DirEntry` objects before the counter reached 20,001 and
+        # refused. The OSError handler now wraps the ITERATION too, because
+        # scandir can raise part-way through, not only at open.
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    seen += 1
+                    if seen > _RENAME_SCAN_MAX_ENTRIES:
+                        return True  # too big to clear — refuse rather than guess
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        return True  # same reasoning: unknown means refused
+                    if _is_sqlite_artifact(entry.name) or _in_configured_database_area(
+                        Path(entry.path), identity
+                    ):
+                        return True
+        except OSError:
+            # Cannot inspect it, so cannot clear it. Refuse.
+            return True
+    return False
+
+
 def _is_allowed(path: Path) -> bool:
-    """Check that *path* resolves inside an allowed root and isn't blocked."""
+    """Check that *path* resolves inside an allowed root and isn't blocked.
+
+    CONTAINMENT IS CHECKED FIRST, and that ordering is load-bearing rather than
+    stylistic: every later check returns False on a match, so reordering cannot
+    change the verdict — but it does change what this function TOUCHES. The
+    directory test below stats the path, the configured-database check realpaths
+    the configured value, and the rename guard walks the tree. Doing any of that
+    to a path not yet proven to lie inside an allowed root is filesystem work on
+    unvalidated input, which is what CodeQL's py/path-injection flagged here.
+    Reject out-of-root paths before touching the filesystem at all.
+
+    (An earlier revision of this docstring said "nothing here opens or STATS the
+    caller's path". That was false — ``resolve()`` and ``is_dir()`` both stat it.
+    The SAFETY argument survives, because a stat takes no POSIX lock and opens no
+    descriptor, which is the property this guard actually needs; the absoluteness
+    did not, and a reader who believed it would conclude the ordering was moot
+    and reorder it.)
+    """
     resolved = path.resolve()
+    if not any(resolved.is_relative_to(root.resolve()) for root in _ALLOWED_ROOTS):
+        return False
     if resolved.name.lower() in _BLOCKED_NAMES:
         return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
     for part in resolved.parts:
         if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
             return False
-    return any(resolved.is_relative_to(root.resolve()) for root in _ALLOWED_ROOTS)
+    # DIRECTORIES ARE EXEMPT from both database rules, and this is checked BEFORE
+    # them. A directory cannot be opened as a database, so it cannot trigger the
+    # lock loss this guards. Blocking one bought nothing and cost real function:
+    # the configured data directory is itself "inside the configured database
+    # area", so `file_list` returned 403 for it and the whole directory became
+    # unbrowsable — every ordinary file in it too, though listing a directory
+    # opens nothing. Review (Devin) reported it against the default path.
+    #
+    # What a directory can still reach is bounded by the callers, not by trust:
+    # `file_delete` refuses directories outright, `file_read` and `file_download`
+    # require `is_file()`, and `file_rename` has the recursive
+    # `_contains_live_database` guard. So exempting one grants listing and
+    # renaming-when-empty-of-databases, and nothing that opens a file.
+    #
+    # Stated limit: a not-yet-existing path cannot be told apart from a file
+    # here, so creating a NEW directory with a database-shaped name, or one
+    # inside the database area, is still refused. Narrow, and the caller can
+    # rename into it afterwards.
+    try:
+        if resolved.is_dir():
+            return True
+    except OSError:
+        pass
+    # PRIMARY: the configured database and everything beside it. Authoritative
+    # rather than heuristic — the path comes from config, so it covers the main
+    # database under any name (including none) and every sidecar.
+    if _in_configured_database_area(resolved):
+        return False
+    # SECONDARY: name, for databases living elsewhere. Checked on the RESOLVED
+    # name, so a SYMLINK cannot smuggle one through under an innocent-looking
+    # path. A HARDLINK still can: a second name for the same inode, created
+    # outside these routes, is indistinguishable from an ordinary file by both
+    # rules here — it defeats the name rule by being named anything, and the
+    # configured-area rule by living anywhere. That needs the registry (#2235),
+    # not another guess.
+    return not _is_sqlite_artifact(resolved.name)
 
 
 def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
@@ -289,6 +624,15 @@ def file_rename():
         return jsonify({"error": "new_name must be a filename, not a path"}), 400
     if not source.exists():
         return jsonify({"error": "Source not found"}), 404
+
+    # `_is_allowed` inspects a LEAF name, so it cannot see that a directory
+    # contains the live database. Renaming that directory does not open the
+    # file — it is outside the "never open a database" rule — but the outcome is
+    # the same loss: the server keeps writing through descriptors whose
+    # directory entry has moved, and the next connection creates a fresh empty
+    # database at the original path. MEASURED reachable (200) before this guard.
+    if source.is_dir() and _contains_live_database(source):
+        return jsonify({"error": "Directory contains a live database"}), 403
 
     dest = source.parent / new_name
     if not _is_allowed(dest):

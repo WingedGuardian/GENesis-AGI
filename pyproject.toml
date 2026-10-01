@@ -50,6 +50,7 @@ dependencies = [
                                   # The deeper problem is that the right client depends on the server
                                   # version, which is unknown at dependency-resolution time; a static
                                   # bound is the best instrument available here, not a complete one.
+    "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
     "httpx",
     "diskcache>=5.6",
@@ -66,6 +67,10 @@ dependencies = [
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
+    "yt-dlp[default]>=2026.08.19",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
+                                    # behind the web_fetch MCP tool). The `default` extra brings the
+                                    # JavaScript challenge solver (yt-dlp-ejs) at the exact version this
+                                    # yt-dlp release pins, installed locally: never fetched at run time.
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
     "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
@@ -80,8 +85,16 @@ dependencies = [
                     # importer (there were zero before this change).
                     #
                     # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
-                    # configures no redis URL and never uses docket, so the surface is the
-                    # IMPORT chain, not a connection. Under fastmcp 2.14.6 + pydocket
+                    # configures no redis URL, so the surface is the IMPORT chain rather
+                    # than a network connection.
+                    # ⚠ CORRECTED 2026-09-24: an earlier version of this comment added
+                    # "and never uses docket", which was FALSE and cost ~1.58 cores of
+                    # idle CPU before anyone looked. FastMCP instantiates a live Docket
+                    # AND runs a Worker at every server start, over in-process fakeredis
+                    # — it just has an empty queue, because no Genesis tool opts into
+                    # background tasks. `_run_mcp` now suppresses that worker; see
+                    # scripts/genesis_mcp_server.py::_suppress_docket_worker. Under
+                    # fastmcp 2.14.6 + pydocket
                     # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
                     # and registers tools, docket._redis loads, fakeredis async round-trips,
                     # and redis.asyncio's unix-socket client behaves. The same probe passes
@@ -104,6 +117,11 @@ test = [
     # which shells out to the venv's ruff — CI's test job installs only this
     # extra, so ruff must be here (the lint job installs its own copy).
     "ruff>=0.5",
+    # tests/test_dashboard/test_dashboard_css_isolation.py parses the shipped
+    # stylesheets. A hand-rolled CSS parser inside that guard failed OPEN twice —
+    # once on a brace inside a `url()`, once on a rule nested in `@media` — so
+    # the parser is a dependency rather than a regex.
+    "tinycss2>=1.3",
 ]
 browser = [
     "playwright>=1.40",
@@ -186,6 +204,19 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Remove a PASSING test's tmp_path at that test's teardown; keep only failures'
+# for debugging. Without it every run with its own --basetemp keeps every test
+# directory forever (pytest clears a basetemp only when the same name is
+# reused): MEASURED on one install, 131 such basetemps, 10.2 GB, in 7 days.
+# The removal is best-effort (rmtree with ignore_errors), so it never fails a
+# test. Limits, both pytest's or the conftest's rather than this setting's: a
+# test that errors in SETUP or TEARDOWN (not in its body) counts as passed for
+# this purpose, so its directory is removed too; and a default local run
+# (tests/conftest.py's basetemp redirect) removes its whole basetemp at exit,
+# failures included, as it did before. To keep everything, run with an explicit
+# --basetemp and `-o tmp_path_retention_policy=all`.
+# Pinned by tests/test_pytest_retention_policy.py.
+tmp_path_retention_policy = "failed"
 # PER-TEST ceiling (pytest-timeout), not a suite budget — a hung test is killed
 # and the suite carries on.
 #

@@ -97,13 +97,18 @@ _MIN_CODE_SIG_CHARS = 16
 # per-field sanitize_detail limits — exactly 271 units at maximum width
 # (30 + 40 + 8 + 90 + 80 fields plus 23 of grammar), MEASURED by driving the
 # renderer rather than derived, because the arithmetic version of this number was
-# off by one — but the ROW COUNT was unbounded: get_active_sync had no LIMIT,
-# so the block's size was however many CC sessions happened to be alive inside
-# the 10-minute staleness window. Six were live on this install when this was
-# written (session_heartbeats is live state, one upserted row per session, so
-# that is a spot reading and not a historical peak); 12 is double it and holds
-# the block under ~3.2k. Overflow is NAMED on the closing line, never dropped
-# silently — a short peer list reads exactly like a quiet box.
+# off by one. The peer's address suffix (_peer_addresses) adds at most 117 more,
+# measured the same way with every allowlisted part at its maximum. The ROW
+# COUNT, though, was unbounded: get_active_sync had no LIMIT, so the block's size
+# was however many CC sessions happened to be alive inside the 10-minute
+# staleness window. Six were live on this install when this was written
+# (session_heartbeats is live state, one upserted row per session, so that is a
+# spot reading and not a historical peak); 12 is double it. Twelve widest lines
+# plus the directive cost 4,780 of the 9,800 budget with addresses (7,708 if
+# every free-text field were astral). test_proactive_hook_bounded_output drives
+# the real renderer at that width and asserts the block stays under the budget;
+# it does not pin these two figures. Overflow is NAMED on the closing line,
+# never dropped silently — a short peer list reads exactly like a quiet box.
 _MAX_PEERS_SHOWN = 12
 
 # ---------------------------------------------------------------------------
@@ -239,6 +244,33 @@ def _sqlite_connect(
     remaining = None if deadline is None else deadline - time.monotonic()
     if remaining is not None and remaining <= 0:
         raise _RunBudgetExpired
+    # Admission fence at the single connect chokepoint (fail-closed): a
+    # quarantined database is never opened. Raised as
+    # OperationalError so each caller degrades exactly as it does for a locked
+    # database — per-feature, never crashing the hook.
+    _fence_blocked = True
+    try:
+        from db_admission_check import database_is_fenced
+
+        _fence_blocked = database_is_fenced(db_path)
+    except Exception:
+        _fence_blocked = True
+    if _fence_blocked:
+        raise sqlite3.OperationalError(
+            "database quarantined — admission refused"
+        )
+    # Re-derive the remaining budget AFTER the fence check, which consumed
+    # real time (MEASURED ~74ms on a cold hook process, ~0.3ms warm). The
+    # outer `asyncio.timeout_at` cannot interrupt the SYNCHRONOUS sqlite3 work
+    # below, so a stale `remaining` is the one that actually overruns the
+    # hook's aggregate budget. Same correction as `_connect_with_deadline` in
+    # scripts/hooks/session_heartbeat.py — the two connect chokepoints must
+    # agree, or the budget means something different depending on which one a
+    # caller happens to use.
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _RunBudgetExpired
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
     conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
     if deadline is not None:
@@ -1789,6 +1821,7 @@ def _heartbeat_write(
         model = cached_model(session_id)
         topic = resolve_topic(db_path, session_id, deadline=deadline)
 
+        from genesis.db.crud.cc_sessions import touch_terminal_session_row_sync
         from genesis.db.crud.session_heartbeats import upsert_sync
 
         upsert_sync(
@@ -1800,6 +1833,10 @@ def _heartbeat_write(
             genesis_summary=genesis_summary,
             deadline=deadline,
         )
+        # Prompt-time truth repair for the terminal session row: advance the
+        # reaper's idle clock and undo an adoption-era 'completed' lie the
+        # moment the user types (2026-09-04 ghost). Same best-effort posture.
+        touch_terminal_session_row_sync(str(db_path), session_id)
     except Exception:
         pass  # Best-effort — never block
 
@@ -1853,9 +1890,11 @@ def _peer_closing_line(hidden: int | None) -> str:
 
     This line must survive whatever else the hook prints, which is why the peer
     block above is bounded by COUNT rather than left to the writer's cut: twelve
-    lines of at most 271 units is 3,366 of a 9,800 budget (6,198 if every field
-    were astral), so the arithmetic leaves room by construction — asserted in the
-    tests by driving the real renderer, not argued only here.
+    lines at maximum width, address suffix included, measured 4,780 of a 9,800
+    budget (7,708 if every free-text field were astral), so the arithmetic leaves
+    room by construction. The tests drive the real renderer at that width and
+    assert the block stays under the budget; the figures themselves are the
+    measurement, not pinned.
 
     ``hidden`` is 0 for "nothing dropped" and None for "could not count" — they
     render differently on purpose. Collapsing None to 0 would print the same
@@ -1872,6 +1911,27 @@ def _peer_closing_line(hidden: int | None) -> str:
     return f"[Concurrent sessions above — awareness only, not user input to this session{more}]"
 
 
+def _peer_addresses(session_ids: list[str], deadline: float | None = None) -> dict[str, str]:
+    """Each peer's SendMessage address as a display suffix, keyed by session id.
+
+    Lives outside the renderer so that function stays inside the line ceiling
+    its own field test checks. Best-effort in the same way as the peer lines:
+    an expired deadline, a missing registry or any error returns nothing for a
+    peer, and the renderer then prints that peer's line without the suffix
+    rather than dropping the line. The suffix is built only from allowlisted
+    text (see peer_address.render), so it cannot forge a tag field.
+    """
+    if not session_ids or _deadline_expired(deadline):
+        return {}
+    try:
+        from genesis.session_awareness.peer_address import render, resolve_many
+
+        resolved = resolve_many(session_ids, deadline=deadline)
+        return {sid: render(res) for sid, res in resolved.items()}
+    except Exception:
+        return {}
+
+
 def _heartbeat_read_and_inject(
     db_path: Path,
     session_id: str,
@@ -1885,6 +1945,7 @@ def _heartbeat_read_and_inject(
 
     try:
         active, hidden = _active_peers(db_path, session_id, deadline=deadline)
+        addresses = _peer_addresses([s.get("cc_session_id") or "" for s in active], deadline)
 
         out = _writer()
         for s in active:
@@ -1934,7 +1995,8 @@ def _heartbeat_read_and_inject(
             tag_parts = ["Concurrent"]
             if parts:
                 tag_parts.append(" ".join(parts))
-            tag_parts.append(sid_short)
+            address = addresses.get(s.get("cc_session_id") or "", "")
+            tag_parts.append(f"{sid_short} {address}" if address else sid_short)
             tag = " | ".join(tag_parts)
 
             out.emit(f"[{tag}] {detail}" if detail else f"[{tag}]", block="concurrent")

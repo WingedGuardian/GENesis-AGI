@@ -101,6 +101,25 @@ The scan is a **supplementary guard, never exclusion**: it cannot by itself
 prevent a holder appearing between inspection and replacement. Exclusion comes
 from whatever keeps holders out — not from this scan.
 
+Script-side hooks and workers (the audit trail, edit sensor, precompact,
+procedure advisor, proactive memory, session context/heartbeat/alerts, repo
+pulse, snapshot GC) consult a shared admission check before opening the
+database (`genesis.db.admission.database_is_fenced`), and every connection
+factory in `genesis.db.connection` asserts it at open time. While the database
+is quarantined they silently skip it and resume on their own once the
+quarantine clears. The check fails closed: if state cannot be established, the
+opener skips.
+
+Scope this precisely, because the useful question during a recovery is what is
+NOT covered. The check binds the enumerated automatic openers under `scripts/`
+and the connection factories. It does **not** yet bind every opener in
+`src/genesis/` — several modules open the database directly rather than through
+a factory, and the inventory test that would catch them does not reach read-only
+opens. Treat the fence as removing the hook-writer class that drove the
+2026-09-18 recurrence, not as proof that nothing can touch the file. Exclusion
+during a replacement still comes from stopping the services that hold it.
+
+
 ## During Migration Work
 
 1. Keep Genesis changes on a dedicated hardening branch.

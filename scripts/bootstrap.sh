@@ -45,7 +45,10 @@ if [ -f "$UPDATE_STATE" ]; then
     STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
     STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
 
-    # Check if the update process is still alive
+    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
+    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
+    # zombie or reused pid: the "dead" branch below resets the tree, so here a
+    # stale holder must err toward "still running", never toward the reset.
     if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
         echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
     elif [ "$STATE_PHASE" = "done" ]; then
@@ -330,15 +333,14 @@ if [ -f "$_cc_env" ]; then
     # not swallow the suppression outcome — this was the one caller with no
     # signal at all: `|| true` discarded the return code AND nothing read the
     # state, so bootstrap completed cleanly over a failed suppression check.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "  WARNING: CC auto-updater suppression not verified" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
-                 "the pin; the daily genesis-cc-settings-align timer will retry" \
-                 "and its unit goes red if it cannot"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list of
+    # good states: a reader that did not know a new state would warn falsely.
+    if ! cc_suppression_verified; then
+        echo "  WARNING: CC auto-updater suppression not verified" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+             "the pin; the daily genesis-cc-settings-align timer will retry" \
+             "and its unit goes red if it cannot"
+    fi
     cc_shadow_scan || true
 fi
 
@@ -737,7 +739,7 @@ else
 fi
 if [[ -n "$HOOKS_DST" ]]; then
     # Phase 6: prefer sync-hooks.sh if available — it handles the
-    # full set (pre-commit, pre-push, post-commit) + helper scripts
+    # full set (HOOKS_TO_SYNC in sync-hooks.sh) + helper scripts
     # (emit_bugfix_audit.py) + version tracking via
     # .genesis-hook-versions. Legacy loop remains as a fallback for
     # very old installs that don't have sync-hooks.sh yet.
@@ -745,7 +747,7 @@ if [[ -n "$HOOKS_DST" ]]; then
         "$HOOKS_SRC/sync-hooks.sh" --quiet || echo "  WARNING: sync-hooks.sh exited non-zero (may be user-modified — leaving alone)"
         echo "  + hooks synced via sync-hooks.sh"
     else
-        for hook in pre-commit pre-push; do
+        for hook in pre-commit pre-push pre-merge-commit; do
             if [[ -f "$HOOKS_SRC/$hook" ]]; then
                 cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
                 chmod +x "$HOOKS_DST/$hook"
@@ -792,6 +794,15 @@ if command -v serena &>/dev/null; then
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
     ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
 fi
+# grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
+# Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
+# Genesis owns is one whose entries it can safely heal, and it leaves an
+# operator's own `grep` server alone.
+# No API key and no local binary: it is a REMOTE server, so there is nothing to
+# gate on `command -v`. User scope so it reaches worktree sessions too, which is
+# where most work here happens; project scope would cover only the main tree.
+# Registering does not start anything and costs nothing when unused.
+_register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 echo
 
 # --- Code Intelligence Indexing ---
@@ -873,14 +884,18 @@ CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
-# Watchgod config — 500MB budget, 150MB sacred ground
+# Watchgod config. The watchgod (scripts/tmp_watchgod.sh) guards whole
+# filesystems and measures cc-tmp's real capacity itself — statvfs plus the
+# btrfs quota on the volume — so the only thing it needs from here is where
+# cc-tmp lives. The v1 keys this block used to write (a 500 MB budget, a
+# "sacred ground", a hand-propagated volume capacity) are gone with the budget
+# they served. Install-local overrides — observe mode, thresholds, extra
+# watched paths — belong in watchgod.local.conf, which nothing regenerates.
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
 WEOF
-echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "  CC temp: ${CC_TMP_DIR}"
 
 echo "  ~/.genesis/ initialized"
 echo
@@ -1102,7 +1117,7 @@ else
 fi
 echo
 
-# --- Network resilience (KeepConfiguration + networkd watchdog) ---
+# --- Network resilience (KeepConfiguration + networkd and Tailscale watchdogs) ---
 # Same guarded-source contract as memory resilience: a partial checkout without
 # the lib degrades to a warning, never aborts bootstrap under set -e.
 if [[ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]]; then
@@ -1151,10 +1166,32 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # Every token any template uses must appear here, and `sed` will NOT
+        # tell you when one is missing — an unknown `__TOKEN__` passes through
+        # verbatim into a unit that then installs and enables reporting success.
+        # __AZ_ROOT__ is the instance that proves it: install.sh gained the
+        # expression, this loop never did, and agent-zero.service rendered here
+        # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
+        # install) while the venv path one line below it came out correct.
+        # Default matches install.sh and scripts/vendor_assets.sh.
+        # Parity with install.sh is pinned by
+        # tests/test_scripts/test_systemd_template_placeholders.py.
+        #
+        # ESCAPED, unlike the four above it, and the asymmetry is deliberate:
+        # AZ_ROOT is the only one an OPERATOR supplies (an env var), while the
+        # others are computed here. MEASURED what unescaped does — `&` is sed's
+        # whole-match backreference, so AZ_ROOT=/tmp/R&D renders
+        # `WorkingDirectory=/tmp/R__AZ_ROOT__D`, putting the literal token BACK
+        # into the unit this line exists to fix; and a `|` makes sed exit 1,
+        # which under this script's `set -euo pipefail` aborts the whole render
+        # loop with units half-written. install.sh escapes all five via
+        # _sed_repl_esc; this matches it rather than widening the gap.
+        _az_root_esc=$(printf '%s' "${AZ_ROOT:-$HOME/agent-zero}" | sed -e 's/[\\&|]/\\&/g')
         rendered=$(sed -e "s|__HOME__|$HOME|g" \
                        -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
                        -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
                        -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

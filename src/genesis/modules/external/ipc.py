@@ -12,6 +12,7 @@ from typing import Protocol
 
 import httpx
 
+from genesis.cc.child_env import FUNCTION_HOOKS_ENV
 from genesis.cc.types import CCModel, EffortLevel, model_supports_effort
 from genesis.modules.external.config import IPCConfig
 
@@ -265,8 +266,10 @@ class SshIPCAdapter:
         parts: list[str] = []
         if self._remote_working_dir:
             parts.append(f"cd {shlex.quote(self._remote_working_dir)} &&")
+        # A remote Claude Code session is dispatched too: function hooks off
+        # (genesis.cc.child_env), as an env assignment on the remote command.
         parts.append(
-            f"{shlex.quote(self._remote_claude_path)} -p"
+            f"{FUNCTION_HOOKS_ENV}=0 {shlex.quote(self._remote_claude_path)} -p"
             f" --model {shlex.quote(model)}"
             f" --output-format json"
             f"{effort_seg}"

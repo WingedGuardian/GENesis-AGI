@@ -351,6 +351,7 @@ class EgoSession:
             working_dir=background_session_dir(),
             mcp_config=self._mcp_config_path,
             disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS),
+            caller_tag=self._cc_caller_tag("cycle"),
         )
 
         # Autonomous dispatch check
@@ -1389,6 +1390,15 @@ class EgoSession:
 
     # -- Helpers -----------------------------------------------------------
 
+    def _cc_caller_tag(self, stage: str) -> str:
+        """``cc.invocation_failed`` caller tag naming THIS ego and the stage.
+
+        Both egos share this class, so a fixed tag would make their failures
+        unattributable and coalesce one behind the other. Derived from the
+        per-instance source tag: ``user_ego_cycle`` -> ``user_ego.<stage>``.
+        """
+        return f"{self._source_tag.removesuffix('_cycle')}.{stage}"
+
     async def _run_gate_cc(self, prompt: str, *, label: str):
         """Run a lightweight in-cycle gate CC call (reconcile/realist), returning
         the CC output or None on error. Mirrors the realist's fail-open envelope
@@ -1404,6 +1414,7 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=self._cc_caller_tag(f"gate.{label.lower()}"),
             )
             output = await self._invoker.run(invocation)
             if output.is_error:
@@ -1991,6 +2002,7 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=self._cc_caller_tag("realist"),
             )
             output = await self._invoker.run(invocation)
             # Track realist cost for cycle accounting
@@ -2446,6 +2458,27 @@ class EgoSession:
                 # Infer from proposal action_type if available
                 brief_action = brief.get("action_type", "")
                 profile = _infer_profile(brief_action)
+                # SAY SO. The substitute has a DIFFERENT tool scope, not a smaller
+                # one: measured against the removed `steward`, `research` gains
+                # `Write` and `interact` gains `Write` plus browser tools, while
+                # both correctly lose Bash. So the work runs with capabilities the
+                # brief did not ask for, and the session's outcome is recorded as
+                # this proposal's outcome — a proposal can be marked executed by a
+                # session that could not do what it described.
+                #
+                # Logged rather than refused because refusing is a design decision
+                # about what the ego's dispatchable set IS, not a repair; that is
+                # tracked separately. The unknown-MODEL fallback nine lines below
+                # already warns on exactly this shape, so this is the missing half
+                # of an existing convention, not a new one.
+                if brief_profile:
+                    logger.warning(
+                        "Execution brief %s requested profile %r, which is not "
+                        "registered — running as %r instead, whose tool scope "
+                        "differs. The outcome will be recorded against this "
+                        "proposal regardless.",
+                        proposal_id, brief_profile, profile,
+                    )
             # Resolve straight from the enum so any valid tier (incl. fable) is
             # honored; an unknown value logs and falls back to sonnet rather than
             # silently downgrading a real tier.
