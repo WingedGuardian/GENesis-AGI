@@ -231,6 +231,48 @@ class TestUpstreamCheck:
         )
 
     @pytest.mark.asyncio
+    async def test_an_update_remote_refusal_fails_the_check_instead_of_using_origin(
+        self, collector, db, caplog,
+    ) -> None:
+        """When the shared rule refuses (another remote names the public
+        repository and origin does not), update.sh stops. The collector must not
+        quietly compare against origin instead: that reports a remote the rule
+        rejected as the update source and hides the refusal from anyone who only
+        sees the update-available signal. It fails the check, logging why, and
+        fetches nothing."""
+        import logging
+
+        from genesis.util import update_remote as ur
+
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('a', 'genesis_version', 'genesis_version_baseline', "
+            "?, 'low', '2026-04-01T00:00:00Z')",
+            (json.dumps({"version": "abc123"}),),
+        )
+        await db.commit()
+
+        def refuse(root, public_repo=None, *, pin=False):
+            raise ur.UpdateRemoteError("origin does not name the public repository")
+
+        spawn = AsyncMock()
+        caplog.set_level(logging.ERROR)
+        with _mock_head("abc123"), _mock_failure_file_check(), \
+             patch.object(ur, "update_remote", refuse), \
+             patch(
+                 "genesis.learning.signals.genesis_version.asyncio.create_subprocess_exec",
+                 spawn,
+             ):
+            reading = await collector.collect()
+
+        assert reading.failed is True
+        assert not spawn.called, "the check fetched from a remote the rule refused"
+        assert any(
+            r.exc_info and isinstance(r.exc_info[1], ur.UpdateRemoteError)
+            for r in caplog.records
+        ), "the refusal did not reach the error log"
+
+    @pytest.mark.asyncio
     async def test_a_measured_zero_resolves_a_stale_update_alert(
         self, collector, db,
     ) -> None:

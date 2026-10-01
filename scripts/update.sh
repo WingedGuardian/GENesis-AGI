@@ -241,22 +241,35 @@ echo "  Genesis Update"
 echo "  ──────────────────────────────────────"
 
 # ── Resolve upstream remote ────────────────────────────────
-# Use the remote pointing to github_public_repo (e.g. 'public' for GENesis-AGI).
-# Falls back to 'origin' if detection fails or genesis.env is unavailable.
-_detect_update_remote() {
-    local public_repo
-    public_repo=$(
-        "$VENV_DIR/bin/python" -c \
-        "from genesis.env import github_public_repo; print(github_public_repo())" \
-        2>/dev/null
-    ) || public_repo="GENesis-AGI"
-    local remote
-    remote=$(git -C "$GENESIS_ROOT" remote -v 2>/dev/null \
-        | awk "/$public_repo.*fetch/{print \$1; exit}")
-    echo "${remote:-origin}"
-}
-UPDATE_REMOTE="$(_detect_update_remote)"
-echo "  Update remote: $UPDATE_REMOTE"
+# The remote whose main this update installs, chosen by the shared rule in
+# src/genesis/util/update_remote.py and pinned in this checkout's git config
+# (genesis.updateRemote) on first use, so a remote added later, such as a
+# contributor's fork fetched to review a pull request, cannot change where
+# updates come from. Exit 2 from the helper is a refusal (the choice would be a
+# guess); any other failure means it could not run, and origin is used.
+_UR_RC=0
+_UR_OUT=$("$VENV_DIR/bin/python" -m genesis.util.update_remote "$GENESIS_ROOT" --pin 2>/dev/null) \
+    || _UR_RC=$?
+_UR_HOW=""
+case "$_UR_RC" in
+    0)
+        UPDATE_REMOTE="$(printf '%s\n' "$_UR_OUT" | sed -n 1p)"
+        _UR_HOW="$(printf '%s\n' "$_UR_OUT" | sed -n 2p)"
+        ;;
+    2)
+        echo "ERROR: cannot choose the update remote: $_UR_OUT"
+        echo "       Refusing to update until it is chosen."
+        exit 1
+        ;;
+    *)
+        echo "  WARNING: the update-remote rule could not run (exit $_UR_RC); using origin."
+        UPDATE_REMOTE="origin"
+        ;;
+esac
+[ -n "$UPDATE_REMOTE" ] || UPDATE_REMOTE="origin"
+# How it was chosen (origin, fallback, pinned, override), so a log shows when a
+# GENESIS_UPDATE_REMOTE override or a pin, not the rule, decided this run.
+echo "  Update remote: $UPDATE_REMOTE${_UR_HOW:+ ($_UR_HOW)}"
 
 # ── Current state ─────────────────────────────────────────
 ORIGINAL_BRANCH=$(git -C "$GENESIS_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "main")

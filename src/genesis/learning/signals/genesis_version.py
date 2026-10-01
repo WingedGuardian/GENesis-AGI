@@ -52,26 +52,18 @@ def _load_updates_config() -> dict:
 
 
 def _update_remote() -> str:
-    """Return the git remote that points to the public/primary repo.
+    """Return the git remote update.sh takes its updates from.
 
-    Reads github.public_repo from genesis.env and matches it against
-    'git remote -v'. Falls back to 'origin' if detection fails.
+    The same rule update.sh uses (genesis.util.update_remote), read-only: it
+    reads a pin but never writes one. A refusal propagates: every caller runs
+    inside collect()'s upstream-check try, which logs it and reports the check
+    as FAILED. Comparing against origin instead would report a remote the rule
+    rejected as this install's update source, and hide the refusal update.sh
+    stops on.
     """
-    import subprocess
-    try:
-        from genesis.env import github_public_repo
-        public_repo = github_public_repo()
-        result = subprocess.run(
-            ["git", "-C", str(_GENESIS_ROOT), "remote", "-v"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if public_repo in line and "(fetch)" in line:
-                    return line.split()[0]
-    except Exception:
-        pass
-    return "origin"
+    from genesis.util.update_remote import update_remote
+
+    return update_remote(_GENESIS_ROOT)
 
 
 class GenesisVersionCollector:
@@ -257,8 +249,8 @@ class GenesisVersionCollector:
     async def _check_upstream(self) -> tuple[int, str]:
         """Fetch upstream and compare release tags.
 
-        Uses the remote pointing to github_public_repo() (e.g. 'public'),
-        falling back to 'origin'. Tag-based comparison is robust against
+        Uses the remote update.sh updates from (``_update_remote``); when that
+        rule refuses, the check fails. Tag-based comparison is robust against
         squash-merge divergence — same release tag means same content even
         if commit SHAs differ.
 

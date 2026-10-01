@@ -195,6 +195,13 @@ names, so an overlay of a read-only file is editable (#2446).
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+- **The update remote** — which git remote `scripts/update.sh` fetches `main` from, and
+  which the version collector compares against. Chosen by `src/genesis/util/update_remote.py`:
+  env `GENESIS_UPDATE_REMOTE` (one run), then the checkout's own git config
+  `genesis.updateRemote` (read with `--local`; a global or system entry is ignored), then
+  `origin`. `update.sh` pins `origin` there on first use, so a remote added later (a
+  contributor's fork fetched for review) cannot move it. When `origin` does not name
+  `github.public_repo` but another remote does, it refuses until that key is set by hand.
 - **`env.example`** — a template of deployment/topology env vars. Its header suggests
   "`.env` at the repo root", but nothing in `src/` or `scripts/` loads a repo-root `.env`.
   Runtime entries belong in `secrets.env` or the unit environment. Install-time entries
