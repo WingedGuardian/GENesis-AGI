@@ -602,6 +602,61 @@ def test_the_guard_bounds_whatever_decision_it_is_given(monkeypatch) -> None:
     assert _decision(json.loads(out)) == "ask"
 
 
+def _billion_alias_chain() -> str:
+    """Nine levels of ten aliases each: tiny on disk, 10**9 items once expanded."""
+    lines = ["l0: &l0 [x, x, x, x, x, x, x, x, x, x]"]
+    for i in range(1, 9):
+        refs = ", ".join([f"*l{i - 1}"] * 10)
+        lines.append(f"l{i}: &l{i} [{refs}]")
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param("hooks:\n  asks:\n    secrets_env: 0x" + "f" * 5000 + "\n", id="huge-hex-int"),
+        pytest.param(
+            _billion_alias_chain() + "hooks:\n  asks:\n    secrets_env: *l8\n",
+            id="alias-bomb-value",
+        ),
+        pytest.param(_billion_alias_chain() + "hooks: *l8\n", id="alias-bomb-section"),
+    ],
+)
+def test_a_pathological_value_cannot_crash_or_hang_the_guard(tmp_path, config: str) -> None:
+    """The real guard, reading a real config file: describing a malformed value
+    for its note must never raise or run past the hook timeout, or the hook
+    makes no decision and the access runs unprompted. The ask must survive."""
+    home = tmp_path / "home"
+    cfg = home / ".genesis" / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "genesis.yaml").write_text(config)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("_TEST_HOOK_ASK_POLICY", "GENESIS_CC_SESSION")
+    }
+    env["HOME"] = str(home)
+    proc = subprocess.run(
+        [sys.executable, str(_HOOKS / "secrets_env_access_guard.py")],
+        input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": "cat ~/genesis/secrets.env"}}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        env=env,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
+    assert _decision(json.loads(proc.stdout.strip())) == "ask", proc.stdout[:300]
+
+
+def test_a_single_merge_key_is_reported_as_a_merge_key(config_file, capsys) -> None:
+    config_file.write_text("base: &b {secrets_env: off}\nhooks:\n  asks:\n    <<: *b\n")
+    assert policy.ask_suppressed(_KEY) is False
+    err = capsys.readouterr().err
+    assert "merge key" in err and "more than once" not in err
+
+
 def test_a_broken_output_helper_still_delivers_the_decision(monkeypatch) -> None:
     """A helper that is present but broken (a syntax error mid-deploy) raises
     something other than ImportError. Uncaught, the guard would exit with no

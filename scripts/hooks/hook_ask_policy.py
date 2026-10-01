@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import reprlib
 import sys
 
 #: Every ask this module can speak about. A key absent from this set is not a
@@ -231,11 +232,28 @@ def _duplicates_on_the_policy_path(yaml, text: str) -> list[str]:
     return dupes
 
 
+#: A bounded repr: it never walks more than a few items or levels, so a tiny
+#: YAML alias chain that expands to a billion elements cannot hang the hook.
+_SHORT_REPR = reprlib.Repr()
+_SHORT_REPR.maxlevel = 2
+_SHORT_REPR.maxlist = _SHORT_REPR.maxtuple = _SHORT_REPR.maxdict = _SHORT_REPR.maxset = 4
+_SHORT_REPR.maxstring = _SHORT_REPR.maxother = 60
+
+
 def _clip(value: object, limit: int = 80) -> str:
-    """``repr(value)`` cut to ``limit`` characters. A note quotes what the
-    operator wrote, and a whole config file pasted into the approval prompt would
-    drown the question it is attached to."""
-    shown = repr(value)
+    """A short, bounded description of ``value`` for a note. A note quotes what
+    the operator wrote, and a whole config file pasted into the approval prompt
+    would drown the question it is attached to.
+
+    It must never raise or run long: it is called on operator-written values on
+    the path that decides whether to ask, and a hook that crashes or times out
+    makes no decision at all, so the access would run unprompted. ``reprlib``
+    bounds the walk; the catch covers what it still delegates to the builtin
+    ``repr`` (an integer past Python's int-to-str digit limit raises)."""
+    try:
+        shown = _SHORT_REPR.repr(value)
+    except Exception:  # noqa: BLE001 - describing a value must never cost the ask
+        shown = f"<{type(value).__name__}>"
     return shown if len(shown) <= limit else shown[: limit - 3] + "..."
 
 
@@ -258,6 +276,13 @@ def _declared() -> dict[str, object]:
         import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
 
         dupes = _duplicates_on_the_policy_path(yaml, text)
+        if dupes and all(d == "<< (merge key)" for d in dupes):
+            _note(
+                f"hooks.asks in {_CONFIG_PATH} uses a YAML merge key (<<) on the "
+                f"policy path — refused, so every ask stays ENABLED. Write the "
+                f"keys out directly to restore your declared policy."
+            )
+            return {}
         if dupes:
             _note(
                 f"hooks.asks in {_CONFIG_PATH} declares {', '.join(dupes)} more than "
