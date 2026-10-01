@@ -437,10 +437,24 @@ def _git_activity_time(worktree_path: str) -> float:
             # A rename reads "R  old -> new"; the NEW path is the one on disk.
             if " -> " in rel:
                 rel = rel.split(" -> ", 1)[1]
+            path = root / rel.strip('"')
             try:
-                newest = max(newest, (root / rel.strip('"')).lstat().st_mtime)
-            except OSError:
+                newest = max(newest, path.lstat().st_mtime)
                 continue
+            except OSError:
+                pass
+            # A DELETED path has no mtime of its own, but unlinking it updated
+            # its directory's. Take the nearest ancestor that still exists,
+            # stopping at the worktree root, or a deletion below the shallow walk
+            # leaves the worktree looking as idle as it was before the change.
+            for parent in path.parents:
+                if root not in parent.parents:
+                    break
+                try:
+                    newest = max(newest, parent.lstat().st_mtime)
+                    break
+                except OSError:
+                    continue
     return newest
 
 

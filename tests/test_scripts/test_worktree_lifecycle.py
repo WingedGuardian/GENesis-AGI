@@ -1615,6 +1615,31 @@ def test_an_archive_whose_names_are_not_utf8_can_be_recovered(reaper_repo, tmp_p
     assert (wt / "untracked.txt").read_text() == "only here\n"
 
 
+def test_deleting_a_deep_tracked_file_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A deleted path has no mtime of its own, so the activity probe skipped it,
+    and the shallow walk does not reach a file three directories down. An old
+    worktree whose only recent change was such a deletion kept its old age and
+    was reaped at once, without the 14-day wait a dirty worktree is promised.
+    Unlinking a file updates its directory's mtime, and that is the evidence."""
+    repo = reaper_repo.repo
+    deep = Path("deep") / "x" / "y" / "f.txt"
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_text("tracked\n")
+    _git(repo, "add", str(deep))
+    _git(repo, "commit", "-qm", "deep file")
+    wt = tmp_path / "wt_deep"
+    _git(repo, "worktree", "add", "-q", "-b", "deep-br", str(wt), "main")
+    _age_path(wt, 20)
+    (wt / deep).unlink()
+    assert wl._has_uncommitted_changes(str(wt)), "precondition: git sees the deletion"
+
+    # A worktree that reads as fresh returns before the dirty check, so the age
+    # and the action are what this asserts.
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["age_days"] < 1, cls
+    assert cls["action"] == "none", cls
+
+
 def test_a_dirty_check_that_cannot_answer_counts_as_dirty(reaper_repo, monkeypatch):
     """FAIL-CLOSED: when `git status` cannot answer, the worktree is treated as
     dirty, so an error holds it for the long window instead of archiving it
