@@ -476,6 +476,18 @@ def test_a_deleted_author_identity_report_still_counts_before_cutover():
     assert got["reviewed_heads"] == [H2]
 
 
+def test_an_unresolvable_identity_report_after_cutover_is_ignored_before_it_is_unknown():
+    template = "external report head={head}"
+    gone = "a" * 40  # force-pushed out of the PR
+    after = _ev(comments=(_cm(f"external report head={gone}"),), templates=(template,))
+    assert after["status"] == "ok" and after["count"] == 0
+    assert after["current_head_reviewed"] is False
+    before = _ev(
+        comments=(_cm(f"external report head={gone}", when=BEFORE),), templates=(template,)
+    )
+    assert before["status"] == "unknown" and "unresolved_review_head" in before["errors"]
+
+
 def test_a_stale_findings_module_is_unknown_not_a_traceback(monkeypatch):
     monkeypatch.delattr(rf, "is_finding")
     got = _ev(reviews=(_rv(DEVIN, H1, _devin("🟡")),))

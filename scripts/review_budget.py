@@ -484,6 +484,8 @@ def evaluate_evidence(
         for pattern in identities:
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
+                if error == "unresolved_review_head" and not before:
+                    continue  # confirms only, as for a clean comment below
                 if error:
                     return _unknown(error, current_head=head)
                 confirm(resolved or "", before)
