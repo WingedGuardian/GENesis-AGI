@@ -71,9 +71,11 @@ _LIKE_RE = re.compile(
     r"\b(?:\w+\.)?(source|type|category)\s+(NOT\s+)?LIKE\s+'([^']+)'", re.IGNORECASE
 )
 
-# A pattern an untrusted value may match, with the reason that is safe. An
-# exclusion (NOT LIKE) hides the row, which is always safe, so only positive
-# matches need a reason.
+# A pattern an untrusted value may match, with the reason that is safe. Only
+# positive matches can make a reader ACT on an untrusted row, so only they need
+# a reason. An exclusion (NOT LIKE / NOT IN / !=) is the reverse: the prefix lets
+# an untrusted row past it, which gives a session nothing it lacked (it could
+# always pick a type the filter does not exclude).
 _ALLOWED_POSITIVE_MATCHES: dict[str, str] = {
     # perception/writer.py: cooldown lookups that also require an exact
     # first-party source ('reflection'), which a namespaced source never equals.
@@ -267,3 +269,32 @@ def test_a_namespaced_row_is_never_permanent():
     permanent = sorted(_PERMANENT_TYPES)[0]
     assert _compute_ttl(permanent) is None
     assert _compute_ttl(UNTRUSTED_OBS_PREFIX + permanent) == _DEFAULT_TTL
+
+
+def test_a_deeply_repeated_prefix_does_not_break_the_write():
+    """Codex on #2614 round 3: a type of ~1000 repeated prefixes recursed until
+    RecursionError, so the write failed."""
+    from genesis.db.crud.observations import _compute_ttl
+
+    assert _compute_ttl(UNTRUSTED_OBS_PREFIX * 5000 + "user_signal") == _compute_ttl("user_signal")
+
+
+@pytest.mark.asyncio
+async def test_the_light_world_count_counts_entries_not_boundary_lines():
+    """Codex P3 on #2614: a wrapped signal renders as three lines."""
+    from unittest.mock import patch
+
+    from genesis.ego import world_snapshot
+    from genesis.ego.user_context import UserEgoContextBuilder
+
+    snap = world_snapshot.WorldSnapshot(user_signals=[
+        {"type": UNTRUSTED_OBS_PREFIX + "user_signal", "content": "c", "priority": "medium"}])
+
+    async def build(db):
+        return snap
+
+    builder = UserEgoContextBuilder.__new__(UserEgoContextBuilder)
+    builder._db = None
+    with patch.object(world_snapshot, "build", build):
+        text = await builder._world_snapshot_section(depth="light")
+    assert "1 items in world snapshot" in text

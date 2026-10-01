@@ -306,8 +306,11 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
 
     if obs_type.startswith(UNTRUSTED_OBS_PREFIX):
         # A row written by an untrusted session keeps its original type's TTL,
-        # but never permanent retention: that is for Genesis's own records.
-        base = obs_type[len(UNTRUSTED_OBS_PREFIX):]
+        # but never permanent retention: that is for Genesis's own records. The
+        # type is free-form, so a repeated prefix is stripped in a loop.
+        base = obs_type
+        while base.startswith(UNTRUSTED_OBS_PREFIX):
+            base = base[len(UNTRUSTED_OBS_PREFIX):]
         return _DEFAULT_TTL if base in _PERMANENT_TYPES else _compute_ttl(base)
 
     if obs_type in _PERMANENT_TYPES:

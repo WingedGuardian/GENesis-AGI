@@ -97,8 +97,10 @@ def _eval_disallowed_tools() -> list[str]:
     context filter on origin; the user-ego world snapshot shows the judge's
     ``untrusted:user_signal`` rows inside the untrusted-content boundary. Readers
     that take every type (the ego and sentinel contexts, the surplus executor, the
-    morning report) still show these rows, labelled ``untrusted:``; wrapping them
-    there is the tabled "external-origin observation content" follow-up.
+    morning report) still show these rows, labelled ``untrusted:``, and so do
+    readers that EXCLUDE certain types (``NOT IN`` / ``!=``), which the prefix
+    now passes. Wrapping them there is the tabled "external-origin observation
+    content" follow-up.
     """
     return SessionConfigBuilder().build_reflection_disallowed()
 
