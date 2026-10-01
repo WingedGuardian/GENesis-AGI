@@ -21,9 +21,99 @@ sys.path.insert(0, str(SCRIPTS / "hooks"))
 import git_push_guard as requests  # noqa: E402
 import review_enforcement_commit as commits  # noqa: E402
 import review_state as state  # noqa: E402
-from git_repo_selection import REPO_VARS, raw_sets_repo_env, seg_redirects_repo  # noqa: E402
+from git_repo_selection import REPO_VARS  # noqa: E402
 from review_deadline import Deadline  # noqa: E402
-from shell_parse import analyze_checked, gh_pr_subcommand, git_subcommand, mentions  # noqa: E402
+from shell_parse import (  # noqa: E402
+    _GH_ALL_VALUE_FLAGS,
+    _GH_FLAG_TABLE,
+    _argv,
+    _gh_option,
+    analyze_checked,
+    gh_command,
+    gh_pr_subcommand,
+    git_subcommand,
+    git_subcommand_index,
+    mentions,
+)
+
+
+def _non_mutating(seg) -> bool:
+    """Prove help/dry-run from option positions, never from message/path text."""
+    argv = seg.argv
+    if git_subcommand(argv) == "commit":
+        i = git_subcommand_index(argv) + 1
+        dry_run = False
+        while i < len(argv):
+            tok = argv[i]
+            if tok == "--":
+                break
+            if tok in {"--help", "-h"}:
+                return True
+            if tok in {"--dry-run", "--no-dry-run"}:
+                dry_run = tok == "--dry-run"
+            elif tok.startswith("--"):
+                name = tok.split("=", 1)[0]
+                if name == "--gpg-sign":
+                    # Git's optional key is attached, never the next token.
+                    # Do not hide a following --no-dry-run behind this option.
+                    i += 1
+                    continue
+                if name in commits._COMMIT_VALUE_LONG:
+                    i += 1 if "=" in tok else 2
+                    continue
+                # Unknown option arity cannot establish a read-only mode.
+                return False
+            elif tok.startswith("-"):
+                consumes_next = False
+                for j, ch in enumerate(tok[1:], 1):
+                    if ch in commits._COMMIT_ARG_SHORT:
+                        consumes_next = j == len(tok) - 1
+                        break
+                    if ch == "S":  # optional attached signing key
+                        break
+                    if ch == "h":
+                        return True
+                    if ch not in "aienopqsvuz":
+                        return False
+                i += 2 if consumes_next else 1
+                continue
+            i += 1
+        return dry_run
+    if gh_pr_subcommand(argv) == "comment":
+        invocation = gh_command(argv)
+        if invocation is None or invocation.unmodelled:
+            return False
+        i = 1
+        while i < len(argv):
+            if argv[i] == "--":
+                break
+            flags = _GH_ALL_VALUE_FLAGS if i < invocation.path_end else _GH_FLAG_TABLE[("pr", "comment")][0]
+            name, glued = _gh_option(argv[i], flags)
+            if name in flags:
+                i += 1 if glued is not None else 2
+                continue
+            if argv[i] in {"--help", "-h"}:
+                return True
+            i += 1
+    return False
+
+
+def _commit_cwd(seg, cwd: str) -> str | None:
+    """Accept only no global options or one literal -C, with no shell-state model."""
+    index = git_subcommand_index(seg.argv)
+    options = seg.argv[1:index]
+    target = cwd
+    if options:
+        if len(options) == 2 and options[0] == "-C":
+            target = options[1]
+        elif len(options) == 1 and options[0].startswith("-C"):
+            target = options[0][2:]
+        else:
+            return None
+        if target.startswith("~") or any(ch in target for ch in "$`\\*?[]{}()<>\n"):
+            return None
+        target = os.path.join(cwd, target)
+    return os.path.abspath(target) if Path(target).is_dir() else None
 
 
 def decide(payload: object) -> str | None:
@@ -41,24 +131,27 @@ def decide(payload: object) -> str | None:
         if mentions(command, re.compile(r"\b(?:git|gh)\b")):
             return f"Cannot classify this shell action: {blind.cause}. {blind.hint}"
         return None
-    commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
-    if commit_segs:
-        # The lookup samples pre-command state. Other git/gh operations could
-        # change that state or spend budget in the same command. Require separate
-        # invocations rather than constructing another shell-state interpreter.
-        other_actions = [
-            s for s in segs
-            if s not in commit_segs and (s.exe in {"git", "gh"} or gh_pr_subcommand(s.argv))
-        ]
-        if len(commit_segs) != 1 or other_actions:
-            return "Run one commit separately from other git/gh actions."
-        if any(os.environ.get(name) for name in REPO_VARS) or any(
-            seg_redirects_repo(s) or raw_sets_repo_env(s.raw) for s in segs
-        ):
-            return "Repository-selection overrides cannot be resolved; use a literal git -C directory."
-        effective_cwd = commits._effective_diff_cwd(command, payload, segs, commit_seg=commit_segs[0])
-        if not isinstance(effective_cwd, str):
-            return "Cannot resolve the commit directory; use a literal git -C directory."
+    actions = [
+        seg for seg in segs if not _non_mutating(seg) and (
+            git_subcommand(seg.argv) == "commit" or (
+                gh_pr_subcommand(seg.argv) == "comment"
+                and requests._comment_review_request(seg.argv)[2] is not False
+            )
+        )
+    ]
+    if not actions:
+        return None
+    # Exact raw/resolved argv agreement excludes stripped env assignments and
+    # wrappers. Single top-level commands exclude prior/conditional shell state.
+    if len(segs) != 1 or actions[0].depth or _argv(actions[0].raw) != actions[0].argv:
+        return "Run the action as one standalone, unwrapped git/gh command."
+    if any(os.environ.get(name) for name in (*REPO_VARS, "GH_REPO")):
+        return "Inherited repository-selection overrides cannot be resolved."
+    seg = actions[0]
+    if git_subcommand(seg.argv) == "commit":
+        effective_cwd = _commit_cwd(seg, cwd)
+        if effective_cwd is None:
+            return "Use the current directory or one literal git -C directory; other global options are unsupported."
         deadline = Deadline.after(commits._COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
         branch = state.get_current_branch(cwd=effective_cwd, deadline=deadline.expires_at)
         result = commits._branch_review_budget(

@@ -194,7 +194,8 @@ def test_launcher_denies_each_module_scope_import_failure(tmp_path, poisoned):
         "review_state": "",
         "git_repo_selection": "REPO_VARS = ()\nraw_sets_repo_env = seg_redirects_repo = None\n",
         "review_deadline": "Deadline = None\n",
-        "shell_parse": "analyze_checked = gh_pr_subcommand = git_subcommand = mentions = None\n",
+        "shell_parse": "analyze_checked = gh_pr_subcommand = git_subcommand = git_subcommand_index = mentions = None\n"
+            "_argv = _GH_ALL_VALUE_FLAGS = _GH_FLAG_TABLE = _gh_option = gh_command = None\n",
     }
     for name, text in stubs.items():
         if name == poisoned:
@@ -208,3 +209,83 @@ def test_launcher_denies_each_module_scope_import_failure(tmp_path, poisoned):
     assert not run.stdout
     assert "poisoned sibling: " + poisoned in run.stderr
     assert "handoff" in run.stderr.lower()
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -m x", 'gh pr comment 1 --repo owner/repo --body "@codex review"',
+])
+@pytest.mark.parametrize("variable", ["GH_REPO", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"])
+def test_inherited_overrides_block_both_budget_paths(adapter, monkeypatch, command, variable):
+    monkeypatch.setenv(variable, "owner/other")
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup"))
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: pytest.fail("lookup"))
+    assert adapter.decide(payload(command))
+
+
+@pytest.mark.parametrize("command", [
+    "env -C /elsewhere git commit -m x",
+    "pushd /elsewhere && git commit -m x",
+    "false && cd /elsewhere; git commit -m x",
+    "builtin cd /elsewhere && git commit -m x",
+    "command cd /elsewhere && git commit -m x",
+    "cd /elsewhere && git commit -m x",
+    "git -C / -C /elsewhere commit -m x",
+    "git -C/ -C/elsewhere commit -m x",
+    "git -c core.worktree=/elsewhere commit -m x",
+    "env GH_REPO=owner/other git commit -m x",
+    'GH_REPO=owner/other gh pr comment 1 --body "@codex review"',
+    'env GH_REPO=owner/other gh pr comment 1 --body "@codex review"',
+    'export GH_REPO=owner/other; gh pr comment 1 --body "@codex review"',
+    'GH_REPO=owner/other; gh pr comment 1 --body "@codex review"',
+    'command gh pr comment 1 --body "@codex review"',
+])
+def test_unmodelled_actions_block_before_any_budget_lookup(adapter, monkeypatch, command):
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup"))
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: pytest.fail("lookup"))
+    assert adapter.decide(payload(command))
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -h", "git commit --help", "git commit --dry-run",
+    "git commit --dry-run -m x", "git commit -m x --dry-run",
+    "git commit --no-dry-run --dry-run",
+    "gh pr comment --help", "gh pr comment 1 --help",
+    "gh pr comment -b x --help",
+])
+def test_definitive_non_mutating_modes_skip_lookups(adapter, monkeypatch, command):
+    monkeypatch.setenv("GH_REPO", "owner/other")
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup"))
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: pytest.fail("lookup"))
+    assert adapter.decide(payload(command)) is None
+
+
+@pytest.mark.parametrize("command", [
+    "git commit --dry-run --no-dry-run",
+    'git commit -m "--help"', 'git commit -m "--dry-run"',
+    'git commit --message "--help"', 'git commit --message=--help',
+    'git commit -m--help', 'git commit -- --help',
+    'git commit --future-unknown-value --help',
+    'gh pr comment 1 --body "--help"',
+    'gh pr comment 1 --body-file=--help',
+    'gh pr comment 1 -- --help',
+])
+def test_mode_like_values_cannot_skip_the_guard(adapter, monkeypatch, command):
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: {"status": "unknown"})
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: ("ask", "limit"))
+    segs, blind = adapter.analyze_checked(command)
+    assert blind is None
+    assert not adapter._non_mutating(segs[0])
+    if segs[0].exe == "git":
+        assert adapter.decide(payload(command))
+
+
+@pytest.mark.parametrize("signing", ["--gpg-sign", "--gpg-sign=key", "-S", "-Skey"])
+@pytest.mark.parametrize("modes,blocked", [
+    ("--dry-run {signing} --no-dry-run", True),
+    ("--no-dry-run {signing} --dry-run", False),
+    ("{signing} --dry-run --no-dry-run", True),
+])
+def test_optional_signing_key_cannot_hide_mode_reversal(adapter, monkeypatch, signing, modes, blocked):
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: {"status": "unknown"})
+    command = "git commit " + modes.format(signing=signing) + " -m probe"
+    assert bool(adapter.decide(payload(command))) == blocked
