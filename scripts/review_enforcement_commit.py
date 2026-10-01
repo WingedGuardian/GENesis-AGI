@@ -724,31 +724,94 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
     return "branch" if sub == "switch" or targets else None
 
 
-def _git_common_dir(cwd: str | None) -> str | None:
-    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None."""
+def _git_common_dir(cwd: str | None, *, deadline: float | None = None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None.
+
+    With ``deadline`` (the hook's aggregate one) the probe draws from it like the
+    neighbouring git probes: an overrun raises ``DeadlineExpired``, which
+    ``run_guard`` turns into a refusal, instead of each call spending its own
+    5 seconds against a 10-second harness kill that would let the commit run."""
     try:
         args = ["git"] + (["-C", cwd] if cwd else [])
         args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=bounded_timeout(deadline, 5)
+        )
         out = result.stdout.strip()
-        return os.path.realpath(out) if result.returncode == 0 and out else None
+        # One absolute line or nothing: git before 2.31 does not know
+        # `--path-format`, exits 0, and echoes the option back beside a relative
+        # `.git`, which must read as unreadable (fail closed), never as an identity.
+        if result.returncode != 0 or "\n" in out or not os.path.isabs(out):
+            return None
+        return os.path.realpath(out)
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return None
+    except DeadlineExpired:
+        raise
     except Exception:
         return None
 
 
-def _live_integration_repo(cwd: str | None) -> bool:
+def _live_manifest_binding() -> tuple[str, str | None]:
+    """What the deploy manifest says about WHICH repository it belongs to.
+
+    The manifest may carry a top-level ``"repo"``: the ABSOLUTE git common dir of
+    the checkout it belongs to. Returns one of:
+
+    * ``("bound", <canonical path>)`` — the key names an existing git common dir
+      (a directory holding ``objects/`` and ``HEAD``);
+    * ``("absent", None)`` — a JSON object without the key: the caller keeps its
+      rule for manifests written before the key existed;
+    * ``("malformed", None)`` — anything else: unreadable or malformed JSON, not a
+      JSON object, or a key that is not the absolute path of an existing git
+      common dir (a work-tree path, a checkout that has since moved). The caller
+      ARMS, for every target: a broken manifest fails closed.
+
+    The same rule is kept in ``git_push_guard._live_manifest_binding`` and in the git hooks'
+    ``live_manifest_applies``; ``TestManifestRepoBinding`` pins all four copies
+    to one verdict table."""
+    try:
+        with open(Path.home() / ".genesis" / "deploy_manifest.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — unreadable fails closed, never "disarmed"
+        return ("malformed", None)
+    if not isinstance(data, dict):
+        return ("malformed", None)
+    if "repo" not in data:
+        return ("absent", None)
+    repo = data["repo"]
+    if (
+        isinstance(repo, str)
+        and os.path.isabs(repo)
+        and os.path.isdir(os.path.join(repo, "objects"))
+        and os.path.isfile(os.path.join(repo, "HEAD"))
+    ):
+        return ("bound", os.path.realpath(repo))
+    return ("malformed", None)
+
+
+def _live_integration_repo(cwd: str | None, *, deadline: float | None = None) -> bool:
     """Whether ``cwd``'s repository runs a local integration branch named ``live``.
 
     The deploy manifest declares that this install runs one (without it a
-    branch named ``live`` is ordinary), and the commit must be in THIS
-    repository or one of its worktrees: a session commits in unrelated
-    checkouts too, and their own ``live`` branches are none of this gate's
-    business. With the manifest present but an identity unreadable, fail
-    closed, as this gate does for an unverifiable branch."""
+    branch named ``live`` is ordinary), and the commit must be in the repository
+    the manifest is about (``_live_manifest_binding``): when it names one, that
+    repository and no other; when it has no ``"repo"`` key, THIS repository or
+    one of its worktrees, since a session commits in unrelated checkouts too and
+    their own ``live`` branches are none of this gate's business. A malformed
+    manifest, or an identity that cannot be read, fails closed, as this gate does
+    for an unverifiable branch. ``deadline`` bounds both identity probes (see
+    ``_git_common_dir``)."""
     if not (Path.home() / ".genesis" / "deploy_manifest.json").is_file():
         return False
-    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
-    there = _git_common_dir(cwd)
+    kind, bound = _live_manifest_binding()
+    if kind == "malformed":
+        return True
+    there = _git_common_dir(cwd, deadline=deadline)
+    if kind == "bound":
+        return there is None or there == bound
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)), deadline=deadline)
     if here is None or there is None:
         return True
     return here == there
@@ -1573,7 +1636,7 @@ def main() -> None:
             )
             return
         if seg_branch == "live" and _live_integration_repo(
-            seg_cwd if isinstance(seg_cwd, str) else None
+            seg_cwd if isinstance(seg_cwd, str) else None, deadline=hook_deadline
         ):
             # `live` is the local integration branch: origin/main plus the
             # candidate branches in ~/.genesis/deploy_manifest.json, rebuilt with

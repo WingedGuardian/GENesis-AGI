@@ -16,6 +16,7 @@ retrieved from — always known at retrieval time, unlike the per-item store-tim
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 
 from genesis.security.sanitizer import (
@@ -571,6 +572,48 @@ _CHANNEL_STAMPED_OBS_SOURCES: frozenset[str] = frozenset({"retrospective", "cc_d
 #: Prefix an observation ``source`` carries when it re-labels a surplus/recon
 #: intake finding: ``intake:<IntakeSource.value>``.
 _INTAKE_SOURCE_PREFIX = "intake:"
+
+
+#: Prefix put on the type, source and category of every observation an UNTRUSTED
+#: session writes through ``observation_write``. Genesis's own readers select by
+#: exact type/source/category (escalations, update notices, alerts, detected
+#: tasks, user-model deltas, …), so a namespaced row can never be taken for a
+#: pipeline's row, whatever name the session chose. Nothing is refused: the
+#: row still lands, under a name that says where it came from.
+UNTRUSTED_OBS_PREFIX = "untrusted:"
+
+#: Substrings that readers match with ``LIKE '%x%'`` on these columns. A
+#: namespaced value has each one broken with a hyphen, so no substring reader
+#: matches it either. ``tests/test_security/test_untrusted_observation_namespace.py``
+#: derives every LIKE pattern from the source tree and fails on one this list
+#: does not cover.
+_LIKE_READER_SUBSTRINGS: tuple[str, ...] = ("reflection", "triage")
+
+#: The highest priority an untrusted row may carry: ``critical`` pages the user
+#: on Telegram (``outreach/scheduler.py``) whatever the type.
+_UNTRUSTED_MAX_PRIORITY = "high"
+
+
+def _break_like_substrings(value: str) -> str:
+    for word in _LIKE_READER_SUBSTRINGS:
+        value = re.sub(re.escape(word), word[:2] + "-" + word[2:], value, flags=re.IGNORECASE)
+    return value
+
+
+def namespace_untrusted_observation(
+    *, source: str, type_: str, category: str | None, priority: str
+) -> tuple[str, str, str | None, str]:
+    """``(source, type, category, priority)`` for a write from an untrusted session.
+
+    Each name gets :data:`UNTRUSTED_OBS_PREFIX`, with any substring a LIKE reader
+    matches broken, and ``critical`` drops to ``high``. Applied only to writes
+    from a session whose origin is not owner/first-party (the caller checks).
+    """
+    def ns(value: str) -> str:
+        return UNTRUSTED_OBS_PREFIX + _break_like_substrings(value or "")
+
+    capped = _UNTRUSTED_MAX_PRIORITY if (priority or "").strip().lower() == "critical" else priority
+    return ns(source), ns(type_), (ns(category) if category else category), capped
 
 
 def _intake_observation_origin(source: str) -> str | None:

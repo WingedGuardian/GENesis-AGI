@@ -99,13 +99,27 @@ storage_pool:
   # Pressure RELIEF — the tiers above only alert. When free data or metadata
   # space drops to its reserve, relief deletes ONE guardian-owned snapshot per
   # pass (pre-recovery first, the rollback lifeline last), never anything
-  # else, and never grows the pool. Runbook: docs/reference/thin-pool-recovery.md.
+  # else. Runbook: docs/reference/thin-pool-recovery.md.
   #   "live" | "alert_only" | "off"   (invalid → alert_only; env
   #   GUARDIAN_POOL_RELIEF_DISABLED=1 also forces alert_only). alert_only and
   #   off also stop delete-first rotation.
   relief_mode: "live"
   min_reserve_pct: 3.0         # data reserve, % of the pool
   min_meta_reserve_pct: 10.0   # metadata reserve, % of the metadata LV
+  # EARLY relief from the MEASURED growth rate: when data or metadata would
+  # fill within early_horizon_hours, relief frees pre-recovery and superseded
+  # healthy snapshots, and the rollback lifeline only once it is older than
+  # lifeline_max_age_hours and (on LVM) measured holding space; a young
+  # lifeline is taken only at the reserve. 0 disables early relief; an invalid
+  # value turns off early relief and the extend only.
+  # LVM with the genesis-thinpool profile: at LVM's own 80% threshold, when VG
+  # free is less than one 20% autoextend step (so LVM will not extend), relief
+  # grows the pool into that space, keeping extend_keep_free_mib unallocated.
+  early_horizon_hours: 48
+  lifeline_max_age_hours: 48
+  history_sample_interval_s: 300   # pool history: one sample per 5 min
+  history_max_samples: 2016        # 7 days
+  extend_keep_free_mib: 512
 
 # Guardian-side RAM tiered alert (E-rest PR-E1). The container's own RAM alert
 # (infra:container_memory_high) dies exactly when it thrashes/OOMs; the guardian

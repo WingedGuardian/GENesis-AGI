@@ -100,6 +100,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_scope.py",
         "scripts/review_state.py",
         "scripts/review_budget.py",
+        "scripts/review_findings.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
@@ -279,6 +280,7 @@ def evaluate_evidence(
     issue_comments: Sequence[Mapping[str, object]],
     changed_files: Sequence[Mapping[str, object] | str],
     external_identity_templates: Sequence[str] = (),
+    primary_login: str = CODEX_REVIEW_BOT,
 ) -> dict[str, Any]:
     """Evaluate already-fetched PR evidence without I/O.
 
@@ -319,7 +321,7 @@ def evaluate_evidence(
             continue
         if not isinstance(login, str):
             return _unknown("malformed_review_record", current_head=head)
-        if login != CODEX_REVIEW_BOT:
+        if login != primary_login:
             continue
         resolved, error = _resolve_sha(str(item.get("commit_id") or ""), commits)
         if error:
@@ -350,7 +352,7 @@ def evaluate_evidence(
         comment_bodies.append(body)
         if any(m.group(1).lower() == head for m in _CONFIRMATION_RE.finditer(body)):
             confirmation_requested = True
-        if login == CODEX_REVIEW_BOT and author_type == "Bot" and _CODEX_CLEAN_RE.search(body):
+        if login == primary_login and author_type == "Bot" and _CODEX_CLEAN_RE.search(body):
             match = _REVIEWED_COMMIT_RE.search(body)
             if match is None:
                 return _unknown("clean_comment_missing_head", current_head=head)
@@ -606,6 +608,17 @@ def _evaluate_pr_inner(
         if config_error:
             return _unknown(config_error)
 
+    # The reviewer whose reviewed heads are rounds is THE primary
+    # (`review_findings.CODEX_LOGIN`), the same reviewer merge freshness requires,
+    # read from that one definition rather than a copy here. An unimportable
+    # module is unknown, never "Codex by default".
+    try:
+        import review_findings  # noqa: PLC0415 - sibling stdlib module, per call
+
+        primary_login = review_findings.primary_reviewer_login()
+    except Exception:  # noqa: BLE001 - reverse skew is unknown, never zero rounds.
+        return _unknown("review_findings_unimportable")
+
     timeout_for = timeout_for or (lambda seconds: seconds)
     deadline = Deadline.after(budget_seconds, monotonic=monotonic)
     # A call given less than this cannot complete a TLS handshake plus a GitHub
@@ -818,6 +831,7 @@ def _evaluate_pr_inner(
         issue_comments=fetched["comments"],
         changed_files=fetched["files"],
         external_identity_templates=external_identity_templates,
+        primary_login=primary_login,
     )
 
 

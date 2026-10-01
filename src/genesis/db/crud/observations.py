@@ -299,8 +299,20 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
     """Look up TTL for an observation type.
 
     Returns None only for types in _PERMANENT_TYPES. All other unknown
-    types get _DEFAULT_TTL (14 days) with a warning log.
+    types get _DEFAULT_TTL (14 days) with a warning log. A namespaced
+    ``untrusted:<type>`` gets ``<type>``'s TTL, and never None.
     """
+    from genesis.memory.provenance import UNTRUSTED_OBS_PREFIX
+
+    if obs_type.startswith(UNTRUSTED_OBS_PREFIX):
+        # A row written by an untrusted session keeps its original type's TTL,
+        # but never permanent retention: that is for Genesis's own records. The
+        # type is free-form, so a repeated prefix is stripped in a loop.
+        base = obs_type
+        while base.startswith(UNTRUSTED_OBS_PREFIX):
+            base = base[len(UNTRUSTED_OBS_PREFIX):]
+        return _DEFAULT_TTL if base in _PERMANENT_TYPES else _compute_ttl(base)
+
     if obs_type in _PERMANENT_TYPES:
         return None
 

@@ -733,6 +733,41 @@ def test_the_cli_loads_configured_reviewer_identities():
     ).external_identity_template == ["x{head}"]
 
 
+def _seams(monkeypatch, reviews):
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", H5)
+    monkeypatch.setenv(
+        "_TEST_REVIEW_BUDGET_COMMITS",
+        "\n".join(json.dumps({"sha": h}) for h in (H1, H2, H3, H4, H5)),
+    )
+    monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "\n".join(json.dumps(r) for r in reviews))
+    monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_FILES", json.dumps({"filename": "src/x.py"}))
+
+
+def test_the_round_counter_counts_the_primary(monkeypatch):
+    """A2a round 1 (Devin 🔴): the round counter counts THE primary's reviewed heads,
+    read from `review_findings` at call time, never another reviewer's."""
+    import review_findings as rf
+
+    devin = "devin-ai-integration[bot]"
+    _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
+    assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 0
+    _seams(monkeypatch, [{"login": rf.CODEX_LOGIN, "commit_id": h} for h in (H1, H2, H3, H4)])
+    got = rb.evaluate_pr("o/r", 1, external_identity_templates=())
+    assert got["count"] == 4 and got["commit_approval_required"] is True
+    # Bound to the accessor, not a copy: whatever it names is what is counted.
+    monkeypatch.setattr(rf, "primary_reviewer_login", lambda: devin)
+    _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
+    assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 4
+
+
+def test_an_unimportable_reviewer_list_makes_the_budget_unknown(monkeypatch):
+    _seams(monkeypatch, [_review(H4)])
+    monkeypatch.setitem(sys.modules, "review_findings", None)  # import now raises
+    got = rb.evaluate_pr("o/r", 1, external_identity_templates=())
+    assert got["status"] == "unknown" and "review_findings_unimportable" in got["errors"]
+
+
 def test_graphql_comment_landing_between_reads_is_unknown(monkeypatch):
     """The re-read covers issue comments as well as reviews: a clean-review or
     confirmation comment is budget evidence too."""

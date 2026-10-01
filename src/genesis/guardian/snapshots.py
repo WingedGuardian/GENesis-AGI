@@ -839,6 +839,11 @@ class SnapshotManager:
                 logger.info("Rotated superseded healthy snapshot: %s", old_name)
         return name
 
+    async def lifeline_holds_space(self) -> float | None:
+        """Public read of :meth:`_lifeline_holds_space` (pool relief's early
+        level asks for the same evidence before taking an aged lifeline)."""
+        return await self._lifeline_holds_space()
+
     async def _lifeline_holds_space(self) -> float | None:
         """Bytes the healthy snapshots MEASURABLY hold alone, or None.
 

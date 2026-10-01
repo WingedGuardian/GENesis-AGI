@@ -481,6 +481,31 @@ verified: 18e41e1e1 2026-09-23
   COALESCEs content columns; a writer distinguishes "read fine, nothing to
   report" (empty string — CLEARS) from "could not read" (None — PRESERVES), and
   collapsing those two is what makes a finished topic immortal.
+  **Each tag also carries the peer's address** —
+  `[Concurrent | <model> | a1b2c3d4 -> genesis-7f (cc-2:@1.%1)]`, the name
+  `SendMessage` takes and its tmux pane — resolved by
+  `session_awareness/peer_address.py`, the ONLY reader of Claude Code's own
+  session registry (`$CLAUDE_CONFIG_DIR` or `~/.claude`, then `sessions/<pid>.json`).
+  It picks candidates as Claude Code's own peer lookup does (the entries for
+  that session id, following a session moved into a background job, and skipping
+  spare, parked and socketless entries), then answers only when exactly one is
+  live: the same pid domain (machine id plus PID namespace), a running process,
+  and a matching start time, which is what rejects a recycled pid. Where Claude
+  Code would fall back to probing a socket it cannot otherwise verify, this
+  never opens one and says `(not reachable)` instead; with two live candidates
+  it says `(ambiguous)`, and a registry field of the wrong type gives
+  `(registry format changed)` — never a guess, because the registry keeps
+  dead and resumed entries and a name or first-entry join is wrong. Names
+  and panes are peer-written, so they are allowlisted and omitted WHOLE, never
+  cut — a shortened name is a wrong address; the tool and `--json` results
+  carry the same allowlisted form. An address is the same user's own claim, not
+  an authenticated identity: the registry is a directory any process of that user
+  can write, so read it as the hint `ListAgents` gives. Registry files are opened
+  non-blocking without following symlinks, so a FIFO or link named like an entry
+  cannot hang the per-prompt hook. The same lookup is
+  `python -m genesis session-address <id>` (whose `--check` compares it with
+  `claude agents --json`, Claude Code's supported listing) and the
+  `session_address` MCP tool.
 
 - **Slot environment pinning + usable temp directories.**
   LIVE. `tmux new-session` builds a new session's environment from the tmux
@@ -545,7 +570,15 @@ verified: 18e41e1e1 2026-09-23
   rows are left for the 14-day TTL, never discarded. The autonomy-dispatcher `task_detected`
   pickup applies the same trust check (`immunity.is_trusted_for_privileged_write`) SKIP-ONLY
   — it refuses dispatch without resolving/hiding the row (the path is inert today; producer
-  stamping is in the follow-up).
+  stamping is in the follow-up). (3) Writes are namespaced too: `observation_write` from an
+  untrusted session stores the row with `untrusted:` in front of its type, source and category
+  (substrings that LIKE readers match, such as `reflection` and `triage`, are broken) and caps
+  `critical` at `high` (`provenance.namespace_untrusted_observation`). Nothing is refused, so
+  gateway `task_detected` and the inbox judge's `user_signal` still land; no exact-name reader
+  can take them for a pipeline's row. The user-ego world snapshot reads
+  `untrusted:user_signal` and renders it inside the untrusted-content boundary. A test derives
+  every LIKE pattern readers apply to these columns (raw SQL and the CRUD `*_like`/`source_prefix`
+  keywords) and fails if one matches a namespaced value.
   **WS-3 observation write-provenance + laundering-critical read exclusions (PR-1, built
   2026-08-22):** origin is now definite at the WRITE boundary — the CRUD chokepoint
   (`db/crud/observations.py` `create()`/`upsert()` → `derive_observation_origin`) classifies
@@ -1522,8 +1555,25 @@ verified: 84c7259d 2026-08-31
     (`unactionable`) and trusts only validated tiers/reserves.
   - Ownership is the full generated name (`<prefix>YYYYmmdd-HHMMSS` plus
     `-healthy`/`-pre-recovery`), never a bare prefix — for EVERY listing
-    (prune, rotation, rollback target), and `take()` refuses any other label. It never grows the pool and never acts on an
+    (prune, rotation, rollback target), and `take()` refuses any other label. It never acts on an
     unmeasured or ambiguous pool (unknown backend, several thin pools).
+  - EARLY level (`pool_runway.py`): a bounded 7-day `pool_history.jsonl`
+    (bytes, per pool identity) gives a growth rate (seen in BOTH halves of a
+    2/6/24/72h window, or across a sample gap > max(30 min, 3 intervals));
+    data or metadata full within `early_horizon_hours` (48) → relief acts
+    with LESS authority: pre-recovery, superseded healthy, and the lifeline
+    only once older than `lifeline_max_age_hours` (48) AND, on LVM,
+    `SnapshotManager.lifeline_holds_space` (delete-first's evidence). A young
+    lifeline is taken only at the reserve; the pre-delete re-check re-applies
+    the level. Invalid early keys disable early + extend only
+    (`validate_early_config`), never the reserve.
+  - LVM partial extend (`pool_extend.py`): autoextend's OWN trigger, not the
+    rate — `genesis-thinpool` profile, data ≥ 80%, VG free < one 20% step,
+    metadata not short → `lvextend` by VG free minus
+    max(`extend_keep_free_mib`, 2× metadata LV), ≥ 1 GiB, whole extents,
+    re-planned right before the mutation (never above the fresh plan); a
+    timeout → `extend_indeterminate` (pass ends); a failure → 24h backoff.
+    The only way the guardian grows a pool.
   - Levers: `storage_pool.relief_mode` (`live`/`alert_only`/`off`) and
     `GUARDIAN_POOL_RELIEF_DISABLED=1`. Runbook:
     `docs/reference/thin-pool-recovery.md`.
@@ -1573,10 +1623,16 @@ verified: 788dd9a9 2026-09-06
   reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
-  `upstream-pr-steward` campaign's own owner notifications — the ones it already
-  logs to `outreach_history` (category `notification`, topic `%steward%`) when a
-  tracked EXTERNAL PR changes — into foreground CC sessions as a one-line
+  GitHub-steward owner notifications already in `outreach_history` (category
+  `notification`, topic `%steward%`) into foreground CC sessions as a one-line
   `[PRs] …` nudge, so a status change missed on Telegram still reaches the user.
+  Those rows are written by `recon/account_activity.py` — a Python poller inside
+  genesis-server, whose topics are prefixed `GitHub steward: …`, which is what
+  the `%steward%` LIKE matches — and by the `github-activity-digest` campaign's
+  digests. There is **no** `upstream-pr-steward` campaign — MEASURED, the slug
+  names none of the 6 `campaigns` rows and was never committed as a campaign
+  definition. #792 added the `steward` DirectSession profile and referred to an
+  intended campaign for it; the profile is real, the campaign is not.
   Read-only, **home-anchored DB** (NOT `genesis_db_path()`/`repo_root()`, which
   would read an empty `<worktree>/data/` — the same trap `_charter_db_path`
   avoids). Seen-state is a home-anchored JSON sidecar
@@ -1586,8 +1642,7 @@ verified: 788dd9a9 2026-09-06
   window (no retention step). Lever: settings domain `pr_watch`
   (`config/pr_watch.yaml` + `pr_watch_config.py`) + `GENESIS_PR_WATCH_DISABLED`
   kill switch; skips dispatched sessions (`GENESIS_CC_SESSION=1`) so the human's
-  next foreground session still gets the nudge. The campaign's discovery/notify
-  behavior lives in its install-local strategy doc (campaigns ship zero defaults).
+  next foreground session still gets the nudge.
 - **Infra protection posture (2026-07-16; network plane 2026-07-17)**: hourly
   `_check_infra_protection_posture` reads the infra profile's effective facts
   and raises one `high` `infrastructure_alert` when a memory-plane protection
