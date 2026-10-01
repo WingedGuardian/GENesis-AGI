@@ -91,6 +91,7 @@ root ignores the whole file (warning); a non-mapping section ignores that sectio
 | `qdrant_url()` | env `QDRANT_URL` | *(no yaml layer)* | `http://localhost:6333` | present |
 | `ollama_enabled()` | env `GENESIS_ENABLE_OLLAMA` | yaml `network.ollama_enabled` | `False` | **present** |
 | `embed_priority_tier()` | env `GENESIS_EMBED_PRIORITY_TIER` | yaml `memory.embed_priority_tier` | `True` | **present** |
+| `embed_local_first()` | env `GENESIS_EMBED_LOCAL_FIRST` | yaml `memory.embed_local_first` | `False` | **present** |
 | `build_lane_enabled()` | env `GENESIS_BUILD_LANE_ENABLED` | yaml `build_lane.enabled` | `False` | **present** |
 | `models_md_synthesis_enabled()` | env `GENESIS_MODELS_MD_SYNTHESIS_OFF` (inverted) | yaml `models_md_synthesis.enabled` | `True` | present |
 | `github_user()` | env `GENESIS_GITHUB_USER` | yaml `github.user` | `""` | non-empty |

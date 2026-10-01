@@ -786,6 +786,35 @@ def embed_priority_tier() -> bool:
     return True
 
 
+def embed_local_first() -> bool:
+    """Whether embedding chains put the local backend (Ollama) ahead of cloud.
+
+    Defaults to FALSE: cloud leads and Ollama is the fallback rung. Local
+    embedding is inference, so on a host without a GPU every call burns CPU the
+    rest of the system needs. MEASURED 2026-09-26 through the shipped chain, 20
+    calls each: Ollama p50 2395.8ms, DeepInfra p50 207.8ms.
+
+    This is an install-local preference, not a code decision: a host with a GPU,
+    or one that wants embeddings to stay on the box, can flip it. It sets the
+    order of every chain built without an explicit ``ollama_first`` (storage and
+    recall alike). It never changes WHICH model writes; the chain stays in the
+    corpus's vector space whatever the order (see
+    ``EmbeddingProvider.build_chain``). Recall has a 4.5s deadline, so on a slow
+    host local-first recall can push recall onto its keyword-only fallback.
+
+    Set GENESIS_EMBED_LOCAL_FIRST=true in secrets.env, or
+    memory.embed_local_first: true in ~/.genesis/config/genesis.yaml. Read when a
+    chain is built, so a change takes effect on restart.
+    """
+    env_val = os.environ.get("GENESIS_EMBED_LOCAL_FIRST")
+    if env_val is not None:
+        return _yaml_bool(env_val)
+    local_val = _local_section("memory").get("embed_local_first")
+    if local_val is not None:
+        return _yaml_bool(local_val)
+    return False
+
+
 def build_lane_enabled() -> bool:
     """Check if the autonomous capability-build lane is active.
 

@@ -279,11 +279,11 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             from genesis.env import embed_priority_tier
 
             storage_embedding = EmbeddingProvider(
-                backends=EmbeddingProvider.build_chain(ollama_first=False),
+                backends=EmbeddingProvider.build_chain(),
             )
             recall_embedding = EmbeddingProvider(
                 backends=EmbeddingProvider.build_chain(
-                    ollama_first=False, priority_tier=embed_priority_tier(),
+                    priority_tier=embed_priority_tier(),
                 ),
             )
             # The activity tracker enables InstrumentationMiddleware, which also
