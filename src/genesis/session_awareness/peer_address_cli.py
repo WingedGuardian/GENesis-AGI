@@ -37,22 +37,32 @@ async def lookup(db, queries: list[str]) -> list[dict]:
     or more than one, is reported as ``unresolved-prefix`` rather than looked up
     as though it were an id.
     """
-    from genesis.db.crud.session_charters import resolve_session_id
+    from genesis.db.crud.session_charters import is_full_session_id, resolve_session_id
 
-    expanded: dict[str, str] = {}
+    # A list, not a dict: a query asked twice gets two answers.
+    pairs: list[tuple[str, str | None]] = []
     for query in queries:
-        q = query.strip()
-        expanded[query] = await resolve_session_id(db, q) if db is not None else q
-    full = [sid for sid in expanded.values() if len(sid) >= 32]
-    resolved = pa.resolve_many(full)
+        q = query.strip().lower()
+        if is_full_session_id(q):
+            pairs.append((query, q))
+        elif db is None:
+            pairs.append((query, None))
+        else:
+            # resolve_session_id returns anything of 32+ characters unchanged, so
+            # a long prefix is expanded through its first 31 and the result must
+            # still begin with the whole query.
+            cand = await resolve_session_id(db, q[:31])
+            ok = is_full_session_id(cand) and cand.lower().startswith(q.lower())
+            pairs.append((query, cand if ok else None))
+    resolved = pa.resolve_many(sorted({sid for _q, sid in pairs if sid}))
     why = (
         "no single known session id starts with this"
         if db is not None
         else "the Genesis database was not found, so only a full session id resolves"
     )
     out = []
-    for query, sid in expanded.items():
-        if len(sid) < 32:
+    for query, sid in pairs:
+        if sid is None:
             out.append(
                 {
                     "query": query,
@@ -102,11 +112,20 @@ def compared(results: list[dict]) -> list[dict]:
     return [res for res in results if res.get("session_id")]
 
 
+# The answers a check can compare with Claude Code's. Anything else (a format
+# change, an ambiguity, no registry) is a failure to establish agreement, so it
+# is reported, never read as "both say absent".
+_COMPARABLE = (pa.OK, pa.NOT_REACHABLE, pa.UNNAMED)
+
+
 def disagreements(results: list[dict], oracle: dict[str, str]) -> list[str]:
     """Every session where this lookup and Claude Code's own answer differ."""
     problems = []
     for res in compared(results):
         sid = res["session_id"]
+        if res["status"] not in _COMPARABLE:
+            problems.append(f"{sid}: this lookup could not decide ({res['status']})")
+            continue
         ours = res["name"] if res["status"] == pa.OK else None
         theirs = oracle.get(sid)
         if ours != theirs:
@@ -125,6 +144,8 @@ def _line(res: dict) -> str:
 
 
 async def _open_db():
+    from urllib.request import pathname2url
+
     import aiosqlite
 
     from genesis.env import genesis_db_path
@@ -132,7 +153,9 @@ async def _open_db():
     path = genesis_db_path()
     if not path.exists():
         return None
-    return await aiosqlite.connect(f"file:{path}?mode=ro", uri=True)
+    # Percent-encoded, as session_heartbeat.ro_uri does: a '?' or '#' in the
+    # path would otherwise be read as URI syntax and open the wrong file.
+    return await aiosqlite.connect(f"file:{pathname2url(str(path))}?mode=ro", uri=True)
 
 
 async def _run(queries: list[str]) -> list[dict]:

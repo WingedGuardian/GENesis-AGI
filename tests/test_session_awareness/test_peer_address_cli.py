@@ -188,3 +188,61 @@ def test_check_counts_only_what_it_compared(monkeypatch, capsys, fake_resolver):
     monkeypatch.setattr(cli, "_oracle", lambda: {SID: "genesis-7f"})
     assert cli._cmd(argparse.Namespace(ids=[SID, "abc"], json=False, check=True)) == 0
     assert "agrees with claude agents on 1 of 2 (1 not compared" in capsys.readouterr().err
+
+
+async def test_a_32_to_35_character_prefix_still_expands(tmp_path, fake_resolver):
+    """resolve_session_id passes 32+ characters through untouched, so a long
+    prefix must not be mistaken for a full id."""
+    db = await _db(tmp_path, [SID])
+    try:
+        results = await cli.lookup(db, [SID[:32], SID[:35], SID.upper()[:33]])
+    finally:
+        await db.close()
+    assert [r["session_id"] for r in results] == [SID, SID, SID]
+
+
+async def test_a_prefix_that_diverges_after_31_characters_is_not_expanded(tmp_path, fake_resolver):
+    db = await _db(tmp_path, [SID])
+    try:
+        (res,) = await cli.lookup(db, [SID[:31] + "f"])
+    finally:
+        await db.close()
+    assert res["status"] == "unresolved-prefix"
+
+
+async def test_a_repeated_query_gets_one_answer_per_ask(fake_resolver):
+    results = await cli.lookup(None, [SID, SID])
+    assert [r["query"] for r in results] == [SID, SID]
+
+
+@pytest.mark.parametrize("status", [pa.FORMAT_CHANGED, pa.AMBIGUOUS, pa.NO_REGISTRY])
+def test_an_undecided_answer_fails_the_check_instead_of_matching_absent(status):
+    """Claude Code omitting the session must not turn 'could not decide' into agreement."""
+    results = [{"session_id": SID, "status": status, "name": None}]
+    (problem,) = cli.disagreements(results, {})
+    assert status in problem
+
+
+async def test_the_database_path_is_percent_encoded(monkeypatch, tmp_path):
+    import genesis.env
+
+    weird = tmp_path / "work#1?x"
+    weird.mkdir()
+    dbfile = weird / "genesis.db"
+    import sqlite3
+
+    sqlite3.connect(dbfile).execute("CREATE TABLE marker (x)").connection.commit()
+    monkeypatch.setattr(genesis.env, "genesis_db_path", lambda: dbfile)
+    db = await cli._open_db()
+    try:
+        cur = await db.execute("SELECT name FROM sqlite_master WHERE name='marker'")
+        assert await cur.fetchone() == ("marker",)
+    finally:
+        await db.close()
+
+
+async def test_an_uppercase_full_id_needs_no_database(fake_resolver):
+    hexy = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    assert hexy.upper() != hexy  # guard: the id really has letters to fold
+    (res,) = await cli.lookup(None, [hexy.upper()])
+    assert (res["session_id"], res["status"]) == (hexy, "ok")

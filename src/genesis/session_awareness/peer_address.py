@@ -81,6 +81,8 @@ _MAX_ENTRY_BYTES = 65_536
 _DISPLAY_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}", re.ASCII)
 _DISPLAY_PANE = re.compile(r"[A-Za-z0-9_.-]{1,32}:@\d{1,6}\.%\d{1,6}", re.ASCII)
 _DIGITS = re.compile(r"\d+", re.ASCII)
+# A background job id is peer-written too, and it can reach a result's detail.
+_DISPLAY_JOB = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
 
 OK = "ok"
 NOT_REACHABLE = "not-reachable"
@@ -160,8 +162,12 @@ class _Entry:
 @dataclass
 class _Registry:
     entries: list[_Entry]
-    malformed: list[dict]  # parsed objects with a field present but mistyped
+    # (parsed object, the pid its FILE is named for). A file name is only a
+    # claim, so it is used one way only: to show an entry cannot be a live peer.
+    malformed: list[tuple[dict, int]]
     unreadable: int  # files that could not be read or parsed
+    # (pid the file is named for, its mtime or None) for each unreadable file.
+    unreadable_files: list[tuple[int, float | None]] = field(default_factory=list)
     complete: bool = True  # False when a deadline stopped the scan part way
 
 
@@ -222,16 +228,30 @@ def _parse(obj: object) -> _Entry | None:
     pid = obj.get("pid")
     if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 1):
         return None
+    # Every field that drives selection or output is type-checked, so a changed
+    # shape fails loudly instead of quietly selecting differently.
+    spare = obj.get("spare")
+    if spare is not None and not isinstance(spare, bool):
+        return None
     values = {}
-    for key in ("sessionId", "procStart", "pidDomain", "name", "tmux", "jobId"):
+    for key in (
+        "sessionId",
+        "procStart",
+        "pidDomain",
+        "name",
+        "tmux",
+        "jobId",
+        "parkedJobId",
+        "messagingSocketPath",
+    ):
         ok, values[key] = _optional_str(obj, key)
         if not ok:
             return None
     start = values["procStart"]
     if start is not None and not _DIGITS.fullmatch(start):
         return None
-    sock = obj.get("messagingSocketPath")
-    parked = obj.get("parkedJobId")
+    sock = values["messagingSocketPath"]
+    parked = values["parkedJobId"]
     return _Entry(
         pid=pid,
         session_id=values["sessionId"],
@@ -239,10 +259,10 @@ def _parse(obj: object) -> _Entry | None:
         pid_domain=values["pidDomain"],
         name=values["name"] or None,
         pane=values["tmux"] or None,
-        has_socket=isinstance(sock, str) and bool(sock),
-        spare=obj.get("spare") is True,
+        has_socket=bool(sock),
+        spare=spare is True,
         parked=parked is not None,
-        parked_job=parked if isinstance(parked, str) else None,
+        parked_job=parked or None,
         job_id=values["jobId"],
     )
 
@@ -280,16 +300,22 @@ def _load(directory: Path, deadline: float | None = None) -> _Registry | None:
         try:
             data = _read_entry(directory / fname)
             if data is None:
-                reg.unreadable += 1
-                continue
+                raise ValueError("not a plain, small file")
             obj = json.loads(data)
         except (OSError, ValueError):
-            # A torn write or a racing delete. Counted, never silently skipped.
+            # A torn write, a racing delete, or not a regular file. Counted,
+            # never silently skipped.
             reg.unreadable += 1
+            try:
+                mtime: float | None = os.lstat(directory / fname).st_mtime
+            except OSError:
+                mtime = None
+            reg.unreadable_files.append((int(fname.split(".", 1)[0]), mtime))
             continue
         entry = _parse(obj)
         if entry is None:
-            reg.malformed.append(obj if isinstance(obj, dict) else {})
+            file_pid = int(fname.split(".", 1)[0])
+            reg.malformed.append((obj if isinstance(obj, dict) else {}, file_pid))
         else:
             reg.entries.append(entry)
     return reg
@@ -313,15 +339,59 @@ def _verdict(entry: _Entry, own: str, proc_root: Path) -> str:
     return "live" if start == entry.proc_start else "recycled"
 
 
-def _unaddressable(obj: dict, own: str, proc_root: Path) -> bool:
-    """True only when a malformed entry provably cannot be a live peer here."""
+def _unaddressable(obj: dict, file_pid: int, own: str, proc_root: Path) -> bool:
+    """True only when a malformed entry provably cannot be a live peer here.
+
+    Uses the entry's own pid when it has a usable one, else the pid its file is
+    named for (Claude Code names each file for its process).
+    """
     domain = obj.get("pidDomain")
     if isinstance(domain, str) and domain != own:
         return True
     pid = obj.get("pid")
-    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1:
-        return _proc_start(proc_root, pid)[1] == "dead"
-    return False
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 1):
+        pid = file_pid
+    return _proc_start(proc_root, pid)[1] == "dead"
+
+
+def _boot_time(proc_root: Path) -> int | None:
+    """Kernel boot time (``btime`` in /proc/stat), or None."""
+    try:
+        for line in (proc_root / "stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _could_hide_a_peer(pid: int, mtime: float | None, proc_root: Path, btime: int | None) -> bool:
+    """Whether an unreadable file named for ``pid`` might be a live peer's entry.
+
+    Not when the pid is dead, and not when the file was last written before
+    that process started (so it was written for an earlier process with the
+    same number). Birth is ``btime + start ticks / CLK_TCK``, the same sum
+    Claude Code uses; MEASURED to match ``ps -o lstart`` inside a container.
+    """
+    ticks, _why = _proc_start(proc_root, pid)
+    if ticks is None:
+        return _why != "dead"
+    if mtime is None or btime is None:
+        return True
+    born = btime + int(ticks) / os.sysconf("SC_CLK_TCK")
+    return mtime >= born - 1.0
+
+
+def _expired(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _via_job(entry: _Entry) -> tuple[str, ...]:
+    """Detail naming the background job, with its id only in allowlisted form."""
+    job = entry.job_id or ""
+    if _DISPLAY_JOB.fullmatch(job):
+        return (f"moved to background job {job}",)
+    return ("moved to a background job",)
 
 
 def resolve_many(
@@ -346,15 +416,39 @@ def resolve_many(
         return {sid: Resolution(sid, NO_REGISTRY, detail=(why,)) for sid in session_ids}
     own = own_pid_domain(proc_root, machine_id_path)
 
+    timed_out = {
+        sid: Resolution(sid, NO_REGISTRY, detail=("registry scan ran out of time",))
+        for sid in session_ids
+    }
+    # Every loop that touches /proc checks the deadline: the hook calls this
+    # synchronously, where the outer asyncio timeout cannot interrupt it.
     # Keyed by the entry, not the pid: the file name and the pid field are
     # separate claims, and nothing here depends on them agreeing.
-    verdicts: dict[int, str] = {id(e): _verdict(e, own, proc_root) for e in reg.entries}
+    verdicts: dict[int, str] = {}
+    for e in reg.entries:
+        if _expired(deadline):
+            return timed_out
+        verdicts[id(e)] = _verdict(e, own, proc_root)
     live_names = Counter(e.name for e in reg.entries if verdicts[id(e)] == "live" and e.name)
     # Dead entries are never cleaned out of the registry, so one written by an
     # old Claude Code in an older shape would otherwise mark every miss as a
     # format change forever. Only an entry whose process may still be running
-    # can be hiding a live address.
-    suspect = [m for m in reg.malformed if not _unaddressable(m, own, proc_root)]
+    # can be hiding a live address. The same holds for a file that could not be
+    # read at all: unless the pid it is named for is dead, it may be a second
+    # live candidate, so no answer can be definitive.
+    suspect = []
+    for m, file_pid in reg.malformed:
+        if _expired(deadline):
+            return timed_out
+        if not _unaddressable(m, file_pid, own, proc_root):
+            suspect.append(m)
+    blind = []
+    btime = _boot_time(proc_root) if reg.unreadable_files else None
+    for pid, mtime in reg.unreadable_files:
+        if _expired(deadline):
+            return timed_out
+        if _could_hide_a_peer(pid, mtime, proc_root, btime):
+            blind.append(pid)
 
     out: dict[str, Resolution] = {}
     for sid in session_ids:
@@ -368,9 +462,19 @@ def resolve_many(
         moved = [e for e in reg.entries if e.session_id != sid and e.job_id and e.job_id in jobs]
         candidates = mine + moved
         hits = [e for e in candidates if verdicts[id(e)] == "live"]
+        # Zero hits counts too: Claude Code rewrites a session's own file in
+        # place, so a torn read most likely hides the very entry asked for.
+        if blind and len(hits) <= 1:
+            out[sid] = Resolution(
+                sid,
+                AMBIGUOUS,
+                names=(hits[0].name,) if hits and hits[0].name else (),
+                detail=tuple(f"pid {p}: registry file unreadable, process running" for p in blind),
+            )
+            continue
         if len(hits) == 1:
             hit = hits[0]
-            via = (f"moved to background job {hit.job_id}",) if any(hit is e for e in moved) else ()
+            via = _via_job(hit) if any(hit is e for e in moved) else ()
             if hit.name is None:
                 out[sid] = Resolution(sid, UNNAMED, pid=hit.pid, pane=hit.pane, detail=via)
             else:

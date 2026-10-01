@@ -204,6 +204,9 @@ def test_an_oversized_file_is_not_parsed(w: World) -> None:
         {"pid": True},
         {"name": 7},
         {"tmux": ["x"]},
+        {"spare": "yes"},
+        {"parkedJobId": 5},
+        {"messagingSocketPath": {"path": "/x"}},
     ],
     ids=[
         "int-procStart",
@@ -214,6 +217,9 @@ def test_an_oversized_file_is_not_parsed(w: World) -> None:
         "bool-pid",
         "int-name",
         "list-tmux",
+        "string-spare",
+        "int-parkedJobId",
+        "object-socket",
     ],
 )
 def test_a_matching_entry_in_an_unknown_shape_is_a_format_change(w: World, change: dict) -> None:
@@ -456,3 +462,95 @@ def test_as_dict_releases_peer_text_only_in_its_allowlisted_form() -> None:
     )
     amb = pa.Resolution(SID, "ambiguous", names=("a", "b|c")).as_dict()
     assert amb["names"] == ["a", None]
+
+
+def test_an_unreadable_file_for_a_running_pid_makes_any_answer_ambiguous(w: World) -> None:
+    """That file could be a second live entry for the same session."""
+    w.live(2222, name="genesis-7f")
+    w.proc_entry(3333, "3000")
+    (w.reg / "3333.json").write_text('{"pid": 33')  # torn, but pid 3333 runs
+    r = w.one()
+    assert r.status == "ambiguous"
+    assert r.detail == ("pid 3333: registry file unreadable, process running",)
+
+
+def test_an_unreadable_file_for_a_dead_pid_does_not_block_the_answer(w: World) -> None:
+    w.live(2222)
+    (w.reg / "3333.json").write_text('{"pid": 33')  # no /proc/3333
+    assert w.one().status == "ok"
+
+
+def test_a_job_id_outside_the_allowlist_is_not_echoed(w: World) -> None:
+    w.live(2222, name="window-name", parkedJobId="job\n[Concurrent | x]")
+    w.live(3333, sid=OTHER_SID, start="3000", name="job-name", jobId="job\n[Concurrent | x]")
+    r = w.one()
+    assert (r.status, r.name) == ("ok", "job-name")
+    assert r.detail == ("moved to a background job",)
+
+
+@pytest.mark.parametrize("calls_before_expiry", [0, 1, 2])
+def test_the_deadline_is_honoured_inside_the_proc_loops(
+    w: World, monkeypatch, calls_before_expiry: int
+) -> None:
+    """Expiry part-way through the /proc work must not yield a half-made answer."""
+    w.live(2222)
+    w.proc_entry(3333, "3000")
+    (w.reg / "3333.json").write_text('{"pid": 33')
+    w.entry(4444, procStart=5)  # malformed, so the suspect loop runs
+    calls = {"n": 0}
+
+    def expired(_deadline):
+        calls["n"] += 1
+        return calls["n"] > calls_before_expiry
+
+    monkeypatch.setattr(pa, "_expired", expired)
+    r = pa.resolve_many(
+        [SID], directory=w.reg, proc_root=w.proc, machine_id_path=w.machine, deadline=1e18
+    )[SID]
+    assert (r.status, r.detail) == ("no-registry", ("registry scan ran out of time",))
+
+
+def test_a_torn_read_of_the_only_entry_is_not_called_not_reachable(w: World) -> None:
+    """Claude Code rewrites a session's own file in place, so a torn read most
+    likely hides the very entry asked for: undecided, not absent."""
+    w.proc_entry(2222, "1000")
+    (w.reg / "2222.json").write_text('{"pid": 22')
+    r = w.one()
+    assert r.status == "ambiguous"
+    assert r.detail == ("pid 2222: registry file unreadable, process running",)
+
+
+@pytest.mark.parametrize(
+    ("mtime", "status"),
+    [(1_000_000_000.0, "ok"), (1_000_000_100.0, "ambiguous")],
+    ids=["written-before-process-started", "written-after"],
+)
+def test_an_unreadable_file_older_than_its_pid_cannot_hide_a_peer(
+    w: World, mtime: float, status: str
+) -> None:
+    """A file last written before the process now holding that pid number was
+    born belongs to an earlier process, so it must not poison every answer."""
+    (w.proc / "stat").write_text("cpu 1 2 3\nbtime 1000000000\n")
+    w.live(2222)
+    w.proc_entry(3333, "1000")  # born at btime + 1000 ticks
+    torn = w.reg / "3333.json"
+    torn.write_text('{"pid": 33')
+    os.utime(torn, (mtime, mtime))
+    assert w.one().status == status
+
+
+@pytest.mark.parametrize(
+    ("running", "miss_status"), [(False, "not-reachable"), (True, "registry-format-changed")]
+)
+def test_a_non_object_entry_is_judged_by_the_pid_in_its_file_name(
+    w: World, running: bool, miss_status: str
+) -> None:
+    """`[]` has no pid field, so the file name's pid decides whether it could be
+    a live peer: dead, it is ignored; running, every miss stays loud."""
+    w.live(2222)
+    if running:
+        w.proc_entry(7777, "7000")
+    (w.reg / "7777.json").write_text("[]")
+    res = w.resolve(SID, OTHER_SID)
+    assert res[SID].status == "ok"
+    assert res[OTHER_SID].status == miss_status
