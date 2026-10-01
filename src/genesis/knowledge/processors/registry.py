@@ -58,7 +58,7 @@ def build_default_registry() -> ContentProcessorRegistry:
     from genesis.knowledge.processors.text import TextProcessor
     from genesis.knowledge.processors.video import VideoProcessor
     from genesis.knowledge.processors.web import WebProcessor
-    from genesis.knowledge.processors.youtube import YouTubeProcessor
+    from genesis.knowledge.processors.youtube import YOUTUBE_URL_PATTERN, YouTubeProcessor
 
     registry = ContentProcessorRegistry()
 
@@ -84,10 +84,7 @@ def build_default_registry() -> ContentProcessorRegistry:
 
     # YouTube URLs (must be registered before generic web)
     youtube = YouTubeProcessor()
-    registry.register_url_pattern(
-        youtube,
-        r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)",
-    )
+    registry.register_url_pattern(youtube, YOUTUBE_URL_PATTERN)
 
     # Generic web URLs (catch-all for http/https)
     web = WebProcessor()

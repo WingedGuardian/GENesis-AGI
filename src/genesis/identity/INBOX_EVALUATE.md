@@ -143,6 +143,12 @@ You MUST address every single one:
   the page's title and description plus a `youtube_error` saying why: report
   that error for that URL, and do not evaluate content you did not get.
 
+- **LinkedIn posts: use `web_fetch` too.** For a LinkedIn post URL it returns
+  the post page and, when the post's video has captions, appends them under
+  `## Video transcript`. Evaluate what the video says as well as the post
+  text. A `video_error` means the post has a video whose captions could not be
+  read: say so, and do not guess at what the video says.
+
 - **NEVER tell the user to do something you haven't attempted yourself.**
   If one fetch fails, try the other tool and the other backends `web_fetch`
   offers. Only after exhausting them should you report failure — and even

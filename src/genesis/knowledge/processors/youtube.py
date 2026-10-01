@@ -45,8 +45,12 @@ _YTDLP_SLOTS = asyncio.Semaphore(3)
 # above speech bitrates, so a real track fits and a padded stream cannot.
 _AUDIO_MB_PER_MINUTE = 2
 
-_YOUTUBE_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+"
+# What the ingestion registry routes to this processor: every host and path
+# shape ``is_youtube_video_url`` accepts (watch, shorts, live, embed; www, m and
+# music hosts; youtu.be). The processor re-checks with that predicate.
+YOUTUBE_URL_PATTERN = (
+    r"(?:https?://)?(?:(?:www|m|music)\.)?"
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|live/|embed/)|youtu\.be/)"
 )
 
 # Hosts whose video URLs this processor fetches. yt-dlp's YouTube extractor
@@ -68,7 +72,11 @@ _TRACK_KEY = re.compile(r"[A-Za-z0-9_-]{1,40}")
 _CAPTION_HOST_SUFFIXES = (".youtube.com", ".googlevideo.com")
 
 
-def _caption_urls_allowed(formats: object) -> bool:
+def _caption_urls_allowed(
+    formats: object, hosts: tuple[str, tuple[str, ...]] = ("youtube.com", _CAPTION_HOST_SUFFIXES)
+) -> bool:
+    """Every track URL is https on ``hosts``: ``(bare host, allowed suffixes)``."""
+    root, suffixes = hosts
     if not isinstance(formats, list) or not formats:
         return False
     for fmt in formats:
@@ -80,9 +88,7 @@ def _caption_urls_allowed(formats: object) -> bool:
             host = (parts.hostname or "").lower()
         except ValueError:
             return False
-        if parts.scheme != "https" or not (
-            host == "youtube.com" or host.endswith(_CAPTION_HOST_SUFFIXES)
-        ):
+        if parts.scheme != "https" or not (host == root or host.endswith(suffixes)):
             return False
     return True
 
@@ -144,7 +150,9 @@ def network_diagnostic(stderr: str) -> str:
     return f"{detail} — {hint}"
 
 
-def select_caption(info: dict) -> dict | None:
+def select_caption(
+    info: dict, *, caption_hosts: tuple[str, tuple[str, ...]] = ("youtube.com", _CAPTION_HOST_SUFFIXES)
+) -> dict | None:
     """Choose at most one caption track: the video's original language first,
     manual captions over automatic ones, with the choice's provenance labelled.
 
@@ -157,7 +165,7 @@ def select_caption(info: dict) -> dict | None:
         return {
             k: v for k, v in tracks.items()
             if v and k != "live_chat" and isinstance(k, str) and _TRACK_KEY.fullmatch(k)
-            and _caption_urls_allowed(v)
+            and _caption_urls_allowed(v, caption_hosts)
         }
 
     manual = usable(info.get("subtitles"))
@@ -245,10 +253,23 @@ async def _exec(argv: list[str]) -> tuple[int, bytes, bytes]:
 
 
 class YouTubeProcessor:
-    """Extract metadata and transcripts from YouTube videos via yt-dlp."""
+    """Extract metadata and transcripts from YouTube videos via yt-dlp.
+
+    The site-specific parts are class attributes, so another yt-dlp site can
+    reuse the same fixed argv, process limits and caption handling
+    (``linkedin.LinkedInCaptionProcessor``).
+    """
+
+    site = "YouTube"
+    extractor = "youtube"
+    caption_hosts: tuple[str, tuple[str, ...]] = ("youtube.com", _CAPTION_HOST_SUFFIXES)
+    is_video_url = staticmethod(is_youtube_video_url)
 
     def can_handle(self, source: str) -> bool:
-        return bool(_YOUTUBE_PATTERN.search(source))
+        source = source.strip()
+        if "://" not in source:
+            source = "https://" + source  # the ingestion registry pattern allows no scheme
+        return self.is_video_url(source)
 
     async def process(self, source: str, **kwargs: object) -> ProcessedContent:
         result = await self.fetch(source)
@@ -270,11 +291,11 @@ class YouTubeProcessor:
         if "://" not in url:
             url = "https://" + url  # the ingestion registry pattern allows no scheme
         result = YouTubeFetch(url=url, metadata={"url": url})
-        if not is_youtube_video_url(url):
-            result.errors.append("not a YouTube video URL")
+        if not self.is_video_url(url):
+            result.errors.append(f"not a {self.site} video URL")
             return result
         if url.lower().startswith("http://"):
-            # Never fetch a cleartext YouTube URL: an on-path responder could
+            # Never fetch a cleartext video URL: an on-path responder could
             # answer before the HTTPS redirect, and the result would still
             # claim verified TLS (#2568 review).
             url = "https://" + url[len("http://"):]
@@ -307,7 +328,7 @@ class YouTubeProcessor:
                 None, "not_live", "was_live",
             )
 
-            track = select_caption(info)
+            track = select_caption(info, caption_hosts=self.caption_hosts)
             if track:
                 manual = track["kind"] == "manual"
                 rc, _, stderr = await self._run(
@@ -384,12 +405,12 @@ class YouTubeProcessor:
             stderr = raw.decode(errors="replace")
         return rc, stdout, stderr
 
-    @staticmethod
-    def _argv(args: list[str], url: str | None, *, verify: bool) -> list[str]:
+    @classmethod
+    def _argv(cls, args: list[str], url: str | None, *, verify: bool) -> list[str]:
         argv = [
             sys.executable, "-m", "yt_dlp",
             "--ignore-config", "--no-cookies", "--no-cookies-from-browser",
-            "--no-playlist", "--use-extractors", "youtube",
+            "--no-playlist", "--use-extractors", cls.extractor,
             # yt-dlp enables only deno by default; Genesis requires Node.
             "--js-runtimes", "node",
             "--no-progress",
