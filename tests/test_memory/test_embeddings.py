@@ -558,6 +558,29 @@ class TestBuildChainPriorityTier:
         assert self._deepinfra(chain)._service_tier is None
 
 
+def test_embedding_levers_reach_the_memory_mcp_child() -> None:
+    """The memory MCP child loads secrets.env only through its `_MCP_VARS`
+    allowlist, and it builds embedding chains that read both levers. A lever
+    missing from the allowlist is silently dropped when set only in secrets.env,
+    so the child would disagree with the main runtime. Parsed from the source:
+    importing the server would drag in the whole MCP stack."""
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "scripts/genesis_mcp_server.py").read_text()
+    allow: set[str] = set()
+    for node in ast.walk(ast.parse(src)):
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "_MCP_VARS" for t in node.targets)
+            and isinstance(node.value, ast.Set)
+        ):
+            allow |= {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+    assert allow, "_MCP_VARS set literal not found"
+    for lever in ("GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER"):
+        assert lever in allow, f"{lever} is read by the child but missing from _MCP_VARS"
+
+
 class TestRecallChainWiring:
     """The WIRING, not the capability — 'built != wired'.
 

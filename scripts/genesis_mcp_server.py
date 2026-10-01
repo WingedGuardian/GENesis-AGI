@@ -661,6 +661,11 @@ def main(argv: list[str] | None = None) -> None:
         "API_KEY_DEEPSEEK",
         # Ollama config
         "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
+        # Embedding chain levers read when the memory child builds its chains
+        # (env.embed_local_first / env.embed_priority_tier). Absent here, a value
+        # set only in secrets.env is dropped and the child disagrees with the
+        # main runtime about the order and the recall tier.
+        "GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER",
         # HTTP transport auth
         "GENESIS_MCP_HTTP_TOKEN",
         # Discord bot (used by discord-bot MCP server)
