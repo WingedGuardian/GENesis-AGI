@@ -261,34 +261,6 @@ prune_mcp_spawn() {
     find "$dir" -maxdepth 1 -type f -name '.*' -mmin +60 -delete 2>/dev/null || true
 }
 
-prune_rollback_save_refs() {
-    # update.sh's rollback saves uncommitted work it would otherwise reset away as
-    # refs/genesis/rollback-save/<YYYYmmddTHHMMSSZ>-<pid> (a `git stash create`
-    # commit). Delete those older than <days>, judged by the UTC timestamp in the
-    # name: fixed-width, so a string comparison orders them. A name that does not
-    # parse is left alone. Best effort: a failure here prunes nothing and says so.
-    local repo="$1" days="$2" cutoff ref ts
-    cutoff="$(date -u -d "$days days ago" +%Y%m%dT%H%M%SZ 2>/dev/null)" || {
-        echo "rollback-save prune SKIPPED: cannot compute the cutoff date"
-        return 0
-    }
-    git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || {
-        echo "rollback-save prune SKIPPED: $repo is not a git repository"
-        return 0
-    }
-    git -C "$repo" for-each-ref --format='%(refname)' refs/genesis/rollback-save/ 2>/dev/null \
-        | while IFS= read -r ref; do
-            ts="${ref##*/}"
-            ts="${ts%%-*}"
-            [[ "$ts" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
-            if [[ "$ts" < "$cutoff" ]]; then
-                git -C "$repo" update-ref -d "$ref" 2>/dev/null \
-                    || echo "rollback-save prune failed for $ref"
-            fi
-        done
-    return 0
-}
-
 prune_guard_corpus() {
     # scripts/replay_guard_corpus.py caches every distinct Bash (command, cwd)
     # pair from this install's transcripts so it can replay them through a guard.
@@ -509,9 +481,6 @@ main() {
                 || echo "premerge-backups prune failed or spared $_pmb_dir"
         done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
     fi
-    # update.sh's rollback keeps uncommitted work it saved before a reset under
-    # refs/genesis/rollback-save/<UTC>-<pid>; the same 45 days as the backup runs.
-    prune_rollback_save_refs "$REPO_DIR" 45
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env.

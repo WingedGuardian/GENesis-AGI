@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -175,16 +176,32 @@ def test_a_failure_after_the_merge_resets_this_runs_merge(repo, tmp_path):
     assert _verdict(r) == ("reset", "true")
     assert _restarts(r)
     assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
+    assert _git(repo, "symbolic-ref", "--short", "HEAD") == "main"
     assert (repo / "code.py").read_text() == "x = 1\n"
-    assert "BACKUP-BEFORE-RESET" in r.stdout, "ephemeral edits are saved before the reset"
-    assert "rollback-save" not in r.stdout, "a clean tree saves nothing"
-    assert _git(repo, "for-each-ref", "refs/genesis/rollback-save/") == ""
+    assert "BACKUP-BEFORE-RESET" in r.stdout, "ephemeral edits are saved before the rollback"
 
 
-def _saved_sha(r: subprocess.CompletedProcess) -> str:
-    m = re.search(r"stash apply --index ([0-9a-f]{40})", r.stdout)
-    assert m, r.stdout
-    return m.group(1)
+def _at_the_write(action: str, seen: Path) -> str:
+    """A `git` wrapper that runs <action> (shell) once, right before the rollback
+    refreshes the index or writes the tree: after every check the rollback makes.
+    The rollback before this change (refresh, then `reset --keep`) and the one after
+    it (refresh, then `checkout -B`) both pass through this point. <seen> is
+    created when it runs (the rollback sends that git call's output to /dev/null,
+    so an echo would not show)."""
+    return (
+        "_late_done=0\n"
+        "git() {\n"
+        '    if [ "$_late_done" = 0 ]; then\n'
+        '        case "${3:-} ${4:-} ${5:-} ${6:-} ${7:-} ${8:-}" in\n'
+        '            "update-index "* | "reset "* | "checkout "*-B* | "-c "*" checkout "*-B*)\n'
+        "                _late_done=1\n"
+        f"                {action}\n"
+        f'                : > "{seen}" ;;\n'
+        "        esac\n"
+        "    fi\n"
+        '    command git "$@"\n'
+        "}\n"
+    )
 
 
 def _second_file(repo: Path) -> None:
@@ -194,8 +211,9 @@ def _second_file(repo: Path) -> None:
 
 def test_an_edit_outside_the_range_is_kept_in_place(repo, tmp_path):
     """#2679: another session edits a file this update never touched, and stages a
-    new file, after the merge; then a later step fails. The reset (`--keep`) undoes
-    the merge and leaves both where they are; the index state is recorded too."""
+    new file, after the merge; then a later step fails. The rollback's checkout
+    undoes the merge and leaves both where they are, the new file still staged
+    (`reset --keep` unstaged it)."""
     _second_file(repo)
     merged = _merge_like_commit(repo)
     (repo / "notes.txt").write_text("their edit after the merge\n")
@@ -207,18 +225,47 @@ def test_an_edit_outside_the_range_is_kept_in_place(repo, tmp_path):
     assert (repo / "code.py").read_text() == "x = 1\n", "the merge was undone"
     assert (repo / "notes.txt").read_text() == "their edit after the merge\n"
     assert (repo / "new_module.py").read_text() == "brand new\n"
-    sha = _saved_sha(r)
-    refs = _git(repo, "for-each-ref", "--format=%(objectname)", "refs/genesis/rollback-save/")
-    assert refs == sha, "kept alive by a named ref"
-    assert _git(repo, "show", f"{sha}^2:new_module.py") == "brand new", "the staged state"
+    assert _git(repo, "diff", "--cached", "--name-only") == "new_module.py", "still staged"
     # Someone else's edit is code nobody validated: no restart on it (#2623's rule).
     assert not _restarts(r)
     assert "notes.txt" in r.stdout
 
 
+@pytest.mark.parametrize("kind", ["staged-edit", "index-only", "intent-to-add"])
+def test_the_index_survives_the_rollback(repo, tmp_path, kind):
+    """A staged change on a path the rollback does not write stays staged.
+    `reset --keep` rewrote the whole index to the tag: a staged edit became
+    unstaged, content that existed only in the index was dropped, and an
+    intent-to-add entry fell out of the index. The checkout keeps every index entry
+    it does not write (measured, git 2.43)."""
+    _second_file(repo)
+    merged = _merge_like_commit(repo)
+    if kind == "staged-edit":
+        (repo / "notes.txt").write_text("staged notes\n")
+        _git(repo, "add", "notes.txt")
+    elif kind == "index-only":
+        (repo / "notes.txt").write_text("only in the index\n")
+        _git(repo, "add", "notes.txt")
+        (repo / "notes.txt").write_text("base notes\n")
+    else:
+        (repo / "planned.py").write_text("planned\n")
+        _git(repo, "add", "-N", "planned.py")
+    r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
+    assert _verdict(r)[0] == "reset", r.stdout
+    assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
+    if kind == "staged-edit":
+        assert _git(repo, "diff", "--cached", "--name-only") == "notes.txt"
+        assert _git(repo, "show", ":notes.txt") == "staged notes"
+    elif kind == "index-only":
+        assert _git(repo, "show", ":notes.txt") == "only in the index"
+    else:
+        assert "planned.py" in _git(repo, "ls-files").splitlines()
+        assert (repo / "planned.py").read_text() == "planned\n"
+
+
 def test_an_edit_to_a_file_the_update_changed_refuses_the_reset(repo, tmp_path):
-    """The reset would have to overwrite the edit: git refuses, moving nothing, and
-    the merged code, the edit and the database stay for a person to sort out."""
+    """The rollback would have to overwrite the edit: git refuses, moving nothing,
+    and the merged code, the edit and the database stay for a person to sort out."""
     merged = _merge_like_commit(repo)
     (repo / "code.py").write_text("their edit after the merge\n")
     r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
@@ -230,62 +277,17 @@ def test_an_edit_to_a_file_the_update_changed_refuses_the_reset(repo, tmp_path):
 
 
 def test_an_edit_made_just_before_the_reset_is_judged_by_git(repo, tmp_path):
-    """The snapshot-to-reset race (#2722 round 1): an edit landing AFTER the
-    snapshot is still seen, because git checks each path as the reset writes it.
-    The edit is injected after the snapshot helper, right before the reset."""
+    """The check-to-write race (#2722 round 1): an edit landing after every check
+    the rollback makes is still seen, because git checks each path inside the one
+    command that writes it."""
     merged = _merge_like_commit(repo)
-    # The last check before the refresh and the reset makes the edit, then passes.
-    late = (
-        "_rollback_reset_collision_free() {\n"
-        f'    printf "late edit\\n" > "{repo}/code.py"\n'
-        "    return 0\n}\n"
-    )
+    seen = tmp_path / "injected"
+    late = _at_the_write(f'printf "late edit\\n" > "{repo}/code.py"', seen)
     r = _run(_rollback_guard(repo, own_head=merged, extra=late), tmp_path)
-    assert "Recorded" not in r.stdout, "control: the snapshot ran on a clean tree"
+    assert seen.exists(), "control: the edit was injected"
     assert _verdict(r) == ("reset", "false"), r.stdout
     assert (repo / "code.py").read_text() == "late edit\n"
     assert _git(repo, "rev-parse", "HEAD") == merged
-
-
-def test_an_unwritable_backup_dir_does_not_block_a_clean_rollback(repo, tmp_path):
-    """#2722 round 1 (P2): nothing to save, so storage for a snapshot is never
-    needed — a bad backup directory must not stop the reset."""
-    merged = _merge_like_commit(repo)
-    blocker = tmp_path / "not-a-dir"
-    blocker.write_text("a file where the backup directory must go\n")
-    r = _run(_rollback_guard(repo, own_head=merged, backup_root=str(blocker / "run")), tmp_path)
-    assert _verdict(r) == ("reset", "true"), r.stdout
-    assert _restarts(r)
-
-
-@pytest.mark.parametrize("why", ["unwritable", "intent-to-add"])
-def test_a_failed_snapshot_does_not_block_the_reset(repo, tmp_path, why):
-    """The snapshot is a record, not the protection: when git cannot take it, or
-    there is nowhere to write its record, the reset still runs and still keeps
-    the edit in place."""
-    _second_file(repo)
-    merged = _merge_like_commit(repo)
-    backup_root = ""
-    if why == "unwritable":
-        blocker = tmp_path / "not-a-dir"
-        blocker.write_text("x\n")
-        backup_root = str(blocker / "run")
-        (repo / "notes.txt").write_text("their edit\n")
-        kept, content = repo / "notes.txt", "their edit\n"
-    else:
-        (repo / "ita.py").write_text("planned\n")
-        _git(repo, "add", "-N", "ita.py")
-        kept, content = repo / "ita.py", "planned\n"
-    r = _run(_rollback_guard(repo, own_head=merged, backup_root=backup_root), tmp_path)
-    assert _verdict(r)[0] == "reset", r.stdout
-    assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
-    assert kept.read_text() == content
-    if why == "intent-to-add":
-        assert "NOTE: git could not snapshot" in r.stdout
-    else:
-        # The snapshot itself needs no directory: only its text record is lost.
-        assert "Recorded" in r.stdout
-        assert not (tmp_path / "not-a-dir" / "run").exists()
 
 
 def _flag_and_change(repo: Path, path: str, flag: str, change: str) -> None:
@@ -305,8 +307,9 @@ def _flag_and_change(repo: Path, path: str, flag: str, change: str) -> None:
 @pytest.mark.parametrize("change", ["content", "chmod", "symlink"])
 def test_a_hidden_change_to_a_file_the_update_changed_refuses(repo, tmp_path, flag, change):
     """#2722 round 1: a mode or type change behind assume-unchanged hashes like
-    the committed blob, and skip-worktree hides an edit from diff and stash. Under
-    --keep git itself refuses over every one of them (measured)."""
+    the committed blob, and skip-worktree hides an edit from diff and stash. git
+    re-checks flagged entries before writing them and refuses over every one of
+    them (measured)."""
     merged = _merge_like_commit(repo)
     _flag_and_change(repo, "code.py", flag, change)
     before = os.lstat(repo / "code.py")
@@ -332,26 +335,27 @@ def test_a_hidden_change_outside_the_range_survives_the_reset(repo, tmp_path, fl
 
 
 def test_a_file_rewritten_with_identical_bytes_does_not_refuse(repo, tmp_path):
-    """--keep does not refresh the index: without the refresh first, a file an
-    indexer rewrote byte-for-byte reads as modified and the rollback refuses. The
-    rewrite lands after the last check (earlier `git diff` calls refresh the index
-    as a side effect, which would hide the gap)."""
+    """A file an indexer rewrote byte-for-byte must not read as a local change. The
+    rewrite lands after the last check (earlier git calls refresh the index as a
+    side effect, which would hide the gap). This guards the outcome, not the
+    explicit refresh: the checkout refreshes the index itself (measured, git
+    2.43), so deleting the update-index call does not fail it. That call's place
+    is held by test_the_rollback_checks_then_switches_back."""
     merged = _merge_like_commit(repo)
     p = repo / "code.py"
-    late = (
-        "_rollback_reset_collision_free() {\n"
-        f'    cp -p "{p}" "{p}.tmp" && mv "{p}.tmp" "{p}"\n'
-        f'    touch -d "+30 seconds" "{p}"\n'
-        "    return 0\n}\n"
+    seen = tmp_path / "injected"
+    late = _at_the_write(
+        f'cp -p "{p}" "{p}.tmp" && mv "{p}.tmp" "{p}" && touch -d "+30 seconds" "{p}"', seen
     )
     r = _run(_rollback_guard(repo, own_head=merged, extra=late), tmp_path)
+    assert seen.exists(), "control: the rewrite was injected"
     assert _verdict(r) == ("reset", "true"), r.stdout
     assert p.read_text() == "x = 1\n"
 
 
 def test_an_untracked_file_where_the_reset_writes_refuses_the_reset(repo, tmp_path):
     """The merge removed a file the rollback tag tracks, and someone put an
-    untracked file there: the reset would overwrite it with the tag's version."""
+    untracked file there: the rollback would overwrite it with the tag's version."""
     _git(repo, "rm", "-q", "code.py")
     _git(repo, "commit", "-qm", "merged upstream: code.py removed")
     merged = _git(repo, "rev-parse", "HEAD")
@@ -363,20 +367,186 @@ def test_an_untracked_file_where_the_reset_writes_refuses_the_reset(repo, tmp_pa
     assert _git(repo, "rev-parse", "HEAD") == merged
 
 
-def test_an_ignored_file_where_the_reset_writes_refuses_the_reset(repo, tmp_path):
-    """--keep overwrites an IGNORED file at a path it writes (measured): the
-    collision scan refuses first."""
-    _git(repo, "rm", "-q", "code.py")
-    (repo / ".gitignore").write_text("code.py\n")
-    _git(repo, "add", ".gitignore")
-    _git(repo, "commit", "-qm", "merged upstream: code.py removed and ignored")
-    merged = _git(repo, "rev-parse", "HEAD")
-    (repo / "code.py").write_text("local ignored settings\n")
-    r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
-    assert _verdict(r) == ("reset", "false")
-    assert (repo / "code.py").read_text() == "local ignored settings\n"
-    assert "untracked or ignored file where the reset writes" in r.stdout
+def _merge_ignoring(repo: Path, shape: str, outside: Path) -> tuple[str, str, Callable[[], bool]]:
+    """A merge after which an IGNORED local path can sit where the rollback writes.
+    Returns the merge commit, a shell command that plants that path, and a check
+    that it is still intact."""
+    if shape == "file":
+        # The merge stops tracking code.py and ignores it; a local copy sits there.
+        _git(repo, "rm", "-q", "code.py")
+        (repo / ".gitignore").write_text("code.py\n")
+        plant = f'printf "local ignored settings\\n" > "{repo}/code.py"'
+
+        def intact() -> bool:
+            return (repo / "code.py").read_text() == "local ignored settings\n"
+
+    elif shape == "inside-dir":
+        # The tag tracks a FILE d; the merge makes d a directory, and an ignored file
+        # sits inside it. Rolling back replaces the directory with the file.
+        _retag_with(repo, "d", "file d\n")
+        _git(repo, "rm", "-q", "d")
+        (repo / "d").mkdir()
+        (repo / "d" / "a").write_text("tracked in the directory\n")
+        (repo / ".gitignore").write_text("d/ign\n")
+        plant = f'printf "PRECIOUS\\n" > "{repo}/d/ign"'
+
+        def intact() -> bool:
+            return (repo / "d" / "ign").read_text() == "PRECIOUS\n"
+
+    else:  # symlink-parent
+        # The tag tracks p/f; the merge removes p and ignores it; locally p is a
+        # symlink to a directory elsewhere.
+        (repo / "p").mkdir()
+        _retag_with(repo, "p/f", "tracked p/f\n")
+        _git(repo, "rm", "-q", "-r", "p")
+        (repo / ".gitignore").write_text("p\n")
+        outside.mkdir()
+        (outside / "f").write_text("OUTSIDE\n")
+        plant = f'ln -s "{outside}" "{repo}/p"'
+
+        def intact() -> bool:
+            return (repo / "p").is_symlink() and (outside / "f").read_text() == "OUTSIDE\n"
+
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", f"merged upstream ({shape})")
+    return _git(repo, "rev-parse", "HEAD"), plant, intact
+
+
+@pytest.mark.parametrize("shape", ["file", "inside-dir", "symlink-parent"])
+@pytest.mark.parametrize("when", ["before-the-checks", "after-the-last-check"])
+def test_an_ignored_path_where_the_rollback_writes_refuses_it(repo, tmp_path, shape, when):
+    """`reset --keep` overwrote an ignored file at a path it writes, deleted one
+    inside a directory it replaced with a file, and replaced an ignored symlink
+    where it needed a directory (measured, git 2.43). A scan before it could only
+    see what already existed (#2722 round 2: the scan-to-reset race). The
+    checkout runs with --no-overwrite-ignore and refuses over all three as it
+    writes, whenever they appeared."""
+    merged, plant, intact = _merge_ignoring(repo, shape, tmp_path / "outside")
+    extra, seen = "", tmp_path / "injected"
+    if when == "before-the-checks":
+        subprocess.run(["bash", "-c", plant], check=True)
+    else:
+        extra = _at_the_write(plant, seen)
+    r = _run(_rollback_guard(repo, own_head=merged, extra=extra), tmp_path)
+    if when == "after-the-last-check":
+        assert seen.exists(), "control: the path was planted after the checks"
+    assert intact(), r.stdout
+    assert _verdict(r) == ("reset", "false"), r.stdout
+    assert not _restarts(r)
     assert _git(repo, "rev-parse", "HEAD") == merged
+    assert "git refused" in r.stdout and "NOT rolled back" in r.stdout
+
+
+def _merge_brings_a_submodule(repo: Path, tmp_path: Path, shape: str) -> str:
+    """The merge brings a submodule `sub` (a gitlink): in place of a regular file the
+    rollback tag tracks, or as a new path. The submodule then holds a local edit
+    and an untracked file."""
+    src = tmp_path / "subsrc"
+    _git(tmp_path, "init", "-q", "-b", "main", str(src))
+    (src / "s.txt").write_text("sub v1\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-qm", "s1")
+    if shape == "removed-submodule":
+        # The pre-update state has the submodule; the merge removes it, and new
+        # work then lands where it was. The gitlink is on the TAG side only.
+        _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), "sub")
+        _git(repo, "commit", "-qm", "track a submodule")
+        _git(repo, "tag", "-f", "pre-update-test")
+        _git(repo, "rm", "-q", "sub")
+        _git(repo, "commit", "-qm", "merged upstream: the submodule removed")
+        (repo / "sub").mkdir(exist_ok=True)
+        (repo / "sub" / "s.txt").write_text("edited inside the submodule\n")
+        (repo / "sub" / "untracked.txt").write_text("UNTRACKED IN THE SUBMODULE\n")
+        return _git(repo, "rev-parse", "HEAD")
+    if shape == "file-to-submodule":
+        _retag_with(repo, "sub", "a regular file\n")
+        _git(repo, "rm", "-q", "sub")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), "sub")
+    _git(repo, "commit", "-qm", "merged upstream: a submodule")
+    (repo / "sub" / "s.txt").write_text("edited inside the submodule\n")
+    (repo / "sub" / "untracked.txt").write_text("UNTRACKED IN THE SUBMODULE\n")
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _submodule_intact(repo: Path) -> bool:
+    return (repo / "sub" / "s.txt").read_text() == "edited inside the submodule\n" and (
+        repo / "sub" / "untracked.txt"
+    ).read_text() == "UNTRACKED IN THE SUBMODULE\n"
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+@pytest.mark.parametrize("shape", ["file-to-submodule", "added-submodule", "removed-submodule"])
+def test_a_submodule_in_the_range_refuses_the_rollback(repo, tmp_path, shape, hidden):
+    """Files inside a submodule are outside every check git makes on the
+    superproject: a gitlink-to-file switch replaced the submodule's edited and
+    untracked files, under `reset --keep` and the checkout alike (measured, git
+    2.43; #2722 round 2). Any gitlink on either side of the range refuses, the
+    tag's side included. `hidden` sets diff.ignoreSubmodules=all, which drops
+    gitlink lines from porcelain `git diff` (measured): the listing is plumbing,
+    so the config cannot hide a submodule from the check."""
+    merged = _merge_brings_a_submodule(repo, tmp_path, shape)
+    if hidden:
+        _git(repo, "config", "diff.ignoreSubmodules", "all")
+    r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
+    assert _submodule_intact(repo), r.stdout
+    assert _verdict(r) == ("reset", "false"), r.stdout
+    assert not _restarts(r)
+    assert _git(repo, "rev-parse", "HEAD") == merged
+    assert "would change a submodule" in r.stdout and "submodule: sub" in r.stdout
+
+
+_UNLISTABLE = (
+    "git() {\n"
+    '    if [ "${3:-} ${4:-}" = "diff-tree -r" ]; then return 128; fi\n'
+    '    command git "$@"\n'
+    "}\n"
+)
+
+
+def test_an_unlistable_range_refuses_the_rollback(repo, tmp_path):
+    """The submodule check reads the range first; when git cannot list it, the
+    rollback refuses rather than read "no submodule"."""
+    merged = _merge_like_commit(repo)
+    r = _run(_rollback_guard(repo, own_head=merged, extra=_UNLISTABLE), tmp_path)
+    assert _verdict(r) == ("reset", "false"), r.stdout
+    assert not _restarts(r)
+    assert _git(repo, "rev-parse", "HEAD") == merged
+    assert "cannot list what the rollback" in r.stdout
+
+
+def _failing_post_checkout(repo: Path, ran: Path) -> None:
+    """A post-checkout hook that records it ran and fails. checkout runs it after
+    moving HEAD and the files, and returns its exit status (measured, git 2.43)."""
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text(f'#!/bin/sh\n: > "{ran}"\nexit 1\n')
+    hook.chmod(0o755)
+
+
+# The switch-back completes, then reports failure: whatever makes checkout exit
+# non-zero after it has moved the tree.
+_RC_AFTER_MOVE = (
+    "git() {\n"
+    "    local rc=0\n"
+    '    command git "$@" || rc=$?\n'
+    '    case " $* " in *" checkout "*" -B "*) return 1 ;; esac\n'
+    '    return "$rc"\n'
+    "}\n"
+)
+
+
+def test_a_failing_post_checkout_hook_neither_runs_nor_undoes_the_rollback(repo, tmp_path):
+    """The rollback's checkout runs with hooks off: a hook that fails would turn a
+    completed rollback into a reported refusal, keeping the migrated database
+    under the old code. The hook must not run, and the rollback must stand."""
+    merged = _merge_like_commit(repo)
+    ran = tmp_path / "hook-ran"
+    _failing_post_checkout(repo, ran)
+    r = _run(_rollback_guard(repo, own_head=merged), tmp_path)
+    assert _verdict(r) == ("reset", "true"), r.stdout
+    assert _restarts(r)
+    assert not ran.exists(), "the post-checkout hook ran during the rollback"
+    assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
 
 
 def _retag_with(repo: Path, name: str, content: str) -> None:
@@ -391,8 +561,8 @@ def _retag_with(repo: Path, name: str, content: str) -> None:
 @pytest.mark.parametrize("in_range", [False, True])
 def test_a_file_replaced_by_a_directory_keeps_the_directory(repo, tmp_path, ignored, in_range):
     """Someone replaced a tracked file with a directory of their own untracked (or
-    ignored) files. A hard reset deleted them; --keep keeps them, refusing when
-    the update changed that file and leaving them alone when it did not."""
+    ignored) files. A hard reset deleted them; the checkout keeps them, refusing
+    when the update changed that file and leaving them alone when it did not."""
     _retag_with(repo, "keep.txt", "tracked\n")
     if in_range:
         (repo / "keep.txt").write_text("changed by the update\n")
@@ -429,9 +599,10 @@ def test_an_unchanged_assume_unchanged_symlink_does_not_refuse(repo, tmp_path):
 def test_an_ephemeral_edit_the_update_changed_is_cleared_only_with_a_backup(
     repo, tmp_path, backed_up
 ):
-    """An indexer rewrites AGENTS.md; if the update changed it, --keep would refuse
-    every rollback over it. With a current backup the edit is cleared first (as
-    before the merge); without one it is kept and the reset refuses."""
+    """An indexer rewrites AGENTS.md; if the update changed it, the checkout would
+    refuse every rollback over it (measured). With a current backup the edit is
+    cleared first (as before the merge); without one it is kept and the rollback
+    refuses."""
     _retag_with(repo, "AGENTS.md", "index v1\n")
     (repo / "AGENTS.md").write_text("index v2\n")
     _git(repo, "commit", "-qam", "update regenerates AGENTS.md")
@@ -466,54 +637,48 @@ def _db(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize(
     "case, restored",
-    [("clean", True), ("edit-outside", True), ("edit-inside", False)],
+    [
+        ("clean", True),
+        ("edit-outside", True),
+        ("edit-inside", False),
+        ("submodule", False),
+        ("unlistable", False),
+        ("failing-hook", True),
+        ("rc-after-move", True),
+    ],
 )
 def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restored):
-    """Migrations ran. When the reset undid the merge, the pre-update database comes
-    back with the old code (foreign edits outside the update's files do not change
-    which code that is); when git refused, the merged code stays and so does the
-    migrated database. Run, not read: the guard and the DB decision together."""
+    """Migrations ran. When the checkout undid the merge, the pre-update database
+    comes back with the old code (foreign edits outside the update's files do not
+    change which code that is); when the rollback was refused (git refused, a
+    submodule in the range, or the range could not be listed), the merged code
+    stays and so does the migrated database. Run, not read: the guard and the DB
+    decision together, through each refusal arm. A failing post-checkout hook and
+    a non-zero exit after the tree moved are not refusals: the old code is on
+    disk, so the old database must come back with it."""
     _second_file(repo)
-    merged = _merge_like_commit(repo)
+    extra = ""
+    if case == "submodule":
+        merged = _merge_brings_a_submodule(repo, tmp_path, "added-submodule")
+    else:
+        merged = _merge_like_commit(repo)
     if case == "edit-outside":
         (repo / "notes.txt").write_text("their edit\n")
     elif case == "edit-inside":
         (repo / "code.py").write_text("their edit\n")
+    elif case == "unlistable":
+        extra = _UNLISTABLE
+    elif case == "failing-hook":
+        _failing_post_checkout(repo, tmp_path / "hook-ran")
+    elif case == "rc-after-move":
+        extra = _RC_AFTER_MOVE
     db = _db(tmp_path)
-    r = _run(_rollback_guard(repo, own_head=merged, db_file=str(db)), tmp_path)
+    r = _run(_rollback_guard(repo, own_head=merged, db_file=str(db), extra=extra), tmp_path)
     assert r.returncode == 0, r.stderr
     assert db.read_text() == ("pre-update\n" if restored else "migrated\n"), r.stdout
     assert ("DB_OK=true" in r.stdout) is restored, r.stdout
     if not restored:
         assert "migrated database is kept" in r.stdout
-
-
-def test_a_kept_merge_keeps_the_migrated_database():
-    """Both failure arms of the reset mark the code as kept (the run-based test
-    above exercises the refusal; this pins the collision arm's flag too)."""
-    guard = _block("rollback-code-guard")
-    assert guard.count("code_kept=true") == 2
-
-
-def test_old_rollback_save_refs_are_pruned(tmp_path):
-    hygiene = REPO_ROOT / "scripts" / "disk_hygiene.sh"
-    repo = tmp_path / "r"
-    _git(tmp_path, "init", "-q", "-b", "main", str(repo))
-    _git(repo, "commit", "-q", "--allow-empty", "-m", "c1")
-    head = _git(repo, "rev-parse", "HEAD")
-    for name in ("20200101T000000Z-1", "29991231T000000Z-2", "not-a-timestamp"):
-        _git(repo, "update-ref", f"refs/genesis/rollback-save/{name}", head)
-    r = subprocess.run(
-        ["bash", "-c", f"source '{hygiene}'\nprune_rollback_save_refs '{repo}' 45"],
-        capture_output=True,
-        text=True,
-        env=_env(tmp_path),
-    )
-    assert r.returncode == 0, r.stderr
-    left = _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/genesis/rollback-save/")
-    assert "20200101T000000Z-1" not in left, "older than 45 days: pruned"
-    assert "29991231T000000Z-2" in left, "recent: kept"
-    assert "not-a-timestamp" in left, "unparseable: left alone"
 
 
 def test_a_switched_branch_is_left_exactly_as_it_is(repo, tmp_path):
@@ -736,19 +901,29 @@ def test_the_closing_banner_does_not_claim_a_rollback_that_did_not_happen():
     assert "NOT fully rolled back" in body[banner:]
 
 
-def test_the_rollback_no_longer_checks_a_branch_out():
+_SWITCH_BACK = 'checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"'
+
+
+def _code(block: str) -> str:
+    return "\n".join(ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout():
     """`checkout "$ORIGINAL_BRANCH"` was how a rollback moved someone's checkout
-    off their branch; the guard requires being on it instead."""
+    off their branch; the guard requires being on it instead. Undoing the merge is
+    one non-forced, ignore-preserving checkout that names the branch, inside the
+    reset arm only; never a reset of the tree."""
     text = _text()
     body = text[
         text.index("_do_rollback() {") : text.index("\n}\n", text.index("_do_rollback() {"))
     ]
     assert 'checkout "$ORIGINAL_BRANCH"' not in body
-    guard = _block("rollback-code-guard")
-    assert guard.count('reset -q --keep "$ROLLBACK_TAG"') == 1
-    assert (
-        guard.index("reset)") < guard.index('reset -q --keep "$ROLLBACK_TAG"') < guard.index("*)")
-    )
+    code = _code(_block("rollback-code-guard"))
+    assert code.count(_SWITCH_BACK) == 1
+    assert code.index("reset)") < code.index(_SWITCH_BACK) < code.index("*)")
+    assert "-c core.hooksPath=/dev/null " + _SWITCH_BACK in code
+    for gone in ("reset --hard", "reset --keep", "reset -q --keep", " -f ", "--force"):
+        assert gone not in code, gone
 
 
 def test_an_ephemeral_edit_the_update_did_not_change_is_left_in_place(repo, tmp_path):
@@ -768,18 +943,16 @@ def test_an_ephemeral_edit_the_update_did_not_change_is_left_in_place(repo, tmp_
     assert (repo / "AGENTS.md").read_text() == "indexer rewrote it\n"
 
 
-def test_the_rollback_resets_with_keep_after_its_checks():
-    """Order inside the reset arm: record, clear, scan, refresh, then `--keep`;
-    never `--hard`."""
-    guard = _block("rollback-code-guard")
-    code = "\n".join(ln for ln in guard.splitlines() if not ln.lstrip().startswith("#"))
-    assert "reset --hard" not in code
+def test_the_rollback_checks_then_switches_back():
+    """Order inside the reset arm: back up, list the range (submodule check), clear,
+    refresh, then the checkout."""
+    code = _code(_block("rollback-code-guard"))
     order = [
-        '_save_tracked_changes_before_reset "$EPHEMERAL_BACKUP_ROOT"',
+        '_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"',
+        'diff-tree -r --raw --no-renames --no-abbrev HEAD "$ROLLBACK_TAG"',
         '_ephemeral_clear_before_reset "$EPHEMERAL_BACKUP_ROOT"',
-        "_rollback_reset_collision_free;",
         "update-index -q --refresh",
-        'reset -q --keep "$ROLLBACK_TAG"',
+        _SWITCH_BACK,
     ]
     idx = [code.index(s) for s in order]
     assert idx == sorted(idx), idx

@@ -132,23 +132,35 @@ through the rollback trap.
   with a non-forced checkout. Any other move is left alone. Dependencies and
   services come back only on the pre-update code (the original branch at the
   rollback commit, no foreign tracked edit); otherwise the rollback reports itself
-  incomplete. The reset of this run's own merge is `git reset --keep`, never
-  `--hard` (#2679): someone may have edited after the merge. `--keep` rewrites only
-  the paths that differ between HEAD and the rollback tag, refuses, moving nothing,
-  when one of them carries a local change (assume-unchanged, skip-worktree, mode
-  and type changes included), and leaves every other path's edits in place. git
-  judges each path as it writes it, so there is no window between a check and
-  the reset. Before it: the index and worktree are recorded best-effort with
-  `git stash create` as `refs/genesis/rollback-save/<UTC>-<pid>` (the staged state
-  is the one thing `--keep` drops; pruned by disk hygiene after 45 days); a backed-up
-  ephemeral edit the range touches is cleared; the shared collision scan in its
-  `direct` form refuses an untracked or ignored file where the reset writes
-  (`--keep` overwrites an ignored one); and the index is refreshed, since `--keep`
-  would read a file rewritten with identical bytes as modified. A refused or failed
-  reset keeps the migrated database with the merged code. A foreign edit that
-  survives the reset still blocks the restart (the rule above). One case is
-  still open: the watchdog restarts a server the rollback held down within one
-  tick (#2718).
+  incomplete. This run's own merge is undone by switching the original branch
+  back to the rollback tag with a NON-forced checkout,
+  `git checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"`,
+  never `reset --hard` (#2679): someone may have edited after the merge. Measured
+  on git 2.43, the checkout rewrites only the paths that differ between HEAD and
+  the tag, leaves every other path's edits and the index's staged state in place,
+  and refuses (rc 1), moving nothing, when a path it writes carries a local change
+  (assume-unchanged, skip-worktree, mode and type changes included) or when an
+  untracked or IGNORED file, an ignored file inside a directory it would replace,
+  an ignored symlink where it needs a directory, or an untracked nested repository
+  sits where it writes. `reset --keep` was tried and dropped: it overwrites the
+  ignored cases and rewrites the index (staged state lost), so it needed a
+  separate collision scan, which could go stale before the reset ran, and a stash
+  snapshot. What remains is the window inside the one checkout command, which
+  checks every path it will write and then writes them all: a change landing
+  during that write phase is not seen.
+  Before the checkout: a range that changes a submodule (a gitlink on either side
+  of `git diff-tree -r --raw HEAD <tag>`, plumbing because porcelain `git diff`
+  drops gitlinks under `diff.ignoreSubmodules`) refuses the rollback, since files
+  inside a submodule are outside git's checks (a gitlink-to-file switch replaced
+  them, measured), and a range git cannot list refuses too; a backed-up ephemeral
+  edit the range touches is cleared; and the index is refreshed (the checkout also
+  refreshes it itself). The checkout runs with hooks off: git runs `post-checkout`
+  after moving HEAD and returns the hook's status, so a failing hook would report
+  a finished rollback as refused. Whatever the exit status, HEAD at the tag on the
+  original branch counts as rolled back. A refused rollback keeps the migrated database with the
+  merged code and does not restart services. A foreign edit that survives the
+  checkout still blocks the restart (the rule above). One case is still open: the
+  watchdog restarts a server the rollback held down within one tick (#2718).
 - **Incoming changes that would overwrite a local untracked or ignored file are
   refused** (`genesis_range_collisions`, over the range from the merge base, every
   change but a deletion: an incoming MODIFICATION of a path the local branch
@@ -156,7 +168,7 @@ through the rollback trap.
   conflict too). The
   merge also passes `--no-overwrite-ignore`, but git 2.43 honours that only on a
   fast-forward; a true 3-way merge overwrites the file, and a rollback's
-  reset then deletes it. So the scan is the protection: before the stop,
+  checkout then deletes it. So the scan is the protection: before the stop,
   and again as the last step before the merge (`late-collision-scan`), where a hit
   rolls back with HEAD unmoved: the rollback resets nothing, so the file stays.
   Paths git invents in a file/directory conflict (`<path>~HEAD`) are not scanned
@@ -169,7 +181,7 @@ through the rollback trap.
   3-way merge refuses on any index change), and discards a file's edits only when a backup of
   its current content exists. `_do_rollback` saves any dirty ephemeral file whose
   current edits have no backup (a `--post-merge` run, or an edit made after the
-  backup) before its reset, and clears one only when such a backup exists. After the stop, the merge is also checked
+  backup) before its checkout, and clears one only when such a backup exists. After the stop, the merge is also checked
   against the branch the run started on.
 
 ## Success records name a server that did not come back (2026-09-30)

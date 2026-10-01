@@ -106,17 +106,11 @@ genesis_untracked_node() {
 # and an ignored file already sitting at that name is overwritten. Only incoming
 # path names are scanned, so a name git makes up is not; plain update.sh merges
 # had the same exposure before this scan existed.
-# With a 4th argument `direct`, the paths are what changes between <from> and <to>
-# themselves (two-dot, no merge base): what a reset from <from> to <to> writes.
-# update.sh's rollback uses it, where <to> is an ancestor of <from> and the
-# merge-base form is therefore empty.
 # Prints the colliding paths, one per line. Returns 0 when there are none, 1 when
 # there are, 2 when the range cannot be listed.
 genesis_range_collisions() {
     local root="$1" from="$2" to="$3" collisions="" f p t
-    local -a spec=("$from...$to")
-    [ "${4:-}" = direct ] && spec=("$from" "$to")
-    git -C "$root" diff --no-renames --name-only --diff-filter=d "${spec[@]}" >/dev/null 2>&1 \
+    git -C "$root" diff --no-renames --name-only --diff-filter=d "$from...$to" >/dev/null 2>&1 \
         || return 2
     # A path in the index can never collide, and the second scan runs while the
     # server is stopped, so the index is read ONCE and those paths skip the two
@@ -142,7 +136,7 @@ genesis_range_collisions() {
                 break
             fi
         done
-    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "${spec[@]}" 2>/dev/null)
+    done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$from...$to" 2>/dev/null)
     printf '%s' "$collisions"
     [ -z "$collisions" ]
 }

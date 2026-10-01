@@ -1080,10 +1080,11 @@ jobs:
         # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
         # ceiling does not move. Floor: 23582 + 24 = 23606.
         #
-        # The rollback-save branch (#2679) grows test_update_checkout_moved.py
-        # from 29 to 64 (the `reset --keep` rollback, its parametrized index-flag
-        # cases and the database decision) and test_deploy_checkout.py from 36 to
-        # 37 (the collision scan's direct mode), counted by --collect-only after
-        # the last test edit. On top of the #2101 floor above, that is
-        # 23606 + 35 + 1 = 23642 (29 and 36 re-measured on main after #2101).
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23642
+        # The rollback branch (#2679) grows test_update_checkout_moved.py from 29
+        # to 79 (the checkout-based rollback, its parametrized index-flag, index,
+        # ignored-path, submodule and hook cases, and the database decision),
+        # counted by --collect-only after the last test edit; test_deploy_checkout.py
+        # stays at 36 (the collision scan's direct mode it briefly added is gone
+        # again). On top of the #2101 floor above, that is 23606 + 50 = 23656 (29
+        # and 36 re-measured on main after #2101).
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23656
