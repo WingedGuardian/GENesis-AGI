@@ -1644,6 +1644,25 @@ def test_substitute_review_proceeds_with_a_note_and_no_prompt(monkeypatch, capsy
     assert not _asked(captured.out), "the stand-in still raised a permission prompt"
     assert "devin-ai-integration[bot]" in captured.err and HEAD[:12] in captured.err
     assert "stands in for Codex" in captured.err
+    assert "format unknown" not in captured.err  # a known format reads as before
+
+
+def test_an_unknown_format_stand_in_is_named_as_unscored_at_merge(monkeypatch, capsys):
+    """Informed consent: the merge NOTE says when nothing scores the stand-in's
+    findings yet."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=json.dumps(
+            {"login": "acme-review[bot]", "commit_id": HEAD, "state": "COMMENTED", "has_body": True}
+        ),
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert (
+        f"{HEAD[:12]}; acme-review[bot] (format unknown: its findings are not scored yet) "
+        f"reviewed that exact head"
+    ) in captured.err
 
 
 def test_substitute_review_is_refused_in_a_dispatched_session(monkeypatch, capsys):
@@ -1667,7 +1686,7 @@ def test_substitute_review_without_a_review_at_head_still_blocks(monkeypatch, ca
     )
     err = capsys.readouterr().err
     assert rc == 2
-    assert "no Devin or CodeRabbit review at head" in err
+    assert "no other reviewer's review at head" in err
 
 
 def test_a_body_less_record_at_head_does_not_substitute(monkeypatch, capsys):
@@ -1680,7 +1699,7 @@ def test_a_body_less_record_at_head_does_not_substitute(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert rc == 2, "a thread-reply wrapper stood in for a review of the head"
     assert not _asked(captured.out)
-    assert "no Devin or CodeRabbit review at head" in captured.err
+    assert "no other reviewer's review at head" in captured.err
 
 
 def test_without_the_sigil_a_substitute_review_changes_nothing(monkeypatch, capsys):

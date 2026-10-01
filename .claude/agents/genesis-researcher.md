@@ -58,3 +58,25 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 
 - Follow the evidence, verification, depth, and output rules in `web-research`.
 - For code discovery, prefer CBM/Serena over raw text search when those tools are available.
+
+<!-- scratch-rule -->
+## Scratch files
+
+If your task has you create scratch files (repro scripts, fixtures, test runs,
+downloads; not files the task asks you to write), put them in ONE directory you
+make for this run: `mkdir -p ~/tmp && mktemp -d -p ~/tmp genesis-researcher-XXXX`. Note the
+absolute path it prints and reuse that literal path: shell variables do not carry
+over between calls. Pass it explicitly every time (`mktemp -p <dir>`,
+`tempfile.mkdtemp(dir=<dir>)`, `pytest --basetemp <dir>/pt`) and never rely on
+the default temp location. That is usually Claude Code's working temp, which
+every session on the machine shares, and filling it, with bytes or with many
+small files, breaks all of them at once. This overrides any harness-provided
+"scratchpad directory": it lives on that same shared temp, so keep it for small
+notes only.
+
+- Never export or persistently change `TMPDIR`. When code you run (not your own)
+  uses the default temp location, prefix that one command: `TMPDIR=<dir> <cmd>`.
+- A reproduction that creates many files or large files (load, fuzzing, DoS,
+  "N files" cases) caps the count and size, and stays inside that directory.
+- Remove the directory when you finish, unless the caller needs its contents;
+  then give its path in your report.

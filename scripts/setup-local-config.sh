@@ -206,7 +206,8 @@ gh.setdefault("private_repo", "")  # keep an existing value; default only if abs
 header = (
     "# Genesis local configuration — machine-specific, never committed to git.\n"
     "# Regenerate: ./scripts/setup-local-config.sh\n"
-    "# Env var overrides take precedence over values here.\n\n"
+    "# Env var overrides take precedence over values here, except hooks.asks,\n"
+    "# which is read only from this file.\n\n"
 )
 
 # Atomic write: temp file in the SAME dir + os.replace, so a mid-write kill can

@@ -89,13 +89,18 @@ def _eval_disallowed_tools() -> list[str]:
     autonomy dispatcher's ``task_detected`` pickup — via
     ``immunity.is_trusted_for_privileged_write``, so a forged
     ``user_model_delta`` / ``task_detected`` is rejected at the point of privileged
-    consumption. PARTIAL, NOT the whole vector: the digest types this tool writes
-    (``user_signal`` / ``architecture_insight``) are still surfaced UNFILTERED into
-    LLM context by other consumers (``essential_knowledge._recent_decisions`` → the
-    always-loaded L1 file; ``reflection`` context; several ego/sentinel raw-SQL
-    reads). Closing that broader observation-content-surfacing surface (exclude/wrap
-    external-origin content at the surfacing points) is tracked — see the
-    "external-origin observation content" follow-up.
+    consumption. The tool also NAMESPACES every row this judge writes
+    (``provenance.namespace_untrusted_observation``): type, source and category
+    are stored as ``untrusted:<name>`` and ``critical`` drops to ``high``, so no
+    reader that selects by exact name can take a judge row for a pipeline's row,
+    and nothing pages the owner. L1 (``essential_knowledge``) and reflection
+    context filter on origin; the user-ego world snapshot shows the judge's
+    ``untrusted:user_signal`` rows inside the untrusted-content boundary. Readers
+    that take every type (the ego and sentinel contexts, the surplus executor, the
+    morning report) still show these rows, labelled ``untrusted:``, and so do
+    readers that EXCLUDE certain types (``NOT IN`` / ``!=``), which the prefix
+    now passes. Wrapping them there is the tabled "external-origin observation
+    content" follow-up.
     """
     return SessionConfigBuilder().build_reflection_disallowed()
 

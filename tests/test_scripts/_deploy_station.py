@@ -28,8 +28,15 @@ UPDATE_SH = REPO / "scripts" / "update.sh"
 VENV = Path(sys.prefix)
 LOCK_HELD_RC = 200
 
-PYPROJECT_OK = '[project]\nname = "fixture"\ndependencies = ["packaging"]\n'
-PYPROJECT_UNMET = '[project]\nname = "fixture"\ndependencies = ["packaging>=9999"]\n'
+# The build configuration the dependency gate can certify, and the layout
+# install_fixture records by default (its .pth names <source>/src). It goes
+# BEFORE [project], so a bare key a test appends still lands in [project].
+BUILD_CONFIG = (
+    '[build-system]\nrequires = ["setuptools>=64"]\nbuild-backend = "setuptools.build_meta"\n\n'
+    '[tool.setuptools.packages.find]\nwhere = ["src"]\n\n'
+)
+PYPROJECT_OK = BUILD_CONFIG + '[project]\nname = "fixture"\ndependencies = ["packaging"]\n'
+PYPROJECT_UNMET = BUILD_CONFIG + '[project]\nname = "fixture"\ndependencies = ["packaging>=9999"]\n'
 
 
 def exec_file(path: Path, body: str) -> None:
@@ -144,13 +151,28 @@ def install_fixture(
     editable: bool = True,
     requires_python: str = "",
     entry_points: dict[str, dict[str, str]] | None = None,
+    pth: str | None = "src",
 ) -> None:
     """What `pip install -e <source>` leaves behind, as importlib.metadata reads
     it: a .dist-info with the project's requirements, its entry points
-    (entry_points.txt, one section per group) and a direct_url.json naming the
-    source. Put `site` on PYTHONPATH and the venv's python finds it first."""
+    (entry_points.txt, one section per group), a direct_url.json naming the
+    source, and the editable install's .pth listed in RECORD. Put `site` on
+    PYTHONPATH and the venv's python finds it first.
+
+    *pth* is the directory under *source* the .pth names, the one line setuptools
+    writes for a `packages.find` layout with one `where` (measured, setuptools
+    84: `where = ["src"]` writes `<source>/src`). A value starting with "import "
+    is written verbatim instead, the shape of a finder-based install; None writes
+    no .pth at all."""
     info = site / f"{name}-0.0.0.dist-info"
     info.mkdir(parents=True, exist_ok=True)
+    record = [f"{info.name}/METADATA,,", f"{info.name}/direct_url.json,,", f"{info.name}/RECORD,,"]
+    if pth is not None:
+        pth_name = f"__editable__.{name}-0.0.0.pth"
+        body = pth if pth.startswith("import ") else str((source / pth).resolve())
+        (site / pth_name).write_text(body + "\n")
+        record.append(f"{pth_name},,")
+    (info / "RECORD").write_text("\n".join(record) + "\n")
     lines = ["Metadata-Version: 2.1", f"Name: {name}", "Version: 0.0.0"]
     if requires_python:
         lines.append(f"Requires-Python: {requires_python}")
