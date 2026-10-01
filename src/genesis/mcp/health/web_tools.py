@@ -706,8 +706,8 @@ def _wrap_fetch_result(out: dict) -> dict:
     text, and this tool is called by sessions that read attacker-authored links.
     So nothing the remote side supplies is exempt: every string anywhere in the
     result is wrapped, at any depth, except the top-level values Genesis sets
-    (``_GENESIS_SET_KEYS``), and a nested dict with a key outside
-    ``_KNOWN_FIELDS`` is wrapped whole. Only the
+    (``_GENESIS_SET_KEYS``), and a nested dict's keys outside ``_KNOWN_FIELDS``
+    move into one wrapped ``unrecognized_fields`` string. Only the
     WebFetcher path used to wrap; TinyFish, Firecrawl, Crawl4AI and the Ladder
     backend returned pages unmarked. Upstream markers are stripped first, so a
     page WebFetcher or the YouTube route already wrapped carries exactly one
@@ -724,11 +724,18 @@ def _wrap_fetch_result(out: dict) -> dict:
         if isinstance(value, str):
             return wrap_text(value) if value else value
         if isinstance(value, dict):
-            if not all(isinstance(k, str) and k in _KNOWN_FIELDS for k in value):
-                # A key outside the known schema may carry page text: keep the
-                # data, as one wrapped string.
-                return wrap_text(json.dumps(value, ensure_ascii=False, default=str))
-            return {k: wrap(v) for k, v in value.items()}
+            known = {k: wrap(v) for k, v in value.items() if isinstance(k, str) and k in _KNOWN_FIELDS}
+            unknown = {str(k): v for k, v in value.items() if not (isinstance(k, str) and k in _KNOWN_FIELDS)}
+            if unknown:
+                # A key outside the known schema may itself be page text, so
+                # those fields travel as one wrapped JSON string; the dict keeps
+                # its shape whatever a provider adds.
+                try:
+                    blob = json.dumps(unknown, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):  # a cycle or a nested non-str key
+                    blob = repr(unknown)
+                known[_UNRECOGNIZED_FIELD] = wrap_text(blob)
+            return known
         if isinstance(value, list):
             return [wrap(v) for v in value]
         return value
@@ -751,9 +758,10 @@ _GENESIS_SET_KEYS: dict[str, frozenset[str]] = {
     }),
 }
 
-# Field names a result or batch entry may carry and still keep its structure.
-# A dict with any other key is wrapped whole, so page-derived keys never reach
-# the caller bare.
+# Field names a result or batch entry may carry as themselves. Any other key
+# moves, with its value, into one wrapped ``unrecognized_fields`` string, so a
+# page-derived key never reaches the caller bare and an entry stays a dict.
+_UNRECOGNIZED_FIELD = "unrecognized_fields"
 _KNOWN_FIELDS = frozenset({
     "author", "backend_tried", "backend_used", "caption", "content", "cost_usd",
     "description", "error", "errors", "fallback_used", "final_url", "image_links",
