@@ -64,9 +64,10 @@ genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
 # shape how the network behaves, and removing one needs a networkd restart.
 #
 # Every step needs sudo and tolerates failure, so the command then CHECKS: a
-# unit file or script still present, or a timer still active, is printed after
-# GENESIS_ROOT_WATCHDOG_LEFT and the command exits 1. The callers report that
-# instead of success (on the incus path the exit status does not come back).
+# unit file or script still present, or a watchdog unit still active, is
+# printed after GENESIS_ROOT_WATCHDOG_LEFT and the command exits 1. The callers
+# report that instead of success (on the incus path the exit status does not
+# come back).
 # BEGIN root-watchdog-remove
 _WD_ROOT="${GENESIS_ROOT_WATCHDOG_PREFIX:-}"  # test seam; empty = the real root
 _WD_UNITS="genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service genesis-network-watchdog.timer genesis-network-watchdog.service"
@@ -76,24 +77,42 @@ $_WD_ROOT/usr/local/lib/genesis/tailscale-watchdog.py $_WD_ROOT/usr/local/lib/ge
 _WD_RUN_FILES="$_WD_ROOT/run/genesis-tailscale-watchdog.json $_WD_ROOT/run/genesis-tailscale-watchdog-status.json \
 $_WD_ROOT/run/genesis-network-watchdog.json $_WD_ROOT/run/genesis-network-watchdog.last"
 GENESIS_ROOT_WATCHDOG_LEFT="root watchdog still present:"
+GENESIS_ROOT_WATCHDOG_DONE="root watchdog removed: nothing left"
 GENESIS_ROOT_WATCHDOG_REMOVE="for u in $_WD_UNITS; do sudo -n systemctl disable --now \"\$u\" 2>/dev/null || true; done; \
 sudo -n rm -f $_WD_FILES $_WD_RUN_FILES 2>/dev/null || true; \
 sudo -n systemctl daemon-reload 2>/dev/null || true; \
 left=''; for f in $_WD_FILES; do if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then left=\"\$left \$f\"; fi; done; \
-for u in $_WD_UNITS; do case \"\$u\" in *.timer) if systemctl is-active --quiet \"\$u\" 2>/dev/null; then left=\"\$left \$u\"; fi ;; esac; done; \
-if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi"
+for u in $_WD_UNITS; do st=\$(systemctl show \"\$u\" -p ActiveState --value 2>/dev/null); \
+case \"\$st\" in ''|inactive|failed) ;; *) left=\"\$left \$u\" ;; esac; done; \
+if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi; \
+echo \"$GENESIS_ROOT_WATCHDOG_DONE\""
 # END root-watchdog-remove
 
-# report_root_watchdog_removal <output> — the removal command's verdict. It
-# never aborts the uninstall: the rest of Genesis still comes out.
+# report_root_watchdog_removal <output> — report LEFT or require the DONE marker
+# before claiming removal. It never aborts the uninstall.
 report_root_watchdog_removal() {
-    local out="$1"
+    local out="$1" line remaining="" found_done=false
     if [[ "$out" == *"$GENESIS_ROOT_WATCHDOG_LEFT"* ]]; then
         warn "The root network/Tailscale watchdog was NOT fully removed, and can keep restarting tailscaled (dropping SSH sessions). Needs root:${out#*"$GENESIS_ROOT_WATCHDOG_LEFT"}"
         warn "Remove it as root: systemctl disable --now $_WD_UNITS; then delete the files listed above."
         return 0
     fi
-    [ -n "$out" ] && echo "$out"
+    while IFS= read -r line; do
+        if [ "$line" = "$GENESIS_ROOT_WATCHDOG_DONE" ]; then
+            found_done=true
+        elif [ -z "$remaining" ]; then
+            remaining="$line"
+        else
+            remaining+=$'\n'"$line"
+        fi
+    done <<< "$out"
+    if [ "$found_done" != true ]; then
+        [ -n "$out" ] && echo "$out"
+        warn "Could not confirm root watchdog removal: the command did not report back, so it may still be restarting tailscaled (dropping SSH sessions)."
+        warn "Check/remove as root: systemctl status $_WD_UNITS; systemctl disable --now $_WD_UNITS"
+        return 0
+    fi
+    [ -n "$remaining" ] && echo "$remaining"
     ok "Removed root network and Tailscale watchdog timers"
     REMOVED+=("root watchdog timers")
 }
@@ -613,7 +632,11 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             ok "Stopped Genesis services"
 
             # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
-            report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
+            if [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would disable and remove the root network and Tailscale watchdog timers"
+            else
+                report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
+            fi
 
             # Persistent= timers keep a stamp file under
             # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it

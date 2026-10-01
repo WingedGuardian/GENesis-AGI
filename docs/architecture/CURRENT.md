@@ -3028,7 +3028,8 @@ verified: f24c15e9 2026-09-05
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md). The root Tailscale watchdog
-  (`genesis-tailscale-watchdog.timer`) is reported by its unit-file state only
+  (`genesis-tailscale-watchdog.timer`) is reported by its effective unit-file
+  state—the timer's, or the service's when masked
   (`tailscale_watchdog_unit_state`, beside `tailscaled_loaded`, which gates the
   `tailscale_watchdog_absent` posture rule); its `/run` file is event data for the
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into

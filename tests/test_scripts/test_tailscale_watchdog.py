@@ -415,6 +415,14 @@ def test_a_malformed_peer_with_nothing_to_probe_is_not_blind(tmp_path):
     assert (s["last_action"], s["blind_runs"]) == ("incomplete", 0)
 
 
+def test_all_malformed_peers_count_as_blind(tmp_path):
+    world = World({"bad": {"Active": True, "LastHandshake": 5, "TailscaleIPs": [B]}})
+    c = ctx(world, tmp_path)
+    for expected in (1, 2, 3):
+        s = tick(world, c)
+        assert (s["last_action"], s["blind_runs"]) == ("incomplete", expected)
+
+
 def test_the_scan_start_rotates_so_every_peer_gets_probed(tmp_path):
     world = World({f"p{i}": peer(f"100.64.0.{i}") for i in range(1, 5)})
     world.stuck("100.64.0.4")
@@ -1120,6 +1128,108 @@ def _identity_reads(world, on_read):
     return run
 
 
+def _poll_show_reads(world, responses):
+    real = world.run
+    reads = []
+    restarted = False
+
+    def run(argv, timeout, **kw):
+        nonlocal restarted
+        if argv[1] == "try-restart":
+            result = real(argv, timeout, **kw)
+            restarted = True
+            return result
+        if restarted and argv[1] == "show":
+            reads.append(argv)
+            response = responses[min(len(reads) - 1, len(responses) - 1)]
+            if response is None:
+                return 1, ""
+            rc, props = response
+            if rc != 0:
+                return rc, ""
+            requested = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-p"]
+            return 0, "".join(f"{key}={props.get(key, '')}\n" for key in requested)
+        return real(argv, timeout, **kw)
+
+    return run, reads
+
+
+def test_incomplete_identity_with_changed_start_voids_stuck_evidence(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.unit["InvocationID"] = ""
+    real = world.run
+
+    def operator_restart_during_scan(argv, timeout, **kw):
+        if argv[1] == "ping":
+            world.unit["ActiveEnterTimestampMonotonic"] = "2000000"
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path)
+    c.run = operator_restart_during_scan
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"], s["blind_runs"]) == ("daemon-changed", {}, 1)
+    assert world.restarts() == 0
+
+
+@pytest.mark.parametrize("start", ["", "0"])
+def test_incomplete_identity_without_comparable_fields_is_blind(tmp_path, start):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.unit.update({"InvocationID": "", "ActiveEnterTimestampMonotonic": start})
+    c = ctx(world, tmp_path)
+    for expected in (1, 2, 3):
+        s = tick(world, c)
+        assert (
+            s["last_action"],
+            s["evidence"],
+            s["present_complete"],
+            s["blind_runs"],
+        ) == ("identity-unreadable", {}, False, expected)
+    assert world.restarts() == 0
+
+
+def test_incomplete_identity_with_failed_post_scan_read_is_unreadable(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.unit["InvocationID"] = ""
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, lambda n: (1, "") if n == 2 else None)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"]) == ("identity-unreadable", {})
+    assert world.restarts() == 0
+
+
+def test_incomplete_identity_with_stable_start_keeps_stuck_evidence(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.unit["InvocationID"] = ""
+    tw.run_once(ctx(world, tmp_path))
+    s = state(tmp_path)
+    assert s["evidence"] == {A: "stuck"}
+    assert s["last_action"] != "identity-unreadable"
+    assert world.restarts() == 0
+
+
+def test_incomplete_identity_detects_changed_invocation_id(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    world.unit.update({"InvocationID": "inv-1", "ActiveEnterTimestampMonotonic": ""})
+
+    def operator_restart(n):
+        if n == 2:
+            world.unit["InvocationID"] = "inv-operator"
+
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, operator_restart)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"]) == ("daemon-changed", {})
+    assert world.restarts() == 0
+
+
 def test_tailscaled_stopped_just_before_the_heal_voids_the_run(tmp_path):
     world = World({"a": peer(A)})
     world.stuck(A)
@@ -1166,6 +1276,37 @@ def test_an_unreadable_check_before_the_heal_restarts_nothing(tmp_path):
     s = state(tmp_path)
     assert (s["last_action"], s["events"]) == ("stuck", [])
     assert world.restarts() == 0
+
+
+def test_restart_poll_continues_after_unreadable_reads(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    c = ctx(world, tmp_path, NETWD_TS_POLL_SEC="3")
+    c.run, reads = _poll_show_reads(
+        world,
+        [
+            None,
+            None,
+            (0, {"InvocationID": "inv-2", "ActiveState": "active", "Job": ""}),
+        ],
+    )
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert s["last_action"] == "healed"
+    assert len(reads) == 3
+    assert world.restarts() == 1
+
+
+def test_restart_poll_that_stays_unreadable_is_unverified(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+    c = ctx(world, tmp_path, NETWD_TS_POLL_SEC="3")
+    c.run, reads = _poll_show_reads(world, [None, None, None, None])
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert s["last_action"] == "unverified"
+    assert len(reads) == 4
+    assert world.restarts() == 1
 
 
 # ── round 3: every restart that dropped sessions without a heal counts ───
