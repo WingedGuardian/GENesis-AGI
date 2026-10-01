@@ -5396,20 +5396,23 @@ def _codex_clean_signal_at_head(
       findings as a review object, but MEASURED on 2 of 339 PRs it posted them as a
       `💡` issue comment with no review object while the summary read Completed;
     - no non-Codex edit or deleted edit revision exists on any Codex comment;
-    - the PR's head-side history has never moved under it: no force-push, head-branch
-      deletion or head-branch restore. A deleted comment leaves no trace in the API.
+    - the PR's history beneath the signal has not moved: no head force-push,
+      head-branch deletion or restore, or base change. A base change stays a veto
+      because the signal names the head, not the base Codex reviewed against;
+      retargeting changes the effective diff without moving the head. A base
+      force-push stays retired: merging requires the default base
+      (``_check_base_is_default``), whose ruleset forbids force-push and deletion,
+      so a force-pushed non-default base can reach a merge only through a base
+      change, which vetoes. MEASURED 2026-10-01: all 541 commits dropped by 191
+      force-pushes (PR #65 to #2309) still resolve repo-wide by 7-hex id; the
+      oldest is from 2026-04-17. Dropped head commits are therefore not the
+      binding risk. A deleted comment leaves no trace in the API.
 
     Residual, stated: a branch or tag named exactly after the short id takes priority
     in GitHub's lookup (it uses git's name-guessing rules; measured:
     ``pull/2720/head`` and ``main`` resolve). Creating one needs push rights to the
     base repo, whose sole collaborator is the owner, and no hex-named ref exists.
     Fork authors cannot create base-repo refs.
-
-    Base-side events are not vetoes: a commit leaves the PR list only if the head is
-    rewritten or the commit enters the base. Merging requires the default base
-    (``_check_base_is_default``), and ``main``'s ruleset forbids force-push and
-    deletion with no bypass. A commit that entered the base therefore stays reachable
-    forever, and its prefix 422s.
 
     Anything unreadable is None: the gate then blocks exactly as before. When a
     clean signal WAS seen and refused, ``why`` (if given) receives ``signal`` (what
@@ -5469,8 +5472,9 @@ def _codex_clean_signal_at_head(
         return None
     if evidence["history_moved"]:
         note["reason"] = (
-            "this PR's head-branch history moved (a force-push, or the branch was "
-            "deleted or restored), so a short id can no longer be bound to the head"
+            "this PR's history moved (a head force-push, a head-branch deletion or "
+            "restore, or a base change), so a clean signal no longer binds to what "
+            "Codex reviewed"
         )
         note["permanent"] = True
         return None
@@ -5503,7 +5507,7 @@ _CODEX_SIGNAL_QUERY = (
     "nodes { body author { login __typename } editor { login } "
     "userContentEdits(first: 50) { totalCount nodes { editor { login } deletedAt } } } } "
     "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, HEAD_REF_DELETED_EVENT, "
-    "HEAD_REF_RESTORED_EVENT], first: 1) { filteredCount "
+    "HEAD_REF_RESTORED_EVENT, BASE_REF_CHANGED_EVENT], first: 1) { filteredCount "
     "nodes { __typename } } } } }"
 )
 
@@ -5512,15 +5516,19 @@ def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
     """``{"comments": [...], "history_moved": bool}`` for the clean-signal check, or
     None when unreadable. ONE GraphQL read, because a comment's ``editor`` and
     ``userContentEdits`` exist only there (REST keeps the ORIGINAL author on an edited
-    comment, so the author says nothing about the body). History moved now means
-    head-side events only. Base-side events are retired: a commit leaves the PR list
-    only if the head is rewritten or the commit enters the base. Merging requires the
-    default base (``_check_base_is_default``), and ``main``'s ruleset forbids
-    force-push and deletion with no bypass, so a commit that entered the base stays
-    reachable forever and its prefix 422s. Delete and restore stay because recreating
-    the head branch can replace history without a force-push event. MEASURED
-    2026-10-01: 541 of 541 commits dropped by 191 force-pushes (PR #65 to #2309)
-    still resolve repo-wide by 7-hex id; the oldest is from 2026-04-17.
+    comment, so the author says nothing about the body). Edit-history completeness
+    is required only for Codex Bot comments; unrelated comments' edit data is ignored.
+    History moved includes head force-push, head-branch delete/restore, and
+    ``BASE_REF_CHANGED_EVENT``. A base change stays a veto because a clean signal
+    names the head, not the base it was reviewed against; retargeting changes the
+    effective diff without moving the head. A base force-push is retired: merging
+    requires the default base (``_check_base_is_default``), whose ruleset forbids
+    force-push and deletion, so a force-pushed non-default base can reach a merge
+    only through a base change, which vetoes. Delete and restore stay because
+    recreating the head branch can replace history without a force-push event.
+    MEASURED 2026-10-01: 541 of 541 commits dropped by 191 force-pushes (PR #65 to
+    #2309) still resolve repo-wide by 7-hex id; the oldest is from 2026-04-17, so
+    dropped head commits are not the binding risk.
 
     History moved when the type-filtered timeline has ANY node. Two readings must
     agree, or the read is refused: the documented one (the ``itemTypes`` filter on
@@ -5568,36 +5576,37 @@ def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
         for node in comments["nodes"]:
             author = node.get("author") or {}
             editor = node.get("editor") or {}
-            edits = node.get("userContentEdits")
-            if not isinstance(edits, dict):
-                return None
-            edit_nodes = edits.get("nodes")
-            edit_count = edits.get("totalCount")
-            if (
-                not isinstance(edit_nodes, list)
-                or type(edit_count) is not int
-                or edit_count > len(edit_nodes)
-            ):
-                return None
             foreign_edit = None
-            current_editor = editor.get("login")
-            if current_editor is not None and current_editor != codex:
-                foreign_edit = f"edited by {current_editor}"
-            else:
-                for edit in edit_nodes:
-                    edit_editor = (edit.get("editor") or {}).get("login")
-                    if edit.get("deletedAt"):
-                        foreign_edit = (
-                            "had an edit revision deleted "
-                            f"(edit by {edit_editor or 'an unknown account'})"
-                        )
-                        break
-                if foreign_edit is None:
+            if author.get("login") == codex and author.get("__typename") == "Bot":
+                edits = node.get("userContentEdits")
+                if not isinstance(edits, dict):
+                    return None
+                edit_nodes = edits.get("nodes")
+                edit_count = edits.get("totalCount")
+                if (
+                    not isinstance(edit_nodes, list)
+                    or type(edit_count) is not int
+                    or edit_count > len(edit_nodes)
+                ):
+                    return None
+                current_editor = editor.get("login")
+                if current_editor is not None and current_editor != codex:
+                    foreign_edit = f"edited by {current_editor}"
+                else:
                     for edit in edit_nodes:
                         edit_editor = (edit.get("editor") or {}).get("login")
-                        if edit_editor != codex:
-                            foreign_edit = f"edited by {edit_editor or 'an unknown account'}"
+                        if edit.get("deletedAt"):
+                            foreign_edit = (
+                                "had an edit revision deleted "
+                                f"(edit by {edit_editor or 'an unknown account'})"
+                            )
                             break
+                    if foreign_edit is None:
+                        for edit in edit_nodes:
+                            edit_editor = (edit.get("editor") or {}).get("login")
+                            if edit_editor != codex:
+                                foreign_edit = f"edited by {edit_editor or 'an unknown account'}"
+                                break
             rows.append(
                 {
                     "login": author.get("login"),

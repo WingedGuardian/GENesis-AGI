@@ -3093,7 +3093,7 @@ class TestCleanSignalAtHead:
     """#2418: Codex posts NO review object when it finds nothing, so its word on a clean
     head is a comment. It counts only when the abbreviated id resolves repo-wide to
     exactly the head, nothing Codex filed carries findings for the head, no Codex
-    comment has a foreign edit, and no head-side history move came after it."""
+    comment has a foreign edit, and no head history move or base change came after it."""
 
     @pytest.fixture(autouse=True)
     def _fresh_pass_reason(self):
@@ -3207,23 +3207,24 @@ class TestCleanSignalAtHead:
             "HeadRefForcePushedEvent",
             "HeadRefDeletedEvent",
             "HeadRefRestoredEvent",
+            "BaseRefChangedEvent",
         ],
     )
-    def test_any_head_history_move_voids_the_signal(self, monkeypatch, event):
-        """Each head-side event can replace history beneath a previously posted signal."""
+    def test_any_history_move_voids_the_signal(self, monkeypatch, event):
+        """Each event can invalidate the head or diff reviewed by a clean signal."""
         self._setup(monkeypatch, _clean_node(HEAD[:10]), moves=(event,))
         assert _mod._check_codex_reviewed_head("1")[0] is True
         self._setup(monkeypatch, _summary_node(HEAD[:7]), moves=(event, event, event))
         assert _mod._check_codex_reviewed_head("1")[0] is True
 
-    def test_the_query_asks_for_head_side_history_only(self):
+    def test_the_query_asks_for_head_history_and_base_change(self):
         for event in (
             "HEAD_REF_FORCE_PUSHED_EVENT",
             "HEAD_REF_DELETED_EVENT",
             "HEAD_REF_RESTORED_EVENT",
+            "BASE_REF_CHANGED_EVENT",
         ):
             assert event in _mod._CODEX_SIGNAL_QUERY
-        assert "BASE_REF_CHANGED_EVENT" not in _mod._CODEX_SIGNAL_QUERY
         assert "BASE_REF_FORCE_PUSHED_EVENT" not in _mod._CODEX_SIGNAL_QUERY
 
     def test_the_whole_timeline_total_is_not_a_force_push_count(self, monkeypatch):
@@ -3337,6 +3338,22 @@ class TestCleanSignalAtHead:
         comment["userContentEdits"]["totalCount"] = 60
         monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", json.dumps(raw))
         assert _mod._check_codex_reviewed_head("1")[0] is True
+
+    def test_a_non_codex_comments_truncated_edits_do_not_block(self, monkeypatch):
+        human_truncated = _node(
+            "Human comment", login="alice", kind="User", edits=("alice",) * 50
+        )
+        human_truncated["userContentEdits"]["totalCount"] = 60
+        human_missing = _node("Another human comment", login="bob", kind="User")
+        del human_missing["userContentEdits"]
+        self._setup(
+            monkeypatch,
+            human_truncated,
+            human_missing,
+            _summary_node(HEAD[:7]),
+        )
+        block, _, head = _mod._check_codex_reviewed_head("1")
+        assert block is False and head == HEAD
 
     def test_codex_only_clean_summary_edits_are_accepted(self, monkeypatch):
         self._setup(monkeypatch, _summary_node(HEAD[:7]))

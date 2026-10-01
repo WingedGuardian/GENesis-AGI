@@ -3952,11 +3952,16 @@ findings below, a gated `gh pr merge`:
   may carry findings (Codex usually files findings as a review object, but MEASURED
   on 2 of 339 PRs it posted them as a `💡` issue comment with none). Any non-Codex edit
   or deleted edit revision on any Codex comment permanently refuses clean signals;
-  the block names the editor when available. History veto is head-side only:
-  force-push, head-branch deletion or restoration. Base-side events are retired
-  because a commit leaves the PR list only when the head is rewritten or the commit
-  enters the base; merges require the default base, whose ruleset prevents force-push
-  and deletion, so a base-reachable commit remains resolvable and its prefix 422s.
+  the block names the editor when available. Edit-history completeness is required
+  only for Codex Bot comments; unrelated comments' edit data is ignored. History
+  veto covers head force-push, head-branch deletion or restoration, and base changes.
+  A base change stays a veto because the clean signal names the head, not the base
+  Codex reviewed against; retargeting changes the effective diff without moving the
+  head. A base force-push is retired: merging requires the default base, whose
+  ruleset forbids force-push and deletion, so a force-pushed non-default base can
+  reach a merge only through a base change, which vetoes. All 541 commits dropped
+  by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits
+  are not the binding risk.
   A branch or tag exactly named after a short id can shadow GitHub's commit lookup
   (which uses git name-guessing rules); measured `pull/2720/head` and `main` resolve.
   Creating a shadow ref needs base-repo push rights, held only by the owner, and no
