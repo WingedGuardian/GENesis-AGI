@@ -28,8 +28,8 @@ listed it (11 such `wt-*` relocation stubs had accumulated).
 
 Stdlib-only. A malformed hook payload fails open. A command that mentions a
 removal but cannot be read is refused, and so is one that runs a removal under
-`xargs` or `parallel` without naming the worktree, or hands the removal to a
-shell as text the parser never reads.
+`xargs` or `parallel` without naming the worktree or the operation, or hands the
+removal to a shell or `source` through stdin.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
@@ -179,10 +180,9 @@ _NOT_A_TEXT_CARRIER = (
     "is not itself dangerous"
 )
 _NOT_A_NAME_CARRIER = (
-    "not a carrier by NAME: `analyze` flattens a shell's `-c` payload and reads a "
-    "here-document body, and a file argument is not text in this command; a shell "
-    "reading its program from a pipe, a here-string or a process substitution is "
-    "a carrier through `_runs_unread_shell_text`"
+    "not a carrier by NAME: `analyze` flattens a shell's `-c` payload, and a file "
+    "argument is not text in this command; a shell reading its program from stdin "
+    "or a process substitution is a carrier through `_runs_unread_shell_text`"
 )
 _CARRIER_EXCLUDES: dict[str, str] = {
     **{name: _NOT_A_TEXT_CARRIER for name in (
@@ -210,13 +210,18 @@ _COMMAND_CARRIER = re.compile(
 )
 
 # Programs that can run SHELL TEXT the parser never read. A shell whose program
-# comes through a pipe, a here-string or a process substitution is one: the text
-# sits in another command's arguments, or (a here-string's word) in no segment
-# at all. Three are not. A shell given `-c`, because `analyze` flattens that
-# payload. A shell fed a here-document, because the parser reads the body as
-# commands and a removal there is seen directly. A shell or `source` given a
-# FILE, because the removal would be in the file, not in this command's text,
-# so the carrier fallback would only mistake a later mention for a target.
+# comes from stdin is one: through a pipe or a here-string the text sits in
+# another command's arguments, or (a here-string's word) in no segment at all.
+# So is a process substitution. Two are not. A shell given `-c`, because
+# `analyze` flattens that payload. A shell or `source` given a FILE, because the
+# removal would be in the file, not in this command's text, so the carrier
+# fallback would only mistake a later mention for a target.
+#
+# A shell fed a HERE-DOCUMENT is counted too, though the parser reads the body:
+# segments keep no redirects, so which shell a here-document feeds can only be
+# guessed from the raw text, and a guess made once for the whole command exempted
+# a piped shell next to it (review, round 1). Counting it costs a refusal when the
+# body only mentions the removal; MEASURED at 0 of 29,556 recorded commands.
 # Kept in step with `shell_parse._NESTED` by test_carrier_sets.
 _SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "ash"})
 _SOURCERS = frozenset({"source", "."})
@@ -225,13 +230,12 @@ _SOURCERS = frozenset({"source", "."})
 _SHELL_LONG_OPTS_WITH_VALUE = frozenset({"--rcfile", "--init-file"})
 # Program operands that are stdin rather than a file.
 _STDIN_PROGRAMS = ("/dev/stdin", "/dev/fd/", "/proc/self/fd/")
-# A shell word followed on its own line by a here-document operator (`<<`, not
-# `<<<`). Read from the raw text because the parser keeps no redirects in a
-# segment. It only NARROWS a rule this file adds: a miss keeps the shell a
-# carrier (a refusal), a false match leaves the command to main's verdict.
-_HEREDOC_FED_SHELL = re.compile(
-    r"(?:^|[\s;&|(!{])(?:\S*/)?(?:" + "|".join(sorted(_SHELLS)) + r")\b[^\n;&|]*(?<!<)<<(?!<)",
-    re.MULTILINE,
+# `git worktree` operations. Under a word supplier, a first word that is not one of
+# these (an `xargs -I` placeholder, a `parallel` slot, an empty word) is read as an
+# operation this guard cannot see, and so is any word once a replace-string option is
+# present, since a placeholder can be spelled as an operation name.
+_WORKTREE_OPERATIONS = frozenset(
+    {"add", "list", "lock", "move", "prune", "remove", "repair", "unlock"}
 )
 # The launchers that can ADD words to the command they run, from stdin or a list.
 # `sudo`, `nice`, `timeout` and the like run `git` with exactly the words given.
@@ -299,18 +303,29 @@ def _extract_worktree_targets(segs: list) -> list[str]:
 
 def _worktree_words(seg) -> list[str] | None:
     """The words after ``git worktree`` in ``seg``, or ``None`` when ``seg`` is
-    not a ``git worktree`` segment."""
-    if seg.exe != "git":
+    not a ``git worktree`` segment.
+
+    ``analyze`` unwraps ``xargs`` to the ``git`` it runs but leaves ``parallel`` as
+    the executable, so for a ``parallel`` segment the ``git`` command is read from
+    its argv, starting at the first word that names ``git``.
+    """
+    argv = seg.argv
+    if seg.exe == "parallel":
+        starts = [i for i, w in enumerate(argv) if os.path.basename(w) == "git"]
+        if not starts:
+            return None
+        argv = argv[starts[0] :]
+    elif seg.exe != "git":
         return None
     # The INDEX from the parser's own scan, never `argv.index(_SUBCOMMAND)`:
     # that returns the first token equal to the name, and a global option's
     # operand can BE that name. `git -C worktree worktree remove /tmp/x` anchored on
     # the `-C` operand, so `after_sub[0]` was the literal "worktree" instead of
     # "remove", the segment was skipped, and a real removal was ALLOWED.
-    sub_idx = git_subcommand_index(seg.argv)
-    if sub_idx is None or seg.argv[sub_idx] != _SUBCOMMAND:
+    sub_idx = git_subcommand_index(argv)
+    if sub_idx is None or argv[sub_idx] != _SUBCOMMAND:
         return None
-    return seg.argv[sub_idx + 1 :]
+    return argv[sub_idx + 1 :]
 
 
 def _removal_operands(seg) -> list[str] | None:
@@ -327,17 +342,33 @@ def _fed_by_word_supplier(seg) -> bool:
     """Whether ``git`` in ``seg`` runs under ``xargs`` or ``parallel``.
 
     ``analyze`` strips wrappers from ``argv`` and keeps them in ``raw``, so the
-    words of ``raw`` before ``git`` are the wrappers that ran it. Only a wrapper in
+    words of ``raw`` include the wrappers that ran ``git``. Only a wrapper in
     `_WORD_SUPPLIERS` can add the missing worktree or operation; ``sudo git
-    worktree remove`` with no path removes nothing.
+    worktree remove`` with no path removes nothing. Every word is checked, dequoted
+    first since the parser resolves a quoted ``'xargs'`` too, and none ends the
+    scan: a wrapper's option value spelled ``git`` (``sudo -u git``) must not hide a
+    supplier after it. A word spelled like a supplier anywhere in the segment
+    counts, which errs toward refusing.
     """
-    for word in seg.raw.split():
-        name = os.path.basename(word.lstrip("({!"))
-        if name == "git":
-            return False
-        if name in _WORD_SUPPLIERS:
-            return True
-    return False
+    return any(os.path.basename(word.lstrip("({!")) in _WORD_SUPPLIERS for word in _raw_words(seg))
+
+
+def _raw_words(seg) -> list[str]:
+    """The words of ``seg.raw``, dequoted the way the shell reads them."""
+    try:
+        return shlex.split(seg.raw)
+    except ValueError:
+        return seg.raw.split()
+
+
+def _substitutes_words(seg) -> bool:
+    """Whether a replace-string option (``-I``, ``-i``, ``--replace``) is present, so
+    the supplier can rewrite any word of the command, an operation name included. A
+    word spelled like the option anywhere in the segment counts, which errs toward
+    refusing."""
+    return any(
+        w in ("-i", "--replace") or w.startswith(("-I", "--replace=")) for w in _raw_words(seg)
+    )
 
 
 def _launcher_unread(segs: list) -> str | None:
@@ -363,7 +394,7 @@ def _launcher_unread(segs: list) -> str | None:
         if after_sub is None or not _fed_by_word_supplier(seg):
             continue
         words = [w for w in after_sub if not w.startswith("-")]
-        if not words:
+        if not words or words[0] not in _WORKTREE_OPERATIONS or _substitutes_words(seg):
             return "operation"
         if words[0] == _OPERATION and len(words) == 1:
             return "worktree"
@@ -379,13 +410,10 @@ def _program_is_unread(operand: str | None) -> bool:
     return operand.startswith("(") or operand.startswith(_STDIN_PROGRAMS)
 
 
-def _runs_unread_shell_text(seg, heredoc_fed: bool = False) -> bool:
+def _runs_unread_shell_text(seg) -> bool:
     """Whether ``seg`` runs shell text the parser did not read.
 
-    ``heredoc_fed``: the command feeds a shell a here-document, whose body the
-    parser does read, so a shell with no program operand is not counted.
-
-    ``source`` and ``.`` run their first operand. A shell runs its ``-c``
+    ``source`` and ``.`` run their first operand, after an optional ``--``. A shell runs its ``-c``
     payload, which ``analyze`` flattens when the bundle starts with ``-``, so
     that shell is not a carrier; the same letter after ``+`` also runs the
     payload but is not flattened, so that shell is. Otherwise a shell reads its
@@ -394,7 +422,10 @@ def _runs_unread_shell_text(seg, heredoc_fed: bool = False) -> bool:
     a ``-c`` meant for a script is not mistaken for the shell's own.
     """
     if seg.exe in _SOURCERS:
-        return len(seg.argv) > 1 and _program_is_unread(seg.argv[1])
+        operands = seg.argv[1:]
+        if operands[:1] == ["--"]:
+            operands = operands[1:]
+        return bool(operands) and _program_is_unread(operands[0])
     if seg.exe not in _SHELLS:
         return False
     args = seg.argv[1:]
@@ -419,8 +450,6 @@ def _runs_unread_shell_text(seg, heredoc_fed: bool = False) -> bool:
         if arg[0] == "-" and "s" in bundle:
             return True
         i += bundle.count("o") + bundle.count("O")
-    if operand is None and heredoc_fed:
-        return False
     return _program_is_unread(operand)
 
 
@@ -441,13 +470,9 @@ def _carries_a_command(cmd: str, segs: list) -> bool:
 
     A shell or ``source`` that runs text the parser did not read counts too (see
     ``_runs_unread_shell_text``): piping or here-stringing a removal into ``bash``
-    puts it in text no segment carries. One given a file or a here-document
-    does not.
+    puts it in text no segment carries. One given a file does not.
     """
-    heredoc_fed = bool(_HEREDOC_FED_SHELL.search(cmd))
-    if any(
-        seg.exe in _CARRIER_NAMES or _runs_unread_shell_text(seg, heredoc_fed) for seg in segs
-    ):
+    if any(seg.exe in _CARRIER_NAMES or _runs_unread_shell_text(seg) for seg in segs):
         return True
     return bool(_COMMAND_CARRIER.search(cmd))
 
@@ -543,13 +568,13 @@ _UNREAD_REASONS = {
     ),
     "operation": (
         "this command has `git worktree` under `xargs` or `parallel` with no "
-        "operation after it, so if it runs, the operation and the worktree come "
-        "from stdin or a list"
+        "operation written out after it, so if it runs, the operation and the "
+        "worktree can come from stdin or a list"
     ),
     "mention": (
         "this command names removing a worktree inside text that a shell or "
         "another program may run (a string passed to `eval`, `ssh` or a similar "
-        "carrier, a program piped or here-stringed into a shell, or text the "
+        "carrier, a program a shell reads from stdin, or text the "
         "tokenizer cannot read), and names no worktree after it"
     ),
 }

@@ -695,6 +695,8 @@ _UNREAD_TARGET_REMOVALS = [
     # the `git` it runs, so the carrier test sees no carrier name in the text.
     f"echo /tmp/wt-x | /usr/bin/xargs {_PHRASE}",
     f"echo /tmp/wt-x | sudo xargs {_PHRASE}",
+    f"echo /tmp/wt-x | '/usr/bin/xargs' {_PHRASE}",
+    f'echo /tmp/wt-x | "xargs" {_PHRASE}',
     f"echo /tmp/wt-x | parallel {_PHRASE}",
     # A here-document body a shell runs: the parser reads it as commands.
     f"bash <<'EOF'\necho /tmp/wt-x | xargs {_PHRASE}\nEOF",
@@ -726,10 +728,14 @@ _UNREAD_PROGRAM_REMOVALS = [
     # `-s` reads stdin even when positional words follow; `-o` takes a value.
     f"bash -s arg <<< '{_PHRASE} /tmp/wt-x'",
     f"bash -o pipefail <<< '{_PHRASE} /tmp/wt-x'",
+    # A here-document fed to one shell must not exempt a piped shell beside it.
+    f"bash <<'EOF'\necho harmless\nEOF\necho '{_PHRASE} /tmp/wt-x' | bash",
     # C: `source` / `.`, which run a file's text as shell
     f"source /dev/stdin <<< '{_PHRASE} /tmp/wt-x'",
     f". <(echo '{_PHRASE} /tmp/wt-x')",
     f"source <(echo '{_PHRASE} /tmp/wt-x')",
+    f". -- /dev/stdin <<< '{_PHRASE} /tmp/wt-x'",
+    f"echo '{_PHRASE} /tmp/wt-x' | source -- /dev/stdin",
 ]
 
 # A launcher that supplies the OPERATION itself from stdin or a list: the parsed
@@ -737,6 +743,16 @@ _UNREAD_PROGRAM_REMOVALS = [
 _UNREAD_OPERATION_REMOVALS = [
     f"echo {_OP} /tmp/wt-x | xargs git {_SUB}",
     f"echo {_OP} /tmp/wt-x | xargs -r git -C /r {_SUB}",
+    f"echo {_OP} | xargs -I{{}} git {_SUB} {{}} /tmp/wt-x",
+    # parallel substitutes `{}` without any option, so only the first-word rule sees it.
+    f"echo {_OP} | parallel git {_SUB} {{}} /tmp/wt-x",
+    f"parallel git {_SUB} ::: {_OP} ::: /tmp/wt-x",
+    # A wrapper's option value spelled `git` must not hide the supplier after it.
+    f"echo {_OP} /tmp/wt-x | env 'G=/usr/bin/git' xargs git {_SUB}",
+    f"echo {_OP} /tmp/wt-x | sudo -u 'git' xargs git {_SUB}",
+    # A placeholder spelled like an option, or like an operation name.
+    f"printf '{_OP}\\n' | xargs -I -h git {_SUB} -h /tmp/wt-x",
+    f"printf '{_OP}\\n' | xargs -I list git {_SUB} list /tmp/wt-x",
 ]
 
 # Refused on main too, but only because the coarse reader took an operator
@@ -816,10 +832,6 @@ class TestATargetTheGuardCannotReadIsRefused:
             # A wrapper that supplies no words is not a launcher for this rule.
             f"git commit -F - <<'EOF'\nfix: `sudo {_PHRASE}` names nothing\nEOF",
             f"sudo git {_SUB}",
-            # A shell fed a here-document: the parser reads the body, so the shell
-            # is not a carrier and a mention in the body is only a mention.
-            f"bash <<'EOF'\ngrep -rn \"{_PHRASE}\" docs/\nEOF",
-            f"sh <<'EOF'\ngit grep -n '{_SUB} {_OP}'\nEOF",
         ],
     )
     def test_ordinary_commands_near_the_new_carriers_still_run(
@@ -831,6 +843,24 @@ class TestATargetTheGuardCannotReadIsRefused:
         worktree is refused only when a launcher reaches it."""
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 0, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"bash <<'EOF'\ngrep -rn \"{_PHRASE}\" docs/\nEOF",
+            f"sh <<'EOF'\ngit grep -n '{_SUB} {_OP}'\nEOF",
+        ],
+    )
+    def test_a_here_document_fed_shell_is_a_carrier_known_cost(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """KNOWN COST, pinned. Segments keep no redirects, so which shell a
+        here-document feeds cannot be told from the parse, and a shell reading its
+        program from stdin is a carrier even when the body only mentions the
+        removal. Exempting here-document-fed shells from the raw text exempted a
+        piped shell beside one (review, round 1)."""
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
 
     def test_prose_naming_a_supplied_removal_gets_an_honest_refusal(
         self, guard_cmd: str
