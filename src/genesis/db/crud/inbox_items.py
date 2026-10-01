@@ -201,8 +201,8 @@ async def count_live_rows_for_approval(
     A row is 'live' iff it is in ``processing`` state carrying an
     ``awaiting_approval:<request_id>`` or ``dispatching:<request_id>`` marker —
     i.e. a batch that is parked on, or mid-dispatch against, exactly this
-    approval. Invalidated (``approval_invalidated:``), failed, and completed
-    rows do NOT count.
+    approval. Invalidated (``approval_invalidated:``), superseded, failed, and
+    completed rows do NOT count.
 
     A return of ``0`` means the approval is **orphaned**: no inbox row will
     ever be dispatched against it (its rows were invalidated or superseded
@@ -244,11 +244,16 @@ async def supersede_parked_rows(
     the request with zero live rows (content removed entirely), the monitor's
     orphan-recovery guard cancels it on a later scan with no replacement.
 
+    Rows move to ``status='superseded'`` — being replaced by a newer snapshot
+    is not a failure, and writing ``failed`` buried real failures under them.
+    ``error_message`` keeps the reason for audit and ``retry_count`` is left
+    untouched.
+
     Returns the number of rows superseded.
     """
     cursor = await db.execute(
         """UPDATE inbox_items
-           SET status = 'failed',
+           SET status = 'superseded',
                error_message = ? || 'superseded by newer modification',
                processed_at = ?
            WHERE file_path = ? AND status = 'processing'
@@ -350,6 +355,7 @@ async def get_all_known(
 
     Excludes (allows reprocessing):
     - failed items with retry_count < max_retries (retriable)
+    - superseded items (a newer drop replaced their snapshot)
     - completed items whose response file was deleted (user wants re-eval)
     """
     from pathlib import Path
@@ -370,6 +376,9 @@ async def get_all_known(
     # - retriable failed rows (retry_count < max): the retry lane owns their
     #   re-queueing; letting one erase the file from "known" would re-classify
     #   the file as NEW and re-evaluate FULL content.
+    # - superseded rows: a newer drop replaced their snapshot, so their hash is
+    #   stale by definition. (Written as retriable 'failed' until the
+    #   'superseded' status existed, and invisible here for that reason.)
     # - completed rows whose response file was deleted: user-initiated re-eval.
     cursor = await db.execute(
         "SELECT file_path, content_hash, status, response_path, retry_count "
@@ -382,6 +391,8 @@ async def get_all_known(
         file_path, content_hash, status, response_path, retry_count = (
             row[0], row[1], row[2], row[3], row[4],
         )
+        if status == "superseded":
+            continue
         if status == "failed" and (retry_count or 0) < max_retries:
             continue
         if status == "completed" and response_path and not Path(response_path).exists():
@@ -696,7 +707,13 @@ async def get_handled_batch_content(
     *,
     max_retries: int = 3,
 ) -> list[str]:
-    """Return exact batch blocks that are completed or retry-exhausted."""
+    """Return exact batch blocks that are completed or retry-exhausted.
+
+    A ``superseded`` row is never handled, whatever its retry_count: its
+    snapshot was replaced before it was evaluated. (While supersession was
+    written as ``failed``, a row at the retry cap was counted here, so its
+    never-evaluated items were dropped from later deltas.)
+    """
     cursor = await db.execute(
         """SELECT batch_items FROM inbox_items
            WHERE file_path = ?

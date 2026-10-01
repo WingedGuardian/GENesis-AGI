@@ -9669,6 +9669,12 @@ _PUSH_SAFE_VALUE_FLAGS = frozenset({"-o", "--push-option"})
 # separately (glued push-option value). ``f`` (force) and ``d`` (delete) are absent
 # by design — a bundle containing either is not a plain current-branch update.
 _PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46")
+# Git GLOBAL options (before ``push``) that a plain re-push may carry. ``-C`` is
+# resolved into the push's cwd by the caller; the pager switches change nothing
+# about the push. Every other global option — above all ``-c`` / ``--config-env``,
+# which supply config the repo-config reads cannot see — refuses.
+_PUSH_SAFE_GLOBAL_VALUE_FLAGS = frozenset({"-C"})
+_PUSH_SAFE_GLOBAL_FLAGS = frozenset({"-P", "--no-pager"})
 
 
 def _push_is_force(argv: list[str]) -> bool:
@@ -9819,8 +9825,9 @@ def _git_config_get(base: list[str], key: str, *, all_values: bool = False, as_b
     ``[section]\\n\\tkey`` shorthand) normalizes to a canonical ``"true"``/``"false"``.
 
     NOTE: this reads the effective REPO config; it does NOT see a command-line
-    ``git -c key=val`` override on the push itself (tabled residue — the config
-    check is best-effort for the common repo-config case, not a hard boundary).
+    ``git -c key=val`` override on the push itself. The push path does not rely
+    on it for that: ``_push_ref_positionals`` refuses ``-c`` / ``--config-env``
+    and ``_push_seg_has_no_prefix`` refuses an assignment prefix.
     """
     args = ["config"]
     if as_bool:
@@ -9842,27 +9849,83 @@ _SAFE_RECURSE_SUBMODULES = frozenset({"no", "false", "off", "0", "check"})
 
 
 def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
-    """Whether a bare / remote-only push updates ONLY the current branch under the
-    effective REPO config — ALLOWLIST posture (mirrors ``_push_targets_current_branch``).
+    """Whether the effective config leaves a plain current-branch push PLAIN —
+    the ONE config-safety predicate every auto-allowed re-push must pass.
 
-    Broadening/redirecting knobs checked (each case-insensitive):
-      • ``remote.<remote>.push`` refspec (``push = HEAD:main`` → sends HEAD to main);
-      • ``remote.<remote>.mirror`` (a bare push mirrors ALL refs — force-updates /
-        deletes unrelated remote refs);
-      • ``push.default`` other than ``simple``/``current`` (``upstream``/``tracking``
-        push cur to a differently-named upstream; ``matching`` pushes every
-        same-named branch);
-      • ``push.recurseSubmodules``/``submodule.recurse`` (side-channel-publishes
-        submodule commits).
-    Simple ONLY when NONE is set to a broadening value. Fail-closed: an unresolved
-    remote, any of the above, or any config-read error → False (prompt).
+    ``_push_targets_current_branch`` calls this on EVERY path that can return
+    True (bare, ``<remote>``, ``<remote> <ref>`` and ``<remote> <src>:<dst>``), so
+    the re-push relaxation never reaches a push whose config was not read here.
+    ALLOWLIST posture: simple only when NONE of the keys below is set to a
+    value that changes the push.
 
-    BEST-EFFORT, not a hard boundary (`remote` is already resolved with git's
-    pushRemote/pushDefault precedence by the caller). It reads REPO config only, so a
-    command-line ``git -c key=val push`` override, ``remote.<remote>.mirror``,
-    ``push.followTags``, or a ``url.*.pushInsteadOf`` rewrite are NOT caught — tabled
-    adversarial residue (each needs a deliberately unusual command / hostile config,
-    and `git config` writes are already soft-warned). Bounded by 5s timeouts.
+    WHICH keys, and why these. Enumerated from git-config(1) and git-push(1)
+    (git 2.43, consulted 2026-09-29) for the keys that change WHAT a push
+    executes, WHERE it lands, or WHICH refs it sends — and that apply to a push
+    WITHOUT applying equally to the fetch-side ``git ls-remote`` that
+    ``_push_is_republish`` runs to prove the branch is already published:
+
+      where it lands / which ref it updates
+      • ``remote.<r>.push`` — a configured push refspec remaps or broadens;
+      • ``push.default`` other than ``simple``/``current`` — ``upstream``/
+        ``tracking`` push to a differently-named branch, ``matching`` to every
+        same-named one (both MEASURED with git 2.43 to update ``main`` from
+        ``git push origin <cur>``);
+      • push URL ≠ fetch URL — ``remote.<r>.pushurl`` or a
+        ``url.<base>.pushInsteadOf`` rewrite sends the push somewhere OTHER than
+        the URL ``ls-remote`` checked (MEASURED: ``git remote get-url --push``
+        reflects both rewrites while ``ls-remote`` still answered from the fetch
+        URL), so "already published" would be a fact about a different
+        repository. A remote with more than one URL refuses too: the push goes
+        to every URL, ``ls-remote`` asks only the first (MEASURED). For a
+        raw-URL destination (no remote section to compare), any
+        ``pushInsteadOf`` rule refuses;
+      • a legacy ``$GIT_COMMON_DIR/remotes/<r>`` or ``branches/<r>`` file —
+        push refspecs ``git config`` never reports (MEASURED: a ``Push:`` line
+        created another branch while ``remote.<r>.push`` read as unset);
+      which refs go with it
+      • ``remote.<r>.mirror`` — every ref, force and delete;
+      • ``push.followTags`` — annotated tags ride along (MEASURED: a colon
+        refspec push published a new tag);
+      • ``push.recurseSubmodules`` / ``submodule.recurse`` — submodule commits
+        are pushed to the SUBMODULE's remote, a different repository (MEASURED:
+        ``git push origin HEAD:refs/heads/<cur>`` under ``on-demand`` created
+        ``<cur>`` in the submodule's remote);
+      what it executes
+      • ``remote.<r>.receivepack`` — the program run for the push, the config
+        twin of ``--receive-pack``, which the argv scan already refuses
+        (MEASURED: a configured helper ran on ``git push origin HEAD``);
+      • ``push.gpgSign`` — signing runs ``gpg.program``, on a push only.
+
+    Deliberately NOT here, and why (the stated residue):
+      • ``core.sshCommand`` / ``GIT_SSH*``, ``credential.helper``,
+        ``remote.<r>.vcs`` helpers, ``remote.<r>.proxy`` / ``core.gitProxy``,
+        ``remote.<r>.uploadpack``, ``url.<base>.insteadOf``: each runs (or
+        rewrites) for a FETCH as well — ``insteadOf`` rewrites ``ls-remote`` the
+        same way, so the republish probe sees the push's real destination — and
+        refusing a push cannot stop a program an unprompted ``git fetch`` (or
+        this guard's own ``ls-remote``) already runs;
+      • ``core.hooksPath`` and the ``pre-push`` hook it selects: this one DOES
+        run only on a push, and is left out on purpose — installs set
+        ``core.hooksPath`` to their own hook directory, so refusing it would
+        turn every ordinary re-push into an ask. The hook FILE is also
+        editable by any write, which no config read can see;
+      • ``push.pushOption``, ``push.autoSetupRemote``, ``push.negotiate``,
+        ``push.useBitmaps``: ref-neutral; ``push.useForceIfIncludes`` only acts
+        with a force, which takes the force arm;
+      • config supplied by the PUSH COMMAND ITSELF (``git -c``, ``--config-env``,
+        a ``GIT_CONFIG_*`` assignment prefix) is invisible to these reads, so
+        ``_push_ref_positionals`` refuses those spellings instead; and config
+        an EARLIER segment of the same command would write (``git config …``,
+        ``git remote set-url --add …``, an ``export``) does not exist yet when
+        this runs, so the push arm drops the relaxation for any command whose
+        other segments are not on ``_push_compound_is_inert``'s allowlist.
+        (Inherited process environment IS visible: the hook launcher passes
+        the git config channels through by design.)
+      • timeouts: each read here is a flat 5s local call, not charged to the
+        shared hook deadline the network probes use — residue, local reads only.
+
+    Fail-closed: an unresolved remote, any key above, or any config-read error
+    → False (prompt). Bounded by 5s timeouts per read.
     """
     if not remote:
         return False
@@ -9880,6 +9943,13 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
         return False
     rc, out = got
     if rc == 0 and out == "true":
+        return False
+    # 1c. A configured receive-pack PROGRAM — the config twin of --receive-pack.
+    got = _git_config_get(base, f"remote.{remote}.receivepack")
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out:
         return False
     # 2. push.default must be a same-name mode (unset → simple → safe).
     got = _git_config_get(base, "push.default")
@@ -9901,7 +9971,91 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     if got is None:
         return False
     rc, out = got
-    return not (rc == 0 and out == "true")
+    if rc == 0 and out == "true":
+        return False
+    # 4. push.followTags publishes annotated tags alongside the branch.
+    got = _git_config_get(base, "push.followTags", as_bool=True)
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out == "true":
+        return False
+    # 5. push.gpgSign (a boolean OR "if-asked") runs gpg.program on the push.
+    #    Only an explicit false is safe; unset is the default (no signing).
+    got = _git_config_get(base, "push.gpgSign")
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out.lower() not in ("false", "no", "off", "0"):
+        return False
+    # 6. A legacy remote FILE carries push refspecs `git config` never shows.
+    if _legacy_remote_file_exists(remote, base):
+        return False
+    # 7. The push must land where the republish probe looked.
+    return _push_url_matches_probe(remote, base)
+
+
+def _legacy_remote_file_exists(remote: str, base: list[str]) -> bool:
+    """Whether ``<git-common-dir>/remotes/<remote>`` or ``…/branches/<remote>``
+    exists — git's pre-config remote definitions. MEASURED (git 2.43): a
+    ``remotes/<name>`` file with a ``Push: HEAD:refs/heads/<other>`` line made
+    ``git push <name>`` create ``<other>`` while ``git config --get-all
+    remote.<name>.push`` reported unset. Existence refuses, whatever the file
+    says; an unreadable git dir also refuses (True)."""
+    got = _run_git_lines(base + ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if got is None or got[0] != 0 or len(got[1]) != 1:
+        return True
+    common = got[1][0]
+    # Concatenate, never os.path.join: a raw-URL "remote" starting with `/`
+    # would make join discard the prefix and test the URL path itself.
+    return any(os.path.lexists(f"{common}/{kind}/{remote}") for kind in ("remotes", "branches"))
+
+
+def _push_url_matches_probe(remote: str, base: list[str]) -> bool:
+    """Whether a push to ``remote`` lands on the URL ``git ls-remote`` answers from.
+
+    ``_push_is_republish`` proves "already published" with ``git ls-remote
+    <remote>``, which resolves the FETCH URL (``insteadOf`` applied). The push
+    itself goes to the PUSH URL, which ``remote.<r>.pushurl`` and
+    ``url.<base>.pushInsteadOf`` both move. When the two sets differ, the probe
+    describes a different repository and cannot vouch for this push.
+
+    For a raw URL/path destination there is no remote section to compare
+    (``git remote get-url`` exits 2), so any ``pushInsteadOf`` rule at all
+    refuses — the rule could match that URL, and working out whether it does
+    would be re-implementing git's longest-prefix rewrite by hand.
+    """
+    fetch = _run_git_lines(base + ["remote", "get-url", "--all", remote])
+    push = _run_git_lines(base + ["remote", "get-url", "--push", "--all", remote])
+    if fetch is None or push is None:
+        return False  # an error reading either → fail closed
+    frc, furls = fetch
+    prc, purls = push
+    if frc == 0 and prc == 0:
+        # EXACTLY one URL, identical on both sides. A remote with several
+        # `url` entries pushes to EVERY one while ls-remote answers from the
+        # first only (MEASURED: equal two-URL sets, ls-remote hit on the first,
+        # and the push created the branch on the second).
+        return len(set(furls)) == 1 and set(furls) == set(purls)
+    if frc == 2 and prc == 2:
+        # Not a configured remote NAME — a raw URL/path destination.
+        rules = _run_git_lines(
+            base + ["config", "--get-regexp", r"^url\..*\.pushinsteadof$"]
+        )
+        if rules is None:
+            return False
+        rrc, _lines = rules
+        return rrc == 1  # 1 = no such key: nothing can rewrite the push URL
+    return False
+
+
+def _run_git_lines(argv: list[str]) -> tuple[int, list[str]] | None:
+    """``(returncode, non-empty stripped stdout lines)``, or None on an exception."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.returncode, [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def _push_is_dry_run(seg) -> bool:
@@ -9910,17 +10064,47 @@ def _push_is_dry_run(seg) -> bool:
     `-n` / `--dry-run` publish nothing, so none of the states the adjacency
     prompt reports can result from them. `-n` also travels inside a short
     bundle (`-un`), which is why this reads the letters rather than the token.
+
+    Reads only the PUSH's own options, and skips each value-taking flag's
+    value: ``git push -o --dry-run origin HEAD`` sends ``--dry-run`` to the
+    server as a push-option and performs a REAL push (git-push(1): ``-o``
+    takes the next argument). The same walk as ``_push_positionals`` — global
+    options and their values, then ``_PUSH_VALUE_FLAGS`` values — so a value
+    is never read as the flag. ``--`` ends option parsing.
     """
     argv = getattr(seg, "argv", None) or []
-    for t in argv[1:]:
-        if t == "--dry-run" or t.split("=", 1)[0] == "--dry-run":
+    i = 1  # skip argv[0] == "git"
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return False
+    i += 1
+    while i < len(argv):
+        t = argv[i]
+        if t == "--":
+            return False
+        if t in _PUSH_VALUE_FLAGS:
+            i += 2  # the value token is data, never the dry-run flag
+            continue
+        if t == "--dry-run":
             return True
         if t.startswith("-") and not t.startswith("--") and len(t) > 1:
-            for ch in t[1:]:
+            letters = t[1:]
+            for pos, ch in enumerate(letters):
                 if ch == "o":
-                    break
+                    if pos == len(letters) - 1:
+                        i += 1  # `-uo VALUE`: the NEXT token is the value
+                    break  # `-oVALUE`: the rest of this token is the value
                 if ch == "n":
                     return True
+        i += 1
     return False
 
 
@@ -9939,17 +10123,35 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     None means "a flag here changes the ref set" (``--all``, ``--tags``,
     ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
     shorthand, or anything unknown). Both callers treat None as a refusal.
+
+    GIT GLOBAL options are an allowlist too (``_PUSH_SAFE_GLOBAL_*``): only
+    ``-C <dir>`` (the caller resolves the push's cwd from it) and the pager
+    switches pass. Everything else before ``push`` → None, because the global
+    options are where a push carries its OWN config and environment, which
+    ``_push_config_is_simple`` reads from the repository and cannot see:
+    ``-c key=val`` and ``--config-env`` (MEASURED: ``git -c
+    remote.origin.receivepack=<helper> push origin HEAD`` was auto-allowed
+    before this), ``--exec-path`` (where git finds the programs it runs),
+    ``--namespace``, ``--git-dir`` / ``--work-tree``, and anything unknown.
     """
-    # Advance past git global options to the `push` token.
+    # Advance past git global options to the `push` token — allowlisted.
     i = 1
+    dash_c = 0
     while i < len(argv):
         t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
+        if t in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+            # git applies repeated -C cumulatively; the caller resolves only
+            # the first, so a second one would make it probe the wrong repo.
+            dash_c += 1
+            if dash_c > 1:
+                return None
             i += 2
             continue
-        if t.startswith("-"):
+        if t in _PUSH_SAFE_GLOBAL_FLAGS:
             i += 1
             continue
+        if t.startswith("-"):
+            return None  # -c / --config-env / --exec-path / --git-dir / unknown
         break
     if i >= len(argv) or argv[i] != "push":
         return None
@@ -9973,17 +10175,23 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
             return None  # +<refspec> force shorthand
         if t.startswith("-") and len(t) > 1:
             # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value.
+            # glued push-option value, so the rest of the token is that value; an
+            # `o` that ENDS the bundle (`-uo VALUE`) takes the NEXT token instead,
+            # exactly as `_push_is_dry_run` reads it.
             safe = True
-            for ch in t[1:]:
+            letters = t[1:]
+            skip = 1
+            for pos, ch in enumerate(letters):
                 if ch == "o":
+                    if pos == len(letters) - 1:
+                        skip = 2
                     break
                 if ch not in _PUSH_SAFE_SHORT_LETTERS:
                     safe = False
                     break
             if not safe:
                 return None
-            i += 1
+            i += skip
             continue
         positionals.append(t)
         i += 1
@@ -10006,29 +10214,214 @@ def _push_targets_current_branch(
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
-         • ``git push <remote> <cur>`` (no ``src:dst`` colon) → an explicit refspec
-           overrides ``remote.push`` / ``push.default`` / ``pushRemote`` → True;
-         • bare ``git push`` / ``git push <remote>`` → True only if
-           ``_push_config_is_simple(remote)`` (no redirecting/broadening repo config);
-         • a colon refspec, a differently-named branch, or ≥2 refspecs → False.
+         • ``git push <remote> <ref>`` where ``<ref>`` names the current branch
+           (``_ref_names_current_branch``: ``<cur>``, ``HEAD``, ``@`` or
+           ``refs/heads/<cur>``);
+         • ``git push <remote> <src>:<dst>`` when BOTH halves name the current
+           branch (``_colon_refspec_updates_current_branch``);
+         • bare ``git push`` / ``git push <remote>``;
+         • a differently-named branch, a tag, a delete, or ≥2 refspecs → False.
+      3. The segment runs ``git`` directly — no ``VAR=value`` assignment or
+         wrapper before it (``_push_seg_has_no_prefix``): an assignment such as
+         ``GIT_CONFIG_COUNT=…`` hands the push config the checks below cannot see.
+      4. ``_push_config_is_simple(remote)`` — for EVERY recognised shape. This is
+         the single exit that can return True, so no spelling reaches the
+         re-push relaxation without the config check. Colon refspecs included:
+         their spelled-out destination is immune to the ``remote.<r>.push`` /
+         ``push.default`` remap (MEASURED), but not to the side channels that
+         ride along with any push — submodule recursion, followed tags, a
+         configured receive-pack program, a divergent push URL. One predicate
+         for all shapes costs an ask on the rare remap config and removes the
+         per-shape subset that let those side channels through.
     Conservative by construction: any unrecognized form re-prompts. argv-based
     (quote-stripped).
     """
     if not cur:
+        return False
+    if not _push_seg_has_no_prefix(seg):
         return False
     positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
     if positionals is None:
         return False
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
+    if positionals and positionals[0] != remote:
+        # The remote git will read from argv must be the one the caller resolved
+        # and every check below keys on. They diverge when the two parsers read
+        # an option value differently (`git push -uo origin HEAD`: git takes
+        # `origin` as the -o value and `HEAD` as the remote).
+        return False
     if len(positionals) == 2:
         refspec = positionals[1]
-        # Explicit `<remote> <cur>` — an explicit refspec overrides remote.push /
-        # push.default / pushRemote, so it is a plain current-branch update.
-        return ":" not in refspec and refspec == cur
-    # Bare `git push` or `git push <remote>` → the ref set depends on repo config,
-    # keyed on the remote git will ACTUALLY push to (resolved by the caller).
+        if ":" in refspec:
+            shape_ok = _colon_refspec_updates_current_branch(refspec, cur)
+        else:
+            shape_ok = _ref_names_current_branch(refspec, cur)
+        if not shape_ok:
+            return False
+    # Every recognised shape — bare, `<remote>`, `<remote> <ref>`, `<remote>
+    # <src>:<dst>` — ends here, keyed on the remote git will ACTUALLY push to
+    # (resolved by the caller).
     return _push_config_is_simple(remote, cwd=cwd)
+
+
+#: git subcommands that may share a command with an auto-allowed re-push. None
+#: of them writes config, remotes, or the legacy remote files, and none takes a
+#: program or output-file option (``fetch --upload-pack``, ``log --output`` are
+#: why those are absent).
+_INERT_GIT_NEIGHBOURS = frozenset({"status", "rev-parse", "add", "commit"})
+
+
+def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
+    """Whether every OTHER segment of the command leaves push config alone.
+
+    The hook reads config BEFORE any of the command runs, so a config write in
+    an earlier segment is invisible to ``_push_config_is_simple`` — MEASURED:
+    ``git config remote.origin.receivepack <prog> && git push origin HEAD`` was
+    auto-allowed, as was ``git remote set-url --add origin <url> && git push``.
+    What can write config is an open set (``git config``, ``git remote``,
+    ``git submodule``, an ``export``, any script), so this is an ALLOWLIST: a
+    ``cd``, or git running one of ``_INERT_GIT_NEIGHBOURS`` with no global
+    option but ``-C``. Anything else keeps the ask. Same shape as the
+    close-then-push check beside its caller.
+
+    A subcommand name alone is not evidence: MEASURED by audit,
+    ``git log … >> .git/config``, ``git status <(git config …)`` and
+    ``git -c core.fsmonitor=<cmd> status`` each wrote config ahead of an
+    auto-allowed push. The parse drops redirects from BOTH a segment's argv
+    and its ``raw`` (MEASURED: ``git rev-parse … >> .git/config`` yields raw
+    ``git rev-parse …`` and no recorded redirect), and strips the ``<``/``>``
+    of a process substitution. So redirection and process substitution are
+    tested on the RAW COMMAND: in a command with any other segment, a ``<`` or
+    ``>`` anywhere asks (``git status 2>/dev/null && git push`` included — an
+    accepted over-block; a lone ``git push … 2>&1`` is unaffected). Each
+    neighbour must additionally re-tokenize to exactly its argv, which refuses
+    a stripped wrapper. A substring match only ever keeps the ask."""
+    others = [s for s in segs if s is not push_seg]
+    if "<(" in command or ">(" in command:
+        return False
+    if others and ("<" in command or ">" in command):
+        return False
+    for s in others:
+        try:
+            words = shlex.split(s.raw or "", comments=True)
+        except ValueError:
+            return False
+        if words != list(s.argv or []):
+            return False  # a stripped wrapper (sudo / env / command …)
+        if s.exe == "cd":
+            continue
+        if s.exe != "git":
+            return False
+        i = 1
+        while i < len(s.argv) and s.argv[i].startswith("-"):
+            if s.argv[i] != "-C":
+                return False  # -c / --exec-path / --git-dir / -p …
+            i += 2
+        if git_subcommand(s.argv) not in _INERT_GIT_NEIGHBOURS:
+            return False
+    return True
+
+
+def _push_seg_has_no_prefix(seg) -> bool:
+    """Whether the push segment's own text starts with the ``git`` word itself.
+
+    The parse strips ``VAR=value`` assignments and wrappers (``env …``,
+    ``command``) from ``argv``, so ``GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=… git
+    push`` and ``git push`` have the same argv (MEASURED) while only the first
+    carries config the repository reads cannot see. Rather than enumerate which
+    variables matter — an open set that includes ``HOME`` and
+    ``GIT_CONFIG_GLOBAL`` — refuse ANY prefix: a plain re-push is typed as
+    ``git …``. Unparseable text also refuses.
+    """
+    raw = getattr(seg, "raw", None)
+    if not raw:
+        return False
+    try:
+        # comments=True: an apostrophe in a trailing `# don't` comment is not
+        # an unbalanced quote.
+        words = shlex.split(raw, comments=True)
+    except ValueError:
+        return False
+    # Exactly `git`: a path-qualified `./git` could be any program.
+    return bool(words) and words[0] == "git"
+
+
+def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
+    """Whether a push refspec (one side of it) names the CURRENT branch ``cur``.
+
+    Four spellings do, and under default push config git treats them identically
+    on a push: the bare branch name, ``HEAD``, its one-character alias ``@``, and
+    the fully-qualified ``refs/heads/<cur>``. (Under ``remote.<r>.push`` or
+    ``push.default=upstream`` the bare name and ``refs/heads/<cur>`` are REMAPPED;
+    the caller therefore also requires ``_push_config_is_simple``.) MEASURED with git 2.43 against a local bare remote:
+    ``git push origin @`` creates ``refs/heads/<cur>`` exactly as
+    ``git push origin HEAD`` does — and it still did with a local branch
+    literally named ``@`` present at a different commit (git allows creating
+    one): the push sent HEAD to ``refs/heads/<cur>``, not that branch.
+
+    Before this function the predicate accepted only the bare name, so
+    ``git push -u origin HEAD`` — the form this repo's development workflow
+    prescribes for a branch's first publication — fell to the push arm's
+    catch-all. That arm asks unconditionally, so the re-push relaxation, the
+    no-open-PR check and the close-then-push check never ran for it.
+
+    This is a deliberate, bounded LOOSENING: these spellings now reach the
+    re-push relaxation, where an ask becomes an allow only when ``<cur>`` is
+    already on the remote with an open PR. Everything else stays False — another
+    branch's name, a tag, and ``refs/heads/main`` pushed from a feature branch
+    are still unrecognised and keep prompting. A falsy ``cur`` (detached HEAD) never matches — there is no
+    current branch for a ref to name.
+    """
+    if not cur:
+        return False
+    return ref in (cur, "HEAD", "@", f"refs/heads/{cur}")
+
+
+def _colon_refspec_updates_current_branch(refspec: str, cur: str | None) -> bool:
+    """Whether a ``src:dst`` refspec plainly updates the current branch.
+
+    ``git push origin HEAD:refs/heads/<cur>`` is how a session republishes a
+    branch whose upstream it cannot rely on. The predicate used to reject every
+    colon outright, which sent it to the catch-all ask.
+
+    Established POSITIVELY, both halves, because a colon refspec is where the
+    dangerous forms live and they must all stay False:
+
+        ``HEAD:refs/heads/main``      publishing a feature branch ONTO main
+        ``:refs/heads/<branch>``      an empty source DELETES the remote branch
+        ``main:refs/heads/<cur>``     another branch's tip under this name
+        ``HEAD:refs/tags/v1``         a tag, not a branch publish
+        ``HEAD:<cur>``                unqualified — see below
+        ``HEAD:a:b`` / ``HEAD:``      refused by the destination equality
+
+    The destination must be FULLY QUALIFIED. git-push(1): "If <dst>
+    unambiguously refers to a ref on the <repository> remote, then push to that
+    ref" — MEASURED against a remote holding ``refs/tags/<cur>`` and no
+    ``refs/heads/<cur>``, git 2.43 resolved ``HEAD:<cur>`` against the tag and
+    rejected it ("the tag already exists in the remote"). Nothing publishes in
+    that case, but calling it a plain update of the current branch would be
+    false.
+
+    On splitting: git splits a refspec on the LAST colon, this uses the first.
+    That cannot yield a false True: ``git check-ref-format --branch 'a:b'`` is
+    fatal, so ``cur`` never contains a colon, and a True verdict therefore implies
+    a colon-free destination, where both splits coincide.
+
+    A leading ``+`` (git's force shorthand) never reaches here:
+    ``_push_is_force`` returns True on it and ``_push_ref_positionals`` returns
+    None, so the push takes the force arm.
+    """
+    if not cur:
+        return False
+    src, sep, dst = refspec.partition(":")
+    if not sep:
+        return False  # no colon — the caller routes those elsewhere
+    if not src or not dst:
+        return False  # `:dst` is a DELETE; `src:` is not a plain update
+    if not _ref_names_current_branch(src, cur):
+        return False  # the source must resolve to the current branch
+    return dst == f"refs/heads/{cur}"
 
 
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
@@ -10967,8 +11360,12 @@ def _run_merge_and_push_gates() -> int:
                 #   • cur not in (main, master) → a push to the default branch never
                 #     goes silent (it is always on the remote);
                 #   • _push_targets_current_branch → a bare / `<remote>` / `<remote>
-                #     <cur>` push with only ref-neutral flags and (for bare/remote-only)
-                #     a simple repo config — everything else prompts;
+                #     <cur|HEAD|@|refs/heads/cur>` / `<remote> HEAD:refs/heads/<cur>`
+                #     push with only allowlisted global options and ref-neutral flags,
+                #     and — for EVERY shape — a config `_push_config_is_simple`
+                #     accepts; everything else prompts;
+                #   • _push_compound_is_inert (below) → no other segment could write
+                #     config before the push runs;
                 #   • _push_is_republish → live ls-remote confirms `cur` is present on
                 #     the remote git will ACTUALLY push to (pushRemote/pushDefault
                 #     resolved by _effective_push_remote, so a triangular fork workflow
@@ -10996,7 +11393,11 @@ def _run_merge_and_push_gates() -> int:
                     # first push was already approved), so it can never authorize a
                     # genuine first push; a broken/absent push_allowlist degrades to
                     # the pure ls-remote path (import guarded to None above).
-                    urls = _remote_push_urls(push_remote, cwd=pcwd) if push_remote else set()
+                    # `_push_dest_urls`, not `_remote_push_urls`: a destination
+                    # spelled as a raw URL names no configured remote, and without
+                    # its URL the open-PR lookup below sees no target, answers None,
+                    # and the public-repo no-PR block never runs.
+                    urls = _push_dest_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
                     if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
@@ -11092,6 +11493,21 @@ def _run_merge_and_push_gates() -> int:
                                 f"it. Approve to push, then open its PR "
                                 f"(gh pr create) — or close the branch out."
                             )
+                    # Ordered AFTER the no-PR arm: that arm denies on the public
+                    # repo, and a compound must not turn its deny into this ask.
+                    # Config is read before ANY segment runs, so a step that
+                    # writes config or remotes ahead of the push is invisible
+                    # to the predicate that just passed. Only an allowlisted
+                    # neighbour keeps the relaxation.
+                    elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
+                        push_allow_reason = None
+                        ask_reason = (
+                            f"re-push to '{cur}': another step in this command "
+                            f"may change git config or remotes before the push "
+                            f"runs, so the config check could not see what the "
+                            f"push will use. Run the push as its own command to "
+                            f"skip this prompt."
+                        )
                 else:
                     ask_reason = (
                         f"git push needs your approval before publishing externally "

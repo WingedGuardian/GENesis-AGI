@@ -206,10 +206,11 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # deletes anything itself.
 pressure_main() {
     local last_resort="${1:-}"
-    # The standard (ORANGE) pass pins --last-resort-above past 100 %: left to
-    # disk_reclaim.py's own 95 % default, an ORANGE pass on a >=95 % disk
-    # deleted the code-intel indexes before RED ever fired (review finding,
-    # #2521 item 1). Only the last-resort (RED) pass clears them.
+    # The standard (ORANGE) pass pins --last-resort-above past 100 %. That is
+    # disk_reclaim.py's own default now (#2567), but it stays explicit: an
+    # ORANGE pass that inherited the old 95 % default deleted the code-intel
+    # indexes before RED ever fired (review finding, #2521 item 1). Only the
+    # last-resort (RED) pass clears them.
     local -a reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 101)
     # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
     if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then

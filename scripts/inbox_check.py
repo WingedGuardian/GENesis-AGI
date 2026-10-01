@@ -16,6 +16,32 @@ import sys
 from pathlib import Path
 
 
+async def open_migrated_db(path: str | Path | None = None):
+    """Open the DB exactly as server boot does: base schema, THEN numbered migrations.
+
+    ``init_db`` alone only runs ``CREATE TABLE IF NOT EXISTS`` + additive column
+    adds; it cannot widen a CHECK constraint. A standalone run against a DB the
+    server has not yet migrated would otherwise write statuses the old CHECK
+    rejects. Mirrors ``genesis.runtime.init.db``: a failed migration is fatal.
+    """
+    from genesis.db.connection import init_db
+    from genesis.db.migrations.runner import MigrationRunner
+
+    db = await (init_db(path) if path is not None else init_db())
+    try:
+        results = await MigrationRunner(db).run_pending()
+        failed = [r for r in results if not r.success]
+        if failed:
+            details = "; ".join(f"{r.name}: {r.error}" for r in failed)
+            raise RuntimeError(f"{len(failed)} schema migration(s) failed: {details}")
+    except BaseException:
+        # The runner can also RAISE (e.g. duplicate ids at preflight) rather
+        # than report a failed result; close the connection on every path.
+        await db.close()
+        raise
+    return db
+
+
 async def main(dry_run: bool = False) -> None:
     from genesis.env import repo_root
     from genesis.inbox.config import load_inbox_config
@@ -52,11 +78,10 @@ async def main(dry_run: bool = False) -> None:
     # Full check — needs DB + CC
     from genesis.cc.invoker import CCInvoker
     from genesis.cc.session_manager import SessionManager
-    from genesis.db.connection import init_db
     from genesis.inbox.monitor import InboxMonitor
     from genesis.inbox.writer import ResponseWriter
 
-    db = await init_db()
+    db = await open_migrated_db()
     print(f"\nUsing DB: {db.db_path if hasattr(db, 'db_path') else 'default'}")
 
     invoker = CCInvoker(working_dir=str(Path.home() / "genesis"))
