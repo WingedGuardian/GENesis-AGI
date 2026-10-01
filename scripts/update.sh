@@ -2428,10 +2428,12 @@ fi
 # true — it scope-isolates today — and the stale text misled anyone reasoning about
 # signal safety here.
 #
-# The REMAINING exposure is `_apply_direct`'s FALLBACK: when systemd-run is absent
-# or the user manager/D-Bus is unreachable it drops to `start_new_session`, which
-# changes only the session, not the cgroup, so the update stays in
-# genesis-server.service's cgroup. On that path this restart's stop-phase would
+# The REMAINING exposure is the `start_new_session` FALLBACK in both dashboard
+# paths: `_apply_direct` takes it when systemd-run is absent or the user bus is
+# unreachable (it probes first); `_apply_supervised` takes it only when the
+# systemd-run binary is absent (with no bus it currently launches nothing at
+# all — issue #2724). That fallback changes only the session, not the cgroup, so
+# the update stays in genesis-server.service's cgroup. On that path this restart's stop-phase would
 # self-SIGTERM → _on_signal → a SPURIOUS rollback of a healthy, fully-migrated
 # deploy. Any fix there MUST be scope isolation, NOT a handler tweak.
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then

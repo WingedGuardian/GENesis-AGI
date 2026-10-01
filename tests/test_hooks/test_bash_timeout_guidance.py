@@ -150,9 +150,11 @@ class TestDeployAdviceIsDetachment:
             )
 
     def test_surfaces_prescribe_the_unit_flag(self):
-        """`--unit` is the flag that actually leaves the session.
+        """The prescribed command runs as a named transient SERVICE.
 
-        Anchored to the COMMAND, not the token: both files also discuss `--unit` in
+        Service mode (no `--scope`) is what detaches; `--unit` names the unit so
+        the verify step (`systemctl --user is-active genesis-deploy-manual`)
+        has something to query. Anchored to the COMMAND, not the token: both files also discuss `--unit` in
         prose, so whole-file containment is satisfied by the discussion even after
         the prescribed command loses the flag.
         """
@@ -197,8 +199,8 @@ class TestDeployAdviceIsDetachment:
 
         ORDER is the invariant, not just presence. `--setenv` configures the
         prospective UNIT and cannot help the CLIENT connect, so the assignments must
-        precede the systemd-run invocation to have any effect. update.sh:50-54 seeds
-        the same two for the same reason.
+        precede the systemd-run invocation to have any effect. update.sh exports
+        the same two near its top for the same reason.
         """
         for rel, text in _advice_files():
             span = _prescribed_span(text)
@@ -262,6 +264,41 @@ class TestDeployAdviceIsDetachment:
                 "per-terminal credential refresh cannot cover a no-TTY unit"
             )
 
+    def test_no_surface_prescribes_scope_with_wait(self):
+        """`systemd-run --scope --wait` is refused outright ("--wait may not be
+        combined with --scope", MEASURED on systemd 255), so a sudo preflight
+        written that way can never run. The check has to run as a service unit
+        (`--wait --pipe`), which is also the no-TTY context the deploy gets."""
+        combo = re.compile(r"systemd-run[^'\n]*?(--scope[^'\n]*?--wait|--wait[^'\n]*?--scope)")
+        for rel, text in _advice_files():
+            hit = combo.search(_flatten_continuations(text))
+            assert hit is None, (
+                f"{rel} prescribes {hit.group(0)!r}; systemd rejects --scope with --wait"
+            )
+
+    def test_no_doc_launches_update_sh_as_a_background_task(self):
+        """Every doc that tells a session how to launch update.sh must point at
+        detachment. The CC update procedure (its skill and cc-compatibility.md)
+        said "background task" for the deploy steps after the main surfaces were
+        corrected — the same advice, in the place a CC bump actually reads."""
+        # Article optional: "(background task)" was one of the four live phrasings.
+        bad = re.compile(r"update\.sh`?\*{0,2}[^.]{0,80}?\(?(as )?(an? )?\*{0,2}background task")
+        # TRACKED files only: a walk of the checkout also reads gitignored trees
+        # (old linked worktrees, the venv) and fails on text that is not the repo's.
+        tracked = subprocess.run(
+            ["git", "-C", str(_REPO), "ls-files", "*.md"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert tracked, "git ls-files returned no markdown — the scan would be vacuous"
+        offenders = []
+        for rel in sorted(tracked):
+            if rel.startswith(("changelog.d/", "tests/")) or rel == "CHANGELOG.md":
+                continue
+            path = _REPO / rel
+            if path.is_file() and bad.search(_one_line(path.read_text(errors="replace"))):
+                offenders.append(rel)
+        assert offenders == [], f"update.sh launched as a background task in: {offenders}"
+
     def test_surfaces_warn_that_setsid_does_not_detach(self):
         """MEASURED: `timeout 1 setsid bash -c 'sleep 4; …'` exits 124 with no
         output file. A new session id does not stop a parent from waiting.
@@ -280,8 +317,9 @@ class TestDeployAdviceIsDetachment:
             )
 
     def test_skill_does_not_claim_absence_of_a_trap_proves_sigkill(self):
-        """The traps install at update.sh:708-709, AFTER the pre-update backup at
-        :245-254 — and the 2026-09-16 deploy died during the backup. A SIGTERM
+        """update.sh installs its first INT/TERM trap (`_on_signal_prestop`) AFTER
+        the pre-update backup (the `backup.sh` call) — and the 2026-09-16 deploy
+        died during the backup. A SIGTERM
         there also runs no handler, so 'no trap ran' cannot identify the signal."""
         skill = _one_line((_REPO / _SKILL).read_text().lower())
         assert "does not identify a kill as sigkill" in skill, (

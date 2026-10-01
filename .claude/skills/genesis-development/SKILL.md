@@ -283,8 +283,8 @@ systemd-run --user --collect --unit genesis-deploy-manual \
 ```
 
 substituting the checkout root you actually ran from for `$HOME/genesis` if it
-differs — `install.sh:1241-1247` supports noncanonical locations and `update.sh`
-derives its root from its own path, so the canonical path is an example, not a
+differs — `scripts/install.sh` sets `REPO_DIR` from its own location, so
+noncanonical checkouts are supported, and `update.sh` derives its root the same way, so the canonical path is an example, not a
 constant. (Keep the command itself pasteable — a literal `<placeholder>` in the
 value is a shell syntax error.)
 
@@ -296,21 +296,24 @@ value is a shell syntax error.)
   first (one-time, needs sudo). Without it the "detached" deploy survives the CC
   session only as long as you stay logged in — which is the same coupling, one
   level up.
-- **Noninteractive sudo.** `update.sh` calls `bootstrap.sh` unconditionally
-  (`update.sh:1660`), and bootstrap calls `sudo`. The no-sudo claim covers only
+- **Noninteractive sudo.** `update.sh` runs `bootstrap.sh` on every run that
+  applies a change (its "Run bootstrap" step), and bootstrap calls `sudo`. The no-sudo claim covers only
   `update.sh`'s own text, not its transitive calls. If sudo prompts anywhere on
   this install, the detached deploy aborts mid-bootstrap. Require NOPASSWD-style
   sudo: sudo's per-terminal timestamps mean refreshing the credential in your
   terminal does not authorize the no-TTY calls inside the unit, and a warm
-  cache expires mid-deploy anyway. Check `sudo -n true` from inside the
-  launched unit (or make it the unit's first step); if it fails, run the
-  deploy in a terminal instead.
+  cache expires mid-deploy anyway. Check it in the same no-TTY service
+  context the deploy will get, with the bus variables set:
+  `systemd-run --user --wait --pipe --quiet --collect -- sudo -n true` must
+  exit 0 (MEASURED 2026-10-01: `--scope --wait` is refused outright, "--wait
+  may not be combined with --scope"). If it fails, run the deploy in a
+  terminal instead.
 
 **`mkdir -p ~/tmp` is part of the command, not tidiness.** `~/tmp` is not
 guaranteed — `install.sh` and `bootstrap.sh` create it only when `/tmp` is small —
 and the shell opens the redirect *before* exec'ing `update.sh`, so a missing
-directory kills the unit instantly, before the deploy's own `mkdir` at
-`update.sh:38` can run. With `--collect` that leaves nothing behind to diagnose,
+directory kills the unit instantly, before the deploy's own `mkdir -p "$HOME/tmp"`
+near the top of `update.sh` can run. With `--collect` that leaves nothing behind to diagnose,
 which is the same invisible failure the verify step below exists for.
 
 **The bus variables come first, and they are not decoration.** A CC session often
@@ -318,27 +321,27 @@ has no `XDG_RUNTIME_DIR`, and without it the `systemd-run --user` CLIENT cannot
 reach the user manager: MEASURED 2026-09-16, a scrubbed environment gives
 `Failed to connect to bus: No medium found` and nothing starts at all. `--setenv`
 configures the prospective *unit* and cannot help the client connect, so it is no
-substitute. `update.sh:50-54` seeds exactly these two for the same reason, and
+substitute. `update.sh` exports exactly these two near its top for the same reason, and
 `cc/invoker.py` records the same failure as measured on a live install. This one is
 easy to get wrong by testing in a session that happens to have the variables —
 which is how it reached review here.
 
 **A transient service inherits the user manager's environment, not your shell's.**
 Only what you name with `--setenv` crosses over, so a deploy depending on an
-exported variable silently changes behaviour: `SSH_AUTH_SOCK` (a private SSH remote
-will not fetch without it, `update.sh:696`) and `GENESIS_SYNC_PRIVATE_PATTERNS`
-(`bootstrap.sh:647` branches on it) are forwarded above. Naming an unset variable is
+exported variable silently changes behaviour: `SSH_AUTH_SOCK` (`update.sh`'s
+`git fetch` of a private SSH remote fails without the agent) and
+`GENESIS_SYNC_PRIVATE_PATTERNS` (`bootstrap.sh` branches on it) are forwarded above. Naming an unset variable is
 harmless — measured, the unit still starts.
 
 **Never apply this to `bootstrap.sh` or `host-setup.sh`.** Both need a channel a
-detached service does not have. `bootstrap.sh` calls `sudo` unconditionally
-(`:165`) and its bare `sudo mkdir` at `:813` is fatal under `set -e`, so wherever
+detached service does not have. `bootstrap.sh` runs under `set -euo pipefail` and
+calls bare `sudo` (the journald and sshd drop-in steps' `sudo mkdir`), so wherever
 sudo prompts it aborts partway through configuring the machine — and "sudo is
 passwordless here" is a fact about one box, not about the recipe. `host-setup.sh` is
-worse: interactive, run on the bare host VM, and at `:536-538` the recreate prompt
-treats EOF as the default `Y`, so detaching it stops and renames the existing
+worse: interactive, run on the bare host VM, and its "Delete and recreate? [Y/n]"
+prompt treats EOF as the default `Y`, so detaching it stops and renames the existing
 container. `update.sh` is the only script in this family with **no sudo calls of
-its own** — it does invoke `bootstrap.sh` (`update.sh:1660`), which does call
+its own** — it does invoke `bootstrap.sh` (its "Run bootstrap" step), which does call
 sudo, hence the noninteractive-sudo precondition above — and it remains the only
 one covered. Run the other two in a real terminal;
 the advisory no longer fires on them rather than offer a recipe that breaks them.
@@ -362,10 +365,15 @@ keeps the CALLER'S session id (MEASURED) — cgroup-isolated, still session-held
 than a CC session. And **`setsid` is not detachment**: it runs the program in a new
 session but does not background it or stop the caller waiting on it — MEASURED,
 `timeout 1 setsid bash -c 'sleep 4; echo > f'` exits 124 having written no file.
-Use `--unit`, which hands ownership to a service systemd keeps alive.
+What detaches is the default transient SERVICE mode (no `--scope`): MEASURED
+2026-10-01 on systemd 255, a service child's parent is the user manager and it
+runs in a new process session, while a `--scope` child's parent is the calling
+shell. `--unit` does not detach anything — an auto-named service lands in the
+same place — it only gives the unit a fixed name for the verify step below.
 
-Then VERIFY it took — `systemctl --user is-active genesis-deploy-manual` must
-print `active`. `systemd-run` does NOT inherit the tool's cwd, so a bare relative
+Then VERIFY it took — with the same two bus variables set (a scrubbed session
+otherwise gets a bus error, which says nothing about the launch),
+`systemctl --user is-active genesis-deploy-manual` must print `active`. `systemd-run` does NOT inherit the tool's cwd, so a bare relative
 path resolves under `$HOME`, bash exits instantly, `--collect` reaps the unit, and
 a failed launch is indistinguishable from a successful one. (It also reports
 `inactive` once the deploy has FINISHED, so check promptly and read the log for the
@@ -374,12 +382,12 @@ up, `POST /api/genesis/updates/apply` with `{"supervised": false}` does the same
 and passes the environment for you.
 
 **A mid-run kill is never a no-op, but what it does depends on the signal and on
-the phase.** Three windows, in order. From `:1253-1254` — where the rollback trap
-arms, which is just BEFORE the merge at `:1257`, not after it — an interrupt runs
-`_on_signal` → `_do_rollback`. Between `:708-709` and there, `_on_signal_prestop`
-restarts the services it stopped and explicitly does not roll back.
-Earlier still — during the pre-update backup at `:245-254` — **no INT/TERM trap is
-installed yet**, so a SIGTERM there runs no handler at all. That last point matters
+the phase.** Three windows, in order. From where `trap '_on_signal INT' INT` arms
+the rollback trap — just BEFORE `_write_state "merging"`, not after the merge — an
+interrupt runs `_on_signal` → `_do_rollback`. Between `trap '_on_signal_prestop …'`
+and there, `_on_signal_prestop` restarts the services it stopped and explicitly does
+not roll back. Earlier still — during the pre-update backup (the `backup.sh` call) —
+**no INT/TERM trap is installed yet**, so a SIGTERM there runs no handler at all. That last point matters
 for diagnosis: "no trap ran" does NOT identify a kill as SIGKILL, because the
 untrapped window produces the same evidence. Note too that `_do_rollback` disarms
 INT/TERM as it starts, so a second signal lands mid-rollback with default
@@ -3646,7 +3654,9 @@ session assumed deploy "happens somehow").
 
 **After merging such a PR, in the same session:**
 
-1. Run `scripts/update.sh` from `~/genesis` (it redeploys the guardian when
+1. Run `scripts/update.sh` from `~/genesis`, DETACHED from the session with
+   the `systemd-run --user` recipe in the Timeout Policy above, never in the
+   foreground or via `run_in_background` (it redeploys the guardian when
    guardian-relevant paths changed and heals host/container CC + Node pin
    drift — including on a no-delta run).
 2. Verify the deploy landed: gateway `version` op reports the expected
