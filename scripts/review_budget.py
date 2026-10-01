@@ -608,10 +608,10 @@ def _evaluate_pr_inner(
         if config_error:
             return _unknown(config_error)
 
-    # The reviewer whose reviewed heads are rounds is the reviewer list's PRIMARY —
-    # the same reviewer merge freshness requires — so moving the primary moves the
-    # count with it instead of leaving the approval limits counting a reviewer nobody
-    # waits on. An unimportable list is unknown, never "Codex by default".
+    # The reviewer whose reviewed heads are rounds is THE primary
+    # (`review_findings.CODEX_LOGIN`), the same reviewer merge freshness requires,
+    # read from that one definition rather than a copy here. An unimportable
+    # module is unknown, never "Codex by default".
     try:
         import review_findings  # noqa: PLC0415 - sibling stdlib module, per call
 

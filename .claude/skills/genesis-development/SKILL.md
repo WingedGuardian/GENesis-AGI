@@ -3800,7 +3800,7 @@ findings below, a gated `gh pr merge`:
   findings comment sits on the PR) it says a finding-free re-review cannot help.
   `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
   the signal does not resolve, the routes are an owner-approved `# substitute-review`
-  on a Devin or CodeRabbit review at that exact head, or a conscious
+  on another reviewer's review at that exact head, or a conscious
   `# stale-review-override` (which on the hook surface also needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
@@ -3914,7 +3914,8 @@ findings below, a gated `gh pr merge`:
   the review-context gates. Both were false of this one sigil.
 - **`# substitute-review` is the NARROW Codex stand-in** (owner standing order,
   2026-09-24). When Codex has not reviewed the head, a NON-dismissed,
-  NON-pending Devin or CodeRabbit review whose `commit_id` is EXACTLY the head
+  NON-pending review by another GitHub App reviewer (any, such as Devin or
+  CodeRabbit, except the PR's own workflow bot and CodeQL) whose `commit_id` is EXACTLY the head
   satisfies the Codex freshness check. The owner approves each use IN
   CONVERSATION before you add the sigil — the sigil is the record of that yes, so
   never add it without asking (owner ruling 2026-09-24, which replaced a native
@@ -4098,7 +4099,7 @@ The review-findings gate specifically:
    stale review, a conscious
    `# stale-review-override` — except on a hook-surface PR, where that sigil also
    requires the exact base-and-head fallback-review evidence described above — or
-   an owner-approved `# substitute-review` resting on a Devin or CodeRabbit review
+   an owner-approved `# substitute-review` resting on another reviewer's review
    at that exact head.
    ⚠ This item previously read "no review comments at all (quota exhausted) →
    merge allowed on CI alone", which is FALSE and contradicted the Pre-Merge Gate

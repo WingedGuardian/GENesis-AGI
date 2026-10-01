@@ -155,15 +155,15 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
         pass
     os._exit(2)
 
-# The per-reviewer severity parsers and the reviewer list live in a stdlib
-# sibling so every gate reads the SAME list, and so the round counter can read
-# findings with the same code this gate scores them with. Only the MERGE gate
-# needs them, so a missing or broken module (including a reviewer-list edit that
-# fails its import-time validation) must not take down every push and git command
-# this guard sees. It degrades to stubs that fail closed where they are read: each
-# findings scanner and freshness block, naming the error; no primary reviewer is
-# known, so no review is fresh; no substitute is offered; and a parser raises,
-# which `run_guard` turns into a block.
+# The primary reviewer, the known review formats and the per-reviewer severity
+# parsers live in a stdlib sibling so every gate reads the SAME definitions, and
+# so the round counter can read findings with the same code this gate scores them
+# with. Only the MERGE gate needs them, so a missing or broken module (including a
+# registry edit that fails its import-time validation) must not take down every
+# push and git command this guard sees. It degrades to stubs that fail closed
+# where they are read: each findings scanner and freshness block, naming the
+# error; no primary reviewer is known, so no review is fresh; no substitute is
+# offered; and a parser raises, which `run_guard` turns into a block.
 _REVIEW_FINDINGS_ERROR: str | None = None
 try:
     from review_findings import (  # noqa: E402
@@ -186,13 +186,20 @@ try:
     )
     from review_findings import (
         enforced_logins,
+        is_substitute_candidate,
         primary_reviewer_login,
-        substitute_reviewer_logins,
     )
 except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate only.
+    # Only the exception's TYPE name is rendered, never the exception: even
+    # __str__ can raise (the hook_input block above), and an exception escaping
+    # here exits 1 before `run_guard` exists, which disengages every gate.
+    try:
+        _findings_exc_type = type(_findings_exc).__name__
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        _findings_exc_type = "an exception"
     _REVIEW_FINDINGS_ERROR = (
-        f"scripts/review_findings.py is unimportable ({type(_findings_exc).__name__}: "
-        f"{_findings_exc}); repair the hook tree"
+        f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
+        f"repair the hook tree"
     )
     _INLINE_P1_RE = _INLINE_P2_RE = _CR_HEADER_FIELD_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
@@ -203,8 +210,8 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
     def primary_reviewer_login():  # type: ignore[no-redef]
         return None
 
-    def substitute_reviewer_logins():  # type: ignore[no-redef]
-        return ()
+    def is_substitute_candidate(login, user_type):  # type: ignore[no-redef]
+        return False
 
     def _cr_severity(body):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
@@ -1532,11 +1539,11 @@ _CLEAN_PATTERNS = [
 
 
 def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
-    """``(sets, "")`` or ``({}, block message)``: which logins each finding scanner
-    reads, from the reviewer list (see `review_findings.enforced_logins`). When the
-    list's module could not be imported, a scanner cannot know whose findings it is
-    reading, so it BLOCKS rather than read none — after its own override check, so
-    `# review-override` still waives it."""
+    """``(sets, "")`` or ``({}, block message)``: which parser each finding scanner
+    reads a known login's findings with (see `review_findings.enforced_logins`).
+    When that module could not be imported, a scanner cannot know whose findings it
+    is reading, so it BLOCKS rather than read none — after its own override check,
+    so `# review-override` still waives it."""
     if _REVIEW_FINDINGS_ERROR:
         return {}, (
             f"the hook tree is broken: {_REVIEW_FINDINGS_ERROR}. Review findings cannot "
@@ -1546,8 +1553,11 @@ def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
 
 
 def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
-    """The review-body verdict scan's authors: the Codex-badge reviewers, plus the CI
-    bot, whose comments are walked and skipped as non-verdicts."""
+    """The review-body verdict scan's authors: every known badge-format reviewer,
+    plus the CI bot, whose marker-less comments are walked and skipped as
+    non-verdicts. Each author's verdict is its OWN: the walk keeps every login's
+    newest verdict separately, so one login's clean verdict never clears another's
+    finding (#2683), and every badge reviewer's own finding is still read."""
     return sets.get("codex-badge", frozenset()) | {"github-actions[bot]"}
 
 
@@ -1635,9 +1645,9 @@ _INLINE_P2_SCORE_WEIGHT = 0.5
 # and only the second is what that sentence refuses. No config key is added.
 _INLINE_SCORE_BLOCK_THRESHOLDS = {"critical": 1.0, "standard": 2.0, "light": 3.0}
 # Which accounts' inline comments are review output even when GitHub does not type
-# the author a Bot: the reviewers whose parser reads badges, plus CodeQL's
-# (surfaced, never scored). Derived from `review_findings.REVIEWERS` inside the
-# scan, never listed here: a second copy of reviewer logins is what drifts.
+# the author a Bot: the known logins whose parser reads badges, plus CodeQL's
+# (surfaced, never scored). Derived from `review_findings.KNOWN_FORMATS` inside
+# the scan, never listed here: a second copy of reviewer logins is what drifts.
 _INLINE_REVIEW_PARSERS = ("codex-badge", "codeql")
 #: The template's distinctive sentence. A body that does not contain it is NOT
 #: this template and is never suppressed, however short it is — see the gate at
@@ -3108,20 +3118,24 @@ def _check_inline_review_findings(
         and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
     }
-    # The reviewer list decides which logins each parser reads (read ONCE per scan).
+    # The known-format registry decides which parser reads which login (read ONCE
+    # per scan).
     devin_logins = scanner_sets.get("devin-marker", frozenset())
     coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
     inline_review_logins = frozenset().union(
         *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
     )
-    devin_cleared: set[str] = set()
+    # Every Devin-format structure is keyed by (login, finding_id), never the bare
+    # id: two reviewers' ids can collide, and one reviewer's answered finding must
+    # never clear another's. Same-login duplicate copies still group.
+    devin_cleared: set[tuple[str, str]] = set()
     # Groups a MAINTAINER answered. A group cleared only by Devin's own reply is
     # surfaced below rather than dropped: Devin's reviewer and its builder post
     # under ONE login (MEASURED: the same account posts "Fixed in <sha>" replies
     # on a devin/* branch), so a self-withdrawal is reply TEXT, not an identity.
     # It still clears (owner ruling), but never silently (owner, 2026-09-24).
-    devin_maint_cleared: set[str] = set()
-    devin_copies: dict[str, list[dict]] = {}
+    devin_maint_cleared: set[tuple[str, str]] = set()
+    devin_copies: dict[tuple[str, str], list[dict]] = {}
     for c in raw:
         if c.get("reply_to") or (c.get("login") or "") not in devin_logins:
             continue
@@ -3130,12 +3144,13 @@ def _check_inline_review_findings(
         fid, _sev = _devin_finding(c.get("body") or "")
         if fid is None:
             continue
-        devin_copies.setdefault(fid, []).append(c)
+        dkey = (c.get("login") or "", fid)
+        devin_copies.setdefault(dkey, []).append(c)
         if c.get("id") in replied_to or c.get("id") in self_withdrawn:
-            devin_cleared.add(fid)
+            devin_cleared.add(dkey)
         if c.get("id") in replied_to:
-            devin_maint_cleared.add(fid)
-    devin_seen: set[str] = set()
+            devin_maint_cleared.add(dkey)
+    devin_seen: set[tuple[str, str]] = set()
     devin_block: list[str] = []  # severe bug / critical security — the floor, 1.0 each
     devin_minor: list[str] = []  # non-severe bug / security warning — 0.5 each
     devin_analysis: list[str] = []  # informational — surfaced, never scored
@@ -3270,10 +3285,11 @@ def _check_inline_review_findings(
                 # gate's parser, not the finding, and it never scored either way.
                 devin_unknown.append(_inline_title(body))
                 continue
-            if fid in devin_seen:
+            dkey = (login, fid)
+            if dkey in devin_seen:
                 continue  # another post of a finding already classified
-            devin_seen.add(fid)
-            copies = devin_copies.get(fid, [c])
+            devin_seen.add(dkey)
+            copies = devin_copies.get(dkey, [c])
             # Drift is a fact about a COMMENT, so every unreadable copy is
             # reported: before dedup can fold it into a readable sibling under
             # the same id, and before clearing, for the reason given above.
@@ -3288,10 +3304,10 @@ def _check_inline_review_findings(
                     if has_readable:
                         drift_title += " (a copy of a finding classified by its readable copy)"
                     devin_unknown.append(drift_title)
-            if fid in devin_cleared:
+            if dkey in devin_cleared:
                 # Answered: a maintainer reply, or Devin withdrew it. The second
                 # is listed, from the parser alone (no file-list read).
-                if fid not in devin_maint_cleared:
+                if dkey not in devin_maint_cleared:
                     devin_self_withdrawn.append(
                         next(
                             (
@@ -4223,12 +4239,18 @@ def _check_pr_review_findings(
     # _review_bots()) end the walk clean, silently clearing an earlier ERROR. Requiring
     # a recognized verdict marker closes BOTH the unrecognized-bot and the
     # recognized-but-non-verdict (status-comment) masking paths.
+    #
+    # PER LOGIN (#2683): each author's NEWEST verdict is its own. A blocking newest
+    # verdict from ANY author blocks; a clean one settles only that author, and the
+    # walk goes on for the others. Under a single shared verdict a second badge
+    # reviewer's `VERDICT: PASS` ended the walk clean over the primary's `[P1]`.
     review_bots = _review_bots(scanner_sets)
+    settled: set[str] = set()  # authors whose newest verdict was clean
     for c in reversed(comments):
         login = c.get("login") or ""
         body = c.get("body") or ""  # GitHub returns null body for deleted comments
-        # Only recognized review bots set the verdict.
-        if login not in review_bots:
+        # Only recognized review bots set a verdict, and only their NEWEST one.
+        if login not in review_bots or login in settled:
             continue
         # Codex quota-exhausted messages are not a review.
         if "reached your Codex usage limits" in body and not any(
@@ -4250,18 +4272,19 @@ def _check_pr_review_findings(
                 f"the merge command to acknowledge and proceed."
             )
         if is_clean:
-            # An explicit clean verdict ends the walk — but trust it only on a
-            # COMPLETE read. On an incomplete read the pages we have are the
+            # An explicit clean verdict settles THIS author: its older comments are
+            # superseded. It is trusted only on a COMPLETE read, which the check
+            # below enforces: on an incomplete read the pages we have are the
             # EARLIEST, so a newer finding could sit on an unread page.
-            if complete:
-                return False, ""
-            return _scan_unreadable("review-body comments (incomplete read)")
+            settled.add(login)
+            continue
         # Neither blocking nor clean → not a verdict comment → keep walking.
 
-    # No verdict-bearing finding among the comments we read. On an INCOMPLETE read a
+    # No blocking newest verdict among the comments we read. On an INCOMPLETE read a
     # newer finding could exist on an unread page — fail per _scan_unreadable rather
-    # than report clean. An empty/complete result is clean: the freshness gate
-    # (_check_codex_reviewed_head) separately requires a CURRENT review to EXIST.
+    # than report clean, whether or not a clean verdict was seen. An empty/complete
+    # result is clean: the freshness gate (_check_codex_reviewed_head) separately
+    # requires a CURRENT review to EXIST.
     if not complete:
         return _scan_unreadable("review-body comments (incomplete read)")
     return False, ""
@@ -4276,8 +4299,8 @@ def _check_pr_review_findings(
 # (the review object's ``commit_id``) — NOT a short prefix from the body, which a
 # stale prefix (or a ground SHA sharing it) could satisfy. Waived by
 # '# review-override' (the conscious "merge without a current Codex review" case).
-# WHICH reviewer merge freshness requires comes from the reviewer list
-# (`review_findings.REVIEWERS`): the one marked `primary`, Codex.
+# WHICH reviewer merge freshness requires is `review_findings.CODEX_LOGIN`: THE
+# primary, a named constant rather than a list role.
 def _primary_reviewer_login() -> str | None:
     """The primary reviewer's REST login, or None when the list is unimportable.
 
@@ -4411,12 +4434,15 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
 
 
 def _pr_review_records(pr_num: str, repo: str | None = None) -> list[dict] | None:
-    """EVERY review record ``{login, commit_id, state}`` on the PR, oldest-first, or
+    """EVERY review record ``{login, type, commit_id, state, has_body}`` on the PR,
+    oldest-first, or
     None on any API/parse error. The one implementation behind both the Codex reader
     below and the substitute-review lookup, so they parse GitHub's answer the same
     way. It is NOT one fetch: the substitute path calls it again after the Codex
     check, which costs a second read on that path only. Same seam as before: ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
-    per line, ``{login, commit_id[, state]}``; missing ``state`` = active)."""
+    per line, ``{login, commit_id[, state][, type]}``; missing ``state`` = active;
+    missing ``type`` reads as a Bot exactly when the login carries the ``[bot]``
+    suffix, which a human login cannot)."""
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:
         try:
@@ -4427,8 +4453,8 @@ def _pr_review_records(pr_num: str, repo: str | None = None) -> list[dict] | Non
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/reviews",
                     "--paginate",
                     "--jq",
-                    ".[] | {login: .user.login, commit_id: .commit_id, state: .state, "
-                    "has_body: (((.body // \"\") | length) > 0)}",
+                    ".[] | {login: .user.login, type: .user.type, commit_id: .commit_id, "
+                    "state: .state, has_body: (((.body // \"\") | length) > 0)}",
                 ],
                 capture_output=True,
                 text=True,
@@ -4453,9 +4479,14 @@ def _pr_review_records(pr_num: str, repo: str | None = None) -> list[dict] | Non
             continue
         if not isinstance(obj, dict):
             continue
+        login = obj.get("login") or ""
+        utype = obj.get("type")
+        if not isinstance(utype, str):
+            utype = "Bot" if isinstance(login, str) and login.endswith("[bot]") else "User"
         records.append(
             {
-                "login": obj.get("login") or "",
+                "login": login,
+                "type": utype,
                 "commit_id": (obj.get("commit_id") or "").strip().lower(),
                 "state": (obj.get("state") or "").upper(),
                 # Absent (the test seam, an older projection) reads as True so the
@@ -6793,14 +6824,51 @@ def _check_codex_reviewed_head_core(
 
 # The reviewers that may stand in for Codex at head — owner standing order,
 # 2026-09-24, ASKED AND APPROVED per PR. Codex stays the official cross-model
-# reviewer; this exists for its outages. Both review automatically on every push
-# here (MEASURED 2026-09-24: of 33 open non-draft PRs, 25 carried a Devin or
-# CodeRabbit review at their current head, 4 a Codex one).
-# WHICH reviewers may stand in comes from the reviewer list: every one that is
-# not primary and not `surface_only` (Devin and CodeRabbit). A list the gate could
-# not load offers no substitute at all.
-def _substitute_review_logins() -> tuple[str, ...]:
-    return substitute_reviewer_logins()
+# reviewer; this exists for its outages. Devin and CodeRabbit review automatically
+# on every push here (MEASURED 2026-09-24: of 33 open non-draft PRs, 25 carried a
+# Devin or CodeRabbit review at their current head, 4 a Codex one).
+# WHICH reviewers may stand in is `review_findings.is_substitute_candidate`: any
+# Bot-typed App reviewer except the primary, a bot the PR's own workflow can
+# drive, and a surface-only one (owner ruling 2026-09-30) — a new reviewer needs
+# no list entry. A module the gate could not load offers no substitute at all.
+
+
+def _substitute_format_note(login: str) -> str:
+    """What the gate appends where it names a stand-in to the owner. A login no
+    known format reads has findings no scanner scores yet (that enforcement is a
+    later change), so the owner is told before approving, not after. Empty for a
+    known format, so those lines read exactly as before."""
+    if _REVIEW_FINDINGS_ERROR is None and any(
+        login in logins for logins in enforced_logins().values()
+    ):
+        return ""
+    return " (format unknown: its findings are not scored yet)"
+
+
+def _substitute_label(login: str) -> str:
+    """``login`` plus its `_substitute_format_note`."""
+    return f"{login}{_substitute_format_note(login)}"
+
+
+def _substitute_available_note(pr_num: str, repo: str | None = None) -> str:
+    """The ``--check-pr`` freshness row's stand-in offer, or ``""`` when none.
+
+    Through the SAME lookup the merge gate uses, so the report can never offer a
+    substitute the gate would refuse. Only logins `is_substitute_candidate`
+    validated reach this raw row — never reviewer-controlled text.
+    """
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return ""
+    found = _substitute_reviewers_at_head(pr_num, head.strip().lower(), repo=repo)
+    if not (found and found[0]):
+        return ""
+    return (
+        f" — substitute available: "
+        f"{' and '.join(_substitute_label(x) for x in found[0])} reviewed this "
+        f"head (with the owner's yes in conversation, merge with "
+        f"'# substitute-review')"
+    )
 
 
 def _substitute_reviewers_at_head(
@@ -6816,8 +6884,8 @@ def _substitute_reviewers_at_head(
     record is a thread-reply wrapper rather than a review of the head (see the
     measurement at the skip). Any other state, CHANGES_REQUESTED included,
     counts: freshness asks only that a review EXISTS at head; what it found is the
-    findings scans' job. ``reviewers_at_head`` is in ``_substitute_review_logins()``
-    order and holds only logins the reviewer list validated against GitHub's
+    findings scans' job. ``reviewers_at_head`` is in order of first appearance and
+    holds only logins `is_substitute_candidate` validated against GitHub's App
     login alphabet, so it is safe to print raw.
     """
     records = _pr_review_records(pr_num, repo=repo)
@@ -6825,27 +6893,29 @@ def _substitute_reviewers_at_head(
         return None
     at_head: list[str] = []
     elsewhere: list[tuple[str, str]] = []
-    for login in _substitute_review_logins():
-        for r in records:
-            if r["login"] != login or r["state"] in ("DISMISSED", "PENDING"):
-                continue
-            # A review record with an EMPTY body is, on this repo, the wrapper
-            # GitHub creates when the bot replies inside a thread — stamped with
-            # the head at reply time. MEASURED 2026-09-24: of the empty records
-            # at head sampled, every one held only replies ("agreed, I withdraw
-            # this finding", "same finding re-anchored…"), and on 4 of 23 open
-            # PRs such wrappers were the ONLY substitute record at head. Counting
-            # them would tell the owner "<bot> reviewed this exact head" when it
-            # only replied in a thread. A real review carries its summary body
-            # ("Devin Review found N potential issues", "Actionable comments
-            # posted: N") — 19 of 29 open PRs had one at head.
-            if not r.get("has_body", True):
-                continue
-            if r["commit_id"] == head:
-                if login not in at_head:
-                    at_head.append(login)
-            elif r["commit_id"] and (login, r["commit_id"]) not in elsewhere:
-                elsewhere.append((login, r["commit_id"]))
+    for r in records:
+        login = r["login"]
+        if not is_substitute_candidate(login, r["type"]):
+            continue
+        if r["state"] in ("DISMISSED", "PENDING"):
+            continue
+        # A review record with an EMPTY body is, on this repo, the wrapper
+        # GitHub creates when the bot replies inside a thread — stamped with
+        # the head at reply time. MEASURED 2026-09-24: of the empty records
+        # at head sampled, every one held only replies ("agreed, I withdraw
+        # this finding", "same finding re-anchored…"), and on 4 of 23 open
+        # PRs such wrappers were the ONLY substitute record at head. Counting
+        # them would tell the owner "<bot> reviewed this exact head" when it
+        # only replied in a thread. A real review carries its summary body
+        # ("Devin Review found N potential issues", "Actionable comments
+        # posted: N") — 19 of 29 open PRs had one at head.
+        if not r.get("has_body", True):
+            continue
+        if r["commit_id"] == head:
+            if login not in at_head:
+                at_head.append(login)
+        elif r["commit_id"] and (login, r["commit_id"]) not in elsewhere:
+            elsewhere.append((login, r["commit_id"]))
     return at_head, elsewhere
 
 
@@ -6862,7 +6932,7 @@ def _check_codex_reviewed_head(
     Everything the core does is unchanged; see
     ``_check_codex_reviewed_head_core``. What this adds runs ONLY when the core
     would block AND the merge carries ``# substitute-review``: a non-dismissed,
-    non-pending Devin or CodeRabbit review whose ``commit_id`` is EXACTLY the
+    non-pending review by another reviewer whose ``commit_id`` is EXACTLY the
     current head then satisfies freshness, the head is returned so the merge stays
     bound to it by ``--match-head-commit``, and the substitute is recorded in
     ``substitute_out`` so the caller can announce and log it. The owner's
@@ -6894,7 +6964,7 @@ def _check_codex_reviewed_head(
             msg
             + (
                 "\nIf Codex is unavailable: with the owner's approval, append "
-                "'# substitute-review' to accept a Devin or CodeRabbit review AT THIS "
+                "'# substitute-review' to accept another reviewer's review AT THIS "
                 "HEAD in Codex's place (ask the owner in conversation first; the sigil "
                 "records their yes)."
             ),
@@ -6920,12 +6990,17 @@ def _check_codex_reviewed_head(
         if substitute_out is not None:
             substitute_out.append({"reviewers": at_head, "head": head})
         return False, "", head
-    seen = ", ".join(f"{login}@{sha[:12]}" for login, sha in elsewhere) or "none"
+    seen = (
+        ", ".join(
+            f"{login}@{sha[:12]}{_substitute_format_note(login)}" for login, sha in elsewhere
+        )
+        or "none"
+    )
     return (
         True,
         msg
         + (
-            f"\n'# substitute-review' found no Devin or CodeRabbit review at head "
+            f"\n'# substitute-review' found no other reviewer's review at head "
             f"{head[:12]} (substitute reviews on other commits: {seen}). A substitute "
             f"must have reviewed the EXACT head being merged."
         ),
@@ -11379,9 +11454,12 @@ def _run_merge_and_push_gates() -> int:
                         )
                         return 2
                     _amend_note("substitute-review", waived="codex-freshness:used")
+                    _who_labelled = " and ".join(
+                        _substitute_label(x) for x in substitute_used[0]["reviewers"]
+                    )
                     print(
                         f"NOTE: PR #{pr_num} — Codex has not reviewed head "
-                        f"{verified_head[:12]}; {_who} reviewed that exact head and "
+                        f"{verified_head[:12]}; {_who_labelled} reviewed that exact head and "
                         f"stands in for Codex under '# substitute-review' (the owner's "
                         f"approval, given in conversation). Every other merge gate still "
                         f"applies.",
@@ -11958,19 +12036,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]
-        # Say when an owner-approved stand-in exists, through the SAME lookup the
-        # merge gate uses, so the report can never offer a substitute the gate
-        # would refuse. Only logins from `_substitute_review_logins()` reach
-        # this raw row — never reviewer-controlled text.
-        _sub_head = _pr_head_sha(pr_num, repo=repo)
-        if _sub_head:
-            _sub = _substitute_reviewers_at_head(pr_num, _sub_head.strip().lower(), repo=repo)
-            if _sub and _sub[0]:
-                label += (
-                    f" — substitute available: {' and '.join(_sub[0])} reviewed this "
-                    f"head (with the owner's yes in conversation, merge with "
-                    f"'# substitute-review')"
-                )
+        label += _substitute_available_note(pr_num, repo=repo)
     else:
         # Distinguish a genuinely-current review from a stale-but-trivial-delta
         # allow — both return the same tuple, but the report must NOT assert

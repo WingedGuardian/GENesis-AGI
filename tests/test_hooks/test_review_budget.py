@@ -744,24 +744,21 @@ def _seams(monkeypatch, reviews):
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_FILES", json.dumps({"filename": "src/x.py"}))
 
 
-def test_the_round_counter_counts_the_lists_primary(monkeypatch):
-    """A2a round 1 (Devin 🔴): moving the primary must move what is counted, or the
-    approval limits count a reviewer nobody waits on and never engage."""
-    import dataclasses
-
+def test_the_round_counter_counts_the_primary(monkeypatch):
+    """A2a round 1 (Devin 🔴): the round counter counts THE primary's reviewed heads,
+    read from `review_findings` at call time, never another reviewer's."""
     import review_findings as rf
 
-    acme = "acme-codex[bot]"  # a second codex-badge reviewer: the primary must be one
-    _seams(monkeypatch, [{"login": acme, "commit_id": h} for h in (H1, H2, H3, H4)])
+    devin = "devin-ai-integration[bot]"
+    _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
     assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 0
-    moved = (
-        *(dataclasses.replace(r, primary=False) for r in rf.REVIEWERS),
-        rf.Reviewer(login=acme, parser="codex-badge", primary=True),
-    )
-    rf._validate(moved)  # the edited list is itself a valid one
-    monkeypatch.setattr(rf, "REVIEWERS", moved)
+    _seams(monkeypatch, [{"login": rf.CODEX_LOGIN, "commit_id": h} for h in (H1, H2, H3, H4)])
     got = rb.evaluate_pr("o/r", 1, external_identity_templates=())
     assert got["count"] == 4 and got["commit_approval_required"] is True
+    # Bound to the accessor, not a copy: whatever it names is what is counted.
+    monkeypatch.setattr(rf, "primary_reviewer_login", lambda: devin)
+    _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
+    assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 4
 
 
 def test_an_unimportable_reviewer_list_makes_the_budget_unknown(monkeypatch):

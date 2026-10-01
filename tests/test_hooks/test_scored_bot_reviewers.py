@@ -9,8 +9,9 @@ surface-only. A finding clears by a maintainer reply, or by the SAME bot that
 raised it replying `✅ **Resolved**` in its thread — never by another reviewer,
 never by free prose. With the owner approving per PR in conversation (the
 `# substitute-review` sigil records that yes; ruling f7e8d2ed replaced an
-earlier native prompt), a Devin or CodeRabbit review at the exact head
-satisfies the Codex freshness check.
+earlier native prompt), another eligible reviewer's review at the exact head
+satisfies the Codex freshness check (any GitHub App reviewer except the PR's own
+workflow bot and CodeQL; owner model 2026-09-30).
 
 Why the comment shape below is trusted: MEASURED 2026-09-24 over every Devin
 comment on the 33 open non-draft PRs — 166 comments, every one opening with
@@ -138,17 +139,19 @@ class TestDevinSeverity:
         block, _ = _scan(guard, [stranger])
         assert block is False
 
-    def test_a_reviewer_added_to_the_list_has_its_findings_enforced(self, guard, monkeypatch):
-        """A2a round 1 (Codex P1 / Devin 🔴): a reviewer the list TRUSTS must be a
-        reviewer whose findings are READ. Bound to the Devin parser, its severe
-        finding hits the floor exactly as Devin's does."""
+    def test_a_login_added_to_the_known_formats_has_its_findings_enforced(
+        self, guard, monkeypatch
+    ):
+        """A2a round 1 (Codex P1 / Devin 🔴): a login the registry binds to a parser
+        has its findings READ with it. Bound to the Devin parser, its severe finding
+        hits the floor exactly as Devin's does."""
         rf = sys.modules[guard.enforced_logins.__module__]
         body = _devin_body("🔴", "Severe from an added reviewer")
         # Control: before it is listed, the same finding is not scored.
         block, _ = _scan(guard, [_c(1, body, login="acme-review[bot]")])
         assert block is False
         added = rf.Reviewer(login="acme-review[bot]", parser="devin-marker")
-        monkeypatch.setattr(rf, "REVIEWERS", (*rf.REVIEWERS, added))
+        monkeypatch.setattr(rf, "KNOWN_FORMATS", (*rf.KNOWN_FORMATS, added))
         block, msg = _scan(guard, [_c(1, body, login="acme-review[bot]")])
         assert block and "always-fix floor" in msg
 
@@ -322,6 +325,41 @@ class TestDevinDedupAndClearing:
         ]
         block, msg = _scan(guard, comments)
         assert not block, msg
+
+    @pytest.fixture
+    def second_devin_format(self, guard, monkeypatch):
+        """A second login read with the Devin parser (issue #2656)."""
+        rf = sys.modules[guard.enforced_logins.__module__]
+        other = rf.Reviewer(login="acme-devin[bot]", parser="devin-marker")
+        monkeypatch.setattr(rf, "KNOWN_FORMATS", (*rf.KNOWN_FORMATS, other))
+        return other.login
+
+    def test_a_reply_to_one_reviewers_finding_never_clears_anothers_with_the_same_id(
+        self, guard, second_devin_format
+    ):
+        """Issue #2656: findings are keyed by (login, id). Two Devin-format reviewers
+        whose ids collide stay separate findings: answering one leaves the other."""
+        shared = "BUG_pr-review-job-shared_0001"
+        comments = [
+            _c(1, _devin_body("🔴", "Devin's own finding", fid=shared)),
+            _c(2, _devin_body("🔴", "The other reviewer's", fid=shared), login=second_devin_format),
+            _c(9, "Fixed.", login="owner", utype="User", reply_to=1, assoc="OWNER"),
+        ]
+        block, msg = _scan(guard, comments)
+        assert block and "The other reviewer's" in msg
+        assert "Devin's own finding" not in msg
+
+    def test_a_self_withdrawal_never_clears_another_reviewers_finding_with_the_same_id(
+        self, guard, second_devin_format
+    ):
+        shared = "BUG_pr-review-job-shared_0001"
+        comments = [
+            _c(1, _devin_body("🔴", "Withdrawn by Devin", fid=shared)),
+            _c(2, _devin_body("🔴", "Still standing", fid=shared), login=second_devin_format),
+            _c(9, "✅ **Resolved**: fixed.", reply_to=1),
+        ]
+        block, msg = _scan(guard, comments)
+        assert block and "Still standing" in msg
 
     def test_another_bots_resolved_reply_does_not_clear(self, guard):
         comments = [
@@ -716,9 +754,19 @@ class TestSubstituteAtHead:
         )
         assert block
 
-    def test_an_unlisted_reviewer_at_head_does_not_count(self, guard, monkeypatch):
-        block, *_ = self._check(
+    def test_an_unlisted_bot_reviewer_at_head_counts(self, guard, monkeypatch):
+        """Owner ruling 2026-09-30: any Bot-typed App reviewer with a substantive
+        review at the exact head may stand in; a new reviewer needs no list entry."""
+        block, _msg, verified, out = self._check(
             guard, monkeypatch, _reviews({"login": "some-other-bot[bot]", "commit_id": HEAD})
+        )
+        assert not block and verified == HEAD
+        assert out == [{"reviewers": ["some-other-bot[bot]"], "head": HEAD}]
+
+    def test_the_workflow_bot_at_head_does_not_count(self, guard, monkeypatch):
+        """A bot the PR's own workflow can drive is the PR author, not a reviewer."""
+        block, *_ = self._check(
+            guard, monkeypatch, _reviews({"login": "github-actions[bot]", "commit_id": HEAD})
         )
         assert block
 

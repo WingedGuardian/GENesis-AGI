@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Who reviews this repository, and how each reviewer's findings are read.
 
-Two things live here, both stdlib-only so every gate can import them:
+Stdlib-only, so every gate can import it. It keeps TRUST and ENFORCEMENT apart:
 
-1. The REVIEWER LIST, ``REVIEWERS``. It names the reviewers whose reviews count,
-   which one is primary (the one merge freshness asks for), and which parser reads
-   each one's findings. The merge gate reads from it the primary (merge
-   freshness), the substitute set, and which logins its finding scanners read
-   with each parser; the round counter reads the primary.
-2. The per-reviewer SEVERITY PARSERS (Codex badges, CodeRabbit's header, Devin's
+1. TRUST is narrow and named. ``CODEX_LOGIN`` is THE primary reviewer: the one
+   merge freshness asks for, whose reviewed heads the round counter counts, and
+   whom ``@codex review`` summons. A stand-in under ``# substitute-review`` (the
+   owner approves each use) is any Bot-typed App reviewer with a substantive
+   review at the exact head, except the primary, a bot the PR's own workflow can
+   drive, and a surface-only reviewer (``is_substitute_candidate``). No list
+   confers trust: a list that did is what kept failing open (a second entry in a
+   role the consumers assumed was Codex's alone inherited Codex's authority).
+2. ENFORCEMENT is open and per reviewer. ``KNOWN_FORMATS`` says which parser reads
+   a known login's findings; it grants nothing. Each known format is scored by its
+   parser, and findings and verdicts are kept separate per reviewer login.
+3. The per-reviewer SEVERITY PARSERS (Codex badges, CodeRabbit's header, Devin's
    marker), moved here from the merge gate so the round counter can read a
    finding with the same code the merge gate scores it with.
 
-The list is code, not config, on purpose. It decides whose review satisfies the
-merge gate, so it changes through a reviewed PR, exactly like the hook code that
-enforces it. A config file would ADD write surfaces beyond the ones the hook code
-already has (install overlays, the dashboard's config editor) and failure states
-(missing, unreadable, malformed), for no benefit.
+All of it is code, not config, on purpose: it decides whose review satisfies the
+merge gate, so it changes through a reviewed PR exactly like the hook code. A
+config file would ADD write surfaces beyond the ones the hook code already has
+(install overlays, the dashboard's config editor) and failure states (missing,
+unreadable, malformed), for no benefit.
 """
 
 from __future__ import annotations
@@ -25,95 +31,112 @@ import json
 import re
 from dataclasses import dataclass
 
-#: The parsers this module registers, by the name a reviewer is bound to.
+#: THE primary reviewer (the Codex GitHub App). A named constant, not a list role:
+#: the round counter's clean-comment match, the `@codex review` request gate and
+#: every freshness message are Codex-specific.
+CODEX_LOGIN = "chatgpt-codex-connector[bot]"
+#: Bots a PR's own workflow can drive (a workflow posts as `github-actions[bot]`),
+#: so their output is the PR author's, never a reviewer's: never trusted.
+#: This covers the workflow GITHUB_TOKEN identity. A GitHub App whose private key
+#: sits in repository secrets could likewise be driven by a PR's own workflow; if
+#: such an App is ever installed, its login must be added here.
+WORKFLOW_BOTS = frozenset({"github-actions[bot]"})
+#: The parsers the merge gate's scanners implement, by the name a format binds to.
 PARSERS = frozenset({"codex-badge", "coderabbit-header", "devin-marker", "codeql"})
 # A GitHub APP's REST login: its lowercase slug plus the `[bot]` suffix. REQUIRED,
 # not optional: a human account's login can never contain `[`, so the suffix is what
-# proves a listed reviewer is an App. Without it an entry could name the session's
-# OWN account primary and satisfy merge freshness with its own review.
+# proves a reviewer is an App. Without it a session's OWN account could stand in
+# for the primary with its own review.
 # Lowercase-only because App slugs are, and GitHub compares logins case-blind: a
 # `CodeRabbitAI[bot]` entry would otherwise match nothing and silently do nothing.
-# Bounded and anchored, so an entry cannot put markup into gate output.
+# Bounded and anchored, so a login cannot put markup into gate output.
 _LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}\[bot\]$")
 
 
 @dataclass(frozen=True)
 class Reviewer:
-    """One reviewer. ``login`` is the REST login (``…[bot]``)."""
+    """One known review format. ``login`` is the REST login (``…[bot]``)."""
 
     login: str
     parser: str
-    primary: bool = False
     surface_only: bool = False
 
 
-# The review apps installed on this repository. `primary` is the reviewer merge
-# freshness asks for (exactly one); `surface_only` findings are shown, never counted
-# or scored.
-REVIEWERS: tuple[Reviewer, ...] = (
-    Reviewer(login="chatgpt-codex-connector[bot]", parser="codex-badge", primary=True),
+# Which parser reads each known reviewer's findings. This confers NO trust: the
+# primary is CODEX_LOGIN, and stand-ins are decided by `is_substitute_candidate`.
+# `surface_only` findings are shown, never counted or scored.
+KNOWN_FORMATS: tuple[Reviewer, ...] = (
+    Reviewer(login=CODEX_LOGIN, parser="codex-badge"),
     Reviewer(login="devin-ai-integration[bot]", parser="devin-marker"),
     Reviewer(login="coderabbitai[bot]", parser="coderabbit-header"),
     Reviewer(login="github-advanced-security[bot]", parser="codeql", surface_only=True),
 )
 
 
-def _validate(reviewers: tuple[Reviewer, ...]) -> None:
-    """Raise ValueError when ``reviewers`` breaks an invariant.
+def _validate(formats: tuple[Reviewer, ...]) -> None:
+    """Raise ValueError when ``formats`` breaks an invariant.
 
     Run at import, so an edit that breaks one fails loudly there, and the merge
-    gate's soft import turns that into a merge gate that blocks, naming the error.
+    gate's soft import turns that into a merge gate that blocks.
     """
-    primaries = [r for r in reviewers if r.primary]
-    if len(primaries) != 1:
-        raise ValueError("exactly one reviewer must be primary")
-    if primaries[0].surface_only:
-        raise ValueError("the primary reviewer cannot be surface-only")
-    if primaries[0].parser != "codex-badge":
-        # The round counter's clean-comment match, the `@codex review` request gate
-        # and every freshness message are Codex-specific.
-        raise ValueError("the primary must use the codex-badge parser")
-    logins = [r.login for r in reviewers]
+    codex = [r for r in formats if r.login == CODEX_LOGIN]
+    if not codex or codex[0].parser != "codex-badge":
+        raise ValueError("the primary must be listed with the codex-badge parser")
+    logins = [r.login for r in formats]
     if len(set(logins)) != len(logins):
         raise ValueError("a reviewer login is listed twice")
-    for r in reviewers:
+    for r in formats:
+        if r.login in WORKFLOW_BOTS:
+            raise ValueError(f"{r.login}: a workflow bot is never a reviewer")
         if not _LOGIN_RE.fullmatch(r.login):
             raise ValueError(f"{r.login!r} is not a GitHub App REST login")
         if r.parser not in PARSERS:
             raise ValueError(f"{r.login}: unregistered parser {r.parser!r}")
         if (r.parser == "codeql") != r.surface_only:
-            # CodeQL, and only CodeQL, is surface-only. Nothing scores its findings,
-            # so a CodeQL reviewer that could stand in for the primary would be trusted
-            # unenforced; and the scanner has no display-only mode for the scored
-            # parsers, so `surface_only` on one would silently still score.
+            # CodeQL, and only CodeQL, is surface-only: nothing scores its findings,
+            # and the scanner has no display-only mode for the scored parsers, so
+            # `surface_only` on one of them would silently still score.
             raise ValueError(f"{r.login}: surface_only goes with parser 'codeql', and only there")
-    if not any(not r.surface_only for r in reviewers):
-        raise ValueError("at least one reviewer must not be surface-only")
 
 
-_validate(REVIEWERS)
+_validate(KNOWN_FORMATS)
 
 
 def primary_reviewer_login() -> str:
-    """The primary reviewer's REST login: the one merge freshness asks for."""
-    return next(r.login for r in REVIEWERS if r.primary)
-
-
-def substitute_reviewer_logins() -> tuple[str, ...]:
-    """Every non-primary reviewer that reviews (not ``surface_only``), in order."""
-    return tuple(r.login for r in REVIEWERS if not r.primary and not r.surface_only)
+    """THE primary reviewer's REST login: the one merge freshness asks for."""
+    return CODEX_LOGIN
 
 
 def enforced_logins() -> dict[str, frozenset[str]]:
-    """``{parser: logins}`` — whose findings the merge gate READS with which parser.
-
-    Every reviewer the list names is here, so a trusted reviewer's findings are
-    always read: trust and enforcement are bound to the same list.
-    """
+    """``{parser: logins}`` — which parser the merge gate reads each known login's
+    findings with."""
     by_parser: dict[str, set[str]] = {}
-    for reviewer in REVIEWERS:
+    for reviewer in KNOWN_FORMATS:
         by_parser.setdefault(reviewer.parser, set()).add(reviewer.login)
     return {parser: frozenset(logins) for parser, logins in by_parser.items()}
+
+
+def surface_only_logins() -> frozenset[str]:
+    """Known reviewers whose findings are shown, never counted (CodeQL)."""
+    return frozenset(r.login for r in KNOWN_FORMATS if r.surface_only)
+
+
+def is_substitute_candidate(login: str, user_type: str) -> bool:
+    """Whether a review by ``login`` may stand in for the primary's under
+    ``# substitute-review`` (which the owner still approves per use).
+
+    Any Bot-typed GitHub App qualifies — a new reviewer needs no list entry —
+    except the primary itself, a bot the PR's own workflow can drive, and a
+    surface-only reviewer, whose findings nothing scores.
+    """
+    return (
+        user_type == "Bot"
+        and isinstance(login, str)
+        and _LOGIN_RE.fullmatch(login) is not None
+        and login != CODEX_LOGIN
+        and login not in WORKFLOW_BOTS
+        and login not in surface_only_logins()
+    )
 
 
 # ── Per-reviewer severity parsers (moved from the merge gate, unchanged) ──────
