@@ -2758,7 +2758,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      list) carries `Cross-model streak: N (cap 3)`, updated every external cycle. It
      counts consecutive defect-bearing external rounds for this cap — a STREAK
      POSITION, never a round NUMBER. Round numbers come only from
-     `review_budget.py`'s reviewed-head count, and the two differ (a locally run
+     `review_budget.py`'s round count, and the two differ (a locally run
      secondary advances the streak without adding a reviewed head). The streak is a tracked artifact — "it's the same class, it doesn't really count" is exactly
      the rationalization the counter exists to kill (for a repeat EXTERNAL round).
   2. **The block point is BEFORE dispatching the next review.** The check is
@@ -2826,15 +2826,25 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   | 2 | **MODE-SWITCH block** | Decide premise-vs-polish, run the fresh-context class audit, then use `# audit-ack` only if that audit happened. |
   | 3 | **HARD STOP** | Hand back, redesign, narrow, or shelve. `# escalation-ack` records a fresh decision and resets only this local streak. |
 
-  Standing authorization is a separate GitHub-backed budget. It counts DISTINCT
-  REVIEWED HEADS, not local marks: Codex review objects including dismissed reviews,
-  Codex clean-review comments, and the configured external review identity all collapse
-  to one round when they name the same commit. Ordinary PRs carry standing authorization
-  through four reviewed heads. Starting with the fifth review request or the fix commit
-  after four reviewed heads, every action needs its own native user approval.
+  Standing authorization is a separate GitHub-backed budget. It counts ROUNDS, not
+  local marks: a round is a distinct head that drew FINDINGS from any GitHub App
+  reviewer (owner ruling, 2026-10-01). Every reviewer on one head collapses to one
+  round; a dismissed review with findings still counts; a head a force-push removed
+  still counts. Only an explicit informational class opens nothing — Codex P3, Devin
+  🔍, CodeRabbit trivial/info and its nitpick section — while a comment a known parser
+  cannot read, and any top-level comment from a reviewer with no known format, DOES
+  count. Humans, workflow bots and CodeQL never open a round. A clean review, a Codex
+  clean comment and the configured identity template CONFIRM a head; they never add a
+  round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
+  keeps the old rule (every head Codex reviewed, clean included), so no PR's count
+  moved at the cutover. The rule lives in `review_findings.is_finding` and
+  `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
+  Ordinary PRs carry standing authorization through four rounds. Starting with the
+  fifth review request or the fix commit after four rounds, every action needs its
+  own native user approval.
 
   **ROUND 4 IS TERMINAL (owner ruling, 2026-09-25).** There is no ordinary round 5.
-  At four reviewed heads the decision is not "another round" — it is MERGE, with the
+  At four rounds the decision is not "another round" — it is MERGE, with the
   outstanding issues accepted and FILED, or SEND IT BACK for rework. A fifth round
   exists only where the owner explicitly authorizes one, and that authorization is
   re-asked EVERY subsequent round, each of which is equally terminal and faces the
@@ -2968,22 +2978,29 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   through rounds 4–6.)
 
   **The Claude Code PR-side hook uses the same shared evaluator.** A review request reads the
-  distinct reviewed heads live from GitHub. Below four ordinary heads it proceeds under
+  rounds live from GitHub. Below four ordinary rounds it proceeds under
   standing authorization. At four or more it emits a native user approval for exactly
   one request; at five or more its message strongly recommends stopping. API, parse,
   prefix-resolution, changed-file, or PR-identity uncertainty asks in foreground and
-  denies in autonomous sessions. Dismissed reviews still count as spent rounds. A clean
-  review comment's abbreviated SHA is resolved against the PR's full commit list, and an
-  ambiguous prefix makes the result unknown.
+  denies in autonomous sessions, and so do findings a review's body declares but whose
+  comments were deleted. A clean review comment's abbreviated SHA is resolved against the
+  PR's full commit list, and an ambiguous prefix makes the result unknown.
+  `--check-pr` prints the count as an advisory `rounds` row, with findings per round and
+  a RISING marker; it never moves the verdict.
 
 - **GATE-FIX LANE — a hook-surface PR gets two standing discovery rounds
   (standing user rule, 2026-09-09).** The shared evaluator now enforces the distinction
-  mechanically. After exactly two reviewed heads, a current unreviewed head may receive
+  mechanically. After exactly two rounds, a current unreviewed head may receive
   ONE confirmation request without another approval only when the request carries
   `<!-- genesis-review-request head=<full-40-hex> kind=confirmation -->`. The marker is
   dispatch evidence, never approval or review evidence. Once present, a repeated request
   needs fresh approval. A review after that confirmation, or any further discovery
-  request, also needs fresh approval.
+  request, also needs fresh approval. Because a CLEAN confirmation adds no round, the
+  marker itself is the one-shot token: once a marker exists for any head other than the
+  current one, the confirmation is SPENT and every later request and fix commit asks. A
+  head that drew findings itself is a round, never a fix to confirm, so it gets no free
+  request. (Residual, by owner ruling: an approved UNMARKED request that comes back
+  clean leaves the marked one unspent.)
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.
@@ -3125,9 +3142,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   granted for the same reason those two are: a gate fix is what unblocks the PRs stacked
   behind it, so leaving one to bake is the queue declining to repair itself.
 
-  **On the word "round" here:** one reviewed head is one round however many
-  recognized reviewers saw it. The shared evaluator deduplicates reviewer sources by
-  commit identity, so a dual round does not spend two rounds.
+  **On the word "round" here:** one head that drew findings is one round however many
+  reviewers saw it. The shared evaluator deduplicates reviewers by commit identity, so
+  a dual round does not spend two rounds.
 
   **A note for anyone reading only CLAUDE.md:** the shared evaluator now gates a third
   discovery request mechanically. The local round-2 MODE-SWITCH still acts on commits
@@ -3145,7 +3162,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   operates, its architecture, or its infrastructure; its consequences are
   far-reaching or irreversible; or it is delicate enough that getting it wrong
   damages a running Genesis. Treat the local round-2 mode switch, the round-3 hard
-  stop, or a native approval after the standing reviewed-head budget as a trigger
+  stop, or a native approval after the standing round budget as a trigger
   to ask whether this is that kind of PR rather than merely another
   round — taking this exit does NOT discharge that tier's own stop, which is
   still owed; the handoff is the answer you bring to it, not a way around it.

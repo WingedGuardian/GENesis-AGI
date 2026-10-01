@@ -545,3 +545,63 @@ def test_freshness_helpers_keep_dismissed_semantics(monkeypatch):
     )
     assert _mod._codex_review_commit_ids("1372") == [HEADS[0]]
     assert _mod._latest_codex_reviewed_sha("1372") == HEADS[0]
+
+
+# -- the round rule after its cutover (any App reviewer's findings) ------------
+
+_AFTER_CUTOVER = "2099-01-01T00:00:00Z"
+_DEVIN = "devin-ai-integration[bot]"
+_DEVIN_FINDING = '<!-- devin-review-comment {"id": "B1"} -->\n\n🟡 **Off by one**\n'
+
+
+def _app_reviews(monkeypatch, *records):
+    """Replace the review seam with post-cutover records of the given shape."""
+    monkeypatch.setenv(
+        "_TEST_GH_CODEX_REVIEWS",
+        _jsonl(
+            {
+                "login": login,
+                "commit_id": sha,
+                "state": "COMMENTED",
+                "submitted_at": _AFTER_CUTOVER,
+                "body": "",
+                "top_level": [_DEVIN_FINDING] if finding else [],
+            }
+            for login, sha, finding in records
+        ),
+    )
+
+
+def test_post_cutover_findings_from_another_app_reach_the_cap(monkeypatch):
+    """After the cutover a Devin finding opens a round exactly as a Codex one did,
+    and a clean review adds none: the guard reads the same evaluator."""
+    _evidence(monkeypatch)
+    _app_reviews(monkeypatch, *((_DEVIN, h, True) for h in HEADS[:3]))
+    assert _decision() == ("allow", "")
+    _app_reviews(monkeypatch, *((_DEVIN, h, True) for h in HEADS[:4]))
+    decision, reason = _decision()
+    assert decision == "ask" and "4 review rounds" in reason
+    _app_reviews(monkeypatch, *((_DEVIN, h, False) for h in HEADS[:4]))
+    assert _decision() == ("allow", "")
+
+
+def test_a_clean_confirmation_spends_the_gate_lanes_one_free_request(monkeypatch):
+    """Clean reviews add no round, so the gate lane must not grant its one
+    confirmation again at the next head (architect review of A2b, 2026-10-01)."""
+    rounds = ((_DEVIN, HEADS[0], True), (_DEVIN, HEADS[1], True))
+    gate = ("scripts/hooks/git_push_guard.py",)
+    _evidence(monkeypatch, head=HEADS[2], files=gate)
+    _app_reviews(monkeypatch, *rounds)
+    marker = _mod._review_budget.confirmation_marker(HEADS[2])
+    assert _decision(f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'") == (
+        "allow",
+        "",
+    )
+    posted = (("a-maintainer", "User", _mod._review_budget.confirmation_marker(HEADS[2])),)
+    _evidence(monkeypatch, head=HEADS[3], files=gate, comments=posted)
+    _app_reviews(monkeypatch, *rounds, (CODEX, HEADS[2], False))
+    marker = _mod._review_budget.confirmation_marker(HEADS[3])
+    decision, _ = _decision(
+        f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'"
+    )
+    assert decision == "ask"

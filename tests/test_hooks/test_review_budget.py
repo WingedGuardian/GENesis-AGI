@@ -39,7 +39,7 @@ def _eval(*, head=H5, reviews=(), comments=(), files=("src/x.py",), commits=None
     return rb.evaluate_evidence(
         current_head=head,
         commit_heads=commits or (H1, H2, H3, H4, H5),
-        codex_reviews=reviews,
+        reviews=reviews,
         issue_comments=comments,
         changed_files=files,
         external_identity_templates=templates,
@@ -130,11 +130,16 @@ def test_ambiguous_prefix_and_malformed_relevant_records_are_unknown():
     assert malformed["status"] == "unknown"
 
 
-def test_full_review_head_must_belong_to_pr_commit_list():
+def test_a_review_on_a_force_pushed_away_head_still_counts():
+    """A review object names its FULL commit, so a head a force-push removed from
+    the PR is still a round. It used to read `unknown`, which wedged every commit
+    and review request on 5 of the 300 most recent merged PRs (MEASURED
+    2026-10-01, every one a Codex review on a rewritten commit)."""
     outside = "f" * 40
     got = _eval(reviews=(_review(outside),))
-    assert got["status"] == "unknown"
-    assert "unresolved_review_head" in got["errors"]
+    assert got["status"] == "ok", got
+    assert got["reviewed_heads"] == [outside]
+    assert got["count"] == 1
 
 
 def test_current_head_must_be_present_in_pr_commit_list():
@@ -493,7 +498,14 @@ def _no_seams(monkeypatch):
 
 
 def _gql_review(head, *, login="chatgpt-codex-connector", kind="Bot", state="COMMENTED"):
-    return {"state": state, "author": {"login": login, "__typename": kind}, "commit": {"oid": head}}
+    return {
+        "state": state,
+        "submittedAt": "2026-01-01T00:00:00Z",
+        "body": "",
+        "author": {"login": login, "__typename": kind},
+        "commit": {"oid": head},
+        "comments": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+    }
 
 
 _COMMITS = [{"commit": {"oid": h}} for h in (H1, H2, H3, H4, H5)]
@@ -623,7 +635,7 @@ def test_graphql_failures_fail_closed(monkeypatch):
 
 def test_graphql_deleted_author_is_skipped_like_rest_ghost(monkeypatch):
     _no_seams(monkeypatch)
-    ghost = {"state": "COMMENTED", "author": None, "commit": {"oid": H2}}
+    ghost = {**_gql_review(H2), "author": None}
     serve = _graphql_server(reviews=[ghost, _gql_review(H5)], files=_FILES, commits=_COMMITS)
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
@@ -750,8 +762,21 @@ def test_the_round_counter_counts_the_primary(monkeypatch):
     import review_findings as rf
 
     devin = "devin-ai-integration[bot]"
-    _seams(monkeypatch, [{"login": devin, "commit_id": h} for h in (H1, H2, H3, H4)])
+    # Before the round-rule cutover only the primary's heads count; another
+    # reviewer's review there is not a round, findings or not.
+    before = "2026-01-01T00:00:00Z"
+    _seams(
+        monkeypatch,
+        [
+            {"login": devin, "commit_id": h, "submitted_at": before, "top_level": ["x"]}
+            for h in (H1, H2, H3, H4)
+        ],
+    )
     assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["count"] == 0
+    # A non-primary review that cannot be placed either side of it is unknown,
+    # never dropped: dropping it would undercount after the cutover.
+    _seams(monkeypatch, [{"login": devin, "commit_id": H1}])
+    assert rb.evaluate_pr("o/r", 1, external_identity_templates=())["status"] == "unknown"
     _seams(monkeypatch, [{"login": rf.CODEX_LOGIN, "commit_id": h} for h in (H1, H2, H3, H4)])
     got = rb.evaluate_pr("o/r", 1, external_identity_templates=())
     assert got["count"] == 4 and got["commit_approval_required"] is True

@@ -36,8 +36,11 @@ index is kept.
 Two lanes remain. They differ in WHEN, in the label they carry, and in
 retention (only clean MERGED archives are eligible, and retention is off, #2504):
 
-  MERGED (7+ days idle)     content is also in main, so it drains sooner
+  MERGED (7+ days idle)     merged AND clean: content is also in main, so it drains sooner
   UNMERGED (14+ days idle)  may be the only copy, so it is held longer
+
+A merged worktree with uncommitted changes takes the UNMERGED lane: no merge
+verdict covers edits that were never committed (see `_classify`).
 
 Between day 7 and day 14 an unmerged worktree reports as ``at_risk``: a
 bounded, draining window that surfaces work about to be archived, rather than a
@@ -206,10 +209,17 @@ def _default_branch(repo_root: Path) -> str:
 
 
 def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
-    """Run git, returning stdout on success and None on any failure."""
+    """Run git, returning stdout on success and None on any failure.
+
+    Decoded with ``surrogateescape``: with ``core.quotePath=false`` git prints a
+    path as raw bytes, and a strict decode of a non-UTF-8 name RAISED out of this
+    helper, which the scan does not catch, so one such filename in any worktree
+    ended the whole run. Surrogates round-trip through ``os.fsencode`` to the
+    same path.
+    """
     try:
         result = subprocess.run(
-            ["git", *args], capture_output=True, text=True,
+            ["git", *args], capture_output=True, text=True, errors="surrogateescape",
             cwd=str(repo_root), timeout=timeout, env=_git_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -427,10 +437,24 @@ def _git_activity_time(worktree_path: str) -> float:
             # A rename reads "R  old -> new"; the NEW path is the one on disk.
             if " -> " in rel:
                 rel = rel.split(" -> ", 1)[1]
+            path = root / rel.strip('"')
             try:
-                newest = max(newest, (root / rel.strip('"')).lstat().st_mtime)
-            except OSError:
+                newest = max(newest, path.lstat().st_mtime)
                 continue
+            except OSError:
+                pass
+            # A DELETED path has no mtime of its own, but unlinking it updated
+            # its directory's. Take the nearest ancestor that still exists,
+            # stopping at the worktree root, or a deletion below the shallow walk
+            # leaves the worktree looking as idle as it was before the change.
+            for parent in path.parents:
+                if root not in parent.parents:
+                    break
+                try:
+                    newest = max(newest, parent.lstat().st_mtime)
+                    break
+                except OSError:
+                    continue
     return newest
 
 
@@ -574,7 +598,8 @@ def _merge_verdict(
         result = subprocess.run(
             ["gh", "pr", "list", "--head", ref, "--base", _default_branch(repo_root),
              "--state", "merged", "--limit", "10", "--json", "number,headRefOid"],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(repo_root), timeout=30,
         )
         if result.returncode == 0:
             prs = json.loads(result.stdout)
@@ -593,7 +618,8 @@ def _merge_verdict(
     try:
         result = subprocess.run(
             ["git", "cherry", "main", ref],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
             # Lines starting with '+' are unique commits not in main
@@ -664,9 +690,13 @@ def _has_in_progress_op(worktree_path: str) -> bool:
     """
     for marker in _IN_PROGRESS_MARKERS:
         try:
+            # surrogateescape: the marker path runs through the worktree's admin
+            # directory, which carries the worktree's own name byte for byte, and
+            # a strict decode of a non-UTF-8 name raised out of the scan.
             result = subprocess.run(
                 ["git", "rev-parse", "--git-path", marker],
-                capture_output=True, text=True, cwd=worktree_path, timeout=10,
+                capture_output=True, text=True, errors="surrogateescape",
+                cwd=worktree_path, timeout=10,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return True  # fail-closed: can't verify state → protect the worktree
@@ -684,25 +714,24 @@ def _has_in_progress_op(worktree_path: str) -> bool:
 def _has_uncommitted_changes(worktree_path: str) -> bool:
     """True if the worktree has ANY uncommitted state (tracked edits or untracked).
 
-    Fail-CLOSED: any error returns True. A "dirty" verdict only ever routes a
-    worktree to the gentler lane (trash instead of permanent delete), so being
-    wrong in this direction costs disk, while being wrong the other way destroys
-    work that exists nowhere else.
+    Fail-CLOSED: any error returns True. A "dirty" verdict only ever holds a
+    worktree for the longer 14-day window, so being wrong in this direction keeps
+    it live a week longer, while being wrong the other way puts uncommitted work
+    on the short clock.
 
     Untracked files count as dirty on purpose: a forced worktree removal deletes
     them, and an untracked file in a merged worktree is exactly the kind of
     unreferenced work that no branch protects.
     """
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, cwd=worktree_path, timeout=30,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return True
-    if result.returncode != 0:
-        return True
-    return bool(result.stdout.strip())
+    # The flags are PINNED because config can hide changes from a bare status:
+    # `status.showUntrackedFiles=no` drops every untracked file (MEASURED), and a
+    # dirty worktree would then read clean and go back on the short clock.
+    out = _run_git(
+        Path(worktree_path),
+        ["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"],
+        timeout=30,
+    )
+    return True if out is None else bool(out.strip())
 
 
 def _dirty_patch(worktree_path: str) -> bytes:
@@ -739,9 +768,9 @@ def _dirty_patch(worktree_path: str) -> bytes:
 STATE_IN_USE = "in_use"            # a live process is sitting in it
 STATE_PROTECTED = "protected"      # locked / mid-rebase / contains a nested worktree
 STATE_FRESH = "fresh"              # touched within MERGED_STALE_DAYS
-STATE_AT_RISK = "at_risk"          # unmerged, aging, NOT yet reapable  <- the alert set
-STATE_REAP_MERGED = "reap_merged"  # merged and old enough — archive now
-STATE_REAP_UNMERGED = "reap_unmerged"  # unmerged, past the long window — trash now
+STATE_AT_RISK = "at_risk"          # unmerged or dirty, aging, NOT yet reapable  <- the alert set
+STATE_REAP_MERGED = "reap_merged"  # merged, clean and old enough — archive now
+STATE_REAP_UNMERGED = "reap_unmerged"  # unmerged or dirty, past the long window — trash now
 
 
 def _classify(
@@ -825,32 +854,42 @@ def _classify(
     verdict = _merge_verdict(
         ref, repo_root, is_branch=is_branch, allow_network=allow_network,
     ) if ref else ""
+
+    # A MERGE VERDICT NEVER COVERS UNCOMMITTED WORK. Every verdict answers a
+    # question about COMMITS: is the tip an ancestor of main, was its PR merged,
+    # are its patches already in main. None of them sees edits that were never
+    # committed, so a dirty worktree's uncommitted changes exist nowhere else
+    # whatever the verdict says. The vacuous case makes this concrete: a branch
+    # that never got a commit of its own has a main commit as its tip, so the
+    # ancestry test passes with nothing merged, and the same holds for a branch
+    # stacked on a squash-merged PR head (patch-id). So a dirty worktree always
+    # waits the longer unmerged window, and only a CLEAN one drains on the merged
+    # clock: one that holds nothing `git status` can see. (Ignored files and
+    # assume-unchanged or skip-worktree edits are invisible to it, as before.)
+    out["dirty"] = _has_uncommitted_changes(wt_path)
+    held = verdict if verdict and out["dirty"] else ""
+    if held:
+        verdict = ""
     out["merge_method"] = verdict
     out["merged"] = bool(verdict)
 
     if not verdict:
-        # Dirty state matters MORE on this lane, not less: unmerged content may be
-        # the only copy. It was previously computed only for merged worktrees.
-        out["dirty"] = _has_uncommitted_changes(wt_path)
+        what = f"uncommitted changes on work merged via {held}" if held else "unmerged"
         if age_days < UNMERGED_STALE_DAYS:
             out["state"] = STATE_AT_RISK
             out["reason"] = (
-                f"unmerged, {age_days:.0f}d cold — reaped to trash at "
+                f"{what}, {age_days:.0f}d cold — reaped to trash at "
                 f"{UNMERGED_STALE_DAYS}d"
             )
             return out
         out["state"] = STATE_REAP_UNMERGED
         out["action"] = "trash"
-        out["reason"] = f"unmerged and {age_days:.0f}d cold (>= {UNMERGED_STALE_DAYS}d)"
+        out["reason"] = f"{what} and {age_days:.0f}d cold (>= {UNMERGED_STALE_DAYS}d)"
         return out
 
     out["state"] = STATE_REAP_MERGED
-    out["dirty"] = _has_uncommitted_changes(wt_path)
     out["action"] = "trash"
-    out["reason"] = (
-        f"merged via {verdict}, {age_days:.0f}d cold"
-        + (" (has uncommitted changes)" if out["dirty"] else "")
-    )
+    out["reason"] = f"merged via {verdict}, {age_days:.0f}d cold"
     return out
 
 
@@ -1210,6 +1249,14 @@ def _trash_worktree(
     # already resolved.
     if _is_locked_now(wt_path):
         _log(f"SKIP {wt_path}: locked between classification and reap")
+        return False
+    # AND RE-READ DIRTINESS for the merged lane, because `_classify` now puts a
+    # dirty worktree on the long clock whatever its merge verdict, and a session
+    # can write to a clean one during the minutes-long scan (an editor working by
+    # absolute path from another directory has no process cwd inside it). The
+    # archive is kept either way; this keeps such a worktree off the short clock.
+    if lane == "merged" and _has_uncommitted_changes(str(wt_path)):
+        _log(f"SKIP {wt_path}: uncommitted changes appeared between classification and reap")
         return False
     # AND refuse to move a worktree that CONTAINS another registered worktree.
     # Moving the parent relocates the nested tree's files out from under git; a
@@ -2099,9 +2146,13 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         add_cmd = ["git", "worktree", "add", "--force", "--detach", original_path, commit]
     else:
         add_cmd = ["git", "worktree", "add", "--force", original_path, branch]
+    # Decoded with surrogateescape: git echoes the branch name, which can hold
+    # bytes that are not UTF-8, and a strict decode raised here with the worktree
+    # recreated but its untracked files not yet copied back.
     result = subprocess.run(
         add_cmd,
-        capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+        capture_output=True, text=True, errors="surrogateescape",
+        cwd=str(repo_root), timeout=30,
     )
 
     if result.returncode != 0 and commit and not (detached or not branch):
@@ -2125,7 +2176,8 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         # with one `git switch -c`, and that is stated rather than left implicit.
         retry = subprocess.run(
             ["git", "worktree", "add", "--force", "--detach", original_path, commit],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(repo_root), timeout=30,
         )
         if retry.returncode == 0:
             print(
@@ -2993,6 +3045,16 @@ def main() -> int:
                              "(gh pr list). Faster, and can only ever under-report "
                              "a branch as unmerged — never the reverse")
     args = parser.parse_args()
+    # A path is decoded with surrogateescape (see `_run_git`), so a worktree name
+    # that is not UTF-8 carries a surrogate into every log line naming it, and a
+    # strict stream — which a pipe or the systemd journal is under a UTF-8
+    # locale, as the timer runs — RAISED on the first such line and ended the run
+    # (MEASURED, run as the timer runs it). Escape what cannot be encoded. The
+    # metadata this script writes goes through `json.dumps`, which escapes it
+    # already.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="backslashreplace")
 
     if args.list_trash:
         _list_trash()

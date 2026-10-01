@@ -739,8 +739,11 @@ def ollama_enabled() -> bool:
     Defaults to False (cloud-primary architecture). Set GENESIS_ENABLE_OLLAMA=true
     in secrets.env or network.ollama_enabled in ~/.genesis/config/genesis.yaml.
     """
+    # Empty means unset (see embed_priority_tier): this lever decides whether
+    # the Ollama rung joins the embedding chain, and the memory MCP child drops
+    # empty secrets.env values, so "" must not mean "on" here alone.
     env_val = os.environ.get("GENESIS_ENABLE_OLLAMA")
-    if env_val is not None:
+    if env_val is not None and env_val.strip():
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
     local_val = _local_section("network").get("ollama_enabled")
     if local_val is not None:
@@ -774,8 +777,11 @@ def embed_priority_tier() -> bool:
     out — recall then degrades to the keyword-only path whenever the queue runs
     deeper than the deadline.
     """
+    # An EMPTY value is unset, not a vote: the memory MCP child drops empty
+    # secrets.env values before they reach its environment, so treating "" as
+    # an answer here would let the two processes resolve one setting apart.
     env_val = os.environ.get("GENESIS_EMBED_PRIORITY_TIER")
-    if env_val is not None:
+    if env_val is not None and env_val.strip():
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
     # Via `_local_section`, which tolerates every shape a hand-edited yaml can
     # produce: the documented opt-out must not be able to break the thing it opts
@@ -784,6 +790,36 @@ def embed_priority_tier() -> bool:
     if local_val is not None:
         return _yaml_bool(local_val)
     return True
+
+
+def embed_local_first() -> bool:
+    """Whether embedding chains put the local backend (Ollama) ahead of cloud.
+
+    Defaults to FALSE: cloud leads and Ollama is the fallback rung. Local
+    embedding is inference, so on a host without a GPU every call burns CPU the
+    rest of the system needs. MEASURED 2026-09-26 through the shipped chain, 20
+    calls each: Ollama p50 2395.8ms, DeepInfra p50 207.8ms.
+
+    This is an install-local preference, not a code decision: a host with a GPU,
+    or one that wants embeddings to stay on the box, can flip it. It sets the
+    order of every chain built without an explicit ``ollama_first`` (storage and
+    recall alike). It never changes WHICH model writes; the chain stays in the
+    corpus's vector space whatever the order (see
+    ``EmbeddingProvider.build_chain``). Recall has a 4.5s deadline, so on a slow
+    host local-first recall can push recall onto its keyword-only fallback.
+
+    Set GENESIS_EMBED_LOCAL_FIRST=true in secrets.env, or
+    memory.embed_local_first: true in ~/.genesis/config/genesis.yaml. Read when a
+    chain is built, so a change takes effect on restart.
+    """
+    # Empty means unset, for the same reason as embed_priority_tier above.
+    env_val = os.environ.get("GENESIS_EMBED_LOCAL_FIRST")
+    if env_val is not None and env_val.strip():
+        return _yaml_bool(env_val)
+    local_val = _local_section("memory").get("embed_local_first")
+    if local_val is not None:
+        return _yaml_bool(local_val)
+    return False
 
 
 def build_lane_enabled() -> bool:
