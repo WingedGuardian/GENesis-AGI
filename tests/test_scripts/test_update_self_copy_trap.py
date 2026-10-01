@@ -30,6 +30,7 @@ UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 SHARED_LIBS = [
     REPO_ROOT / "scripts" / "lib" / "guardian_pause.sh",
     REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh",
+    REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh",
 ]
 _PRELUDE = "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
 

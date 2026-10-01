@@ -200,10 +200,64 @@ liveness_visible() {
     # hidden. What this cannot see: another uid's processes (hidepid,
     # ProtectProc=invisible, or plain EACCES). That was always the model —
     # the swept trees are this user's own, written by this user's processes.
-    local proc="${TL_PROC:-/proc}" p
+    #
+    # The caller's own DESCENDANTS do not count either (#2515), and neither do
+    # zombies (no descriptors to see). In a private PID namespace /proc shows
+    # only the caller's own tree, and a live child of its own — the watchgod's
+    # backgrounded du, a pipeline stage — would otherwise read as "visible".
+    # The caller's ANCESTORS do count (its parent is the user's service
+    # manager): under the same-uid model, seeing their descriptors is exactly
+    # the evidence wanted.
+    local proc="${TL_PROC:-/proc}" p pid
     for p in "$proc"/[0-9]*; do
-        [[ "${p##*/}" == "$$" || "${p##*/}" == "$BASHPID" ]] && continue
-        [[ -r "$p/fd" && -x "$p/fd" ]] && return 0
+        pid="${p##*/}"
+        [[ "$pid" == "$$" || "$pid" == "$BASHPID" ]] && continue
+        [[ -r "$p/fd" && -x "$p/fd" ]] || continue
+        # 0 = ours or a zombie, 2 = could not classify (it vanished mid-check):
+        # neither is evidence of another live process, so neither counts.
+        _tl_own_or_zombie "$proc" "$pid"
+        case $? in 0|2) continue ;; esac
+        return 0
+    done
+    return 1
+}
+
+_tl_status_field() {
+    # Echo field $2 (State or PPid) of $1 (a /proc/<pid>/status path); rc 1
+    # when unreadable or absent.
+    local line
+    [[ -r "$1" ]] || return 1
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^$2:[[:space:]]+([^[:space:]]+) ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < "$1" 2>/dev/null
+    return 1
+}
+
+_tl_own_or_zombie() {
+    # 0 when pid $2 (under proc root $1) is a zombie or a descendant of this
+    # shell ($$ or $BASHPID). 1 when it is positively ANOTHER process: its chain
+    # ends at PPid 0 or 1 outside our tree, or runs past 64 hops. 2 when it
+    # cannot be classified: a status file that will not read, here or partway
+    # up the chain. The caller has already read the pid's fd/, so same-uid
+    # access is proven and an unreadable status means the process (or an
+    # ancestor) exited mid-check; that proves nothing, so the caller skips it
+    # rather than counting it (counting it was a fail-open in exactly the
+    # private-namespace case this exists for, review of #2515). The match
+    # against $$ is checked before the PPid<=1 stop, because in a private PID
+    # namespace the caller itself can be pid 1.
+    local proc="$1" pid="$2" state ppid hops=0
+    state=$(_tl_status_field "$proc/$pid/status" State) || return 2
+    [[ "$state" == Z* ]] && return 0
+    ppid=$(_tl_status_field "$proc/$pid/status" PPid) || return 2
+    while (( hops < 64 )); do
+        [[ "$ppid" =~ ^[0-9]+$ ]] || return 2
+        [[ "$ppid" == "$$" || "$ppid" == "$BASHPID" ]] && return 0
+        (( ppid <= 1 )) && return 1
+        ppid=$(_tl_status_field "$proc/$ppid/status" PPid) || return 2
+        hops=$(( hops + 1 ))
     done
     return 1
 }
