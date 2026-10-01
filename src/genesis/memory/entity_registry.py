@@ -90,7 +90,15 @@ async def resolve_entity(
     existing = await entities_crud.get_by_norm_name(
         db, norm_name=norm_name, entity_type=entity_type,
     )
-    if existing is None and entity_type in _CONCEPT_CLUSTER:
+    # get_by_norm_name falls back to a dead-end TOMBSTONE when a same-type
+    # merged row resolves to nothing (create_entity's collision fallback needs
+    # that). A tombstone is not an identity to attach extraction work to, so a
+    # cluster type folds past it exactly as it folds past a miss (#1729 round-4
+    # review). person/org keep the same-type answer: no cross-type fold exists
+    # for them, so a dead end there needs a schema change to avoid.
+    if (
+        existing is None or existing.get("status") != "active"
+    ) and entity_type in _CONCEPT_CLUSTER:
         # Query the cluster EXPLICITLY rather than taking the untyped lookup's
         # single top row and rejecting when it is non-cluster: under that shape
         # a person/org sharing the norm SHADOWED a legitimate cluster fold and

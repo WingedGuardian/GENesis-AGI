@@ -1083,10 +1083,10 @@ jobs:
         # UNION with the entity apply-rails PR (#1729). Measured against main's
         # versions with --collect-only, after the last test-adding edit:
         #   test_entity_adjudication.py         50 -> 62   (+12)
-        #   test_entity_apply_rails.py           new -> 23  (+23)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
         #   test_entity_adjudication_config.py  13 -> 15   (+2)
         #   test_migration_0065_...             14 -> 14   (0)
         # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
         # superseded by this count. No new skips, so the ceiling holds.
-        # Floor: 23606 + 37 = 23643.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23643
+        # Floor: 23606 + 38 = 23644.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23644

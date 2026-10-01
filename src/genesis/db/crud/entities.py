@@ -139,7 +139,12 @@ async def get_by_norm_name_in_types(
     and rejected when that row was non-cluster — so a person/org sharing the
     norm SHADOWED a legitimate cluster fold, and an avoidable shard was minted
     (adjudication reconciles it later, at LLM cost). Querying the cluster
-    explicitly makes the shadow impossible (MW-3 PR-2b, review NOTE N2)."""
+    explicitly makes the shadow impossible (MW-3 PR-2b, review NOTE N2).
+
+    Contract: returns an ACTIVE row or None, never a tombstone. This differs
+    on purpose from ``get_by_norm_name``, which falls back to a dead-end merged
+    row because ``create_entity``'s collision path needs a row back. Do not
+    unify the two without keeping both contracts."""
     if not types:
         return None
     placeholders = ",".join("?" for _ in types)
@@ -150,13 +155,19 @@ async def get_by_norm_name_in_types(
         "ELSE 2 END, created_at ASC, entity_id ASC",
         (norm_name, *sorted(types)),
     )
-    if not rows:
-        return None
-    entity = _row_to_dict(db, rows[0])
-    if entity["status"] == "merged" and entity["merged_into"]:
-        survivor = await resolve_active(db, entity["entity_id"])
-        return survivor or entity
-    return entity
+    # Walk candidates in order (active first). A merged row counts only if it
+    # RESOLVES to a live survivor: a dead-end tombstone is not an identity, and
+    # returning it attached extraction work to a non-active row (Codex P2,
+    # #1729) — or hid a later merged row that does resolve.
+    for row in rows:
+        entity = _row_to_dict(db, row)
+        if entity["status"] == "active":
+            return entity
+        if entity["status"] == "merged" and entity["merged_into"]:
+            survivor = await resolve_active(db, entity["entity_id"])
+            if survivor is not None:
+                return survivor
+    return None
 
 
 async def resolve_active(db: aiosqlite.Connection, entity_id: str) -> dict | None:
@@ -706,23 +717,58 @@ async def merged_norm_redirects(db: aiosqlite.Connection) -> dict[str, list[str]
         by_id[entity_id] = (status, merged_into)
         if status == "merged" and merged_into:
             merged.append((norm_name, merged_into))
-    out: dict[str, list[str]] = {}
-    for norm_name, target in merged:
-        seen: set[str] = set()
-        current: str | None = target
-        while current and current not in seen:
-            seen.add(current)
+    # Memoized: each node's terminal (active survivor id, or None for a dead
+    # end) is resolved once per scan. Walking every chain independently cost
+    # ~n²/2 lookups for a chain of n, on the ranking hot path (Codex P2, #1729).
+    terminal: dict[str, str | None] = {}
+
+    def _resolve(start: str) -> str | None:
+        path: list[str] = []
+        on_path: set[str] = set()
+        current: str | None = start
+        result: str | None = None
+        while current:
+            if current in terminal:
+                result = terminal[current]
+                break
+            if current in on_path:
+                break  # cycle — dead end
+            path.append(current)
+            on_path.add(current)
             status, nxt = by_id.get(current, (None, None))
             if status == "active":
-                bucket = out.setdefault(norm_name, [])
-                if current not in bucket:
-                    bucket.append(current)
+                result = current
                 break
             if status == "merged" and nxt:
                 current = nxt
                 continue
-            break  # dead end — drop
+            break  # missing / gone / merged-without-target — dead end
+        for node in path:
+            terminal[node] = result
+        return result
+
+    out: dict[str, list[str]] = {}
+    for norm_name, target in merged:
+        survivor = _resolve(target)
+        if survivor is None:
+            continue  # dead end — drop
+        bucket = out.setdefault(norm_name, [])
+        if survivor not in bucket:
+            bucket.append(survivor)
     return out
+
+
+# Orientation-independent pair match on a queue row's payload. json_extract
+# RAISES on malformed JSON, and the processor treats malformed payloads as a
+# handled case (it discards them), so one bad pending row must not abort every
+# later enqueue (Codex P2 + Devin, #1729). CASE guarantees json_valid is
+# evaluated first; a plain AND does not. Binds: (a, b, a, b).
+_PAIR_MATCH = """CASE WHEN json_valid(payload_json) THEN
+        json_extract(payload_json, '$.entity_id') IN (?, ?)
+        AND json_extract(payload_json, '$.similar_entity_id') IN (?, ?)
+        AND json_extract(payload_json, '$.entity_id')
+            != json_extract(payload_json, '$.similar_entity_id')
+    ELSE 0 END"""
 
 
 async def enqueue_adjudication(
@@ -770,12 +816,9 @@ async def enqueue_adjudication(
     )
     # Pair-based dedup (orientation-independent) — payload_json IN would miss
     # rows whose payload differs only in the stale_recheck flag.
-    _PAIR_DEDUP = """SELECT 1 FROM deferred_work_queue
+    _PAIR_DEDUP = f"""SELECT 1 FROM deferred_work_queue
                    WHERE work_type = 'entity_adjudication' AND status = 'pending'
-                     AND json_extract(payload_json, '$.entity_id') IN (?, ?)
-                     AND json_extract(payload_json, '$.similar_entity_id') IN (?, ?)
-                     AND json_extract(payload_json, '$.entity_id')
-                         != json_extract(payload_json, '$.similar_entity_id')"""
+                     AND {_PAIR_MATCH}"""
     cursor = await db.execute(
         f"""INSERT INTO deferred_work_queue
            (id, work_type, call_site_id, priority, payload_json, deferred_at,
@@ -803,14 +846,11 @@ async def enqueue_adjudication(
         # The pair is already queued — stamp the flag onto the existing
         # pending row so it still lands behind the approval gate.
         await db.execute(
-            """UPDATE deferred_work_queue
+            f"""UPDATE deferred_work_queue
                   SET payload_json = json_set(payload_json, '$.stale_recheck', json('true')),
                       deferred_reason = ?
                 WHERE work_type = 'entity_adjudication' AND status = 'pending'
-                  AND json_extract(payload_json, '$.entity_id') IN (?, ?)
-                  AND json_extract(payload_json, '$.similar_entity_id') IN (?, ?)
-                  AND json_extract(payload_json, '$.entity_id')
-                      != json_extract(payload_json, '$.similar_entity_id')""",
+                  AND {_PAIR_MATCH}""",
             (
                 "stale recheck — identity drifted under the prior approval",
                 entity_id,

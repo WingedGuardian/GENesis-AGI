@@ -6,7 +6,8 @@ and the sweep's weeks-long rediscovery loop becomes the convergence
 bottleneck. Each rail is RED-locked against the pre-rail behavior:
 
 - chain-safe follow: ``resolve_active`` (shared), multi-hop
-  ``get_by_norm_name``, and ``merge_entity`` chain re-pointing;
+  ``get_by_norm_name``, and read-side walks (``merge_entity`` no longer
+  re-points chains; it leaves them for the walks to follow);
 - typed fold lookup: a person/org sharing a norm can no longer shadow the
   concept-cluster fold (review NOTE N2);
 - query-lane merge-following: a merged-away surface form resolves to its
@@ -33,7 +34,7 @@ async def _mk(db, name, norm, etype="concept"):
 
 async def _tombstone(db, loser_id, survivor_id):
     """Hand-write a merged tombstone WITHOUT merge_entity, so chain tests can
-    build the exact multi-hop shape merge_entity's re-pointing would collapse."""
+    build exact multi-hop shapes directly."""
     await db.execute(
         "UPDATE entities SET status='merged', merged_into=? WHERE entity_id=?",
         (survivor_id, loser_id),
@@ -350,3 +351,133 @@ async def test_enqueue_adjudication_reports_whether_it_inserted(db, monkeypatch)
     monkeypatch.setattr(entities_crud, "_ADJUDICATION_ENQUEUE_ENABLED", False)
     c = await _mk(db, "eps other", "eps other")
     assert await entities_crud.enqueue_adjudication(db, entity_id=a, similar_entity_id=c) is False
+
+
+# ── round-4 fixes (review station) ───────────────────────────────────────
+
+
+async def _queue_malformed(db):
+    """A pending adjudication row whose payload is not JSON — the processor's
+    own failure model discards these, so producers must not trip over one."""
+    await db.execute(
+        "INSERT INTO deferred_work_queue (id, work_type, call_site_id, priority, "
+        "payload_json, deferred_at, deferred_reason, created_at) "
+        "VALUES ('bad-1', 'entity_adjudication', 'entity_adjudication', 60, "
+        "'{broken', '2026-01-01', 'test', '2026-01-01')"
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_malformed_pending_payload_does_not_block_enqueue(db):
+    """json_extract raises on malformed JSON; an unguarded pair-dedup made one
+    bad pending row abort every later enqueue (Codex P2 + Devin, #1729)."""
+    await _queue_malformed(db)
+    a = await _mk(db, "zeta one", "zeta one")
+    b = await _mk(db, "zeta onee", "zeta onee")
+    assert await entities_crud.enqueue_adjudication(db, entity_id=a, similar_entity_id=b) is True
+
+
+@pytest.mark.asyncio
+async def test_malformed_pending_payload_does_not_block_stale_flag_upgrade(db):
+    """The stale-recheck flag upgrade is the other json_extract site."""
+    await _queue_malformed(db)
+    a = await _mk(db, "zeta two", "zeta two")
+    b = await _mk(db, "zeta twoo", "zeta twoo")
+    assert await entities_crud.enqueue_adjudication(db, entity_id=a, similar_entity_id=b) is True
+    # Duplicate with the flag → no insert, flag stamped on the pending row.
+    assert (
+        await entities_crud.enqueue_adjudication(
+            db, entity_id=b, similar_entity_id=a, stale_recheck=True
+        )
+        is False
+    )
+    import json
+
+    rows = await db.execute_fetchall(
+        "SELECT id, payload_json FROM deferred_work_queue "
+        "WHERE work_type = 'entity_adjudication' AND status = 'pending'"
+    )
+    by_id = {r[0]: r[1] for r in rows}
+    assert by_id.pop("bad-1") == "{broken", "the malformed row must be left untouched"
+    (valid,) = by_id.values()
+    assert json.loads(valid)["stale_recheck"] is True, "the flag never reached the pending row"
+
+
+@pytest.mark.asyncio
+async def test_typed_lookup_never_returns_a_dead_end_tombstone(db):
+    """A merged cluster row whose redirect dead-ends is not a live identity;
+    returning it attached extraction work to a tombstone (Codex P2, #1729)."""
+    await _mk(db, "Atlas", "atlas", etype="person")
+    dead = await _mk(db, "Atlas", "atlas", etype="concept")
+    await _tombstone(db, dead, "no-such-entity")
+    from genesis.memory.entity_registry import _CONCEPT_CLUSTER
+
+    assert (
+        await entities_crud.get_by_norm_name_in_types(
+            db, norm_name="atlas", types=_CONCEPT_CLUSTER
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_typed_lookup_skips_a_dead_end_to_a_live_row(db):
+    """Regression guard: a live row of another type in the set wins over a
+    dead-end tombstone. (Active rows sort first, so this holds before and after
+    the candidate walk; the walk's own case is the all-merged test below.)"""
+    dead = await _mk(db, "Atlas", "atlas", etype="concept")
+    await _tombstone(db, dead, "no-such-entity")
+    live = await _mk(db, "Atlas", "atlas", etype="product")
+    from genesis.memory.entity_registry import _CONCEPT_CLUSTER
+
+    row = await entities_crud.get_by_norm_name_in_types(
+        db, norm_name="atlas", types=_CONCEPT_CLUSTER
+    )
+    assert row is not None and row["entity_id"] == live
+
+
+@pytest.mark.asyncio
+async def test_merged_norm_redirects_long_chain_resolves_every_link(db):
+    """Memoized resolution must give the same answer as walking each chain:
+    every merged link of a long chain redirects to the one survivor."""
+    ids = [await _mk(db, f"Link {i}", f"link {i}") for i in range(60)]
+    for i in range(59):
+        await _tombstone(db, ids[i], ids[i + 1])
+    redirects = await entities_crud.merged_norm_redirects(db)
+    for i in range(59):
+        assert redirects.get(f"link {i}") == [ids[59]]
+    assert "link 59" not in redirects
+
+
+@pytest.mark.asyncio
+async def test_typed_lookup_tries_the_next_merged_candidate(db):
+    """All candidates merged: a dead end sorting first must not hide a second
+    merged row that does resolve to a live survivor."""
+    dead = await _mk(db, "Atlas", "atlas", etype="concept")
+    await _tombstone(db, dead, "no-such-entity")
+    other = await _mk(db, "Atlas", "atlas", etype="product")
+    survivor = await _mk(db, "Atlas Prime", "atlas prime", etype="product")
+    await _tombstone(db, other, survivor)
+    from genesis.memory.entity_registry import _CONCEPT_CLUSTER
+
+    row = await entities_crud.get_by_norm_name_in_types(
+        db, norm_name="atlas", types=_CONCEPT_CLUSTER
+    )
+    assert row is not None and row["entity_id"] == survivor
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_concept_folds_past_a_dead_end_tombstone(db):
+    """Codex's own example, through the CALLER: extraction resolves with
+    entity_type="concept"; a same-type dead-end tombstone must not be accepted
+    when a live cluster row shares the norm (#1729 round-4 review)."""
+    from genesis.memory import entity_registry
+
+    dead = await _mk(db, "Atlas", "atlas", etype="concept")
+    await _tombstone(db, dead, "no-such-entity")
+    live = await _mk(db, "Atlas", "atlas", etype="product")
+    eid, _prov = await entity_registry.resolve_entity(
+        db, name="Atlas", entity_type="concept", aliases={}
+    )
+    assert eid == live, "a concept extraction attached to a dead-end tombstone"
