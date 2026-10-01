@@ -10936,7 +10936,11 @@ def _run_merge_and_push_gates() -> int:
                     # first push was already approved), so it can never authorize a
                     # genuine first push; a broken/absent push_allowlist degrades to
                     # the pure ls-remote path (import guarded to None above).
-                    urls = _remote_push_urls(push_remote, cwd=pcwd) if push_remote else set()
+                    # `_push_dest_urls`, not `_remote_push_urls`: a destination
+                    # spelled as a raw URL names no configured remote, and without
+                    # its URL the open-PR lookup below sees no target, answers None,
+                    # and the public-repo no-PR block never runs.
+                    urls = _push_dest_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
                     if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
