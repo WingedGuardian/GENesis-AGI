@@ -26,7 +26,10 @@ into the `morning-report-nextsteps` worktree; its transcript moved to a
 separate Claude Code project slug, so /resume from the main repo no longer
 listed it (11 such `wt-*` relocation stubs had accumulated).
 
-Stdlib-only. Fail-open on parse errors.
+Stdlib-only. A malformed hook payload fails open. A command that mentions a
+removal but cannot be read is refused, and so is one that runs a removal under
+`xargs` or `parallel` without naming the worktree or the operation, or hands the
+removal to a shell or `source` through stdin.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
@@ -175,14 +179,17 @@ _NOT_A_TEXT_CARRIER = (
     "with a payload the segment walk already sees, and a bare `uv` mention "
     "is not itself dangerous"
 )
+_NOT_A_NAME_CARRIER = (
+    "not a carrier by NAME: `analyze` flattens a shell's `-c` payload, and a file "
+    "argument is not text in this command; a shell reading its program from stdin "
+    "or a process substitution is a carrier through `_runs_unread_shell_text`"
+)
 _CARRIER_EXCLUDES: dict[str, str] = {
     **{name: _NOT_A_TEXT_CARRIER for name in (
         # package-manager `run` front-ends — subcommand-gated, not bare-name
         "uv", "uvx", "poetry", "hatch", "pdm", "pipenv", "rye",
-        # nested shells — visible argv, the carried command is not a hidden
-        # string the way `eval`/`-c` payloads are
-        "bash", "sh", "dash", "zsh", "ksh", "ash",
     )},
+    **{name: _NOT_A_NAME_CARRIER for name in ("bash", "sh", "dash", "zsh", "ksh", "ash")},
     # re-parse launchers beyond the five this set keeps — narrower scope than
     # _REPARSE_CARRIERS: only the spellings seen in worktree-adjacent corpora
     "runuser": "not seen carrying worktree-touching commands; _REPARSE_CARRIERS guards cover it",
@@ -201,6 +208,38 @@ _COMMAND_CARRIER = re.compile(
     r"(?:^|[\s;&|(])(?:" + "|".join(sorted(_CARRIER_NAMES)) + r")(?:\s|$)"
     r"|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{"
 )
+
+# Programs that can run SHELL TEXT the parser never read. A shell whose program
+# comes from stdin is one: through a pipe or a here-string the text sits in
+# another command's arguments, or (a here-string's word) in no segment at all.
+# So is a process substitution. Two are not. A shell given `-c`, because
+# `analyze` flattens that payload. A shell or `source` given a FILE, because the
+# removal would be in the file, not in this command's text, so the carrier
+# fallback would only mistake a later mention for a target.
+#
+# A shell fed a HERE-DOCUMENT is counted too, though the parser reads the body:
+# segments keep no redirects, so which shell a here-document feeds can only be
+# guessed from the raw text, and a guess made once for the whole command exempted
+# a piped shell next to it (review, round 1). Counting it costs a refusal when the
+# body only mentions the removal; MEASURED at 0 of 29,556 recorded commands.
+# Kept in step with `shell_parse._NESTED` by test_carrier_sets.
+_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "ash"})
+_SOURCERS = frozenset({"source", "."})
+# Long shell options that take the NEXT word as their value, so that word is not
+# the program operand. Short bundles count their `o`/`O` letters instead.
+_SHELL_LONG_OPTS_WITH_VALUE = frozenset({"--rcfile", "--init-file"})
+# Program operands that are stdin rather than a file.
+_STDIN_PROGRAMS = ("/dev/stdin", "/dev/fd/", "/proc/self/fd/")
+# `git worktree` operations. Under a word supplier, a first word that is not one of
+# these (an `xargs -I` placeholder, a `parallel` slot, an empty word) is read as an
+# operation this guard cannot see, and so is any word once a replace-string option is
+# present, since a placeholder can be spelled as an operation name.
+_WORKTREE_OPERATIONS = frozenset(
+    {"add", "list", "lock", "move", "prune", "remove", "repair", "unlock"}
+)
+# The launchers that can ADD words to the command they run, from stdin or a list.
+# `sudo`, `nice`, `timeout` and the like run `git` with exactly the words given.
+_WORD_SUPPLIERS = frozenset({"xargs", "parallel"})
 
 
 def _legacy_targets(cmd: str) -> list[str]:
@@ -256,25 +295,162 @@ def _extract_worktree_targets(segs: list) -> list[str]:
     """
     targets: list[str] = []
     for seg in segs:
-        if seg.exe != "git":
-            continue
-        # The INDEX from the parser's own scan, never `argv.index(_SUBCOMMAND)`:
-        # that returns the first token equal to the name, and a global option's
-        # operand can BE that name. `git -C worktree worktree remove /tmp/x` anchored on
-        # the `-C` operand, so `after_sub[0]` was the literal "worktree" instead of
-        # "remove", the segment was skipped, and a real removal was ALLOWED.
-        sub_idx = git_subcommand_index(seg.argv)
-        if sub_idx is None or seg.argv[sub_idx] != _SUBCOMMAND:
-            continue
-        after_sub = seg.argv[sub_idx + 1 :]
-        if not after_sub or after_sub[0] != _OPERATION:
-            continue
-        for token in after_sub[1:]:
-            if token.startswith("-"):
-                continue  # a flag such as --force
-            targets.append(token)
-            break  # the removal takes one path
+        operands = _removal_operands(seg)
+        if operands:
+            targets.append(operands[0])  # the removal takes one path
     return targets
+
+
+def _worktree_words(seg) -> list[str] | None:
+    """The words after ``git worktree`` in ``seg``, or ``None`` when ``seg`` is
+    not a ``git worktree`` segment.
+
+    ``analyze`` unwraps ``xargs`` to the ``git`` it runs but leaves ``parallel`` as
+    the executable, so for a ``parallel`` segment the ``git`` command is read from
+    its argv, starting at the first word that names ``git``.
+    """
+    argv = seg.argv
+    if seg.exe == "parallel":
+        starts = [i for i, w in enumerate(argv) if os.path.basename(w) == "git"]
+        if not starts:
+            return None
+        argv = argv[starts[0] :]
+    elif seg.exe != "git":
+        return None
+    # The INDEX from the parser's own scan, never `argv.index(_SUBCOMMAND)`:
+    # that returns the first token equal to the name, and a global option's
+    # operand can BE that name. `git -C worktree worktree remove /tmp/x` anchored on
+    # the `-C` operand, so `after_sub[0]` was the literal "worktree" instead of
+    # "remove", the segment was skipped, and a real removal was ALLOWED.
+    sub_idx = git_subcommand_index(argv)
+    if sub_idx is None or argv[sub_idx] != _SUBCOMMAND:
+        return None
+    return argv[sub_idx + 1 :]
+
+
+def _removal_operands(seg) -> list[str] | None:
+    """The non-flag words after ``git worktree remove`` in ``seg``, or ``None``
+    when ``seg`` is not that removal. An EMPTY list is a removal that names no
+    worktree — see ``_launcher_unread``."""
+    after_sub = _worktree_words(seg)
+    if not after_sub or after_sub[0] != _OPERATION:
+        return None
+    return [token for token in after_sub[1:] if not token.startswith("-")]
+
+
+def _fed_by_word_supplier(seg) -> bool:
+    """Whether ``git`` in ``seg`` runs under ``xargs`` or ``parallel``.
+
+    ``analyze`` strips wrappers from ``argv`` and keeps them in ``raw``, so the
+    words of ``raw`` include the wrappers that ran ``git``. Only a wrapper in
+    `_WORD_SUPPLIERS` can add the missing worktree or operation; ``sudo git
+    worktree remove`` with no path removes nothing. Every word is checked, dequoted
+    first since the parser resolves a quoted ``'xargs'`` too, and none ends the
+    scan: a wrapper's option value spelled ``git`` (``sudo -u git``) must not hide a
+    supplier after it. A word spelled like a supplier anywhere in the segment
+    counts, which errs toward refusing.
+    """
+    return any(os.path.basename(word.lstrip("({!")) in _WORD_SUPPLIERS for word in _raw_words(seg))
+
+
+def _raw_words(seg) -> list[str]:
+    """The words of ``seg.raw``, dequoted the way the shell reads them."""
+    try:
+        return shlex.split(seg.raw)
+    except ValueError:
+        return seg.raw.split()
+
+
+def _substitutes_words(seg) -> bool:
+    """Whether a replace-string option (``-I``, ``-i``, ``--replace``) is present, so
+    the supplier can rewrite any word of the command, an operation name included. A
+    word spelled like the option anywhere in the segment counts, which errs toward
+    refusing."""
+    return any(
+        w in ("-i", "--replace") or w.startswith(("-I", "--replace=")) for w in _raw_words(seg)
+    )
+
+
+def _launcher_unread(segs: list) -> str | None:
+    """What a launcher leaves unread in a ``git worktree`` segment it runs, if
+    anything: ``"worktree"`` for a removal that names no worktree, ``"operation"``
+    for a ``git worktree`` that names no operation. ``None`` otherwise.
+
+    That is how the rest of a removal arrives from outside the text: ``analyze``
+    unwraps ``xargs`` (and ``xargs -a``, ``xargs -0``) to the ``git`` it runs, so
+    the segment reads ``git worktree remove``, or just ``git worktree``, with the
+    rest still to come from stdin or a list. Refused because every direct removal
+    is refused, and nothing here can show this one is not a removal.
+
+    Only a segment run under ``xargs`` or ``parallel`` counts. ``git worktree
+    remove`` with no path removes nothing (git rejects it), and the same words in
+    markdown backticks inside a here-document parse as exactly that segment, which
+    is the house style for PR bodies and commit messages. Prose that names the
+    removal under ``xargs`` inside a here-document is still refused: the parser
+    keeps no here-document state, so it cannot be told from a body a shell runs.
+    """
+    for seg in segs:
+        after_sub = _worktree_words(seg)
+        if after_sub is None or not _fed_by_word_supplier(seg):
+            continue
+        words = [w for w in after_sub if not w.startswith("-")]
+        if not words or words[0] not in _WORKTREE_OPERATIONS or _substitutes_words(seg):
+            return "operation"
+        if words[0] == _OPERATION and len(words) == 1:
+            return "worktree"
+    return None
+
+
+def _program_is_unread(operand: str | None) -> bool:
+    """Whether a shell program operand is text the parser never read: stdin
+    (none given, ``-``, ``/dev/stdin``, ``/dev/fd/N``) or a process substitution,
+    which reaches the segment as a word starting with ``(``."""
+    if operand is None or operand == "-":
+        return True
+    return operand.startswith("(") or operand.startswith(_STDIN_PROGRAMS)
+
+
+def _runs_unread_shell_text(seg) -> bool:
+    """Whether ``seg`` runs shell text the parser did not read.
+
+    ``source`` and ``.`` run their first operand, after an optional ``--``. A shell runs its ``-c``
+    payload, which ``analyze`` flattens when the bundle starts with ``-``, so
+    that shell is not a carrier; the same letter after ``+`` also runs the
+    payload but is not flattened, so that shell is. Otherwise a shell reads its
+    program from stdin when given ``-s`` or no program operand, and from its first
+    operand when there is one. Only the options before that operand are read, so
+    a ``-c`` meant for a script is not mistaken for the shell's own.
+    """
+    if seg.exe in _SOURCERS:
+        operands = seg.argv[1:]
+        if operands[:1] == ["--"]:
+            operands = operands[1:]
+        return bool(operands) and _program_is_unread(operands[0])
+    if seg.exe not in _SHELLS:
+        return False
+    args = seg.argv[1:]
+    i = 0
+    operand = None
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg in ("-", "--"):
+            operand = args[i] if i < len(args) else None
+            break
+        if arg.startswith("--"):
+            if arg in _SHELL_LONG_OPTS_WITH_VALUE:
+                i += 1
+            continue
+        if not arg.startswith(("-", "+")):
+            operand = arg
+            break
+        bundle = arg[1:]
+        if "c" in bundle:
+            return arg[0] == "+"
+        if arg[0] == "-" and "s" in bundle:
+            return True
+        i += bundle.count("o") + bundle.count("O")
+    return _program_is_unread(operand)
 
 
 def _carries_a_command(cmd: str, segs: list) -> bool:
@@ -291,8 +467,12 @@ def _carries_a_command(cmd: str, segs: list) -> bool:
     segment's executable by this point, so consulting it closes the whole list at
     once, for every spelling of a path, with no new name to guess. The regex is
     still consulted because a shell function definition has no executable at all.
+
+    A shell or ``source`` that runs text the parser did not read counts too (see
+    ``_runs_unread_shell_text``): piping or here-stringing a removal into ``bash``
+    puts it in text no segment carries. One given a file does not.
     """
-    if any(seg.exe in _CARRIER_NAMES for seg in segs):
+    if any(seg.exe in _CARRIER_NAMES or _runs_unread_shell_text(seg) for seg in segs):
         return True
     return bool(_COMMAND_CARRIER.search(cmd))
 
@@ -374,6 +554,57 @@ def _block_no_direct_removal(target: str) -> int:
     print(
         "The lifecycle manager runs daily via cron. To manually trigger: "
         "python scripts/worktree_lifecycle.py --dry-run",
+        file=sys.stderr,
+    )
+    if discarded_write is not None:
+        discarded_write.warn()
+    return 2
+
+
+_UNREAD_REASONS = {
+    "worktree": (
+        "this command has `git worktree remove` under `xargs` or `parallel` with no "
+        "worktree after it, so if it runs, the worktree comes from stdin or a list"
+    ),
+    "operation": (
+        "this command has `git worktree` under `xargs` or `parallel` with no "
+        "operation written out after it, so if it runs, the operation and the "
+        "worktree can come from stdin or a list"
+    ),
+    "mention": (
+        "this command names removing a worktree inside text that a shell or "
+        "another program may run (a string passed to `eval`, `ssh` or a similar "
+        "carrier, a program a shell reads from stdin, or text the "
+        "tokenizer cannot read), and names no worktree after it"
+    ),
+}
+
+
+def _block_unread_target(kind: str) -> int:
+    """Refuse a removal whose worktree this guard cannot read.
+
+    Each reason states only what the guard saw, because every one of them can
+    fire on prose (next to a carrier, or in a here-document the parser reads as
+    commands): none names a target or asserts that a removal runs, and the remedy
+    for text that is not a command is given.
+    The self-CWD and cross-session checks are skipped because there is no path to
+    resolve; the refusal is unconditional.
+    """
+    print(
+        f"BLOCKED: {_UNREAD_REASONS[kind]}, so this guard cannot read which "
+        "worktree it would remove, or whether it removes one.",
+        file=sys.stderr,
+    )
+    print(
+        "Direct worktree removal is disabled: the lifecycle manager "
+        "(scripts/worktree_lifecycle.py) cleans worktrees up through a trash bin "
+        "with 7-day recovery.",
+        file=sys.stderr,
+    )
+    print(
+        "If this text is not a command (a line in a here-document, a message, a "
+        "search pattern), write it to a file with the Write tool and pass the file "
+        "instead.",
         file=sys.stderr,
     )
     if discarded_write is not None:
@@ -477,10 +708,25 @@ def _handle_bash(data: dict) -> int:
         if discarded_write is not None:
             discarded_write.warn()
         return 2
+    # `unread`: why this guard cannot read the worktree a command may remove,
+    # as a key of `_UNREAD_REASONS`, or None. Every direct removal is refused
+    # whatever it targets, so an unreadable target is refused as well, through
+    # `_block_unread_target`. Before this, each branch below fell through to "no
+    # target, allow" in exactly those cases.
+    unread: str | None = None
     if untokenizable(cmd):
         targets = _legacy_targets(cmd)
+        # The coarse reader looks forward from the phrase; a target that arrives
+        # BEFORE it (on stdin) or not at all leaves it empty.
+        if not targets:
+            if mentions(cmd, _WORKTREE_REMOVE, _GIT_TOKEN):
+                unread = "mention"
+            else:
+                unread = _launcher_unread(segs)
     else:
         targets = _extract_worktree_targets(segs)
+        if not targets:
+            unread = _launcher_unread(segs)
         # The text says a removal and the parser found none, in a command that
         # hands a command STRING to something. That is the carrier class: it
         # tokenizes cleanly, so the probe above cannot see it, and the parser
@@ -509,6 +755,7 @@ def _handle_bash(data: dict) -> int:
         # than restated for a gate it no longer describes.
         if (
             not targets
+            and not unread
             # The view throughout: a word split by quotes or backslashes inside a
             # carried payload still names the removal to the shell that runs it,
             # and the coarse reader must find the target in that same text.
@@ -516,8 +763,14 @@ def _handle_bash(data: dict) -> int:
             and _carries_a_command(cmd, segs)
         ):
             targets = _view_targets(cmd)
+            # The carrier gate fired and the reader found no word after the
+            # phrase. Either the carried text takes its target from outside
+            # (`eval 'xargs <removal>'` fed on stdin) or it is not a removal at
+            # all; nothing here can tell which, so it is refused either way.
+            if not targets:
+                unread = "mention"
     if not targets:
-        return 0
+        return _block_unread_target(unread) if unread else 0
 
     # Get the current working directory
     cwd = os.getcwd()

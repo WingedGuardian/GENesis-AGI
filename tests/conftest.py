@@ -248,6 +248,11 @@ def _isolate_alert_queue(tmp_path):
         "genesis.env.alert_queue_root",
         lambda: tmp_path / "alerts" / "queue",
     )
+    # The awareness tick also reads the root Tailscale watchdog's /run file and
+    # asks systemd about its timer; a real event or a real timer on the test
+    # machine must not become an observation.
+    mp.setenv("GENESIS_TSWD_STATE_FILE", str(tmp_path / "no-tailscale-watchdog.json"))
+    mp.setenv("GENESIS_TSWD_SYSTEMCTL", "/bin/false")
     yield
     mp.undo()
 

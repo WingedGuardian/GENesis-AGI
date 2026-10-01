@@ -132,7 +132,9 @@ later restarts the procedure (step 5).
      with nothing to compare against. It cannot move later either: step 3 replaces the CLI, so this
      is the last point at which the old binary is still installed. See §Model-alias drift below for
      the invocation; the post-align half is step 4.
-2. **Deploy current `main` FIRST** — `scripts/update.sh` as a **background task**, BEFORE aligning
+2. **Deploy current `main` FIRST** — `scripts/update.sh` **detached from the session** (the
+   `systemd-run --user` recipe in the genesis-development skill's Timeout Policy; NOT
+   `run_in_background`, which is session-bound and has killed deploys mid-run), BEFORE aligning
    the candidate, so the soak runs on current code. Otherwise step 8 lands accumulated Genesis change
    AND the CC bump together and you cannot attribute a regression to either.
    **Checkable skip condition — three parts, all required:** `git fetch origin` first (an unfetched
@@ -219,7 +221,8 @@ later restarts the procedure (step 5).
    CC-Gate-Soak: <candidate> on container <start>..<end>, check_cc_running_versions.sh clean, sign-off recorded
    ```
 8. **Host-Deploy Gate** — in the SAME session after merge, run `scripts/update.sh` from `~/genesis`
-   as a **background task** (deploys exceed the Bash tool timeout): it aligns the **container**
+   **detached from the session** (same recipe as step 2 — deploys exceed the Bash tool's hard
+   ceiling, and `run_in_background` is session-bound): it aligns the **container**
    (`cc_ensure_local`) AND the **host VM** (guardian `update-cc` op) to the pin, idempotently.
    Note the nightly `genesis-cc-align.timer` is **host-only** — `cc_align_host.sh` calls
    `cc_align_host_sync` and never `cc_ensure_local`, so it closes HOST drift between updates and

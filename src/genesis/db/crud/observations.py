@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import logging
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -298,8 +299,20 @@ def _compute_ttl(obs_type: str) -> timedelta | None:
     """Look up TTL for an observation type.
 
     Returns None only for types in _PERMANENT_TYPES. All other unknown
-    types get _DEFAULT_TTL (14 days) with a warning log.
+    types get _DEFAULT_TTL (14 days) with a warning log. A namespaced
+    ``untrusted:<type>`` gets ``<type>``'s TTL, and never None.
     """
+    from genesis.memory.provenance import UNTRUSTED_OBS_PREFIX
+
+    if obs_type.startswith(UNTRUSTED_OBS_PREFIX):
+        # A row written by an untrusted session keeps its original type's TTL,
+        # but never permanent retention: that is for Genesis's own records. The
+        # type is free-form, so a repeated prefix is stripped in a loop.
+        base = obs_type
+        while base.startswith(UNTRUSTED_OBS_PREFIX):
+            base = base[len(UNTRUSTED_OBS_PREFIX):]
+        return _DEFAULT_TTL if base in _PERMANENT_TYPES else _compute_ttl(base)
+
     if obs_type in _PERMANENT_TYPES:
         return None
 
@@ -458,6 +471,43 @@ def create_sync(
     Returns True when a row was written, False when it was deduped away or the
     write failed. Callers that need the block to hold regardless MUST NOT treat
     False as a reason to stop — recording is observability, never authorization.
+    A caller that must tell a dedup from a failure uses ``create_sync_status``.
+    """
+    return (
+        create_sync_status(
+            db_path,
+            source=source,
+            type=type,
+            content=content,
+            priority=priority,
+            category=category,
+            content_hash=content_hash,
+            origin_class=origin_class,
+            skip_if_duplicate=skip_if_duplicate,
+            timeout=timeout,
+        )
+        == "written"
+    )
+
+
+def create_sync_status(
+    db_path: str,
+    *,
+    source: str,
+    type: str,
+    content: str,
+    priority: str,
+    category: str | None = None,
+    content_hash: str | None = None,
+    origin_class: str | None = None,
+    skip_if_duplicate: bool = True,
+    timeout: float = 1.0,
+) -> str:
+    """``create_sync``, returning ``"written"``, ``"duplicate"`` or ``"failed"``.
+
+    For a caller that retries only a write that FAILED: a duplicate means an
+    unresolved row with this hash is already recorded, and retrying it would
+    repeat the write attempt forever. Never raises.
     """
     try:
         from genesis.db.connection import connect_sqlite_rw
@@ -512,11 +562,11 @@ def create_sync(
                     params,
                 )
             conn.commit()
-            return cur.rowcount > 0
+            return "written" if cur.rowcount > 0 else "duplicate"
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 - observability must never break its caller
-        return False
+        return "failed"
 
 
 async def upsert(
@@ -1038,6 +1088,9 @@ async def resolve_by_source_and_type(
     resolved_at: str,
     resolution_notes: str,
     category: str | None = None,
+    content_hashes: Collection[str] | None = None,
+    exclude_content_hashes: Collection[str] | None = None,
+    priority: str | None = None,
 ) -> int:
     """Resolve all unresolved observations matching a source + type pair.
 
@@ -1048,8 +1101,15 @@ async def resolve_by_source_and_type(
     clear every matching row regardless of category (including legacy
     NULL-category rows).
 
+    ``content_hashes`` narrows it further to exactly those rows; an EMPTY
+    collection resolves nothing (it names no row), which is different from
+    omitting it. ``exclude_content_hashes`` leaves those rows open, and
+    ``priority`` narrows to one priority.
+
     Returns the number of rows resolved.
     """
+    if content_hashes is not None and not content_hashes:
+        return 0
     sql = (
         "UPDATE observations SET resolved = 1, resolved_at = ?, "
         "resolution_notes = ? "
@@ -1059,6 +1119,17 @@ async def resolve_by_source_and_type(
     if category is not None:
         sql += " AND category = ?"
         params.append(category)
+    if content_hashes is not None:
+        wanted = sorted(set(content_hashes))
+        sql += f" AND content_hash IN ({','.join('?' for _ in wanted)})"
+        params += wanted
+    if exclude_content_hashes:
+        unwanted = sorted(set(exclude_content_hashes))
+        sql += f" AND content_hash NOT IN ({','.join('?' for _ in unwanted)})"
+        params += unwanted
+    if priority is not None:
+        sql += " AND priority = ?"
+        params.append(priority)
     cursor = await db.execute(sql, params)
     await db.commit()
     return cursor.rowcount
@@ -1089,6 +1160,66 @@ async def resolve_by_content_hash(
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def latest_by_hash(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_hash: str,
+) -> dict | None:
+    """The newest observation for ONE ``(source, content_hash)``, resolved or
+    not, or None. For a writer whose rows are one alert per subject and that
+    decides between raising, reopening and leaving it by the latest row's
+    state (``unresolved_by_hash`` sees only open rows)."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM observations WHERE source = ? AND content_hash = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (source, content_hash),
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def reopen(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    expires_at: str | None = None,
+) -> bool:
+    """Mark a resolved observation unresolved again, clearing its resolution
+    and setting ``expires_at``. ``surfaced_at`` is left as it is, so a row
+    that already paged does not page again. True if a resolved row changed."""
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 0, resolved_at = NULL, "
+        "resolution_notes = NULL, expires_at = ? WHERE id = ? AND resolved = 1",
+        (expires_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def update_content(db: aiosqlite.Connection, id: str, content: str) -> bool:
+    """Rewrite an UNRESOLVED observation's content, e.g. a condition alert
+    whose details changed while it stays open. ``content_hash`` and
+    ``surfaced_at`` are untouched, so it neither dedups differently nor pages
+    again. True if a row changed."""
+    cursor = await db.execute(
+        "UPDATE observations SET content = ? WHERE id = ? AND resolved = 0 AND content != ?",
+        (content, id, content),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def set_expires_at(db: aiosqlite.Connection, id: str, expires_at: str | None) -> bool:
+    """Move an UNRESOLVED observation's expiry, e.g. to keep a condition alert
+    alive for a window after it was last confirmed. True if a row changed."""
+    cursor = await db.execute(
+        "UPDATE observations SET expires_at = ? WHERE id = ? AND resolved = 0",
+        (expires_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def supersede_except_hash(

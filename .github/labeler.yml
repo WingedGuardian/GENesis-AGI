@@ -62,6 +62,7 @@ gate-surface:
           - 'scripts/external_review.py'
           - 'scripts/lib/gate_menu.py'
           - 'scripts/review_budget.py'
+          - 'scripts/review_findings.py'
           - 'src/genesis/session_awareness/external_review.py'
           - 'src/genesis/session_awareness/external_review_config.py'
 

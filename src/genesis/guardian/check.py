@@ -1023,7 +1023,8 @@ async def _check_pool_relief(
         acted = outcome.split(":", 1)[0] in (
             "deleted", "delete_failed", "list_failed", "no_target", "state_unwritable",
             "unmeasured", "ambiguous_pool", "no_signal", "delete_indeterminate",
-            "lifeline_protected", "pool_changed",
+            "lifeline_protected", "pool_changed", "extended", "extend_indeterminate",
+            "early_no_target", "extend_stopped",
         )
         (logger.warning if acted else logger.info)("pool relief: %s", outcome)
     except Exception as exc:
