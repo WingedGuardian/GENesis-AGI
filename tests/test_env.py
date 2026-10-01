@@ -301,7 +301,7 @@ class TestEmbedLocalFirst:
         self._config(monkeypatch, {"memory": {"embed_local_first": "false"}})
         assert env_mod.embed_local_first() is False
 
-    @pytest.mark.parametrize(("value", "expected"), [("true", True), ("false", False), ("", False)])
+    @pytest.mark.parametrize(("value", "expected"), [("true", True), ("false", False)])
     def test_env_overrides_local_config(
         self, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
     ):
@@ -310,6 +310,48 @@ class TestEmbedLocalFirst:
         self._config(monkeypatch, {"memory": {"embed_local_first": not expected}})
         monkeypatch.setenv("GENESIS_EMBED_LOCAL_FIRST", value)
         assert env_mod.embed_local_first() is expected
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    @pytest.mark.parametrize("yaml_value", [True, False])
+    def test_an_empty_env_value_is_unset_and_defers_to_yaml(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, yaml_value: bool
+    ):
+        """The memory MCP child drops empty secrets.env values before they reach
+        its environment; the main runtime keeps them. Both must therefore read
+        "" as unset, or the two processes resolve one setting apart."""
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {"memory": {"embed_local_first": yaml_value}})
+        monkeypatch.setenv("GENESIS_EMBED_LOCAL_FIRST", value)
+        assert env_mod.embed_local_first() is yaml_value
+
+    @pytest.mark.parametrize("yaml_value", [True, False])
+    def test_ollama_enabled_treats_an_empty_env_value_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch, yaml_value: bool
+    ):
+        """Same rule: this lever decides whether Ollama joins the embedding chain."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(
+            env_mod, "_LOCAL_CONFIG", {"network": {"ollama_enabled": yaml_value}}
+        )
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "")
+        assert env_mod.ollama_enabled() is yaml_value
+
+    @pytest.mark.parametrize("yaml_value", [True, False])
+    def test_priority_tier_treats_an_empty_env_value_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch, yaml_value: bool
+    ):
+        """Same rule for the sibling lever, which the MCP child now also loads."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(
+            env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": yaml_value}}
+        )
+        monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", "")
+        assert env_mod.embed_priority_tier() is yaml_value
 
 
 class TestEmbedPriorityTier:
