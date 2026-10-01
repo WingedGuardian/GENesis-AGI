@@ -801,7 +801,7 @@ else
 fi
 
 if [ -n "$HOOKS_DST" ]; then
-    for hook in pre-commit pre-push; do
+    for hook in pre-commit pre-push pre-merge-commit; do
         if [ -f "$HOOKS_SRC/$hook" ]; then
             cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
             chmod +x "$HOOKS_DST/$hook"
@@ -834,14 +834,18 @@ CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
-# Watchgod config — 500MB budget, 150MB sacred ground
+# Watchgod config. The watchgod (scripts/tmp_watchgod.sh) guards whole
+# filesystems and measures cc-tmp's real capacity itself — statvfs plus the
+# btrfs quota on the volume — so the only thing it needs from here is where
+# cc-tmp lives. The v1 keys this block used to write (a 500 MB budget, a
+# "sacred ground", a hand-propagated volume capacity) are gone with the budget
+# they served. Install-local overrides — observe mode, thresholds, extra
+# watched paths — belong in watchgod.local.conf, which nothing regenerates.
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
 WEOF
-echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "    + CC temp: ${CC_TMP_DIR}"
 
 # Auto-cd to genesis on login so Claude Code finds the project (slash
 # commands, hooks, .claude/settings.json all depend on cwd = project root)
@@ -946,13 +950,11 @@ if [ -f "$_cc_env" ]; then
     # travels on CC_SUPPRESSION_STATE and used to be dropped here entirely. A
     # warning suffices at this step — step 12 makes the authoritative call and
     # sets SETUP_WARNINGS if it still cannot verify.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "    WARNING: CC auto-updater suppression not verified yet" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list.
+    if ! cc_suppression_verified; then
+        echo "    WARNING: CC auto-updater suppression not verified yet" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — step 12 will retry"
+    fi
 fi
 
 echo "  [7/$TOTAL_STEPS] Generating systemd service files from templates..."
@@ -1106,6 +1108,12 @@ if command -v claude &>/dev/null; then
     fi
     command -v serena &>/dev/null && \
         _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+    # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
+    # repos. Registered under a Genesis-owned name, not the generic `grep`, so
+    # an operator's own grep server is never touched.
+    # No API key and no local binary, so nothing to gate on `command -v`: it is
+    # a remote endpoint. User scope so worktree sessions get it too.
+    _register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 fi
 
 # Queue initial code intelligence indexing — write an index-request marker for
@@ -1395,9 +1403,10 @@ fi
 # No daemon-reload here: the unconditional one above covers this block, and
 # nothing writes into $SYSTEMD_USER_DIR between the two.
 #
-# Failing to arm this is SURFACED rather than skipped in silence. cc-tmp filling
-# is what kills CC sessions and this unit is what watches it, so an install that
-# quietly ends with temp protection off is the failure mode worth shouting about
+# Failing to arm this is SURFACED rather than skipped in silence. A full disk (or
+# a full cc-tmp quota) breaks every session at once and this unit is what watches
+# for it, so an install that quietly ends with that guard off is the failure mode
+# worth shouting about
 # — and it is how the bug above stayed hidden. This is also the only place in
 # the repo that enables this unit, so nothing retries a failure here.
 if [ -f "$SYSTEMD_USER_DIR/genesis-tmp-watchgod.service" ]; then
@@ -1594,8 +1603,10 @@ if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
     echo "    + Suppressed CC native installer prompt (npm-only)"
 fi
 
-# Seed user-level ~/.claude/settings.json with two CC defaults: (1) suppress the
-# auto-updater, and (2) Genesis's subagent-nesting depth. CC 2.1.217+ made nested
+# Seed user-level ~/.claude/settings.json with CC defaults: (1) suppress the
+# auto-updater, (2) Genesis's subagent-nesting depth and MCP description cap, and
+# (3) the claude.ai skills/plugins sync opt-out, each only where nothing of that
+# kind is synced yet (see cc_reconcile_container_settings). CC 2.1.217+ made nested
 # subagent spawning opt-in (default 1 = no nesting); Genesis allows ONE level
 # (session->subagent->subagent = 3 tiers) via CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2.
 # Repo-level .claude/settings.json is NOT sufficient — it only applies when CC is
@@ -1609,8 +1620,13 @@ _settings_file="$HOME/.claude/settings.json"
 #     scripts/lib/cc_version.sh — the SAME function the align path and the
 #     genesis-cc-settings-align timer re-run, so setup and steady state cannot
 #     drift apart);
-#   * the container-only subagent-nesting default is SET IF ABSENT, so a
-#     deliberate operator override (0 to disable, or higher) is preserved.
+#   * the container defaults (subagent nesting, the MCP description cap, and the
+#     claude.ai skills/plugins sync opt-outs where nothing was synced when checked) are SET
+#     IF ABSENT, so a deliberate operator value is preserved. The list — and its
+#     rationale, including CC's trash-on-disable behaviour for synced skills and
+#     plugins — lives in scripts/lib/cc_version.sh (cc_reconcile_container_settings),
+#     because every container reconcile path runs the same function; this call is
+#     one of them, not the only one.
 # One call so BOTH policies share a single write contract (mode/xattr carry-over,
 # compare-and-swap, fsync) instead of this file keeping a second, weaker copy of
 # it. Note what this does NOT claim: on a fresh install the file is still touched
@@ -1621,7 +1637,7 @@ _settings_file="$HOME/.claude/settings.json"
 # rewrites settings.json), not this ordering.
 # (The host VM's recovery `claude -p` is single-brain and never nests, so
 # host-setup.sh deliberately passes no nesting default.)
-if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2"; then
+if cc_reconcile_container_settings "$_settings_file"; then
     # rc 0 now means VERIFIED (a post-operation read confirmed the keys), so
     # "verified" is finally true here. The nesting default is deliberately not
     # claimed on this line: on the python3-less create path it is NOT applied
@@ -1631,7 +1647,19 @@ if cc_ensure_updater_suppressed "$_settings_file" "CLAUDE_CODE_MAX_SUBAGENT_SPAW
 else
     echo "    WARNING: Could not write CC settings in $_settings_file"
     echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\","
-    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\"}}"
+    echo "                            \"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH\": \"2\","
+    # Only the sync opt-outs cc_reconcile_container_settings did NOT hold back: an
+    # opt-out withheld because something is already synced must not be suggested
+    # here either — pasting it would retire the synced items the check protected.
+    _sync_hint=""
+    for _pair in "${CC_CLAUDE_AI_SYNC_OPTOUTS[@]}"; do
+        _k="${_pair#*:}"
+        case " ${CC_SYNC_OPTOUT_WITHHELD[*]:-} " in
+            *":${_k}:"*) continue ;;
+        esac
+        _sync_hint="${_sync_hint}, \"${_k}\": false"
+    done
+    echo "                            \"CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH\": \"${CC_MCP_DESCRIPTION_LIMIT:-8192}\"}${_sync_hint}}"
     setup_warn "could not write Claude Code settings in $_settings_file"
 fi
 

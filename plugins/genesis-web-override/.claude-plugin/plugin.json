@@ -1,0 +1,5 @@
+{
+  "name": "genesis-web-override",
+  "version": "0.1.0",
+  "description": "Answers Claude Code's built-in WebSearch with Genesis's web_search chain, falling back to the built-in on any failure. Needs CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1."
+}

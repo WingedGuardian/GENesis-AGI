@@ -106,6 +106,30 @@ is robustness (a hung fetch no longer extends an outage), not a downtime rewrite
   keep their own restart/exit semantics; the stop still precedes the merge.
 - `bash -n` clean; the 3 BEGIN/END marker blocks stay intact and isolated.
 
+## Success records name a server that did not come back (2026-09-30)
+
+A change at the success writers, outside the pre-stop window: every `success` row
+(P6 and both no-change writers) builds its degraded value through
+`_success_degraded_subsystems`, so each can carry `genesis-server-not-restarted`.
+P6 decides it by whether genesis-server was in `WERE_RUNNING` (not by
+`_OPERATOR_STOP`, which is true only when `WERE_RUNNING` is entirely empty). A
+bridge-only run does not reach P6's success writer at all today: its health gate
+checks genesis-server whenever `WERE_RUNNING` is non-empty, and rolls back. The
+no-change path, which has no health loop, decides it with `_server_health_ok`:
+P6's per-attempt probe, retried while the unit reports itself starting (or while a
+direct-started process lives), bounded by elapsed time at 180s. Unit state alone is
+not used, because a crash-looping unit reads `activating`. The no-change path writes a row
+only to persist a degradation, as before, and with the server down only over
+nothing-recorded or a prior `success` (an allowlist): any other latest status
+stays the latest. The no-change path and P6 read the last status through one
+reader (`_latest_update_status`), which reads the install's own database with any
+stdlib interpreter and reports `unreadable` rather than "nothing recorded" when it
+cannot tell.
+
+No reader of `update_history` consults `degraded_subsystems` today, so the marker
+informs a human reading the history; it does not yet change what the deploy-state
+readers treat as deployed.
+
 ## New test — phase-order lock
 
 `tests/test_scripts/test_update_phase_order.py` (extraction-style, reads the

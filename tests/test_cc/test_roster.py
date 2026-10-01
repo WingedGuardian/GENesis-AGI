@@ -274,6 +274,38 @@ def test_apply_routing_env_auth_token_only_still_drops_api_key():
     assert env["ANTHROPIC_AUTH_TOKEN"] == "zk-secret"
 
 
+def test_apply_routing_env_peer_sets_subagent_model_force():
+    """Peer routing pins CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1.
+
+    CC 2.1.251 demoted CLAUDE_CODE_SUBAGENT_MODEL from override-everything to
+    default-only: an agent definition's ``model:`` frontmatter (four shipped
+    agents carry ``model: sonnet``) now outranks it, so a subagent spawned
+    while routed to a peer would ask the peer endpoint for an alias it cannot
+    resolve — the exact model-not-found the slot exists to prevent. CC 2.1.257
+    added the _FORCE switch restoring override semantics. MEASURED against the
+    2.1.280 binary (2026-09-22): it is a SWITCH, not a model slot — the binary
+    logs 'Workflow agent model X ignored: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is
+    set' — so it is set to "1", never to the model id. Inert on <=2.1.246
+    (unknown var), binding from 2.1.257.
+    """
+    env: dict[str, str] = {}
+    R.apply_routing_env(
+        env,
+        base_url="https://peer.example/anthropic",
+        auth_token="zk-peer",
+        model_id="peer-model-x",
+    )
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
+
+
+def test_apply_routing_env_native_pops_subagent_model_force():
+    # Un-routing must clear the switch too, or a reused env would force the
+    # (now absent) subagent model slot on a native invocation.
+    env = {"CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"}
+    R.apply_routing_env(env, base_url=None, auth_token=None, model_id=None)
+    assert "CLAUDE_CODE_SUBAGENT_MODEL_FORCE" not in env
+
+
 def test_shipped_config_ships_no_peers():
     """DELIVERABLE LOCK: config/cc_roster.yaml ships INFRASTRUCTURE, not peers.
 

@@ -112,9 +112,9 @@ the reasoning trail, and per-section status markers are a convention every
 future edit must remember, which is the shape that drifts.
 
 **One known collision, named rather than left to be discovered.**
-`config/gstack-patches/codex-SKILL.md` instructs its review flow to append a
-`## GSTACK REVIEW REPORT` section and "always place it as the very last section
-in the plan file" — i.e. below the divider. The divider governs *plan content*;
+gstack's plan-review skills (its `codex` skill among them) instruct their review
+flow to append a `## GSTACK REVIEW REPORT` section as the last section of the
+plan file — i.e. below the divider. The divider governs *plan content*;
 a tool-appended status block at end-of-file is not plan content and is current
 by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.

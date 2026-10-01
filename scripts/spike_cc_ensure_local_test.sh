@@ -32,7 +32,7 @@ FAIL_DETAILS=()
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CC_ENV="$SCRIPT_DIR/lib/cc_version.sh"
-mkdir -p "$HOME/tmp"   # NEVER the default $TMPDIR (= CC's watchgod-policed cc-tmp)
+mkdir -p "$HOME/tmp"   # NEVER the default $TMPDIR (= CC's quota-capped cc-tmp)
 SANDBOX="$(mktemp -d -p "$HOME/tmp" cc_ensure_test.XXXXXX)"
 trap 'rm -rf "$SANDBOX"' EXIT
 

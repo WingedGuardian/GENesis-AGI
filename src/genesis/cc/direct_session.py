@@ -96,15 +96,13 @@ def _write_result_artifact(session_id: str, raw: str) -> str | None:
 # Per-session CC Bash-sandbox isolation (background dispatch sessions)
 # ---------------------------------------------------------------------------
 # By default a background session's CC Bash sandbox (CLAUDE_CODE_TMPDIR) lives in
-# the shared, watchgod-policed ~/.genesis/cc-tmp. Giving each session its OWN
-# sandbox under ~/tmp (OFF cc-tmp) means (a) its scratch can't be clipped by
-# tmp_watchgod's RED nuclear-cleanup mid-run, and (b) it stops contributing to
-# cc-tmp pressure that could trip cleanup of foreground CLI sessions. Mirrors the
+# the shared, quota-capped ~/.genesis/cc-tmp. Giving each session its OWN
+# sandbox under ~/tmp (OFF cc-tmp) means its scratch cannot fill the volume
+# every foreground CLI session's temp shares. (v1 of tmp_watchgod also deleted
+# from cc-tmp under a budget; v2 only sweeps what ended sessions left.) Mirrors the
 # gauntlet (eval/gauntlet.py). This overrides CLAUDE_CODE_TMPDIR — the CC-specific
 # per-invocation sandbox var — NOT the shell TMPDIR, which the `tmp_filesystem_limit`
-# procedure correctly says never to override globally. (It does NOT prevent a
-# "kill": background sessions are asyncio subprocesses, not tmux sessions, so
-# watchgod's tmux-kill can't reach them anyway — do not claim otherwise.)
+# procedure correctly says never to override globally.
 _BG_CC_TMP_ROOT = Path.home() / "tmp" / "bg-cc-sessions"
 
 
@@ -344,10 +342,19 @@ PROFILES: dict[str, list[str]] = {
     # ── Steward profile ──────────────────────────────────────────
     # For the upstream-PR stewardship campaign. UNIQUE among profiles: it
     # grants Bash (so it can run `gh`) — every other profile blocks Bash.
-    # The shell is NOT open, though: scripts/bash_safety_hook.sh restricts it
-    # to the `gh` binary only (via GENESIS_BASH_ALLOWLIST). Write/Edit/browser
-    # stay blocked — the campaign comments/reopens/closes PRs and ESCALATES
-    # code fixes rather than editing/pushing itself.
+    # `GENESIS_BASH_ALLOWLIST` restricts the first token to `gh`, and that
+    # restriction is now actually ENFORCED — by the guard the invoker injects
+    # into the dispatch's settings, NOT by scripts/bash_safety_hook.sh, which
+    # this repository wires nowhere. Write/Edit/browser stay blocked.
+    #
+    # READ THIS BEFORE RELYING ON IT: a first-token allowlist bounds which
+    # BINARY runs, not what the session can do. The permitted binary writes
+    # files to caller-chosen paths and makes authenticated API calls, so this
+    # profile is NOT confined to commenting — the tool blocks describe the
+    # TOOLS, not the capability. Treat it as a session acting with the
+    # operator's credentials and filesystem access, which matters because it
+    # also ingests external, attacker-authored PR content. A subcommand-level
+    # allowlist is what would make "confined" true.
     "steward": (
         [t for t in _UNIVERSAL_DISALLOW if t != "Bash"]
         + _NO_BROWSER_INTERACTION
@@ -1667,6 +1674,7 @@ class DirectSessionRunner:
             strict_mcp_config=strict_mcp,
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
             roster_eligible=roster_eligible,
+            caller_tag=f"direct_session.{request.profile}",
             **routing,
         )
 

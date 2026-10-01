@@ -1,0 +1,1 @@
+- Every proactive memory recall now leaves a retrieval trace: which retriever (vector, full-text, event, graph) found each candidate and at what rank, its fused, rerank and final scores, and whether it was injected or dropped (and why). Traces are written in the background, kept 14 days, and can be switched off with `proactive.trace: off` in `config/memory_recall.yaml`.

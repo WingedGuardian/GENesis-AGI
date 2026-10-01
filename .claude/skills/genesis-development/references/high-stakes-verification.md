@@ -271,3 +271,85 @@ opens the resource under investigation joins the population you are measuring.
 Prefer read-only surfaces (`/proc`, filesystem metadata) and say so in the
 docstring, or you will spend a round distinguishing your own footprints from
 the defect's.
+
+## 11. Audit your CLAIMS, not only your code
+
+A green suite is the PRECONDITION for this pass, never its result. The tests
+check what the code does; nothing checks the sentences you wrote ABOUT what it
+does — and those are what the next session builds on, because permanent record
+has no tone of voice.
+
+**Scope, because this file opens by saying it is not for ordinary work.** This
+section is the exception: it fires whenever a session wrote a NUMBER or a DATED
+status claim into permanent record, on ordinary work too. That predicate is
+deliberately narrow — every wrap-up asserts SOMETHING, so a trigger on "status
+assertions" would fire always and therefore be ignored, while a number and a
+dated claim are both things you can look at a sentence and see.
+
+READ, and EXTERNAL to this repo — a sibling toolkit's methodology handed over
+2026-09-22, not a Genesis measurement: its author reports the pass finding
+defects a fully green suite had shipped past, each one a sentence that outran
+its evidence.
+
+**Claims live in ENUMERABLE places, which is what makes this mechanical rather
+than a mood.** This is the canonical list; SKILL.md and CLAUDE.md point here
+rather than carrying their own copies:
+
+| Surface | Why it goes wrong |
+|---|---|
+| commit messages and the PR body | written last, from memory, after the measuring is over |
+| docstrings touched by the diff | a claim about behaviour, aging independently of the behaviour |
+| in-thread review replies | asserts a finding is fixed; nothing re-checks it |
+| ledger evidence and follow-up resolution notes | the durable record of what happened |
+| Genesis memories stored this session | permanent, system-wide, recalled as fact |
+| changelog fragments | becomes a user-facing entry verbatim |
+| issue bodies | a public record the next reader treats as measured |
+| specs and evaluations | read later as a decision's basis, long after the basis moved |
+| plan documents | line numbers, PR heads and counts go quietly false as the tree moves |
+
+Then put each sentence on trial. Five steps, each carrying the instance that
+bought it. The first four come from the single session that adopted this pass,
+which is the argument for it; the fifth arrived later and is marked where it
+sits:
+
+1. **Re-compute every number written in prose, and name its denominator.**
+   MEASURED 2026-09-22, counting `except` handlers whose body is only `pass`
+   over the 1,291 **Python** files under `src/genesis/`: a two-line `grep` said
+   **212**, an AST walk said **274** — a gap of **62 (22.6% of 274)** that the
+   grep's single spelling never reached. Stated as the difference of totals,
+   which is what was measured: whether the grep's hits were a strict subset was
+   not checked, and a set-difference claim would need that.
+2. **Re-measure anything taken before the tree moved.** Counting a different
+   thing — handlers with no `raise` and no logging call, same tree — a peer
+   session fast-forwarded the checkout mid-analysis and the count moved
+   **1,154 to 1,155 across 409 to 410 files**. The stale figure was already
+   written into a draft issue body.
+3. **Verify the edit applied where you believe it did.** A `sed` correcting that
+   number matched **2 of 3** sites; the third spanned a line break. Caught by
+   reading the file back, not by the exit code.
+4. **When a file and a tool disagree, RE-DERIVE — one of them is scoped to a
+   different question.** An allowlist comment and a classifier docstring
+   disagreed about whether skill-file findings score; calling the predicate
+   settled it in seconds, and the comment-reading was the wrong one. The
+   generalisation is already written up in SKILL.md's Pre-Merge Gate section
+   under `_is_doc_path` — read it there.
+
+Denominators for negatives are covered by the table at the top of this file and
+are not restated here. The fifth step is not, and is stated rather than pointed
+at — which is itself its instance:
+
+5. **Re-read every evidence sentence against the artifact it names** — open the
+   PR, the file, the row. An evidence string is a claim like any other, and it
+   is the one written with the least attention, because by then the work feels
+   finished. The instance is this section: its first draft declared this step
+   "covered by the table at the top of this file", and it was in no row. A
+   pointer to an obligation that does not exist reads exactly like the
+   obligation being met, which is the failure this whole pass is about.
+
+Two outcomes of this pass feel like failure and are not. A claim that SHRINKS
+under audit is the method working (§8). And where one of §7's four causes fires,
+the instrument is a legitimate suspect ahead of the code — in the session above
+two of them did: a detector disagreed with an independent second measurement,
+and a proposed fix was brand new and gave the answer its author wanted. Both
+were wrong. Neither licenses suspecting your tools as a habit; §7's scoping is
+the rule, not a caveat on it.

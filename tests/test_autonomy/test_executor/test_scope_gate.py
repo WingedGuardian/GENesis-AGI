@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from genesis.autonomy.executor import worktree_mgr
 from genesis.autonomy.executor.engine import CCSessionExecutor
 from genesis.autonomy.executor.scope_gate import (
     ScopeGateResult,
@@ -313,6 +314,57 @@ class TestDeliverScopeGate:
         task = await task_states.get_by_id(db, "t-sg1")
         assert "merge-base failed" in json.loads(task["outputs"])["scope_blocked"]
 
+    async def test_merge_base_is_taken_against_the_recorded_cut_commit(
+        self, db, tmp_path, monkeypatch,
+    ):
+        """The diff base is the commit the task was cut from, recorded at the
+        cut: not local `main` (which can lag the remote), and not the ref
+        `origin/main` (which the task's own worktree can move)."""
+        await _seed(db)
+        engine = _engine(db)
+        engine._worktree_paths["t-sg1"] = tmp_path
+        engine._open_build_pr = AsyncMock()
+        await engine._set_output("t-sg1", "base_branch", "main")
+        await engine._set_output("t-sg1", "base_sha", "c0ffee" * 7)
+        monkeypatch.setattr(
+            engine, "_task_source", AsyncMock(return_value="build_lane"),
+        )
+        calls = _subprocess_script(monkeypatch, [
+            _FakeProc(0, b""),
+            _FakeProc(0, b"abc123\n"),
+            _FakeProc(0, _raw("src/genesis/skills/foo/SKILL.md").encode() + b"\n"),
+            _FakeProc(0),
+        ])
+
+        await engine._deliver("t-sg1", "d", _CODE_STEPS, [])
+
+        assert calls[1] == ("git", "merge-base", "HEAD", "c0ffee" * 7)
+        assert calls[-1][:2] == ("git", "push")
+
+    async def test_without_a_recorded_base_the_gate_compares_to_local_main(
+        self, db, tmp_path, monkeypatch,
+    ):
+        """No recorded base (origin/HEAD unresolved, or a task from before this):
+        exactly the previous comparison, one merge-base call, no retry."""
+        await _seed(db)
+        engine = _engine(db)
+        engine._worktree_paths["t-sg1"] = tmp_path
+        engine._open_build_pr = AsyncMock()
+        monkeypatch.setattr(
+            engine, "_task_source", AsyncMock(return_value="build_lane"),
+        )
+        calls = _subprocess_script(monkeypatch, [
+            _FakeProc(0, b""),
+            _FakeProc(0, b"abc123\n"),
+            _FakeProc(0, _raw("src/genesis/skills/foo/SKILL.md").encode() + b"\n"),
+            _FakeProc(0),
+        ])
+
+        await engine._deliver("t-sg1", "d", _CODE_STEPS, [])
+
+        assert calls[1] == ("git", "merge-base", "HEAD", "main")
+        assert calls[-1][:2] == ("git", "push")
+
     async def test_blocked_gate_notifies_user(self, db, tmp_path, monkeypatch):
         await _seed(db)
         engine = _engine(db)
@@ -379,3 +431,95 @@ def test_scope_gate_result_import_shape():
     """The engine imports ScopeGateResult lazily — keep the contract pinned."""
     r = ScopeGateResult(allowed=False, reason="x")
     assert r.blocked_paths == [] and r.checked_paths == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("recorded", "expected_base"), [("develop", "develop"), (None, "main")])
+async def test_pr_targets_the_branch_the_gate_diffed_against(
+    db, tmp_path, monkeypatch, recorded, expected_base,
+):
+    """The PR base and the scope gate's diff base come from the same record, so
+    the gate evaluates exactly what the PR carries."""
+    from genesis.autonomy.executor import pr_open
+
+    await _seed(db)
+    engine = _engine(db)
+    if recorded:
+        await engine._set_output("t-sg1", "base_branch", recorded)
+        await engine._set_output("t-sg1", "base_sha", "c0ffee" * 7)
+    captured: dict = {}
+
+    async def fake_open(**kwargs):
+        captured.update(kwargs)
+        return pr_open.PrOpenResult(ok=True, pr_url="https://example.invalid/pr/1")
+
+    monkeypatch.setattr(pr_open, "open_draft_pr", fake_open)
+    await engine._open_build_pr("t-sg1", tmp_path, "task/t-sg1")
+    assert captured["base"] == expected_base
+
+
+# ── The engine passes the resolved base through, and records it ─────────
+
+
+@pytest.mark.asyncio
+class TestBaseWiring:
+    """End-to-end tests above run with a subprocess mock that makes origin/HEAD
+    unresolved, so they only ever exercise the fallback. These pin the resolved
+    path: the base reaches create_worktree and is persisted, on creation and on
+    recovery, and an unresolved re-resolution clears a stale record."""
+
+    _BASE = worktree_mgr.BaseRef(name="main", sha="c0ffee" * 7)
+
+    def _spy(self, monkeypatch, base):
+        seen: list[dict] = []
+
+        async def fake_create(task_id, repo_root, worktree_base, base=None):
+            seen.append({"base": base})
+            return worktree_base / f"task-{task_id[:8]}"
+
+        monkeypatch.setattr(worktree_mgr, "resolve_base", AsyncMock(return_value=base))
+        monkeypatch.setattr(worktree_mgr, "create_worktree", fake_create)
+        return seen
+
+    async def _outputs(self, db) -> dict:
+        task = await task_states.get_by_id(db, "t-sg1")
+        return json.loads(task["outputs"])
+
+    async def test_create_passes_and_records_the_base(self, db, monkeypatch):
+        await _seed(db)
+        engine = _engine(db)
+        seen = self._spy(monkeypatch, self._BASE)
+        await engine._create_worktree("t-sg1")
+        assert seen == [{"base": self._BASE}]
+        out = await self._outputs(db)
+        assert (out["base_branch"], out["base_sha"]) == ("main", self._BASE.sha)
+        engine._bases.clear()  # a restart: read back from the outputs
+        assert await engine._base_for("t-sg1") == self._BASE
+
+    async def test_recovery_recut_passes_and_records_the_base(self, db, tmp_path, monkeypatch):
+        await _seed(db)
+        engine = _engine(db)
+        seen = self._spy(monkeypatch, self._BASE)
+        monkeypatch.setattr(worktree_mgr, "verify_worktree", AsyncMock(return_value=False))
+        await engine._set_output("t-sg1", "worktree_path", str(tmp_path / "gone"))
+        task = await task_states.get_by_id(db, "t-sg1")
+        assert await engine._recover_worktree("t-sg1", task) is True
+        assert seen == [{"base": self._BASE}]
+        assert (await self._outputs(db))["base_sha"] == self._BASE.sha
+
+    async def test_an_unresolved_recut_clears_a_stale_record(self, db, monkeypatch):
+        await _seed(db)
+        engine = _engine(db)
+        await engine._set_output("t-sg1", "base_branch", "main")
+        await engine._set_output("t-sg1", "base_sha", "c0ffee" * 7)
+        seen = self._spy(monkeypatch, None)
+        await engine._create_worktree("t-sg1")
+        assert seen == [{"base": None}]
+        engine._bases.clear()
+        assert await engine._base_for("t-sg1") is None
+
+    async def test_a_name_without_a_commit_is_not_a_base(self, db):
+        await _seed(db)
+        engine = _engine(db)
+        await engine._set_output("t-sg1", "base_branch", "main")
+        assert await engine._base_for("t-sg1") is None
