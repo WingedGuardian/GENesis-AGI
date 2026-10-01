@@ -29,7 +29,8 @@ _FENCE_MARKS = ("```", "~~~")
 
 _HEADING_RE = re.compile(r"^#{2,}\s*Acceptance\s*$", re.IGNORECASE)
 _ANY_HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
-_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.*)$")
+_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_TASK_MARKER_RE = re.compile(r"^\[[ xX]\]\s*")
 _COMMENT_SPAN_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 _ISSUE_RE = re.compile(
@@ -109,14 +110,37 @@ def _acceptance_bullets(lines: list[str]) -> tuple[bool, list[str]]:
         if not m:
             continue
         text = _COMMENT_SPAN_RE.sub("", m.group(1)).strip()
-        if text:
+        # An unchecked/checked task marker alone is not a criterion; the
+        # marker is stripped for the emptiness test only — a kept bullet
+        # keeps its text as written.
+        if _TASK_MARKER_RE.sub("", text):
             bullets.append(text)
     return found, bullets
 
 
+_POINTER_PREFIX_RE = re.compile(r"^\s*(?:>\s*|(?:[-*+]|\d+[.)])\s+)")
+
+
+def _unwrap(line: str) -> str:
+    """Strip the wrappers a pointer line may carry.
+
+    A pointer may sit behind blockquote markers, a list marker, and one pair
+    of ``**`` emphasis — but no trailing text, which the anchored patterns
+    still reject on the unwrapped line.
+    """
+    prev = None
+    while prev != line:
+        prev = line
+        line = _POINTER_PREFIX_RE.sub("", line).strip()
+    if len(line) > 4 and line.startswith("**") and line.endswith("**"):
+        line = line[2:-2].strip()
+    return line
+
+
 def _source_pointer(lines: list[str]) -> tuple[dict | None, str | None]:
     """First source-pointer line wins; returns (source, problem)."""
-    for line in lines:
+    for raw in lines:
+        line = _unwrap(raw)
         m = _ISSUE_RE.match(line)
         if m:
             return {"kind": "issue", "value": m.group(1)}, None
@@ -133,6 +157,7 @@ def _source_pointer(lines: list[str]) -> tuple[dict | None, str | None]:
                 return {"kind": kind, "value": value}, None
             if "/" in value:
                 return None, "spec/plan pointer must be a name, not a path"
+            return None, "spec/plan pointer is not a valid name"
     return None, None
 
 

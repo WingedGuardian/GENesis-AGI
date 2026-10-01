@@ -88,6 +88,26 @@ def test_comment_only_bullet_does_not_count(mod):
     assert "## Acceptance has no bullets" in out["problems"]
 
 
+def test_empty_task_marker_bullets_do_not_count(mod):
+    body = "## Acceptance\n\n- [ ]\n- [x]\n- [ ] <!-- placeholder -->\n"
+    out = mod.parse_acceptance(body)
+    assert out["present"] is False
+    assert out["bullets"] == []
+    assert "## Acceptance has no bullets" in out["problems"]
+
+
+def test_checked_task_marker_bullet_keeps_its_text(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- [x] done\n")
+    assert out["present"] is True
+    assert out["bullets"] == ["[x] done"]
+
+
+def test_ordered_paren_marker_counts(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n1) item\n")
+    assert out["present"] is True
+    assert out["bullets"] == ["item"]
+
+
 # ── Source pointer ──────────────────────────────────────────────────
 
 
@@ -125,6 +145,37 @@ def test_spec_path_is_a_problem(mod):
     out = mod.parse_acceptance(body)
     assert out["source"] is None
     assert "spec/plan pointer must be a name, not a path" in out["problems"]
+
+
+def test_wrapped_issue_pointers(mod):
+    for line in ("- Closes #5", "> Closes #5", "**Closes #5**"):
+        out = mod.parse_acceptance(f"## Acceptance\n\n- x\n\n{line}\n")
+        assert out["source"] == {"kind": "issue", "value": "5"}, line
+
+
+def test_wrapped_ledger_and_followup_pointers(mod):
+    body = f"## Acceptance\n\n- x\n\n- **Ledger: {_HEX32}**\n"
+    out = mod.parse_acceptance(body)
+    assert out["source"] == {"kind": "ledger", "value": _HEX32}
+    body = f"## Acceptance\n\n- x\n\n> Follow-up: {_HEX32}\n"
+    out = mod.parse_acceptance(body)
+    assert out["source"] == {"kind": "follow_up", "value": _HEX32}
+
+
+def test_list_marker_spec_pointer(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\n* Spec: my-spec\n")
+    assert out["source"] == {"kind": "spec", "value": "my-spec"}
+
+
+def test_issue_pointer_with_trailing_text_is_not_a_pointer(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nCloses #5 and more\n")
+    assert out["source"] is None
+
+
+def test_invalid_spec_name_wins_over_later_pointer(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nSpec: foo!\nCloses #3\n")
+    assert out["source"] is None
+    assert "spec/plan pointer is not a valid name" in out["problems"]
 
 
 def test_no_pointer(mod):
