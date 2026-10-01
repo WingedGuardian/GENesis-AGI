@@ -97,11 +97,45 @@ def acquire_run_lock(name: str, *, legacy_name: str | None = None) -> RunLock:
         release_run_lock(lock)
         raise
     except OSError as exc:
-        logger.warning("run lock: skipping the old lock %s (%s)", legacy, exc)
+        _check_existing_legacy(lock, legacy, exc)
     except BaseException:
         release_run_lock(lock)
         raise
     return lock
+
+
+def _check_existing_legacy(lock: RunLock, legacy: Path, exc: OSError) -> None:
+    """The writable open of the old lock failed. Decide whether that proves
+    nothing could be holding it.
+
+    If the file does not exist (or ``~/tmp`` is not a directory), no old runner
+    can hold a lock there: skip, with a warning. If it DOES exist, an old runner
+    may hold it even though we cannot write it (its permissions changed while
+    it was held), so check it read-only — flock works on a read-only
+    descriptor. A file that exists but cannot be opened at all cannot be
+    checked: refuse the run loudly rather than risk two runs at once.
+    """
+    try:
+        exists = legacy.lstat() is not None
+    except (FileNotFoundError, NotADirectoryError):
+        exists = False
+    except OSError:
+        exists = True  # cannot even look: treat as present, so it is checked
+    if not exists:
+        logger.warning("run lock: skipping the old lock %s (%s)", legacy, exc)
+        return
+    try:
+        lock.handles.append(_lock_nb(legacy, "r"))
+    except BlockingIOError:
+        release_run_lock(lock)
+        raise
+    except BaseException as exc2:
+        release_run_lock(lock)
+        raise OSError(
+            f"cannot check the old run lock {legacy} ({exc2}); a runner from "
+            "before the update may hold it, so this run is refused. Fix the "
+            "file's permissions or remove it if no old runner is running."
+        ) from exc2
 
 
 def release_run_lock(lock: RunLock | None) -> None:

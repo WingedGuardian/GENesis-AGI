@@ -195,3 +195,47 @@ def test_each_runner_maps_busy_to_its_own_error(homes):
         finally:
             old.close()
         release(acquire())
+
+
+def test_read_only_old_lock_is_still_checked(homes):
+    # Devin review of #2703: an old runner may hold a lock file whose
+    # permissions changed after it opened it. A read-only file is checked
+    # read-only (flock works on any descriptor), so a free one proceeds...
+    home, _ghome = homes
+    old = home / "tmp" / ".bench.lock"
+    old.write_text("")
+    old.chmod(0o444)
+    lock = rl.acquire_run_lock("bench.lock", legacy_name=".bench.lock")
+    try:
+        assert len(lock.handles) == 2
+    finally:
+        rl.release_run_lock(lock)
+
+
+def test_read_only_old_lock_held_by_an_old_runner_is_busy(homes):
+    # ...and one an old runner holds refuses the run.
+    home, _ghome = homes
+    old = home / "tmp" / ".bench.lock"
+    holder = _old_runner_lock(old)
+    try:
+        old.chmod(0o444)
+        with pytest.raises(BlockingIOError) as excinfo:
+            rl.acquire_run_lock("bench.lock", legacy_name=".bench.lock")
+        assert excinfo.value is not None
+        rl.release_run_lock(rl.acquire_run_lock("bench.lock"))  # nothing left held
+    finally:
+        holder.close()
+
+
+def test_old_lock_that_exists_but_cannot_be_opened_refuses_the_run(homes):
+    home, _ghome = homes
+    old = home / "tmp" / ".bench.lock"
+    old.write_text("")
+    old.chmod(0o000)
+    try:
+        with pytest.raises(OSError, match="cannot check the old run lock") as excinfo:
+            rl.acquire_run_lock("bench.lock", legacy_name=".bench.lock")
+        assert not isinstance(excinfo.value, BlockingIOError)
+        rl.release_run_lock(rl.acquire_run_lock("bench.lock"))  # nothing left held
+    finally:
+        old.chmod(0o600)
