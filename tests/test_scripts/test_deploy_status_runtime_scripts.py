@@ -572,6 +572,66 @@ def test_an_uncommitted_edit_to_a_script_run_afresh_is_a_runtime_edit(station, p
     assert b.startswith("unknown (uncommitted runtime edits"), b
 
 
+def test_status_from_a_worktree_uses_the_main_checkouts_lists(station, tmp_path):
+    """Round-1 review (Codex P1): `status` from a linked worktree reports the main
+    checkout, but it sourced the WORKTREE's lib/deploy_status.sh, so the lists that
+    decide what the bracket hashes came from a branch that can be older than main.
+    Here the main checkout carries this script and its libs, and a worktree's copy
+    of the lists lacks scripts/disk_reclaim.py. A pull of that script into the main
+    checkout must still void a bracket taken from the worktree: status hands over to
+    the main checkout's own script, whose lists name it."""
+    lib = REPO / "scripts" / "lib"
+    files = {
+        f"scripts/lib/{f.name}": f.read_text()
+        for f in sorted(lib.iterdir())
+        if f.is_file() and f.suffix in {".sh", ".py"}
+    }
+    files["scripts/deploy_code_only.sh"] = (REPO / "scripts" / "deploy_code_only.sh").read_text()
+    files["scripts/disk_reclaim.py"] = "# v1\n"
+    _advance_upstream(station, "the deploy script, as a real checkout carries it", files)
+    r = _run(station, "pull", env=_env(station, GIT_COMMITTER_DATE=_later(station, 60)))
+    assert r.returncode == 0, r.stderr
+    station["env"]["BOOTED_AT"] = str(station["booted_at"] + 120)
+
+    wt = tmp_path / "elsewhere" / "wt"
+    _git(station["root"], "worktree", "add", "-q", "-b", "wt", str(wt))
+    stale = wt / "scripts" / "lib" / "deploy_status.sh"
+    entry = "    scripts/disk_reclaim.py"
+    text = stale.read_text()
+    assert text.count(entry) == 1, "precondition: the entry this case removes"
+    stale.write_text(text.replace(entry, "    # (not yet listed on this branch)"))
+    from_wt = ["bash", str(wt / "scripts" / "deploy_code_only.sh"), "status"]
+    # The systemctl shim names the unit's WorkingDirectory from UNIT_DIR, else from
+    # GENESIS_DEPLOY_ROOT; the hand-over drops the latter, so pin the unit where a real
+    # one runs: the main checkout.
+    wt_env = _env(station, GENESIS_DEPLOY_ROOT=str(wt), UNIT_DIR=str(station["root"]))
+
+    r = subprocess.run(from_wt, env=wt_env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    assert "reporting the main checkout" in r.stdout, r.stdout
+    start = next(
+        (
+            ln.removeprefix("bracket: ")
+            for ln in r.stdout.splitlines()
+            if ln.startswith("bracket: ")
+        ),
+        "",
+    )
+    assert start.startswith("b1-"), r.stdout
+
+    _advance_upstream(station, "script", {"scripts/disk_reclaim.py": "# v2\n"})
+    r = _run(station, "pull", env=_env(station, GIT_COMMITTER_DATE=_later(station, 180)))
+    assert r.returncode == 0, r.stderr
+
+    r = subprocess.run(
+        [*from_wt, "--verify", start], env=wt_env, capture_output=True, text=True, timeout=120
+    )
+    assert r.returncode == 1, (
+        "a bracket taken from a worktree whose lists lag main stayed valid across a pull "
+        f"of a script main lists:\n{r.stdout}\n{r.stderr}"
+    )
+
+
 def test_a_pull_of_an_unlisted_script_leaves_the_bracket_valid(station):
     """The control: scripts/ as a whole is not server code."""
     start, _ = _change(station, "scripts/some_tool.py")

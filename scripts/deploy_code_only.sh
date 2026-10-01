@@ -21,7 +21,8 @@
 #            the server's MainPID and invocation, and what runs beside the commit
 #            (runtime-edits, runtime-overrides), and the validation bracket's
 #            token; --verify <token> answers whether it still holds (below).
-#            Run from a linked worktree, it reports the main checkout.
+#            Run from a linked worktree, it reports the main checkout, through
+#            the main checkout's own copy of this script and its libs.
 #   --wait N seconds to queue for the lock (default 7200, the same two hours a
 #            validation's hold may run, or GENESIS_DEPLOY_LOCK_WAIT)
 #
@@ -174,6 +175,8 @@ _PORT_PROBE_PY="$(cat "${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by
 _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
 
+# Kept whole for the status hand-over below (the parse consumes "$@").
+_ORIG_ARGS=("$@")
 MODE=""
 VERIFY=""
 # Two hours: a validation's documented hold is `flock -s -w 7200`, and a detached
@@ -210,6 +213,18 @@ if [ "$MODE" = status ] && [ -n "$_git_dir" ] && [ -n "$_common_dir" ] \
     GENESIS_ROOT="$(dirname -- "$_common_dir")"
     _git_dir="$_common_dir"
     echo "(from a linked worktree: reporting the main checkout, $GENESIS_ROOT)"
+    # What `status` hashes and reports (the runtime path lists in lib/deploy_status.sh)
+    # belongs to the tree being reported, and this worktree's copy, sourced above, can
+    # be older or newer than main's. Hand over to the main checkout's own script with
+    # the same arguments. GENESIS_DEPLOY_ROOT is dropped so that script takes its root
+    # from where it lives; the guard variable stops a second hand-over. A main
+    # checkout with no copy of this script keeps this one (and its lists).
+    _main_self="$GENESIS_ROOT/scripts/deploy_code_only.sh"
+    if [ -z "${GENESIS_DEPLOY_STATUS_HANDOVER:-}" ] && [ -f "$_main_self" ] \
+        && [ "$(readlink -f -- "$_main_self")" != "$(readlink -f -- "${BASH_SOURCE[0]}")" ]; then
+        exec env -u GENESIS_DEPLOY_ROOT GENESIS_DEPLOY_STATUS_HANDOVER=1 \
+            bash "$_main_self" "${_ORIG_ARGS[@]}"
+    fi
 fi
 if [ -z "$_git_dir" ] || [ -z "$_common_dir" ] || [ "$(unset CDPATH; cd -- "$_git_dir" && pwd -P)" != "$_common_dir" ] \
     || [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
