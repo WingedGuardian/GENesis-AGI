@@ -17,8 +17,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
-from genesis.cc.exceptions import CCNetworkOfflineError
+from genesis.cc.exceptions import CCNetworkOfflineError, CCOverloadedError
 from genesis.cc.session_config import SessionConfigBuilder
+from genesis.cc.transient_retry import replay_unsafe, run_with_overload_retry
 from genesis.inbox.scanner import (
     Item,
     compute_hash,
@@ -2234,14 +2235,38 @@ class InboxMonitor:
             return False
 
         try:
-            output = await self._invoker.run(invocation)
-        except CCNetworkOfflineError as exc:
+            # Approval was cleared at the drop level (and the row claimed), so an
+            # overload retry re-runs this same approved batch; it never goes
+            # back through the approval gate.
+            output = await run_with_overload_retry(self._invoker, invocation)
+        except Exception as exc:
             # #1766 (inbox leg): the network being down is not this item's
             # failure. Fail the row so the retry lane picks it up once
             # connectivity returns, but keep its retry budget — the default
             # failed-path increment turns a ~90-minute outage into permanently
-            # parked items (3 retries x 30-minute scans).
-            err = f"CC invocation deferred, network offline: {exc}"
+            # parked items (3 retries x 30-minute scans). A provider overload
+            # that outlasted the in-call retries before doing any work is the
+            # same kind of failure: capacity, not the item. One that arrived
+            # after the session already did work (replay-unsafe) spends budget
+            # like any other failure, so the retry lane cannot replay that work
+            # without bound.
+            if isinstance(exc, CCOverloadedError) and not replay_unsafe(exc):
+                err = f"CC invocation deferred, provider overloaded: {exc}"
+            elif isinstance(exc, CCNetworkOfflineError):
+                err = f"CC invocation deferred, network offline: {exc}"
+            else:
+                err = f"CC invocation failed: {exc}"
+                errors.append(err)
+                logger.error(err, exc_info=True)
+                await self._session_manager.fail(session_id, reason=err)
+                await inbox_items.update_status(
+                    self._db,
+                    item.id,
+                    status="failed",
+                    error_message=err,
+                    processed_at=now_iso,
+                )
+                return False
             errors.append(err)
             logger.warning(err)
             await self._session_manager.fail(session_id, reason=err)
@@ -2251,19 +2276,6 @@ class InboxMonitor:
             await inbox_items.mark_failed_keeping_retries(
                 self._db, item.id, error_message=err, processed_at=now_iso,
                 retriable_below=self._config.max_retries,
-            )
-            return False
-        except Exception as exc:
-            err = f"CC invocation failed: {exc}"
-            errors.append(err)
-            logger.error(err, exc_info=True)
-            await self._session_manager.fail(session_id, reason=err)
-            await inbox_items.update_status(
-                self._db,
-                item.id,
-                status="failed",
-                error_message=err,
-                processed_at=now_iso,
             )
             return False
 

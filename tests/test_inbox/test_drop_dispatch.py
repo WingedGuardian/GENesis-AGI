@@ -1489,6 +1489,92 @@ async def test_network_offline_does_not_burn_a_retry(
 
 
 @pytest.mark.asyncio
+async def test_overload_is_retried_inside_the_approved_dispatch(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    """A 529 re-runs the same batch below the drop's approval: route() is
+    consulted once per drop, never again for the retry, and the item completes."""
+    from genesis.cc import transient_retry
+    from genesis.cc.exceptions import CCOverloadedError
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(transient_retry, "_sleep", _fake_sleep)
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    disp = _wired(decision=AutonomousDispatchDecision(mode="cli", reason="approved"))
+    mon._autonomous_dispatcher = disp
+    mock_invoker.run.side_effect = [CCOverloadedError("529 Overloaded"), _ok()]
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+
+    result = await mon.check_once()
+
+    assert disp.route.call_count == 1, "the retry must not re-enter the approval gate"
+    assert mock_invoker.run.call_count == 2
+    first, second = mock_invoker.run.call_args_list
+    assert first.args[0] is second.args[0], "the same invocation is re-run"
+    assert slept == [30]
+    assert result.batches_dispatched == 1
+    rows = await (await db.execute(
+        "SELECT status FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert [r["status"] for r in rows] == ["completed"], [dict(r) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_overload_does_not_burn_a_retry(
+    db, inbox_dir, mock_invoker, mock_session_manager, monkeypatch,
+):
+    """An overload that outlasts the in-call retries is capacity, not the item:
+    like a network outage it must leave the item's retry budget untouched."""
+    from genesis.cc import transient_retry
+    from genesis.cc.exceptions import CCOverloadedError
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(transient_retry, "_sleep", _fake_sleep)
+    mock_invoker.run.side_effect = CCOverloadedError("529 Overloaded")
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=1)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    assert mock_invoker.run.call_count == 4, "three in-call retries, then give up"
+    rows = await (await db.execute(
+        "SELECT status, retry_count, error_message FROM inbox_items "
+        "WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert len(rows) == 1 and rows[0]["retry_count"] == 0, [dict(r) for r in rows]
+    assert "overloaded" in rows[0]["error_message"]
+    assert str(inbox_dir / "Genesis.md") in await inbox_items.get_retriable_failure_files(
+        db, max_retries=1,
+    ), "the item must stay retriable after an overload"
+
+
+@pytest.mark.asyncio
+async def test_mid_session_overload_spends_a_retry(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    """An overload after the session already did work is not re-run in-call,
+    and it spends the item's retry budget: otherwise the retry lane would
+    replay that work every scan for as long as overloads continue."""
+    from genesis.cc.exceptions import CCOverloadedError
+
+    mock_invoker.run.side_effect = CCOverloadedError("529 Overloaded", num_turns=5)
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager,
+                           max_retries=3)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+    await mon.check_once()
+    assert mock_invoker.run.call_count == 1, "replay-unsafe: no in-call retry"
+    rows = await (await db.execute(
+        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert len(rows) == 1 and rows[0]["retry_count"] == 1, [dict(r) for r in rows]
+
+
+@pytest.mark.asyncio
 async def test_retry_lane_park_spares_non_url_failures(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):

@@ -4877,6 +4877,7 @@ def _error_cases():
     from genesis.cc.exceptions import (
         CCMCPError,
         CCNetworkOfflineError,
+        CCOverloadedError,
         CCParsingError,
         CCQuotaExhaustedError,
         CCRateLimitError,
@@ -4885,6 +4886,8 @@ def _error_cases():
 
     return [
         (CCRateLimitError("limit"), "warning"),
+        # Limit family: a provider-capacity overload is expected and recovers.
+        (CCOverloadedError("overloaded"), "warning"),
         (CCQuotaExhaustedError("quota"), "warning"),
         (CCTimeoutError("slow"), "error"),
         (CCProcessError("exit 1"), "error"),
@@ -5032,6 +5035,62 @@ async def test_invocation_failed_no_bus_still_reraises(monkeypatch, entry):
     with pytest.raises(CCTimeoutError) as raised:
         await _call(invoker, entry, CCInvocation(prompt="x"))
     assert raised.value is exc
+
+
+@pytest.mark.asyncio
+async def test_error_result_overload_carries_the_real_turn_count(invoker):
+    """Exit 0 with an is_error result: the classifier gets the result prose as
+    text, but the status code and turn count come from the raw stdout result
+    object — so the overload retry's replay guard sees the real turn count."""
+    from genesis.cc.exceptions import CCOverloadedError
+
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 529,
+            "num_turns": 6,
+            "result": "API Error: 529 Overloaded. This is a server-side issue.",
+            "session_id": "sess-529",
+            "total_cost_usd": 0.0,
+            "duration_ms": 10,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_line.encode(), b""))
+    mock_proc.returncode = 0
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCOverloadedError) as raised,
+    ):
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert raised.value.num_turns == 6
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_result_overload_carries_the_real_turn_count(
+    invoker,
+    monkeypatch,
+):
+    from genesis.cc.exceptions import CCOverloadedError
+
+    _no_host_syscalls(monkeypatch)
+    ev = _error_result_event("API Error: 529 Overloaded. This is a server-side issue.")
+    ev["api_error_status"] = 529
+    ev["num_turns"] = 9
+    data = _make_stream_lines({"type": "system", "subtype": "init", "session_id": "s1"}, ev)
+    proc = _streaming_proc(data)
+    proc.pid = 424207
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCOverloadedError) as raised,
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+    assert raised.value.num_turns == 9
 
 
 async def test_invocation_failed_emit_error_does_not_mask_original(monkeypatch, fail_bus):

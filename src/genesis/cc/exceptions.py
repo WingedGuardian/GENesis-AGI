@@ -97,6 +97,35 @@ class CCRateLimitError(_CCLimitError):
     """CC hit transient rate limit (recovers in minutes)."""
 
 
+class CCOverloadedError(CCRateLimitError):
+    """The provider answered HTTP 529 / ``overloaded_error`` — capacity, not quota.
+
+    A subclass of ``CCRateLimitError`` on purpose: every existing rate-limit
+    consumer already does the right thing for an overload — roster failover to
+    a peer, the durable park (which falls back to its cadence floor because an
+    overload carries no reset hint), WARNING severity on
+    ``cc.invocation_failed``, and the RATE_LIMITED status. The distinct type
+    exists for the one place that treats it differently:
+    ``genesis.cc.transient_retry``, which re-runs an overloaded call after a
+    short wait and never retries a genuine rate limit.
+
+    ``num_turns`` is the CLI result's own turn count when the classifier had
+    one. More than one turn means the session already made tool round-trips
+    before the overload, so re-running it would replay them.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        raw_event: dict | None = None,
+        raw_text: str | None = None,
+        num_turns: int | None = None,
+    ):
+        super().__init__(message, raw_event=raw_event, raw_text=raw_text)
+        self.num_turns = num_turns
+
+
 class CCQuotaExhaustedError(_CCLimitError):
     """CC usage quota exhausted — hard ceiling lasting hours.
 
