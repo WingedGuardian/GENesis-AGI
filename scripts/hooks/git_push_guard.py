@@ -10846,7 +10846,7 @@ def _no_url_rewrite_rules(cwd: str | None) -> bool:
     return got is not None and got[0] == 1
 
 
-def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd) -> bool:
+def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None) -> bool:
     """Whether a FIRST push of the current branch may go unprompted under
     ``hooks.asks.push_publish: off`` — i.e. every place it can land is the public
     repo and nothing else in the command can change that.
@@ -10878,7 +10878,29 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd) -> bool:
         return False
     if not _all_urls_are_public_repo(urls):
         return False
-    return _transport_is_plain(push_remote if named else None, cwd)
+    if not _transport_is_plain(push_remote if named else None, cwd):
+        return False
+    # LAST, because it is the one network call: the caller reached here because
+    # `_push_is_republish` said "not confirmed present", which is ALSO its answer
+    # to an ls-remote error or timeout. Silencing on that would let an
+    # already-public branch with no open PR skip the no-open-PR check.
+    return len(urls) == 1 and _remote_branch_definitely_absent(next(iter(urls)), branch, cwd)
+
+
+def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
+    """True ONLY when ``git ls-remote --exit-code`` against ``url`` answers that
+    ``refs/heads/<branch>`` does not exist (exit 2). A hit, any other exit code,
+    a timeout or any error is False, so the caller asks. Same subprocess shape
+    and shared deadline as ``_remote_branch_sha``."""
+    if not branch:
+        return False
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["ls-remote", "--exit-code", "--heads", url, f"refs/heads/{branch}"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=_gh_timeout(10.0))
+    except Exception:
+        return False
+    return result.returncode == 2
 
 
 def _raw_remote_push_urls(name: str, cwd: str | None) -> set[str] | None:
@@ -11624,13 +11646,19 @@ def _run_merge_and_push_gates() -> int:
                         # ask, scope checked only when the key is off.
                         publish_off = _ask_suppressed("push_publish")
                         if publish_off and _push_publish_scope_holds(
-                            push_remote, segs, push_segs[0], cmd, pcwd
+                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur
                         ):
                             publish_note = _suppressed_reason(
                                 "push_publish",
                                 f"first push of '{cur}' to the configured public repo "
                                 f"({_canonical_public_repo()}).",
                             )
+                            # The note is the only channel on this path, so any
+                            # policy NOTE (an unknown key, say) rides it — the
+                            # same shape as needs_user.decide.
+                            notes = _drain_ask_notes()
+                            if notes:
+                                publish_note = f"{publish_note}\n\n{notes}"
                         else:
                             ask_reason = _publish_ask_text(
                                 f"git push needs your approval before publishing "

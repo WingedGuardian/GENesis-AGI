@@ -41,6 +41,9 @@ gpg = private_module(
 PUBLIC = "https://github.com/owner/repo"
 OTHER = "https://github.com/owner/other"
 
+#: Captured before the autouse fixture stubs it, for the tests that drive it for real.
+_REAL_ABSENT = gpg._remote_branch_definitely_absent
+
 
 def _repo(tmp_path, git_config=()) -> Path:
     repo = tmp_path / "repo"
@@ -91,6 +94,9 @@ def _first_publish(monkeypatch):
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+    # The definitive-absence probe is a network call: stubbed to "absent" here,
+    # driven for real against a local bare repo in its own tests below.
+    monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: True)
     for var in gpg._TRANSPORT_ENV:
         monkeypatch.delenv(var, raising=False)
 
@@ -584,3 +590,77 @@ def test_an_unreadable_remote_config_is_unresolved(monkeypatch) -> None:
     monkeypatch.setattr(gpg, "_git_config_get", lambda *a, **k: None)
     monkeypatch.setattr(gpg, "_resolve_push_remote", lambda *a, **k: "origin")
     assert gpg._effective_push_remote(segs[0], "feat/x") is None
+
+
+# ─── secondary review: definitive absence, and NOTEs on the silenced path ────
+
+
+def test_an_unconfirmed_absence_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
+    """`_push_is_republish` answers "not present" on an ls-remote ERROR too. The
+    suppression needs a definitive "absent", or it would skip the no-open-PR
+    check for an already-public branch whose probe merely failed."""
+    monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: False)
+    _assert_asks(*_run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD"))
+
+
+def test_the_probe_is_asked_about_the_resolved_url_and_branch(
+    monkeypatch, tmp_path, capsys, off
+) -> None:
+    seen = []
+    monkeypatch.setattr(
+        gpg, "_remote_branch_definitely_absent", lambda url, branch, cwd: seen.append((url, branch)) or True
+    )
+    _assert_silenced(*_run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD"))
+    assert seen == [(PUBLIC, "feat/x")], seen
+
+
+def test_a_present_branch_keeps_the_republish_path(monkeypatch, tmp_path, capsys, off) -> None:
+    """Probe says present (republish): the existing re-push logic decides, and
+    the no-open-PR block still fires on the public repo."""
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    probe = []
+    monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: probe.append(a) or True)
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push origin HEAD")
+    assert rc == 2 and "NO OPEN PR" in err, (rc, out, err)
+    assert probe == [], "the suppression probe must not run on the re-push path"
+
+
+def _bare(tmp_path, with_branch: bool) -> str:
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--quiet", "--bare", str(bare)], check=True, timeout=30)
+    if with_branch:
+        src = _repo(tmp_path / "src")
+        subprocess.run(
+            ["git", "-C", str(src), "push", "--quiet", str(bare), "HEAD:refs/heads/feat/x"],
+            check=True, capture_output=True, timeout=30,
+        )
+    return str(bare)
+
+
+def test_the_real_probe_reports_absent(tmp_path) -> None:
+    assert _REAL_ABSENT(_bare(tmp_path, False), "feat/x", None) is True
+
+
+def test_the_real_probe_reports_present_as_not_absent(tmp_path) -> None:
+    assert _REAL_ABSENT(_bare(tmp_path, True), "feat/x", None) is False
+
+
+def test_the_real_probe_treats_an_error_as_not_absent(tmp_path) -> None:
+    assert _REAL_ABSENT(str(tmp_path / "nope.git"), "feat/x", None) is False
+
+
+def test_the_real_probe_treats_a_timeout_as_not_absent(monkeypatch, tmp_path) -> None:
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=1)
+
+    monkeypatch.setattr(gpg.subprocess, "run", boom)
+    assert _REAL_ABSENT("https://github.com/owner/repo", "feat/x", None) is False
+
+
+def test_policy_notes_ride_the_silenced_note(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off,force_push=off")
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD")
+    _assert_silenced(rc, out, err)
+    ctx = _hso(out)["additionalContext"]
+    assert "NOTE:" in ctx and "force_push" in ctx, ctx
