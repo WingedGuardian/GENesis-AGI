@@ -176,3 +176,35 @@ def test_ordinary_exception_is_deny_not_exit_one(adapter, monkeypatch, capsys):
     monkeypatch.setattr(adapter.sys, "stdin", __import__("io").StringIO("{}"))
     assert adapter.main() == 2
     assert not capsys.readouterr().out
+
+
+@pytest.mark.parametrize("poisoned", [
+    "git_push_guard", "review_enforcement_commit", "review_state",
+    "git_repo_selection", "review_deadline", "shell_parse",
+])
+def test_launcher_denies_each_module_scope_import_failure(tmp_path, poisoned):
+    """The configured shell entry point converts every sibling import crash to deny."""
+    hooks = tmp_path / "scripts" / "hooks"
+    hooks.mkdir(parents=True)
+    for name in ("codex-review-stop", "codex_review_stop.py"):
+        (hooks / name).write_bytes((HOOKS / name).read_bytes())
+    stubs = {
+        "git_push_guard": "",
+        "review_enforcement_commit": "",
+        "review_state": "",
+        "git_repo_selection": "REPO_VARS = ()\nraw_sets_repo_env = seg_redirects_repo = None\n",
+        "review_deadline": "Deadline = None\n",
+        "shell_parse": "analyze_checked = gh_pr_subcommand = git_subcommand = mentions = None\n",
+    }
+    for name, text in stubs.items():
+        if name == poisoned:
+            text = "raise RuntimeError('poisoned sibling: " + name + "')\n"
+        (hooks / (name + ".py")).write_text(text)
+    run = subprocess.run(
+        ["bash", str(hooks / "codex-review-stop")], input="{}",
+        text=True, capture_output=True, timeout=10,
+    )
+    assert run.returncode == 2
+    assert not run.stdout
+    assert "poisoned sibling: " + poisoned in run.stderr
+    assert "handoff" in run.stderr.lower()
