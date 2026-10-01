@@ -68,7 +68,7 @@ def _fake_ytdlp(info: dict | None, vtt: str | None, seen: list):
     async def run(argv):
         seen.append(argv)
         if info is None:
-            return 1, b"", b"ERROR: [LinkedIn] no video in this post"
+            return 1, b"", b"ERROR: [LinkedIn] 7000: Unable to extract video; please report this issue"
         out = argv[argv.index("-o") + 1].replace("%%", "%")
         stem = out.replace("video.%(ext)s", "video.")
         if "--write-info-json" in argv:
@@ -150,24 +150,38 @@ def _body(text):
     return strip_boundary_markers(text).strip("\n")
 
 
-async def test_the_transcript_is_appended_to_the_post_page(page, ytdlp):
+async def test_the_transcript_rides_beside_the_unchanged_page(page, ytdlp):
     tool, calls = page
     use, _ = ytdlp
     use({"title": "Post text", "subtitles": {"en": _LICDN}}, _VTT)
     out = await tool(url=_POST)
-    body = _body(out["content"])
-    assert body.startswith("the post text")
-    assert "## Video transcript (manual captions, en, provenance: unknown)" in body
-    assert "hello from the video" in body
+    assert _body(out["content"]) == "the post text"
+    assert _body(out["video_transcript"]) == "hello from the video"
+    assert _body(out["video_caption"]["kind"]) == "manual"
+    assert out["video_tls_verified"] is True
     assert calls == [_POST] and "video_error" not in out
 
 
 async def test_a_text_post_is_returned_unchanged_and_silent(page, ytdlp):
     tool, _ = page
     use, _ = ytdlp
-    use(None, None)  # yt-dlp: no video in this post
+    use(None, None)  # yt-dlp: "Unable to extract video" (no <video> tag)
     out = await tool(url=_POST)
-    assert _body(out["content"]) == "the post text" and "video_error" not in out
+    assert _body(out["content"]) == "the post text"
+    assert "video_error" not in out and "video_transcript" not in out
+
+
+async def test_a_failed_lookup_is_reported_not_taken_for_a_text_post(page, ytdlp, monkeypatch):
+    """Codex P1 / Devin on #2698: a rate limit or certificate failure also
+    leaves no title, and was reported as 'text post'."""
+    tool, _ = page
+
+    async def throttled(argv):
+        return 1, b"", b"ERROR: [LinkedIn] 7000: HTTP Error 429: Too Many Requests"
+
+    monkeypatch.setattr(yt, "_exec", throttled)
+    out = await tool(url=_POST)
+    assert "429" in _body(out["video_error"])
 
 
 async def test_a_post_video_without_captions_says_why(page, ytdlp):
@@ -179,6 +193,49 @@ async def test_a_post_video_without_captions_says_why(page, ytdlp):
     assert "no captions" in _body(out["video_error"])
 
 
+async def test_an_unverified_caption_fetch_is_reported(page, ytdlp, monkeypatch):
+    """Codex P2 on #2698: tls_verified was dropped."""
+    from genesis.knowledge.processors.youtube import YouTubeFetch
+
+    async def fetch(self, url, *, audio_fallback=False):
+        return YouTubeFetch(url=url, metadata={"title": "t"}, transcript="words",
+                            caption={"kind": "manual"}, tls_verified=False)
+
+    monkeypatch.setattr(LinkedInCaptionProcessor, "fetch", fetch)
+    tool, _ = page
+    out = await tool(url=_POST)
+    assert out["video_tls_verified"] is False
+
+
+async def test_a_long_transcript_is_clipped_and_flagged(page, ytdlp):
+    tool, _ = page
+    use, _ = ytdlp
+    use({"title": "Post text", "subtitles": {"en": _LICDN}},
+        "WEBVTT\n\n00:00.000 --> 00:01.000\n" + "w " * 5000)
+    out = await tool(url=_POST, max_chars=2000)
+    assert len(_body(out["video_transcript"])) <= 2000
+    assert out["video_transcript_truncated"] is True
+    assert "truncated" not in out  # the page itself was not clipped
+
+
+async def test_a_short_transcript_is_not_flagged_truncated(page, ytdlp):
+    tool, _ = page
+    use, _ = ytdlp
+    use({"title": "Post text", "subtitles": {"en": _LICDN}}, _VTT)
+    out = await tool(url=_POST)
+    assert "video_transcript_truncated" not in out
+
+
+@pytest.mark.parametrize("url", [_POST.removeprefix("https://"), "HTTPS://" + _POST[8:]])
+async def test_a_post_url_without_or_with_an_uppercase_scheme_still_gets_captions(page, ytdlp, url):
+    """Codex P2 on #2698: an uppercase scheme was prefixed again."""
+    tool, calls = page
+    use, _ = ytdlp
+    use({"title": "Post text", "subtitles": {"en": _LICDN}}, _VTT)
+    out = await tool(url=url)
+    assert "hello from the video" in _body(out["video_transcript"])
+
+
 async def test_an_explicit_backend_skips_the_caption_lookup(page, ytdlp):
     tool, _ = page
     use, seen = ytdlp
@@ -187,60 +244,53 @@ async def test_an_explicit_backend_skips_the_caption_lookup(page, ytdlp):
     assert seen == []
 
 
-async def test_a_batch_appends_the_transcript_to_the_posts_entry(page, ytdlp):
+async def test_a_batch_entry_carries_the_video_fields(page, ytdlp):
     tool, _ = page
     use, _ = ytdlp
     use({"title": "Post text", "subtitles": {"en": _LICDN}}, _VTT)
     out = await tool(urls=["https://example.com/a", _POST])
     by_url = {_body(r["url"]): r for r in out["results"]}
-    assert "hello from the video" in _body(by_url[_POST]["text"])
-    assert "Video transcript" not in _body(by_url["https://example.com/a"]["text"])
+    assert _body(by_url[_POST]["text"]).startswith("post ")
+    assert _body(by_url[_POST]["video_transcript"]) == "hello from the video"
+    assert "video_transcript" not in by_url["https://example.com/a"]
 
 
-# ─── ingestion routing (routed from #2568 review) ───────────────────────────
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://m.youtube.com/watch?v=abc123",
-        "https://music.youtube.com/watch?v=abc123",
-        "https://www.youtube.com/live/abc123",
-        "https://www.youtube.com/embed/abc123",
-        "youtu.be/abc123",
-    ],
-)
-def test_ingestion_routes_every_video_url_shape_to_the_youtube_processor(url):
-    from genesis.knowledge.processors.registry import build_default_registry
-
-    processor = build_default_registry().get_processor(url)
-    assert isinstance(processor, YouTubeProcessor) and processor.can_handle(url)
-
-
-def test_ingestion_does_not_route_a_channel_page_to_the_youtube_processor():
-    assert not YouTubeProcessor().can_handle("https://www.youtube.com/@somechannel")
-
-
-async def test_page_plus_transcript_stays_within_max_chars(page, ytdlp, monkeypatch):
-    """Security review: the transcript was appended after the page's own cap,
-    so a post could return about twice max_chars."""
+async def test_a_batch_post_with_no_page_keeps_the_page_error_and_the_video(page, ytdlp, monkeypatch):
+    """Codex/Devin on #2698: a transcript-only row hid the page failure, and a
+    missing-page row lost the caption error."""
     from genesis.mcp.health import web_tools
 
-    async def big(url, backend="auto", max_chars=50000):
-        return {"url": url, "content": "p" * max_chars, "backend_used": "tinyfish", "error": None}
+    async def multi(urls, max_chars=50000):
+        return {"results": [], "errors": [{"url": u, "error": "page_not_found"} for u in urls],
+                "backend_used": "tinyfish"}
 
-    monkeypatch.setattr(web_tools, "_impl_web_fetch", big)
-    tool, _ = page
-    use, _ = ytdlp
-    use({"title": "Post text", "subtitles": {"en": _LICDN}}, "WEBVTT\n\n00:00.000 --> 00:01.000\n" + "w " * 5000)
-    out = await tool(url=_POST, max_chars=2000)
-    body = _body(out["content"])
-    assert len(body) <= 2000 and "## Video transcript" in body and out["truncated"] is True
-
-
-async def test_a_post_url_without_a_scheme_still_gets_captions(page, ytdlp):
+    monkeypatch.setattr(web_tools, "_impl_web_fetch_multi", multi)
     tool, _ = page
     use, _ = ytdlp
     use({"title": "Post text", "subtitles": {"en": _LICDN}}, _VTT)
-    out = await tool(url=_POST.removeprefix("https://"))
-    assert "hello from the video" in _body(out["content"])
+    out = await tool(urls=[_POST])
+    assert out["results"] == []
+    row = out["errors"][0]
+    assert _body(row["error"]) == "page_not_found"
+    assert _body(row["video_transcript"]) == "hello from the video"
+
+
+async def test_a_batch_with_a_youtube_video_and_a_post_keeps_each_result_on_its_url(
+    page, ytdlp, monkeypatch
+):
+    """Class audit: the two overlays share one gather; results must not cross."""
+    from genesis.mcp.health import youtube_route
+
+    async def video(url, max_chars):
+        return {"url": url, "content": "yt transcript", "backend_used": "yt-dlp"}, None
+
+    monkeypatch.setattr(youtube_route, "fetch_youtube", video)
+    tool, _ = page
+    use, _ = ytdlp
+    use({"title": "Post text", "subtitles": {"en": _LICDN}}, _VTT)
+    yt_url = "https://youtu.be/abc123"
+    out = await tool(urls=[yt_url, _POST])
+    by_url = {_body(r["url"]): r for r in out["results"]}
+    assert _body(by_url[yt_url]["content"]) == "yt transcript"
+    assert "video_transcript" not in by_url[yt_url]
+    assert _body(by_url[_POST]["video_transcript"]) == "hello from the video"
