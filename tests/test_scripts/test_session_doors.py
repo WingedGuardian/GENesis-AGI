@@ -37,6 +37,30 @@ echo "$*" >> "$FAKE_TMUX_LOG"
 # created on it afterwards — invisible on the argv line the other assertions read.
 echo "INHERITED_TMPDIR=[${TMPDIR-<unset>}]" >> "$FAKE_TMUX_LOG"
 args="$*"
+# ONE existence oracle, consulted by BOTH name-addressed spellings below.
+# It used to live inline in the has-session branch, which was fine while that
+# was the only way the door asked. The door now asks with `list-sessions -f`
+# (silent -- has-session ERRORS on absent, and a tmux error is logged in the
+# server's message log), so a second copy here would be two oracles
+# that can disagree, and the TOCTOU simulation would only exist on the dead
+# path. Returns 0 if the named session exists.
+_fake_session_exists() {
+    local name="$1"
+    # TOCTOU simulation: a session that is ABSENT when manual mode's selection
+    # loop asks, and PRESENT when the rebuild branch asks later. That is the race
+    # — a concurrent manual launch creating the slot in between — and it cannot
+    # be reproduced with a stateless session list, because the same file answers
+    # both questions. It is NAME-ADDRESSED, which is why the door's probe must
+    # keep the name in argv rather than filtering a bare listing in-script.
+    if [[ -n "${FAKE_TMUX_SESSIONS_APPEAR:-}" && "$name" == "$FAKE_TMUX_SESSIONS_APPEAR" ]]; then
+        _n=0; [[ -f "$FAKE_TMUX_APPEAR_N" ]] && _n=$(cat "$FAKE_TMUX_APPEAR_N")
+        echo $(( _n + 1 )) > "$FAKE_TMUX_APPEAR_N"
+        [[ "$_n" -ge 1 ]] && return 0
+        return 1
+    fi
+    [[ -f "$FAKE_TMUX_SESSIONS" ]] && grep -qxF "$name" "$FAKE_TMUX_SESSIONS" && return 0
+    return 1
+}
 if [[ "$args" == *has-session* ]]; then
     # invoked as: tmux has-session -t =cc-N
     name=""
@@ -46,19 +70,32 @@ if [[ "$args" == *has-session* ]]; then
         prev="$a"
     done
     name="${name#=}"
-    # TOCTOU simulation: a session that is ABSENT when manual mode's selection
-    # loop asks, and PRESENT when the rebuild branch asks later. That is the race
-    # — a concurrent manual launch creating the slot in between — and it cannot
-    # be reproduced with a stateless session list, because the same file answers
-    # both questions.
-    if [[ -n "${FAKE_TMUX_SESSIONS_APPEAR:-}" && "$name" == "$FAKE_TMUX_SESSIONS_APPEAR" ]]; then
-        _n=0; [[ -f "$FAKE_TMUX_APPEAR_N" ]] && _n=$(cat "$FAKE_TMUX_APPEAR_N")
-        echo $(( _n + 1 )) > "$FAKE_TMUX_APPEAR_N"
-        [[ "$_n" -ge 1 ]] && exit 0
-        exit 1
-    fi
-    [[ -f "$FAKE_TMUX_SESSIONS" ]] && grep -qxF "$name" "$FAKE_TMUX_SESSIONS" && exit 0
+    _fake_session_exists "$name" && exit 0
     exit 1
+fi
+# The door's silent existence probe: `list-sessions -F '#{session_name}' -f
+# '#{==:#{session_name},NAME}'`. A real tmux exits 0 either way and answers by
+# emitting the name or nothing, so this must NOT exit 1 for a missing session —
+# doing so would let a door that wrongly tested the STATUS pass here and fail
+# in production. Handled before the general list-sessions branch, which serves
+# the enumeration callers from a different file.
+if [[ "$args" == *list-sessions* && "$args" == *"#{==:#{session_name},"* ]]; then
+    filt=""
+    prev=""
+    for a in "$@"; do
+        if [[ "$prev" == "-f" ]]; then filt="$a"; fi
+        prev="$a"
+    done
+    # sed, not ${var#pattern}: that pattern needs the `#` and `{` escaped with
+    # backslashes, and this script lives in a NON-RAW Python string, where a
+    # backslash before either is an invalid escape — a SyntaxWarning today and
+    # a SyntaxError in a future Python, reported against a line number inside
+    # this bash, which reads as nonsense. Keeping the bash backslash-free
+    # sidesteps it. (This comment is inside that same string, so it cannot
+    # spell the offending sequence either.)
+    name=$(printf '%s' "$filt" | sed 's/^#{==:#{session_name},//; s/}$//')
+    _fake_session_exists "$name" && echo "$name"
+    exit 0
 fi
 if [[ "$args" == *list-sessions* ]]; then
     # The listing file stores 'name|attached|activity' lines; emit the shape
@@ -510,15 +547,39 @@ class TestManualMode:
         assert "cc-2  detached" in result.stderr
         assert "tmux attach" in result.stderr
 
-    def test_has_session_probes_use_exact_name_match(self, door):
+    def test_session_probes_use_exact_name_match_and_stay_silent(self, door):
+        """Pins the PROPERTY, not the spelling.
+
+        This asserted `has-session` with a `-t =` prefix. Both halves were
+        really one requirement -- match the name EXACTLY, because a bare `-t`
+        is prefix-matched by tmux and cc-1 would read as existing whenever only
+        cc-10 did -- and `has-session` was just the verb that happened to carry
+        it. It also carried something unwanted: has-session answers "absent" by
+        ERRORING, and a tmux error is logged in the server's message log, on
+        ordinary successful logins where absent is the expected answer.
+
+        So the exactness is asserted against whatever probe the door uses, and
+        the noisy verb is asserted ABSENT. Written this way, a future probe that
+        is silent but sloppily prefix-matching still fails here.
+        """
         run, log, sessions, _listing, _panes = door
         sessions.write_text("cc-1\n")
         run("manual")
-        probes = [ln for ln in log.read_text().splitlines() if "has-session" in ln]
-        assert probes, "allocation must probe has-session"
-        # '=' prefix: without it tmux prefix-matches, so cc-1 reads as
-        # existing whenever only cc-10 does.
-        assert all("-t =cc-" in p for p in probes), probes
+        lines = log.read_text().splitlines()
+
+        probes = [ln for ln in lines if "#{==:#{session_name}," in ln]
+        assert probes, (
+            "allocation must probe for an existing session; no name-addressed "
+            "existence probe reached the fake tmux at all"
+        )
+        assert all("#{==:#{session_name},cc-" in p for p in probes), probes
+
+        noisy = [ln for ln in lines if "has-session" in ln]
+        assert not noisy, (
+            "the door probed with `has-session`, which errors on the absent "
+            "path, on a login where absent is the expected answer:\n  "
+            + "\n  ".join(noisy)
+        )
 
     def test_extra_args_are_forwarded_into_the_slot(self, door):
         run, log, _sessions, _listing, _panes = door
@@ -1672,3 +1733,61 @@ class TestBypassTempDirIsValidatedNotAssumed:
         assert "if _cc_resolve_tmpdir; then" in body, (
             "the slot path no longer calls the shared resolution"
         )
+
+
+class TestWebOverrideLever:
+    """GENESIS_CC_WEB_OVERRIDE=1 in ~/.genesis/cc-slot.env gives a NEW slot the
+    WebSearch override: Claude Code's function-hooks flag pinned on, and the
+    plugin loaded from this checkout with --plugin-dir. Dispatched sessions never
+    come through this door; CCInvoker pins the flag to 0 (genesis.cc.child_env).
+
+    Decided in both directions. A new session's env comes from the tmux SERVER
+    (measured above), so leaving the flag out of the create line would hand the
+    pane whatever a server started earlier holds; with the lever off the pane
+    unsets it instead (review: a removed lever kept the override on).
+    """
+
+    @staticmethod
+    def _lever(run, value: str | None) -> None:
+        env_file = run.home / ".genesis" / "cc-slot.env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("" if value is None else f"GENESIS_CC_WEB_OVERRIDE={value}\n")
+
+    @staticmethod
+    def _plugin(run) -> Path:
+        d = run.checkout / "plugins" / "genesis-web-override"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_on_pins_the_flag_and_loads_the_plugin_from_the_checkout(self, door):
+        run, log, _sessions, _listing, _panes = door
+        plugin = self._plugin(run)
+        self._lever(run, "1")
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        assert "-e CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1" in line, line
+        assert line.index("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=") < line.index(" LANG="), line
+        assert f"claude --plugin-dir {plugin} " in line, line
+        assert "unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS" not in line, line
+
+    @pytest.mark.parametrize("value", [None, "0", "yes"])
+    def test_anything_but_1_unsets_the_flag_in_the_pane(self, door, value):
+        run, log, _sessions, _listing, _panes = door
+        self._plugin(run)
+        self._lever(run, value)
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        assert "-e CLAUDE_CODE_ENABLE_FUNCTION_HOOKS" not in line, line
+        assert "unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS && " in line, line
+        assert "--plugin-dir" not in line, line
+
+    def test_on_without_the_plugin_warns_and_starts_without_it(self, door):
+        run, log, _sessions, _listing, _panes = door
+        self._lever(run, "1")
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        assert "GENESIS_CC_WEB_OVERRIDE=1 but" in result.stderr, result.stderr
+        line = _new_session_line(log)
+        assert "--plugin-dir" not in line and "unset CLAUDE_CODE_ENABLE_FUNCTION_HOOKS && " in line, line

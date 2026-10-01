@@ -22,16 +22,22 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
+# The pause, resume and renewer live in a shared lib;
+# update.sh keeps the call site and the EXIT-trap composition.
+GUARDIAN_LIB = REPO_ROOT / "scripts" / "lib" / "guardian_pause.sh"
 
 # Exact strings (real statements, not comment prose).
-SELF_DELETE = "trap 'rm -f \"${BASH_SOURCE[0]}\" 2>/dev/null' EXIT"
-EXIT_REARM = "trap '_guardian_resume; rm -f \"${BASH_SOURCE[0]}\" 2>/dev/null' EXIT"
+# The self-copy is named through the startup binding, never a late-bound
+# ${BASH_SOURCE[0]} (test_update_self_copy_trap.py has the reason).
+SELF_DELETE = "trap 'rm -f \"$_SELF_COPY\" 2>/dev/null' EXIT"
+EXIT_REARM = "trap '_guardian_resume; rm -f \"$_SELF_COPY\" 2>/dev/null' EXIT"
 STOP_CALL = "\n    _stop_genesis_server\n"
 PAUSE_CALL = "_guardian_pause"
 
@@ -39,6 +45,11 @@ PAUSE_CALL = "_guardian_pause"
 @pytest.fixture(scope="module")
 def text() -> str:
     return UPDATE_SH.read_text()
+
+
+@pytest.fixture(scope="module")
+def lib() -> str:
+    return GUARDIAN_LIB.read_text()
 
 
 def _extract_func(text: str, name: str) -> str:
@@ -55,9 +66,19 @@ def _idx(text: str, marker: str) -> int:
 
 
 # ── structure / placement ───────────────────────────────────────────────────
-def test_helpers_defined_column0_braces(text: str) -> None:
-    _extract_func(text, "_guardian_pause")
-    _extract_func(text, "_guardian_resume")
+def test_helpers_defined_column0_braces(lib: str) -> None:
+    _extract_func(lib, "_guardian_pause")
+    _extract_func(lib, "_guardian_resume")
+
+
+def test_update_sh_sources_the_lib_before_the_pause(text: str) -> None:
+    """update.sh must define the helpers (source the lib) before it calls them,
+    and before anything can move the checkout under the running copy."""
+    source = _idx(text, '. "$SCRIPT_DIR/lib/guardian_pause.sh"')
+    call = re.search(r"^\s+_guardian_pause\n", text, re.MULTILINE)
+    assert call and source < call.start()
+    fetch = _idx(text, 'timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main')
+    assert source < fetch, "source the lib before the fetch (and so before any merge)"
 
 
 def test_pause_called_before_the_stop(text: str) -> None:
@@ -77,49 +98,59 @@ def test_pause_is_host_gated(text: str) -> None:
 
 
 def test_resume_on_exit_trap_preserves_self_delete(text: str) -> None:
-    """BLOCKER-2: the EXIT re-arm keeps the temp-copy self-delete."""
+    """BLOCKER-2: the EXIT re-arm keeps the temp-copy self-delete. The CALLER arms
+    it (a lib cannot know what else shares the EXIT slot), BEFORE the pause, so no
+    signal can land between an accepted pause and its resume."""
     assert EXIT_REARM in text, "EXIT trap must re-arm with resume AND the self-delete"
     assert text.count(SELF_DELETE) >= 1, "original self-delete EXIT trap must remain"
+    call = re.search(r"^\s+_guardian_pause\n", text, re.MULTILINE)
+    assert call and text.index(EXIT_REARM) < call.start(), "arm the resume before the pause"
 
 
-def test_resume_is_flag_guarded(text: str) -> None:
-    body = _extract_func(text, "_guardian_resume")
+def test_resume_is_flag_guarded(lib: str) -> None:
+    body = _extract_func(lib, "_guardian_resume")
     assert '"${_GUARDIAN_PAUSED:-}"' in body, "resume must no-op unless paused"
 
 
-def test_ssh_calls_are_bounded_and_nonaborting(text: str) -> None:
+def test_ssh_calls_are_bounded_and_nonaborting(lib: str) -> None:
     """BLOCKER-1: each SSH is bounded (timeout + ConnectTimeout) and cannot abort
     the deploy — both pause and resume guard the ssh with an `if`. The actual
     no-abort behaviour is proven functionally below."""
     for name in ("_guardian_pause", "_guardian_resume"):
-        body = _extract_func(text, name)
+        body = _extract_func(lib, name)
         assert "ssh" in body, f"{name} must SSH the gateway"
         assert "timeout" in body and "ConnectTimeout" in body, f"{name} SSH must be bounded"
     # resume swallows a failed SSH: the ssh sits in an `if` CONDITION (set -e-safe,
     # so a non-zero exit can't abort) and the function returns 0 explicitly. The
     # `if` is load-bearing beyond swallowing — it clears _GUARDIAN_PAUSED only on
     # success, so a failed resume keeps the flag set for the EXIT-trap retry.
-    resume = _extract_func(text, "_guardian_resume")
+    resume = _extract_func(lib, "_guardian_resume")
     assert re.search(r"if\s+timeout[^\n]*\bssh\b", resume), (
         "resume SSH must be guarded by an `if` (set -e-safe, non-aborting)"
     )
     assert "return 0" in resume, "resume must `return 0` so a failed resume never aborts"
 
 
-def test_wire_contract_pause_int_in_gateway_range(text: str) -> None:
+def test_wire_contract_pause_int_in_gateway_range(lib: str) -> None:
     r"""SHOULD-FIX #2: update.sh must send `pause <int>` with the int in the gateway's
     accepted 1-3600 range (PR-1's `pause\ *)` case). Pins our side of the cross-PR
     contract so a drift (TTL out of range, or a renamed verb) fails here."""
-    pause = _extract_func(text, "_guardian_pause")
+    pause = _extract_func(lib, "_guardian_pause")
     assert '"pause $GUARDIAN_PAUSE_TTL"' in pause, "wire verb must be `pause <ttl>`"
-    m = re.search(r"^GUARDIAN_PAUSE_TTL=(\d+)$", text, re.MULTILINE)
+    # A plain literal, never an env-overridable default: the health window of both
+    # callers is derived from it, and a TTL of 0 would make that window 0.
+    m = re.search(r"^GUARDIAN_PAUSE_TTL=(\d+)$", lib, re.MULTILINE)
+    assert re.search(r"^GUARDIAN_PAUSE_RENEW_MAX=\d+$", lib, re.MULTILINE), (
+        "RENEW_MAX must be a literal too"
+    )
     assert m, "GUARDIAN_PAUSE_TTL must be a literal integer"
     assert 1 <= int(m.group(1)) <= 3600, "TTL must be in the gateway's 1-3600 range"
 
 
-def test_syntax_ok(text: str) -> None:
-    r = subprocess.run(["bash", "-n", str(UPDATE_SH)], capture_output=True, text=True, timeout=30)
-    assert r.returncode == 0, r.stderr
+def test_syntax_ok() -> None:
+    for script in (UPDATE_SH, GUARDIAN_LIB):
+        r = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
 
 
 # ── functional: drive the SHIPPED helpers with a stubbed, LOGGED ssh ──────────
@@ -156,18 +187,17 @@ def _harness(text: str, tmp_path: Path, *, ssh_rc: int, pre_paused: bool = False
     )
     for f in ("timeout", "ssh"):
         (stub / f).chmod(0o755)
-    pause = _extract_func(text, "_guardian_pause")
-    resume = _extract_func(text, "_guardian_resume")
-    renew = _extract_func(text, "_guardian_renew_loop")
 
     def run(body: str) -> str:
+        # The SHIPPED lib, sourced as update.sh sources it,
+        # with the caller's EXIT trap armed per the lib's caller contract.
         script = tmp_path / "h.sh"
         script.write_text(
             "#!/bin/bash\nset -euo pipefail\n"
-            f'HOME="{home}"; VENV_DIR="{tmp_path}/venv"; GUARDIAN_PAUSE_TTL=1800\n'
-            "GUARDIAN_PAUSE_RENEW_MAX=4\n"
-            '_GUARDIAN_PAUSED=""; _GUARDIAN_HOST=""; _GUARDIAN_KEY=""; _GUARDIAN_RENEW_PID=""\n'
-            f"{pause}\n{resume}\n{renew}\n{body}\necho REACHED_END\n"
+            f'HOME="{home}"; VENV_DIR="{tmp_path}/venv"\n'
+            f'. "{GUARDIAN_LIB}"\n'
+            "trap _guardian_resume EXIT\n"
+            f"{body}\necho REACHED_END\n"
         )
         env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"}
         r = subprocess.run(
@@ -262,19 +292,22 @@ def test_resume_noops_when_not_paused(text: str, tmp_path: Path) -> None:
     assert not ssh_log.exists() or "resume" not in ssh_log.read_text(), "no spurious resume"
 
 
-def test_lease_renewer_wired_and_bounded(text: str) -> None:
+def test_lease_renewer_wired_and_bounded(lib: str) -> None:
     """P2 #4: the renewer is bounded (GUARDIAN_PAUSE_RENEW_MAX), started as a
     REDIRECTED background job by _guardian_pause, and killed by _guardian_resume
     BEFORE the resume SSH (so it can't re-pause after we resume)."""
-    renew = _extract_func(text, "_guardian_renew_loop")
+    renew = _extract_func(lib, "_guardian_renew_loop")
     assert "GUARDIAN_PAUSE_RENEW_MAX" in renew, "renewer must be bounded (no runaway)"
     assert "pause $GUARDIAN_PAUSE_TTL" in renew, "renewer must re-issue the pause verb"
-    pause = _extract_func(text, "_guardian_pause")
-    assert "_guardian_renew_loop >/dev/null 2>&1 &" in pause, (
-        "pause starts the renewer (redirected bg)"
+    assert renew.index("_guardian_parent_alive") < renew.index("pause $GUARDIAN_PAUSE_TTL"), (
+        "check the parent is alive BEFORE each renew"
+    )
+    pause = _extract_func(lib, "_guardian_pause")
+    assert "_guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &" in pause, (
+        "pause starts the renewer redirected, with the deploy lock fd closed"
     )
     assert "_GUARDIAN_RENEW_PID=$!" in pause, "pause must capture the renewer PID"
-    resume = _extract_func(text, "_guardian_resume")
+    resume = _extract_func(lib, "_guardian_resume")
     assert 'kill "$_GUARDIAN_RENEW_PID"' in resume, "resume must kill the renewer"
     assert resume.index("_GUARDIAN_RENEW_PID") < resume.index("resume >/dev/null"), (
         "the renewer must be killed BEFORE the resume SSH"
@@ -291,6 +324,127 @@ def test_lease_renewer_reissues_pause_then_stops(text: str, tmp_path: Path) -> N
     sent = ssh_log.read_text() if ssh_log.exists() else ""
     n = sent.count("pause 2")
     assert n >= 2, f"renewer must re-issue pause at least once (saw {n} 'pause 2')"
+
+
+def test_the_deploy_lock_is_free_right_after_a_clean_exit(text: str, tmp_path: Path) -> None:
+    """The renewer used to inherit the deploy lock fd. _guardian_resume kills the
+    renewer's bash, but its `sleep` outlives the kill, so the lock stayed held for
+    up to TTL/2 after EVERY run, clean exit included. Now the lock is free the
+    moment the deploy exits."""
+    run, _ = _harness(text, tmp_path, ssh_rc=0)
+    lock = tmp_path / "update.lock"
+    # `sleep 1` after the pause: the leak is the renewer's `sleep`, so the renewer
+    # must be asleep when the EXIT resume kills it. Without the delay the resume
+    # can land before the sleep is forked, and the test passes with the leak in
+    # place (MEASURED: it survived the mutation that reintroduces the leak).
+    out = run(
+        f'exec {{_UPDATE_LOCK_FD}}>"{lock}"\nflock -x "$_UPDATE_LOCK_FD"\n'
+        "GUARDIAN_PAUSE_TTL=40\n_guardian_pause\nsleep 1\n"
+    )
+    assert "REACHED_END" in out, out
+    free = subprocess.run(["flock", "-n", str(lock), "true"], capture_output=True, timeout=10)
+    assert free.returncode == 0, "the deploy lock was still held after the deploy exited"
+
+
+def test_the_renewer_stops_when_its_deploy_is_killed(text: str, tmp_path: Path) -> None:
+    """A SIGKILLed deploy runs no EXIT trap, so nothing kills the renewer. It must
+    notice its parent is gone and stop BEFORE sending another pause, rather than
+    re-pausing the Guardian for about an hour while later deploys proceed."""
+    run, ssh_log = _harness(text, tmp_path, ssh_rc=0)
+    pidfile = tmp_path / "renewer.pid"
+    run(
+        f'GUARDIAN_PAUSE_TTL=2\n_guardian_pause\necho "$_GUARDIAN_RENEW_PID" > "{pidfile}"\nkill -9 $$\n'
+    )
+    renewer = int(pidfile.read_text())
+    assert renewer > 1
+    time.sleep(3.5)  # three renew periods at TTL=2
+    sent = ssh_log.read_text()
+    assert sent.count("pause 2") == 1, f"the renewer re-paused after its deploy died: {sent!r}"
+    alive = subprocess.run(["kill", "-0", str(renewer)], capture_output=True)
+    assert alive.returncode != 0, "the renewer outlived its deploy"
+
+
+def _parent_alive(pid: int, start: str) -> bool:
+    """Drive the REAL _guardian_parent_alive for a (pid, recorded start) pair."""
+    r = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'. "{GUARDIAN_LIB}"\n_GUARDIAN_PARENT_PID={pid}\n'
+            f'_GUARDIAN_PARENT_START="{start}"\n_guardian_parent_alive',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return r.returncode == 0
+
+
+def _start_of(pid: int) -> tuple[str, str]:
+    """(state, starttime) straight from /proc, independent of the helper."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    fields = stat[stat.rindex(")") + 2 :].split()
+    return fields[0], fields[19]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_the_pause_records_the_deploys_start_time(text: str, tmp_path: Path) -> None:
+    """The identity check is only as good as the value the pause records: an
+    empty _GUARDIAN_PARENT_START silently falls back to `kill -0` (review finding
+    on #2494). Compared with /proc read independently of the lib's parser."""
+    run, _ = _harness(text, tmp_path, ssh_rc=0)
+    out = run(
+        "_guardian_pause\n"
+        'echo "RECORDED=[$_GUARDIAN_PARENT_START]"\n'
+        "python3 -c \"import sys; s = open('/proc/%s/stat' % sys.argv[1]).read(); "
+        "print('ACTUAL=[' + s[s.rindex(')') + 2:].split()[19] + ']')\" \"$$\"\n"
+        "_guardian_resume\n"
+    )
+    recorded = re.search(r"RECORDED=\[(\d*)\]", out)
+    actual = re.search(r"ACTUAL=\[(\d+)\]", out)
+    assert recorded and actual, out
+    assert recorded.group(1) == actual.group(1), out
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_the_renewer_parent_check_follows_process_identity(tmp_path: Path) -> None:
+    """Codex P2 on #2494: `kill -0` alone says "alive" for a zombie and for a
+    reused pid. Identity is the pid AND its start time; a zombie is dead."""
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        _, start = _start_of(live.pid)
+        assert _parent_alive(live.pid, start), "a live parent with its own start time"
+        # The same pid with another start time is a DIFFERENT process (a reused pid).
+        assert not _parent_alive(live.pid, str(int(start) + 1)), "a reused pid"
+    finally:
+        live.kill()
+        live.wait()
+    assert not _parent_alive(live.pid, start), "a parent that is gone"
+
+    # A real zombie: the child exits, its parent never reaps it.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys, time\npid = os.fork()\nif pid == 0:\n    os._exit(0)\n"
+            "print(pid, flush=True)\ntime.sleep(30)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        zpid = int(holder.stdout.readline())
+        deadline = time.monotonic() + 10
+        while _start_of(zpid)[0] != "Z" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        state, zstart = _start_of(zpid)
+        assert state == "Z", "guard: the fixture must really be a zombie"
+        # Control: kill -0 still succeeds on it — the defect this closes.
+        assert subprocess.run(["kill", "-0", str(zpid)]).returncode == 0
+        assert not _parent_alive(zpid, zstart), "a zombie is not a live deploy"
+    finally:
+        holder.kill()
+        holder.wait()
 
 
 if sys.platform.startswith("win"):  # pragma: no cover

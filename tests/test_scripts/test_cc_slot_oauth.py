@@ -72,7 +72,7 @@ def test_no_token_leak_via_tmux_e(script_text):
 
 def test_pane_command_interpolates_oauth_prefix(script_text):
     # The token-prep prefix runs BEFORE cd, leaving the `cd && claude` guard intact.
-    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude " in script_text
+    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude " in script_text
 
 
 def test_claude_stays_under_cd_guard(script_text):
@@ -87,7 +87,9 @@ def test_claude_stays_under_cd_guard(script_text):
     # than inherit the tmux server's stale values. The `:-` form matters — this
     # literal is extracted and evaluated under `set -u` by the cd-guard harness
     # below, where a bare ${_TMPDIR_UNSET} would be unbound.
-    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}claude " in script_text
+    # `${_FUNCTION_HOOKS_UNSET:-}` follows it on the same terms: an `unset` joined
+    # with `&&`, present unless the web-override lever pins the flag on.
+    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude " in script_text
     assert "&& { ${_OAUTH_SRC}claude" not in script_text  # not the brace-group shape
 
 

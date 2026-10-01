@@ -698,3 +698,157 @@ def test_breaker_verdict_is_three_state_and_degrades_safely():
     assert r.stdout.strip().endswith("OK"), (
         "breakerVerdict/breakerOpenedBy/breakerTooltip disagreed:\n" + r.stdout
     )
+
+
+def test_the_secrets_editor_sends_null_to_clear_and_never_an_empty_value():
+    """EXECUTABLE coverage of the PUT payload shape — the first there has been.
+
+    Nothing tested what the editor actually puts on the wire, which is precisely
+    how the empty-string ambiguity survived: `""` meant both "unchanged" and
+    "delete this", the client had to infer which, and every guard in `saveSecret`
+    existed to patch up that inference.
+
+    The assertions are on the RAW SERIALIZED BODY, deliberately. A handler that
+    sent `undefined` instead of `null` produces `{"keys":{}}` — which the server
+    answers as a 400 "must contain keys" — and a parsed object cannot tell
+    "absent" from "explicitly null", which is the ENTIRE distinction this
+    protocol is built on. Parsing here would hide the one bug that matters.
+
+    Both handlers are `async` and reach `fetchApi`/`confirm` as FREE identifiers
+    rather than store members, so the driver declares those at top level and runs
+    an async IIFE — new for this file, and the reason the extraction alone is not
+    enough.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    js = DASHBOARD_JS.read_text()
+
+    def _body(sig):
+        i = js.index(sig)
+        return js[i + len(sig): js.index("\n        },", i)]
+
+    save_body = _body("async saveSecret(keyName) {")
+    clear_body = _body("async clearSecret(keyName) {")
+
+    script = (
+        "let calls = [];\n"
+        "let confirmAnswer = true;\n"
+        "globalThis.confirm = () => confirmAnswer;\n"
+        # Echoes the request the way the real route does, so the default path
+        # exercises agreement rather than the drift case.
+        "let echoCleared = null;\n"
+        "globalThis.fetchApi = async (url, opts) => {\n"
+        "  calls.push({url, body: opts && opts.body});\n"
+        "  const sent = JSON.parse((opts && opts.body) || '{\"keys\":{}}').keys;\n"
+        "  const dflt = Object.keys(sent).filter(k => sent[k] === null);\n"
+        "  const body = {status: 'ok', updated: Object.keys(sent)};\n"
+        "  if (echoCleared !== 'omit') body.cleared = echoCleared === null ? dflt : echoCleared;\n"
+        "  return {ok: true, json: async () => body};\n"
+        "};\n"
+        "const saveSecret = async function (keyName) {" + save_body + "};\n"
+        "const clearSecret = async function (keyName) {" + clear_body + "};\n"
+        "function mkctx(over) {\n"
+        "  return Object.assign({\n"
+        "    secretsValues: {}, secretsSeeded: {}, secretsEditing: {},\n"
+        "    secretsWithheld: false, secretsSaving: false, secretsMessage: null,\n"
+        "    secretsGroups: [{name:'g', keys:[{key:'K', is_optional_override:true}]}],\n"
+        "    fetchSecrets(){}, loadSetupStatus(){}, _establishSession: async () => {},\n"
+        "  }, over || {});\n"
+        "}\n"
+        "let bad = 0;\n"
+        "function check(label, cond, extra) {\n"
+        "  if (!cond) { bad++; console.log('FAIL', label, extra === undefined ? '' : extra); }\n"
+        "}\n"
+        "(async () => {\n"
+        # Clear, confirmed -> exactly one request carrying a literal null.
+        "  calls = []; confirmAnswer = true;\n"
+        "  let ctx = mkctx();\n"
+        "  await clearSecret.call(ctx, 'K');\n"
+        "  check('clear sends one request', calls.length === 1, calls.length);\n"
+        "  check('clear body is an explicit null',\n"
+        "        calls[0] && calls[0].body === '{\"keys\":{\"K\":null}}', calls[0] && calls[0].body);\n"
+        "  check('clear body carries the literal :null (not undefined)',\n"
+        "        calls[0] && calls[0].body.includes(':null'), calls[0] && calls[0].body);\n"
+        # Clear, declined -> nothing leaves the browser.
+        "  calls = []; confirmAnswer = false;\n"
+        "  await clearSecret.call(mkctx(), 'K');\n"
+        "  check('declining the confirm sends nothing', calls.length === 0, calls.length);\n"
+        # Save with a value -> the value, never a null.
+        "  calls = []; confirmAnswer = true;\n"
+        "  await saveSecret.call(mkctx({secretsValues: {K: 'http://x.invalid'}}), 'K');\n"
+        "  check('save sends the value',\n"
+        "        calls.length === 1 && calls[0].body === '{\"keys\":{\"K\":\"http://x.invalid\"}}',\n"
+        "        calls[0] && calls[0].body);\n"
+        # Save trims, and a trimmed-but-present value is still a set.
+        "  calls = [];\n"
+        "  await saveSecret.call(mkctx({secretsValues: {K: '  http://x.invalid  '}}), 'K');\n"
+        "  check('save trims without turning the value into a clear',\n"
+        "        calls.length === 1 && calls[0].body === '{\"keys\":{\"K\":\"http://x.invalid\"}}',\n"
+        "        calls[0] && calls[0].body);\n"
+        # An empty Save is refused outright: it can no longer clear ANYTHING.
+        "  calls = [];\n"
+        "  ctx = mkctx({secretsValues: {K: ''}});\n"
+        "  await saveSecret.call(ctx, 'K');\n"
+        "  check('an empty save sends nothing', calls.length === 0, calls.length);\n"
+        "  check('an empty save points at Clear',\n"
+        "        ctx.secretsMessage && /Clear/.test(ctx.secretsMessage.text),\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.text);\n"
+        # ...including for a CLEARABLE key, which is the row that used to delete.
+        "  calls = [];\n"
+        "  ctx = mkctx({secretsValues: {K: '   '}});\n"
+        "  await saveSecret.call(ctx, 'K');\n"
+        "  check('an empty save on a CLEARABLE key still sends nothing',\n"
+        "        calls.length === 0, calls.length);\n"
+        # The withheld message still wins over the generic one.
+        "  calls = [];\n"
+        "  ctx = mkctx({secretsValues: {K: ''}, secretsSeeded: {K: ''}, secretsWithheld: true});\n"
+        "  await saveSecret.call(ctx, 'K');\n"
+        "  check('withheld+untouched sends nothing', calls.length === 0, calls.length);\n"
+        "  check('withheld gets the message explaining WHY it looks empty',\n"
+        "        ctx.secretsMessage && /hidden until you log in/.test(ctx.secretsMessage.text),\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.text);\n"
+        # The `cleared` echo is READ, not assumed. It is the only confirmation
+        # the clear half of the contract has, so a server that stops reporting
+        # it must not leave the operator told the override is gone.
+        "  calls = []; echoCleared = null;\n"
+        "  ctx = mkctx();\n"
+        "  await clearSecret.call(ctx, 'K');\n"
+        "  check('an echoed clear reports success',\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.type === 'restart',\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.type);\n"
+        "  calls = []; echoCleared = [];\n"
+        "  ctx = mkctx();\n"
+        "  await clearSecret.call(ctx, 'K');\n"
+        "  check('a server that does NOT report it cleared does not claim success',\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.type === 'error',\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.type);\n"
+        "  calls = []; echoCleared = 'omit';\n"
+        "  ctx = mkctx();\n"
+        "  await clearSecret.call(ctx, 'K');\n"
+        "  check('an ABSENT cleared field degrades to a caveat, not a crash',\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.type === 'error',\n"
+        "        ctx.secretsMessage && ctx.secretsMessage.type);\n"
+        "  check('and the request still completed', ctx.secretsSaving === false,\n"
+        "        ctx.secretsSaving);\n"
+        # No stuck spinner on any exit path — a disabled Save/Clear pair that
+        # never re-enables is a dead panel until reload.
+        "  calls = []; confirmAnswer = false; echoCleared = null;\n"
+        "  ctx = mkctx();\n"
+        "  await clearSecret.call(ctx, 'K');\n"
+        "  check('declining the confirm leaves no stuck spinner',\n"
+        "        ctx.secretsSaving === false, ctx.secretsSaving);\n"
+        "  confirmAnswer = true;\n"
+        "  ctx = mkctx({secretsValues: {K: ''}});\n"
+        "  await saveSecret.call(ctx, 'K');\n"
+        "  check('a refused empty Save leaves no stuck spinner',\n"
+        "        ctx.secretsSaving === false, ctx.secretsSaving);\n"
+        "  console.log(bad === 0 ? 'OK' : 'FAIL ' + bad);\n"
+        "})();\n"
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    assert r.stdout.strip().endswith("OK"), (
+        "the secrets editor's PUT payload shape is wrong:\n" + r.stdout
+    )
