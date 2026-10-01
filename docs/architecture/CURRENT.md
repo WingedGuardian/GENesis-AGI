@@ -496,6 +496,16 @@ verified: 18e41e1e1 2026-09-23
   empty, and the pane command unsets them itself: this script ends in
   `exec tmux`, which STARTS the server every later slot inherits from, and
   omitting a pin is not the same as having no value.
+  The `GENESIS_CC_WEB_OVERRIDE` cc-slot lever is decided the same way in both
+  directions: set to `1`, a new slot pins `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`
+  and loads `plugins/genesis-web-override` from the checkout with `--plugin-dir`
+  (Claude Code's `WebSearch` answered by the Genesis chain); otherwise the pane
+  unsets the flag. Every dispatched `claude -p` child pins it to `0` instead,
+  through `genesis.cc.child_env.pin_dispatched_env`, because Claude Code falls
+  back to a server-side default when it is unset.
+  `tests/test_cc/test_child_env.py` finds the spawn sites from the source (a
+  `claude -p` argv, or the dispatched marker) and fails on one that skips the
+  pin; an argv built at run time is outside what it can see.
   Recovering a slot that is alive but running no claude — detecting it, and
   rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
@@ -1563,10 +1573,16 @@ verified: 788dd9a9 2026-09-06
   reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
-  `upstream-pr-steward` campaign's own owner notifications — the ones it already
-  logs to `outreach_history` (category `notification`, topic `%steward%`) when a
-  tracked EXTERNAL PR changes — into foreground CC sessions as a one-line
+  GitHub-steward owner notifications already in `outreach_history` (category
+  `notification`, topic `%steward%`) into foreground CC sessions as a one-line
   `[PRs] …` nudge, so a status change missed on Telegram still reaches the user.
+  Those rows are written by `recon/account_activity.py` — a Python poller inside
+  genesis-server, whose topics are prefixed `GitHub steward: …`, which is what
+  the `%steward%` LIKE matches — and by the `github-activity-digest` campaign's
+  digests. There is **no** `upstream-pr-steward` campaign — MEASURED, the slug
+  names none of the 6 `campaigns` rows and was never committed as a campaign
+  definition. #792 added the `steward` DirectSession profile and referred to an
+  intended campaign for it; the profile is real, the campaign is not.
   Read-only, **home-anchored DB** (NOT `genesis_db_path()`/`repo_root()`, which
   would read an empty `<worktree>/data/` — the same trap `_charter_db_path`
   avoids). Seen-state is a home-anchored JSON sidecar
@@ -1576,8 +1592,7 @@ verified: 788dd9a9 2026-09-06
   window (no retention step). Lever: settings domain `pr_watch`
   (`config/pr_watch.yaml` + `pr_watch_config.py`) + `GENESIS_PR_WATCH_DISABLED`
   kill switch; skips dispatched sessions (`GENESIS_CC_SESSION=1`) so the human's
-  next foreground session still gets the nudge. The campaign's discovery/notify
-  behavior lives in its install-local strategy doc (campaigns ship zero defaults).
+  next foreground session still gets the nudge.
 - **Infra protection posture (2026-07-16; network plane 2026-07-17)**: hourly
   `_check_infra_protection_posture` reads the infra profile's effective facts
   and raises one `high` `infrastructure_alert` when a memory-plane protection
@@ -2940,7 +2955,12 @@ verified: f24c15e9 2026-09-05
   the default-route link `AdministrativeState=configured`, so the posture check
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
-  docs/reference/network-resilience.md).
+  docs/reference/network-resilience.md). The root Tailscale watchdog
+  (`genesis-tailscale-watchdog.timer`) is reported by its unit-file state only
+  (`tailscale_watchdog_unit_state`, beside `tailscaled_loaded`, which gates the
+  `tailscale_watchdog_absent` posture rule); its `/run` file is event data for the
+  awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
+  the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),

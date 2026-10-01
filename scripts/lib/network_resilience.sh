@@ -14,6 +14,10 @@
 #   B. A root networkd watchdog (genesis-network-watchdog.timer) that detects a
 #      failed/inactive/route-less networkd and restarts it — automating the
 #      manual recovery. The restart is address-preserving under (A).
+#   C. A root Tailscale watchdog (genesis-tailscale-watchdog.timer) that heals a
+#      stuck Tailscale tunnel (scripts/systemd/genesis-tailscale-watchdog.py).
+#      It does not depend on networkd, so it installs on any systemd host with a
+#      tailscaled unit, before the networkd gates below.
 #
 # Degrades gracefully: no systemd, no networkd, no networkctl, or no usable
 # sudo each produce a one-line skip note and rc=0 — must never abort
@@ -30,6 +34,10 @@ NETRES_LIBEXEC_DIR="${NETRES_LIBEXEC_DIR:-/usr/local/lib/genesis}"
 # trailing `; true` keeps a failed resolution from aborting the sourcing caller
 # under `set -e` — a bad path is caught later by the readable-source guard.
 NETRES_WATCHDOG_SRC="${NETRES_WATCHDOG_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-network-watchdog.sh}"
+NETRES_TS_WATCHDOG_SRC="${NETRES_TS_WATCHDOG_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-tailscale-watchdog.py}"
+# The Tailscale watchdog runs under the HOST's Python (standard library only),
+# never the Genesis venv, which root does not own and an update can rebuild.
+NETRES_PYTHON="${NETRES_PYTHON:-/usr/bin/python3}"
 
 # KeepConfiguration=true (superset of =dhcp): retains BOTH DHCP-provided and
 # static/foreign config across a networkd failure or daemon stop. `true` is
@@ -54,11 +62,43 @@ _netres_service_content() {
         "ExecStart=$1"
 }
 
+_NETRES_TS_TIMER=$'[Unit]\nDescription=Genesis Tailscale watchdog — heal a stuck Tailscale tunnel\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=2min\nAccuracySec=20s\n\n[Install]\nWantedBy=timers.target'
+
+# TimeoutStartSec bounds a HUNG run; the oneshot otherwise has no start timeout
+# and a hang would stop its timer. The worst legitimate run under every
+# setting's maximum (genesis-tailscale-watchdog.py SETTINGS), with every phase
+# overrunning its own deadline by the one call in flight, is about 55 min;
+# tests/test_scripts/test_network_resilience.py derives it from SETTINGS and
+# fails if this limit does not clear it by 5 min. 65min clears it; the
+# defaults take ~6 min.
+_netres_ts_service_content() {
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=Genesis Tailscale watchdog (heal a stuck Tailscale tunnel)' \
+        'After=tailscaled.service' \
+        '' \
+        '[Service]' \
+        'Type=oneshot' \
+        'TimeoutStartSec=65min' \
+        '# Root resolves tailscale and systemctl by name: pin PATH to root-owned' \
+        "# directories (systemd's own default for system services, made explicit)." \
+        'Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+        "ExecStart=$NETRES_PYTHON $1"
+}
+
 # _netres_put_file <path> <content> <mode> — write-if-different via sudo. Bumps
 # _NETRES_WROTE on a real write; sets _NETRES_FAILED + WARNS on failure. Never
 # fails the caller (returns 0) so `set -e` callers are safe even outside an if.
 _netres_put_file() {
     local path="$1" content="$2" mode="$3"
+    # Never write THROUGH a symlink. A masked unit is a symlink to /dev/null:
+    # tee would discard the file and chmod would change /dev/null itself, which
+    # breaks every non-root process that writes to it.
+    if sudo test -L "$path" 2>/dev/null; then
+        echo "  WARNING: $path is a symlink (a masked unit?) — not writing through it; network resilience NOT fully applied."
+        _NETRES_FAILED=1
+        return 0
+    fi
     if [[ "$(sudo cat "$path" 2>/dev/null)" == "$content" ]]; then
         return 0
     fi
@@ -144,46 +184,102 @@ _netres_install_watchdog() {
     if ((_NETRES_WROTE > before)); then
         sudo systemctl daemon-reload 2>/dev/null || true
     fi
-    # ALWAYS ensure the timer is active AND enabled (self-heal), decoupled from
-    # whether a file changed: a re-run must re-establish a timer that was disabled/
-    # stopped/masked externally since install — not skip just because the units are
-    # unchanged. Both states matter: `is-active` alone misses an active-but-DISABLED
-    # timer (e.g. `systemctl disable` without --now), which would silently fail to
-    # persist across a reboot. Both probes are reads (no sudo) and silent, so a
-    # healthy timer causes ZERO churn; only a down/unpersisted timer heals. NR1.
-    # Heal unless the timer is active AND *persistently* enabled. `is-enabled`
-    # exits 0 for BOTH "enabled" and "enabled-runtime" — but the latter is
-    # transient (stored under /run, gone on reboot), exactly what persistence must
-    # prevent — so key on stdout being EXACTLY "enabled" (matching the posture
-    # collector's network_watchdog_enabled signal), not the exit status.
-    local _wd_enabled
-    _wd_enabled="$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)"
-    if ! systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
+    _netres_ensure_timer_enabled genesis-network-watchdog.timer "watchdog timer"
+}
+
+# _netres_ensure_timer_enabled <timer> <label> — ALWAYS ensure the timer is
+# active AND enabled (self-heal), decoupled from whether a file changed: a
+# re-run must re-establish a timer that was disabled/stopped externally since
+# install, not skip just because the units are unchanged. Both states matter:
+# `is-active` alone misses an active-but-DISABLED timer (e.g. `systemctl
+# disable` without --now), which would silently fail to persist across a
+# reboot. Both probes are reads (no sudo) and silent, so a healthy timer causes
+# ZERO churn; only a down/unpersisted timer heals. NR1.
+# Heal unless the timer is active AND *persistently* enabled. `is-enabled`
+# exits 0 for BOTH "enabled" and "enabled-runtime" — but the latter is
+# transient (stored under /run, gone on reboot), exactly what persistence must
+# prevent — so key on stdout being EXACTLY "enabled" (matching the posture
+# collector's *_watchdog_enabled signals), not the exit status.
+_netres_ensure_timer_enabled() {
+    local timer="$1" label="$2" _wd_enabled
+    _wd_enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+    if ! systemctl is-active "$timer" >/dev/null 2>&1 \
         || [ "$_wd_enabled" != "enabled" ]; then
-        # (A masked timer was already unmasked + its unit rewritten above, before
-        # these writes, so enable now has a real unit file to act on.) enable+start,
-        # then VERIFY — never claim a heal that didn't take: a still-down or
-        # not-persistently-enabled timer surfaces as WARNING + _NETRES_FAILED.
-        sudo systemctl enable genesis-network-watchdog.timer 2>/dev/null || true
-        sudo systemctl start genesis-network-watchdog.timer 2>/dev/null || true
-        if systemctl is-active genesis-network-watchdog.timer >/dev/null 2>&1 \
-            && [ "$(systemctl is-enabled genesis-network-watchdog.timer 2>/dev/null || true)" = "enabled" ]; then
+        # enable+start, then VERIFY — never claim a heal that didn't take: a
+        # still-down or not-persistently-enabled timer surfaces as WARNING +
+        # _NETRES_FAILED.
+        sudo systemctl enable "$timer" 2>/dev/null || true
+        sudo systemctl start "$timer" 2>/dev/null || true
+        if systemctl is-active "$timer" >/dev/null 2>&1 \
+            && [ "$(systemctl is-enabled "$timer" 2>/dev/null || true)" = "enabled" ]; then
             _NETRES_HEALED=1
         else
-            echo "  WARNING: watchdog timer could not be re-enabled (may be masked or broken)."
+            echo "  WARNING: $label could not be re-enabled (may be masked or broken)."
             _NETRES_FAILED=1
         fi
     fi
 }
 
+# Part C — install the Tailscale watchdog (helper + oneshot service + timer).
+# Its own gates, independent of networkd: a systemd host with a tailscaled unit,
+# the host's Python 3.8+, and non-interactive sudo. The durable off switch is
+# NETWD_TS_MODE=off (or observe) in a drop-in on the service: a unit installed
+# in /etc/systemd/system cannot be masked. A mask that does exist (the timer or
+# service masked before it was ever installed) is still respected: nothing is
+# written or enabled. (The networkd timer above unmasks instead; that is its
+# older, deliberate contract, NR1.)
+_netres_install_tailscale_watchdog() {
+    if ! systemctl cat tailscaled.service >/dev/null 2>&1; then
+        echo "  Tailscale watchdog: no tailscaled unit on this host — skipping."
+        return 0
+    fi
+    local _unit
+    for _unit in genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service; do
+        if [[ "$(systemctl is-enabled "$_unit" 2>/dev/null || true)" == masked* ]]; then
+            echo "  Tailscale watchdog: $_unit is masked (operator off switch) — leaving it alone."
+            return 0
+        fi
+    done
+    if ! "$NETRES_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+        echo "  WARNING: Tailscale watchdog needs $NETRES_PYTHON (3.8+) — NOT installed."
+        _NETRES_FAILED=1
+        return 0
+    fi
+    if ! sudo -n true 2>/dev/null; then
+        echo "  Tailscale watchdog: sudo unavailable non-interactively — skipping."
+        return 0
+    fi
+    if [[ ! -r "$NETRES_TS_WATCHDOG_SRC" ]]; then
+        echo "  WARNING: Tailscale watchdog source missing ($NETRES_TS_WATCHDOG_SRC) — NOT installed."
+        _NETRES_FAILED=1
+        return 0
+    fi
+    local dst="$NETRES_LIBEXEC_DIR/tailscale-watchdog.py" before=$_NETRES_WROTE
+    _netres_put_file "$dst" "$(cat "$NETRES_TS_WATCHDOG_SRC")" "0755"
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-tailscale-watchdog.service" "$(_netres_ts_service_content "$dst")" "0644"
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-tailscale-watchdog.timer" "$_NETRES_TS_TIMER" "0644"
+    if ((_NETRES_WROTE > before)); then
+        sudo systemctl daemon-reload 2>/dev/null || true
+        echo "  Tailscale watchdog installed ($dst)."
+    fi
+    _netres_ensure_timer_enabled genesis-tailscale-watchdog.timer "Tailscale watchdog timer"
+}
+
 # network_resilience_apply — the entrypoint. Always returns 0.
 network_resilience_apply() {
-    echo "--- Network resilience (KeepConfiguration + networkd watchdog) ---"
+    echo "--- Network resilience (KeepConfiguration + networkd and Tailscale watchdogs) ---"
 
     if [[ ! -d "$NETRES_SYSTEMD_RUNTIME_DIR" ]]; then
         echo "  Skipped: not a systemd system (no $NETRES_SYSTEMD_RUNTIME_DIR)."
         return 0
     fi
+
+    _NETRES_WROTE=0
+    _NETRES_FAILED=""
+    _NETRES_HEALED=""
+    # Part C first: it does not need networkd, so the gates below must not
+    # skip it. It prints its own lines.
+    _netres_install_tailscale_watchdog
     if ! command -v networkctl >/dev/null 2>&1; then
         echo "  Skipped: networkctl not present — not a systemd-networkd system."
         return 0
@@ -206,9 +302,6 @@ network_resilience_apply() {
         return 0
     fi
 
-    _NETRES_WROTE=0
-    _NETRES_FAILED=""
-    _NETRES_HEALED=""
     _netres_apply_keepconfig
     _netres_install_watchdog
 

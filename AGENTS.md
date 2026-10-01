@@ -212,7 +212,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **video-processing** (`src/genesis/skills/video-processing/SKILL.md`) — Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
 - **voice-master** (`.claude/skills/voice-master/SKILL.md`) — Foundational voice authority and AI humanizer — writes content in the user's authentic voice with built-in AI detection, and supports stealth / anti- attribution writing (forum personas, anonymous posts, "write as not-me"). Use when asked to write/draft/generate content, invoke /voice, /write-as-me, or /humanize, run voice calibration, check "does this sound like me?", "make this sound human" / "de-AI this", "write a forum post as [persona]", or run AI detection ("does this sound like AI?", "check for AI patterns", "anti-slop check"). Do NOT use this skill for code, technical docs, or any output the user has not asked to be written in their voice — code styling defers to the separate code-voice skill.
 - **web-research** (`.claude/skills/web-research/SKILL.md`) — Evidence-driven web and open-source research for questions that require multiple sources, factual verification, comparisons, or an adopt/adapt/build decision. Use for substantial research in foreground sessions, the genesis-researcher subagent, and research-profile background sessions. Skip for a single stable fact or a known URL that only needs fetching.
-- **youtube-fetch** (`.claude/skills/youtube-fetch/SKILL.md`) — Fetches YouTube video metadata and transcripts using yt-dlp. Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
+- **youtube-fetch** (`.claude/skills/youtube-fetch/SKILL.md`) — Fetches YouTube video metadata and transcripts (genesis web_fetch MCP tool first, yt-dlp via Bash as the fallback). Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
 
 ### MCP Tools
 
@@ -297,7 +297,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `outreach_pending` — List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
-- `outreach_queue` — View recent outreach messages.
+- `outreach_queue` — List the 20 most recent SENT outreach messages, newest first.
 - `outreach_send` — Queue a message for delivery. Returns outreach_id.
 - `outreach_send_and_wait` — Send a message and wait for user reply. Returns JSON with reply or timeout.
 - `provision_grow` — Grow this VM's or container's capacity — approval-gated.

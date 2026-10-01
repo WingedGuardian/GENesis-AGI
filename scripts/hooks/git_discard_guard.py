@@ -171,8 +171,10 @@ try:
         analyze_checked,
         git_subcommand_index,
         has_trailing_override,
+        may_build_words,
         mention_views,
         mentions,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -278,6 +280,15 @@ _SNAPSHOT_VERBS = frozenset(
 # quadratic in the command's length, and this runs on the hook path, where MEASURED
 # a 32,000-character command took 4 seconds with it.
 _GIT_WORD = re.compile(r"\bgit\b")
+_HIDDEN_VERB_MSG = (
+    "[git-discard-guard] BLOCKED: this command runs git with a subcommand the "
+    "guard cannot read (a variable, a substitution or an escape stands where it "
+    "goes, or an option before it that the parser cannot classify). It could be "
+    "one that discards uncommitted work, and the guard cannot check or snapshot "
+    "an operation it cannot name. To proceed: write the git subcommand out "
+    "literally, and pass any option the parser does not recognise after it or "
+    "not at all."
+)
 # The submodule gate's word, case-folded: the config KEY is case-insensitive.
 _RECURSE_WORD = re.compile("recurse", re.IGNORECASE)
 _SNAPSHOT_VERB_WORD = re.compile(
@@ -1745,7 +1756,13 @@ def main() -> int:
     # a line continuation inside `git` or `clean` hides the word from a raw test and
     # the parse — which resolves it correctly — never ran. The view only widens what
     # reaches the parse; every verdict is still made on the parse.
-    if not any(mentions(cmd, "git", s) for s in _TRIGGER_SUBSTRINGS):
+    if not any(mentions(cmd, "git", s) for s in _TRIGGER_SUBSTRINGS) and not (
+        # A subcommand the shell BUILDS names none of the trigger verbs, so the
+        # words above cannot see it; a word that might be built is what lets the
+        # parse (Phase 1d) look. The parser answers which words those are, so this
+        # keeps no list of its own.
+        mentions(cmd, _GIT_WORD) and may_build_words(cmd)
+    ):
         return 0
 
     # Phase 1 — the clean BLOCK (UNRECOVERABLE → fail CLOSED).
@@ -1803,6 +1820,23 @@ def main() -> int:
         if blind_msg:
             with contextlib.suppress(OSError):
                 print(blind_msg, file=sys.stderr)
+            if discarded_write is not None:
+                with contextlib.suppress(
+                    Exception
+                ):  # not run_guard-wrapped: a raise here exits 1 = NON-blocking
+                    discarded_write.warn()
+            return 2
+
+    # Phase 1d — a git subcommand the parse cannot read at all (a variable, a
+    # substitution or an escape in its place, or an option before it the parser
+    # cannot classify). It may be `clean`, and it may discard work in a repository
+    # nobody can name, so neither the clean block nor the snapshot net can act on
+    # it. Refused, as the push guard refuses the same shape. Fails OPEN on a parser
+    # crash, like 1b and 1c.
+    with contextlib.suppress(Exception):
+        if "git" in unresolved_verb_programs(cmd):
+            with contextlib.suppress(OSError):
+                print(_HIDDEN_VERB_MSG, file=sys.stderr)
             if discarded_write is not None:
                 with contextlib.suppress(
                     Exception
