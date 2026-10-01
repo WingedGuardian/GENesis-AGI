@@ -533,20 +533,23 @@ def test_both_callers_name_the_lock_fd_the_way_the_lib_expects():
 
 
 def _update_sh_dirty(root: Path) -> str:
-    """update.sh's REAL dirty-tree pipeline, extracted, run against *root*."""
-    lines = UPDATE_SH.read_text().splitlines()
-    start = next(
-        i
-        for i, ln in enumerate(lines)
-        if ln.strip().startswith('DIRTY_FILES=$(git -C "$GENESIS_ROOT"')
+    """update.sh's REAL dirty-tree query, run against *root*. Both scripts call the
+    one query in scripts/lib/deploy_checkout.sh, so parity is that they call it and
+    that it behaves; the assignment is extracted from update.sh, not retyped."""
+    code = SCRIPT.read_text()
+    assert '_dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"' in code
+    matches = re.findall(
+        r'DIRTY_FILES="\$\(genesis_tracked_dirty_paths "\$GENESIS_ROOT"\)"', UPDATE_SH.read_text()
     )
-    block = "\n".join(ln.strip() for ln in lines[start : start + 3])
-    lib = REPO / "scripts" / "lib" / "deploy_marker.sh"
+    assert len(matches) == 1, matches
+    marker_lib = REPO / "scripts" / "lib" / "deploy_marker.sh"
+    checkout_lib = REPO / "scripts" / "lib" / "deploy_checkout.sh"
     r = subprocess.run(
         [
             "bash",
             "-c",
-            f'set -euo pipefail\nHOME=/nonexistent\n. "{lib}"\nGENESIS_ROOT="{root}"\n{block}\nprintf %s "$DIRTY_FILES"',
+            f'set -euo pipefail\nHOME=/nonexistent\n. "{marker_lib}"\n. "{checkout_lib}"\n'
+            f'GENESIS_ROOT="{root}"\n{matches[0]}\nprintf %s "$DIRTY_FILES"',
         ],
         capture_output=True,
         text=True,

@@ -1058,6 +1058,18 @@ jobs:
         #   test_update_tier2_baseline.py goes 5 -> 8 (unreadable history, no
         #   history table, and no interpreter for the reader are each a new case).
         # test_update_rollback_recovery.py is edited count-neutrally (8 == 8).
-        # So the floor is 23476 + 13 = 23489. No new test carries a skipif, so
-        # the ceiling does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23489
+        # So that floor is 23476 + 13 = 23489.
+        #
+        # The deploy-checkout lib branch adds three test files that do not exist on
+        # main, so each delta is its FULL collected count, and edits seven others
+        # count-neutrally (each re-measured, branch == main):
+        #   pytest tests/test_scripts/test_deploy_checkout.py --collect-only -q
+        #     -> 36 tests collected
+        #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
+        #     -> 28 tests collected
+        #   pytest tests/test_scripts/test_update_checkout_moved.py --collect-only -q
+        #     -> 29 tests collected
+        # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
+        # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
+        # does not move.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23582

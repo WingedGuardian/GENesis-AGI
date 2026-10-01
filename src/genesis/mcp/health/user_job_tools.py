@@ -43,7 +43,7 @@ async def user_job_create(
         description: Optional description of what the job does
         job_type: Job category (e.g., "generic", "maintenance")
         profile: CC session profile — any registered DirectSession profile
-            (e.g. observe, research, interact, campaign, steward)
+            (e.g. observe, research, interact, campaign)
         model: CC model — sonnet, opus, or haiku
         effort: CC effort level — low, medium, high
     """

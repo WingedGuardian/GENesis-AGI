@@ -6,7 +6,8 @@
 # This file is machine-specific — NEVER commit it to git.
 # All values here can also be set via environment variables (env var wins) —
 # EXCEPT `timezone`, which is file-first (this value wins; USER_TIMEZONE env is
-# only a deprecated fallback). See the `timezone:` note below.
+# only a deprecated fallback), and `hooks.asks`, which is FILE-ONLY (no
+# supported env override). See the notes on each below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 network:
@@ -35,3 +36,32 @@ github:
   # this on first use — you usually don't need to set it manually.
   # Override here only if your fork has a non-default name.
   private_repo: ""
+
+# Approval prompts you have chosen to turn off on THIS install.
+#
+# The credentials guard asks before anything touches secrets.env. On an install
+# whose own tooling reads that file routinely, the prompt stops being a
+# decision, and a prompt answered by reflex makes the prompts worth reading
+# harder to notice. Name it here to silence it.
+#
+# ASKS ONLY. Nothing here can reach a BLOCK, nor the deny a Genesis-dispatched
+# session gets. Silencing a prompt does not APPROVE anything: the hook stops
+# raising it and leaves a note naming this setting, and Claude Code's own
+# permission settings still decide the command. Leaving this section out — the
+# default — keeps every prompt.
+#
+# `secrets_env` is the only key. The push / PR-open prompt is deliberately NOT
+# listed and cannot be turned off: it is where code leaves the machine. Any
+# other key is ignored, and the prompt says so.
+#
+# FILE-ONLY: there is no supported environment-variable override — the hook
+# reads this file directly, on every invocation.
+#
+# This is a fatigue lever, not a security boundary: the session whose prompt it
+# silences can edit this file too. Every silenced access still leaves a note in
+# the transcript naming this setting.
+#
+#hooks:
+#  asks:
+#    # the secrets.env credentials prompt.
+#    secrets_env: off
