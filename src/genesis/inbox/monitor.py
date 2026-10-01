@@ -625,11 +625,14 @@ class InboxMonitor:
             # Tri-state consume keeps sibling drops safe (their consume
             # returns "already_consumed" and they proceed on their row
             # claims). A vanished file needs no consume — nothing re-detects.
+            # 'superseded', not 'failed': the newer content is re-detected and
+            # evaluated under a fresh approval, so nothing failed. The
+            # non-failed branch of update_status leaves retry_count alone.
             if current_hash != stored_hash:
                 await inbox_items.update_status(
                     self._db,
                     row_id,
-                    status="failed",
+                    status="superseded",
                     error_message=(f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}content changed"),
                     processed_at=now_iso,
                 )

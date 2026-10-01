@@ -1072,4 +1072,11 @@ jobs:
         # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
         # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
         # does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23582
+        #
+        # UNION with the deploy-guidance PR (#2101): it changes one existing test
+        # file, tests/test_hooks/test_bash_timeout_guidance.py, which collects 3
+        # tests on main and 27 here, so its DELTA is +24 (measured against main,
+        # after the last test-adding edit, not against an earlier state of the
+        # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
+        # ceiling does not move. Floor: 23582 + 24 = 23606.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23606

@@ -518,8 +518,11 @@ TABLES = {
             id             TEXT PRIMARY KEY,
             file_path      TEXT NOT NULL,
             content_hash   TEXT NOT NULL,
+            -- superseded = a parked row whose snapshot a newer drop replaced
+            -- (not a failure; error_message keeps the reason for audit).
             status         TEXT NOT NULL DEFAULT 'pending' CHECK (
-                status IN ('pending', 'processing', 'completed', 'failed')
+                status IN ('pending', 'processing', 'completed', 'failed',
+                           'superseded')
             ),
             batch_id       TEXT,
             response_path  TEXT,

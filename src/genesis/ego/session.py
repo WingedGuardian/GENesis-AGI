@@ -305,6 +305,9 @@ class EgoSession:
             context_builder=self._context_builder,
             context_weights=focus.context_weights if focus else None,
             focus_id=focus.focus_id if focus else None,
+            # Same tag store_cycle() writes as ego_source, so the
+            # "previous assessment" read is this ego's own last cycle.
+            ego_source=self._source_tag,
         )
 
         # Focus-specific prompt
@@ -479,8 +482,10 @@ class EgoSession:
         # Fetch recent focuses from ego_cycle_outcomes for context
         recent_focuses: list[dict[str, str]] = []
         try:
+            # Scoped to this ego: both egos share ego_cycle_outcomes, and an
+            # unscoped read tells this ego to avoid the OTHER ego's picks.
             rows = await ego_crud.list_cycle_outcomes(
-                self._db, limit=5,
+                self._db, limit=5, ego_source=self._source_tag,
             )
             recent_focuses = [
                 {

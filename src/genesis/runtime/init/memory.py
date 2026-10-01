@@ -75,7 +75,9 @@ async def init(rt: GenesisRuntime) -> None:
         # URLs, IPs) that belong alongside episodic memories.
         await _migrate_reference_vectors(qdrant, rt._db)
 
-        # Both chains are cloud-first; they differ only in the rate tier.
+        # Both chains take the install's order (env.embed_local_first(), i.e.
+        # memory.embed_local_first in the local config; cloud-first unless set).
+        # They differ only in the rate tier.
         # Both share the same L2 diskcache — cache keys are text-based, not
         # provider-dependent, so a write cached via one backend is instantly
         # available for a read via the other.
@@ -110,8 +112,8 @@ async def init(rt: GenesisRuntime) -> None:
         from genesis.env import embed_priority_tier
 
         priority = embed_priority_tier()
-        storage_backends = EmbeddingProvider.build_chain(ollama_first=False)
-        recall_backends = EmbeddingProvider.build_chain(ollama_first=False, priority_tier=priority)
+        storage_backends = EmbeddingProvider.build_chain()
+        recall_backends = EmbeddingProvider.build_chain(priority_tier=priority)
         logger.info(
             "Embedding chains: storage=%s, recall=%s (recall priority_tier=%s)",
             [b.name for b in storage_backends],
