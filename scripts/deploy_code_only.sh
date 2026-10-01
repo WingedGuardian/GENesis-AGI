@@ -47,7 +47,8 @@
 # restart add a Guardian pause (no false "Genesis down" alert or paid diagnosis)
 # and a health wait sized the way update.sh sizes its own. deploy skips the stop
 # and the restart when the files the server loads (src/, config/,
-# pyproject.toml) are the ones it booted from, after the merge and at every
+# pyproject.toml, and the scripts it keeps imported: _RUNTIME_RELOAD_SCRIPTS in
+# lib/deploy_status.sh) are the ones it booted from, after the merge and at every
 # commit HEAD has held since the boot (the server imports src/ lazily, so a
 # pulled tree's module stays loaded after a later commit restores the files).
 # The fast-forward never overwrites a file git ignores: git refuses it at the
@@ -100,19 +101,24 @@
 # valid run. A token exists only when the server is up, its boot commit is known,
 # HEAD's runtime files are the ones it booted from and were at every commit HEAD
 # held since the boot (after a pull of code, even one a later commit undid:
-# restart first), and nothing under src/, config/ or pyproject.toml is edited
-# outside git; otherwise it prints "unknown (<why>)", which no token matches. It
+# restart first), and nothing under src/, config/, pyproject.toml or a script
+# the server uses (the two lists in lib/deploy_status.sh) is edited outside
+# git; otherwise it prints "unknown (<why>)", which no token matches. It
 # covers the boot commit, the MainPID, systemd's invocation id (a pid can be
-# reused, an invocation cannot) and a fingerprint of the ignored runtime files
+# reused, an invocation cannot), the scripts the server runs afresh as they
+# stand at HEAD (_RUNTIME_FRESH_SCRIPTS: a pull of one voids the token and
+# needs no restart) and a fingerprint of the ignored runtime files
 # (a config/*.local.yaml, which git status never lists) and of the user overlays
-# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs or
-# hooks without invalidating the run.
+# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs, or
+# over hooks and scripts the server never runs, without invalidating the run.
 # It is a TRIPWIRE, not a certificate: "valid" means none of those changes
 # happened, not that nothing the server runs changed. It cannot see, and reads
 # valid through: a change to the venv's installed packages (imported lazily
 # too); the other files the server reads from ~/.genesis/config (a user
 # outreach.yaml, genesis.yaml, modules/: only the *.local.yaml overlays are
-# fingerprinted); an edit under src/, config/ or pyproject.toml made and undone
+# fingerprinted); a script the server reaches only through a systemd unit it
+# starts or a Claude Code session it launches; an edit under src/, config/,
+# pyproject.toml or a listed script made and undone
 # without moving HEAD (by hand, a stash and its pop, a checkout of a file from
 # another commit), including one present at boot; and a reflog rewritten or backdated (`git reflog expire
 # --rewrite`, a move made with GIT_COMMITTER_DATE, a clock stepped back). Proving
@@ -753,7 +759,8 @@ fi
 _read_baseline
 # A deploy with nothing to deploy: the server is running, its boot commit is
 # known, and the files it loads are the same at HEAD and at every commit HEAD
-# held since the boot (a merge of docs or hooks only, or no merge at all). A
+# held since the boot (a merge of docs, or of hooks and scripts the server does
+# not keep imported, or no merge at all). A
 # restart would only cost an outage and end in-flight dispatched sessions. The
 # restart mode is there to force one.
 if [ "$MODE" = deploy ] && [ -z "$_STOPPED" ] && [ -n "$SERVING" ] && _runtime_held "$SHA"; then
