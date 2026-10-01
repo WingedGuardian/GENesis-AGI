@@ -2,19 +2,20 @@
 # deploy_candidates — the entry to the engine of `live`, the local integration
 # branch (scripts/deploy_candidates.py; its header documents every command).
 #
-# Usage: scripts/deploy_candidates add <branch> --owner <who> [--pr N] [--owner-approved]
+# Usage: scripts/deploy_candidates add <branch> --owner <who> [--pr N] [--wait N]
 #        scripts/deploy_candidates drop <branch> [--no-rebuild] [--wait N]
 #        scripts/deploy_candidates rebuild [--wait N]
 #        scripts/deploy_candidates list | status
 #        scripts/deploy_candidates adopt <new-branch> --owner <who>
 #
-# This shell is thin on purpose. For the commands that move the checkout
-# (rebuild, and drop, which rebuilds) it takes, the way deploy_code_only.sh does:
-#   update.lock EXCLUSIVE and QUEUING (--wait N seconds, default 7200, or
-#     GENESIS_DEPLOY_LOCK_WAIT), so a rebuild never lands inside update.sh, a
-#     deploy or a validation's shared hold;
-#   the deploy marker, so the watchdog defers instead of restarting the server
-#     in the middle of a checkout move.
+# This shell is thin on purpose. For every command that writes the manifest or
+# moves the checkout (rebuild, drop in every form, add) it takes update.lock
+# EXCLUSIVE and QUEUING, the way deploy_code_only.sh does (--wait N seconds,
+# default 7200, or GENESIS_DEPLOY_LOCK_WAIT): ONE lock for every manifest
+# mutation, so nothing lands inside update.sh, a deploy, a validation's shared
+# hold or another of these commands. For the commands that can move the
+# checkout (rebuild, drop) it also takes the deploy marker, so the watchdog
+# defers instead of restarting the server in the middle of a move.
 # Then it runs the engine as a CHILD, passing the lock's fd (which the engine
 # checks) and EPHEMERAL_DIRTY_RE from scripts/lib/deploy_marker.sh, the one
 # definition of which tracked files a deploy may find dirty. Every other command
@@ -22,8 +23,9 @@
 #
 # drop, list and status work from a plain shell (`env -i bash scripts/deploy_candidates
 # drop <branch>`): HOME is resolved from passwd when unset, and the engine needs
-# only python3's standard library, git and flock. That is the repair path for a
-# candidate whose hook blocks every session.
+# only python3's standard library, git and flock. drop needs no network
+# either. That is the repair path for a candidate whose hook blocks
+# every session.
 #
 # Exit codes: the engine's (0 done, 1 refused or failed, 2 usage), plus 200 when
 # update.lock is still held after the wait; 130 and 143 when interrupted.
@@ -50,17 +52,17 @@ WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
 # --wait belongs to this shell; everything else goes to the engine as given.
 args=()
 needs_lock=""
+needs_marker=""
 cmd="${1:-}"
 case "$cmd" in
-    rebuild|drop) needs_lock=1 ;;
+    rebuild|drop) needs_lock=1; needs_marker=1 ;;
+    add) needs_lock=1 ;;
 esac
 while [ $# -gt 0 ]; do
     case "$1" in
         --wait)
-            [ -n "$needs_lock" ] || die "--wait belongs to rebuild and drop."
+            [ -n "$needs_lock" ] || die "--wait belongs to rebuild, drop and add."
             WAIT_S="${2:?--wait needs a number of seconds}"; shift 2 ;;
-        --no-rebuild)
-            needs_lock=""; args+=("$1"); shift ;;
         *) args+=("$1"); shift ;;
     esac
 done
@@ -69,7 +71,7 @@ case "$WAIT_S" in
 esac
 
 if [ -z "$needs_lock" ]; then
-    exec python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}"
+    PYTHONSAFEPATH=1 exec python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}"
 fi
 
 mkdir -p "$(dirname "$LOCK_FILE")"
@@ -80,18 +82,20 @@ if ! flock -w "$WAIT_S" "$_UPDATE_LOCK_FD"; then
     exit "$LOCK_HELD_RC"
 fi
 
-trap '_release_deploy_marker' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-_marker_rc=0
-_acquire_deploy_marker || _marker_rc=$?
-if [ "$_marker_rc" -eq 2 ]; then
-    die "cannot write the deploy marker $DEPLOY_MARKER_FILE — without it the watchdog could restart genesis-server mid-rebuild. Nothing changed."
-elif [ "$_marker_rc" -ne 0 ]; then
-    die "a live deploy (pid $DEPLOY_MARKER_HOLDER) holds the deploy marker $DEPLOY_MARKER_FILE — a dashboard update or a restore is running. Nothing changed."
+if [ -n "$needs_marker" ]; then
+    trap '_release_deploy_marker' EXIT
+    _marker_rc=0
+    _acquire_deploy_marker || _marker_rc=$?
+    if [ "$_marker_rc" -eq 2 ]; then
+        die "cannot write the deploy marker $DEPLOY_MARKER_FILE — without it the watchdog could restart genesis-server mid-rebuild. Nothing changed."
+    elif [ "$_marker_rc" -ne 0 ]; then
+        die "a live deploy (pid $DEPLOY_MARKER_HOLDER) holds the deploy marker $DEPLOY_MARKER_FILE — a dashboard update or a restore is running. Nothing changed."
+    fi
 fi
 
 rc=0
-DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}" || rc=$?
+DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" PYTHONSAFEPATH=1 python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}" || rc=$?
 exit "$rc"
