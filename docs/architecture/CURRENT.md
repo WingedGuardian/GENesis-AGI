@@ -999,8 +999,11 @@ verified: 640c4f2e3 2026-09-18
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
-- **inbox/**: file-drop monitor with approval-gated dispatch. Before any DB,
-  approval, response, or baseline mutation, it composes and validates one
+- **inbox/**: file-drop monitor with approval-gated dispatch.
+  `monitor.py` owns scanning, approval, retries and baseline writes;
+  `batch_runner.py` executes one approved batch and post-processes its output,
+  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
   precedence footer. A missing, unreadable, or empty component fails the scan
