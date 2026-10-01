@@ -362,16 +362,111 @@ def test_bg_sandbox_reap_refuses_when_blind(tmp_path):
 def test_seeing_only_yourself_in_proc_is_blind(tmp_path):
     """A /proc that shows only the calling process (the snapshot's own find
     would still find its own descriptors) proves nothing: blind. Control: one
-    other readable process makes it visible."""
+    other readable process, outside the caller's tree, makes it visible."""
     fake = tmp_path / "proc"
     snippet = (
         f"source '{_HYGIENE}'\nTL_PROC='{fake}'\nmkdir -p \"$TL_PROC/$$/fd\"\n"
         "if liveness_visible; then echo VISIBLE; else echo BLIND; fi\n"
         "mkdir -p \"$TL_PROC/4242424/fd\"\n"
+        "printf 'State:\\tS (x)\\nPPid:\\t1\\n' > \"$TL_PROC/4242424/status\"\n"
         "if liveness_visible; then echo VISIBLE; else echo BLIND; fi\n"
     )
     r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     assert r.stdout.split() == ["BLIND", "VISIBLE"], r.stdout + r.stderr
+
+
+def _liveness_with(tmp_path, procs: str) -> str:
+    """Run liveness_visible against a fake /proc. `procs` is bash that adds
+    entries with `fake <pid> <ppid> [state]`; "$$" is the caller. The caller's
+    own entry always exists, as it does in a real /proc."""
+    fake = tmp_path / "proc"
+    snippet = (
+        f"source '{_HYGIENE}'\nTL_PROC='{fake}'\n"
+        'fake() { mkdir -p "$TL_PROC/$1/fd"; '
+        "printf 'Name:\\tx\\nState:\\t%s (x)\\nPPid:\\t%s\\n' \"${3:-S}\" \"$2\" "
+        '> "$TL_PROC/$1/status"; }\n'
+        'fake $$ 1\n'
+        f"{procs}\n"
+        "if liveness_visible; then echo VISIBLE; else echo BLIND; fi\n"
+    )
+    r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def test_seeing_only_your_own_child_is_blind(tmp_path):
+    # #2515: in a private PID namespace /proc shows only the caller's tree.
+    assert _liveness_with(tmp_path, "fake 4242 $$") == "BLIND"
+
+
+def test_seeing_only_your_own_grandchild_is_blind(tmp_path):
+    assert _liveness_with(tmp_path, "fake 4242 $$\nfake 4243 4242") == "BLIND"
+
+
+def test_an_unrelated_process_beside_your_child_is_visible(tmp_path):
+    assert _liveness_with(tmp_path, "fake 4242 $$\nfake 5151 1") == "VISIBLE"
+
+
+def test_a_process_that_vanishes_mid_check_proves_nothing(tmp_path):
+    # Its fd/ was readable, then its status was gone: it exited between the two
+    # reads. That is no evidence of another live process (review of #2515).
+    assert _liveness_with(tmp_path, 'mkdir -p "$TL_PROC/5151/fd"') == "BLIND"
+
+
+def test_a_chain_whose_ancestor_vanished_proves_nothing(tmp_path):
+    # 4243's parent 4242 has an fd/ but no status: reaped mid-walk.
+    procs = 'mkdir -p "$TL_PROC/4242/fd"\nfake 4243 4242'
+    assert _liveness_with(tmp_path, procs) == "BLIND"
+
+
+def test_an_unrelated_zombie_proves_nothing(tmp_path):
+    assert _liveness_with(tmp_path, "fake 5151 1 Z") == "BLIND"
+
+
+def test_a_process_whose_chain_ends_at_ppid_0_is_visible(tmp_path):
+    # A parent outside the namespace reads as PPid 0: not ours.
+    assert _liveness_with(tmp_path, "fake 5151 0") == "VISIBLE"
+
+
+def _can_unshare_pid() -> bool:
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "unshare", "-pf", "--mount-proc", "true"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def test_in_a_real_private_pid_namespace_your_own_child_is_blind():
+    # The #2515 scenario for real: inside its own PID namespace the caller is
+    # pid 1 and /proc shows only its own tree, so its child's PPid is 1 — which
+    # must read as OURS (the $$ match is checked before the PPid<=1 stop).
+    # Probed here rather than in a skipif, so the sudo call runs only when this
+    # test is selected, not at every collection of the module.
+    if not _can_unshare_pid():
+        pytest.skip("needs a private PID namespace (sudo -n unshare -pf --mount-proc)")
+    lib = _HYGIENE.parent / "lib" / "tmp_liveness.sh"
+    snippet = (
+        f"source '{lib}'\n"
+        "sleep 20 & c=$!\n"
+        'if liveness_visible; then echo "$$ VISIBLE"; else echo "$$ BLIND"; fi\n'
+        'kill "$c"\n'
+    )
+    r = subprocess.run(
+        ["sudo", "-n", "unshare", "-pf", "--mount-proc", "bash", "-c", snippet],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+    )
+    assert r.stdout.split() == ["1", "BLIND"], r.stdout + r.stderr
+
+
+def test_a_chain_deeper_than_the_bound_terminates_and_counts(tmp_path):
+    # 70 generations under the caller: past the 64-hop bound the walk gives up
+    # and counts the process (visible) rather than looping or hanging.
+    chain = "p=$$; for i in $(seq 1 70); do fake $((6000+i)) $p; p=$((6000+i)); done"
+    assert _liveness_with(tmp_path, chain) == "VISIBLE"
 
 
 def test_standard_pressure_never_clears_the_code_intel_indexes(tmp_path):
