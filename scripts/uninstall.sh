@@ -64,10 +64,10 @@ genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
 # shape how the network behaves, and removing one needs a networkd restart.
 #
 # Every step needs sudo and tolerates failure, so the command then CHECKS: a
-# unit file or script still present, or a watchdog unit still active, is
-# printed after GENESIS_ROOT_WATCHDOG_LEFT and the command exits 1. The callers
-# report that instead of success (on the incus path the exit status does not
-# come back).
+# unit file or script still present, or an active, transitional, or unreadable
+# watchdog state, is printed after GENESIS_ROOT_WATCHDOG_LEFT and exits 1. The
+# callers report that instead of success (on the incus path the exit status
+# does not come back).
 # BEGIN root-watchdog-remove
 _WD_ROOT="${GENESIS_ROOT_WATCHDOG_PREFIX:-}"  # test seam; empty = the real root
 _WD_UNITS="genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service genesis-network-watchdog.timer genesis-network-watchdog.service"
@@ -82,8 +82,8 @@ GENESIS_ROOT_WATCHDOG_REMOVE="for u in $_WD_UNITS; do sudo -n systemctl disable 
 sudo -n rm -f $_WD_FILES $_WD_RUN_FILES 2>/dev/null || true; \
 sudo -n systemctl daemon-reload 2>/dev/null || true; \
 left=''; for f in $_WD_FILES; do if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then left=\"\$left \$f\"; fi; done; \
-for u in $_WD_UNITS; do st=\$(systemctl show \"\$u\" -p ActiveState --value 2>/dev/null); \
-case \"\$st\" in ''|inactive|failed) ;; *) left=\"\$left \$u\" ;; esac; done; \
+for u in $_WD_UNITS; do st=\$(systemctl show \"\$u\" -p ActiveState --value 2>/dev/null); rc=\$?; \
+case \"\$rc:\$st\" in 0:|0:inactive|0:failed) ;; *) left=\"\$left \$u\" ;; esac; done; \
 if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi; \
 echo \"$GENESIS_ROOT_WATCHDOG_DONE\""
 # END root-watchdog-remove

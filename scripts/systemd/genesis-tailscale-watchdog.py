@@ -845,14 +845,14 @@ def run_once(ctx: Ctx) -> int:
         present_complete = False
         return finish(action)
 
-    # A post-scan read that fails keeps verdicts judged on a complete identity
-    # (one flaky systemctl call should not blank a run); the check immediately
-    # before try-restart still refuses to heal on anything but the same daemon.
-    # An incomplete scan-start identity keeps them only on readable continuity.
+    # Complete identities need evidence of a change to void; incomplete starts
+    # need readable continuity.
     after_raw = unit_props(ctx, "tailscaled", *_IDENTITY)
     after_scan = _identity(after_raw)
     if judged_daemon is not None:
-        if after_scan is not None and not same_daemon(judged_daemon, after_scan):
+        if (after_scan is not None and not same_daemon(judged_daemon, after_scan)) or (
+            after_raw is not None and _continuity(unit, after_raw) == "changed"
+        ):
             return void("tailscaled restarted or stopped during the scan")
     else:
         continuity = _continuity(unit, after_raw)

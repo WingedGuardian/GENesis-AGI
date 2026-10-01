@@ -1230,6 +1230,55 @@ def test_incomplete_identity_detects_changed_invocation_id(tmp_path):
     assert world.restarts() == 0
 
 
+def test_complete_identity_detects_changed_partial_post_scan_read(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+
+    def operator_restart(n):
+        if n == 2:
+            world.unit.update({"InvocationID": "inv-operator", "ActiveEnterTimestampMonotonic": ""})
+
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, operator_restart)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"]) == ("daemon-changed", {})
+    assert world.restarts() == 0
+
+
+def test_complete_identity_detects_stopped_partial_post_scan_read(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+
+    def stopped(n):
+        if n == 2:
+            world.unit.update({"ActiveState": "inactive", "ActiveEnterTimestampMonotonic": ""})
+
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, stopped)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert (s["last_action"], s["evidence"]) == ("daemon-changed", {})
+    assert world.restarts() == 0
+
+
+def test_complete_identity_keeps_verdict_on_stable_partial_post_scan_read(tmp_path):
+    world = World({"a": peer(A)})
+    world.stuck(A)
+
+    def unreadable_start(n):
+        if n == 2:
+            world.unit["ActiveEnterTimestampMonotonic"] = ""
+
+    c = ctx(world, tmp_path)
+    c.run = _identity_reads(world, unreadable_start)
+    tw.run_once(c)
+    s = state(tmp_path)
+    assert s["evidence"] == {A: "stuck"}
+    assert s["last_action"] != "daemon-changed"
+    assert world.restarts() == 0
+
+
 def test_tailscaled_stopped_just_before_the_heal_voids_the_run(tmp_path):
     world = World({"a": peer(A)})
     world.stuck(A)

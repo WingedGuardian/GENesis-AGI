@@ -751,6 +751,9 @@ exec "$@"
 _UN_SYSTEMCTL_STUB = """#!/bin/bash
 if [ "$1" = "show" ]; then
     unit="$2"
+    for failed in ${SYSTEMCTL_FAIL_UNITS:-}; do
+        [ "$failed" = "$unit" ] && exit 1
+    done
     for pair in ${UNIT_STATES:-}; do
         [ "${pair%%=*}" = "$unit" ] && { printf '%s\\n' "${pair#*=}"; exit 0; }
     done
@@ -858,6 +861,23 @@ def test_uninstall_accepts_inactive_or_failed_watchdog_units(tmp_path, unit, sta
         if line.startswith('GENESIS_ROOT_WATCHDOG_DONE="')
     )
     assert (result.returncode, result.stdout) == (0, marker + "\n")
+
+
+@pytest.mark.parametrize(
+    "unit",
+    (
+        "genesis-tailscale-watchdog.timer",
+        "genesis-tailscale-watchdog.service",
+        "genesis-network-watchdog.timer",
+        "genesis-network-watchdog.service",
+    ),
+)
+def test_uninstall_failed_state_query_reports_unit_still_present(tmp_path, unit):
+    result = _run_removal(tmp_path, SUDO_OK="1", SYSTEMCTL_FAIL_UNITS=unit)
+    assert (result.returncode, result.stdout.strip()) == (
+        1,
+        f"root watchdog still present: {unit}",
+    )
 
 
 def _run_root_watchdog_report(output):
