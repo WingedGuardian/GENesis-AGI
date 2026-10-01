@@ -50,9 +50,15 @@ github:
 # permission settings still decide the command. Leaving this section out — the
 # default — keeps every prompt.
 #
-# `secrets_env` is the only key. The push / PR-open prompt is deliberately NOT
-# listed and cannot be turned off: it is where code leaves the machine. Any
-# other key is ignored, and the prompt says so.
+# Two keys exist. `secrets_env` is the credentials prompt. `push_publish`
+# silences only the first `git push` of the current branch, in a plain shape,
+# when the remote it really goes to is https://github.com/<the public repo named
+# under `github:` above>. A URL rewrite whose result is that https URL is fine;
+# the ssh / scp forms always ask, as does any `http.*` git config, a remote
+# proxy or helper, or a proxy / TLS / ssh environment variable visible to the
+# hook. `gh pr create` is not covered (gh without a terminal does not push).
+# A force push, a push anywhere else, or any doubt about the destination still
+# asks. Any other key is ignored, and the prompt says so.
 #
 # FILE-ONLY: there is no supported environment-variable override — the hook
 # reads this file directly, on every invocation.
@@ -65,3 +71,5 @@ github:
 #  asks:
 #    # the secrets.env credentials prompt.
 #    secrets_env: off
+#    # the first-publish prompt, public-repo destinations only.
+#    push_publish: off

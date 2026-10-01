@@ -155,6 +155,23 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
         pass
     os._exit(2)
 
+# The install-local ask policy (`hooks.asks.push_publish`). SOFT, and the fallback
+# is the prompt: a missing or older policy module means "nothing declared", which
+# is the public default, so version skew costs an extra prompt, never a silence.
+try:
+    from hook_ask_policy import ask_suppressed as _ask_suppressed  # noqa: E402
+    from hook_ask_policy import drain_notes as _drain_ask_notes  # noqa: E402
+    from hook_ask_policy import suppressed_reason as _suppressed_reason  # noqa: E402
+except Exception:  # noqa: BLE001 — skew falls back to ASKING.
+    def _ask_suppressed(key: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def _drain_ask_notes() -> str:  # type: ignore[misc]
+        return ""
+
+    def _suppressed_reason(key: str, detail: str = "") -> str:  # type: ignore[misc]
+        return ""
+
 # The primary reviewer, the known review formats and the per-reviewer severity
 # parsers live in a stdlib sibling so every gate reads the SAME definitions, and
 # so the round counter can read findings with the same code this gate scores them
@@ -10463,18 +10480,27 @@ def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str 
     republish + config checks MUST target this remote, not the fetch/upstream
     remote — otherwise a triangular fork workflow (pull from origin, push to fork)
     checks the wrong remote and can silently allow a first push to the fork.
+
+    ``branch.<cur>.remote`` is read from CONFIG, not via ``@{upstream}``: the
+    upstream expression fails when the remote-tracking ref is missing (never
+    fetched, or pruned after the remote branch was deleted), and git still pushes
+    to ``branch.<cur>.remote`` then. Answering "origin" there sent the republish
+    and scope checks to a remote the push never reaches. A config read error, or
+    a ``.`` (the local repository) value, returns None — callers treat an
+    unresolved remote as "ask".
     """
     argv = getattr(seg, "argv", None) or []
     if _push_repo_flag(argv) or _push_named_remote(argv):
         return _resolve_push_remote(seg, cwd=cwd)  # explicit --repo / positional wins
     base = ["git"] + (["-C", cwd] if cwd else [])
-    if cur:
-        got = _git_config_get(base, f"branch.{cur}.pushRemote")
-        if got and got[0] == 0 and got[1]:
-            return got[1]
-    got = _git_config_get(base, "remote.pushDefault")
-    if got and got[0] == 0 and got[1]:
-        return got[1]
+    keys = ([f"branch.{cur}.pushRemote"] if cur else []) + ["remote.pushDefault"]
+    keys += [f"branch.{cur}.remote"] if cur else []
+    for key in keys:
+        got = _git_config_get(base, key)
+        if got is None:
+            return None  # unreadable config → unresolved → the caller asks
+        if got[0] == 0 and got[1]:
+            return None if got[1] == "." else got[1]
     return _resolve_push_remote(seg, cwd=cwd) or "origin"
 
 
@@ -10775,6 +10801,181 @@ def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
         return branch, slug.split("/", 1)[0], url
     except Exception:
         return None
+
+
+#: The ONLY spelling of a destination the ``push_publish`` switch accepts:
+#: ``https://github.com/<owner>/<repo>`` with an optional ``.git`` and trailing
+#: slash — nothing else (no userinfo, no port, no extra path, and never the ssh or
+#: scp forms, whose transport is a program this hook cannot vouch for). An
+#: ALLOWLIST: two audit rounds found ways to reroute ssh and http transports that
+#: a denylist of config keys missed. Stricter than ``_repo_identity_from_url`` on
+#: purpose — that one keeps the LAST two path parts.
+_GH_HTTPS_URL = re.compile(
+    r"https://github\.com/(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+    r"/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?/?"
+)
+
+
+def _strict_github_slug(url: str) -> str | None:
+    """``owner/repo`` (lower-cased) when ``url`` is exactly the github.com https
+    form in ``_GH_HTTPS_URL``, else None. Matched on the RAW value: a URL with
+    leading or trailing whitespace is not that form, so it never qualifies."""
+    m = _GH_HTTPS_URL.fullmatch(url)
+    return f"{m.group('owner')}/{m.group('repo')}".lower() if m else None
+
+
+def _all_urls_are_public_repo(urls: set[str]) -> bool:
+    """Whether ``urls`` is NON-EMPTY and EVERY member names the configured public
+    repo exactly. An undeterminable public repo, an empty set, or one URL that is
+    not an exact match → False (keep the prompt)."""
+    canonical = _canonical_public_repo()
+    if not canonical or not urls:
+        return False
+    want = canonical.strip().lower()
+    return all(_strict_github_slug(u) == want for u in urls)
+
+
+def _no_url_rewrite_rules(cwd: str | None) -> bool:
+    """True only when NO ``url.<base>.insteadOf``/``pushInsteadOf`` rule is set.
+
+    Needed for a RAW-URL destination: no remote section exists for ``git remote
+    get-url`` to expand, so the URL as typed is only the real destination when
+    nothing can rewrite it. A read error counts as "a rule may exist"."""
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    got = _run_git_lines(base + ["config", "--get-regexp", r"^url\..*insteadof$"])
+    return got is not None and got[0] == 1
+
+
+def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd) -> bool:
+    """Whether a FIRST push of the current branch may go unprompted under
+    ``hooks.asks.push_publish: off`` — i.e. every place it can land is the public
+    repo and nothing else in the command can change that.
+
+    Reached only from the first-publish ask of a push that already passed
+    ``_push_targets_current_branch`` (allowlisted flags, no env/wrapper prefix, no
+    ``-c``, and ``_push_config_is_simple``: one URL, push URL == fetch URL, no push
+    refspec / mirror / receivepack / followTags / submodule recursion). On top of
+    that:
+      * the destination's push URLs come from ``git remote get-url --push``, which
+        applies ``insteadOf``/``pushInsteadOf``; a raw-URL destination has no remote
+        to expand, so it qualifies only when no rewrite rule exists at all;
+      * every URL must be an EXACT public-repo match (``_all_urls_are_public_repo``);
+      * every other segment must be inert (``_push_compound_is_inert``) — no close,
+        no create, no second publish, no config write ahead of the push.
+    Anything else returns False and the prompt stands."""
+    if not push_remote:
+        return False
+    if not _push_compound_is_inert(segs, push_seg, cmd):
+        return False
+    named = _raw_remote_push_urls(push_remote, cwd)
+    if named is None:
+        return False
+    if named:
+        urls = named
+    elif _looks_like_url(push_remote) and _no_url_rewrite_rules(cwd):
+        urls = {push_remote}
+    else:
+        return False
+    if not _all_urls_are_public_repo(urls):
+        return False
+    return _transport_is_plain(push_remote if named else None, cwd)
+
+
+def _raw_remote_push_urls(name: str, cwd: str | None) -> set[str] | None:
+    """A remote's push URLs exactly as git prints them — only the line break is
+    removed, never surrounding whitespace, so a URL configured with a stray space
+    cannot be normalised into an exact match. Empty set: not a configured remote
+    (git exits 2). None: any other failure."""
+    try:
+        r = subprocess.run(
+            ["git"] + (["-C", cwd] if cwd else []) + ["remote", "get-url", "--push", "--all", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if r.returncode == 2:
+        return set()
+    if r.returncode != 0:
+        return None
+    lines = r.stdout.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return set(lines) if lines and all(lines) else None
+
+
+#: Environment variables that can move or weaken an https push (proxies, TLS
+#: trust, ssh/proxy programs, injected git config). Any of them set in the
+#: HOOK's environment keeps the ask. Residue, stated rather than hidden: the
+#: hook does NOT see the environment the push runs in. The Bash tool's shell is
+#: initialised from the user's profile and hooks are not, so a variable exported
+#: only in a shell profile is invisible here. A per-command ``VAR=…`` prefix is
+#: refused separately (``_push_seg_has_no_prefix`` / ``_push_compound_is_inert``).
+_TRANSPORT_ENV = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "GIT_SSL_NO_VERIFY", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "GIT_SSL_CERT", "GIT_SSL_KEY",
+    "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "GIT_PROXY_COMMAND", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+)
+
+
+def _transport_is_plain(remote: str | None, cwd: str | None) -> bool:
+    """Whether an https push to github.com goes out with stock transport.
+
+    ALLOWLIST posture for the http layer: ANY ``http.*`` key in the config git
+    reads for this repository (proxy, sslVerify, curloptResolve, per-URL
+    sections, extra headers …) keeps the ask, as does an unreadable config. On
+    top: ``remote.<r>.proxy`` (an http proxy outside ``http.*``) and
+    ``remote.<r>.vcs`` (hands the push to a remote helper whatever the URL), and
+    any of ``_TRANSPORT_ENV`` set in the hook's environment. ssh-only and
+    git://-only keys (``core.sshCommand``, ``core.gitProxy``) are not checked:
+    only the https form qualifies. Applied only by the ``push_publish``
+    suppression; the re-push allow is unchanged."""
+    if any(os.environ.get(v) for v in _TRANSPORT_ENV):
+        return False
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    got = _run_git_lines(base + ["config", "--get-regexp", r"^http\."])
+    if got is None or got[0] != 1:
+        return False  # 0 = some http.* key is set; anything else = unreadable
+    if remote:
+        for key in (f"remote.{remote}.vcs", f"remote.{remote}.proxy"):
+            got = _git_config_get(base, key, all_values=True)
+            if got is None or (got[0] == 0 and got[1]):
+                return False
+    return True
+
+
+def _publish_ask_text(reason: str, publish_off: bool) -> str:
+    """The first-publish ask, plus why ``push_publish: off`` did not silence it
+    and any NOTE the policy raised (Claude Code drops an exit-0 hook's stderr, so
+    the prompt is the only place a misconfigured key can be reported)."""
+    if publish_off:
+        reason += (
+            "\n\nhooks.asks.push_publish is off, but this command did not qualify: "
+            "it is silenced only when EVERY destination resolves exactly to the "
+            "configured public repo and nothing else in the command can change that."
+        )
+    notes = _drain_ask_notes()
+    return f"{reason}\n\n{notes}" if notes else reason
+
+
+def _emit_context_only(note: str) -> int:
+    """Emit NO permission decision — only ``additionalContext`` — and return 0.
+
+    The house shape for a silenced ask (``needs_user.decide`` with an
+    ``ask_key``): this hook stops objecting and approves nothing, so Claude
+    Code's own permission settings and the other hooks still decide the command.
+    An ``allow`` here would approve every other step of a compound command."""
+    payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}}
+    try:
+        from hook_output import print_json_bounded
+
+        print_json_bounded(payload, text_keys=("hookSpecificOutput.additionalContext",))
+    except Exception:  # noqa: BLE001 — the note must be delivered regardless
+        print(json.dumps(payload))
+    return 0
 
 
 def _ask(reason: str) -> int:
@@ -11274,6 +11475,10 @@ def _run_merge_and_push_gates() -> int:
         # invocation before the hard-blocks run, so `git push <republish> && git
         # commit --no-verify` would sail through. Set the reason here; emit at the tail.
         push_allow_reason: str | None = None
+        # A first-publish prompt this install silenced (`hooks.asks.push_publish:
+        # off`, public-repo destinations only). Emitted at the tail as NO decision
+        # plus a context note, and only if nothing else set an ask or a block.
+        publish_note: str | None = None
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -11413,10 +11618,25 @@ def _run_merge_and_push_gates() -> int:
                             f"its first push); only the first push of a branch/PR prompts."
                         )
                     else:
-                        ask_reason = (
-                            f"git push needs your approval before publishing externally "
-                            f"(target: {branch or 'default'})."
-                        )
+                        # FIRST publication of `cur`. The install may silence this
+                        # one prompt (owner ruling 2026-10-01) — policy read first
+                        # so a misconfigured key announces itself on every such
+                        # ask, scope checked only when the key is off.
+                        publish_off = _ask_suppressed("push_publish")
+                        if publish_off and _push_publish_scope_holds(
+                            push_remote, segs, push_segs[0], cmd, pcwd
+                        ):
+                            publish_note = _suppressed_reason(
+                                "push_publish",
+                                f"first push of '{cur}' to the configured public repo "
+                                f"({_canonical_public_repo()}).",
+                            )
+                        else:
+                            ask_reason = _publish_ask_text(
+                                f"git push needs your approval before publishing "
+                                f"externally (target: {branch or 'default'}).",
+                                publish_off,
+                            )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
                     # outside CI and the leak-detector (ci.yml triggers on
@@ -12249,6 +12469,13 @@ def _run_merge_and_push_gates() -> int:
             return 2
         if ask_reason is not None:
             return _ask(ask_reason)
+
+        # A first-publish prompt this install silenced — NO decision, only a
+        # context note. After every block and every ask above (an ask from any
+        # other arm wins), and BEFORE the create `_allow` below, which would
+        # otherwise approve the command on this hook's behalf.
+        if publish_note is not None:
+            return _emit_context_only(publish_note)
 
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
         # hard-block has had its chance to return 2, so a compound

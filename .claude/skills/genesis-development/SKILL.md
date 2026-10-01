@@ -3151,9 +3151,17 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. `secrets_env` is the
-  ONLY key. The push / PR-open prompt has none on purpose: it is where code
-  leaves the machine, so it stays a decision on every install.
+  the command, and a dispatched session is still denied. The only other key is
+  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
+  It silences only the first `git push` of the CURRENT branch in a plain
+  shape, when the remote git really pushes to resolves (rewrites applied) to
+  exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
+  simple push config, no `http.*` config, and no proxy/TLS/ssh/config env var
+  in the hook's environment (an env var exported only in a shell profile is
+  invisible to the hook: known residue). `gh pr create` is not covered, since
+  gh without a TTY aborts rather than pushing. Force pushes, other destinations,
+  close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
+  are untouched, and any doubt about the destination keeps the prompt.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
