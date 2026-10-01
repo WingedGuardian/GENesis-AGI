@@ -2985,7 +2985,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 2ac29c19 2026-09-14
+verified: 5e8dc977 2026-10-01
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3013,6 +3013,12 @@ verified: 2ac29c19 2026-09-14
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
   `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  Codex's local CLI also has a budget-only shell action hook in
+  `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
+  existing commit/request budget decisions, denies approval-required or unknown
+  evidence, and returns control to the user without native approval or Genesis
+  lifecycle registration. It does not enforce the future reflection gates or
+  cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
