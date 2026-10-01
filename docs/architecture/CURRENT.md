@@ -2548,11 +2548,17 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: ee9ebf85c 2026-09-05
+verified: 20db08465 2026-10-01
 ```
 
-- **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
-  each a free-first → paid-last chain; `never_pays` sites are filtered to
+- **October 2026 model refresh**: the stable NVIDIA DeepSeek alias selects
+  V4.1 Flash after the old Flash endpoint returned HTTP 410. Eight ordinary
+  Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
+  suppressor's exact validated pair and standalone evaluation judge remain
+  DeepSeek Pro. Candidate compatibility has been probed; candidate quality for
+  these protected judgments has not been qualified.
+- **routing/**: `config/model_routing.yaml` defines 63 call sites,
+  with free-first and explicitly paid-first chains; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
   the provider's OWN unit and never converted between them. As SHIPPED today:
