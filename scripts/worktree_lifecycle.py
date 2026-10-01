@@ -521,21 +521,33 @@ def _head_moved_time(log: Path, *, strict: bool) -> float:
     `git switch -c` to start new work changes no file and no commit, and this
     is the only place it shows.
     """
-    try:
-        with log.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - _REFLOG_TAIL_BYTES))
-            tail = f.read()
-    except (FileNotFoundError, NotADirectoryError):
-        return 0.0  # no reflog: reflogs off for this repository, or never moved
-    except OSError as e:
-        if strict:
-            raise _ProbeFailed(f"cannot read {log}: {e}") from e
-        return 0.0
-    lines = tail.split(b"\n")
-    if size > _REFLOG_TAIL_BYTES:
-        lines = lines[1:]  # the first line of a tail read is cut
+    # Read the END of the file, and read further back whenever that end holds
+    # no counted entry: one entry can outgrow any fixed tail (a commit message
+    # is not bounded), and a cut entry must never be mistaken for "no entry".
+    want = _REFLOG_TAIL_BYTES
+    while True:
+        try:
+            with log.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - want))
+                tail = f.read()
+        except (FileNotFoundError, NotADirectoryError):
+            return 0.0  # no reflog: reflogs off for this repository, or never moved
+        except OSError as e:
+            if strict:
+                raise _ProbeFailed(f"cannot read {log}: {e}") from e
+            return 0.0
+        whole = size <= want
+        stamp = _newest_head_move(tail.split(b"\n") if whole else tail.split(b"\n")[1:])
+        if stamp or whole:
+            return stamp
+        want *= 4
+
+
+def _newest_head_move(lines: list[bytes]) -> float:
+    """The timestamp of the newest counted entry in reflog ``lines`` (file
+    order), 0.0 if none. See `_head_moved_time` for what counts."""
     entries = []  # (old, new, timestamp), in file order
     for line in lines:
         # `<old> <new> <name> <<email>> <unix-seconds> <tz>\t<message>`
@@ -579,12 +591,15 @@ def _git_activity_time(
       directory's, and the walk reads directories.
     * HISTORY: when HEAD last moved (`_head_moved_time`), because a commit,
       checkout or reset leaves the status clean. A NESTED repository also counts
-      its git directory's own mtime: a commit there rewrites its index, which
-      catches a commit on a branch whose reflog is off (``core.logAllRefUpdates
-      =false``). Not at the top level, where `git gc` in the shared repository
-      rewrites every worktree's git directory (MEASURED); a nested repository is
-      a separate repository that gc does not touch. Optional locks are off for
-      every git call here (`_git_env`), or the probe would itself move it.
+      its INDEX file's mtime: a commit rewrites it, which catches a commit on a
+      branch whose reflog is off (``core.logAllRefUpdates=false``). The index
+      and not the git directory: `git gc` and `git maintenance` in that
+      repository move its git directory (MEASURED: 0.0 days after either, for a
+      repository idle 20) and leave the index alone (20.0), so the directory
+      would keep a stale worktree looking used for as long as maintenance runs.
+      Not at the top level, where the index is refreshed by anything that
+      looks at the worktree. Optional locks are off for every git call here
+      (`_git_env`), so the probe itself never rewrites an index.
 
     Classification absorbs failures and reads them as 0.0, which can only leave
     another signal's answer standing, never invent idleness; the archive step
@@ -601,14 +616,16 @@ def _git_activity_time(
     t = timeout if _depth == 0 else _nested_probe_timeout(strict)
     if t is None:
         return newest
-    where = _run_git(
-        root, ["rev-parse", "--absolute-git-dir", "--git-path", "logs/HEAD"], timeout=t
-    )
-    lines = (where or "").splitlines()
-    if len(lines) == 2:
-        newest = _head_moved_time(root / lines[1], strict=strict)
+    # ONE path, as bytes, with only git's terminating newline removed: a path
+    # may itself hold a newline or carriage return, so no line-based parse of
+    # several paths can be trusted. HEAD's reflog and the index both live in
+    # this repository's own git directory, linked worktrees included.
+    where = _run_git_bytes(root, ["rev-parse", "--absolute-git-dir"], timeout=t)
+    if where and where.endswith(b"\n") and len(where) > 1:
+        git_dir = Path(os.fsdecode(where[:-1]))
+        newest = _head_moved_time(git_dir / "logs" / "HEAD", strict=strict)
         if _depth > 0:
-            newest = max(newest, _mtime(Path(lines[0]), strict=strict))
+            newest = max(newest, _mtime(git_dir / "index", strict=strict))
     elif strict:
         raise _ProbeFailed(f"cannot resolve the git dir of {root}")
 
@@ -798,13 +815,19 @@ def _state_fingerprint(worktree_path: str, *, timeout: float = 60) -> str | None
     signals being complete.
     """
     root = Path(worktree_path)
-    head = _run_git_bytes(root, ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"], timeout=timeout)
+    head_args = ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"]
+    head = _run_git_bytes(root, head_args, timeout=timeout)
     status = _run_git_bytes(
         root,
         ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none"],
         timeout=timeout,
     )
-    if head is None or status is None:
+    # HEAD again AFTER the status: a commit landing between the two calls would
+    # otherwise pair the old HEAD with the new, clean status, which can equal
+    # the classification digest. A change in between reads as "no answer",
+    # which holds.
+    head_after = _run_git_bytes(root, head_args, timeout=timeout)
+    if head is None or status is None or head_after != head:
         return None
     return hashlib.sha256(head + b"\0" + status).hexdigest()
 

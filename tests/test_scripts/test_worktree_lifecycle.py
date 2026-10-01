@@ -2306,3 +2306,92 @@ def test_a_branch_switch_after_classification_holds(reaper_repo, tmp_path, monke
     assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
     assert "git state changed between classification and reap" in capsys.readouterr().out
     assert wt.exists()
+# ─── round 3: robustness of the three signals ────────────────────────────────
+
+
+def test_a_nested_repo_whose_path_holds_a_newline_is_still_read(reaper_repo, tmp_path):
+    """Line-based parsing of git's paths split such a path in two, and the
+    strict archive-time probe then held the worktree on every run. One path,
+    read as bytes, with only git's own terminating newline removed."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_newline_nested")
+    nested = wt / "x" / "odd\nname"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f").write_text("1\n")
+    _git(nested, "add", "f")
+    _git(nested, "commit", "-qm", "c1")
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    _age_reflog(nested, 20)
+    assert (time.time() - wl._last_activity_time(str(wt), strict=True)) / 86400 > 19, "control: idle"
+    # A commit that changes no file: only that repository's history and index
+    # show it, so it is seen only if the RIGHT git directory was read.
+    _git(nested, "commit", "-q", "--allow-empty", "-m", "c2")
+    assert (time.time() - wl._last_activity_time(str(wt), strict=True)) / 86400 < 1
+
+
+def test_a_reflog_entry_larger_than_the_tail_read_is_still_seen(reaper_repo, tmp_path):
+    """A commit message has no size bound, so the newest entry can outgrow the
+    fixed tail read; the cut fragment was dropped and the commit went unseen.
+    The read now extends backward until it finds a whole counted entry."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_huge_reflog")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    _age_path(wt, 20)
+    msg = tmp_path / "msg.txt"
+    msg.write_text("x" * (wl._REFLOG_TAIL_BYTES + 5000) + "\n")
+    _git(wt, "commit", "-q", "--allow-empty", "-F", str(msg))
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert log.stat().st_size > wl._REFLOG_TAIL_BYTES, (
+        "precondition: the newest entry outgrows the tail"
+    )
+    assert (time.time() - wl._head_moved_time(log, strict=True)) / 86400 < 1
+
+
+def test_a_commit_between_the_fingerprints_two_reads_is_not_missed(
+    reaper_repo, tmp_path, monkeypatch
+):
+    """HEAD and the status are separate git calls. A commit landing between
+    them paired the old HEAD with the new, clean status, which can equal the
+    classification digest. HEAD is read again after the status, and a change
+    in between reads as no answer, which holds."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_torn")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    real = wl._run_git_bytes
+
+    def commit_after_status(root, args, *, timeout):
+        out = real(root, args, timeout=timeout)
+        if args[:1] == ["status"]:
+            _git(wt, "commit", "-q", "--allow-empty", "-m", "lands between the reads")
+        return out
+
+    monkeypatch.setattr(wl, "_run_git_bytes", commit_after_status)
+    assert wl._state_fingerprint(str(wt)) is None
+
+
+def test_maintenance_in_a_nested_repo_does_not_keep_the_worktree_active(reaper_repo, tmp_path):
+    """`git gc` and `git maintenance` in a nested repository move its git
+    directory's mtime (MEASURED) without anyone using it, so reading that
+    directory kept a stale worktree looking used for as long as maintenance
+    ran. The index file is read instead; gc leaves it alone."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_nested_gc")
+    nested = wt / "x" / "y" / "clone"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    for i in range(3):
+        (nested / f"f{i}").write_text(f"{i}\n")
+        _git(nested, "add", "-A")
+        _git(nested, "commit", "-qm", f"c{i}")
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    _age_reflog(nested, 20)
+    _git(nested, "gc", "-q")
+    assert (time.time() - (nested / ".git").stat().st_mtime) / 86400 < 1, (
+        "precondition: gc moved the git dir"
+    )
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19
