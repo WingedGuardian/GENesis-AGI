@@ -109,10 +109,20 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _cli(root: Path, *args: str, **env_extra: str) -> subprocess.CompletedProcess:
+def _child_env(**env_extra: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.pop(ur.OVERRIDE_ENV, None)
+    # Run THIS tree's module: the editable install points `genesis` at the main
+    # checkout, so from a linked worktree the child would otherwise import a
+    # different copy (or none, before this module exists on main).
+    src = str(REPO / "src")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (src, env.get("PYTHONPATH", "")) if p)
     env.update(GENESIS_GITHUB_PUBLIC_REPO=PUBLIC, **env_extra)
+    return env
+
+
+def _cli(root: Path, *args: str, **env_extra: str) -> subprocess.CompletedProcess:
+    env = _child_env(**env_extra)
     return subprocess.run(
         [sys.executable, "-m", "genesis.util.update_remote", str(root), *args],
         capture_output=True,
@@ -121,6 +131,23 @@ def _cli(root: Path, *args: str, **env_extra: str) -> subprocess.CompletedProces
         env=env,
         cwd=str(REPO),
     )
+
+
+def test_cli_runs_this_trees_module():
+    """The CLI tests must exercise the module beside this test file, not the
+    copy an editable install resolves (the main checkout, from a worktree)."""
+    probe = subprocess.run(
+        [sys.executable, "-c", "import genesis.util.update_remote as m; print(m.__file__)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=_child_env(),
+        cwd=str(REPO),
+    )
+    assert (
+        Path(probe.stdout.strip()).resolve()
+        == (REPO / "src" / "genesis" / "util" / "update_remote.py").resolve()
+    ), probe
 
 
 @pytest.fixture
