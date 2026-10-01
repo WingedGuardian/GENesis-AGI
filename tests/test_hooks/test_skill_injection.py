@@ -251,7 +251,10 @@ def test_vendor_gate_still_lets_aws_lambda_through(tmp_path, monkeypatch):
 
     monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
     skill = _lib_skill(tmp_path, "aws", "aws-serverless", "skills", "aws-lambda")
-    assert hook._score_skill(skill, hook._extract_keywords("aws lambda")) == 4.0
+    assert (
+        hook._score_skill(skill, hook._extract_keywords("aws lambda"), "aws lambda")
+        == 2.0
+    )
 
 
 def test_vendor_gate_derives_vendor_from_path_not_a_hardcoded_list(tmp_path, monkeypatch):
@@ -262,13 +265,16 @@ def test_vendor_gate_derives_vendor_from_path_not_a_hardcoded_list(tmp_path, mon
     monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
     acme = _lib_skill(tmp_path, "acme-corp", "bundle", "skills", "widget-tuner")
     assert hook._score_skill(acme, ["widget"]) == 0.0
-    assert hook._score_skill(acme, ["acme", "corp", "widget"]) == 2.0
+    assert (
+        hook._score_skill(acme, ["acme", "corp", "widget"], "acme corp widget-tuner")
+        == 2.0
+    )
     top_level = _lib_skill(tmp_path, "widget-tuner")
-    assert hook._score_skill(top_level, ["widget"]) == 2.0
+    assert hook._score_skill(top_level, ["widget"], "widget-tuner") == 2.0
     grouped = _lib_skill(tmp_path, "writing", "widget-tuner")
-    assert hook._score_skill(grouped, ["widget"]) == 2.0, "a grouping folder is not a vendor"
+    assert hook._score_skill(grouped, ["widget"], "widget-tuner") == 2.0, "a grouping folder is not a vendor"
     repo = {"name": "widget-tuner", "keywords": [], "path": "src/genesis/skills/widget-tuner"}
-    assert hook._score_skill(repo, ["widget"]) == 2.0
+    assert hook._score_skill(repo, ["widget"], "widget-tuner") == 2.0
 
 
 def test_open_vendor_gate_skips_the_stoplist(tmp_path, monkeypatch):
@@ -308,9 +314,12 @@ def test_vendor_folder_words_are_tokenized_like_the_prompt(tmp_path, monkeypatch
     monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
     dotted = _lib_skill(tmp_path, "acme.io", "bundle", "skills", "widget-tuner")
     assert hook._score_skill(dotted, ["widget"]) == 0.0
-    assert hook._score_skill(dotted, hook._extract_keywords("acme.io widget")) == 2.0
+    assert (
+        hook._score_skill(dotted, hook._extract_keywords("acme.io widget"), "acme.io widget-tuner")
+        == 2.0
+    )
     tiny = _lib_skill(tmp_path, "xy", "bundle", "skills", "widget-tuner")
-    assert hook._score_skill(tiny, ["widget"]) == 2.0
+    assert hook._score_skill(tiny, ["widget"], "widget-tuner") == 2.0
 
 
 def test_malformed_catalog_path_does_not_raise(tmp_path, monkeypatch):
@@ -319,7 +328,7 @@ def test_malformed_catalog_path_does_not_raise(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
     for bad in (7, ["a"], None, ""):
         skill = {"name": "widget-tuner", "keywords": [], "path": bad}
-        assert hook._score_skill(skill, ["widget"]) == 2.0
+        assert hook._score_skill(skill, ["widget"], "widget-tuner") == 2.0
 
 
 def test_every_repo_skill_stays_reachable():
