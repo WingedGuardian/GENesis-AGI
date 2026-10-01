@@ -17,6 +17,16 @@ asking.
 
 **Dispatched sessions are DENIED, loudly** — see ``needs_user``.
 
+**An install may turn the prompt off** with ``hooks.asks.secrets_env: off`` in
+``~/.genesis/config/genesis.yaml``. That is a decision about approval fatigue on
+one box, not a change to the public default (which stays ``ask``) and not a
+change to the dispatched deny, which ``needs_user.decide`` reaches before the
+policy is consulted. Turning the prompt off does NOT approve the command: the
+guard emits no permission decision, only a context note naming the setting, so
+other hooks and Claude Code's own permission settings still decide it, and the
+transcript still shows the credentials were touched — "stop asking me" rather
+than "stop telling me". See ``hook_ask_policy``.
+
 **Matching is by RESOLVED PATH, not by command text.** The first version matched
 the literal string ``secrets.env`` in a Bash command and was broken in seconds by
 ``cat ~/genesis/secrets.*``, ``cat s*.env`` and friends — and it never saw
@@ -104,9 +114,7 @@ def main() -> int:
     ti = tool_input(payload)
 
     paths = [ti[f] for f in _PATH_FIELDS if isinstance(ti.get(f), str)]
-    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(
-        ti.get("pattern"), str
-    ):
+    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(ti.get("pattern"), str):
         paths.append(ti["pattern"])
     command = ti.get("command") if isinstance(ti.get("command"), str) else ""
 
@@ -140,7 +148,51 @@ def main() -> int:
         "LLM call, it belongs in a routing call site instead."
     )
 
-    print(json.dumps(decide("access secrets.env", reason, detail=subject, payload=payload)))
+    # ``ask_key`` lets THIS install silence the prompt (hooks.asks.secrets_env:
+    # off in ~/.genesis/config/genesis.yaml) without changing the public default
+    # or reaching the dispatched-session deny — see needs_user.decide, which
+    # checks the dispatched branch first.
+    # REVERSE version skew, and the fail direction is the point. This guard has
+    # no run_guard wrapper and no try/except around main(): its documented
+    # posture is that a crash exits non-zero, which Claude Code treats as
+    # NON-blocking — so an uncaught TypeError here would let the credentials
+    # access through with no prompt, no block and no record. That is the one
+    # outcome this file exists to prevent, and it would be reachable purely by
+    # deploying this file next to an older needs_user.py that has no `ask_key`
+    # parameter. Retry without it: the prompt is exactly what this guard did
+    # before the knob existed, so the degraded path is the old behaviour rather
+    # than a new one.
+    try:
+        decision = decide(
+            "access secrets.env",
+            reason,
+            detail=subject,
+            payload=payload,
+            ask_key="secrets_env",
+        )
+    except TypeError:
+        decision = decide("access secrets.env", reason, detail=subject, payload=payload)
+    # Bounded: the decision carries operator-written NOTEs, and a payload over
+    # the harness's output cap is persisted instead of read, which would lose
+    # the ask and let the access through ungated. Only the free text is trimmed;
+    # the envelope (the decision itself) always survives.
+    # ANY failure of the output helper (missing, or present but broken, e.g. a
+    # syntax error mid-deploy) must still deliver the decision: an uncaught
+    # error here exits non-zero with no stdout, which Claude Code does not
+    # treat as blocking, so the access would proceed with no prompt. The plain
+    # print stays small because the notes are already clipped at their source.
+    try:
+        from hook_output import print_json_bounded
+
+        print_json_bounded(
+            decision,
+            text_keys=(
+                "hookSpecificOutput.permissionDecisionReason",
+                "hookSpecificOutput.additionalContext",
+            ),
+        )
+    except Exception:  # noqa: BLE001 - the decision must be delivered regardless
+        print(json.dumps(decision))
     return 0
 
 

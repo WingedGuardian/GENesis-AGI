@@ -21,7 +21,8 @@
 #            the server's MainPID and invocation, and what runs beside the commit
 #            (runtime-edits, runtime-overrides), and the validation bracket's
 #            token; --verify <token> answers whether it still holds (below).
-#            Run from a linked worktree, it reports the main checkout.
+#            Run from a linked worktree, it reports the main checkout, through
+#            the main checkout's own copy of this script and its libs.
 #   --wait N seconds to queue for the lock (default 7200, the same two hours a
 #            validation's hold may run, or GENESIS_DEPLOY_LOCK_WAIT)
 #
@@ -47,7 +48,8 @@
 # restart add a Guardian pause (no false "Genesis down" alert or paid diagnosis)
 # and a health wait sized the way update.sh sizes its own. deploy skips the stop
 # and the restart when the files the server loads (src/, config/,
-# pyproject.toml) are the ones it booted from, after the merge and at every
+# pyproject.toml, and the scripts it keeps imported: _RUNTIME_RELOAD_SCRIPTS in
+# lib/deploy_status.sh) are the ones it booted from, after the merge and at every
 # commit HEAD has held since the boot (the server imports src/ lazily, so a
 # pulled tree's module stays loaded after a later commit restores the files).
 # The fast-forward never overwrites a file git ignores: git refuses it at the
@@ -100,19 +102,24 @@
 # valid run. A token exists only when the server is up, its boot commit is known,
 # HEAD's runtime files are the ones it booted from and were at every commit HEAD
 # held since the boot (after a pull of code, even one a later commit undid:
-# restart first), and nothing under src/, config/ or pyproject.toml is edited
-# outside git; otherwise it prints "unknown (<why>)", which no token matches. It
+# restart first), and nothing under src/, config/, pyproject.toml or a script
+# the server uses (the two lists in lib/deploy_status.sh) is edited outside
+# git; otherwise it prints "unknown (<why>)", which no token matches. It
 # covers the boot commit, the MainPID, systemd's invocation id (a pid can be
-# reused, an invocation cannot) and a fingerprint of the ignored runtime files
+# reused, an invocation cannot), the scripts the server runs afresh as they
+# stand at HEAD (_RUNTIME_FRESH_SCRIPTS: a pull of one voids the token and
+# needs no restart) and a fingerprint of the ignored runtime files
 # (a config/*.local.yaml, which git status never lists) and of the user overlays
-# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs or
-# hooks without invalidating the run.
+# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs, or
+# over hooks and scripts the server never runs, without invalidating the run.
 # It is a TRIPWIRE, not a certificate: "valid" means none of those changes
 # happened, not that nothing the server runs changed. It cannot see, and reads
 # valid through: a change to the venv's installed packages (imported lazily
 # too); the other files the server reads from ~/.genesis/config (a user
 # outreach.yaml, genesis.yaml, modules/: only the *.local.yaml overlays are
-# fingerprinted); an edit under src/, config/ or pyproject.toml made and undone
+# fingerprinted); a script the server reaches only through a systemd unit it
+# starts or a Claude Code session it launches; an edit under src/, config/,
+# pyproject.toml or a listed script made and undone
 # without moving HEAD (by hand, a stash and its pop, a checkout of a file from
 # another commit), including one present at boot; and a reflog rewritten or backdated (`git reflog expire
 # --rewrite`, a move made with GIT_COMMITTER_DATE, a clock stepped back). Proving
@@ -168,6 +175,8 @@ _PORT_PROBE_PY="$(cat "${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by
 _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
 
+# Kept whole for the status hand-over below (the parse consumes "$@").
+_ORIG_ARGS=("$@")
 MODE=""
 VERIFY=""
 # Two hours: a validation's documented hold is `flock -s -w 7200`, and a detached
@@ -204,6 +213,18 @@ if [ "$MODE" = status ] && [ -n "$_git_dir" ] && [ -n "$_common_dir" ] \
     GENESIS_ROOT="$(dirname -- "$_common_dir")"
     _git_dir="$_common_dir"
     echo "(from a linked worktree: reporting the main checkout, $GENESIS_ROOT)"
+    # What `status` hashes and reports (the runtime path lists in lib/deploy_status.sh)
+    # belongs to the tree being reported, and this worktree's copy, sourced above, can
+    # be older or newer than main's. Hand over to the main checkout's own script with
+    # the same arguments. GENESIS_DEPLOY_ROOT is dropped so that script takes its root
+    # from where it lives; the guard variable stops a second hand-over. A main
+    # checkout with no copy of this script keeps this one (and its lists).
+    _main_self="$GENESIS_ROOT/scripts/deploy_code_only.sh"
+    if [ -z "${GENESIS_DEPLOY_STATUS_HANDOVER:-}" ] && [ -f "$_main_self" ] \
+        && [ "$(readlink -f -- "$_main_self")" != "$(readlink -f -- "${BASH_SOURCE[0]}")" ]; then
+        exec env -u GENESIS_DEPLOY_ROOT GENESIS_DEPLOY_STATUS_HANDOVER=1 \
+            bash "$_main_self" "${_ORIG_ARGS[@]}"
+    fi
 fi
 if [ -z "$_git_dir" ] || [ -z "$_common_dir" ] || [ "$(unset CDPATH; cd -- "$_git_dir" && pwd -P)" != "$_common_dir" ] \
     || [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
@@ -753,7 +774,8 @@ fi
 _read_baseline
 # A deploy with nothing to deploy: the server is running, its boot commit is
 # known, and the files it loads are the same at HEAD and at every commit HEAD
-# held since the boot (a merge of docs or hooks only, or no merge at all). A
+# held since the boot (a merge of docs, or of hooks and scripts the server does
+# not keep imported, or no merge at all). A
 # restart would only cost an outage and end in-flight dispatched sessions. The
 # restart mode is there to force one.
 if [ "$MODE" = deploy ] && [ -z "$_STOPPED" ] && [ -n "$SERVING" ] && _runtime_held "$SHA"; then

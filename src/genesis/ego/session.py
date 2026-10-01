@@ -351,6 +351,7 @@ class EgoSession:
             working_dir=background_session_dir(),
             mcp_config=self._mcp_config_path,
             disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS),
+            caller_tag=self._cc_caller_tag("cycle"),
         )
 
         # Autonomous dispatch check
@@ -1389,6 +1390,15 @@ class EgoSession:
 
     # -- Helpers -----------------------------------------------------------
 
+    def _cc_caller_tag(self, stage: str) -> str:
+        """``cc.invocation_failed`` caller tag naming THIS ego and the stage.
+
+        Both egos share this class, so a fixed tag would make their failures
+        unattributable and coalesce one behind the other. Derived from the
+        per-instance source tag: ``user_ego_cycle`` -> ``user_ego.<stage>``.
+        """
+        return f"{self._source_tag.removesuffix('_cycle')}.{stage}"
+
     async def _run_gate_cc(self, prompt: str, *, label: str):
         """Run a lightweight in-cycle gate CC call (reconcile/realist), returning
         the CC output or None on error. Mirrors the realist's fail-open envelope
@@ -1404,6 +1414,7 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=self._cc_caller_tag(f"gate.{label.lower()}"),
             )
             output = await self._invoker.run(invocation)
             if output.is_error:
@@ -1991,6 +2002,7 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=self._cc_caller_tag("realist"),
             )
             output = await self._invoker.run(invocation)
             # Track realist cost for cycle accounting

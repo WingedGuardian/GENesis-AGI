@@ -1278,6 +1278,63 @@ async def test_build_verdict_flows_through_monitor_to_greenlight(
     assert gate.ensure_approval.await_args.kwargs["action_type"] == "build_greenlight"
 
 
+@pytest.mark.asyncio
+async def test_enabling_the_lane_retires_the_lane_off_build_fallback(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    """Lane off -> a BUILD verdict becomes a pinned fallback follow-up. When the
+    operator then enables the lane and the item is re-evaluated, the lane owns
+    it (candidate + greenlight card), so the fallback must stop being
+    actionable — otherwise the same build shows up twice, once stale."""
+    from unittest.mock import AsyncMock
+
+    from genesis.autonomy.build_lane import BuildLane
+    from genesis.db.crud import build_candidates, follow_ups
+
+    monkeypatch.setattr("genesis.autonomy.build_lane._PLANS_DIR", tmp_path / "plans")
+
+    gate = AsyncMock()
+    gate.ensure_approval = AsyncMock(return_value=("pending", "req-1", "pending"))
+    lane = BuildLane(db=db, dispatcher=AsyncMock(), approval_gate=gate, enabled=False)
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=1)
+    mon.set_build_lane(lane)
+    mock_invoker.run.return_value = _ok(text=_build_eval_text())
+
+    notepad = inbox_dir / "Capabilities.md"
+    notepad.write_text("https://example.com/widget")
+    await mon.check_once()
+
+    def _widget_rows(rows):
+        return [r for r in rows if "Widget Skill" in r["content"]]
+
+    fallback = _widget_rows(await follow_ups.get_actionable(db))
+    assert len(fallback) == 1, "precondition: lane-off fallback row was not created"
+    assert fallback[0]["content"].startswith("[BUILD] Widget Skill")
+    gate.ensure_approval.assert_not_awaited()
+
+    # Operator enables the lane; new notepad content forces a re-evaluation.
+    mon.set_build_lane(
+        BuildLane(db=db, dispatcher=AsyncMock(), approval_gate=gate, enabled=True),
+    )
+    notepad.write_text("https://example.com/widget\n\nhttps://example.com/widget-v2")
+    await mon.check_once()
+
+    candidate = await build_candidates.get_open_by_item_key(
+        db, BuildLane.item_key("Widget Skill"),
+    )
+    assert candidate is not None, "precondition: the live lane did not consume the item"
+    gate.ensure_approval.assert_awaited_once()
+
+    assert _widget_rows(await follow_ups.get_actionable(db)) == [], (
+        "stale lane-off fallback still actionable beside the live greenlight card"
+    )
+    retired = await follow_ups.get_by_id(db, fallback[0]["id"])
+    assert retired is not None, "the fallback must be retired, never deleted"
+    assert retired["status"] == "completed"
+    assert "build lane" in (retired["resolution_notes"] or "").lower()
+
+
 # ── Parking is visible (975ca61b precondition) + #1952 + #1766 inbox leg ────
 
 

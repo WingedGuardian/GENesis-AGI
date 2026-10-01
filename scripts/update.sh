@@ -841,6 +841,8 @@ _ensure_server_down() {
     return 0
 }
 
+# Set only by _start_genesis_server's direct-start fallback; never inherited.
+_SERVER_DIRECT_PID=""
 _start_genesis_server() {
     # Use `restart` (NOT `start`): systemd's Restart=on-failure can resurrect a
     # STALE-code instance mid-update (a kill-based stop is seen as a failure and
@@ -862,7 +864,10 @@ _start_genesis_server() {
     # (systemd-started servers don't inherit our FDs; only this nohup path does.)
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
         {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
-    echo "  Started genesis-server in degraded mode (pid $!)"
+    # No unit tracks this process, so the no-change path's health probe waits on
+    # this pid instead of the unit's state.
+    _SERVER_DIRECT_PID=$!
+    echo "  Started genesis-server in degraded mode (pid $_SERVER_DIRECT_PID)"
     # Write marker so dashboard can detect degraded mode
     echo "nohup" > "$HOME/.genesis/server-start-mode"
 }
@@ -999,6 +1004,30 @@ _restart_tmp_watchgod_if_stale() {
     return 0
 }
 
+# An interpreter for the pure-stdlib metadata READERS (the latest-status probe and
+# the tier-2 baseline): venv first, then system interpreters, so a missing or
+# broken venv — the state a failed update can leave — still lets them read. The
+# history WRITER does not use this: it imports genesis, which only the venv can.
+# Each caller states its own floor. Prints the path.
+_metadata_python() {
+    local min_minor="${1:?usage: _metadata_python <minor-version>}"
+    [[ "$min_minor" =~ ^[0-9]+$ ]] || return 1
+    local candidate
+    for candidate in "$VENV_DIR/bin/python" python3.12 python3.11 python3; do
+        if [ "$candidate" = "$VENV_DIR/bin/python" ]; then
+            [ -x "$candidate" ] || continue
+        else
+            candidate="$(command -v "$candidate" 2>/dev/null || true)"
+            [ -n "$candidate" ] || continue
+        fi
+        if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, $min_minor) else 1)" 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── update_history helper ────────────────────────────────
 # Records an entry in update_history. Silently no-ops if the table
 # doesn't exist yet (first update before migration 0001 has run).
@@ -1011,7 +1040,13 @@ _record_update_history() {
     fi
     local db_path="$GENESIS_ROOT/data/genesis.db"
     [ -f "$db_path" ] || return 0
-    [ -x "$VENV_DIR/bin/python" ] || return 0
+    # The insert imports genesis (and through it aiosqlite), so ONLY the venv can
+    # run it — a system interpreter lacks the dependencies. Without the venv the
+    # record cannot be written; say so instead of skipping it silently.
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        echo "  WARNING: failed to record update_history entry: no venv interpreter at $VENV_DIR/bin/python" >&2
+        return 0
+    fi
 
     # Run the insert in Python for parameterized SQL. The inline script
     # distinguishes three exit paths:
@@ -1092,6 +1127,117 @@ PYEOF
     esac
     return 0
 }
+
+# BEGIN success-degraded-subsystems (extracted by tests/test_scripts/test_update_success_records.py)
+# The degraded-subsystems value for a `success` row. EVERY success writer builds
+# its value here, so each one can carry `genesis-server-not-restarted`: a success
+# row naming the new HEAD while nothing is serving it is the one record that
+# must never be written bare.
+_success_degraded_subsystems() {
+    local degraded="$1"
+    local server_not_restarted="$2"
+    if [ "$server_not_restarted" = "true" ]; then
+        degraded="${degraded:+$degraded,}genesis-server-not-restarted"
+    fi
+    printf '%s\n' "$degraded"
+}
+# END success-degraded-subsystems
+
+# BEGIN deploy-outcome-probes (extracted by tests/test_scripts/test_update_success_records.py)
+# Status of the most recent update_history row. ONE reader for the two places
+# that must agree on it: P6's recovery detection, and the no-delta path, which
+# must not write a newer success row over an unresolved `failed`/`rolled_back`
+# one — when last_update_failure.json was never written, that row is the only
+# signal recovery has.
+#
+# Prints the status; "" only when nothing is recorded (no database file, no
+# table yet, no rows); and "unreadable" when a row may exist but could not be
+# read. Callers treat "unreadable" as a possible unresolved failure, never as
+# "nothing recorded". It reads the database _record_update_history writes
+# ($GENESIS_ROOT, not a fixed home path), with any interpreter that can run
+# stdlib sqlite3 — so a broken venv, which stops the WRITER, cannot also blind
+# this reader to the row a previous run left.
+_latest_update_status() {
+    local db_path="$GENESIS_ROOT/data/genesis.db"
+    if [ ! -f "$db_path" ]; then
+        echo ""
+        return 0
+    fi
+    local py=""
+    py="$(_metadata_python 12 || true)"
+    if [ -z "$py" ]; then
+        echo "unreadable"
+        return 0
+    fi
+    GH_DB_PATH="$db_path" "$py" - <<'PYEOF' 2>/dev/null || echo "unreadable"
+import os
+import sqlite3
+import sys
+
+try:
+    # Read-only: never create or migrate the database from a status probe.
+    con = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True, timeout=5)
+    try:
+        # started_at is `date -Iseconds` (LOCAL time plus offset): order by the
+        # instant, not the text, or a DST fall-back puts a later run behind an
+        # earlier one.
+        row = con.execute(
+            "SELECT status FROM update_history ORDER BY datetime(started_at) DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        row = None
+    print((row[0] or "") if row else "")
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+# Whether genesis-server answers its health endpoint right now. Used where a
+# restart is attempted without P6's health loop: `_start_genesis_server` returns 0
+# whenever `systemctl restart` exits cleanly, and its direct-start fallback
+# returns 0 unconditionally, so its return code cannot say whether the server came
+# back. Anything but a healthy answer counts as NOT up, so the error lands on the
+# side that reports a problem rather than hiding one.
+_server_health_ok() {
+    # P6's probe (curl --max-time 20, above the health route's own ~15s budget),
+    # retried every 15s ONLY while the unit says it is starting or running, for
+    # at most 180s — P6's own floor for its health window. A unit reading
+    # `active`/`activating` is never proof by itself: a crash-looping unit under
+    # Restart=on-failure reads `activating` between attempts, so it waits out the
+    # bound and reads "not back". An unreadable (empty) answer keeps polling to the
+    # bound. Any other unit state (inactive, failed) stops at once, unless
+    # _start_genesis_server fell back to a direct start: no unit tracks that
+    # process, so the wait follows its pid instead. A server booting slower than
+    # the bound reads "not back": the side that reports a problem. The bound is ELAPSED time ($SECONDS), so a transfer
+    # that hangs for its full --max-time counts against it too; the worst overrun is
+    # one poll step plus one transfer (the deadline is checked before the sleep).
+    local state
+    local deadline=$((SECONDS + ${_SERVER_HEALTH_WAIT_SECS:-180})) step="${_SERVER_HEALTH_POLL_SECS:-15}"
+    while :; do
+        curl -sf --max-time 20 http://localhost:5000/api/genesis/health > /dev/null 2>&1 && return 0
+        state="$(systemctl --user is-active genesis-server.service 2>/dev/null || true)"
+        case "$state" in
+            active | activating | reloading) ;;
+            "")
+                # Unreadable (a lost user bus prints nothing and exits non-zero),
+                # not evidence of death — P6 reads it the same way. Keep polling
+                # to the bound; a direct-started process that is gone still stops it.
+                if [ -n "${_SERVER_DIRECT_PID:-}" ]; then
+                    kill -0 "$_SERVER_DIRECT_PID" 2>/dev/null || return 1
+                fi
+                ;;
+            *)
+                [ -n "${_SERVER_DIRECT_PID:-}" ] && kill -0 "$_SERVER_DIRECT_PID" 2>/dev/null \
+                    || return 1
+                ;;
+        esac
+        [ "$SECONDS" -lt "$deadline" ] || return 1
+        sleep "$step"
+    done
+}
+# END deploy-outcome-probes
 
 # ── Rollback helper function ─────────────────────────────
 _do_rollback() {
@@ -1451,27 +1597,42 @@ NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 # recovery, so a no-op pull must still fall through to full activation
 # (bootstrap + migrations + restart + a fresh update_history baseline) when
 # update.sh-only paths changed since the last recorded success. Returns 0
-# (pending) when the diff is non-empty OR errors (fail toward the full run);
-# baseline unknown/unresolvable (pre-first-update install, rewritten history)
-# returns 1 — shortcut as before, the awareness alert still covers it. Keep
-# the path list in LOCKSTEP with TIER2_PATHS in
+# (pending) when the diff is non-empty OR errors (fail toward the full run) —
+# including a history that exists but cannot be read, which is NOT the same as
+# no baseline. A baseline that is genuinely absent or unresolvable
+# (pre-first-update install, no table or success row yet, rewritten history)
+# returns 1 — shortcut as before, the awareness alert still covers it. Reads
+# through `_metadata_python` (stdlib only, so no venv needed). Keep the path list in
+# LOCKSTEP with TIER2_PATHS in
 # src/genesis/observability/snapshots/deploy_health.py.
 _tier2_pending_since_baseline() {
     local _baseline=""
-    if [ -f "$GENESIS_ROOT/data/genesis.db" ] && [ -x "$VENV_DIR/bin/python" ]; then
+    if [ -f "$GENESIS_ROOT/data/genesis.db" ]; then
+        local _py=""
+        _py="$(_metadata_python 12 || true)"
+        [ -n "$_py" ] || return 0
         _baseline=$(GH_DB_PATH="$GENESIS_ROOT/data/genesis.db" \
-            "$VENV_DIR/bin/python" - 2>/dev/null <<'PYEOF' || true
+            "$_py" - 2>/dev/null <<'PYEOF'
 import os
 import sqlite3
+import sys
 
-conn = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True)
-row = conn.execute(
-    "SELECT new_commit FROM update_history WHERE status='success' "
-    "ORDER BY datetime(completed_at) DESC LIMIT 1"
-).fetchone()
-print((row[0] or "").strip() if row else "")
+try:
+    conn = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT new_commit FROM update_history WHERE status='success' "
+            "ORDER BY datetime(completed_at) DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        row = None
+    print((row[0] or "").strip() if row else "")
+except Exception:
+    sys.exit(1)
 PYEOF
-        )
+        ) || return 0
     fi
     [ -n "$_baseline" ] || return 1
     git -C "$GENESIS_ROOT" cat-file -e "${_baseline}^{commit}" 2>/dev/null || return 1
@@ -1541,14 +1702,56 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # we must not erase it. This path also exits before the success-path
     # recording, so it doubles as the place to persist any host-side degradation
     # the drift healing just found.
+    #
+    # "Not restarted" is decided by a health probe AFTER the restart attempt, not
+    # by whether it was running at entry, and not by the unit's state. This path
+    # has no health loop, and `_start_genesis_server` reports success even when
+    # the unit never came back (its direct-start fallback always returns 0) — so
+    # entry state alone let a failed restart write a bare success row, and unit
+    # state reads a crash-looping server as `activating`. (P6 is different: it
+    # verifies health and rolls back on failure, so entry-state membership is
+    # enough there.)
+    _nd_server_not_restarted=true
+    if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] && _server_health_ok; then
+        _nd_server_not_restarted=false
+    fi
+    _nd_base_degraded="${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
+    _nd_degraded="$(_success_degraded_subsystems \
+        "${HOST_CC_DEGRADED:-}" "$_nd_server_not_restarted")"
     if [ -f "$HOME/.genesis/last_update_failure.json" ] \
-        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        && [ "$_nd_server_not_restarted" = "false" ]; then
         rm -f "$HOME/.genesis/last_update_failure.json"
-        _record_update_history "success" "" "$HOST_CC_DEGRADED"
-        echo "  Cleared stale update-failure marker (server healthy, code current)."
-    elif [ -n "$HOST_CC_DEGRADED" ] || [ -n "$PRE_UPDATE_DEGRADED" ]; then
-        echo "  NOTE: recording degraded subsystem: ${HOST_CC_DEGRADED:-$PRE_UPDATE_DEGRADED}"
-        _record_update_history "success" "" "$HOST_CC_DEGRADED"
+        _record_update_history "success" "" "$_nd_degraded"
+        echo "  Cleared stale update-failure marker (server running, code current)."
+    elif [ -n "$_nd_base_degraded" ]; then
+        # A row is written here only to persist a degradation, as before: a
+        # no-change run with nothing degraded records nothing, whatever the
+        # server's state, because a success row names HEAD and every
+        # "what is deployed" reader counts it.
+        # With the server down, the latest record must stay the latest when it
+        # is anything but a success: P6's recovery detection reads only the
+        # newest status, and when last_update_failure.json was never written,
+        # that row is all it has. ALLOWLIST: only nothing-recorded or a prior
+        # success may be recorded over.
+        _nd_last_status=""
+        if [ "$_nd_server_not_restarted" = "true" ]; then
+            _nd_last_status="$(_latest_update_status)"
+        fi
+        case "$_nd_last_status" in
+            "" | success)
+                # The writer appends PRE_UPDATE_DEGRADED itself; show what the row carries.
+                echo "  NOTE: recording degraded subsystem: ${_nd_degraded}${PRE_UPDATE_DEGRADED:+${_nd_degraded:+,}$PRE_UPDATE_DEGRADED}"
+                _record_update_history "success" "" "$_nd_degraded"
+                ;;
+            unreadable)
+                echo "  NOTE: genesis-server is not running and the last update's status" \
+                    "could not be read — not recording over what may be an unresolved failure."
+                ;;
+            *)
+                echo "  NOTE: genesis-server is not running and the last update ended" \
+                    "'$_nd_last_status' — not recording over it, so recovery still sees it."
+                ;;
+        esac
     fi
     _restart_tmp_watchgod_if_stale
     echo ""
@@ -1758,8 +1961,8 @@ _write_state "health_check"
 # a recovery re-run — the server SHOULD come back and be health-verified; or (b)
 # the operator deliberately stopped it before updating — respect that, don't
 # start what they stopped. Distinguish via failure artifacts: a leftover
-# last_update_failure.json, or a last update_history status of rolled_back/failed,
-# marks a recovery. Without the recovery push, the restart+health block below is
+# last_update_failure.json, or a last update_history status of rolled_back/failed
+# (or one that cannot be read), marks a recovery. Without the recovery push, the restart+health block below is
 # skipped and we'd record "success" with the server down and no health check.
 _OPERATOR_STOP=false
 if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
@@ -1767,22 +1970,18 @@ if [ ${#WERE_RUNNING[@]} -eq 0 ]; then
     if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
         _recovery=true
     else
-        _last_status="$("$VENV_DIR/bin/python" - <<'PYEOF' 2>/dev/null || true
-import os
-import sqlite3
-
-try:
-    con = sqlite3.connect(os.path.expanduser("~/genesis/data/genesis.db"), timeout=5)
-    row = con.execute(
-        "SELECT status FROM update_history ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    print(row[0] if row else "")
-except Exception:
-    print("")
-PYEOF
-)"
+        # The shared reader (deploy-outcome-probes): the database update.sh itself
+        # writes, not a fixed home path, and any interpreter that can read it.
+        _last_status="$(_latest_update_status)"
         case "$_last_status" in
             rolled_back | failed) _recovery=true ;;
+            unreadable)
+                # Unknown is not "nothing failed". Recovering costs a restart and
+                # a health check (with rollback on failure); guessing "operator
+                # stop" would record success over what may be a live failure.
+                echo "  Last update status could not be read — treating this as a recovery run."
+                _recovery=true
+                ;;
             *) : ;;
         esac
     fi
@@ -2159,13 +2358,22 @@ fi
 if [ -n "$HOST_CC_DEGRADED" ]; then
     echo "  NOTE: recording degraded subsystem: $HOST_CC_DEGRADED"
 fi
-# If the server was operator-stopped (empty WERE_RUNNING, no recovery artifact),
-# it was intentionally NOT restarted or health-verified — record that in the
-# degraded column so this isn't a bare "success" that hides a down server.
-_p6_degraded="$HOST_CC_DEGRADED"
+# If genesis-server was not restarted, it was NOT health-verified either — record
+# that in the degraded column so this isn't a bare "success" that hides a down
+# server. The test is MEMBERSHIP of genesis-server in WERE_RUNNING, not
+# `_OPERATOR_STOP`: that flag is true only when WERE_RUNNING is ENTIRELY empty,
+# and genesis-bridge also populates the array — the bridge runs precisely WHEN
+# genesis-server is down, so a bridge-up/server-down run left `_OPERATOR_STOP`
+# false and wrote a bare success row. The no-delta writers use the same helper,
+# so all three success writers agree on what the marker means. `_OPERATOR_STOP`
+# keeps its own, narrower meaning for the operator-stopped NOTE just below.
+_p6_server_not_restarted=false
+[[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]] \
+    || _p6_server_not_restarted=true
+_p6_degraded="$(_success_degraded_subsystems \
+    "$HOST_CC_DEGRADED" "$_p6_server_not_restarted")"
 if [ "${_OPERATOR_STOP:-false}" = "true" ]; then
     echo "  NOTE: server was not running at update start (operator-stopped) — not restarted."
-    _p6_degraded="${_p6_degraded:+$_p6_degraded,}genesis-server-not-restarted"
 fi
 # Subsystems that failed to initialise (or an unreadable/stale manifest). Advisory
 # by design — see the health-verification block — but it must reach the record,

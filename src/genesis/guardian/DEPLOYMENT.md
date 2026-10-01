@@ -20,7 +20,12 @@ CLAUDE.md: Generated from `config/guardian-claude.md` (NOT the repo root CLAUDE.
 - `snapshots.py` — Incus snapshot management with headroom-based gating
 - `pool.py` — storage-pool measurement (LVM-thin data/metadata, df fallback) + tiered alerts
 - `pool_relief.py` — pool relief: frees guardian-owned snapshots when free
-  space reaches its reserve (runbook: `docs/reference/thin-pool-recovery.md`)
+  space reaches its reserve, or early from the measured growth (runbook:
+  `docs/reference/thin-pool-recovery.md`)
+- `pool_runway.py` — bounded pool history (`pool_history.jsonl`), growth rate
+  and hours-to-full for relief's early level
+- `pool_extend.py` — relief's LVM partial extend into VG space autoextend
+  cannot use
 - `_subprocess.py` — shared async subprocess runner (used by 5+ modules)
 - `cgroup_ops.py` — host-side cgroup operations (I/O pressure, PID enumeration, process kill)
 - `approval.py` — HTTP approval server for recovery confirmation

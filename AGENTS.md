@@ -167,7 +167,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 ### Skills
 
-Each entry gives the skill's real directory; its instructions are the `SKILL.md` inside. Read the path, never infer one from the name — the name is not the directory. Some skills nest inside a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not `.claude/skills/gitnexus-cli/`), and skills live under two roots.
+Each entry gives the full path to the skill's instruction file. The filename is usually `SKILL.md` but not always, so read the path as given rather than assuming one — and never infer a path from the name, because the name is not the directory. Some skills nest inside a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not `.claude/skills/gitnexus-cli/`), and skills live under two roots.
 
 - **aws-fde-delivery** (`src/genesis/skills/aws-fde-delivery/SKILL.md`) — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Web and desktop automation with layered escalation (Fetch, Genesis Browser, Remote CDP, On-Demand MCP, Desktop), anti-detection, and persistent profiles
@@ -208,10 +208,11 @@ Each entry gives the skill's real directory; its instructions are the `SKILL.md`
 - **triage-calibration** (`src/genesis/skills/triage-calibration/SKILL.md`) — Daily triage accuracy calibration — use during scheduled calibration runs to verify triage classification accuracy against few-shot examples and adjust confidence thresholds
 - **unshelve** (`.claude/skills/unshelve/SKILL.md`) — Search for shelved sessions — find past bookmarked sessions by keyword or browse recent ones.
 - **user_evaluate** (`src/genesis/skills/user_evaluate/SKILL.md`) — Evaluate content for personal relevance to the user using the user model
+- **validating-merges** (`.claude/skills/validating-merges/SKILL.md`) — This skill should be used when a session's job is POST-MERGE VERIFICATION — taking merged PRs and establishing whether the change actually does what it claimed, then recording the result against its `pr_verifications` obligation. "validate the merged PRs", "work the verification backlog", "did that PR actually work", "run the post-merge E2E". It owns the obligation ledger the repo-pulse worker fills. Do NOT load it for building a change and opening its PR (that is `genesis-development`), or for driving open PRs to merge (that is `closing-session`).
 - **video-processing** (`src/genesis/skills/video-processing/SKILL.md`) — Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
 - **voice-master** (`.claude/skills/voice-master/SKILL.md`) — Foundational voice authority and AI humanizer — writes content in the user's authentic voice with built-in AI detection, and supports stealth / anti- attribution writing (forum personas, anonymous posts, "write as not-me"). Use when asked to write/draft/generate content, invoke /voice, /write-as-me, or /humanize, run voice calibration, check "does this sound like me?", "make this sound human" / "de-AI this", "write a forum post as [persona]", or run AI detection ("does this sound like AI?", "check for AI patterns", "anti-slop check"). Do NOT use this skill for code, technical docs, or any output the user has not asked to be written in their voice — code styling defers to the separate code-voice skill.
 - **web-research** (`.claude/skills/web-research/SKILL.md`) — Evidence-driven web and open-source research for questions that require multiple sources, factual verification, comparisons, or an adopt/adapt/build decision. Use for substantial research in foreground sessions, the genesis-researcher subagent, and research-profile background sessions. Skip for a single stable fact or a known URL that only needs fetching.
-- **youtube-fetch** (`.claude/skills/youtube-fetch/SKILL.md`) — Fetches YouTube video metadata and transcripts using yt-dlp. Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
+- **youtube-fetch** (`.claude/skills/youtube-fetch/SKILL.md`) — Fetches YouTube video metadata and transcripts (genesis web_fetch MCP tool first, yt-dlp via Bash as the fallback). Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
 
 ### MCP Tools
 
@@ -296,7 +297,7 @@ Each entry gives the skill's real directory; its instructions are the `SKILL.md`
 - `outreach_pending` — List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
-- `outreach_queue` — View recent outreach messages.
+- `outreach_queue` — List the 20 most recent SENT outreach messages, newest first.
 - `outreach_send` — Queue a message for delivery. Returns outreach_id.
 - `outreach_send_and_wait` — Send a message and wait for user reply. Returns JSON with reply or timeout.
 - `provision_grow` — Grow this VM's or container's capacity — approval-gated.

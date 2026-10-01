@@ -383,6 +383,19 @@ def test_a_rename_is_not_a_new_capability(home: Path, repo: Path):
     )
     assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
 
+def test_a_relative_rename_is_not_a_new_capability(home: Path, repo: Path):
+    """A ./-relative rename should not be classified as a new capability."""
+    src = repo / "src" / "genesis" / "autonomy" / "old.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+
+    p = _plan(
+        home,
+        "# Plan\nRename `./src/genesis/autonomy/old.py` to\n"
+        "`./src/genesis/autonomy/new.py`.\n",
+    )
+
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
 def test_a_pyi_rename_is_not_a_new_capability(home: Path, repo: Path):
     """A .pyi rename should not be classified as a new capability."""
     src = repo / "src" / "genesis" / "autonomy" / "old.pyi"
