@@ -194,6 +194,33 @@ def test_single_parent_head_uses_merge_base(tmp_path: Path):
     assert PR_ADDED in lsa.added_lines(spec, cwd=str(repo))
 
 
+def test_stacked_pr_resolves_against_its_base_branch(tmp_path: Path):
+    """Stacked PR: base is another PR's branch, not main (#2735).
+
+    parent: A ─ P1(+parent_token)
+    pr:     P1 ─ E(+pr_value)
+    The range must be P1..HEAD — the parent's own commit is NOT swept into the
+    scan (an install identifier the parent introduced would false-block the
+    child PR), while the child's own addition is.
+    """
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "base.txt", "hello\n", "A")
+    d = _commit(repo, "main2.txt", "maindata\n", "D main")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "-b", "parent", a)
+    p1 = _commit(repo, "parent.txt", "PARENT_TOKEN_7f8g9h\n", "P1 parent PR value")
+    _git(repo, "update-ref", "refs/remotes/origin/parent", p1)
+    _git(repo, "checkout", "-q", "-b", "pr", p1)
+    _commit(repo, "pr.txt", f"{PR_ADDED}\n", "E stacked-PR value")
+    spec = lsa.resolve_scan_spec("pull_request", "", "", base_ref="parent", cwd=str(repo))
+    assert spec == ("range", f"{p1}..HEAD")  # merge-base(origin/parent, E) == P1
+    out = lsa.added_lines(spec, cwd=str(repo))
+    assert PR_ADDED in out
+    assert "PARENT_TOKEN_7f8g9h" not in out
+
+
 def test_no_reachable_main_fails_closed(tmp_path: Path):
     """No origin/main ref → merge-base fails → RangeError (fail closed, never empty)."""
     repo = tmp_path / "r"

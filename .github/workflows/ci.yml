@@ -4,7 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # No `branches:` filter — a stacked PR (base = another PR's branch) must
+    # run CI too. `edited` is added so a retarget re-runs the suite; on the
+    # `edited` payload `changes.base` is present ONLY when the base branch
+    # changed (title/body edits carry no `changes.base`), and every job below
+    # gates on it so a title edit still fires nothing.
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
@@ -21,7 +26,16 @@ permissions:
   contents: read
 
 jobs:
+  # EVERY job carries the same guard: run unless the event is a `pull_request`
+  # `edited` that changed no base — `github.event.changes.base` is present in
+  # the payload only when the base branch moved (retarget). A job-level `if:`
+  # on each job rather than one guard job the others `needs:`: a guard would
+  # add a 16th job to a workflow whose job set the rulesets fix, and a skipped
+  # job reports `skipped` honestly on the check list instead of masquerading
+  # as a pass. The expression stays identical everywhere so the test can
+  # assert it mechanically.
   lint:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +53,7 @@ jobs:
         run: ruff check src/ tests/ scripts/
 
   dependency-audit:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # REPORTS known-vulnerable dependencies in the resolved runtime tree. It no
     # longer FAILS — see the step-level continue-on-error below, which is the whole
     # point of this job's current shape.
@@ -148,6 +163,7 @@ jobs:
             --ignore-vuln PYSEC-2026-2476
 
   leak-detector:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Verify no user-specific content (IPs, timezones, personal paths, secrets)
     # leaked into the codebase. Blocking — PRs must pass this.
     runs-on: ubuntu-latest
@@ -324,6 +340,7 @@ jobs:
           PRIV: ${{ secrets.GENESIS_PRIVATE_PATTERNS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
@@ -343,8 +360,8 @@ jobs:
           # PR/push leaves the net diff clean yet stays in published history).
           # RANGE SELECTION is security-critical and lives in tested Python:
           # scripts/ci/leak_scan_added_lines.py. For a pull_request it anchors on
-          # the merge ref's first parent (HEAD^1 = main@ci), NOT the stale
-          # github.event.pull_request.base.sha — base.sha lags main, so
+          # the merge-base with the LIVE base branch (origin/$BASE_REF), NOT the
+          # stale github.event.pull_request.base.sha — base.sha lags, so
           # base.sha..HEAD used to re-sweep (and re-flag) values main itself
           # added-then-removed since the PR was opened. The helper keeps every
           # '^+' line incl. '+++ b/path' headers, and fails CLOSED (nonzero exit)
@@ -359,6 +376,7 @@ jobs:
           printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
 
   migration-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Migration ids, three rules: every file in a migrations directory is a
     # legal migration (the residue is a violation, because a name that matches
     # nothing is discovered by nothing and NEVER RUNS), no duplicate id in
@@ -434,6 +452,7 @@ jobs:
           fi
 
   changelog-fragments:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Every file in changelog.d/ is a legal fragment — the residue is a
     # violation, for the same reason the migration-id check treats it that way:
     # a fragment nobody recognises is a changelog entry that never ships, and
@@ -490,6 +509,7 @@ jobs:
           fi
 
   external-io-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # WS5 regression guard: no NEW ungated autonomous external-world egress
     # (Discord REST/webhook, public social APIs) outside the reasoned allowlist.
     # See scripts/check_external_io.py.
@@ -503,6 +523,7 @@ jobs:
         run: python scripts/check_external_io.py
 
   atomic-write-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # An atomic write that orphans its temp on the exception path leaks a file
     # into a directory nothing sweeps. MEASURED 2026-09-29: 66 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
@@ -526,6 +547,7 @@ jobs:
         run: python scripts/check_atomic_writes.py
 
   frozen-clock-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # A test that captures a wall clock at IMPORT time gives the whole suite's
     # runtime to burn its safety margin, then fails on slow runners as an
     # unreproducible "flake". Measured instance: a 25-minute margin that passed
@@ -544,6 +566,7 @@ jobs:
         run: python scripts/check_frozen_clock.py
 
   subsystem-map-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Judgment-layer map guard: docs/architecture/CURRENT.md must claim every
     # top-level src/genesis module (an unmapped or vanished module = the map
     # lies to audits → error). Stale 'verified:' stamps only warn. The stamp
@@ -564,6 +587,7 @@ jobs:
         run: python scripts/check_subsystem_map.py
 
   shared-artifact-consumer-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Shared-artifact registry guard: docs/architecture/shared-artifacts.md must
     # declare every code consumer of each registered artifact — a NEW consumer a
     # documenting file never learned about is a doc that lies → error. The reader
@@ -581,6 +605,7 @@ jobs:
         run: python scripts/check_shared_artifact_consumers.py
 
   hook-versions-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Completeness backstop for .genesis-hook-versions: every version of a
     # tracked git hook that ever shipped on main must be recorded, or a
     # community install still carrying it gets wedged (sync-hooks.sh treats an
@@ -596,6 +621,7 @@ jobs:
         run: bash scripts/check_hook_versions_complete.sh
 
   cc-node-lockstep:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Enforce the CC↔Node pin lockstep: NODE_MAJOR in scripts/lib/cc_version.sh
     # must satisfy the pinned Claude Code's engines.node floor. Prevents the
     # "bumped CC past a Node floor, forgot NODE_MAJOR" mistake that left a host
@@ -612,6 +638,7 @@ jobs:
         run: python scripts/check_cc_node_lockstep.py
 
   review-depth-check:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Advisory review-DEPTH visibility: recompute substantiality on the PR range
     # (base...HEAD, so it needs full history — fetch-depth: 0) and emit a LOUD
     # ::warning:: annotation when the change is substantial, so the human reviewer
@@ -636,6 +663,7 @@ jobs:
         run: python scripts/check_review_depth.py
 
   cc-pin-receipts:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     # Advisory early warning that a pin bump is missing its gate receipts (the
     # full changelog read, and the local-first soak — docs/reference/
     # cc-compatibility.md §Updating). Advisory BY DESIGN (exit 0 always), for a
@@ -662,22 +690,31 @@ jobs:
           # Attacker-controlled text: passed via env, NEVER interpolated into
           # `run`. Same handling the leak-detector job uses for PR_BASE_SHA.
           PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
           # merge-base, NOT HEAD^1: parent count is not a reliable "this is the
           # merge ref" signal, and scripts/ci/leak_scan_added_lines.py rejects
           # that inference for the same reason.
           #
-          # BOTH commands are guarded. Under `set -e` an unresolvable origin/main
+          # The diff base is the PR's base BRANCH — for a stacked PR that is
+          # the parent PR's branch, not main. github.base_ref carries it on a
+          # pull_request event; push/schedule/dispatch leave it empty and keep
+          # main, which is the only correct base on those events.
+          #
+          # BOTH commands are guarded. Under `set -e` an unresolvable base ref
           # (or no common ancestor) would kill the step and turn this job RED —
           # in a job whose entire justification is that it cannot fail. An empty
           # base is handled by the checker itself: advisory mode reports "no base
           # SHA to compare against" and exits 0.
-          git fetch --no-tags --quiet origin main || true
-          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+          base_ref="${BASE_REF:-main}"
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}" || true
+          base="$(git merge-base "origin/${base_ref}" HEAD 2>/dev/null || true)"
           python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
 
   test:
+    if: ${{ github.event.action != 'edited' || github.event.changes.base }}
     runs-on: ubuntu-latest
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
@@ -1079,4 +1116,14 @@ jobs:
         # after the last test-adding edit, not against an earlier state of the
         # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
         # ceiling does not move. Floor: 23582 + 24 = 23606.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23606
+        #
+        # UNION with this branch (#2735): tests/test_scripts/test_ci_triggers.py
+        # does not exist on main so its delta is its FULL count, and
+        # test_leak_scan_added_lines.py gains one stacked-PR case (14 -> 15).
+        # MEASURED by collection after the last test-adding edit:
+        #   pytest tests/test_scripts/test_ci_triggers.py --collect-only -q -> 5
+        #   pytest tests/test_scripts/test_leak_scan_added_lines.py --collect-only -q
+        #     -> 15 branch / 14 main  (delta +1)
+        # so the floor is 23606 + 5 + 1 = 23612. No new case carries a skipif,
+        # so the ceiling does not move.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23612
