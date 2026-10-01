@@ -4,7 +4,8 @@
 Stdlib-only, so every gate can import it. It keeps TRUST and ENFORCEMENT apart:
 
 1. TRUST is narrow and named. ``CODEX_LOGIN`` is THE primary reviewer: the one
-   merge freshness asks for, whose reviewed heads the round counter counts, and
+   merge freshness asks for, whose clean reviews confirm a head for the round
+   counter (and, before its cutover, were the only rounds it counted), and
    whom ``@codex review`` summons. A stand-in under ``# substitute-review`` (the
    owner approves each use) is any Bot-typed App reviewer with a substantive
    review at the exact head, except the primary, a bot the PR's own workflow can
@@ -17,6 +18,9 @@ Stdlib-only, so every gate can import it. It keeps TRUST and ENFORCEMENT apart:
 3. The per-reviewer SEVERITY PARSERS (Codex badges, CodeRabbit's header, Devin's
    marker), moved here from the merge gate so the round counter can read a
    finding with the same code the merge gate scores it with.
+4. What opens a review ROUND (``is_finding`` and its siblings), read by
+   ``review_budget``: any App reviewer's finding, where only an explicit
+   informational class is excluded and unreadable drift counts.
 
 All of it is code, not config, on purpose: it decides whose review satisfies the
 merge gate, so it changes through a reviewed PR exactly like the hook code. A
@@ -276,3 +280,108 @@ def devin_finding(body: str) -> tuple[str | None, str | None]:
         # cannot identify would let one post count twice.
         return None, None
     return finding_id, DEVIN_MARKERS.get(marker)
+
+
+# ── What opens a review ROUND (read by scripts/review_budget.py) ──────────────
+# A round is a head that drew findings. Only an EXPLICIT informational class is
+# excluded: Codex P3, Devin 🔍, CodeRabbit trivial/info and its nitpick section
+# (owner rulings 2026-09-29 and 2026-10-01). A comment a known parser cannot read
+# still counts, and so does any top-level comment from a reviewer with no known
+# format: a round counter that undercounts on drift fails open. MEASURED
+# 2026-10-01 over 368 PRs: 0 unreadable Codex, Devin or CodeRabbit comments.
+INLINE_P3_RE = re.compile(r"!\[P3 Badge\]")
+CR_INFORMATIONAL = frozenset({"trivial", "info"})
+_CR_SOURCE_FOOTER_RE = re.compile(r"_Source: [^_]+_")
+# CodeRabbit puts findings it could not anchor inline into its review BODY. The
+# nitpick section is informational; these two carry findings. Bounded prefix for
+# the section's emoji, so the scan stays linear on a third-party body.
+_CR_BODY_FINDINGS_RE = re.compile(
+    r"<summary>[^<\n]{0,40}?(?:Outside diff range|Duplicate) comments \((\d+)\)</summary>"
+)
+# What each known format writes in a review body when it posted findings. A
+# review that declares findings but has no top-level comment left had them
+# DELETED, and must not read as a clean review. MEASURED 2026-10-01 over 368 PRs:
+# 1,088 reviews declare findings, every one with ≥1 top-level comment.
+_DECLARES_FINDINGS = {
+    "codex-badge": re.compile(r"\A\s*### 💡 Codex Review"),
+    "coderabbit-header": re.compile(r"\*\*Actionable comments posted: [1-9]\d*\*\*"),
+    "devin-marker": re.compile(r"\*\*Devin Review\*\* found [1-9]\d* (?:new )?potential issues?"),
+}
+# Codex sometimes posts findings as an ISSUE comment ("💡 Codex Review" with P1/P2
+# badges and permalinks) rather than a review. It names no `Reviewed commit:`;
+# its head is the one full SHA in its permalinks. MEASURED 2026-10-01: 2 such
+# comments in 368 PRs, each with exactly one distinct SHA.
+_BLOB_SHA_RE = re.compile(r"/blob/([0-9a-f]{40})/")
+
+
+def is_app_login(login: object) -> bool:
+    """Whether ``login`` is a GitHub App's REST login (``…[bot]``)."""
+    return isinstance(login, str) and _LOGIN_RE.fullmatch(login) is not None
+
+
+def _format_of(login: str) -> Reviewer | None:
+    return next((r for r in KNOWN_FORMATS if r.login == login), None)
+
+
+def is_finding(login: str, body: str) -> bool:
+    """Whether one TOP-LEVEL inline comment by ``login`` is a finding for round
+    counting. Unknown formats and unreadable comments count; only an explicit
+    informational class does not."""
+    fmt = _format_of(login)
+    if fmt is None:
+        return True
+    if fmt.surface_only:
+        return False
+    if fmt.parser == "codex-badge":
+        if INLINE_P1_RE.search(body) or INLINE_P2_RE.search(body):
+            return True
+        return INLINE_P3_RE.search(body) is None
+    if fmt.parser == "devin-marker":
+        return devin_finding(body)[1] != "analysis"
+    # CodeRabbit can bundle several findings into one comment, each under its own
+    # header line (the merge gate splits them in `_cr_findings`). Read every
+    # header, not only the first: a Trivial header ahead of a Major one must not
+    # hide the Major. Any header that is not informational, or that cannot be
+    # read, counts; a comment with no header at all counts too.
+    headers = 0
+    for line in body.split("\n"):
+        if not line.strip():
+            continue
+        level, seen = cr_severity(line)
+        if not seen or _CR_SOURCE_FOOTER_RE.fullmatch(line.strip()):
+            # `_Source: Linters/SAST tools_` is a footer, not a header (MEASURED
+            # 2026-10-01: every no-severity italic line in 917 CodeRabbit comments
+            # is one of these). Any other unreadable header still counts.
+            continue
+        headers += 1
+        if level not in CR_INFORMATIONAL:
+            return True
+    return headers == 0
+
+
+def body_finding_count(login: str, body: str) -> int:
+    """Findings a known reviewer delivered in its review BODY (CodeRabbit's
+    outside-diff and duplicate sections). Zero for every other format."""
+    fmt = _format_of(login)
+    if fmt is None or fmt.parser != "coderabbit-header":
+        return 0
+    return sum(int(m.group(1)) for m in _CR_BODY_FINDINGS_RE.finditer(body))
+
+
+def declares_findings(login: str, body: str) -> bool:
+    """Whether a known reviewer's review body says it posted findings."""
+    fmt = _format_of(login)
+    pattern = _DECLARES_FINDINGS.get(fmt.parser) if fmt else None
+    return bool(pattern and pattern.search(body))
+
+
+def codex_comment_finding_head(body: str) -> tuple[bool, str | None]:
+    """``(is_findings_comment, head)`` for an issue comment by the primary.
+
+    ``head`` is None when the comment carries P1/P2 findings but not exactly one
+    distinct permalink SHA, so the caller can refuse rather than guess.
+    """
+    if not (INLINE_P1_RE.search(body) or INLINE_P2_RE.search(body)):
+        return False, None
+    shas = set(_BLOB_SHA_RE.findall(body))
+    return True, (shas.pop() if len(shas) == 1 else None)

@@ -14,27 +14,17 @@ Why this exists (the fail-BLOCK the former inline range hit):
   value main itself *added then removed* (the add commit's patch still shows it)
   — false-blocking a clean PR.
 
-  The fix anchors on the merge base with the LIVE base branch:
-  ``merge-base(origin/$BASE_REF, HEAD)..HEAD``. This is robust to every checkout
+  The fix anchors on the merge base with LIVE main:
+  ``merge-base(origin/main, HEAD)..HEAD``. This is robust to every checkout
   shape — the synthetic merge ref (mergeable PR, where the merge base is
-  ``base@ci``) AND the PR head (unmergeable PR, incl. one whose head is itself a
+  ``main@ci``) AND the PR head (unmergeable PR, incl. one whose head is itself a
   merge commit). We do NOT infer "this is the merge ref" from HEAD's parent
   count: an unmergeable PR whose head is a merge commit also has two parents, and
   ``HEAD^1..HEAD`` would then exclude that PR's own first-parent history — a
   PR-authored secret there would escape the gate. A value the PR *introduces*
-  always lives in a commit reachable from HEAD but not from its base branch, so
-  it is always in ``merge-base..HEAD``; the deliberate add-then-remove-within-a-PR
-  detection is preserved (all PR-own commits stay in range; ``--no-merges`` walks
-  each).
-
-  The base branch is NOT hardcoded to ``main``: a stacked PR's base is the
-  parent PR's branch, and anchoring on main there would sweep the parent's
-  commits into the range — re-flagging values the PARENT introduced (this
-  install's own identifiers appear on main-authored history more than once).
-  The branch name arrives via ``BASE_REF`` (mapped from ``github.base_ref`` on
-  the workflow env, itself only present on pull_request events); absent, the
-  selector falls back to ``main``, which preserves the pre-stacked-CI behaviour
-  on ordinary PRs.
+  always lives in a commit reachable from HEAD but not from main, so it is always
+  in ``merge-base..HEAD``; the deliberate add-then-remove-within-a-PR detection is
+  preserved (all PR-own commits stay in range; ``--no-merges`` walks each).
 
 CONTRACT:
   stdout  the added ('^+') lines across the range's non-merge commit patches
@@ -94,7 +84,6 @@ def resolve_scan_spec(
     event_name: str,
     push_before: str,
     head_sha: str,
-    base_ref: str = "",
     cwd: str | None = None,
 ) -> tuple[str, str]:
     """Return the scan spec as ``(kind, value)``.
@@ -104,30 +93,18 @@ def resolve_scan_spec(
     Raises :class:`RangeError` when the range cannot be resolved (fail closed).
     """
     if event_name == "pull_request":
-        # Anchor on the live BASE branch via merge-base — robust for BOTH the
-        # synthetic merge ref (mergeable PR) and the PR head (unmergeable, incl.
-        # a merge-commit head). Parent count is NOT a reliable "is this the
-        # merge ref" signal, so we never special-case HEAD^1. The base is the
-        # PR's own base branch (stacked PRs diff against their parent branch,
-        # not main); BASE_REF/GITHUB_BASE_REF supplies it, empty → "main".
-        # Fetch is best-effort (a full checkout already has the tracking ref
-        # under fetch-depth:0); the merge-base result is what gates.
-        ref = base_ref.strip() or "main"
-        _git(
-            [
-                "fetch",
-                "--no-tags",
-                "--quiet",
-                "origin",
-                f"+refs/heads/{ref}:refs/remotes/origin/{ref}",
-            ],
-            cwd,
-        )
-        mb = _git(["merge-base", f"origin/{ref}", "HEAD"], cwd)
+        # Anchor on live main via merge-base — robust for BOTH the synthetic
+        # merge ref (mergeable PR) and the PR head (unmergeable, incl. a
+        # merge-commit head). Parent count is NOT a reliable "is this the merge
+        # ref" signal, so we never special-case HEAD^1. Fetch is best-effort (a
+        # full checkout already has origin/main under fetch-depth:0); the
+        # merge-base result is what gates.
+        _git(["fetch", "--no-tags", "--quiet", "origin", "main"], cwd)
+        mb = _git(["merge-base", "origin/main", "HEAD"], cwd)
         base = mb.stdout.strip()
         if mb.returncode != 0 or not base:
             raise RangeError(
-                f"pull_request: merge-base(origin/{ref}, HEAD) failed — cannot "
+                "pull_request: merge-base(origin/main, HEAD) failed — cannot "
                 "bound the scan to the PR's own commits"
             )
         return ("range", f"{base}..HEAD")
@@ -179,11 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     event_name = os.environ.get("EVENT_NAME", "")
     push_before = os.environ.get("PUSH_BEFORE", "")
     head_sha = os.environ.get("HEAD_SHA", "")
-    # github.base_ref mapped on the workflow env; GITHUB_BASE_REF is the
-    # runner's own copy of the same value. Empty → "main" inside the resolver.
-    base_ref = os.environ.get("BASE_REF", "") or os.environ.get("GITHUB_BASE_REF", "")
     try:
-        spec = resolve_scan_spec(event_name, push_before, head_sha, base_ref=base_ref)
+        spec = resolve_scan_spec(event_name, push_before, head_sha)
         out = added_lines(spec)
     except RangeError as exc:
         print(

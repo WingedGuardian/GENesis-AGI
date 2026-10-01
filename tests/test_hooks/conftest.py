@@ -187,6 +187,20 @@ def _hermetic_review_bodies(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_rounds_row(monkeypatch):
+    """Pin the ``--check-pr`` ``rounds`` row for EVERY hook test.
+
+    The row asks ``review_budget.evaluate_pr``, which reads GitHub over GraphQL.
+    ``check_pr_report`` is driven 59 times across 8 hook test files, two of them
+    as a SUBPROCESS, so the pin is an environment variable those children
+    inherit. Without it each report test makes a live call: green on a dev box
+    with gh authenticated, red in CI. The row's own rendering is tested in
+    tests/test_hooks/test_review_rounds.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_ROUNDS_ROW", "hermetic (test pin)")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_base_advance(monkeypatch):
     """Hermetic defaults for the base-advance refinement of the freshness gate.
 

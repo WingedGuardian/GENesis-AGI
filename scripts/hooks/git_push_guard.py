@@ -4711,9 +4711,9 @@ def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] 
     """NON-DISMISSED Codex review commit oids, oldest-first, or None on error.
 
     Freshness identity — a dismissed review vouches for no commit, so the #1366
-    reviewed-head gate must not treat its sha as reviewed. For ROUND COUNTING
-    (dismissed rounds still ran) the escalation gate uses ``_codex_reviews``
-    directly. Consumer: ``_latest_codex_reviewed_sha`` (last entry).
+    reviewed-head gate must not treat its sha as reviewed. ROUND COUNTING
+    (where dismissed rounds still ran) is ``review_budget.evaluate_pr``'s, not
+    this function's. Consumer: ``_latest_codex_reviewed_sha`` (last entry).
     """
     reviews = _codex_reviews(pr_num, repo=repo)
     if reviews is None:
@@ -5054,7 +5054,7 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
             # not be told it does not.
             return (
                 f"PR #{pr_num} changes the review-gate surface and has {count} "
-                f"distinct reviewed heads, its {limit} discovery rounds. One "
+                f"review rounds (heads that drew findings), its {limit} discovery rounds. One "
                 "exact-head confirmation request is STILL BUDGETED, but this guard "
                 "cannot see the current head's marker in this request — either it is "
                 "absent, or the body is opaque here (--body-file, editor). If you did "
@@ -5067,7 +5067,8 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
         where = "past" if count > limit else "at the end of"
         return (
             f"PR #{pr_num} changes the review-gate surface and already has {count} "
-            f"distinct reviewed heads, {where} its {limit} discovery rounds. "
+            f"review rounds (heads that drew findings), {where} its {limit} discovery "
+            "rounds. "
             f"{_review_budget.TERMINAL_DECISION} Approve only after deciding that "
             "another gate-design round is worth the risk; earlier approval never "
             "carries forward."
@@ -5092,7 +5093,7 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
         # ordinary round 5" would be rendered to someone already holding five
         # heads — the same rule the commit gate's matching branch follows.
         return (
-            f"PR #{pr_num} already has {count} distinct reviewed heads — past the "
+            f"PR #{pr_num} already has {count} review rounds (heads that drew findings) — past the "
             f"terminal boundary, so round {next_round} is strongly discouraged: "
             "stop, narrow or redesign the change, accept documented residue, or "
             f"abandon it. {_review_budget.TERMINAL_DECISION} Approve only to "
@@ -5101,11 +5102,78 @@ def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
             "carries forward."
         )
     return (
-        f"PR #{pr_num} already has {count} distinct reviewed heads; standing "
+        f"PR #{pr_num} already has {count} review rounds (heads that drew findings); standing "
         f"authorization ended after {_review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
         f"{terminal} This approval covers exactly "
         f"this one round-{next_round} request and does not carry forward."
     )
+
+
+def _format_rounds(result: dict) -> str:
+    """Render one ``review_budget.evaluate_pr`` result as the ``rounds`` row."""
+    if result.get("status") != "ok":
+        errors = ", ".join(str(e) for e in result.get("errors") or []) or "evidence unknown"
+        return f"unreadable ({errors})"
+    count = int(result.get("count") or 0)
+    gate = bool(result.get("gate_surface"))
+    limit = (
+        _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if gate
+        else _review_budget.STANDING_REVIEWED_HEAD_LIMIT
+    )
+    parts = [f"{count} ({'gate' if gate else 'ordinary'} lane, terminal at {limit})"]
+    rounds = result.get("rounds") or []
+    if result.get("round_state") == "open" and rounds:
+        newest = rounds[-1]
+        who = ", ".join(newest.get("reviewers") or []) or "pre-cutover rule"
+        parts.append(f"open at {str(newest.get('head'))[:10]} ({who})")
+    elif result.get("round_state") == "complete":
+        parts.append("complete (a commit has landed since the last round)")
+    counts = [r.get("findings") for r in rounds if r.get("findings") is not None]
+    if counts:
+        trend = result.get("trend")
+        mark = {"rising": " (RISING)", "falling": " (falling)", "flat": " (flat)"}.get(trend, "")
+        parts.append("findings per round " + "→".join(str(c) for c in counts) + mark)
+    legacy = int(result.get("legacy_heads") or 0)
+    if legacy:
+        parts.append(f"{legacy} head(s) counted by the pre-cutover rule")
+    line = " — ".join(parts)
+    if result.get("confirmation_exempt"):
+        # Still within budget: naming the terminal decision here would foreclose
+        # an option the evaluator is holding open (`_review_budget_message`).
+        line += " — one exact-head confirmation request still budgeted"
+    elif count > limit:
+        line += " — PAST TERMINAL: every further round needs the owner's approval"
+    elif count == limit:
+        line += (
+            " — TERMINAL: a clean review merges; findings mean send it back (your call) "
+            "or merge-and-accept (the owner's call)"
+        )
+    return line
+
+
+def _rounds_row(pr_num: str, repo: str | None = None) -> str:
+    """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    The round budget is enforced where it acts (the review-request ask above and
+    the commit gate); counting it here too would be a second enforcer of one rule.
+    It is printed so the round number is read from the evaluator rather than
+    re-derived by hand (#1719), with findings per round so a rising count is
+    visible without remembering the last one (#1957).
+    ``_TEST_ROUNDS_ROW`` short-circuits it: report tests, including subprocess
+    ones, must never make a live GraphQL call.
+    """
+    seam = os.environ.get("_TEST_ROUNDS_ROW")
+    if seam is not None:
+        return seam
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target or _review_budget is None:
+        return "unreadable (no repository or evaluator)"
+    try:
+        result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
+    except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        return "unreadable (lookup failed)"
+    return _format_rounds(result)
 
 
 def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
@@ -5184,7 +5252,7 @@ def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | N
 def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
     """Return (allow|ask|deny, reason) for Codex review requests.
 
-    Distinct reviewed heads are authoritative. Legacy escalation/final sigils
+    Review rounds from ``review_budget`` are authoritative. Legacy escalation/final sigils
     are intentionally ignored: at the approval boundary only the hook's native
     user decision can authorize the action.
     """
@@ -11229,8 +11297,8 @@ def _run_merge_and_push_gates() -> int:
             _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
 
         # ── Codex round-authorization gate (`gh pr comment … @codex review`) ──
-        # Distinct reviewed heads, including dismissed and clean-comment rounds,
-        # decide when standing authorization ends. A dispatched session cannot
+        # Review rounds (heads that drew findings; before the round-rule cutover,
+        # heads Codex reviewed) decide when standing authorization ends. A dispatched session cannot
         # satisfy the native user decision; unreadable evidence takes the same
         # safe direction rather than becoming zero rounds.
         esc_decision, esc_msg = _check_codex_round_escalation(segs, cmd, payload)
@@ -12695,6 +12763,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # gate disagree on exactly one gate.
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
+    # Advisory: never touches `failures` (see `_rounds_row`).
+    print(f"rounds         : {_rounds_row(pr_num, repo)}")
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
     # FAILURE line, never a false all-clear — the report must not diverge from enforcement.
