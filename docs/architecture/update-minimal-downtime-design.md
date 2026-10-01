@@ -106,6 +106,58 @@ is robustness (a hung fetch no longer extends an outage), not a downtime rewrite
   keep their own restart/exit semantics; the stop still precedes the merge.
 - `bash -n` clean; the 3 BEGIN/END marker blocks stay intact and isolated.
 
+## Later additions to the pre-stop window (2026-09-30)
+
+Four steps now share the window this reorder opened, and each keeps its rule: a
+failure before the stop exits with nothing stopped and nothing changed, never
+through the rollback trap.
+
+- **The deployable-checkout checks run first of all**, before the lock, the
+  rollback tag and the backup. They are the shared ones in
+  `scripts/lib/deploy_checkout.sh`, lifted from `deploy_code_only.sh`, which calls
+  the same functions. A linked worktree, a bare repository, a detached HEAD or a
+  branch other than `$DEPLOY_BRANCH` is refused before any state is touched.
+- **The fetched head is pinned** from a per-run ref (`refs/genesis/update/<pid>`)
+  that the same fetch writes beside the tracking ref, read once and deleted at once.
+  The merge takes that commit. Neither `FETCH_HEAD` nor the tracking ref decides the
+  pin: other sessions fetch in the same checkout and rewrite both.
+- **The checkout must not move under the run.** `ORIGINAL_BRANCH` is the branch
+  the checks validated, not a later re-read. `genesis_checkout_unmoved` re-checks
+  branch and commit before the rollback tag (the pre-update backup can take
+  minutes), and `checkout-unmoved` re-checks them, plus "no new tracked edit",
+  before the clears and again just before the merge. `_do_rollback` resets only
+  from `UPDATE_OWN_HEAD`, the commit this run's merge produced. At the rollback
+  commit there is nothing to undo, so it skips the reset. A clean branch switch
+  (the original branch still at this run's state, nothing uncommitted) is reversed
+  with a non-forced checkout. Any other move is left alone. Dependencies and
+  services come back only on the pre-update code (the original branch at the
+  rollback commit, no foreign tracked edit); otherwise the rollback reports itself
+  incomplete. Two cases are still open: an uncommitted edit made on the same branch
+  after the merge is lost to a post-merge reset (#2679), and the watchdog restarts
+  a server the rollback held down within one tick (#2718).
+- **Incoming changes that would overwrite a local untracked or ignored file are
+  refused** (`genesis_range_collisions`, over the range from the merge base, every
+  change but a deletion: an incoming MODIFICATION of a path the local branch
+  deleted and keeps an ignored copy of is overwritten in the modify/delete
+  conflict too). The
+  merge also passes `--no-overwrite-ignore`, but git 2.43 honours that only on a
+  fast-forward; a true 3-way merge overwrites the file, and a rollback's
+  `reset --hard` then deletes it. So the scan is the protection: before the stop,
+  and again as the last step before the merge (`late-collision-scan`), where a hit
+  rolls back with HEAD unmoved: the rollback resets nothing, so the file stays.
+  Paths git invents in a file/directory conflict (`<path>~HEAD`) are not scanned
+  (#2678).
+- **Local edits to the ephemeral files are backed up** (`ephemeral-prestop-backup`)
+  between the fetch and `_write_state "fetching"` — every dirty one, because a
+  rollback's `reset --hard` discards any of them. The clear before the merge
+  touches only the files the incoming range changes, plus any with a STAGED edit
+  (git keeps an unstaged edit to any other file through the merge, but a true
+  3-way merge refuses on any index change), and discards a file's edits only when a backup of
+  its current content exists. `_do_rollback` saves any dirty ephemeral file whose
+  current edits have no backup (a `--post-merge` run, or an edit made after the
+  backup) before its `reset --hard`. After the stop, the merge is also checked
+  against the branch the run started on.
+
 ## Success records name a server that did not come back (2026-09-30)
 
 A change at the success writers, outside the pre-stop window: every `success` row

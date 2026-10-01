@@ -166,6 +166,10 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$_SELF_DIR/lib/alert_queue.sh"
 # shellcheck source=lib/deploy_status.sh
 . "$_SELF_DIR/lib/deploy_status.sh"
+# The checkout checks and the collision scan, shared with update.sh (needs
+# deploy_marker.sh's EPHEMERAL_DIRTY_RE, sourced above).
+# shellcheck source=lib/deploy_checkout.sh
+. "$_SELF_DIR/lib/deploy_checkout.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).
@@ -201,10 +205,9 @@ case "$WAIT_S" in
 esac
 
 # ── A linked worktree is never a deploy target ────────────────────────
-# Git answers this; a path test alone misses a worktree added anywhere. The path
-# arms stay for a plain clone parked under a worktree directory.
-_git_dir="$(git -C "$GENESIS_ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)"
-_common_dir="$(unset CDPATH; cd -- "$GENESIS_ROOT" 2>/dev/null && cd -- "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)"
+# Git answers this (genesis_is_primary_checkout, in the shared lib); a path test
+# alone misses a worktree added anywhere.
+genesis_checkout_git_dirs "$GENESIS_ROOT"
 # status is read-only, and validators usually work in a worktree: from one, it
 # reports the main checkout, whose .git is the common dir.
 if [ "$MODE" = status ] && [ -n "$_git_dir" ] && [ -n "$_common_dir" ] \
@@ -226,10 +229,8 @@ if [ "$MODE" = status ] && [ -n "$_git_dir" ] && [ -n "$_common_dir" ] \
             bash "$_main_self" "${_ORIG_ARGS[@]}"
     fi
 fi
-if [ -z "$_git_dir" ] || [ -z "$_common_dir" ] || [ "$(unset CDPATH; cd -- "$_git_dir" && pwd -P)" != "$_common_dir" ] \
-    || [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
-    die "deploy_code_only.sh must run against the main checkout, not a worktree ($GENESIS_ROOT)."
-fi
+genesis_is_primary_checkout "$GENESIS_ROOT" "$_git_dir" "$_common_dir" \
+    || die "deploy_code_only.sh must run against the main checkout, not a worktree ($GENESIS_ROOT)."
 
 # ── Checks a restart depends on ───────────────────────────────────────
 # A server outside the unit, such as update.sh's nohup fallback after a failed
@@ -258,20 +259,6 @@ _untracked_runtime() {
     st="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames --untracked-files=all \
         -- src config pyproject.toml)" || die "cannot read the working tree's status — nothing changed."
     printf '%s\n' "$st" | grep '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" || true
-}
-
-# Does <path> (relative to the checkout) hold anything git does not track: an
-# untracked or IGNORED file, or a directory with one inside? A tracked file or
-# directory there is git's to replace; the fast-forward removes it as the range
-# says. Something present that git lists nothing under at all (an empty
-# directory) counts too. An unreadable listing counts: refusing is the safe side.
-_untracked_node() {
-    [ -e "$GENESIS_ROOT/$1" ] || [ -L "$GENESIS_ROOT/$1" ] || return 1
-    local others tracked
-    others="$(git -C "$GENESIS_ROOT" ls-files -z --others -- "$1" 2>/dev/null)" || return 0
-    [ -z "$others" ] || return 0
-    tracked="$(git -C "$GENESIS_ROOT" ls-files -z -- "$1" 2>/dev/null)" || return 0
-    [ -z "$tracked" ]
 }
 
 
@@ -347,15 +334,12 @@ print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true
     [ "$_state_phase" = "done" ] \
         || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
 fi
-_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
-[ "$_branch" = main ] || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not main."
-# The status is read on its own first: in a pipeline its failure would be
-# swallowed, and an unreadable status would pass as a clean tree. --no-renames:
-# a rename is one line naming BOTH paths, so a tracked file renamed INTO an
-# excused path would be excused whole; split, the deletion of the old path shows.
-_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)" \
+# No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
+genesis_deploy_branch_ok "$GENESIS_ROOT" \
+    || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+# Unreadable refuses (see genesis_tracked_dirty_paths for why it is read apart).
+_dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
     || die "cannot read the working tree's status — nothing was deployed."
-_dirty="$(printf '%s\n' "$_status" | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" | grep -v '^$' || true)"
 if [ -n "$_dirty" ]; then
     echo "ERROR: $GENESIS_ROOT has uncommitted tracked changes. Nothing was deployed:" >&2
     echo "$_dirty" >&2
@@ -586,32 +570,16 @@ _pull() {
             die "$_f is edited locally and changed upstream — run scripts/update.sh, which carries it across."
         fi
     done
-    # Paths the range ADDS that already exist here, untracked (or with a file
-    # where a parent directory goes). git refuses to overwrite a plain untracked
-    # file, but it overwrites an IGNORED one without asking (measured, git 2.43):
-    # a local secrets or settings file would be lost.
-    git -C "$GENESIS_ROOT" diff --no-renames --name-only --diff-filter=A "$_head" "$_upstream" >/dev/null \
-        || die "cannot list the files this range adds — nothing changed."
-    # Only what git does NOT track counts: a tracked file or directory in the way
-    # is git's own to replace (the range deletes it as it adds the new path).
-    _collisions=""
-    while IFS= read -r -d '' _f; do
-        if _untracked_node "$_f"; then
-            _collisions+="$_f"$'\n'
-            continue
-        fi
-        [ -e "$GENESIS_ROOT/$_f" ] || [ -L "$GENESIS_ROOT/$_f" ] && continue
-        _p="$_f"
-        while [ "$_p" != "${_p%/*}" ]; do
-            _p="${_p%/*}"
-            [ -d "$GENESIS_ROOT/$_p" ] && [ ! -L "$GENESIS_ROOT/$_p" ] && break
-            if _untracked_node "$_p"; then
-                _collisions+="$_f"$'\n'
-                break
-            fi
-        done
-    done < <(git -C "$GENESIS_ROOT" diff -z --no-renames --name-only --diff-filter=A "$_head" "$_upstream")
+    # Paths the range brings in that already exist here, untracked (on a fast-forward
+    # these can only be additions: every path it changes is tracked here) (or with a file
+    # where a parent directory goes): git would overwrite an IGNORED one without
+    # asking. The scan is the shared lib's genesis_range_collisions; only what git
+    # does NOT track counts.
+    _coll_rc=0
+    _collisions="$(genesis_range_collisions "$GENESIS_ROOT" "$_head" "$_upstream")" || _coll_rc=$?
+    [ "$_coll_rc" -ne 2 ] || die "cannot list the files this range adds — nothing changed."
     if [ -n "$_collisions" ]; then
+        _collisions+=$'\n'
         echo "ERROR: this range adds files that already exist here, untracked; the fast-forward would overwrite them:" >&2
         printf '%s' "$_collisions" | sed 's/^/         /' >&2
         die "move them aside first (scripts/update.sh carries .claude/settings.local.json, .serena/project.yml and src/genesis/identity/USER.md across) — nothing changed."
@@ -668,9 +636,10 @@ _pull() {
     fi
     # An excused file the range also changes is reset to HEAD so the merge can
     # take upstream's copy. Both regenerate (the code-intel indexer rewrites
-    # AGENTS.md, the server the trigger cache), and update.sh discards them the
-    # same way before its merge, so no copy is kept: each reset is NAMED instead,
-    # here, in a refusal's message and in the exit alert, so none passes silently.
+    # AGENTS.md, the server the trigger cache), so this script keeps no copy: each
+    # reset is NAMED instead, here, in a refusal's message and in the exit alert,
+    # so none passes silently. (update.sh differs: it backs such edits up under
+    # ~/.genesis/premerge-backups before its merge.)
     _reset=()
     for _f in AGENTS.md config/procedure_triggers.yaml; do
         if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
