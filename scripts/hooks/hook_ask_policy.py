@@ -36,9 +36,13 @@ the point where code leaves the machine, and it was unsuppressible until the
 owner ruled (2026-10-01) that an install may silence ONE routine shape of it.
 The push guard decides that scope, not this module, and keeps asking on any
 uncertainty. ``push_publish`` silences exactly one prompt: the FIRST ``git
-push`` of the CURRENT branch, in a plain shape (no ``-c``, no ``VAR=…`` prefix,
-no extra refspecs, and nothing beside it but an inert
-``cd``/``status``/``rev-parse``/``add``/``commit``), when ALL of these hold:
+push`` of the CURRENT branch, and ONLY when the whole command is exactly one
+plain ``git push`` (e.g. ``git push -u origin HEAD``): no other step of any kind
+(no ``cd``, no ``git status``/``add``/``commit`` before it, no ``;``/``&&``/
+``|``/``&``/newline), no redirection, no subshell, no global option between
+``git`` and ``push`` (``-C``, ``-c``, ``--git-dir``…), no ``VAR=…`` prefix and no
+wrapper. A chained command still asks — run the first push as its own command.
+It must also be true that:
 
 * the remote git will really push to (pushRemote > pushDefault >
   ``branch.<cur>.remote`` > origin) has push URLs that — after any
@@ -49,10 +53,22 @@ no extra refspecs, and nothing beside it but an inert
 * its push config is simple, and NO ``http.*`` key is set in any config git
   reads for the repository, nor ``remote.<r>.proxy``/``remote.<r>.vcs``;
 * none of the proxy, TLS-trust, ssh/proxy-program or config-injection
-  environment variables the guard lists is set in the HOOK's environment.
-  Known residue: the hook does not see the environment the push runs in — the
-  Bash tool's shell is initialised from the user's profile and hooks are not —
-  so a variable exported only in a shell profile is invisible to this check.
+  environment variables the guard lists is set in the HOOK's environment;
+* a live ``git ls-remote --exit-code`` (redirects refused, no credential
+  prompt) answers that the branch is definitely ABSENT there. An error, a
+  timeout or a redirect keeps the prompt.
+
+Known residue — what the hook cannot see, stated rather than hidden:
+
+* the Bash tool's shell is initialised from the user's profile and hooks are
+  not, so environment variables, aliases, functions and ``PATH`` changes that
+  exist only in a shell profile are invisible to this check;
+* the hook payload's cwd is assumed to be the shell's cwd — an assumption every
+  arm of the push guard shares;
+* config or the checked-out branch changed by a CONCURRENT process between the
+  hook's check and the push;
+* a concurrent publish of the same branch between the probe and the push (git
+  offers no create-only binding without rewriting the command).
 
 The ``gh pr create`` prompt is NOT covered: gh without a TTY aborts ("you must
 first push the current branch…") rather than pushing, so that arm is left

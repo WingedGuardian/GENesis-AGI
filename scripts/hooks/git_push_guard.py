@@ -10860,12 +10860,14 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None
         applies ``insteadOf``/``pushInsteadOf``; a raw-URL destination has no remote
         to expand, so it qualifies only when no rewrite rule exists at all;
       * every URL must be an EXACT public-repo match (``_all_urls_are_public_repo``);
-      * every other segment must be inert (``_push_compound_is_inert``) — no close,
-        no create, no second publish, no config write ahead of the push.
+      * the command is exactly ONE plain ``git push`` (``_is_single_plain_push``)
+        — no other segment at all, since any neighbour can change the push after
+        this check (a ``cd``, a hook, an fsmonitor, a clean filter);
+      * a live probe confirms the branch is absent on the destination.
     Anything else returns False and the prompt stands."""
     if not push_remote:
         return False
-    if not _push_compound_is_inert(segs, push_seg, cmd):
+    if not _is_single_plain_push(segs, push_seg, cmd):
         return False
     named = _raw_remote_push_urls(push_remote, cwd)
     if named is None:
@@ -10887,17 +10889,72 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None
     return len(urls) == 1 and _remote_branch_definitely_absent(next(iter(urls)), branch, cwd)
 
 
+#: Characters that make a command anything other than ONE simple command:
+#: separators and control operators (``;``, ``&``, ``|``, newlines), redirections
+#: and here-docs (``<``, ``>``), subshells, groups and substitutions (``(``,
+#: ``)``, ``{``, ``}``, ``$``, backtick), and the backslash (escapes and line
+#: continuations), plus the glob characters ``*``, ``?`` and ``[``: a branch name
+#: cannot contain them, but a remote name written straight into config can, so a
+#: glob could expand to a different word than the one judged. Inside quotes they
+#: would be harmless, but a quoted ``;`` in a first push is not worth modelling:
+#: the command simply keeps its prompt.
+_SINGLE_PUSH_FORBIDDEN = frozenset(";&|<>(){}$`\\\n\r*?[")
+
+
+def _is_single_plain_push(segs, push_seg, cmd: str) -> bool:
+    """Whether the WHOLE command is exactly one top-level ``git push …``.
+
+    The ``push_publish`` suppression judges the repository the hook payload's
+    cwd names, before anything runs. Anything else in the command can change
+    what the push does after that judgement — a ``cd`` (through ``CDPATH``, in a
+    pipeline, in the background), a ``git status`` that runs ``core.fsmonitor``,
+    a ``git add`` that runs a clean filter, a ``git commit`` whose hook rewrites
+    the push URL or switches branch, a ``-C`` through a symlink. Two audit rounds
+    found members of that class faster than a neighbour allowlist could absorb
+    them, so the rule is structural: one segment, which is the push itself; no
+    shell metacharacter anywhere; the text re-tokenizes to exactly its argv
+    (no assignment prefix, no wrapper); and ``push`` immediately follows ``git``
+    (no global option at all: ``-C``, ``-c``, ``--git-dir``, ``--work-tree``,
+    ``--namespace``, ``--config-env``, …). Applies to the suppression only; the
+    re-push allow keeps ``_push_compound_is_inert``."""
+    if len(segs) != 1 or segs[0] is not push_seg:
+        return False
+    if getattr(push_seg, "depth", 0):
+        return False
+    if any(c in _SINGLE_PUSH_FORBIDDEN for c in cmd):
+        return False
+    if not _push_seg_has_no_prefix(push_seg):
+        return False
+    try:
+        words = shlex.split(cmd, comments=True)
+    except ValueError:
+        return False
+    argv = list(getattr(push_seg, "argv", None) or [])
+    return words == argv and len(words) >= 2 and words[0] == "git" and words[1] == "push"
+
+
 def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
     """True ONLY when ``git ls-remote --exit-code`` against ``url`` answers that
     ``refs/heads/<branch>`` does not exist (exit 2). A hit, any other exit code,
-    a timeout or any error is False, so the caller asks. Same subprocess shape
-    and shared deadline as ``_remote_branch_sha``."""
+    a timeout or any error is False, so the caller asks. Same shared deadline as
+    ``_remote_branch_sha``, plus two things that probe does not need:
+
+    * ``http.followRedirects=false`` — a renamed or moved repository answers with
+      a redirect; following it would vouch for a DIFFERENT repository than the
+      URL the push names, so a redirect fails the probe (non-2) and the prompt
+      stands;
+    * no interactive prompt (``GIT_TERMINAL_PROMPT=0``, empty ``GIT_ASKPASS``/
+      ``SSH_ASKPASS``) — a credential prompt would otherwise hang the hook until
+      its timeout."""
     if not branch:
         return False
     try:
-        args = ["git"] + (["-C", cwd] if cwd else [])
+        args = ["git", "-c", "http.followRedirects=false"] + (["-C", cwd] if cwd else [])
         args += ["ls-remote", "--exit-code", "--heads", url, f"refs/heads/{branch}"]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=_gh_timeout(10.0))
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0), env=env
+        )
     except Exception:
         return False
     return result.returncode == 2

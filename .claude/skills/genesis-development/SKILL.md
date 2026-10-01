@@ -3153,13 +3153,17 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   approves nothing; other hooks and Claude Code's own permissions still decide
   the command, and a dispatched session is still denied. The only other key is
   `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
-  It silences only the first `git push` of the CURRENT branch in a plain
-  shape, when the remote git really pushes to resolves (rewrites applied) to
+  It silences only the first push of the CURRENT branch, and only when the
+  whole command is exactly one plain `git push` (e.g. `git push -u origin
+  HEAD`) — a chained command still asks, so run the first push as its own
+  command. The remote git really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
-  simple push config, no `http.*` config, and no proxy/TLS/ssh/config env var
-  in the hook's environment (an env var exported only in a shell profile is
-  invisible to the hook: known residue). `gh pr create` is not covered, since
-  gh without a TTY aborts rather than pushing. Force pushes, other destinations,
+  simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
+  the hook's environment, and a live probe confirming the branch is absent
+  there. Residue: shell-profile env/aliases/functions/PATH are invisible to the
+  hook, and a concurrent process can still change config or publish the
+  branch between check and push. `gh pr create` is not covered, since gh
+  without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**

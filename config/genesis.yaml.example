@@ -51,9 +51,11 @@ github:
 # default — keeps every prompt.
 #
 # Two keys exist. `secrets_env` is the credentials prompt. `push_publish`
-# silences only the first `git push` of the current branch, in a plain shape,
-# when the remote it really goes to is https://github.com/<the public repo named
-# under `github:` above>. A URL rewrite whose result is that https URL is fine;
+# silences only the first push of the current branch, and only when the whole
+# command is exactly one plain `git push` (e.g. `git push -u origin HEAD`) —
+# chained commands still ask, so run the first push on its own — and the remote
+# it really goes to is https://github.com/<the public repo named under `github:`
+# above>, where a live check finds the branch absent. A URL rewrite whose result is that https URL is fine;
 # the ssh / scp forms always ask, as does any `http.*` git config, a remote
 # proxy or helper, or a proxy / TLS / ssh environment variable visible to the
 # hook. `gh pr create` is not covered (gh without a terminal does not push).

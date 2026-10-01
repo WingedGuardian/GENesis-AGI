@@ -664,3 +664,140 @@ def test_policy_notes_ride_the_silenced_note(monkeypatch, tmp_path, capsys) -> N
     _assert_silenced(rc, out, err)
     ctx = _hso(out)["additionalContext"]
     assert "NOTE:" in ctx and "force_push" in ctx, ctx
+
+
+# ─── round 2 (terminal): only a single plain `git push` is ever silenced ─────
+
+
+def _hook_file(repo: Path, name: str, body: str) -> None:
+    hook = repo / ".git" / "hooks" / name
+    hook.write_text("#!/bin/sh\n" + body + "\n")
+    hook.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd sub && git push -u origin HEAD",
+        "cd sub | git push -u origin HEAD",
+        "cd sub & git push -u origin HEAD",
+        "cd sub\ngit push -u origin HEAD",
+        "cd sub; git push -u origin HEAD",
+        "git push -u origin HEAD & git rev-parse HEAD",
+        "git push -u origin HEAD > out.txt",
+        "git push -u origin HEAD 2>&1",
+        "(git push -u origin HEAD)",
+        "git push -u origin HEAD && true",
+        "git -C . push -u origin HEAD",
+        "git -P push -u origin HEAD",
+        "git --no-pager push -u origin HEAD",
+        "env git push -u origin HEAD",
+        "command git push -u origin HEAD",
+        "X=1 git push -u origin HEAD",
+        "\\git push -u origin HEAD",
+    ],
+)
+def test_anything_but_a_single_plain_push_asks(monkeypatch, tmp_path, capsys, off, command) -> None:
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command)
+    assert rc == 0, (command, rc, out, err)
+    assert _decision(out) == "ask", (command, out, err)
+
+
+def test_a_cdpath_cd_before_the_push_asks(monkeypatch, tmp_path, capsys, off) -> None:
+    """Codex P1: with CDPATH set, `cd sub` can land in an unrelated repo while the
+    guard resolves `sub` against the payload cwd."""
+    other = _repo(tmp_path / "cdpath" / "sub", (("remote.origin.url", OTHER),))
+    monkeypatch.setenv("CDPATH", str(other.parent.parent))
+    rc, out, err = _run(monkeypatch, tmp_path / "main", capsys, "cd sub && git push -u origin HEAD")
+    _assert_asks(rc, out, err)
+
+
+@pytest.mark.parametrize(
+    ("command", "setup"),
+    [
+        ("git status && git push -u origin HEAD", "fsmonitor"),
+        ("git add -A && git push -u origin HEAD", "clean-filter"),
+        ("git commit --allow-empty -m x && git push -u origin HEAD", "hook-pushurl"),
+        ("git commit --allow-empty -m x && git push -u origin HEAD", "hook-checkout"),
+    ],
+)
+def test_a_neighbour_that_runs_code_before_the_push_asks(
+    monkeypatch, tmp_path, capsys, off, command, setup
+) -> None:
+    """Class audit: each "inert" neighbour can run configured code that changes
+    the push after the hook judged it."""
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC), ("commit.gpgsign", "false")))
+    if setup == "fsmonitor":
+        subprocess.run(["git", "-C", str(repo), "config", "core.fsmonitor", "true"], check=True)
+    elif setup == "clean-filter":
+        subprocess.run(["git", "-C", str(repo), "config", "filter.z.clean", "cat"], check=True)
+    elif setup == "hook-pushurl":
+        _hook_file(repo, "post-commit", f"git config remote.origin.pushurl {OTHER}")
+    else:
+        _hook_file(repo, "post-commit", "git checkout -q -b other")
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
+    monkeypatch.setattr(gpg.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.chdir(repo)
+    rc = gpg.main()
+    out = capsys.readouterr()
+    _assert_asks(rc, out.out, out.err)
+
+
+def test_a_dash_C_through_a_symlink_asks(monkeypatch, tmp_path, capsys, off) -> None:
+    """git follows `lnk` before applying `..`; os.path.normpath does not."""
+    import os
+
+    other = _repo(tmp_path / "other", (("remote.origin.url", OTHER),))
+    (other / "sub").mkdir()
+    repo = _repo(tmp_path / "main")
+    os.symlink(other / "sub", repo / "lnk")
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "git -C lnk/.. push -u origin HEAD"},
+        "cwd": str(repo),
+    }
+    monkeypatch.setattr(gpg.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.chdir(repo)
+    rc = gpg.main()
+    out = capsys.readouterr()
+    _assert_asks(rc, out.out, out.err)
+
+
+def test_the_probe_refuses_redirects_and_prompts(monkeypatch) -> None:
+    """Codex P2: a renamed repository redirects; following it would vouch for a
+    different repository. And a credential prompt must never hang the hook."""
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"], seen["env"] = list(args), kwargs.get("env") or {}
+        return subprocess.CompletedProcess(args, 128, "", "redirect refused")
+
+    monkeypatch.setattr(gpg.subprocess, "run", fake_run)
+    assert _REAL_ABSENT(PUBLIC, "feat/x", None) is False
+    args, env = seen["args"], seen["env"]
+    assert args[:3] == ["git", "-c", "http.followRedirects=false"], args
+    assert args[-3:] == ["--heads", PUBLIC, "refs/heads/feat/x"] and "--exit-code" in args
+    assert env.get("GIT_TERMINAL_PROMPT") == "0", env
+    assert env.get("GIT_ASKPASS") == "" and env.get("SSH_ASKPASS") == "", env
+
+
+def test_the_segment_count_is_checked_on_its_own() -> None:
+    """Belt to the metacharacter check: a second parsed segment refuses even if
+    no separator character survived into the text (a parse this guard did not
+    foresee), and so does a push segment that is not the one handed in."""
+    segs, _ = gpg.analyze_checked("git push -u origin HEAD")
+    push = segs[0]
+    assert gpg._is_single_plain_push(segs, push, "git push -u origin HEAD") is True
+    assert gpg._is_single_plain_push([push, push], push, "git push -u origin HEAD") is False
+    other, _ = gpg.analyze_checked("git push -u origin HEAD")
+    assert gpg._is_single_plain_push(other, push, "git push -u origin HEAD") is False
+
+
+@pytest.mark.parametrize(
+    "command", ["git push o* HEAD", "git push origin? HEAD", "git push [o]rigin HEAD"]
+)
+def test_a_glob_in_the_push_keeps_the_prompt(command: str) -> None:
+    """A remote name written into config can contain glob characters, so a glob
+    could expand to a different word than the one judged: never silenced."""
+    segs, _ = gpg.analyze_checked(command)
+    assert gpg._is_single_plain_push(segs, segs[0], command) is False
