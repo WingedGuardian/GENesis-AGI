@@ -57,7 +57,12 @@ export function parseGenesisReply(reply) {
   try {
     data = JSON.parse(text);
   } catch {
-    return "the reply was not JSON";
+    // Genesis web_search always answers JSON, so text that is not JSON has
+    // usually been rewritten on the way back: $.mcp.call runs the full tool
+    // pipeline, PostToolUse hooks included (measured: a token-saving plugin that
+    // archives large MCP results and returns a summary in their place).
+    return "the reply was not JSON; a PostToolUse hook may have rewritten the " +
+      "web_search result (see .claude/docs/web-tools-guide.md)";
   }
   if (data === null || typeof data !== "object") return "the reply was not an object";
   if (data.error) return `web_search error: ${String(data.error)}`;

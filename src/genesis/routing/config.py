@@ -86,8 +86,9 @@ def _load_local_overlay(path: Path) -> object:
 
     RAISES on a file that cannot be read or is not valid YAML, and returns
     whatever shape the YAML holds. Deciding what an unusable overlay means is
-    the caller's job: the loader falls back to the base config loudly, and the
-    save path refuses to write over a file it could not read.
+    the caller's job: the loader refuses the load (nothing in the file can be
+    read, so no restriction could be kept), and the save path refuses to write
+    over a file it could not read.
     """
     local = _local_path_for(path)
     if not local.is_file():
@@ -388,6 +389,14 @@ def load_config(
     base is validated in CI (``test_config_invariants``), so it is the safe
     thing to fall back to. A base that fails to parse still raises.
 
+    One overlay failure is REFUSED rather than contained: a file that cannot be
+    read or parsed as YAML at all. None of its restrictions can be read, so the
+    base would load with every one of them lifted (disabled providers,
+    ``never_pays``, narrowed chains, lower limits). That raises here, after the
+    same ERROR log and health observation, so routing stays down until the file
+    is fixed or removed. An overlay that parses but fails validation still falls
+    back, with its readable restrictions applied.
+
     ``strict_overlay=True`` re-raises the overlay error instead. It is for
     operator-initiated reloads, where the right answer to a broken file is to
     say so and keep the running config.
@@ -420,6 +429,11 @@ def _load_effective(
     except Exception as exc:
         if strict_overlay:
             raise
+        if local_raw is _UNREADABLE:
+            # Nothing in the file can be read, so there is no restriction to
+            # keep, and the base alone would lift all of them. Refuse the load.
+            _report_overlay_rejected(local_path, exc, [_OVERLAY_REFUSED])
+            raise
         try:
             fallback, kept = _restrict_base(base_raw, local_raw)
         except Exception:  # noqa: BLE001 - a defect here must not take routing dark
@@ -439,6 +453,10 @@ _UNREADABLE = object()
 
 #: The kept-restrictions entry when applying them failed.
 _EXCLUSIONS_FAILED = "__exclusions_failed__"
+
+#: The kept-restrictions entry for an overlay that could not be read at all, so
+#: the load was refused and nothing was loaded in its place.
+_OVERLAY_REFUSED = "__overlay_refused__"
 
 #: Strings the `enabled` field reads as off. Shared by `_parse` and the fallback
 #: so both read an overlay's `enabled` the same way.
@@ -667,7 +685,8 @@ def _restrict_base(base_raw: dict, local_raw: object) -> tuple[dict, list[str]]:
     Provider names go through the same rename resolution as the accepted path,
     so an overlay that restricts a provider under its old name still restricts it.
 
-    An overlay in which no name can be read at all (not YAML, not a mapping, a
+    A file that is not YAML never reaches here: ``_load_effective`` refuses it.
+    An overlay that parses but in which no name can be read (not a mapping, a
     section that is not a mapping) has nothing to apply, and the base is used as
     it is. The ERROR log and the health observation say so.
 
@@ -1028,6 +1047,26 @@ def _report_overlay_rejected(
     # The kept restrictions are part of the report's identity: the base can
     # change under an unchanged overlay and change what the fallback kept.
     report = (mtime, detail, tuple(kept))
+    if kept == [_OVERLAY_REFUSED]:
+        if _REPORTED_OVERLAYS.get(key) != report:
+            _REPORTED_OVERLAYS[key] = report
+            logger.error(
+                # Worded for every caller: this also runs in a live server (the
+                # dashboard vitals poll), where the running router is unaffected.
+                "Routing overlay %s could not be read as YAML; this load was REFUSED "
+                "(the shipped config would lift every restriction in it). A router "
+                "started now will NOT come up; a router already running keeps its "
+                "current config. Fix or remove the file. Cause: %s",
+                local_path, detail, exc_info=exc,
+            )
+        content = (
+            f"[routing] {local_path.name} could not be read as YAML, so loading "
+            "routing config is refused: the shipped config would lift every "
+            "restriction in it. A router started now will not come up; one already "
+            f"running keeps its config. Fix or remove the file. Cause: {detail}"
+        )
+        _record_overlay_observation(key, report, content)
+        return
     if kept == [_EXCLUSIONS_FAILED]:
         still = "Its restrictions could NOT be applied; see the ERROR log."
     elif kept:
@@ -1041,6 +1080,18 @@ def _report_overlay_rejected(
             "without its overrides. %s Fix or remove the file. Cause: %s",
             local_path, still, detail, exc_info=exc,
         )
+    _record_overlay_observation(
+        key,
+        report,
+        f"[routing] {local_path.name} was rejected and its overrides are "
+        f"inactive; routing runs on the shipped config. {still} Cause: {detail}",
+    )
+
+
+def _record_overlay_observation(
+    key: str, report: tuple[float, str, tuple[str, ...]], content: str
+) -> None:
+    """Record the health observation for one overlay report. Never raises."""
     if _RECORDED_OVERLAYS.get(key) == report:
         return
     failed_at = _OBSERVATION_FAILED_AT.get((key, report))
@@ -1060,10 +1111,7 @@ def _report_overlay_rejected(
             type="init_degradation",
             category="infrastructure",
             priority="high",
-            content=(
-                f"[routing] {local_path.name} was rejected and its overrides are "
-                f"inactive; routing runs on the shipped config. {still} Cause: {detail}"
-            ),
+            content=content,
             content_hash=version,
         )
     except Exception:  # noqa: BLE001 - an import failure must not break config loading

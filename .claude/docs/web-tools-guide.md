@@ -80,6 +80,21 @@ runs on `mcp__genesis-health__web_search` instead, since the plugin calls it
 through the normal tool pipeline. The flag is not specific to this plugin: it
 turns on hook modules for every enabled plugin that ships them.
 
+**Another plugin can make it fall back on most searches.** The plugin calls
+`web_search` through Claude Code's normal tool pipeline, so PostToolUse hooks
+from other plugins run on that result too. A hook that rewrites large MCP
+results (for example, one that archives them to disk and returns a summary
+instead) leaves the plugin text that is not JSON, and those searches fall
+back to the built-in. token-optimizer does this for results of 4096 characters
+or more, which a typical 10-result search exceeds, so smaller searches still
+succeed. The plugin then logs "a PostToolUse hook may have rewritten the
+web_search result", which shows in the session and in a `--debug-file` log.
+Exempt `mcp__genesis-health__web_search` from that hook. For token-optimizer,
+add it to `TOKEN_OPTIMIZER_ARCHIVE_EXEMPT_TOOLS` in the `env` block of
+`~/.claude/settings.json` (a comma-separated list: append it if the variable is
+already set). The cost is that every session then gets the full `web_search`
+result instead of the summary.
+
 Two limits. Claude Code checks the answer against `WebSearch`'s output schema
 after the plugin returns, so a shape a later Claude Code stops accepting reaches
 the model as a tool error rather than the built-in search: re-checked on every pin

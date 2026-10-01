@@ -13,6 +13,9 @@ The design here is a chokepoint, not a list of shapes:
     Every RESTRICTION the overlay makes still applies to that base, through one
     rule per overlay-settable field (`_FALLBACK_RULES`), so a typo cannot undo
     any of them. A test walks `_parse` and fails on a field with no rule.
+  * The exception is a file that cannot be read or parsed as YAML at all: no
+    restriction in it can be read, so the base would lift every one. That load
+    is REFUSED (logged and recorded the same way): a router starting on it stays down.
   * `_parse` raises on malformed entries and wrongly typed fields rather than
     skipping them, so the chokepoint sees every error it has to contain.
   * One shape does not raise by itself: a non-mapping SECTION (a bare
@@ -117,8 +120,7 @@ def _base_only(tmp_path: Path):
 
 # Every shape here must fall back to the base. The ids name the shape.
 MALFORMED = {
-    # the whole file
-    "yaml_syntax_error": "providers: [unclosed\n",
+    # the whole file (a file that is not YAML at all is REFUSED: see UNPARSEABLE)
     "top_level_list": "- a\n- b\n",
     "top_level_scalar": "nonsense\n",
     # a section that is not a mapping (these replace the base section)
@@ -248,7 +250,23 @@ def test_an_unreadable_entry_is_read_restrictively(tmp_path, recorded, shape):
     assert len(recorded) == 1
 
 
-@pytest.mark.parametrize("local", list(MALFORMED.values()), ids=list(MALFORMED))
+#: Files that are not YAML at all. No restriction in them can be read, so the
+#: load is REFUSED (a router starting on it stays down) rather than falling back.
+#: The second carries a restriction the base would lift, to show why.
+UNPARSEABLE = {
+    "unclosed_flow_list": "providers: [unclosed\n",
+    "restriction_then_syntax_error": (
+        "providers:\n  paid-a:\n    enabled: false\ncall_sites: [unclosed\n"
+    ),
+    "bad_indentation": "providers:\n  paid-a:\n    enabled: false\n   free: true\n",
+}
+
+
+@pytest.mark.parametrize(
+    "local",
+    list(MALFORMED.values()) + list(UNPARSEABLE.values()),
+    ids=list(MALFORMED) + list(UNPARSEABLE),
+)
 def test_strict_overlay_raises_for_the_same_shapes(tmp_path, local):
     """The operator-initiated reload path: say the file is broken, load nothing."""
     with pytest.raises(Exception):  # noqa: B017 - the shapes raise different types
@@ -1467,5 +1485,121 @@ def test_a_reload_rebuilds_the_essential_map_and_a_bare_registry_stays_legacy(tm
     assert managed.uncovered_essential_sites() == ["9_fact_extraction"]
 
     bare = CircuitBreakerRegistry({}, clock=lambda: 0, persist=False, state_file=tmp_path / "b.json")
+    bare.refresh_essential_sites({"9_fact_extraction": ["p1"]})
+    assert bare.uncovered_essential_sites() == []
+
+
+# ── An overlay that is not YAML at all is refused, not contained ────────────
+
+
+@pytest.mark.parametrize("shape", list(UNPARSEABLE))
+def test_an_unparseable_overlay_refuses_the_load(tmp_path, recorded, caplog, shape):
+    """No restriction in the file can be read, so the base would lift all of
+    them. The load is refused: `runtime/init/router.py` then leaves routing down
+    until the file is fixed, as it did before the fallback existed."""
+    local = UNPARSEABLE[shape]
+    with pytest.raises(yaml.YAMLError):
+        yaml.safe_load(local)  # fixture: the text really is not YAML
+
+    with (
+        caplog.at_level(logging.ERROR, logger="genesis.routing.config"),
+        pytest.raises(yaml.YAMLError),
+    ):
+        load_config(_write(tmp_path, local), check_api_keys=False)
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors and "load was REFUSED" in errors[0].getMessage()
+    assert len(recorded) == 1, "the refusal happened without a health observation"
+    row = recorded[0]
+    assert row["source"] == "routing"
+    assert row["priority"] == "high"
+    assert "model_routing.local.yaml" in row["content"]
+    assert "will not come up" in row["content"]
+
+
+def test_an_undecodable_overlay_is_refused_too(tmp_path, recorded):
+    """A file that cannot be read as text holds no readable restriction either."""
+    cfg = _write(tmp_path, None)
+    (tmp_path / "model_routing.local.yaml").write_bytes(b"providers:\n  \xff\xfe: {}\n")
+
+    with pytest.raises(UnicodeDecodeError):
+        load_config(cfg, check_api_keys=False)
+    assert len(recorded) == 1
+
+
+def test_a_parse_valid_but_invalid_overlay_still_falls_back(tmp_path, recorded):
+    """CONTROL for the refusal: the same restriction, in a file that parses but
+    fails validation, is contained. Routing loads, and the restriction holds."""
+    local = "providers:\n  paid-a:\n    enabled: false\n" + _UNRELATED_ERROR
+    loaded = load_config(_write(tmp_path, local), check_api_keys=False)
+
+    assert "paid-a" not in loaded.providers
+    assert len(recorded) == 1
+    assert "will not come up" not in recorded[0]["content"]
+
+
+def test_the_refusal_is_reported_once_per_file_version(tmp_path, recorded, caplog):
+    """`load_config` runs on every dashboard vitals poll: one broken file must be
+    one ERROR line and one observation per version, not one per poll."""
+    cfg = _write(tmp_path, UNPARSEABLE["unclosed_flow_list"])
+    local = tmp_path / "model_routing.local.yaml"
+
+    with caplog.at_level(logging.ERROR, logger="genesis.routing.config"):
+        for _ in range(3):
+            with pytest.raises(yaml.YAMLError):
+                load_config(cfg, check_api_keys=False)
+    assert len(recorded) == 1
+    assert len([r for r in caplog.records if "load was REFUSED" in r.getMessage()]) == 1
+
+    stat = local.stat()
+    os.utime(local, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(yaml.YAMLError):
+        load_config(cfg, check_api_keys=False)
+    assert len(recorded) == 2, "an edited (still broken) file was not reported again"
+
+
+def test_an_unparseable_overlay_leaves_the_runtime_with_no_router(tmp_path, monkeypatch, caplog):
+    """What "routing stays down" means at boot: `runtime/init/router.py` catches
+    the raise, logs it, and sets no router, breakers, cost tracker or dead-letter
+    queue."""
+    from types import SimpleNamespace
+
+    from genesis.runtime.init import router as init_router
+
+    monkeypatch.setattr(C, "_report_overlay_rejected", lambda *a, **k: None)
+    (tmp_path / "config").mkdir()
+    _write(tmp_path / "config", UNPARSEABLE["restriction_then_syntax_error"])
+    monkeypatch.setattr("genesis.env.repo_root", lambda: tmp_path)
+    rt = SimpleNamespace(
+        _router=None, _circuit_breakers=None, _cost_tracker=None, _dead_letter_queue=None
+    )
+
+    with caplog.at_level(logging.ERROR, logger="genesis.runtime"):
+        init_router.init(rt)
+
+    assert rt._router is None
+    assert rt._circuit_breakers is None
+    failed = [r for r in caplog.records if r.getMessage() == "Failed to initialize router"]
+    assert failed and isinstance(failed[0].exc_info[1], yaml.YAMLError)
+
+
+def test_coverage_mode_survives_a_reload_with_no_essential_site(tmp_path):
+    """A managed registry reloaded with a config that has no essential site
+    stores None. The next reload that has them must restore coverage; keyed on
+    the current map, it was ignored until a restart."""
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+
+    managed = CircuitBreakerRegistry(
+        {}, clock=lambda: 0, persist=False, state_file=tmp_path / "a.json",
+        essential_sites={"9_fact_extraction": ["p1"]},
+    )
+    managed.refresh_essential_sites(None)
+    assert managed._essential_sites is None, "fixture: the first reload leaves no map"
+    managed.refresh_essential_sites({"9_fact_extraction": ["p1"]})
+    assert managed.uncovered_essential_sites() == ["9_fact_extraction"]
+
+    # CONTROL: a registry built with no map stays on the legacy check.
+    bare = CircuitBreakerRegistry({}, clock=lambda: 0, persist=False, state_file=tmp_path / "b.json")
+    bare.refresh_essential_sites(None)
     bare.refresh_essential_sites({"9_fact_extraction": ["p1"]})
     assert bare.uncovered_essential_sites() == []

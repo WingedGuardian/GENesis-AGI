@@ -43,21 +43,85 @@ while read local_ref local_oid remote_ref remote_oid; do
         if git rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1; then
             range_args+=(--not refs/remotes/origin/main)
         fi
-        # No `valueonly`: git prints the key itself (`Deploy-rebuild: <v>`), so a
-        # trailer with an EMPTY value is still seen. The `-c` settings pin how git
-        # finds trailers (a separator without `:`, or a comment character that
-        # swallows the trailer line, would hide it), and --no-show-signature keeps
-        # gpg's report off stdout under `log.showSignature`. The output is then
-        # read strictly as `<hash><TAB><trailer>`, so no other line can pose as
-        # a hit.
-        if ! rebuilt=$(git -c trailer.separators=: -c core.commentChar='#' -c core.commentString='#' \
-                log --no-show-signature --format='%H%x09%(trailers:key=Deploy-rebuild,separator=%x2C)' \
-                "${range_args[@]}" 2>/dev/null); then
+        # Read the commits RAW and find the trailer here, never through git's
+        # trailer formatting. Formatting obeys configuration, and settings kept
+        # hiding the trailer one at a time: a key alias (`trailer.<key>.key`)
+        # renames it, `i18n.logOutputEncoding=UTF-16` re-encodes the whole
+        # message, a separator or comment character stops git recognising it
+        # (MEASURED on git 2.43; `git interpret-trailers --parse` obeys the same
+        # trailer settings, so it is no way out). `rev-list` only names commits
+        # and `cat-file --batch` prints each object exactly as stored, so no
+        # setting reaches what the scan reads. --no-replace-objects: a replace
+        # ref (`git replace`) would otherwise show another commit's message, and
+        # parents, in place of the real one the push sends.
+        if ! pushed=$(git --no-replace-objects rev-list "${range_args[@]}" 2>/dev/null); then
             echo "BLOCKED: could not list the commits this push publishes to $remote_ref."
             echo "Refusing rather than risk publishing a Deploy-rebuild commit."
             exit 1
         fi
-        hit=$(printf '%s\n' "$rebuilt" | awk -F'\t' '$1 ~ /^[0-9a-f]+$/ && length($1) >= 40 && $2 != "" {print $1; exit}')
+        hit=""
+        if [ -n "$pushed" ]; then
+            want=$(printf '%s\n' "$pushed" | grep -c .)
+            # The scan is WIDER than git's trailer rules by construction rather
+            # than a copy of them: ANY line after the message's first paragraph
+            # (the subject, which git never reads as trailers) that starts with the
+            # key counts, matched case-insensitively with optional whitespace
+            # before the `:`. git finds the trailer block only after dropping
+            # trailing comment lines, a `Conflicts:` block and a scissors line,
+            # and a last-paragraph copy of that rule missed those shapes; every
+            # trailer git can find lies after the subject, so this cannot. The cost
+            # is a body line of prose starting with the key (MEASURED: 0 of 2,079
+            # commits in this repository's history). The batch is
+            # `<oid> commit <size>`, <size> bytes of object, then a newline;
+            # LC_ALL=C makes length() count bytes. It prints exactly one verdict:
+            # `HIT <oid>`, `OK`, or `ERR` when a header is not a commit or the
+            # number of objects read differs from the number listed. Anything else
+            # (no output at all included) refuses the push below.
+            verdict=$(printf '%s\n' "$pushed" | git --no-replace-objects cat-file --batch 2>/dev/null | LC_ALL=C awk -v want="$want" '
+                function blank(s) { return s ~ /^[ \t\r]*$/ }
+                function scan(   i) {
+                    i = 1
+                    while (i <= n && blank(msg[i])) i++
+                    while (i <= n && !blank(msg[i])) i++
+                    for (; i <= n; i++)
+                        if (tolower(msg[i]) ~ /^deploy-rebuild[ \t]*:/) { hit = oid; return }
+                }
+                remaining <= 0 {
+                    if (NF == 3 && $2 == "commit" && $1 ~ /^[0-9a-f]+$/ && length($1) >= 40 && $3 ~ /^[0-9]+$/) {
+                        oid = $1; remaining = $3 + 1; in_msg = 0; n = 0
+                        next
+                    }
+                    bad = 1
+                    exit
+                }
+                {
+                    remaining -= length($0) + 1
+                    if (in_msg) msg[++n] = $0
+                    else if ($0 == "") in_msg = 1
+                    if (remaining == 0) {
+                        records++
+                        scan()
+                        if (hit != "") exit
+                    } else if (remaining < 0) {
+                        bad = 1
+                        exit
+                    }
+                }
+                END {
+                    if (hit != "") print "HIT " hit
+                    else if (bad || remaining != 0 || records != want) print "ERR"
+                    else print "OK"
+                }')
+            case "$verdict" in
+                "HIT "*) hit=${verdict#HIT } ;;
+                OK) ;;
+                *)
+                    echo "BLOCKED: could not read the commits this push publishes to $remote_ref."
+                    echo "Refusing rather than risk publishing a Deploy-rebuild commit."
+                    exit 1
+                    ;;
+            esac
+        fi
         if [ -n "$hit" ]; then
             echo "BLOCKED: this push to $remote_ref publishes a Deploy-rebuild commit ($hit)."
             echo ""

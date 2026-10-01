@@ -548,7 +548,12 @@ def _git_common_dir(cwd: str | None) -> str | None:
         args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
         result = subprocess.run(args, capture_output=True, text=True, timeout=5)
         out = result.stdout.strip()
-        return os.path.realpath(out) if result.returncode == 0 and out else None
+        # One absolute line or nothing: git before 2.31 does not know
+        # `--path-format`, exits 0, and echoes the option back beside a relative
+        # `.git`, which must read as unreadable (fail closed), never as an identity.
+        if result.returncode != 0 or "\n" in out or not os.path.isabs(out):
+            return None
+        return os.path.realpath(out)
     except Exception:
         return None
 
@@ -560,23 +565,171 @@ def _live_manifest_present() -> bool:
     )
 
 
+def _live_manifest_binding() -> tuple[str, str | None]:
+    """What the deploy manifest says about WHICH repository it belongs to.
+
+    The manifest may carry a top-level ``"repo"``: the ABSOLUTE git common dir of
+    the checkout it belongs to. Returns one of:
+
+    * ``("bound", <canonical path>)`` — the key names an existing git common dir
+      (a directory holding ``objects/`` and ``HEAD``);
+    * ``("absent", None)`` — a JSON object without the key: the caller keeps its
+      rule for manifests written before the key existed;
+    * ``("malformed", None)`` — anything else: unreadable or malformed JSON, not a
+      JSON object, or a key that is not the absolute path of an existing git
+      common dir (a work-tree path, a checkout that has since moved). The caller
+      ARMS, for every target: a broken manifest fails closed.
+
+    The same rule is kept in ``review_enforcement_commit._live_manifest_binding`` and in the git hooks'
+    ``live_manifest_applies``; ``TestManifestRepoBinding`` pins all four copies
+    to one verdict table."""
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — unreadable fails closed, never "disarmed"
+        return ("malformed", None)
+    if not isinstance(data, dict):
+        return ("malformed", None)
+    if "repo" not in data:
+        return ("absent", None)
+    repo = data["repo"]
+    if (
+        isinstance(repo, str)
+        and os.path.isabs(repo)
+        and os.path.isdir(os.path.join(repo, "objects"))
+        and os.path.isfile(os.path.join(repo, "HEAD"))
+    ):
+        return ("bound", os.path.realpath(repo))
+    return ("malformed", None)
+
+
 def _live_integration_active(cwd: str | None) -> bool:
     """Whether ``cwd``'s repository runs a local integration branch named ``live``.
 
     Two conditions. The deploy manifest declares that this install runs one;
     without it, a branch named ``live`` is just an ordinary branch. And the
-    target must be THIS repository (the one this guard ships in, any of its
-    worktrees): a session can run git in unrelated checkouts, whose own `live`
-    branches the manifest says nothing about. When the manifest exists but a
-    repository identity cannot be read, fail closed, as this guard does for an
-    unreadable branch."""
+    target must be the repository the manifest is about
+    (``_live_manifest_binding``): when it names one, that repository and no
+    other; when it has no ``"repo"`` key, THIS repository (the one this guard
+    ships in, any of its worktrees), since a session can run git in unrelated
+    checkouts whose own `live` branches the manifest says nothing about. A
+    malformed manifest, or a repository identity that cannot be read, fails
+    closed, as this guard does for an unreadable branch."""
     if not _live_manifest_present():
         return False
-    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
+    kind, bound = _live_manifest_binding()
+    if kind == "malformed":
+        return True
     there = _git_common_dir(cwd)
+    if kind == "bound":
+        return there is None or there == bound
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
     if here is None or there is None:
         return True
     return here == there
+
+
+# Git subcommands that cannot change WHICH branch HEAD is on. An ALLOWLIST on
+# purpose: the set of commands that can switch branches is open (checkout,
+# switch, rebase <upstream> <branch>, worktree, stash branch, branch -M, bisect,
+# and whatever a later git adds), while this set is closed and checkable.
+_KEEPS_HEAD_BRANCH = frozenset(
+    {
+        "add",
+        "blame",
+        "cat-file",
+        "check-attr",
+        "check-ignore",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "config",
+        "describe",
+        "diff",
+        "fetch",
+        "for-each-ref",
+        "grep",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge",
+        "merge-base",
+        "mv",
+        "pull",
+        "remote",
+        "reset",
+        "restore",
+        "rev-list",
+        "rev-parse",
+        "revert",
+        "rm",
+        "shortlog",
+        "show",
+        "show-ref",
+        "status",
+        "tag",
+    }
+)
+# `init` creates or re-initializes a repository and never moves this one's HEAD;
+# a merge in a repository it creates is not a merge into this repository's branch.
+# `stash` is decided by one token, in `_moves_head`: only `git stash branch`
+# switches (MEASURED 2026-09-30: 0 of 24 stash segments in 288 historical merge
+# commands were that form, and treating every stash as a mover refused 14 of them).
+# Deliberately NOT here: `worktree` (`git worktree add <dir> live` into an empty
+# directory that already exists inside this checkout makes the branch read at hook
+# time the enclosing one, while the merge lands on `live`), `branch` (`git branch
+# -M` renames the current branch) and `rebase` (`--abort` returns to the branch it
+# started from). Telling their forms apart would mean modelling their argv; chained
+# before a merge they are refused, and run separately they pass.
+
+
+def _moves_head(seg) -> bool:
+    """Whether ``seg`` can change the branch a LATER merge in the same command
+    lands on, after this guard has read that branch.
+
+    Decided by SUBCOMMAND, with no argv parsing, against an allowlist
+    (``_KEEPS_HEAD_BRANCH``): a ``git`` command counts unless its subcommand is
+    one that cannot move HEAD to another branch, and any ``gh`` command counts
+    (``gh pr checkout``). Telling a HEAD-moving form from one that leaves HEAD
+    put is an open-set question about git's argv (``git checkout live --``
+    switches branches although it looks like a file restore; ``git rebase
+    <upstream> <branch>`` ends on <branch>), and here a miss is not backstopped:
+    a fast-forward runs no git hook. A file restore chained before a merge is
+    therefore refused too; the remedy, running the two separately, costs one
+    more command.
+
+    ACCEPTED RESIDUE: a git ALIAS (``co``), a dashed executable
+    (``/usr/lib/git-core/git-checkout``, which this guard family does not read as
+    git anywhere, merges included), and anything hidden from the shell parser
+    (``eval``, ``xargs``, a script). ``git pull`` is not in this walk's
+    population as a merge at all."""
+    exe = getattr(seg, "exe", None)
+    if exe == "gh":
+        return True
+    if exe != "git":
+        return False
+    argv = getattr(seg, "argv", None) or []
+    sub = git_subcommand(argv)
+    if sub == "stash":
+        # `git stash branch <name>` checks out a new branch; every other stash form
+        # leaves HEAD where it is. Any `branch` token counts, wherever it sits, so a
+        # value that happens to read "branch" refuses rather than slips through.
+        return "branch" in argv
+    return sub not in _KEEPS_HEAD_BRANCH
+
+
+def _mover_label(seg) -> str:
+    """``git <subcommand>``, or ``gh``, for a refusal message: never the rest of
+    argv (a command line can carry a credential)."""
+    exe = getattr(seg, "exe", None) or "?"
+    if exe != "git":
+        # `gh` alone: its first positional can be a flag's value (`gh --repo x pr
+        # checkout`), and naming it would mean modelling gh's argv.
+        return exe
+    sub = git_subcommand(getattr(seg, "argv", None) or [])
+    return f"git {sub}" if sub else "git"
 
 
 def _walk_merge_into_main(
@@ -603,6 +756,16 @@ def _walk_merge_into_main(
     segment. Fail closed: a merge nested at depth>0, reached under an unresolvable
     cwd, OR whose branch cannot be read (None) is treated as targeting main and
     blocked (unless overridden). A detached HEAD ("") is left allowed.
+
+    Every branch is read BEFORE the command runs, so a merge that follows a
+    ``git checkout``, ``git switch``, ``git rebase`` or any other command that
+    can change the current branch, in the same command
+    (``_moves_head``; earlier segments, or a substitution inside the merge's own
+    segment) lands on a branch the read never saw: ``git checkout live && git
+    merge --ff-only feature`` moves ``live`` with no git hook firing. Such a
+    merge is unresolvable and refused, "switched" in ``fired_on``, whatever the
+    stale read says. The main override still passes it where no ``live`` is
+    declared, as it does any merge it covers.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
     #
@@ -631,8 +794,11 @@ def _walk_merge_into_main(
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
     repo_env_redirected = False  # persistent, for the same reason as in _effective_cwd
+    head_moved = False  # a segment earlier in this command may have changed branch
+    head_mover = None  # the first such segment, named in the refusal
     for raw in split_segments(cmd):
-        top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
+        segs_here = analyze(raw)
+        top = [s for s in segs_here if getattr(s, "depth", 0) == 0]
         merge_here = next(
             (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
             None,
@@ -640,7 +806,23 @@ def _walk_merge_into_main(
         overridden = merge_here is not None and has_trailing_override(
             raw, "merge-to-main-override"
         )
-        if overridden:
+        # A switch nested in the merge's own segment (a command substitution)
+        # runs before the merge, so it counts as earlier too.
+        nested_mover = next(
+            (s for s in segs_here if s is not merge_here and _moves_head(s)), None
+        )
+        switched = merge_here is not None and (head_moved or nested_mover is not None)
+        if switched:
+            # The branch read above predates the switch. Unresolvable: refused, and
+            # with the main override refused wherever a `live` may exist, exactly
+            # like an unresolvable directory below.
+            if not overridden or _live_manifest_present():
+                if fired_on is not None:
+                    fired_on.append("switched")
+                    mover = head_mover if head_mover is not None else nested_mover
+                    fired_on.append("switched-by:" + _mover_label(mover))
+                return True
+        elif overridden:
             # The override acknowledges a merge into main, never into `live`. So
             # the branch is still resolved; where it cannot be (a redirected
             # repository, an unresolvable directory) and a `live` may exist, the
@@ -658,7 +840,7 @@ def _walk_merge_into_main(
                     if fired_on is not None:
                         fired_on.append("live")
                     return True
-        if merge_here is not None and not overridden:
+        if merge_here is not None and not overridden and not switched:
             # This walk resolves the repo itself rather than through
             # `_effective_cwd`, so it carried the same hole: a merge pointed at a
             # repository on main by --git-dir / GIT_DIR was checked against the
@@ -682,6 +864,9 @@ def _walk_merge_into_main(
                 if fired_on is not None:
                     fired_on.append("live")
                 return True
+        if not head_moved:
+            head_mover = next((s for s in segs_here if _moves_head(s)), None)
+            head_moved = head_mover is not None
         if raw_sets_repo_env(raw):
             repo_env_redirected = True
         cd = _cd_target(raw)
@@ -5125,7 +5310,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
 # "Swish!", "You're on a roll.", "Keep them coming!", … — VARIES, so anchor ONLY on the
 # stable prefix) and carries a "**Reviewed commit:** `<sha>`" line with a 10-char
 # ABBREVIATED sha. Both must be present for the comment to be REPORTED; it never vouches
-# for a commit (see ``_latest_codex_clean_comment_sha``).
+# for a commit by itself (see ``_codex_clean_signal_at_head``).
 _CODEX_CLEAN_COMMENT_RE = re.compile(
     r"Codex Review:\s*Didn'?t find any major issues", re.IGNORECASE
 )
@@ -5134,41 +5319,47 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
 )
 
 
-def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """The ABBREVIATED commit sha from Codex's most recent CLEAN issue-comment, or None.
+#: Codex's PR summary comment: ONE comment, edited in place, whose table shows the
+#: latest review of each kind. MEASURED 2026-09-29 on the live queue:
+#: ``| 📝 **Code Review** | ✅ **Completed** <relative-time …>…</relative-time> | `<7hex>` | <trigger> |``.
+#: The status also reads ``🔄 **Running** since …`` and ``⚠️ **Failed**``; only
+#: Completed counts, and only the Code Review row (a security review is another kind).
+_CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+_CODEX_SUMMARY_ROW_RE = re.compile(
+    r"^\|\s*📝\s*\*\*Code Review\*\*\s*\|\s*✅\s*\*\*Completed\*\*\s*"
+    r"<relative-time datetime=\"([^\"]+)\"[^|\n]*\|"
+    r"\s*`([0-9a-fA-F]{7,40})`\s*\|",
+    re.MULTILINE,
+)
+#: A Codex issue comment that CARRIES findings rather than reporting none. MEASURED
+#: 2026-09-29: on 2 of 339 PRs with Codex activity (#1833, #2390) Codex posted its
+#: P1/P2 findings as an ISSUE comment (`### 💡 Codex Review` + severity badges, each
+#: finding linking `/blob/<full sha>/…`) and left NO review object, while its summary
+#: row still read Completed. So "no review object" alone does not mean "clean".
+_CODEX_FINDINGS_COMMENT_RE = re.compile(r"!\[P\d Badge\]|💡 Codex Review")
+#: pulls/N/commits stops at 250. Landing on it cannot prove the list is complete, so
+#: a short sha resolved against it could be ambiguous with a commit it never saw.
+_PR_COMMITS_CEILING = 250
 
-    DIAGNOSTIC ONLY — this value must never satisfy a gate. Codex posts a clean
-    RE-review as an ISSUE COMMENT, not a review object, and names the commit only by an
-    abbreviated id. An abbreviated id does not identify a commit: the head it is compared
-    against is whatever the branch's author pushed, so "the head starts with this prefix"
-    is not "this head was reviewed". Freshness therefore rests on the reviews API's full
-    ``commit_id`` alone (``_latest_codex_reviewed_sha``), and the freshness gate reads this
-    only to explain its block. An earlier version accepted a prefix match as freshness on
-    the argument that the head was a fixed value; the author controls that value, so the
-    argument did not hold.
 
-    Reads ``issues/N/comments``; for a comment authored by the Codex bot (login AND
-    ``user.type == "Bot"``) it requires BOTH the clean marker AND a parseable
-    ``Reviewed commit: <sha>`` line (fail-closed to None). Returns a lowercased prefix
-    (>=7 hex). Comments come oldest-first, so the last match wins. Tests inject via
-    ``_TEST_GH_CODEX_COMMENTS`` (one JSON object per line: ``{login, type, body}``).
-    Fail-safe: None on any API/parse error.
-    """
-    raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
+def _pr_commit_shas(pr_num: str, repo: str | None = None) -> list[str] | None:
+    """Every commit of the PR (full lowercase oids), or None when unreadable or at the
+    endpoint's 250-commit ceiling. Tests inject ``_TEST_GH_PR_COMMITS`` (one sha per
+    line; empty = no commits). Read only on the would-block path."""
+    raw = os.environ.get("_TEST_GH_PR_COMMITS")
     if raw is None:
         try:
             result = subprocess.run(
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
                     "--paginate",
                     "--jq",
-                    ".[] | {login: .user.login, type: .user.type, body: .body}",
+                    ".[].sha",
                 ],
                 capture_output=True,
                 text=True,
-                # See the merge-path timeout budget note in main(): fail-safe → None.
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -5176,31 +5367,195 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
             raw = result.stdout
         except Exception:
             return None
-    latest: str | None = None
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line:
+    shas = [line.strip().lower() for line in (raw or "").splitlines() if line.strip()]
+    if len(shas) >= _PR_COMMITS_CEILING or not all(re.fullmatch(r"[0-9a-f]{40}", s) for s in shas):
+        return None
+    return shas
+
+
+def _codex_clean_signal_at_head(
+    pr_num: str, head: str, repo: str | None = None, why: dict | None = None
+) -> str | None:
+    """``"comment"`` / ``"summary"`` when Codex said it finished at ``head`` clean, else None.
+
+    Codex posts NO review object when it finds nothing. Its word on a clean head is a
+    comment: a clean re-review ("Codex Review: Didn't find any major issues … Reviewed
+    commit: `<10hex>`"), or a ``✅ Completed`` row in its PR summary comment (on PR
+    open, often the only signal: #2418). Both name the commit by an ABBREVIATED id,
+    and an abbreviated id alone identifies no commit (#2487). So a signal counts
+    only when ALL hold:
+
+    - the comment is authored by the configured Codex login with ``type == "Bot"``;
+    - its id resolves UNIQUELY, against THIS PR's own commit list, to a commit EQUAL
+      to ``head`` — a second PR commit sharing the prefix makes it ambiguous and it
+      does not count, and a commit outside the PR cannot resolve at all;
+    - NO Codex review object exists at ``head`` in any state (dismissed included),
+      and NO Codex issue comment on the PR carries findings — Codex usually files
+      findings as a review object, but MEASURED on 2 of 339 PRs it posted them as a
+      `💡` issue comment with no review object while the summary read Completed;
+    - the comment is unedited or edited only by Codex (an edit keeps the original
+      author, so the author proves nothing about the body);
+    - the PR's history has never moved under it: no force-push, no base change,
+      no base force-push, no head-branch restore. Each can drop the reviewed commit
+      from the PR's commit list while a commit sharing its prefix (a short id is
+      cheap to grind) stays, and the prefix would then resolve uniquely to it.
+      GraphQL names only a force-push's old TIP, not what it dropped under it, so
+      the dropped commit cannot be put back into the list. MEASURED 2026-09-30:
+      4 of 73 open PRs carry such an event (one base change, three restores) and
+      fall back to needing a Codex review object; none carries a force-push.
+      Residual, stated: a reviewed commit that reaches the BASE branch by another
+      route also leaves the list, with no event here; exploiting that needs a
+      deliberately ground prefix collision as well.
+
+    Anything unreadable is None: the gate then blocks exactly as before. When a
+    clean signal WAS seen and refused, ``why`` (if given) receives ``signal`` (what
+    was seen), ``reason`` (why it did not count) and ``permanent`` (True when no
+    later clean signal on this PR can count either), so the block can say so
+    rather than send the reader to re-request a review that cannot help.
+    """
+    note = why if why is not None else {}
+    if _review_budget is None:
+        return None
+    evidence = _codex_signal_evidence(pr_num, repo=repo)
+    if evidence is None:
+        note["reason"] = "Codex's comments on this PR could not be read in full"
+        return None
+    codex = _CODEX_REVIEW_BOT.removesuffix("[bot]")  # GraphQL names an App by its slug
+    candidates: list[tuple[str, str]] = []
+    findings = False
+    for c in evidence["comments"]:
+        if c["login"] != codex or c["type"] != "Bot":
             continue
+        body = c["body"]
+        summary = _CODEX_SUMMARY_MARKER in body
+        # Findings delivered as an issue comment veto the signal, at ANY commit: no
+        # gate scores that channel yet, so a clean signal on a later head must not
+        # walk past findings filed there on an earlier one (2 of 339 PRs, measured).
+        if not summary and _CODEX_FINDINGS_COMMENT_RE.search(body):
+            findings = True
+            continue
+        # An edit keeps the original author, so only an unedited comment, or one Codex
+        # itself edited (it rewrites its summary in place), speaks for Codex.
+        if c["editor"] not in (None, codex):
+            continue
+        if _CODEX_CLEAN_COMMENT_RE.search(body):
+            m = _CODEX_REVIEWED_COMMIT_RE.search(body)
+            if m:
+                candidates.append(("comment", m.group(1).lower()))
+        if summary:
+            for m in _CODEX_SUMMARY_ROW_RE.finditer(body):
+                candidates.append(("summary", m.group(2).lower()))
+    if not candidates:
+        return None  # nothing clean was said; there is nothing to explain
+    kind, short = candidates[-1]
+    note["signal"] = f"{kind} naming commit {short}"
+    if findings:
+        note["reason"] = "a Codex findings comment sits on this PR, and no gate scores that channel yet"
+        note["permanent"] = True
+        return None
+    if evidence["history_moved"]:
+        note["reason"] = (
+            "this PR's history moved (a force-push, base change, base force-push or "
+            "branch restore), so a short id can no longer be bound to the head"
+        )
+        note["permanent"] = True
+        return None
+    reviews = _codex_reviews(pr_num, repo=repo)
+    if reviews is None:
+        note["reason"] = "Codex's reviews on this PR could not be read"
+        return None
+    if any((r.get("commit_id") or "").lower() == head for r in reviews):
+        note["reason"] = "a Codex review object (dismissed or pending) sits at the head"
+        return None
+    commits = _pr_commit_shas(pr_num, repo=repo)
+    if not commits:
+        note["reason"] = "this PR's commit list could not be read in full"
+        return None
+    for kind, short in candidates:
+        resolved, error = _review_budget._resolve_sha(short, commits)
+        if not error and resolved == head:
+            note.clear()
+            return kind
+    note["reason"] = (
+        "its abbreviated id does not resolve uniquely to the head among this PR's "
+        "commits (it names an older commit, or is ambiguous)"
+    )
+    return None
+
+
+_CODEX_SIGNAL_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, "
+    "name: $name) { pullRequest(number: $number) { comments(last: 100) { totalCount "
+    "nodes { body author { login __typename } editor { login } } } "
+    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, BASE_REF_CHANGED_EVENT, "
+    "BASE_REF_FORCE_PUSHED_EVENT, HEAD_REF_RESTORED_EVENT], first: 1) { filteredCount "
+    "nodes { __typename } } } } }"
+)
+
+
+def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
+    """``{"comments": [...], "history_moved": bool}`` for the clean-signal check, or
+    None when unreadable. ONE GraphQL read, because a comment's ``editor`` exists only
+    there (REST keeps the ORIGINAL author on an edited comment, so the author says
+    nothing about the body). History moved when the type-filtered timeline has ANY
+    node. Two readings must agree, or the read is refused: the documented one (the
+    ``itemTypes`` filter on ``nodes``) and ``filteredCount``, whose schema text does
+    not say it honours ``itemTypes`` though it MEASURABLY does. Never ``totalCount``:
+    on a filtered connection it counts the WHOLE timeline (MEASURED 2026-09-30:
+    #2619 totalCount 7, filteredCount 0; #65 12 vs 1, matching its one REST
+    timeline force-push). More than 100 comments is None (fail closed).
+    Tests inject ``_TEST_GH_CODEX_SIGNAL`` (the raw GraphQL response).
+    """
+    raw = os.environ.get("_TEST_GH_CODEX_SIGNAL")
+    if raw is None:
+        owner, _, name = (repo or "{owner}/{repo}").partition("/")
         try:
-            obj = json.loads(line)
+            result = subprocess.run(
+                [
+                    "gh", "api", "graphql",
+                    "-f", f"query={_CODEX_SIGNAL_QUERY}",
+                    "-F", f"owner={owner}",
+                    "-F", f"name={name}",
+                    "-F", f"number={pr_num}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+            if result.returncode != 0:
+                return None
+            raw = result.stdout
         except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
-            continue
-        # Require the GitHub-enforced Bot author type too — belt-and-suspenders against
-        # a spoofed login string in an injected/malformed payload.
-        if (obj.get("type") or "") != "Bot":
-            continue
-        body = obj.get("body") or ""
-        if not _CODEX_CLEAN_COMMENT_RE.search(body):
-            continue
-        m = _CODEX_REVIEWED_COMMIT_RE.search(body)
-        if not m:
-            continue  # clean marker but no parseable sha → does not vouch (fail-closed)
-        latest = m.group(1).strip().lower()
-    return latest
+            return None
+    try:
+        payload = json.loads(raw or "")
+        if payload.get("errors"):
+            return None
+        pr = payload["data"]["repository"]["pullRequest"]
+        comments = pr["comments"]
+        if comments["totalCount"] > len(comments["nodes"]):
+            return None
+        rows = []
+        for node in comments["nodes"]:
+            author = node.get("author") or {}
+            editor = node.get("editor") or {}
+            rows.append(
+                {
+                    "login": author.get("login"),
+                    "type": author.get("__typename"),
+                    "editor": editor.get("login"),
+                    "body": node.get("body") or "",
+                }
+            )
+        timeline = pr["timelineItems"]
+        count, nodes = timeline["filteredCount"], timeline["nodes"]
+        if type(count) is not int or count < 0 or not isinstance(nodes, list):
+            return None
+        if (count > 0) != bool(nodes):
+            return None  # the two readings disagree: trust neither
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        return None
+    return {"comments": rows, "history_moved": bool(nodes)}
 
 
 # ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
@@ -6407,6 +6762,12 @@ def _classify_base_advance_delta(
     return "inline"
 
 
+#: Why the last freshness check PASSED, when that is something other than a review
+#: object at head. Read by the ``--check-pr`` row so the report states the gate's own
+#: reason instead of re-deriving it from a second read that could disagree.
+_FRESHNESS_PASS: dict[str, str] = {}
+
+
 def _check_codex_reviewed_head_core(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
@@ -6438,6 +6799,7 @@ def _check_codex_reviewed_head_core(
     ``--match-head-commit`` so a push landing between this check and the merge
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
+    _FRESHNESS_PASS.clear()
     if force:
         # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
         # touches the enforcement-hook surface — recorded fallback-review
@@ -6505,23 +6867,41 @@ def _check_codex_reviewed_head_core(
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
         return False, "", head
-    # The review-object path can't vouch for the current head (Codex has no review, or
-    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT, not a review
-    # object, and it names its commit only by an abbreviated id. That id identifies no
-    # commit — the head is whatever the branch's author pushed — so it NEVER satisfies
-    # this gate. Only a review object whose full ``commit_id`` equals the head vouches
-    # (or, via the caller, an owner-approved substitute at that exact head). The comment
-    # is still read, on this would-block path only, so the block can say it was seen
-    # and name the route that works.
-    clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
-    clean_note = ""
-    if clean_short and head.startswith(clean_short):
-        clean_note = (
-            f"\nNOTE: Codex posted a clean re-review naming commit {clean_short}. A clean "
-            f"re-review arrives as a comment carrying only an abbreviated commit id, which "
-            f"does not identify the commit, so it is not accepted as a review of head "
-            f"{head[:12]}."
+    # Codex posts no review object when it finds nothing; its word on a clean head is
+    # a comment naming an abbreviated id. That counts only when the id resolves
+    # UNIQUELY within this PR's own commits to the head and no Codex review object
+    # sits at the head (#2418; the resolution is what answers #2487's objection that
+    # a prefix alone binds nothing). The merge stays bound to this head.
+    refused: dict = {}
+    clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo, why=refused)
+    if clean_kind:
+        _FRESHNESS_PASS["reason"] = f"clean signal at head: {clean_kind}"
+        _FRESHNESS_PASS["head"] = head
+        print(
+            f"NOTE: PR #{pr_num} — Codex's clean {clean_kind} names head {head[:12]} "
+            f"(its abbreviated id resolves uniquely to the head among the PR's commits, "
+            f"and nothing Codex filed says otherwise) — accepted as a current review.",
+            file=sys.stderr,
         )
+        return False, "", head
+    # Neither a review object nor a resolvable clean signal vouches for the head.
+    # When a clean signal WAS seen, say which and why it did not count; when no later
+    # clean signal can count either, say that too, so the reader is not sent to
+    # re-request a review that cannot clear this.
+    clean_note = ""
+    if refused.get("signal"):
+        clean_note = (
+            f"\nNOTE: Codex's clean {refused['signal']} was read but not accepted as a "
+            f"review of head {head[:12]}: {refused.get('reason', 'it did not qualify')}."
+        )
+        if refused.get("permanent"):
+            clean_note += (
+                " That holds for every clean signal on this PR, so a finding-free Codex "
+                "re-review (which posts no review object) cannot clear this block. What "
+                "can: '# substitute-review' with the owner's approval, "
+                "'# stale-review-override', or a Codex review that posts a review object "
+                "at the head (only a review WITH findings does)."
+            )
     if not reviewed:
         return (
             True,
@@ -10669,7 +11049,26 @@ def _run_merge_and_push_gates() -> int:
         if merge_git_segs and _walk_merge_into_main(
             cmd, payload, merge_git_segs, fired_on=merge_fired_on
         ):
-            if "unresolved" in merge_fired_on:
+            if "switched" in merge_fired_on:
+                mover = next(
+                    (f[len("switched-by:") :] for f in merge_fired_on if f.startswith("switched-by:")),
+                    "a git or gh command",
+                )
+                print(
+                    f"BLOCKED: `{mover}` runs before a merge in this command, and it is "
+                    "not one of the commands known to leave the current branch alone "
+                    "(add, commit, diff, fetch, log, pull, reset, restore, status and "
+                    "similar). This guard reads each merge's branch before the command "
+                    "runs, so it cannot tell which branch the merge lands on — main, "
+                    "or 'live', the local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Run the branch switch and the merge as SEPARATE commands; the "
+                    "merge is then checked on the branch it actually runs on.",
+                    file=sys.stderr,
+                )
+            elif "unresolved" in merge_fired_on:
                 print(
                     "BLOCKED: cannot tell which branch this merge lands on, and "
                     "'# merge-to-main-override' covers main only, never 'live', the "
@@ -11799,8 +12198,17 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
         _head = _pr_head_sha(pr_num, repo=repo)
         _head_l = _head.strip().lower() if _head else None
+        # Only for the head it vouched for: a push landing between the gate and this
+        # re-read must not inherit the old head's pass reason.
+        _pass_reason = (
+            _FRESHNESS_PASS.get("reason")
+            if _head_l is not None and _FRESHNESS_PASS.get("head") == _head_l
+            else None
+        )
         if _head_l is not None and _reviewed == _head_l:
             label = "ok (current)"
+        elif _pass_reason:
+            label = f"ok ({_pass_reason})"
         elif _reviewed is None or _head is None:
             # A transiently-failed re-read must NOT read as "current" (Codex P2
             # #1373): the enforcement gate already passed, but the report must not

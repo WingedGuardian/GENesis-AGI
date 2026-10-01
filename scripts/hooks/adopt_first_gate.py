@@ -116,7 +116,7 @@ _VERDICT_TOKEN = re.compile(r"\b(ADOPT|ADAPT|BUILD|WATCH|IGNORE)\b", re.IGNORECA
 #: verb joining them is the tell.
 _RENAME = re.compile(
     r"\b(?:rename|moves?|relocat\w*)\b[\s\S]{0,80}?"
-    r"(?<![\w./-])(src/[\w./-]+\.(?:pyi|py|jsx|js|tsx|ts|mjs|cjs|html|css|sh))\b"
+    r"(?<![\w./-])((?:\./)?src/[\w./-]+\.(?:pyi|py|jsx|js|tsx|ts|mjs|cjs|html|css|sh))\b"
     r"[\s\S]{0,40}?\b(?:to|into|as)\b[\s\S]{0,40}?(\S+)",
     re.IGNORECASE,
 )
@@ -396,7 +396,7 @@ def _check_plan(payload: dict) -> int:
     # source to the candidate, exclude it.
     for rm in _RENAME.finditer(live):
         if rm.group(1).strip("'`") in existing:
-            renamed = rm.group(2).strip("'`.,;:\"")
+            renamed = rm.group(2).lstrip("'`\"").rstrip("'`\".,;:")
             sources = [s for s in sources if s != renamed and not renamed.endswith("/" + s)]
     if not sources:
         return 0

@@ -732,6 +732,34 @@ def test_routing_config_reload_endpoint(client):
     mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
 
 
+def test_routing_reload_refuses_an_unparseable_overlay(client, tmp_path):
+    """The real strict loader, against the shipped base: an overlay that is not
+    YAML is refused with a 400 and the running config is kept, the same way
+    boot refuses it."""
+    from unittest.mock import AsyncMock
+
+    import genesis.routing.config as routing_config
+
+    broken = tmp_path / "model_routing.local.yaml"
+    broken.write_text("providers: [unclosed\n")
+    mock_router = MagicMock()
+    mock_router.scan_dlq_orphans_after_reload = AsyncMock(return_value=0)
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+
+    with (
+        patch("genesis.runtime.GenesisRuntime") as MockRT,
+        patch.object(routing_config, "_local_path_for", lambda _path: broken),
+    ):
+        MockRT.instance.return_value = mock_rt
+        resp = client.post("/api/genesis/routing/reload")
+
+    assert resp.status_code == 400
+    assert resp.get_json() == {"error": "Config parse failed"}
+    mock_router.reload_config.assert_not_called()
+
+
 def test_settings_put_gate_disable_requires_confirmation(client, tmp_path):
     """Dashboard PUT disabling the mandatory approval gate without the
     confirm flag must 409 and write NOTHING; with the flag it applies

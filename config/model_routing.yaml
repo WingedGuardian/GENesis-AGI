@@ -237,18 +237,27 @@ providers:
     open_duration_s: 120
   openrouter-sonnet:
     type: openrouter
-    model: anthropic/claude-sonnet-5
-    profile: claude-sonnet-5
+    model: anthropic/claude-sonnet-5.5
+    profile: claude-sonnet-5.5
     free: false
     rpm_limit: 20
     open_duration_s: 120
+    params:
+      # Current-generation Claude models reject sampling parameters, and the
+      # desk endpoint forwards a caller-supplied temperature. litellm's
+      # drop_params only drops what it knows a model rejects, and the pinned
+      # litellm predates these models, so name them.
+      additional_drop_params: [temperature, top_p, top_k]
   openrouter-opus:
     type: openrouter
-    model: anthropic/claude-opus-5
-    profile: claude-opus-5
+    model: anthropic/claude-opus-5.5
+    profile: claude-opus-5.5
     free: false
     rpm_limit: 20
     open_duration_s: 120
+    params:
+      # Same reason as openrouter-sonnet above.
+      additional_drop_params: [temperature, top_p, top_k]
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   nvidia-nim-deepseek:
     type: nvidia_nim

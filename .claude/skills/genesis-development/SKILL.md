@@ -2463,8 +2463,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   blocked. An empty result from your own query is "my query found nothing", never "no
   findings exist". Freshness is a SEPARATE gate, and it is NOT a blanket
   reviewed-SHA-equals-HEAD rule: for a hook-surface or otherwise non-trivial delta a
-  current Codex review must COVER head (reviews-API `commit_id == head`; a clean Codex
-  re-review COMMENT does not count, see the Pre-Merge Gate), but a trivial NON-hook delta may still merge on a stale
+  current Codex review must COVER head (reviews-API `commit_id == head`, or a clean
+  Codex signal whose abbreviated id RESOLVES to the head, see the Pre-Merge Gate),
+  but a trivial NON-hook delta may still merge on a stale
   review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
   since is trivial)`, a pass, not a block.
 
@@ -3777,17 +3778,30 @@ findings below, a gated `gh pr merge`:
   TOCTOU defense); the `--check-pr` command supplies this;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
-  **A clean re-review COMMENT does not satisfy this gate.** A *clean* Codex
-  re-review is posted as an ISSUE COMMENT ("Codex Review: Didn't find any major
-  issues. … **Reviewed commit:** `<sha>`"), not a review object, and it names the
-  commit only by an abbreviated id. An abbreviated id identifies no commit — the head
-  it would be compared with is whatever the branch's author pushed — so freshness
-  rests on the reviews API's full `commit_id` alone. The gate still READS the clean
-  comment and says so in its block message. When Codex's only word on the head is a
-  clean comment, the routes that work are an owner-approved `# substitute-review` on a
-  Devin or CodeRabbit review at that exact head, or a conscious
-  `# stale-review-override` (which on the hook surface also needs fallback evidence). (Until 2026-09-27 the gate accepted
-  a prefix match as freshness; that was reverted because the prefix binds nothing.)
+  **A clean Codex signal counts only when its id RESOLVES to the head.** Codex posts
+  NO review object when it finds nothing; its word on a clean head is a comment — a
+  clean re-review ("Codex Review: Didn't find any major issues. … **Reviewed
+  commit:** `<sha>`") or a `✅ Completed` Code Review row in its PR summary comment
+  (on PR open, often the only signal: #2418). Both name the commit by an ABBREVIATED
+  id, and a prefix that merely MATCHES the head binds nothing — the head is whatever
+  the branch's author pushed (#2487). So the gate resolves the id against the PR's
+  OWN commit list and accepts it only when it resolves UNIQUELY to a commit equal to
+  the head, the comment is the Codex Bot's, and no Codex review object (any state)
+  sits at the head, no Codex issue comment on the PR carries findings (Codex
+  usually files findings as a review object, but MEASURED on 2 of 339 PRs it posted
+  them as a `💡` issue comment with none), the comment is unedited or Codex-edited,
+  and the PR's history has never moved under it: ANY force-push, base change, base
+  force-push or head-branch restore on the PR refuses every clean signal on it, whenever
+  it happened (each can drop the reviewed commit from the list while a lookalike
+  sharing its short id, which is cheap to grind, stays). A second PR commit sharing
+  the prefix, a commit outside the PR, an unreadable or 250-capped commit list: all
+  block. The block message says which clean signal it read and why it was refused,
+  and when no later clean signal on the PR can count either (history moved, or a
+  findings comment sits on the PR) it says a finding-free re-review cannot help.
+  `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
+  the signal does not resolve, the routes are an owner-approved `# substitute-review`
+  on a Devin or CodeRabbit review at that exact head, or a conscious
+  `# stale-review-override` (which on the hook surface also needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
   substantiality) is provably review-trivial (docs-only / a small single-file
@@ -4079,8 +4093,9 @@ The review-findings gate specifically:
 4. **An ABSENT review BLOCKS — it does not merge on CI alone.**
    `_check_codex_reviewed_head` returns a block for `if not reviewed`, whatever
    the reason for the absence (quota, never triggered, still running). The only
-   things that clear it are a review object at head (a clean re-review COMMENT
-   does not count), a provably review-trivial delta since a stale review, a conscious
+   things that clear it are a review object at head, a clean Codex signal whose id
+   resolves uniquely to the head (see above), a provably review-trivial delta since a
+   stale review, a conscious
    `# stale-review-override` — except on a hook-surface PR, where that sigil also
    requires the exact base-and-head fallback-review evidence described above — or
    an owner-approved `# substitute-review` resting on a Devin or CodeRabbit review

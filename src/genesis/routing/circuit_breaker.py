@@ -394,6 +394,10 @@ class CircuitBreakerRegistry:
         # which every present essential site is blocked by configuration, which
         # is still coverage mode (nothing uncovered, so NORMAL).
         self._essential_sites = essential_sites
+        # Whether this registry manages coverage at all, fixed at construction.
+        # The map itself can be None after a reload whose config has no
+        # essential site, so it cannot stand in for this.
+        self._manages_coverage = essential_sites is not None
         self._breakers: dict[str, CircuitBreaker] = {}
         self.load_state()
 
@@ -717,8 +721,12 @@ class CircuitBreakerRegistry:
         standalone registry stays on the legacy check, as it was constructed.
         Without this, a map built while an overlay blocked every essential site
         (``{}``, coverage mode, NORMAL) would outlive the fix until a restart.
+
+        Keyed on the construction-time flag, not the current map: a reload with
+        no essential site stores None, and a check on the map would then ignore
+        every later reload, leaving the registry on the legacy check.
         """
-        if self._essential_sites is not None:
+        if self._manages_coverage:
             self._essential_sites = essential_sites
 
     def uncovered_essential_sites(self) -> list[str]:
