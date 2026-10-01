@@ -49,9 +49,17 @@
 # resurrect release-cut deletions, at exit 0, one last time. Verified 2026-09-21
 # on a synthetic repo: a branch with the attribute merged a commit deleting
 # lines inside a hunk the branch edited and removing the attribute — the deleted
-# lines returned, exit 0, no conflict. The remedy is the same one the last
-# paragraph names: after the merge, diff CHANGELOG.md against the base's and
-# restore the removals. Every merge after that first one is safe.
+# lines returned, exit 0, no conflict. Every merge after that first one is safe.
+#
+# A CLONE CAN CLOSE IT for all of its branches at once, before merging: add the
+# line `/CHANGELOG.md merge=text` to `.git/info/attributes`. That file outranks
+# every .gitattributes in the tree (gitattributes(5)) and lives in the shared git
+# directory, so every worktree of the clone sees it. Measured 2026-10-01, git
+# 2.43, on the synthetic repo above: the first catch-up merge then conflicts
+# (exit 1) instead of resurrecting, in the main worktree and in a linked one.
+# `text` is git's default for this file, so the line can stay. On a clone that
+# did not set it, the repair is after the fact: diff CHANGELOG.md against the
+# base's and restore the removals.
 #
 # SO: a CHANGELOG.md collision now CONFLICTS, visibly, and is resolved by hand —
 # which for a branch carrying an inline entry means taking the base's file and
