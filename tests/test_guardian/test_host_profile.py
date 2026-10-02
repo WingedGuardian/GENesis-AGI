@@ -278,4 +278,12 @@ class TestGatherHostProfile:
             "pool_name",
             "vg_name",
             "thinpool_lv",
+            # Relief's runway and LVM extend (revisited: both METRICS — the
+            # metadata LV grows under autoextend, and the profile is LVM
+            # identity like vg_name/thinpool_lv above).
+            "metadata_size_bytes",
+            "thinpool_profile",
+            # btrfs/dir identity (relief history + re-check): a METRIC like
+            # the LVM identity fields above.
+            "pool_source",
         }

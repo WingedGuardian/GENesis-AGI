@@ -5042,7 +5042,7 @@ async def test_error_result_overload_carries_the_real_turn_count(invoker):
     """Exit 0 with an is_error result: the classifier gets the result prose as
     text, but the status code and turn count come from the raw stdout result
     object — so the overload retry's replay guard sees the real turn count."""
-    from genesis.cc.exceptions import CCOverloadedError
+    from genesis.cc.exceptions import CCReplayUnsafeError
 
     result_line = json.dumps(
         {
@@ -5064,10 +5064,10 @@ async def test_error_result_overload_carries_the_real_turn_count(invoker):
 
     with (
         patch("asyncio.create_subprocess_exec", return_value=mock_proc),
-        pytest.raises(CCOverloadedError) as raised,
+        pytest.raises(CCReplayUnsafeError) as raised,
     ):
         await invoker.run(CCInvocation(prompt="hello"))
-    assert raised.value.num_turns == 6
+    assert raised.value.__cause__.num_turns == 6
 
 
 @pytest.mark.asyncio
@@ -5075,7 +5075,7 @@ async def test_streaming_error_result_overload_carries_the_real_turn_count(
     invoker,
     monkeypatch,
 ):
-    from genesis.cc.exceptions import CCOverloadedError
+    from genesis.cc.exceptions import CCReplayUnsafeError
 
     _no_host_syscalls(monkeypatch)
     ev = _error_result_event("API Error: 529 Overloaded. This is a server-side issue.")
@@ -5087,10 +5087,36 @@ async def test_streaming_error_result_overload_carries_the_real_turn_count(
 
     with (
         patch("asyncio.create_subprocess_exec", return_value=proc),
-        pytest.raises(CCOverloadedError) as raised,
+        pytest.raises(CCReplayUnsafeError) as raised,
     ):
         await invoker.run_streaming(CCInvocation(prompt="x"))
-    assert raised.value.num_turns == 9
+    assert raised.value.__cause__.num_turns == 9
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_error_result_preserves_mcp_evidence_from_actual_stderr(invoker, monkeypatch, streaming):
+    from genesis.cc.exceptions import CCReplayUnsafeError
+    from genesis.cc.peer_availability import mentions_mcp
+
+    _no_host_syscalls(monkeypatch)
+    ev = _error_result_event("API Error: 529 Overloaded")
+    ev.update(api_error_status=529, num_turns=1)
+    stderr = b"MCP backend returned 529"
+    if streaming:
+        proc = _streaming_proc(_make_stream_lines(ev))
+        proc.stderr = _make_mock_stderr(stderr)
+        proc.pid = 424207
+    else:
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(json.dumps(ev).encode(), stderr))
+        proc.returncode = 0
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCReplayUnsafeError) as raised,
+    ):
+        await _call(invoker, "run_streaming" if streaming else "run", CCInvocation(prompt="x"))
+    assert raised.value.__cause__.num_turns == 1
+    assert mentions_mcp(raised.value.__cause__)
 
 
 async def test_invocation_failed_emit_error_does_not_mask_original(monkeypatch, fail_bus):

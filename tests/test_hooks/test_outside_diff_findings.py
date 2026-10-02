@@ -4,7 +4,7 @@ When a finding's anchor line falls outside the PR's diff HUNKS, CodeRabbit
 cannot create an inline review comment for it and puts the finding in the
 review BODY instead, under an "Outside diff range comments" section. Neither
 existing scan read it: the inline scan reads ``pulls/N/comments`` (a different
-endpoint) and the review-body scan gates on ``_REVIEW_BOTS``, which does not
+endpoint) and the review-body scan gates on ``_review_bots()``, which does not
 contain CodeRabbit.
 
 MEASURED 2026-09-07 across all 84 then-open non-draft PRs: 27 deduped findings

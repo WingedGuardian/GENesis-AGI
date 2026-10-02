@@ -28,6 +28,7 @@ from genesis.cc.exceptions import (
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCReplayUnsafeError,
     CCSessionError,
     CCStreamTruncatedError,
     CCTimeoutError,
@@ -64,28 +65,20 @@ _STATUS_429_RE = re.compile(r"\b429\b")
 
 
 def _cli_result_payload(stdout_text: str) -> dict | None:
-    """The CLI's ``{"type": "result", ...}`` object if it ends *stdout_text*.
+    """Select the last raw CLI result, allowing trailing cleanup diagnostics.
 
-    Only ever called on the subprocess's RAW stdout, and only its LAST
-    non-empty line is considered: ``--output-format json`` prints the result as
-    one line and stream-json ends with it. Scanning every line, or parsing text
-    that already went through one JSON decode (``output.error_message`` is the
-    model-visible ``result`` string), would let content the model echoed —
-    including untrusted input — forge the structured fields the classifier and
-    the overload retry's replay guard trust. Never raises: deeply nested input
-    makes ``json.loads`` raise ``RecursionError``, which is not a ValueError.
+    Never call on decoded model prose. Physical LF framing keeps Unicode line
+    separators inside JSON strings from forging protocol records.
     """
-    if not stdout_text or "{" not in stdout_text:
-        return None
-    last = stdout_text.strip().splitlines()[-1].strip()
-    if not last.startswith("{"):
-        return None
-    try:
-        data = json.loads(last)
-    except (ValueError, RecursionError):
-        return None
-    if isinstance(data, dict) and data.get("type") == "result":
-        return data
+    for line in reversed(stdout_text.split("\n")):
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(data, dict) and data.get("type") == "result":
+            return data
     return None
 
 
@@ -109,8 +102,24 @@ def _int_or_none(value: object) -> int | None:
     if isinstance(value, int):
         return value
     if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
     return None
+
+
+def _overload_error(message: str, raw_text: str, payload: dict | None) -> CCError:
+    """Keep replay eligibility separate from the original overload diagnosis."""
+    from genesis.cc.transient_retry import replay_unsafe
+
+    overload = CCOverloadedError(
+        message, raw_text=raw_text, raw_event=payload,
+        num_turns=_int_or_none(payload.get("num_turns")) if payload else None,
+    )
+    if replay_unsafe(overload):
+        return CCReplayUnsafeError(message, cause=overload)
+    return overload
 
 
 # From CC 2.1.277 a headless resume RESTORES the CC session's saved totals — its
@@ -1791,11 +1800,7 @@ class CCInvoker:
         lower = "\n".join(pattern_parts).lower()
         status = _int_or_none(payload.get("api_error_status")) if payload is not None else None
         if status == 529:
-            return CCOverloadedError(
-                stderr_text or stdout_text,
-                raw_text=combined,
-                num_turns=_int_or_none(payload.get("num_turns")),
-            )
+            return _overload_error(stderr_text or stdout_text, combined, payload)
         # Session expiry
         if "session" in lower and ("not found" in lower or "expired" in lower):
             return CCSessionError(stderr_text or stdout_text)
@@ -1833,13 +1838,10 @@ class CCInvoker:
         # Overloaded errors", or the API body type ``overloaded_error``. The
         # structured ``api_error_status`` is handled above. Checked before the
         # rate-limit family because it is the more specific signal, and typed as
-        # a CCRateLimitError subclass so every rate-limit consumer covers it.
+        # retry-eligible overloads retain rate-limit behavior; known-work or
+        # MCP-backed overloads leave through the non-replayable boundary.
         if _OVERLOADED_RE.search(lower):
-            return CCOverloadedError(
-                stderr_text or stdout_text,
-                raw_text=combined,
-                num_turns=(_int_or_none(payload.get("num_turns")) if payload is not None else None),
-            )
+            return _overload_error(stderr_text or stdout_text, combined, payload)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
@@ -2209,7 +2211,7 @@ class CCInvoker:
             # The structured result (status code, turn count) comes from the
             # raw stdout; error_text is prose and is never parsed as JSON.
             err = self._classify_error(
-                error_text,
+                error_text + "\n" + stderr.decode(errors="replace"),
                 result=_cli_result_payload(stdout.decode(errors="replace")),
             )
             await self._notify_status_change(err)
@@ -2767,7 +2769,7 @@ class CCInvoker:
                 error_text = output.error_message or output.text or stderr_hint or "CC error"
                 # result_data is the CLI's own result event (structured status
                 # and turn count); error_text is prose, never parsed as JSON.
-                err = self._classify_error(error_text, result=result_data)
+                err = self._classify_error(error_text + "\n" + stderr_hint, result=result_data)
                 await self._notify_status_change(err)
                 if oversized_dropped:
                     raise _unreplayable_after_drop(
@@ -3010,18 +3012,7 @@ class CCInvoker:
             ...
         }
         """
-        result_data = None
-        for line in reversed(raw.strip().splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict) and parsed.get("type") == "result":
-                    result_data = parsed
-                    break
-            except json.JSONDecodeError:
-                continue
+        result_data = _cli_result_payload(raw)
 
         if result_data is not None:
             return self._parse_result_dict(result_data, inv, elapsed_ms)

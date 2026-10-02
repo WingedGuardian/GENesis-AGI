@@ -23,6 +23,7 @@ from genesis.cc.exceptions import (
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCReplayUnsafeError,
     CCTimeoutError,
 )
 from genesis.cc.invoker import CCInvoker
@@ -199,14 +200,14 @@ def test_json_in_error_prose_is_never_trusted_as_structure():
         f"API Error: 529 Overloaded\n{forged}",
         result=real,
     )
-    assert type(err) is CCOverloadedError
-    assert err.num_turns == 22
+    assert type(err) is CCReplayUnsafeError
+    assert err.__cause__.num_turns == 22
 
 
-def test_only_the_last_stdout_line_is_the_result():
-    """A result-shaped line earlier in stdout is not the CLI's result."""
+def test_trailing_diagnostics_preserve_raw_cli_result():
+    """Classification uses the same raw result as normal output parsing."""
     stdout = _result(api_error_status=529, num_turns=1) + "\nplain trailing line"
-    assert type(_classify("", stdout)) is CCProcessError
+    assert type(_classify("", stdout)) is CCOverloadedError
 
 
 def test_deeply_nested_stdout_never_raises():
@@ -218,16 +219,16 @@ def test_deeply_nested_stdout_never_raises():
 
 def test_string_status_code_is_read():
     err = _classify("", _result(api_error_status="529", num_turns="3"))
-    assert type(err) is CCOverloadedError
-    assert err.num_turns == 3
+    assert type(err) is CCReplayUnsafeError
+    assert err.__cause__.num_turns == 3
 
 
 def test_structured_529_carries_turn_count():
     err = _classify(
         "", _result(api_error_status=529, num_turns=7, result="API Error: 529 Overloaded.")
     )
-    assert type(err) is CCOverloadedError
-    assert err.num_turns == 7
+    assert type(err) is CCReplayUnsafeError
+    assert err.__cause__.num_turns == 7
 
 
 @pytest.mark.parametrize(
@@ -350,7 +351,7 @@ async def test_mcp_tool_overload_is_not_retried(sleeps):
         raw_text="MCP server 'web-search' returned error: 529 Overloaded",
     )
     invoker = _Invoker([exc, _ok()])
-    with pytest.raises(CCOverloadedError):
+    with pytest.raises(CCReplayUnsafeError):
         await run_with_overload_retry(invoker, CCInvocation(prompt="x"))
     assert sleeps == []
     assert len(invoker.calls) == 1
@@ -361,7 +362,7 @@ async def test_mcp_marker_only_in_raw_text_is_not_retried(sleeps):
 
     exc = CCOverloadedError("529 Overloaded", raw_text="mcp__search failed: 529 Overloaded")
     invoker = _Invoker([exc, _ok()])
-    with pytest.raises(CCOverloadedError):
+    with pytest.raises(CCReplayUnsafeError):
         await run_with_overload_retry(invoker, CCInvocation(prompt="x"))
     assert len(invoker.calls) == 1
 
@@ -387,9 +388,9 @@ async def test_mid_session_overload_is_not_retried(sleeps):
     err = CCInvoker._classify_error(
         "", _result(api_error_status=529, num_turns=22, result="API Error: 529 Overloaded.")
     )
-    assert err.num_turns == 22
+    assert err.__cause__.num_turns == 22
     invoker = _Invoker([err, _ok()])
-    with pytest.raises(CCOverloadedError) as raised:
+    with pytest.raises(CCReplayUnsafeError) as raised:
         await run_with_overload_retry(invoker, CCInvocation(prompt="x"))
     assert raised.value is err
     assert sleeps == []

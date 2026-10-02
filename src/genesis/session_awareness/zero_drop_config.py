@@ -68,11 +68,16 @@ DEFAULTS: dict[str, Any] = {
     # Consecutive COMPLETED sweeps before a finding is marked escalated.
     # Escalation is visibility only; nothing auto-acts on it.
     "escalation_k": 3,
-    # gh --limit for the full PR history join. MEASURED 2026-09-05: 1651 PRs
-    # returned in one 6s call, so this covers the whole repo with headroom;
-    # n == limit records a loud 'limit_hit' and FREEZES the branch classes
-    # rather than guessing at the tail.
-    "max_prs": 2000,
+    # gh --limit for the full PR history join: a CEILING, not a cost. gh pages
+    # until the PRs run out, so a limit far above the repository's size reads
+    # the whole history for the same time as an exact one (MEASURED 2026-10-01,
+    # 2044 PRs: --limit 2000 took 8s and truncated, --limit 100000 took 9s and
+    # returned all 2044). A cap the repository can outgrow froze the branch
+    # classes on every sweep once it did (2000 against 2044, #2770). n == limit
+    # still records a loud 'limit_hit' and FREEZES the branch classes rather
+    # than guessing at the tail. The bound that matters next is gh's per-call
+    # timeout in repo_pulse_gh (~4ms a row measured, so several thousand PRs).
+    "max_prs": 100000,
     # Local ancestry probes per sweep, testing a branch tip against the head
     # SHA its merged/closed PR recorded. Each is one local `merge-base` on two
     # resolved commits. MEASURED 2026-09-06: 4 needed on this install (217

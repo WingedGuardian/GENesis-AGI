@@ -1554,12 +1554,10 @@ async def test_exhausted_overload_does_not_burn_a_retry(
 
 
 @pytest.mark.asyncio
-async def test_mid_session_overload_spends_a_retry(
+async def test_mid_session_overload_is_held_across_scans(
     db, inbox_dir, mock_invoker, mock_session_manager,
 ):
-    """An overload after the session already did work is not re-run in-call,
-    and it spends the item's retry budget: otherwise the retry lane would
-    replay that work every scan for as long as overloads continue."""
+    """Known-work overloads are held, not replayed on the next scan."""
     from genesis.cc.exceptions import CCOverloadedError
 
     mock_invoker.run.side_effect = CCOverloadedError("529 Overloaded", num_turns=5)
@@ -1569,9 +1567,148 @@ async def test_mid_session_overload_spends_a_retry(
     await mon.check_once()
     assert mock_invoker.run.call_count == 1, "replay-unsafe: no in-call retry"
     rows = await (await db.execute(
-        "SELECT status, retry_count FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
+        "SELECT status, retry_count, error_message FROM inbox_items WHERE file_path LIKE '%Genesis.md'"
     )).fetchall()
-    assert len(rows) == 1 and rows[0]["retry_count"] == 1, [dict(r) for r in rows]
+    assert len(rows) == 1 and rows[0]["retry_count"] == 0, [dict(r) for r in rows]
+    assert rows[0]["error_message"].startswith(inbox_items.REPLAY_UNSAFE_PREFIX)
+    await mon.check_once()
+    assert mock_invoker.run.call_count == 1, "no replay on subsequent scan"
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=100) == []
+
+
+@pytest.mark.asyncio
+async def test_replay_hold_survives_session_bookkeeping_failure(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    from genesis.cc.exceptions import CCOverloadedError
+
+    mock_invoker.run.side_effect = CCOverloadedError("529", num_turns=5)
+    mock_session_manager.fail.side_effect = RuntimeError("session write failed")
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager, max_retries=100)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/held\n")
+    await mon.check_once()
+    row = await (await db.execute("SELECT * FROM inbox_items")).fetchone()
+    assert row["status"] == "failed"
+    assert row["error_message"].startswith(inbox_items.REPLAY_UNSAFE_PREFIX)
+    await mon.check_once()
+    assert mock_invoker.run.await_count == 1
+    assert await inbox_items.get_retriable_failure_files(db, max_retries=100) == []
+
+
+@pytest.mark.asyncio
+async def test_replay_hold_real_db_pipeline_e2e(inbox_dir, tmp_path, monkeypatch):
+    """Real DB/session/writer wiring; CLI output controlled, no external calls."""
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from genesis.cc.exceptions import CCOverloadedError
+    from genesis.cc.session_manager import SessionManager
+    from genesis.inbox.replay_hold import operate
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "runtime"))
+    path = tmp_path / "runtime" / "genesis.db"
+    path.parent.mkdir()
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = aiosqlite.Row
+    await create_all_tables(conn)
+    try:
+        invoker = AsyncMock()
+        invoker.run.side_effect = CCOverloadedError("529", num_turns=5)
+        sm = SessionManager(db=conn, invoker=invoker, day_boundary_hour=0)
+        monitor = _monitor(conn, inbox_dir, invoker, sm, tmp_path, items_per_eval=1)
+        monitor._config = replace(monitor._config, url_coverage_mode="enforce")
+        source = inbox_dir / "Genesis.md"
+        original = "https://example.com/held"
+        source.write_text(original + "\n")
+        await monitor.check_once()
+        rows = await (await conn.execute("SELECT * FROM inbox_items")).fetchall()
+        held_id = rows[0]["id"]
+        assert rows[0]["error_message"].startswith(inbox_items.REPLAY_UNSAFE_PREFIX)
+        assert await inbox_items.get_evaluated_content(conn, str(source)) is None
+        monitor._config = replace(monitor._config, max_retries=100)
+        await monitor.check_once()
+        assert invoker.run.await_count == 1
+        source.write_text(original + "\n\nhttps://example.com/new\n")
+        monitor._clock.now += timedelta(seconds=1)
+        invoker.run.side_effect = None
+        invoker.run.return_value = _ok("# Evaluation\n**Source:** <https://example.com/new>\nNew item evaluated.")
+        await monitor.check_once()
+        assert invoker.run.await_count == 2
+        assert "example.com/held" not in invoker.run.call_args.args[0].prompt
+        baseline = await inbox_items.get_evaluated_content(conn, str(source))
+        assert "example.com/new" in baseline and original not in baseline
+        with pytest.raises(ValueError, match="changed"):
+            await operate(path, held_id, release=True, acknowledge=True)
+        source.write_text(original + "\n")
+        monitor._clock.now += timedelta(seconds=1)
+        assert "No work dispatched" in await operate(path, held_id, release=True, acknowledge=True)
+        invoker.run.return_value = _ok(f"# Evaluation\n**Source:** <{original}>\nHeld item evaluated.")
+        monitor._autonomous_dispatcher = _wired(
+            decision=AutonomousDispatchDecision(mode="cli", reason="approved"),
+        )
+        await monitor.check_once()
+        assert invoker.run.await_count == 3
+        assert monitor._autonomous_dispatcher.route.call_count == 1
+        assert (await inbox_items.get_by_id(conn, held_id))["status"] == "completed"
+        assert original in await inbox_items.get_evaluated_content(conn, str(source))
+        statuses = await (await conn.execute("SELECT status FROM cc_sessions")).fetchall()
+        assert sorted(row[0] for row in statuses) == ["completed", "completed", "failed"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_opaque_hold_blocks_edited_file_but_not_unrelated_file(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
+):
+    from genesis.inbox.scanner import compute_hash
+
+    source = inbox_dir / "Genesis.md"
+    source.write_text("https://example.com/old\n")
+    await inbox_items.create(
+        db, id="opaque", file_path=str(source), content_hash=compute_hash(source),
+        status="failed", created_at="2026-06-30T11:00:00+00:00",
+        error_message="replay_unsafe: lost boundaries", batch_items="inbox-items-v2:{broken",
+    )
+    source.write_text("https://example.com/old\n\nhttps://example.com/added\n")
+    other = inbox_dir / "Capabilities.md"
+    other.write_text("https://example.com/unrelated\n")
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    await mon.check_once()
+    assert mock_invoker.run.await_count == 1
+    assert "example.com/unrelated" in mock_invoker.run.call_args.args[0].prompt
+    assert "example.com/old" not in mock_invoker.run.call_args.args[0].prompt
+    assert await inbox_items.get_evaluated_content(db, str(source)) is None
+    await mon.check_once()
+    assert mock_invoker.run.await_count == 1
+    assert (await inbox_items.get_by_id(db, "opaque"))["error_message"].startswith("replay_unsafe:")
+
+
+@pytest.mark.asyncio
+async def test_queue_drop_losing_reuse_cas_does_not_append_or_create_fallback(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
+):
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path)
+    source = str(inbox_dir / "Genesis.md")
+    await inbox_items.create(
+        db, id="raced", file_path=source, content_hash="old", status="failed",
+        created_at="2026-06-30T11:00:00+00:00", error_message="ordinary failure",
+    )
+    real_reuse = inbox_items.reuse_as_pending
+
+    async def racing_reuse(conn, item_id, **kwargs):
+        await conn.execute("UPDATE inbox_items SET error_message='replay_unsafe: raced' WHERE id=?", (item_id,))
+        await conn.commit()
+        return await real_reuse(conn, item_id, **kwargs)
+
+    monkeypatch.setattr(inbox_items, "reuse_as_pending", racing_reuse)
+    pending = []
+    await mon._queue_drop(source, "https://example.com/a", "new", mon._clock().isoformat(), pending)
+    assert pending == []
+    assert (await (await db.execute("SELECT COUNT(*) FROM inbox_items")).fetchone())[0] == 1
+    row = await inbox_items.get_by_id(db, "raced")
+    assert row["status"] == "failed" and row["content_hash"] == "old"
+    assert row["error_message"] == "replay_unsafe: raced"
 
 
 @pytest.mark.asyncio

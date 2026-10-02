@@ -1418,6 +1418,30 @@ def test_check_pr_report_includes_scheduled_line_ok(monkeypatch, capsys):
     assert rc == 0
 
 
+@pytest.mark.parametrize(
+    "result, shown",
+    [
+        (
+            {"status": "ok", "count": 5, "gate_surface": False, "rounds": [], "legacy_heads": 0},
+            "PAST TERMINAL",
+        ),
+        ({"status": "unknown", "errors": ["graphql_unreadable"]}, "unreadable (graphql_unreadable)"),
+    ],
+)
+def test_the_rounds_row_is_advisory_and_never_moves_the_verdict(monkeypatch, capsys, result, shown):
+    """Past-terminal and unreadable rounds still leave an otherwise green report
+    green: the round budget is enforced where it acts (the review-request ask and
+    the commit gate), never a second time here."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.delenv("_TEST_ROUNDS_ROW", raising=False)
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **k: result)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    row = next(ln for ln in out.splitlines() if ln.startswith("rounds"))
+    assert shown in row
+    assert rc == 0, out
+
+
 def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     """An absent scheduled review is a FAILURE line and flips the report's verdict —
     the report must not diverge from the always-fail-closed enforcement gate."""
@@ -1644,6 +1668,25 @@ def test_substitute_review_proceeds_with_a_note_and_no_prompt(monkeypatch, capsy
     assert not _asked(captured.out), "the stand-in still raised a permission prompt"
     assert "devin-ai-integration[bot]" in captured.err and HEAD[:12] in captured.err
     assert "stands in for Codex" in captured.err
+    assert "format unknown" not in captured.err  # a known format reads as before
+
+
+def test_an_unknown_format_stand_in_is_named_as_unscored_at_merge(monkeypatch, capsys):
+    """Informed consent: the merge NOTE says when nothing scores the stand-in's
+    findings yet."""
+    rc = _run(
+        monkeypatch,
+        _merge_cmd(trailer="# substitute-review"),
+        reviews=json.dumps(
+            {"login": "acme-review[bot]", "commit_id": HEAD, "state": "COMMENTED", "has_body": True}
+        ),
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert (
+        f"{HEAD[:12]}; acme-review[bot] (format unknown: its findings are not scored yet) "
+        f"reviewed that exact head"
+    ) in captured.err
 
 
 def test_substitute_review_is_refused_in_a_dispatched_session(monkeypatch, capsys):
@@ -1667,7 +1710,7 @@ def test_substitute_review_without_a_review_at_head_still_blocks(monkeypatch, ca
     )
     err = capsys.readouterr().err
     assert rc == 2
-    assert "no Devin or CodeRabbit review at head" in err
+    assert "no other reviewer's review at head" in err
 
 
 def test_a_body_less_record_at_head_does_not_substitute(monkeypatch, capsys):
@@ -1680,7 +1723,7 @@ def test_a_body_less_record_at_head_does_not_substitute(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert rc == 2, "a thread-reply wrapper stood in for a review of the head"
     assert not _asked(captured.out)
-    assert "no Devin or CodeRabbit review at head" in captured.err
+    assert "no other reviewer's review at head" in captured.err
 
 
 def test_without_the_sigil_a_substitute_review_changes_nothing(monkeypatch, capsys):

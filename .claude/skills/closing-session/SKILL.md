@@ -321,10 +321,13 @@ GitHub failure by retargeting a PR that was fine.
 | `pin-receipts` | `BLOCK` | Moves the CC pin without its receipts. The detail lines name what is missing. |
 | `codex-at-head` | `BLOCK` | Covers BOTH "no Codex review found" and "review is stale" — they are different situations with the same remedy shape. The detail lines say which, and carry the `git log <reviewed>..<head>` command. Push any pending fix, comment `@codex review`, wait. |
 | `codex-at-head` | `ok (STALE review of <sha>, delta since is trivial)` | A **PASS**, not a block — the delta since the review is trivial. **Except on the hook surface**, which gets no leniency at all. |
-| `codex-at-head` | `ok (freshness label unverified — re-read failed)` | **The one to watch.** It says `ok`, but the report is explicitly declining to assert the head was reviewed — the re-read failed. The gate passed; the claim did not. Re-run before treating freshness as established. |
-| `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: Codex said it finished clean at this head (a clean re-review comment, or a Completed row in its PR summary), the comment's short id resolves uniquely to the head among the PR's own commits, no Codex issue comment on the PR carries findings, the comment is unedited or edited only by Codex (it rewrites its summary in place, so the normal summary pass is Codex-edited), and the PR has no force-push, base change, base force-push or branch restore. The merge stays bound to this head. |
-| `codex-at-head` | `BLOCK` with a `NOTE: Codex's clean <comment\|summary> naming commit … was read but not accepted` line | Codex's clean signal was seen but did not qualify; the note says why. If it also says a finding-free re-review **cannot clear this block** (the PR's history moved, or a Codex findings comment sits on it), do not re-request Codex expecting a clean pass. Either way: if a Devin or CodeRabbit review exists at the exact head, ask the owner and merge with `# substitute-review`. |
-| `codex-at-head` | `BLOCK — … — substitute available: <reviewer> reviewed this head` | Codex has not covered the head, but Devin or CodeRabbit has. Ask the owner in conversation first; with their yes, merge with `# substitute-review`, which records it. The gate keeps the base check and the head binding and refuses in a dispatched session. Asking is not optional, and the gate cannot check that you did, so the obligation is yours. |
+| `codex-at-head` | `ok (STALE review of <sha>, base-advance delta inline)` | A **PASS**: the branch contribution is unchanged and the base supplied the inline delta. The merge remains bound to the verified head. |
+| `codex-at-head` | `ok (freshness label unverified — pass reason not recorded)` | The gate passed, but the report has no pass record for the verified head and will not invent a freshness reason. Re-run before treating freshness as established. |
+| `codex-at-head` | `ok (<gate pass reason>); HEAD MOVED to <sha> after the gate verified <sha> — merge-with stays bound to <sha>, so GitHub will refuse it` | The later head is reported without relabeling the original pass. The printed merge command remains pinned to the gate-verified head; GitHub rejects it rather than merging the newer head. |
+| `codex-at-head` | `ok (<gate pass reason>); verified at <sha>, the current head could not be re-read` | The gate passed for the shown head, but the report could not check whether it moved afterward. Re-run before treating the current head as established. |
+| `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: the clean signal's abbreviated id resolves repo-wide through `commits/{short}` to exactly the head; a 422 for an ambiguous or unknown id refuses it. A matching head is the PR's commit. No Codex review object at head or Codex findings comment may contradict it, and any non-Codex edit or deleted edit revision on any Codex Bot comment permanently refuses the signal (the editor is named when available); unrelated comments' edit data is ignored. History veto covers head force-push, head-branch delete or restore, and base changes. A base change stays a veto because the signal names the head, not the base Codex reviewed against; retargeting changes the effective diff without moving the head. A base force-push is retired: merging requires the default base, whose ruleset forbids force-push and deletion, so a force-pushed non-default base can reach a merge only through a base change, which vetoes. The 541 commits dropped by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits are not the binding risk. A branch/tag named exactly after the short id can shadow GitHub lookup, but creating one needs base-repo push rights (held only by the owner), and no hex-named ref exists. A deleted comment leaves no API trace. The report uses the gate's own pass record, and merge-with stays bound to the verified head. |
+| `codex-at-head` | `BLOCK` with a `NOTE: Codex's clean <comment\|summary> naming commit … was read but not accepted` line | Codex's clean signal was seen but did not qualify; the note says why. If it also says a finding-free re-review **cannot clear this block** (the PR's history moved, or a Codex findings comment sits on it), do not re-request Codex expecting a clean pass. Either way: if another reviewer's review exists at the exact head, ask the owner and merge with `# substitute-review`. |
+| `codex-at-head` | `BLOCK — … — substitute available: <reviewer> reviewed this head` | Codex has not covered the head, but another reviewer has (any GitHub App reviewer except the PR's own workflow bot and CodeQL). Ask the owner in conversation first; with their yes, merge with `# substitute-review`, which records it. The gate keeps the base check and the head binding and refuses in a dispatched session. Asking is not optional, and the gate cannot check that you did, so the obligation is yours. |
 | `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. |
 | `scheduled-claude` | `n/a (scoped to the public repo only)` | Neither pass nor block — the gate does not apply to this repo. |
 | `scheduled-claude` | `ok (<kind> carried from <anc>, <check> green at head)` | A pass on a CARRIED-FORWARD review. It is not a review made at head; do not describe it as one. |
@@ -366,15 +369,17 @@ unanswered finding blocks the gate even when the code is already fixed —
 observed on PR #1541. A reasoned rejection is a valid resolution; silence is not.
 
 **The round budget is evaluated BEFORE dispatching the next review**, never
-after reading its findings. A ROUND is one of GitHub's distinct reviewed heads
-on the PR — that word is reserved for it. Your own internal subagent audits are
+after reading its findings. A ROUND is a distinct head on the PR that drew
+findings from a GitHub App reviewer (before the cutover in
+`scripts/review_budget.py`, a head Codex reviewed) — that word is reserved for it;
+a clean review confirms a head and adds no round. Your own internal subagent audits are
 AUDIT PASSES: they advance nothing, and no counter sees them, so never report a
 round number you did not get from `scripts/review_budget.py`. Reaching the
 budget CONSUMES standing approval — a prior "keep going until it's green" is
 void once it fires. Post the round ledger and get a fresh decision.
 
 **ROUND 4 IS TERMINAL** (owner ruling, 2026-09-25). There is no ordinary round
-5. At four reviewed heads the decision is not "another round": it is to MERGE
+5. At four rounds the decision is not "another round": it is to MERGE
 with the outstanding issues accepted and filed, or to SEND IT BACK for rework. A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way. On the gate-surface lane the same
@@ -384,10 +389,10 @@ Two caveats a closing session needs, because both are live today. The MECHANISM
 still permits round 5+ under per-request approval — aligning it is tracked work,
 so until then this paragraph and the approval prompts are what carry the rule.
 And a SECOND, local non-convergence streak (cap 3) exists alongside the
-reviewed-head budget. They are independent gates: the streak's cap-3 hard
-stop blocks commits whatever the reviewed-head count, and the reviewed-head
+round budget. They are independent gates: the streak's cap-3 hard
+stop blocks commits whatever the round count, and the round
 budget gates review requests and fix commits whatever the streak. Neither
-overrides the other; only the reviewed heads are numbered as rounds.
+overrides the other; only the budget's rounds are numbered as rounds.
 
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.

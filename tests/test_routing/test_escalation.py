@@ -297,7 +297,7 @@ class TestTaskFailureReporting:
     ):
         captured = self._capture(event_bus)
 
-        async def _boom(provider):
+        async def _boom(provider, incident_identity=None):
             raise RuntimeError("resolve exploded")
 
         monkeypatch.setattr(escalation, "_resolve_observation", _boom)

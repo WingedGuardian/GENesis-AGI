@@ -23,13 +23,16 @@ arrived after the session already made tool calls would repeat them (the same
 risk every other lane that re-runs a CC session carries). Two cases are
 therefore NOT retried: a CLI result reporting more than one turn (tool
 round-trips already happened), and an overload carrying MCP evidence (a tool's
-own backend answering 529, not the provider's capacity). Residual risk: an
-overload reported with no turn count is assumed to be pre-work. The turn count
-comes only from the CLI's result object on the LAST line of raw stdout, so if a
-CLI build ever reports a mid-session 529 as plain text with no result object,
-or prints something after the result line, that case would still be re-run.
-Callers that keep their own retry budget use :func:`replay_unsafe` to decide
-whether an exhausted overload should spend it.
+own backend answering 529, not the provider's capacity). Classification wraps
+these cases in ``CCReplayUnsafeError`` so downstream recovery, failover and
+durable parking cannot replay them either. The helper also wraps legacy
+``CCOverloadedError`` instances carrying either signal. Inbox failures persist
+a replay hold rather than spending a retry or advancing the completed baseline.
+
+Accepted residual risk: missing or unusable turn counts remain retryable; this
+is NOT proof that no work ran. Counts come from the last CLI result event in
+raw stdout, even with trailing diagnostic lines, never from decoded result
+prose. Plain-text overloads without a result event can therefore replay work.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Protocol
 
-from genesis.cc.exceptions import CCOverloadedError
+from genesis.cc.exceptions import CCOverloadedError, CCReplayUnsafeError
 
 if TYPE_CHECKING:
     from genesis.cc.types import CCInvocation, CCOutput
@@ -68,8 +71,8 @@ def replay_unsafe(exc: CCOverloadedError) -> bool:
     * the error carries MCP evidence — a tool's own backend answering 529 inside
       the session, which is not the provider's capacity at all.
 
-    An overload with no turn count (plain stderr text) is treated as a failure
-    before any work, which is what the CLI reports for a first-turn 529.
+    Missing or unusable turn counts are retryable by policy, not evidence that
+    no work occurred. A first-turn count likewise is not an exactly-once guarantee.
     """
     from genesis.cc.peer_availability import mentions_mcp
 
@@ -94,7 +97,9 @@ async def run_with_overload_retry(
         try:
             return await invoker.run(invocation)
         except CCOverloadedError as exc:
-            if attempt >= len(OVERLOAD_RETRY_DELAYS_S) or replay_unsafe(exc):
+            if replay_unsafe(exc):
+                raise CCReplayUnsafeError(str(exc), cause=exc) from exc
+            if attempt >= len(OVERLOAD_RETRY_DELAYS_S):
                 raise
             delay = OVERLOAD_RETRY_DELAYS_S[attempt]
             attempt += 1

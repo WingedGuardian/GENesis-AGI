@@ -734,7 +734,11 @@ def test_a_held_breaker_survives_a_rename_across_a_HOT_RELOAD(tmp_path):
 
     assert legacy not in reg._breakers, "the stale key kept the breaker"
     moved = reg._breakers.get(current)
-    assert moved is cb, "a NEW breaker was created instead of moving the live one"
+    # The hold survives on a rebound object; in-flight old requests retain cb.
+    assert moved is not cb
+    assert moved._provider.name == current
+    assert cb._on_recovery is None
+    assert cb._on_state_change is None
     assert moved._state is ProviderState.OPEN
     assert moved._trip_count == 2
 

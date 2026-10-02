@@ -6,7 +6,12 @@ import uuid
 from datetime import UTC, datetime
 
 from genesis.db.crud import observations
-from genesis.memory.provenance import ORIGIN_FIRST_PARTY, session_origin_from_env
+from genesis.memory.provenance import (
+    ORIGIN_FIRST_PARTY,
+    ORIGIN_OWNER,
+    namespace_untrusted_observation,
+    session_origin_from_env,
+)
 
 from ..memory import mcp
 
@@ -49,10 +54,21 @@ async def observation_write(
     Returns the new observation_id, or ``"duplicate_skipped"`` when an unresolved
     observation with the same source, identical content and the same writer
     origin already exists.
+
+    From a session running over untrusted content, the row is stored with
+    ``untrusted:`` in front of its type, source and category, and ``critical``
+    priority becomes ``high`` (``provenance.namespace_untrusted_observation``),
+    so it can never pass for one of Genesis's own pipeline rows. It keeps its
+    original type's lifetime, but is never kept permanently.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
+    origin = session_origin_from_env() or ORIGIN_FIRST_PARTY
+    if origin not in (ORIGIN_OWNER, ORIGIN_FIRST_PARTY):
+        source, type, category, priority = namespace_untrusted_observation(
+            source=source, type_=type, category=category, priority=priority,
+        )
     result = await observations.create(
         memory_mod._db,
         id=str(uuid.uuid4()),
@@ -70,7 +86,7 @@ async def observation_write(
         # first-party "by omission" and slip past the user-model consumer gate.
         # Coalesce None → first_party (server/foreground writers); the gate
         # normalizes adversarially, so a raw None must never be forwarded.
-        origin_class=session_origin_from_env() or ORIGIN_FIRST_PARTY,
+        origin_class=origin,
         skip_if_duplicate=True,
     )
     return result or "duplicate_skipped"

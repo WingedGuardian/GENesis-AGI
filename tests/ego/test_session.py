@@ -201,6 +201,71 @@ class TestUnifiedCycle:
         focus = await ego_crud.get_state(db, "ego_focus_summary")
         assert focus == "general system awareness"
 
+    async def test_previous_assessment_read_scoped_to_own_ego(
+        self, ego_session, mock_compaction,
+    ):
+        """The context read is scoped by the same tag the cycle is stored under.
+
+        Two egos share ego_cycles; if the read and the write disagree on the
+        tag, an ego is handed the other ego's previous assessment (#2695).
+        """
+        await ego_session.run_unified_cycle([_make_signal()])
+
+        read_tag = mock_compaction.assemble_context.call_args.kwargs.get("ego_source")
+        stored = mock_compaction.store_cycle.call_args.args[0]
+        assert read_tag
+        assert read_tag == stored.ego_source
+
+    async def test_recent_focuses_scoped_to_own_ego(self, ego_session, db):
+        """The focus selector's "recent focuses" are this ego's, not the other's.
+
+        Same class as #2695: ego_cycle_outcomes is shared by both egos, so an
+        unscoped read tells each ego to avoid repeating the OTHER ego's picks.
+        """
+        # ego_cycle_outcomes is created by a migration, not in TABLES.
+        await db.execute(
+            "CREATE TABLE ego_cycle_outcomes ("
+            " cycle_id TEXT PRIMARY KEY, focus_type TEXT NOT NULL,"
+            " focus_id TEXT, num_proposals INTEGER DEFAULT 0,"
+            " num_dispatches INTEGER DEFAULT 0, assessment TEXT,"
+            " signals_consumed TEXT, perception_rationale TEXT,"
+            " perceive_cost_usd REAL DEFAULT 0.0, created_at TEXT NOT NULL)"
+        )
+        own = ego_session._source_tag
+        # Two own outcomes, then five newer ones from the other ego: the
+        # other ego fills the selector's whole limit=5 window, so only a
+        # read scoped BEFORE the limit sees this ego's rows at all.
+        sources = [own, own] + ["other_ego_cycle"] * 5
+        for i, src in enumerate(sources):
+            cid = f"c{i}"
+            ts = f"2026-09-0{i + 1}T10:00:00+00:00"
+            await ego_crud.create_cycle(
+                db, id=cid, output_text="x", created_at=ts, ego_source=src,
+            )
+            await ego_crud.create_cycle_outcome(
+                db, cycle_id=cid, focus_type="proactive",
+                perception_rationale=f"rationale-{src}-{i}",
+            )
+            await db.execute(
+                "UPDATE ego_cycle_outcomes SET created_at = ? WHERE cycle_id = ?",
+                (ts, cid),
+            )
+        await db.commit()
+
+        seen: list[list[dict]] = []
+
+        class _Selector:
+            async def select(self, signals, recent_focuses):
+                seen.append(recent_focuses)
+                return None
+
+        ego_session._focus_selector = _Selector()
+        await ego_session._perceive([_make_signal()])
+
+        assert len(seen) == 1
+        rationales = [rf["rationale"] for rf in seen[0]]
+        assert rationales == [f"rationale-{own}-1", f"rationale-{own}-0"]
+
     async def test_no_proposals(
         self, ego_session, mock_invoker, mock_proposal_workflow,
     ):

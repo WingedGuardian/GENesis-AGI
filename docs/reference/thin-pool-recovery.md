@@ -128,6 +128,64 @@ single check can spend up to the diagnosis timeout (an hour by default) in
 diagnosis, so relief then runs about once an hour. The container is down then,
 so the pool is barely growing.
 
+### 3. Early relief (from the measured growth)
+
+The reserve is a floor. Relief also keeps a pool history
+(`pool_history.jsonl` in the Guardian state dir: one sample every 5 minutes,
+7 days kept) and acts EARLY when the measured growth would fill data or
+metadata within `early_horizon_hours` (default 48). Growth is measured in
+bytes, so an extend of either LV never reads as shrinkage. A rate is growth
+that shows in both halves of a window (2h, 6h, 24h or 72h), so a single
+one-off step (a backup, a new snapshot's metadata jump) is not a rate; two
+steps that land in the two halves of one window do read as one. A rise across
+a gap between samples of more than 30 minutes (or three sample intervals, if
+longer), such as an outage's slow checks, counts on its own. Growth that
+started less than about an hour ago is not a rate yet, and reads low for a
+while after; the reserve covers it.
+
+Early relief has less authority than the reserve. It deletes, one per pass,
+in the same order: pre-recovery snapshots, superseded healthy ones, and the
+rollback snapshot only once it is older than `lifeline_max_age_hours`
+(default 48; an old one has diverged the most) AND, on LVM, only when LVM
+measures that the rollback snapshots hold space no live volume maps (the same
+evidence delete-first rotation uses; on btrfs/dir age alone decides). A
+younger rollback snapshot is only ever deleted at the reserve. When early
+relief has nothing it may delete, it sends a WARNING ("nothing the guardian
+may free yet") at most once per `storage_pool.realert_hours`. Its alerts are
+WARNINGs, except that deleting the rollback snapshot is CRITICAL at either
+level. `early_horizon_hours: 0` turns it off. An invalid value in any of these
+keys turns off early relief and the extend only (a daily WARNING, "Early pool
+relief off"); the reserve and delete-first rotation keep running.
+
+### 4. Partial extend (LVM only)
+
+LVM's autoextend refuses to extend at all when the volume group cannot supply
+a whole 20% step, which is what left 3.9 GB of VG free unused in the incident.
+Relief uses autoextend's own trigger, not the growth estimate (a thin pool
+cannot shrink): when the pool carries the `genesis-thinpool` profile (the
+install's opt-in), data is at or above 80%, VG free is less than one 20% step,
+and metadata is not short (at its reserve or by its growth), it grows the pool
+by the VG free space minus `extend_keep_free_mib` (default 512 MiB, or twice
+the metadata LV if larger), in whole extents, at least 1 GiB. That comes
+before deleting anything that pass, and sends a CRITICAL alert. Afterwards VG
+free is down to that keep, so it does not extend again until space is added.
+The pool is re-measured and the extend re-planned immediately before
+`lvextend`, and it never grows by more than the fresh plan. If that re-measure
+shows a different pool, or no longer calls for an extend, the pass ends there
+without deleting anything (the delete path would stop on the same re-measure).
+If the extent size cannot be read, nothing is issued and relief goes on to
+delete instead; that read is retried after an hour. In `alert_only` mode it
+never extends, and sends a WARNING saying it would have. A
+failed `lvextend` sends a WARNING and is not retried for 24 hours. One that
+does not answer within 60 seconds may still have completed: the pass stops
+there with a CRITICAL "extend outcome unknown", and the next pass re-measures.
+Every issued `lvextend`, successful or not, is also recorded in the guardian's
+provisioning ledger (`ledger.json` in the state dir) as `pool_extend`, beside
+the disk grows; it does not count against their rate caps.
+It never extends on a reading it cannot complete: an unknown metadata size or
+metadata % refuses the extend. It assumes the profile holds 80/20 and that dmeventd monitors the pool (host
+provisioning sets both).
+
 ### What it never does
 
 - It only ever deletes snapshots with the exact names the Guardian generates:
@@ -141,7 +199,9 @@ so the pool is barely growing.
 - It never deletes anything else. If the pool is still short after every
   Guardian snapshot is gone, it sends a CRITICAL alert saying something else is
   consuming the pool (throttled to `storage_pool.realert_hours`).
-- It never grows a pool. Adding space is an operator action (below).
+- It never grows a pool beyond the partial extend above: never without the
+  `genesis-thinpool` profile, never on btrfs or dir, and never by adding disk.
+  Adding space is an operator action (below).
 - It never acts on a pool it cannot name or read: an unknown backend, a
   failed measurement, a measurement with no usage figures, or a volume group
   with several thin pools (whatever figures it shows) means no action. If that

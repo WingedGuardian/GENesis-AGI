@@ -65,6 +65,13 @@ def test_canonical_rw_opens_use_guarded_factories():
             source_segment = ast.get_source_segment(source, node) or ""
             if "mode=ro" in source_segment:
                 continue
+            # A private in-memory database is never the canonical store.
+            if (
+                node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == ":memory:"
+            ):
+                continue
             key = f"{relative}:{_enclosing_function(node, parents)}"
             if key not in _CANONICAL_READERS_USING_WRITABLE_MODE:
                 unexpected.append(f"{key}:{node.lineno}")

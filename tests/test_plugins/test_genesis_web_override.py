@@ -25,9 +25,9 @@ const spec = JSON.parse(process.argv[1]);
 const src = require("fs").readFileSync(spec.module, "utf8");
 (async () => {
   const mod = await import("data:text/javascript," + encodeURIComponent(src));
-  const calls = { mcp: [], next: 0, logs: 0 };
+  const calls = { mcp: [], next: 0, logs: 0, messages: [] };
   const $ = {
-    ui: { log: () => { calls.logs += 1; if (spec.logThrows) throw new Error("log down"); } },
+    ui: { log: (m) => { calls.logs += 1; calls.messages.push(m); if (spec.logThrows) throw new Error("log down"); } },
     mcp: { call: async (...args) => {
       calls.mcp.push(args);
       if (spec.mcpThrows) { const err = new Error(spec.mcpThrows); err.name = "HooksError"; throw err; }
@@ -180,3 +180,16 @@ def test_the_manifests_load_the_module():
     assert plugin["name"] == "genesis-web-override"
     assert hooks == {"modules": ["./register.js"]}
     assert (PLUGIN / "hooks" / "register.js").is_file()
+
+
+def test_a_rewritten_reply_falls_back_and_says_why():
+    # Measured on a live install: a PostToolUse hook from a token-saving plugin
+    # replaced a large web_search result with a summary and an archive pointer.
+    summary = (
+        "JSON object (7 keys):\n  query: \"q\"\n  results: [9 items]\n\n"
+        "[Full result archived (4,836 chars (json)) — saved to disk, not lost.]"
+    )
+    res = _run(reply={"content": [{"type": "text", "text": summary}], "isError": False})
+    assert _went_native(res)
+    assert any("PostToolUse hook may have rewritten" in m for m in res["calls"]["messages"])
+

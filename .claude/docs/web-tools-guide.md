@@ -9,8 +9,9 @@ These are the PRIMARY tools. Use them by default in all contexts.
 
 | Need | Tool | Notes |
 |------|------|-------|
-| Fetch URL content | `web_fetch(url)` | Anti-bot, JS fallback, structured output |
-| YouTube video (what it says) | `web_fetch(url)` | Metadata + transcript via yt-dlp (captions in the video's language; no audio transcription), wrapped as untrusted content; no Bash needed. `config/youtube_fetch.yaml` sets certificate handling |
+| Fetch URL content | `web_fetch(url)` | Anti-bot, JS fallback, structured output; page text arrives inside `<external-content>` untrusted-content markers, whatever backend fetched it |
+| YouTube video (what it says) | `web_fetch(url)` | Metadata + transcript via yt-dlp (captions, preferring the video's language, `provenance: unknown` without language evidence; no audio transcription), wrapped as untrusted content; no Bash needed. `config/youtube_fetch.yaml` sets certificate handling |
+| LinkedIn video post (what it says) | `web_fetch(url)` | The post page unchanged, plus a `video_transcript` field from the video's captions via yt-dlp (captions only, never audio; `video_error` when they cannot be read) |
 | Search the web | `web_search(query)` | SearXNG unlimited, structured results |
 | AI-summarized fetch | CC `WebFetch` | Foreground only — when you need AI summary |
 | Quick general lookup | CC `WebSearch` | Foreground only — simple questions |
@@ -79,6 +80,21 @@ the built-in's own permission check and its PreToolUse hooks (the advisory
 runs on `mcp__genesis-health__web_search` instead, since the plugin calls it
 through the normal tool pipeline. The flag is not specific to this plugin: it
 turns on hook modules for every enabled plugin that ships them.
+
+**Another plugin can make it fall back on most searches.** The plugin calls
+`web_search` through Claude Code's normal tool pipeline, so PostToolUse hooks
+from other plugins run on that result too. A hook that rewrites large MCP
+results (for example, one that archives them to disk and returns a summary
+instead) leaves the plugin text that is not JSON, and those searches fall
+back to the built-in. token-optimizer does this for results of 4096 characters
+or more, which a typical 10-result search exceeds, so smaller searches still
+succeed. The plugin then logs "a PostToolUse hook may have rewritten the
+web_search result", which shows in the session and in a `--debug-file` log.
+Exempt `mcp__genesis-health__web_search` from that hook. For token-optimizer,
+add it to `TOKEN_OPTIMIZER_ARCHIVE_EXEMPT_TOOLS` in the `env` block of
+`~/.claude/settings.json` (a comma-separated list: append it if the variable is
+already set). The cost is that every session then gets the full `web_search`
+result instead of the summary.
 
 Two limits. Claude Code checks the answer against `WebSearch`'s output schema
 after the plugin returns, so a shape a later Claude Code stops accepting reaches

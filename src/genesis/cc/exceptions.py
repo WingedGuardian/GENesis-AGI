@@ -19,7 +19,21 @@ class CCProcessError(CCError):
     """CC CLI exited with non-zero status."""
 
 
-class CCStreamTruncatedError(CCProcessError):
+class CCReplayUnsafeError(CCProcessError):
+    """Work may already have run: do not recover, fail over or park for replay.
+
+    The original diagnosis remains a cause for observability, not permission
+    to retry. Single-argument construction also supports transport failures.
+    """
+
+    def __init__(self, message: str = "", *, cause: CCError | None = None):
+        super().__init__(message)
+        self.__cause__ = cause
+        self.raw_text = getattr(cause, "raw_text", None)
+        self.raw_event = getattr(cause, "raw_event", None)
+
+
+class CCStreamTruncatedError(CCReplayUnsafeError):
     """A stream line exceeded the reader limit and took the RESULT with it.
 
     Separate from a bare ``CCProcessError`` because the RECOVERY differs, not
@@ -31,8 +45,9 @@ class CCStreamTruncatedError(CCProcessError):
 
     So conversation.py must re-raise this instead of routing it into
     stale-resume recovery, which exists for a session that no longer resolves.
-    Subclasses ``CCProcessError`` so existing handlers keep catching it; the
-    distinction only has to be visible to the one place that retries.
+    Inherits the shared ``CCReplayUnsafeError`` boundary so recovery and
+    failover handlers suppress replay, while existing process-error handlers
+    still catch it.
     """
 
 
@@ -100,12 +115,9 @@ class CCRateLimitError(_CCLimitError):
 class CCOverloadedError(CCRateLimitError):
     """The provider answered HTTP 529 / ``overloaded_error`` — capacity, not quota.
 
-    A subclass of ``CCRateLimitError`` on purpose: every existing rate-limit
-    consumer already does the right thing for an overload — roster failover to
-    a peer, the durable park (which falls back to its cadence floor because an
-    overload carries no reset hint), WARNING severity on
-    ``cc.invocation_failed``, and the RATE_LIMITED status. The distinct type
-    exists for the one place that treats it differently:
+    Only retry-eligible overloads retain rate-limit behavior. Classification
+    wraps known-work or MCP-backed overloads in ``CCReplayUnsafeError`` so
+    downstream failover/parking cannot replay them. The distinct type supports
     ``genesis.cc.transient_retry``, which re-runs an overloaded call after a
     short wait and never retries a genuine rate limit.
 
