@@ -16,6 +16,7 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 
@@ -146,6 +147,29 @@ def sync_hook_names(text: str) -> list[str]:
     return names
 
 
+# The merges read their rules with git's GLOBAL option, `git --attr-source=<tree>
+# merge-tree` (merge-tree has no such option of its own: given one, git 2.43
+# exits 129, MEASURED). Per git's release notes the global option arrived in
+# 2.41, and 2.43.0 fixed "git merge-tree used to segfault when the
+# --attr-source option is used".
+MIN_GIT = (2, 43)
+
+
+def git_version_failure(repo: Repo) -> str | None:
+    """Why this git is too old for the engine, or None."""
+    text = repo.git("--version", check=False).stdout.strip()
+    m = re.match(r"git version (\d+)\.(\d+)", text)
+    if not m:
+        return f"cannot read the git version ({text!r})"
+    have = (int(m.group(1)), int(m.group(2)))
+    if have < MIN_GIT:
+        return (
+            f"git {have[0]}.{have[1]} is too old: the engine needs git "
+            f"{MIN_GIT[0]}.{MIN_GIT[1]} or newer (git --attr-source with merge-tree)"
+        )
+    return None
+
+
 def readiness_failures(repo: Repo, base: str) -> list[str]:
     """Why this install cannot run candidates now ([] when it can).
 
@@ -154,6 +178,9 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
     the checkout holds (HEAD), whose scripts/hooks/ admission keeps equal to
     reviewed main on `live`, and against the directory git runs them from."""
     fails: list[str] = []
+    too_old = git_version_failure(repo)
+    if too_old:
+        fails.append(too_old)
     serving, why = repo.serving()
     if not serving:
         fails.append(f"the serving commit is unknown ({why}); a candidate needs a running server")
@@ -195,12 +222,17 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
                 f"the git hook {name} is not installed in {hooks_dir} (run scripts/hooks/sync-hooks.sh)"
             )
             continue
-        have = repo.git("hash-object", "--", str(dst)).stdout.strip()
+        # --no-filters: the bytes git will run, not what core.autocrlf would store.
+        have = repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip()
         if have != want:
             fails.append(
                 f"the installed git hook {name} differs from scripts/hooks/{name} at HEAD "
                 "(run scripts/hooks/sync-hooks.sh)"
             )
+        elif not os.access(dst, os.X_OK):
+            # git skips a hook that is not executable ("ignored because it's not
+            # set as executable", MEASURED git 2.43), so the guard is off.
+            fails.append(f"the installed git hook {dst} is not executable (chmod +x {dst})")
     return fails
 
 

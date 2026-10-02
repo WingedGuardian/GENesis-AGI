@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 # Imported only through deploy_candidates.py, whose finder resolves the
 # sibling modules from this directory: scripts/ is never on sys.path.
@@ -30,6 +31,7 @@ from deploy_candidates_core import (  # noqa: E402
     Plan,
     Refusal,
     Repo,
+    after_move,
     out,
 )
 
@@ -113,8 +115,22 @@ def build_plan(
             if repo.is_ancestor(head, tip):
                 contained.append(b)
                 continue
+            # git's global --attr-source: the in-tree merge rules come from the reviewed base,
+            # never from the checkout's index, which on `live` holds candidate
+            # code ($GIT_DIR/info/attributes and core.attributesFile, which only
+            # the install's owner writes, still apply): a
+            # candidate's `.gitattributes` (`merge=union`) would otherwise merge two
+            # conflicting candidates into an unreviewed concatenation (MEASURED,
+            # git 2.43).
             p = repo.git(
-                "merge-tree", "--write-tree", "--name-only", "--no-messages", tip, head, check=False
+                f"--attr-source={base}",
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                tip,
+                head,
+                check=False,
             )
             if p.returncode == 1:
                 files = [ln for ln in p.stdout.splitlines()[1:] if ln.strip()]
@@ -218,15 +234,28 @@ def ensure_reflog_kept(repo: Repo) -> None:
         out("  NOTE: core.logAllRefUpdates was off; turned on so `live` keeps a reflog.")
 
 
-def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> bool:
+class Move(NamedTuple):
+    """What a move did: whether the checkout's files changed, and the commit
+    `live` is at afterwards (its old tip when nothing changed, else the plan's
+    tip). Every post-move WARNING names ``at``, never a commit that is not live."""
+
+    files: bool
+    at: str
+
+
+def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
     """Point the checkout at ``plan.tip``: not at all when nothing changed, the
     ref alone when only commits changed, otherwise ONE `git switch`. Returns
-    whether the checkout's files changed. Git configuration for `live` is
-    written only after the move succeeded, so a refused move writes nothing."""
+    whether the checkout's files changed and where `live` is (a Move). Git
+    configuration for `live` is
+    written only after the move succeeded, so a refused move writes nothing; a
+    failure after the move is a WARNING (core.after_move), never a refusal."""
     live_base, live_merged = repo.live_chain(plan.base)
     cur_tip = repo.resolve(LIVE_REF)
     files_moved = False
+    at = plan.tip
     if branch == LIVE_BRANCH and cur_tip and live_base == plan.base and live_merged == plan.merged:
+        at = cur_tip  # nothing moves: `live` stays where it is
         out(f"  checkout: unchanged ({cur_tip[:12]}): same origin/main, same candidate heads.")
     elif branch == LIVE_BRANCH and cur_tip and repo.tree(cur_tip) == repo.tree(plan.tip):
         # Same files under new commits: move the ref, not the working tree.
@@ -247,20 +276,37 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> bool:
         # as with an untracked one, git refuses and changes nothing.
         p = repo.git("switch", "--no-overwrite-ignore", "-C", LIVE_BRANCH, plan.tip, check=False)
         if p.returncode != 0:
-            raise Refusal(
-                f"git refused to move the checkout to {plan.tip[:12]}; nothing moved:\n{p.stderr.strip()}"
+            # git returns a post-checkout hook's status AFTER the checkout has
+            # moved (MEASURED, git 2.43): read where HEAD is, never trust rc.
+            head_ref = repo.git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+            moved = head_ref == LIVE_REF and repo.resolve("HEAD") == plan.tip
+            if not moved:
+                raise Refusal(
+                    f"git refused to move the checkout to {plan.tip[:12]}; nothing moved:\n{p.stderr.strip()}"
+                )
+            out(
+                f"  WARNING: the checkout moved to {plan.tip[:12]}, but git exited {p.returncode} "
+                f"(a post-checkout hook?): {p.stderr.strip()}"
             )
-        out(f"  checkout: moved to {plan.tip[:12]}.")
+        else:
+            out(f"  checkout: moved to {plan.tip[:12]}.")
         files_moved = True
-    ensure_reflog_kept(repo)
-    up = repo.git(
-        "branch", "--set-upstream-to", f"{BASE_REMOTE}/{BASE_BRANCH}", LIVE_BRANCH, check=False
+    # Past the commit point: the checkout has moved (or was already right), so
+    # nothing below may raise a refusal that would claim nothing changed.
+    state = f"`live` is at {at[:12]}"
+    after_move(state, "keeping the reflog of `live` (git config)", lambda: ensure_reflog_kept(repo))
+    up = after_move(
+        state,
+        "setting `live` to track origin/main",
+        lambda: repo.git(
+            "branch", "--set-upstream-to", f"{BASE_REMOTE}/{BASE_BRANCH}", LIVE_BRANCH, check=False
+        ),
     )
-    if up.returncode != 0:
+    if up is not None and up.returncode != 0:
         out(
             f"  WARNING: could not set `live` to track {BASE_REMOTE}/{BASE_BRANCH}: {up.stderr.strip()}"
         )
-    return files_moved
+    return Move(files_moved, at)
 
 
 def sync_git_hooks(repo: Repo) -> None:

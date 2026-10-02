@@ -1,9 +1,19 @@
 """deploy_candidates_core.py — git, GitHub and output plumbing for the engine of
 `live` (see deploy_candidates.py for what `live` is and every command).
 
-Flat sibling of deploy_candidates.py, imported by name after its directory is put
-on ``sys.path`` (the review_*.py pattern; scripts/ is not a package). Nothing here
-decides anything about a candidate: that is deploy_candidates_gate.py.
+Flat sibling of deploy_candidates.py, loaded by that module's finder (scripts/
+is never on ``sys.path``). Nothing here decides anything about a candidate: that
+is deploy_candidates_gate.py.
+
+Every git call on the repository goes through ``Repo.git``, the one hardened
+runner (``read_commits`` runs its own ``cat-file --batch`` with the same
+hardened environment; ``valid_candidate_name`` runs ``check-ref-format``, which
+reads no repository): an allowlisted
+environment (no caller GIT_* variable can redirect the repository, the replace
+ref base, config or attributes), replace objects and grafts off, and output read
+as bytes and decoded with surrogateescape, so a non-UTF-8 path round-trips
+instead of crashing. Its answers are three-valued where git's are: a git failure
+that is not git's documented "no" raises Unknown, never reads as no.
 """
 
 from __future__ import annotations
@@ -53,21 +63,53 @@ IDENTITY = {
     "GIT_COMMITTER_EMAIL": IDENTITY_EMAIL,
 }
 
-_GIT_LOCATION_VARS = frozenset(
+# Every GIT_* variable from the caller is dropped except these: how git talks to
+# a remote (ssh, credentials, TLS trust, proxy, allowed protocols), and
+# GIT_CONFIG_NOSYSTEM, which only ever reads LESS config. The rest can point git
+# at another
+# repository, index, object store, replace-ref base, graft file, attribute
+# source or config (GIT_CONFIG_COUNT/KEY/VALUE, GIT_CONFIG_PARAMETERS) and so
+# change what every plumbing call below answers.
+_GIT_ENV_KEEP = frozenset(
     {
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_PREFIX",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH_VARIANT",
+        "GIT_ASKPASS",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
+        "GIT_PROXY_COMMAND",
+        "GIT_ALLOW_PROTOCOL",
+        "GIT_CONFIG_NOSYSTEM",
     }
 )
+# gh would query another repository than the checkout's.
+_GH_ENV_DROP = frozenset({"GH_REPO", "GH_HOST"})
+# Set on every git call: a replace ref (refs/replace/<pinned head>) or a graft
+# would make merge-tree, rev-list and ancestry read another commit than the one
+# pinned, so `live` could run code that is in neither the candidate nor its PR
+# (MEASURED, git 2.43; GIT_GRAFT_FILE pointed at an empty file disables grafts).
+GIT_HARDENING = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
-TRAILER_LINE = re.compile(r"^deploy-rebuild[ \t]*:", re.IGNORECASE)
-CANDIDATE_LINE = re.compile(r"^deploy-candidate[ \t]*:[ \t]*(\S+)[ \t]*$", re.IGNORECASE)
+# ASCII case folding only, as the pre-push hook's `LC_ALL=C awk tolower` does.
+TRAILER_LINE = re.compile(r"^deploy-rebuild[ \t]*:", re.IGNORECASE | re.ASCII)
+CANDIDATE_LINE = re.compile(r"^deploy-candidate[ \t]*:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.ASCII)
+_BLANK = re.compile(r"[ \t\r]*")  # the pre-push hook's blank(): /^[ \t\r]*$/
+
+
+def scrub_env(env: Mapping[str, str]) -> dict[str, str]:
+    """The caller's environment without what could redirect git or gh."""
+    return {
+        k: v
+        for k, v in env.items()
+        if not (k.startswith("GIT_") and k not in _GIT_ENV_KEEP) and k not in _GH_ENV_DROP
+    }
+
+
+def _dec(data: bytes) -> str:
+    return data.decode("utf-8", "surrogateescape")
+
 
 # Used in annotations only (strings under `from __future__ import annotations`).
 GhRunner = "Callable[[list[str], str, Mapping[str, str]], tuple[int, str, str]]"
@@ -96,6 +138,18 @@ def out(msg: str = "") -> None:
     print(msg, flush=True)
 
 
+def after_move(state: str, what: str, fn: Callable[[], object]) -> object:
+    """Run a step that comes AFTER the commit point (the checkout, a ref or the
+    manifest has already changed). A failure here must not be reported as a
+    refusal ("nothing changed" would be false): it is a WARNING that states
+    what IS so (``state``) and names the step. Returns fn's result, or None."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 - every failure past the commit point is a warning
+        out(f"  WARNING: {state}, but {what} failed: {exc}")
+        return None
+
+
 def now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)  # noqa: UP017
 
@@ -113,11 +167,23 @@ def positive_int(text: str | None, default: int) -> int:
     return default
 
 
+def _utf8(name: str) -> bool:
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def valid_candidate_name(name: object) -> bool:
-    """A local branch name git accepts that is not `live`, `main` or under them."""
+    """A local branch name git accepts that is not `live`, `main` or under them,
+    and is valid UTF-8: a name with undecodable bytes is written into the
+    Deploy-candidate trailer and read back changed (commit-tree re-encodes the
+    message), so `drop` could not find it in `live` again (MEASURED)."""
     return (
         isinstance(name, str)
         and bool(name)
+        and _utf8(name)
         and not name.startswith("-")
         and name not in RESERVED_NAMES
         and not name.startswith(RESERVED_PREFIXES)
@@ -179,8 +245,8 @@ def serving_default(root: Path, env: Mapping[str, str]) -> tuple[str | None, str
 
 
 class Repo:
-    """One checkout, its git, and its GitHub. Every git call scrubs the variables
-    that would point git at another repository."""
+    """One checkout, its git, and its GitHub. Every git call runs through the one
+    hardened runner (``git``)."""
 
     def __init__(
         self,
@@ -190,10 +256,11 @@ class Repo:
         serving: Callable[[Path], tuple[str | None, str]] | None = None,
     ):
         self.root = Path(root)
-        # Variables that point git at ANOTHER repository, index or object store
-        # (set inside a git hook, or left by a caller) would make every git call
-        # below act somewhere other than self.root.
-        self.env = {k: v for k, v in env.items() if k not in _GIT_LOCATION_VARS}
+        # Variables that point git (or gh) at ANOTHER repository, index, object
+        # store or config (set inside a git hook, or left by a caller) would make
+        # every call below act somewhere other than self.root. Child scripts
+        # (the deploy status script, sync-hooks.sh) get this environment too.
+        self.env = scrub_env(env)
         self._gh = gh or gh_default
         self._serving = serving or (lambda r: serving_default(r, self.env))
         self.home = Path(self.env.get("HOME") or str(Path.home()))
@@ -206,16 +273,16 @@ class Repo:
     def git(
         self, *args: str, check: bool = True, input: str | None = None, extra_env=None, timeout=None
     ):
-        env = dict(self.env)
-        if extra_env:
-            env.update(extra_env)
-        p = subprocess.run(
+        env = {**self.env, **GIT_HARDENING, **(extra_env or {})}
+        raw = subprocess.run(
             ["git", "-C", str(self.root), *args],
             env=env,
             capture_output=True,
-            text=True,
-            input=input,
+            input=None if input is None else input.encode("utf-8", "surrogateescape"),
             timeout=timeout,
+        )
+        p = subprocess.CompletedProcess(
+            raw.args, raw.returncode, _dec(raw.stdout), _dec(raw.stderr)
         )
         if check and p.returncode != 0:
             raise Refusal(f"git {' '.join(args)} failed (exit {p.returncode}): {p.stderr.strip()}")
@@ -242,18 +309,39 @@ class Repo:
             return True, ""
         return False, f"fetching {refspec} failed ({p.stderr.strip()})"
 
+    @staticmethod
+    def _unknown(what: str, p) -> Unknown:
+        return Unknown(f"git cannot tell {what} (exit {p.returncode}): {p.stderr.strip()}")
+
     def resolve(self, ref: str) -> str | None:
+        """The commit ``ref`` names, None when it names none (rev-parse -q exits 1:
+        a missing ref, path or object, MEASURED git 2.43). Any other failure is
+        git unable to answer: Unknown."""
         p = self.git("rev-parse", "--verify", "-q", ref + "^{commit}", check=False)
         text = p.stdout.strip()
-        return text if p.returncode == 0 and HEX40.match(text) else None
+        if p.returncode == 1:
+            return None
+        if p.returncode != 0 or not HEX40.match(text):
+            raise self._unknown(f"what {ref} names", p)
+        return text
 
     def is_ancestor(self, a: str, b: str) -> bool:
-        return self.git("merge-base", "--is-ancestor", a, b, check=False).returncode == 0
+        """merge-base --is-ancestor: 0 yes, 1 no; anything else (128: a missing
+        object) is Unknown, never "no"."""
+        p = self.git("merge-base", "--is-ancestor", a, b, check=False)
+        if p.returncode in (0, 1):
+            return p.returncode == 0
+        raise self._unknown(f"whether {a[:12]} is an ancestor of {b[:12]}", p)
 
     def merge_base(self, a: str, b: str) -> str | None:
+        """None when the two share no history (exit 1); Unknown on any other failure."""
         p = self.git("merge-base", a, b, check=False)
         text = p.stdout.strip()
-        return text if p.returncode == 0 and HEX40.match(text) else None
+        if p.returncode == 1:
+            return None
+        if p.returncode != 0 or not HEX40.match(text):
+            raise self._unknown(f"the merge base of {a[:12]} and {b[:12]}", p)
+        return text
 
     def rev_list(self, *args: str) -> list[str]:
         text = self.git("rev-list", *args).stdout
@@ -264,7 +352,11 @@ class Repo:
 
     def blob_at(self, commit: str, path: str) -> str | None:
         p = self.git("rev-parse", "--verify", "-q", f"{commit}:{path}", check=False)
-        return p.stdout.strip() if p.returncode == 0 else None
+        if p.returncode == 1:
+            return None
+        if p.returncode != 0:
+            raise self._unknown(f"whether {path} exists at {commit[:12]}", p)
+        return p.stdout.strip()
 
     def show(self, commit: str, path: str) -> str | None:
         p = self.git("show", f"{commit}:{path}", check=False)
@@ -310,7 +402,11 @@ class Repo:
 
     def current_branch(self) -> str | None:
         p = self.git("symbolic-ref", "--short", "-q", "HEAD", check=False)
-        return p.stdout.strip() if p.returncode == 0 else None
+        if p.returncode == 1:
+            return None  # a detached HEAD
+        if p.returncode != 0:
+            raise self._unknown("which branch is checked out", p)
+        return p.stdout.strip()
 
     def read_commits(self, oids: list[str]) -> dict[str, tuple[list[str], str, str]]:
         """Each commit's parents, committer email and message, read RAW
@@ -321,7 +417,7 @@ class Repo:
             return {}
         p = subprocess.run(
             ["git", "-C", str(self.root), "--no-replace-objects", "cat-file", "--batch"],
-            env=self.env,
+            env={**self.env, **GIT_HARDENING},
             input=("\n".join(oids) + "\n").encode(),
             capture_output=True,
         )
@@ -340,7 +436,7 @@ class Repo:
             pos = nl + 1 + size + 1
             head, _, msg = body.partition("\n\n")
             parents, committer = [], ""
-            for ln in head.splitlines():
+            for ln in head.split("\n"):
                 if ln.startswith("parent "):
                     parents.append(ln.split()[1])
                 elif ln.startswith("committer "):
@@ -352,12 +448,18 @@ class Repo:
     @staticmethod
     def body_lines(msg: str) -> list[str]:
         """The message lines after its first paragraph (the subject), the only
-        place git ever reads trailers; the same wide rule the pre-push hook uses."""
-        lines = msg.splitlines()
+        place git ever reads trailers; the same wide rule the pre-push hook uses,
+        with its exact line split (LF only) and its blank-line test (ASCII space,
+        tab, CR), so the two can never disagree about a line."""
+        lines = msg.split("\n")
+
+        def blank(line: str) -> bool:
+            return _BLANK.fullmatch(line) is not None
+
         i = 0
-        while i < len(lines) and not lines[i].strip():
+        while i < len(lines) and blank(lines[i]):
             i += 1
-        while i < len(lines) and lines[i].strip():
+        while i < len(lines) and not blank(lines[i]):
             i += 1
         return lines[i:]
 
@@ -428,17 +530,16 @@ class Repo:
 
     def live_checked_out_elsewhere(self) -> str | None:
         """The path of a worktree OTHER than this checkout that has `live`
-        checked out, read from `git worktree list --porcelain` (a documented,
-        stable format: a `worktree <path>` line opens each record and a
-        `branch <ref>` line names its branch). `git switch -C` moves such a
-        branch without complaint (MEASURED, git 2.43)."""
-        text = self.git("worktree", "list", "--porcelain").stdout
+        checked out, read from `git worktree list --porcelain -z`: each field
+        ends in NUL and each record in an extra NUL, so a path holding a newline
+        cannot be misread (MEASURED, git 2.43). `git switch -C` moves such a
+        branch without complaint."""
+        text = self.git("worktree", "list", "--porcelain", "-z").stdout
         here = os.path.realpath(self.root)
-        path = None
-        for line in text.splitlines():
-            if line.startswith("worktree "):
-                path = line[len("worktree ") :]
-            elif line == f"branch {LIVE_REF}" and path and os.path.realpath(path) != here:
+        for record in text.split("\0\0"):
+            fields = record.split("\0")
+            path = next((f[len("worktree ") :] for f in fields if f.startswith("worktree ")), None)
+            if f"branch {LIVE_REF}" in fields and path and os.path.realpath(path) != here:
                 return path
         return None
 

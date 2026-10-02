@@ -131,6 +131,7 @@ if not any(isinstance(f, _SiblingFinder) for f in sys.meta_path):
     sys.meta_path.insert(0, _SiblingFinder())
 
 import argparse  # noqa: E402
+import contextlib  # noqa: E402
 import datetime  # noqa: E402
 import fcntl  # noqa: E402
 import json  # noqa: E402
@@ -199,34 +200,71 @@ class Engine(Repo):
             raise Refusal(
                 f"no deploy manifest ({self.store.path}): nothing to rebuild. Add a candidate first."
             )
+        reasons = self._move_refusals()
+        if reasons:
+            raise Refusal(reasons[0])
+        return data, self.current_branch()
+
+    def _move_refusals(self) -> list[str]:
+        """Every reason the checkout must not move now, in the order rebuild and
+        drop check them, WITHOUT raising: rebuild and drop refuse on the first,
+        and status reports them all, so status never predicts a rebuild that
+        would refuse."""
+        reasons: list[str] = []
         if self.update_state.exists():
             try:
                 phase = json.loads(self.update_state.read_text()).get("phase")
             except (OSError, ValueError, AttributeError):
                 phase = None
             if phase != "done":
-                raise Refusal(
+                reasons.append(
                     f"{self.update_state} records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
                 )
         branch = self.current_branch()
         if branch not in (LIVE_BRANCH, BASE_BRANCH):
-            raise Refusal(
+            reasons.append(
                 f"{self.root} is on {branch or 'a detached HEAD'}; `live` is built from main or `live`."
             )
         elsewhere = self.live_checked_out_elsewhere()
         if elsewhere:
-            raise Refusal(
+            reasons.append(
                 f"`live` is checked out in another worktree ({elsewhere}); moving it would change the files under "
                 "that worktree. Switch that worktree to another branch first."
             )
         dirty = self.dirty_lines()
         if dirty:
-            raise Refusal(
+            reasons.append(
                 f"{self.root} has uncommitted tracked changes; a rebuild never stashes or discards them. "
                 "Turn them into a candidate with `scripts/deploy_candidates adopt <branch> --owner <who>`:\n"
                 + "\n".join("  " + ln for ln in dirty)
             )
-        return data, branch
+        return reasons
+
+    def live_set(self, base: str, data: dict | None) -> tuple[str | None, list[tuple[str, str]]]:
+        """What `live` runs now: (the commit its rebuild merges sit on, [(branch,
+        head)]), or (None, []) when there is no `live`. A candidate counts when a
+        rebuild merge names it, OR when its pinned head is reachable from `live`
+        without being in that base: a candidate an earlier one already carries is
+        CONTAINED, so no merge names it, yet its code is live. Listed candidates
+        come in manifest order; a merged branch the manifest no longer lists
+        follows, since its code is live too. drop and status both read this."""
+        live_base, merged = self.live_chain(base)
+        if live_base is None:
+            return None, []
+        tip = self.resolve(LIVE_REF)
+        named = dict(merged)
+        result: list[tuple[str, str]] = []
+        for c in (data or {}).get("candidates", []):
+            b, h = c["branch"], c["verified_head"]
+            if b in named:
+                result.append((b, named[b]))
+            elif (
+                self.resolve(h) and self.is_ancestor(h, tip) and not self.is_ancestor(h, live_base)
+            ):
+                result.append((b, h))
+        listed = {b for b, _ in result}
+        result += [(b, h) for b, h in merged if b not in listed]
+        return live_base, result
 
     def _refuse_blockers(self, tip: str, what: str) -> None:
         blockers = plan.move_blockers(self, tip)
@@ -344,7 +382,11 @@ class Engine(Repo):
         if self.current_branch() != LIVE_BRANCH or no_rebuild:
             after = self.store.update(remove)
             out(f"{branch} dropped from {self.store.path}.")
-            self._warn_stacked(branch, data, after)
+            core.after_move(
+                f"{branch} WAS dropped from the manifest",
+                "checking which candidates carry its commits",
+                lambda: self._warn_stacked(branch, data, after),
+            )
             out(
                 "The checkout is not rebuilt"
                 + (" (--no-rebuild)." if no_rebuild else " (it is not on `live`).")
@@ -357,11 +399,14 @@ class Engine(Repo):
         if not walk_base:
             raise Refusal(f"{BASE_REF} does not resolve.")
         self.refuse_foreign(walk_base)
-        live_base, merged = self.live_chain(walk_base)
+        live_base, live_now = self.live_set(walk_base, data)
         if live_base is None:
             raise Refusal("`live` does not exist; nothing to rebuild.")
-        dropped_head = dict(merged).get(branch)
-        remaining = [(b, h) for b, h in merged if b != branch]
+        # Contained candidates count: dropping one that an earlier candidate
+        # carries takes that carrier out too (it carries the dropped commits),
+        # and dropping the carrier keeps the contained one, which merges alone.
+        dropped_head = dict(live_now).get(branch)
+        remaining = [(b, h) for b, h in live_now if b != branch]
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
         p = plan.build_plan(
             self,
@@ -427,7 +472,7 @@ class Engine(Repo):
         data, branch = self._move_preflight(need_manifest=True)
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
         out(f"deploy_candidates rebuild {rebuild_id}")
-        ok, why = self.fetch(f"refs/heads/{BASE_BRANCH}:{BASE_REF}")
+        ok, why = self.fetch(f"+refs/heads/{BASE_BRANCH}:{BASE_REF}")
         if not ok:
             raise Unknown(
                 f"{why}; a rebuild never builds on a main it could not fetch. Nothing changed."
@@ -462,11 +507,29 @@ class Engine(Repo):
         p = plan.build_plan(self, base, cands, rebuild_id, sticky=sticky)
         self._print_plan(p, sorted(gone))
         self._refuse_blockers(p.tip, "nothing was retired")
-        if plan.move_checkout(self, p, branch):
-            plan.sync_git_hooks(self)
-        # Retirements are saved only once `live` no longer holds them, and only
-        # for an entry that is still the one decided on (same branch, PR and
-        # head), so a concurrent re-add is never undone.
+        moved = plan.move_checkout(self, p, branch)
+        state = f"`live` is at {moved.at[:12]}"
+        if moved.files:
+            core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
+        # Past the commit point (`live` has moved): every step below is a
+        # WARNING on failure, never a refusal claiming nothing changed.
+        if retire:
+            core.after_move(state, "saving the retirements", lambda: self._save_retirements(retire))
+        core.after_move(
+            state, "fast-forwarding local main", lambda: plan.fast_forward_main(self, base)
+        )
+        out(
+            "  The server was not restarted: it runs what it loaded until it does. Next step, when no"
+        )
+        out(
+            "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
+        )
+        return 0
+
+    def _save_retirements(self, retire: list[dict]) -> None:
+        """Retirements are saved only once `live` no longer holds them, and only
+        for an entry that is still the one decided on (same branch, PR and
+        head), so a concurrent re-add is never undone."""
         if retire:
             decided = {(c["branch"], c["pr"], c["verified_head"]) for c in retire}
 
@@ -483,43 +546,45 @@ class Engine(Repo):
             self.store.update(drop_retired)
             for c in retire:
                 out(f"  retired: {c['branch']} — PR #{c['pr']} is in origin/main")
-                # `live` only ever ran the pinned head; commits the branch
-                # gained after it were never live here. Say so, since the
-                # retirement takes the branch off the manifest.
-                # The pinned commit may have been force-pushed off the PR before
-                # it merged: then code that ran on `live` is not what main holds.
-                merged_head = gate.pr_data(self, c["pr"]).get("headRefOid")
-                if merged_head == c["verified_head"]:
-                    pass
-                elif not isinstance(merged_head, str) or not self.resolve(merged_head):
-                    # Rewritten elsewhere and never fetched here: say so rather
-                    # than stay silent in the one case this check exists for.
-                    out(
-                        f"    cannot tell whether PR #{c['pr']} merged the pinned commit "
-                        f"{c['verified_head'][:12]}: its merged head is not in this repository"
-                    )
-                elif not self.is_ancestor(c["verified_head"], merged_head):
-                    out(
-                        f"    WARNING: PR #{c['pr']} merged without the pinned commit "
-                        f"{c['verified_head'][:12]} (its head was rewritten); what ran on "
-                        "`live` is not what main holds"
-                    )
-                tip = self.resolve(f"refs/heads/{c['branch']}")
-                if tip and tip != c["verified_head"]:
-                    n = len(self.rev_list(tip, "--not", c["verified_head"]))
-                    if n:
-                        out(
-                            f"    {c['branch']} has {n} commit(s) after its pinned head that were "
-                            "never live here; if the PR did not carry them into main, add them again"
-                        )
-        plan.fast_forward_main(self, base)
-        out(
-            "  The server was not restarted: it runs what it loaded until it does. Next step, when no"
-        )
-        out(
-            "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
-        )
-        return 0
+                core.after_move(
+                    f"{c['branch']} was retired",
+                    f"checking what PR #{c['pr']} merged",
+                    lambda c=c: self._retirement_notes(c),
+                )
+
+    def _retirement_notes(self, c: dict) -> None:
+        """What a retired candidate's PR merged, against the commit `live` ran.
+        Called past the commit point (through core.after_move): a git error here
+        is a warning, never a refusal."""
+        # The pinned commit may have been force-pushed off the PR before it
+        # merged: then the code that ran on `live` is not what main holds.
+        merged_head = gate.pr_data(self, c["pr"]).get("headRefOid")
+        if merged_head == c["verified_head"]:
+            pass
+        elif not isinstance(merged_head, str) or not self.resolve(merged_head):
+            # Rewritten elsewhere and never fetched here: say so rather than
+            # stay silent in the one case this check exists for.
+            out(
+                f"    cannot tell whether PR #{c['pr']} merged the pinned commit "
+                f"{c['verified_head'][:12]}: its merged head is not in this repository"
+            )
+        elif not self.is_ancestor(c["verified_head"], merged_head):
+            out(
+                f"    WARNING: PR #{c['pr']} merged without the pinned commit "
+                f"{c['verified_head'][:12]} (its head was rewritten); what ran on "
+                "`live` is not what main holds"
+            )
+        # `live` only ever ran the pinned head; commits the branch gained after
+        # it were never live here. Say so, since retirement takes the branch off
+        # the manifest.
+        tip = self.resolve(f"refs/heads/{c['branch']}")
+        if tip and tip != c["verified_head"]:
+            n = len(self.rev_list(tip, "--not", c["verified_head"]))
+            if n:
+                out(
+                    f"    {c['branch']} has {n} commit(s) after its pinned head that were "
+                    "never live here; if the PR did not carry them into main, add them again"
+                )
 
     def cmd_status(self) -> int:
         data = self.store.load()
@@ -538,16 +603,37 @@ class Engine(Repo):
             return 0
         try:
             fails = gate.readiness_failures(self, base)
-        except Unknown as exc:
-            fails = [f"unknown: {exc}"]
+        except Refusal as exc:  # Unknown included: report, never exit on it
+            fails = [f"cannot check: {exc}"]
         out("ready: yes" if not fails else "ready: NO\n  - " + "\n  - ".join(fails))
+        # What the next rebuild would refuse on, before it changed anything: the
+        # same checks rebuild and drop run, so status never predicts a rebuild
+        # that would refuse.
+        try:
+            refusals = self._move_refusals()
+            foreign = self.foreign_commits(base)
+        except Refusal as exc:
+            refusals, foreign = [f"cannot check: {exc}"], []
+        if foreign:
+            refusals.append(
+                "`live` holds commits that are neither a rebuild merge nor a candidate's: "
+                + ", ".join(c[:12] for c in foreign)
+            )
         live_merged: dict[str, str] = {}
         if self.resolve(LIVE_REF):
-            _, chain = self.live_chain(base)
-            live_merged = dict(chain)
+            try:
+                _, now_live = self.live_set(base, data)
+                live_merged = dict(now_live)
+            except Refusal as exc:
+                out(f"  WARNING: cannot read what `live` holds: {exc}")
             if branch == LIVE_BRANCH and head != self.resolve(LIVE_REF):
                 out("  WARNING: HEAD is not the tip of `live`.")
         if not data["candidates"]:
+            if refusals:
+                out(
+                    "next rebuild would REFUSE (nothing would change):\n  - "
+                    + "\n  - ".join(refusals)
+                )
             out("The deploy manifest lists no candidates.")
             return 0
         verdict: dict[str, str] = {}
@@ -567,6 +653,9 @@ class Engine(Repo):
             except Unknown as exc:
                 verdict[b] = f"UNKNOWN ({exc}): the next rebuild refuses until this is readable"
                 continue
+            except Refusal as exc:  # status reports; it never exits on one candidate
+                verdict[b] = f"cannot check ({exc}): the next rebuild refuses on this"
+                continue
             if reason:
                 sticky[b] = reason
         cands = [
@@ -574,7 +663,17 @@ class Engine(Repo):
             for c in data["candidates"]
             if c["branch"] not in verdict
         ]
-        p = plan.build_plan(self, base, cands, "status-dry-run", sticky=sticky)
+        try:
+            p = plan.build_plan(self, base, cands, "status-dry-run", sticky=sticky)
+            blockers = plan.move_blockers(self, p.tip)
+        except Refusal as exc:
+            p = core.Plan(base=base, tip=base)
+            blockers = []
+            refusals.append(f"cannot plan the next rebuild: {exc}")
+        if blockers:
+            refusals.append("files are in the way of the move: " + ", ".join(blockers))
+        if refusals:
+            out("next rebuild would REFUSE (nothing would change):\n  - " + "\n  - ".join(refusals))
         for c in data["candidates"]:
             b = c["branch"]
             out(
@@ -604,7 +703,15 @@ class Engine(Repo):
         """Would merging ``head`` onto ``base`` leave base's files unchanged? A
         HINT for `status` only (a candidate with no PR never retires on its own);
         retirement itself is proven from the PR's merge commit."""
-        p = self.git("merge-tree", "--write-tree", "--no-messages", base, head, check=False)
+        p = self.git(
+            f"--attr-source={base}",
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            base,
+            head,
+            check=False,
+        )
         return p.returncode == 0 and p.stdout.splitlines()[0].strip() == self.tree(base)
 
     def cmd_adopt(self, branch: str, owner: str) -> int:
@@ -651,6 +758,7 @@ class Engine(Repo):
             # sits on, so the new branch carries no rebuild merge (admission refuses
             # those) and none of the other candidates' code.
             p = self.git(
+                f"--attr-source={live_base}",
                 "merge-tree",
                 "--write-tree",
                 "--no-messages",
@@ -689,7 +797,11 @@ class Engine(Repo):
             "the checkout is untouched."
         )
         try:
-            self._adopt_report(paths, snapshot)
+            core.after_move(
+                f"{branch} WAS created at {commit[:12]}",
+                "the per-file report",
+                lambda: self._adopt_report(paths, snapshot),
+            )
         finally:
             self._adopt_cleanup()
         out("Next: decide which edits still need to go live (the report above), then")
@@ -709,7 +821,7 @@ class Engine(Repo):
         head. Its fetches land in refs/deploy-candidates/adopt/ (removed after),
         never origin/main's ref, so it needs no lock and races no rebuild."""
         notes = []
-        ok, why = self.fetch(f"refs/heads/{BASE_BRANCH}:{self._adopt_ns()}main")
+        ok, why = self.fetch(f"+refs/heads/{BASE_BRANCH}:{self._adopt_ns()}main")
         base = self.resolve(f"{self._adopt_ns()}main") if ok else self.resolve(BASE_REF)
         if not ok:
             notes.append(f"{why}; compared with the last-fetched origin/main")
@@ -737,7 +849,7 @@ class Engine(Repo):
         missing: list[str] = []
         for n, sha in prs:
             if not self.resolve(sha):
-                self.fetch(f"refs/pull/{n}/head:{self._adopt_ns()}pr/{n}")
+                self.fetch(f"+refs/pull/{n}/head:{self._adopt_ns()}pr/{n}")
             if self.resolve(sha):
                 available.append((n, sha))
             else:
@@ -829,6 +941,13 @@ def main(
     root: Path | None = None,
 ) -> int:
     env = dict(os.environ if env is None else env)
+    # git output is decoded with surrogateescape, so a non-UTF-8 path can reach a
+    # message: print it escaped rather than crash on it.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(errors="backslashreplace")
     try:
         args = _parser().parse_args(argv)
     except SystemExit as exc:
@@ -859,6 +978,17 @@ def main(
         return 1
     except Refusal as exc:
         _err(f"ERROR: {exc}")
+        return 1
+    except Exception as exc:  # noqa: BLE001 - an unexpected failure still exits 1, with the facts
+        try:
+            tip = engine.resolve(LIVE_REF)
+        except Exception:  # noqa: BLE001
+            tip = None
+        _err(
+            f"ERROR: unexpected {type(exc).__name__}: {exc}\n`live` is at "
+            f"{tip[:12] if tip else 'an unreadable or missing ref'}; the manifest is "
+            f"{engine.store.path}. Check both before retrying."
+        )
         return 1
     return 2
 
