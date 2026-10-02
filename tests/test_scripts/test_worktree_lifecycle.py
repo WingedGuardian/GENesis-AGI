@@ -71,6 +71,72 @@ def _age_path(path: Path, days: float) -> None:
             continue
         with contextlib.suppress(OSError, NotImplementedError):
             os.utime(item, (old, old), follow_symlinks=False)
+    if (path / ".git").exists():
+        _age_reflog(path, days)
+
+
+def _age_reflog(repo_path: Path, days: float) -> None:
+    """Backdate the timestamp IN every HEAD reflog entry. The activity clock
+    reads when HEAD last moved from the entries themselves, not the file's mtime
+    (which `git gc` rewrites), so a fixture that committed and then aged its
+    files would otherwise still read as committed just now."""
+    git_dir = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "--absolute-git-dir"],
+        check=True, capture_output=True,
+    ).stdout.strip()  # bytes: a fixture path may not be UTF-8
+    log = Path(os.fsdecode(git_dir)) / "logs" / "HEAD"
+    if not log.exists():
+        return
+    stamp = str(int(time.time() - days * 86400)).encode()
+    lines = []
+    for line in log.read_bytes().split(b"\n"):
+        head, tab, msg = line.partition(b"\t")
+        fields = head.split(b" ")
+        if len(fields) >= 4:
+            fields[-2] = stamp
+            line = b" ".join(fields) + tab + msg
+        lines.append(line)
+    log.write_bytes(b"\n".join(lines))
+
+
+def _age_git_dir(repo_path: Path, days: float) -> None:
+    """Backdate a repository's git directory, wherever it lives. `_age_path`
+    skips `.git`, and a submodule's git dir is outside the worktree entirely."""
+    git_dir = Path(_git(repo_path, "rev-parse", "--absolute-git-dir").strip())
+    old = time.time() - days * 86400
+    for p in [git_dir, *git_dir.rglob("*")]:
+        with contextlib.suppress(OSError):
+            os.utime(p, (old, old), follow_symlinks=False)
+
+
+def _add_submodule_worktree(repo: Path, tmp_path: Path, name: str) -> Path:
+    """A worktree of ``repo`` holding an initialised submodule ``mod`` whose
+    only file is ``mod/a/b/s.txt``, with two commits so a checkout can move it.
+    Nothing is aged."""
+    sub = tmp_path / f"{name}-src"
+    sub.mkdir()
+    _git(sub, "init", "-q", "-b", "main")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "a" / "b").mkdir(parents=True)
+    (sub / "a" / "b" / "s.txt").write_text("v1\n")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-qm", "v1")
+    (sub / "a" / "b" / "s.txt").write_text("v2\n")
+    _git(sub, "commit", "-qam", "v2")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git(repo, "commit", "-qm", f"add submodule for {name}")
+    wt = tmp_path / name
+    _git(repo, "worktree", "add", "-q", "-b", f"{name}-br", str(wt), "main")
+    _git(wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+    return wt
+
+
+def _age_submodule_worktree(wt: Path, days: float) -> None:
+    _age_path(wt, days)
+    old = time.time() - days * 86400
+    os.utime(wt / "mod" / ".git", (old, old))
+    _age_git_dir(wt / "mod", days)
 
 
 # Every module path the reaper WRITES to. Each is redirected below; the guard
@@ -1640,6 +1706,260 @@ def test_deleting_a_deep_tracked_file_counts_as_recent_activity(reaper_repo, tmp
     assert cls["action"] == "none", cls
 
 
+def test_deleting_a_quoted_deep_path_counts_as_recent_activity(reaper_repo, tmp_path):
+    """With the default `core.quotePath`, git C-quotes a path holding non-ASCII
+    bytes (`"deep-\\377/x/y/f.txt"`), so the probe stat'ed an escaped name that
+    does not exist and found no activity. The status is read with `-z`, which
+    never quotes."""
+    repo = reaper_repo.repo
+    deep = Path(os.fsdecode(b"deep-\xff")) / "x" / "y" / "f.txt"
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "quoted deep file")
+    wt = tmp_path / "wt_quoted"
+    _git(repo, "worktree", "add", "-q", "-b", "quoted-br", str(wt), "main")
+    _age_path(wt, 20)
+    (wt / deep).unlink()
+    assert wl._has_uncommitted_changes(str(wt)), "precondition: git sees the deletion"
+
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["age_days"] < 1, cls
+    assert cls["action"] == "none", cls
+
+
+def test_an_edit_inside_a_submodule_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A submodule's changes reach the parent's status only as ` M <gitlink>`,
+    and the gitlink directory's own mtime does not move when a file deep inside
+    it is edited. The probe reads the submodule's own status instead."""
+    repo = reaper_repo.repo
+    sub = tmp_path / "subsrc"
+    sub.mkdir()
+    _git(sub, "init", "-q", "-b", "main")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "a" / "b").mkdir(parents=True)
+    (sub / "a" / "b" / "s.txt").write_text("s\n")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-qm", "s0")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git(repo, "commit", "-qm", "add submodule")
+    wt = tmp_path / "wt_sub"
+    _git(repo, "worktree", "add", "-q", "-b", "sub-br", str(wt), "main")
+    _git(wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+    _age_path(wt, 20)
+    # `_age_path` skips every `.git` entry, but the submodule's `.git` FILE sits
+    # two levels down, where the shallow walk samples it; left fresh, it made
+    # this worktree read as active whatever the probe did. Its git dir holds the
+    # HEAD and reflog the probe now reads, written fresh by the checkout above.
+    old = time.time() - 20 * 86400
+    os.utime(wt / "mod" / ".git", (old, old))
+    _age_git_dir(wt / "mod", 20)
+    (wt / "mod" / "a" / "b" / "s.txt").write_text("edited inside the submodule\n")
+    assert wl._has_uncommitted_changes(str(wt)), "precondition: the parent sees a dirty gitlink"
+
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["age_days"] < 1, cls
+    assert cls["action"] == "none", cls
+
+
+def test_a_rename_below_the_shallow_walk_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A renamed file keeps its old mtime, so the rename shows only in the
+    directory that gained the new name. Its mtime is what counts it."""
+    repo = reaper_repo.repo
+    deep = Path("deep") / "x" / "y"
+    (repo / deep).mkdir(parents=True)
+    (repo / deep / "old.txt").write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "rename source")
+    wt = tmp_path / "wt_rename"
+    _git(repo, "worktree", "add", "-q", "-b", "rename-br", str(wt), "main")
+    _age_path(wt, 20)
+    _git(wt, "mv", str(deep / "old.txt"), str(deep / "new.txt"))
+
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_an_edit_after_classification_holds_an_unmerged_worktree(reaper_repo, tmp_path, monkeypatch):
+    """The scan classifies every worktree first and archives afterwards, and the
+    merge verdict can wait on the network for up to 30 seconds, so a worktree
+    can be edited after its age was read. The archive step re-reads the age in
+    both lanes, as it re-reads processes, locks and nesting.
+
+    The late edit goes to a file that is ALREADY modified, so HEAD and the
+    status output are unchanged and the fingerprint comparison cannot see it:
+    only the age re-check can, which is what this test pins (with any other
+    edit, removing the re-check left it green)."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_det_unmerged
+    (wt / "a.txt").write_text("modified before the scan\n")
+    _age_path(wt, 20)
+    before = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert before["state"] == wl.STATE_REAP_UNMERGED, "precondition: due on the unmerged lane"
+
+    real = wl._classify
+
+    def classify_then_edit(entry, *args, **kwargs):
+        out = real(entry, *args, **kwargs)
+        if Path(entry["path"]) == wt:
+            (wt / "a.txt").write_text("edited again after classification\n")
+        return out
+
+    monkeypatch.setattr(wl, "_classify", classify_then_edit)
+    assert _run_main(monkeypatch, repo, tmp_path / "trash", argv=("worktree_lifecycle.py", "--no-network")) == 0
+    assert wt.exists(), "a worktree edited after it was classified was archived"
+    assert (wt / "a.txt").read_text() == "edited again after classification\n"
+
+
+def test_probing_a_nested_repository_does_not_make_it_look_active(reaper_repo, tmp_path):
+    """Reading a nested repository's own status must not move its `.git`
+    directory's mtime, which the shallow walk reads at depth two. With git's
+    optional locks on, `git status` took `index.lock` there, so the reaper's
+    first probe made an idle worktree read as active on every later run."""
+    repo = reaper_repo.repo
+    wt = tmp_path / "wt_nested"
+    _git(repo, "worktree", "add", "-q", "-b", "nested-br", str(wt), "main")
+    nested = wt / "nested"
+    nested.mkdir()
+    _git(nested, "init", "-q")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f.txt").write_text("f\n")
+    _git(nested, "add", "-A")
+    _git(nested, "commit", "-qm", "nested")
+    _age_path(wt, 20)
+    old = time.time() - 20 * 86400
+    for p in [nested / ".git", *(nested / ".git").rglob("*")]:  # `_age_path` skips `.git`
+        os.utime(p, (old, old), follow_symlinks=False)
+
+    ages = [(time.time() - wl._last_activity_time(str(wt))) / 86400 for _ in range(3)]
+    assert min(ages) > 19, ages
+
+
+def test_an_old_file_moved_into_a_deep_directory_counts_as_recent_activity(reaper_repo, tmp_path):
+    """Moving a file keeps its old mtime, so an untracked file moved into a
+    directory below the shallow walk shows only in that directory's mtime."""
+    repo = reaper_repo.repo
+    deep = Path("deep") / "x" / "y"
+    (repo / deep).mkdir(parents=True)
+    (repo / deep / "tracked.txt").write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "deep directory")
+    wt = tmp_path / "wt_moved"
+    _git(repo, "worktree", "add", "-q", "-b", "moved-br", str(wt), "main")
+    outside = tmp_path / "moved.txt"
+    outside.write_text("written long ago\n")
+    _age_path(wt, 20)
+    old = time.time() - 20 * 86400
+    os.utime(outside, (old, old))
+    outside.rename(wt / deep / "moved.txt")
+
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_an_unreadable_age_at_archive_time_skips_rather_than_raises(reaper_repo, tmp_path, monkeypatch):
+    """The archive-time age re-check runs outside the classification's error
+    handling, so a worktree removed in between must be skipped, not end the run."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_det_unmerged
+    _age_path(wt, 20)
+
+    def gone(_path, **_kwargs):
+        raise FileNotFoundError("removed during the scan")
+
+    monkeypatch.setattr(wl, "_last_activity_time", gone)
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    entry = _wt_by_path(repo, wt)
+    assert wl._trash_worktree(entry, repo, lane="unmerged", min_idle_days=14) is False
+    assert wt.exists()
+
+
+def test_a_failed_status_at_archive_time_holds_the_worktree(reaper_repo, tmp_path, monkeypatch, capsys):
+    """The archive-time re-check is the only guard against an edit made after
+    classification. A git status that cannot answer there must hold the
+    worktree, not fall back to the shallow walk and read as idle. Classification
+    keeps the fallback."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_det_unmerged
+    _age_path(wt, 20)
+    real = wl._run_git_bytes
+
+    def status_fails(root, args, *, timeout):
+        return None if args[:1] == ["status"] else real(root, args, timeout=timeout)
+
+    monkeypatch.setattr(wl, "_run_git_bytes", status_fails)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, "classification degrades to the walk"
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(_wt_by_path(repo, wt), repo, lane="unmerged", min_idle_days=14) is False
+    assert "cannot re-read its activity time" in capsys.readouterr().out
+    assert wt.exists()
+
+
+def test_a_spent_nested_probe_budget_holds_rather_than_reads_idle(reaper_repo, tmp_path, monkeypatch):
+    """Nested probes share one time budget per scan. Once it is spent the
+    classification stops descending, and the strict archive-time probe raises
+    rather than reporting the nested repository as idle. `main` resets it."""
+    repo = reaper_repo.repo
+    wt = _add_submodule_worktree(repo, tmp_path, "wt_budget")
+    _age_submodule_worktree(wt, 20)
+    (wt / "mod" / "a" / "b" / "s.txt").write_text("edited inside the submodule\n")
+
+    roots = []
+    for name in ("_run_git", "_run_git_bytes"):
+        real = getattr(wl, name)
+
+        def recording(root, args, *, timeout, _real=real):
+            roots.append(Path(root))
+            return _real(root, args, timeout=timeout)
+
+        monkeypatch.setattr(wl, name, recording)
+    monkeypatch.setattr(wl, "_nested_probe_deadline", time.monotonic() - 1)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, "no descent once spent"
+    with pytest.raises(wl._ProbeFailed):
+        wl._last_activity_time(str(wt), strict=True)
+    assert wt / "mod" not in roots, "a spent budget must start no nested git process at all"
+
+    calls = []
+    monkeypatch.setattr(wl, "_reset_nested_probe_budget", lambda: calls.append(1))
+    assert _run_main(monkeypatch, repo, tmp_path / "trash", argv=("worktree_lifecycle.py", "--dry-run", "--no-network")) == 0
+    assert calls == [1], "main must start each scan with a fresh budget"
+
+
+def test_a_carriage_return_in_a_deep_path_is_read_as_bytes(reaper_repo, tmp_path):
+    """Text mode translates a carriage return inside a NUL-delimited path, so
+    the parsed name was not the file on disk and a deep EDIT went unseen. An
+    edit, because only the status reading can see one: a deletion is now also
+    dated by the directory walk, so it could not tell the parse was wrong."""
+    repo = reaper_repo.repo
+    deep = Path("deep\rcr") / "x" / "y" / "f.txt"
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "carriage return in a path")
+    wt = tmp_path / "wt_cr"
+    _git(repo, "worktree", "add", "-q", "-b", "cr-br", str(wt), "main")
+    _age_path(wt, 20)
+    (wt / deep).write_text("edited\n")
+
+    assert (time.time() - wl._git_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_clean_checkout_inside_a_submodule_counts_as_recent_activity(reaper_repo, tmp_path):
+    """Checking out another revision inside a submodule leaves its status clean,
+    and the parent shows only ` M mod`. The submodule's HEAD and reflog record
+    when HEAD moved there."""
+    repo = reaper_repo.repo
+    wt = _add_submodule_worktree(repo, tmp_path, "wt_subhead")
+    _age_submodule_worktree(wt, 20)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, "precondition: reads idle"
+    _git(wt / "mod", "checkout", "-q", "HEAD~1")
+    assert not _git(wt / "mod", "status", "--porcelain"), "precondition: the submodule is clean"
+
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
 def test_a_dirty_check_that_cannot_answer_counts_as_dirty(reaper_repo, monkeypatch):
     """FAIL-CLOSED: when `git status` cannot answer, the worktree is treated as
     dirty, so an error holds it for the long window instead of archiving it
@@ -1732,3 +2052,346 @@ def test_the_real_script_survives_a_worktree_name_that_is_not_utf8(tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "TRASH" in proc.stdout, proc.stdout[-2000:]
     assert not wt.exists(), "the clean merged worktree should have been archived"
+# ─── activity clock v3: one signal per kind of change ────────────────────────
+
+
+def _untracked_deep_worktree(repo: Path, tmp_path: Path, name: str) -> Path:
+    wt = tmp_path / name
+    _git(repo, "worktree", "add", "-q", "-b", f"{name}-br", str(wt), "main")
+    return wt
+
+
+def test_renaming_an_untracked_folder_deep_in_the_tree_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """A renamed folder keeps its own mtime and git reports only the new paths,
+    whose files are old: only the directory that HOLDS the folder moves, and the
+    first-existing-ancestor reading stopped at the renamed folder itself.
+    MEASURED before the tree walk: 20.0 days after today's rename."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_dir_rename")
+    old = wt / "x" / "y" / "z" / "oldfolder"
+    old.mkdir(parents=True)
+    (old / "file.txt").write_text("untracked\n")
+    _age_path(wt, 20)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, (
+        "control: idle before the rename"
+    )
+    old.rename(old.parent / "newfolder")
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_deleting_the_last_untracked_file_in_a_deep_folder_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """Git reports nothing at all afterwards -- the file is gone and an empty
+    folder is not listed -- so no status-based reading can see it. Its folder's
+    mtime is the only evidence (MEASURED before the tree walk: 20.0 days)."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_last_untracked")
+    deep = wt / "x" / "y" / "z"
+    deep.mkdir(parents=True)
+    (deep / "only.txt").write_text("untracked\n")
+    _age_path(wt, 20)
+    (deep / "only.txt").unlink()
+    assert _git(wt, "status", "--porcelain", "-uall") == "", "precondition: git sees nothing"
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_commit_in_the_worktree_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A deep edit, then committed: the status is clean again and the walk's top
+    two levels never held the file. Only HEAD's move says the worktree was used
+    (MEASURED before: 20.0 days after the commit)."""
+    repo = reaper_repo.repo
+    (repo / "src" / "pkg").mkdir(parents=True)
+    (repo / "src" / "pkg" / "mod.py").write_text("v1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "deep file")
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_commit")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    _age_path(wt, 20)
+    (wt / "src" / "pkg" / "mod.py").write_text("v2\n")
+    os.utime(
+        wt / "src" / "pkg", (time.time() - 20 * 86400,) * 2
+    )  # an in-place edit, and only an edit
+    _git(wt, "commit", "-qam", "edit deep")
+    assert _git(wt, "status", "--porcelain") == "", "precondition: clean after the commit"
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_git_gc_does_not_make_an_idle_worktree_look_active(reaper_repo, tmp_path):
+    """`git gc` rewrites every worktree's reflog FILE (and the directory holding
+    it), so a clock reading those mtimes would see every worktree as just used
+    after any gc. The entries' own timestamps survive (MEASURED), and are what
+    is read."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_gc")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    (wt / "f.txt").write_text("x\n")
+    _git(wt, "add", "f.txt")
+    _git(wt, "commit", "-qm", "a real move of HEAD")
+    _age_path(wt, 20)
+    _git(repo, "gc", "-q")
+    _git(repo, "reflog", "expire", "--all")
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert (time.time() - log.stat().st_mtime) / 86400 < 1, "precondition: gc rewrote the file"
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19
+
+
+def test_creating_a_worktree_on_a_branch_is_not_read_as_a_move_of_head(reaper_repo, tmp_path):
+    """Creation on a branch writes an all-zeros entry AND a `reset: moving to
+    HEAD` with the same commit on both sides (MEASURED). Neither is use."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_created")
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert len(log.read_text().splitlines()) == 2, "precondition: both creation entries are there"
+    assert wl._head_moved_time(log, strict=True) == 0.0
+
+
+def test_a_commit_in_a_nested_repo_with_reflogs_off_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """With ``core.logAllRefUpdates=false`` a commit on a branch writes no HEAD
+    reflog entry and leaves HEAD itself alone, and the nested status is clean
+    after it. The commit rewrites the nested repository's index, so its git
+    directory's mtime moves -- below the top two levels, nothing else sees it."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_nested_nolog")
+    nested = wt / "x" / "y" / "clone"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "core.logAllRefUpdates", "false")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f").write_text("1\n")
+    _git(nested, "add", "f")
+    _git(nested, "commit", "-qm", "c1")
+    assert not (nested / ".git" / "logs" / "HEAD").exists(), "precondition: no HEAD reflog"
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    (nested / "f").write_text("2\n")
+    os.utime(nested, (time.time() - 20 * 86400,) * 2)
+    _git(nested, "commit", "-qam", "c2")
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_an_unreadable_folder_holds_at_archive_time(reaper_repo, tmp_path):
+    """A folder that exists but cannot be listed is not evidence of idleness.
+    Classification reads around it; the strict archive-time probe raises."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 folder")
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_unreadable")
+    locked = wt / "x" / "sealed"
+    locked.mkdir(parents=True)
+    (locked / "f.txt").write_text("untracked\n")
+    _age_path(wt, 20)
+    locked.chmod(0)
+    try:
+        assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, (
+            "classification reads around it"
+        )
+        with pytest.raises(wl._ProbeFailed):
+            wl._last_activity_time(str(wt), strict=True)
+    finally:
+        locked.chmod(0o755)
+
+
+def test_nested_probe_timeouts_never_run_past_the_deadline(reaper_repo, tmp_path, monkeypatch):
+    """One deadline, and every nested git call's timeout is recomputed from it,
+    so no call can run past it and nothing is charged twice."""
+    wt = _add_submodule_worktree(reaper_repo.repo, tmp_path, "wt_deadline")
+    _age_submodule_worktree(wt, 20)
+    (wt / "mod" / "a" / "b" / "s.txt").write_text("edited inside the submodule\n")
+    calls = []
+    for name in ("_run_git", "_run_git_bytes"):
+        real = getattr(wl, name)
+
+        def recording(root, args, *, timeout, _real=real):
+            calls.append((Path(root), timeout, time.monotonic()))
+            out = _real(root, args, timeout=timeout)
+            if Path(root) == wt / "mod":
+                time.sleep(0.3)  # so a timeout computed once and reused shows
+            return out
+
+        monkeypatch.setattr(wl, name, recording)
+    deadline = time.monotonic() + 2.0
+    monkeypatch.setattr(wl, "_nested_probe_deadline", deadline)
+    wl._last_activity_time(str(wt))
+    nested = [(t, at) for root, t, at in calls if root == wt / "mod"]
+    assert len(nested) == 2, f"precondition: two nested calls, got {nested}"
+    for timeout, at in nested:
+        assert timeout <= deadline - at + 0.05, (timeout, deadline - at)
+
+
+def test_a_change_after_classification_holds_even_when_no_signal_sees_it(
+    reaper_repo, tmp_path, monkeypatch, capsys
+):
+    """The fingerprint is the backstop that does not rest on the activity
+    signals being complete: any change in HEAD or the status between the scan
+    and the archive holds the worktree."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_fp")
+    _age_path(wt, 20)
+    row = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert row["action"] == "trash" and row["fingerprint"], row
+    (wt / "new-untracked.txt").write_text("made after the scan\n")
+    frozen = time.time() - 20 * 86400
+    monkeypatch.setattr(
+        wl, "_last_activity_time", lambda _p, **_k: frozen
+    )  # a clock that misses it
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
+    assert "git state changed between classification and reap" in capsys.readouterr().out
+    assert wt.exists()
+
+
+def test_a_held_worktree_stops_advertising_its_archive(reaper_repo, tmp_path, monkeypatch):
+    """The board was published before archiving with `action: trash`; a worktree
+    the archive step held kept that row for a day. Its row now says why it was
+    held, and no longer says it will be archived."""
+    import json
+
+    cache = tmp_path / "board.json"
+    monkeypatch.setattr(wl, "BOARD_CACHE", cache)
+    target = reaper_repo.wt_branch_merged
+    real = wl._is_locked_now
+    monkeypatch.setattr(wl, "_is_locked_now", lambda p: Path(p) == target or real(p))
+    _run_main(monkeypatch, reaper_repo.repo, tmp_path / "trash")
+    assert target.exists()
+    row = next(r for r in json.loads(cache.read_text())["worktrees"] if Path(r["path"]) == target)
+    assert row["action"] == "none", row
+    assert "archive held this run: locked between classification and reap" in row["reason"], row
+def test_switching_to_a_new_branch_on_the_same_commit_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """`git switch -c` to start new work in an old worktree changes no file and
+    no commit; the reflog entry is the only trace. Only creation's own entries
+    are skipped, so this one counts."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_switch")
+    _age_path(wt, 20)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, (
+        "control: idle before the switch"
+    )
+    _git(wt, "switch", "-q", "-c", "new-work")
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_missing_classification_fingerprint_holds(reaper_repo, tmp_path, monkeypatch, capsys):
+    """A row `_classify` produced always carries the key. When git could not
+    answer at classification there is nothing to compare against, and the
+    archive step holds rather than skipping the comparison."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_fp_none")
+    _age_path(wt, 20)
+    row = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    row["fingerprint"] = None
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
+    assert "could not be read at classification" in capsys.readouterr().out
+    assert wt.exists()
+def test_a_branch_switch_after_classification_holds(reaper_repo, tmp_path, monkeypatch, capsys):
+    """The fingerprint carries the branch name, so a `git switch -c` between
+    the scan and the archive holds the worktree even with a clock that missed
+    it (the commit and the status are both unchanged)."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_fp_switch")
+    _age_path(wt, 20)
+    row = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert row["action"] == "trash" and row["fingerprint"], row
+    _git(wt, "switch", "-q", "-c", "started-after-the-scan")
+    frozen = time.time() - 20 * 86400
+    monkeypatch.setattr(wl, "_last_activity_time", lambda _p, **_k: frozen)
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
+    assert "git state changed between classification and reap" in capsys.readouterr().out
+    assert wt.exists()
+# ─── round 3: robustness of the three signals ────────────────────────────────
+
+
+def test_a_nested_repo_whose_path_holds_a_newline_is_still_read(reaper_repo, tmp_path):
+    """Line-based parsing of git's paths split such a path in two, and the
+    strict archive-time probe then held the worktree on every run. One path,
+    read as bytes, with only git's own terminating newline removed."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_newline_nested")
+    nested = wt / "x" / "odd\nname"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f").write_text("1\n")
+    _git(nested, "add", "f")
+    _git(nested, "commit", "-qm", "c1")
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    _age_reflog(nested, 20)
+    assert (time.time() - wl._last_activity_time(str(wt), strict=True)) / 86400 > 19, "control: idle"
+    # A commit that changes no file: only that repository's history and index
+    # show it, so it is seen only if the RIGHT git directory was read.
+    _git(nested, "commit", "-q", "--allow-empty", "-m", "c2")
+    assert (time.time() - wl._last_activity_time(str(wt), strict=True)) / 86400 < 1
+
+
+def test_a_reflog_entry_larger_than_the_tail_read_is_still_seen(reaper_repo, tmp_path):
+    """A commit message has no size bound, so the newest entry can outgrow the
+    fixed tail read; the cut fragment was dropped and the commit went unseen.
+    The read now extends backward until it finds a whole counted entry."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_huge_reflog")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    _age_path(wt, 20)
+    msg = tmp_path / "msg.txt"
+    msg.write_text("x" * (wl._REFLOG_TAIL_BYTES + 5000) + "\n")
+    _git(wt, "commit", "-q", "--allow-empty", "-F", str(msg))
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert log.stat().st_size > wl._REFLOG_TAIL_BYTES, (
+        "precondition: the newest entry outgrows the tail"
+    )
+    assert (time.time() - wl._head_moved_time(log, strict=True)) / 86400 < 1
+
+
+def test_a_commit_between_the_fingerprints_two_reads_is_not_missed(
+    reaper_repo, tmp_path, monkeypatch
+):
+    """HEAD and the status are separate git calls. A commit landing between
+    them paired the old HEAD with the new, clean status, which can equal the
+    classification digest. HEAD is read again after the status, and a change
+    in between reads as no answer, which holds."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_torn")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    real = wl._run_git_bytes
+
+    def commit_after_status(root, args, *, timeout):
+        out = real(root, args, timeout=timeout)
+        if args[:1] == ["status"]:
+            _git(wt, "commit", "-q", "--allow-empty", "-m", "lands between the reads")
+        return out
+
+    monkeypatch.setattr(wl, "_run_git_bytes", commit_after_status)
+    assert wl._state_fingerprint(str(wt)) is None
+
+
+def test_maintenance_in_a_nested_repo_does_not_keep_the_worktree_active(reaper_repo, tmp_path):
+    """`git gc` and `git maintenance` in a nested repository move its git
+    directory's mtime (MEASURED) without anyone using it, so reading that
+    directory kept a stale worktree looking used for as long as maintenance
+    ran. The index file is read instead; gc leaves it alone."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_nested_gc")
+    nested = wt / "x" / "y" / "clone"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    for i in range(3):
+        (nested / f"f{i}").write_text(f"{i}\n")
+        _git(nested, "add", "-A")
+        _git(nested, "commit", "-qm", f"c{i}")
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    _age_reflog(nested, 20)
+    _git(nested, "gc", "-q")
+    assert (time.time() - (nested / ".git").stat().st_mtime) / 86400 < 1, (
+        "precondition: gc moved the git dir"
+    )
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19
