@@ -164,7 +164,9 @@ Easy-to-forget mechanisms:
   digit-guard rules out numeric-suffix pairs, then a two-model LLM judgment
   (`entity_adjudication` + flipped-provider `entity_adjudication_challenge`, both
   must agree) decides merge-vs-distinct. `propose_only` by default (records, does
-  not apply); `live` applies via `merge_entity`. A cursor-managed reconcile sweep
+  not apply); `live` would apply new-pair merges via `merge_entity` unattended,
+  but is FENCED (runs as `propose_only`, settings lever refuses it) until
+  issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
   rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
@@ -341,7 +343,8 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 45f6c23e3 2026-09-26
+
+verified: 33b49a105 2026-09-26
 ```
 
 - **`gh` holds NO GitHub credential in any dispatched session — the SESSION may
@@ -419,6 +422,26 @@ verified: 45f6c23e3 2026-09-26
   de-authenticate). Widening that pin by origin was measured wrong twice over and
   is documented in `.claude/docs/background-sessions.md`; the remedy is denying
   `Bash`, not an env pin.
+
+- **NO dispatch profile grants Bash** (`cc/direct_session.py`,
+  `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
+  to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
+  run (0 sessions, vs 257/167/154 for the three busiest). Removed rather than
+  confined because four MEASURED facts converge on one unbuilt mechanism: `gh` runs
+  arbitrary programs via its own config (closed by the retained seal); `gh` READS
+  arbitrary files via `-F`/`--input`, so a tool-scope denial of `Read`/`Glob`/`Grep`
+  cannot make "no file reads" true while `gh` is permitted; `gh` WRITES to
+  caller-chosen paths; and per-profile denials are re-enablable via
+  `tool_exceptions` absent a protected set. All four want a SUBCOMMAND-level
+  allowlist. An operator lever gating the profile was built and discarded — a lever
+  moves the decision without making the enabled state safe.
+  **The mechanism is retained and is NOT dead code**: the allowlist map, the guard
+  registration and `_BINARY_HARDENING` all key on the BINARY, so an install granting
+  `gh` to its own profile via `genesis.cc.profile_overlay` still gets the sealed
+  config dir and the program-route pins. An empty map is a statement about shipped
+  profiles, never about the machinery. Rationale, and the bar for re-adding one:
+  `.claude/docs/background-sessions.md`, "Why the one Bash-enabled profile was
+  removed".
 - **The slot door heals a bare slot — by CONSENT, never silently**
   (`scripts/cc-slot.sh`, the block above every latch; probe:
   `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —
@@ -631,7 +654,7 @@ verified: 45f6c23e3 2026-09-26
   `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
   Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
   `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
-  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; the video text is returned inside the keyed untrusted-content boundary, and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; every `web_fetch` MCP result, from any backend, is returned inside the keyed untrusted-content boundary (`web_tools._wrap_fetch_result`), and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
   MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
   judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
@@ -1107,8 +1130,11 @@ verified: 640c4f2e3 2026-09-18
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
-- **inbox/**: file-drop monitor with approval-gated dispatch. Before any DB,
-  approval, response, or baseline mutation, it composes and validates one
+- **inbox/**: file-drop monitor with approval-gated dispatch.
+  `monitor.py` owns scanning, approval, retries and baseline writes;
+  `batch_runner.py` executes one approved batch and post-processes its output,
+  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
   precedence footer. A missing, unreadable, or empty component fails the scan
@@ -3137,7 +3163,9 @@ verified: 2ac29c19 2026-09-14
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
-  `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
+  edits under `~/.genesis/premerge-backups/` first — so the block must live in
+  the commit).
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

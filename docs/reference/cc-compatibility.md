@@ -94,7 +94,9 @@ the procedure (step 5).
      to compare against. It cannot move later either — step 3 replaces the CLI. See §Model-alias
      drift in the `cc-update` skill for the invocation and which `modelUsage` entry to read.
 2. **Deploy current `main` FIRST — before the soak, never during it.** Run `scripts/update.sh`
-   (background task) so the box is on current code *before* the candidate goes on. Two reasons:
+   DETACHED from the session (the `systemd-run --user` recipe in the genesis-development
+   skill's Timeout Policy; not `run_in_background`, which is session-bound and has killed
+   deploys mid-run) so the box is on current code *before* the candidate goes on. Two reasons:
    a long gap between deploys means step 8 would otherwise land weeks of Genesis change **and**
    the CC bump in one shot, leaving you unable to attribute a regression to either; and the soak
    is only meaningful as evidence about CC if the code underneath it isn't stale.
@@ -212,7 +214,9 @@ the procedure (step 5).
    CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-27
    CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, check_cc_running_versions.sh clean, sign-off recorded
    ```
-8. **Run `scripts/update.sh`** (a background task — deploys exceed the Bash tool timeout). It
+8. **Run `scripts/update.sh`** DETACHED from the session — deploys exceed the Bash tool's hard
+   ceiling, and `run_in_background` is session-bound, so use the `systemd-run --user` recipe
+   in the genesis-development skill's Timeout Policy. It
    updates the container, redeploys the Guardian (carrying the new gateway script), then queries
    the host's CC version and — **only if it differs from the pin** — dispatches `update-cc <pin>`
    to the Guardian gateway on the host. The dispatch is idempotent (acts only on drift) and

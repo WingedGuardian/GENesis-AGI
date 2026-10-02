@@ -348,7 +348,7 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash -c 'IN=$(cat); URL=$(printf %s \"$IN\" | jq -r .tool_input.url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: WebFetch gets only a YouTube page shell, not what the video says.\" >&2; echo \"Use the genesis web_fetch MCP tool (mcp__genesis-health__web_fetch) with this URL instead: it returns the title, channel, description and the transcript (captions in the language of the video).\" >&2; exit 2; fi'"
+                        "command": "bash -c 'IN=$(cat); URL=$(printf %s \"$IN\" | jq -r .tool_input.url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: WebFetch gets only a YouTube page shell, not what the video says.\" >&2; echo \"Use the genesis web_fetch MCP tool (mcp__genesis-health__web_fetch) with this URL instead: it returns the title, channel, description and the transcript (captions, preferring the language of the video).\" >&2; exit 2; fi'"
                     }
                 ]
             },
