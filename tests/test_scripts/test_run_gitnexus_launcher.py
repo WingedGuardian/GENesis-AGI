@@ -298,3 +298,26 @@ def test_invalid_machine_node_selection_refuses_launcher(tmp_path):
         result = subprocess.run([str(LAUNCHER), "mcp"], env=env, capture_output=True, text=True)
         assert result.returncode != 0
         assert not log.exists()
+
+
+def test_root_node_selection_sets_root_path_component(tmp_path):
+    # Model a root-level executable without requiring privileged writes to /.
+    # Only external executable lookup/stat/version are faked; validation and
+    # PATH calculation execute the production helper unchanged.
+    library = REPO_ROOT / "scripts" / "lib" / "gitnexus_version.sh"
+    script = r'''source "$1"
+function /node() { echo v22.23.2; }
+function command() {
+    if [[ "$*" == "-v node" ]]; then echo /node; else builtin command "$@"; fi
+}
+function [() {
+    if [[ "$*" == "! -x /node ]" ]]; then return 1; fi
+    if [[ "$*" == "/node -ef /node ]" ]]; then return 0; fi
+    builtin [ "$@"
+}
+GITNEXUS_NODE_BIN=/node
+genesis_gitnexus_select_node || exit 1
+[[ "$PATH" == /:* ]] || exit 2
+'''
+    result = subprocess.run(["bash", "-c", script, "bash", str(library)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

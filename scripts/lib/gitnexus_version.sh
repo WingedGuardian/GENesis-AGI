@@ -29,7 +29,7 @@ genesis_gitnexus_select_node() {
         [ -n "$selected" ] || { printf 'GitNexus: empty Node selection: %s\n' "$config" >&2; return 1; }
     fi
     [ -n "$selected" ] || return 0
-    if [[ "$selected" != /*/node ]] || [[ "$selected" == *$'\n'* || "$selected" == *:* ]] || [ ! -x "$selected" ]; then
+    if [[ "$selected" != /* || "${selected##*/}" != node ]] || [[ "$selected" == *$'\n'* || "$selected" == *:* ]] || [ ! -x "$selected" ]; then
         printf 'GitNexus: invalid Node selection: %s\n' "$selected" >&2
         return 1
     fi
@@ -38,7 +38,8 @@ genesis_gitnexus_select_node() {
         printf 'GitNexus: selected Node %s is unsupported\n' "$version" >&2
         return 1
     fi
-    export PATH="${selected%/node}:$PATH"
+    local node_dir="${selected%/*}"
+    export PATH="${node_dir:-/}:$PATH"
     [ "$(command -v node)" -ef "$selected" ] || { printf 'GitNexus: selected Node did not resolve\n' >&2; return 1; }
 }
 
