@@ -18,7 +18,9 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import random
+import tempfile
 from pathlib import Path
 
 import aiosqlite
@@ -325,13 +327,31 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
         raise ValueError("no successfully graded cases; no draft written, retry is safe")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("x") as f:
-        f.write("# Unapproved draft for the reflection_quality rubric.\n")
-        f.write(f"# Generated: {count} sampled, {len(results)} graded\n")
-        f.write(f"# Pass: {passed_count}, Fail: {failed_count}, Error: {error_count}\n")
-        f.write("#\n")
-        for case in results:
-            f.write(json.dumps(case) + "\n")
+    # Sibling staging keeps publication on one filesystem. Link creates the
+    # final name atomically without replacing a competing file or symlink.
+    staging_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=output_path.parent,
+            prefix=".reflection-draft-", suffix=".tmp", delete=False,
+        ) as f:
+            staging_name = f.name
+            f.write("# Unapproved draft for the reflection_quality rubric.\n")
+            f.write(f"# Generated: {count} sampled, {len(results)} graded\n")
+            f.write(f"# Pass: {passed_count}, Fail: {failed_count}, Error: {error_count}\n")
+            f.write("#\n")
+            for case in results:
+                f.write(json.dumps(case) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(staging_name, output_path)
+    finally:
+        # Cleanup failure must not mask a completed publication or its cause.
+        if staging_name is not None:
+            try:
+                Path(staging_name).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove draft staging file %s", staging_name, exc_info=True)
 
     summary = {
         "sampled": len(observations),

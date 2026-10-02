@@ -3,7 +3,13 @@
 `python -m genesis.eval.reflection_golden_set` writes a private, unapproved
 `~/.genesis/output/reflection_quality_draft.jsonl`. Machine decisions are
 `proposed_passed`, never `user_passed`. Existing output files are refused before
-sampling or judge calls; the final write also uses exclusive creation. The
+sampling or judge calls. Complete drafts are staged in a private sibling file,
+flushed, synced and closed before atomic no-overwrite publication. A competing
+file or symlink is never replaced. Normal failures remove staging files; abrupt
+process termination may leave a hidden `.reflection-draft-*.tmp` file, but no
+partial final draft. Hard-link publication requires filesystem support and fails
+without creating the final path if unsupported. This is not a guarantee of
+filesystem survival after power loss. The
 historical `reflection_quality_golden.jsonl` is not migrated or overwritten.
 Zero samples or all failed grades raise without creating an output, so the same
 path can be retried. Partial nonempty drafts retain their grading error counts.

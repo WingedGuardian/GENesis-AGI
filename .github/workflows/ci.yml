@@ -1110,5 +1110,7 @@ jobs:
         # test_reference_integrity.py (main 0, branch 32); no added skip markers.
         # Round-one repair adds 49 cases in test_reference_round1.py
         # (main 0, branch 49); floor 23869 + 32 + 49 = 23950.
+        # Atomic publication adds 11 cases in test_reference_atomic.py
+        # (main 0, branch 11); floor 23869 + 32 + 49 + 11 = 23961.
         # Skip ceiling remains 102; no added skip markers.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23950
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23961

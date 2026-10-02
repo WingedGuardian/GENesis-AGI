@@ -2459,7 +2459,8 @@ verified: 788dd9a9 2026-09-06
   preserving historical files. `eval/calibration.py` exposes opt-in
   `strict_references` whole-file schema, rubric/context and declared human
   provenance and exact grading-question uniqueness checks before scoring.
-  Zero-case generation leaves no output, allowing retry. Reflection CLI and both
+  Zero-case generation leaves no output, allowing retry. Complete drafts are
+  synced and closed in sibling staging before atomic no-overwrite publication. Reflection CLI and both
   MCP experiment consumers retain the separate historical reference default.
   Reflection calibration CLI exposes
   `--strict-references`; legacy reports remain compatible. Declared provenance
