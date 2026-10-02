@@ -3333,9 +3333,21 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. `secrets_env` is the
-  ONLY key. The push / PR-open prompt has none on purpose: it is where code
-  leaves the machine, so it stays a decision on every install.
+  the command, and a dispatched session is still denied. The only other key is
+  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
+  It silences only the first push of the CURRENT branch, and only when the
+  whole command is exactly one plain `git push` (e.g. `git push -u origin
+  HEAD`) — a chained command still asks, so run the first push as its own
+  command. The remote git really pushes to must resolve (rewrites applied) to
+  exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
+  simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
+  the hook's environment, and a live probe confirming the branch is absent
+  there. Residue: shell-profile env/aliases/functions/PATH are invisible to the
+  hook, and a concurrent process can still change config or publish the
+  branch between check and push. `gh pr create` is not covered, since gh
+  without a TTY aborts rather than pushing. Force pushes, other destinations,
+  close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
+  are untouched, and any doubt about the destination keeps the prompt.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
@@ -3979,23 +3991,35 @@ findings below, a gated `gh pr merge`:
   commit:** `<sha>`") or a `✅ Completed` Code Review row in its PR summary comment
   (on PR open, often the only signal: #2418). Both name the commit by an ABBREVIATED
   id, and a prefix that merely MATCHES the head binds nothing — the head is whatever
-  the branch's author pushed (#2487). So the gate resolves the id against the PR's
-  OWN commit list and accepts it only when it resolves UNIQUELY to a commit equal to
-  the head, the comment is the Codex Bot's, and no Codex review object (any state)
-  sits at the head, no Codex issue comment on the PR carries findings (Codex
-  usually files findings as a review object, but MEASURED on 2 of 339 PRs it posted
-  them as a `💡` issue comment with none), the comment is unedited or Codex-edited,
-  and the PR's history has never moved under it: ANY force-push, base change, base
-  force-push or head-branch restore on the PR refuses every clean signal on it, whenever
-  it happened (each can drop the reviewed commit from the list while a lookalike
-  sharing its short id, which is cheap to grind, stays). A second PR commit sharing
-  the prefix, a commit outside the PR, an unreadable or 250-capped commit list: all
-  block. The block message says which clean signal it read and why it was refused,
-  and when no later clean signal on the PR can count either (history moved, or a
-  findings comment sits on the PR) it says a finding-free re-review cannot help.
-  `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
-  the signal does not resolve, the routes are an owner-approved `# substitute-review`
-  on another reviewer's review at that exact head, or a conscious
+  the branch's author pushed (#2487). So the gate resolves the id repo-wide via
+  `GET repos/{owner}/{repo}/commits/{short}` and accepts it only when GitHub resolves
+  it to exactly the PR head; a 422 (ambiguous or unknown) refuses it. Matching the
+  head implies the commit is the PR's. The comment must be the Codex Bot's, no Codex
+  review object (any state) may sit at the head, and no Codex issue comment on the PR
+  may carry findings (Codex usually files findings as a review object, but MEASURED
+  on 2 of 339 PRs it posted them as a `💡` issue comment with none). Any non-Codex edit
+  or deleted edit revision on any Codex comment permanently refuses clean signals;
+  the block names the editor when available. Edit-history completeness is required
+  only for Codex Bot comments; unrelated comments' edit data is ignored. History
+  veto covers head force-push, head-branch deletion or restoration, and base changes.
+  A base change stays a veto because the clean signal names the head, not the base
+  Codex reviewed against; retargeting changes the effective diff without moving the
+  head. A base force-push is retired: merging requires the default base, whose
+  ruleset forbids force-push and deletion, so a force-pushed non-default base can
+  reach a merge only through a base change, which vetoes. All 541 commits dropped
+  by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits
+  are not the binding risk.
+  A branch or tag exactly named after a short id can shadow GitHub's commit lookup
+  (which uses git name-guessing rules); measured `pull/2720/head` and `main` resolve.
+  Creating a shadow ref needs base-repo push rights, held only by the owner, and no
+  hex-named ref exists; fork authors cannot create one. A deleted comment leaves no
+  trace in the API. The block message says which clean signal it read and why it was
+  refused, and when no later clean signal can count it says a finding-free re-review
+  cannot help. `--check-pr` labels a pass from the gate's own record for its verified
+  head; a subsequent head move is stated without relabeling the original pass, while
+  merge-with stays bound to that verified head. When the signal does not resolve,
+  the routes are an owner-approved `# substitute-review` on another reviewer's review
+  at that exact head, or a conscious
   `# stale-review-override` (which on the hook surface also needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
