@@ -343,6 +343,8 @@ _dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
 if [ -n "$_dirty" ]; then
     echo "ERROR: $GENESIS_ROOT has uncommitted tracked changes. Nothing was deployed:" >&2
     echo "$_dirty" >&2
+    genesis_has_flagged_entries "$GENESIS_ROOT" \
+        && echo "  (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)" >&2
     exit 1
 fi
 # The dependency gate asks $VENV_DIR, so the unit must RUN $VENV_DIR: its python

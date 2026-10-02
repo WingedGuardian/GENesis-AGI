@@ -332,6 +332,10 @@ def test_a_hidden_change_outside_the_range_survives_the_reset(repo, tmp_path, fl
     assert _git(repo, "rev-parse", "HEAD") == _git(repo, "rev-parse", "pre-update-test")
     after = os.lstat(repo / "notes.txt")
     assert (after.st_mode, after.st_ino) == (before.st_mode, before.st_ino)
+    # The kept change is code nobody validated, and git status hides it: services
+    # must not come back on it (Codex P1, #2722 round 3).
+    assert not _restarts(r), r.stdout
+    assert "changed:" in r.stdout and "notes.txt" in r.stdout, r.stdout
 
 
 def test_a_file_rewritten_with_identical_bytes_does_not_refuse(repo, tmp_path):

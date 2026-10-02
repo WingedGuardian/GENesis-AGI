@@ -740,6 +740,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
         else
             echo "  git stash        # save and restore after update"
             echo "  git add -p && git commit -m 'chore: save local changes'  # commit"
+            genesis_has_flagged_entries "$GENESIS_ROOT" && echo "  (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)"
         fi
         exit 1
     fi
@@ -1671,6 +1672,7 @@ _do_rollback() {
             echo "    (working-tree status unreadable)"
         elif [ -n "$left" ]; then
             printf '%s\n' "$left" | sed 's/^/    changed: /'
+            genesis_has_flagged_entries "$GENESIS_ROOT" && echo "    (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)"
         fi
         checkout_ok=false
     fi
