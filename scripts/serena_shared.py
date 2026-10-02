@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -287,9 +288,14 @@ def configure(project: Path, enable: bool) -> None:
 
 def write_settings(config_file: Path, project: Path, enabled: bool) -> None:
     config_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = config_file.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"enabled": enabled, "main": str(project)}, indent=2) + "\n")
-    temporary.replace(config_file)
+    fd, name = tempfile.mkstemp(dir=config_file.parent, prefix=config_file.name + ".")
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(json.dumps({"enabled": enabled, "main": str(project)}, indent=2) + "\n")
+        temporary.replace(config_file)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:

@@ -85,6 +85,20 @@ def test_missing_settings_keep_native_mode(tmp_path):
     assert shared.read_settings(tmp_path / "absent") is None
 
 
+def test_failed_settings_publication_preserves_previous_and_cleans_temp(tmp_path, monkeypatch):
+    settings = tmp_path / "settings.json"
+    settings.write_text("previous")
+
+    def fail_replace(*args):
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="publication failed"):
+        shared.write_settings(settings, tmp_path, True)
+    assert settings.read_text() == "previous"
+    assert list(tmp_path.iterdir()) == [settings]
+
+
 def test_disable_works_without_provider_or_proxy(tmp_path, monkeypatch):
     main = checkout(tmp_path / "main")
     settings = tmp_path / "config/settings.json"
