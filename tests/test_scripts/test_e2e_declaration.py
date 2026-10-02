@@ -80,6 +80,11 @@ def test_the_two_scanners_agree_on_marker_visibility(e2e):
         "Intro:\n\n    E2E: inside a standalone indented block\n",
         "para\n    E2E: lazy paragraph continuation, still text\n",
         "> ```\n> E2E: fenced inside a quote\n> ```\n",
+        # Devin Review 🔴 round 3 — quote depth and paragraph context.
+        "> ```\n> sample\nE2E: after the quote ends\n",
+        "```\n> ```\nE2E: quoted marker is content\n```\n",
+        "# Runbook\n    E2E: indented code after a heading\n",
+        "> para\n    E2E: not a lazy continuation outside the quote\n",
     ]
     for body in bodies:
         shared = e2e.readable_body(body)

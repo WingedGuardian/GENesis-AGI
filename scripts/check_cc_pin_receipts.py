@@ -192,9 +192,39 @@ _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 #: neither indent rule may be read off the absolute column alone.
 _LIST_MARKER = re.compile(r"([-+*]|\d{1,9}[.)])(?=[ ]|$)")
 
-#: Blockquote markers are transparent to the block rules — a fence inside a
-#: quote behaves as it does outside one.
-_BLOCKQUOTE = re.compile(r"^(?: {0,3}>[ \t]?)+")
+#: One blockquote marker level. Quote markers are transparent to the block
+#: rules — a fence inside a quote behaves as it does outside one — but the
+#: scanner still needs the DEPTH: a quoted fence ends when its quote ends,
+#: and a `>` inside a top-level fence is literal content, not a marker.
+_QUOTE = re.compile(r" {0,3}>[ \t]?")
+
+
+#: A line that opens no paragraph and lets none continue: an ATX heading, a
+#: thematic break, or a setext underline (which makes the line ABOVE it a
+#: heading — either way the next line starts a new block, so an indented line
+#: after any of these is an indented code block, not a lazy continuation).
+_NO_PARAGRAPH = re.compile(
+    r"#{1,6}(?:[ ]|$)"  # ATX heading
+    r"|(?:\* *){3,}\s*$"  # ***
+    r"|(?:_ *){3,}\s*$"  # ___
+    r"|(?:- *){3,}\s*$"  # ---
+    r"|[=-]+\s*$"  # setext underline
+)
+
+
+def _quote_split(line: str, depth: int | None = None) -> tuple[int, str]:
+    """Strip blockquote markers — all of them, or at most `depth`.
+
+    Returns (markers consumed, remainder). The fence check passes a depth so
+    it sees only the fence's OWN quote level: anything deeper is content."""
+    pos = seen = 0
+    while depth is None or seen < depth:
+        m = _QUOTE.match(line, pos)
+        if m is None:
+            break
+        seen += 1
+        pos = m.end()
+    return seen, line[pos:]
 
 #: GitHub's PR-body limit. Bound the work regardless of the scanner's O(n).
 _MAX_BODY = 65_536
@@ -331,7 +361,8 @@ def readable_body(body: str) -> str:
     """
     visible: list[str] = []
     in_comment = False
-    fence: str | None = None
+    #: The open fence: (marker run, blockquote depth at its opener).
+    fence: tuple[str, int] | None = None
     #: List-item content columns (a stack: nested items push, dedents pop).
     #: Indent rules are RELATIVE to the innermost container, never absolute —
     #: the same four columns mean an indented code block at top level and
@@ -341,9 +372,15 @@ def readable_body(body: str) -> str:
     #: UNLESS a paragraph is open, because indented code cannot interrupt one
     #: (it is a lazy continuation and stays text).
     paragraph = False
+    #: Where that paragraph lives: quote depth + innermost list baseline.
+    #: A lazy continuation line must sit in the SAME containers — a `> para`
+    #: does not carry an unquoted indented line, and a paragraph inside one
+    #: list item does not continue below a dedented one.
+    paragraph_ctx: tuple[int, int] = (0, 0)
 
     for raw in _LINE_ENDS.split(body[:_MAX_BODY]):
-        line = _BLOCKQUOTE.sub("", raw.expandtabs(4))
+        expanded = raw.expandtabs(4)
+        depth, line = _quote_split(expanded)
         indent = len(line) - len(line.lstrip(" "))
 
         # A FENCED line is OPAQUE — checked before comment state is touched, and its
@@ -360,19 +397,25 @@ def readable_body(body: str) -> str:
         # there is no comment stripping to apply, and Markdown wants the marker at
         # the start of the line regardless.
         if fence is not None:
+            run, fence_q = fence
             baseline = containers[-1] if containers else 0
-            if line.strip() and indent < baseline:
-                # The line dedents past the fence's own container: the item (and
-                # the fence with it) ends here — fall through and read the line.
+            # Measure inside the fence's OWN quote level: a `>` deeper than
+            # that level is literal content — only the quote the fence lives
+            # in may supply its closer. A non-blank line that leaves the
+            # fence's quote (or dedents past its list container) ends the
+            # fence with the container, and is then read normally.
+            fdepth, inside = _quote_split(expanded, fence_q)
+            in_indent = len(inside) - len(inside.lstrip(" "))
+            if line.strip() and (fdepth < fence_q or in_indent < baseline):
                 fence = None
             else:
-                stripped_close = line.strip()
+                stripped_close = inside.strip()
                 closer = _FENCE_RUN.match(stripped_close)
                 if (
                     closer is not None
-                    and indent - baseline <= 3
-                    and closer.group(0)[0] == fence[0]
-                    and len(closer.group(0)) >= len(fence)
+                    and in_indent - baseline <= 3
+                    and closer.group(0)[0] == run[0]
+                    and len(closer.group(0)) >= len(run)
                     # CommonMark allows NOTHING but spaces after a closing
                     # marker — ````python is an example's content line.
                     and not stripped_close[closer.end() :].strip()
@@ -402,7 +445,8 @@ def readable_body(body: str) -> str:
             residual = line[pos:]
             res_indent = len(residual) - len(residual.lstrip(" "))
             eff = pos - (containers[-1] if containers else 0) + res_indent
-            if eff >= 4 and not paragraph and not in_comment:
+            ctx = (depth, containers[-1] if containers else 0)
+            if eff >= 4 and not (paragraph and paragraph_ctx == ctx) and not in_comment:
                 # Indented CODE — hidden, and literal: `<!--` inside one opens
                 # nothing, so it must not reach the comment state at all.
                 paragraph = False
@@ -426,9 +470,9 @@ def readable_body(body: str) -> str:
         # rendered-as-code while counting as visible. (The close is handled at the
         # top of the loop; this is the OPEN.)
         if stripped.startswith(_FENCE_MARKS) and eff <= 3:
-            # Record the whole RUN, not three characters: the closer must be
-            # the same character at least as long as the opener.
-            fence = _FENCE_RUN.match(stripped).group(0)
+            # Record the whole RUN and the fence's QUOTE DEPTH: the closer must
+            # be the same character at least as long, carried by the same quote.
+            fence = (_FENCE_RUN.match(stripped).group(0), depth)
             paragraph = False
             continue
 
@@ -437,7 +481,10 @@ def readable_body(body: str) -> str:
             continue
 
         visible.append(rendered)
-        paragraph = True
+        # A heading or rule is visible but opens no paragraph — an indented
+        # line after one is code, not a lazy continuation.
+        paragraph = _NO_PARAGRAPH.search(stripped) is None
+        paragraph_ctx = (depth, containers[-1] if containers else 0)
 
     return "\n".join(visible)
 

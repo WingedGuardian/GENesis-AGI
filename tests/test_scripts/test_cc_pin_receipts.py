@@ -594,6 +594,40 @@ def test_a_fence_inside_a_blockquote_still_counts() -> None:
     _assert_blocked(_evaluate(body=f"> ```\n> {BOTH}> ```\n"), "receipts")
 
 
+def test_a_quoted_fence_ends_when_the_quote_ends() -> None:
+    """Devin Review 🔴 "Quoted fence hides subsequent receipts".
+
+    A fenced block inside a blockquote ends when the quote ends — laziness
+    applies to paragraphs, not code. Stripping `>` without tracking the
+    depth let the fence swallow every unquoted line after it."""
+    _assert_passes(_evaluate(body=f"> ```\n> sample\n{BOTH}"))
+
+
+def test_a_quoted_marker_inside_a_top_level_fence_is_content() -> None:
+    """Devin Review 🔴 "Quoted text closes an outer fence".
+
+    A fence's contents are literal: inside a top-level fence `> ```` ` is
+    text, not a closing delimiter — the `>` the fence never asked for may
+    not be stripped before the closer check."""
+    _assert_blocked(_evaluate(body=f"```\n> ```\n{BOTH}```\n"), "receipts")
+
+
+def test_indented_code_after_a_heading_stays_hidden() -> None:
+    """Devin Review 🔴 "Indented code after headings counts as receipts".
+
+    A heading is not a paragraph, so indented code DOES interrupt right
+    after one — the lazy-continuation exception never applies. Every
+    paragraph-ending line shape is covered: headings, rules, setext."""
+    for opening in ("# Runbook\n", "## Runbook\n", "***\n", "Title\n---\n", "Title\n===\n"):
+        _assert_blocked(_evaluate(body=f"{opening}    {BOTH}"), "receipts")
+
+
+def test_a_quoted_paragraph_does_not_lazily_continue_unquoted() -> None:
+    """`> para\n    x` renders the indented line as top-level code: a lazy
+    continuation must sit in the paragraph's OWN containers."""
+    assert receipts.readable_body("> para\n    x\n") == "para"
+
+
 def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
     """MEASURED over-rejection, on a gate with no override sigil.
 
