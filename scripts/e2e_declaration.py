@@ -99,11 +99,12 @@ _LINE_ENDS = re.compile(r"\r\n|\r|\n")
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 
 
-def _fence_indent_ok(line: str) -> bool:
-    """A fence delimiter lives at zero-to-three leading spaces; four or more
-    is an indented code block. Mirrors the sibling scanner."""
-    expanded = line.expandtabs(4)
-    return len(expanded) - len(expanded.lstrip(" ")) <= 3
+#: A list-item opener: bullet or ordered marker followed by a space or end of
+#: line. List containers shift the indent baseline. Mirrors the sibling.
+_LIST_MARKER = re.compile(r"([-+*]|\d{1,9}[.)])(?=[ ]|$)")
+
+#: Blockquote markers are transparent to the block rules. Mirrors the sibling.
+_BLOCKQUOTE = re.compile(r"^(?: {0,3}>[ \t]?)+")
 
 #: Words that state an omission rather than a decision. `none` is deliberately NOT
 #: here — it is a VALID declaration when it carries a reason, and is classified
@@ -220,20 +221,57 @@ def _local_readable_body(body: str) -> str:
     visible: list[str] = []
     in_comment = False
     fence: str | None = None
-    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
+    #: List-item content columns; indent rules are relative to the innermost
+    #: container, never absolute. Mirrors the sibling scanner.
+    containers: list[int] = []
+    #: Indented code cannot interrupt a paragraph — a lazy continuation stays
+    #: text. Mirrors the sibling scanner.
+    paragraph = False
+    for raw in _LINE_ENDS.split(body[:_MAX_BODY]):
+        line = _BLOCKQUOTE.sub("", raw.expandtabs(4))
+        indent = len(line) - len(line.lstrip(" "))
         if fence is not None:
-            stripped_close = line.strip()
-            closer = _FENCE_RUN.match(stripped_close) if _fence_indent_ok(line) else None
-            if (
-                closer
-                and closer.group(0)[0] == fence[0]
-                and len(closer.group(0)) >= len(fence)
-                and not stripped_close[closer.end() :].strip()
-            ):
+            baseline = containers[-1] if containers else 0
+            if line.strip() and indent < baseline:
                 fence = None
-            continue
+            else:
+                stripped_close = line.strip()
+                closer = _FENCE_RUN.match(stripped_close)
+                if (
+                    closer is not None
+                    and indent - baseline <= 3
+                    and closer.group(0)[0] == fence[0]
+                    and len(closer.group(0)) >= len(fence)
+                    and not stripped_close[closer.end() :].strip()
+                ):
+                    fence = None
+                continue
+        residual, eff = line, indent
+        if line.strip():
+            while containers and indent < containers[-1]:
+                containers.pop()
+            pos = indent
+            if not in_comment:
+                while True:
+                    lm = _LIST_MARKER.match(line, pos)
+                    if lm is None:
+                        break
+                    end, after = lm.end(), line[lm.end() :]
+                    if not after.strip():
+                        pos = end + 1
+                        containers.append(pos)
+                        break
+                    pad = len(after) - len(after.lstrip(" "))
+                    pos = end + (pad if pad <= 4 else 1)
+                    containers.append(pos)
+            residual = line[pos:]
+            res_indent = len(residual) - len(residual.lstrip(" "))
+            eff = pos - (containers[-1] if containers else 0) + res_indent
+            if eff >= 4 and not paragraph and not in_comment:
+                paragraph = False
+                continue
         out: list[str] = []
-        rest = line
+        rest = residual
         while rest:
             if in_comment:
                 close = rest.find(_COMMENT_CLOSE)
@@ -252,11 +290,16 @@ def _local_readable_body(body: str) -> str:
             rest = rest[open_at + len(_COMMENT_OPEN) :]
         kept = "".join(out)
         stripped = kept.strip()
-        run = _FENCE_RUN.match(stripped) if _fence_indent_ok(kept) else None
+        run = _FENCE_RUN.match(stripped) if stripped and eff <= 3 else None
         if run:
             fence = run.group(0)
-        else:
-            visible.append(kept)
+            paragraph = False
+            continue
+        if not stripped:
+            paragraph = False
+            continue
+        visible.append(kept)
+        paragraph = True
     return "\n".join(visible)
 
 

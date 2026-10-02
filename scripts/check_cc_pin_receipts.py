@@ -186,15 +186,15 @@ _LINE_ENDS = re.compile(r"\r\n|\r|\n")
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 
 
-def _fence_indent_ok(line: str) -> bool:
-    """A fence delimiter lives at zero-to-three leading spaces.
+#: A list-item opener: a bullet or ordered marker followed by a space or end
+#: of line. List containers shift the indent baseline — a fence four columns
+#: in is still a fence when the item's content starts at column two, and
+#: neither indent rule may be read off the absolute column alone.
+_LIST_MARKER = re.compile(r"([-+*]|\d{1,9}[.)])(?=[ ]|$)")
 
-    Four or more (a tab expands to up to four columns) makes the line an
-    indented CODE block, not a fence — without the check, an indented run opens
-    a phantom fence that hides real receipts, and an indented line closes a
-    fence the renderer never closed."""
-    expanded = line.expandtabs(4)
-    return len(expanded) - len(expanded.lstrip(" ")) <= 3
+#: Blockquote markers are transparent to the block rules — a fence inside a
+#: quote behaves as it does outside one.
+_BLOCKQUOTE = re.compile(r"^(?: {0,3}>[ \t]?)+")
 
 #: GitHub's PR-body limit. Bound the work regardless of the scanner's O(n).
 _MAX_BODY = 65_536
@@ -332,8 +332,20 @@ def readable_body(body: str) -> str:
     visible: list[str] = []
     in_comment = False
     fence: str | None = None
+    #: List-item content columns (a stack: nested items push, dedents pop).
+    #: Indent rules are RELATIVE to the innermost container, never absolute —
+    #: the same four columns mean an indented code block at top level and
+    #: ordinary item content inside a `- ` item.
+    containers: list[int] = []
+    #: A line indented four past its container is an indented code block —
+    #: UNLESS a paragraph is open, because indented code cannot interrupt one
+    #: (it is a lazy continuation and stays text).
+    paragraph = False
 
-    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
+    for raw in _LINE_ENDS.split(body[:_MAX_BODY]):
+        line = _BLOCKQUOTE.sub("", raw.expandtabs(4))
+        indent = len(line) - len(line.lstrip(" "))
+
         # A FENCED line is OPAQUE — checked before comment state is touched, and its
         # own text is never interpreted. Markdown treats `<!--` inside a fence as
         # literal characters, so letting it open a comment here made the scanner and
@@ -348,18 +360,53 @@ def readable_body(body: str) -> str:
         # there is no comment stripping to apply, and Markdown wants the marker at
         # the start of the line regardless.
         if fence is not None:
-            stripped_close = line.strip()
-            closer = _FENCE_RUN.match(stripped_close) if _fence_indent_ok(line) else None
-            if (
-                closer
-                and closer.group(0)[0] == fence[0]
-                and len(closer.group(0)) >= len(fence)
-                # CommonMark allows NOTHING but spaces after a closing marker —
-                # ````python is an example's content line, not a closer.
-                and not stripped_close[closer.end() :].strip()
-            ):
+            baseline = containers[-1] if containers else 0
+            if line.strip() and indent < baseline:
+                # The line dedents past the fence's own container: the item (and
+                # the fence with it) ends here — fall through and read the line.
                 fence = None
-            continue
+            else:
+                stripped_close = line.strip()
+                closer = _FENCE_RUN.match(stripped_close)
+                if (
+                    closer is not None
+                    and indent - baseline <= 3
+                    and closer.group(0)[0] == fence[0]
+                    and len(closer.group(0)) >= len(fence)
+                    # CommonMark allows NOTHING but spaces after a closing
+                    # marker — ````python is an example's content line.
+                    and not stripped_close[closer.end() :].strip()
+                ):
+                    fence = None
+                continue
+
+        residual, eff = line, indent
+        if line.strip():
+            while containers and indent < containers[-1]:
+                containers.pop()
+            pos = indent
+            if not in_comment:
+                # Consume list-item openers — they may nest on ONE line.
+                while True:
+                    lm = _LIST_MARKER.match(line, pos)
+                    if lm is None:
+                        break
+                    end, after = lm.end(), line[lm.end() :]
+                    if not after.strip():
+                        pos = end + 1
+                        containers.append(pos)
+                        break
+                    pad = len(after) - len(after.lstrip(" "))
+                    pos = end + (pad if pad <= 4 else 1)
+                    containers.append(pos)
+            residual = line[pos:]
+            res_indent = len(residual) - len(residual.lstrip(" "))
+            eff = pos - (containers[-1] if containers else 0) + res_indent
+            if eff >= 4 and not paragraph and not in_comment:
+                # Indented CODE — hidden, and literal: `<!--` inside one opens
+                # nothing, so it must not reach the comment state at all.
+                paragraph = False
+                continue
 
         # Strip comments FIRST, and keep whatever the line has outside them. The
         # previous version dropped the entire remainder of a line once it saw a
@@ -371,21 +418,26 @@ def readable_body(body: str) -> str:
         # refused a compliant PR and told the author the receipts were missing
         # while they were plainly there. MEASURED before the fix — both receipts
         # reported absent, with the identical text on its own lines accepted.
-        rendered, in_comment = _outside_comments(line, in_comment)
+        rendered, in_comment = _outside_comments(residual, in_comment)
         stripped = rendered.strip()
 
         # A fence is closed only by its OWN marker: ``~~~`` does not end a ```
         # block, which is how a receipt below a mismatched closer stayed
         # rendered-as-code while counting as visible. (The close is handled at the
         # top of the loop; this is the OPEN.)
-        if stripped.startswith(_FENCE_MARKS) and _fence_indent_ok(rendered):
+        if stripped.startswith(_FENCE_MARKS) and eff <= 3:
             # Record the whole RUN, not three characters: the closer must be
             # the same character at least as long as the opener.
             fence = _FENCE_RUN.match(stripped).group(0)
+            paragraph = False
             continue
 
-        if stripped:
-            visible.append(rendered)
+        if not stripped:
+            paragraph = False
+            continue
+
+        visible.append(rendered)
+        paragraph = True
 
     return "\n".join(visible)
 

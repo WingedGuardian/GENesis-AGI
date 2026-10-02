@@ -548,6 +548,52 @@ def test_a_delimiter_at_three_spaces_still_counts() -> None:
     _assert_blocked(_evaluate(body=f"   ```\n{BOTH}   ```\n"), "receipts")
 
 
+def test_a_fence_inside_a_list_item_counts_against_the_items_baseline() -> None:
+    """Devin Review 🔴 "Indented code examples count as receipts".
+
+    Indent rules are RELATIVE to the enclosing container: a `- ` item pushes
+    its content column two spaces right, so the ` ``` ` at four columns is a
+    real fence, not indented code — and so is its closer. Read off the
+    absolute column instead and the example's receipts render as code to a
+    reader but count as visible to the gate."""
+    body = f"- Example:\n\n    ```\n    {BOTH}    ```\n"
+    _assert_blocked(_evaluate(body=body), "receipts")
+    assert (
+        receipts.readable_body("- Example:\n\n    ```\n    hidden\n    ```\nvisible\n")
+        == "Example:\nvisible"
+    )
+
+
+def test_a_fence_at_a_list_items_content_column_opens() -> None:
+    """`- ```` ` is the opener itself carried inside the item — content column
+    two means the marker sits at relative indent zero."""
+    _assert_blocked(_evaluate(body=f"- ```\n  {BOTH}  ```\n"), "receipts")
+
+
+def test_marker_looking_text_in_an_indented_block_stays_hidden() -> None:
+    """Devin Review 🔴 — a RECEIPT inside a standalone indented code block is
+    literal code to a reader. The block is content, and comment-looking text
+    inside it is content too — neither may feed the receipt scan or the
+    comment state."""
+    body = f"Intro:\n\n    {BOTH}And outro\n"
+    _assert_blocked(_evaluate(body=body), "receipts")
+    # An `<!--` inside indented code opens no comment — the receipt still counts.
+    body = f"    <!-- example\n{BOTH}"
+    _assert_passes(_evaluate(body=body))
+
+
+def test_an_indented_line_inside_a_paragraph_is_a_lazy_continuation() -> None:
+    """Indented code cannot interrupt a paragraph — `para\n    ```` ` is text
+    to a reader, so the gate must read it as text too."""
+    assert receipts.readable_body("para\n    ```\n") == "para\n```"
+
+
+def test_a_fence_inside_a_blockquote_still_counts() -> None:
+    """Quote markers are transparent to the block rules — `> ```` ` opens a
+    fence exactly as ` ``` ` does."""
+    _assert_blocked(_evaluate(body=f"> ```\n> {BOTH}> ```\n"), "receipts")
+
+
 def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
     """MEASURED over-rejection, on a gate with no override sigil.
 

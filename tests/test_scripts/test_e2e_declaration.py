@@ -73,6 +73,13 @@ def test_the_two_scanners_agree_on_marker_visibility(e2e):
         # 4-space-indented run is indented code, not a delimiter.
         "````\n````python\nE2E: inside a mis-marked fence\n````\n",
         "    ```\nE2E: under an indented marker\n",
+        # Devin Review 🔴 round 2 — indent rules are relative to the container:
+        # the fence inside a list item is real, while marker-looking text in a
+        # standalone indented block is code.
+        "- Example:\n\n    ```\n    E2E: fenced inside an item\n    ```\n",
+        "Intro:\n\n    E2E: inside a standalone indented block\n",
+        "para\n    E2E: lazy paragraph continuation, still text\n",
+        "> ```\n> E2E: fenced inside a quote\n> ```\n",
     ]
     for body in bodies:
         shared = e2e.readable_body(body)
