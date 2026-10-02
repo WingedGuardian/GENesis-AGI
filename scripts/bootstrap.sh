@@ -792,7 +792,7 @@ if command -v serena &>/dev/null; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
     # flag overrides this), so register from the repo root regardless of the
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
-    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
+    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "$GENESIS_ROOT/.claude/mcp/run-serena" "--context" "claude-code" )
 fi
 # grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
 # Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
