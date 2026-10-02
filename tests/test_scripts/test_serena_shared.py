@@ -17,11 +17,15 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts/serena_shared.py"
 spec = importlib.util.spec_from_file_location("serena_shared", SCRIPT)
 shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)
+native_read_unit_state = shared.read_unit_state
 
 
 @pytest.fixture(autouse=True)
 def private_user_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        shared, "read_unit_state", lambda unit: {"LoadState": "loaded", "ActiveState": "inactive"}
+    )
 
 
 def checkout(path, linked=False):
@@ -117,9 +121,7 @@ def test_disable_works_without_provider_or_proxy(tmp_path, monkeypatch):
     monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
     shared.configure(main, False)
     assert json.loads(settings.read_text()) == {"enabled": False, "main": str(main)}
-    assert calls == [
-        ("disable", "--now", "genesis-serena-claude-code.service", "genesis-serena-codex.service")
-    ]
+    assert calls == [("disable", "--now", shared.unit_name(x)) for x in shared.PROFILES]
 
 
 def test_unit_preserves_literal_path_and_resource_ownership(tmp_path):
@@ -400,12 +402,7 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
     with pytest.raises((OSError, subprocess.CalledProcessError)):
         shared.configure(new, True)
     assert shared.read_settings(configured_paths) == {"main": str(new), "enabled": False}
-    assert unit_calls[-1] == (
-        "disable",
-        "--now",
-        "genesis-serena-claude-code.service",
-        "genesis-serena-codex.service",
-    )
+    assert unit_calls[-2:] == [("disable", "--now", shared.unit_name(x)) for x in shared.PROFILES]
     captured = []
     monkeypatch.setattr(shared.os, "execv", lambda executable, argv: captured.append(argv))
     shared.launch("claude-code", old)
@@ -938,3 +935,120 @@ def test_resource_snapshot_matches_native_provider_home_normalization(
         for resource in ("modes", "prompt_templates", "memories/global"):
             assert (home / resource).resolve() == source / resource
             assert (home / resource).is_dir()
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize(
+    "load,active",
+    [
+        ("not-found", "inactive"),
+        ("not-found", "active"),
+        ("not-found", "failed"),
+        ("loaded", "inactive"),
+        ("loaded", "active"),
+    ],
+)
+def test_cleanup_handles_missing_inactive_and_removed_active_unit_files(
+    monkeypatch, context, load, active
+):
+    unit = shared.unit_name(context)
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda name: (
+            {"LoadState": load, "ActiveState": active}
+            if name == unit
+            else {"LoadState": "not-found", "ActiveState": "inactive"}
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.cleanup_units()
+    expected = (
+        []
+        if (load, active) == ("not-found", "inactive")
+        else [("stop", unit)]
+        if load == "not-found"
+        else [("disable", "--now", unit)]
+    )
+    assert calls == expected
+
+
+@pytest.mark.parametrize("failure", ["query", "stop", "disable"])
+def test_cleanup_attempts_second_profile_after_first_profile_failure(monkeypatch, failure):
+    first = shared.unit_name("claude-code")
+    second = shared.unit_name("codex")
+    error = OSError("owned cleanup failure")
+
+    def state(unit):
+        if unit == first and failure == "query":
+            raise error
+        return {
+            "LoadState": "not-found" if unit == first and failure == "stop" else "loaded",
+            "ActiveState": "active",
+        }
+
+    calls = []
+
+    def control(*args):
+        calls.append(args)
+        if args[-1] == first:
+            raise error
+
+    monkeypatch.setattr(shared, "read_unit_state", state)
+    monkeypatch.setattr(shared, "systemctl", control)
+    with pytest.raises(OSError) as caught:
+        shared.cleanup_units()
+    assert caught.value is error
+    assert ("disable", "--now", second) in calls
+
+
+def test_configuration_failure_remains_primary_when_cleanup_also_fails(
+    tmp_path, monkeypatch, configured_paths
+):
+    original = OSError("original snapshot failure")
+    cleanup = OSError("secondary cleanup failure")
+
+    def fail_install(*args):
+        raise original
+
+    def fail_cleanup():
+        raise cleanup
+
+    monkeypatch.setattr(shared, "install_units", fail_install)
+    monkeypatch.setattr(shared, "cleanup_units", fail_cleanup)
+    with pytest.raises(OSError) as caught:
+        shared.configure(checkout(tmp_path / "main"), True)
+    assert caught.value is original
+    assert any("secondary cleanup failure" in note for note in original.__notes__)
+    assert shared.read_settings(configured_paths)["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "output,valid",
+    [
+        ("LoadState=not-found\nActiveState=inactive\n", True),
+        ("LoadState=loaded\n", False),
+        ("garbage", False),
+        ("LoadState=loaded\nActiveState=\n", False),
+    ],
+)
+def test_native_unit_state_requires_complete_manager_response(monkeypatch, output, valid):
+    monkeypatch.setattr(shared.subprocess, "check_output", lambda *args, **kwargs: output)
+    if valid:
+        assert native_read_unit_state("owned.service") == {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+        }
+    else:
+        with pytest.raises(ValueError):
+            native_read_unit_state("owned.service")
+
+
+def test_embedded_backslash_checkout_remains_literal(tmp_path, configured_paths):
+    main = checkout(tmp_path / r"main\x20checkout")
+    shared.configure(main, True)
+    assert shared.read_settings(configured_paths)["enabled"] is True
+    for context in shared.PROFILES:
+        text = (shared.unit_directory() / shared.unit_name(context)).read_text()
+        assert f"WorkingDirectory={main}\n" in text

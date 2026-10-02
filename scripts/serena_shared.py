@@ -324,12 +324,43 @@ def configure(project: Path, enable: bool) -> None:
         configure_locked(project, enable)
 
 
+def cleanup_units() -> None:
+    errors = []
+    for context in PROFILES:
+        unit = unit_name(context)
+        try:
+            state = read_unit_state(unit)
+            if state["LoadState"] == "not-found":
+                if state["ActiveState"] != "inactive":
+                    systemctl("stop", unit)  # A removed unit file can still have a live process.
+            else:
+                systemctl("disable", "--now", unit)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            errors.append((unit, error))
+    if errors:
+        first = errors[0][1]
+        for unit, error in errors[1:]:
+            first.add_note(f"cleanup also failed for {unit}: {error}")
+        raise first
+
+
+def read_unit_state(unit: str) -> dict[str, str]:
+    output = subprocess.check_output(
+        ["systemctl", "--user", "show", unit, "--property=LoadState", "--property=ActiveState"],
+        text=True,
+    )
+    state = dict(line.split("=", 1) for line in output.splitlines())
+    if set(state) != {"LoadState", "ActiveState"} or not all(state.values()):
+        raise ValueError(f"invalid user-manager state for {unit}")
+    return state
+
+
 def configure_locked(project: Path, enable: bool) -> None:
     config_file = settings_path()
     if not enable:
         # Recovery must not depend on a working/current provider or proxy.
         write_settings(config_file, project, False)
-        systemctl("disable", "--now", *(unit_name(x) for x in PROFILES))
+        cleanup_units()
         return
     validate_main(project)
     for port in PORTS.values():
@@ -352,8 +383,13 @@ def configure_locked(project: Path, enable: bool) -> None:
         systemctl("daemon-reload")
         systemctl("enable", "--now", *(unit_name(x) for x in PROFILES))
         write_settings(config_file, project, True)
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        systemctl("disable", "--now", *(unit_name(x) for x in PROFILES))
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        try:
+            cleanup_units()
+        except (OSError, ValueError, subprocess.CalledProcessError) as cleanup_error:
+            error.add_note(f"Serena cleanup failed: {cleanup_error}")
+            for note in getattr(cleanup_error, "__notes__", ()):
+                error.add_note(note)
         raise
 
 
@@ -422,6 +458,8 @@ def main() -> int:
             ready(args.port, args.binary)
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"serena-shared: {error}", file=sys.stderr)
+        for note in getattr(error, "__notes__", ()):
+            print(note, file=sys.stderr)
         return 1
     return 0
 
