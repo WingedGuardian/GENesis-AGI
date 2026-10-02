@@ -24,8 +24,9 @@ def find_genesis_root() -> Path:
 
 # Servers in config/mcp.json.template that INTERACTIVE sessions do not get.
 # The template is the single source for two consumers: this render, which
-# writes .mcp.json (what interactive sessions, and any dispatch on the "full"
-# MCP profile, load), and src/genesis/cc/session_config.py, which renders it per
+# writes .mcp.json (what interactive sessions and the server's conversation-
+# channel sessions load: both run in the checkout; dispatched sessions run
+# outside it and never read it), and src/genesis/cc/session_config.py, which renders it per
 # dispatch profile and keeps only the servers that profile names. That filter
 # can only remove servers, never add them, so a server only some dispatch
 # profile needs must stay in the template and be left out HERE.

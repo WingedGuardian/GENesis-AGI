@@ -1,7 +1,8 @@
 """scripts/setup_claude_config.py — the .mcp.json render interactive sessions load.
 
 config/mcp.json.template is the single source for two consumers: this render
-(interactive sessions, and a dispatch on the "full" MCP profile) and
+(interactive and conversation-channel sessions, which run in the checkout;
+dispatched sessions, "full" included, run outside it and never read .mcp.json) and
 genesis.cc.session_config.render_mcp_servers (dispatch profiles, which filter it
 down and can never add a server). A server only some dispatch profile needs
 therefore stays in the template and is left out of the interactive render (#2319).
