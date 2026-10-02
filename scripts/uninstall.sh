@@ -214,6 +214,27 @@ safe_disable_service() {
     fi
 }
 
+# Remove only this integration's known enablement links, including dangling ones.
+remove_serena_enablement() {
+    local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" root unit link target persistent runtime_target
+    for root in "$HOME/.config/systemd/user" "$runtime/systemd/user"; do
+        for unit in genesis-serena-claude-code.service genesis-serena-codex.service; do
+            link="$root/default.target.wants/$unit"
+            [ -L "$link" ] || continue
+            target="$(readlink -m -- "$link")" || return 1
+            persistent="$(readlink -m -- "$HOME/.config/systemd/user/$unit")" || return 1
+            runtime_target="$(readlink -m -- "$runtime/systemd/user/$unit")" || return 1
+            if [ "$target" != "$persistent" ] && [ "$target" != "$runtime_target" ]; then
+                echo "  WARNING: foreign Serena enablement link preserved: $link"
+            elif [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would remove Serena enablement: $link"
+            else
+                rm -- "$link" || return 1
+            fi
+        done
+    done
+}
+
 # Run a command inside the container (from host). Tolerates container issues.
 container_exec() {
     local cmd="$1"
@@ -521,6 +542,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     qdrant.service; do
             safe_disable_service "$unit"
         done
+        remove_serena_enablement
 
         # Persistent= timers keep a stamp file under
         # ~/.local/share/systemd/timers/. Removing the unit file does NOT remove
@@ -632,7 +654,10 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-backup.timer genesis-backup.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
                     systemctl --user disable \"\$u\" 2>/dev/null || true;
-                done
+                done;
+                DRY_RUN=false;
+                $(declare -f remove_serena_enablement);
+                remove_serena_enablement
             "
             ok "Stopped Genesis services"
 

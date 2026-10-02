@@ -511,9 +511,7 @@ def test_missing_project_entry_registered_despite_user_scope_server(tmp_path, ex
     assert json.loads(user_file.read_text()) == user
 
 
-@pytest.mark.parametrize("path", ["direct", "host"])
-@pytest.mark.parametrize("serena_present", [False, True])
-def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path, serena_present):
+def uninstall_commands(path):
     source = (SCRIPT.parent / "uninstall.sh").read_text()
     if path == "direct":
         helper = source[
@@ -522,11 +520,46 @@ def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path, seren
         start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
         commands = source[start : source.index("        # Persistent= timers", start)]
     else:
-        helper = 'container_exec() { bash -c "$1"; }\n'
+        helper = source[
+            source.index("remove_serena_enablement() {") : source.index("# Run a command inside")
+        ]
+        helper += 'container_exec() { [ "$DRY_RUN" = true ] || bash -c "$1"; }\n'
         start = source.index(
             '            container_exec "', source.index("# Stop all services (timers first")
         )
         commands = source[start : source.index('            ok "Stopped Genesis services"', start)]
+    return helper, commands
+
+
+def uninstall_enablement_entries(tmp_path, entry):
+    links = []
+    roots = (shared.unit_directory(), tmp_path / "runtime/systemd/user")
+    for root in roots:
+        (root / "default.target.wants").mkdir(parents=True)
+        for index, context in enumerate(shared.PROFILES):
+            link = root / "default.target.wants" / shared.unit_name(context)
+            if entry == "regular":
+                link.write_text("preserved")
+            else:
+                target = (
+                    roots[index] / shared.unit_name(context)
+                    if entry == "managed"
+                    else tmp_path / "foreign.service"
+                )
+                link.symlink_to(target)
+            links.append(link)
+    return links
+
+
+@pytest.mark.parametrize("path", ["direct", "host"])
+@pytest.mark.parametrize("serena_present", [False, True])
+@pytest.mark.parametrize("entry", ["managed", "foreign", "regular"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_uninstall_stops_and_disables_both_shared_services(
+    tmp_path, path, serena_present, entry, dry_run
+):
+    helper, commands = uninstall_commands(path)
+    links = uninstall_enablement_entries(tmp_path, entry)
     calls = tmp_path / "calls"
     executable = tmp_path / "systemctl"
     disabled = tmp_path / "disabled"
@@ -542,7 +575,14 @@ if args[1]=='disable':
 """)
     executable.chmod(0o755)
     subprocess.run(
-        ["bash", "-e", "-c", "DRY_RUN=false; ok() { :; }; skip() { :; };\n" + helper + commands],
+        [
+            "bash",
+            "-e",
+            "-c",
+            f"DRY_RUN={str(dry_run).lower()}; ok() {{ :; }}; skip() {{ :; }};\n"
+            + helper
+            + commands,
+        ],
         env=dict(
             os.environ,
             CALLS=str(calls),
@@ -552,6 +592,14 @@ if args[1]=='disable':
         ),
         check=True,
     )
+    for link in links:
+        if not dry_run and entry == "managed":
+            assert not link.is_symlink()
+        else:
+            assert link.is_symlink() if entry != "regular" else link.read_text() == "preserved"
+    if dry_run:
+        assert not disabled.exists()
+        return
     assert "genesis-server.service" in disabled.read_text().split()
     recorded = [line.split() for line in calls.read_text().splitlines()]
     for context in shared.PROFILES if serena_present else ():
