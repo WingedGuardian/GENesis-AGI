@@ -76,7 +76,8 @@ os.killpg = _safe_killpg  # type: ignore[assignment]
 def _warn_without_escalating(message: str) -> None:
     """Emit a RuntimeWarning that CANNOT be turned into an exception.
 
-    Both call sites run inside ``pytest_configure``, where any escaping
+    Every call site runs inside ``pytest_configure`` or ``pytest_unconfigure``
+    (directly, or through ``_force_rmtree``). In configure any escaping
     exception is an INTERNALERROR that kills collection for the entire
     repository — and because the crash happens before the cleanup completes,
     the next run hits it again. That failure has now been reached twice by two
@@ -101,6 +102,11 @@ def _warn_without_escalating(message: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("always")
         warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
+#: The kernel mount table `_force_rmtree` checks; a module attribute so a test
+#: can point it at a synthetic table (a real bind mount needs privileges).
+_MOUNTINFO = Path("/proc/self/mountinfo")
 
 
 def _force_rmtree(path: str) -> None:
@@ -161,6 +167,10 @@ def _force_rmtree(path: str) -> None:
     Best-effort, and LOUD when it fails: anything still present after both
     passes is warned about rather than left silent, because a silently leaked
     leaf is the exact defect this replaced.
+
+    LINUX-ONLY by design: the mount guard reads ``/proc/self/mountinfo`` and
+    fails closed, so on a platform without it every directory is refused (with
+    a warning) and per-run leaves accumulate. Genesis and its CI run on Linux.
     """
     import shutil
     import stat
@@ -191,6 +201,56 @@ def _force_rmtree(path: str) -> None:
             )
         return
 
+    # A NON-DIRECTORY ROOT (a regular file, or a hard link to one) is unlinked
+    # and nothing more. The permission pass below chmods what it walks, and for
+    # a hard link that would change a shared inode outside this tree.
+    try:
+        root_mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        # e.g. EACCES on a parent that is readable but not searchable: the leaf
+        # is there but cannot be inspected, which must not read as a removal.
+        _warn_without_escalating(
+            f"genesis: cannot inspect the pytest temp at {path} ({exc}); not removed. "
+            "It will be retried on the next run."
+        )
+        return
+    if not stat.S_ISDIR(root_mode):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        if os.path.lexists(path):
+            _warn_without_escalating(
+                f"genesis: could not remove the stale pytest temp entry at {path}; "
+                "its parent is not writable by this user. It will be retried on "
+                "the next run."
+            )
+        return
+
+    # A MOUNT POINT AT OR BELOW THE ROOT is refused, never removed through.
+    # `followlinks=False` governs symlinks only: os.walk and shutil.rmtree both
+    # cross a bind mount, so a mount left under a crashed run's basetemp would
+    # have its SOURCE erased. scripts/disk_reclaim.py already guards its own
+    # rmtree targets this way; the same helpers are reused rather than copied.
+    # An unreadable mount table refuses too (fail closed), as there.
+    reclaim = private_module(
+        "_genesis_disk_reclaim_for_conftest",
+        Path(__file__).resolve().parent.parent / "scripts" / "disk_reclaim.py",
+    )
+    mounts = reclaim._mount_points(_MOUNTINFO)
+    mount = None if mounts is None else reclaim._mount_at_or_below(Path(path).resolve(), mounts)
+    if mounts is None or mount is not None:
+        reason = (
+            "the mount table is unreadable"
+            if mounts is None
+            else f"{mount} is mounted at or below it"
+        )
+        _warn_without_escalating(
+            f"genesis: refusing to remove the pytest temp tree at {path}: {reason}. "
+            "Unmount it, then it will be retried on the next run."
+        )
+        return
+
     shutil.rmtree(path, onexc=_swallow)
     # lexists, not exists: `exists` follows symlinks and reports False for a
     # DANGLING one, so a leaf left behind as a broken link would read as a clean
@@ -211,6 +271,21 @@ def _force_rmtree(path: str) -> None:
         with contextlib.suppress(OSError):
             os.chmod(target, os.stat(target).st_mode | stat.S_IRWXU)
 
+    # Re-check the root right before the permission pass: `_grant` and `os.walk`
+    # both follow a symlink at the top, so a root swapped for a link since the
+    # first check would relax permissions outside the tree. This narrows that
+    # window to microseconds; only a same-uid writer could use it at all.
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            _warn_without_escalating(
+                f"genesis: the pytest temp at {path} stopped being a directory "
+                "during cleanup; left as is."
+            )
+            return
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass  # the final lexists check below reports anything left behind
     _grant(path)
     for dirpath, dirnames, _files in os.walk(path, topdown=True, followlinks=False):
         for name in dirnames:
@@ -252,7 +327,15 @@ def _reap_stale_pytest_basetemps(pytest_base: str) -> None:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            _force_rmtree(os.path.join(pytest_base, name))  # dead → reap
+            # dead → reap. Isolated per leaf: one leaf that raises must not unwind
+            # into pytest_configure's fallback, which abandons the redirect, and
+            # it would do so on every run because the leaf is never removed.
+            try:
+                _force_rmtree(os.path.join(pytest_base, name))
+            except Exception as exc:  # noqa: BLE001 — see above
+                _warn_without_escalating(
+                    f"genesis: could not reap the stale pytest temp {name} ({exc!r})."
+                )
         except (OSError, OverflowError):
             # alive-but-not-ours (PermissionError), transient, or an out-of-PID-range
             # name (os.kill(10**30,0) → OverflowError, which is NOT an OSError) → spare.
@@ -393,7 +476,17 @@ def pytest_unconfigure(config):
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     try:
         if target:
-            _force_rmtree(target)
+            # BROAD for the same reason as pytest_configure's fallback: a hook that
+            # raises turns a passing suite into exit 1, and cleanup is best-effort.
+            # MEASURED triggers: RecursionError from shutil's recursive removal on a
+            # very deep tree; an AttributeError if disk_reclaim's helpers move.
+            try:
+                _force_rmtree(target)
+            except Exception as exc:  # noqa: BLE001 — see above
+                _warn_without_escalating(
+                    f"genesis: pytest temp cleanup of {target} failed ({exc!r}); "
+                    "it will be retried on the next run."
+                )
     finally:
         # Release the box-wide lock LAST, so it spans the whole session including
         # this cleanup — but in a `finally`, so a cleanup that raises cannot leave

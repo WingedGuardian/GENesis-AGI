@@ -103,6 +103,17 @@ def test_ci_inside_cc_tmp_still_redirects(monkeypatch):
     assert should_redirect_pytest_basetemp(None, "true", "~/.genesis/cc-tmp/x") is True
 
 
+def test_ci_through_a_symlink_alias_of_cc_tmp_still_redirects(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    cc_tmp = home / ".genesis" / "cc-tmp"
+    cc_tmp.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(cc_tmp)
+    monkeypatch.setenv("HOME", str(home))
+    assert should_redirect_pytest_basetemp(None, "true", str(alias)) is True
+    assert should_redirect_pytest_basetemp(None, "true", "//" + str(cc_tmp).lstrip("/")) is True
+
+
 def test_ci_outside_cc_tmp_stays_exempt(monkeypatch):
     monkeypatch.setenv("HOME", "/home/someone")
     assert should_redirect_pytest_basetemp(None, "true", "/tmp") is False
@@ -521,6 +532,120 @@ def test_cleanup_removes_a_sealed_directory_nested_inside_another(tmp_path):
         for d in (leaf / "a" / "b", leaf / "a"):
             with contextlib.suppress(OSError):
                 d.chmod(0o700)
+
+
+def _fake_mountinfo(path, mount_points):
+    """A mountinfo file whose field 5 lists *mount_points* (always including /)."""
+    lines = [f"{i} 1 0:{i} / {mp} rw - ext4 /dev/fake rw" for i, mp in enumerate(mount_points, 1)]
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_cleanup_refuses_a_tree_with_a_mount_below_it(tmp_path, monkeypatch):
+    """`followlinks=False` does not stop os.walk or rmtree crossing a bind
+    mount, so a mount at or below the leaf must stop removal outright: the
+    leaf stays and a warning says why."""
+    mod = _load_conftest()
+    leaf = tmp_path / "pytest" / "999010"
+    (leaf / "mnt").mkdir(parents=True)
+    (leaf / "mnt" / "source-data.txt").write_text("x")
+    monkeypatch.setattr(
+        mod, "_MOUNTINFO", _fake_mountinfo(tmp_path / "mi", ["/", str(leaf / "mnt")])
+    )
+    with pytest.warns(RuntimeWarning, match="is mounted at or below it"):
+        mod._force_rmtree(str(leaf))
+    assert (leaf / "mnt" / "source-data.txt").exists()
+
+
+def test_cleanup_refuses_when_the_mount_table_is_unreadable(tmp_path, monkeypatch):
+    mod = _load_conftest()
+    leaf = tmp_path / "pytest" / "999011"
+    leaf.mkdir(parents=True)
+    monkeypatch.setattr(mod, "_MOUNTINFO", tmp_path / "missing-mountinfo")
+    with pytest.warns(RuntimeWarning, match="mount table is unreadable"):
+        mod._force_rmtree(str(leaf))
+    assert leaf.exists()
+
+
+def test_cleanup_still_removes_when_no_mount_is_below(tmp_path, monkeypatch):
+    """The control arm: a table with only / leaves removal working."""
+    mod = _load_conftest()
+    leaf = tmp_path / "pytest" / "999012"
+    (leaf / "sub").mkdir(parents=True)
+    monkeypatch.setattr(mod, "_MOUNTINFO", _fake_mountinfo(tmp_path / "mi", ["/"]))
+    mod._force_rmtree(str(leaf))
+    assert not leaf.exists()
+
+
+def test_unconfigure_never_raises_out_of_cleanup(tmp_path, monkeypatch):
+    """A non-OSError from cleanup (MEASURED: RecursionError on a very deep tree)
+    must not turn a passing suite into exit 1: it warns, and the lock is still
+    released."""
+    mod = _load_conftest()
+
+    def _boom(_path):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(mod, "_force_rmtree", _boom)
+    released = []
+    config = SimpleNamespace(
+        _genesis_basetemp_cleanup=str(tmp_path / "leaf"),
+        _genesis_pytest_lock=SimpleNamespace(release=lambda: released.append(True)),
+    )
+    with pytest.warns(RuntimeWarning, match="cleanup of .* failed"):
+        mod.pytest_unconfigure(config)
+    assert released == [True]
+
+
+def test_reaper_isolates_a_leaf_that_raises(tmp_path, monkeypatch):
+    """One stale leaf whose removal raises must not stop the reaper (and so
+    must not reach pytest_configure's fallback, which drops the redirect)."""
+    mod = _load_conftest()
+    base = tmp_path / "pytest"
+    for name in ("999901", "999902"):
+        (base / name).mkdir(parents=True)
+    seen = []
+
+    def _boom(path):
+        seen.append(os.path.basename(path))
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(mod, "_force_rmtree", _boom)
+    with pytest.warns(RuntimeWarning, match="could not reap"):
+        mod._reap_stale_pytest_basetemps(str(base))
+    assert sorted(seen) == ["999901", "999902"], "every dead leaf must still be tried"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the permission bits under test")
+def test_cleanup_warns_when_the_leaf_cannot_be_inspected(tmp_path):
+    """A parent that is readable but not searchable makes lstat fail with
+    EACCES: the leaf is there, so that must warn rather than pass as removed."""
+    mod = _load_conftest()
+    leaf = tmp_path / "pytest" / "999014"
+    leaf.mkdir(parents=True)
+    leaf.parent.chmod(0o600)
+    try:
+        with pytest.warns(RuntimeWarning, match="cannot inspect"):
+            mod._force_rmtree(str(leaf))
+    finally:
+        leaf.parent.chmod(0o700)
+    assert leaf.exists()
+
+
+def test_cleanup_unlinks_a_hardlinked_leaf_without_touching_its_inode(tmp_path):
+    """A non-directory leaf is unlinked, never chmod-ed: for a hard link the
+    permission pass would change an inode shared with a file outside the tree."""
+    mod = _load_conftest()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    outside.chmod(0o400)
+    leaf = tmp_path / "pytest" / "999013"
+    leaf.parent.mkdir(parents=True)
+    os.link(outside, leaf)
+    mod._force_rmtree(str(leaf))
+    assert not os.path.lexists(leaf)
+    assert oct(outside.stat().st_mode & 0o777) == oct(0o400), "the shared inode was chmod-ed"
+    outside.chmod(0o600)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the permission bits under test")

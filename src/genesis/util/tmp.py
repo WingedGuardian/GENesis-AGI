@@ -38,7 +38,8 @@ def should_redirect_pytest_basetemp(
     ci_env: str | None,
     tmpdir_env: str | None = None,
 ) -> bool:
-    """Whether pytest's basetemp should be steered to ``~/tmp``. Pure — no I/O.
+    """Whether pytest's basetemp should be steered to ``~/tmp``. No writes: the
+    only filesystem access is reading symlinks to recognise a cc-tmp ``TMPDIR``.
 
     pytest's ``tmp_path``/``basetemp`` default to ``<TMPDIR>/pytest-of-<user>/``,
     and on this project BOTH of the places that resolves to are small and policed:
@@ -97,13 +98,31 @@ _CC_TMP = os.path.join("~", ".genesis", "cc-tmp")
 
 
 def _in_cc_tmp(tmpdir_env: str | None) -> bool:
-    """Whether a raw ``$TMPDIR`` value names cc-tmp or a path under it. Pure:
-    lexical (``expanduser`` + ``normpath``), so it never touches the filesystem."""
+    """Whether a raw ``$TMPDIR`` value names cc-tmp or a path under it.
+
+    Compared both lexically and after resolving symlinks and relative paths, so
+    an alias of cc-tmp (a symlink to it, ``//home/...``, a relative spelling)
+    still counts. Resolving only READS the filesystem; nothing is created, so
+    the no-op path stays side-effect free. A resolution error counts as "not in
+    cc-tmp" only after the lexical form has also failed to match.
+    """
     if not tmpdir_env:
         return False
+
+    def _under(target: str, root: str) -> bool:
+        return target == root or target.startswith(root.rstrip(os.sep) + os.sep)
+
     cc_tmp = os.path.normpath(os.path.expanduser(_CC_TMP))
     target = os.path.normpath(os.path.expanduser(tmpdir_env))
-    return target == cc_tmp or target.startswith(cc_tmp + os.sep)
+    if _under(target, cc_tmp):
+        return True
+    try:
+        return _under(
+            os.path.realpath(os.path.abspath(target)),
+            os.path.realpath(cc_tmp),
+        )
+    except (OSError, ValueError):
+        return False
 
 
 # ``CI`` is the de-facto cross-vendor signal; GitHub Actions (this repo's only CI —
