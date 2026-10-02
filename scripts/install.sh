@@ -1104,7 +1104,7 @@ if command -v claude &>/dev/null; then
             echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
         fi
     fi
-    command -v serena &>/dev/null && \
+    _serena_registration_available && \
         _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
     # repos. Registered under a Genesis-owned name, not the generic `grep`, so

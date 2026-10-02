@@ -92,6 +92,20 @@ else:
 PYEOF
 }
 
+# A shared provider remains usable even when bootstrap cannot find its binary.
+_serena_registration_available() {
+    python3 - <<'PYCODE'
+import json, os, shutil, sys
+from pathlib import Path
+path = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser() / "config/serena-shared.json"
+try:
+    sharing = json.loads(path.read_text()).get("enabled") is True
+except (OSError, ValueError, AttributeError):
+    sharing = False
+sys.exit(0 if sharing or shutil.which("serena") else 1)
+PYCODE
+}
+
 _register_serena() (
     local root="$1" outcome
     cd -- "$root" || return 1

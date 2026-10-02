@@ -53,7 +53,7 @@ def binary(name: str) -> str:
     result = shutil.which(name)
     if not result:
         raise ValueError(f"{name} is not installed or is missing from PATH")
-    return result
+    return str(Path(result).resolve())
 
 
 def systemctl(*args: str) -> None:
@@ -399,6 +399,7 @@ def configure_locked(project: Path, enable: bool) -> None:
     binary("terse")
     # No old checkout may route to a new service if startup/publication fails.
     write_settings(config_file, project, False)
+    cleanup_units()  # Preflight failure already attempted both units; do not retry it.
     try:
         install_units(project, config_file, serena)
         systemctl("daemon-reload")
@@ -409,7 +410,7 @@ def configure_locked(project: Path, enable: bool) -> None:
             cleanup_units()
         except (OSError, ValueError, subprocess.CalledProcessError) as cleanup_error:
             error.add_note(f"Serena cleanup failed: {cleanup_error}")
-            for note in getattr(cleanup_error, "__notes__", ()):
+            for note in tuple(getattr(cleanup_error, "__notes__", ())):
                 error.add_note(note)
         raise
 

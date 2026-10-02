@@ -784,7 +784,7 @@ if command -v codebase-memory-mcp &>/dev/null; then
         echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
     fi
 fi
-if command -v serena &>/dev/null; then
+if _serena_registration_available; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
     # flag overrides this), so register from the repo root regardless of the
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
