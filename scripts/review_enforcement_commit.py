@@ -94,6 +94,7 @@ try:
         has_trailing_override,
         mentions,
         split_segments,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -132,6 +133,21 @@ _CWD_UNKNOWN = object()
 # detect the same set of commits or the marker cleared drifts from the one
 # checked. Guarded by test_commit_pattern_matches_git_dash_c_and_dash_C.
 _COMMIT_PATTERN = re.compile(r"\bcommit\b")
+_GIT_WORD = re.compile(r"\bgit\b")
+
+#: A git command whose SUBCOMMAND the parse cannot read: a variable, a
+#: substitution or an escape stands where it goes, or an option before it that
+#: the parser cannot classify. It may be a commit, and nothing in its text says
+#: so, which is why the early exit below cannot be what lets it through. The
+#: push guard refuses the same shape for the same reason.
+_HIDDEN_GIT_VERB_MSG = (
+    "BLOCKED: this command runs git with a subcommand review enforcement cannot "
+    "read (a variable, a substitution or an escape stands where it goes, or an "
+    "option before it that the parser cannot classify), so it cannot tell "
+    "whether it commits.\n"
+    "To proceed: write the git subcommand out literally, and pass any option "
+    "the parser does not recognise after it or not at all."
+)
 
 
 def _commit_override(command: str, segs: list) -> str:
@@ -708,31 +724,94 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
     return "branch" if sub == "switch" or targets else None
 
 
-def _git_common_dir(cwd: str | None) -> str | None:
-    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None."""
+def _git_common_dir(cwd: str | None, *, deadline: float | None = None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None.
+
+    With ``deadline`` (the hook's aggregate one) the probe draws from it like the
+    neighbouring git probes: an overrun raises ``DeadlineExpired``, which
+    ``run_guard`` turns into a refusal, instead of each call spending its own
+    5 seconds against a 10-second harness kill that would let the commit run."""
     try:
         args = ["git"] + (["-C", cwd] if cwd else [])
         args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=bounded_timeout(deadline, 5)
+        )
         out = result.stdout.strip()
-        return os.path.realpath(out) if result.returncode == 0 and out else None
+        # One absolute line or nothing: git before 2.31 does not know
+        # `--path-format`, exits 0, and echoes the option back beside a relative
+        # `.git`, which must read as unreadable (fail closed), never as an identity.
+        if result.returncode != 0 or "\n" in out or not os.path.isabs(out):
+            return None
+        return os.path.realpath(out)
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return None
+    except DeadlineExpired:
+        raise
     except Exception:
         return None
 
 
-def _live_integration_repo(cwd: str | None) -> bool:
+def _live_manifest_binding() -> tuple[str, str | None]:
+    """What the deploy manifest says about WHICH repository it belongs to.
+
+    The manifest may carry a top-level ``"repo"``: the ABSOLUTE git common dir of
+    the checkout it belongs to. Returns one of:
+
+    * ``("bound", <canonical path>)`` — the key names an existing git common dir
+      (a directory holding ``objects/`` and ``HEAD``);
+    * ``("absent", None)`` — a JSON object without the key: the caller keeps its
+      rule for manifests written before the key existed;
+    * ``("malformed", None)`` — anything else: unreadable or malformed JSON, not a
+      JSON object, or a key that is not the absolute path of an existing git
+      common dir (a work-tree path, a checkout that has since moved). The caller
+      ARMS, for every target: a broken manifest fails closed.
+
+    The same rule is kept in ``git_push_guard._live_manifest_binding`` and in the git hooks'
+    ``live_manifest_applies``; ``TestManifestRepoBinding`` pins all four copies
+    to one verdict table."""
+    try:
+        with open(Path.home() / ".genesis" / "deploy_manifest.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — unreadable fails closed, never "disarmed"
+        return ("malformed", None)
+    if not isinstance(data, dict):
+        return ("malformed", None)
+    if "repo" not in data:
+        return ("absent", None)
+    repo = data["repo"]
+    if (
+        isinstance(repo, str)
+        and os.path.isabs(repo)
+        and os.path.isdir(os.path.join(repo, "objects"))
+        and os.path.isfile(os.path.join(repo, "HEAD"))
+    ):
+        return ("bound", os.path.realpath(repo))
+    return ("malformed", None)
+
+
+def _live_integration_repo(cwd: str | None, *, deadline: float | None = None) -> bool:
     """Whether ``cwd``'s repository runs a local integration branch named ``live``.
 
     The deploy manifest declares that this install runs one (without it a
-    branch named ``live`` is ordinary), and the commit must be in THIS
-    repository or one of its worktrees: a session commits in unrelated
-    checkouts too, and their own ``live`` branches are none of this gate's
-    business. With the manifest present but an identity unreadable, fail
-    closed, as this gate does for an unverifiable branch."""
+    branch named ``live`` is ordinary), and the commit must be in the repository
+    the manifest is about (``_live_manifest_binding``): when it names one, that
+    repository and no other; when it has no ``"repo"`` key, THIS repository or
+    one of its worktrees, since a session commits in unrelated checkouts too and
+    their own ``live`` branches are none of this gate's business. A malformed
+    manifest, or an identity that cannot be read, fails closed, as this gate does
+    for an unverifiable branch. ``deadline`` bounds both identity probes (see
+    ``_git_common_dir``)."""
     if not (Path.home() / ".genesis" / "deploy_manifest.json").is_file():
         return False
-    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
-    there = _git_common_dir(cwd)
+    kind, bound = _live_manifest_binding()
+    if kind == "malformed":
+        return True
+    there = _git_common_dir(cwd, deadline=deadline)
+    if kind == "bound":
+        return there is None or there == bound
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)), deadline=deadline)
     if here is None or there is None:
         return True
     return here == there
@@ -1106,6 +1185,23 @@ def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
             return None
         remote_names.add(name.strip())
         url = rest.rsplit(" (", 1)[0].strip()
+        # A remote whose listed URL is EMPTY gives gh nothing to resolve. The common
+        # cause: any `remote.<name>.*` key makes git list the name, so one global key
+        # (say `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in
+        # every repository that has no remote (MEASURED: a bare `origin<TAB>` line).
+        # It is not the only cause — an empty or whitespace-only `url`, a remote with
+        # only gh's own `gh-resolved` key, and an `insteadOf` rewrite that empties
+        # the URL all list the same way — and the skip covers every one, because the
+        # test is on the listed URL, not on how it came to be empty. A URL git does
+        # know is listed on its own line, a push-only URL included.
+        #
+        # Skipping it hides nothing ONLY because gh resolves a repository from this
+        # same `git remote -v` listing: MEASURED with gh 2.101 and git 2.43, gh
+        # answered "no git remotes found" in each of the states above. A gh that
+        # resolved from raw config instead would turn them into repositories this
+        # gate skips; re-check this premise when the gh version moves.
+        if not url:
+            continue
         if not _is_local_remote_url(url):
             return True
     # Every listed remote's fetch AND push URL is a filesystem path by now.
@@ -1290,14 +1386,15 @@ def _commit_budget_reason(result: dict) -> str:
     if result.get("gate_surface"):
         # Unlike the push guard's gate-surface branch, this one has no
         # still-within-budget sub-state to get wrong: reaching here needs
-        # `commit_approval`, which is `count > GATE_DISCOVERY_ROUND_LIMIT`, while
-        # `confirmation_exempt` requires `count == GATE_DISCOVERY_ROUND_LIMIT`. The
+        # `commit_approval`, which is `count > GATE_DISCOVERY_ROUND_LIMIT` or the
+        # limit with its one confirmation already spent, while
+        # `confirmation_exempt` requires the limit with it UNSPENT. The
         # two are mutually exclusive, so the budget genuinely IS spent and the
         # terminal decision is the truthful thing to name. Recorded so the next
         # audit does not re-raise the push guard's defect against this branch.
         return (
-            f"PR #{pr} changes the review-gate surface and has {count} distinct "
-            f"reviewed heads. Its {review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery "
+            f"PR #{pr} changes the review-gate surface and has {count} review "
+            f"rounds. Its {review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery "
             "rounds plus confirmation are spent. "
             f"{review_budget.TERMINAL_DECISION} Approve this one additional fix "
             "commit only; earlier approval does not carry forward."
@@ -1307,7 +1404,7 @@ def _commit_budget_reason(result: dict) -> str:
         # STRONGLY_DISCOURAGED_REVIEWED_HEADS, so the rule's "there is no ordinary
         # round 5" would be rendered to someone who already holds five heads.
         return (
-            f"PR #{pr} has {count} distinct reviewed heads — past the terminal "
+            f"PR #{pr} has {count} review rounds — past the terminal "
             "boundary. Further work is strongly discouraged: stop, narrow or "
             "redesign, accept documented residue, or abandon it. "
             f"{review_budget.TERMINAL_DECISION} Approve only this single additional "
@@ -1319,7 +1416,7 @@ def _commit_budget_reason(result: dict) -> str:
     # the sentence after it. The boundary claim is true in this branch, where the
     # count is exactly the ordinary limit.
     return (
-        f"PR #{pr} has {count} distinct reviewed heads; standing authorization ended "
+        f"PR #{pr} has {count} review rounds; standing authorization ended "
         f"after {review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
         f"{review_budget.ORDINARY_TERMINAL_RULE} Approve this single fix commit only — "
         "it authorizes no review round, and a previous approval cannot authorize "
@@ -1341,6 +1438,14 @@ def main() -> None:
     # identical to the invalidator's early-out, or a commit this gate checks can
     # leave that module's marker standing.
     if not mentions(command, _COMMIT_PATTERN):
+        # Nothing in the text names a commit, and one could still run: a git
+        # subcommand the shell builds says nothing about which it is. Asked only
+        # when the text names git, and answered by the parse, so an ordinary
+        # variable in an ARGUMENT is not refused. The invalidator's early exit is
+        # deliberately NOT widened to match: it runs after a command succeeds,
+        # and every command this branch catches is refused before it runs.
+        if mentions(command, _GIT_WORD) and "git" in unresolved_verb_programs(command):
+            _deny(_HIDDEN_GIT_VERB_MSG)
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through
@@ -1532,7 +1637,7 @@ def main() -> None:
             )
             return
         if seg_branch == "live" and _live_integration_repo(
-            seg_cwd if isinstance(seg_cwd, str) else None
+            seg_cwd if isinstance(seg_cwd, str) else None, deadline=hook_deadline
         ):
             # `live` is the local integration branch: origin/main plus the
             # candidate branches in ~/.genesis/deploy_manifest.json, rebuilt with

@@ -432,8 +432,11 @@ def _check_fingerprints(
 ) -> list[Finding]:
     if fingerprint_file is None or not fingerprint_file.is_file():
         return []
+    # surrogateescape: a byte that is not UTF-8 is kept as itself rather than
+    # raising, so one such line (a comment included) cannot stop every other
+    # fingerprint being checked. The commit-msg hook reads the file the same way.
     try:
-        raw = fingerprint_file.read_text(encoding="utf-8")
+        raw = fingerprint_file.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError:
         return []
     patterns: list[re.Pattern[str]] = []
@@ -443,8 +446,11 @@ def _check_fingerprints(
             continue
         try:
             patterns.append(re.compile(stripped))
-        except re.error:
-            # Treat as literal if not valid regex
+        except Exception:
+            # Not a pattern Python can compile: match it as literal text. Any
+            # failure, not only re.error — a repeat count past the C limit raises
+            # OverflowError and deep nesting RecursionError, and either used to
+            # end the scan with every other fingerprint unchecked.
             patterns.append(re.compile(re.escape(stripped)))
     if not patterns:
         return []

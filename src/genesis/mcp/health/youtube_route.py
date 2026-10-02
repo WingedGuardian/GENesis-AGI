@@ -89,10 +89,7 @@ def _result(url: str, result, max_chars: int, start: float, **extra) -> dict:
     small ``max_chars``, and forged markers inside the video text are stripped.
     """
     content = _format(result)
-    body = content[:max_chars]
-    # To a fixpoint: one pass leaves a marker behind from a nested forgery.
-    while (stripped := strip_boundary_markers(body)) != body:
-        body = stripped
+    body = strip_boundary_markers(content[:max_chars])
     return {
         "url": url,
         "title": result.metadata.get("title", ""),

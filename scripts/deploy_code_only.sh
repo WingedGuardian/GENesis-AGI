@@ -21,7 +21,8 @@
 #            the server's MainPID and invocation, and what runs beside the commit
 #            (runtime-edits, runtime-overrides), and the validation bracket's
 #            token; --verify <token> answers whether it still holds (below).
-#            Run from a linked worktree, it reports the main checkout.
+#            Run from a linked worktree, it reports the main checkout, through
+#            the main checkout's own copy of this script and its libs.
 #   --wait N seconds to queue for the lock (default 7200, the same two hours a
 #            validation's hold may run, or GENESIS_DEPLOY_LOCK_WAIT)
 #
@@ -47,7 +48,8 @@
 # restart add a Guardian pause (no false "Genesis down" alert or paid diagnosis)
 # and a health wait sized the way update.sh sizes its own. deploy skips the stop
 # and the restart when the files the server loads (src/, config/,
-# pyproject.toml) are the ones it booted from, after the merge and at every
+# pyproject.toml, and the scripts it keeps imported: _RUNTIME_RELOAD_SCRIPTS in
+# lib/deploy_status.sh) are the ones it booted from, after the merge and at every
 # commit HEAD has held since the boot (the server imports src/ lazily, so a
 # pulled tree's module stays loaded after a later commit restores the files).
 # The fast-forward never overwrites a file git ignores: git refuses it at the
@@ -100,19 +102,24 @@
 # valid run. A token exists only when the server is up, its boot commit is known,
 # HEAD's runtime files are the ones it booted from and were at every commit HEAD
 # held since the boot (after a pull of code, even one a later commit undid:
-# restart first), and nothing under src/, config/ or pyproject.toml is edited
-# outside git; otherwise it prints "unknown (<why>)", which no token matches. It
+# restart first), and nothing under src/, config/, pyproject.toml or a script
+# the server uses (the two lists in lib/deploy_status.sh) is edited outside
+# git; otherwise it prints "unknown (<why>)", which no token matches. It
 # covers the boot commit, the MainPID, systemd's invocation id (a pid can be
-# reused, an invocation cannot) and a fingerprint of the ignored runtime files
+# reused, an invocation cannot), the scripts the server runs afresh as they
+# stand at HEAD (_RUNTIME_FRESH_SCRIPTS: a pull of one voids the token and
+# needs no restart) and a fingerprint of the ignored runtime files
 # (a config/*.local.yaml, which git status never lists) and of the user overlays
-# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs or
-# hooks without invalidating the run.
+# in ~/.genesis/config, which the loaders prefer. HEAD may move over docs, or
+# over hooks and scripts the server never runs, without invalidating the run.
 # It is a TRIPWIRE, not a certificate: "valid" means none of those changes
 # happened, not that nothing the server runs changed. It cannot see, and reads
 # valid through: a change to the venv's installed packages (imported lazily
 # too); the other files the server reads from ~/.genesis/config (a user
 # outreach.yaml, genesis.yaml, modules/: only the *.local.yaml overlays are
-# fingerprinted); an edit under src/, config/ or pyproject.toml made and undone
+# fingerprinted); a script the server reaches only through a systemd unit it
+# starts or a Claude Code session it launches; an edit under src/, config/,
+# pyproject.toml or a listed script made and undone
 # without moving HEAD (by hand, a stash and its pop, a checkout of a file from
 # another commit), including one present at boot; and a reflog rewritten or backdated (`git reflog expire
 # --rewrite`, a move made with GIT_COMMITTER_DATE, a clock stepped back). Proving
@@ -159,6 +166,10 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$_SELF_DIR/lib/alert_queue.sh"
 # shellcheck source=lib/deploy_status.sh
 . "$_SELF_DIR/lib/deploy_status.sh"
+# The checkout checks and the collision scan, shared with update.sh (needs
+# deploy_marker.sh's EPHEMERAL_DIRTY_RE, sourced above).
+# shellcheck source=lib/deploy_checkout.sh
+. "$_SELF_DIR/lib/deploy_checkout.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).
@@ -168,6 +179,8 @@ _PORT_PROBE_PY="$(cat "${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by
 _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
 
+# Kept whole for the status hand-over below (the parse consumes "$@").
+_ORIG_ARGS=("$@")
 MODE=""
 VERIFY=""
 # Two hours: a validation's documented hold is `flock -s -w 7200`, and a detached
@@ -192,10 +205,9 @@ case "$WAIT_S" in
 esac
 
 # ── A linked worktree is never a deploy target ────────────────────────
-# Git answers this; a path test alone misses a worktree added anywhere. The path
-# arms stay for a plain clone parked under a worktree directory.
-_git_dir="$(git -C "$GENESIS_ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)"
-_common_dir="$(unset CDPATH; cd -- "$GENESIS_ROOT" 2>/dev/null && cd -- "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd -P || true)"
+# Git answers this (genesis_is_primary_checkout, in the shared lib); a path test
+# alone misses a worktree added anywhere.
+genesis_checkout_git_dirs "$GENESIS_ROOT"
 # status is read-only, and validators usually work in a worktree: from one, it
 # reports the main checkout, whose .git is the common dir.
 if [ "$MODE" = status ] && [ -n "$_git_dir" ] && [ -n "$_common_dir" ] \
@@ -204,11 +216,21 @@ if [ "$MODE" = status ] && [ -n "$_git_dir" ] && [ -n "$_common_dir" ] \
     GENESIS_ROOT="$(dirname -- "$_common_dir")"
     _git_dir="$_common_dir"
     echo "(from a linked worktree: reporting the main checkout, $GENESIS_ROOT)"
+    # What `status` hashes and reports (the runtime path lists in lib/deploy_status.sh)
+    # belongs to the tree being reported, and this worktree's copy, sourced above, can
+    # be older or newer than main's. Hand over to the main checkout's own script with
+    # the same arguments. GENESIS_DEPLOY_ROOT is dropped so that script takes its root
+    # from where it lives; the guard variable stops a second hand-over. A main
+    # checkout with no copy of this script keeps this one (and its lists).
+    _main_self="$GENESIS_ROOT/scripts/deploy_code_only.sh"
+    if [ -z "${GENESIS_DEPLOY_STATUS_HANDOVER:-}" ] && [ -f "$_main_self" ] \
+        && [ "$(readlink -f -- "$_main_self")" != "$(readlink -f -- "${BASH_SOURCE[0]}")" ]; then
+        exec env -u GENESIS_DEPLOY_ROOT GENESIS_DEPLOY_STATUS_HANDOVER=1 \
+            bash "$_main_self" "${_ORIG_ARGS[@]}"
+    fi
 fi
-if [ -z "$_git_dir" ] || [ -z "$_common_dir" ] || [ "$(unset CDPATH; cd -- "$_git_dir" && pwd -P)" != "$_common_dir" ] \
-    || [[ "$GENESIS_ROOT" == *"/.claude/worktrees/"* ]] || [[ "$GENESIS_ROOT" == *"/.worktrees/"* ]]; then
-    die "deploy_code_only.sh must run against the main checkout, not a worktree ($GENESIS_ROOT)."
-fi
+genesis_is_primary_checkout "$GENESIS_ROOT" "$_git_dir" "$_common_dir" \
+    || die "deploy_code_only.sh must run against the main checkout, not a worktree ($GENESIS_ROOT)."
 
 # ── Checks a restart depends on ───────────────────────────────────────
 # A server outside the unit, such as update.sh's nohup fallback after a failed
@@ -237,20 +259,6 @@ _untracked_runtime() {
     st="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames --untracked-files=all \
         -- src config pyproject.toml)" || die "cannot read the working tree's status — nothing changed."
     printf '%s\n' "$st" | grep '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" || true
-}
-
-# Does <path> (relative to the checkout) hold anything git does not track: an
-# untracked or IGNORED file, or a directory with one inside? A tracked file or
-# directory there is git's to replace; the fast-forward removes it as the range
-# says. Something present that git lists nothing under at all (an empty
-# directory) counts too. An unreadable listing counts: refusing is the safe side.
-_untracked_node() {
-    [ -e "$GENESIS_ROOT/$1" ] || [ -L "$GENESIS_ROOT/$1" ] || return 1
-    local others tracked
-    others="$(git -C "$GENESIS_ROOT" ls-files -z --others -- "$1" 2>/dev/null)" || return 0
-    [ -z "$others" ] || return 0
-    tracked="$(git -C "$GENESIS_ROOT" ls-files -z -- "$1" 2>/dev/null)" || return 0
-    [ -z "$tracked" ]
 }
 
 
@@ -326,18 +334,17 @@ print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true
     [ "$_state_phase" = "done" ] \
         || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
 fi
-_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
-[ "$_branch" = main ] || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not main."
-# The status is read on its own first: in a pipeline its failure would be
-# swallowed, and an unreadable status would pass as a clean tree. --no-renames:
-# a rename is one line naming BOTH paths, so a tracked file renamed INTO an
-# excused path would be excused whole; split, the deletion of the old path shows.
-_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)" \
+# No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
+genesis_deploy_branch_ok "$GENESIS_ROOT" \
+    || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+# Unreadable refuses (see genesis_tracked_dirty_paths for why it is read apart).
+_dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
     || die "cannot read the working tree's status — nothing was deployed."
-_dirty="$(printf '%s\n' "$_status" | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" | grep -v '^$' || true)"
 if [ -n "$_dirty" ]; then
     echo "ERROR: $GENESIS_ROOT has uncommitted tracked changes. Nothing was deployed:" >&2
     echo "$_dirty" >&2
+    genesis_has_flagged_entries "$GENESIS_ROOT" \
+        && echo "  (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)" >&2
     exit 1
 fi
 # The dependency gate asks $VENV_DIR, so the unit must RUN $VENV_DIR: its python
@@ -565,32 +572,16 @@ _pull() {
             die "$_f is edited locally and changed upstream — run scripts/update.sh, which carries it across."
         fi
     done
-    # Paths the range ADDS that already exist here, untracked (or with a file
-    # where a parent directory goes). git refuses to overwrite a plain untracked
-    # file, but it overwrites an IGNORED one without asking (measured, git 2.43):
-    # a local secrets or settings file would be lost.
-    git -C "$GENESIS_ROOT" diff --no-renames --name-only --diff-filter=A "$_head" "$_upstream" >/dev/null \
-        || die "cannot list the files this range adds — nothing changed."
-    # Only what git does NOT track counts: a tracked file or directory in the way
-    # is git's own to replace (the range deletes it as it adds the new path).
-    _collisions=""
-    while IFS= read -r -d '' _f; do
-        if _untracked_node "$_f"; then
-            _collisions+="$_f"$'\n'
-            continue
-        fi
-        [ -e "$GENESIS_ROOT/$_f" ] || [ -L "$GENESIS_ROOT/$_f" ] && continue
-        _p="$_f"
-        while [ "$_p" != "${_p%/*}" ]; do
-            _p="${_p%/*}"
-            [ -d "$GENESIS_ROOT/$_p" ] && [ ! -L "$GENESIS_ROOT/$_p" ] && break
-            if _untracked_node "$_p"; then
-                _collisions+="$_f"$'\n'
-                break
-            fi
-        done
-    done < <(git -C "$GENESIS_ROOT" diff -z --no-renames --name-only --diff-filter=A "$_head" "$_upstream")
+    # Paths the range brings in that already exist here, untracked (on a fast-forward
+    # these can only be additions: every path it changes is tracked here) (or with a file
+    # where a parent directory goes): git would overwrite an IGNORED one without
+    # asking. The scan is the shared lib's genesis_range_collisions; only what git
+    # does NOT track counts.
+    _coll_rc=0
+    _collisions="$(genesis_range_collisions "$GENESIS_ROOT" "$_head" "$_upstream")" || _coll_rc=$?
+    [ "$_coll_rc" -ne 2 ] || die "cannot list the files this range adds — nothing changed."
     if [ -n "$_collisions" ]; then
+        _collisions+=$'\n'
         echo "ERROR: this range adds files that already exist here, untracked; the fast-forward would overwrite them:" >&2
         printf '%s' "$_collisions" | sed 's/^/         /' >&2
         die "move them aside first (scripts/update.sh carries .claude/settings.local.json, .serena/project.yml and src/genesis/identity/USER.md across) — nothing changed."
@@ -647,9 +638,10 @@ _pull() {
     fi
     # An excused file the range also changes is reset to HEAD so the merge can
     # take upstream's copy. Both regenerate (the code-intel indexer rewrites
-    # AGENTS.md, the server the trigger cache), and update.sh discards them the
-    # same way before its merge, so no copy is kept: each reset is NAMED instead,
-    # here, in a refusal's message and in the exit alert, so none passes silently.
+    # AGENTS.md, the server the trigger cache), so this script keeps no copy: each
+    # reset is NAMED instead, here, in a refusal's message and in the exit alert,
+    # so none passes silently. (update.sh differs: it backs such edits up under
+    # ~/.genesis/premerge-backups before its merge.)
     _reset=()
     for _f in AGENTS.md config/procedure_triggers.yaml; do
         if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
@@ -753,7 +745,8 @@ fi
 _read_baseline
 # A deploy with nothing to deploy: the server is running, its boot commit is
 # known, and the files it loads are the same at HEAD and at every commit HEAD
-# held since the boot (a merge of docs or hooks only, or no merge at all). A
+# held since the boot (a merge of docs, or of hooks and scripts the server does
+# not keep imported, or no merge at all). A
 # restart would only cost an outage and end in-flight dispatched sessions. The
 # restart mode is there to force one.
 if [ "$MODE" = deploy ] && [ -z "$_STOPPED" ] && [ -n "$SERVING" ] && _runtime_held "$SHA"; then

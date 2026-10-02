@@ -173,11 +173,28 @@ class TestLastResortTier:
         assert tiers == {"last_resort"}, tiers
 
     def test_held_below_last_resort_threshold(self, tmp_path):
-        # Medium gate (90) is crossed but last_resort (95) is not: DB survives.
+        # Medium gate (90) is crossed but the last-resort threshold is not: DB survives.
         lr = _make_cache(tmp_path, "lr1", "last_resort")
         with patch.object(_mod, "_CACHE_TARGETS", [lr]):
-            self._run(["--apply", "--if-above", "90"], disk_pct=92.0, home=tmp_path / ".genesis")
+            self._run(
+                ["--apply", "--if-above", "90", "--last-resort-above", "95"],
+                disk_pct=92.0,
+                home=tmp_path / ".genesis",
+            )
         assert lr.path.exists()  # NOT deleted at 92% — the whole point
+
+    def test_default_never_clears_the_indexes(self, tmp_path):
+        # #2567: with no --last-resort-above, no disk level clears an index DB.
+        # Index deletion belongs to the disk guardian's RED pass, which asks for
+        # it explicitly; any other caller (the remediation registry, a model
+        # running the script by hand) must not get it by default.
+        lr = _make_cache(tmp_path, "lr-default", "last_resort")
+        home = tmp_path / ".genesis"
+        with patch.object(_mod, "_CACHE_TARGETS", [lr]):
+            rc = self._run(["--apply", "--if-above", "0"], disk_pct=99.9, home=home)
+        assert rc == 0  # a held index is not a deferral, so no retry signal
+        assert lr.path.exists()
+        assert not (home / "index-requests").exists()
 
     def test_cleared_at_last_resort_threshold_drops_marker(self, tmp_path):
         lr = _make_cache(tmp_path, "lr2", "last_resort")
@@ -278,10 +295,6 @@ class TestLastResortTier:
         assert not (home / "index-requests").exists()  # and drops no marker
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 _READ_MOUNTS = _mod._mount_points  # the real parser, fed a crafted table
 
 
@@ -374,3 +387,7 @@ def test_mount_points_keep_raw_bytes_whatever_the_locale(tmp_path):
     with patch.object(Path, "read_text", lambda self, *a, **k: self.read_bytes().decode("latin-1")):
         mounts = _READ_MOUNTS(info)
     assert Path(os.fsdecode(name)) in mounts
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

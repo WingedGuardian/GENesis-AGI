@@ -108,8 +108,8 @@ from shell_parse import (  # noqa: E402
     BlindSpot,
     analyze_checked,
     gh_command,
-    has_continuation,
     mentions,
+    rewrites_before_running,
 )
 
 
@@ -583,7 +583,8 @@ def _process(payload: dict) -> None:
     sid = session_id(payload)
     found, blind = _hits(command)
 
-    # A LINE CONTINUATION is a bounds-type blind spot, so the parse has no segments
+    # A LINE CONTINUATION, or an escape the shell decodes (`rewrites_before_running`),
+    # is a bounds-type blind spot, so the parse has no segments
     # and no target: say so for THIS command, in one line, whenever its text names a
     # gh listing. Not recorded per session. The keyed blind block below is spent once
     # per session, and a continuation is ordinary input, so MEASURED in review: after
@@ -591,7 +592,7 @@ def _process(payload: dict) -> None:
     # advisory at all. Re-parsing the join to find the target was tried instead, and
     # review found a new defect in that modelling each round. The real bounds keep the
     # keyed block: they are measured at 0 real commands, so spending it costs nothing.
-    if blind is not None and blind.bounds_induced and has_continuation(command):
+    if blind is not None and blind.bounds_induced and rewrites_before_running(command):
         if _names_a_gh_read(command):
             print_json_bounded(
                 _envelope(_unreadable_listing_note(blind)),

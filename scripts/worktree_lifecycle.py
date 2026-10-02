@@ -36,8 +36,11 @@ index is kept.
 Two lanes remain. They differ in WHEN, in the label they carry, and in
 retention (only clean MERGED archives are eligible, and retention is off, #2504):
 
-  MERGED (7+ days idle)     content is also in main, so it drains sooner
+  MERGED (7+ days idle)     merged AND clean: content is also in main, so it drains sooner
   UNMERGED (14+ days idle)  may be the only copy, so it is held longer
+
+A merged worktree with uncommitted changes takes the UNMERGED lane: no merge
+verdict covers edits that were never committed (see `_classify`).
 
 Between day 7 and day 14 an unmerged worktree reports as ``at_risk``: a
 bounded, draining window that surfaces work about to be archived, rather than a
@@ -163,10 +166,21 @@ _GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 
 
 def _git_env() -> dict[str, str]:
-    """The environment with git's repository-location overrides removed."""
+    """The environment with git's repository-location overrides removed, and
+    git's optional locks off.
+
+    The locks matter because this script MEASURES mtimes. `git status` takes an
+    `index.lock` to refresh the index opportunistically, which moves the mtime
+    of the `.git` directory it runs in. For a repository nested inside a
+    worktree that directory is inside the tree, where the activity walk reads
+    it, so the reaper's own probe made an idle worktree read as active on every
+    later run (MEASURED: 20.0, 0.0, 0.0 days across three probes). Inherited by
+    the git processes a status spawns for submodules.
+    """
     env = dict(os.environ)
     for var in _GIT_LOCATION_VARS:
         env.pop(var, None)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     return env
 
 
@@ -209,9 +223,11 @@ def _default_branch(repo_root: Path) -> str:
 def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
     """Run git, returning stdout on success and None on any failure.
 
-    Decoded with ``surrogateescape``: git prints paths as raw bytes (always, with
-    ``core.quotePath=false``), and a strict decode RAISED out of this helper on a
-    non-UTF-8 name. Surrogates round-trip through ``os.fsencode`` to the same path.
+    Decoded with ``surrogateescape``: with ``core.quotePath=false`` git prints a
+    path as raw bytes, and a strict decode of a non-UTF-8 name RAISED out of this
+    helper, which the scan does not catch, so one such filename in any worktree
+    ended the whole run. Surrogates round-trip through ``os.fsencode`` to the
+    same path.
     """
     try:
         result = subprocess.run(
@@ -221,6 +237,84 @@ def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+def _run_git_bytes(repo_root: Path, args: list[str], *, timeout: float) -> bytes | None:
+    """`_run_git` without decoding: stdout as bytes on success, None on failure.
+
+    For NUL-delimited output, where text mode is wrong twice over: its newline
+    translation rewrites a carriage return INSIDE a path, so the parsed name is
+    not the file on disk.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True,
+            cwd=str(repo_root), timeout=timeout, env=_git_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+class _ProbeFailed(Exception):
+    """A strict activity probe could not get an answer.
+
+    Raised only when the caller asked for ``strict``: at archive time an
+    unanswered probe, or a path that exists but cannot be read, must not read
+    as "idle", while classification degrades to whatever it could read.
+    """
+
+
+#: Wall-clock seconds the nested-repository probes may spend in one scan, across
+#: every worktree. Depth alone does not bound them: each level can report many
+#: nested repositories, and each is more git calls.
+_NESTED_PROBE_BUDGET_S = 300.0
+
+#: The monotonic instant that budget runs out. `main` sets it once per scan.
+#: None means no budget is running, so a caller of these functions alone (a
+#: test, a one-off) is never starved by how long ago the module was imported.
+_nested_probe_deadline: float | None = None
+
+
+def _reset_nested_probe_budget() -> None:
+    global _nested_probe_deadline
+    _nested_probe_deadline = time.monotonic() + _NESTED_PROBE_BUDGET_S
+
+
+def _nested_probe_timeout(strict: bool) -> float | None:
+    """The timeout for the NEXT nested git call, or None when the budget is spent.
+
+    Recomputed before every call from one deadline, so no call can run past it
+    and nothing is charged twice: a call's timeout is at most what is left, so
+    the calls together cannot exceed the budget, however they nest. With the
+    budget spent a ``strict`` probe raises, so the archive step holds the
+    worktree instead of reading what it could not check as idle.
+    """
+    if _nested_probe_deadline is None:
+        return 60.0
+    left = _nested_probe_deadline - time.monotonic()
+    if left <= 0:
+        if strict:
+            raise _ProbeFailed("the nested-repository probe budget is spent")
+        return None
+    return min(60.0, left)
+
+
+def _mtime(path: Path, *, strict: bool) -> float:
+    """``path``'s own mtime (lstat), 0.0 if it does not exist.
+
+    Any OTHER failure -- a permission error, an I/O error -- raises
+    `_ProbeFailed` when ``strict``: a path that is there but unreadable is not
+    evidence of idleness. Classification reads it as 0.0, as before.
+    """
+    try:
+        return path.lstat().st_mtime
+    except (FileNotFoundError, NotADirectoryError):
+        return 0.0
+    except OSError as e:
+        if strict:
+            raise _ProbeFailed(f"cannot read {path}: {e}") from e
+        return 0.0
 
 
 def _nested_worktrees_under(wt_path: Path, repo_root: Path) -> list[str]:
@@ -401,71 +495,279 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     return worktrees
 
 
-def _git_activity_time(worktree_path: str) -> float:
-    """Activity git can see that a shallow mtime walk cannot. 0.0 if unknown.
+def _head_moved_time(log: Path, *, strict: bool) -> float:
+    """When HEAD last MOVED in a repository: the timestamp of the newest entry
+    in its HEAD reflog, ``log``. 0.0 if there is none.
 
-    ONE signal: the mtimes of paths git reports as modified or untracked. That
-    is someone EDITING, at any depth, which is exactly what the walk below
-    cannot see.
+    A COMMIT, checkout or reset leaves `git status` clean and changes no
+    directory the tree walk reads, so without this a worktree used an hour ago
+    read as idle once its work was committed (MEASURED: a deep edit committed
+    after a 20-day backdate still read 20.0 days).
 
-    NOT the HEAD commit timestamp, which is the obvious second signal and was
-    tried first. It answers the wrong question -- when the COMMIT was made, not
-    when this WORKTREE was used -- so a worktree cut from a fresh mainline
-    commit and then abandoned reads as active forever and is never reclaimed.
-    Nine existing tests failed on precisely that, which is the suite correctly
-    refusing a signal that cannot tell a new checkout from a used one.
+    The ENTRY's timestamp, never the file's mtime. `git gc` rewrites every
+    worktree's reflog file, and the directory holding it, whether or not the
+    worktree was touched: MEASURED, both read 0.0 days after a gc in the shared
+    repository, for a worktree idle 20 days, while the entry kept its 20.0. Read
+    as an mtime, every gc would make every worktree look active.
 
-    Failures are absorbed and contribute 0.0, because this only ever RAISES the
-    measured activity: a git call that fails degrades to the old mtime answer
-    rather than making a worktree look more idle than it is.
+    And not the COMMIT timestamp (``%ct``), which says when a commit was made,
+    not when this worktree last moved to it: a worktree cut from a fresh
+    mainline commit would read as used.
+
+    Only CREATION is skipped: an entry from all zeros and, on a branch, the
+    `reset: moving to HEAD` git writes right after it, on the same commit
+    (MEASURED); counting either would read a checkout made for nothing as use,
+    and the tree walk dates creation anyway, since it writes every directory.
+    Every other entry counts, including one that stays on the same commit: a
+    `git switch -c` to start new work changes no file and no commit, and this
+    is the only place it shows.
+    """
+    # Read the END of the file, and read further back whenever that end holds
+    # no counted entry: one entry can outgrow any fixed tail (a commit message
+    # is not bounded), and a cut entry must never be mistaken for "no entry".
+    want = _REFLOG_TAIL_BYTES
+    while True:
+        try:
+            with log.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - want))
+                tail = f.read()
+        except (FileNotFoundError, NotADirectoryError):
+            return 0.0  # no reflog: reflogs off for this repository, or never moved
+        except OSError as e:
+            if strict:
+                raise _ProbeFailed(f"cannot read {log}: {e}") from e
+            return 0.0
+        whole = size <= want
+        stamp = _newest_head_move(tail.split(b"\n") if whole else tail.split(b"\n")[1:])
+        if stamp or whole:
+            return stamp
+        want *= 4
+
+
+def _newest_head_move(lines: list[bytes]) -> float:
+    """The timestamp of the newest counted entry in reflog ``lines`` (file
+    order), 0.0 if none. See `_head_moved_time` for what counts."""
+    entries = []  # (old, new, timestamp), in file order
+    for line in lines:
+        # `<old> <new> <name> <<email>> <unix-seconds> <tz>\t<message>`
+        fields = line.split(b"\t", 1)[0].split(b" ")
+        if len(fields) < 4:
+            continue  # not a reflog line
+        try:
+            entries.append((fields[0], fields[1], float(fields[-2])))
+        except ValueError:
+            continue
+    for i in range(len(entries) - 1, -1, -1):
+        old, new, stamp = entries[i]
+        if old.strip(b"0") == b"":
+            continue  # creation
+        if old == new and i > 0 and entries[i - 1][0].strip(b"0") == b"":
+            continue  # the `reset: moving to HEAD` that follows creation
+        return stamp
+    return 0.0
+
+
+#: How much of a reflog's end `_head_moved_time` reads. One entry is ~150 bytes,
+#: so this holds hundreds of the newest, and reflogs grow without bound between
+#: expiries.
+_REFLOG_TAIL_BYTES = 65536
+
+
+def _git_activity_time(
+    worktree_path: str,
+    _depth: int = 0,
+    *,
+    strict: bool = False,
+    timeout: float = 60,
+) -> float:
+    """Activity in one repository that only git can locate. 0.0 if unknown.
+
+    Two signals, each for a kind of change the directory walk in
+    `_last_activity_time` cannot see:
+
+    * CONTENT: the paths `git status` reports as changed, and their own mtimes
+      (see `_path_activity`). An edit moves a file's mtime and never its
+      directory's, and the walk reads directories.
+    * HISTORY: when HEAD last moved (`_head_moved_time`), because a commit,
+      checkout or reset leaves the status clean. A NESTED repository also counts
+      its INDEX file's mtime: a commit rewrites it, which catches a commit on a
+      branch whose reflog is off (``core.logAllRefUpdates=false``). The index
+      and not the git directory: `git gc` and `git maintenance` in that
+      repository move its git directory (MEASURED: 0.0 days after either, for a
+      repository idle 20) and leave the index alone (20.0), so the directory
+      would keep a stale worktree looking used for as long as maintenance runs.
+      Not at the top level, where the index is refreshed by anything that
+      looks at the worktree. Optional locks are off for every git call here
+      (`_git_env`), so the probe itself never rewrites an index.
+
+    Classification absorbs failures and reads them as 0.0, which can only leave
+    another signal's answer standing, never invent idleness; the archive step
+    re-checks. That step passes ``strict``: there a git call that fails, or a
+    path that exists but cannot be read, raises `_ProbeFailed`, because an
+    unanswered probe must hold the worktree, not read as idle.
+
+    Nested repositories are descended to `_SUBMODULE_DEPTH_CAP` levels, within
+    the scan-wide budget (`_nested_probe_timeout`).
     """
     newest = 0.0
     root = Path(worktree_path)
 
+    t = timeout if _depth == 0 else _nested_probe_timeout(strict)
+    if t is None:
+        return newest
+    # ONE path, as bytes, with only git's terminating newline removed: a path
+    # may itself hold a newline or carriage return, so no line-based parse of
+    # several paths can be trusted. HEAD's reflog and the index both live in
+    # this repository's own git directory, linked worktrees included.
+    where = _run_git_bytes(root, ["rev-parse", "--absolute-git-dir"], timeout=t)
+    if where and where.endswith(b"\n") and len(where) > 1:
+        git_dir = Path(os.fsdecode(where[:-1]))
+        newest = _head_moved_time(git_dir / "logs" / "HEAD", strict=strict)
+        if _depth > 0:
+            newest = max(newest, _mtime(git_dir / "index", strict=strict))
+    elif strict:
+        raise _ProbeFailed(f"cannot resolve the git dir of {root}")
+
     # `-uall` so an untracked file deep in the tree counts; `--porcelain=v1`
-    # pins the format, whose first 3 columns are status + a space.
-    dirty = _run_git(root, ["status", "--porcelain=v1", "-uall"], timeout=60)
-    if dirty:
-        for line in dirty.splitlines()[:_DIRTY_SCAN_CAP]:
-            if len(line) < 4:
-                continue
-            rel = line[3:]
-            # A rename reads "R  old -> new"; the NEW path is the one on disk.
-            if " -> " in rel:
-                rel = rel.split(" -> ", 1)[1]
-            try:
-                newest = max(newest, (root / rel.strip('"')).lstat().st_mtime)
-            except OSError:
-                continue
+    # pins the format, whose first 3 columns are status + a space. `-z` because
+    # without it git C-quotes any path holding unusual bytes
+    # (`"deep-\377/f.txt"` under the default `core.quotePath`), and a quoted
+    # name is not a path on disk. With `-z` paths are raw and NUL-separated, and
+    # a rename or copy is TWO fields: destination, then source. Read as BYTES so
+    # no newline translation can rewrite a carriage return inside a path.
+    t = timeout if _depth == 0 else _nested_probe_timeout(strict)
+    if t is None:
+        return newest
+    dirty = _run_git_bytes(
+        root,
+        ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none"],
+        timeout=t,
+    )
+    if dirty is None:
+        if strict:
+            raise _ProbeFailed(f"git status failed in {root}")
+        return newest
+    fields = dirty.split(b"\0")
+    i = examined = 0
+    while i < len(fields) and examined < _DIRTY_SCAN_CAP:
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        # The source of a rename or copy is the next field; skip it. It no
+        # longer exists, and the directory it left is dated by the tree walk.
+        if b"R" in entry[:2] or b"C" in entry[:2]:
+            i += 1
+        examined += 1
+        newest = max(newest, _path_activity(root / os.fsdecode(entry[3:]), _depth, strict=strict))
     return newest
 
 
-#: Bound on the dirty-path scan. A worktree with more changed paths than this is
-#: self-evidently active, so the cap cannot make one look idle — the commit
-#: timestamp above is already in hand, and every path examined only raises the
-#: answer. Bounded because a first-run worktree can report tens of thousands of
-#: untracked paths and this runs per worktree.
+def _path_activity(path: Path, depth: int, *, strict: bool = False) -> float:
+    """The newest mtime that shows a change to a path git reported as changed.
+
+    Its own mtime shows an EDIT. A NESTED REPOSITORY (a submodule, or an
+    untracked clone) is reported only by its top directory, whose mtime does not
+    move when a file inside it changes, so its own status and history are read
+    too (`_git_activity_time`, one level deeper). Creations, deletions and
+    renames are not read here: they change a directory's entries, and the tree
+    walk dates every directory.
+    """
+    newest = _mtime(path, strict=strict)
+    if depth >= _SUBMODULE_DEPTH_CAP:
+        return newest
+    try:
+        nested = not path.is_symlink() and (path / ".git").exists()
+    except OSError as e:
+        if strict:
+            raise _ProbeFailed(f"cannot read {path}: {e}") from e
+        nested = False
+    if nested:
+        newest = max(newest, _git_activity_time(str(path), depth + 1, strict=strict))
+    return newest
+
+
+#: Bound on the dirty-path scan, because a first-run worktree can report tens of
+#: thousands of untracked paths and this runs per worktree. It is a real limit:
+#: git sorts its output by path, so in a worktree with more changed paths than
+#: this, a recent EDIT that sorts past the bound is not seen (creations,
+#: deletions and renames still are, by the tree walk).
 _DIRTY_SCAN_CAP = 2000
 
+#: How many levels of nested repository `_path_activity` descends. Each level is
+#: more git calls; the bound keeps a deeply nested tree from multiplying them.
+_SUBMODULE_DEPTH_CAP = 3
 
-def _last_activity_time(worktree_path: str) -> float:
+
+def _tree_dirs_newest(root: Path, *, strict: bool) -> float:
+    """The newest mtime of any directory in the worktree, at any depth.
+
+    Creating, deleting or renaming an entry changes the mtime of the directory
+    holding it -- and only that directory: a renamed file or folder keeps its
+    own mtime, and a deleted one has none (MEASURED). So reading every directory
+    dates every structural change anywhere in the tree, including ones git never
+    reports: an untracked folder renamed deep in the tree, or the last untracked
+    file in a folder deleted, both read 20.0 days idle before this.
+
+    ``.git`` is skipped (its contents change under `git gc`, which is not use);
+    symlinked directories are not followed. Under ``strict``, a directory that
+    cannot be listed raises, so a worktree holding one is held at archive time
+    on every run, with the reason on the board, until it is made readable:
+    the archive itself could not read it either. MEASURED cost on the install that
+    prompted this: 21,047 directories across 62 worktrees in under 3 seconds,
+    the largest worktree 374.
+    """
+    newest = 0.0
+
+    def _unreadable(e: OSError) -> None:
+        if strict and not isinstance(e, (FileNotFoundError, NotADirectoryError)):
+            raise _ProbeFailed(f"cannot list {e.filename}: {e}") from e
+
+    for dirpath, dirnames, _files in os.walk(root, onerror=_unreadable):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        newest = max(newest, _mtime(Path(dirpath), strict=strict))
+    return newest
+
+
+def _last_activity_time(worktree_path: str, *, strict: bool = False) -> float:
     """Most recent evidence of activity in the worktree.
 
-    THE SHALLOW WALK IS UNSOUND ALONE, which is why git is consulted too. It
-    samples the root and TWO levels, but modifying a file updates that file's
-    mtime and never its ancestors' — and nearly all source in this repo lives
-    below the sampled depth.
+    Three signals, each covering a kind of change the others cannot see, so a
+    gap in one is not papered over by hoping another catches it:
 
-    MEASURED: backdate a worktree 19 days, then edit
-    `src/genesis/memory/store.py`. The walk still reports 19.0 days and the
-    worktree stays eligible for archiving, while `git status` on the same tree
-    shows the modification. The control moves as expected — editing a depth-1
-    file such as `README.md` does report 0.0 days — which is exactly what made
-    the gap invisible: the obvious test passes.
+    * STRUCTURE -- a file or folder created, deleted or renamed, at any depth:
+      every directory's mtime (`_tree_dirs_newest`).
+    * CONTENT -- an edit to a file git does not ignore: the mtimes of the paths
+      `git status` reports (`_git_activity_time`). A tracked file's edit is
+      reported however deep it is. MEASURED before this existed: a worktree
+      backdated 19 days with `src/genesis/memory/store.py` edited still read
+      19.0 days.
+    * HISTORY -- a commit, checkout or reset: when HEAD last moved, from its
+      reflog (`_head_moved_time`), since those leave the status clean.
 
-    So the answer is the MAXIMUM of the walk and what git can see. Combining by
-    max is what makes the addition safe: a failing or slow git call can only
-    leave the old, lower answer standing, never invent idleness.
+    Plus the original walk of the files in the top two levels, kept so this can
+    only ever raise the answer it gave before.
+
+    NOT SEEN, as far as found, stated rather than discovered later (none of
+    these is caught by the archive-time fingerprint unless it happens during
+    the scan):
+
+    * an edit to an IGNORED file, or to one marked assume-unchanged or
+      skip-worktree;
+    * STAGING an old edit: the index lives outside the tree, and no file moves;
+    * rewriting a file in place with identical content;
+    * a commit whose committer date was set in the past (the reflog entry
+      carries that date), or any commit at the top level of a repository with
+      reflogs off;
+    * an edit that sorts past `_DIRTY_SCAN_CAP` changed paths;
+    * inside a nested repository more than `_SUBMODULE_DEPTH_CAP` levels down,
+      or once the scan's nested-probe budget is spent (classification only).
+
+    Combining by MAX is what makes each addition safe: a reading that fails
+    leaves the others standing, never invents idleness. Under ``strict`` (the
+    archive step) a failure raises `_ProbeFailed` instead.
     """
     latest = os.path.getmtime(worktree_path)
     root = Path(worktree_path)
@@ -484,12 +786,51 @@ def _last_activity_time(worktree_path: str) -> float:
                         mtime = sub.stat().st_mtime
                         if mtime > latest:
                             latest = mtime
-                    except OSError:
+                    except (FileNotFoundError, NotADirectoryError):
                         continue
-        except OSError:
+                    except OSError as e:
+                        if strict:
+                            raise _ProbeFailed(f"cannot read {sub}: {e}") from e
+                        continue
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as e:
+            if strict:
+                raise _ProbeFailed(f"cannot read {item}: {e}") from e
             continue
 
-    return max(latest, _git_activity_time(worktree_path))
+    latest = max(latest, _tree_dirs_newest(root, strict=strict))
+    return max(latest, _git_activity_time(worktree_path, strict=strict))
+
+
+def _state_fingerprint(worktree_path: str, *, timeout: float = 60) -> str | None:
+    """What git says this worktree IS -- its commit, the branch it is on, and
+    its full status -- as one digest. None if git could not answer. The branch
+    name catches a `git switch -c` that changes neither commit nor files.
+
+    `_classify` reads it right after the age, before the merge verdict (which
+    can wait on the network) and before every other worktree is classified;
+    `_trash_worktree` reads it again just before archiving. Any difference
+    means someone changed the worktree in between, which holds it whether or
+    not any activity signal noticed: a backstop that does not depend on the
+    signals being complete.
+    """
+    root = Path(worktree_path)
+    head_args = ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"]
+    head = _run_git_bytes(root, head_args, timeout=timeout)
+    status = _run_git_bytes(
+        root,
+        ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none"],
+        timeout=timeout,
+    )
+    # HEAD again AFTER the status: a commit landing between the two calls would
+    # otherwise pair the old HEAD with the new, clean status, which can equal
+    # the classification digest. A change in between reads as "no answer",
+    # which holds.
+    head_after = _run_git_bytes(root, head_args, timeout=timeout)
+    if head is None or status is None or head_after != head:
+        return None
+    return hashlib.sha256(head + b"\0" + status).hexdigest()
 
 
 class _SkipNetwork(Exception):
@@ -580,7 +921,8 @@ def _merge_verdict(
         result = subprocess.run(
             ["gh", "pr", "list", "--head", ref, "--base", _default_branch(repo_root),
              "--state", "merged", "--limit", "10", "--json", "number,headRefOid"],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(repo_root), timeout=30,
         )
         if result.returncode == 0:
             prs = json.loads(result.stdout)
@@ -599,7 +941,8 @@ def _merge_verdict(
     try:
         result = subprocess.run(
             ["git", "cherry", "main", ref],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(repo_root), timeout=10,
         )
         if result.returncode == 0:
             # Lines starting with '+' are unique commits not in main
@@ -611,32 +954,6 @@ def _merge_verdict(
         pass
 
     return ""
-
-
-def _tip_on_mainline(ref: str, repo_root: Path) -> bool:
-    """True when ``ref`` resolves to a commit on ``main``'s FIRST-PARENT line.
-
-    For a ref that is already an ancestor of main, this separates "main made this
-    commit itself", so the ref contributed nothing of its own, from "this commit
-    reached main through a merge", so the ref had real work that got merged.
-    See the call site in `_classify` for why that matters and for the one case
-    it cannot tell apart (a fast-forward).
-
-    Fails TRUE, and that direction is deliberate. The caller only acts on True
-    for a DIRTY worktree, and acting means holding it for the longer unmerged
-    window. An error therefore costs a week of disk, never a worktree archived
-    early. The walk is one ``rev-list`` over main's first-parent history,
-    which MEASURED 1,916 commits on this repo's main on 2026-09-25, and it runs
-    only for an ancestor verdict past the merged threshold.
-    """
-    tip = _run_git(repo_root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], timeout=15)
-    tip = (tip or "").strip()
-    if not tip:
-        return True
-    mainline = _run_git(repo_root, ["rev-list", "--first-parent", "main"], timeout=60)
-    if mainline is None:
-        return True
-    return tip in mainline.split()
 
 
 # Per-worktree admin-dir markers for an in-progress Git operation. Each lives
@@ -696,10 +1013,9 @@ def _has_in_progress_op(worktree_path: str) -> bool:
     """
     for marker in _IN_PROGRESS_MARKERS:
         try:
-            # surrogateescape: a linked worktree's marker path runs through its
-            # admin directory, which carries the worktree's own name byte for
-            # byte, and a strict decode of a non-UTF-8 name raised out of here
-            # (and out of `_trash_worktree`, which has no handler for it).
+            # surrogateescape: the marker path runs through the worktree's admin
+            # directory, which carries the worktree's own name byte for byte, and
+            # a strict decode of a non-UTF-8 name raised out of the scan.
             result = subprocess.run(
                 ["git", "rev-parse", "--git-path", marker],
                 capture_output=True, text=True, errors="surrogateescape",
@@ -721,29 +1037,24 @@ def _has_in_progress_op(worktree_path: str) -> bool:
 def _has_uncommitted_changes(worktree_path: str) -> bool:
     """True if the worktree has ANY uncommitted state (tracked edits or untracked).
 
-    Fail-CLOSED: any error returns True. A "dirty" verdict only ever routes a
-    worktree to the gentler lane (trash instead of permanent delete), so being
-    wrong in this direction costs disk, while being wrong the other way destroys
-    work that exists nowhere else.
+    Fail-CLOSED: any error returns True. A "dirty" verdict only ever holds a
+    worktree for the longer 14-day window, so being wrong in this direction keeps
+    it live a week longer, while being wrong the other way puts uncommitted work
+    on the short clock.
 
     Untracked files count as dirty on purpose: a forced worktree removal deletes
     them, and an untracked file in a merged worktree is exactly the kind of
     unreferenced work that no branch protects.
     """
-    try:
-        # BYTES: with `core.quotePath=false` git prints a non-UTF-8 filename raw,
-        # and a strict text decode raised out of this fail-closed check. The lane
-        # rule in `_classify` now calls this for every stale ancestor verdict, so
-        # that crash would have aborted the whole classification.
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, cwd=worktree_path, timeout=30, env=_git_env(),
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
-        return True
-    if result.returncode != 0:
-        return True
-    return bool(result.stdout.strip())
+    # The flags are PINNED because config can hide changes from a bare status:
+    # `status.showUntrackedFiles=no` drops every untracked file (MEASURED), and a
+    # dirty worktree would then read clean and go back on the short clock.
+    out = _run_git(
+        Path(worktree_path),
+        ["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"],
+        timeout=30,
+    )
+    return True if out is None else bool(out.strip())
 
 
 def _dirty_patch(worktree_path: str) -> bytes:
@@ -780,9 +1091,9 @@ def _dirty_patch(worktree_path: str) -> bytes:
 STATE_IN_USE = "in_use"            # a live process is sitting in it
 STATE_PROTECTED = "protected"      # locked / mid-rebase / contains a nested worktree
 STATE_FRESH = "fresh"              # touched within MERGED_STALE_DAYS
-STATE_AT_RISK = "at_risk"          # unmerged, aging, NOT yet reapable  <- the alert set
-STATE_REAP_MERGED = "reap_merged"  # merged and old enough — archive now
-STATE_REAP_UNMERGED = "reap_unmerged"  # unmerged, past the long window — trash now
+STATE_AT_RISK = "at_risk"          # unmerged or dirty, aging, NOT yet reapable  <- the alert set
+STATE_REAP_MERGED = "reap_merged"  # merged, clean and old enough — archive now
+STATE_REAP_UNMERGED = "reap_unmerged"  # unmerged or dirty, past the long window — trash now
 
 
 def _classify(
@@ -862,57 +1173,36 @@ def _classify(
         out["reason"] = f"activity {age_days:.0f}d ago (< {MERGED_STALE_DAYS}d)"
         return out
 
+    # What git says this worktree is, NOW: before the merge verdict, which can
+    # wait on the network, and before the rest of the scan. The archive step
+    # compares it, so a change made in between holds the worktree.
+    out["fingerprint"] = _state_fingerprint(wt_path)
+
     ref, is_branch = (branch, True) if branch else (head, False)
     verdict = _merge_verdict(
         ref, repo_root, is_branch=is_branch, allow_network=allow_network,
     ) if ref else ""
 
-    # AN "ANCESTOR" VERDICT CAN BE VACUOUS. `merge-base --is-ancestor` passes for
-    # any tip main can reach, and the tip of a branch that never got a commit of
-    # its own is a main commit, so it always passes, with nothing merged. Such a
-    # worktree can still hold uncommitted work, and that work is not in main.
-    #
-    # "No commits of its own" is read as "the tip sits on main's FIRST-PARENT
-    # line". `main..<ref>` cannot answer it: that range is empty for EVERY
-    # ancestor, including a branch whose real commits were merged. A branch
-    # merged with a merge commit has its tip on a second parent, so it is off
-    # main's first-parent line and stays merged. A branch that was fast-forwarded
-    # into main looks the same as one that never had a commit. That ambiguity
-    # fails safe: the worktree waits the longer unmerged window. It applies to
-    # detached HEADs too, since `git worktree add --detach <path> main` followed
-    # by edits is the same situation.
-    #
-    # THE ONE MISS FAILS UNSAFE, and it is stated rather than hidden. A branch or
-    # detached HEAD with no commits of its own, cut from a commit that reached
-    # main as a SECOND parent (e.g. a PR head that was later merged with a merge
-    # commit), sits off the first-parent line, so it keeps the merged lane and
-    # reaps at the shorter threshold while dirty. MEASURED in an isolated repo.
-    # Structurally it is indistinguishable from a real merge-commit merge. The
-    # cost is bounded: archiving LOCKS the worktree's registration, and while
-    # that registration survives `--recover` reattaches the archived tree to it,
-    # edits and staged state included. When it does not survive, recovery exits
-    # non-zero and names the archive that still holds the edits.
-    #
-    # ONLY A DIRTY WORKTREE MOVES LANES. A clean one holds nothing main lacks, so
-    # the merged clock loses nothing. Moving it would also add it to the at-risk
-    # alert set for a week and report a loss that cannot happen. The rule is
-    # therefore: a vacuous ancestor verdict plus uncommitted work means unmerged.
-    vacuous = False
-    if verdict == "ancestor" and _tip_on_mainline(ref, repo_root):
-        out["dirty"] = _has_uncommitted_changes(wt_path)
-        if out["dirty"]:
-            verdict, vacuous = "", True
+    # A MERGE VERDICT NEVER COVERS UNCOMMITTED WORK. Every verdict answers a
+    # question about COMMITS: is the tip an ancestor of main, was its PR merged,
+    # are its patches already in main. None of them sees edits that were never
+    # committed, so a dirty worktree's uncommitted changes exist nowhere else
+    # whatever the verdict says. The vacuous case makes this concrete: a branch
+    # that never got a commit of its own has a main commit as its tip, so the
+    # ancestry test passes with nothing merged, and the same holds for a branch
+    # stacked on a squash-merged PR head (patch-id). So a dirty worktree always
+    # waits the longer unmerged window, and only a CLEAN one drains on the merged
+    # clock: one that holds nothing `git status` can see. (Ignored files and
+    # assume-unchanged or skip-worktree edits are invisible to it, as before.)
+    out["dirty"] = _has_uncommitted_changes(wt_path)
+    held = verdict if verdict and out["dirty"] else ""
+    if held:
+        verdict = ""
     out["merge_method"] = verdict
     out["merged"] = bool(verdict)
 
     if not verdict:
-        # Dirty state matters MORE on this lane, not less: unmerged content may be
-        # the only copy. It was previously computed only for merged worktrees.
-        if out["dirty"] is None:
-            out["dirty"] = _has_uncommitted_changes(wt_path)
-        what = ("uncommitted changes on a tip that sits on main's own history "
-                "(no commits of its own, or fast-forwarded into main)" if vacuous
-                else "unmerged")
+        what = f"uncommitted changes on work merged via {held}" if held else "unmerged"
         if age_days < UNMERGED_STALE_DAYS:
             out["state"] = STATE_AT_RISK
             out["reason"] = (
@@ -926,13 +1216,8 @@ def _classify(
         return out
 
     out["state"] = STATE_REAP_MERGED
-    if out["dirty"] is None:
-        out["dirty"] = _has_uncommitted_changes(wt_path)
     out["action"] = "trash"
-    out["reason"] = (
-        f"merged via {verdict}, {age_days:.0f}d cold"
-        + (" (has uncommitted changes)" if out["dirty"] else "")
-    )
+    out["reason"] = f"merged via {verdict}, {age_days:.0f}d cold"
     return out
 
 
@@ -1233,6 +1518,7 @@ def _trash_name_taken(trash_path: Path) -> bool:
 def _trash_worktree(
     wt: dict, repo_root: Path, *, dry_run: bool = False,
     lane: str = "merged", merge_method: str = "",
+    min_idle_days: float | None = None,
 ) -> bool:
     """Move a worktree to the trash directory.
 
@@ -1242,6 +1528,17 @@ def _trash_worktree(
     expires only ``"merged"`` archives recorded with no uncommitted changes, and
     keeps every other case (``"unmerged"``, absent, unreadable, or
     ``had_uncommitted_changes`` not False) indefinitely.
+
+    ``min_idle_days`` is the lane's staleness threshold. When given, the age is
+    re-read right before archiving and a worktree touched since classification
+    is skipped. A row from `_classify` also carries ``fingerprint``; when it
+    does, a worktree whose HEAD, branch or status changed since is skipped too.
+    Like the process, lock and dirtiness re-checks, these are skipped under
+    ``dry_run``, so a dry run can list a worktree a real run would skip.
+
+    A skip WRITES TO ``wt``: ``wt["held"]`` gets the reason (which `main`
+    publishes on the board instead of the stale ``action: trash``), and an age
+    skip refreshes ``wt["age_days"]``.
 
     Returns True if trashed (or would be trashed in dry-run).
     """
@@ -1277,12 +1574,18 @@ def _trash_worktree(
     # process is in this worktree" and the move is minutes rather than
     # milliseconds. A session that opens an old worktree during the scan is
     # exactly what `_find_processes_in_dir` exists to protect.
+    def _hold(why: str) -> bool:
+        # Logged, and recorded ON THE ROW, so `main`'s republish can show why the
+        # board's `action: trash` did not happen instead of advertising it for
+        # another day against a worktree that is still there.
+        _log(f"SKIP {wt_path}: {why}")
+        wt["held"] = why
+        return False
+
     if not wt_path.exists():
-        _log(f"SKIP {wt_path}: disappeared between classification and reap")
-        return False
+        return _hold("disappeared between classification and reap")
     if _find_processes_in_dir(str(wt_path)) or _has_in_progress_op(str(wt_path)):
-        _log(f"SKIP {wt_path}: became active or protected between classification and reap")
-        return False
+        return _hold("became active or protected between classification and reap")
     # AND RE-READ THE LOCK, because `_classify` treats it as PROTECTED and this
     # revalidation previously did not repeat it. A lock is the one protection a
     # third party takes DURING the scan: `git worktree lock` is how a session
@@ -1291,8 +1594,48 @@ def _trash_worktree(
     # than re-running `git worktree list` keeps it to one stat on the path we
     # already resolved.
     if _is_locked_now(wt_path):
-        _log(f"SKIP {wt_path}: locked between classification and reap")
-        return False
+        return _hold("locked between classification and reap")
+    # AND RE-READ DIRTINESS for the merged lane, because `_classify` now puts a
+    # dirty worktree on the long clock whatever its merge verdict, and a session
+    # can write to a clean one during the minutes-long scan (an editor working by
+    # absolute path from another directory has no process cwd inside it). The
+    # archive is kept either way; this keeps such a worktree off the short clock.
+    if lane == "merged" and _has_uncommitted_changes(str(wt_path)):
+        return _hold("uncommitted changes appeared between classification and reap")
+    # AND RE-READ THE AGE, in both lanes. The classification read it before the
+    # merge verdict, which can wait on the network for up to 30 seconds, and the
+    # whole scan runs before any archive, so an edit in between reached the
+    # unmerged lane with the old age and was archived seconds after it was made.
+    # `main` passes its lane's threshold; a caller that names none skips this.
+    if min_idle_days is not None:
+        # STRICT: an unanswered git probe, or a path that exists but cannot be
+        # read, raises here instead of reading as idle, because this is the last
+        # check before the archive.
+        try:
+            idle_days = (time.time() - _last_activity_time(str(wt_path), strict=True)) / 86400
+        except (OSError, _ProbeFailed) as e:  # removed, unreadable, or git could not answer
+            return _hold(f"cannot re-read its activity time: {e}")
+        if idle_days < min_idle_days:
+            wt["age_days"] = round(idle_days, 1)
+            return _hold(
+                f"activity {idle_days:.1f}d ago, inside the "
+                f"{min_idle_days:g}-day window it was classified past"
+            )
+    # AND COMPARE what git says the worktree is with what `_classify` read. A
+    # commit, a rename, any change between the two shows here whether or not an
+    # activity signal noticed it, so this does not rest on the signals being
+    # complete. A row `_classify` produced always carries the key; when git
+    # could not answer then, there is nothing to compare against, which holds
+    # too. A row built by hand (no key) skips this.
+    if "fingerprint" in wt:
+        classified = wt["fingerprint"]
+        if classified is None:
+            return _hold("its git state could not be read at classification")
+        now_fp = _state_fingerprint(str(wt_path))
+        if now_fp is None:
+            return _hold("cannot re-read its git state")
+        if now_fp != classified:
+            return _hold("its git state changed between classification and reap")
     # AND refuse to move a worktree that CONTAINS another registered worktree.
     # Moving the parent relocates the nested tree's files out from under git; a
     # later prune then drops the nested worktree's per-worktree HEAD, which for a
@@ -1314,11 +1657,10 @@ def _trash_worktree(
     # path already being reaped.
     nested = _nested_worktrees_under(wt_path, repo_root)
     if nested:
-        _log(
-            f"SKIP {wt_path}: contains {len(nested)} registered worktree(s) "
+        return _hold(
+            f"contains {len(nested)} registered worktree(s) "
             f"(first: {nested[0]}) — moving the parent would strand them"
         )
-        return False
 
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
@@ -2348,9 +2690,13 @@ def _restore_from_dir(
         add_cmd = ["git", "worktree", "add", "--force", "--detach", original_path, commit]
     else:
         add_cmd = ["git", "worktree", "add", "--force", original_path, branch]
+    # Decoded with surrogateescape: git echoes the branch name, which can hold
+    # bytes that are not UTF-8, and a strict decode raised here with the worktree
+    # recreated but its untracked files not yet copied back.
     result = subprocess.run(
         add_cmd,
-        capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+        capture_output=True, text=True, errors="surrogateescape",
+        cwd=str(repo_root), timeout=30,
     )
 
     if result.returncode != 0 and commit and not (detached or not branch):
@@ -2374,7 +2720,8 @@ def _restore_from_dir(
         # with one `git switch -c`, and that is stated rather than left implicit.
         retry = subprocess.run(
             ["git", "worktree", "add", "--force", "--detach", original_path, commit],
-            capture_output=True, text=True, cwd=str(repo_root), timeout=30,
+            capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(repo_root), timeout=30,
         )
         if retry.returncode == 0:
             print(
@@ -3720,12 +4067,16 @@ def main() -> int:
                              "(gh pr list). Faster, and can only ever under-report "
                              "a branch as unmerged — never the reverse")
     args = parser.parse_args()
-
-    # A worktree path is bytes, and one that is not valid UTF-8 decodes to lone
-    # surrogates. Under a locale whose stdout is strict (any `xx_XX.UTF-8`; only the
-    # C locale gets surrogateescape) printing such a path raised mid-recovery, AFTER
-    # the tree had moved and before the checks that report an incomplete result.
-    # Escape instead of raising; commands meant to be pasted are quoted separately.
+    _reset_nested_probe_budget()  # one budget per scan, however the script is driven
+    # A path is decoded with surrogateescape (see `_run_git`), so a worktree name
+    # that is not UTF-8 carries a surrogate into every log line naming it, and a
+    # strict stream — which a pipe or the systemd journal is under a UTF-8
+    # locale, as the timer runs — RAISED on the first such line and ended the run
+    # (MEASURED, run as the timer runs it). Escape what cannot be encoded. The
+    # metadata this script writes goes through `json.dumps`, which escapes it
+    # already. `--recover` needs it as much as the scan: a raise there landed
+    # AFTER the tree had moved and before the checks that report an incomplete
+    # result. Commands meant to be pasted are quoted separately.
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(errors="backslashreplace")
@@ -3858,6 +4209,7 @@ def main() -> int:
             r, repo_root, dry_run=args.dry_run,
             lane="merged" if r["merged"] else "unmerged",
             merge_method=r["merge_method"],
+            min_idle_days=MERGED_STALE_DAYS if r["merged"] else UNMERGED_STALE_DAYS,
         )
 
     # Republish AFTER acting. The pre-flight publish above is for crash-safety;
@@ -3865,12 +4217,19 @@ def main() -> int:
     # worktrees that were archived seconds later and no longer exist. Reclassifying
     # would cost another full scan, so the acted-on rows are simply retired in
     # place — which is exactly what the dashboard needs to stop showing ghosts.
+    # A row the archive step HELD keeps its worktree, so it stops advertising
+    # `action: trash` too, with the reason, whatever held it: a re-check above,
+    # or an error the archive step reported in the log.
     if not args.dry_run and not args.no_network:
         for r in results:
-            if r["action"] != "none" and not Path(r["path"]).exists():
+            if r["action"] == "none":
+                continue
+            r["action"] = "none"
+            if "held" not in r and not Path(r["path"]).exists():
                 r["state"] = "archived"
-                r["action"] = "none"
                 r["reason"] = "archived by this run; recover with --recover"
+            else:
+                r["reason"] = f"archive held this run: {r.pop('held', 'see the reaper log')}"
         _write_board_cache(results)
 
     tally: dict[str, int] = {}

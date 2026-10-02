@@ -85,6 +85,7 @@
 /scripts/external_review.py             @WingedGuardian
 /scripts/lib/gate_menu.py               @WingedGuardian
 /scripts/review_budget.py               @WingedGuardian
+/scripts/review_findings.py             @WingedGuardian
 /src/genesis/session_awareness/external_review.py @WingedGuardian
 /src/genesis/session_awareness/external_review_config.py @WingedGuardian
 

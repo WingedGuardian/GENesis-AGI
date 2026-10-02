@@ -11,6 +11,7 @@ everything (or nothing) fails the suite.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -194,6 +195,164 @@ def test_conflicted_merge_into_live_is_refused_at_commit(setup):
     assert "Commit on 'live'" in res.stdout + res.stderr
 
 
+# ── the manifest names its repository (#2532) ───────────────────────────
+#
+# A git hook runs only in the repository it is installed in, but a second clone
+# under the same home directory can install these hooks too, and the manifest
+# describes ONE checkout. Its optional top-level "repo" is that checkout's
+# absolute git common dir. Absent: armed exactly as before. This repository:
+# armed. Another: not armed. Unreadable or malformed: armed.
+
+
+def _write_manifest(env, body: str) -> None:
+    (Path(env["HOME"]) / ".genesis" / "deploy_manifest.json").write_text(body)
+
+
+def _common_dir(repo: Path, env) -> str:
+    return _git(repo, env, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+
+
+def _diverged_live(repo: Path, env) -> None:
+    """A feature commit, and `live` moved past main by plumbing, so merging
+    `feature` into `live` must create a merge commit (and reach pre-merge-commit)."""
+    _commit_file(repo, env, "b.txt", "b\n")
+    _git(repo, env, "checkout", "-q", "live")
+    tree = _git(repo, env, "write-tree").stdout.strip()
+    tip = _git(
+        repo, env, "commit-tree", tree, "-p", "HEAD", "-m", "rebuild", "-m", "Deploy-rebuild: x"
+    ).stdout.strip()
+    _git(repo, env, "update-ref", "refs/heads/live", tip)
+
+
+def test_manifest_naming_this_repository_arms_the_commit_check(setup):
+    repo, env = setup
+    _write_manifest(env, json.dumps({"repo": _common_dir(repo, env)}))
+    _git(repo, env, "checkout", "-q", "live")
+    res = _commit_file(repo, env, "b.txt", "b\n", check=False)
+    assert res.returncode != 0
+    assert "Commit on 'live'" in res.stdout + res.stderr
+
+
+def test_manifest_naming_another_repository_leaves_this_live_alone(setup, tmp_path):
+    repo, env = setup
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], env=env, check=True)
+    _write_manifest(env, json.dumps({"repo": _common_dir(other, env)}))
+    _git(repo, env, "checkout", "-q", "live")
+    res = _commit_file(repo, env, "b.txt", "b\n", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_manifest_repository_is_compared_canonically(setup, tmp_path):
+    """A symlinked spelling of this repository's git dir is still this repository."""
+    repo, env = setup
+    alias = tmp_path / "alias-of-git-dir"
+    alias.symlink_to(repo / ".git")
+    assert str(alias) != _common_dir(repo, env)  # guard: a different spelling
+    _write_manifest(env, json.dumps({"repo": str(alias)}))
+    _git(repo, env, "checkout", "-q", "live")
+    res = _commit_file(repo, env, "b.txt", "b\n", check=False)
+    assert res.returncode != 0
+    assert "Commit on 'live'" in res.stdout + res.stderr
+
+
+def test_manifest_repository_covers_its_linked_worktrees(setup, tmp_path):
+    """A linked worktree shares the main checkout's common dir, so `live`
+    checked out there is the same integration branch."""
+    repo, env = setup
+    wt = tmp_path / "wt"
+    _git(repo, env, "worktree", "add", "-q", str(wt), "live")
+    _write_manifest(env, json.dumps({"repo": _common_dir(repo, env)}))
+    res = _commit_file(wt, env, "b.txt", "b\n", check=False)
+    assert res.returncode != 0
+    assert "Commit on 'live'" in res.stdout + res.stderr
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "{}\n",  # no "repo": manifests written before the key existed
+        "not json at all\n",
+        "[]\n",
+        '{"repo": 5}\n',
+        '{"repo": ""}\n',
+        '{"repo": "relative/.git"}\n',
+    ],
+)
+def test_manifest_without_a_usable_repository_arms_the_commit_check(setup, body):
+    repo, env = setup
+    _write_manifest(env, body)
+    _git(repo, env, "checkout", "-q", "live")
+    res = _commit_file(repo, env, "b.txt", "b\n", check=False)
+    assert res.returncode != 0
+    assert "Commit on 'live'" in res.stdout + res.stderr
+
+
+@pytest.mark.parametrize("where", ["worktree", "linked-gitdir", "gone", "root"])
+def test_a_repo_value_that_is_no_git_common_dir_arms_the_commit_check(setup, tmp_path, where):
+    """A work-tree path, a linked worktree's own git dir, a checkout that has
+    since moved, or `/` is not "another repository": each would disarm the
+    check if read that way, so each arms it."""
+    repo, env = setup
+    wt = tmp_path / "wt"
+    _git(repo, env, "worktree", "add", "-q", str(wt), "live")
+    value = {
+        "worktree": str(repo),
+        "linked-gitdir": _git(
+            wt, env, "rev-parse", "--path-format=absolute", "--git-dir"
+        ).stdout.strip(),
+        "gone": str(tmp_path / "moved-away" / ".git"),
+        "root": "/",
+    }[where]
+    _write_manifest(env, json.dumps({"repo": value}))
+    res = _commit_file(wt, env, "b.txt", "b\n", check=False)
+    assert res.returncode != 0
+    assert "Commit on 'live'" in res.stdout + res.stderr
+
+
+def test_manifest_naming_this_repository_arms_the_merge_check(setup):
+    repo, env = setup
+    _write_manifest(env, json.dumps({"repo": _common_dir(repo, env)}))
+    _diverged_live(repo, env)
+    res = _git(repo, env, "merge", "--no-edit", "feature", check=False)
+    assert res.returncode != 0
+    assert "Merge into 'live'" in res.stdout + res.stderr
+
+
+def test_manifest_naming_another_repository_leaves_a_merge_into_live_alone(setup, tmp_path):
+    repo, env = setup
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], env=env, check=True)
+    _write_manifest(env, json.dumps({"repo": _common_dir(other, env)}))
+    _diverged_live(repo, env)
+    res = _git(repo, env, "merge", "--no-edit", "feature", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_malformed_manifest_arms_the_merge_check(setup):
+    repo, env = setup
+    _write_manifest(env, "not json at all\n")
+    _diverged_live(repo, env)
+    res = _git(repo, env, "merge", "--no-edit", "feature", check=False)
+    assert res.returncode != 0
+    assert "Merge into 'live'" in res.stdout + res.stderr
+
+
+def _binding_block(hook: str) -> str:
+    text = (_HOOKS / hook).read_text()
+    start = text.index("# >>> live-manifest-binding")
+    end = text.index("# <<< live-manifest-binding")
+    return text[start:end]
+
+
+def test_both_git_hooks_carry_the_same_manifest_binding():
+    """pre-commit and pre-merge-commit each decide whether the manifest is about
+    this repository. Two copies that drift would arm one hook and not the other,
+    so they are pinned byte for byte."""
+    assert _binding_block("pre-commit") == _binding_block("pre-merge-commit")
+    assert "live_manifest_applies" in _binding_block("pre-commit")
+
+
 # ── pre-push ────────────────────────────────────────────────────────────
 
 
@@ -325,20 +484,240 @@ def test_trailer_separator_config_cannot_hide_a_rebuild_commit(setup):
     assert "Deploy-rebuild commit" in res.stdout + res.stderr
 
 
+def _break_origin_main_tracking_ref(repo: Path, env) -> None:
+    """Point refs/remotes/origin/main at an object that does not exist.
+
+    The hook excludes that ref from its walk, so listing the pushed commits now
+    fails, while `git push` itself never reads the ref (measured on git 2.43: a
+    plain push of another branch still succeeds). `update-ref` refuses a missing
+    object, so the ref is written as a loose file after packing the others."""
+    _git(repo, env, "pack-refs", "--all")
+    ref = repo / ".git" / "refs" / "remotes" / "origin" / "main"
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text("1" * 40 + "\n")
+
+
 def test_push_is_refused_when_its_commits_cannot_be_listed(setup):
     """Fail closed: if git cannot list what the push publishes, refuse rather
-    than publish unchecked. An invalid `log.date` makes `git log` fail while
-    `git push` itself still works (measured on git 2.43), so without the refusal
-    this push would succeed. (A PATH shim cannot stand in: git puts its own
-    exec-path first on a hook's PATH. A missing object cannot either: the push
-    then fails later on its own, and the test would pass with no refusal.)"""
+    than publish unchecked. (A PATH shim for git cannot stand in: git puts its
+    own exec-path first on a hook's PATH. A missing object reached from the
+    pushed tip cannot either: the push then fails later on its own, and the test
+    would pass with no refusal.)"""
     repo, env = setup
     _commit_file(repo, env, "b.txt", "b\n")
-    _git(repo, env, "config", "log.date", "bogusfmt")
+    _break_origin_main_tracking_ref(repo, env)
     res = _git(repo, env, "push", "origin", "feature", check=False)
     assert res.returncode != 0
     assert "could not list the commits" in res.stdout + res.stderr
     assert _git(repo, env, "ls-remote", "origin", "feature").stdout == ""
+
+
+def test_the_broken_tracking_ref_does_not_stop_a_plain_push(setup):
+    """Control for the test above: without the hook the same push succeeds, so
+    the refusal there is the hook's and not git's."""
+    repo, env = setup
+    _commit_file(repo, env, "b.txt", "b\n")
+    _break_origin_main_tracking_ref(repo, env)
+    res = _git(repo, env, "push", "--no-verify", "origin", "feature", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_push_is_refused_when_the_trailer_scan_cannot_run(setup, tmp_path):
+    """Fail closed on the SCAN too, not only on the listing: when the program
+    that reads the commit messages produces no verdict, the push is refused.
+    (`awk` is not in git's exec-path, so a PATH shim reaches it.)"""
+    repo, env = setup
+    _commit_file(repo, env, "b.txt", "b\n")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake_awk = shim / "awk"
+    fake_awk.write_text("#!/bin/sh\nexit 1\n")
+    fake_awk.chmod(0o755)
+    env = {**env, "PATH": f"{shim}{os.pathsep}{env['PATH']}"}
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "could not" in res.stdout + res.stderr
+    assert _git(repo, env, "ls-remote", "origin", "feature").stdout == ""
+
+
+# ── pre-push: no setting or repository state hides the trailer (#2532) ──
+#
+# The hook used to ask git to FORMAT the trailers (`%(trailers:key=…)`), and
+# formatting obeys configuration: each setting below hid a rebuild commit that the
+# same push without it refused (measured on git 2.43). `git interpret-trailers
+# --parse` obeys the same trailer configuration, so it is not a way out. The hook
+# now reads the raw commit objects and finds the trailer itself.
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("trailer.deploy-rebuild.key", "X"),  # a key alias renames the trailer
+        ("trailer.Deploy-rebuild.key", "Y"),  # the alias matches case-insensitively
+        ("i18n.logOutputEncoding", "UTF-16"),  # re-encodes every formatted message
+    ],
+)
+def test_a_git_setting_cannot_hide_a_rebuild_commit(setup, key, value):
+    repo, env = setup
+    _git(repo, env, "config", key, value)
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+    assert _git(repo, env, "ls-remote", "origin", "feature").stdout == ""
+
+
+def test_a_command_line_trailer_alias_cannot_hide_a_rebuild_commit(setup):
+    """`git -c … push` hands its settings to the hook through the environment,
+    so the alias also arrives that way, not only from a config file."""
+    repo, env = setup
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(
+        repo, env, "-c", "trailer.deploy-rebuild.key=X", "push", "origin", "feature", check=False
+    )
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_a_replace_ref_cannot_hide_a_rebuild_commit(setup):
+    """`git replace` makes git show another commit's message in place of the
+    rebuild commit's; the push still publishes the real one."""
+    repo, env = setup
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    innocent = _rebuild_commit(repo, env, ("ordinary work",))
+    _git(repo, env, "replace", tip, innocent)
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    shown = _git(repo, env, "log", "-1", "--format=%B", "feature").stdout
+    assert "Deploy-rebuild" not in shown  # guard: the replacement is in force
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+@pytest.mark.parametrize(
+    "trailer",
+    [
+        "deploy-rebuild: m1",  # git matches trailer keys case-insensitively
+        "DEPLOY-REBUILD: m1",
+        "Deploy-rebuild : m1",  # whitespace before the separator
+        "Deploy-rebuild:\tm1",
+    ],
+)
+def test_trailer_spellings_git_accepts_are_rebuild_commits(setup, trailer):
+    repo, env = setup
+    tip = _rebuild_commit(repo, env, ("rebuild live", trailer))
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_a_trailer_among_other_trailers_is_a_rebuild_commit(setup):
+    repo, env = setup
+    tip = _rebuild_commit(
+        repo, env, ("rebuild live", "Signed-off-by: t\nDeploy-rebuild: m1\nReviewed-by: u")
+    )
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_a_message_without_a_final_newline_is_still_scanned(setup, tmp_path):
+    """`commit-tree -F` stores the message byte for byte, so the object can end
+    without a newline; the scan must still see its last line."""
+    repo, env = setup
+    msg = tmp_path / "msg"
+    msg.write_bytes(b"rebuild live\n\nDeploy-rebuild: m1")
+    tree = _git(repo, env, "write-tree").stdout.strip()
+    tip = _git(repo, env, "commit-tree", tree, "-p", "HEAD", "-F", str(msg)).stdout.strip()
+    raw = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "commit", tip], env=env, capture_output=True
+    ).stdout
+    assert raw.endswith(b"Deploy-rebuild: m1")  # guard: no trailing newline stored
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_a_rebuild_commit_deep_in_a_long_push_is_found(setup):
+    """Many commits in one push, the rebuild commit in the middle: the scan reads
+    every commit object in the batch, not only the first or the tip."""
+    repo, env = setup
+    for i in range(5):
+        _commit_file(repo, env, f"pre{i}.txt", f"{i}\n")
+    tip = _rebuild_commit(repo, env, ("rebuild live", "Deploy-rebuild: m1"))
+    _git(repo, env, "reset", "-q", "--soft", tip)
+    for i in range(5):
+        _commit_file(repo, env, f"post{i}.txt", f"{i}\n")
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert tip in res.stdout + res.stderr
+
+
+def test_a_trailer_line_anywhere_after_the_subject_is_refused(setup):
+    """The scan is WIDER than git by construction: any body line starting with
+    the key counts, not only the last paragraph. The accepted cost is a commit
+    documenting the trailer with a line that starts with it (indent it)."""
+    repo, env = setup
+    tip = _rebuild_commit(
+        repo,
+        env,
+        ("docs: describe the rebuild commits", "They end in:\nDeploy-rebuild: <hash>", "More prose."),
+    )
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_an_indented_mention_in_the_body_is_prose(setup):
+    repo, env = setup
+    tip = _rebuild_commit(
+        repo,
+        env,
+        ("docs: describe the rebuild commits", "They end in:\n    Deploy-rebuild: <hash>"),
+    )
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        b"rebuild live\n\nDeploy-rebuild: m1\n\n# a comment paragraph\n",
+        b"rebuild live\n\nDeploy-rebuild: m1\n\nConflicts:\n\tf.txt\n",
+        b"rebuild live\n\nDeploy-rebuild: m1\n\n# ------------------------ >8 ------------------------\n"
+        b"diff --git a/f b/f\n",
+        b"Merge branch 'x' into live\n\nDeploy-rebuild: m1\n\n# Conflicts:\n#\tf.txt\n",
+    ],
+)
+def test_trailing_text_git_ignores_does_not_hide_the_trailer(setup, tmp_path, message):
+    """git drops trailing comment lines, a `Conflicts:` block and a scissors
+    section before it looks for the trailer block, so it still sees each of
+    these trailers; the scan must too."""
+    repo, env = setup
+    msg = tmp_path / "msg"
+    msg.write_bytes(message)
+    tree = _git(repo, env, "write-tree").stdout.strip()
+    tip = _git(repo, env, "commit-tree", tree, "-p", "HEAD", "-F", str(msg)).stdout.strip()
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode != 0
+    assert "Deploy-rebuild commit" in res.stdout + res.stderr
+
+
+def test_a_subject_that_looks_like_the_trailer_is_not_one(setup):
+    """git never reads the subject paragraph as trailers."""
+    repo, env = setup
+    tip = _rebuild_commit(repo, env, ("Deploy-rebuild: in the subject",))
+    _git(repo, env, "update-ref", "refs/heads/feature", tip)
+    res = _git(repo, env, "push", "origin", "feature", check=False)
+    assert res.returncode == 0, res.stdout + res.stderr
 
 
 def test_branch_deletion_push_is_allowed_on_a_sha256_repository(tmp_path):

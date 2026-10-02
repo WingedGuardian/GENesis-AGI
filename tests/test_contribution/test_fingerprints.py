@@ -18,6 +18,9 @@ from genesis.contribution.findings import FindingKind
 
 # ERE / re-portability: constructs a generated pattern must never contain
 # (GNU-grep extensions or PCRE-only syntax that break `grep -E` on other hosts).
+# Both current readers use Python re; the constraint stays for installed
+# commit-msg copies that predate the Python reader and still read the file with
+# `grep -E -f` until the next hook sync (see fingerprints.py's format contract).
 _BANNED = (r"\d", r"\w", r"\s", r"\D", r"\W", r"\S", "(?=", "(?!", "(?<", "(?P")
 
 
