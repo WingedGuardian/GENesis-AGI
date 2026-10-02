@@ -903,3 +903,38 @@ def test_failed_exec_releases_configuration_lock(tmp_path, monkeypatch, use_shar
         shared.launch("codex", tmp_path)
     with (shared.unit_directory() / ".genesis-serena.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("resource", ["modes", "prompt_templates", "memories/global"])
+def test_absent_source_resource_is_created_before_native_directory_access(tmp_path, resource):
+    source = tmp_path / "source" / resource
+    destination = tmp_path / "snapshot" / resource
+    shared.link_resource(destination, source)
+    assert destination.is_symlink() and source.is_dir()
+    source.rmdir()
+    shared.link_resource(destination, source)
+    assert source.is_dir(), "existing dangling link must also be repaired"
+    # This is the pinned provider's global-memory initialization operation.
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "first.md").write_text("shared resource")
+    assert (source / "first.md").read_text() == "shared resource"
+
+
+@pytest.mark.parametrize("value", [None, "", " \t ", "custom", " \tcustom \n"])
+def test_resource_snapshot_matches_native_provider_home_normalization(
+    tmp_path, monkeypatch, configured_paths, value
+):
+    source = tmp_path / ("custom" if value and value.strip() else ".serena")
+    source.mkdir()
+    (source / "serena_config.yml").write_text("native: true\n")
+    if value is None:
+        monkeypatch.delenv("SERENA_HOME", raising=False)
+    else:
+        monkeypatch.setenv("SERENA_HOME", value.replace("custom", str(source)))
+    shared.configure(checkout(tmp_path / "main"), True)
+    for context in shared.PROFILES:
+        home = configured_paths.parent.parent / "serena-shared" / context
+        assert (home / "serena_config.yml").read_text() == "native: true\n"
+        for resource in ("modes", "prompt_templates", "memories/global"):
+            assert (home / resource).resolve() == source / resource
+            assert (home / resource).is_dir()

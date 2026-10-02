@@ -1106,6 +1106,6 @@ jobs:
         # PR trigger, no edited type, push/schedule/dispatch unchanged,
         # cc-pin merge-base, and the origin/main line allowlist); no added
         # skips. Floor: 23864 + 5 = 23869.
-        # Shared Serena: new test_serena_shared.py collects 132 tests (0 -> 132).
-        # Floor: 23869 + 132 = 24001; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24001
+        # Shared Serena: new test_serena_shared.py collects 140 tests (0 -> 140).
+        # Floor: 23869 + 140 = 24009; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24009

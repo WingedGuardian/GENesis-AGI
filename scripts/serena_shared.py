@@ -269,6 +269,7 @@ print(yaml.safe_dump(config, sort_keys=False))
 def link_resource(destination: Path, source: Path) -> None:
     """Keep native shared resources in their original store; never discard data."""
     if destination.is_symlink() and destination.resolve() == source.resolve():
+        source.mkdir(parents=True, exist_ok=True)
         return
     if destination.exists() or destination.is_symlink():
         if destination.is_dir() and not destination.is_symlink() and not any(destination.iterdir()):
@@ -277,6 +278,7 @@ def link_resource(destination: Path, source: Path) -> None:
             raise ValueError(
                 f"preserve/reconcile existing Serena resource before linking: {destination}"
             )
+    source.mkdir(parents=True, exist_ok=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.symlink_to(source, target_is_directory=True)
 
@@ -359,7 +361,9 @@ def install_units(project: Path, config_file: Path, serena: str) -> None:
     directory = unit_directory()
     directory.mkdir(parents=True, exist_ok=True)
     home_root = config_file.parent.parent / "serena-shared"
-    source_home = Path(os.environ.get("SERENA_HOME") or Path.home() / ".serena").resolve()
+    source_home = Path(
+        os.environ.get("SERENA_HOME", "").strip() or Path.home() / ".serena"
+    ).resolve()
     for context in PROFILES:
         home = home_root / context
         home.mkdir(parents=True, exist_ok=True)

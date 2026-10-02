@@ -60,7 +60,9 @@ journalctl --user -u genesis-serena-claude-code -u genesis-serena-codex
 ```
 
 Each service has a 4 GiB hard limit, zero swap, two CPU quota, cgroup-owned
-children, and at most three starts within five minutes after failures. These
+children, and at most three starts within five minutes after failures. Manual starts, including configure retries, also count toward that limit;
+after repeated failures, fix the cause and wait for the five-minute interval
+before retrying. Configure does not implicitly reset the failure counter. These
 limits are based on the measured main-checkout experiment, not a guarantee for
 arbitrary repository growth. Measure again before provider upgrades; service
 startup refuses versions other than 1.7.0. Shared queries serialize through
