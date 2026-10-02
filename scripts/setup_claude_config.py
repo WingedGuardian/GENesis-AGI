@@ -22,6 +22,33 @@ def find_genesis_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+# Servers in config/mcp.json.template that INTERACTIVE sessions do not get.
+# The template is the single source for two consumers: this render, which
+# writes .mcp.json (what interactive sessions, and any dispatch on the "full"
+# MCP profile, load), and src/genesis/cc/session_config.py, which renders it per
+# dispatch profile and keeps only the servers that profile names. That filter
+# can only remove servers, never add them, so a server only some dispatch
+# profile needs must stay in the template and be left out HERE.
+#   discord-bot: only the community-responder profile uses it (#2319). Listed in
+#   .mcp.json, every interactive session spawned it for nothing: its tools are
+#   on-demand HTTP, so the cost was one idle process per session (measured: 8 of
+#   40 MCP processes on one install).
+# tests/test_scripts/test_setup_claude_config.py checks each entry is still in
+# the template and still named by a dispatch profile.
+INTERACTIVE_EXCLUDED_SERVERS = frozenset({"discord-bot"})
+
+
+def render_mcp_text(template: str, genesis_root: Path) -> str:
+    """The .mcp.json content for <genesis_root>: the template with its root
+    substituted and the interactive-excluded servers removed."""
+    config = json.loads(template.replace("{{GENESIS_ROOT}}", str(genesis_root)))
+    servers = config.get("mcpServers", {})
+    config["mcpServers"] = {
+        name: spec for name, spec in servers.items() if name not in INTERACTIVE_EXCLUDED_SERVERS
+    }
+    return json.dumps(config, indent=2) + "\n"
+
+
 def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
     """Render .mcp.json from template. Returns True if changes were made."""
     template_path = genesis_root / "config" / "mcp.json.template"
@@ -31,8 +58,7 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
         print(f"ERROR: MCP template not found at {template_path}", file=sys.stderr)
         return False
 
-    template = template_path.read_text()
-    rendered = template.replace("{{GENESIS_ROOT}}", str(genesis_root))
+    rendered = render_mcp_text(template_path.read_text(), genesis_root)
 
     if output_path.exists():
         current = output_path.read_text()
@@ -181,9 +207,17 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing")
     parser.add_argument("--global", dest="do_global", action="store_true",
                         help="Also configure ~/.claude/settings.json from manifest")
+    parser.add_argument("--mcp-only", action="store_true",
+                        help="Only render .mcp.json (install.sh uses this)")
     args = parser.parse_args()
 
     genesis_root = (args.genesis_root or find_genesis_root()).resolve()
+
+    if args.mcp_only:
+        render_mcp_config(genesis_root, args.dry_run)
+        # A missing template renders nothing: say so in the exit status, not only
+        # on stderr, so a caller can tell.
+        sys.exit(0 if args.dry_run or (genesis_root / ".mcp.json").exists() else 1)
 
     print(f"Genesis root: {genesis_root}")
     print()

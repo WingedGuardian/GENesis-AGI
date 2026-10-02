@@ -296,7 +296,11 @@ class SessionConfigBuilder:
         Profiles:
           - ``"none"``: no MCP servers (LIGHT reflection).
           - ``"reflection"``: health + memory only (DEEP/STRATEGIC).
-          - ``"full"``: all servers — returns *None* so CC uses its default config.
+          - ``"full"``: returns *None* so CC uses its default config, the
+            repo's ``.mcp.json``. That is the template MINUS the servers only a
+            dispatch profile uses (``INTERACTIVE_EXCLUDED_SERVERS`` in
+            ``scripts/setup_claude_config.py``, today ``discord-bot``), so a
+            profile that needs one of those must name an ``_MCP_PROFILES`` entry.
 
         Returns a file path string or *None*.
         """

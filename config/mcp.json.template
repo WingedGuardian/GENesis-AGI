@@ -19,6 +19,10 @@
     "genesis-recon": {
       "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
       "args": ["--server", "recon"]
+    },
+    "discord-bot": {
+      "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
+      "args": ["--server", "discord-bot"]
     }
   }
 }
