@@ -250,9 +250,7 @@ def test_txt_counts_as_code_now():
 
 
 def test_other_prose_spellings_excluded():
-    diff = _diff("docs/guide.markdown", _hunk(["+# T"])) + _diff(
-        "COPYING", _hunk(["+text"])
-    )
+    diff = _diff("docs/guide.markdown", _hunk(["+# T"])) + _diff("COPYING", _hunk(["+text"]))
     result = ps.count_diff(diff)
     assert result["excluded"] == {"docs/guide.markdown": "prose", "COPYING": "prose"}
 
@@ -263,14 +261,7 @@ def test_dot_test_js_is_a_test():
 
 
 def test_change_lines_after_completed_hunk_unparseable():
-    diff = (
-        "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n"
-        "+++ b/x.py\n"
-        "@@ -0,0 +1 @@\n"
-        "+a = 1\n"
-        "+b = 2\n"
-    )
+    diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -0,0 +1 @@\n+a = 1\n+b = 2\n"
     assert ps.count_diff(diff)["excluded"] == {"x.py": "unparseable"}
 
 
@@ -296,6 +287,57 @@ def test_load_failure_raises_runtime_error(monkeypatch):
 def test_parse_shape_fence_mismatch_does_not_close():
     body = "```\n~~~\nShape: hidden\n```\nShape: shown"
     assert ps.parse_shape(body) == "shown"
+
+
+def test_extensionless_script_hash_comments_not_counted():
+    diff = _diff("scripts/watchgod", ["@@ -0,0 +1,2 @@", "+# a comment", "+echo hi"])
+    result = ps.count_diff(diff)
+    assert result["counted"] == 1
+
+
+def test_parse_shape_strips_format_chars():
+    assert ps.parse_shape("Shape: \u200b") is None
+    assert ps.parse_shape("Shape: \u200b\nShape: real reason") == "real reason"
+    assert ps.parse_shape("Shape: a\u200bb") == "ab"
+
+
+def test_removed_lines_classified_by_pre_rename_path():
+    diff = (
+        "diff --git a/old.py b/new.js\n"
+        "similarity index 50%\n"
+        "rename from old.py\n"
+        "rename to new.js\n"
+        "--- a/old.py\n"
+        "+++ b/new.js\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-# old comment\n"
+        "+// new comment\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["counted"] == 0
+
+
+def test_unquoted_same_path_with_spaces():
+    diff = (
+        "diff --git a/blob file.bin b/blob file.bin\n"
+        "Binary files a/blob file.bin and b/blob file.bin differ\n"
+    )
+    assert ps.count_diff(diff)["excluded"] == {"blob file.bin": "binary"}
+
+
+def test_unquoted_new_file_with_spaces():
+    diff = (
+        "diff --git a/docs/my page.md b/docs/my page.md\n"
+        "new file mode 100644\n"
+        "index 0000000..e69de29\n"
+        "--- /dev/null\n"
+        "+++ b/docs/my page.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+# T\n"
+    )
+    result = ps.count_diff(diff)
+    keys = set(result["excluded"]) | set(result["by_file"])
+    assert "docs/my page.md" in keys
 
 
 def test_random_diffs_never_raise_and_count_nonnegative():

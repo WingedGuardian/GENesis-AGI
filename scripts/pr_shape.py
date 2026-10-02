@@ -30,7 +30,9 @@ from pathlib import Path
 SHAPE_AT = 500
 OVERRIDE_AT = 1001
 
-_COMMENT_EXTS = {".py", ".sh", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
+#: "" covers extensionless executables — the repo carries 13 tracked
+#: extensionless shebang scripts (scripts/watchgod, scripts/hooks/pre-push…).
+_COMMENT_EXTS = {".py", ".sh", ".yaml", ".yml", ".toml", ".cfg", ".ini", ""}
 _SLASH_COMMENT_EXTS = {".js", ".ts"}
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -110,7 +112,8 @@ def _is_comment(content: str, path: str) -> bool:
 def _unquote(s: str) -> str:
     """Decode a Git C-quoted path; unquoted input passes through.
 
-    Handles ``\\\\``, ``\\"``, ``\\t``, ``\\n`` and ``\\ooo`` octal byte escapes,
+    Handles Git's C-style escapes (``\\\\``, ``\\"``, ``\\t``, ``\\n``,
+    ``\\a``, ``\\b``, ``\\v``, ``\\f``, ``\\r``) and ``\\ooo`` octal bytes,
     then UTF-8 decodes with replacement. Never raises.
     """
     try:
@@ -155,6 +158,13 @@ def _unquote(s: str) -> str:
 def _diff_git_paths(rest: str) -> tuple[str | None, str | None]:
     """Split ``a/<old> b/<new>`` (either side possibly C-quoted) into paths."""
 
+    if not rest.startswith('"'):
+        # Same-path file with spaces arrives unquoted as `a/P b/P`; renames
+        # with spaces are quoted by git, so a symmetric pair is one path.
+        k, rem = divmod(len(rest) - 5, 2)
+        if rem == 0 and rest[2 + k : 5 + k] == " b/" and rest[2 : 2 + k] == rest[5 + k :]:
+            return rest[5 + k :], rest[5 + k :]
+
     def token(s: str) -> tuple[str, str]:
         if s.startswith('"'):
             m = _QUOTED_TOKEN_RE.match(s)
@@ -180,12 +190,8 @@ class _FileState:
         self.new_path: str | None = None
         self.old_path: str | None = None
         self.rename_to: str | None = None
-        self.binary = False
-        self.unparseable = False
-        self.in_hunk = False
-        self.seen_hunk = False
-        self.old_rem = 0
-        self.new_rem = 0
+        self.binary = self.unparseable = self.in_hunk = self.seen_hunk = False
+        self.old_rem = self.new_rem = 0
         self.added: list[str] = []
         self.removed: list[str] = []
 
@@ -227,7 +233,11 @@ def count_diff(diff_text: str) -> dict:
             if first == "-":
                 current.old_rem -= 1
                 content = line[1:]
-                if content.strip() and not _is_comment(content, current.path):
+                # Removed lines are classified against the PRE-rename path:
+                # a `-# comment` in old.py stays a comment even when the file
+                # is being renamed to new.js.
+                old = current.old_path or current.path
+                if content.strip() and not _is_comment(content, old):
                     current.removed.append(content.strip())
             elif first == "+":
                 current.new_rem -= 1
@@ -334,11 +344,13 @@ def parse_shape(body: str | None) -> str | None:
     """
     if not body:
         return None
-    readable_body = _load_sibling(
-        "check_cc_pin_receipts.py", "_cc_pin_receipts_for_pr_shape"
-    ).readable_body
-    for line in readable_body(body).split("\n"):
+    sibling = _load_sibling("check_cc_pin_receipts.py", "_cc_pin_receipts_for_pr_shape")
+    for line in sibling.readable_body(body).split("\n"):
         match = _SHAPE_RE.match(line)
-        if match and match.group(1).strip():
-            return match.group(1).strip()
+        if match:
+            # Invisible Unicode format chars (Cf — zero-width space, joiners,
+            # bidi controls) are not content; the sibling owns the stripper.
+            value = sibling._strip_formatting_chars(match.group(1)).strip()
+            if value:
+                return value
     return None
