@@ -118,8 +118,10 @@ isolation is still load-bearing for you — it is:
   the backup target (`/api/genesis/backup/status`) and the filesystem paths
   and NAS username (`/api/genesis/backup/config`). Those are withheld from an unauthenticated
   caller on every install, including a passwordless one. The routes still
-  answer and the response shape is unchanged; only the sensitive values are
-  absent.
+  answer, but a withheld value changes the response's shape: the secrets
+  route returns each key with an empty value and `values_withheld: true`,
+  `/api/genesis/backup/status` omits `destinations.tier2.target`, and
+  `/api/genesis/backup/config` omits `local_path`, `nas` and `nas_user`.
 
   **This is not the whole class, and it should not be read as one.** The
   carve-out is a list of FIELDS — not a property of a route, a helper, or the
