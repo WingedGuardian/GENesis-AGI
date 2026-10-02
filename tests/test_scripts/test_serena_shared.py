@@ -221,14 +221,18 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
         assert calls.read_text() == "tool upgrade serena-agent\n"
 
 
+@pytest.mark.parametrize("project_path", ["canonical", "symlink", "other"])
 @pytest.mark.parametrize("custom,fail_publication", [(False, False), (True, False), (False, True)])
 def test_legacy_project_registration_migrates_without_touching_custom_entry(
-    tmp_path, custom, fail_publication
+    tmp_path, custom, fail_publication, project_path
 ):
     root = checkout(tmp_path / "project")
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    stored_project = {"canonical": root, "symlink": alias, "other": tmp_path / "other"}[project_path]
     entry = {
         "command": "serena",
-        "args": ["start-mcp-server", "--context", "claude-code", "--project", str(root)],
+        "args": ["start-mcp-server", "--context", "claude-code", "--project", str(stored_project)],
     }
     if custom:
         entry["env"] = {"CUSTOM": "preserve"}
@@ -276,7 +280,7 @@ exec(compile(sys.stdin.read(), '<registration helper>', 'exec'))
     assert actual["other"] == other
     assert actual["serena"] == (
         entry
-        if custom or fail_publication
+        if custom or fail_publication or project_path == "other"
         else {"command": str(root / ".claude/mcp/run-serena"), "args": ["--context", "claude-code"]}
     )
     assert config.stat().st_mode & 0o777 == 0o640

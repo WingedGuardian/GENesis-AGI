@@ -103,8 +103,12 @@ config = root / ".mcp.json"
 try:
     data = json.loads(config.read_text())
     entry = data["mcpServers"]["serena"]
-    args = ["start-mcp-server", "--context", "claude-code", "--project", str(root)]
-    legacy = (entry.get("command") == "serena" and entry.get("args") == args
+    args = entry.get("args")
+    project_matches = (isinstance(args, list) and len(args) == 5
+                       and args[:4] == ["start-mcp-server", "--context", "claude-code", "--project"]
+                       and isinstance(args[4], str) and Path(args[4]).is_absolute()
+                       and Path(args[4]).resolve() == root)
+    legacy = (entry.get("command") == "serena" and project_matches
               and entry.get("type", "stdio") == "stdio" and not entry.get("env"))
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
     legacy = False
