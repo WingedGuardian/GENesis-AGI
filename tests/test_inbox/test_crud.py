@@ -368,3 +368,22 @@ async def test_count_live_rows_for_approval(db):
     assert await inbox_items.count_live_rows_for_approval(db, req) == 2
     assert await inbox_items.count_live_rows_for_approval(db, "req-other") == 1
     assert await inbox_items.count_live_rows_for_approval(db, "no-such-req") == 0
+
+
+async def test_invalidated_rows_at_the_cap_are_not_handled(db):
+    """Review N1: a row invalidated ("content changed") after its retries were
+    spent was counted as HANDLED, so its lines were silently subtracted from
+    every future delta. Invalidated content was never evaluated."""
+    await inbox_items.create(
+        db, id="inv", file_path="/f.md", content_hash="h", status="failed",
+        created_at="2026-01-01T00:00:00+00:00", batch_items="https://x.com/a",
+        error_message="approval_invalidated:content changed", retry_count=3,
+    )
+    await inbox_items.create(
+        db, id="ex", file_path="/f.md", content_hash="h", status="failed",
+        created_at="2026-01-01T00:00:01+00:00", batch_items="https://x.com/b",
+        error_message="partial_url_failure", retry_count=3,
+    )
+    handled = await inbox_items.get_handled_batch_content(db, "/f.md", max_retries=3)
+    assert "https://x.com/b" in " ".join(handled)
+    assert "https://x.com/a" not in " ".join(handled)

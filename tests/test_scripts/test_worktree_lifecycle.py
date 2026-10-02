@@ -71,6 +71,72 @@ def _age_path(path: Path, days: float) -> None:
             continue
         with contextlib.suppress(OSError, NotImplementedError):
             os.utime(item, (old, old), follow_symlinks=False)
+    if (path / ".git").exists():
+        _age_reflog(path, days)
+
+
+def _age_reflog(repo_path: Path, days: float) -> None:
+    """Backdate the timestamp IN every HEAD reflog entry. The activity clock
+    reads when HEAD last moved from the entries themselves, not the file's mtime
+    (which `git gc` rewrites), so a fixture that committed and then aged its
+    files would otherwise still read as committed just now."""
+    git_dir = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "--absolute-git-dir"],
+        check=True, capture_output=True,
+    ).stdout.strip()  # bytes: a fixture path may not be UTF-8
+    log = Path(os.fsdecode(git_dir)) / "logs" / "HEAD"
+    if not log.exists():
+        return
+    stamp = str(int(time.time() - days * 86400)).encode()
+    lines = []
+    for line in log.read_bytes().split(b"\n"):
+        head, tab, msg = line.partition(b"\t")
+        fields = head.split(b" ")
+        if len(fields) >= 4:
+            fields[-2] = stamp
+            line = b" ".join(fields) + tab + msg
+        lines.append(line)
+    log.write_bytes(b"\n".join(lines))
+
+
+def _age_git_dir(repo_path: Path, days: float) -> None:
+    """Backdate a repository's git directory, wherever it lives. `_age_path`
+    skips `.git`, and a submodule's git dir is outside the worktree entirely."""
+    git_dir = Path(_git(repo_path, "rev-parse", "--absolute-git-dir").strip())
+    old = time.time() - days * 86400
+    for p in [git_dir, *git_dir.rglob("*")]:
+        with contextlib.suppress(OSError):
+            os.utime(p, (old, old), follow_symlinks=False)
+
+
+def _add_submodule_worktree(repo: Path, tmp_path: Path, name: str) -> Path:
+    """A worktree of ``repo`` holding an initialised submodule ``mod`` whose
+    only file is ``mod/a/b/s.txt``, with two commits so a checkout can move it.
+    Nothing is aged."""
+    sub = tmp_path / f"{name}-src"
+    sub.mkdir()
+    _git(sub, "init", "-q", "-b", "main")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "a" / "b").mkdir(parents=True)
+    (sub / "a" / "b" / "s.txt").write_text("v1\n")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-qm", "v1")
+    (sub / "a" / "b" / "s.txt").write_text("v2\n")
+    _git(sub, "commit", "-qam", "v2")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git(repo, "commit", "-qm", f"add submodule for {name}")
+    wt = tmp_path / name
+    _git(repo, "worktree", "add", "-q", "-b", f"{name}-br", str(wt), "main")
+    _git(wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+    return wt
+
+
+def _age_submodule_worktree(wt: Path, days: float) -> None:
+    _age_path(wt, days)
+    old = time.time() - days * 86400
+    os.utime(wt / "mod" / ".git", (old, old))
+    _age_git_dir(wt / "mod", days)
 
 
 # Every module path the reaper WRITES to. Each is redirected below; the guard
@@ -381,6 +447,54 @@ def test_recover_legacy_branch_entry(reaper_repo, tmp_path, monkeypatch):
     assert branch == "merged-br"
 
 
+def test_recover_dry_run_previews_and_writes_nothing(
+    reaper_repo, tmp_path, monkeypatch, capsys
+):
+    """`--recover --dry-run` previews the recovery and writes nothing (#2188).
+
+    `--dry-run` is honoured by the reap path ("WOULD TRASH ..."), so a recovery
+    that silently ignored it performed a full real restore under a flag whose
+    documented contract is "Show what would happen without doing it". The
+    preview reports in the conditional tense and leaves both sides untouched:
+    the destination is not recreated and the trash entry is not consumed.
+    """
+    import json
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+
+    src = reaper_repo.wt_branch_merged
+    entry = trash / "wt_branch_merged-20260101"
+    subprocess.run(["mv", str(src), str(entry)], check=True)
+    _git(reaper_repo.repo, "worktree", "prune")
+    (entry / "notes.txt").write_text("untracked")
+    (entry / ".trash_meta.json").write_text(
+        json.dumps(
+            {
+                "original_path": str(src),
+                "branch": "merged-br",
+                "commit": reaper_repo.c0,
+                "trashed_at": "2026-01-01T00:00:00+00:00",
+            }
+        )
+    )
+
+    ok = wl._recover("wt_branch_merged", reaper_repo.repo, dry_run=True)
+    assert ok is True
+
+    out = capsys.readouterr().out
+    assert "WOULD RECOVER" in out
+    assert "merged-br" in out
+    # Only notes.txt is restorable: checkout recreates tracked files, and `.git`
+    # / `.trash_meta.json` are never restored.
+    assert "WOULD RESTORE 1 untracked file(s)" in out
+    # Nothing was written: destination absent, trash entry intact.
+    assert not src.exists()
+    assert entry.is_dir()
+    assert (entry / ".trash_meta.json").exists()
+
+
 # ─── detached reap predicate is ancestor-ONLY (Codex P1 findings B & C) ───────
 
 
@@ -439,8 +553,7 @@ def test_recover_restores_untracked_file(reaper_repo, tmp_path, monkeypatch):
 
     This is the recovery contract's positive guarantee (copy-only-missing). Full
     dirty-state reconstruction — uncommitted tracked edits, deletions, mode-only
-    changes, the staged split — is an intentional non-goal (see _recover docstring),
-    since the reaper only trashes worktrees already merged into main.
+    changes, the staged split — is an intentional non-goal (see _recover docstring).
     """
     trash = tmp_path / "trash"
     trash.mkdir()
@@ -450,7 +563,8 @@ def test_recover_restores_untracked_file(reaper_repo, tmp_path, monkeypatch):
     wt = reaper_repo.wt_branch_merged
     (wt / "scratch.txt").write_text("untracked scratch\n")  # untracked, absent from the commit
 
-    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    # A dirty worktree is archived only on the unmerged lane.
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo, lane="unmerged")
     assert not wt.exists()
 
     assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
@@ -476,7 +590,8 @@ def test_recover_does_not_reapply_tracked_modification(reaper_repo, tmp_path, mo
     committed = (wt / "a.txt").read_text()  # tracked, committed at c0
     (wt / "a.txt").write_text("DIRTY EDIT\n")  # uncommitted tracked modification
 
-    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    # A dirty worktree is archived only on the unmerged lane.
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo, lane="unmerged")
     assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
     assert (wt / "a.txt").read_text() == committed, (
         "recovery reapplied a trashed tracked modification (overlay behavior)"
@@ -539,7 +654,8 @@ def test_recover_restores_untracked_symlink_as_symlink(reaper_repo, tmp_path, mo
     wt = reaper_repo.wt_branch_merged
     (wt / "lnk").symlink_to("some/relative/target")  # untracked (dangling) symlink
 
-    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    # A dirty worktree is archived only on the unmerged lane.
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo, lane="unmerged")
     assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
     restored = wt / "lnk"
     assert restored.is_symlink(), "untracked symlink was not restored as a symlink"
@@ -574,7 +690,8 @@ def test_recover_does_not_write_through_dangling_dest_symlink(tmp_path, monkeypa
     monkeypatch.setattr(wl, "TRASH_DIR", trash)
     monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
     wtdict = next(w for w in wl._list_worktrees(repo) if Path(w["path"]) == wt)
-    wl._trash_worktree(wtdict, repo)
+    # A dirty worktree is archived only on the unmerged lane.
+    wl._trash_worktree(wtdict, repo, lane="unmerged")
 
     assert wl._recover("wt", repo) is True
     assert not outside.exists(), (
@@ -726,7 +843,11 @@ def test_a_second_reap_of_the_same_basename_does_not_overwrite_an_archive(
     for path in (first, second):
         wt = next(w for w in worktrees if Path(w["path"]) == path)
         cls = wl._classify(wt, worktrees, repo)
-        wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+        # The lane main() passes for this classification.
+        wl._trash_worktree(
+            cls, repo, lane="merged" if cls["merged"] else "unmerged",
+            merge_method=cls["merge_method"],
+        )
 
     archives = sorted(trash.glob("dup-*.tar.gz"))
     assert len(archives) == 2, (
@@ -969,7 +1090,11 @@ def test_a_dangling_internal_name_symlink_is_not_written_through(
     worktrees = wl._list_worktrees(repo)
     entry = next(w for w in worktrees if Path(w["path"]) == wt)
     cls = wl._classify(entry, worktrees, repo)
-    wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+    # The lane main() passes for this classification.
+    wl._trash_worktree(
+        cls, repo, lane="merged" if cls["merged"] else "unmerged",
+        merge_method=cls["merge_method"],
+    )
 
     assert not outside.exists(), (
         "the recovery patch was written THROUGH a dangling symlink and landed "
@@ -1014,7 +1139,11 @@ def test_a_dangling_trash_meta_symlink_is_preserved(reaper_repo, tmp_path, monke
     worktrees = wl._list_worktrees(repo)
     entry = next(w for w in worktrees if Path(w["path"]) == wt)
     cls = wl._classify(entry, worktrees, repo)
-    wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+    # The lane main() passes for this classification.
+    wl._trash_worktree(
+        cls, repo, lane="merged" if cls["merged"] else "unmerged",
+        merge_method=cls["merge_method"],
+    )
 
     import tarfile as _tf
 
@@ -1061,7 +1190,11 @@ def test_the_patch_write_refuses_to_follow_a_symlink_the_check_missed(
     worktrees = wl._list_worktrees(repo)
     entry = next(w for w in worktrees if Path(w["path"]) == wt)
     cls = wl._classify(entry, worktrees, repo)
-    wl._trash_worktree(cls, repo, lane="merged", merge_method=cls["merge_method"])
+    # The lane main() passes for this classification.
+    wl._trash_worktree(
+        cls, repo, lane="merged" if cls["merged"] else "unmerged",
+        merge_method=cls["merge_method"],
+    )
 
     assert not outside.exists(), (
         "with the collision check blind, the open FOLLOWED the symlink and "
@@ -1166,7 +1299,8 @@ def test_a_successful_recovery_still_works(reaper_repo, tmp_path, monkeypatch):
 
     wt = reaper_repo.wt_branch_merged
     (wt / "scratch.txt").write_text("untracked scratch\n")
-    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo)
+    # A dirty worktree is archived only on the unmerged lane.
+    wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo, lane="unmerged")
 
     assert wl._recover("wt_branch_merged", reaper_repo.repo) is True
     assert (wt / "scratch.txt").read_text() == "untracked scratch\n"
@@ -1228,3 +1362,1036 @@ def test_an_untouched_worktree_still_reads_as_idle(reaper_repo, tmp_path):
         f"a clean, aged worktree reported {age_days:.1f} days — consulting git "
         "made an idle worktree look active, so nothing would ever be reclaimed"
     )
+
+
+# ─── dry-run preview agrees with what recovery would do (Devin round on #2206) ─
+
+
+def _preview_fixture(tmp_path: Path, setup) -> tuple[Path, Path, str]:
+    """A repo whose committed tree `setup(repo)` builds, and an empty directory
+    trash entry pointing at that commit. Returns (repo, entry, commit)."""
+    import json
+
+    repo = tmp_path / "prev_repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "s@s")
+    _git(repo, "config", "user.name", "s")
+    setup(repo)
+    _git(repo, "commit", "-q", "-m", "tree")
+    commit = _git(repo, "rev-parse", "HEAD").strip()
+    entry = tmp_path / "trash" / "entry-20260101"
+    entry.mkdir(parents=True)
+    (entry / ".trash_meta.json").write_text(
+        json.dumps({"original_path": str(tmp_path / "gone"), "commit": commit, "detached": True})
+    )
+    return repo, entry, commit
+
+
+def _links(repo: Path, links: dict[str, str]) -> None:
+    for name, target in links.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, repo / name)
+        _git(repo, "add", name)
+
+
+def _restore_count(capsys) -> str:
+    out = capsys.readouterr().out
+    return next(line for line in out.splitlines() if "WOULD RESTORE" in line)
+
+
+def test_preview_carries_the_suffix_through_link_hops(tmp_path, capsys):
+    """`a -> b/sub`, `b -> c`, `c/sub -> <outside>`: realpath of `a` leaves the
+    worktree, so recovery skips `a/file` and the preview must not count it."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo, entry, _ = _preview_fixture(
+        tmp_path,
+        lambda r: _links(r, {"a": "b/sub", "b": "c", "c/sub": str(outside)}),
+    )
+    (entry / "a").mkdir()
+    (entry / "a" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_count(capsys)
+
+
+def test_preview_resolves_the_stored_files_own_path_not_just_the_link(tmp_path, capsys):
+    """`a -> b` stays inside, but `b/x -> <outside>`: stored `a/x/file` resolves
+    through BOTH links. Checking only the tracked ancestor `a` misses `b/x`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo, entry, _ = _preview_fixture(
+        tmp_path, lambda r: _links(r, {"a": "b", "b/x": str(outside)})
+    )
+    (entry / "a" / "x").mkdir(parents=True)
+    (entry / "a" / "x" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 0 untracked" in _restore_count(capsys)
+
+
+def test_preview_counts_a_file_behind_an_in_tree_link(tmp_path, capsys):
+    """Control for the two above: a link chain that stays inside the worktree
+    does not stop the file being restored."""
+    repo, entry, _ = _preview_fixture(tmp_path, lambda r: _links(r, {"a": "b/sub", "b": "c"}))
+    (entry / "a").mkdir()
+    (entry / "a" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    assert "WOULD RESTORE 1 untracked" in _restore_count(capsys)
+
+
+def test_preview_treats_a_submodule_gitlink_as_a_directory(tmp_path, capsys):
+    """A gitlink is checked out as a directory, so a stored file under it is
+    restorable, not a collision with a tracked file."""
+
+    def setup(r: Path) -> None:
+        (r / "f").write_text("f")
+        _git(r, "add", "f")
+        _git(r, "commit", "-q", "-m", "base")
+        sha = _git(r, "rev-parse", "HEAD").strip()
+        _git(r, "update-index", "--add", "--cacheinfo", f"160000,{sha},sub")
+
+    repo, entry, _ = _preview_fixture(tmp_path, setup)
+    (entry / "sub").mkdir()
+    (entry / "sub" / "file").write_text("x")
+    assert wl._describe_recovery(entry, repo) is True
+    out = _restore_count(capsys)
+    assert "WOULD RESTORE 1 untracked" in out
+
+
+def test_preview_refuses_an_archive_whose_only_metadata_is_nested(tmp_path, capsys):
+    """Recovery requires `.trash_meta.json` at the archive's inner root; a
+    worktree's own nested file of that name must not stand in for it."""
+    import io
+    import json
+    import tarfile
+
+    repo, _, commit = _preview_fixture(tmp_path, lambda r: _links(r, {"l": "x"}))
+    archive = tmp_path / "trash" / "arch-20260101.tar.gz"
+    body = json.dumps({"original_path": str(tmp_path / "gone"), "commit": commit}).encode()
+    with tarfile.open(archive, "w:gz") as tf:
+        info = tarfile.TarInfo("arch/deep/.trash_meta.json")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    assert wl._describe_recovery(archive, repo) is False
+    assert "No .trash_meta.json" in capsys.readouterr().err
+
+
+# ─── a merge verdict never covers uncommitted work ───────────────────────────
+
+
+@pytest.mark.parametrize("which", ["wt_branch_merged", "wt_det_merged"])
+def test_uncommitted_work_on_a_zero_commit_worktree_is_not_on_the_merged_clock(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+    which,
+):
+    """A worktree whose tip is a main commit has merged NOTHING.
+
+    `merge-base --is-ancestor` passes for it anyway, so it was classed MERGED
+    and archived at 7 days. That is the short clock meant for work that is
+    already in main, but here the uncommitted edits were the only copy. MEASURED
+    on a live install, 2026-10-01: 14 of 241 archives were merged-lane with an
+    ancestor tip, all 14 on main's first-parent line, and 10 of them were dirty.
+    Both fixtures qualify: `merged-br` sits at c0 with no commit of its own, and
+    the detached one is checked out at c0.
+    """
+    repo = reaper_repo.repo
+    wt = getattr(reaper_repo, which)
+    (wt / "a.txt").write_text("uncommitted work\n")
+    _age_path(wt, 10)  # past MERGED_STALE_DAYS, short of UNMERGED_STALE_DAYS
+
+    worktrees = wl._list_worktrees(repo)
+    cls = wl._classify(_wt_by_path(repo, wt), worktrees, repo)
+    assert cls["state"] == wl.STATE_AT_RISK, cls
+    assert cls["merged"] is False and cls["merge_method"] == "", cls
+    assert "uncommitted changes on work merged via ancestor" in cls["reason"], cls
+
+    trash = tmp_path / "trash"
+    assert _run_main(monkeypatch, repo, trash) == 0
+    assert wt.exists(), f"{which} holds only uncommitted work and was archived on the merged clock"
+    assert not list(trash.glob(f"{which}-*"))
+
+
+def test_a_dirty_branch_stacked_on_a_squash_merged_pr_waits_the_long_window(
+    reaper_repo,
+    tmp_path,
+):
+    """The patch-id verdict is just as blind to uncommitted work.
+
+    A follow-up branch cut from a PR's head after main SQUASH-merged that PR has
+    no commits of its own either, but its tip is not on main at all, so the
+    ancestry test fails and `git cherry` answers "patch-id". A rule that looked
+    only at the ancestor verdict would archive it at 7 days while dirty; MEASURED
+    in a scratch repository.
+    """
+    repo = reaper_repo.repo
+    _git(repo, "switch", "-qc", "pr", "main")
+    (repo / "p.txt").write_text("pr work\n")
+    _git(repo, "add", "p.txt")
+    _git(repo, "commit", "-qm", "pr work")
+    _git(repo, "switch", "-q", "main")
+    _git(repo, "merge", "--squash", "-q", "pr")
+    _git(repo, "commit", "-qm", "squash pr")
+    wt = tmp_path / "wt_followup"
+    _git(repo, "worktree", "add", "-q", "-b", "followup", str(wt), "pr")
+    (wt / "edit.txt").write_text("uncommitted follow-up\n")
+    _age_path(wt, 10)
+
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["state"] == wl.STATE_AT_RISK, cls
+    assert "merged via patch-id" in cls["reason"], cls
+
+
+def test_only_clean_merged_work_drains_on_the_merged_clock(reaper_repo, tmp_path, monkeypatch):
+    """The control, and it has to MOVE in both directions at 10 days.
+
+    * a branch with a real commit merged into main through a merge commit, left
+      CLEAN: it holds nothing main lacks, so it is reaped at the merged threshold;
+    * the same shape with a leftover uncommitted edit: no merge verdict covers
+      that edit, so it waits the unmerged window and reports as at-risk;
+    * a CLEAN zero-commit worktree still drains at 7 days and stays out of the
+      at-risk set.
+    Fails if the rule is widened to every merged worktree (the clean ones stop
+    draining), or narrowed to an ancestor tip on main's first-parent line (the
+    dirty merge-commit worktree drains). Narrowing to the ancestor verdict alone
+    is caught by the squash-stacked test instead.
+    """
+    import json
+
+    repo = reaper_repo.repo
+
+    def merged_worktree(name: str, branch: str) -> Path:
+        path = tmp_path / name
+        _git(repo, "worktree", "add", "-q", "-b", branch, str(path), "main")
+        (path / f"{branch}.txt").write_text("real work\n")
+        _git(path, "add", f"{branch}.txt")
+        _git(path, "commit", "-qm", f"real work {branch}")
+        _git(repo, "merge", "--no-ff", "-q", "-m", f"merge {branch}", branch)
+        return path
+
+    clean = merged_worktree("wt_real_clean", "real-clean")
+    dirty = merged_worktree("wt_real_dirty", "real-dirty")
+    (dirty / "a.txt").write_text("leftover uncommitted edit\n")
+
+    for p in (
+        clean,
+        dirty,
+        reaper_repo.wt_branch_merged,
+        reaper_repo.wt_det_merged,
+        reaper_repo.wt_det_unmerged,
+    ):
+        _age_path(p, 10)
+
+    dirty_cls = wl._classify(_wt_by_path(repo, dirty), wl._list_worktrees(repo), repo)
+    assert dirty_cls["state"] == wl.STATE_AT_RISK, dirty_cls
+
+    trash = tmp_path / "trash"
+    assert _run_main(monkeypatch, repo, trash) == 0
+
+    assert not clean.exists(), "clean merged work past 7 days must still be reaped"
+    assert dirty.exists(), "merged work with an uncommitted edit must wait the long window"
+    assert not reaper_repo.wt_branch_merged.exists(), (
+        "a CLEAN zero-commit worktree has nothing to lose and stays on the merged clock"
+    )
+    assert reaper_repo.wt_det_unmerged.exists(), "the unmerged control must be kept"
+    lanes = {
+        json.loads(f.read_text())["original_path"].rsplit("/", 1)[-1]: json.loads(f.read_text())[
+            "lane"
+        ]
+        for f in trash.glob("*.meta.json")
+    }
+    assert lanes.get("wt_real_clean") == "merged", lanes
+    assert lanes.get("wt_branch_merged") == "merged", lanes
+    assert "wt_real_dirty" not in lanes, lanes
+
+
+@pytest.mark.parametrize("name_bytes", [b"bad-\xff.txt", None])
+def test_a_non_utf8_name_does_not_end_the_scan(reaper_repo, tmp_path, monkeypatch, name_bytes):
+    """A raw non-UTF-8 name reaches the scan two ways, and both used to abort it.
+
+    With `core.quotePath=false` git prints a FILENAME raw, through `git status`
+    (the dirty check and the activity probe). A worktree whose own NAME is not
+    UTF-8 puts those bytes in the admin-directory path that the in-progress
+    probe prints. A strict decode raised out of the scan, which nothing catches,
+    so one such worktree ended the whole run. Driven through `_classify` and
+    `main`. `name_bytes=None` is the worktree-name case. pytest's captured
+    stdout tolerates the surrogates a log line then carries, so the printing
+    half is pinned separately by the subprocess test below.
+    """
+    repo = reaper_repo.repo
+    _git(repo, "config", "core.quotePath", "false")
+    if name_bytes is None:
+        wt = Path(os.fsdecode(os.fsencode(str(tmp_path)) + b"/wt-\xff"))
+        _git(repo, "worktree", "add", "-q", "--detach", str(wt), "main")
+        (wt / "edit.txt").write_text("uncommitted\n")
+    else:
+        wt = reaper_repo.wt_det_merged
+        (wt / os.fsdecode(name_bytes)).write_text("x\n")
+    _age_path(wt, 10)
+
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["dirty"] is True, cls
+    assert cls["state"] == wl.STATE_AT_RISK, cls
+
+    trash = tmp_path / "trash"
+    assert _run_main(monkeypatch, repo, trash) == 0
+    assert wt.exists()
+
+
+def test_every_text_mode_subprocess_call_states_how_it_decodes():
+    """git echoes branch and worktree names in its output and its errors, and
+    those names can hold bytes that are not UTF-8. A strict decode raises
+    UnicodeDecodeError, which nothing on the scan or recovery path catches, so
+    every text-mode call in the script must say how it decodes."""
+    import ast
+
+    strict, checked = [], 0
+    for node in ast.walk(ast.parse(_SCRIPT.read_text())):
+        if not isinstance(node, ast.Call):
+            continue
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        text = kw.get("text")
+        if isinstance(text, ast.Constant) and text.value is True:
+            checked += 1
+            if "errors" not in kw:
+                strict.append(node.lineno)
+    assert checked >= 5, f"the walk found only {checked} text-mode calls; it is not seeing the script"
+    assert strict == [], f"text-mode calls with a strict decode at lines {strict}"
+
+
+def test_an_archive_whose_names_are_not_utf8_can_be_recovered(reaper_repo, tmp_path, monkeypatch):
+    """The scan no longer crashes on such a worktree, so it can now be archived,
+    which makes recovering it reachable for the first time. Recreating the
+    worktree echoes the branch name, and a strict decode of that output raised
+    after the checkout and before the untracked files were copied back."""
+    repo = reaper_repo.repo
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    raw = b"bad-\xff"
+    wt = Path(os.fsdecode(os.fsencode(str(tmp_path)) + b"/" + raw))
+    _git(repo, "worktree", "add", "-q", "-b", os.fsdecode(raw), str(wt), reaper_repo.c0)
+    (wt / "untracked.txt").write_text("only here\n")
+
+    # A dirty worktree is archived only on the unmerged lane.
+    assert wl._trash_worktree(_wt_by_path(repo, wt), repo, lane="unmerged") is True
+    assert not wt.exists()
+    assert wl._recover(wt.name, repo) is True
+    assert (wt / "untracked.txt").read_text() == "only here\n"
+
+
+def test_deleting_a_deep_tracked_file_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A deleted path has no mtime of its own, so the activity probe skipped it,
+    and the shallow walk does not reach a file three directories down. An old
+    worktree whose only recent change was such a deletion kept its old age and
+    was reaped at once, without the 14-day wait a dirty worktree is promised.
+    Unlinking a file updates its directory's mtime, and that is the evidence."""
+    repo = reaper_repo.repo
+    deep = Path("deep") / "x" / "y" / "f.txt"
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_text("tracked\n")
+    _git(repo, "add", str(deep))
+    _git(repo, "commit", "-qm", "deep file")
+    wt = tmp_path / "wt_deep"
+    _git(repo, "worktree", "add", "-q", "-b", "deep-br", str(wt), "main")
+    _age_path(wt, 20)
+    (wt / deep).unlink()
+    assert wl._has_uncommitted_changes(str(wt)), "precondition: git sees the deletion"
+
+    # A worktree that reads as fresh returns before the dirty check, so the age
+    # and the action are what this asserts.
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["age_days"] < 1, cls
+    assert cls["action"] == "none", cls
+
+
+def test_deleting_a_quoted_deep_path_counts_as_recent_activity(reaper_repo, tmp_path):
+    """With the default `core.quotePath`, git C-quotes a path holding non-ASCII
+    bytes (`"deep-\\377/x/y/f.txt"`), so the probe stat'ed an escaped name that
+    does not exist and found no activity. The status is read with `-z`, which
+    never quotes."""
+    repo = reaper_repo.repo
+    deep = Path(os.fsdecode(b"deep-\xff")) / "x" / "y" / "f.txt"
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "quoted deep file")
+    wt = tmp_path / "wt_quoted"
+    _git(repo, "worktree", "add", "-q", "-b", "quoted-br", str(wt), "main")
+    _age_path(wt, 20)
+    (wt / deep).unlink()
+    assert wl._has_uncommitted_changes(str(wt)), "precondition: git sees the deletion"
+
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["age_days"] < 1, cls
+    assert cls["action"] == "none", cls
+
+
+def test_an_edit_inside_a_submodule_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A submodule's changes reach the parent's status only as ` M <gitlink>`,
+    and the gitlink directory's own mtime does not move when a file deep inside
+    it is edited. The probe reads the submodule's own status instead."""
+    repo = reaper_repo.repo
+    sub = tmp_path / "subsrc"
+    sub.mkdir()
+    _git(sub, "init", "-q", "-b", "main")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "a" / "b").mkdir(parents=True)
+    (sub / "a" / "b" / "s.txt").write_text("s\n")
+    _git(sub, "add", "-A")
+    _git(sub, "commit", "-qm", "s0")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git(repo, "commit", "-qm", "add submodule")
+    wt = tmp_path / "wt_sub"
+    _git(repo, "worktree", "add", "-q", "-b", "sub-br", str(wt), "main")
+    _git(wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+    _age_path(wt, 20)
+    # `_age_path` skips every `.git` entry, but the submodule's `.git` FILE sits
+    # two levels down, where the shallow walk samples it; left fresh, it made
+    # this worktree read as active whatever the probe did. Its git dir holds the
+    # HEAD and reflog the probe now reads, written fresh by the checkout above.
+    old = time.time() - 20 * 86400
+    os.utime(wt / "mod" / ".git", (old, old))
+    _age_git_dir(wt / "mod", 20)
+    (wt / "mod" / "a" / "b" / "s.txt").write_text("edited inside the submodule\n")
+    assert wl._has_uncommitted_changes(str(wt)), "precondition: the parent sees a dirty gitlink"
+
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["age_days"] < 1, cls
+    assert cls["action"] == "none", cls
+
+
+def test_a_rename_below_the_shallow_walk_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A renamed file keeps its old mtime, so the rename shows only in the
+    directory that gained the new name. Its mtime is what counts it."""
+    repo = reaper_repo.repo
+    deep = Path("deep") / "x" / "y"
+    (repo / deep).mkdir(parents=True)
+    (repo / deep / "old.txt").write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "rename source")
+    wt = tmp_path / "wt_rename"
+    _git(repo, "worktree", "add", "-q", "-b", "rename-br", str(wt), "main")
+    _age_path(wt, 20)
+    _git(wt, "mv", str(deep / "old.txt"), str(deep / "new.txt"))
+
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_an_edit_after_classification_holds_an_unmerged_worktree(reaper_repo, tmp_path, monkeypatch):
+    """The scan classifies every worktree first and archives afterwards, and the
+    merge verdict can wait on the network for up to 30 seconds, so a worktree
+    can be edited after its age was read. The archive step re-reads the age in
+    both lanes, as it re-reads processes, locks and nesting.
+
+    The late edit goes to a file that is ALREADY modified, so HEAD and the
+    status output are unchanged and the fingerprint comparison cannot see it:
+    only the age re-check can, which is what this test pins (with any other
+    edit, removing the re-check left it green)."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_det_unmerged
+    (wt / "a.txt").write_text("modified before the scan\n")
+    _age_path(wt, 20)
+    before = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert before["state"] == wl.STATE_REAP_UNMERGED, "precondition: due on the unmerged lane"
+
+    real = wl._classify
+
+    def classify_then_edit(entry, *args, **kwargs):
+        out = real(entry, *args, **kwargs)
+        if Path(entry["path"]) == wt:
+            (wt / "a.txt").write_text("edited again after classification\n")
+        return out
+
+    monkeypatch.setattr(wl, "_classify", classify_then_edit)
+    assert _run_main(monkeypatch, repo, tmp_path / "trash", argv=("worktree_lifecycle.py", "--no-network")) == 0
+    assert wt.exists(), "a worktree edited after it was classified was archived"
+    assert (wt / "a.txt").read_text() == "edited again after classification\n"
+
+
+def test_probing_a_nested_repository_does_not_make_it_look_active(reaper_repo, tmp_path):
+    """Reading a nested repository's own status must not move its `.git`
+    directory's mtime, which the shallow walk reads at depth two. With git's
+    optional locks on, `git status` took `index.lock` there, so the reaper's
+    first probe made an idle worktree read as active on every later run."""
+    repo = reaper_repo.repo
+    wt = tmp_path / "wt_nested"
+    _git(repo, "worktree", "add", "-q", "-b", "nested-br", str(wt), "main")
+    nested = wt / "nested"
+    nested.mkdir()
+    _git(nested, "init", "-q")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f.txt").write_text("f\n")
+    _git(nested, "add", "-A")
+    _git(nested, "commit", "-qm", "nested")
+    _age_path(wt, 20)
+    old = time.time() - 20 * 86400
+    for p in [nested / ".git", *(nested / ".git").rglob("*")]:  # `_age_path` skips `.git`
+        os.utime(p, (old, old), follow_symlinks=False)
+
+    ages = [(time.time() - wl._last_activity_time(str(wt))) / 86400 for _ in range(3)]
+    assert min(ages) > 19, ages
+
+
+def test_an_old_file_moved_into_a_deep_directory_counts_as_recent_activity(reaper_repo, tmp_path):
+    """Moving a file keeps its old mtime, so an untracked file moved into a
+    directory below the shallow walk shows only in that directory's mtime."""
+    repo = reaper_repo.repo
+    deep = Path("deep") / "x" / "y"
+    (repo / deep).mkdir(parents=True)
+    (repo / deep / "tracked.txt").write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "deep directory")
+    wt = tmp_path / "wt_moved"
+    _git(repo, "worktree", "add", "-q", "-b", "moved-br", str(wt), "main")
+    outside = tmp_path / "moved.txt"
+    outside.write_text("written long ago\n")
+    _age_path(wt, 20)
+    old = time.time() - 20 * 86400
+    os.utime(outside, (old, old))
+    outside.rename(wt / deep / "moved.txt")
+
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_an_unreadable_age_at_archive_time_skips_rather_than_raises(reaper_repo, tmp_path, monkeypatch):
+    """The archive-time age re-check runs outside the classification's error
+    handling, so a worktree removed in between must be skipped, not end the run."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_det_unmerged
+    _age_path(wt, 20)
+
+    def gone(_path, **_kwargs):
+        raise FileNotFoundError("removed during the scan")
+
+    monkeypatch.setattr(wl, "_last_activity_time", gone)
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    entry = _wt_by_path(repo, wt)
+    assert wl._trash_worktree(entry, repo, lane="unmerged", min_idle_days=14) is False
+    assert wt.exists()
+
+
+def test_a_failed_status_at_archive_time_holds_the_worktree(reaper_repo, tmp_path, monkeypatch, capsys):
+    """The archive-time re-check is the only guard against an edit made after
+    classification. A git status that cannot answer there must hold the
+    worktree, not fall back to the shallow walk and read as idle. Classification
+    keeps the fallback."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_det_unmerged
+    _age_path(wt, 20)
+    real = wl._run_git_bytes
+
+    def status_fails(root, args, *, timeout):
+        return None if args[:1] == ["status"] else real(root, args, timeout=timeout)
+
+    monkeypatch.setattr(wl, "_run_git_bytes", status_fails)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, "classification degrades to the walk"
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(_wt_by_path(repo, wt), repo, lane="unmerged", min_idle_days=14) is False
+    assert "cannot re-read its activity time" in capsys.readouterr().out
+    assert wt.exists()
+
+
+def test_a_spent_nested_probe_budget_holds_rather_than_reads_idle(reaper_repo, tmp_path, monkeypatch):
+    """Nested probes share one time budget per scan. Once it is spent the
+    classification stops descending, and the strict archive-time probe raises
+    rather than reporting the nested repository as idle. `main` resets it."""
+    repo = reaper_repo.repo
+    wt = _add_submodule_worktree(repo, tmp_path, "wt_budget")
+    _age_submodule_worktree(wt, 20)
+    (wt / "mod" / "a" / "b" / "s.txt").write_text("edited inside the submodule\n")
+
+    roots = []
+    for name in ("_run_git", "_run_git_bytes"):
+        real = getattr(wl, name)
+
+        def recording(root, args, *, timeout, _real=real):
+            roots.append(Path(root))
+            return _real(root, args, timeout=timeout)
+
+        monkeypatch.setattr(wl, name, recording)
+    monkeypatch.setattr(wl, "_nested_probe_deadline", time.monotonic() - 1)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, "no descent once spent"
+    with pytest.raises(wl._ProbeFailed):
+        wl._last_activity_time(str(wt), strict=True)
+    assert wt / "mod" not in roots, "a spent budget must start no nested git process at all"
+
+    calls = []
+    monkeypatch.setattr(wl, "_reset_nested_probe_budget", lambda: calls.append(1))
+    assert _run_main(monkeypatch, repo, tmp_path / "trash", argv=("worktree_lifecycle.py", "--dry-run", "--no-network")) == 0
+    assert calls == [1], "main must start each scan with a fresh budget"
+
+
+def test_a_carriage_return_in_a_deep_path_is_read_as_bytes(reaper_repo, tmp_path):
+    """Text mode translates a carriage return inside a NUL-delimited path, so
+    the parsed name was not the file on disk and a deep EDIT went unseen. An
+    edit, because only the status reading can see one: a deletion is now also
+    dated by the directory walk, so it could not tell the parse was wrong."""
+    repo = reaper_repo.repo
+    deep = Path("deep\rcr") / "x" / "y" / "f.txt"
+    (repo / deep).parent.mkdir(parents=True)
+    (repo / deep).write_text("tracked\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "carriage return in a path")
+    wt = tmp_path / "wt_cr"
+    _git(repo, "worktree", "add", "-q", "-b", "cr-br", str(wt), "main")
+    _age_path(wt, 20)
+    (wt / deep).write_text("edited\n")
+
+    assert (time.time() - wl._git_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_clean_checkout_inside_a_submodule_counts_as_recent_activity(reaper_repo, tmp_path):
+    """Checking out another revision inside a submodule leaves its status clean,
+    and the parent shows only ` M mod`. The submodule's HEAD and reflog record
+    when HEAD moved there."""
+    repo = reaper_repo.repo
+    wt = _add_submodule_worktree(repo, tmp_path, "wt_subhead")
+    _age_submodule_worktree(wt, 20)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, "precondition: reads idle"
+    _git(wt / "mod", "checkout", "-q", "HEAD~1")
+    assert not _git(wt / "mod", "status", "--porcelain"), "precondition: the submodule is clean"
+
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_dirty_check_that_cannot_answer_counts_as_dirty(reaper_repo, monkeypatch):
+    """FAIL-CLOSED: when `git status` cannot answer, the worktree is treated as
+    dirty, so an error holds it for the long window instead of archiving it
+    early. The dirty check now decides the lane, so this is load-bearing."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_branch_merged
+    _age_path(wt, 10)
+    real = wl._run_git
+
+    def failing_status(root, args, *, timeout):
+        if args[:2] == ["status", "--porcelain"]:
+            return None
+        return real(root, args, timeout=timeout)
+
+    monkeypatch.setattr(wl, "_run_git", failing_status)
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["dirty"] is True, cls
+    assert cls["state"] == wl.STATE_AT_RISK, cls
+
+
+def test_config_that_hides_untracked_files_cannot_make_a_worktree_read_clean(reaper_repo):
+    """`status.showUntrackedFiles=no` drops every untracked file from a bare
+    `git status`. The dirty check pins its flags, so an untracked file still
+    counts and the worktree stays off the short clock."""
+    repo = reaper_repo.repo
+    _git(repo, "config", "status.showUntrackedFiles", "no")
+    wt = reaper_repo.wt_branch_merged
+    (wt / "new.txt").write_text("untracked work\n")
+    _age_path(wt, 10)
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["dirty"] is True, cls
+    assert cls["state"] == wl.STATE_AT_RISK, cls
+
+
+def test_a_worktree_dirtied_after_classification_is_not_archived_on_the_merged_clock(
+    reaper_repo,
+    tmp_path,
+    monkeypatch,
+):
+    """The scan takes minutes, so the archive step re-reads dirtiness for the
+    merged lane, as it already re-reads processes, locks and nesting."""
+    repo = reaper_repo.repo
+    wt = reaper_repo.wt_branch_merged
+    _age_path(wt, 10)
+    cls = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert cls["state"] == wl.STATE_REAP_MERGED, cls  # clean when classified
+    (wt / "late.txt").write_text("written during the scan\n")
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(_wt_by_path(repo, wt), repo, lane="merged") is False
+    assert wt.exists() and (wt / "late.txt").is_file()
+
+
+def test_the_real_script_survives_a_worktree_name_that_is_not_utf8(tmp_path):
+    """Run the script the way the timer does: as a process whose stdout is a
+    pipe, which Python opens with strict error handling. A worktree name that is
+    not UTF-8 reaches every log line naming it, and the first such line used to
+    raise and end the run. pytest's captured stdout does not raise, so this is
+    the only test that sees the printing half of the failure.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.quotePath", "false")
+    (repo / "a.txt").write_text("a\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "c0")
+    # The script resolves its repository from its own location.
+    (repo / "scripts" / "worktree_lifecycle.py").write_bytes(_SCRIPT.read_bytes())
+    wt = Path(os.fsdecode(os.fsencode(str(tmp_path)) + b"/wt-\xff"))
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt), "main")
+    _age_path(wt, 20)
+
+    # Strict UTF-8 stdio, which is what the timer gets under a UTF-8 locale.
+    # Pinned rather than inherited: a C locale or Python's UTF-8 mode makes the
+    # streams tolerant, and the printing half of this test would pass vacuously.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONUTF8", "LC_ALL")}
+    env.update(HOME=str(tmp_path / "home"), LANG="en_US.UTF-8", PYTHONIOENCODING="utf-8:strict")
+    proc = subprocess.run(
+        [sys.executable, str(repo / "scripts" / "worktree_lifecycle.py"), "--no-network"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        env=env,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "TRASH" in proc.stdout, proc.stdout[-2000:]
+    assert not wt.exists(), "the clean merged worktree should have been archived"
+# ─── activity clock v3: one signal per kind of change ────────────────────────
+
+
+def _untracked_deep_worktree(repo: Path, tmp_path: Path, name: str) -> Path:
+    wt = tmp_path / name
+    _git(repo, "worktree", "add", "-q", "-b", f"{name}-br", str(wt), "main")
+    return wt
+
+
+def test_renaming_an_untracked_folder_deep_in_the_tree_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """A renamed folder keeps its own mtime and git reports only the new paths,
+    whose files are old: only the directory that HOLDS the folder moves, and the
+    first-existing-ancestor reading stopped at the renamed folder itself.
+    MEASURED before the tree walk: 20.0 days after today's rename."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_dir_rename")
+    old = wt / "x" / "y" / "z" / "oldfolder"
+    old.mkdir(parents=True)
+    (old / "file.txt").write_text("untracked\n")
+    _age_path(wt, 20)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, (
+        "control: idle before the rename"
+    )
+    old.rename(old.parent / "newfolder")
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_deleting_the_last_untracked_file_in_a_deep_folder_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """Git reports nothing at all afterwards -- the file is gone and an empty
+    folder is not listed -- so no status-based reading can see it. Its folder's
+    mtime is the only evidence (MEASURED before the tree walk: 20.0 days)."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_last_untracked")
+    deep = wt / "x" / "y" / "z"
+    deep.mkdir(parents=True)
+    (deep / "only.txt").write_text("untracked\n")
+    _age_path(wt, 20)
+    (deep / "only.txt").unlink()
+    assert _git(wt, "status", "--porcelain", "-uall") == "", "precondition: git sees nothing"
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_commit_in_the_worktree_counts_as_recent_activity(reaper_repo, tmp_path):
+    """A deep edit, then committed: the status is clean again and the walk's top
+    two levels never held the file. Only HEAD's move says the worktree was used
+    (MEASURED before: 20.0 days after the commit)."""
+    repo = reaper_repo.repo
+    (repo / "src" / "pkg").mkdir(parents=True)
+    (repo / "src" / "pkg" / "mod.py").write_text("v1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "deep file")
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_commit")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    _age_path(wt, 20)
+    (wt / "src" / "pkg" / "mod.py").write_text("v2\n")
+    os.utime(
+        wt / "src" / "pkg", (time.time() - 20 * 86400,) * 2
+    )  # an in-place edit, and only an edit
+    _git(wt, "commit", "-qam", "edit deep")
+    assert _git(wt, "status", "--porcelain") == "", "precondition: clean after the commit"
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_git_gc_does_not_make_an_idle_worktree_look_active(reaper_repo, tmp_path):
+    """`git gc` rewrites every worktree's reflog FILE (and the directory holding
+    it), so a clock reading those mtimes would see every worktree as just used
+    after any gc. The entries' own timestamps survive (MEASURED), and are what
+    is read."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_gc")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    (wt / "f.txt").write_text("x\n")
+    _git(wt, "add", "f.txt")
+    _git(wt, "commit", "-qm", "a real move of HEAD")
+    _age_path(wt, 20)
+    _git(repo, "gc", "-q")
+    _git(repo, "reflog", "expire", "--all")
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert (time.time() - log.stat().st_mtime) / 86400 < 1, "precondition: gc rewrote the file"
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19
+
+
+def test_creating_a_worktree_on_a_branch_is_not_read_as_a_move_of_head(reaper_repo, tmp_path):
+    """Creation on a branch writes an all-zeros entry AND a `reset: moving to
+    HEAD` with the same commit on both sides (MEASURED). Neither is use."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_created")
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert len(log.read_text().splitlines()) == 2, "precondition: both creation entries are there"
+    assert wl._head_moved_time(log, strict=True) == 0.0
+
+
+def test_a_commit_in_a_nested_repo_with_reflogs_off_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """With ``core.logAllRefUpdates=false`` a commit on a branch writes no HEAD
+    reflog entry and leaves HEAD itself alone, and the nested status is clean
+    after it. The commit rewrites the nested repository's index, so its git
+    directory's mtime moves -- below the top two levels, nothing else sees it."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_nested_nolog")
+    nested = wt / "x" / "y" / "clone"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "core.logAllRefUpdates", "false")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f").write_text("1\n")
+    _git(nested, "add", "f")
+    _git(nested, "commit", "-qm", "c1")
+    assert not (nested / ".git" / "logs" / "HEAD").exists(), "precondition: no HEAD reflog"
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    (nested / "f").write_text("2\n")
+    os.utime(nested, (time.time() - 20 * 86400,) * 2)
+    _git(nested, "commit", "-qam", "c2")
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_an_unreadable_folder_holds_at_archive_time(reaper_repo, tmp_path):
+    """A folder that exists but cannot be listed is not evidence of idleness.
+    Classification reads around it; the strict archive-time probe raises."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 folder")
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_unreadable")
+    locked = wt / "x" / "sealed"
+    locked.mkdir(parents=True)
+    (locked / "f.txt").write_text("untracked\n")
+    _age_path(wt, 20)
+    locked.chmod(0)
+    try:
+        assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, (
+            "classification reads around it"
+        )
+        with pytest.raises(wl._ProbeFailed):
+            wl._last_activity_time(str(wt), strict=True)
+    finally:
+        locked.chmod(0o755)
+
+
+def test_nested_probe_timeouts_never_run_past_the_deadline(reaper_repo, tmp_path, monkeypatch):
+    """One deadline, and every nested git call's timeout is recomputed from it,
+    so no call can run past it and nothing is charged twice."""
+    wt = _add_submodule_worktree(reaper_repo.repo, tmp_path, "wt_deadline")
+    _age_submodule_worktree(wt, 20)
+    (wt / "mod" / "a" / "b" / "s.txt").write_text("edited inside the submodule\n")
+    calls = []
+    for name in ("_run_git", "_run_git_bytes"):
+        real = getattr(wl, name)
+
+        def recording(root, args, *, timeout, _real=real):
+            calls.append((Path(root), timeout, time.monotonic()))
+            out = _real(root, args, timeout=timeout)
+            if Path(root) == wt / "mod":
+                time.sleep(0.3)  # so a timeout computed once and reused shows
+            return out
+
+        monkeypatch.setattr(wl, name, recording)
+    deadline = time.monotonic() + 2.0
+    monkeypatch.setattr(wl, "_nested_probe_deadline", deadline)
+    wl._last_activity_time(str(wt))
+    nested = [(t, at) for root, t, at in calls if root == wt / "mod"]
+    assert len(nested) == 2, f"precondition: two nested calls, got {nested}"
+    for timeout, at in nested:
+        assert timeout <= deadline - at + 0.05, (timeout, deadline - at)
+
+
+def test_a_change_after_classification_holds_even_when_no_signal_sees_it(
+    reaper_repo, tmp_path, monkeypatch, capsys
+):
+    """The fingerprint is the backstop that does not rest on the activity
+    signals being complete: any change in HEAD or the status between the scan
+    and the archive holds the worktree."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_fp")
+    _age_path(wt, 20)
+    row = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert row["action"] == "trash" and row["fingerprint"], row
+    (wt / "new-untracked.txt").write_text("made after the scan\n")
+    frozen = time.time() - 20 * 86400
+    monkeypatch.setattr(
+        wl, "_last_activity_time", lambda _p, **_k: frozen
+    )  # a clock that misses it
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
+    assert "git state changed between classification and reap" in capsys.readouterr().out
+    assert wt.exists()
+
+
+def test_a_held_worktree_stops_advertising_its_archive(reaper_repo, tmp_path, monkeypatch):
+    """The board was published before archiving with `action: trash`; a worktree
+    the archive step held kept that row for a day. Its row now says why it was
+    held, and no longer says it will be archived."""
+    import json
+
+    cache = tmp_path / "board.json"
+    monkeypatch.setattr(wl, "BOARD_CACHE", cache)
+    target = reaper_repo.wt_branch_merged
+    real = wl._is_locked_now
+    monkeypatch.setattr(wl, "_is_locked_now", lambda p: Path(p) == target or real(p))
+    _run_main(monkeypatch, reaper_repo.repo, tmp_path / "trash")
+    assert target.exists()
+    row = next(r for r in json.loads(cache.read_text())["worktrees"] if Path(r["path"]) == target)
+    assert row["action"] == "none", row
+    assert "archive held this run: locked between classification and reap" in row["reason"], row
+def test_switching_to_a_new_branch_on_the_same_commit_counts_as_recent_activity(
+    reaper_repo, tmp_path
+):
+    """`git switch -c` to start new work in an old worktree changes no file and
+    no commit; the reflog entry is the only trace. Only creation's own entries
+    are skipped, so this one counts."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_switch")
+    _age_path(wt, 20)
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19, (
+        "control: idle before the switch"
+    )
+    _git(wt, "switch", "-q", "-c", "new-work")
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 < 1
+
+
+def test_a_missing_classification_fingerprint_holds(reaper_repo, tmp_path, monkeypatch, capsys):
+    """A row `_classify` produced always carries the key. When git could not
+    answer at classification there is nothing to compare against, and the
+    archive step holds rather than skipping the comparison."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_fp_none")
+    _age_path(wt, 20)
+    row = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    row["fingerprint"] = None
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
+    assert "could not be read at classification" in capsys.readouterr().out
+    assert wt.exists()
+def test_a_branch_switch_after_classification_holds(reaper_repo, tmp_path, monkeypatch, capsys):
+    """The fingerprint carries the branch name, so a `git switch -c` between
+    the scan and the archive holds the worktree even with a clock that missed
+    it (the commit and the status are both unchanged)."""
+    repo = reaper_repo.repo
+    wt = _untracked_deep_worktree(repo, tmp_path, "wt_fp_switch")
+    _age_path(wt, 20)
+    row = wl._classify(_wt_by_path(repo, wt), wl._list_worktrees(repo), repo, allow_network=False)
+    assert row["action"] == "trash" and row["fingerprint"], row
+    _git(wt, "switch", "-q", "-c", "started-after-the-scan")
+    frozen = time.time() - 20 * 86400
+    monkeypatch.setattr(wl, "_last_activity_time", lambda _p, **_k: frozen)
+    monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(wl, "LOG_DIR", tmp_path / "trash" / "logs")
+    assert wl._trash_worktree(row, repo, lane="unmerged", min_idle_days=14) is False
+    assert "git state changed between classification and reap" in capsys.readouterr().out
+    assert wt.exists()
+# ─── round 3: robustness of the three signals ────────────────────────────────
+
+
+def test_a_nested_repo_whose_path_holds_a_newline_is_still_read(reaper_repo, tmp_path):
+    """Line-based parsing of git's paths split such a path in two, and the
+    strict archive-time probe then held the worktree on every run. One path,
+    read as bytes, with only git's own terminating newline removed."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_newline_nested")
+    nested = wt / "x" / "odd\nname"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    (nested / "f").write_text("1\n")
+    _git(nested, "add", "f")
+    _git(nested, "commit", "-qm", "c1")
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    _age_reflog(nested, 20)
+    assert (time.time() - wl._last_activity_time(str(wt), strict=True)) / 86400 > 19, "control: idle"
+    # A commit that changes no file: only that repository's history and index
+    # show it, so it is seen only if the RIGHT git directory was read.
+    _git(nested, "commit", "-q", "--allow-empty", "-m", "c2")
+    assert (time.time() - wl._last_activity_time(str(wt), strict=True)) / 86400 < 1
+
+
+def test_a_reflog_entry_larger_than_the_tail_read_is_still_seen(reaper_repo, tmp_path):
+    """A commit message has no size bound, so the newest entry can outgrow the
+    fixed tail read; the cut fragment was dropped and the commit went unseen.
+    The read now extends backward until it finds a whole counted entry."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_huge_reflog")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    _age_path(wt, 20)
+    msg = tmp_path / "msg.txt"
+    msg.write_text("x" * (wl._REFLOG_TAIL_BYTES + 5000) + "\n")
+    _git(wt, "commit", "-q", "--allow-empty", "-F", str(msg))
+    log = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "logs" / "HEAD"
+    assert log.stat().st_size > wl._REFLOG_TAIL_BYTES, (
+        "precondition: the newest entry outgrows the tail"
+    )
+    assert (time.time() - wl._head_moved_time(log, strict=True)) / 86400 < 1
+
+
+def test_a_commit_between_the_fingerprints_two_reads_is_not_missed(
+    reaper_repo, tmp_path, monkeypatch
+):
+    """HEAD and the status are separate git calls. A commit landing between
+    them paired the old HEAD with the new, clean status, which can equal the
+    classification digest. HEAD is read again after the status, and a change
+    in between reads as no answer, which holds."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_torn")
+    _git(wt, "config", "user.email", "t@t")
+    _git(wt, "config", "user.name", "t")
+    real = wl._run_git_bytes
+
+    def commit_after_status(root, args, *, timeout):
+        out = real(root, args, timeout=timeout)
+        if args[:1] == ["status"]:
+            _git(wt, "commit", "-q", "--allow-empty", "-m", "lands between the reads")
+        return out
+
+    monkeypatch.setattr(wl, "_run_git_bytes", commit_after_status)
+    assert wl._state_fingerprint(str(wt)) is None
+
+
+def test_maintenance_in_a_nested_repo_does_not_keep_the_worktree_active(reaper_repo, tmp_path):
+    """`git gc` and `git maintenance` in a nested repository move its git
+    directory's mtime (MEASURED) without anyone using it, so reading that
+    directory kept a stale worktree looking used for as long as maintenance
+    ran. The index file is read instead; gc leaves it alone."""
+    wt = _untracked_deep_worktree(reaper_repo.repo, tmp_path, "wt_nested_gc")
+    nested = wt / "x" / "y" / "clone"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@t")
+    _git(nested, "config", "user.name", "t")
+    for i in range(3):
+        (nested / f"f{i}").write_text(f"{i}\n")
+        _git(nested, "add", "-A")
+        _git(nested, "commit", "-qm", f"c{i}")
+    _age_path(wt, 20)
+    _age_git_dir(nested, 20)
+    _age_reflog(nested, 20)
+    _git(nested, "gc", "-q")
+    assert (time.time() - (nested / ".git").stat().st_mtime) / 86400 < 1, (
+        "precondition: gc moved the git dir"
+    )
+    assert (time.time() - wl._last_activity_time(str(wt))) / 86400 > 19

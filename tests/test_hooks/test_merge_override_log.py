@@ -406,16 +406,32 @@ class TestWiredIntoTheMergePath:
         # ELSE: four of them blocked on a real PR's review state while their
         # docstrings claimed to exercise "a real merge". Mirrors the seam set in
         # test_merge_gate_characterization.py, which is network-free by design.
-        # ONE JSON OBJECT PER LINE, per `_codex_reviews`' documented seam contract —
-        # which is what makes `rounds` the round COUNT the escalation gate sees, and
-        # so the only way a test here can reach that gate's cap comparisons at all.
+        # ONE JSON OBJECT PER LINE, per `_codex_reviews`' documented seam contract.
+        # `rounds` is the REAL round count (#2378): one review per DISTINCT head,
+        # the last at HEAD so the merge path's freshness gate (which reads the
+        # same seam) still sees a review at head, plus the `_TEST_REVIEW_BUDGET_*`
+        # seams the evaluator reads, so `evaluate_pr` computes a budget instead of
+        # degrading to `unknown`. The records carry no timestamp, so they count
+        # under the pre-cutover rule: every head the primary reviewed.
+        heads = [f"{n:040x}" for n in range(1, rounds)] + [HEAD]
         monkeypatch.setenv(
             "_TEST_GH_CODEX_REVIEWS",
             "\n".join(
-                json.dumps({"login": "chatgpt-codex-connector[bot]", "commit_id": HEAD})
-                for _ in range(rounds)
+                json.dumps(
+                    {"login": "chatgpt-codex-connector[bot]", "commit_id": h, "state": "COMMENTED"}
+                )
+                for h in heads
             ),
         )
+        monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", HEAD)
+        # The review-request gate derives the repo with `gh repo view` unless
+        # pinned: unauthenticated (a CI runner) that read fails, `evaluate_pr` is
+        # never called, and the test silently measures the degrade path again.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "owner/repo")
+        monkeypatch.setenv(
+            "_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps({"sha": h}) for h in heads)
+        )
+        monkeypatch.setenv("_TEST_REVIEW_BUDGET_FILES", json.dumps({"filename": "src/x.py"}))
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
@@ -594,12 +610,11 @@ class TestWiredIntoTheMergePath:
         separate decision; this test pins the CURRENT answer (it does not), so a
         future change to it is deliberate rather than accidental.
 
-        Which means the cases below must REACH the honour points, not merely run
-        the scan. With one seeded review `effective == 1`, neither cap comparison
-        is taken and the sigil is never consulted — a `_note_override` added inside
-        either branch would leave such a test green, which is the exact accident
-        this docstring claims to prevent. So the tail of this test drives the round
-        count up to each cap.
+        It pins that **the override scan writes no row for these sigils**. The cap
+        branches themselves are pinned by
+        `test_the_review_request_reaches_the_real_cap_comparisons` below, which
+        drives the real budget through `_drive`'s seams (#2378), and by
+        `tests/test_hooks/test_git_push_guard_escalation.py`.
         """
         for cmd in (
             'git commit -m "wip"  # escalation-ack',
@@ -611,24 +626,48 @@ class TestWiredIntoTheMergePath:
             self._drive(monkeypatch, cmd)
             assert _rows(log_dir) == [], f"{cmd!r} produced a row"
 
-        # THE HONOUR POINTS. Everything above runs with `effective == 1`, below both
-        # caps, so the sigil is never consulted — those cases pin "the scan writes
-        # nothing", not "the waiver writes nothing". These two put the round count
-        # ON each cap, which is where `acked` / `final_acked` actually decide
-        # something, and are therefore the cases a future `_note_override` inside
-        # either branch would have to survive.
-        for cmd, rounds in (
-            (
-                'gh pr comment 5 --body "@codex review"  # escalation-ack',
-                _mod.ESCALATION_ROUND_CAP,
-            ),
-            (
-                'gh pr comment 5 --body "@codex review"  # final-round-accept',
-                _mod.FINAL_ROUND_CAP,
-            ),
-        ):
-            self._drive(monkeypatch, cmd, rounds=rounds)
-            assert _rows(log_dir) == [], f"{cmd!r} logged at the HONOUR point"
+        # Two trailing `_drive` calls used to sit here, labelled THE HONOUR POINTS on
+        # the belief that `rounds=` put the count ON each cap. Both are DELETED, and
+        # neither deletion costs coverage:
+        #
+        #   * the `escalation-ack` one re-ran the identical command the first loop
+        #     already drives, at a `rounds=` value measured inert — a duplicate
+        #     assertion, and the sole reader of a dead re-export in the guard;
+        #   * the `final-round-accept` one used a retired constant, and its branch
+        #     (the retired-sigil NOTE in `_check_codex_round_escalation`) is keyed on
+        #     the SIGIL rather than on any count, so the first loop covers it too.
+        #
+        # What remains is the honest claim: the scan writes no row for an ack-class
+        # sigil on the review-request path.
+
+    def test_the_review_request_reaches_the_real_cap_comparisons(self, monkeypatch, log_dir):
+        """#2378: `_drive`'s `rounds` reaches the evaluator as a REAL count. Below
+        the ordinary limit a review request is allowed; at it, it asks. Spied
+        rather than inferred, so a degraded `unknown` (which also asks) cannot
+        pass this test, and a broken cap comparison flips the verdict."""
+        seen: list[tuple[object, ...]] = []
+        evaluate = _mod._review_budget.evaluate_pr
+        decide = _mod._check_codex_round_escalation
+
+        def spy_evaluate(*a, **k):
+            result = evaluate(*a, **k)
+            seen.append(("budget", result["status"], result["count"]))
+            return result
+
+        def spy_decide(*a, **k):
+            decision = decide(*a, **k)
+            seen.append(("decision", decision[0]))
+            return decision
+
+        monkeypatch.setattr(_mod._review_budget, "evaluate_pr", spy_evaluate)
+        monkeypatch.setattr(_mod, "_check_codex_round_escalation", spy_decide)
+        limit = _mod._review_budget.STANDING_REVIEWED_HEAD_LIMIT
+        for rounds, verdict in ((limit - 1, "allow"), (limit, "ask")):
+            seen.clear()
+            self._drive(monkeypatch, 'gh pr comment 5 --body "@codex review"', rounds=rounds)
+            assert ("budget", "ok", rounds) in seen, seen
+            assert ("decision", verdict) in seen, seen
+        assert _rows(log_dir) == []
 
     def test_no_sigil_writes_nothing(self, monkeypatch, log_dir):
         """Positive control's twin: an ordinary merge must not log."""

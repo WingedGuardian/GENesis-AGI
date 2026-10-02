@@ -741,3 +741,71 @@ class TestSettingsProvenanceAndGateFlip:
                 "AND resolved_at IS NULL",
             )
         assert rows == [], "re-enable must resolve the standing alert"
+
+
+@pytest.mark.parametrize("key", ["items_per_eval", "max_retries"])
+@pytest.mark.parametrize("bad", [0, -1, "x"])
+def test_inbox_validator_bounds_items_and_retries(key, bad):
+    """#1953: these two were never validated on the MCP/dashboard path."""
+    errors = _validate_inbox_monitor({key: bad})
+    assert any(key in e for e in errors), errors
+
+
+@pytest.mark.parametrize("bad", [True, False, 2.7, float("inf"), float("-inf"), float("nan")])
+def test_positive_int_validator_rejects_non_integers(bad):
+    """#2447 review: `_validate_positive_int` coerced with int(), so `true` was
+    stored as 1 and 2.7 as 2 and reported applied, while the config loader then
+    replaced the value with its default; infinity raised OverflowError."""
+    from genesis.mcp.health.settings import _validate_positive_int
+
+    errors: list[str] = []
+    _validate_positive_int({"max_retries": bad}, "max_retries", errors)
+    assert errors and "max_retries" in errors[0], errors
+
+
+@pytest.mark.parametrize("good", [4, 4.0, "4"])
+def test_positive_int_validator_accepts_integers(good):
+    from genesis.mcp.health.settings import _validate_positive_int
+
+    errors: list[str] = []
+    _validate_positive_int({"max_retries": good}, "max_retries", errors)
+    assert errors == []
+
+
+@pytest.mark.parametrize("value", [True, 2.7, float("inf"), 0, -1, 4, 4.0, "4"])
+def test_validator_and_loader_agree_on_what_is_an_integer(value):
+    """The settings path and the loader must accept exactly the same values, or
+    a write reports success and the loader silently discards it."""
+    from genesis.inbox.config import load_inbox_config_from_string
+    from genesis.mcp.health.settings import _validate_positive_int
+
+    errors: list[str] = []
+    _validate_positive_int({"max_retries": value}, "max_retries", errors)
+    import yaml
+
+    doc = yaml.safe_dump({"inbox_monitor": {"watch_path": "/tmp/x", "max_retries": value}})
+    loaded = load_inbox_config_from_string(doc).max_retries
+    kept = loaded == int(value) if not errors else None
+    assert (errors == []) == bool(kept), (value, errors, loaded)
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("batch_size", True), ("batch_size", 2.7), ("batch_size", float("inf")),
+        ("batch_size", 11), ("evaluation_cooldown_seconds", "abc"),
+        ("evaluation_cooldown_seconds", True), ("evaluation_cooldown_seconds", -5),
+        ("evaluation_cooldown_seconds", 2.5),
+    ],
+)
+def test_inbox_validator_covers_every_numeric_key(key, bad):
+    """#2447 class audit: batch_size kept a hand-written int() branch (true and
+    2.7 accepted, inf raised) and evaluation_cooldown_seconds was never checked,
+    so both were reported applied while the loader discarded them."""
+    errors = _validate_inbox_monitor({key: bad})
+    assert any(key in e for e in errors), errors
+
+
+@pytest.mark.parametrize(("key", "good"), [("batch_size", 5), ("evaluation_cooldown_seconds", 0)])
+def test_inbox_validator_accepts_valid_numeric_values(key, good):
+    assert _validate_inbox_monitor({key: good}) == []

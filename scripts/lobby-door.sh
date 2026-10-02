@@ -63,35 +63,45 @@ set -uo pipefail
 # terminal failed: not a terminal" every time, so an existence test is used.)
 #
 # ⚠ This comment also used to say SILENT, and that was the load-bearing
-# falsehood. The probe printed nothing HERE — its stderr was redirected — while
-# tmux announced the miss to every OTHER attached client. "Prints nothing" was
-# checked from the wrong end, and the claim then read as settled for anyone who
-# came looking. Silence on your own stderr is not silence on the server.
+# falsehood. "Prints nothing" had been checked from the wrong end: the probe's
+# own stderr was redirected, so the caller saw silence either way. That much
+# still stands. What followed from it did not — see the correction below.
 # WHY NOT `has-session`, WHICH IS THE OBVIOUS SPELLING
 # ----------------------------------------------------
-# Because on tmux, "no such session" is an ERROR, and a tmux error is a
-# SERVER-SIDE MESSAGE shown on every attached client's status line in
-# `message-style` — which is `bg=yellow` here, against a green `status-style`.
-# The `2>/dev/null` silences this PROCESS's stderr; it does not stop the server
-# telling the other clients.
-#
-# MEASURED on tmux 3.4 with a client attached:
-#   has-session -t "=lobby-555555" 2>/dev/null   -> +1 "can't find session"
+# Because on tmux, "no such session" is an ERROR, and a tmux error is recorded
+# in the SERVER's message log. MEASURED on tmux 3.4 with a client attached:
+#   has-session -t "=lobby-555555" 2>/dev/null    -> +1 "can't find session"
 #   list-sessions -F … | grep -qxF "lobby-555555" -> +0
-# Same verdict, no message. With NO client attached neither emits, so a test
-# for this MUST attach one or it proves nothing.
+# Same verdict, no log entry. The probe below runs on the SUCCESS path — the
+# name is free every time — so one entry accumulated per fleet connection.
 #
-# This matters because the picker-name probe below runs on the SUCCESS path:
-# the name is free every time, so "can't find session" fired on every single
-# fleet connection, painting the operator's status line yellow. `display-time`
-# is 750ms, so a warm connect finished painting after it expired and a cold one
-# did not — which is exactly the intermittency that made this so hard to pin.
+# CORRECTION, 2026-09-25. This block used to go much further, and it was wrong.
+# It said the error is "shown on every attached client's status line in
+# `message-style` (bg=yellow)", that `2>/dev/null` therefore could not stop it,
+# and that `display-time` 750ms explained the intermittency. MEASURED and
+# REFUTED: with a client attached through a pty and the capture read after the
+# client exits, three absent probes added three log entries and ZERO bytes to
+# that client's stream, while a `display-message` control on the same client
+# painted at row 24 in black-on-yellow, 1/1. A door invoked as an ssh
+# RemoteCommand runs tmux as a client with NO session, so the error goes to
+# that client's own stderr — which the redirect did suppress.
 #
-# Evidence it was really this: the operator's own `show-messages` log showed
+# The yellow bar the operator actually saw was NOT this. It was `choose-tree`'s
+# own `(search)` prompt, opened by a `?` byte from their terminal's DECRQM
+# reply being delivered as a keystroke; the same reply's digit then chose an
+# entry. That is the bug, and it is fixed by not landing in a chooser at all —
+# see lobby-picker.sh, which this door now runs.
+#
+# What the `show-messages` log genuinely showed is the sequence, not a paint:
 #   has-session -t =lobby-1161923 / message: can't find session: lobby-1161923
 #   / new-session / choose-tree / switch-client -Z -t =cc-5:
-# — the chooser opening under the message, and the keypress meant to dismiss
-# the message being eaten by choose-tree as "select the highlighted entry".
+# The switch at the end is the stolen selection. The message above it was
+# coincident, not causal — which is exactly the tidy story a surprising
+# observation invites, and the reason the first two fixes did not hold.
+#
+# Keeping the silent probe anyway: it removes per-connection log noise, and an
+# erroring probe on a path where absent is the expected answer is wrong on its
+# own terms. It is simply not what was painting anything.
 _session_exists() {
     # -F (fixed string) because a session name is free text, -x so `lobby` can
     # never match `lobby-123`. `list-sessions` failing (no server yet, first
@@ -157,6 +167,76 @@ unset _n
 # this door was written to remove, restored through its own picker. MEASURED:
 # the filter keeps `cc-*` and the persistent `lobby`, and drops `lobby-12345`
 # and `lobby-67890`.
-exec tmux -u new-session -s "$SESSION" \; \
-    set-option -t "=${SESSION}:" destroy-unattached on \; \
-    choose-tree -Zs -f '#{!=:#{m:lobby-*,#{session_name}},1}'
+# The landing screen is a LINE-based picker, not choose-tree, and that is a
+# security-of-input decision rather than a style one. MEASURED 2026-09-24: a
+# terminal's DECRPM reply (`ESC [ ? 2004 ; 2 $ y`) is not recognised by tmux's
+# client key parser -- it consumes Device Attributes replies, which end in `c`,
+# but not these, which end in `y` -- so the bytes arrive as KEYS. In
+# choose-tree `?` opens the (search) prompt and a digit CHOOSES that entry, so
+# one stray reply painted the status line yellow and yanked the client into an
+# arbitrary session, every cold connect (#2140).
+#
+# Ruled out by measurement, not argument: draining the tty first (still
+# stolen), hosting the chooser in a pane (prompt gone, still stolen), any
+# recovery keypress (already switched), and upgrading tmux -- 3.7c was built
+# and probed and is STILL stolen, and a pane's query never reaches the terminal
+# on 3.4 anyway, so an upgrade removes no source.
+#
+# A line-based screen has no single-key actions, so stray bytes become part of
+# a line that fails to parse. choose-tree is one keypress away (`t`, or Ctrl-b
+# s) once the terminal has stopped talking.
+# Resolve the picker beside THIS script. `${0%/*}` alone is wrong when $0
+# carries no slash (invoked via PATH, an alias, or `sh lobby-door.sh`): the
+# expansion leaves $0 untouched and yields `lobby-door.sh/lobby-picker.sh`.
+# ssh always passes an absolute path, so the login route is safe either way --
+# every manual and debug route is not, and the failure is the silent one below.
+# shellcheck disable=SC1007  # `CDPATH= cd` is the idiom, not a typo'd assignment:
+# it empties CDPATH for this one command so `cd` cannot resolve elsewhere or
+# echo the target, either of which would corrupt the captured path.
+_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || _dir=""
+PICKER="${_dir}/lobby-picker.sh"
+
+# DEGRADE TO A SHELL, NEVER TO NO-LOGIN.
+#
+# MEASURED: with the picker absent, `new-session <cmd>` runs a command that
+# fails instantly, the pane dies, the window closes, the session has no windows
+# left, it is destroyed, the client detaches and ssh exits. The operator sees
+# the terminal flash and print `[exited]`, with no error and no clue, on EVERY
+# connect. The old door could not fail this way -- `new-session` with no command
+# always left a shell, so even a broken chooser left you logged in.
+#
+# Causes are all live: the picker is a separate file that can go missing (it is
+# deleted by `git clean -fd`, absent in a fresh clone or a worktree, and lost by
+# any deploy that tidies untracked files), it can lose its executable bit across
+# a copy, and `$0` can resolve wrong per the note above. None of that should
+# cost the operator their one-click fleet access, so check first and fall back
+# to exactly what the pre-picker door did.
+# ONE exec, with the pane command as an optional argument, rather than an exec
+# per branch. Two exec lines would create exactly one session at runtime (the
+# branches are exclusive) but TWO textually, and `test_the_session_is_per_connection`
+# counts attach lines to pin "one session per connection". That test is right to
+# count: keeping the invariant checkable is worth more than the extra branch, and
+# loosening the test to accept two would retire the check for every future edit.
+if [ -x "$PICKER" ]; then
+    # `/bin/sh` is passed as a SEPARATE argument, not folded into one string.
+    # With a single shell-command argument tmux runs it through `sh -c`, which
+    # word-splits -- so a repo path containing a space becomes two nonexistent
+    # paths, the pane command fails, and this door's failure mode for that is a
+    # LOGOUT: the window is destroyed, then the session, then the client is
+    # detached. MEASURED on tmux 3.4 with the picker under a directory named
+    # `dir with space`:
+    #   new-session -d -s doorA "$PICKER"            -> session does NOT exist
+    #   new-session -d -s doorB /bin/sh "$PICKER"    -> menu drawn
+    # With two or more arguments tmux execs them directly, so nothing splits.
+    # Latent on this install (no space in the path today) and one word to close;
+    # the consequence is the exact failure the picker-missing branch below exists
+    # to prevent, so it is not left to luck about where the repo is cloned.
+    set -- /bin/sh "$PICKER"
+else
+    printf 'lobby: picker missing or not executable (%s) -- plain shell.\n' \
+        "$PICKER" >&2
+    set --
+fi
+
+exec tmux -u new-session -s "$SESSION" "$@" \; \
+    set-option -t "=${SESSION}:" destroy-unattached on

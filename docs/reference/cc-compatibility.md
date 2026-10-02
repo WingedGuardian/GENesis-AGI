@@ -15,7 +15,7 @@
 
 ## Current CC Version
 
-**Pinned:** Claude Code **2.1.246** (bumped 2026-08-31 from 2.1.218; a 25-release, fixes-dominated delta — see Version History for the evaluation). Deployment path: the gated sequence in §Updating Claude Code — evaluate (incl. the mandatory full-changelog read) → soak the candidate on the container → **then** merge the pin, after which one `scripts/update.sh` run aligns the container via `cc_ensure_local` and syncs the host via the guardian `update-cc` op. The merge-then-`update.sh` half is the *deployment* mechanism, not the whole procedure: a bump that starts there has skipped the gates. The `cc-update` skill routes to §Updating. Node floor unchanged (`>=22`; 2.1.246 declares `engines.node >=22.0.0`, verified against the npm registry — as does 2.1.251, so the next cycle does not move it either). Prior state: 2.1.218 on both machines from 2026-07-22; the container ran the 2.1.246 candidate from 2026-08-25 under the inherited-`CC_VERSION` soak lever while the host stayed on the pin, which is the documented rollback path and why the two machines were deliberately split during the soak. **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix; the host uses `sudo npm install -g`, resolving `/usr/bin/claude` → `/usr/lib/node_modules/@anthropic-ai/claude-code`). **There is no native-installer path** (re-verified live on the host 2026-07-22).
+**Pinned:** Claude Code **2.1.280** (bumped 2026-09-26 from 2.1.246; a 34-version range of which 26 were published, gain-heavy — see Version History for the evaluation). Node floor unchanged (`engines.node >=22.0.0` at 2.1.280, verified against the npm registry 2026-09-25). The npm package is a thin wrapper around a **platform-native executable** (`bin/claude.exe`, ~233 MB on linux-x64, measured 2026-09-25) — which is why `check_cc_running_versions.sh` can resolve CC's own inode rather than a Node interpreter's. Prior pin: 2.1.246 (bumped 2026-08-31 from 2.1.218). Deployment path: the gated sequence in §Updating Claude Code — evaluate (incl. the mandatory full-changelog read) → soak the candidate on the container → **then** merge the pin, after which one `scripts/update.sh` run aligns the container via `cc_ensure_local` and syncs the host via the guardian `update-cc` op. The merge-then-`update.sh` half is the *deployment* mechanism, not the whole procedure: a bump that starts there has skipped the gates. The `cc-update` skill routes to §Updating. Prior state: 2.1.246 on both machines from 2026-08-31; the container ran the 2.1.280 candidate from 2026-09-22 (align) / 2026-09-23 04:28Z (soak clock) while the host stayed on the pin, which is the documented rollback path and why the two machines were deliberately split during the soak. **Both** container and host install Claude Code **via npm-global** (`npm install -g @anthropic-ai/claude-code@<version>` — the container auto-detects its npm prefix; the host uses `sudo npm install -g`, resolving `/usr/bin/claude` → `/usr/lib/node_modules/@anthropic-ai/claude-code`). **There is no native-installer path** (re-verified live on the host 2026-07-22).
 **Pin (single source of truth):** `CC_VERSION` in `scripts/lib/cc_version.sh`, which
 also exports the shared **`cc_ensure_local`** aligner. Sourced by `scripts/install.sh`,
 `scripts/host-setup.sh`, `scripts/bootstrap.sh`, and `scripts/update.sh`. Bump it in one
@@ -94,7 +94,9 @@ the procedure (step 5).
      to compare against. It cannot move later either — step 3 replaces the CLI. See §Model-alias
      drift in the `cc-update` skill for the invocation and which `modelUsage` entry to read.
 2. **Deploy current `main` FIRST — before the soak, never during it.** Run `scripts/update.sh`
-   (background task) so the box is on current code *before* the candidate goes on. Two reasons:
+   DETACHED from the session (the `systemd-run --user` recipe in the genesis-development
+   skill's Timeout Policy; not `run_in_background`, which is session-bound and has killed
+   deploys mid-run) so the box is on current code *before* the candidate goes on. Two reasons:
    a long gap between deploys means step 8 would otherwise land weeks of Genesis change **and**
    the CC bump in one shot, leaving you unable to attribute a regression to either; and the soak
    is only meaningful as evidence about CC if the code underneath it isn't stale.
@@ -212,7 +214,9 @@ the procedure (step 5).
    CC-Gate-Changelog: read (2.1.218, 2.1.246] in full from CHANGELOG.md, 2026-08-27
    CC-Gate-Soak: 2.1.246 on container 2026-08-25..2026-08-27, check_cc_running_versions.sh clean, sign-off recorded
    ```
-8. **Run `scripts/update.sh`** (a background task — deploys exceed the Bash tool timeout). It
+8. **Run `scripts/update.sh`** DETACHED from the session — deploys exceed the Bash tool's hard
+   ceiling, and `run_in_background` is session-bound, so use the `systemd-run --user` recipe
+   in the genesis-development skill's Timeout Policy. It
    updates the container, redeploys the Guardian (carrying the new gateway script), then queries
    the host's CC version and — **only if it differs from the pin** — dispatches `update-cc <pin>`
    to the Guardian gateway on the host. The dispatch is idempotent (acts only on drift) and
@@ -452,6 +456,17 @@ revision is loaded, so it reports undetermined rather than a false all-clear.
 The same is true under a `hidepid` procfs, where other users' processes are not
 enumerable at all and the denominator itself would be unverified.
 
+**An `undetermined` at soak start can be an ORPHANED pre-align session.** During the
+2.1.280 soak (2026-09-22) the sweep refused a clean verdict because of a CC process
+left over from an earlier login — started days before the align, so necessarily on
+the replaced binary. That is exactly what the soak gate exists to catch; the fix was
+ending that session (after confirming it was abandoned), after which the sweep read
+`undetermined=0`. **Why its executable could not be resolved was not established.**
+It is NOT `kernel.yama.ptrace_scope`: Yama restricts ptrace ATTACH, not the READ the
+sweep performs, and on the same install (`ptrace_scope=1`) `readlink` and `stat -L`
+of `/proc/<pid>/exe` succeed for same-user processes that are not descendants of the
+caller (MEASURED 2026-09-25).
+
 
 ## Integration Surface — Genesis Components That Use CC
 
@@ -497,6 +512,12 @@ enumerable at all and the denominator itself would be unverified.
 - MCP config per session (`--mcp-config`)
 - Session resume (`--resume`)
 - Bare mode (`--bare`)
+- Function hooks, early access (`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`): opt-in for
+  interactive slots only, where the `GENESIS_CC_WEB_OVERRIDE` cc-slot lever loads
+  `plugins/genesis-web-override` with `--plugin-dir` to answer `WebSearch` with the
+  Genesis chain. Every dispatched session is pinned to `0`
+  (`src/genesis/cc/child_env.py`). Measured facts it rests on are in
+  `.claude/docs/web-tools-guide.md`; re-checked on every pin bump (checklist item 9).
 - Turn limits (`--max-turns`) and strict MCP config (`--strict-mcp-config`) for Guardian diagnosis
 - PreToolUse / PostToolUse / SessionStart / Stop / UserPromptSubmit hooks
 
@@ -721,7 +742,15 @@ When a new CC version is released, run through this:
    the session simply relays the gate's options in its own words again — the
    pre-2026-09 behaviour, and the exact thing the mechanism exists to stop. Nothing
    blocks and nothing errors, because by design no gate reads this back.
-9. **Update this document** with findings.
+9. **Re-run the WebSearch override against the candidate** (`plugins/genesis-web-override`,
+   a function-hook plugin; early access, so its API can move in any release). In a
+   scratch cwd: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude -p --model haiku
+   --plugin-dir <repo>/plugins/genesis-web-override --debug-file <f> "Use WebSearch once …"`
+   with genesis-health connected, and confirm the debug log shows
+   `resolved by a hooks module (result)` and no `does not match its output shape`.
+   A shape Claude Code stops accepting reaches the model as a tool error, not as
+   the built-in search, so this is the one place the regression shows.
+10. **Update this document** with findings.
 
 ---
 
@@ -772,6 +801,7 @@ When a new CC version is released, run through this:
 | 2.1.201 | 2026-07-04 | Sonnet 5 sessions stop using the mid-conversation system role for harness reminders — behavioral change only | **Pin bumped 2.1.198→2.1.201 (#897); DEPLOYED + VERIFIED on all four nodes 2026-07-04/05** — machine A container `/usr/local/bin` + host `/usr/bin` (gateway-verified), machine B container `~/.npm-global` + host, all reporting 2.1.201; machine B's host also healed Node 20→22 in the same pass. This was the first single-command `update.sh` pipeline exercise; it surfaced three gaps, all fixed in the follow-up pipeline-hardening PR: the re-tracked `settings.local.json` blocking the clean-tree gate, drift healing skipped on no-delta runs ("Nothing to do" after a manual pull), and `cc_ensure_local`'s verify failing falsely when the npm prefix is off-PATH in non-interactive shells. Watch reflection-session quality on Sonnet for a few days (harness-reminder role change). |
 | 2.1.202–2.1.218 | 2026-07-22 | Range reviewed via changelog + `recon_cc_update_check` (**informational**). Fixes + hardening dominated. **Hooks:** exit-code-2 blocking now enforced as documented + agent-frontmatter hooks gated to trusted folders (@214). **Subagents:** nested spawning is now **opt-in** — OFF by default, re-enabled via `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`; a per-message concurrency cap `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (default 20) was added (@217); worktree-isolated subagents no longer run git against the parent checkout (@203/@206/@210/@216). **Skills/commands:** CC no longer auto-invokes `/code-review` + `/verify` (@215); `/code-review` runs as a background subagent (@218); `/fork`↔`/subtask` swap + Task-tool `mode` param deprecated (@212). **Background sessions:** large lifecycle fix batch (undeletable/blank-resume, killed-agent respawn, idle keepalive, live-parent protection). **Security:** Agent tool hardened vs indirect prompt injection (@210), bidi-override neutralization (@211), EndConversation tool + Bash permission-check hardening (@214). **Perf:** quadratic long-session normalization slowdown (@216) + long-session/MCP memory leaks (@208/@217) fixed. | **Pin bumped 2.1.201→2.1.218.** Rolls out to container + host via the standard `scripts/update.sh` path (Host-Deploy Gate — run in the same session as the merge; verify both report 2.1.218). Node floor unchanged (`>=22`). Grep-verified Genesis uses neither Task-tool `mode` nor `/fork` (only GitHub forks + docs), so @212 is inert here. **Follow-through:** (1) @217 nesting — Genesis opts into ONE level (session→subagent→subagent = 3 tiers) via `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`, shipped IN THIS PR as an `install.sh` user-settings default (set-if-absent, so an operator override is preserved). Value runtime-verified on 2.1.218: the binary's `FZ()` resolver defaults the cap to 1 (= no nesting, matching the @217 changelog), so 2 = exactly one nesting level = 3 tiers; a live nested-dispatch test blocked the 3rd spawn. Reaches installs via `install.sh`/`bootstrap.sh` (like the auto-updater suppression), applied live on this box; `host-setup.sh` deliberately omits it — the host's single-brain recovery `claude -p` never nests. (2) @215 `/code-review` auto-invoke removal — Genesis's own review-enforcement hooks (`review_enforcement_prompt/commit.py`) are now the primary trigger, not a backstop (review-layer unification tracked separately). Post-deploy safety check: confirm workflow/subagent file-writes still hit the PreToolUse approval gate under `claude -p` (@217 auto-approve behavior). The @214 exit-code-2 fix strengthens the approval gate + `bash_safety_hook`. |
 | 2.1.219–2.1.246 | 2026-08-31 | Range read in full from `CHANGELOG.md` (25 releases; 2.1.230/242/244 were never published). Fixes and hardening dominated; the load-bearing items for Genesis are all late in the range. **Delegation:** from @246 a subagent that hits `maxTurns` returns **partial output without failing**, so a silent early stop is indistinguishable from a genuinely short report — the reason the changelog-read procedure now requires per-release acknowledgement reconciled against the headings rather than trusting a delegate's summary. **Guardian:** @246 fixes a `--strict-mcp-config` startup hang, which lands directly on Guardian Diagnosis. **Worktrees:** @245→@246 fixes a background-retention sweep that reaped user-created `.claude/worktrees/` — relevant because this repo keeps long-lived worktrees per branch. **Headless:** `-p --continue`/`--resume` now resume in plan mode. Node floor unchanged (`engines.node >=22.0.0`, verified against the npm registry at both 2.1.246 and 2.1.251), so `NODE_MAJOR` stays 22 and `cc-node-lockstep` is satisfied without a lockstep bump. | **Pin bumped 2.1.218→2.1.246.** Changelog read over `(2.1.218, 2.1.246]` completed in full from `CHANGELOG.md` before the bump — the mandatory §Updating step-1 gate — and the candidate soaked on the container from 2026-08-25 to 2026-08-31 under the inherited `CC_VERSION` lever, with `check_cc_running_versions.sh` at soak end reporting **every live CC process on the on-disk binary and none stale** — the oldest dating from the align itself, which is what makes the soak continuous rather than merely elapsed — and owner sign-off recorded. (The script additionally reported an `undetermined` process. That is a known false positive, not evidence about any CC session: `cmdline_runs_cc` matches any node process whose first non-flag argument is basename `cli.js`, which catches Playwright's bundled driver as well as Claude Code's launcher, and a node interpreter's inode says nothing about a CC revision. Tracked separately; expect it on any install with the `browser` extra.) The host stayed on 2.1.218 throughout by design — `cc_align_host.sh` aims at the PUBLIC pin, which is what preserved the rollback path during the soak and why merging this row is what actually closes the split. Rolls out to container + host via `scripts/update.sh`; verify the host through a FRESH gateway `version` op, never `host_gateway_state.json`, which is written from the pre-alignment probe. **Target deliberately 2.1.246, not npm `latest` 2.1.251:** 2.1.246 is the version that actually soaked, and a re-target restarts the procedure and resets the soak clock; the 2.1.247–2.1.251 delta rolls into the next cycle. |
+| 2.1.247–2.1.280 | 2026-09-22 | Range read in full from `CHANGELOG.md` over `(2.1.246, 2.1.280]` (34 versions, 26 published). **Gain-heavy.** **Guardian:** a `--strict-mcp-config` startup stall fixed (@274) and `-p` hangs now exit 1 instead of wedging (@277) — both on the Guardian Diagnosis path. **Headless (`-p`):** waits on armed Monitors (@257, 10-min cap @271) — INERT here, `Monitor` is in Genesis's disallowed tool list; stream-json cwd persists across turns (@265); a RESUMED `-p` session restores its saved totals, so it reports CUMULATIVE `total_cost_usd` and `modelUsage` while `usage` tokens stay per call (@277; MEASURED on 2.1.280: 0.0378 → 0.0415 → 0.0450 over three resumed calls, and 0.0383 → 0.0421 → 0.1475 across a haiku → sonnet `--model` switch, with the earlier model's entry carried over) — the foreground conversation path ADDED each turn's report, so this pin would have inflated `cc_sessions.cost_usd` by re-adding the whole session every turn (display-only: no budget reads it); fixed ahead of the pin by recording the per-turn difference, keyed on the CC version because nothing in the result survives a model switch (#2376); `modelUsage` no longer carries CC's auxiliary haiku title row (@277, measured) but still carries subagent models, so the max-tier selection stays. **Models:** the `opus` alias now resolves to `claude-opus-5-5` (@280, measured: was `claude-opus-5`; `CCModel` recognises it, so downgrade detection is not blind); Fable 5.1 becomes a default (@257). **Subagents:** from @251 an agent frontmatter `model:` beats `CLAUDE_CODE_SUBAGENT_MODEL`, and @257 adds `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` to restore env precedence — fixed ahead of this pin in #2259, verified by a live differential with a control arm. **MCP:** CC cuts every tool description at 2,048 chars, and @280 adds `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` to raise it — two Genesis tools were over it and were trimmed in #2277 (Known Issues). **Settings:** `syncClaudeAiSkills` / `syncClaudeAiPlugins` (top-level booleans) — Genesis defaults both to false (below). **Hooks:** no field the guard chain reads was removed or renamed (checked against a real PreToolUse payload captured on the 2.1.280 binary); brace-leading non-JSON stdout handling changed (@248) — swept, no wired hook emits it. **CC function hooks ("Claude Mods")** shipped early-access and changelog-silent; adoption tracked in #2260, nothing enforcement-bearing depends on the flag. Node floor unchanged (`engines.node >=22.0.0` at 2.1.280, npm registry), so `NODE_MAJOR` stays 22. | **Pin bumped 2.1.246→2.1.280.** Changelog gate completed before the align (2026-09-22; receipt in this PR's `CC-Gate-Changelog` trailer). **Candidate validation on the container (2026-09-22), all MEASURED on the live binary:** a captured real PreToolUse payload keeps every field the guard chain reads, same names and nesting; the hook stdout cap is UNCHANGED at exactly 10,000 total emitted chars (the probe emits `n+22`, see Known Issues); the `_FORCE` differential passed (no `_FORCE` → frontmatter model, `_FORCE=1` → env model, main-session model constant). **Soak:** container ran 2.1.280 from 2026-09-23 04:28Z to 2026-09-26 04:28Z, with `check_cc_running_versions.sh` exiting 0 at start and 0 at end (2026-09-26 04:28:47Z: `current=4 stale=0 other-copy=0 undetermined=0`) at end; a mid-soak read (2026-09-25 22:00Z) was `current=4 stale=0 undetermined=0`. At soak start an orphaned pre-align session held the sweep at `undetermined` until it was ended — see §Which copy is INSTALLED vs RUNNING. **Soak watch-item anthropics/claude-code#95633** (a bypass session switched to plan mode routes read-only Bash to the permission prompt, since 2.1.275; open upstream, no fix through 2.1.283): 1 plan-mode entry during the soak (via the EnterPlanMode tool) showed read-only Bash auto-allowed at bypass-equal latency, 0 rejected; the Shift+Tab entry route was not exercised. Not a reason to hold — only reverting to 2.1.246 avoids it. Owner sign-off: the owner, in session, 2026-09-26 05:30Z, after the final sweep and with Codex and Devin reviews in hand. **Settings defaults (container only — the host gets none):** every container reconcile path (`install.sh`, `cc_ensure_local` on bootstrap/update, the daily `cc_settings_align` timer) now runs one function, `cc_reconcile_container_settings`, which sets subagent nesting depth and `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192` if absent. It therefore reaches EXISTING installs. It also sets `syncClaudeAiSkills` / `syncClaudeAiPlugins` = false (top-level JSON booleans, reconciler `top:` form, #2295) **only where that kind has nothing synced yet**: per the 2.1.280 binary, turning sync off hides already-synced skills (`~/.claude/skills/synced`) or plugins (`~/.claude/plugins/synced`) from new sessions and moves them to `<kind>/.trash` at the next launch (re-downloaded, not restored, on re-enable), and the only way to opt out would be to act before updating. Where something is synced the key is set to `true` instead (Claude Code already treats an absent key as on, so nothing changes), and a one-time notice says how to turn it off. Setting the key makes the decision survive a sign-out, which empties the synced folder. Where what is synced cannot be read, nothing is written and every reconcile prints a notice until the operator sets the key. An existing value is never touched; deleting a key is not an opt-out (it is refilled). A defaults-only write reports the `defaults` state, which is never recorded as a degraded deploy. Rolls out to container + host via `scripts/update.sh`; verify the host through a FRESH gateway `version` op. **Target deliberately 2.1.280**, the version that soaked; later releases roll into the next cycle. |
 
 ---
 
@@ -926,12 +956,14 @@ by one shared function, **`cc_ensure_updater_suppressed`** (`scripts/lib/cc_vers
   live install, `update.sh` had not run for **14 days**, which is precisely the window in
   which a drifted settings file stays silently unprotected.
 - **A non-ok outcome reaches health, not just the log** — the function sets
-  `CC_SUPPRESSION_STATE` (`ok` / `repaired` / `failed` / `contended` / `unverified`),
-  `update.sh` folds anything other than `ok` into `HOST_CC_DEGRADED` → `update_history` →
+  `CC_SUPPRESSION_STATE` (`ok` / `defaults` / `repaired` / `failed` / `contended` /
+  `unverified`; `defaults` = both keys were already correct and only set-if-absent
+  container defaults were written), `update.sh` folds anything other than `ok` or
+  `defaults` (the shared `cc_suppression_clean` predicate) into `HOST_CC_DEGRADED` → `update_history` →
   deploy health (the same channel a *version* sync failure uses), and the **service**
   (`genesis-cc-settings-align.service`, driven by the timer of the same name) exits
   non-zero so the unit enters `failed` — visible in
-  `systemctl --user status genesis-cc-settings-align.service`. `ok` and `repaired` are EARNED, never defaulted: the state starts `unverified` at
+  `systemctl --user status genesis-cc-settings-align.service`. `ok`, `defaults` and `repaired` are EARNED, never defaulted: the state starts `unverified` at
   function entry and is promoted only where a post-operation READ confirms both keys
   (the reconciler's re-read; the python3-less create's grep-back of its own literals;
   the read-only check the align timer runs even when another run holds the write
@@ -1073,6 +1105,13 @@ Claude Code cuts every MCP tool description (and server-instruction string) at
 `… [truncated]`, but everything past the cut is absent from the model's contract
 regardless.
 
+**Those logs are written by ordinary sessions, not only `--debug` ones** — MEASURED
+2026-09-25 on 2.1.280: a fresh `claude -p` with no `--debug` wrote 9 lines to its
+`mcp-logs-genesis-health` file. To verify a fix, run a fresh
+`claude -p` FROM THE REPO — another working directory does not load the repo's MCP
+servers at all — and require a non-zero count of that session's own log lines as
+the control before reading zero truncation lines as clean.
+
 **MEASURED with a control arm** (a fresh `claude -p` against this repo's real
 `.mcp.json`, asked whether a named tail sentence was present): `follow_up_create`
 (then 4,733 chars) read back **CUT**; the 211-char `module_list` read **FULL**; the
@@ -1101,11 +1140,16 @@ see.
 2. `tests/test_mcp/test_tool_description_budget.py` fails any Genesis MCP tool
    description over 2,048, so the next oversized one is caught in CI.
 
-**Not done here, deliberately:** raising the cap. `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`
-exists only from CC 2.1.280, and the pin this doc describes may predate it; a
-description that relies on it is still cut on an older CC or where the setting is
-absent. Fitting under 2,048 is the portable fix. Seeding the lever would matter
-only for third-party servers (gitnexus above), which is its own decision.
+**Raising the cap is seeded for THIRD-PARTY servers only.** Container installs get
+`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192` set-if-absent (`CC_CONTAINER_SETTINGS_DEFAULTS`
+in `scripts/lib/cc_version.sh`), so the gitnexus tools above arrive whole. To use another cap,
+edit the key in `~/.claude/settings.json` (an existing value is never overwritten). The
+`CC_MCP_DESCRIPTION_LIMIT=<n>` variable only seeds the key where it is ABSENT (a fresh install);
+once the key exists it is a no-op, and a value below CC's own 2,048 default is refused with a
+warning and 8192 used. MEASURED
+cost roughly +1,200 tokens per session. Genesis's OWN tools stay under 2,048
+regardless (`tests/test_mcp/test_tool_description_budget.py`), because a description
+that relies on the lever is still cut on an older CC or wherever the setting is absent.
 
 **Measure it the way CC does:** CC's logged lengths match the NFKC-normalized
 description, not the raw one — the pre-change `follow_up_create` logged 4,735

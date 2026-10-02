@@ -14,7 +14,9 @@
 #     cases blocked rm -rf on ANY absolute path, ANY ~/ path, and ANY
 #     .-prefixed relative (.venv, .pytest_cache): a standing false-positive
 #     cluster. USER-APPROVED POLICY (2026-08-01): deep non-protected paths
-#     (depth >= 4) are now deletable everywhere; shallow/broad targets and the
+#     (depth >= 4) are now deletable everywhere — a wildcard counts only its
+#     literal prefix, so <a>/<b>/<c>/* is depth 3 (2026-09);
+#     shallow/broad targets and the
 #     protected data dirs (genesis data/DB, transcripts, backups, snapshots,
 #     browser profiles) stay hard-blocked. If the guards are unavailable or
 #     crash, the legacy globs run instead (degraded, never open).
@@ -68,7 +70,7 @@ if [ -z "$CMD" ]; then
     exit 0
 fi
 
-# Bash allowlist gate — scoped background profiles (e.g. "steward") export
+# Bash allowlist gate — a scoped background profile exports
 # GENESIS_BASH_ALLOWLIST. The predicate itself lives in hooks/bash_allowlist_lib.sh
 # so that this global chokepoint and the hook injected into dispatched sessions
 # (hooks/bash_allowlist_guard.sh) share ONE implementation and cannot drift;

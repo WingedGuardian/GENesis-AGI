@@ -121,6 +121,7 @@ def _run(
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 HEALTH_OK=true
+MANIFEST_DELTA_PY="$(cat "{REPO / "scripts" / "lib" / "manifest_delta.py"}")"
 MANIFEST_BEFORE={json.dumps(before_json)}
 SERVER_PID_BEFORE="{pid_b}"
 _do_rollback() {{ echo "ROLLBACK-CALLED: $*"; exit 9; }}
@@ -429,3 +430,20 @@ def test_runtime_stamps_the_writing_pid(text: str) -> None:
     upstream would turn the bind into a permanent check:manifest-not-this-server."""
     cap = (REPO / "src" / "genesis" / "runtime" / "_capabilities.py").read_text()
     assert '"pid": os.getpid(),' in cap, "bootstrap manifest must record its writer's pid"
+
+
+def test_the_check_is_read_before_the_merge_and_run_from_that_copy(text: str) -> None:
+    """update.sh runs the check AFTER merging, so reading the file at call time
+    would run whatever version the merge brought in against a caller that did
+    not change: a renamed or reshaped file then reads as an interpreter failure.
+    The run must read the check once at startup, before the fetch, and execute
+    that copy."""
+    read_at = text.find('MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"')
+    fetch_at = text.find("--- Fetching latest ---")
+    assert read_at != -1, "update.sh no longer reads the check into MANIFEST_DELTA_PY"
+    assert fetch_at != -1, "the fetch marker moved; update this test"
+    assert read_at < fetch_at, "the check must be read before anything can move the tree"
+    assert 'python3 -c "$MANIFEST_DELTA_PY"' in text
+    assert "lib/manifest_delta.py\"\n" not in text.split("--- Fetching latest ---", 1)[1], (
+        "the check is executed from disk after the fetch"
+    )
