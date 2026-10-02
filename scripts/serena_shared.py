@@ -267,8 +267,8 @@ def link_resource(destination: Path, source: Path) -> None:
 
 
 def validate_main(project: Path) -> None:
-    if str(project).rstrip() != str(project):
-        raise ValueError("checkout path cannot end in whitespace")
+    if str(project).rstrip() != str(project) or str(project).endswith("\\"):
+        raise ValueError("checkout path cannot end in whitespace or a backslash")
     try:
         metadata = subprocess.check_output(
             [

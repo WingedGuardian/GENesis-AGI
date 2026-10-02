@@ -410,8 +410,8 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
     assert captured[0][-2:] == ["--project", str(old)]
 
 
-@pytest.mark.parametrize("suffix", [" ", "\t"])
-def test_trailing_checkout_whitespace_rejected_before_mutation(tmp_path, configured_paths, suffix):
+@pytest.mark.parametrize("suffix", [" ", "\t", "\\"])
+def test_unsupported_checkout_path_ending_rejected_before_mutation(tmp_path, configured_paths, suffix):
     main = checkout(tmp_path / ("main" + suffix))
     with pytest.raises(ValueError, match="end in whitespace"):
         shared.configure(main, True)

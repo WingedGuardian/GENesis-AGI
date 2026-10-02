@@ -25,7 +25,8 @@ An existing resource containing data is never silently replaced.
 `GENESIS_HOME` relocates the settings/provider-home root. Both profiles use
 native single-project mode; the Codex context retains its native name for
 OpenAI tool schemas. Dashboard and GUI surfaces are disabled. Ports 9165 and
-9166 must be free; startup also checks the actual native exposed tools and
+9166 must be free. Checkout paths ending in whitespace or a backslash are
+rejected before configuration changes. Startup also checks the actual native exposed tools and
 refuses any configuration that reintroduces project or mode switching.
 Enable/disable transitions take one per-user process lock, including preflight
 and final publication. Launchers check the running provider’s checkout before
