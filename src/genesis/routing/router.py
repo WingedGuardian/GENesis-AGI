@@ -17,6 +17,7 @@ from genesis.routing.cost_tracker import CostTracker
 from genesis.routing.daily_budget import DailyBudgetLedger
 from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.degradation import DegradationTracker
+from genesis.routing.essential import build_essential_provider_map
 from genesis.routing.rate_gate import RateGateRegistry
 from genesis.routing.retry import classify_error, compute_delay
 from genesis.routing.types import (
@@ -143,6 +144,9 @@ class Router:
 
         # Update breaker registry so get() can create breakers for new providers
         self.breakers.update_providers(new_config.providers)
+        # Which essential sites are blocked is a property of the config, so the
+        # coverage map is rebuilt with it (a no-op for a registry built without one).
+        self.breakers.refresh_essential_sites(build_essential_provider_map(new_config))
 
         # Ensure circuit breakers exist for all providers
         for name in new_config.providers:

@@ -228,6 +228,17 @@ def alert_queue_root() -> Path:
     return genesis_home() / "alerts" / "queue"
 
 
+def boundary_key_path() -> Path:
+    """Path to the per-install secret that keys content-boundary ids.
+
+    ``ContentSanitizer.wrap_content`` derives each wrap's marker id from this key
+    and the content, so the same content always wraps identically (caches and
+    duplicate checks keep working) while text inside a block cannot compute the
+    id that would close it. Created once, mode 0600, by the sanitizer.
+    """
+    return genesis_home() / "boundary_key"
+
+
 def internal_api_token_path() -> Path:
     """Path to the persistent internal API token (generated once at server boot).
 
@@ -253,6 +264,55 @@ def read_internal_api_token() -> str | None:
         return tok or None
     except OSError:
         return None
+
+
+def bearer_token(name: str) -> str:
+    """Return an operator-configured bearer token, or ``""`` when unconfigured.
+
+    THE one reader for ``GENESIS_MCP_HTTP_TOKEN`` and ``GENESIS_DESK_TOKEN``.
+    Stripped, so a quoted whitespace-only value in secrets.env counts as
+    unconfigured everywhere. That agreement is the point (#2110): three readers
+    once disagreed, and a whitespace-only value became the literal MCP HTTP
+    secret while the dashboard treated the same value as absent. A test locks
+    every other raw read of these names out of ``src/`` and ``scripts/``.
+
+    A non-ASCII value is also unconfigured: see ``ascii_bearer``.
+    """
+    return ascii_bearer(os.environ.get(name, "").strip(), name)
+
+
+_NON_ASCII_BEARER_WARNED: set[str] = set()
+
+
+def ascii_bearer(value: str, label: str) -> str:
+    """``value`` if it is ASCII, else ``""`` (unconfigured), warning once per label.
+
+    HTTP fixes no charset for header values, so a non-ASCII token has more than
+    one byte spelling (UTF-8, latin-1). Accepting several spellings lets two
+    different configured tokens match the same bytes: a desk token ``ö`` sent as
+    UTF-8 equals a broad token ``Ã¶`` sent as latin-1, which would open broad
+    routes to a desk client. With ASCII tokens there is exactly one spelling.
+    """
+    if value.isascii():
+        return value
+    if label not in _NON_ASCII_BEARER_WARNED:
+        _NON_ASCII_BEARER_WARNED.add(label)
+        logger.warning(
+            "%s contains non-ASCII characters and is ignored; bearer tokens must be ASCII",
+            label,
+        )
+    return ""
+
+
+def bearer_matches(presented: bytes, token: str) -> bool:
+    """Constant-time check that ``presented`` (the bytes after ``Bearer ``) is
+    ``token``. Configured tokens are ASCII (``ascii_bearer``), so there is one
+    byte spelling to compare; a non-ASCII token never matches."""
+    import hmac
+
+    if not token or not token.isascii():
+        return False
+    return hmac.compare_digest(presented, token.encode("ascii"))
 
 
 def memory_writebacks_off() -> bool:
@@ -493,6 +553,31 @@ def _deploy_state_is_recent(state: dict) -> bool:
     return (datetime.now(UTC) - started).total_seconds() < _UPDATE_STALE_AFTER_S
 
 
+def _marker_holder_live(pid: int) -> bool:
+    """Is `pid` a LIVE holder of a deploy signal?
+
+    ``os.kill(pid, 0)`` alone says yes for a zombie (a killed deploy its parent
+    has not reaped), which kept the watchdog from reviving a down server until
+    the parent reaped it. So: running and not a zombie. Nothing here compares
+    clocks, so a wall-clock step can never make a live holder read as stale. A
+    reused pid still reads as live; recording the holder's start tick with its
+    pid is the complete fix (a marker format change for every writer, tracked
+    separately). Where /proc cannot answer, liveness is all there is. Mirrors
+    ``_deploy_marker_holder_live`` in scripts/lib/deploy_marker.sh.
+    """
+    if pid <= 1:  # 0 and -1 address process GROUPS; 1 is init (and AsyncMock().pid)
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 2 :].split()[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return True
+
+
 def update_in_progress() -> bool:
     """True while a Genesis self-update (deploy) is actively running.
 
@@ -514,9 +599,10 @@ def update_in_progress() -> bool:
       before the file is removed) and ``started_at`` is recent.
 
     A signal counts only if its PID is > 1 (an ``AsyncMock().pid`` is 1) AND
-    still alive (``os.kill(pid, 0)``). Any dead / absent / corrupt / ``done`` /
-    expired signal is treated as "no deploy", so a stale file can never
-    permanently disable the watchdog. This check is defensive by contract: it
+    that process is a live holder of it (``_marker_holder_live``: running and not
+    a zombie). Any dead / zombie / absent / corrupt / ``done`` / expired signal
+    is treated as "no deploy", so a stale file can never permanently disable
+    the watchdog. This check is defensive by contract: it
     NEVER raises into the caller (the watchdog restart path).
     """
     try:
@@ -527,11 +613,10 @@ def update_in_progress() -> bool:
         if pid_file.exists():
             try:
                 pid = int(pid_file.read_text().strip())
-                if pid > 1:
-                    os.kill(pid, 0)
+                if pid > 1 and _marker_holder_live(pid):
                     return True
-            except (ProcessLookupError, ValueError, OSError):
-                pass  # dead / invalid PID — not an active deploy
+            except (ValueError, OSError):
+                pass  # dead / zombie / invalid PID — not an active deploy
 
         # CLI path: update.sh state file with phase + owning PID + start time.
         state_file = home / "update_state.json"
@@ -548,9 +633,9 @@ def update_in_progress() -> bool:
                 pid = state.get("pid")
                 if isinstance(pid, int) and pid > 1:
                     try:
-                        os.kill(pid, 0)
-                        return True
-                    except (ProcessLookupError, OSError):
+                        if _marker_holder_live(pid):
+                            return True
+                    except OSError:
                         pass  # owning process gone — stale state file
 
         return False
@@ -654,8 +739,11 @@ def ollama_enabled() -> bool:
     Defaults to False (cloud-primary architecture). Set GENESIS_ENABLE_OLLAMA=true
     in secrets.env or network.ollama_enabled in ~/.genesis/config/genesis.yaml.
     """
+    # Empty means unset (see embed_priority_tier): this lever decides whether
+    # the Ollama rung joins the embedding chain, and the memory MCP child drops
+    # empty secrets.env values, so "" must not mean "on" here alone.
     env_val = os.environ.get("GENESIS_ENABLE_OLLAMA")
-    if env_val is not None:
+    if env_val is not None and env_val.strip():
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
     local_val = _local_section("network").get("ollama_enabled")
     if local_val is not None:
@@ -689,8 +777,11 @@ def embed_priority_tier() -> bool:
     out — recall then degrades to the keyword-only path whenever the queue runs
     deeper than the deadline.
     """
+    # An EMPTY value is unset, not a vote: the memory MCP child drops empty
+    # secrets.env values before they reach its environment, so treating "" as
+    # an answer here would let the two processes resolve one setting apart.
     env_val = os.environ.get("GENESIS_EMBED_PRIORITY_TIER")
-    if env_val is not None:
+    if env_val is not None and env_val.strip():
         return env_val.strip().lower() not in {"0", "false", "no", "off"}
     # Via `_local_section`, which tolerates every shape a hand-edited yaml can
     # produce: the documented opt-out must not be able to break the thing it opts
@@ -699,6 +790,36 @@ def embed_priority_tier() -> bool:
     if local_val is not None:
         return _yaml_bool(local_val)
     return True
+
+
+def embed_local_first() -> bool:
+    """Whether embedding chains put the local backend (Ollama) ahead of cloud.
+
+    Defaults to FALSE: cloud leads and Ollama is the fallback rung. Local
+    embedding is inference, so on a host without a GPU every call burns CPU the
+    rest of the system needs. MEASURED 2026-09-26 through the shipped chain, 20
+    calls each: Ollama p50 2395.8ms, DeepInfra p50 207.8ms.
+
+    This is an install-local preference, not a code decision: a host with a GPU,
+    or one that wants embeddings to stay on the box, can flip it. It sets the
+    order of every chain built without an explicit ``ollama_first`` (storage and
+    recall alike). It never changes WHICH model writes; the chain stays in the
+    corpus's vector space whatever the order (see
+    ``EmbeddingProvider.build_chain``). Recall has a 4.5s deadline, so on a slow
+    host local-first recall can push recall onto its keyword-only fallback.
+
+    Set GENESIS_EMBED_LOCAL_FIRST=true in secrets.env, or
+    memory.embed_local_first: true in ~/.genesis/config/genesis.yaml. Read when a
+    chain is built, so a change takes effect on restart.
+    """
+    # Empty means unset, for the same reason as embed_priority_tier above.
+    env_val = os.environ.get("GENESIS_EMBED_LOCAL_FIRST")
+    if env_val is not None and env_val.strip():
+        return _yaml_bool(env_val)
+    local_val = _local_section("memory").get("embed_local_first")
+    if local_val is not None:
+        return _yaml_bool(local_val)
+    return False
 
 
 def build_lane_enabled() -> bool:

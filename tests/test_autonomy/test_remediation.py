@@ -158,6 +158,12 @@ class TestRegistration:
         assert any("disk_reclaim.py" in part for part in disk.command)
         assert "--if-above" in disk.command and "--fail-above" in disk.command
 
+    def test_disk_cleanup_never_clears_index_dbs(self):
+        # #2567: index deletion belongs only to the disk guardian's RED pass.
+        disk = [a for a in DEFAULT_REMEDIATIONS if a.name == "disk_cleanup"][0]
+        flag = disk.command.index("--last-resort-above")
+        assert float(disk.command[flag + 1]) > 100
+
 
 # ---------------------------------------------------------------------------
 # L2: Auto-run

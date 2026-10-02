@@ -25,6 +25,7 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,9 @@ def sandbox(tmp_path):
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
     (home / "tmp").mkdir()
+    (gd / ".venv" / "bin").mkdir(parents=True)
+    (gd / ".venv" / "bin" / "python").symlink_to(Path(sys.executable))
+    (gd / "src").symlink_to(_SCRIPTS.parent / "src", target_is_directory=True)
     subprocess.run(
         ["sqlite3", str(gd / "data" / "genesis.db"), "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
         check=True,
@@ -124,6 +128,11 @@ def sandbox(tmp_path):
     offsite.mkdir()
     bind = tmp_path / "bin"
     bind.mkdir()
+    systemctl_calls = tmp_path / "systemctl_calls.log"
+    _make_stub(
+        bind / "systemctl",
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{systemctl_calls}"\nexit 0\n',
+    )
     tg = tmp_path / "telegram_calls.log"
     return {
         "home": home,
@@ -133,6 +142,7 @@ def sandbox(tmp_path):
         "offsite": offsite,
         "clone": clone,
         "tmp": tmp_path,
+        "systemctl_calls": systemctl_calls,
     }
 
 
@@ -175,7 +185,7 @@ def _run_backup(sb, **extra):
         text=True,
         stdin=subprocess.DEVNULL,
     )
-    status_file = sb["home"] / ".genesis" / "backup_status.json"
+    status_file = Path(extra.get("GENESIS_HOME", sb["home"] / ".genesis")) / "backup_status.json"
     status = json.loads(status_file.read_text()) if status_file.exists() else None
     return proc, status
 
@@ -203,6 +213,47 @@ def test_backup_skips_when_lock_held(sandbox):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert "SKIPPED" in proc.stdout and "99999 restore" in proc.stdout, proc.stdout
     assert status is None, f"skip must not write backup_status.json: {status}"
+
+
+def test_update_backup_lock_contention_is_loud_failure(sandbox):
+    """An update-triggered backup cannot silently skip behind the DR lock."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    lock_dir = sandbox["home"] / ".genesis" / "locks"
+    lock_dir.mkdir(parents=True)
+    lock_file = lock_dir / "backup-restore.lock"
+    lock_file.write_text("99999 restore 2026-01-01T00:00:00\n")
+    with open(lock_file, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        proc, status = _run_backup(
+            sandbox,
+            GENESIS_BACKUP_TRIGGER="update",
+            GENESIS_BACKUP_RUN_ID="update-run-1",
+        )
+    assert proc.returncode != 0
+    assert status["run_id"] == "update-run-1"
+    assert status["failure_stage"] == "lock_busy"
+    assert status["db_integrity_status"] == "indeterminate"
+    assert status["sqlite_backup_verified"] is False
+
+
+def test_backup_status_proves_sqlite_artifact_for_this_run(sandbox):
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, GENESIS_BACKUP_RUN_ID="proof-run")
+    assert proc.returncode == 0, proc.stdout
+    assert status["run_id"] == "proof-run"
+    assert status["db_integrity_status"] == "healthy"
+    assert status["sqlite_backup_verified"] is True
+    assert status["failure_class"] == "none"
+
+
+def test_missing_integrity_checker_is_indeterminate_not_raw_fallback(sandbox):
+    _install_curl(sandbox, _CURL_ABSENT)
+    (sandbox["gd"] / ".venv" / "bin" / "python").unlink()
+    proc, status = _run_backup(sandbox, GENESIS_BACKUP_RUN_ID="no-checker")
+    assert proc.returncode != 0
+    assert status["db_integrity_status"] == "indeterminate"
+    assert status["failure_class"] == "db_integrity"
+    assert status["failure_stage"] == "integrity_checker_unavailable"
 
 
 def test_backup_holder_line_written(sandbox):
@@ -235,6 +286,13 @@ def test_restore_lock_timeout_names_holder(sandbox):
     status = json.loads((sandbox["home"] / ".genesis" / "restore_status.json").read_text())
     assert status["success"] is False, status
     assert any("lock" in f for f in status["failures"]), status
+
+
+def test_restore_uses_global_update_then_dr_lock_order():
+    text = _RESTORE.read_text()
+    update_lock = text.index('exec {_RESTORE_UPDATE_LOCK_FD}>"$_UPDATE_LOCK_FILE"')
+    dr_lock = text.index("dr_lock_open", update_lock)
+    assert update_lock < dr_lock
 
 
 def test_backup_gc_autodetach_disabled(sandbox):
@@ -319,11 +377,68 @@ def test_corrupt_sql_fails_and_withheld(sandbox):
         f'for a in "$@"; do [ "$a" = "-d" ] && {{ echo "gpg: decryption failed: Bad session key" >&2; exit 2; }}; done\n'
         f'exec {real_gpg} "$@"\n',
     )
+    prior = sandbox["clone"] / "data" / "genesis.sql.gpg"
+    prior.parent.mkdir(parents=True, exist_ok=True)
+    prior.write_bytes(b"last-known-good")
     proc, status = _run_backup(sandbox)
     assert status["success"] is False, status
     assert "round-trip" in status["failure_reason"], status
+    assert prior.read_bytes() == b"last-known-good"
     files = _offsite_files(sandbox)
     assert not any(f.endswith("data/genesis.sql.gpg") for f in files), files
+
+
+def test_corrupt_source_refuses_before_backup_state_changes(sandbox):
+    """A known-corrupt source never replaces local last-good or reaches NAS."""
+    _install_curl(sandbox, _CURL_HEALTHY)
+    prior = sandbox["clone"] / "data" / "genesis.sql.gpg"
+    prior.parent.mkdir(parents=True, exist_ok=True)
+    prior.write_bytes(b"last-known-good")
+    db = sandbox["gd"] / "data" / "genesis.db"
+    db.write_bytes(b"not a sqlite database")
+
+    custom_state = sandbox["home"] / "custom-genesis-home"
+    proc, status = _run_backup(sandbox, GENESIS_HOME=str(custom_state))
+
+    assert proc.returncode != 0, proc.stdout
+    assert status["success"] is False
+    assert "source integrity check failed" in status["failure_reason"]
+    assert prior.read_bytes() == b"last-known-good"
+    assert _offsite_files(sandbox) == []
+    assert (custom_state / "db_quarantine.json").exists()
+    stopped = sandbox["systemctl_calls"].read_text()
+    assert "stop genesis-server.service" in stopped
+    assert "stop genesis-bridge.service" in stopped
+
+
+def test_indeterminate_check_does_not_treat_stale_marker_as_current_corruption(sandbox):
+    """A stale marker cannot turn an inode-race result into corruption proof."""
+    db = sandbox["gd"] / "data" / "genesis.db"
+    marker = sandbox["home"] / ".genesis" / "db_quarantine.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "db_path": str(db.resolve()),
+                "st_dev": db.stat().st_dev,
+                "st_ino": db.stat().st_ino + 1,
+            }
+        )
+    )
+    python = sandbox["gd"] / ".venv" / "bin" / "python"
+    python.unlink()
+    _make_stub(
+        python,
+        f"#!/usr/bin/env bash\n"
+        'case "$*" in *"-m genesis.db.integrity check"*) '
+        'echo "UNHEALTHY: database identity changed repeatedly"; exit 2 ;; esac\n'
+        f'exec "{sys.executable}" "$@"\n',
+    )
+
+    proc, status = _run_backup(sandbox)
+
+    assert proc.returncode != 0
+    assert status["db_integrity_status"] == "indeterminate"
+    assert not sandbox["systemctl_calls"].exists()
 
 
 def test_roundtrip_error_detail_sanitized_valid_json(sandbox):
@@ -354,15 +469,14 @@ def test_roundtrip_error_detail_sanitized_valid_json(sandbox):
 # ── SF3: freshness gate ──────────────────────────────────────────────
 
 
-def test_qdrant_unreachable_is_benign(sandbox):
-    """Server unreachable (000) is NOT a failure — a fresh/bootstrapping install
-    or Qdrant-less host would otherwise page CRITICAL every 6h forever. Qdrant is
-    rebuildable from SQL, so the backup succeeds with a WARNING."""
+def test_qdrant_unreachable_is_loud_non_db_failure(sandbox):
+    """Unreachable Qdrant is rebuildable, but the incomplete backup is loud."""
     _install_curl(sandbox, _CURL_DOWN)
     proc, status = _run_backup(sandbox)
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert status["success"] is True, status
-    assert "Qdrant" not in status["failure_reason"], status
+    assert status["success"] is False, status
+    assert status["failure_class"] == "non_db"
+    assert status["failure_stage"] == "qdrant_probe"
+    assert "Qdrant unreachable" in status["failure_reason"], status
     assert "unreachable" in proc.stdout.lower(), proc.stdout
 
 
@@ -399,6 +513,55 @@ def test_fresh_qdrant_uploaded_offsite(sandbox):
     assert any(f.endswith("/COMPLETE") for f in files), files
 
 
+def test_corruption_backup_update_gate_and_database_restore_e2e(sandbox):
+    """Replay the operator path: last-good → corruption → abort → restore."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    first, first_status = _run_backup(sandbox, GENESIS_BACKUP_RUN_ID="last-good")
+    assert first.returncode == 0, first.stdout
+    assert first_status["sqlite_backup_verified"] is True
+
+    db = sandbox["gd"] / "data" / "genesis.db"
+    db.write_bytes(b"not a sqlite database")
+    failed, failed_status = _run_backup(sandbox, GENESIS_BACKUP_RUN_ID="corrupt-run")
+    assert failed.returncode != 0
+    assert failed_status["db_integrity_status"] == "corrupt"
+    assert (sandbox["home"] / ".genesis" / "db_quarantine.json").exists()
+
+    gate = subprocess.run(
+        [
+            "python3",
+            str(_SCRIPTS / "lib" / "backup_status_gate.py"),
+            str(sandbox["home"] / ".genesis" / "backup_status.json"),
+            "corrupt-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert gate.returncode == 2
+    assert gate.stdout.startswith("abort_db:")
+
+    _make_stub(
+        sandbox["bind"] / "systemctl",
+        '#!/usr/bin/env bash\ncase "$*" in *"is-active"*) exit 1 ;; *) exit 0 ;; esac\n',
+    )
+    restored = subprocess.run(
+        ["bash", str(_RESTORE), "--database-only"],
+        env=_env(sandbox),
+        capture_output=True,
+        text=True,
+        input="y\n",
+    )
+    assert restored.returncode == 0, f"{restored.stdout}\n{restored.stderr}"
+    assert not (sandbox["home"] / ".genesis" / "db_quarantine.json").exists()
+    value = subprocess.run(
+        ["sqlite3", str(db), "SELECT x FROM t;"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert value == "1"
+
+
 def test_stale_qdrant_gpg_excluded_from_offsite(sandbox):
     """A leftover .gpg from a prior run (this run's snapshot failed with the
     collection absent) is EXCLUDED from the new dated snapshot but KEPT
@@ -425,7 +588,9 @@ def test_stale_sql_excluded_from_offsite(sandbox):
     (data_dir / "genesis.sql.gpg").write_bytes(b"old-sql")
     proc, status = _run_backup(sandbox)
     assert status["success"] is False, status
-    assert "genesis.sql.gpg is stale" in proc.stdout, proc.stdout
+    assert proc.returncode != 0
+    assert "source database not found" in proc.stdout, proc.stdout
+    assert (data_dir / "genesis.sql.gpg").read_bytes() == b"old-sql"
     files = _offsite_files(sandbox)
     assert not any(f.endswith("data/genesis.sql.gpg") for f in files), files
 

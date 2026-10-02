@@ -93,6 +93,15 @@ def _reference_concept_hits(targets: list[str]) -> list[str]:
     if not db_path.exists():
         return []
 
+    # Admission fence (fail-closed): advisory read — silence when fenced.
+    try:
+        from db_admission_check import database_is_fenced
+
+        if database_is_fenced(db_path):
+            return []
+    except Exception:
+        return []
+
     concepts: list[str] = []
     try:
         # mode=ro is WAL-aware read-only (immutable=1 would miss un-checkpointed

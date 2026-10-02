@@ -690,6 +690,54 @@ async def test_self_send_skipped_on_gate_cleared_resume(
     adapter.send_message.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_a_post_send_history_failure_does_not_escape_deliver(
+    config, db, mock_drafter, mock_formatter, monkeypatch
+):
+    """The send is IRREVERSIBLE; everything after it must be too.
+
+    A raise from the history writes propagates to the alert queue's drain,
+    which keeps the entry and resends — one alert, two pages, the class issue
+    #1781 was — and dedup cannot suppress the retry because it requires the
+    delivered_at row that this very failure did not write. Every OTHER
+    post-send hook in the block is wrapped with a comment saying a post-send
+    raise must never escape; the two writes that matter most were the two that
+    were not.
+    """
+    from genesis.outreach import pipeline as pipeline_mod
+
+    async def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(pipeline_mod.outreach_crud, "create", boom)
+
+    adapter = _email_adapter("genesis@example.com")  # the agent's OWN address
+    adapter.send_message = AsyncMock(return_value="msg-1")
+    pipeline = OutreachPipeline(
+        governance=GovernanceGate(config, db),
+        drafter=mock_drafter, formatter=mock_formatter,
+        channels={"email": adapter}, db=db, config=config,
+        recipients={"email": "ops@example.com"},
+    )
+    request = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="t", context="c",
+        salience_score=0.5, signal_type="x", channel="email",
+        validated_recipient="ops@example.com",
+    )
+    formatted = FormattedContent(
+        text="hi", target=FormatTarget.EMAIL, truncated=False, original_length=2,
+    )
+
+    result = await pipeline._deliver(
+        "oid-post-send", "email", formatted, request, None, gate_cleared=True,
+    )
+
+    # The message went out and the caller is told so; the failed bookkeeping
+    # is an ERROR line, not a status change and not an exception.
+    assert result.status == OutreachStatus.DELIVERED
+    adapter.send_message.assert_awaited_once()
+
+
 # ── verbatim (factual notifications skip the LLM drafter) ──────────────────
 
 
@@ -1175,6 +1223,45 @@ async def test_inflight_awaited_released_after_timeout_allows_retry(config):
     _r2, reply2 = await pipeline.submit_raw_and_wait("txt", req, timeout_s=0.05)
     assert reply2 is None
     pipeline.submit_raw.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_defer_retry_false_suppresses_the_deferral(config, db, mock_drafter, mock_formatter):
+    """A caller with its own durable retry opts out of the pipeline's deferral.
+
+    The alert-queue drain and the recovery worker's re-submissions both set
+    defer_retry=False; without the gate the pipeline enqueued a SECOND retrier
+    for a delivery someone already owned, and each success was the other's
+    duplicate (issue #1781, measured double-page 2026-09-05).
+    """
+    failing_channel = AsyncMock()
+    failing_channel.send_message.side_effect = ConnectionError("Network down")
+    mock_deferred = AsyncMock()
+    mock_deferred.has_open = AsyncMock(return_value=False)
+
+    gate = GovernanceGate(config, db)
+    pipeline = OutreachPipeline(
+        governance=gate,
+        drafter=mock_drafter,
+        formatter=mock_formatter,
+        channels={"telegram": failing_channel},
+        deferred_queue=mock_deferred,
+        db=db,
+        config=config,
+        recipients={"telegram": "12345"},
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.SURPLUS,
+        topic="Defer test",
+        context="Will fail delivery; caller owns the retry",
+        salience_score=0.9,
+        signal_type="queued_alert",
+        defer_retry=False,
+    )
+    result = await pipeline.submit(req)
+    assert result.status == OutreachStatus.FAILED
+    mock_deferred.enqueue.assert_not_called()
+    mock_deferred.has_open.assert_not_awaited()  # gate sits ABOVE the dedup probe
 
 
 @pytest.mark.asyncio

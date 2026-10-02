@@ -9,7 +9,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A relative entrypoint puts CDPATH in play, and CDPATH is not merely noise here:
+# `cd` SEARCHES it, so this capture could both collect an extra echoed line and
+# resolve into a DIFFERENT checkout entirely. Clear CDPATH inside the
+# substitution — remove the cause rather than the symptom. stderr stays visible
+# so a genuine cd failure still speaks.
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # HOME may be unset in some container environments; derive from passwd (uid,
@@ -40,7 +45,10 @@ if [ -f "$UPDATE_STATE" ]; then
     STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
     STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
 
-    # Check if the update process is still alive
+    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
+    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
+    # zombie or reused pid: the "dead" branch below resets the tree, so here a
+    # stale holder must err toward "still running", never toward the reset.
     if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
         echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
     elif [ "$STATE_PHASE" = "done" ]; then
@@ -71,11 +79,13 @@ if [ -f "$UPDATE_STATE" ]; then
         echo "  Recording crash recovery in update_history..."
         DB_PATH="$GENESIS_ROOT/data/genesis.db"
         if [ -f "$DB_PATH" ]; then
-            python3 -c "
+            PYTHONPATH="$GENESIS_ROOT/src" python3 -c "
 import sqlite3, uuid, json
 from datetime import datetime, timezone
+from genesis.db.integrity import assert_not_quarantined
 state = json.load(open('$UPDATE_STATE'))
 try:
+    assert_not_quarantined('$DB_PATH')
     con = sqlite3.connect('$DB_PATH', timeout=5)
     con.execute(
         'INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, status, '
@@ -323,15 +333,14 @@ if [ -f "$_cc_env" ]; then
     # not swallow the suppression outcome — this was the one caller with no
     # signal at all: `|| true` discarded the return code AND nothing read the
     # state, so bootstrap completed cleanly over a failed suppression check.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "  WARNING: CC auto-updater suppression not verified" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
-                 "the pin; the daily genesis-cc-settings-align timer will retry" \
-                 "and its unit goes red if it cannot"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list of
+    # good states: a reader that did not know a new state would warn falsely.
+    if ! cc_suppression_verified; then
+        echo "  WARNING: CC auto-updater suppression not verified" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+             "the pin; the daily genesis-cc-settings-align timer will retry" \
+             "and its unit goes red if it cannot"
+    fi
     cc_shadow_scan || true
 fi
 
@@ -730,7 +739,7 @@ else
 fi
 if [[ -n "$HOOKS_DST" ]]; then
     # Phase 6: prefer sync-hooks.sh if available — it handles the
-    # full set (pre-commit, pre-push, post-commit) + helper scripts
+    # full set (HOOKS_TO_SYNC in sync-hooks.sh) + helper scripts
     # (emit_bugfix_audit.py) + version tracking via
     # .genesis-hook-versions. Legacy loop remains as a fallback for
     # very old installs that don't have sync-hooks.sh yet.
@@ -738,7 +747,7 @@ if [[ -n "$HOOKS_DST" ]]; then
         "$HOOKS_SRC/sync-hooks.sh" --quiet || echo "  WARNING: sync-hooks.sh exited non-zero (may be user-modified — leaving alone)"
         echo "  + hooks synced via sync-hooks.sh"
     else
-        for hook in pre-commit pre-push; do
+        for hook in pre-commit pre-push pre-merge-commit; do
             if [[ -f "$HOOKS_SRC/$hook" ]]; then
                 cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
                 chmod +x "$HOOKS_DST/$hook"
@@ -785,6 +794,15 @@ if command -v serena &>/dev/null; then
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
     ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
 fi
+# grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
+# Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
+# Genesis owns is one whose entries it can safely heal, and it leaves an
+# operator's own `grep` server alone.
+# No API key and no local binary: it is a REMOTE server, so there is nothing to
+# gate on `command -v`. User scope so it reaches worktree sessions too, which is
+# where most work here happens; project scope would cover only the main tree.
+# Registering does not start anything and costs nothing when unused.
+_register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 echo
 
 # --- Code Intelligence Indexing ---
@@ -866,14 +884,18 @@ CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
-# Watchgod config — 500MB budget, 150MB sacred ground
+# Watchgod config. The watchgod (scripts/tmp_watchgod.sh) guards whole
+# filesystems and measures cc-tmp's real capacity itself — statvfs plus the
+# btrfs quota on the volume — so the only thing it needs from here is where
+# cc-tmp lives. The v1 keys this block used to write (a 500 MB budget, a
+# "sacred ground", a hand-propagated volume capacity) are gone with the budget
+# they served. Install-local overrides — observe mode, thresholds, extra
+# watched paths — belong in watchgod.local.conf, which nothing regenerates.
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
 WEOF
-echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "  CC temp: ${CC_TMP_DIR}"
 
 echo "  ~/.genesis/ initialized"
 echo
@@ -963,22 +985,33 @@ read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
 # SSH or closed browser tab just detaches the session — reattach with
 # `tmux attach -t cc-N`. Opt out: GENESIS_NO_TMUX_WRAP=1.
 claude() {
-    local arg
+    local arg genesis_root=__GENESIS_ROOT__
     for arg in "$@"; do
         case "$arg" in
             -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
         esac
     done
     if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
-        && [ -x "$HOME/genesis/scripts/cc-slot.sh" ] \
+        && [ -x "$genesis_root/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
-        "$HOME/genesis/scripts/cc-slot.sh" manual "$@"
+        "$genesis_root/scripts/cc-slot.sh" manual "$@"
     else
         command claude "$@"
     fi
 }
 # <<< genesis tmux-wrap <<<
 WRAPEOF
+_tmux_wrap_root=$(printf '%q' "$GENESIS_ROOT")
+_tmux_wrap_patsub_replacement_was_set=0
+if shopt -q patsub_replacement 2>/dev/null; then
+    _tmux_wrap_patsub_replacement_was_set=1
+    shopt -u patsub_replacement
+fi
+TMUX_WRAP_BLOCK="${TMUX_WRAP_BLOCK//__GENESIS_ROOT__/${_tmux_wrap_root}}"
+if [ "$_tmux_wrap_patsub_replacement_was_set" -eq 1 ]; then
+    shopt -s patsub_replacement
+fi
+unset _tmux_wrap_root _tmux_wrap_patsub_replacement_was_set
 touch "$BASHRC"
 if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
     # Replace the existing block in place (idempotent update path). Capture the
@@ -1084,7 +1117,7 @@ else
 fi
 echo
 
-# --- Network resilience (KeepConfiguration + networkd watchdog) ---
+# --- Network resilience (KeepConfiguration + networkd and Tailscale watchdogs) ---
 # Same guarded-source contract as memory resilience: a partial checkout without
 # the lib degrades to a warning, never aborts bootstrap under set -e.
 if [[ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]]; then
@@ -1159,6 +1192,15 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
         _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
         _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
+        # Every token any template uses must appear here, and `sed` will NOT
+        # tell you when one is missing — an unknown `__TOKEN__` passes through
+        # verbatim into a unit that then installs and enables reporting success.
+        # __AZ_ROOT__ is the instance that proves it: install.sh gained the
+        # expression, this loop never did, and agent-zero.service rendered here
+        # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
+        # install). Parity with install.sh is pinned by
+        # tests/test_scripts/test_systemd_template_placeholders.py.
+        _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
         # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
         # source of truth for the pin); the literal fallback keeps the render
         # working when that lib is absent, in which case the unit is inert
@@ -1169,8 +1211,10 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                        -e "s|__VENV__|$_venv_esc|g" \
                        -e "s|__REPO_DIR__|$_repo_esc|g" \
                        -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
+                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                        -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
                        -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
+
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

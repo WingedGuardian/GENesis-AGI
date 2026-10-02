@@ -155,13 +155,15 @@ class TestBootstrap:
              patch("genesis.runtime.GenesisRuntime._init_db", new_callable=AsyncMock) as mock_init_db, \
              patch("genesis.runtime.GenesisRuntime._init_observability"), \
              patch("genesis.runtime.GenesisRuntime._init_providers"), \
-             patch("genesis.runtime.GenesisRuntime._init_awareness", new_callable=AsyncMock) as mock_awareness:
+             patch("genesis.runtime.GenesisRuntime._init_awareness", new_callable=AsyncMock) as mock_awareness, \
+             patch("genesis.runtime._core.write_bootstrap_manifest_file") as write_manifest:
             # _init_db doesn't set _db → stays None → bootstrap returns early
             mock_init_db.side_effect = AsyncMock(return_value=None)
 
             await rt.bootstrap()
             assert rt.is_bootstrapped is False
             mock_awareness.assert_not_called()
+            write_manifest.assert_called_once_with(rt)
 
     @pytest.mark.asyncio
     async def test_bootstrap_graceful_qdrant_failure(self):

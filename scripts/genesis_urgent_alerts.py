@@ -44,6 +44,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from hook_input import session_path  # noqa: E402
 from hook_output import BoundedStdout  # noqa: E402
 
+
+def _db_is_fenced(db_path) -> bool:
+    """Admission fence, fail-closed: unknown state reads as fenced."""
+    try:
+        from db_admission_check import database_is_fenced
+
+        return database_is_fenced(db_path)
+    except Exception:
+        return True
+
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
 _SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
@@ -258,7 +268,7 @@ def _emit_charter_tag(session_id: str) -> None:
     try:
         root = os.environ.get("GENESIS_REPO_ROOT", "")
         db = (Path(root) if root else Path.home() / "genesis") / "data" / "genesis.db"
-        if not db.exists():
+        if not db.exists() or _db_is_fenced(db):
             return
         conn = sqlite3.connect(_ro_uri(db), uri=True, timeout=0.5)
         try:
@@ -419,7 +429,7 @@ def _last_successful_deploy(db_path: Path) -> tuple[str, str] | None:
     Mirrors ``db.crud.update_history.last_successful_update`` exactly (same
     ``status='success'`` filter + ``datetime(completed_at)`` ordering) but
     stdlib-only so the hook never imports aiosqlite. None on any failure."""
-    if not db_path.exists():
+    if not db_path.exists() or _db_is_fenced(db_path):
         return None
     try:
         conn = sqlite3.connect(_ro_uri(db_path), uri=True, timeout=0.5)

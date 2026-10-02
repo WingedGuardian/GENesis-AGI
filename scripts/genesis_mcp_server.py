@@ -270,7 +270,22 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
                 create_standalone_router()
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
-            embedding = EmbeddingProvider()
+            # Split providers, mirroring runtime/init/memory.py: writes on the
+            # ordinary rate tier, recall on the priority tier the operator
+            # lever selects. One shared provider would put memory_recall /
+            # knowledge_recall on the ordinary tier, whose documented queue
+            # under load (8.6-13.3s) then becomes interactive recall latency.
+            # Both chains come from build_chain, so they share one vector space.
+            from genesis.env import embed_priority_tier
+
+            storage_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(),
+            )
+            recall_embedding = EmbeddingProvider(
+                backends=EmbeddingProvider.build_chain(
+                    priority_tier=embed_priority_tier(),
+                ),
+            )
             # The activity tracker enables InstrumentationMiddleware, which also
             # runs the per-call commit/rollback boundary that releases read
             # snapshots (WS-15 follow-up). Without a tracker the middleware — and
@@ -281,7 +296,9 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             # memory_recall / knowledge_recall rerank here exactly as in the
             # full runtime. Degrades to a no-op without API_KEY_VOYAGE.
             reranker = VoyageReranker()
-            init(db=db, qdrant_client=qdrant, embedding_provider=embedding,
+            init(db=db, qdrant_client=qdrant,
+                 storage_embedding_provider=storage_embedding,
+                 recall_embedding_provider=recall_embedding,
                  activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
             clear_mcp_crash("memory")
             yield
@@ -456,13 +473,116 @@ def _run_mcp(mcp_instance, transport_kwargs: dict) -> None:
     For HTTP with auth: injects a raw ASGI auth wrapper via FastMCP's
     middleware parameter, then delegates to mcp.run() so lifespan
     handling works correctly.
+
+    Also suppresses FastMCP's docket task-queue worker — see
+    ``_suppress_docket_worker``. This is the single chokepoint every
+    bootstrapper routes through, which is why the suppression lives here
+    rather than in each of the five.
     """
     auth_token = transport_kwargs.pop("_auth_token", None)
 
     if auth_token and transport_kwargs["transport"] != "stdio":
         transport_kwargs["middleware"] = [_bearer_auth_middleware(auth_token)]
 
+    _suppress_docket_worker(mcp_instance)
+
     mcp_instance.run(**transport_kwargs)
+
+
+def _suppress_docket_worker(mcp_instance) -> None:
+    """Stop FastMCP starting a docket task-queue worker we never use.
+
+    MEASURED 2026-09-24: 41 idle MCP server processes burned 1.37 CPU cores
+    CONTINUOUSLY, uniformly across all five server types. None of it was
+    Genesis code. fastmcp 2.14.6 enters ``_docket_lifespan`` as a sibling of the
+    user lifespan (server.py:572-575), builds ``Docket(url="memory://")`` and
+    runs ``worker.run_forever()`` (server.py:476). ``memory://`` is fakeredis,
+    whose pubsub read is a literal ``await asyncio.sleep(0.01)`` loop that its
+    own comment calls a "kludge" (fakeredis/aioredis.py:143-154) — a 100 Hz spin
+    for a queue that is always empty.
+
+    Always empty because Genesis registers NOTHING with it: we never pass
+    ``tasks=`` to ``FastMCP``, so every tool resolves to ``mode="forbidden"`` and
+    fastmcp's own registration loop skips all of them (server.py:418-423).
+    Suppressing the worker therefore removes no capability — a claim pinned by
+    ``tests/test_mcp/test_docket_worker_suppressed.py``, which fails if any tool
+    ever opts in.
+
+    ``_is_mounted`` is the attribute fastmcp's own ``mount()`` sets for exactly
+    this purpose (server.py:2714), and server.py:403 is its only read. Upstream
+    reached the same conclusion: prefecthq/fastmcp#2887 closed with the
+    maintainer noting docket "has been removed as a default in 3.0". This is a
+    backport of that decision.
+
+    ⚠ It is a PRIVATE attribute. **Delete this function and its tests when
+    Genesis moves to fastmcp 3.x/4.x** — the pin exists so a version bump that
+    renames or removes the gate fails loudly in tests instead of silently
+    restoring ~1.4 cores of idle burn.
+
+    One reachable protocol delta, stated so nobody re-derives it: the three
+    ``tasks/*`` LOOKUP handlers (``fastmcp/server/tasks/protocol.py:70,171,304``)
+    return ``INTERNAL_ERROR "Background tasks require Docket"`` instead of
+    ``INVALID_PARAMS "Task <id> not found"`` for a bogus taskId. No task can ever
+    exist — ``server.py:715`` raises METHOD_NOT_FOUND for a ``forbidden`` tool
+    before docket is consulted — so nothing reachable changes. The initialize
+    handshake is byte-identical (``get_task_capabilities`` is unconditional).
+
+    Best-effort by design: a failure here costs CPU, never correctness, so it
+    must never stop a server booting.
+
+    **Why a pre-state check and not a try/except.** ``FastMCP`` defines no
+    ``__slots__``, so ``obj._is_mounted = True`` SUCCEEDS on a version that
+    renamed or removed the attribute — it just creates a dead one nobody reads.
+    A ``try/except`` there guards the failure that cannot happen and misses the
+    one that will: the burn would return silently, on every install, with no
+    exception and no log line. Checking that the attribute EXISTS FIRST is what
+    makes version drift loud at runtime rather than only in CI.
+    """
+    sentinel = object()
+    if getattr(mcp_instance, "_is_mounted", sentinel) is sentinel:
+        logger.warning(
+            "fastmcp (%s) no longer exposes _is_mounted; the docket-worker "
+            "suppression is INERT and every MCP server will idle-spin at ~4%% "
+            "of a CPU core (see tests/test_mcp/test_docket_worker_suppressed.py "
+            "and _suppress_docket_worker's docstring)",
+            _fastmcp_version(),
+        )
+        return
+
+    mcp_instance._is_mounted = True
+
+
+def _fastmcp_version() -> str:
+    """fastmcp's version, for the drift warning. Never raises."""
+    try:
+        import fastmcp
+
+        return getattr(fastmcp, "__version__", "unknown")
+    except Exception:  # noqa: BLE001 — a diagnostic must not break startup
+        return "unknown"
+
+
+def _resolve_http_auth_token(cli_token: str | None) -> str:
+    """The HTTP transport's bearer token: ``--auth-token`` if given, else the env.
+
+    Both are stripped, so a whitespace-only value is unconfigured here exactly as
+    it is on the dashboard's /v1 routes (#2110). Before this, a quoted "   " in
+    secrets.env became the literal MCP secret while the dashboard read the same
+    value as absent.
+
+    Reads ONLY ``GENESIS_MCP_HTTP_TOKEN``. The desk-scoped token must never reach
+    this transport, which exposes the full MCP tool surface (#2442). A non-ASCII
+    token is unconfigured here too (``genesis.env.ascii_bearer``).
+    """
+    from genesis.env import ascii_bearer, bearer_token
+
+    cli = (cli_token or "").strip()
+    if cli:
+        # An explicit override is never replaced by the environment token: an
+        # invalid one leaves the transport unconfigured, so startup refuses,
+        # rather than quietly accepting a credential the operator meant to replace.
+        return ascii_bearer(cli, "--auth-token")
+    return bearer_token("GENESIS_MCP_HTTP_TOKEN")
 
 
 def _bearer_auth_middleware(expected_token: str):
@@ -472,10 +592,11 @@ def _bearer_auth_middleware(expected_token: str):
     streaming responses pass through without buffering (unlike
     BaseHTTPMiddleware which breaks text/event-stream).
     """
-    import hmac
     import json as _json
 
     from starlette.middleware import Middleware
+
+    from genesis.env import bearer_matches
 
     _token = expected_token
 
@@ -487,9 +608,12 @@ def _bearer_auth_middleware(expected_token: str):
             if scope["type"] not in ("http", "websocket"):
                 return await self.app(scope, receive, send)
 
+            # Compare BYTES, never decoded str: a strict decode raises on
+            # non-UTF-8 header bytes, and compare_digest raises on non-ASCII
+            # str, so either turned a bad credential into a 500 (#2467).
             headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], _token):
+            auth = headers.get(b"authorization", b"")
+            if auth.startswith(b"Bearer ") and bearer_matches(auth[7:], _token):
                 return await self.app(scope, receive, send)
 
             if scope["type"] == "http":
@@ -537,6 +661,11 @@ def main(argv: list[str] | None = None) -> None:
         "API_KEY_DEEPSEEK",
         # Ollama config
         "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
+        # Embedding chain levers read when the memory child builds its chains
+        # (env.embed_local_first / env.embed_priority_tier). Absent here, a value
+        # set only in secrets.env is dropped and the child disagrees with the
+        # main runtime about the order and the recall tier.
+        "GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER",
         # HTTP transport auth
         "GENESIS_MCP_HTTP_TOKEN",
         # Discord bot (used by discord-bot MCP server)
@@ -590,7 +719,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # HTTP transport: validate auth token is configured
     if args.transport == "streamable-http":
-        token = args.auth_token or os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
+        token = _resolve_http_auth_token(args.auth_token)
         if not token:
             logger.error(
                 "HTTP transport requires auth token. Set GENESIS_MCP_HTTP_TOKEN "

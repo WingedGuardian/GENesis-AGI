@@ -114,12 +114,14 @@ models:
 #
 #     moonshot:      anthropic_base_url: "https://api.moonshot.cn/anthropic"
 #     minimax:       anthropic_base_url: "https://api.minimaxi.com/anthropic"
-#     deepseek:      anthropic_base_url: "https://api.deepseek.com/anthropic"
 #
-# Kimi Code is the one exception to "not verified": it was gauntlet-validated
-# 2026-08-27. It is still an EXAMPLE and not a shipped peer, for this file's own
-# reason — its `model_id` is tier-dependent, which is the stale-pinned-id
-# failure above with an extra way to go wrong. `kimi-for-coding` (256K) is the
+# TWO providers below are exceptions to "not verified" — Kimi Code and DeepSeek,
+# each gauntlet-validated on the install it was written against. Both are still
+# EXAMPLES and not shipped peers, for this file's own stale-pinned-id reason.
+#
+# Kimi Code was gauntlet-validated 2026-08-27, and its own extra hazard is a
+# tier-dependent `model_id` — the stale-pinned-id failure above with one more
+# way to go wrong. `kimi-for-coding` (256K) is the
 # entry tier; the larger k3 ids need a higher one. Set it from what YOUR account
 # exposes, and note that this endpoint bills a subscription quota rather than
 # per-token, which makes it a fallback for a rate-limited primary rather than a
@@ -138,7 +140,50 @@ models:
 # with an edit, because the tier decides the id: if your account exposes a
 # different one, change the KEY AND the `model_id` together, never just one.
 #
+# DeepSeek is the second exception (gauntlet-validated 3/3, 2026-09-19), and it
+# is written up here for a COST trap the other providers do not have. Endpoint
+# and model ids are from the vendor's own reference (api-docs.deepseek.com,
+# "Using the Anthropic API" and "Your First API Call", read 2026-09-19):
+#
+#     "deepseek-flash[1m]":
+#       anthropic_base_url: "https://api.deepseek.com/anthropic"
+#       auth_env: DEEPSEEK_CODING_API_KEY
+#       model_id: "deepseek-flash[1m]"
+#       failover_order: 2
+#
+# This endpoint bills PER TOKEN, so a peer here is a fallback for a rate-limited
+# primary, never a cheaper one — and unlike the subscription-quota case above,
+# the bill is a function of how much the failover actually runs.
+#
+# TWO VENDOR BEHAVIOURS MAKE THAT BILL EASY TO GET WRONG, and both are silent:
+#   1. An unsupported model name is MAPPED to `deepseek-flash` rather than
+#      rejected. So a typo'd `model_id` never errors — a 200 is not evidence
+#      that the id you wrote exists, which is exactly the check most people
+#      think they just performed.
+#   2. A model name beginning `claude-opus` is mapped to `deepseek-v4-pro` and
+#      BILLED AT THE PRO PRICE (`claude-haiku`/`claude-sonnet` map to
+#      `deepseek-flash`). The vendor's own quickstart configures two variables,
+#      `ANTHROPIC_BASE_URL` and the key — which leaves `ANTHROPIC_DEFAULT_OPUS_MODEL`
+#      holding a Claude id, so Claude Code's opus-tier calls quietly bill at the
+#      Pro rate while every other tier bills at Flash.
+#
+# The roster closes (2) by construction rather than by remembering it:
+# `apply_routing_env` sets EVERY slot in `_ROSTER_MODEL_ENV_VARS` — including
+# the opus, fable and sub-agent slots — to the peer's own `model_id`, so no
+# Claude id survives in the child env to be mapped. That is worth knowing if you
+# ever hand-roll this outside the roster.
+#
 # Prove a peer before you depend on it: `gmodel --print-env <name>` to check the
 # env resolves, then `genesis eval gauntlet -m <name>` to confirm it can
 # actually drive a coding fix-loop. Record the date in `validated:` yourself.
+#
+# ONE THING THAT RUN WILL LIE TO YOU ABOUT: its reported `cost_usd` is not the
+# peer's bill. The invoker takes that figure verbatim from Claude Code's own
+# `total_cost_usd`, which CC computes from its Anthropic price table and cannot
+# know a third-party provider's rates — so the number is real arithmetic over
+# the right token counts at the wrong prices, which is exactly the kind of wrong
+# that reads as authoritative. MEASURED on one gauntlet run against a per-token
+# peer: CC reported $1.1981 where the provider's dashboard billed about $0.05.
+# The direction depends on the peer, so do not treat 24x as a correction factor.
+# Read peer spend from the provider, never from `eval_results`.
 # ─────────────────────────────────────────────────────────────────────────────

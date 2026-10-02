@@ -508,6 +508,15 @@ class GuardianWatchdog:
         db_path = genesis_db_path()
         if not db_path.exists():
             return None
+        # Admission fence: timer-driven (genesis-watchdog.timer), so no human
+        # is present, and this opens read-WRITE. None is already this
+        # function's documented "no deploy baseline" answer, and the caller
+        # skips the drift check rather than falling back to HEAD — which is
+        # exactly the right behaviour against a quarantined database.
+        from genesis.db.admission import database_is_fenced
+
+        if database_is_fenced(db_path):
+            return None
         try:
             async with aiosqlite.connect(str(db_path)) as db:
                 await db.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")

@@ -17,6 +17,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 INSTALL = REPO_ROOT / "scripts" / "install.sh"
@@ -600,3 +602,70 @@ def test_b9_callers_render_a_digest_mismatch_distinctly(tmp_path):
                 f"{script.name}: a wrong pin renders identically to outcome {other} "
                 f"— {rendered['3']!r}"
             )
+
+
+# ── CDPATH: `cd` SEARCHES it, and echoes what it resolves ────────────
+#
+# With CDPATH exported and a RELATIVE entrypoint, `cd` searches CDPATH for the
+# directory, so a `$(cd … && pwd)` capture can (a) collect an extra echoed line
+# and (b) resolve into a DIFFERENT checkout entirely. (b) is the dangerous one:
+# silencing the echo alone turns a loud failure into a silently wrong root. The
+# fix is to clear CDPATH inside the capture — and only running the shipped line
+# proves it is still there. Two arms, because the benign one cannot see (b):
+#   local — CDPATH=".": the directory is found locally; only the echo can bite.
+#   decoy — CDPATH=<other checkout>: a decoy holding the same relative path must
+#           NOT win. Without the CDPATH clear, the capture resolves there.
+
+_CD_CAPTURES = [
+    # (script, the variable the capture assigns, lines that must run first)
+    ("bootstrap.sh", "SCRIPT_DIR", ""),
+    ("cc-slot.sh", "_CC_SLOT_DIR", '_CC_SLOT_SCRIPT="${BASH_SOURCE[0]}"'),
+]
+
+
+@pytest.mark.parametrize("hostile", [False, True], ids=["local-cdpath", "decoy-cdpath"])
+@pytest.mark.parametrize(("script", "var", "prelude"), _CD_CAPTURES)
+def test_root_resolution_survives_cdpath(script, var, prelude, hostile, tmp_path):
+    text = (REPO_ROOT / "scripts" / script).read_text()
+    # The UNINDENTED assignment: cc-slot.sh has a second copy inside its symlink
+    # loop, and this is the one that runs on every invocation. Matched on shape
+    # (an unindented `var="$(… cd …)"`) rather than on the current spelling, so a
+    # different CDPATH remedy does not read as "capture not found".
+    pattern = re.compile(rf'^{var}="\$\(.*\bcd\b.*\)"$')
+    line = next(
+        (
+            ln.strip()
+            for ln in text.splitlines()
+            if not ln.startswith((" ", "\t")) and pattern.match(ln.strip())
+        ),
+        None,
+    )
+    assert line, f"no unconditional {var} capture found in {script}"
+
+    checkout = tmp_path / "checkout"
+    entry = checkout / "scripts" / script
+    entry.parent.mkdir(parents=True)
+    entry.write_text(f'set -u\n{prelude}\n{line}\nprintf %s "${{{var}}}"\n')
+
+    if hostile:
+        decoy = tmp_path / "decoy"
+        (decoy / "scripts").mkdir(parents=True)
+        cdpath = str(decoy)
+    else:
+        cdpath = "."
+
+    proc = subprocess.run(
+        ["bash", f"scripts/{script}"],  # relative, so CDPATH is consulted
+        cwd=str(checkout),
+        env={"PATH": "/usr/bin:/bin", "CDPATH": cdpath, "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    expected = str(entry.parent.resolve())
+    assert "\n" not in proc.stdout, (
+        f"{script}: the capture holds more than one line — {proc.stdout!r}"
+    )
+    assert proc.stdout == expected, (
+        f"{script}: resolved {proc.stdout!r}, expected {expected!r} (CDPATH={cdpath})"
+    )

@@ -27,7 +27,7 @@ def text() -> str:
 
 
 def test_flock_guard_present(text: str) -> None:
-    assert 'UPDATE_LOCK_FILE="$HOME/.genesis/locks/update.lock"' in text
+    assert 'UPDATE_LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"' in text
     assert 'exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"' in text
     assert 'flock -n "$_UPDATE_LOCK_FD"' in text
 
@@ -46,7 +46,9 @@ def test_flock_after_worktree_refusal_before_backup(text: str) -> None:
     """Placement: after the worktree refusal (so worktree runs never take the
     lock) and before the rollback tag / pre-update backup (so the whole mutating
     run is protected) — and thus before the ERR/signal traps arm."""
-    worktree = text.find("update.sh must not run from a worktree")
+    # The worktree refusal is the shared lib's check (scripts/lib/deploy_checkout.sh);
+    # its call site is what must precede the lock.
+    worktree = text.find('genesis_is_primary_checkout "$GENESIS_ROOT"')
     lock = text.find('exec {_UPDATE_LOCK_FD}>"$UPDATE_LOCK_FILE"')
     rollback_tag = text.find('ROLLBACK_TAG="pre-update-')
     trap_arm = text.find("trap _on_err ERR")

@@ -14,6 +14,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -42,6 +43,41 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
         pass
     os._exit(2)
 
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): native approval helper is "
+            "incompatible; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
+try:
+    from review_deadline import (  # noqa: E402
+        Deadline,
+        DeadlineExpired,
+        bounded_timeout,
+        propagate_deadline_timeout,
+    )
+except Exception as _deadline_exc:  # noqa: BLE001 — a broken deadline can fail open.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (review_enforcement_commit): deadline helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
 # DEGRADED-path mention set, defined ABOVE the guarded import so it survives that
 # import failing. Same single verb as `_COMMIT_PATTERN` further down; kept separate
 # because sharing would put the constant after the import it has to outlive. The
@@ -53,9 +89,12 @@ try:
     from shell_parse import (  # noqa: E402
         analyze_checked,
         commit_skips_hooks,
+        gh_pr_subcommand,
         git_subcommand,
         has_trailing_override,
+        mentions,
         split_segments,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__":
@@ -94,6 +133,21 @@ _CWD_UNKNOWN = object()
 # detect the same set of commits or the marker cleared drifts from the one
 # checked. Guarded by test_commit_pattern_matches_git_dash_c_and_dash_C.
 _COMMIT_PATTERN = re.compile(r"\bcommit\b")
+_GIT_WORD = re.compile(r"\bgit\b")
+
+#: A git command whose SUBCOMMAND the parse cannot read: a variable, a
+#: substitution or an escape stands where it goes, or an option before it that
+#: the parser cannot classify. It may be a commit, and nothing in its text says
+#: so, which is why the early exit below cannot be what lets it through. The
+#: push guard refuses the same shape for the same reason.
+_HIDDEN_GIT_VERB_MSG = (
+    "BLOCKED: this command runs git with a subcommand review enforcement cannot "
+    "read (a variable, a substitution or an escape stands where it goes, or an "
+    "option before it that the parser cannot classify), so it cannot tell "
+    "whether it commits.\n"
+    "To proceed: write the git subcommand out literally, and pass any option "
+    "the parser does not recognise after it or not at all."
+)
 
 
 def _commit_override(command: str, segs: list) -> str:
@@ -366,7 +420,7 @@ def _effective_diff_cwd(command: str, payload: dict, segs: list, commit_seg=None
     return _existing_dir_or_unknown(cur)
 
 
-def _staged_files(cwd: str | None) -> list[str] | None:
+def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str] | None:
     """Staged paths for the pending commit, or None if the diff cannot be read.
 
     Uses ``--name-status -M`` so renames/copies surface BOTH sides (P2-E): a
@@ -380,7 +434,12 @@ def _staged_files(cwd: str | None) -> list[str] | None:
         args += ["-C", cwd]
     args += ["diff", "--cached", "--name-status", "-M"]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=bounded_timeout(deadline, 10),
+        )
         if result.returncode != 0:
             return None
         paths: list[str] = []
@@ -397,6 +456,11 @@ def _staged_files(cwd: str | None) -> list[str] | None:
             elif len(parts) >= 2:
                 paths.append(parts[-1])
         return paths
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return None
+    except DeadlineExpired:
+        raise
     except Exception:
         return None
 
@@ -560,13 +624,12 @@ _UNRESOLVABLE_TARGET_CHARS = "$`*?[{\\()<>~"
 
 
 def _branch_mutation_risk(argv: list[str]) -> str | None:
-    """Whether a ``git switch``/``git checkout`` could move HEAD toward main/master or
-    an unverifiable branch.
+    """Whether a ``git switch``/``git checkout`` can move HEAD before a commit.
 
-    Returns ``"main"`` if it could land HEAD on main/master, ``"unknown"`` if the
-    target is unresolvable (a variable/subst/glob/``-`` previous-branch), else
-    ``None`` — a literal non-main branch (``checkout -b feature``) carries no
-    direct-to-main risk, and a FILE-RESTORE form moves no branch at all.
+    Returns ``"main"`` for main/master, ``"unknown"`` for an unresolvable target,
+    ``"branch"`` for another literal branch, and ``None`` only for a file-restore
+    form. The review budget is branch-specific, so every HEAD-moving form must run
+    separately from the commit; this hook can only inspect pre-command state.
 
     Only HEAD-MOVING forms are assessed, to avoid false-blocking file restores
     (``git checkout HEAD~1 -- f`` / ``git checkout main f.py``, which leave HEAD put):
@@ -654,10 +717,107 @@ def _branch_mutation_risk(argv: list[str]) -> str | None:
             return "main"
         if t == "-" or any(ch in t for ch in _UNRESOLVABLE_TARGET_CHARS):
             return "unknown"
-    return None
+    # Every valid `git switch` changes/selects HEAD. Even when option parsing
+    # cannot recover a target (`switch -- <branch>`, `switch --detach`, or a
+    # syntactically incomplete command), it cannot safely share a commit's
+    # pre-command branch budget. Checkout alone has file-restore forms.
+    return "branch" if sub == "switch" or targets else None
 
 
-def _worktree_root(cwd: str) -> str:
+def _git_common_dir(cwd: str | None, *, deadline: float | None = None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None.
+
+    With ``deadline`` (the hook's aggregate one) the probe draws from it like the
+    neighbouring git probes: an overrun raises ``DeadlineExpired``, which
+    ``run_guard`` turns into a refusal, instead of each call spending its own
+    5 seconds against a 10-second harness kill that would let the commit run."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=bounded_timeout(deadline, 5)
+        )
+        out = result.stdout.strip()
+        # One absolute line or nothing: git before 2.31 does not know
+        # `--path-format`, exits 0, and echoes the option back beside a relative
+        # `.git`, which must read as unreadable (fail closed), never as an identity.
+        if result.returncode != 0 or "\n" in out or not os.path.isabs(out):
+            return None
+        return os.path.realpath(out)
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+        return None
+    except DeadlineExpired:
+        raise
+    except Exception:
+        return None
+
+
+def _live_manifest_binding() -> tuple[str, str | None]:
+    """What the deploy manifest says about WHICH repository it belongs to.
+
+    The manifest may carry a top-level ``"repo"``: the ABSOLUTE git common dir of
+    the checkout it belongs to. Returns one of:
+
+    * ``("bound", <canonical path>)`` — the key names an existing git common dir
+      (a directory holding ``objects/`` and ``HEAD``);
+    * ``("absent", None)`` — a JSON object without the key: the caller keeps its
+      rule for manifests written before the key existed;
+    * ``("malformed", None)`` — anything else: unreadable or malformed JSON, not a
+      JSON object, or a key that is not the absolute path of an existing git
+      common dir (a work-tree path, a checkout that has since moved). The caller
+      ARMS, for every target: a broken manifest fails closed.
+
+    The same rule is kept in ``git_push_guard._live_manifest_binding`` and in the git hooks'
+    ``live_manifest_applies``; ``TestManifestRepoBinding`` pins all four copies
+    to one verdict table."""
+    try:
+        with open(Path.home() / ".genesis" / "deploy_manifest.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — unreadable fails closed, never "disarmed"
+        return ("malformed", None)
+    if not isinstance(data, dict):
+        return ("malformed", None)
+    if "repo" not in data:
+        return ("absent", None)
+    repo = data["repo"]
+    if (
+        isinstance(repo, str)
+        and os.path.isabs(repo)
+        and os.path.isdir(os.path.join(repo, "objects"))
+        and os.path.isfile(os.path.join(repo, "HEAD"))
+    ):
+        return ("bound", os.path.realpath(repo))
+    return ("malformed", None)
+
+
+def _live_integration_repo(cwd: str | None, *, deadline: float | None = None) -> bool:
+    """Whether ``cwd``'s repository runs a local integration branch named ``live``.
+
+    The deploy manifest declares that this install runs one (without it a
+    branch named ``live`` is ordinary), and the commit must be in the repository
+    the manifest is about (``_live_manifest_binding``): when it names one, that
+    repository and no other; when it has no ``"repo"`` key, THIS repository or
+    one of its worktrees, since a session commits in unrelated checkouts too and
+    their own ``live`` branches are none of this gate's business. A malformed
+    manifest, or an identity that cannot be read, fails closed, as this gate does
+    for an unverifiable branch. ``deadline`` bounds both identity probes (see
+    ``_git_common_dir``)."""
+    if not (Path.home() / ".genesis" / "deploy_manifest.json").is_file():
+        return False
+    kind, bound = _live_manifest_binding()
+    if kind == "malformed":
+        return True
+    there = _git_common_dir(cwd, deadline=deadline)
+    if kind == "bound":
+        return there is None or there == bound
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)), deadline=deadline)
+    if here is None or there is None:
+        return True
+    return here == there
+
+
+def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
     """The git worktree ROOT that owns ``cwd`` (canonicalized), or ``realpath(cwd)``
     as a fallback. Two different SUBDIRECTORIES of one worktree — and a symlink alias
     of it — resolve to the same root, so a legitimate same-worktree commit chain
@@ -668,17 +828,21 @@ def _worktree_root(cwd: str) -> str:
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=bounded_timeout(deadline, 5),
         )
         root = r.stdout.strip()
         if r.returncode == 0 and root:
             return os.path.realpath(root)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except subprocess.TimeoutExpired as exc:
+        propagate_deadline_timeout(deadline, exc)
+    except (FileNotFoundError, OSError):
         pass
     return os.path.realpath(cwd)
 
 
-def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
+def _merge_note(
+    cwd: str | None, *, gate: str = "round", deadline: float | None = None
+) -> str:
     """A hint appended to a denial when a merge is mid-flight.
 
     ``gate`` selects the consequence clause, because the two gates are misled by
@@ -703,7 +867,7 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=bounded_timeout(deadline, 5),
         )
         if out.returncode != 0 or not out.stdout.strip():
             return ""
@@ -717,6 +881,8 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
             or (git_dir / "rebase-merge").exists()
             or (git_dir / "rebase-apply").exists()
         )
+    except DeadlineExpired:
+        return ""
     except (subprocess.SubprocessError, OSError, ValueError):
         return ""
     if not merging:
@@ -770,6 +936,494 @@ def _merge_note(cwd: str | None, *, gate: str = "round") -> str:
     )
 
 
+def _is_dispatched() -> bool:
+    """Whether this hook runs inside a Genesis autonomous CC session."""
+    return os.environ.get("GENESIS_CC_SESSION") == "1"
+
+
+def _native_ask(reason: str) -> None:
+    """Emit a native PreToolUse decision and exit successfully for CC to ask."""
+    emit_native_ask(reason)
+    sys.exit(0)
+
+
+def _unknown_budget(reason: str) -> dict:
+    return {
+        "status": "unknown",
+        "reason": "evidence_unknown",
+        "errors": [reason],
+        "approval_required": True,
+        "commit_approval_required": True,
+        "strongly_discouraged": True,
+    }
+
+
+def _current_branch_pr_identity(raw: str) -> tuple[str, int] | None | dict:
+    """Parse ``gh pr status --json`` for the current branch.
+
+    ``None`` is a positive no-open-PR result.  A dict is an unknown-budget
+    result.  The status command is used instead of ``pr list --head`` because
+    it follows GitHub CLI's current-branch/remotes resolution and therefore
+    also identifies cross-repository PRs and branches with unpushed commits.
+    """
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return _unknown_budget("commit_pr_status_malformed")
+    if not isinstance(payload, dict):
+        return _unknown_budget("commit_pr_status_malformed")
+    current = payload.get("currentBranch")
+    if current is None:
+        return None
+    if not isinstance(current, dict):
+        return _unknown_budget("commit_pr_status_malformed")
+    state = current.get("state")
+    if state in {"CLOSED", "MERGED"}:
+        # ``gh pr status`` exposes only the NEWEST match for the branch. A closed
+        # singular record does not prove no older OPEN PR exists for it, and an
+        # unseen open PR may already have exhausted its budget — so "closed" is
+        # unknown evidence, never proof of absence.
+        return _unknown_budget("commit_pr_status_closed_only")
+    number, url = current.get("number"), current.get("url")
+    if state != "OPEN" or not isinstance(number, int) or not isinstance(url, str):
+        return _unknown_budget("commit_pr_identity_malformed")
+    match = re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?", url)
+    if match is None or int(match.group(2)) != number:
+        return _unknown_budget("commit_pr_identity_malformed")
+    return match.group(1), number
+
+
+def _normalize_public_repo(value: str) -> str | None:
+    """A plain ``owner/repo``, or None. Mirrors ``git_push_guard._normalize_repo``;
+    ``test_canonical_public_repo_matches_the_push_guards_reading`` locks the two
+    readings of the config together."""
+    if not value or "$" in value or "`" in value:
+        return None
+    v = value.strip().split("://", 1)[-1]
+    parts = [p for p in v.split("/") if p]
+    if parts and parts[0] == "github.com":
+        parts = parts[1:]
+    if len(parts) != 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _canonical_public_repo() -> str | None:
+    """The configured public repo (``github.user``/``github.public_repo`` in
+    ``~/.genesis/config/genesis.yaml``) as ``owner/repo``, or None when it cannot
+    be determined. Same source, seam (``_TEST_CANONICAL_PUBLIC_REPO``) and result
+    as the push guard's ``_canonical_public_repo``; kept local because importing
+    that module would load the whole push guard onto the commit path."""
+    override = os.environ.get("_TEST_CANONICAL_PUBLIC_REPO")
+    if override is not None:
+        return _normalize_public_repo(override) if override.strip() else None
+    try:
+        import yaml  # lazy: the genesis venv has pyyaml; absence → None → engage.
+
+        with open(os.path.expanduser("~/.genesis/config/genesis.yaml")) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        gh = cfg.get("github") or {}
+        user = (gh.get("user") or "").strip()
+        repo = (gh.get("public_repo") or "").strip()
+        if user and repo:
+            return _normalize_public_repo(f"{user}/{repo}")
+    except Exception:  # noqa: BLE001 — undeterminable is None, and None engages.
+        return None
+    return None
+
+
+def _outside_public_repo(repo: str) -> bool:
+    """True only when ``repo`` is PROVABLY not the configured public repo.
+
+    An undeterminable public repo returns False — the budget still applies, which
+    is the direction the gate had before it was scoped (uncertain → engage).
+
+    Proof requires a different repository NAME, not merely a different slug. The
+    configured OWNER is the weak half of that config: the shipped example carries
+    a placeholder, setup can default it to a display name, and a contributor
+    install names its own fork. Any of those would otherwise read the real public
+    repo's PRs as "unrelated" and switch the budget off. Comparing names keeps a
+    same-named fork in scope, which is the conservative direction."""
+    canonical = _canonical_public_repo()
+    if canonical is None:
+        return False
+    target = str(repo).strip().lower().removesuffix(".git")
+    wanted = canonical.lower().removesuffix(".git")
+    return target != wanted and target.rsplit("/", 1)[-1] != wanted.rsplit("/", 1)[-1]
+
+
+#: Remote URL prefixes that are filesystem paths. gh resolves a repository only
+#: from remotes on a GitHub host, so a remote spelled like this can never yield a
+#: pull request. Deliberately a short closed set: any other spelling (including a
+#: bare relative path) is treated as possibly-GitHub, so a miss here keeps the
+#: pre-existing unknown result rather than dropping the budget.
+#:
+#: The set EXCLUDES two spellings that look like paths but carry a host: gh parses
+#: ``//host/owner/repo`` and ``file://host/owner/repo`` to that host (MEASURED on
+#: gh 2.100 — both resolved the public repo's PRs). Hence ``file:///`` (empty
+#: host) rather than ``file://``, and a lone leading ``/`` checked separately.
+_LOCAL_REMOTE_PREFIXES = ("./", "../", "file:///")
+
+
+def _is_local_remote_url(url: str) -> bool:
+    """Whether ``url`` is a filesystem path gh cannot resolve to any host."""
+    if url.startswith(_LOCAL_REMOTE_PREFIXES):
+        return True
+    return url.startswith("/") and not url.startswith("//")
+
+
+#: Git GLOBAL options the exemption tolerates before the subcommand: ``-c`` sets a
+#: config value for that one invocation; ``-C`` changes directory. Neither can
+#: point git at a repository other than the one the effective cwd resolves to,
+#: provided ``-C`` appears at most once (``_effective_diff_cwd`` reads the first).
+#: (A ``-c core.hooksPath=…`` hook could itself commit elsewhere; so could a
+#: repository's own hooks, on the base code too. That is arbitrary code the
+#: operator installed, outside what a pre-command check can model.)
+_EXEMPTION_GIT_GLOBALS = frozenset({"-c", "-C"})
+
+
+def _exemption_shape_ok(segs, command: str) -> bool:
+    """Whether the probed cwd is PROVABLY the repository this command commits in.
+
+    The remote probe below reads ``cwd`` at HOOK time. Every way to make the
+    commit land somewhere else — ``--git-dir``, ``GIT_DIR=`` prefixes or exports,
+    ``pushd``, ``env -C``, a second ``-C``, a wrapper, and any EARLIER segment
+    that changes the directory layout before the commit runs (``git worktree
+    add`` into the probed path, a ``cd`` that fails at run time under ``;`` or
+    ``||``) — would make a remote-less cwd prove nothing about the repository
+    actually committed to. That set is open, so this is an ALLOWLIST of one
+    shape that cannot do any of it; anything else keeps the unknown result.
+
+    Accepted: the whole command is ONE top-level ``git … commit …`` segment,
+    verb literal, raw text starting with ``git`` (so no env-assignment or
+    wrapper prefix was stripped), global options only ``-c <value>`` and at most
+    one ``-C <dir>``. A single segment has nothing that runs before it, which is
+    what closes the hook-time-versus-run-time gap — except process substitution,
+    whose body the parser leaves inside the segment, so that is refused by text. ``cd … && git commit`` in a
+    scratch repo therefore still asks, as it did before this scoping: that is a
+    known, fail-closed residue, and ``git -C <dir> commit`` is the form to use."""
+    if not segs or len(segs) != 1:
+        return False
+    seg = segs[0]
+    if seg.depth != 0 or seg.verb_unresolved or not seg.argv:
+        return False
+    # The one way a single parsed segment still runs a second command: process
+    # substitution. shell_parse leaves `<(…)`/`>(…)` bodies inside argv rather
+    # than emitting them as segments (its documented gap), while bash runs them.
+    # Tested on the RAW COMMAND: the segment's own ``raw`` has the `<`/`>`
+    # already stripped (MEASURED), so it cannot see the construct. A plain
+    # substring test is safe here: a false match only keeps unknown.
+    if "<(" in command or ">(" in command:
+        return False
+    if seg.argv[0] != "git" or not seg.raw.lstrip().startswith("git"):
+        return False
+    dash_c = 0
+    i = 1
+    while i < len(seg.argv) and seg.argv[i].startswith("-"):
+        opt = seg.argv[i]
+        if opt not in _EXEMPTION_GIT_GLOBALS or i + 1 >= len(seg.argv):
+            return False
+        dash_c += opt == "-C"
+        i += 2
+    if dash_c > 1:
+        return False
+    return git_subcommand(seg.argv) == "commit" and i < len(seg.argv) and seg.argv[i] == "commit"
+
+
+def _has_possibly_github_remote(cwd: str, deadline: Deadline) -> bool | None:
+    """Whether ``cwd``'s repository has anything gh might resolve to GitHub.
+
+    Reads ``git remote -v``, which is also what gh reads, and which applies
+    ``url.<base>.insteadOf`` rewrites (MEASURED: a filesystem remote rewritten to
+    a GitHub URL is listed as the GitHub URL). Also reads the branch push/pull
+    targets: ``git push -u <url>`` leaves ``branch.<b>.remote`` set to a URL with
+    no remote defined, and that branch can have an open PR even though gh finds
+    no remote (MEASURED by audit). None = could not tell.
+
+    A branch target is USUALLY a remote NAME, not a URL: ``git clone <path>``
+    writes ``branch.<b>.remote=origin`` (MEASURED, git 2.43). A name is resolved
+    through the remotes ``git remote -v`` just listed, and it is possibly GitHub
+    exactly when one of that remote's URLs is — which the first loop has already
+    answered, so a name that resolves there adds nothing. Only a value that is
+    NOT a listed remote is classified as a URL/path in its own right; an unknown
+    name therefore stays possibly-GitHub, the conservative direction."""
+    try:
+        read = subprocess.run(
+            ["git", "-C", cwd, "remote", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=deadline.timeout(3.0),
+            check=False,
+        )
+        targets = subprocess.run(
+            [
+                "git",
+                "-C",
+                cwd,
+                "config",
+                "--get-regexp",
+                r"^(branch\..*\.(remote|pushremote)|remote\.pushdefault)$",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=deadline.timeout(3.0),
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 — could not tell; the caller keeps unknown.
+        return None
+    if read.returncode != 0:
+        return None
+    # `git config --get-regexp` exits 1 when nothing matches; anything else is an error.
+    if targets.returncode not in (0, 1) or (targets.returncode == 1 and targets.stdout.strip()):
+        return None
+    remote_names: set[str] = set()
+    for line in read.stdout.splitlines():
+        if not line.strip():
+            continue
+        name, sep, rest = line.partition("\t")
+        if not sep:
+            return None
+        remote_names.add(name.strip())
+        url = rest.rsplit(" (", 1)[0].strip()
+        # A remote whose listed URL is EMPTY gives gh nothing to resolve. The common
+        # cause: any `remote.<name>.*` key makes git list the name, so one global key
+        # (say `remote.origin.prune` in ~/.gitconfig) puts a URL-less `origin` in
+        # every repository that has no remote (MEASURED: a bare `origin<TAB>` line).
+        # It is not the only cause — an empty or whitespace-only `url`, a remote with
+        # only gh's own `gh-resolved` key, and an `insteadOf` rewrite that empties
+        # the URL all list the same way — and the skip covers every one, because the
+        # test is on the listed URL, not on how it came to be empty. A URL git does
+        # know is listed on its own line, a push-only URL included.
+        #
+        # Skipping it hides nothing ONLY because gh resolves a repository from this
+        # same `git remote -v` listing: MEASURED with gh 2.101 and git 2.43, gh
+        # answered "no git remotes found" in each of the states above. A gh that
+        # resolved from raw config instead would turn them into repositories this
+        # gate skips; re-check this premise when the gh version moves.
+        if not url:
+            continue
+        if not _is_local_remote_url(url):
+            return True
+    # Every listed remote's fetch AND push URL is a filesystem path by now.
+    for line in targets.stdout.splitlines():
+        if not line.strip():
+            continue
+        _key, sep, value = line.partition(" ")
+        value = value.strip()
+        if not sep or not value:
+            return None
+        # "." is the local repository itself. A listed remote NAME resolves to
+        # the URLs just classified, all local. A filesystem path is not GitHub.
+        # Anything else — an unlisted name or a URL — might be, so it counts.
+        if value == "." or value in remote_names:
+            continue
+        if not _is_local_remote_url(value):
+            return True
+    return False
+
+
+def _no_pr_possible_or_unknown(
+    cwd: str, deadline: Deadline, reason: str, segs, command: str
+) -> dict | None:
+    """After a failed PR lookup: None when gh cannot resolve any repository here.
+
+    A repository with nothing gh could resolve to GitHub (no remote or branch
+    target that might be GitHub, no ``GH_REPO``) gives gh no repository to find a pull
+    request in, so there is no budget to consult: a scratch or lab repo. The
+    claim is about what gh can resolve, not about GitHub at large, so it is only
+    made when the command provably commits in the probed repository
+    (``_exemption_shape_ok``). Any doubt keeps the unknown result, which asks in
+    the foreground and denies when dispatched."""
+    if os.environ.get("GH_REPO", "").strip():
+        return _unknown_budget(reason)
+    if any(os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")):
+        return _unknown_budget(reason)
+    if not _exemption_shape_ok(segs, command):
+        return _unknown_budget(reason)
+    if _has_possibly_github_remote(cwd, deadline) is False:
+        return None
+    return _unknown_budget(reason)
+
+
+#: This hook is registered in .claude/settings.json with `"timeout": 10`, and an
+#: overrun SIGKILLs it -- which FAILS OPEN: the commit proceeds with neither the
+#: budget check nor the review-current and depth checks that run after it. The
+#: lookup is several serial GitHub calls of 6-8s each, so a degraded-but-not-dead
+#: GitHub keeps every individual call inside its own cap while the total runs far
+#: past 10s. These bound the whole lookup instead.
+#:
+#: The split leaves ~2.5s for everything else this hook does after the lookup
+#: (diff classification, marker reads, message rendering), all of it local.
+_COMMIT_HOOK_REGISTERED_TIMEOUT = 10.0
+_COMMIT_BUDGET_LOOKUP_SECONDS = 7.5
+_COMMIT_POST_LOOKUP_SECONDS = 2.0
+
+
+def _branch_review_budget(
+    cwd: str | None,
+    branch: str | None,
+    *,
+    budget_seconds: float = _COMMIT_BUDGET_LOOKUP_SECONDS,
+    deadline: Deadline | None = None,
+    segs=None,
+    command: str = "",
+) -> dict | None:
+    """The current branch PR's shared budget; None means no budget applies.
+
+    SCOPE: the budget belongs to an open PR on the configured PUBLIC repo, and to
+    nothing else. Two cases therefore return None, and only these two:
+
+    * the lookup failed, but the repository has no remote gh could resolve to
+      GitHub (no remote or branch target that might be GitHub — a target naming
+      a remote counts by that remote's URLs — and ``GH_REPO`` unset) and the
+      command provably commits in that repository — gh has no repository to find
+      a pull request in (``_no_pr_possible_or_unknown``; ``segs`` is the parsed
+      command, and None keeps the unknown result);
+    * the branch's open PR lives in a repository that is PROVABLY not the
+      configured public one (``_outside_public_repo``).
+
+    Everything else keeps the pre-existing direction. A read/import/identity
+    failure where a GitHub remote exists is an ``unknown`` result, never the same
+    as no pull request. So is running out of time: one aggregate deadline covers
+    every network call here, and exhausting it asks a human rather than letting
+    the harness kill the hook and allow the commit unchecked. Tests select a PR
+    with ``_TEST_REVIEW_BUDGET_PR`` and feed the shared evaluator through its
+    endpoint seams.
+    """
+    if not cwd or not branch:
+        return _unknown_budget("commit_pr_identity_unknown")
+    lookup_deadline = (
+        deadline.capped_after(budget_seconds, reserve=_COMMIT_POST_LOOKUP_SECONDS)
+        if deadline
+        else Deadline.after(budget_seconds)
+    )
+    try:
+        import review_budget
+    except Exception:  # noqa: BLE001 — reverse version skew asks/denies.
+        return _unknown_budget("review_budget_unavailable")
+
+    test_pr = os.environ.get("_TEST_REVIEW_BUDGET_PR")
+    if test_pr is not None:
+        if test_pr == "none":
+            return None
+        repo = os.environ.get("_TEST_REVIEW_BUDGET_REPO", "owner/repo")
+        if not test_pr.isdigit():
+            return _unknown_budget("commit_pr_identity_unknown")
+        if _outside_public_repo(repo):
+            return None
+        remaining = lookup_deadline.remaining()
+        result = review_budget.evaluate_pr(
+            repo, test_pr, budget_seconds=max(0.0, remaining or 0.0)
+        )
+        result["pr"] = int(test_pr)
+        result["repo"] = repo
+        return result
+
+    try:
+        try:
+            pr_read = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "status",
+                    "--json",
+                    "number,state,url",
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                # Share the one deadline: a flat 8 here plus the evaluator's own
+                # serial calls is exactly what overran the harness window.
+                timeout=lookup_deadline.timeout(8.0),
+                check=False,
+            )
+        except (FileNotFoundError, PermissionError):
+            # gh could not be launched at all. Same question as a failed read.
+            return _no_pr_possible_or_unknown(
+                cwd, lookup_deadline, "commit_pr_gh_unavailable", segs, command
+            )
+        if pr_read.returncode != 0:
+            return _no_pr_possible_or_unknown(
+                cwd, lookup_deadline, "commit_pr_list_unreadable", segs, command
+            )
+        identity = _current_branch_pr_identity(pr_read.stdout)
+        if identity is None:
+            return None
+        if isinstance(identity, dict):
+            return identity
+        repo, number = identity
+        if _outside_public_repo(repo):
+            return None
+        remaining = lookup_deadline.remaining()
+        result = review_budget.evaluate_pr(
+            repo, number, budget_seconds=max(0.0, remaining or 0.0)
+        )
+        result["pr"] = number
+        result["repo"] = repo
+        return result
+    except Exception:  # noqa: BLE001 — an uncertain budget cannot allow silently.
+        return _unknown_budget("commit_pr_lookup_failed")
+
+
+def _commit_budget_reason(result: dict) -> str:
+    if result.get("status") != "ok":
+        return (
+            "The open pull request's review history could not be read reliably. "
+            "Approve this one commit only if you independently verified that the "
+            "review budget permits it; autonomous sessions are denied."
+        )
+    pr = result.get("pr")
+    count = int(result.get("count") or 0)
+    # The fix-commit approval is protected exactly like the review-request one, so
+    # it owes the owner the same terminal framing — without it, continued round-5
+    # work reads as routine at the one surface where the decision is actually made.
+    # Single-sourced from the evaluator so the two gates cannot drift: the push
+    # guard's `_review_budget_message` states the identical rule. Imported locally,
+    # mirroring `_branch_review_budget`; reaching this point required that import
+    # to have already succeeded there, since `status == "ok"` comes from it.
+    import review_budget  # noqa: PLC0415 — local by the same convention as above.
+
+    if result.get("gate_surface"):
+        # Unlike the push guard's gate-surface branch, this one has no
+        # still-within-budget sub-state to get wrong: reaching here needs
+        # `commit_approval`, which is `count > GATE_DISCOVERY_ROUND_LIMIT` or the
+        # limit with its one confirmation already spent, while
+        # `confirmation_exempt` requires the limit with it UNSPENT. The
+        # two are mutually exclusive, so the budget genuinely IS spent and the
+        # terminal decision is the truthful thing to name. Recorded so the next
+        # audit does not re-raise the push guard's defect against this branch.
+        return (
+            f"PR #{pr} changes the review-gate surface and has {count} review "
+            f"rounds. Its {review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery "
+            "rounds plus confirmation are spent. "
+            f"{review_budget.TERMINAL_DECISION} Approve this one additional fix "
+            "commit only; earlier approval does not carry forward."
+        )
+    if result.get("strongly_discouraged"):
+        # TERMINAL_DECISION, never ORDINARY_TERMINAL_RULE: this branch fires at
+        # STRONGLY_DISCOURAGED_REVIEWED_HEADS, so the rule's "there is no ordinary
+        # round 5" would be rendered to someone who already holds five heads.
+        return (
+            f"PR #{pr} has {count} review rounds — past the terminal "
+            "boundary. Further work is strongly discouraged: stop, narrow or "
+            "redesign, accept documented residue, or abandon it. "
+            f"{review_budget.TERMINAL_DECISION} Approve only this single additional "
+            "fix commit; every commit past the boundary needs its own approval, and "
+            "earlier approval never carries forward."
+        )
+    # The RULE, not the NOTICE: this gate authorizes a COMMIT, so the notice's
+    # "approve one further round" clause would be false here and would contradict
+    # the sentence after it. The boundary claim is true in this branch, where the
+    # count is exactly the ordinary limit.
+    return (
+        f"PR #{pr} has {count} review rounds; standing authorization ended "
+        f"after {review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
+        f"{review_budget.ORDINARY_TERMINAL_RULE} Approve this single fix commit only — "
+        "it authorizes no review round, and a previous approval cannot authorize "
+        "another commit."
+    )
+
+
 def main() -> None:
     # Parse tool input
     payload = read_payload()
@@ -778,7 +1432,20 @@ def main() -> None:
     # consumed by read_payload, so nothing further down can read it again.
     if discarded_write is not None:
         discarded_write.remember(command)
-    if not _COMMIT_PATTERN.search(command):
+    # Read through `mentions`: a word the shell assembles from quotes,
+    # backslashes or joined lines is not spelled in the raw text, and a raw test
+    # would skip the parse that resolves it. Widen-only — the parse below still makes every decision. Keep
+    # identical to the invalidator's early-out, or a commit this gate checks can
+    # leave that module's marker standing.
+    if not mentions(command, _COMMIT_PATTERN):
+        # Nothing in the text names a commit, and one could still run: a git
+        # subcommand the shell builds says nothing about which it is. Asked only
+        # when the text names git, and answered by the parse, so an ordinary
+        # variable in an ARGUMENT is not refused. The invalidator's early exit is
+        # deliberately NOT widened to match: it runs after a command succeeds,
+        # and every command this branch catches is refused before it runs.
+        if mentions(command, _GIT_WORD) and "git" in unresolved_verb_programs(command):
+            _deny(_HIDDEN_GIT_VERB_MSG)
         sys.exit(0)  # Not a commit, allow
 
     # Parse the command into the segments it actually executes (through
@@ -826,6 +1493,17 @@ def main() -> None:
         )
         return
 
+    # One aggregate deadline for the WHOLE hook, opened before the first local
+    # git probe. The hook is registered with `"timeout": 10`, and an overrun is a
+    # SIGKILL — which FAILS OPEN: the commit proceeds with neither the budget
+    # check nor the review-current/depth checks behind it. Per-call subprocess
+    # caps each reset the clock, so serial local probes (worktree/branch/counter
+    # reads, then the budget lookup) could overrun the window in aggregate; every
+    # probe below draws from this one deadline instead. The small reserve keeps
+    # room to print the decision and exit before the kill lands.
+    hook_budget = Deadline.after(_COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
+    hook_deadline = hook_budget.expires_at
+
     # Resolve the dir the commit actually targets (git -C / the LAST cd before
     # the commit segment / payload cwd). A decoy `cd A && …; cd B && git commit`
     # runs in B, and B is what we must inspect. An ambiguous cwd (variable /
@@ -842,12 +1520,8 @@ def main() -> None:
     try:
         from review_state import (
             ESCALATION_ROUND_CAP,
-            FINAL_ROUND_CAP,
-            consume_final_accept,
             get_current_branch,
-            get_final_accept_consumed,
-            get_review_lifetime,
-            get_review_round,
+            get_review_counters,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
@@ -909,10 +1583,10 @@ def main() -> None:
     # branch ONCE at hook time, before any segment runs. A `git switch main` /
     # `git checkout main` (or an unresolvable target) EARLIER in the chain than a
     # commit lands that commit on a branch this read cannot see — slipping the
-    # direct-to-main block. Fail closed when a pre-commit branch mutation could reach
-    # main/master or is unresolvable; a literal non-main target (`git checkout -b
-    # feature && git commit`, the flow this gate itself recommends) carries no
-    # direct-to-main risk and stays allowed.
+    # direct-to-main block and the per-branch review budget. Refuse every recognized
+    # HEAD-moving form before a commit: even a literal non-main target can have a
+    # different PR budget from the branch sampled at hook entry. File-restore forms
+    # still pass because they do not move HEAD.
     #
     # SCOPE IS CONSCIOUSLY BOUNDED — do NOT keep adding forms one at a time (user
     # decision 2026-08-12, after the escalation cap fired on this axis). This covers
@@ -933,9 +1607,8 @@ def main() -> None:
                 break
             if git_subcommand(s.argv) in _BRANCH_MUTATING_SUBCMDS and _branch_mutation_risk(s.argv):
                 _deny(
-                    "BLOCKED: this command switches branches (git switch/checkout to "
-                    "main/master or an unresolvable target) before a commit, so the "
-                    "guard cannot verify which branch the commit lands on. Run the "
+                    "BLOCKED: this command switches branches before a commit, so the "
+                    "guard cannot verify the destination branch's review budget. Run the "
                     "branch switch and the commit as SEPARATE commands."
                 )
                 return
@@ -954,11 +1627,30 @@ def main() -> None:
             )
             return
         seg_cwds.append(seg_cwd)
-        seg_branch = get_current_branch(cwd=seg_cwd if isinstance(seg_cwd, str) else None)
+        seg_branch = get_current_branch(
+            cwd=seg_cwd if isinstance(seg_cwd, str) else None, deadline=hook_deadline
+        )
         if seg_branch in ("main", "master"):
             _deny(
                 "BLOCKED: Direct commits to main are not allowed. "
                 "Create a branch first: git checkout -b <scope>/<description>"
+            )
+            return
+        if seg_branch == "live" and _live_integration_repo(
+            seg_cwd if isinstance(seg_cwd, str) else None, deadline=hook_deadline
+        ):
+            # `live` is the local integration branch: origin/main plus the
+            # candidate branches in ~/.genesis/deploy_manifest.json, rebuilt with
+            # `git commit-tree`. A hand commit here is one the planned rebuild
+            # engine (not built yet) will refuse as unknown, so it belongs on a
+            # branch cut from origin/main.
+            _deny(
+                "BLOCKED: Commit on 'live', the local integration branch. It is "
+                "rebuilt from origin/main plus the candidates in "
+                "~/.genesis/deploy_manifest.json. Commit on a branch cut from "
+                "origin/main (git worktree add --no-track "
+                ".claude/worktrees/<name> -b <scope>/<desc> origin/main), then "
+                "add it as a candidate."
             )
             return
     # Commits chained into DIFFERENT dirs share this one gate, but the review
@@ -975,7 +1667,10 @@ def main() -> None:
     # different-subdir case). Only resolved when ≥2 commits actually chain, to avoid
     # the extra git call on the common single-commit path.
     if len(all_commit_segs) >= 2:
-        distinct_dirs = {_worktree_root(c) if isinstance(c, str) else c for c in seg_cwds}
+        distinct_dirs = {
+            _worktree_root(c, deadline=hook_deadline) if isinstance(c, str) else c
+            for c in seg_cwds
+        }
         if len(distinct_dirs) > 1:
             _deny(
                 "BLOCKED: this command chains git commits into DIFFERENT worktrees, "
@@ -1042,100 +1737,63 @@ def main() -> None:
     # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
     # must sit on the INNER command (the sigil isn't propagated to wrappers); the
     # documented `git commit … # escalation-ack` form is a plain segment.
-    round_n = get_review_round(cwd=cwd)
+    round_n, _local_lifetime = get_review_counters(cwd=cwd, deadline=hook_deadline)
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
-    # Set when Rule 3a honours a '# final-round-accept', SPENT only at an actual
-    # allow. The two must not be the same moment: Rule 3a is checked FIRST, but
-    # four later rules (the escalation cap, the mode-switch tier, the depth gate,
-    # Rule 2) can still deny the very same command — and consuming inside the tier
-    # burned the one-shot token on a commit that never ran. Because the consuming
-    # tier is then checked first on the retry, the branch became permanently
-    # uncommittable. MEASURED before this fix, at streak 7 / lifetime 7 (a state
-    # this file's own comment calls reachable): all four sigil combinations
-    # returned exit 2, including the one the block message itself prints.
-    spend_final_accept = False
+    branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
+    cloud_budget = _branch_review_budget(
+        cwd, branch, deadline=hook_budget, segs=segs, command=command
+    )
+    pending_round_approval = bool(
+        cloud_budget is not None
+        and (
+            cloud_budget.get("status") != "ok"
+            or cloud_budget.get("commit_approval_required")
+        )
+    )
+
+    if pending_round_approval:
+        separately_gated = [
+            s
+            for s in segs
+            if git_subcommand(s.argv) in {"push", "merge"}
+            # EVERY ``gh pr comment`` counts separately: an inline body can hide a
+            # review request the argv scan sees, but a ``--body-file``/editor body
+            # is opaque here — gating on the visible ``@codex review`` token let one
+            # approval cover a request it never read.
+            or gh_pr_subcommand(s.argv) in {"create", "merge", "close", "comment"}
+        ]
+        if len(commit_segs) != 1 or separately_gated:
+            _deny(
+                "BLOCKED: this review-budget approval may authorize exactly one fix "
+                "commit. Run multiple commits and push/merge/close/PR-create/review "
+                "actions separately so each receives its own decision."
+            )
+            return
 
     def _allow() -> None:
-        """Exit 0, spending the acceptance only if one was actually honoured."""
-        if spend_final_accept:
-            consume_final_accept(cwd=cwd)
+        """Exit through the one approval chokepoint after all hard checks pass."""
+        # Defense in depth: even a future helper that accidentally degrades a
+        # deadline failure must not reach an allow after the hook budget expired.
+        hook_budget.timeout(0.001)
+        if pending_round_approval and cloud_budget is not None:
+            reason = _commit_budget_reason(cloud_budget)
+            # A stale worktree still emits the retired terminal sigil. It is
+            # parsed but authorizes nothing — name that so an old habit does
+            # not read the ask as a gate misfire.
+            if commit_segs and all(
+                has_trailing_override(s.raw, "final-round-accept") for s in commit_segs
+            ):
+                reason += (
+                    "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                    "authorizes any gate; only this native approval admits the "
+                    "commit."
+                )
+            if _is_dispatched():
+                _deny("BLOCKED: " + reason)
+                return
+            _native_ask(reason)
         sys.exit(0)
-
-    # Rule 3a: the FINAL-ROUND terminal. Checked BEFORE the consecutive cap below,
-    # and that ordering is the entire point — at the terminal the round counter has
-    # typically just been reset by an earlier '# escalation-ack', so the cap would
-    # not fire and an escalation-ack must not be able to clear this.
-    #
-    # The cap below is REPEATABLE by construction: its ack calls
-    # reset_review_round, so a change can cycle 1-2-3-ack, 4-5-6-ack, without end.
-    # This tier is the terminal that cycle never reaches. It is deliberately NOT
-    # resettable by its own ack: '# final-round-accept' clears exactly ONE commit
-    # and the block returns on the next one. A sigil that kept working would just
-    # be a fourth repeatable sigil, which is the defect being closed.
-    #
-    # Counted the same way as the streak — EXTERNAL cross-model rounds only
-    # (see review_state.bump_review_round). Internal self/subagent audits stay
-    # free, including the one the mode-switch tier itself mandates; counting those
-    # would make the machine penalise the remedy it demands.
-    lifetime_n = get_review_lifetime(cwd=cwd)
-    if lifetime_n >= FINAL_ROUND_CAP:
-        final_acked = bool(commit_segs) and all(
-            has_trailing_override(s.raw, sigil="final-round-accept") for s in commit_segs
-        )
-        # "Clears exactly ONE commit" has to be RECORDED to be true. Re-requiring the
-        # sigil on every commit is not a terminal — a session under a mandate to make
-        # progress just appends it again, which is the fourth repeatable escape hatch
-        # this tier exists to remove. The acceptance is spent on first use and the
-        # branch cannot buy another.
-        if final_acked and get_final_accept_consumed(cwd=cwd):
-            _deny(
-                f"BLOCKED: the final-round acceptance for this branch was ALREADY USED "
-                f"(lifetime {lifetime_n} >= terminal {FINAL_ROUND_CAP}). It clears one "
-                "commit, once — re-applying the sigil does not buy another round, or it "
-                "would be the repeatable escape hatch this terminal replaced.\n\n"
-                "You accepted the outstanding findings and committed. If that commit "
-                "still needs work, the loop did not end, and continuing is no longer a "
-                "call this session makes:\n"
-                "  (a) TAKE IT TO THE USER — say what is still open and that the branch "
-                "is past its terminal. Only they can authorise more work here.\n"
-                "  (b) ABANDON the branch and restart from a design that does not need "
-                "seven rounds.\n\n"
-                "A dispatched session with nobody reading cannot choose either alone — "
-                "surface it and stop." + _merge_note(cwd)
-            )
-            return
-        if not final_acked:
-            # The terminal deliberately does NOT reset the streak, so streak>=3 and
-            # lifetime>=7 is a REACHABLE state in which BOTH sigils are genuinely
-            # required — the escalation cap below is still live once this one clears.
-            # Printing only one would send a session round a loop of alternating
-            # blocks, so name the co-required form when it applies.
-            escalation_hint = " escalation-ack" if round_n >= ESCALATION_ROUND_CAP else ""
-            _deny(
-                f"BLOCKED: FINAL ROUND reached — {lifetime_n} EXTERNAL cross-model review "
-                f"rounds on this branch (terminal {FINAL_ROUND_CAP}; internal same-model "
-                "audits are not counted). Two full escalation cycles have already run and "
-                "each already asked for a fresh decision; a change still surfacing new "
-                "defects from an independent reviewer after that is not converging, and "
-                "another round is not the answer.\n\n"
-                "This is a judgement call, and there are exactly two ways out:\n"
-                "  (a) ACCEPT the outstanding findings and merge — document each one and "
-                "why it is acceptable in the PR body, then:\n"
-                f'        git commit -m "your message"  # final-round-accept{escalation_hint}\n'
-                "      That clears ONE commit; the block returns on the next, so the "
-                "decision has to actually end the loop.\n"
-                "  (b) ABANDON the branch and restart from a design that does not need "
-                "seven rounds. No sigil — just stop committing here.\n\n"
-                "Take this to the user before choosing; neither option is yours to make "
-                "alone." + _merge_note(cwd)
-            )
-            return
-        # Acked = the accept decision was made. Deliberately NO reset: the counter
-        # stays at/above the terminal so the next commit blocks again. The spend is
-        # DEFERRED to the allow (see `_allow` above) — the later rules can still
-        # deny this command, and a token spent on a denied command bricks the branch.
-        spend_final_accept = True
 
     if round_n >= ESCALATION_ROUND_CAP:
         acked = bool(commit_segs) and all(
@@ -1178,7 +1836,7 @@ def main() -> None:
                 "streak — landing the work and erasing the evidence that stopped it. "
                 "Hand the branch off with the premise-check writeup instead. The streak "
                 "is per-branch, so whoever picks up the SAME branch inherits it: say so "
-                "in the handoff." + _merge_note(cwd)
+                "in the handoff." + _merge_note(cwd, deadline=hook_deadline)
             )
             return
         # Acked = a fresh decision to continue → reset the round budget so the next
@@ -1186,7 +1844,7 @@ def main() -> None:
         # life. Reset stands even if a later rule blocks THIS commit: the
         # acknowledgment was made, and erring toward less friction only happens
         # AFTER a conscious ack.
-        reset_review_round(cwd=cwd)
+        reset_review_round(cwd=cwd, deadline=hook_deadline)
     elif round_n == ESCALATION_ROUND_CAP - 1:
         # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
         # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
@@ -1252,7 +1910,8 @@ def main() -> None:
                 "ATTESTS that the class-level audit happened — appending it because "
                 "you want to land something is falsifying it. Hand the branch off "
                 "with the evidence instead. (The streak is per-branch, so a builder "
-                "picking up the SAME branch inherits it: say so in the handoff.)" + _merge_note(cwd)
+                "picking up the SAME branch inherits it: say so in the handoff.)"
+                + _merge_note(cwd, deadline=hook_deadline)
             )
             return
 
@@ -1277,7 +1936,7 @@ def main() -> None:
     commit_may_add_content = _commit_may_add_content(segs)
 
     if not commit_may_add_content:
-        staged = _staged_files(cwd)
+        staged = _staged_files(cwd, deadline=hook_deadline)
         if staged and all(_is_docs_or_config(p) for p in staged):
             _allow()
 
@@ -1292,13 +1951,17 @@ def main() -> None:
     try:
         from review_scope import classify_change_substantiality
 
-        staged_level = classify_change_substantiality(cwd=cwd)
+        staged_level = classify_change_substantiality(cwd=cwd, deadline=hook_deadline)
+    except DeadlineExpired:
+        raise
     except Exception:  # noqa: BLE001 - depth is advisory; never crash the gate
         staged_level = "unknown"
     try:
         from review_state import get_marker_depth
 
-        marker_level, marker_adversarial = get_marker_depth(cwd=cwd)
+        marker_level, marker_adversarial = get_marker_depth(cwd=cwd, deadline=hook_deadline)
+    except DeadlineExpired:
+        raise
     except Exception:  # noqa: BLE001 - a marker-read error must not block on the add-chain
         # path (fail OPEN there); on the normal path the is_review_current() guard below
         # re-reads the marker and fails CLOSED, the safe direction for the stricter gate.
@@ -1324,7 +1987,9 @@ def main() -> None:
         # later substantial diff B that a '# review-override' then waives past Rule 2's
         # staleness block, when B was never audited (the integrity hole this gate closes).
         depth_level = staged_level
-        depth_is_adversarial = marker_adversarial and marker_content_current(cwd=cwd)
+        depth_is_adversarial = marker_adversarial and marker_content_current(
+            cwd=cwd, deadline=hook_deadline
+        )
 
     if depth_level == "substantial" and not depth_is_adversarial:
         depth_acked = bool(commit_segs) and all(
@@ -1352,7 +2017,7 @@ def main() -> None:
                 "escalation cap; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
-                + _merge_note(cwd, gate="depth")
+                + _merge_note(cwd, gate="depth", deadline=hook_deadline)
             )
             return
 
@@ -1360,9 +2025,11 @@ def main() -> None:
     if commit_may_add_content:
         # The staged diff at hook time isn't what will be committed (staging deferred, -a,
         # a pathspec, …) — can't check the diff hash, so require a valid (unexpired) marker.
-        rule2_blocks = not has_valid_review_marker(cwd=cwd)
+        rule2_blocks = not has_valid_review_marker(cwd=cwd, deadline=hook_deadline)
     else:
-        rule2_blocks = has_code_changes(cwd=cwd) and not is_review_current(cwd=cwd)
+        rule2_blocks = has_code_changes(cwd=cwd, deadline=hook_deadline) and not is_review_current(
+            cwd=cwd, deadline=hook_deadline
+        )
 
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges

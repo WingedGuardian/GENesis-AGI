@@ -13,11 +13,11 @@ ARE the value passed to their ``CCInvocation``), not an orphaned constant.
 
 Scope — this guard is about the SPAWN class ONLY, across: reflection (fully read-only),
 the inbox/mail judges, the experimentation single-turn completion, and sentinel-degraded.
-NOTE: the mail judge is now fully denied ``Bash`` (its prompt uses no tools). The inbox
-judge additionally denies every genesis MCP *write* (memory_store/settings_update/…)
-while KEEPING the reads + ``observation_write`` its prompt needs; its ONLY remaining
-residual is ``Bash`` (retained for the yt-dlp/curl YouTube-fetch path — relocating that
-into Python is follow-up 727a3724). Deliberately NOT covered here at all:
+NOTE: the mail judge is fully denied ``Bash`` (its prompt uses no tools). The inbox
+judge is denied ``Bash`` too (its YouTube fetch moved behind ``web_fetch``, follow-up
+d83569bf) and every genesis MCP *write* (memory_store/settings_update/…), while KEEPING
+the reads (``web_fetch`` included) + ``observation_write`` its prompt needs.
+Deliberately NOT covered here at all:
 - ``surplus`` — NOT a CC session: the live ``SurplusLLMExecutor`` runs via the tool-less
   Router (no ``claude -p``, no spawn tools to deny), so it is outside this scope.
 - ``cc/direct_session`` (its ``research`` profile runs a documented deep-research
@@ -74,7 +74,7 @@ def test_experimentation_completion_denies_spawn():
     assert set(_CLI_DISALLOWED_TOOLS) >= _SPAWN
 
 
-# ── 727a3724 (partial): judge Bash + inbox MCP-write hardening ────────────────
+# ── 727a3724 / d83569bf: judge Bash + inbox MCP-write hardening ──────────────
 # The inbox/mail judges run skip_permissions=True on EXTERNAL, adversarial input.
 # These lock the LOSSLESS half of that hardening: no Bash on the mail judge (its
 # prompt uses no tools) and no dangerous MCP writes on the inbox judge, without
@@ -137,11 +137,13 @@ def test_inbox_judge_keeps_reads_and_observation_write():
     assert "mcp__genesis-memory__observation_write" not in d
 
 
-def test_inbox_judge_retains_bash_residual():
-    # DELIBERATE residual (727a3724): Bash is kept so the prompt can shell out to
-    # yt-dlp/curl for YouTube inbox URLs. If a future change denies Bash WITHOUT
-    # relocating that fetch into Python, YouTube inbox items break — this pins the
-    # residual so the trade-off is made consciously, not by accident.
+def test_inbox_judge_denies_bash_and_keeps_web_fetch():
+    # d83569bf: the judge reads attacker-authored content under skip_permissions,
+    # so it gets no shell. The YouTube fetch it used Bash for now lives behind
+    # web_fetch, which must stay allowed or YouTube inbox items break.
     from genesis.inbox.monitor import _eval_disallowed_tools
 
-    assert "Bash" not in _eval_disallowed_tools()
+    d = set(_eval_disallowed_tools())
+    assert "Bash" in d
+    assert "mcp__genesis-health__web_fetch" not in d
+    assert not any(t.startswith("mcp__genesis-health__") and t.endswith("*") for t in d)

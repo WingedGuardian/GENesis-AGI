@@ -80,6 +80,38 @@ class TestCyclesCRUD:
         rows = await ego_crud.list_recent_cycles(db, limit=2)
         assert len(rows) == 2
 
+    async def test_list_recent_cycles_ego_source_filter(self, db):
+        """ego_source scopes the read to one ego; None returns every ego."""
+        rows = [
+            ("u1", "2026-01-01", "user_ego_cycle"),
+            ("g1", "2026-01-02", "genesis_ego_cycle"),
+            ("u2", "2026-01-03", "user_ego_cycle"),
+            ("legacy", "2026-01-04", ""),
+        ]
+        for id_, ts, src in rows:
+            await ego_crud.create_cycle(
+                db, **_make_cycle_kwargs(id_, ts, ego_source=src),
+            )
+        # NULL ego_source (pre-migration rows); create_cycle only writes "".
+        await db.execute(
+            "INSERT INTO ego_cycles (id, output_text, created_at, ego_source) "
+            "VALUES ('null-src', 'x', '2026-01-05', NULL)"
+        )
+        await db.commit()
+
+        user = await ego_crud.list_recent_cycles(
+            db, limit=10, ego_source="user_ego_cycle",
+        )
+        assert [r["id"] for r in user] == ["u2", "u1"]
+        genesis = await ego_crud.list_recent_cycles(
+            db, limit=10, ego_source="genesis_ego_cycle",
+        )
+        assert [r["id"] for r in genesis] == ["g1"]
+        everything = await ego_crud.list_recent_cycles(db, limit=10)
+        assert [r["id"] for r in everything] == [
+            "null-src", "legacy", "u2", "g1", "u1",
+        ]
+
     async def test_uncompacted_beyond_window_empty_table(self, db):
         rows = await ego_crud.list_uncompacted_beyond_window(db, window_size=3)
         assert rows == []
