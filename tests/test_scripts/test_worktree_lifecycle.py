@@ -3744,3 +3744,154 @@ def test_a_dangling_symlink_at_the_path_is_refused_before_anything_moves(
     assert wt.is_symlink() and os.readlink(wt) == str(tmp_path / "nowhere")
     assert list((tmp_path / "trash").glob("wt_branch_merged*.tar.gz"))
     assert _is_locked(reaper_repo.repo, wt)
+
+
+def test_the_reaper_patch_is_named_by_its_recorded_name_not_its_suffix(
+    reaper_repo, tmp_path, monkeypatch, capsys,
+):
+    """The reaper writes its snapshot under the first FREE name. A worktree holding
+    only `.dirty.patch.archived-2` leaves `.dirty.patch` free, so that is where the
+    snapshot goes. Inferring "the last in the sequence" named the worktree's own
+    file as the reaper's and called it safe to delete; the name written is now
+    recorded, and only that file is named."""
+    _disable_compression(monkeypatch)
+    wt = reaper_repo.wt_branch_merged
+    (wt / ".dirty.patch.archived-2").write_text("MY OWN PATCH\n")
+    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    meta = json.loads((_only_entry(tmp_path) / ".trash_meta.json").read_text())
+    assert meta["patch_file"] == ".dirty.patch", meta
+    capsys.readouterr()
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path) == 0
+    out, err = capsys.readouterr()
+    said = out + err
+    assert f"{wt / '.dirty.patch'} is the reaper's snapshot" in said, said
+    assert str(wt / ".dirty.patch.archived-2") not in said, said
+    assert (wt / ".dirty.patch.archived-2").read_text() == "MY OWN PATCH\n"
+
+
+def test_an_unrecorded_patch_name_is_not_guessed_from_the_suffix(tmp_path, capsys):
+    """Without a recorded name (an older archive, or a failed final metadata write)
+    the reaper's file cannot be told apart by name, so several candidates are listed
+    without picking one. A record of None means no snapshot was written: nothing is
+    named."""
+    paths = [tmp_path / ".dirty.patch", tmp_path / ".dirty.patch.archived-2"]
+    assert wl._name_reaper_patches(paths, "TAIL", file=sys.stdout) is True
+    said = capsys.readouterr().out
+    assert all(str(p) in said for p in paths), said
+    assert "does not record which one" in said and "last one listed" not in said, said
+    assert wl._name_reaper_patches(paths, "TAIL", file=sys.stdout, recorded=None) is False
+    assert wl._name_reaper_patches(
+        paths[1:], "TAIL", file=sys.stdout, recorded=".dirty.patch") is False
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("route", ["reattach", "recreate"])
+@pytest.mark.parametrize("compress", [True, False], ids=["archive", "directory"])
+def test_a_directory_kept_aside_is_previewed_as_the_real_run_restores_it(
+    reaper_repo, tmp_path, monkeypatch, capsys, route, compress,
+):
+    """A worktree's own `.trash_meta.json` can be a DIRECTORY, and archiving sets it
+    aside as one. The preview built its root-name list from files only, so it said
+    the recorded entry was missing while the real run renamed it back."""
+    if not compress:
+        _disable_compression(monkeypatch)
+    wt = reaper_repo.wt_branch_merged
+    (wt / ".trash_meta.json").mkdir()
+    (wt / ".trash_meta.json" / "x").write_text("MINE\n")
+    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    if route == "recreate":
+        _drop_registration(reaper_repo.repo, wt)
+    capsys.readouterr()
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    assert "no such file" not in preview, preview
+    if route == "reattach":
+        assert "checked:" in preview, preview
+    else:
+        assert "would be given its name back" in preview, preview
+    _recover_main(monkeypatch, reaper_repo.repo, tmp_path)
+    assert "no such file" not in capsys.readouterr().err
+    assert (wt / ".trash_meta.json" / "x").read_text() == "MINE\n"
+
+
+@pytest.mark.parametrize("route", ["reattach", "recreate"])
+def test_an_empty_directory_kept_aside_is_previewed_as_each_route_finds_it(
+    reaper_repo, tmp_path, monkeypatch, capsys, route,
+):
+    """The two routes see different roots. A reattach places the whole tree, so an
+    EMPTY directory set aside is there and is renamed back. A recreate copies files
+    and symlinks only, so it does not come back and the real run reports it
+    missing. The preview must say what each route will find."""
+    wt = reaper_repo.wt_branch_merged
+    (wt / ".trash_meta.json").mkdir()
+    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    if route == "recreate":
+        _drop_registration(reaper_repo.repo, wt)
+    capsys.readouterr()
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    _recover_main(monkeypatch, reaper_repo.repo, tmp_path)
+    err = capsys.readouterr().err
+    if route == "reattach":
+        assert "no such file" not in preview and "no such file" not in err, (preview, err)
+        assert (wt / ".trash_meta.json").is_dir()
+    else:
+        assert "no such file" in preview and "no such file" in err, (preview, err)
+
+
+@pytest.mark.parametrize("recorded", ["dirty", "missing"])
+def test_a_recreate_says_held_only_when_the_archive_recorded_it(
+    reaper_repo, tmp_path, monkeypatch, capsys, recorded,
+):
+    """Archives made before the dirty flag was recorded carry metadata without it.
+    Recovery still treats them as possibly dirty and exits 2, the safe direction,
+    but it used to say they HELD uncommitted changes, which nobody checked. MEASURED
+    on a live install: every archive taking the recreate path was of that kind."""
+    _disable_compression(monkeypatch)
+    wt = _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    entry = _only_entry(tmp_path)
+    if recorded == "missing":
+        meta = json.loads((entry / ".trash_meta.json").read_text())
+        del meta["had_uncommitted_changes"]  # as an archive from before the flag
+        (entry / ".trash_meta.json").write_text(json.dumps(meta))
+    _drop_registration(reaper_repo.repo, wt)
+    capsys.readouterr()
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path) == 2
+    err = capsys.readouterr().err
+    for said in (preview, err):
+        assert "NOT" in said and "restored" in said, said
+        if recorded == "dirty":
+            # The FULL claim: "held uncommitted changes" alone also matches the
+            # "does not record whether it held …" sentence.
+            assert "archive held uncommitted changes" in said.lower(), said
+            assert "does not record" not in said, said
+        else:
+            assert "does not record whether it held uncommitted changes" in said, said
+            assert "archive held uncommitted" not in said.lower(), said
+
+
+@pytest.mark.parametrize("written", [True, False], ids=["written", "write_failed"])
+def test_the_reattach_preview_names_the_snapshot_only_when_there_is_one(
+    reaper_repo, tmp_path, monkeypatch, capsys, written,
+):
+    """The preview promised that the reaper's snapshot would be named whenever the
+    archive had a tracked patch to write, including when the write failed and no
+    file exists. It now follows the real run's rule: the recorded name, if present."""
+    _disable_compression(monkeypatch)
+    _trash_dirty(reaper_repo, tmp_path, monkeypatch)
+    entry = _only_entry(tmp_path)
+    if not written:  # as an archive whose patch write failed
+        (entry / ".dirty.patch").unlink()
+        _edit_meta(entry, patch_file=None)
+    capsys.readouterr()
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    if written:
+        assert "the reaper's snapshot .dirty.patch inside it would be left in place" in preview
+    else:
+        assert "snapshot" not in preview, preview
+    _recover_main(monkeypatch, reaper_repo.repo, tmp_path)
+    said = "".join(capsys.readouterr())
+    assert ("is the reaper's snapshot" in said) is written, said

@@ -1940,6 +1940,14 @@ def _trash_worktree(
             _rerecord(None)  # it went away before the move: nothing was set aside
         staging_meta.rename(final_meta)
 
+        # The name the snapshot was actually written under, or None when none was.
+        # Recorded so recovery can name THAT file. Inferring it from the suffix
+        # sequence is wrong whenever the worktree's own files leave a gap (only
+        # `.dirty.patch.archived-2` present: the reaper takes `.dirty.patch`), and
+        # recovery calls the file it names safe to delete. Set in the final
+        # rewrite below; the staging copy never carries it, so an archive whose
+        # final rewrite failed reads as unrecorded, not as "no snapshot".
+        written_patch: str | None = None
         if patch_text:
             # N1: the success log used to sit INSIDE the suppress, so a failed
             # write produced no output at all while the tombstone still recorded
@@ -1995,9 +2003,11 @@ def _trash_worktree(
                     )
                     with os.fdopen(fd, "wb") as fh:
                         fh.write(patch_text)
+                    written_patch = target.name
                     _log(f"  saved uncommitted tracked changes → {trash_path}/{target.name}")
                 except OSError as e:
                     _log(f"  WARN could not save {target.name} for {trash_path.name}: {e}")
+        meta["patch_file"] = written_patch
 
         # THE REGISTRATION IS LEFT IN PLACE, DELIBERATELY.
         #
@@ -2131,6 +2141,9 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     does NOT restore them and exits 2.
     """
     candidates: list[str] = []
+    # Every entry at the tree's root, directories included: what a reattach,
+    # which places the whole tree, will find there.
+    root_entries: set[str] = set()
     if stored.is_dir():
         meta_path = stored / ".trash_meta.json"
         if not meta_path.exists():
@@ -2146,6 +2159,7 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 continue
             if item.is_symlink() or item.is_file():
                 candidates.append(rel.as_posix())
+        root_entries = {p.name for p in stored.iterdir()}
         consume_note = f"Trash entry would be KEPT at {stored}"
     else:
         try:
@@ -2184,6 +2198,7 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                     parts = PurePosixPath(m.name).parts
                     if len(parts) < 2:
                         continue  # the root dir member itself
+                    root_entries.add(parts[1])
                     rel = PurePosixPath(*parts[1:])
                     if ".git" in rel.parts or rel.name == ".trash_meta.json":
                         continue
@@ -2198,8 +2213,12 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         )
 
     # The tree's ROOT names, which `_aside_meta_problem` judges the worktree's own
-    # `.trash_meta.json` from: the same answer the real run reaches on disk.
-    root_names = {c for c in candidates if "/" not in c}
+    # `.trash_meta.json` from, as each real run will find them on disk. A reattach
+    # places the whole tree, so it is every root entry (`root_entries`): a
+    # worktree's own `.trash_meta.json` can be a DIRECTORY, set aside as one. A
+    # recreate copies files and symlinks only, so a root directory comes back only
+    # when something inside it is copied: the first component of each candidate.
+    copied_root_names = {c.split("/", 1)[0] for c in candidates}
     original_path = meta.get("original_path", "")
     branch = meta.get("branch", "")
     commit = meta.get("commit", "")
@@ -2247,7 +2266,7 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
             return False
         _log(f"WOULD REATTACH {original_path} to its preserved registration")
         problems = list(plan["problems"])
-        aside = _aside_meta_problem(meta, root_names, name_taken=False)
+        aside = _aside_meta_problem(meta, root_entries, name_taken=False)
         if aside:
             problems.append(aside)
         for problem in problems:
@@ -2258,8 +2277,15 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
             _log(f"  checked: {plan['checked']} (the index is the registration's own, "
                  "not verified against the archive)")
         if lost_edits and meta.get("had_tracked_patch") is not False:
-            _log("  the reaper's .dirty.patch snapshot inside it would be left in place "
-                 "and named")
+            # The same rule the real run names it by: a recorded name is named only
+            # when that file is in the tree, a recorded None names nothing.
+            recorded = meta.get("patch_file", _UNRECORDED)
+            if isinstance(recorded, str) and recorded in root_entries:
+                _log(f"  the reaper's snapshot {recorded} inside it would be left in place "
+                     "and named")
+            elif recorded is _UNRECORDED or not (recorded is None or isinstance(recorded, str)):
+                _log("  any snapshot the reaper wrote into it (a .dirty.patch file) would be "
+                     "left in place and named")
         _log("  failures after the tree is placed (a reaper file that cannot be removed, "
              "an unlock that fails) cannot be previewed")
         _log("WOULD MOVE the trash entry into place (it becomes the worktree)"
@@ -2504,11 +2530,12 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 "aborts partway"
             )
     if lost_edits:
-        _log("  the archive held uncommitted changes and has no registration to reattach "
-             "to, so any uncommitted edits to tracked files and the staged state would "
-             "NOT be restored; the run would exit 2")
+        _log(f"  {_dirty_clause(meta)} and it has no registration to reattach to, so any "
+             "uncommitted edits to tracked files and the staged state would NOT be "
+             "restored; the run would exit 2")
     aside = _aside_meta_problem(
-        meta, root_names, name_taken=tree is not None and ".trash_meta.json" in tree[0])
+        meta, copied_root_names,
+        name_taken=tree is not None and ".trash_meta.json" in tree[0])
     if aside:
         _log(f"  a real run would report: {aside}")
         _log("  and exit 2")
@@ -3012,12 +3039,13 @@ def _restore_from_dir(
         # unmerged lane archives dirty work routinely. No recipe: the archive is
         # named, and what to do with the edits is the reader's call.
         report["incomplete"] = True
+        clause = _dirty_clause(meta)
         print(
-            f"The archive held uncommitted changes, and its registration is gone, so "
-            f"they could not be reattached: {original_path} was recreated at its "
-            "recorded ref with its untracked files, and any uncommitted edits to "
-            "tracked files, and the staged state, were NOT restored. They are still in "
-            f"the archive, kept at {where}.",
+            f"{clause[0].upper()}{clause[1:]}, and its registration is gone, so nothing "
+            f"could be reattached: {original_path} was recreated at its recorded ref "
+            "with its untracked files, and any uncommitted edits to tracked files, and "
+            "the staged state, were NOT restored. Whatever it held is still in the "
+            f"archive, kept at {where}.",
             file=sys.stderr,
         )
         copied = sorted(
@@ -3028,7 +3056,7 @@ def _restore_from_dir(
         if meta.get("had_tracked_patch") is not False:
             _name_reaper_patches(
                 copied, "it came back as an untracked file and is NOT applied",
-                file=sys.stderr)
+                file=sys.stderr, recorded=meta.get("patch_file", _UNRECORDED))
     return True
 
 
@@ -3217,6 +3245,21 @@ def _registration_lock(original_path: str, repo_root: Path) -> tuple[bool, str |
         except OSError:
             return False, None
     return True, None
+
+
+def _dirty_clause(meta: dict) -> str:
+    """What the archive's own metadata says about uncommitted changes, for a run that
+    treats it as possibly dirty (anything but a recorded False).
+
+    A recorded True is stated as a fact. Anything else is NOT: archives made before
+    the flag was recorded carry metadata without it, and their sidecars may hold a
+    value filled in later by a method the archive does not record, which recovery
+    does not read. Saying "held" there claims what nobody checked.
+    """
+    if meta.get("had_uncommitted_changes") is True:
+        return "the archive held uncommitted changes"
+    return ("the archive does not record whether it held uncommitted changes (it was "
+            "made before that was recorded)")
 
 
 def _aside_meta_problem(meta: dict, root_names: set[str], *, name_taken: bool) -> str | None:
@@ -3536,7 +3579,7 @@ def _reattach(
         _name_reaper_patches(
             _untracked_reaper_patches(dest),
             "the tree already holds those edits, so it is safe to delete once checked",
-            file=sys.stdout,
+            file=sys.stdout, recorded=meta.get("patch_file", _UNRECORDED),
         )
     for problem in plan["problems"]:
         report["incomplete"] = True
@@ -3587,14 +3630,30 @@ def _untracked_reaper_patches(tree: Path) -> list[Path]:
     return [p for p in found if p.name not in listed]
 
 
-def _name_reaper_patches(paths: list[Path], tail: str, *, file) -> bool:
+# `patch_file` missing from the metadata: an archive from before the name was
+# recorded, or one whose final metadata rewrite failed. Distinct from None, which
+# is a RECORD that no snapshot was written.
+_UNRECORDED = object()
+
+
+def _name_reaper_patches(paths: list[Path], tail: str, *, file,
+                         recorded: object = _UNRECORDED) -> bool:
     """Say which file is the reaper's snapshot of the edits. True when one was named.
 
-    One candidate is the reaper's. With several, the reaper's is the LAST in the
-    naming sequence (it takes the first free name, so the lower ones already
-    existed), which is said as a rule to check rather than asserted, since a
-    snapshot whose write failed leaves only the worktree's own files behind.
+    ``recorded`` is the archive's ``patch_file``: the name the snapshot was written
+    under, or None when none was. When the archive records it, exactly that file
+    is named and nothing else. When it does not, the reaper's file cannot be told
+    from the worktree's own by name: it takes the first FREE name in the sequence,
+    so a gap in the worktree's own names puts it below them, not last. Several
+    candidates are therefore listed without saying which one it is.
     """
+    if recorded is None or isinstance(recorded, str):
+        match = [p for p in paths if p.name == recorded]
+        if not match:
+            return False
+        print(f"{match[0]} is the reaper's snapshot of the uncommitted edits, written at "
+              f"archive time; {tail}.", file=file)
+        return True
     if not paths:
         return False
     if len(paths) == 1:
@@ -3606,9 +3665,9 @@ def _name_reaper_patches(paths: list[Path], tail: str, *, file) -> bool:
               f"{tail}.", file=file)
         return True
     print("One of these is the reaper's snapshot of the uncommitted edits, written at "
-          "archive time: " + ", ".join(str(p) for p in paths) + ". The reaper takes the "
-          "first free name in that sequence, so its snapshot is the last one listed and "
-          f"the others were already in the worktree; {tail}.", file=file)
+          "archive time: " + ", ".join(str(p) for p in paths) + f"; whichever it is, "
+          f"{tail}. This archive does not record which one it wrote, and the others are "
+          "the worktree's own files, so check each one before deleting any.", file=file)
     return True
 
 
