@@ -359,3 +359,62 @@ from "how we ask for it" and serves as acceptance tests for model changes.
 ## Related Documents
 
 - [genesis-v3-build-phases.md](genesis-v3-build-phases.md) — Phase 2: compute routing
+
+## Reload, model replacement and persisted health
+
+`Router.reload_config()` prepares the production delegate, rate gates and breaker
+bindings before publishing configuration. Each request captures its configuration,
+delegate, pacing and full breaker map before its first await. An old request
+therefore finishes with the model identity it actually requested, even if a provider
+is removed or repointed while it waits. Custom delegates retain their existing
+`CallDelegate` contract; the router still supplies the generation's model ID.
+
+Existing account pacing locks and last admissions are shared across reloads and
+registered alias renames; configured RPM changes update that shared gate.
+Dashboard toggles select and change the current breaker under the registry lock,
+so reload cannot discard a reported operator action. Routed trip events carry a
+health identity; escalation rejects events for retired identities, including events
+held up by another event-bus listener.
+
+The runtime's registry object stays in place. Replaced or renamed breakers receive
+copies of raw hold state with the new provider binding; old persistence and recovery
+callbacks are detached. Recovery after a rename reports the current alias. Registry
+updates own their provider dictionary rather than mutating the delegate's old config.
+Previously, shared-dictionary mutation indirectly refreshed the delegate for normal
+same-alias reloads; it did not provide coherent in-flight routing.
+
+Persisted health carries SHA-256 request identity (provider type, model ID and
+endpoint) plus bounded failure provenance. It stores neither raw errors nor endpoint
+credentials. A changed identity clears only retirement-only history evidenced by a
+provider response with HTTP 410 and an exact affirmative model-retirement statement.
+The exact observed `litellm.APIError: ` wrapper is removed once before checking;
+unknown wrappers and appended qualifications remain ambiguous.
+Every failed retry must establish retirement; a mixed 500/410 visit stays held.
+Negated, account-related or otherwise ambiguous statements stay held. Persisted
+retirement provenance must agree with its saved identity and transient call failure. A generic
+410, 404, authentication, quota, entitlement, operator, mixed or ambiguous legacy
+hold stays held. Alias-only renames do not count as model replacement. Existing
+operator hold expiry and restart backoff caps still apply. Returning to a sole
+legacy alias also preserves its hold.
+
+Daily usage remains independent of model health. The ledger resolves registered
+alias families on reads and writes, combines current UTC-day visits under old/new
+keys, and consolidates them on the next counted write. Late old requests contribute
+to that same counter; repeated restart does not re-add migrated usage. Rolling back
+to a sole legacy alias preserves usage too. A reentrant lock protects alias
+resolution and counter reads/writes from concurrent dashboard access. Two aliases explicitly configured at
+once retain separate counters. Neither model replacement nor reload resets usage.
+
+Runtime provider probes and dashboard health snapshots use the router's current
+config and breaker bindings. A probe started before reload is discarded rather
+than changing replacement health; reload invalidates cached routing health.
+
+Verification uses local HTTP responses and mocked provider completions with the production delegate and
+disposable SQLite/JSON state. `tests/test_routing/test_routing_generation.py` covers
+reload/restart identity, suspension at budget/rate/retry/completion, late callbacks,
+hold preservation, preparation failure and alias accounting. It makes no provider
+accuracy claim and performs no live Fusion inference.
+
+`tests/test_routing/test_routing_generation_http.py` verifies real LiteLLM HTTP
+dispatch, old/new result identity, token usage and SQLite cost recording against a
+localhost server. It performs no external model inference.

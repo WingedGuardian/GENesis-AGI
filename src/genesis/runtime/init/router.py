@@ -35,7 +35,10 @@ def init(rt: GenesisRuntime) -> None:
         # provider trips its breaker repeatedly without recovery.
         from genesis.routing.escalation import ProviderEscalation
 
-        escalation = ProviderEscalation(db=rt._db, event_bus=rt._event_bus)
+        escalation = ProviderEscalation(
+            db=rt._db, event_bus=rt._event_bus,
+            current_identity=lambda name: breakers.current_identity(name),
+        )
         from genesis.routing.essential import build_essential_provider_map
 
         breakers = CircuitBreakerRegistry(

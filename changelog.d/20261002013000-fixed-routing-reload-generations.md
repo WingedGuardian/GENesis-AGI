@@ -1,0 +1,1 @@
+- Routing reloads keep active requests on their original model and isolate replacement-model health. Provider renames preserve daily usage and report recovery under the current name; model replacements retain account and operator holds.

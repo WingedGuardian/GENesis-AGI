@@ -56,7 +56,8 @@ _EVIDENCE_SPAN_CAP_S = 14 * 24 * 3600
 class ProviderEscalation:
     """Track per-provider failures and escalate to observations."""
 
-    def __init__(self, db, event_bus, *, clock=None):
+    def __init__(self, db, event_bus, *, clock=None, current_identity=None):
+        self._current_identity = current_identity
         self._db = db
         self._event_bus = event_bus
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -75,6 +76,10 @@ class ProviderEscalation:
             return
 
         provider = event.details.get("provider", "unknown")
+        identity = event.details.get("health_identity")
+        if (identity is not None and self._current_identity is not None
+                and identity != self._current_identity(provider)):
+            return  # reload may happen while an earlier bus listener awaits
         state = self._state.setdefault(
             provider,
             {

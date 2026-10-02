@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
+from genesis.routing.provider_identity import provider_identity, restored_provenance, valid_identity
 from genesis.routing.types import (
     DegradationLevel,
     ErrorCategory,
@@ -75,6 +78,8 @@ class CircuitBreaker:
         # `record_probe_success`. Moves in lockstep with the OPEN transitions:
         # set at every trip, cleared at every close.
         self._opened_by_call: bool = False
+        self._failure_cause: str | None = None
+        self._failure_identity: str | None = None
 
     @property
     def consecutive_failures(self) -> int:
@@ -146,6 +151,8 @@ class CircuitBreaker:
         was_tripped = self._trip_count > 0
         self._consecutive_failures = 0
         self._last_failure_category = None
+        self._failure_cause = None
+        self._failure_identity = None
         if self.state == ProviderState.HALF_OPEN:
             self._consecutive_successes += 1
             if self._consecutive_successes >= self._success_threshold:
@@ -237,6 +244,8 @@ class CircuitBreaker:
             self._consecutive_successes = 0
             self._consecutive_failures = 0
             self._last_failure_category = None
+            self._failure_cause = None
+            self._failure_identity = None
             self._trip_count = 0
             self._opened_by_call = False
             if self._state != old:
@@ -250,8 +259,18 @@ class CircuitBreaker:
             # the defect this whole change removes. `record_success` still
             # fires it, which is the correct and only path.
 
-    def record_failure(self, category: ErrorCategory) -> bool:
+    def record_failure(self, category: ErrorCategory, *, retirement: bool = False) -> bool:
         """Record a failed call. Returns True if this failure caused the breaker to trip OPEN."""
+        identity = provider_identity(self._provider)
+        cause = "retirement" if retirement and category == ErrorCategory.TRANSIENT else "other"
+        if (self._failure_cause is None and self._trip_count == 0
+                and self._consecutive_failures == 0 and self._state == ProviderState.CLOSED
+                and self._last_failure_category is None):
+            self._failure_cause = cause
+            self._failure_identity = identity
+        elif self._failure_cause != cause or self._failure_identity != identity:
+            # Any mixed/legacy/operator history makes retirement-only unproven.
+            self._failure_cause = "other"
         self._last_failure_category = category
         self._consecutive_successes = 0
         self._consecutive_failures += 1
@@ -326,6 +345,8 @@ class CircuitBreaker:
         self._state = ProviderState.OPEN
         self._opened_at = self._clock()
         self._trip_count = 99
+        self._failure_cause = "operator"
+        self._failure_identity = None
         self._opened_by_call = True
         # An operator disable is not a failure, so it must not inherit the
         # last failure's category: `_effective_open_duration()` reads it to
@@ -362,6 +383,8 @@ class CircuitBreaker:
         # would render a stale `last_failure` / `reason` on a breaker a human
         # just declared healthy (`vitals.py`, `api_keys.py` both read it).
         self._last_failure_category = None
+        self._failure_cause = None
+        self._failure_identity = None
         self._notify_change()
 
 
@@ -377,7 +400,8 @@ class CircuitBreakerRegistry:
         persist: bool = True,
         essential_sites: dict[str, list[str]] | None = None,
     ) -> None:
-        self._providers = providers
+        self._lock = threading.RLock()
+        self._providers = dict(providers)
         self._clock = clock
         self._state_file = Path(state_file) if state_file else _STATE_FILE
         self._on_recovery = on_recovery
@@ -409,40 +433,97 @@ class CircuitBreakerRegistry:
         for a lookup that only matters on two paths.
         """
         try:
-            from genesis.routing.config import _resolve_provider_alias
+            from genesis.routing.config import _current_provider_name, _resolve_provider_alias
         except Exception:  # noqa: BLE001 — no alias map available is no migration.
             return name if name in known else None
         resolved = _resolve_provider_alias(name, known)
-        return resolved if resolved in known else None
+        if resolved in known:
+            return resolved
+        # The append-only family map also preserves holds on rollback to a sole
+        # legacy alias. Never choose between two explicitly configured siblings.
+        family = _current_provider_name(name)
+        peers = [candidate for candidate in known if _current_provider_name(candidate) == family]
+        return peers[0] if len(peers) == 1 else None
 
     def update_providers(self, providers: dict[str, ProviderConfig]) -> None:
-        """Merge new provider configs into the registry (for hot-reload).
+        with self._lock:
+            self._update_providers(providers)
 
-        A RENAME across a hot reload would otherwise strand the live breaker.
-        Note this method MERGES rather than replaces, so after a rename
-        ``self._providers`` holds BOTH generations while ``self._breakers`` holds
-        the hold under the OLD key — and ``Router.reload_config``'s subsequent
-        ``get(new_name)`` creates a fresh CLOSED breaker beside it. An OPEN or
-        HALF_OPEN provider would resume taking traffic mid-run, with the operator
-        given no sign, which is the same loss as the restart path below and
-        reachable without one.
+    def _update_providers(self, providers: dict[str, ProviderConfig]) -> None:
+        """Prepare all replacements, then swap registry-owned bindings.
 
-        So any breaker whose key is absent from the INCOMING config but whose
-        alias resolves into it is moved onto the new key, unless that key already
-        has a breaker — an existing one is live state and is never overwritten.
+        Same identity and alias keeps live health. A rename/replacement copies
+        raw hold state into a rebound breaker, so late old requests cannot heal,
+        poison or persist replacement health. Only proven retirement-only state
+        for a different identity is cleared; all ambiguous holds are retained.
         """
-        for old in [k for k in self._breakers if k not in providers]:
-            target = self._alias_target(old, providers)
-            if target and target != old and target not in self._breakers:
-                self._breakers[target] = self._breakers.pop(old)
-                logger.info(
-                    "Circuit breaker for '%s' moved to '%s' across a hot reload "
-                    "(provider renamed upstream) — its state and trip count are kept",
-                    old, target,
-                )
-        self._providers.update(providers)
+        bindings = {
+            name: self._bind_breaker(self._prior_breaker(name, providers), cfg)
+            for name, cfg in providers.items()
+        }
+        kept = {id(cb) for cb in bindings.values()}
+        detached = [cb for cb in self._breakers.values() if id(cb) not in kept]
+        self._providers = dict(providers)
+        self._breakers = bindings
+        for cb in detached:
+            cb._on_state_change = None
+            cb._on_recovery = None
+        self.save_state()
+
+    def _prior_breaker(self, name: str, providers) -> CircuitBreaker | None:
+        if name in self._breakers:
+            return self._breakers[name]
+        return next((candidate for legacy, candidate in self._breakers.items()
+                     if legacy not in providers and self._alias_target(legacy, providers) == name), None)
+
+    def _bind_breaker(self, old: CircuitBreaker | None, cfg: ProviderConfig) -> CircuitBreaker:
+        if old is None:
+            return CircuitBreaker(
+                cfg, open_duration_s=cfg.open_duration_s, clock=self._clock,
+                on_state_change=self.save_state if self._persist else None,
+                on_recovery=self._on_recovery,
+            )
+        if old._provider == cfg:
+            return old
+        replacement = copy.copy(old)
+        replacement._provider = cfg
+        replacement._open_duration_s = cfg.open_duration_s
+        if self._retired_identity_changed(old._failure_cause, old._failure_identity, cfg):
+            # Reset without invoking callbacks for an unobserved model.
+            replacement._on_state_change = None
+            replacement.force_close()
+        replacement._on_state_change = self.save_state if self._persist else None
+        replacement._on_recovery = self._on_recovery
+        return replacement
+
+    @staticmethod
+    def _retired_identity_changed(cause, identity, cfg: ProviderConfig) -> bool:
+        return (
+            cause == "retirement" and valid_identity(identity)
+            and identity != provider_identity(cfg)
+        )
+
+    def current_identity(self, provider: str) -> str | None:
+        """Identity of a current binding, without recreating removed providers."""
+        with self._lock:
+            cb = self._breakers.get(provider)
+            return provider_identity(cb._provider) if cb is not None else None
+
+    def toggle(self, provider: str) -> ProviderState:
+        """Apply a dashboard toggle to the current binding atomically with reload."""
+        with self._lock:
+            cb = self.get(provider)
+            if cb.state == ProviderState.OPEN:
+                cb.force_close()
+            else:
+                cb.force_open()
+            return cb.state
 
     def get(self, provider: str) -> CircuitBreaker:
+        with self._lock:
+            return self._get(provider)
+
+    def _get(self, provider: str) -> CircuitBreaker:
         """Get or create a circuit breaker for the named provider."""
         if provider not in self._breakers:
             cfg = self._providers[provider]
@@ -456,6 +537,10 @@ class CircuitBreakerRegistry:
         return self._breakers[provider]
 
     def save_state(self) -> None:
+        with self._lock:
+            self._save_state()
+
+    def _save_state(self) -> None:
         """Persist breaker states to disk so they survive restarts.
 
         No-op for read-only (persist=False) registries — MCP children must not
@@ -472,6 +557,9 @@ class CircuitBreakerRegistry:
                 "trip_count": cb._trip_count,
                 "last_failure_category": cb._last_failure_category.value if cb._last_failure_category else None,
                 "opened_by_call": cb._opened_by_call,
+                "identity": provider_identity(cb._provider),
+                "failure_cause": cb._failure_cause,
+                "failure_identity": cb._failure_identity,
             }
         try:
             atomic_write_text(self._state_file, json.dumps(data, indent=2))
@@ -528,6 +616,10 @@ class CircuitBreakerRegistry:
                         "(provider renamed upstream)",
                         name, target,
                     )
+                cfg = self._providers[target]
+                cause, identity = restored_provenance(info, True)
+                if self._retired_identity_changed(cause, identity, cfg):
+                    continue
                 cb = self.get(target)
                 saved_state = info.get("state", "CLOSED")
                 # BOTH non-closed states restore. Restoring only OPEN made
@@ -622,6 +714,7 @@ class CircuitBreakerRegistry:
                 # provider with no traffic to rescue it, which is the harm
                 # the poison-pill work removed. Files written by THIS build
                 # always carry the key, so the ambiguity is legacy-only.
+                cb._failure_cause, cb._failure_identity = restored_provenance(info, restored_live)
                 saved_origin = info.get("opened_by_call")
                 if not restored_live:
                     cb._opened_by_call = False

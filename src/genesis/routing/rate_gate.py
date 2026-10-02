@@ -80,6 +80,24 @@ class RateGateRegistry:
             60.0 / rpm,
         )
 
+    def reconfigured(self, providers, alias_target) -> RateGateRegistry:
+        """Retain shared pacing locks/admissions across reload and known renames."""
+        registry = RateGateRegistry()
+        for name, cfg in providers.items():
+            if cfg.rpm_limit is None or cfg.rpm_limit <= 0:
+                continue
+            prior = name if name in self._gates else None
+            if prior is None:
+                prior = next((old for old in self._gates if old not in providers
+                              and alias_target(old, providers) == name), None)
+            gate = self._gates.get(prior)
+            if gate is None:
+                registry.register(name, cfg.rpm_limit)
+            else:
+                gate._interval = 60.0 / cfg.rpm_limit
+                registry._gates[name] = gate
+        return registry
+
     async def acquire(self, provider: str) -> float:
         """Acquire rate gate for provider. Returns 0.0 if no gate configured."""
         gate = self._gates.get(provider)

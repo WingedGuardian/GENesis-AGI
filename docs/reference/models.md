@@ -757,3 +757,20 @@ noted co-orchestrator potential and disagreement gate use case for Genesis.
 2026-03-03 — added Grok 4, GPT-5.2, GPT-5 Nano/Mini, Qwen 3.5 Plus,
 Qwen3-Max-Thinking; added Mistral/Groq/OpenRouter free tiers; updated
 Gemini entries; cross-referenced model routing registry
+
+### Routing changes while requests are active
+
+Model configuration reloads bind each request to one routing generation. An active
+request finishes with its original delegate/model and reports that identity;
+subsequent requests use the replacement. Model replacement preserves daily usage,
+operator/account/authentication/quota holds and ambiguous legacy health. Only proven
+retirement-only failure history can be cleared for a changed request identity.
+See [reload and persisted health](../architecture/genesis-v3-model-routing-registry.md#reload-model-replacement-and-persisted-health)
+for migration and rollback semantics. This behavior does not qualify any replacement
+model for evaluation judging or novelty suppression.
+
+Operator toggles act on current breaker bindings atomically with reload. Existing
+pacing admissions survive same-name repoints and registered alias renames. Routed
+trip events include health identity, and escalation ignores retired identities.
+Retirement checking handles the observed LiteLLM APIError wrapper conservatively;
+unknown or qualified statements retain the hold.
