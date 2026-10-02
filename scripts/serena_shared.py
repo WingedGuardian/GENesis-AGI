@@ -292,6 +292,17 @@ def configure(project: Path, enable: bool) -> None:
     binary("terse")
     # No old checkout may route to a new service if startup/publication fails.
     write_settings(config_file, project, False)
+    install_units(project, config_file, serena)
+    try:
+        systemctl("daemon-reload")
+        systemctl("enable", "--now", *(unit_name(x) for x in PROFILES))
+        write_settings(config_file, project, True)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        systemctl("disable", "--now", *(unit_name(x) for x in PROFILES))
+        raise
+
+
+def install_units(project: Path, config_file: Path, serena: str) -> None:
     directory = Path.home() / ".config/systemd/user"
     directory.mkdir(parents=True, exist_ok=True)
     home_root = config_file.parent.parent / "serena-shared"
@@ -311,9 +322,6 @@ def configure(project: Path, enable: bool) -> None:
         (directory / unit_name(context)).write_text(
             render_unit(project, context, home, serena, os.environ.get("PATH", os.defpath))
         )
-    systemctl("daemon-reload")
-    systemctl("enable", "--now", *(unit_name(x) for x in PROFILES))
-    write_settings(config_file, project, True)
 
 
 def write_settings(config_file: Path, project: Path, enabled: bool) -> None:

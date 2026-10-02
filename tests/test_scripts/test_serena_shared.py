@@ -338,6 +338,7 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
     new = checkout(tmp_path / "new")
     shared.write_settings(configured_paths, old, True)
     original_write = shared.write_settings
+    unit_calls = []
 
     def write_settings(path, project, enabled):
         if failure == "publication" and enabled:
@@ -345,6 +346,7 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
         original_write(path, project, enabled)
 
     def systemctl(*args):
+        unit_calls.append(args)
         if failure == "startup" and args[0] == "enable":
             raise subprocess.CalledProcessError(1, "enable services")
 
@@ -353,6 +355,12 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
     with pytest.raises((OSError, subprocess.CalledProcessError)):
         shared.configure(new, True)
     assert shared.read_settings(configured_paths) == {"main": str(new), "enabled": False}
+    assert unit_calls[-1] == (
+        "disable",
+        "--now",
+        "genesis-serena-claude-code.service",
+        "genesis-serena-codex.service",
+    )
     captured = []
     monkeypatch.setattr(shared.os, "execv", lambda executable, argv: captured.append(argv))
     shared.launch("claude-code", old)
