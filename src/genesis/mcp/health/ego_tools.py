@@ -813,9 +813,7 @@ async def ego_decision(
     async with get_raw_db(db_path) as db:
         if action == "list":
             decisions, total = await ego_crud.list_active_decisions(
-                db,
-                ego_target=ego_target,
-                limit=20,
+                db, ego_target=ego_target, limit=20,
             )
             return {
                 "status": "ok",

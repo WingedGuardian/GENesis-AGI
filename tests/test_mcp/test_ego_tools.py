@@ -198,7 +198,9 @@ class TestUserAuthorityToolsDisallowedInCycle:
         from genesis.ego.session import _EGO_CYCLE_DISALLOWED_TOOLS
 
         assert "mcp__genesis-health__ego_directive" in _EGO_CYCLE_DISALLOWED_TOOLS
-        assert "mcp__genesis-health__ego_proposal_resolve" in _EGO_CYCLE_DISALLOWED_TOOLS
+        assert (
+            "mcp__genesis-health__ego_proposal_resolve" in _EGO_CYCLE_DISALLOWED_TOOLS
+        )
 
 
 @pytest.fixture
@@ -289,22 +291,20 @@ class TestEgoDecisionRecord:
         assert repeated["related_total"] == 1
 
     async def test_tags_with_wildcard_characters_match_literally(self, decision_db):
-        await self._record("[dev/x] ruling one here")
-        underscore = await self._record("[dev_x] ruling one here")
-
-        assert underscore["action"] == "recorded"
-        assert underscore["related"] == []
-        assert underscore["related_total"] == 0
-
-        await self._record("[de%/x] separate ruling here", ego_target="genesis_ego")
+        await self._record("[dev/x] separate ruling here", ego_target="genesis_ego")
+        underscore = await self._record(
+            "[dev_x] separate ruling here",
+            ego_target="genesis_ego",
+        )
         percent = await self._record(
-            "[dev/x] separate ruling here",
+            "[de%/x] separate ruling here",
             ego_target="genesis_ego",
         )
 
-        assert percent["action"] == "recorded"
-        assert percent["related"] == []
-        assert percent["related_total"] == 0
+        assert [
+            (result["action"], result["related"], result["related_total"])
+            for result in (underscore, percent)
+        ] == [("recorded", [], 0), ("recorded", [], 0)]
 
     async def test_truncated_content_is_used_for_repeat_matching(self, decision_db):
         text = "[dev/x] " + "a" * 600
