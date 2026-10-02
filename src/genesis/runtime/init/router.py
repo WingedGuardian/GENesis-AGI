@@ -39,6 +39,8 @@ def init(rt: GenesisRuntime) -> None:
             db=rt._db, event_bus=rt._event_bus,
             current_identity=lambda name: breakers.current_identity(name),
             current_incident_identity=lambda name: breakers.current_incident_identity(name),
+            incident_binding=lambda name: breakers.current_incident_binding(name),
+            incident_owner=lambda name, incident: breakers.incident_owner(name, incident),
         )
         from genesis.routing.essential import build_essential_provider_map
 

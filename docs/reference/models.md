@@ -778,3 +778,8 @@ unknown or qualified statements retain the hold.
 Captured API-key health retains breaker reasons and essential-site severity. Proven
 retirement replacement begins a fresh escalation/notification incident and retires
 old rows explicitly; ordinary account holds keep their existing incident history.
+
+Ordinary provider renames retain incident ownership, outage age and notification
+acknowledgments through restart; adding an independent sibling does not inherit
+that history. Partial recovery persists cleared retirement provenance without
+changing the existing two-success recovery threshold.

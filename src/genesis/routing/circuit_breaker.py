@@ -84,6 +84,7 @@ class CircuitBreaker:
         self._failure_identity: str | None = None
         # Legacy/account incidents retain None; retirement creates a fresh namespace.
         self._incident_identity: str | None = None
+        self._incident_provider = provider.name
 
     @property
     def consecutive_failures(self) -> int:
@@ -153,6 +154,7 @@ class CircuitBreaker:
         """Record a successful call."""
         old = self._state
         was_tripped = self._trip_count > 0
+        had_provenance = self._failure_cause is not None or self._failure_identity is not None
         self._consecutive_failures = 0
         self._last_failure_category = None
         self._failure_cause = None
@@ -181,7 +183,7 @@ class CircuitBreaker:
             # claim is what generated the bugs this redesign removes.
             self._state = ProviderState.CLOSED
             self._opened_by_call = False
-        if self._state != old:
+        if self._state != old or had_provenance:
             self._notify_change()
         # Notify recovery listeners when provider fully recovers
         if was_tripped and self._trip_count == 0 and self._on_recovery:
@@ -483,6 +485,15 @@ class CircuitBreakerRegistry:
             name: self._bind_breaker(self._prior_breaker(name, providers), cfg)
             for name, cfg in providers.items()
         }
+        # Preserve existing owners first; a newly configured sibling cannot
+        # claim the historical anchor/namespace of a continuing incident.
+        seen = set()
+        for name in sorted(bindings, key=lambda name: self._prior_breaker(name, providers) is None):
+            cb = bindings[name]
+            pair = (cb._incident_provider, cb._incident_identity)
+            if pair in seen:
+                cb._incident_identity = self._new_incident_identity()
+            seen.add((cb._incident_provider, cb._incident_identity))
         kept = {id(cb) for cb in bindings.values()}
         detached = [cb for cb in self._breakers.values() if id(cb) not in kept]
         self._providers = dict(providers)
@@ -515,8 +526,9 @@ class CircuitBreakerRegistry:
             replacement._on_state_change = None
             replacement.force_close()
             replacement._incident_identity = self._new_incident_identity()
+            replacement._incident_provider = cfg.name
             if self._on_retirement:
-                self._on_retirement(old._provider.name, old._incident_identity)
+                self._on_retirement(old._incident_provider, old._incident_identity)
         replacement._on_state_change = self.save_state if self._persist else None
         replacement._on_recovery = self._on_recovery
         return replacement
@@ -531,6 +543,18 @@ class CircuitBreakerRegistry:
     @staticmethod
     def _new_incident_identity() -> str:
         return hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+
+    def current_incident_binding(self, provider: str) -> tuple[str, str | None]:
+        """Fresh configured alias lookup; no historical alias redirection."""
+        with self._lock:
+            cb = self.get(provider)
+            return cb._incident_provider, cb._incident_identity
+
+    def incident_owner(self, anchor: str, incident: str | None) -> str | None:
+        """Current owner of historical evidence, distinct from fresh aliases."""
+        with self._lock:
+            return next((name for name, cb in self._breakers.items()
+                         if (cb._incident_provider, cb._incident_identity) == (anchor, incident)), None)
 
     def current_incident_identity(self, provider: str) -> str | None:
         with self._lock:
@@ -567,6 +591,11 @@ class CircuitBreakerRegistry:
                 on_state_change=self.save_state if self._persist else None,
                 on_recovery=self._on_recovery,
             )
+            cb = self._breakers[provider]
+            if any(other is not cb and (other._incident_provider, other._incident_identity)
+                   == (cb._incident_provider, cb._incident_identity) for other in self._breakers.values()):
+                cb._incident_identity = self._new_incident_identity()
+                self.save_state()
         return self._breakers[provider]
 
     def save_state(self) -> None:
@@ -594,6 +623,7 @@ class CircuitBreakerRegistry:
                 "failure_cause": cb._failure_cause,
                 "failure_identity": cb._failure_identity,
                 "incident_identity": cb._incident_identity,
+                "incident_provider": cb._incident_provider,
             }
         try:
             atomic_write_text(self._state_file, json.dumps(data, indent=2))
@@ -655,14 +685,19 @@ class CircuitBreakerRegistry:
                 cause, identity = restored_provenance(info, True)
                 saved_incident = info.get("incident_identity")
                 incident = saved_incident if valid_identity(saved_incident) else None
+                anchor = info.get("incident_provider", name)
+                from genesis.routing.config import _current_provider_name
+                if not isinstance(anchor, str) or _current_provider_name(anchor) != _current_provider_name(target):
+                    anchor = target
                 cb = self.get(target)
                 if self._retired_identity_changed(cause, identity, cfg):
                     cb._incident_identity = self._new_incident_identity()
                     retired_during_restore = True
                     if self._on_retirement:
-                        self._on_retirement(name, incident)
+                        self._on_retirement(anchor, incident)
                     continue
                 cb._incident_identity = incident
+                cb._incident_provider = anchor
                 saved_state = info.get("state", "CLOSED")
                 # BOTH non-closed states restore. Restoring only OPEN made
                 # the guarantee below expire at the next restart, by an

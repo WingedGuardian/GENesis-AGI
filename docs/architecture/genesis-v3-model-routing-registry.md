@@ -443,3 +443,16 @@ distinct from a live legacy incident whose namespace is `None`. This applies bef
 and after both deferred failure and notification writes, including registered alias
 renames and removal while a database write waits. Cleanup resolves the obsolete
 row without claiming a successful provider call.
+
+Ordinary registered renames preserve a persisted incident owner (the original
+provider alias) as well as its namespace. Escalation hashes, outage timestamps and
+user acknowledgments therefore remain valid across rename/restart/rollback without
+rewriting observation rows. Fresh configured-alias lookup remains direct-first;
+historical evidence resolves by its owned alias/namespace pair. Adding a formerly
+used alias as an independent sibling assigns a distinct namespace if needed and
+does not take ownership of the continuing incident. Partial HALF_OPEN recovery
+persists changed failure provenance even before the two-success close threshold.
+
+Resilience, call-site and API-key rendering use the same captured breaker view.
+Snapshot rendering does not publish stale cloud-axis updates; the awareness tick
+continues deriving the live cloud axis independently from the live registry.

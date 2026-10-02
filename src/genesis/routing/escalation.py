@@ -19,6 +19,7 @@ import uuid
 from datetime import UTC, datetime
 
 from genesis.observability.types import GenesisEvent, Severity, Subsystem
+from genesis.routing.provider_identity import valid_identity
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,10 @@ _NOTIFY_AFTER_S = 3600.0
 _EVIDENCE_SPAN_CAP_S = 14 * 24 * 3600
 
 
-def _incident_is_current(provider: str, incident: str | None, lookup) -> bool:
+def _incident_is_current(provider: str, incident: str | None, lookup, owner=None) -> bool:
     """Absent bindings are stale; a live legacy None namespace is valid."""
+    if owner is not None:
+        return owner(provider, incident) is not None
     if lookup is None:
         return True
     try:
@@ -69,18 +72,24 @@ class ProviderEscalation:
     """Track per-provider failures and escalate to observations."""
 
     def __init__(self, db, event_bus, *, clock=None, current_identity=None,
-                 current_incident_identity=None):
+                 current_incident_identity=None, incident_binding=None, incident_owner=None):
         self._current_identity = current_identity
         self._current_incident_identity = current_incident_identity
+        self._incident_binding = incident_binding
+        self._incident_owner = incident_owner
         self._db = db
         self._event_bus = event_bus
         self._clock = clock or (lambda: datetime.now(UTC))
         # Per-provider tracking state:
         # {name: {"trip_count": int, "first_trip_at": str, "escalated": bool}}
-        self._state: dict[str, dict] = {}
+        self._state: dict[str | tuple[str, str], dict] = {}
 
     def _incident_is_current(self, provider: str, incident: str | None) -> bool:
-        return _incident_is_current(provider, incident, self._current_incident_identity)
+        return _incident_is_current(provider, incident, self._current_incident_identity, self._incident_owner)
+
+    @staticmethod
+    def _state_key(provider, incident):
+        return provider if incident is None else (provider, incident)
 
     def attach(self) -> None:
         """Subscribe to routing events on the event bus."""
@@ -98,12 +107,15 @@ class ProviderEscalation:
                 and identity != self._current_identity(provider)):
             return  # reload may happen while an earlier bus listener awaits
         incident = event.details.get("incident_identity")
+        if self._incident_binding is not None:
+            anchor, current = self._incident_binding(provider)
+            if current != incident:
+                return
+            provider = anchor
         if not self._incident_is_current(provider, incident):
             return
-        if provider in self._state and self._state[provider].get("incident_identity") != incident:
-            del self._state[provider]
         state = self._state.setdefault(
-            provider,
+            self._state_key(provider, incident),
             {
                 "incident_identity": incident,
                 "trip_count": 0,
@@ -196,9 +208,10 @@ class ProviderEscalation:
 
     def record_retirement(self, provider: str, incident_identity: str | None) -> None:
         """Retire obsolete evidence without asserting successful recovery."""
-        state = self._state.get(provider)
-        if state is not None and state.get("incident_identity") == incident_identity:
-            del self._state[provider]
+        key = self._state_key(provider, incident_identity)
+        state = self._state.get(key)
+        if state is not None:
+            del self._state[key]
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -223,13 +236,16 @@ class ProviderEscalation:
         """
         incident = (self._current_incident_identity(provider)
                     if self._current_incident_identity is not None else None)
-        if provider in self._state:
+        if self._incident_binding is not None:
+            provider, incident = self._incident_binding(provider)
+        key = self._state_key(provider, incident)
+        if key in self._state:
             logger.info(
                 "Provider '%s' recovered after %d trips — clearing escalation state",
                 provider,
-                self._state[provider].get("trip_count", 0),
+                self._state[key].get("trip_count", 0),
             )
-            del self._state[provider]
+            del self._state[key]
 
         # record_recovery() is called from the SYNC CircuitBreaker.record_success()
         # path. In production that runs inside the async routing call (a loop is
@@ -447,6 +463,7 @@ async def notify_provider_if_due(
     provider_still_failing=None,
     incident_identity: str | None = None,
     current_incident_identity=None,
+    incident_owner=None,
 ) -> bool:
     """Tell the user ONCE that a provider has been dead long enough to matter.
 
@@ -554,7 +571,8 @@ async def notify_provider_if_due(
     # direction and a wrong page is the unrecoverable one.
     if provider_still_failing is not None:
         try:
-            if not provider_still_failing(provider):
+            live_provider = incident_owner(provider, incident_identity) if incident_owner is not None else provider
+            if live_provider is None or not provider_still_failing(live_provider):
                 logger.info(
                     "outage row for '%s' is past the floor but the breaker "
                     "reads recovered — stale row, not paging",
@@ -639,7 +657,7 @@ async def notify_provider_if_due(
         human = f"more than {_EVIDENCE_SPAN_CAP_S / 86400:.0f} days"
     else:
         human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
-    if not _incident_is_current(provider, incident_identity, current_incident_identity):
+    if not _incident_is_current(provider, incident_identity, current_incident_identity, incident_owner):
         return False
     try:
         obs_id = await observations.create(
@@ -680,7 +698,7 @@ async def notify_provider_if_due(
         )
         return False
 
-    if not _incident_is_current(provider, incident_identity, current_incident_identity):
+    if not _incident_is_current(provider, incident_identity, current_incident_identity, incident_owner):
         await observations.resolve_by_content_hash(
             db, source="routing",
             content_hash=ProviderEscalation._notify_content_hash(provider, incident_identity),
@@ -710,6 +728,7 @@ _SWEEP_ROW_LIMIT = 200
 async def sweep_due_notifications(
     db, *, clock=None, priority: str = "critical", provider_still_failing=None,
     current_incident_identity=None,
+    incident_owner=None,
 ) -> int:
     """Notify for every provider whose unresolved outage has passed the floor.
 
@@ -765,7 +784,7 @@ async def sweep_due_notifications(
             _SWEEP_ROW_LIMIT,
         )
 
-    providers: set[str] = set()
+    providers: set[tuple[str, str | None]] = set()
     for row in rows:
         raw = row.get("content")
         try:
@@ -774,14 +793,20 @@ async def sweep_due_notifications(
             continue
         if isinstance(blob, dict):
             name = blob.get("provider")
-            if isinstance(name, str) and name:
-                providers.add(name)
+            incident = blob.get("incident_identity")
+            if isinstance(name, str) and name and (incident is None or valid_identity(incident)):
+                providers.add((name, incident))
 
     written = 0
-    for provider in sorted(providers):
+    for provider, saved_incident in sorted(providers, key=lambda pair: (pair[0], pair[1] or "")):
         try:
-            incident = (current_incident_identity(provider)
-                        if current_incident_identity is not None else None)
+            if incident_owner is not None:
+                incident = saved_incident
+                if incident_owner(provider, incident) is None:
+                    continue
+            else:
+                incident = (current_incident_identity(provider)
+                            if current_incident_identity is not None else None)
             if await notify_provider_if_due(
                 db,
                 provider,
@@ -790,6 +815,7 @@ async def sweep_due_notifications(
                 provider_still_failing=provider_still_failing,
                 incident_identity=incident,
                 current_incident_identity=current_incident_identity,
+                incident_owner=incident_owner,
             ):
                 written += 1
         except Exception:

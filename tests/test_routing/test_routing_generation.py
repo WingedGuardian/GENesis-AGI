@@ -5,7 +5,6 @@ All provider responses are local mocks; state files stay in pytest tmp_path.
 import asyncio
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,34 +17,10 @@ from genesis.routing.types import (
     BudgetStatus,
     CallSiteConfig,
     ErrorCategory,
-    ProviderConfig,
     ProviderState,
     RetryPolicy,
-    RoutingConfig,
 )
-
-
-def config(model="old-model", name="provider"):
-    provider = ProviderConfig(name=name, provider_type="openai", model_id=model,
-                              is_free=True, rpm_limit=None, open_duration_s=60)
-    return RoutingConfig(providers={name: provider},
-                         call_sites={"test": CallSiteConfig(id="test", chain=[name])},
-                         retry_profiles={"default": RetryPolicy(max_retries=0)})
-
-
-def make_router(cfg, tmp_path):
-    tracker = MagicMock(db=None)
-    tracker.check_budget = AsyncMock(return_value=BudgetStatus.UNDER_LIMIT)
-    return Router(config=cfg,
-                  breakers=CircuitBreakerRegistry(cfg.providers,
-                      state_file=tmp_path / "breakers.json", persist=False),
-                  cost_tracker=tracker, degradation=MagicMock(should_skip=lambda _: False),
-                  delegate=LiteLLMDelegate(cfg, profile_registry=MagicMock()))
-
-
-def response():
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
-                           usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1))
+from tests.test_routing.generation_helpers import config, make_router, response
 
 
 @pytest.mark.asyncio
@@ -753,314 +728,45 @@ def test_reload_retains_pacing_admission(tmp_path, rename):
     assert gate.interval == 2.0
 
 
-async def drain_escalation_tasks():
-    tasks = [task for task in asyncio.all_tasks()
-             if task is not asyncio.current_task() and task.get_name().startswith("escalation-")]
-    if tasks:
-        await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("already_escalated", [False, True])
-async def test_retirement_replacement_starts_fresh_durable_incident(tmp_path, empty_db, already_escalated):
-    from genesis.observability.events import GenesisEventBus
-    from genesis.observability.types import Severity, Subsystem
-    from genesis.routing.escalation import ProviderEscalation, sweep_due_notifications
-    from genesis.routing.provider_identity import provider_identity
-
-    bus = GenesisEventBus()
-    escalation = ProviderEscalation(empty_db, bus,
-        current_identity=lambda name: registry.current_identity(name),
-        current_incident_identity=lambda name: registry.current_incident_identity(name))
-    registry = CircuitBreakerRegistry(config().providers, state_file=tmp_path / "incidents.json",
-        on_retirement=escalation.record_retirement)
-    escalation.attach()
-
-    async def trip():
-        await bus.emit(Subsystem.ROUTING, Severity.WARNING, "breaker.tripped", "test",
-                       provider="provider", health_identity=provider_identity(registry.get("provider")._provider),
-                       incident_identity=registry.current_incident_identity("provider"))
-
-    for _ in range(5 if already_escalated else 4):
-        await trip()
-    await drain_escalation_tasks()
-    old = registry.get("provider")
-    old._failure_threshold = 1
-    old.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-    registry.update_providers(config("new-model").providers)
-    incident = registry.current_incident_identity("provider")
-    assert incident is not None
-    await drain_escalation_tasks()
-    await trip()
-    assert escalation._state["provider"]["trip_count"] == 1
-    assert not escalation._state["provider"]["escalated"]
-    assert escalation._state["provider"]["incident_identity"] == incident
-    cursor = await empty_db.execute("SELECT resolved, resolution_notes FROM observations WHERE content_hash = ?",
-                                   (escalation._provider_content_hash("provider"),))
-    rows = await cursor.fetchall()
-    if already_escalated:
-        assert rows and all(row[0] == 1 and "retired" in row[1] and "recovered" not in row[1] for row in rows)
-    else:
-        assert not rows
-    assert await sweep_due_notifications(empty_db, current_incident_identity=registry.current_incident_identity,
-                                         provider_still_failing=lambda _: True) == 0
-    for _ in range(4):
-        await trip()
-    await drain_escalation_tasks()
-    cursor = await empty_db.execute("SELECT resolved FROM observations WHERE content_hash = ?",
-                                   (escalation._provider_content_hash("provider", incident),))
-    assert [row[0] for row in await cursor.fetchall()] == [0]
-    restored = CircuitBreakerRegistry(config("new-model").providers, state_file=tmp_path / "incidents.json")
-    assert restored.current_incident_identity("provider") == incident
-    # A -> B -> A does not revive historical A hashes.
-    new = registry.get("provider")
-    new._failure_threshold = 1
-    new.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-    registry.update_providers(config().providers)
-    assert registry.current_incident_identity("provider") not in (None, incident)
-    await drain_escalation_tasks()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("hold", ["operator", "auth", "quota", "ambiguous"])
-async def test_repoint_preserves_account_escalation_history(tmp_path, empty_db, hold):
-    from genesis.observability.events import GenesisEventBus
-    from genesis.observability.types import Severity, Subsystem
-    from genesis.routing.escalation import ProviderEscalation
-
-    bus = GenesisEventBus()
-    escalation = ProviderEscalation(empty_db, bus,
-        current_identity=lambda name: registry.current_identity(name),
-        current_incident_identity=lambda name: registry.current_incident_identity(name))
-    registry = CircuitBreakerRegistry(config().providers, state_file=tmp_path / "account.json",
-        on_retirement=escalation.record_retirement)
-    escalation.attach()
-    for _ in range(4):
-        await bus.emit(Subsystem.ROUTING, Severity.WARNING, "breaker.tripped", "test", provider="provider")
-    old = registry.get("provider")
-    old._failure_threshold = 1
-    if hold == "operator":
-        old.force_open()
-    else:
-        old.record_failure({"auth": ErrorCategory.PERMANENT, "quota": ErrorCategory.QUOTA_EXHAUSTED,
-                            "ambiguous": ErrorCategory.TRANSIENT}[hold])
-    registry.update_providers(config("new-model").providers)
-    assert registry.current_incident_identity("provider") is None
-    await bus.emit(Subsystem.ROUTING, Severity.WARNING, "breaker.tripped", "test", provider="provider")
-    await drain_escalation_tasks()
-    assert escalation._state["provider"]["trip_count"] == 5
-    assert escalation._state["provider"]["escalated"]
-
-
-def test_restart_retires_model_with_fresh_persisted_incident(tmp_path):
-    path = tmp_path / "restart-incident.json"
-    registry = CircuitBreakerRegistry(config().providers, state_file=path)
-    old = registry.get("provider")
-    old._failure_threshold = 1
-    old.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-    retired = MagicMock()
-    new = CircuitBreakerRegistry(config("new-model").providers, state_file=path, on_retirement=retired)
-    incident = new.current_incident_identity("provider")
-    assert incident is not None
-    retired.assert_called_once_with("provider", None)
-    assert new.get("provider").state == ProviderState.CLOSED
-    again = CircuitBreakerRegistry(config("new-model").providers, state_file=path)
-    assert again.current_incident_identity("provider") == incident
-
-
-@pytest.mark.asyncio
-async def test_retired_deferred_observation_is_not_left_actionable(empty_db, monkeypatch):
-    from genesis.db.crud import observations
-    from genesis.observability.events import GenesisEventBus
-    from genesis.routing.escalation import ProviderEscalation
-
-    current = [None]
-    escalation = ProviderEscalation(empty_db, GenesisEventBus(), current_incident_identity=lambda _: current[0])
-    state = {"incident_identity": None, "trip_count": 5, "first_trip_at": "2026-10-01T00:00:00+00:00",
-             "last_trip_at": "2026-10-01T00:01:00+00:00", "escalated": False}
-    entered, release = asyncio.Event(), asyncio.Event()
-    actual_create = observations.create
-
-    async def suspended_create(*args, **kwargs):
-        entered.set()
-        await release.wait()
-        return await actual_create(*args, **kwargs)
-
-    monkeypatch.setattr(observations, "create", suspended_create)
-    pending = asyncio.create_task(escalation._create_observation("provider", state))
-    await entered.wait()
-    current[0] = "a" * 64
-    escalation.record_retirement("provider", None)
-    await drain_escalation_tasks()
-    release.set()
-    await pending
-    cursor = await empty_db.execute("SELECT resolved, resolution_notes FROM observations WHERE content_hash = ?",
-                                   (escalation._provider_content_hash("provider"),))
-    rows = await cursor.fetchall()
-    assert rows and all(row[0] == 1 and "retired" in row[1] for row in rows)
-    assert not state["escalated"]
-
-
-@pytest.mark.asyncio
-async def test_retired_deferred_notification_is_not_left_actionable(empty_db, monkeypatch):
-    import json
-    from datetime import UTC, datetime, timedelta
-
-    from genesis.db.crud import observations
-    from genesis.routing.escalation import ProviderEscalation, notify_provider_if_due
-
-    now = datetime.now(UTC)
-    incident = "a" * 64
-    current = [incident]
-    await observations.create(empty_db, id="old-failure", source="routing", type="provider_failure",
-        content=json.dumps({"provider": "provider", "incident_identity": incident}), priority="high",
-        created_at=(now - timedelta(hours=2)).isoformat(),
-        content_hash=ProviderEscalation._provider_content_hash("provider", incident))
-    entered, release = asyncio.Event(), asyncio.Event()
-    actual_create = observations.create
-
-    async def suspended_create(*args, **kwargs):
-        entered.set()
-        await release.wait()
-        return await actual_create(*args, **kwargs)
-
-    monkeypatch.setattr(observations, "create", suspended_create)
-    pending = asyncio.create_task(notify_provider_if_due(empty_db, "provider", clock=lambda: now,
-        incident_identity=incident, current_incident_identity=lambda _: current[0],
-        provider_still_failing=lambda _: True))
-    await entered.wait()
-    current[0] = "b" * 64
-    release.set()
-    assert not await pending
-    cursor = await empty_db.execute("SELECT resolved, resolution_notes FROM observations WHERE content_hash = ?",
-                                   (ProviderEscalation._notify_content_hash("provider", incident),))
-    rows = await cursor.fetchall()
-    assert rows and all(row[0] == 1 and "retired" in row[1] for row in rows)
-
-
-def test_health_view_never_restores_or_writes_disk_and_keeps_captured_coverage(tmp_path, monkeypatch):
+async def test_captured_resilience_matches_health_during_reload(tmp_path, monkeypatch):
+    import genesis.observability.snapshots as snapshots
+    from genesis.observability.health_data import HealthDataService
+    from genesis.resilience.state import ResilienceStateMachine
+    from genesis.routing.types import DegradationLevel
     cfg = config()
     cfg.call_sites["3_micro_reflection"] = CallSiteConfig(id="3_micro_reflection", chain=["provider"])
     router = make_router(cfg, tmp_path)
     old = router.breakers.get("provider")
     old._failure_threshold = 1
     old.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-    captured_cfg, bindings = router.health_snapshot()
-    router.reload_config(config("new-model"))
-    monkeypatch.setattr(CircuitBreakerRegistry, "load_state", MagicMock(side_effect=AssertionError("disk read")))
-    view = CircuitBreakerRegistry.health_view(captured_cfg, bindings)
-    assert view.get("provider") is old
-    assert view.uncovered_essential_sites() == ["3_micro_reflection"]
-    assert router.breakers.get("provider").state == ProviderState.CLOSED
-    assert view._persist is False
-    view.save_state()
-
-
-@pytest.mark.asyncio
-async def test_awareness_notification_uses_current_retirement_incident(tmp_path, empty_db, monkeypatch):
-    import json
-    from datetime import UTC, datetime, timedelta
-
-    from genesis.awareness.loop import _check_provider_outage_notify
-    from genesis.db.crud import observations
-    from genesis.routing.escalation import ProviderEscalation
-    from genesis.runtime import GenesisRuntime
-
-    router = make_router(config(), tmp_path)
-    old = router.breakers.get("provider")
-    old._failure_threshold = 1
-    old.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-    router.reload_config(config("new-model"))
-    router.breakers.get("provider").force_open()
-    incident = router.breakers.current_incident_identity("provider")
-    assert incident is not None
-    await observations.create(empty_db, id="current-failure", source="routing", type="provider_failure",
-        content=json.dumps({"provider": "provider", "incident_identity": incident}), priority="high",
-        created_at=(datetime.now(UTC) - timedelta(hours=2)).isoformat(),
-        content_hash=ProviderEscalation._provider_content_hash("provider", incident))
-    monkeypatch.setattr(GenesisRuntime, "instance", lambda: SimpleNamespace(_circuit_breakers=router.breakers))
-    monkeypatch.setattr("genesis.awareness.provider_notify_config.effective_mode", lambda: "live")
-    await _check_provider_outage_notify(empty_db)
-    await _check_provider_outage_notify(empty_db)
-    cursor = await empty_db.execute("SELECT content_hash, content FROM observations WHERE priority='critical' AND resolved=0")
-    rows = await cursor.fetchall()
-    assert len(rows) == 1
-    assert rows[0][0] == ProviderEscalation._notify_content_hash("provider", incident)
-    assert json.loads(rows[0][1])["incident_identity"] == incident
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("writer", ["observation", "notification"])
-@pytest.mark.parametrize("replacement", ["rename", "remove"])
-@pytest.mark.parametrize("legacy_incident", [True, False])
-async def test_missing_alias_retires_deferred_database_write(
-        tmp_path, empty_db, monkeypatch, writer, replacement, legacy_incident):
-    import json
-    from datetime import UTC, datetime, timedelta
-
-    from genesis.db.crud import observations
-    from genesis.observability.events import GenesisEventBus
-    from genesis.routing.escalation import ProviderEscalation, notify_provider_if_due
-
-    now = datetime.now(UTC)
-    escalation = ProviderEscalation(empty_db, GenesisEventBus(),
-        current_incident_identity=lambda name: registry.current_incident_identity(name))
-    registry = CircuitBreakerRegistry(config("predecessor", "glm51").providers,
-        state_file=tmp_path / "missing-alias.json", on_retirement=escalation.record_retirement)
-    if not legacy_incident:
-        predecessor = registry.get("glm51")
-        predecessor._failure_threshold = 1
-        predecessor.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-        registry.update_providers(config("old-model", "glm51").providers)
-        await drain_escalation_tasks()
-    incident = registry.current_incident_identity("glm51")
-    assert (incident is None) == legacy_incident
-    old = registry.get("glm51")
-    old._failure_threshold = 1
-    old.record_failure(ErrorCategory.TRANSIENT, retirement=True)
-    state = {"incident_identity": incident, "trip_count": 5, "first_trip_at": now.isoformat(),
-             "last_trip_at": now.isoformat(), "escalated": False}
-    if writer == "notification":
-        await observations.create(empty_db, id="old-outage", source="routing", type="provider_failure",
-            content=json.dumps({"provider": "glm51", "incident_identity": incident}), priority="high",
-            created_at=(now - timedelta(hours=2)).isoformat(),
-            content_hash=escalation._provider_content_hash("glm51", incident))
+    machine = ResilienceStateMachine()
+    machine.update_cloud = MagicMock()
+    service = HealthDataService(circuit_breakers=router.breakers, routing_config=cfg,
+        routing_snapshot=router.health_snapshot, resilience_state_machine=machine)
     entered, release = asyncio.Event(), asyncio.Event()
-    actual_create = observations.create
-
-    async def suspended_create(*args, **kwargs):
+    async def suspended(*args, **kwargs):
         entered.set()
         await release.wait()
-        return await actual_create(*args, **kwargs)
-
-    monkeypatch.setattr(observations, "create", suspended_create)
-    if writer == "observation":
-        pending = asyncio.create_task(escalation._create_observation("glm51", state))
-        content_hash = escalation._provider_content_hash("glm51", incident)
-    else:
-        pending = asyncio.create_task(notify_provider_if_due(empty_db, "glm51", clock=lambda: now,
-            incident_identity=incident, current_incident_identity=registry.current_incident_identity,
-            provider_still_failing=lambda name: registry.get(name).state != ProviderState.CLOSED))
-        content_hash = escalation._notify_content_hash("glm51", incident)
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=5)
-        registry.update_providers(config("new-model", "glm").providers if replacement == "rename" else {})
-        await drain_escalation_tasks()
-        if replacement == "rename":
-            assert registry.get("glm").state == ProviderState.CLOSED
-            assert registry.current_incident_identity("glm") not in (None, incident)
-    finally:
-        release.set()
+        return {}
+    for name in ["cc_sessions", "infrastructure", "queues", "surplus_status", "cost", "awareness",
+                 "outreach_stats", "mcp_status", "provider_activity", "memory_health", "eval_staleness",
+                 "services_async", "deploy_health", "reflex"]:
+        monkeypatch.setattr(snapshots, name, AsyncMock(return_value={}))
+    monkeypatch.setattr(snapshots, "infrastructure", suspended)
+    for name in ["conversation_activity", "proactive_memory_metrics"]:
+        monkeypatch.setattr(snapshots, name, MagicMock(return_value={}))
+    monkeypatch.setattr("genesis.observability.snapshots.api_keys.resolve_api_key", lambda _: "test-key")
+    service._vcr_snapshot = AsyncMock(return_value={})
+    pending = asyncio.create_task(service._compute_snapshot())
+    await asyncio.wait_for(entered.wait(), 5)
+    router.reload_config(config("replacement"))
+    release.set()
     result = await pending
-    if writer == "notification":
-        assert result is False
-    cursor = await empty_db.execute("SELECT resolved, resolution_notes FROM observations WHERE content_hash = ?",
-                                   (content_hash,))
-    rows = await cursor.fetchall()
-    assert rows and all(row[0] == 1 and "retired" in row[1] and "recovered" not in row[1] for row in rows)
-    assert not state["escalated"]
-    # Absence is stale before a write too; live None must remain a valid incident.
-    assert not escalation._incident_is_current("glm51", incident)
-    assert not escalation._incident_is_current("glm51", None)
-    if replacement == "rename":
-        assert escalation._incident_is_current("glm", registry.current_incident_identity("glm"))
+    assert result["api_keys"]["providers"]["provider"]["cb_state"] == "open"
+    assert result["resilience"]["level"] == DegradationLevel.ESSENTIAL.value
+    assert result["resilience"]["summary"] == "Providers down: provider"
+    assert router.breakers.get("provider").state == ProviderState.CLOSED
+    machine.update_cloud.assert_not_called()

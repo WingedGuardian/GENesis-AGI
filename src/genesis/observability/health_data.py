@@ -483,7 +483,7 @@ class HealthDataService:
             "timestamp": now,
             "call_sites": r_call_sites,
             "cc_sessions": r_cc_sessions,
-            "resilience": self._resilience_state(),
+            "resilience": self._resilience_state(breakers),
             "infrastructure": r_infrastructure,
             "queues": r_queues,
             "surplus": r_surplus,
@@ -597,10 +597,14 @@ class HealthDataService:
             for name, r in self._provider_health.results.items()
         }
 
-    def _resilience_state(self) -> dict:
+    def _resilience_state(self, captured_breakers=None) -> dict:
         """Compute resilience state with detail from circuit breaker registry."""
         from genesis.observability.snapshots.infrastructure import resilience_state_detail
 
+        if captured_breakers is not None:
+            # Rendering an old generation must not mutate the live cloud axis;
+            # awareness independently refreshes that axis from the live registry.
+            return resilience_state_detail(captured_breakers, None)
         return resilience_state_detail(self._breakers, self._state_machine)
 
     async def validate_api_keys(self) -> None:

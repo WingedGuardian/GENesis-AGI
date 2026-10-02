@@ -2610,6 +2610,7 @@ async def _check_provider_outage_notify(db) -> None:
         # provider — fail toward silence.
         provider_still_failing = None
         current_incident_identity = None
+        incident_owner = None
         try:
             from genesis.routing.types import ProviderState
             from genesis.runtime import GenesisRuntime
@@ -2617,6 +2618,7 @@ async def _check_provider_outage_notify(db) -> None:
             _breakers = getattr(GenesisRuntime.instance(), "_circuit_breakers", None)
             if _breakers is not None:
                 current_incident_identity = _breakers.current_incident_identity
+                incident_owner = _breakers.incident_owner
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
         except Exception:
@@ -2635,6 +2637,7 @@ async def _check_provider_outage_notify(db) -> None:
         written = await sweep_due_notifications(
             db, priority=priority, provider_still_failing=provider_still_failing,
             current_incident_identity=current_incident_identity,
+            incident_owner=incident_owner,
         )
         if written:
             logger.info(
