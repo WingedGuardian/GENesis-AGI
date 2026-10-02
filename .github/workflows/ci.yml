@@ -1064,6 +1064,50 @@ jobs:
         #   test_update_tier2_baseline.py goes 5 -> 8 (unreadable history, no
         #   history table, and no interpreter for the reader are each a new case).
         # test_update_rollback_recovery.py is edited count-neutrally (8 == 8).
-        # So the floor is 23476 + 13 = 23489. No new test carries a skipif, so
-        # the ceiling does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23530
+        # So that floor is 23476 + 13 = 23489.
+        #
+        # The deploy-checkout lib branch adds three test files that do not exist on
+        # main, so each delta is its FULL collected count, and edits seven others
+        # count-neutrally (each re-measured, branch == main):
+        #   pytest tests/test_scripts/test_deploy_checkout.py --collect-only -q
+        #     -> 36 tests collected
+        #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
+        #     -> 28 tests collected
+        #   pytest tests/test_scripts/test_update_checkout_moved.py --collect-only -q
+        #     -> 29 tests collected
+        # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
+        # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
+        # does not move.
+        #
+        # UNION with the deploy-guidance PR (#2101): it changes one existing test
+        # file, tests/test_hooks/test_bash_timeout_guidance.py, which collects 3
+        # tests on main and 27 here, so its DELTA is +24 (measured against main,
+        # after the last test-adding edit, not against an earlier state of the
+        # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
+        # ceiling does not move. Floor: 23582 + 24 = 23606.
+        #
+        # UNION with the entity apply-rails PR (#1729). Measured against main's
+        # versions with --collect-only, after the last test-adding edit:
+        #   test_entity_adjudication.py         50 -> 62   (+12)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
+        #   test_entity_adjudication_config.py  13 -> 15   (+2)
+        #   test_migration_0065_...             14 -> 14   (0)
+        # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
+        # superseded by this count. No new skips, so the ceiling holds.
+        # Floor: 23606 + 38 = 23644.
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        #
+        # UNION with the db-transaction PR (#1881): the +41 union paragraph
+        # above this block applies here, re-verified at merge by --collect-only:
+        # test_connection.py collects 56 on the branch vs 15 on main. No new
+        # test carries a skipif, so the ceiling does not move.
+        # Floor: 23709 + 41 = 23750.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23750
