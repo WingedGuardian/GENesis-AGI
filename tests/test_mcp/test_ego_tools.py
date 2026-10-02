@@ -8,7 +8,7 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import ego as ego_crud
-from genesis.db.schema import TABLES
+from genesis.db.schema import TABLES, create_all_tables
 
 
 @pytest.fixture
@@ -198,6 +198,167 @@ class TestUserAuthorityToolsDisallowedInCycle:
         from genesis.ego.session import _EGO_CYCLE_DISALLOWED_TOOLS
 
         assert "mcp__genesis-health__ego_directive" in _EGO_CYCLE_DISALLOWED_TOOLS
-        assert (
-            "mcp__genesis-health__ego_proposal_resolve" in _EGO_CYCLE_DISALLOWED_TOOLS
+        assert "mcp__genesis-health__ego_proposal_resolve" in _EGO_CYCLE_DISALLOWED_TOOLS
+
+
+@pytest.fixture
+async def decision_db(tmp_path):
+    db_path = tmp_path / "decisions.db"
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        await create_all_tables(conn)
+    with patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path):
+        yield db_path
+
+
+class TestEgoDecisionRecord:
+    async def _record(self, content, *, ego_target="user_ego"):
+        from genesis.mcp.health.ego_tools import ego_decision
+
+        return await ego_decision.fn(
+            action="record",
+            content=content,
+            ego_target=ego_target,
         )
+
+    async def _list(self, *, ego_target="user_ego"):
+        from genesis.mcp.health.ego_tools import ego_decision
+
+        return await ego_decision.fn(action="list", ego_target=ego_target)
+
+    async def test_distinct_same_tag_rulings_are_recorded(self, decision_db):
+        first = await self._record("[dev/x] do not-A, ever")
+        second = await self._record("[dev/x] do A, always")
+
+        assert second["action"] == "recorded"
+        assert second["decision_id"] != first["decision_id"]
+        assert second["related"] == [
+            {
+                "id": first["decision_id"],
+                "content": "[dev/x] do not-A, ever",
+                "reaffirm_count": 0,
+            }
+        ]
+        assert second["related_total"] == 1
+        listed = await self._list()
+        assert listed["total_active"] == 2
+        old = next(row for row in listed["decisions"] if row["id"] == first["decision_id"])
+        assert old["reaffirm_count"] == 0
+
+    async def test_repeat_ignoring_case_and_whitespace_reaffirms(self, decision_db):
+        first = await self._record("[dev/x] Do  A always")
+        repeated = await self._record(" [dev/x] do a ALWAYS ")
+
+        assert repeated["action"] == "reaffirmed"
+        assert repeated["decision_id"] == first["decision_id"]
+        assert repeated["related"] == []
+        assert repeated["related_total"] == 0
+        listed = await self._list()
+        assert listed["total_active"] == 1
+        assert listed["decisions"][0]["reaffirm_count"] == 1
+
+    async def test_related_results_are_capped_and_summarized(self, decision_db):
+        ids = set()
+        for index in range(6):
+            text = f"[dev/x] ruling {index} " + ("x" * 240 if index == 4 else "settled")
+            result = await self._record(text)
+            ids.add(result["decision_id"])
+
+        seventh = await self._record("[dev/x] ruling seven, distinct")
+
+        assert len(seventh["related"]) == 5
+        assert seventh["related_total"] == 6
+        assert {row["id"] for row in seventh["related"]} <= ids
+        assert all(len(row["content"]) <= 200 for row in seventh["related"])
+
+    async def test_reaffirmed_ruling_lists_other_same_tag_rulings(self, decision_db):
+        first = await self._record("[dev/x] ruling A")
+        second = await self._record("[dev/x] ruling B")
+
+        repeated = await self._record("[dev/x] ruling A")
+
+        assert repeated["action"] == "reaffirmed"
+        assert repeated["decision_id"] == first["decision_id"]
+        assert repeated["related"] == [
+            {
+                "id": second["decision_id"],
+                "content": "[dev/x] ruling B",
+                "reaffirm_count": 0,
+            }
+        ]
+        assert repeated["related_total"] == 1
+
+    async def test_tags_with_wildcard_characters_match_literally(self, decision_db):
+        await self._record("[dev/x] ruling one here")
+        underscore = await self._record("[dev_x] ruling one here")
+
+        assert underscore["action"] == "recorded"
+        assert underscore["related"] == []
+        assert underscore["related_total"] == 0
+
+        await self._record("[de%/x] separate ruling here", ego_target="genesis_ego")
+        percent = await self._record(
+            "[dev/x] separate ruling here",
+            ego_target="genesis_ego",
+        )
+
+        assert percent["action"] == "recorded"
+        assert percent["related"] == []
+        assert percent["related_total"] == 0
+
+    async def test_truncated_content_is_used_for_repeat_matching(self, decision_db):
+        text = "[dev/x] " + "a" * 600
+        first = await self._record(text)
+
+        repeated = await self._record(text + "b" * 50)
+
+        assert repeated["action"] == "reaffirmed"
+        assert repeated["decision_id"] == first["decision_id"]
+        assert (await self._list())["total_active"] == 1
+
+    async def test_tag_boundary_does_not_match_goal_scoped_tag(self, decision_db):
+        await self._record("[a/b] same rule text")
+        goal_scoped = await self._record("[a/b/goal:x] same rule text")
+
+        assert goal_scoped["action"] == "recorded"
+        assert goal_scoped["related"] == []
+        assert goal_scoped["related_total"] == 0
+        assert (await self._list())["total_active"] == 2
+
+    async def test_decisions_are_isolated_by_ego_target(self, decision_db):
+        user = await self._record("[dev/x] same ruling here")
+        genesis = await self._record(
+            "[dev/x] same ruling here",
+            ego_target="genesis_ego",
+        )
+
+        assert genesis["action"] == "recorded"
+        assert genesis["decision_id"] != user["decision_id"]
+        assert (await self._list())["total_active"] == 1
+        assert (await self._list(ego_target="genesis_ego"))["total_active"] == 1
+
+    async def test_superseded_ruling_is_not_reaffirmed(self, decision_db):
+        from genesis.mcp.health.ego_tools import ego_decision
+
+        first = await self._record("[dev/x] ruling A")
+        retired = await ego_decision.fn(
+            action="supersede",
+            decision_id=first["decision_id"],
+            reason="replaced",
+        )
+        repeated = await self._record("[dev/x] ruling A")
+
+        assert retired["action"] == "superseded"
+        assert repeated["action"] == "recorded"
+        assert repeated["related"] == []
+        assert repeated["related_total"] == 0
+
+    async def test_untagged_rulings_always_create_without_related(self, decision_db):
+        first = await self._record("plain ruling without a tag")
+        second = await self._record("plain ruling without a tag")
+
+        assert first["action"] == second["action"] == "recorded"
+        assert first["decision_id"] != second["decision_id"]
+        assert first["related"] == second["related"] == []
+        assert first["related_total"] == second["related_total"] == 0
+        assert (await self._list())["total_active"] == 2

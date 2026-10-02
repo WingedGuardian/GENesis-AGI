@@ -1525,22 +1525,29 @@ async def list_active_decisions(
     return [dict(r) for r in await cursor.fetchall()], total
 
 
-async def find_active_decision(
+def decision_text_key(text: str) -> str:
+    """Comparison key for decision content: whitespace-collapsed, casefolded."""
+    return " ".join(text.split()).casefold()
+
+
+async def find_tagged_decisions(
     db: aiosqlite.Connection,
     *,
-    prefix: str,
+    tag: str,
     ego_target: str = "user_ego",
-) -> dict | None:
-    """Active decision whose content starts with the ``[type/category]``
-    dedup prefix, or None."""
+) -> list[dict]:
+    """Active decisions whose content begins with the literal ``tag``, newest first.
+
+    Literal prefix compare (not LIKE): ``_`` and ``%`` in a tag match only
+    themselves, and the closing ``]`` keeps ``[a/b]`` from matching ``[a/b/goal:x]``.
+    """
     cursor = await db.execute(
         "SELECT * FROM ego_directives "
         "WHERE status = 'active' AND kind = 'decision' AND ego_target = ? "
-        "AND content LIKE ? ORDER BY created_at DESC LIMIT 1",
-        (ego_target, prefix + "%"),
+        "AND substr(content, 1, ?) = ? ORDER BY created_at DESC",
+        (ego_target, len(tag), tag),
     )
-    row = await cursor.fetchone()
-    return dict(row) if row else None
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def reaffirm_decision(db: aiosqlite.Connection, decision_id: str) -> bool:

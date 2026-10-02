@@ -37,18 +37,8 @@ def decision_prefix(proposal: dict) -> str:
     refined with a goal discriminator (``/goal:<goal_id>``) when the proposal
     targets a goal.
 
-    Without the goal segment, two rulings that share an action_type/category
-    but concern DIFFERENT goals (e.g. deprioritize goal A vs pause goal B, both
-    ``goal_status_change/goal_management``) collide: ``find_active_decision``
-    matches the first by content prefix and the second REAFFIRMS it instead of
-    capturing its distinct ruling, silently dropping the second (2026-07-28).
-    Goal-scoping the key keeps per-goal rulings separate while still deduping
-    repeat rulings about the SAME goal.
-
-    (A ``goal_status_change`` proposal with NO goal_id is degenerate; it keeps
-    the bare ``[type/category]`` key and could still prefix-match a goal-scoped
-    decision under ``find_active_decision``'s ``LIKE prefix%`` — accepted, as
-    that path carries no distinct per-goal ruling to lose.)
+    A goal-less key stays bare ``[type/category]``. The literal tag lookup
+    includes the closing ``]``, so it never matches a goal-scoped decision.
     """
     action_type = proposal.get("action_type") or "unknown"
     category = proposal.get("action_category") or "general"
@@ -197,10 +187,22 @@ async def _capture_decision(
     prefix = decision_prefix(proposal)
     ego_target = "genesis_ego" if proposal.get("ego_source") == "genesis_ego_cycle" else "user_ego"
 
-    existing = await ego_crud.find_active_decision(
+    ruling = (standing_rule or reason).strip()
+    key = f"{prefix} {ruling}"
+    same_tag = await ego_crud.find_tagged_decisions(
         db,
-        prefix=prefix,
+        tag=prefix,
         ego_target=ego_target,
+    )
+    exact = ego_crud.decision_text_key(key[:_DECISION_CONTENT_MAX])
+    suffixed = ego_crud.decision_text_key(key) + " (rejected proposal:"
+    existing = next(
+        (
+            r
+            for r in same_tag
+            if (k := ego_crud.decision_text_key(r["content"])) == exact or k.startswith(suffixed)
+        ),
+        None,
     )
     if existing:
         await ego_crud.reaffirm_decision(db, existing["id"])
@@ -212,9 +214,8 @@ async def _capture_decision(
         )
         return
 
-    ruling = (standing_rule or reason).strip()
     snippet = (proposal.get("content") or "")[:150]
-    content = f"{prefix} {ruling}"
+    content = key
     if standing_rule is None:
         content += f" (rejected proposal: {snippet})"
     decision_id = await ego_crud.create_decision(
@@ -224,8 +225,9 @@ async def _capture_decision(
         source_proposal_id=proposal.get("id"),
     )
     logger.info(
-        "Decision captured (%s) from proposal %s",
+        "Decision captured (%s, %d other same-tag rulings) from proposal %s",
         decision_id,
+        len(same_tag),
         proposal.get("id", "?"),
     )
 
