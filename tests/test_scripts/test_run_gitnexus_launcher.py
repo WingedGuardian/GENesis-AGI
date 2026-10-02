@@ -8,8 +8,17 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / ".claude" / "mcp" / "run-gitnexus"
+
+
+@pytest.fixture(autouse=True)
+def isolated_machine_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "isolated-home"))
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "isolated-home" / ".genesis"))
+    monkeypatch.delenv("GITNEXUS_NODE_BIN", raising=False)
 
 
 def _fake_gitnexus(tmp_path: Path, version: str) -> tuple[Path, Path]:
@@ -250,3 +259,42 @@ def test_ensure_pin_does_not_install_over_an_ambiguous_machine(tmp_path):
     proc, installs = _run(empty, empty_path)
     assert installs, f"an empty machine was not installed to: {proc.stdout!r}"
     assert any("gitnexus@" in ln for ln in installs), installs
+
+
+# Same selection under different caller PATH orders, with no global mutation.
+def test_machine_node_selection_overrides_incoming_path(tmp_path):
+    binary, log = _fake_gitnexus(tmp_path, "1.6.12")
+    binary.write_text('#!/usr/bin/env bash\nif [ "${1:-}" = "--version" ]; then echo 1.6.12; exit 0; fi\nprintf "%s\n" "$(node --version)" > "'+str(log)+'"\n')
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    selected = selected_dir / "node"
+    selected.write_text('#!/bin/sh\necho v22.23.2\n')
+    selected.chmod(0o755)
+    wrong_dir = tmp_path / "wrong"
+    wrong_dir.mkdir()
+    wrong = wrong_dir / "node"
+    wrong.write_text('#!/bin/sh\necho v23.0.0\n')
+    wrong.chmod(0o755)
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    (home / ".genesis" / "gitnexus-node").write_text(str(selected)+"\n")
+    for prefix in [wrong_dir, Path("/usr/bin")]:
+        env = {**os.environ, "HOME": str(home), "GENESIS_HOME": str(home / ".genesis"), "GITNEXUS_BIN": str(binary), "PATH": f"{prefix}:/usr/bin:/bin"}
+        env.pop("GITNEXUS_NODE_BIN", None)
+        result = subprocess.run([str(LAUNCHER), "status"], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert log.read_text().strip() == "v22.23.2"
+
+
+def test_invalid_machine_node_selection_refuses_launcher(tmp_path):
+    binary, log = _fake_gitnexus(tmp_path, "1.6.12")
+    home = tmp_path / "home"
+    config = home / ".genesis" / "gitnexus-node"
+    config.parent.mkdir(parents=True)
+    for selection in ["", "relative/node", "/missing/node", "/usr/bin/node\n/unexpected/node", "/usr/bin/python3"]:
+        config.write_text(selection)
+        env = {**os.environ, "HOME": str(home), "GENESIS_HOME": str(config.parent), "GITNEXUS_BIN": str(binary)}
+        env.pop("GITNEXUS_NODE_BIN", None)
+        result = subprocess.run([str(LAUNCHER), "mcp"], env=env, capture_output=True, text=True)
+        assert result.returncode != 0
+        assert not log.exists()

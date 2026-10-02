@@ -20,6 +20,28 @@ genesis_gitnexus_node_version_supported() {
     fi
 }
 
+# Optional machine selection shared by analyzer and MCP readers. A single-line
+# absolute node path selects only this process's PATH, never global Node.
+genesis_gitnexus_select_node() {
+    local selected="${GITNEXUS_NODE_BIN:-}" config="${GENESIS_HOME:-${HOME:-}/.genesis}/gitnexus-node" version
+    if [ -z "$selected" ] && { [ -e "$config" ] || [ -L "$config" ]; }; then
+        selected="$(cat -- "$config")" || return 1
+        [ -n "$selected" ] || { printf 'GitNexus: empty Node selection: %s\n' "$config" >&2; return 1; }
+    fi
+    [ -n "$selected" ] || return 0
+    if [[ "$selected" != /*/node ]] || [[ "$selected" == *$'\n'* || "$selected" == *:* ]] || [ ! -x "$selected" ]; then
+        printf 'GitNexus: invalid Node selection: %s\n' "$selected" >&2
+        return 1
+    fi
+    version="$("$selected" --version 2>/dev/null)" || return 1
+    if ! genesis_gitnexus_node_version_supported "$version"; then
+        printf 'GitNexus: selected Node %s is unsupported\n' "$version" >&2
+        return 1
+    fi
+    export PATH="${selected%/node}:$PATH"
+    [ "$(command -v node)" -ef "$selected" ] || { printf 'GitNexus: selected Node did not resolve\n' >&2; return 1; }
+}
+
 genesis_gitnexus_node_supported() {
     local version
     command -v node >/dev/null 2>&1 || return 1
