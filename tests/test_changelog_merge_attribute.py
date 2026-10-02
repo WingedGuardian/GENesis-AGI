@@ -1,8 +1,9 @@
-"""The ABSENCE of a CHANGELOG merge driver, pinned by behaviour and by its reason.
+"""CHANGELOG.md on git's BUILT-IN merge, pinned by behaviour and by its reason.
 
-CHANGELOG.md deliberately has no merge driver. A collision on it CONFLICTS, and
-that is the intended outcome: the failure this file guards against is the silent
-one, not the visible one.
+CHANGELOG.md deliberately has no custom merge driver: `.gitattributes` sets bare
+``merge``, git's built-in text merge, which no clone config can swap out. A
+collision on it CONFLICTS, and that is the intended outcome: the failure this file
+guards against is the silent one, not the visible one.
 
 The collision is real. Two branches that each add a bullet under the same
 ``[Unreleased]`` heading are not disagreeing — they are inserting at the same
@@ -45,10 +46,14 @@ Six tests, and NONE of them is redundant — read this before deleting one:
   ``.gitattributes`` names for that window: a ``.git/info/attributes`` line
   outranks the checkout, so the same first merge conflicts instead.
 
-The tests grade this repository's own attribute surface. A developer's local
-``merge.default`` routes unspecified paths to a driver regardless; no committed
-file can pin that, which is why every git subprocess here disables ambient
-config rather than trying to enumerate it.
+The tests grade this repository's own attribute surface, so every git subprocess
+here disables ambient config rather than trying to enumerate it. The clone config
+that would otherwise undo the guarantee by default is tested on purpose: a clone's
+``merge.default`` decides an UNSPECIFIED path and its ``merge.text.driver``
+redefines ``merge=text``, so the committed attribute is bare ``merge`` (set),
+which selects git's built-in driver and which neither can redirect. Explicit
+local opt-outs (``-Xours``, ``attr.tree``, a clone's own info/attributes) are out
+of scope and named in .gitattributes.
 """
 
 from __future__ import annotations
@@ -187,6 +192,8 @@ def _make_repo(tmp_path: Path, *, attributes: str) -> Path:
         shutil.copyfile(GITATTRIBUTES, repo / ".gitattributes")
     elif attributes == "union":
         (repo / ".gitattributes").write_text("/CHANGELOG.md merge=union\n")
+    elif attributes == "text":  # a NAMED driver, which clone config can redefine
+        (repo / ".gitattributes").write_text("/CHANGELOG.md merge=text\n")
     _git_ok("add", "-A", cwd=repo)
     _git_ok("commit", "--quiet", "-m", "base", cwd=repo)
     return repo
@@ -216,10 +223,25 @@ def _branch_removing_the_existing_entry(repo: Path, branch: str) -> None:
     _git_ok("commit", "--quiet", "-m", f"{branch}: cut the entry", cwd=repo)
 
 
+_UNION_DRIVER = "git merge-file --union %A %O %B"
+
+# Clone config that routes a merge through union when the committed attribute
+# leaves it the chance (measured 2026-10-01, git 2.43): merge.default decides an
+# unspecified path, merge.text.driver redefines `merge=text`.
+_CLONE_CONFIGS = {
+    "none": (),
+    "merge.default=union": (("merge.default", "union"),),
+    "union merge.text.driver": (("merge.text.driver", _UNION_DRIVER),),
+}
+
+
+@pytest.mark.parametrize("clone_config", list(_CLONE_CONFIGS))
 def test_a_changelog_collision_conflicts_rather_than_merging_silently(
-    tmp_path: Path,
+    tmp_path: Path, clone_config: str
 ) -> None:
-    """The guarantee: with THIS repo's attributes, the collision is visible.
+    """The guarantee: with THIS repo's attributes, the collision is visible, and
+    stays visible on a clone whose config would route an unpinned path through
+    union.
 
     A conflict here is the intended outcome, not a regression. It is resolved by
     taking the base's CHANGELOG.md and moving the entry into a changelog.d/
@@ -227,6 +249,8 @@ def test_a_changelog_collision_conflicts_rather_than_merging_silently(
     automatically.
     """
     repo = _make_repo(tmp_path, attributes="real")
+    for key, value in _CLONE_CONFIGS[clone_config]:
+        _git_ok("config", key, value, cwd=repo)
     _branch_adding_bullet(repo, "feature-a", "entry from branch A")
     _branch_adding_bullet(repo, "feature-b", "entry from branch B")
 
@@ -239,6 +263,31 @@ def test_a_changelog_collision_conflicts_rather_than_merging_silently(
         "CHANGELOG.md. A driver that resolves this silently also resurrects "
         "deletions; see test_a_union_driver_resurrects_a_deletion and "
         f".gitattributes.\nstdout: {second.stdout}\nstderr: {second.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    "clone_config, unpinned",
+    [("merge.default=union", "none"), ("union merge.text.driver", "text")],
+)
+def test_each_clone_config_does_route_an_unpinned_changelog_through_union(
+    tmp_path: Path, clone_config: str, unpinned: str
+) -> None:
+    """Control for the parametrized tests above: each clone config really does
+    take effect, so its conflict there is the pin's doing. Without this, a
+    misspelled config key would make those cases pass while testing nothing.
+    Unspecified follows merge.default; `merge=text` follows merge.text.driver."""
+    repo = _make_repo(tmp_path, attributes=unpinned)
+    for key, value in _CLONE_CONFIGS[clone_config]:
+        _git_ok("config", key, value, cwd=repo)
+    _branch_adding_bullet(repo, "feature-a", "entry from branch A")
+    _branch_adding_bullet(repo, "feature-b", "entry from branch B")
+    _git_ok("checkout", "--quiet", "trunk", cwd=repo)
+    _git_ok("merge", "--quiet", "--no-edit", "feature-a", cwd=repo)
+    second = _git("merge", "--no-edit", "feature-b", cwd=repo)
+    assert second.returncode == 0, (
+        f"control: {clone_config} did not route the unpinned file through union\n"
+        f"stdout: {second.stdout}\nstderr: {second.stderr}"
     )
 
 
@@ -280,8 +329,9 @@ def test_a_union_driver_resurrects_a_deletion(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("clone_config", list(_CLONE_CONFIGS))
 def test_a_pre_fix_branch_resurrects_once_on_its_first_catch_up_merge(
-    tmp_path: Path,
+    tmp_path: Path, clone_config: str
 ) -> None:
     """The transition window: an old branch union-merges exactly once more.
 
@@ -290,15 +340,19 @@ def test_a_pre_fix_branch_resurrects_once_on_its_first_catch_up_merge(
     commit that removes it — the removal cannot protect the merge that carries
     it. Residual risk, documented in .gitattributes; this test keeps it honest
     in both directions: the resurrection happens, and it happens exactly once.
+    The fix commit carries the SHIPPED .gitattributes, and the window must stay
+    one merge wide under each clone config: that is the shipped file's claim.
     """
     repo = _make_repo(tmp_path, attributes="union")
+    for key, value in _CLONE_CONFIGS[clone_config]:
+        _git_ok("config", key, value, cwd=repo)
     pre_fix = _git_ok("rev-parse", "trunk", cwd=repo).stdout.strip()
 
     # The fix lands on trunk together with a release cut — the real shape: the
     # attribute removal arrives inside a merge that also deletes entries.
     changelog = repo / "CHANGELOG.md"
     changelog.write_text(changelog.read_text().replace("- a pre-existing entry\n", "", 1))
-    (repo / ".gitattributes").write_text("# CHANGELOG.md: no merge driver\n")
+    shutil.copyfile(GITATTRIBUTES, repo / ".gitattributes")  # the shipped file
     _git_ok("add", "-A", cwd=repo)
     _git_ok("commit", "--quiet", "-m", "release cut + remove union", cwd=repo)
 
@@ -345,17 +399,21 @@ def test_a_pre_fix_branch_resurrects_once_on_its_first_catch_up_merge(
     )
 
 
-def test_a_clone_level_override_closes_the_window(tmp_path: Path) -> None:
+@pytest.mark.parametrize("clone_config", list(_CLONE_CONFIGS))
+def test_a_clone_level_override_closes_the_window(tmp_path: Path, clone_config: str) -> None:
     """The prevention .gitattributes names: ``.git/info/attributes`` outranks the
-    checked-out file (gitattributes(5)), so ``/CHANGELOG.md merge=text`` there makes
-    the pre-fix branch's FIRST catch-up merge conflict instead of resurrecting.
-    The same fixture as the test above, which is the moving control: without the
-    override this exact merge exits 0 with the deleted line back."""
+    checked-out file (gitattributes(5)), so ``/CHANGELOG.md merge`` there makes
+    the pre-fix branch's FIRST catch-up merge conflict instead of resurrecting,
+    whatever the clone's merge config. The same fixture as the test above, which
+    is the moving control: without the override this exact merge exits 0 with the
+    deleted line back."""
     repo = _make_repo(tmp_path, attributes="union")
+    for key, value in _CLONE_CONFIGS[clone_config]:
+        _git_ok("config", key, value, cwd=repo)
     pre_fix = _git_ok("rev-parse", "trunk", cwd=repo).stdout.strip()
     changelog = repo / "CHANGELOG.md"
     changelog.write_text(changelog.read_text().replace("- a pre-existing entry\n", "", 1))
-    (repo / ".gitattributes").write_text("# CHANGELOG.md: no merge driver\n")
+    shutil.copyfile(GITATTRIBUTES, repo / ".gitattributes")  # the shipped file
     _git_ok("add", "-A", cwd=repo)
     _git_ok("commit", "--quiet", "-m", "release cut + remove union", cwd=repo)
     _git_ok("checkout", "--quiet", "-b", "pre-fix-branch", pre_fix, cwd=repo)
@@ -367,8 +425,8 @@ def test_a_clone_level_override_closes_the_window(tmp_path: Path) -> None:
     assert _merge_attr("CHANGELOG.md", cwd=repo) == "union"
 
     (repo / ".git" / "info").mkdir(exist_ok=True)
-    (repo / ".git" / "info" / "attributes").write_text("/CHANGELOG.md merge=text\n")
-    assert _merge_attr("CHANGELOG.md", cwd=repo) == "text"
+    (repo / ".git" / "info" / "attributes").write_text("/CHANGELOG.md merge\n")
+    assert _merge_attr("CHANGELOG.md", cwd=repo) == "set"
 
     first = _git("merge", "--no-edit", "trunk", cwd=repo)
     assert first.returncode != 0, (
@@ -377,7 +435,7 @@ def test_a_clone_level_override_closes_the_window(tmp_path: Path) -> None:
     )
 
 
-def test_no_tracked_path_resolves_to_a_union_driver() -> None:
+def test_no_tracked_path_resolves_to_a_union_driver(tmp_path: Path) -> None:
     """Grade the whole population, not a hand-picked sample.
 
     A negative list can only fail on paths a reviewer thought to enumerate, and
@@ -387,9 +445,9 @@ def test_no_tracked_path_resolves_to_a_union_driver() -> None:
 
     Scope of the guarantee, stated so it is not read as more than it is: this
     grades the repository's own attribute surface, under a git environment
-    stripped of the caller's config and attribute sources. It says nothing about
-    what a merge does on a machine whose own ``merge.default`` routes unspecified
-    paths to a driver — that is a per-machine choice no committed file can pin.
+    stripped of the caller's config and attribute sources. What a clone's own
+    merge config does to CHANGELOG.md is pinned separately, by the committed bare
+    ``merge`` asserted below and the parametrized collision test.
     """
     assert GITATTRIBUTES.is_file(), "repo-root .gitattributes is missing"
     files = _git_ok("ls-files", "-z", cwd=REPO_ROOT)
@@ -411,13 +469,17 @@ def test_no_tracked_path_resolves_to_a_union_driver() -> None:
         "no tracked path may resolve to merge=union — it resolves silently and "
         f"cannot express a deletion; got {sorted(union_paths)}"
     )
-    # The population check alone does not pin the ABSENCE: a future
-    # `/CHANGELOG.md merge=text` rule passes `union_paths == set()` while
-    # silently re-arming a non-default driver on exactly the path this file
-    # exists to leave alone.
-    assert _merge_attr("CHANGELOG.md", cwd=REPO_ROOT) == "unspecified", (
-        "CHANGELOG.md must resolve to NO merge driver — any explicit driver "
-        "substitutes for the conflict this file deliberately keeps"
+    # The population check alone does not pin the BUILT-IN driver: `merge=text`
+    # or no attribute at all both pass `union_paths == set()`, and each can be
+    # routed back to union by clone config (a merge.text.driver, a merge.default).
+    # Bare `merge` (set) is the one value neither can redirect.
+    # Graded on a FRESH repo holding a copy of the committed file: the checkout
+    # this runs in may carry its own `.git/info/attributes`, which outranks the
+    # committed file and would answer for it.
+    fresh = _make_repo(tmp_path, attributes="real")
+    assert _merge_attr("CHANGELOG.md", cwd=fresh) == "set", (
+        "CHANGELOG.md must resolve to `merge` (set) — git's built-in text merge, "
+        "which no clone config can swap for a driver that resolves silently"
     )
 
 

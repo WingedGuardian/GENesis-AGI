@@ -1,5 +1,6 @@
-# CHANGELOG.md deliberately has NO merge driver. This file records why, because
-# the obvious fix is to give it `merge=union` and that was tried here and removed.
+# CHANGELOG.md is pinned to git's BUILT-IN text merge (the last line of this
+# file), deliberately not `merge=union`. This file records why, because the
+# obvious fix is to give it `merge=union` and that was tried here and removed.
 #
 # THE PROBLEM UNION WAS ADDED FOR, which is real: two branches that each add a
 # bullet under the same `[Unreleased]` heading are not disagreeing — they are
@@ -49,17 +50,38 @@
 # resurrect release-cut deletions, at exit 0, one last time. Verified 2026-09-21
 # on a synthetic repo: a branch with the attribute merged a commit deleting
 # lines inside a hunk the branch edited and removing the attribute — the deleted
-# lines returned, exit 0, no conflict. Every merge after that first one is safe.
+# lines returned, exit 0, no conflict. Every merge after that first one runs
+# the built-in driver pinned below.
 #
 # A CLONE CAN CLOSE IT for all of its branches at once, before merging: add the
-# line `/CHANGELOG.md merge=text` to `.git/info/attributes`. That file outranks
-# every .gitattributes in the tree (gitattributes(5)) and lives in the shared git
+# line `/CHANGELOG.md merge` to `.git/info/attributes`. That file outranks every
+# .gitattributes in the tree (gitattributes(5)) and lives in the shared git
 # directory, so every worktree of the clone sees it. Measured 2026-10-01, git
 # 2.43, on the synthetic repo above: the first catch-up merge then conflicts
 # (exit 1) instead of resurrecting, in the main worktree and in a linked one.
-# `text` is git's default for this file, so the line can stay. On a clone that
-# did not set it, the repair is after the fact: diff CHANGELOG.md against the
-# base's and restore the removals.
+# The built-in driver is what git uses for this file anyway, so the line can
+# stay. On a clone that did not set it, the repair is after the fact: diff
+# CHANGELOG.md against the base's and restore the removals.
+#
+# WHY BARE `merge` AND NOT `merge=text` OR NOTHING. Leaving the attribute
+# unspecified hands the choice to the clone's `merge.default`, and a string value
+# such as `merge=text` names a driver the clone can define (`merge.text.driver`).
+# Set without a value, `merge` selects git's built-in three-way merge, which no
+# `merge.default` or `merge.<driver>.driver` setting can redirect (gitattributes(5),
+# "Performing a three-way merge"). Measured 2026-10-01, git 2.43, on the
+# collision-plus-deletion shape: with `merge.default=union` an unspecified
+# CHANGELOG.md resurrected the deletion at exit 0, and with a union
+# `merge.text.driver` so did `merge=text`; bare `merge` conflicted under both, and
+# under union-valued text/union/set/true drivers. Hence the line below, and the
+# same spelling for the clone-level step above.
+#
+# What it does NOT cover, because each is an explicit local opt-out rather than a
+# default: a strategy option (`git merge -Xours`, or `branch.<name>.mergeOptions`),
+# `attr.tree` pointing attribute lookup at another tree, and a clone's own
+# `.git/info/attributes`, which outranks this file in both directions. And a
+# cherry-pick of a release-cut commit onto a branch cut while union was in force
+# hits the same one-time window as its first catch-up merge; a rebase does not,
+# because during a rebase the checkout carries the base's file.
 #
 # SO: a CHANGELOG.md collision now CONFLICTS, visibly, and is resolved by hand —
 # which for a branch carrying an inline entry means taking the base's file and
@@ -67,5 +89,6 @@
 # the failure mode this file exists to prevent is the SILENT one.
 #
 # tests/test_changelog_merge_attribute.py pins all of this by behaviour — that
-# the collision conflicts, that union would resurrect deletions, and that NO
-# tracked path resolves to a union driver.
+# the collision conflicts even under a union merge.default, that union would
+# resurrect deletions, and that NO tracked path resolves to a union driver.
+/CHANGELOG.md merge
