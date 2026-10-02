@@ -397,13 +397,14 @@ hold stays held. Alias-only renames do not count as model replacement. Existing
 operator hold expiry and restart backoff caps still apply. Returning to a sole
 legacy alias also preserves its hold.
 
-Daily usage remains independent of model health. The ledger resolves registered
-alias families on reads and writes, combines current UTC-day visits under old/new
-keys, and consolidates them on the next counted write. Late old requests contribute
-to that same counter; repeated restart does not re-add migrated usage. Rolling back
-to a sole legacy alias preserves usage too. A reentrant lock protects alias
-resolution and counter reads/writes from concurrent dashboard access. Two aliases explicitly configured at
-once retain separate counters. Neither model replacement nor reload resets usage.
+Daily usage remains independent of model health and keyed by the exact configured
+provider name. Same-name model replacement and late completion preserve its row;
+removing an explicitly independent alias does not transfer its counts to a survivor.
+UTC rollover, persistence and limit semantics are unchanged. A reentrant lock and
+copied pure views protect concurrent dashboard reads. Registered cross-alias budget
+migration is deferred: it needs durable historical ownership captured with requests,
+not inference from the current alias set. A rename can therefore undercount a shared
+account until UTC rollover, as before this change; vendor rate limits remain the backstop.
 
 Runtime provider probes and dashboard health snapshots use the router's current
 config and breaker bindings. A probe started before reload is discarded rather
@@ -456,3 +457,10 @@ persists changed failure provenance even before the two-success close threshold.
 Resilience, call-site and API-key rendering use the same captured breaker view.
 Snapshot rendering does not publish stale cloud-axis updates; the awareness tick
 continues deriving the live cloud axis independently from the live registry.
+
+
+State restoration suppresses persistence until all saved bindings and incident fields
+have been applied, then atomically saves the completed registry. CLOSED pre-trip
+failures retain validated provenance with their counters without asserting a call-opened
+hold. Removing a provider retires only historical incidents that have no continuing
+owner; an ordinary rename keeps its incident intact.

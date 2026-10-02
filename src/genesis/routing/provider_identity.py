@@ -49,16 +49,16 @@ def valid_identity(value) -> bool:
     return isinstance(value, str) and _HEALTH_ID.fullmatch(value) is not None
 
 
-def restored_provenance(info: dict, live: bool) -> tuple[str | None, str | None]:
+def restored_provenance(info: dict, live: bool, *, pending: bool = False) -> tuple[str | None, str | None]:
     """Unknown or malformed provenance preserves the hold without granting reset."""
     cause, identity = info.get("failure_cause"), info.get("failure_identity")
-    if not live:
+    if not live and not pending:
         return None, None
     cause = cause if cause in ("retirement", "other", "operator") else None
     if cause == "retirement" and (
         not valid_identity(identity) or info.get("identity") != identity
         or info.get("last_failure_category") != ErrorCategory.TRANSIENT.value
-        or info.get("opened_by_call") is not True
+        or info.get("opened_by_call") is not (not pending)
     ):
         cause = None  # internally inconsistent evidence grants no reset
     return cause, identity if valid_identity(identity) else None

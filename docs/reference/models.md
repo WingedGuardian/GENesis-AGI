@@ -762,7 +762,7 @@ Gemini entries; cross-referenced model routing registry
 
 Model configuration reloads bind each request to one routing generation. An active
 request finishes with its original delegate/model and reports that identity;
-subsequent requests use the replacement. Model replacement preserves daily usage,
+subsequent requests use the replacement. Same-alias model replacement preserves daily usage,
 operator/account/authentication/quota holds and ambiguous legacy health. Only proven
 retirement-only failure history can be cleared for a changed request identity.
 See [reload and persisted health](../architecture/genesis-v3-model-routing-registry.md#reload-model-replacement-and-persisted-health)
@@ -783,3 +783,8 @@ Ordinary provider renames retain incident ownership, outage age and notification
 acknowledgments through restart; adding an independent sibling does not inherit
 that history. Partial recovery persists cleared retirement provenance without
 changing the existing two-success recovery threshold.
+
+
+Daily counters retain exact configured names; cross-alias counter migration is separate
+follow-up work. Removed provider bindings retire ownerless incidents. Restoration writes
+only completed state, and validated pre-trip failure evidence survives restart.

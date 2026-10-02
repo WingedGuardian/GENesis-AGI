@@ -2550,7 +2550,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: f9fd402fe 2026-10-02
+verified: 85d548cbb 2026-10-02
 ```
 
 - **Coherent routing reloads** (`Router.reload_config`,
@@ -2560,9 +2560,9 @@ verified: f9fd402fe 2026-10-02
   digests and retirement-only provenance permit a replacement reset only with
   explicit retirement evidence, preserving auth/quota/operator/mixed/legacy holds.
   Runtime health probes and dashboard snapshots read generation-bound config and
-  breakers; late probes cannot alter replacement health. Daily accounting resolves
-  registered alias families, including late completions
-  and rollback; counted writes consolidate rows once. See the model-routing
+  breakers; late probes cannot alter replacement health. Daily accounting preserves
+  exact-name rows across same-alias model changes with synchronized pure reads;
+  cross-alias budget migration is deferred. See the model-routing
   registry reference's reload section and `test_routing_generation.py`.
 - **Reload controls**: registry-locked dashboard toggles preserve operator actions
   across model repoints. Shared pacing gates retain admissions across reloads and

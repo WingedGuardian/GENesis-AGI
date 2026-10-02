@@ -432,6 +432,7 @@ class CircuitBreakerRegistry:
         # essential site, so it cannot stand in for this.
         self._manages_coverage = essential_sites is not None
         self._breakers: dict[str, CircuitBreaker] = {}
+        self._restoring_state = False
         if restore_state:
             self.load_state()
 
@@ -498,9 +499,14 @@ class CircuitBreakerRegistry:
         detached = [cb for cb in self._breakers.values() if id(cb) not in kept]
         self._providers = dict(providers)
         self._breakers = bindings
+        owned = {(cb._incident_provider, cb._incident_identity) for cb in bindings.values()}
+        removed = {(cb._incident_provider, cb._incident_identity) for cb in detached} - owned
         for cb in detached:
             cb._on_state_change = None
             cb._on_recovery = None
+        if self._on_retirement:
+            for anchor, incident in removed:
+                self._on_retirement(anchor, incident)
         self.save_state()
 
     def _prior_breaker(self, name: str, providers) -> CircuitBreaker | None:
@@ -527,8 +533,6 @@ class CircuitBreakerRegistry:
             replacement.force_close()
             replacement._incident_identity = self._new_incident_identity()
             replacement._incident_provider = cfg.name
-            if self._on_retirement:
-                self._on_retirement(old._incident_provider, old._incident_identity)
         replacement._on_state_change = self.save_state if self._persist else None
         replacement._on_recovery = self._on_recovery
         return replacement
@@ -609,7 +613,7 @@ class CircuitBreakerRegistry:
         write the shared file. Uses an atomic write so a concurrent reader never
         observes a truncated file (which load_state would silently discard).
         """
-        if not self._persist:
+        if not self._persist or self._restoring_state:
             return
         data = {}
         for name, cb in self._breakers.items():
@@ -631,9 +635,19 @@ class CircuitBreakerRegistry:
             logger.error("Failed to save circuit breaker state", exc_info=True)
 
     def load_state(self) -> None:
-        """Restore breaker states from disk after restart."""
-        if not self._state_file.is_file():
-            return
+        """Restore all bindings before any callback can persist their state."""
+        with self._lock:
+            if not self._state_file.is_file():
+                return
+            self._restoring_state = True
+            try:
+                completed = self._load_state()
+            finally:
+                self._restoring_state = False
+            if completed:
+                self.save_state()
+
+    def _load_state(self) -> bool:
         try:
             data = json.loads(self._state_file.read_text())
             # A RENAME retires the key this state was persisted under, and the
@@ -665,7 +679,6 @@ class CircuitBreakerRegistry:
                 if target:
                     ordered.append((name, info, target))
 
-            retired_during_restore = False
             for name, info, target in ordered:
                 if target in restored:
                     logger.info(
@@ -682,23 +695,27 @@ class CircuitBreakerRegistry:
                         name, target,
                     )
                 cfg = self._providers[target]
-                cause, identity = restored_provenance(info, True)
+                cb = self.get(target)
+                saved_state = info.get("state", "CLOSED")
+                restored_live = saved_state in (ProviderState.OPEN.value, ProviderState.HALF_OPEN.value)
+                count = info.get("consecutive_failures")
+                pending = (saved_state == ProviderState.CLOSED.value
+                           and type(count) is int and 0 < count < cb._failure_threshold
+                           and type(info.get("trip_count")) is int and info["trip_count"] == 0)
+                cause, identity = restored_provenance(info, restored_live, pending=pending)
                 saved_incident = info.get("incident_identity")
                 incident = saved_incident if valid_identity(saved_incident) else None
                 anchor = info.get("incident_provider", name)
                 from genesis.routing.config import _current_provider_name
                 if not isinstance(anchor, str) or _current_provider_name(anchor) != _current_provider_name(target):
                     anchor = target
-                cb = self.get(target)
                 if self._retired_identity_changed(cause, identity, cfg):
                     cb._incident_identity = self._new_incident_identity()
-                    retired_during_restore = True
                     if self._on_retirement:
                         self._on_retirement(anchor, incident)
                     continue
                 cb._incident_identity = incident
                 cb._incident_provider = anchor
-                saved_state = info.get("state", "CLOSED")
                 # BOTH non-closed states restore. Restoring only OPEN made
                 # the guarantee below expire at the next restart, by an
                 # entirely ordinary route: `.state` assigns HALF_OPEN when
@@ -711,10 +728,6 @@ class CircuitBreakerRegistry:
                 # `_opened_at` is reset for OPEN only: for HALF_OPEN it is
                 # not consulted (the window has already elapsed), and the
                 # breaker is routable, so the next real call decides it.
-                restored_live = saved_state in (
-                    ProviderState.OPEN.value,
-                    ProviderState.HALF_OPEN.value,
-                )
                 if saved_state == ProviderState.OPEN.value:
                     cb._state = ProviderState.OPEN
                     cb._opened_at = cb._clock()
@@ -728,70 +741,11 @@ class CircuitBreakerRegistry:
                 # Cap=3 → max backoff = min(120*2^2, 1800) = 480s (8 min).
                 if saved_state == ProviderState.OPEN.value:
                     cb._trip_count = min(cb._trip_count, 3)
-                # The category QUALIFIES a failing breaker, so it must be
-                # restored under the same condition as the state it
-                # describes.
-                #
-                # KNOWN, ACCEPTED side effect on the OTHER reader of this
-                # field: `_effective_open_duration()` consults it to pick
-                # the 4h quota cap. A QUOTA_EXHAUSTED provider persisted as
-                # half_open therefore restarts on the 30-minute cap until it
-                # re-fails and re-classifies — a shorter retry interval, not
-                # a longer one, so it errs toward re-trying a provider that
-                # may have recovered. Restoring the category unconditionally
-                # to preserve the cap is NOT the fix: `_trip_count` is also
-                # restored unconditionally, so that would hand the heal
-                # guard a tripped-looking breaker and strand it. Restoring it unconditionally onto a breaker that
-                # comes back CLOSED (anything not saved as OPEN) leaves a
-                # dead fact from a previous process — and once
-                # `record_probe_success` began consulting it, that stale
-                # value permanently disabled probe healing for a provider
-                # that is not failing at all: stuck HALF_OPEN after any probe
-                # blip, with no traffic to rescue it. Reachable in normal
-                # operation because `.state` mutates OPEN -> HALF_OPEN when
-                # merely READ, and `save_state` serialises every breaker.
-                # Restored under the SAME condition as the category, and
-                # for the same reason: it qualifies a breaker that is NOT
-                # closed (OPEN or HALF_OPEN — `restored_live`). A saved-
-                # CLOSED row restores with neither, where "a call opened
-                # this" is not a fact about anything — carrying it would be
-                # the poison pill in a new field.
-                # MIGRATION, and it decides the first post-deploy cycle:
-                # a file written before this field existed has no key at
-                # all, and `.get()` would read that absence as "a probe
-                # opened it" -- the one origin a legacy OPEN row CANNOT
-                # have. In every version that wrote a keyless file,
-                # `probe_suspect()` produced HALF_OPEN and nothing else,
-                # and load_state THEN restored non-OPEN as CLOSED, so a
-                # persisted OPEN can only have come from a real call trip
-                # or an operator disable. Both must read True. (The restore
-                # has since widened to HALF_OPEN; a keyless half_open row
-                # defaults to probe-origin below, because that state is
-                # reachable both ways.) MEASURED against this
-                # deploy's own live state file: the provider in the
-                # motivating outage is persisted OPEN with no key, so
-                # defaulting to False would have left it probe-healable for
-                # one more cycle -- the fix failing its own acceptance bar.
-                # An explicit False in a NEW-format file is preserved.
-                # `null` is treated as ABSENT, not as False: `save_state`
-                # only ever writes a bool, so a null reaching here came
-                # from a hand-edit or a torn write, and reading it as False
-                # would hand back exactly the probe-healable value this
-                # migration exists to prevent.
-                # The keyless MIGRATION default is True for OPEN only, and
-                # that scope is load-bearing. A legacy OPEN row can only have
-                # come from a call trip or an operator disable (see above),
-                # so True is the sole possible origin. A legacy HALF_OPEN row
-                # is genuinely AMBIGUOUS — `probe_suspect()` reaches it
-                # directly, and so does a call trip whose window elapsed —
-                # so it defaults to False, the conservative direction: a
-                # probe may heal it, which merely restores pre-fix behaviour
-                # and self-corrects on the next real failure. Defaulting it
-                # True instead would strand a healthy probe-suspected
-                # provider with no traffic to rescue it, which is the harm
-                # the poison-pill work removed. Files written by THIS build
-                # always carry the key, so the ambiguity is legacy-only.
-                cb._failure_cause, cb._failure_identity = restored_provenance(info, restored_live)
+                # Pre-trip failures are evidence even while CLOSED. Restore
+                # only valid positive pending counters; this does not assert
+                # that a call opened the breaker or grant probe-heal immunity.
+                cb._failure_cause, cb._failure_identity = restored_provenance(
+                    info, restored_live, pending=pending)
                 saved_origin = info.get("opened_by_call")
                 if not restored_live:
                     cb._opened_by_call = False
@@ -803,7 +757,7 @@ class CircuitBreakerRegistry:
                 try:
                     cb._last_failure_category = (
                         ErrorCategory(saved_cat)
-                        if saved_cat and restored_live
+                        if saved_cat and (restored_live or pending)
                         else None
                     )
                 except ValueError:
@@ -823,11 +777,11 @@ class CircuitBreakerRegistry:
                         saved_cat, name,
                     )
                     cb._last_failure_category = None
-            if retired_during_restore:
-                self.save_state()
             logger.info("Circuit breaker state restored from %s", self._state_file)
+            return True
         except Exception:
             logger.warning("Failed to load circuit breaker state", exc_info=True)
+            return False
 
     def _provider_available(self, name: str) -> bool:
         """True if a provider can serve an essential site's traffic.

@@ -110,8 +110,6 @@ class Router:
         self._event_bus = event_bus
         self._dead_letter = dead_letter
         self._daily_budget = daily_budget
-        if daily_budget is not None:
-            daily_budget.bind_providers(config.providers)
         self._activity_tracker: ProviderActivityTracker | None = None
         self._rate_gates = self._build_rate_gates(config)
 
@@ -152,8 +150,6 @@ class Router:
             essential_sites = build_essential_provider_map(new_config)
             self.breakers.update_providers(new_config.providers)
             self.breakers.refresh_essential_sites(essential_sites)
-            if self._daily_budget is not None:
-                self._daily_budget.bind_providers(new_config.providers)
             self.config = new_config
             self.delegate = delegate
             self._rate_gates = gates

@@ -470,3 +470,112 @@ async def test_alias_rename_keeps_prethreshold_evidence(tmp_path, empty_db, fres
     await drain_escalation_tasks()
     key = escalation._state_key(anchor, incident)
     assert escalation._state[key]["trip_count"] == 5 and escalation._state[key]["escalated"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fresh", [False, True])
+async def test_removed_provider_retires_existing_incident(tmp_path, empty_db, fresh):
+    from genesis.observability.events import GenesisEventBus
+    from genesis.observability.types import Severity, Subsystem
+    from genesis.routing.escalation import ProviderEscalation
+
+    bus = GenesisEventBus()
+    escalation = ProviderEscalation(empty_db, bus,
+        incident_binding=lambda name: registry.current_incident_binding(name),
+        incident_owner=lambda anchor, incident: registry.incident_owner(anchor, incident))
+    registry = CircuitBreakerRegistry(config().providers, state_file=tmp_path / "removed.json",
+        on_retirement=escalation.record_retirement)
+    escalation.attach()
+    cb = registry.get("provider")
+    if fresh:
+        cb._incident_identity = registry._new_incident_identity()
+    incident = cb._incident_identity
+    for _ in range(5):
+        await bus.emit(Subsystem.ROUTING, Severity.WARNING, "breaker.tripped", "test",
+            provider="provider", incident_identity=incident)
+    await drain_escalation_tasks()
+    key = escalation._provider_content_hash("provider", incident)
+    cursor = await empty_db.execute("SELECT resolved FROM observations WHERE content_hash=?", (key,))
+    assert (await cursor.fetchone())[0] == 0
+    registry.update_providers({})
+    await drain_escalation_tasks()
+    cursor = await empty_db.execute("SELECT resolved,resolution_notes FROM observations WHERE content_hash=?", (key,))
+    row = await cursor.fetchone()
+    assert row[0] == 1 and "retired" in row[1]
+    assert not escalation._state
+    registry.update_providers(config().providers)
+    await bus.emit(Subsystem.ROUTING, Severity.WARNING, "breaker.tripped", "test",
+        provider="provider", incident_identity=registry.current_incident_identity("provider"))
+    assert next(iter(escalation._state.values()))["trip_count"] == 1
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("retirement", [False, True])
+def test_closed_pending_provenance_survives_repeated_restart(tmp_path, count, retirement):
+    path = tmp_path / "pending.json"
+    providers = config().providers
+    registry = CircuitBreakerRegistry(providers, state_file=path)
+    for _ in range(count):
+        registry.get("provider").record_failure(ErrorCategory.TRANSIENT, retirement=retirement)
+    registry.save_state()
+    for _ in range(2):
+        registry = CircuitBreakerRegistry(providers, state_file=path)
+        cb = registry.get("provider")
+        assert cb.state == ProviderState.CLOSED
+        assert cb._consecutive_failures == count
+        assert cb._failure_cause == ("retirement" if retirement else "other")
+        assert not cb._opened_by_call
+    for _ in range(3 - count):
+        cb.record_failure(ErrorCategory.TRANSIENT, retirement=retirement)
+    assert cb.state == ProviderState.OPEN
+    registry.update_providers(config("replacement").providers)
+    assert registry.get("provider").state == (ProviderState.CLOSED if retirement else ProviderState.OPEN)
+
+
+def test_restore_never_persists_partial_bindings(tmp_path, monkeypatch):
+    import json
+
+    path = tmp_path / "restore.json"
+    providers = {name: config(name=name).providers[name] for name in ("glm", "glm51", "later")}
+    registry = CircuitBreakerRegistry(providers, state_file=path)
+    for name in providers:
+        registry.get(name).force_open()
+    data = json.loads(path.read_text())
+    data["glm"]["incident_provider"] = "glm51"
+    data["glm"]["incident_identity"] = None
+    data["glm51"]["incident_identity"] = "a" * 64
+    path.write_text(json.dumps(data))
+    writes = []
+    from genesis.routing import circuit_breaker
+    real_write = circuit_breaker.atomic_write_text
+
+    def observe_write(target, text):
+        writes.append(json.loads(text))
+        real_write(target, text)
+
+    monkeypatch.setattr(circuit_breaker, "atomic_write_text", observe_write)
+    for _ in range(2):
+        registry = CircuitBreakerRegistry(providers, state_file=path)
+        assert all(registry.get(name).state == ProviderState.OPEN for name in providers)
+    assert len(writes) == 2
+    assert all(set(w) == set(providers) and all(row["state"] == "open" for row in w.values()) for w in writes)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("mode", ["reload", "restart"])
+def test_pending_retirement_does_not_poison_replacement(tmp_path, count, mode):
+    path = tmp_path / "pending-replacement.json"
+    registry = CircuitBreakerRegistry(config().providers, state_file=path)
+    for _ in range(count):
+        registry.get("provider").record_failure(ErrorCategory.TRANSIENT, retirement=True)
+    registry.save_state()
+    replacement = config("replacement").providers
+    if mode == "reload":
+        registry.update_providers(replacement)
+    else:
+        registry = CircuitBreakerRegistry(replacement, state_file=path)
+    cb = registry.get("provider")
+    assert cb._consecutive_failures == 0
+    assert cb._failure_cause is None
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    assert cb.state == ProviderState.CLOSED

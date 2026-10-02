@@ -177,7 +177,6 @@ class DailyBudgetLedger:
         self._persist = persist
         # name -> {"day": "YYYY-MM-DD", "requests": int, "tokens": int}
         self._counters: dict[str, dict] = {}
-        self._known_providers: set[str] | None = None
         self._lock = threading.RLock()
         self._load()
 
@@ -280,51 +279,22 @@ class DailyBudgetLedger:
     def _today(self) -> str:
         return self._clock().strftime("%Y-%m-%d")
 
-    def bind_providers(self, providers) -> None:
-        """Keep registered renames on one account counter, including late calls.
-
-        Two explicitly configured entries retain separate counters. Renames use
-        the existing append-only map, never a model-name guess. Reads stay pure;
-        writes consolidate source rows so restart cannot count a migration twice.
-        """
-        with self._lock:
-            self._known_providers = set(providers)
-
-    def _name(self, name: str) -> str:
-        from genesis.routing.config import _current_provider_name
-
-        # Both explicit entries are independent configuration, not a migration.
-        if self._known_providers is not None and name in self._known_providers:
-            family = _current_provider_name(name)
-            peers = [n for n in self._known_providers if _current_provider_name(n) == family]
-            if len(peers) > 1:
-                return name
-        family = _current_provider_name(name)
-        if self._known_providers is not None:
-            peers = [n for n in self._known_providers if _current_provider_name(n) == family]
-            if len(peers) == 1:
-                return peers[0]  # also preserves usage when rolling back a rename
-        return family
-
     def _peek(self, name: str) -> dict:
-        """Pure current-day view; combine disjoint visits under renamed keys."""
+        """Pure current-day view of one explicitly named provider's counters."""
         with self._lock:
-            key = self._name(name)
             today = self._today()
-            rows = [row for n, row in self._counters.items()
-                    if self._name(n) == key and row.get("day") == today]
-            return {"day": today,
-                    "requests": sum(row["requests"] for row in rows),
-                    "tokens": sum(row["tokens"] for row in rows)}
+            row = self._counters.get(name)
+            if row is None or row.get("day") != today:
+                return {"day": today, "requests": 0, "tokens": 0}
+            return dict(row)
 
     def _entry(self, name: str) -> dict:
-        """Consolidate a rename exactly once on the single-writer path."""
-        key = self._name(name)
-        entry = self._peek(name)
-        for source in list(self._counters):
-            if self._name(source) == key:
-                del self._counters[source]
-        self._counters[key] = entry
+        """Roll over one provider row on the locked writer path."""
+        today = self._today()
+        entry = self._counters.get(name)
+        if entry is None or entry.get("day") != today:
+            entry = {"day": today, "requests": 0, "tokens": 0}
+            self._counters[name] = entry
         return entry
 
     def _load(self) -> None:

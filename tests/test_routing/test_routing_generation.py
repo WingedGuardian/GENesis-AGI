@@ -109,7 +109,7 @@ def test_breaker_reload_does_not_mutate_old_configuration(tmp_path):
     assert old.providers["provider"].model_id == "old-model"
 
 
-def test_alias_rename_preserves_daily_usage(tmp_path):
+def test_different_alias_budgets_remain_separate(tmp_path):
     from genesis.routing.config import _RENAMED_PROVIDERS
     from genesis.routing.daily_budget import DailyBudgetLedger
     from genesis.routing.types import CallResult
@@ -121,8 +121,8 @@ def test_alias_rename_preserves_daily_usage(tmp_path):
     ledger.record(old, CallResult(success=True, content="ok"))
     assert ledger.exhausted(old)
     assert ledger.status(old)["requests_used"] == 1
-    assert ledger.status(new)["requests_used"] == 1
-    assert ledger.exhausted(new)
+    assert ledger.status(new)["requests_used"] == 0
+    assert not ledger.exhausted(new)
 
 
 @pytest.mark.parametrize("mode", ["reload", "restart"])
@@ -274,7 +274,7 @@ def test_retirement_requires_specific_evidence(status, error, reached, expected)
 
 
 @pytest.mark.parametrize("old_day", ["current", "stale"])
-def test_alias_counters_merge_once_and_keep_valid_units(tmp_path, old_day):
+def test_named_counters_keep_valid_units_and_other_alias_rows(tmp_path, old_day):
     import json
     from datetime import UTC, datetime
 
@@ -291,19 +291,19 @@ def test_alias_counters_merge_once_and_keep_valid_units(tmp_path, old_day):
         current: {"day": "2026-10-01", "requests": 3, "tokens": 8},
     }}))
     cfg = replace(config(name=current).providers[current], rpd_limit=100)
-    expected = 5 if old_day == "current" else 3
+    expected = 3
     ledger = DailyBudgetLedger(state_path=path, clock=lambda: now)
     assert ledger.status(cfg)["requests_used"] == expected
     assert ledger.status(cfg)["tokens_used"] == 8
     ledger.record(cfg, CallResult(success=True))
     saved = json.loads(path.read_text())["providers"]
-    assert list(saved) == [current]
+    assert set(saved) == ({legacy, current} if old_day == "current" else {current})
     for _ in range(3):
         ledger = DailyBudgetLedger(state_path=path, clock=lambda: now)
         assert ledger.status(cfg)["requests_used"] == expected + 1
 
 
-def test_late_alias_usage_and_rollback_share_current_counter(tmp_path):
+def test_late_alias_usage_stays_on_original_named_counter(tmp_path):
     from genesis.routing.config import _RENAMED_PROVIDERS
     from genesis.routing.daily_budget import DailyBudgetLedger
     from genesis.routing.types import CallResult
@@ -312,15 +312,13 @@ def test_late_alias_usage_and_rollback_share_current_counter(tmp_path):
     old = replace(config(name=legacy).providers[legacy], rpd_limit=10)
     new = replace(old, name=current)
     ledger = DailyBudgetLedger(state_path=tmp_path / "usage.json", persist=False)
-    ledger.bind_providers({legacy: old})
     ledger.record(old, CallResult(success=True))
-    ledger.bind_providers({current: new})
     ledger.record(old, CallResult(success=True))  # late completion under the old alias
-    assert ledger.status(new)["requests_used"] == 2
-    ledger.bind_providers({legacy: old})
+    assert ledger.status(new)["requests_used"] == 0
     assert ledger.status(old)["requests_used"] == 2
     ledger.record(new, CallResult(success=True))
-    assert ledger.status(old)["requests_used"] == 3
+    assert ledger.status(old)["requests_used"] == 2
+    assert ledger.status(new)["requests_used"] == 1
 
 
 def test_explicit_both_aliases_keep_independent_counters(tmp_path):
@@ -332,7 +330,6 @@ def test_explicit_both_aliases_keep_independent_counters(tmp_path):
     old = replace(config(name=legacy).providers[legacy], rpd_limit=10)
     new = replace(old, name=current)
     ledger = DailyBudgetLedger(state_path=tmp_path / "usage.json", persist=False)
-    ledger.bind_providers({legacy: old, current: new})
     ledger.record(old, CallResult(success=True))
     assert ledger.status(old)["requests_used"] == 1
     assert ledger.status(new)["requests_used"] == 0
@@ -460,7 +457,7 @@ def test_operator_hold_survives_alias_rollback(tmp_path, mode):
     assert registry.get(legacy)._failure_cause == "operator"
 
 
-def test_daily_dashboard_reader_and_alias_writer_are_serialized(tmp_path, monkeypatch):
+def test_daily_dashboard_reader_and_provider_writer_are_serialized(tmp_path, monkeypatch):
     import threading
 
     from genesis.routing.config import _RENAMED_PROVIDERS
@@ -474,16 +471,16 @@ def test_daily_dashboard_reader_and_alias_writer_are_serialized(tmp_path, monkey
     ledger._counters = {legacy: {"day": today, "requests": 1, "tokens": 0},
                         current: {"day": today, "requests": 2, "tokens": 0}}
     entered, release, writer_started = threading.Event(), threading.Event(), threading.Event()
-    real_name = ledger._name
+    real_today = ledger._today
     errors, observed = [], []
 
-    def blocking_name(name):
+    def blocking_today():
         if threading.current_thread().name == "dashboard" and not entered.is_set():
             entered.set()
             assert release.wait(5)
-        return real_name(name)
+        return real_today()
 
-    monkeypatch.setattr(ledger, "_name", blocking_name)
+    monkeypatch.setattr(ledger, "_today", blocking_today)
 
     def reader():
         try:
@@ -506,8 +503,8 @@ def test_daily_dashboard_reader_and_alias_writer_are_serialized(tmp_path, monkey
     write_thread.join(5)
     assert not read_thread.is_alive() and not write_thread.is_alive()
     assert not errors
-    assert observed == [3]
-    assert ledger.status(cfg)["requests_used"] == 4
+    assert observed == [2]
+    assert ledger.status(cfg)["requests_used"] == 3
 
 
 @pytest.mark.asyncio
