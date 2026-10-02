@@ -27,6 +27,15 @@ native single-project mode; the Codex context retains its native name for
 OpenAI tool schemas. Dashboard and GUI surfaces are disabled. Ports 9165 and
 9166 must be free; startup also checks the actual native exposed tools and
 refuses any configuration that reintroduces project or mode switching.
+Enable/disable transitions take one per-user process lock, including preflight
+and final publication. Launchers check the running provider’s checkout before
+attaching, so a stale marker in another configuration root refuses. Version
+1.7.0 is checked before changing configuration and again at service startup;
+Automatic upgrades take the same lock and require both managed services to be
+stopped and disabled (or persistently masked), regardless of `GENESIS_HOME`.
+Unreadable user-manager state skips the optional upgrade with a warning; it
+does not stop installation of Genesis. Native upgrades remain available when
+no shared services are installed.
 An occupied port refuses configuration. Stop the two owned
 services before deliberately refreshing snapshots with another configure run.
 

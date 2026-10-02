@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import selectors
 import socket
 import subprocess
 import sys
@@ -15,6 +16,11 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts/serena_shared.py"
 spec = importlib.util.spec_from_file_location("serena_shared", SCRIPT)
 shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)
+
+
+@pytest.fixture(autouse=True)
+def private_user_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def checkout(path, linked=False):
@@ -49,6 +55,7 @@ def test_launch_routes_only_exact_main(tmp_path, monkeypatch, context, which):
     monkeypatch.setattr(shared, "read_settings", lambda _: {"main": str(main), "enabled": True})
     monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
     monkeypatch.setattr(shared.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(shared, "active_project", lambda unit: main)
     captured = []
     monkeypatch.setattr(shared.os, "execv", lambda executable, argv: captured.append(argv))
     project = {"main": main, "linked": linked, "none": None}[which]
@@ -203,6 +210,9 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
     bindir.mkdir()
     (bindir / "serena").write_text("#!/bin/sh\nexit 0\n")
     (bindir / "uv").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+    (bindir / "systemctl").write_text(
+        "#!/bin/sh\nprintf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\n"
+    )
     for executable in bindir.iterdir():
         executable.chmod(0o755)
     home = tmp_path / (".genesis" if home_kind in ("empty", "unset") else "state")
@@ -319,6 +329,7 @@ def test_reconfigure_removes_deleted_native_settings_snapshot(tmp_path, monkeypa
     monkeypatch.setenv("SERENA_HOME", str(source))
     monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
     monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared, "validate_version", lambda *args: None)
     monkeypatch.setattr(shared, "snapshot_context", lambda *args: None)
     monkeypatch.setattr(shared, "systemctl", lambda *args: None)
     shared.configure(main, True)
@@ -349,6 +360,7 @@ def configured_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("SERENA_HOME", str(tmp_path / "provider"))
     monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
     monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared, "validate_version", lambda *args: None)
     monkeypatch.setattr(shared, "snapshot_context", lambda *args: None)
     monkeypatch.setattr(shared, "systemctl", lambda *args: None)
     return settings
@@ -524,3 +536,303 @@ def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path):
         unit = shared.unit_name(context)
         for operation in ("stop", "disable"):
             assert any(args[:2] == ["--user", operation] and unit in args[2:] for args in recorded)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("first_enable", [False, True])
+@pytest.mark.parametrize("second_enable", [False, True])
+@pytest.mark.parametrize("first_fails", [False, True])
+def test_configuration_process_lock_covers_all_transitions_and_releases_on_error(
+    tmp_path, first_enable, second_enable, first_fails, locked
+):
+    code = """import importlib.util, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('shared', sys.argv[1])
+shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
+native_lock=shared.fcntl.flock
+def lock(fd, operation):
+    print('locking', flush=True)
+    if sys.argv[5] == 'True': native_lock(fd, operation)
+shared.fcntl.flock=lock
+def action(project, enabled):
+    print(str(project), flush=True)
+    sys.stdin.buffer.read(1)
+    if sys.argv[4] == 'True': raise OSError('owned failure')
+shared.configure_locked=action
+shared.configure(Path(sys.argv[2]), sys.argv[3] == 'True')
+"""
+    clients = []
+    with selectors.DefaultSelector() as ready:
+        try:
+            for number, enable, fails in [
+                (1, first_enable, first_fails),
+                (2, second_enable, False),
+            ]:
+                client = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        code,
+                        str(SCRIPT),
+                        str(number),
+                        str(enable),
+                        str(fails),
+                        str(locked),
+                    ],
+                    env=dict(os.environ, GENESIS_HOME=str(tmp_path / str(number))),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                clients.append(client)
+                ready.register(client.stdout, selectors.EVENT_READ)
+                assert ready.select(5)
+                assert client.stdout.readline().strip() == b"locking"
+                if number == 1:
+                    assert ready.select(5)
+                    assert client.stdout.readline().strip() == b"1"
+                    ready.unregister(client.stdout)
+                elif locked:
+                    assert not ready.select(0.2), "second transition entered while first held lock"
+                else:
+                    assert ready.select(5), "no-op control did not enter the overlapping transition"
+                    assert client.stdout.readline().strip() == b"2"
+            clients[0].stdin.write(b"x")
+            clients[0].stdin.flush()
+            assert clients[0].wait(timeout=5) == int(first_fails)
+            if locked:
+                assert ready.select(5)
+                assert clients[1].stdout.readline().strip() == b"2"
+            clients[1].stdin.write(b"x")
+            clients[1].stdin.flush()
+            assert clients[1].wait(timeout=5) == 0
+        finally:
+            for client in clients:
+                if client.poll() is None:
+                    client.kill()
+                client.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+def test_stale_configuration_root_refuses_service_for_another_checkout(
+    tmp_path, monkeypatch, context
+):
+    first = checkout(tmp_path / "first")
+    second = checkout(tmp_path / "second")
+    state = tmp_path / "state-first"
+    shared.write_settings(state / "config/serena-shared.json", first, True)
+    shared.write_settings(tmp_path / "state-second/config/serena-shared.json", second, True)
+    monkeypatch.setenv("GENESIS_HOME", str(state))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=second)
+    monkeypatch.setattr(
+        shared.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
+    )
+    monkeypatch.setattr(shared.subprocess, "check_output", lambda *args, **kwargs: str(child.pid))
+    try:
+        with pytest.raises(ValueError, match="different checkout"):
+            shared.launch(context, first)
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def test_unsupported_provider_refuses_before_configuration_changes(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    settings = tmp_path / "config/serena-shared.json"
+    shared.write_settings(settings, main, True)
+    original = settings.read_bytes()
+    monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    native_output = shared.subprocess.check_output
+
+    def output(command, **kwargs):
+        return (
+            "Serena 2.0.0\n"
+            if command == ["/bin/serena", "--version"]
+            else native_output(command, **kwargs)
+        )
+
+    monkeypatch.setattr(shared.subprocess, "check_output", output)
+    with pytest.raises(ValueError, match="revalidate"):
+        shared.configure(main, True)
+    assert settings.read_bytes() == original
+    assert not list(shared.unit_directory().glob("*.service"))
+
+
+def test_installer_waits_for_configuration_then_preserves_published_provider(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    scripts = {
+        "serena": "#!/bin/sh\nexit 0\n",
+        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "flock": '#!/bin/sh\necho locking\nexec /usr/bin/flock "$@"\n',
+    }
+    for name, content in scripts.items():
+        executable = bindir / name
+        executable.write_text(content)
+        executable.chmod(0o755)
+    env = dict(
+        os.environ,
+        GENESIS_HOME=str(tmp_path / "state"),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+    )
+    code = """import importlib.util, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('shared',sys.argv[1])
+shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
+def action(project,enabled):
+    print('entered',flush=True);sys.stdin.buffer.read(1)
+    shared.write_settings(shared.settings_path(),project,True)
+shared.configure_locked=action
+shared.configure(Path('/main'),True)
+"""
+    clients = []
+    with selectors.DefaultSelector() as ready:
+        try:
+            first = subprocess.Popen(
+                [sys.executable, "-c", code, str(SCRIPT)],
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            clients.append(first)
+            ready.register(first.stdout, selectors.EVENT_READ)
+            assert ready.select(5) and first.stdout.readline().strip() == b"entered"
+            ready.unregister(first.stdout)
+            second = subprocess.Popen(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; _install_serena',
+                    "bash",
+                    str(SCRIPT.parent / "lib/serena_install.sh"),
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            clients.append(second)
+            ready.register(second.stdout, selectors.EVENT_READ)
+            assert ready.select(5) and second.stdout.readline().strip() == b"locking"
+            assert not ready.select(0.2)
+            assert not calls.exists()
+            first.stdin.write(b"x")
+            first.stdin.flush()
+            assert first.wait(timeout=5) == 0
+            stdout, stderr = second.communicate(timeout=5)
+            assert second.returncode == 0 and b"sharing enabled" in stdout, stderr
+            assert not calls.exists()
+        finally:
+            for client in clients:
+                if client.poll() is None:
+                    client.kill()
+                client.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize(
+    "state,upgrade",
+    [
+        ("LoadState=not-found\nActiveState=inactive\nUnitFileState=\n", True),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n", True),
+        ("LoadState=loaded\nActiveState=failed\nUnitFileState=disabled\n", True),
+        ("LoadState=masked\nActiveState=inactive\nUnitFileState=masked\n", True),
+        ("LoadState=loaded\nActiveState=active\nUnitFileState=disabled\n", False),
+        ("LoadState=loaded\nActiveState=activating\nUnitFileState=disabled\n", False),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\n", False),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled-runtime\n", False),
+        ("LoadState=masked\nActiveState=inactive\nUnitFileState=masked-runtime\n", False),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", False),
+        ("unreadable", False),
+        ("malformed", False),
+    ],
+)
+def test_global_provider_upgrade_requires_both_services_stopped_and_disabled(
+    tmp_path, context, state, upgrade
+):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    scripts = {
+        "serena": "#!/bin/sh\nexit 0\n",
+        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "systemctl": (
+            '#!/bin/sh\nif [ "$3" = "$SELECTED" ]; then\n'
+            '  [ "$STATE" != unreadable ] || exit 1\n  printf "%s" "$STATE"\n'
+            "else\n  printf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\nfi\n"
+        ),
+    }
+    for name, content in scripts.items():
+        executable = bindir / name
+        executable.write_text(content)
+        executable.chmod(0o755)
+    env = dict(
+        os.environ,
+        GENESIS_HOME=str(tmp_path / "other-config-root"),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+        SELECTED=shared.unit_name(context),
+        STATE=state,
+    )
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; _install_serena',
+            "bash",
+            str(SCRIPT.parent / "lib/serena_install.sh"),
+        ],
+        env=env,
+        check=True,
+    )
+    assert calls.exists() is upgrade
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+def test_configure_then_installer_in_another_root_preserves_global_provider(
+    tmp_path, configured_paths, context
+):
+    shared.configure(checkout(tmp_path / "main"), True)
+    assert shared.read_settings(configured_paths)["enabled"] is True
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    scripts = {
+        "serena": "#!/bin/sh\nexit 0\n",
+        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "systemctl": (
+            '#!/bin/sh\nif [ "$3" = "$SELECTED" ]; then\n'
+            "printf 'LoadState=loaded\\nActiveState=active\\nUnitFileState=enabled\\n'\n"
+            "else\nprintf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\nfi\n"
+        ),
+    }
+    for name, content in scripts.items():
+        executable = bindir / name
+        executable.write_text(content)
+        executable.chmod(0o755)
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; _install_serena',
+            "bash",
+            str(SCRIPT.parent / "lib/serena_install.sh"),
+        ],
+        env=dict(
+            os.environ,
+            GENESIS_HOME=str(tmp_path / "root-b"),
+            PATH=f"{bindir}:{os.defpath}",
+            CALLS=str(calls),
+            SELECTED=shared.unit_name(context),
+        ),
+        check=True,
+    )
+    assert not calls.exists()
+    assert shared.read_settings(configured_paths)["enabled"] is True

@@ -6,6 +6,7 @@ Terse owns the stdio transport. Changes to provider snapshots require configure.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -63,6 +64,21 @@ def unit_name(context: str) -> str:
     return f"genesis-serena-{context}.service"
 
 
+def unit_directory() -> Path:
+    return Path.home() / ".config/systemd/user"
+
+
+def active_project(unit: str) -> Path:
+    pid = int(
+        subprocess.check_output(
+            ["systemctl", "--user", "show", unit, "--property=MainPID", "--value"], text=True
+        ).strip()
+    )
+    if pid <= 0:
+        raise ValueError(f"{unit} unavailable")
+    return (Path("/proc") / str(pid) / "cwd").resolve(strict=True)
+
+
 def launch(context: str, project: Path | None) -> None:
     config = read_settings(settings_path())
     if config and config["enabled"] and project == Path(config["main"]).resolve():
@@ -70,6 +86,8 @@ def launch(context: str, project: Path | None) -> None:
         active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit], check=False)
         if active.returncode:
             raise ValueError(f"{unit} unavailable; restore the managed service or disable sharing")
+        if active_project(unit) != project:
+            raise ValueError(f"{unit} serves a different checkout; disable stale sharing settings")
         command = [
             binary("terse"),
             "proxy",
@@ -130,10 +148,14 @@ WantedBy=default.target
 """
 
 
-def serve(project: Path, context: str, serena: str) -> None:
+def validate_version(serena: str) -> None:
     version = subprocess.check_output([serena, "--version"], text=True).strip()
     if version != "Serena 1.7.0":
         raise ValueError("revalidate shared services before changing Serena 1.7.0")
+
+
+def serve(project: Path, context: str, serena: str) -> None:
+    validate_version(serena)
     args = [
         serena,
         "start-mcp-server",
@@ -272,6 +294,15 @@ def validate_main(project: Path) -> None:
 
 
 def configure(project: Path, enable: bool) -> None:
+    # Units/ports are per user, even when callers choose different GENESIS_HOME.
+    directory = unit_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".genesis-serena.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        configure_locked(project, enable)
+
+
+def configure_locked(project: Path, enable: bool) -> None:
     config_file = settings_path()
     if not enable:
         # Recovery must not depend on a working/current provider or proxy.
@@ -290,6 +321,7 @@ def configure(project: Path, enable: bool) -> None:
                     "refreshing snapshots, and preserve any foreign listener"
                 ) from error
     serena = binary("serena")
+    validate_version(serena)
     binary("terse")
     # No old checkout may route to a new service if startup/publication fails.
     write_settings(config_file, project, False)
@@ -304,7 +336,7 @@ def configure(project: Path, enable: bool) -> None:
 
 
 def install_units(project: Path, config_file: Path, serena: str) -> None:
-    directory = Path.home() / ".config/systemd/user"
+    directory = unit_directory()
     directory.mkdir(parents=True, exist_ok=True)
     home_root = config_file.parent.parent / "serena-shared"
     source_home = Path(os.environ.get("SERENA_HOME") or Path.home() / ".serena").resolve()
