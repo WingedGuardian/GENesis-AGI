@@ -29,10 +29,15 @@ OpenAI tool schemas. Dashboard and GUI surfaces are disabled. Ports 9165 and
 rejected before configuration changes. Startup also checks the actual native exposed tools and
 refuses any configuration that reintroduces project or mode switching.
 Enable/disable transitions take one per-user process lock, including preflight
-and final publication. Launchers check the running provider’s checkout before
-attaching, so a stale marker in another configuration root refuses. Version
+and final publication. Shared launchers hold a shared lock from settings read
+through the native Terse process lifetime and check the running provider’s
+checkout before attaching. A stale marker in another configuration root refuses.
+Configure refuses while shared clients or another configuration are active;
+close shared MCP connections before enabling, disabling or changing snapshots.
+Native stdio/worktree clients release this lock before starting their provider.
+Revalidate inherited lock ownership when upgrading the native Terse transport. Version
 1.7.0 is checked before changing configuration and again at service startup;
-Automatic upgrades take the same lock and require both managed services to be
+Automatic upgrades skip immediately if that lock is busy; otherwise they take it and require both managed services to be
 stopped and disabled (or persistently masked), regardless of `GENESIS_HOME`.
 Unreadable user-manager state skips the optional upgrade with a warning; it
 does not stop installation of Genesis. Native upgrades remain available when
@@ -77,7 +82,7 @@ retain their existing native stdio lifecycle and resource behavior.
 python3 scripts/serena_shared.py configure --main "$PWD"
 ```
 
-This first disables sharing in settings and then disables/stops the two owned
+Close shared MCP connections first. This disables sharing in settings and then disables/stops the two owned
 services. It does not require a working provider or proxy. Reconnect clients;
 the same launcher now uses native stdio. Preserve provider snapshots for
 inspection; they live under the existing backed-up `.genesis` directory.

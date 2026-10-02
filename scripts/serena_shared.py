@@ -80,8 +80,23 @@ def active_project(unit: str) -> Path:
 
 
 def launch(context: str, project: Path | None) -> None:
+    directory = unit_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".genesis-serena.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        command, shared = launch_command(context, project)
+        if shared:
+            # Native Terse keeps this descriptor until exit, including initialization.
+            os.set_inheritable(lock.fileno(), True)
+        else:
+            lock.close()  # Worktree/native readers do not prevent reconfiguration.
+        os.execv(command[0], command)  # noqa: S606 - resolved executable, argv without shell
+
+
+def launch_command(context: str, project: Path | None) -> tuple[list[str], bool]:
     config = read_settings(settings_path())
-    if config and config["enabled"] and project == Path(config["main"]).resolve():
+    shared = bool(config and config["enabled"] and project == Path(config["main"]).resolve())
+    if shared:
         unit = unit_name(context)
         active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit], check=False)
         if active.returncode:
@@ -101,7 +116,7 @@ def launch(context: str, project: Path | None) -> None:
     else:
         command = [binary("serena"), "start-mcp-server", "--context", context]
         command += ["--project", str(project)] if project else ["--project-from-cwd"]
-    os.execv(command[0], command)  # noqa: S606 - resolved executable, argv without shell
+    return command, shared
 
 
 def quote_unit(value: str) -> str:
@@ -298,7 +313,12 @@ def configure(project: Path, enable: bool) -> None:
     directory = unit_directory()
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / ".genesis-serena.lock").open("a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError(
+                "Serena configuration busy; close shared MCP clients before configuring"
+            ) from error
         configure_locked(project, enable)
 
 

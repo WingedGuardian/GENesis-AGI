@@ -1,5 +1,6 @@
 """Routing and recovery contracts for the native shared Serena boundary."""
 
+import fcntl
 import importlib.util
 import json
 import os
@@ -75,6 +76,8 @@ def test_failed_shared_service_does_not_spawn_stdio_duplicate(tmp_path, monkeypa
     monkeypatch.setattr(shared.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=3))
     with pytest.raises(ValueError, match="unavailable"):
         shared.launch("claude-code", main)
+    with (shared.unit_directory() / ".genesis-serena.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 @pytest.mark.parametrize(
@@ -411,7 +414,9 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
 
 
 @pytest.mark.parametrize("suffix", [" ", "\t", "\\"])
-def test_unsupported_checkout_path_ending_rejected_before_mutation(tmp_path, configured_paths, suffix):
+def test_unsupported_checkout_path_ending_rejected_before_mutation(
+    tmp_path, configured_paths, suffix
+):
     main = checkout(tmp_path / ("main" + suffix))
     with pytest.raises(ValueError, match="end in whitespace"):
         shared.configure(main, True)
@@ -594,19 +599,18 @@ shared.configure(Path(sys.argv[2]), sys.argv[3] == 'True')
                     assert client.stdout.readline().strip() == b"1"
                     ready.unregister(client.stdout)
                 elif locked:
-                    assert not ready.select(0.2), "second transition entered while first held lock"
+                    assert client.wait(timeout=5) == 1
+                    assert b"configuration busy" in client.stderr.read()
                 else:
                     assert ready.select(5), "no-op control did not enter the overlapping transition"
                     assert client.stdout.readline().strip() == b"2"
             clients[0].stdin.write(b"x")
             clients[0].stdin.flush()
             assert clients[0].wait(timeout=5) == int(first_fails)
-            if locked:
-                assert ready.select(5)
-                assert clients[1].stdout.readline().strip() == b"2"
-            clients[1].stdin.write(b"x")
-            clients[1].stdin.flush()
-            assert clients[1].wait(timeout=5) == 0
+            if not locked:
+                clients[1].stdin.write(b"x")
+                clients[1].stdin.flush()
+                assert clients[1].wait(timeout=5) == 0
         finally:
             for client in clients:
                 if client.poll() is None:
@@ -661,7 +665,7 @@ def test_unsupported_provider_refuses_before_configuration_changes(tmp_path, mon
     assert not list(shared.unit_directory().glob("*.service"))
 
 
-def test_installer_waits_for_configuration_then_preserves_published_provider(tmp_path):
+def test_installer_skips_active_configuration_without_waiting_or_mutating_provider(tmp_path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     calls = tmp_path / "calls"
@@ -721,13 +725,12 @@ shared.configure(Path('/main'),True)
             clients.append(second)
             ready.register(second.stdout, selectors.EVENT_READ)
             assert ready.select(5) and second.stdout.readline().strip() == b"locking"
-            assert not ready.select(0.2)
+            stdout, stderr = second.communicate(timeout=5)
+            assert second.returncode == 0 and b"clients or configuration active" in stdout, stderr
             assert not calls.exists()
             first.stdin.write(b"x")
             first.stdin.flush()
             assert first.wait(timeout=5) == 0
-            stdout, stderr = second.communicate(timeout=5)
-            assert second.returncode == 0 and b"sharing enabled" in stdout, stderr
             assert not calls.exists()
         finally:
             for client in clients:
@@ -836,3 +839,67 @@ def test_configure_then_installer_in_another_root_preserves_global_provider(
     )
     assert not calls.exists()
     assert shared.read_settings(configured_paths)["enabled"] is True
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize("use_shared", [False, True])
+def test_launcher_binds_checkout_through_proxy_exec_and_releases_native_mode(
+    tmp_path, context, use_shared
+):
+    code = """import importlib.util, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('shared',sys.argv[1])
+shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
+def command(context,project):
+    print('validated',flush=True);sys.stdin.buffer.read(1)
+    return [sys.executable,'-c',"import sys;print('proxy',flush=True);sys.stdin.buffer.read(1)"],sys.argv[3]=='True'
+shared.launch_command=command
+shared.launch(sys.argv[2],Path('/main'))
+"""
+    client = subprocess.Popen(
+        [sys.executable, "-c", code, str(SCRIPT), context, str(use_shared)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    lock_path = shared.unit_directory() / ".genesis-serena.lock"
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(client.stdout, selectors.EVENT_READ)
+            assert ready.select(5) and client.stdout.readline().strip() == b"validated"
+            with lock_path.open("a") as lock:
+                # Even before exec, a replacement cannot pass the checked identity.
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                client.stdin.write(b"x")
+                client.stdin.flush()
+                assert ready.select(5) and client.stdout.readline().strip() == b"proxy"
+                if use_shared:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                client.stdin.write(b"x")
+                client.stdin.flush()
+                assert client.wait(timeout=5) == 0
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if client.poll() is None:
+            client.kill()
+        client.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("use_shared", [False, True])
+def test_failed_exec_releases_configuration_lock(tmp_path, monkeypatch, use_shared):
+    monkeypatch.setattr(shared, "launch_command", lambda *args: (["/missing"], use_shared))
+
+    def fail_exec(*args):
+        raise OSError("execution failed")
+
+    monkeypatch.setattr(shared.os, "execv", fail_exec)
+    with pytest.raises(OSError, match="execution failed"):
+        shared.launch("codex", tmp_path)
+    with (shared.unit_directory() / ".genesis-serena.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

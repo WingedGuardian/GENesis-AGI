@@ -1102,6 +1102,6 @@ jobs:
         # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
         # Routing generations: 143 collected across the four new generation files.
         # Floor 23721 + 143 = 23864; skip ceiling remains 102.
-        # Shared Serena: new test_serena_shared.py collects 126 tests (0 -> 126).
-        # Floor: 23864 + 126 = 23990; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23990
+        # Shared Serena: new test_serena_shared.py collects 132 tests (0 -> 132).
+        # Floor: 23864 + 132 = 23996; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23996

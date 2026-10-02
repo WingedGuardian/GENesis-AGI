@@ -11,8 +11,8 @@ _install_serena() (
         echo "  WARNING: Serena lock unavailable; skipping install/upgrade"
         return 0
     fi
-    if ! flock -x "$serena_lock_fd"; then
-        echo "  WARNING: Serena lock failed; skipping install/upgrade"
+    if ! flock -xn "$serena_lock_fd"; then
+        echo "  WARNING: Serena clients or configuration active; skipping install/upgrade"
         return 0
     fi
     sharing="$(python3 - <<'PY'
