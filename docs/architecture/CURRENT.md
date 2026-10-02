@@ -2550,9 +2550,15 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: 39f1cc9ef 2026-10-02
+verified: 1ff7c3e3c 2026-10-02
 ```
 
+- **October 2026 model refresh**: the stable NVIDIA DeepSeek alias selects
+  V4.1 Flash after the old Flash endpoint returned HTTP 410. Eight ordinary
+  Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
+  suppressor's exact validated pair and standalone evaluation judge remain
+  DeepSeek Pro. Candidate compatibility has been probed; candidate quality for
+  these protected judgments has not been qualified.
 - **Coherent routing reloads** (`Router.reload_config`,
   `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
   bindings before yielding. Replacement/rename breakers preserve holds while
@@ -2576,8 +2582,8 @@ verified: 39f1cc9ef 2026-10-02
   Captured pacing intervals stay immutable while admission locks/history are shared.
   Current health snapshots update the live cloud axis under the reload lock in both
   full and readonly runtimes; stale generations render without changing live state.
-- **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
-  each a free-first → paid-last chain; `never_pays` sites are filtered to
+- **routing/**: `config/model_routing.yaml` defines 63 call sites,
+  with free-first and explicitly paid-first chains; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
   the provider's OWN unit and never converted between them. As SHIPPED today:
