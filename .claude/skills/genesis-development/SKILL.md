@@ -1270,7 +1270,12 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   argument the code prefers over the env var under test); or its fixture never
   creates the shape it claims (a `bash -c 'sleep 30 # marker'` decoy
   exec-replaces itself and loses the marker from its argv — add a
-  guard-the-guard assert that the fixture really has the property). Ask of every
+  guard-the-guard assert that the fixture really has the property); or the code
+  under test HEALS the condition before the guarded step runs (an earlier
+  `git diff` refreshes the index as a side effect, so a test of an
+  index-refresh guard passed with the refresh deleted). To test a guard against
+  a transient condition, inject the condition AFTER the last step that could heal
+  it, and prove it with a mutation. Ask of every
   new test: *would this still pass if the mechanism it names were deleted?*
   When the DISTINGUISHING fact is produced by a lane the assertion cannot see,
   asking every test to assert it is a convention, and conventions decay — the
@@ -2544,6 +2549,19 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   does not establish that size causes rounds. **The limit, honestly:** the
   provenance trigger rests on one clear instance and one clear counter-instance.
   Act on it as a signal; it is not a law.
+- **Findings concentrating on safety code you built AROUND one external command:
+  read that command's manual for a native mode before writing the next guard.**
+  Adopt-before-build covers whole tools; this is the same question one level
+  down. When successive rounds land on hand-built protection around a single
+  command (snapshot, then refuse, then a destructive form of the command), the
+  tool often already ships the guarantee. Instance, #2722 (open as of 2026-10-01): moving the
+  rollback from hand-built snapshot-and-refuse around `reset --hard` to
+  `git reset --keep` retired most of a round's findings at once, and a later
+  premise check found that `git checkout --no-overwrite-ignore` refuses an ignored
+  file that `--keep` silently overwrites (MEASURED, git 2.43). The modes differ
+  in exactly these edges, so read every candidate's manual entry, not only the
+  first that fits. The trigger is the concentration of findings on one seam, not
+  their count.
 - **Interrogate every MECHANISM you introduce along six axes BEFORE the first
   review — original code and fixes alike.** The two bullets above enumerate the
   class of a DEFECT, reactively, once a reviewer names one. This one is about the
@@ -4393,7 +4411,13 @@ The review-findings gate specifically:
    MEASURED: a re-run started 15 minutes AFTER the fix merged still failed, and
    `git merge-base --is-ancestor <fix-sha> refs/pull/<N>/merge` returned false —
    the pull request's merge ref did not contain the fix. Only a push or
-   `gh pr update-branch <N>` recomputes it. Two consequences: do not "just
+   `gh pr update-branch <N>` reliably recomputes it, and both move the head.
+   Closing and reopening the PR is NOT a substitute. MEASURED 2026-10-01: a
+   reopen fired a new CI run that checked out a merge ref GitHub had built about
+   three and a half hours earlier, on a main several merges behind. Whatever you
+   try, read the job log's `HEAD is now at <merge sha>
+   Merge <head> into <base>` line and confirm the base is the main you expect.
+   "CI re-fired" is not evidence that it tested current main. Two consequences: do not "just
    re-run" someone's stale red, and do not tell them it will clear — it will
    not, and their next push clears it for free anyway.
 
@@ -4489,6 +4513,19 @@ Standard open-source workflow: PRs go directly to the public repo.
   deletion in the PR body; if you suspect main's change is a bug rather than
   policy, file that before merging. A deleted test with no filed disagreement
   is how coverage disappears.
+- **The CI collected-test floor conflicts whenever main moved it while your
+  branch added tests.** `.github/workflows/ci.yml` carries one hand-maintained
+  `--min-collected` number, and both sides have raised it from a shared base.
+  Picking either side under-counts. The merged floor is MAIN's floor plus YOUR
+  branch's delta, and the delta is measured, never recalled. Run
+  `--collect-only` on main's version of each test file your branch changes and on
+  the merged version, after your LAST test-adding edit. A file new to the branch
+  counts in full. Keep main's comment block and add one paragraph showing your
+  per-file counts. The `--ceiling` on the same line merges the same way: main's
+  ceiling plus your branch's skip delta, counted on the CI runner from the junit
+  report, never locally (installed tools differ, so local skip counts are the
+  wrong denominator). Issue #2743 tracks replacing the hand-maintained number. A test path held in a shell variable reads to
+  `full_suite_guard` as a whole-suite run, so write the count as a script.
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
 - **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`

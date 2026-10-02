@@ -164,7 +164,9 @@ Easy-to-forget mechanisms:
   digit-guard rules out numeric-suffix pairs, then a two-model LLM judgment
   (`entity_adjudication` + flipped-provider `entity_adjudication_challenge`, both
   must agree) decides merge-vs-distinct. `propose_only` by default (records, does
-  not apply); `live` applies via `merge_entity`. A cursor-managed reconcile sweep
+  not apply); `live` would apply new-pair merges via `merge_entity` unattended,
+  but is FENCED (runs as `propose_only`, settings lever refuses it) until
+  issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
   rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.

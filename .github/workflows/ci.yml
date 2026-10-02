@@ -1080,11 +1080,22 @@ jobs:
         # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
         # ceiling does not move. Floor: 23582 + 24 = 23606.
         #
-        # The rollback branch (#2679) grows test_update_checkout_moved.py from 29
-        # to 79 (the checkout-based rollback, its parametrized index-flag, index,
-        # ignored-path, submodule and hook cases, and the database decision),
-        # counted by --collect-only after the last test edit; test_deploy_checkout.py
-        # stays at 36 (the collision scan's direct mode it briefly added is gone
-        # again). On top of the #2101 floor above, that is 23606 + 50 = 23656 (29
-        # and 36 re-measured on main after #2101).
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23656
+        # UNION with the entity apply-rails PR (#1729). Measured against main's
+        # versions with --collect-only, after the last test-adding edit:
+        #   test_entity_adjudication.py         50 -> 62   (+12)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
+        #   test_entity_adjudication_config.py  13 -> 15   (+2)
+        #   test_migration_0065_...             14 -> 14   (0)
+        # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
+        # superseded by this count. No new skips, so the ceiling holds.
+        # Floor: 23606 + 38 = 23644.
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23709
