@@ -32,7 +32,7 @@ except (ValueError, KeyError, TypeError, OSError):
 # A first install needs no user manager, but PATH absence alone can hide a pinned tool.
 if sharing == "disabled" and shutil.which("serena") is None:
     try:
-        root = Path(subprocess.check_output(["uv", "tool", "dir"], text=True).strip())
+        root = Path(os.fsdecode(subprocess.check_output(["uv", "tool", "dir"]).removesuffix(b"\n")))
         if not root.is_absolute():
             raise ValueError("invalid uv tool directory")
         provider = root / "serena-agent"

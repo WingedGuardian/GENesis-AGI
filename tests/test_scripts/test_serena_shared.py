@@ -1271,7 +1271,7 @@ def test_fresh_install_without_manager_preserves_existing_or_uncertain_provider(
     for name in ("python3", "flock", "mkdir"):
         (bindir / name).symlink_to(shutil.which(name))
     calls = tmp_path / "calls"
-    tools = tmp_path / "tools"
+    tools = tmp_path / "tools "  # Native tool-dir output must preserve path whitespace.
     tools.mkdir()
     if tool == "installed":
         (tools / "serena-agent").mkdir()
@@ -1313,3 +1313,48 @@ def test_fresh_install_without_manager_preserves_existing_or_uncertain_provider(
         assert calls.read_text() == "tool install serena-agent\n"
     else:
         assert not calls.exists()
+
+
+@pytest.mark.parametrize("value", ["provider", "~/provider"])
+def test_relative_provider_resources_and_contexts_use_main_when_configuring_elsewhere(
+    tmp_path, monkeypatch, configured_paths, value
+):
+    main = checkout(tmp_path / "main")
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    for root, content in ((main, "main"), (caller, "caller")):
+        source = root / value
+        source.mkdir(parents=True)
+        (source / "serena_config.yml").write_text(content)
+    monkeypatch.setenv("SERENA_HOME", value)
+    monkeypatch.chdir(caller)
+    contexts = []
+
+    def snapshot(serena, context, destination, project):
+        contexts.append((context, project))
+
+    monkeypatch.setattr(shared, "snapshot_context", snapshot)
+    shared.configure(main, True)
+    assert contexts == [(context, main) for context in shared.PROFILES]
+    for context in shared.PROFILES:
+        home = configured_paths.parent.parent / "serena-shared" / context
+        assert (home / "serena_config.yml").read_text() == "main"
+        for resource in ("modes", "prompt_templates", "memories/global"):
+            assert (home / resource).resolve() == main / value / resource
+
+
+def test_native_context_snapshot_launches_from_fixed_main(tmp_path, monkeypatch):
+    main = tmp_path / "main"
+    main.mkdir()
+    destination = tmp_path / "context.yml"
+    monkeypatch.setattr(shared, "provider_python", lambda binary: sys.executable)
+    calls = []
+
+    def output(command, **kwargs):
+        calls.append((command, kwargs))
+        return "name: claude-code\nsingle_project: true\n"
+
+    monkeypatch.setattr(shared.subprocess, "check_output", output)
+    shared.snapshot_context("/bin/serena", "claude-code", destination, main)
+    assert calls[0][1]["cwd"] == main
+    assert destination.read_text() == "name: claude-code\nsingle_project: true\n"

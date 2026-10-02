@@ -246,7 +246,7 @@ def provider_python(serena: str) -> str:
     return interpreter
 
 
-def snapshot_context(serena: str, context: str, destination: Path) -> None:
+def snapshot_context(serena: str, context: str, destination: Path, project: Path) -> None:
     # Use the installed provider's loader and YAML implementation so user
     # contexts win exactly as they do in native stdio. Keep the native name:
     # Serena selects Codex's OpenAI schema compatibility by that name.
@@ -261,7 +261,7 @@ config['name'] = sys.argv[1]
 config['single_project'] = True
 print(yaml.safe_dump(config, sort_keys=False))
 """
-    content = subprocess.check_output([interpreter, "-c", code, context], text=True)
+    content = subprocess.check_output([interpreter, "-c", code, context], cwd=project, text=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(content)
 
@@ -418,9 +418,11 @@ def install_units(project: Path, config_file: Path, serena: str) -> None:
     directory = unit_directory()
     directory.mkdir(parents=True, exist_ok=True)
     home_root = config_file.parent.parent / "serena-shared"
-    source_home = Path(
-        os.environ.get("SERENA_HOME", "").strip() or Path.home() / ".serena"
-    ).resolve()
+    source_home = Path(os.environ.get("SERENA_HOME", "").strip() or Path.home() / ".serena")
+    # Native main readers launch from the checkout; configure may be called elsewhere.
+    if not source_home.is_absolute():
+        source_home = project / source_home
+    source_home = source_home.resolve()
     for context in PROFILES:
         home = home_root / context
         home.mkdir(parents=True, exist_ok=True)
@@ -430,7 +432,7 @@ def install_units(project: Path, config_file: Path, serena: str) -> None:
             shutil.copyfile(source, home / "serena_config.yml")
         else:
             (home / "serena_config.yml").unlink(missing_ok=True)
-        snapshot_context(serena, context, home / "contexts" / f"{context}.yml")
+        snapshot_context(serena, context, home / "contexts" / f"{context}.yml", project)
         for resource in ("modes", "prompt_templates", "memories/global"):
             link_resource(home / resource, source_home / resource)
         (directory / unit_name(context)).write_text(

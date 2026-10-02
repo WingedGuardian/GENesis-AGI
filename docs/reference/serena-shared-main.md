@@ -89,3 +89,5 @@ services. It does not require a working provider or proxy. Reconnect clients;
 the same launcher now uses native stdio. Preserve provider snapshots for
 inspection; they live under the existing backed-up `.genesis` directory.
 Codebase MCP enablement and GitNexus indexing are independent of this change.
+
+Relative `SERENA_HOME` overrides are resolved from the canonical main checkout, including when configure is invoked elsewhere. Native context discovery uses that same working directory; literal `~` is not expanded.
