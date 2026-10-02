@@ -431,7 +431,8 @@ async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer)
                         "The Tailscale tunnel watchdog is running but has checked no"
                         f" tunnel for {blind_runs} runs in a row: tailscaled is not"
                         " running, the tailscale CLI is failing, its status output could"
-                        " not be read, or its probe limits are set to zero. A stuck tunnel"
+                        " not be read, tailscaled's systemd identity could not be read,"
+                        " or its probe limits are set to zero. A stuck tunnel"
                         " will be neither healed nor reported. Check: sudo systemctl"
                         " status tailscaled; tailscale status --json."
                     ),
@@ -448,7 +449,7 @@ async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer)
             ),
         )
         return 0
-    if not timer or timer.get("UnitFileState") != "enabled":
+    if not timer or timer.get("UnitFileState") not in {"enabled", "enabled-runtime"}:
         return 0  # turned off (the caller withdrew its alerts) or unknown
     if timer.get("ServiceActiveState") in ("activating", "active"):
         return 0  # a long run is still in progress

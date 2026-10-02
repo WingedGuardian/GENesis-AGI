@@ -464,3 +464,9 @@ have been applied, then atomically saves the completed registry. CLOSED pre-trip
 failures retain validated provenance with their counters without asserting a call-opened
 hold. Removing a provider retires only historical incidents that have no continuing
 owner; an ordinary rename keeps its incident intact.
+
+Captured pacing policy is immutable across reload: old and new generations share
+admission serialization and timestamps, while each retains its configured RPM.
+Health snapshots project cloud resilience only while their routing generation is
+current, under the reload publication lock. Full and readonly runtimes inject this
+projector; standalone live-registry health services retain their existing updates.

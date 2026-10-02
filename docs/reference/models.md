@@ -770,7 +770,10 @@ for migration and rollback semantics. This behavior does not qualify any replace
 model for evaluation judging or novelty suppression.
 
 Operator toggles act on current breaker bindings atomically with reload. Existing
-pacing admissions survive same-name repoints and registered alias renames. Routed
+pacing admissions survive same-name repoints and registered alias renames; each
+captured generation retains its RPM interval. Current health snapshots project live
+cloud resilience atomically with reload in full and readonly runtimes, while stale
+snapshots remain read-only. Routed
 trip events include health identity, and escalation ignores retired identities.
 Retirement checking handles the observed LiteLLM APIError wrapper conservatively;
 unknown or qualified statements retain the hold.

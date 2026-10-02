@@ -31,10 +31,55 @@ default is unchanged for every other clone. It is deliberately not a general
   ``asks:`` with no body, or an explicit ``null``/``~``) is not a declaration,
   so it asks without a NOTE: a partly uncommented template leaves exactly that.
 
-**The push / PR-open approval prompt is deliberately NOT suppressible.** It is
-the point where code leaves the machine, and publication is meant to stay a
-conscious decision on every install. It has no key here, and adding one is a
-design change, not a configuration change.
+**The push / PR-open prompt is suppressible only in its narrowest form.** It is
+the point where code leaves the machine, and it was unsuppressible until the
+owner ruled (2026-10-01) that an install may silence ONE routine shape of it.
+The push guard decides that scope, not this module, and keeps asking on any
+uncertainty. ``push_publish`` silences exactly one prompt: the FIRST ``git
+push`` of the CURRENT branch, and ONLY when the whole command is exactly one
+plain ``git push`` (e.g. ``git push -u origin HEAD``): no other step of any kind
+(no ``cd``, no ``git status``/``add``/``commit`` before it, no ``;``/``&&``/
+``|``/``&``/newline), no redirection, no subshell, no global option between
+``git`` and ``push`` (``-C``, ``-c``, ``--git-dir``…), no ``VAR=…`` prefix and no
+wrapper. A chained command still asks — run the first push as its own command.
+It must also be true that:
+
+* the remote git will really push to (pushRemote > pushDefault >
+  ``branch.<cur>.remote`` > origin) has push URLs that — after any
+  ``insteadOf``/``pushInsteadOf`` rewrite — are exactly
+  ``https://github.com/<public repo>`` (``github.user``/``github.public_repo``),
+  with an optional ``.git`` or trailing slash. A rewrite whose RESULT is that URL
+  is accepted; the ssh and scp forms always ask;
+* its push config is simple, and NO ``http.*`` key is set in any config git
+  reads for the repository, nor ``remote.<r>.proxy``/``remote.<r>.vcs``;
+* none of the proxy, TLS-trust, ssh/proxy-program or config-injection
+  environment variables the guard lists is set in the HOOK's environment;
+* a live ``git ls-remote --exit-code`` (redirects refused, no credential
+  prompt) answers that the branch is definitely ABSENT there. An error, a
+  timeout or a redirect keeps the prompt.
+
+Known residue — what the hook cannot see, stated rather than hidden:
+
+* the Bash tool's shell is initialised from the user's profile and hooks are
+  not, so environment variables, aliases, functions and ``PATH`` changes that
+  exist only in a shell profile are invisible to this check;
+* the hook payload's cwd is assumed to be the shell's cwd — an assumption every
+  arm of the push guard shares;
+* config or the checked-out branch changed by a CONCURRENT process between the
+  hook's check and the push;
+* a concurrent publish of the same branch between the probe and the push (git
+  offers no create-only binding without rewriting the command).
+
+The ``gh pr create`` prompt is NOT covered: gh without a TTY aborts ("you must
+first push the current branch…") rather than pushing, so that arm is left
+exactly as it was.
+
+A force push, a push anywhere else, a close-then-push, a re-push with no open PR,
+a round-cap ask, every block and the dispatched-session deny are all outside the
+key's reach. Classified on the repo's three axes: verdict — a narrowing of an
+existing ASK, never a new allow or block; audience — the agent (the context note
+names what was silenced); background effect — none, because a dispatched session
+is denied every push before the key is consulted.
 
 **Suppression means "this hook stops objecting", never "approve on my behalf".**
 A suppressed ask is replaced by NO permission decision at all: the hook exits 0
@@ -68,6 +113,7 @@ Configuration (all keys optional; absent means ask)::
     hooks:
       asks:
         secrets_env: off      # the secrets.env credentials prompt
+        push_publish: off     # first publish of a branch to the public repo only
 
 The value is the ask's ENABLED state, so YAML's own booleans read the right way
 round: ``off``/``false``/``no`` suppress, ``on``/``true``/``yes`` (and absent)
@@ -99,7 +145,7 @@ import sys
 #: policy this install declined to use — it is a key nothing classified, so it
 #: can never suppress anything. Adding a member is a deliberate act with a call
 #: site attached; there is no path that grows this set from configuration.
-KEYS = frozenset({"secrets_env"})
+KEYS = frozenset({"secrets_env", "push_publish"})
 
 _CONFIG_PATH = "~/.genesis/config/genesis.yaml"
 _SEAM = "_TEST_HOOK_ASK_POLICY"

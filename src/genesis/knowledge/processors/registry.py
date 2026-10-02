@@ -34,8 +34,12 @@ class ContentProcessorRegistry:
     def get_processor(self, source: str) -> ContentProcessor | None:
         """Find the appropriate processor for a source path or URL."""
         # Check URL patterns first (URLs may also have extensions)
+        # A pattern is a cheap pre-filter; the processor's own can_handle has
+        # the last word, so a URL that merely contains a matching fragment falls
+        # through to the next pattern instead of reaching a processor that
+        # would reject it.
         for pattern, processor in self._url_patterns:
-            if pattern.search(source):
+            if pattern.search(source) and processor.can_handle(source):
                 return processor
 
         # Fall back to extension matching for file paths
@@ -58,7 +62,7 @@ def build_default_registry() -> ContentProcessorRegistry:
     from genesis.knowledge.processors.text import TextProcessor
     from genesis.knowledge.processors.video import VideoProcessor
     from genesis.knowledge.processors.web import WebProcessor
-    from genesis.knowledge.processors.youtube import YouTubeProcessor
+    from genesis.knowledge.processors.youtube import YOUTUBE_URL_PATTERN, YouTubeProcessor
 
     registry = ContentProcessorRegistry()
 
@@ -84,10 +88,7 @@ def build_default_registry() -> ContentProcessorRegistry:
 
     # YouTube URLs (must be registered before generic web)
     youtube = YouTubeProcessor()
-    registry.register_url_pattern(
-        youtube,
-        r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)",
-    )
+    registry.register_url_pattern(youtube, YOUTUBE_URL_PATTERN)
 
     # Generic web URLs (catch-all for http/https)
     web = WebProcessor()

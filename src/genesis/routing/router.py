@@ -127,6 +127,18 @@ class Router:
         with self._routing_lock:
             return self.config, {name: self.breakers.get(name) for name in self.config.providers}
 
+    def health_resilience(self, config: RoutingConfig, captured_breakers, state_machine) -> dict:
+        """Render captured health; only the current generation projects live state.
+
+        The identity check and projection share reload's publication lock, so a
+        concurrent reload cannot publish between validation and the cloud update.
+        """
+        from genesis.observability.snapshots.infrastructure import resilience_state_detail
+
+        with self._routing_lock:
+            machine = state_machine if self.config is config else None
+            return resilience_state_detail(captured_breakers, machine)
+
     def set_activity_tracker(self, tracker: ProviderActivityTracker) -> None:
         """Inject activity tracker for per-provider call metrics."""
         self._activity_tracker = tracker

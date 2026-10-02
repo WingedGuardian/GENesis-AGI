@@ -84,6 +84,7 @@ class HealthDataService:
         circuit_breakers: CircuitBreakerRegistry | None = None,
         routing_config: RoutingConfig | None = None,
         routing_snapshot=None,
+        routing_resilience=None,
         cost_tracker: CostTracker | None = None,
         cc_budget: CCBudgetTracker | None = None,
         deferred_queue: DeferredWorkQueue | None = None,
@@ -99,6 +100,7 @@ class HealthDataService:
         self._breakers = circuit_breakers
         self._routing_config = routing_config
         self._routing_snapshot = routing_snapshot
+        self._routing_resilience = routing_resilience
         self._cache_config = routing_config
         self._cost_tracker = cost_tracker
         self._cc_budget = cc_budget
@@ -483,7 +485,7 @@ class HealthDataService:
             "timestamp": now,
             "call_sites": r_call_sites,
             "cc_sessions": r_cc_sessions,
-            "resilience": self._resilience_state(breakers),
+            "resilience": self._resilience_state(breakers, routing_config),
             "infrastructure": r_infrastructure,
             "queues": r_queues,
             "surplus": r_surplus,
@@ -597,15 +599,20 @@ class HealthDataService:
             for name, r in self._provider_health.results.items()
         }
 
-    def _resilience_state(self, captured_breakers=None) -> dict:
+    def _resilience_state(self, captured_breakers=None, captured_config=None) -> dict:
         """Compute resilience state with detail from circuit breaker registry."""
         from genesis.observability.snapshots.infrastructure import resilience_state_detail
 
-        if captured_breakers is not None:
-            # Rendering an old generation must not mutate the live cloud axis;
-            # awareness independently refreshes that axis from the live registry.
+        if captured_breakers is not None and self._routing_snapshot:
+            if self._routing_resilience:
+                return self._routing_resilience(
+                    captured_config, captured_breakers, self._state_machine,
+                )
+            # A snapshot-only client cannot prove ownership atomically. Keep its
+            # historical rendering pure; production injects the guarded projector.
             return resilience_state_detail(captured_breakers, None)
-        return resilience_state_detail(self._breakers, self._state_machine)
+        breakers = captured_breakers if captured_breakers is not None else self._breakers
+        return resilience_state_detail(breakers, self._state_machine)
 
     async def validate_api_keys(self) -> None:
         """Test each provider's API key with a lightweight call. Cache results."""

@@ -720,9 +720,11 @@ def test_reload_retains_pacing_admission(tmp_path, rename):
     new = config('new-model',name=new_name)
     new = replace(new, providers={new_name:replace(new.providers[new_name],rpm_limit=30)})
     router.reload_config(new)
-    assert router._rate_gates._gates[new_name] is gate
-    assert gate._last_request == 123.0
-    assert gate.interval == 2.0
+    new_gate = router._rate_gates._gates[new_name]
+    assert new_gate._lock is gate._lock
+    assert new_gate._last_request == gate._last_request == 123.0
+    assert gate.interval == 1.0
+    assert new_gate.interval == 2.0
 
 
 
@@ -742,7 +744,8 @@ async def test_captured_resilience_matches_health_during_reload(tmp_path, monkey
     machine = ResilienceStateMachine()
     machine.update_cloud = MagicMock()
     service = HealthDataService(circuit_breakers=router.breakers, routing_config=cfg,
-        routing_snapshot=router.health_snapshot, resilience_state_machine=machine)
+        routing_snapshot=router.health_snapshot, routing_resilience=router.health_resilience,
+        resilience_state_machine=machine)
     entered, release = asyncio.Event(), asyncio.Event()
     async def suspended(*args, **kwargs):
         entered.set()
