@@ -10,6 +10,7 @@ hmac.compare_digest (constant-time, no timing attacks).
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -390,6 +391,98 @@ def check_api_mutation_auth():
     return jsonify({"error": "authentication required"}), 401
 
 
+# ── App-level /api/genesis network-scope gate ─────────────────────────
+#
+# The mutation gate above leaves every READ open, and /api/genesis/* reads serve
+# stored memory, knowledge, session-transcript and observation content -- which
+# is where any secret a user ever pasted into a conversation ends up. Rather than
+# list the content routes (a denylist the next route would miss), every
+# /api/genesis/* route is refused unless the TCP peer is on a trusted network,
+# and only the routes a host-side supervisor probes from outside stay open.
+#
+# ``request.remote_addr`` is the TCP peer: the standalone host installs no
+# proxy-header middleware, so a forwarded-for header cannot claim a trusted
+# address. That is NOT verifiable for a host that mounts these blueprints on an
+# app it does not own (the Agent Zero adapter): if that app trusts forwarded
+# headers, a spoofed loopback address passes this gate. A reverse proxy that
+# forwards from 127.0.0.1 (e.g. a path-scoped tailnet serve) likewise inherits
+# loopback trust for whatever paths IT exposes -- scope the proxy, not this gate.
+#
+# Both Genesis-owned prefixes are covered: the tool API (/api/t/) returns the
+# same recall content, and its own auth is the mutation gate, which is a no-op
+# when no dashboard password is set.
+
+_NETWORK_SCOPE_OFF = ("off", "0", "false", "no")
+
+# Loopback (local processes, SSH tunnels) and the Tailscale address ranges.
+_DEFAULT_TRUSTED_NETWORKS = ("127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48")
+# Always trusted, even when an operator override replaces the list above, so a
+# bad override can never lock the install out of its own API.
+_LOOPBACK_NETWORKS = (ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"))
+
+# Exact (method, path) pairs reachable from ANY network: what the host-side
+# supervisor actually calls -- its liveness, heartbeat and pause-state READS and
+# its dialogue POST. Method-scoped on purpose: POST /pause (the kill switch) is
+# not something an outside caller needs.
+_OPEN_FROM_ANY_NETWORK = frozenset({
+    ("GET", "/api/genesis/health"),
+    ("GET", "/api/genesis/heartbeat"),
+    ("GET", "/api/genesis/pause"),
+    ("POST", "/api/genesis/guardian-dialogue"),
+})
+
+
+def _trusted_networks() -> tuple:
+    """Trusted networks: the override env var REPLACES the default; loopback always."""
+    raw = os.environ.get("GENESIS_DASHBOARD_TRUSTED_NETWORKS")
+    entries = _DEFAULT_TRUSTED_NETWORKS if raw is None else raw.split(",")
+    nets = list(_LOOPBACK_NETWORKS)
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            # Skipped, not widened: an unparseable entry narrows access.
+            logger.warning("GENESIS_DASHBOARD_TRUSTED_NETWORKS: ignoring invalid entry")
+    return tuple(nets)
+
+
+def _peer_is_trusted(addr: str | None) -> bool:
+    if not addr:
+        return False
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip.version == net.version and ip in net for net in _trusted_networks())
+
+
+def check_api_network_scope():
+    """App-level gate: refuse Genesis-owned API routes to untrusted peers.
+
+    Covers ``_GENESIS_API_PREFIXES`` (``/api/genesis/`` and the tool API
+    ``/api/t/``). Independent of the dashboard password -- it holds with auth
+    disabled. Open: any path outside those prefixes, the exact supervisor
+    (method, path) pairs in ``_OPEN_FROM_ANY_NETWORK``, and everything when
+    ``GENESIS_DASHBOARD_NETWORK_SCOPE=off``. Everything else from an untrusted or
+    unknown peer gets 403.
+    """
+    if os.environ.get("GENESIS_DASHBOARD_NETWORK_SCOPE", "on").strip().lower() in _NETWORK_SCOPE_OFF:
+        return None
+    path = request.path
+    if not path.startswith(_GENESIS_API_PREFIXES):
+        return None
+    if (request.method, path) in _OPEN_FROM_ANY_NETWORK:
+        return None
+    if _peer_is_trusted(request.remote_addr):
+        return None
+    return jsonify({"error": "not available from this network"}), 403
+
+
 def apply_api_mutation_gate(app) -> None:
     """Mint the internal API token and register the app-level ``/api`` mutation gate.
 
@@ -403,6 +496,8 @@ def apply_api_mutation_gate(app) -> None:
     if getattr(app, "_genesis_api_mutation_gate_applied", False):
         return
     get_or_create_internal_api_token()  # mint once (0600) before the gate needs it
+    # Network scope first: a refused peer never reaches the auth checks.
+    app.before_request(check_api_network_scope)
     app.before_request(check_api_mutation_auth)
     app._genesis_api_mutation_gate_applied = True
 
