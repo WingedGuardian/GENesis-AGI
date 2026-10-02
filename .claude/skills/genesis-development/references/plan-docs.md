@@ -88,9 +88,6 @@ exactly the failure CLAUDE.md's evidence principle names.
 
 ## The one body rule
 
-The body also answers the five plan-time premise questions in
-`.claude/docs/premise-check.md`, "At plan and issue time".
-
 ```
 ## ═══ SUPERSEDED BELOW ═══
 ```
@@ -121,6 +118,9 @@ plan file — i.e. below the divider. The divider governs *plan content*;
 a tool-appended status block at end-of-file is not plan content and is current
 by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.
+
+A plan doc's body answers the five plan-time premise questions in
+`.claude/docs/premise-check.md`, "At plan and issue time".
 
 ## What each field is for
 
