@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -156,16 +157,13 @@ class DailyBudgetLedger:
     """UTC-day request/token counters per provider, persisted as one small
     JSON file.
 
-    Thread contract: WRITES happen only on the server's asyncio loop
-    (``record``, and ``exhausted``/``record`` from the router's chain walk,
-    with no await between a counter's read and write). The dashboard route
-    reads from a Flask worker thread via ``status``, which is deliberately
-    NON-MUTATING (``_peek``) — a torn cross-thread read's worst case is a
-    stale or zero view, which is the undercount side. ``_save`` runs an
-    fsync'd atomic write on the loop thread once per counted call; bounded
-    by free-tier volume (~10^3/day) and dwarfed by LLM latency — debouncing
-    would only move losses to the undercount side, so it is not worth the
-    machinery yet."""
+    Thread contract: the server loop writes counters and provider bindings;
+    dashboard Flask workers read through non-mutating ``_peek``. A reentrant
+    lock covers alias resolution, iteration and counted writes so cross-thread
+    readers cannot iterate a changing dictionary. ``_save`` performs an fsync'd
+    atomic write on the writer thread once per counted call; bounded by free-tier
+    volume (~10^3/day) and dwarfed by LLM latency. Persistence remains single-process.
+    """
 
     def __init__(
         self,
@@ -179,6 +177,7 @@ class DailyBudgetLedger:
         self._persist = persist
         # name -> {"day": "YYYY-MM-DD", "requests": int, "tokens": int}
         self._counters: dict[str, dict] = {}
+        self._lock = threading.RLock()
         self._load()
 
     # ── public API ──────────────────────────────────────────────────────
@@ -197,6 +196,11 @@ class DailyBudgetLedger:
         return cfg.tpd_limit is not None and entry["tokens"] >= cfg.tpd_limit
 
     def record(self, cfg: ProviderConfig, result: CallResult) -> bool:
+        """Record atomically against concurrent pure dashboard readers."""
+        with self._lock:
+            return self._record(cfg, result)
+
+    def _record(self, cfg: ProviderConfig, result: CallResult) -> bool:
         """Record one provider visit's outcome against the daily counters.
 
         Returns True exactly when this record crossed the provider from
@@ -276,19 +280,18 @@ class DailyBudgetLedger:
         return self._clock().strftime("%Y-%m-%d")
 
     def _peek(self, name: str) -> dict:
-        """Rolled-over VIEW of a counter row without writing any state —
-        safe for cross-thread readers and for pure checks. A row from
-        another day reads as zeros; only ``record`` (via ``_entry``)
-        actually rolls the stored counters over."""
-        entry = self._counters.get(name)
-        if entry is None or entry.get("day") != self._today():
-            return {"day": self._today(), "requests": 0, "tokens": 0}
-        return entry
+        """Pure current-day view of one explicitly named provider's counters."""
+        with self._lock:
+            today = self._today()
+            row = self._counters.get(name)
+            if row is None or row.get("day") != today:
+                return {"day": today, "requests": 0, "tokens": 0}
+            return dict(row)
 
     def _entry(self, name: str) -> dict:
-        """Counter row for ``name``, rolled over lazily on UTC-day change."""
-        entry = self._counters.get(name)
+        """Roll over one provider row on the locked writer path."""
         today = self._today()
+        entry = self._counters.get(name)
         if entry is None or entry.get("day") != today:
             entry = {"day": today, "requests": 0, "tokens": 0}
             self._counters[name] = entry

@@ -1270,7 +1270,12 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   argument the code prefers over the env var under test); or its fixture never
   creates the shape it claims (a `bash -c 'sleep 30 # marker'` decoy
   exec-replaces itself and loses the marker from its argv — add a
-  guard-the-guard assert that the fixture really has the property). Ask of every
+  guard-the-guard assert that the fixture really has the property); or the code
+  under test HEALS the condition before the guarded step runs (an earlier
+  `git diff` refreshes the index as a side effect, so a test of an
+  index-refresh guard passed with the refresh deleted). To test a guard against
+  a transient condition, inject the condition AFTER the last step that could heal
+  it, and prove it with a mutation. Ask of every
   new test: *would this still pass if the mechanism it names were deleted?*
   When the DISTINGUISHING fact is produced by a lane the assertion cannot see,
   asking every test to assert it is a convention, and conventions decay — the
@@ -2544,6 +2549,19 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   does not establish that size causes rounds. **The limit, honestly:** the
   provenance trigger rests on one clear instance and one clear counter-instance.
   Act on it as a signal; it is not a law.
+- **Findings concentrating on safety code you built AROUND one external command:
+  read that command's manual for a native mode before writing the next guard.**
+  Adopt-before-build covers whole tools; this is the same question one level
+  down. When successive rounds land on hand-built protection around a single
+  command (snapshot, then refuse, then a destructive form of the command), the
+  tool often already ships the guarantee. Instance, #2722 (open as of 2026-10-01): moving the
+  rollback from hand-built snapshot-and-refuse around `reset --hard` to
+  `git reset --keep` retired most of a round's findings at once, and a later
+  premise check found that `git checkout --no-overwrite-ignore` refuses an ignored
+  file that `--keep` silently overwrites (MEASURED, git 2.43). The modes differ
+  in exactly these edges, so read every candidate's manual entry, not only the
+  first that fits. The trigger is the concentration of findings on one seam, not
+  their count.
 - **Interrogate every MECHANISM you introduce along six axes BEFORE the first
   review — original code and fixes alike.** The two bullets above enumerate the
   class of a DEFECT, reactively, once a reviewer names one. This one is about the
@@ -3315,9 +3333,21 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. `secrets_env` is the
-  ONLY key. The push / PR-open prompt has none on purpose: it is where code
-  leaves the machine, so it stays a decision on every install.
+  the command, and a dispatched session is still denied. The only other key is
+  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
+  It silences only the first push of the CURRENT branch, and only when the
+  whole command is exactly one plain `git push` (e.g. `git push -u origin
+  HEAD`) — a chained command still asks, so run the first push as its own
+  command. The remote git really pushes to must resolve (rewrites applied) to
+  exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
+  simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
+  the hook's environment, and a live probe confirming the branch is absent
+  there. Residue: shell-profile env/aliases/functions/PATH are invisible to the
+  hook, and a concurrent process can still change config or publish the
+  branch between check and push. `gh pr create` is not covered, since gh
+  without a TTY aborts rather than pushing. Force pushes, other destinations,
+  close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
+  are untouched, and any doubt about the destination keeps the prompt.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
@@ -3961,23 +3991,35 @@ findings below, a gated `gh pr merge`:
   commit:** `<sha>`") or a `✅ Completed` Code Review row in its PR summary comment
   (on PR open, often the only signal: #2418). Both name the commit by an ABBREVIATED
   id, and a prefix that merely MATCHES the head binds nothing — the head is whatever
-  the branch's author pushed (#2487). So the gate resolves the id against the PR's
-  OWN commit list and accepts it only when it resolves UNIQUELY to a commit equal to
-  the head, the comment is the Codex Bot's, and no Codex review object (any state)
-  sits at the head, no Codex issue comment on the PR carries findings (Codex
-  usually files findings as a review object, but MEASURED on 2 of 339 PRs it posted
-  them as a `💡` issue comment with none), the comment is unedited or Codex-edited,
-  and the PR's history has never moved under it: ANY force-push, base change, base
-  force-push or head-branch restore on the PR refuses every clean signal on it, whenever
-  it happened (each can drop the reviewed commit from the list while a lookalike
-  sharing its short id, which is cheap to grind, stays). A second PR commit sharing
-  the prefix, a commit outside the PR, an unreadable or 250-capped commit list: all
-  block. The block message says which clean signal it read and why it was refused,
-  and when no later clean signal on the PR can count either (history moved, or a
-  findings comment sits on the PR) it says a finding-free re-review cannot help.
-  `--check-pr` labels such a pass `ok (clean signal at head: comment|summary)`. When
-  the signal does not resolve, the routes are an owner-approved `# substitute-review`
-  on another reviewer's review at that exact head, or a conscious
+  the branch's author pushed (#2487). So the gate resolves the id repo-wide via
+  `GET repos/{owner}/{repo}/commits/{short}` and accepts it only when GitHub resolves
+  it to exactly the PR head; a 422 (ambiguous or unknown) refuses it. Matching the
+  head implies the commit is the PR's. The comment must be the Codex Bot's, no Codex
+  review object (any state) may sit at the head, and no Codex issue comment on the PR
+  may carry findings (Codex usually files findings as a review object, but MEASURED
+  on 2 of 339 PRs it posted them as a `💡` issue comment with none). Any non-Codex edit
+  or deleted edit revision on any Codex comment permanently refuses clean signals;
+  the block names the editor when available. Edit-history completeness is required
+  only for Codex Bot comments; unrelated comments' edit data is ignored. History
+  veto covers head force-push, head-branch deletion or restoration, and base changes.
+  A base change stays a veto because the clean signal names the head, not the base
+  Codex reviewed against; retargeting changes the effective diff without moving the
+  head. A base force-push is retired: merging requires the default base, whose
+  ruleset forbids force-push and deletion, so a force-pushed non-default base can
+  reach a merge only through a base change, which vetoes. All 541 commits dropped
+  by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits
+  are not the binding risk.
+  A branch or tag exactly named after a short id can shadow GitHub's commit lookup
+  (which uses git name-guessing rules); measured `pull/2720/head` and `main` resolve.
+  Creating a shadow ref needs base-repo push rights, held only by the owner, and no
+  hex-named ref exists; fork authors cannot create one. A deleted comment leaves no
+  trace in the API. The block message says which clean signal it read and why it was
+  refused, and when no later clean signal can count it says a finding-free re-review
+  cannot help. `--check-pr` labels a pass from the gate's own record for its verified
+  head; a subsequent head move is stated without relabeling the original pass, while
+  merge-with stays bound to that verified head. When the signal does not resolve,
+  the routes are an owner-approved `# substitute-review` on another reviewer's review
+  at that exact head, or a conscious
   `# stale-review-override` (which on the hook surface also needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
@@ -4393,7 +4435,13 @@ The review-findings gate specifically:
    MEASURED: a re-run started 15 minutes AFTER the fix merged still failed, and
    `git merge-base --is-ancestor <fix-sha> refs/pull/<N>/merge` returned false —
    the pull request's merge ref did not contain the fix. Only a push or
-   `gh pr update-branch <N>` recomputes it. Two consequences: do not "just
+   `gh pr update-branch <N>` reliably recomputes it, and both move the head.
+   Closing and reopening the PR is NOT a substitute. MEASURED 2026-10-01: a
+   reopen fired a new CI run that checked out a merge ref GitHub had built about
+   three and a half hours earlier, on a main several merges behind. Whatever you
+   try, read the job log's `HEAD is now at <merge sha>
+   Merge <head> into <base>` line and confirm the base is the main you expect.
+   "CI re-fired" is not evidence that it tested current main. Two consequences: do not "just
    re-run" someone's stale red, and do not tell them it will clear — it will
    not, and their next push clears it for free anyway.
 
@@ -4489,6 +4537,19 @@ Standard open-source workflow: PRs go directly to the public repo.
   deletion in the PR body; if you suspect main's change is a bug rather than
   policy, file that before merging. A deleted test with no filed disagreement
   is how coverage disappears.
+- **The CI collected-test floor conflicts whenever main moved it while your
+  branch added tests.** `.github/workflows/ci.yml` carries one hand-maintained
+  `--min-collected` number, and both sides have raised it from a shared base.
+  Picking either side under-counts. The merged floor is MAIN's floor plus YOUR
+  branch's delta, and the delta is measured, never recalled. Run
+  `--collect-only` on main's version of each test file your branch changes and on
+  the merged version, after your LAST test-adding edit. A file new to the branch
+  counts in full. Keep main's comment block and add one paragraph showing your
+  per-file counts. The `--ceiling` on the same line merges the same way: main's
+  ceiling plus your branch's skip delta, counted on the CI runner from the junit
+  report, never locally (installed tools differ, so local skip counts are the
+  wrong denominator). Issue #2743 tracks replacing the hand-maintained number. A test path held in a shell variable reads to
+  `full_suite_guard` as a whole-suite run, so write the count as a script.
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
 - **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`

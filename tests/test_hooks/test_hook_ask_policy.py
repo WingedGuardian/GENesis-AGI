@@ -8,9 +8,9 @@ could reach further than it should, rather than around its happy path:
   * **Polarity.** Every failure to read a policy (absent file, bad YAML, missing
     pyyaml, duplicate key, non-boolean value, unknown key) must produce the ASK.
     There is no config that silences something by accident.
-  * **Closed set.** ``secrets_env`` is the only key. ``push_publish`` in
-    particular is NOT a key: the push / PR-open prompt is unsuppressible by
-    design, so declaring it off must suppress nothing and say so.
+  * **Closed set.** ``secrets_env`` and ``push_publish`` are the only keys
+    (``push_publish`` by owner ruling 2026-10-01; its narrow scope is enforced by
+    the push guard and tested there). Any other key suppresses nothing and says so.
   * **Shape.** Suppression is NOT an allow. It is no permission decision at all,
     plus a context note naming the setting, so a compound
     (`source secrets.env && curl`) is never approved by a setting that was only
@@ -49,10 +49,10 @@ _KEY = "secrets_env"
 # ─── the module itself: every failure lands on ASK ───────────────────────────
 
 
-def test_the_key_set_is_exactly_secrets_env() -> None:
+def test_the_key_set_is_exactly_the_two_classified_asks() -> None:
     """The closed vocabulary, pinned whole. Growing it is a design decision with
     a call site attached, never a side effect."""
-    assert frozenset({"secrets_env"}) == policy.KEYS
+    assert frozenset({"secrets_env", "push_publish"}) == policy.KEYS
 
 
 def test_an_undeclared_ask_is_enabled(monkeypatch) -> None:
@@ -111,29 +111,52 @@ def test_a_key_outside_the_closed_set_suppresses_nothing(monkeypatch) -> None:
     assert policy.ask_suppressed(_KEY) is False
 
 
-def test_push_publish_off_is_an_unknown_key(monkeypatch, capsys) -> None:
-    """The push / PR-open prompt is unsuppressible by design. An install that
-    copies `push_publish: off` from an older draft of this feature gets NOTHING
-    suppressed — not the push prompt (no key), and not the secrets prompt — and
-    is told so, in the payload the hook actually delivers."""
+def test_push_publish_off_is_a_known_key(monkeypatch, capsys) -> None:
+    """Owner ruling 2026-10-01: `push_publish` is a classified key. Off suppresses
+    THAT key only — the secrets prompt is untouched — and raises no unknown-key
+    NOTE. Its narrow scope (public-repo destinations only) is the push guard's
+    to enforce, and is tested there."""
     monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
-    assert policy.ask_suppressed("push_publish") is False
+    policy.drain_notes()
+    assert policy.ask_suppressed("push_publish") is True
     assert policy.ask_suppressed(_KEY) is False
-    err = capsys.readouterr().err
-    assert "push_publish" in err and "not a prompt this install can turn off" in err
-    notes = policy.drain_notes()
-    assert notes.startswith("NOTE:") and "push_publish" in notes
+    assert "not a prompt this install can turn off" not in capsys.readouterr().err
+    assert policy.drain_notes() == ""
 
 
-def test_push_publish_off_in_the_file_is_an_unknown_key(tmp_path, monkeypatch, capsys) -> None:
-    """Same, through the real file reader, alongside a valid key: the valid key
-    still works and the push key is still announced as ignored."""
+def test_push_publish_absent_or_on_keeps_the_ask(monkeypatch) -> None:
+    """The public default is unchanged: an undeclared key, or `on`, asks."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "secrets_env=off")
+    assert policy.ask_suppressed("push_publish") is False
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=on")
+    assert policy.ask_suppressed("push_publish") is False
+
+
+def test_push_publish_non_boolean_keeps_the_ask(monkeypatch) -> None:
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=maybe")
+    policy.drain_notes()
+    assert policy.ask_suppressed("push_publish") is False
+    assert "push_publish" in policy.drain_notes()
+
+
+def test_push_publish_off_in_the_file_is_read(tmp_path, monkeypatch, capsys) -> None:
+    """Same, through the real file reader, alongside the other key: each key
+    answers for itself."""
     path = tmp_path / "genesis.yaml"
     path.write_text("hooks:\n  asks:\n    push_publish: off\n    secrets_env: on\n")
     monkeypatch.delenv("_TEST_HOOK_ASK_POLICY", raising=False)
     monkeypatch.setattr(policy, "_CONFIG_PATH", str(path))
     assert policy.ask_suppressed(_KEY) is False
-    assert "push_publish" in capsys.readouterr().err
+    assert policy.ask_suppressed("push_publish") is True
+    assert "push_publish" not in capsys.readouterr().err
+
+
+def test_a_duplicated_push_publish_in_the_file_keeps_the_ask(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "genesis.yaml"
+    path.write_text("hooks:\n  asks:\n    push_publish: on\n    push_publish: off\n")
+    monkeypatch.delenv("_TEST_HOOK_ASK_POLICY", raising=False)
+    monkeypatch.setattr(policy, "_CONFIG_PATH", str(path))
+    assert policy.ask_suppressed("push_publish") is False
 
 
 def test_a_non_boolean_value_keeps_the_ask_and_says_so(monkeypatch, capsys) -> None:
@@ -437,13 +460,13 @@ def test_a_suppressed_key_makes_no_decision_and_leaves_a_note(monkeypatch) -> No
 def test_a_suppressed_prompt_still_carries_its_notes(monkeypatch) -> None:
     """The suppression payload is the only channel on that path, so a NOTE
     raised while reading the policy has to ride the additionalContext."""
-    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "secrets_env=off,push_publish=off")
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "secrets_env=off,force_push=off")
     monkeypatch.setattr(needs_user, "is_dispatched", lambda: False)
     doc = needs_user.decide("access secrets.env", "because", ask_key=_KEY)
     assert _decision(doc) is None, doc
     ctx = _hso(doc)["additionalContext"]
     assert "hooks.asks.secrets_env" in ctx
-    assert "NOTE:" in ctx and "push_publish" in ctx, ctx
+    assert "NOTE:" in ctx and "force_push" in ctx, ctx
 
 
 def test_a_misconfigured_secrets_policy_says_so_in_the_prompt(monkeypatch) -> None:
@@ -457,15 +480,15 @@ def test_a_misconfigured_secrets_policy_says_so_in_the_prompt(monkeypatch) -> No
     assert "NOTE:" in reason and "secrets_env" in reason, reason
 
 
-def test_push_publish_off_reaches_the_prompt_as_a_note(monkeypatch) -> None:
-    """The unknown-key NOTE for `push_publish` is delivered in the secrets
-    prompt's own payload, not only on stderr."""
-    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
+def test_an_unknown_key_reaches_the_prompt_as_a_note(monkeypatch) -> None:
+    """An unknown-key NOTE is delivered in the secrets prompt's own payload,
+    not only on stderr."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "force_push=off")
     monkeypatch.setattr(needs_user, "is_dispatched", lambda: False)
     doc = needs_user.decide("access secrets.env", "because", ask_key=_KEY)
     assert _decision(doc) == "ask"
     reason = _hso(doc)["permissionDecisionReason"]
-    assert "NOTE:" in reason and "push_publish" in reason, reason
+    assert "NOTE:" in reason and "force_push" in reason, reason
 
 
 def test_an_older_needs_user_without_ask_key_still_prompts(monkeypatch) -> None:
@@ -734,12 +757,11 @@ def test_the_secrets_compound_asks_with_no_policy() -> None:
 
 
 def test_the_real_guard_with_push_publish_off_still_asks() -> None:
-    """End to end: the push key reaches nothing, and says so in the prompt."""
+    """End to end: the push key does not reach the credentials prompt."""
     rc, out = _secrets_guard(_SECRETS_COMPOUND, "push_publish=off")
     assert rc == 0
     doc = json.loads(out)
     assert _decision(doc) == "ask", out
-    assert "push_publish" in _hso(doc)["permissionDecisionReason"]
 
 
 def test_the_real_guard_still_denies_a_dispatched_session(tmp_path) -> None:
