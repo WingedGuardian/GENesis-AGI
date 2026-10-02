@@ -99,37 +99,6 @@ _LINE_ENDS = re.compile(r"\r\n|\r|\n")
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 
 
-#: A list-item opener: bullet or ordered marker followed by a space or end of
-#: line. List containers shift the indent baseline. Mirrors the sibling.
-_LIST_MARKER = re.compile(r"([-+*]|\d{1,9}[.)])(?=[ ]|$)")
-
-#: One blockquote marker level. Transparent to the block rules, but the
-#: fence check still needs the DEPTH. Mirrors the sibling scanner.
-_QUOTE = re.compile(r" {0,3}>[ \t]?")
-
-#: A line that opens no paragraph and lets none continue. Mirrors the sibling.
-_NO_PARAGRAPH = re.compile(
-    r"#{1,6}(?:[ ]|$)"  # ATX heading
-    r"|(?:\* *){3,}\s*$"  # ***
-    r"|(?:_ *){3,}\s*$"  # ___
-    r"|(?:- *){3,}\s*$"  # ---
-    r"|[=-]+\s*$"  # setext underline
-)
-
-
-def _quote_split(line: str, depth: int | None = None) -> tuple[int, str]:
-    """Strip blockquote markers — all of them, or at most `depth`.
-
-    Returns (markers consumed, remainder). Mirrors the sibling scanner."""
-    pos = seen = 0
-    while depth is None or seen < depth:
-        m = _QUOTE.match(line, pos)
-        if m is None:
-            break
-        seen += 1
-        pos = m.end()
-    return seen, line[pos:]
-
 #: Words that state an omission rather than a decision. `none` is deliberately NOT
 #: here — it is a VALID declaration when it carries a reason, and is classified
 #: before this set is consulted.
@@ -244,66 +213,21 @@ def _local_readable_body(body: str) -> str:
     hides to the end, as CommonMark does)."""
     visible: list[str] = []
     in_comment = False
-    #: The open fence: (marker run, blockquote depth at its opener).
-    fence: tuple[str, int] | None = None
-    #: List-item content columns; indent rules are relative to the innermost
-    #: container, never absolute. Mirrors the sibling scanner.
-    containers: list[int] = []
-    #: Indented code cannot interrupt a paragraph — a lazy continuation stays
-    #: text, and only in the paragraph's own container context. Mirrors the
-    #: sibling scanner.
-    paragraph = False
-    paragraph_ctx: tuple[int, int] = (0, 0)
-    for raw in _LINE_ENDS.split(body[:_MAX_BODY]):
-        expanded = raw.expandtabs(4)
-        depth, line = _quote_split(expanded)
-        indent = len(line) - len(line.lstrip(" "))
+    fence: str | None = None
+    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
         if fence is not None:
-            run, fence_q = fence
-            baseline = containers[-1] if containers else 0
-            fdepth, inside = _quote_split(expanded, fence_q)
-            in_indent = len(inside) - len(inside.lstrip(" "))
-            if line.strip() and (fdepth < fence_q or in_indent < baseline):
+            stripped_close = line.strip()
+            closer = _FENCE_RUN.match(stripped_close)
+            if (
+                closer
+                and closer.group(0)[0] == fence[0]
+                and len(closer.group(0)) >= len(fence)
+                and not stripped_close[closer.end() :].strip()
+            ):
                 fence = None
-            else:
-                stripped_close = inside.strip()
-                closer = _FENCE_RUN.match(stripped_close)
-                if (
-                    closer is not None
-                    and in_indent - baseline <= 3
-                    and closer.group(0)[0] == run[0]
-                    and len(closer.group(0)) >= len(run)
-                    and not stripped_close[closer.end() :].strip()
-                ):
-                    fence = None
-                continue
-        residual, eff = line, indent
-        if line.strip():
-            while containers and indent < containers[-1]:
-                containers.pop()
-            pos = indent
-            if not in_comment:
-                while True:
-                    lm = _LIST_MARKER.match(line, pos)
-                    if lm is None:
-                        break
-                    end, after = lm.end(), line[lm.end() :]
-                    if not after.strip():
-                        pos = end + 1
-                        containers.append(pos)
-                        break
-                    pad = len(after) - len(after.lstrip(" "))
-                    pos = end + (pad if pad <= 4 else 1)
-                    containers.append(pos)
-            residual = line[pos:]
-            res_indent = len(residual) - len(residual.lstrip(" "))
-            eff = pos - (containers[-1] if containers else 0) + res_indent
-            ctx = (depth, containers[-1] if containers else 0)
-            if eff >= 4 and not (paragraph and paragraph_ctx == ctx) and not in_comment:
-                paragraph = False
-                continue
+            continue
         out: list[str] = []
-        rest = residual
+        rest = line
         while rest:
             if in_comment:
                 close = rest.find(_COMMENT_CLOSE)
@@ -322,17 +246,11 @@ def _local_readable_body(body: str) -> str:
             rest = rest[open_at + len(_COMMENT_OPEN) :]
         kept = "".join(out)
         stripped = kept.strip()
-        run = _FENCE_RUN.match(stripped) if stripped and eff <= 3 else None
+        run = _FENCE_RUN.match(stripped)
         if run:
-            fence = (run.group(0), depth)
-            paragraph = False
-            continue
-        if not stripped:
-            paragraph = False
-            continue
-        visible.append(kept)
-        paragraph = _NO_PARAGRAPH.search(stripped) is None
-        paragraph_ctx = (depth, containers[-1] if containers else 0)
+            fence = run.group(0)
+        else:
+            visible.append(kept)
     return "\n".join(visible)
 
 

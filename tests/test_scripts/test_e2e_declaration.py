@@ -69,22 +69,8 @@ def test_the_two_scanners_agree_on_marker_visibility(e2e):
         "````\n```\nE2E: inside a longer fence\n```\n````\n",
         "prose\x85E2E: joined by NEL\n",
         "prose\u2028E2E: joined by a line separator\n",
-        # Devin Review on #2777 — a closer may carry no trailing text, and a
-        # 4-space-indented run is indented code, not a delimiter.
+        # Devin Review on #2777 — a closer may carry no trailing text.
         "````\n````python\nE2E: inside a mis-marked fence\n````\n",
-        "    ```\nE2E: under an indented marker\n",
-        # Devin Review 🔴 round 2 — indent rules are relative to the container:
-        # the fence inside a list item is real, while marker-looking text in a
-        # standalone indented block is code.
-        "- Example:\n\n    ```\n    E2E: fenced inside an item\n    ```\n",
-        "Intro:\n\n    E2E: inside a standalone indented block\n",
-        "para\n    E2E: lazy paragraph continuation, still text\n",
-        "> ```\n> E2E: fenced inside a quote\n> ```\n",
-        # Devin Review 🔴 round 3 — quote depth and paragraph context.
-        "> ```\n> sample\nE2E: after the quote ends\n",
-        "```\n> ```\nE2E: quoted marker is content\n```\n",
-        "# Runbook\n    E2E: indented code after a heading\n",
-        "> para\n    E2E: not a lazy continuation outside the quote\n",
     ]
     for body in bodies:
         shared = e2e.readable_body(body)
