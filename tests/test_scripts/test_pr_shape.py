@@ -271,6 +271,23 @@ def test_unquote_decodes_c_escapes():
         assert out == f"a/x{chr(byte)}y", (esc, out)
 
 
+def test_c_escapes_table_decodes_all_nine_escapes():
+    expected = {
+        "n": "\n",
+        "t": "\t",
+        "a": "\a",
+        "b": "\b",
+        "v": "\v",
+        "f": "\f",
+        "r": "\r",
+        "\\": "\\",
+        '"': '"',
+    }
+    for esc, char in expected.items():
+        assert ps._C_ESCAPES[esc] == char.encode("utf-8")
+        assert ps._unquote(f'"a/x\\{esc}y"') == f"a/x{char}y"
+
+
 def test_load_failure_raises_runtime_error(monkeypatch):
     def boom(filename, name):
         raise RuntimeError(f"cannot load {filename}")
@@ -338,6 +355,121 @@ def test_unquoted_new_file_with_spaces():
     result = ps.count_diff(diff)
     keys = set(result["excluded"]) | set(result["by_file"])
     assert "docs/my page.md" in keys
+
+
+def test_config_template_comments_not_counted():
+    for path in (
+        "config/genesis.yaml.example",
+        "x.service",
+        "x.service.template",
+        ".gitignore",
+        ".gitattributes",
+    ):
+        diff = _diff(path, ["@@ -0,0 +1,2 @@", "+# a comment", "+key = 1"])
+        assert ps.count_diff(diff)["counted"] == 1, path
+
+
+def test_json5_slash_comments_not_counted():
+    diff = _diff("x.json5", ["@@ -0,0 +1,2 @@", "+// a comment", "+key: 1,"])
+    assert ps.count_diff(diff)["counted"] == 1
+
+
+def test_example_suffix_stripped_once():
+    # `x.yaml.example.example` strips ONE suffix → `.example` basename →
+    # counted as code, comments included.
+    diff = _diff("x.yaml.example.example", ["@@ -0,0 +1,2 @@", "+# c", "+y = 1"])
+    assert ps.count_diff(diff)["counted"] == 2
+
+
+def test_rename_classifies_each_side_by_its_own_path():
+    diff = (
+        "diff --git a/src/foo.py b/tests/test_foo.py\n"
+        "similarity index 50%\n"
+        "rename from src/foo.py\n"
+        "rename to tests/test_foo.py\n"
+        "--- a/src/foo.py\n"
+        "+++ b/tests/test_foo.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-x = 1\n"
+        "-y = 2\n"
+        "+a = 3\n"
+        "+b = 4\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["counted"] == 2
+    assert result["by_file"] == {"src/foo.py": 2}
+    assert result["excluded"] == {"tests/test_foo.py": "test"}
+
+
+def test_rename_into_counted_path_counts_additions_only():
+    diff = (
+        "diff --git a/tests/test_foo.py b/src/foo.py\n"
+        "similarity index 50%\n"
+        "rename from tests/test_foo.py\n"
+        "rename to src/foo.py\n"
+        "--- a/tests/test_foo.py\n"
+        "+++ b/src/foo.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-x = 1\n"
+        "-y = 2\n"
+        "+a = 3\n"
+        "+b = 4\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["counted"] == 2
+    assert result["by_file"] == {"src/foo.py": 2}
+    assert result["excluded"] == {"tests/test_foo.py": "test"}
+
+
+def test_same_path_test_file_still_fully_excluded():
+    diff = _diff("tests/test_foo.py", _hunk(["+a = 1", "-x = 2"]))
+    result = ps.count_diff(diff)
+    assert result["counted"] == 0
+    assert result["excluded"] == {"tests/test_foo.py": "test"}
+    assert result["by_file"] == {}
+
+
+def test_rename_with_both_sides_counted_unchanged():
+    diff = (
+        "diff --git a/src/a.py b/src/b.py\n"
+        "similarity index 50%\n"
+        "rename from src/a.py\n"
+        "rename to src/b.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/b.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-x = 1\n"
+        "+y = 2\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["counted"] == 2
+    assert result["by_file"] == {"src/b.py": 2}
+    assert result["excluded"] == {}
+
+
+def test_non_utf8_quoted_paths_stay_distinct():
+    diff = (
+        'diff --git "a/x\\376.py" "b/x\\376.py"\n'
+        '--- "a/x\\376.py"\n'
+        '+++ "b/x\\376.py"\n'
+        "@@ -0,0 +1 @@\n"
+        "+a = 1\n"
+        'diff --git "a/x\\377.py" "b/x\\377.py"\n'
+        '--- "a/x\\377.py"\n'
+        '+++ "b/x\\377.py"\n'
+        "@@ -0,0 +1 @@\n"
+        "+b = 2\n"
+    )
+    result = ps.count_diff(diff)
+    assert result["by_file"] == {"x\\376.py": 1, "x\\377.py": 1}
+
+
+def test_binary_file_under_tests_excluded_as_test():
+    diff = (
+        "diff --git a/tests/blob.bin b/tests/blob.bin\n"
+        "Binary files a/tests/blob.bin and b/tests/blob.bin differ\n"
+    )
+    assert ps.count_diff(diff)["excluded"] == {"tests/blob.bin": "test"}
 
 
 def test_random_diffs_never_raise_and_count_nonnegative():

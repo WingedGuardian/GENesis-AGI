@@ -32,8 +32,13 @@ OVERRIDE_AT = 1001
 
 #: "" covers extensionless executables — the repo carries 13 tracked
 #: extensionless shebang scripts (scripts/watchgod, scripts/hooks/pre-push…).
-_COMMENT_EXTS = {".py", ".sh", ".yaml", ".yml", ".toml", ".cfg", ".ini", ""}
-_SLASH_COMMENT_EXTS = {".js", ".ts"}
+_COMMENT_EXTS = frozenset(
+    ".py .sh .yaml .yml .toml .cfg .ini .service .gitignore .gitattributes".split()  # noqa: SIM905
+) | {""}
+_SLASH_COMMENT_EXTS = {".js", ".ts", ".json5"}
+
+#: Git's C-style escapes for quoted paths; _unquote decodes through this.
+_C_ESCAPES = {c: bytes([b]) for c, b in zip('ntabvfr\\"', b'\n\t\a\b\v\f\r\\"', strict=True)}
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _QUOTED_TOKEN_RE = re.compile(r'^"(?:[^"\\]|\\.)*"')
@@ -101,12 +106,17 @@ def _exclusion_reason(path: str) -> str | None:
 
 
 def _is_comment(content: str, path: str) -> bool:
-    stripped = content.strip()
-    name = _basename(path)
+    stripped, name = content.strip(), _basename(path)
+    # Config templates keep the commented-out semantics of the file they
+    # instantiate: genesis.yaml.example comments are yaml comments.
+    for suffix in (".example", ".template"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
     ext = "." + name.rsplit(".", 1)[1] if "." in name else ""
-    if stripped.startswith("#") and ext in _COMMENT_EXTS:
-        return True
-    return stripped.startswith("//") and ext in _SLASH_COMMENT_EXTS
+    return (stripped.startswith("#") and ext in _COMMENT_EXTS) or (
+        stripped.startswith("//") and ext in _SLASH_COMMENT_EXTS
+    )
 
 
 def _unquote(s: str) -> str:
@@ -114,7 +124,8 @@ def _unquote(s: str) -> str:
 
     Handles Git's C-style escapes (``\\\\``, ``\\"``, ``\\t``, ``\\n``,
     ``\\a``, ``\\b``, ``\\v``, ``\\f``, ``\\r``) and ``\\ooo`` octal bytes,
-    then UTF-8 decodes with replacement. Never raises.
+    then UTF-8 decodes strictly — non-UTF-8 bytes return the raw escaped
+    spelling so distinct paths stay distinct. Never raises.
     """
     try:
         if len(s) < 2 or not (s.startswith('"') and s.endswith('"')):
@@ -133,24 +144,18 @@ def _unquote(s: str) -> str:
                     out.append(int(inner[i + 1 : j], 8) & 0xFF)
                     i = j
                     continue
-                out.extend(
-                    {
-                        "n": b"\n",
-                        "t": b"\t",
-                        "a": b"\a",
-                        "b": b"\b",
-                        "v": b"\v",
-                        "f": b"\f",
-                        "r": b"\r",
-                        "\\": b"\\",
-                        '"': b'"',
-                    }.get(nxt, b"\\" + nxt.encode("utf-8", "replace"))
-                )
+                out.extend(_C_ESCAPES.get(nxt, b"\\" + nxt.encode("utf-8", "replace")))
                 i += 2
                 continue
             out.extend(c.encode("utf-8", "replace"))
             i += 1
-        return bytes(out).decode("utf-8", "replace")
+        try:
+            # Strict UTF-8: replacement chars would collapse distinct
+            # non-UTF-8 paths onto one key, and surrogateescape keys can
+            # raise on print — fall back to the raw escaped spelling.
+            return bytes(out).decode("utf-8")
+        except UnicodeDecodeError:
+            return inner
     except Exception:
         return s
 
@@ -232,21 +237,18 @@ def count_diff(diff_text: str) -> dict:
             first = line[0] if line else " "
             if first == "-":
                 current.old_rem -= 1
-                content = line[1:]
                 # Removed lines are classified against the PRE-rename path:
                 # a `-# comment` in old.py stays a comment even when the file
                 # is being renamed to new.js.
                 old = current.old_path or current.path
-                if content.strip() and not _is_comment(content, old):
-                    current.removed.append(content.strip())
+                if (content := line[1:].strip()) and not _is_comment(content, old):
+                    current.removed.append(content)
             elif first == "+":
                 current.new_rem -= 1
-                content = line[1:]
-                if content.strip() and not _is_comment(content, current.path):
-                    current.added.append(content.strip())
+                if (content := line[1:].strip()) and not _is_comment(content, current.path):
+                    current.added.append(content)
             elif first == " " or line == "":
-                current.old_rem -= 1
-                current.new_rem -= 1
+                current.old_rem, current.new_rem = current.old_rem - 1, current.new_rem - 1
             else:
                 current.unparseable = True
                 current.in_hunk = False
@@ -294,28 +296,36 @@ def count_diff(diff_text: str) -> dict:
     if current is not None and current.in_hunk:
         current.unparseable = True
 
-    counted_files: list[_FileState] = []
+    # Each side of a rename is excluded on its OWN path: a test-bound half
+    # contributes nothing while the counted half is keyed under its path.
+    sides: list[tuple[str, list[str], list[str]]] = []  # (by path, added, removed)
     excluded: dict[str, str] = {}
     for f in files:
-        reason = _exclusion_reason(f.path)
-        if f.binary:
-            reason = reason or "binary"
-        if f.unparseable:
-            reason = reason or "unparseable"
-        if reason:
-            excluded[f.path] = reason
+        old = f.old_path or f.path
+        new_reason = _exclusion_reason(f.path)
+        if f.binary or f.unparseable:
+            excluded[f.path] = new_reason or ("binary" if f.binary else "unparseable")
+            continue
+        old_reason = _exclusion_reason(old)
+        if old_reason and new_reason:
+            excluded[f.path] = new_reason
+        elif old_reason:
+            excluded[old] = old_reason
+            sides.append((f.path, f.added, []))
+        elif new_reason:
+            excluded[f.path] = new_reason
+            sides.append((old, [], f.removed))
         else:
-            counted_files.append(f)
+            sides.append((f.path, f.added, f.removed))
 
     # Moves pair globally across the diff by multiset: a line removed anywhere
     # and added verbatim elsewhere counts once, as the addition.
-    additions_pool = Counter(add for f in counted_files for add in f.added)
-    moved = 0
-    counted = 0
+    additions_pool = Counter(add for _, added, _ in sides for add in added)
+    moved = counted = 0
     by_file: dict[str, int] = {}
-    for f in counted_files:
-        file_count = len(f.added)
-        for rem in f.removed:
+    for by_path, added, removed in sides:
+        file_count = len(added)
+        for rem in removed:
             if additions_pool.get(rem, 0) > 0:
                 additions_pool[rem] -= 1
                 moved += 1
@@ -323,7 +333,7 @@ def count_diff(diff_text: str) -> dict:
                 file_count += 1
         counted += file_count
         if file_count:
-            by_file[f.path] = file_count
+            by_file[by_path] = file_count
 
     band = "ok" if counted < SHAPE_AT else "shape" if counted < OVERRIDE_AT else "override"
     return {
