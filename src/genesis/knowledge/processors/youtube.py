@@ -45,9 +45,12 @@ _YTDLP_SLOTS = asyncio.Semaphore(3)
 # above speech bitrates, so a real track fits and a padded stream cannot.
 _AUDIO_MB_PER_MINUTE = 2
 
-_YOUTUBE_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+"
-)
+# The ingestion registry's pre-filter for this processor: any URL that names a
+# YouTube host. ``can_handle`` (``is_youtube_video_url``) then decides, so every
+# shape it accepts routes here (watch with ``v`` anywhere in the query, shorts,
+# live, embed; www, m, music; youtu.be; any letter case), and a channel,
+# playlist or look-alike URL goes to the web processor.
+YOUTUBE_URL_PATTERN = r"(?i)(?:youtube\.com|youtu\.be)/"
 
 # Hosts whose video URLs this processor fetches. yt-dlp's YouTube extractor
 # also accepts many third-party mirror hosts, so the host is checked here,
@@ -262,7 +265,10 @@ class YouTubeProcessor:
     is_video_url = staticmethod(is_youtube_video_url)
 
     def can_handle(self, source: str) -> bool:
-        return bool(_YOUTUBE_PATTERN.search(source))
+        source = source.strip()
+        if "://" not in source:
+            source = "https://" + source  # the ingestion registry pattern allows no scheme
+        return is_youtube_video_url(source)
 
     async def process(self, source: str, **kwargs: object) -> ProcessedContent:
         result = await self.fetch(source)
