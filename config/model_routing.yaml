@@ -261,10 +261,10 @@ providers:
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   nvidia-nim-deepseek:
     type: nvidia_nim
-    model: deepseek-ai/deepseek-v4-flash-0731
-    profile: nvidia-nim-deepseek-v4-flash-0731
+    model: deepseek-ai/deepseek-v4.1-flash
+    profile: nvidia-nim-deepseek-v4.1-flash
     free: true
-    rpm_limit: 20  # NIM free tier ~40 RPM per-model (verified 2026-08); 20 = conservative floor
+    rpm_limit: 20  # Retained conservative local cap; current account quota not measured
     open_duration_s: 120
   # cerebras DISABLED — all models removed from Cerebras as of 2026-05.
   # Only reasoning-only models remain (gpt-oss-120b, zai-glm-4.7) which
@@ -320,12 +320,12 @@ providers:
     rpm_limit: 20
     open_duration_s: 120
   openrouter-mimo:
-    # 2026-08-07: repointed xiaomi/mimo-v2-pro (delisted, 0 endpoints, verified
-    # live) → mimo-v2.5-pro (7 live endpoints). Last fallback rung of the
-    # currently-disabled 36_code_auditor, so correctness hygiene, not an active fix.
+    # Verified 2026-10-01: MiMo 2.6 Pro is listed on OpenRouter and returns
+    # JSON through LiteLLMDelegate. Keep the alias stable for local overlays.
+    # The calibrated judge and novelty-suppression pair remain DeepSeek Pro.
     type: openrouter
-    model: xiaomi/mimo-v2.5-pro
-    profile: mimo-v2.5-pro
+    model: xiaomi/mimo-v2.6-pro
+    profile: mimo-v2.6-pro
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -499,13 +499,11 @@ call_sites:
     default_paid: true
     dispatch: cli
     cc_model: Sonnet
-  # Executor Gate 2 deliverable-quality review leads with paid V4-pro
-  # (openrouter-deepseek-v4): a user-chosen pro-grade lever for this quality gate,
-  # since NIM's free tier now serves flash (not pro) after the 2026-08 repoint.
-  # Free NIM flash + paid v4-flash + qwen remain as fallbacks.
+  # Executor Gate 2 deliverable-quality review leads with paid MiMo 2.6 Pro.
+  # Free NIM V4.1 Flash, paid V4.1 Flash and Qwen remain as fallbacks.
   17_executor_review:
     chain:
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - nvidia-nim-deepseek
     - openrouter-deepseek-flash
     - openrouter-qwen36plus
@@ -521,7 +519,7 @@ call_sites:
     chain:
     - openrouter-gpt-max
     - nvidia-nim-deepseek
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - openrouter-qwen36plus
     default_paid: true
     description: "Task executor Gate 3 — devil's advocate challenge of deliverables"
@@ -711,7 +709,7 @@ call_sites:
     chain:
     - nvidia-nim-deepseek
     - openrouter-deepseek-flash
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - groq-free
     - mistral-large-free
     - mistral-medium-free
@@ -740,7 +738,7 @@ call_sites:
     - mistral-large-free
     - mistral-medium-free
     - gemini-free
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     default_paid: true
     description: Salvage a deep-reflection CC session that ended in prose (no
       fenced JSON) into the required structured JSON, so the cycle's cognitive
@@ -756,7 +754,7 @@ call_sites:
     chain:
     - nvidia-nim-deepseek
     - openrouter-deepseek-flash
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - mistral-large-free
     - mistral-medium-free
     - gemini-free
@@ -766,7 +764,7 @@ call_sites:
     chain:
     - nvidia-nim-deepseek
     - openrouter-deepseek-flash
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - mistral-large-free
     - mistral-medium-free
     - gemini-free
@@ -783,14 +781,14 @@ call_sites:
     retry_profile: background
     description: "Intelligence intake — score uncurated recon findings for relevance and quality"
   # Reasoning-first (2026-07-12): generating operational gotchas from structured
-  # infra facts is failure-mode reasoning over data, so it mirrors the `judge`
-  # chain (deepseek reasoning) rather than a general-chat model — better matched
+  # infra facts is failure-mode reasoning over data, so it keeps a paid-first
+  # reasoning approach rather than a general-chat model — better matched
   # AND cheaper than sonnet. Regenerates only on a section's fact-hash change, so
   # cost is negligible. Free general models (gemini/mistral) proved high-quality
   # on the live first run and serve as robust fallback.
   46_infra_annotation:
     chain:
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - nvidia-nim-deepseek
     - gemini-free
     - mistral-large-free
@@ -948,7 +946,7 @@ call_sites:
     dispatch: api
     description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
-      \ Paid v4-pro (the calibrated judge model) first, then NIM v4-flash, then paid v4-flash\
+      \ Paid v4-pro (the existing judge baseline) first, then NIM v4.1-flash, then paid v4.1-flash\
       \ for resilience; model_used\
       \ is logged per judgment for calibration traceability."
   voice_conversation:
@@ -965,7 +963,7 @@ call_sites:
       \ as fallbacks."
   desk_primary:
     chain:
-    - openrouter-deepseek-v4
+    - openrouter-mimo
     - glm
     - openrouter-sonnet
     default_paid: true
@@ -975,7 +973,7 @@ call_sites:
       OpenAI-compatible client (/v1/desk/chat/completions). CAPABLE first, not
       cheapest: that client fires its own tools by emitting an exact control tag
       and a near-miss silently does nothing, so instruction-following is the
-      binding constraint. DeepSeek V4-pro leads on the owner's stated preference
+      binding constraint. MiMo V2.6 Pro leads on the owner's stated preference
       for open models over frontier pricing; Sonnet is last-resort resilience,
       never the default."
   desk_fast:
@@ -1012,7 +1010,7 @@ call_sites:
       \u2014 this sends the window's household transcript text to an external free LLM; only the
       float verdict is persisted (never the text). Provider bake-off 2026-07-01 over real
       garbled windows: mistral-small-latest (100% clean JSON, ~0.8s) primary + nvidia-nim
-      deepseek-v4-flash-0731 (fast, valid JSON on live probe 2026-08-19; different vendor) fallback; both free, so never_pays
+      deepseek-v4.1-flash (valid JSON on live probe 2026-10-01; different vendor) fallback; both free, so never_pays
       keeps a valid chain. NON-Groq deliberately \u2014 Groq's 8B is EOL 2026-08-16 and its
       gpt-oss-20b replacement breaks strict JSON.
   ambient_arbiter:
