@@ -321,6 +321,9 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
     finally:
         await db.close()
 
+    if not results:
+        raise ValueError("no successfully graded cases; no draft written, retry is safe")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("x") as f:
         f.write("# Unapproved draft for the reflection_quality rubric.\n")

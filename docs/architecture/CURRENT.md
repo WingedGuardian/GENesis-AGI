@@ -2458,7 +2458,10 @@ verified: 788dd9a9 2026-09-06
   private unapproved drafts (`proposed_passed`, no automatic `user_passed`),
   preserving historical files. `eval/calibration.py` exposes opt-in
   `strict_references` whole-file schema, rubric/context and declared human
-  provenance checks before scoring. Reflection calibration CLI exposes
+  provenance and exact grading-question uniqueness checks before scoring.
+  Zero-case generation leaves no output, allowing retry. Reflection CLI and both
+  MCP experiment consumers retain the separate historical reference default.
+  Reflection calibration CLI exposes
   `--strict-references`; legacy reports remain compatible. Declared provenance
   is not authenticated approval or model qualification. See
   `docs/reference/golden-reference-integrity.md`.

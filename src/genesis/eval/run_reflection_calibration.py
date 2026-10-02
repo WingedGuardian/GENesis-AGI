@@ -22,6 +22,7 @@ from pathlib import Path
 # (LiteLLMDelegate-backed, provider-name selection, 429 retries). This script
 # previously carried its own inline copy — refactored onto the shared one
 # (the cleanup its docstring tracked). The bench harness uses the same shim.
+from genesis.eval.calibration import DEFAULT_REFLECTION_REFERENCE
 from genesis.experimentation.standalone_router import (
     DEFAULT_JUDGE_PROVIDER,
     StandaloneLiteLLMRouter,
@@ -29,7 +30,7 @@ from genesis.experimentation.standalone_router import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GOLDEN = Path.home() / ".genesis" / "output" / "reflection_quality_golden.jsonl"
+DEFAULT_GOLDEN = DEFAULT_REFLECTION_REFERENCE
 
 
 async def run(golden_path: Path, *, strict_references: bool = False) -> None:

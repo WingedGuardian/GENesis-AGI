@@ -5,6 +5,16 @@
 `proposed_passed`, never `user_passed`. Existing output files are refused before
 sampling or judge calls; the final write also uses exclusive creation. The
 historical `reflection_quality_golden.jsonl` is not migrated or overwritten.
+Zero samples or all failed grades raise without creating an output, so the same
+path can be retried. Partial nonempty drafts retain their grading error counts.
+
+Reflection calibration and both MCP consumers (`experiment_run`, `evo_run`)
+keep the historical reference path as their default through
+`calibration.DEFAULT_REFLECTION_REFERENCE`; generator output is a separate draft.
+Missing-reference guidance requires generation followed by independent human
+adjudication into a separate reference. Explicit reference paths remain supported.
+A historical file existing does not establish human approval.
+
 Generation itself uses inference: do not run it as an offline validation step.
 
 For human-graded references, each row contains a unique, nonblank string `id`,
@@ -27,7 +37,12 @@ python -m genesis.eval.run_reflection_calibration --golden /private/human-refere
 That command performs inference only after validation; it is not a validate-only
 command. The library equivalent is `run_calibration(..., strict_references=True)`.
 Malformed rows, label coercion, duplicates, missing context, mismatched rubrics or
-versions, and model-only provenance are rejected before any scoring call.
+versions, and model-only provenance are rejected before any scoring call. Strict
+mode also rejects repeated grading questions under different IDs: identity uses
+the exact rendered judge prompt, using the same pure renderer as scoring.
+Different labels, unused fields or irrelevant metadata do not make a question
+distinct. Different expected text or context counts as distinct only when it
+changes the rendered question. No text normalization is applied.
 
 Without strict mode, existing valid legacy datasets retain their historical
 reporting behavior. Generated drafts omit the required `user_passed` field and

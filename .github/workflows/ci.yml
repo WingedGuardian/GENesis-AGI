@@ -1108,5 +1108,7 @@ jobs:
         # skips. Floor: 23864 + 5 = 23869.
         # Human-reference integrity adds 32 collected cases in the new
         # test_reference_integrity.py (main 0, branch 32); no added skip markers.
-        # Floor 23869 + 32 = 23901; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23901
+        # Round-one repair adds 49 cases in test_reference_round1.py
+        # (main 0, branch 49); floor 23869 + 32 + 49 = 23950.
+        # Skip ceiling remains 102; no added skip markers.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23950

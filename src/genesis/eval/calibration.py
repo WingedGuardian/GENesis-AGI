@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.eval.rubrics import Rubric, get_rubric
-from genesis.eval.scorers import LLMJudgeScorer
+from genesis.eval.scorers import LLMJudgeScorer, render_rubric_prompt
 
 if TYPE_CHECKING:
     from genesis.routing.router import Router
@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # Default ship-gate. A rubric below this agreement rate is not allowed
 # into live scoring.
 DEFAULT_AGREEMENT_THRESHOLD = 0.80
+
+# Consumer default remains the historical reference, independently of draft generation.
+DEFAULT_REFLECTION_REFERENCE = (
+    Path.home() / ".genesis" / "output" / "reflection_quality_golden.jsonl"
+)
 
 
 @dataclass(frozen=True)
@@ -149,6 +154,7 @@ def _validate_references(cases: list[dict], rubric: Rubric) -> None:
     if get_rubric(rubric.name) != rubric:
         raise ValueError("strict references require the registered rubric")
     seen: set[str] = set()
+    questions: set[str] = set()
     for index, case in enumerate(cases, 1):
         prefix = f"reference case {index}"
         for key in ("id", "actual"):
@@ -167,6 +173,10 @@ def _validate_references(cases: list[dict], rubric: Rubric) -> None:
         for name in rubric.extra_placeholders:
             if not isinstance(config.get(name), str) or not config[name].strip():
                 raise ValueError(f"{prefix}: context {name!r} must be a nonblank string")
+        question = render_rubric_prompt(rubric, case["actual"], case.get("expected", ""), config)
+        if question in questions:
+            raise ValueError(f"{prefix}: duplicate grading question")
+        questions.add(question)
         provenance = case.get("reference_provenance")
         if not isinstance(provenance, dict) or provenance.get("label_source") != "human":
             raise ValueError(f"{prefix}: reference_provenance must declare human grading")
