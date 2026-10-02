@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "setup_claude_config.py"
 TEMPLATE = REPO_ROOT / "config" / "mcp.json.template"
@@ -103,15 +105,23 @@ def test_mcp_only_renders_just_the_mcp_json(tmp_path):
     assert "discord-bot" not in json.loads((tmp_path / ".mcp.json").read_text())["mcpServers"]
 
 
-def test_mcp_only_fails_when_nothing_could_be_rendered(tmp_path):
-    r = subprocess.run(
-        [sys.executable, str(SCRIPT), "--mcp-only", "--genesis-root", str(tmp_path)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+@pytest.mark.parametrize("stale_output", [False, True])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_mcp_only_fails_when_nothing_could_be_rendered(tmp_path, stale_output, dry_run):
+    """No template means nothing was rendered, whatever is already on disk: an
+    earlier .mcp.json, or --dry-run, must not report that as success."""
+    stale = '{"mcpServers": {}}\n'
+    if stale_output:
+        (tmp_path / ".mcp.json").write_text(stale)
+    cmd = [sys.executable, str(SCRIPT), "--mcp-only", "--genesis-root", str(tmp_path)]
+    if dry_run:
+        cmd.append("--dry-run")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     assert r.returncode == 1, (r.returncode, r.stderr)
-    assert not (tmp_path / ".mcp.json").exists()
+    if stale_output:
+        assert (tmp_path / ".mcp.json").read_text() == stale
+    else:
+        assert not (tmp_path / ".mcp.json").exists()
 
 
 def test_install_renders_mcp_json_through_the_same_renderer():

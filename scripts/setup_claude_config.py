@@ -216,7 +216,11 @@ def main():
     if args.mcp_only:
         render_mcp_config(genesis_root, args.dry_run)
         # A missing template renders nothing: say so in the exit status, not only
-        # on stderr, so a caller can tell.
+        # on stderr, so a caller can tell. Judge the template, not the output: a
+        # .mcp.json left by an earlier render, or --dry-run, must not turn the
+        # failure into a success.
+        if not (genesis_root / "config" / "mcp.json.template").exists():
+            sys.exit(1)
         sys.exit(0 if args.dry_run or (genesis_root / ".mcp.json").exists() else 1)
 
     print(f"Genesis root: {genesis_root}")
