@@ -16,7 +16,7 @@ _install_serena() (
         return 0
     fi
     sharing="$(python3 - <<'PY'
-import json, os, subprocess
+import json, os, shutil, subprocess
 from pathlib import Path
 path = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser() / "config/serena-shared.json"
 try:
@@ -29,6 +29,17 @@ except FileNotFoundError:
     sharing = "disabled"
 except (ValueError, KeyError, TypeError, OSError):
     sharing = "unknown"
+# A first install needs no user manager, but PATH absence alone can hide a pinned tool.
+if sharing == "disabled" and shutil.which("serena") is None:
+    try:
+        root = Path(subprocess.check_output(["uv", "tool", "dir"], text=True).strip())
+        if not root.is_absolute():
+            raise ValueError("invalid uv tool directory")
+        provider = root / "serena-agent"
+        if not (provider.exists() or provider.is_symlink()):
+            sharing = "fresh"
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        sharing = "unknown tool installation"
 # Unit names and the installed provider are per-user, independent of GENESIS_HOME.
 if sharing == "disabled":
     try:
@@ -50,7 +61,9 @@ if sharing == "disabled":
 print(sharing)
 PY
 )" || sharing=unknown
-    if [ "$sharing" != disabled ]; then
+    if [ "$sharing" = fresh ]; then
+        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
+    elif [ "$sharing" != disabled ]; then
         echo "  Serena: automatic install/upgrade skipped (sharing $sharing); disable sharing before upgrading and revalidate before enabling."
     elif command -v serena >/dev/null 2>&1; then
         uv tool upgrade serena-agent 2>/dev/null || echo "  WARNING: Serena upgrade failed (non-critical)"

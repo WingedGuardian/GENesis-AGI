@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import selectors
+import shutil
 import socket
 import subprocess
 import sys
@@ -1208,3 +1209,59 @@ def test_aliased_runtime_unit_root_is_cleaned_once(tmp_path, monkeypatch):
     shared.cleanup_units()
     assert not link.is_symlink()
     assert calls == [("daemon-reload",)]
+
+
+@pytest.mark.parametrize("manager", ["missing", "failed"])
+@pytest.mark.parametrize("tool", ["absent", "installed", "broken-link", "unknown"])
+@pytest.mark.parametrize("marker", [False, True, "invalid"])
+def test_fresh_install_without_manager_preserves_existing_or_uncertain_provider(
+    tmp_path, manager, tool, marker
+):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # Isolate PATH so the real installed provider and user manager cannot participate.
+    for name in ("python3", "flock", "mkdir"):
+        (bindir / name).symlink_to(shutil.which(name))
+    calls = tmp_path / "calls"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    if tool == "installed":
+        (tools / "serena-agent").mkdir()
+    elif tool == "broken-link":
+        (tools / "serena-agent").symlink_to(tmp_path / "deleted")
+    uv = bindir / "uv"
+    uv.write_text(
+        '#!/bin/sh\nif [ "$*" = "tool dir" ]; then\n'
+        '  [ "$TOOL" != unknown ] || exit 1\n  printf "%s\\n" "$TOOLS"\n'
+        'else\n  printf "%s\\n" "$*" >> "$CALLS"\nfi\n'
+    )
+    uv.chmod(0o755)
+    if manager == "failed":
+        systemctl = bindir / "systemctl"
+        systemctl.write_text("#!/bin/sh\nexit 1\n")
+        systemctl.chmod(0o755)
+    state = tmp_path / "state"
+    (state / "config").mkdir(parents=True)
+    (state / "config/serena-shared.json").write_text(json.dumps({"enabled": marker}))
+    subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            'source "$1"; _install_serena',
+            "bash",
+            str(SCRIPT.parent / "lib/serena_install.sh"),
+        ],
+        env=dict(
+            os.environ,
+            PATH=str(bindir),
+            GENESIS_HOME=str(state),
+            CALLS=str(calls),
+            TOOLS=str(tools),
+            TOOL=tool,
+        ),
+        check=True,
+    )
+    if marker is False and tool == "absent":
+        assert calls.read_text() == "tool install serena-agent\n"
+    else:
+        assert not calls.exists()
