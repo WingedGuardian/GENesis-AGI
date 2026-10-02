@@ -108,6 +108,39 @@ def test_ordered_paren_marker_counts(mod):
     assert out["bullets"] == ["item"]
 
 
+def test_lazy_continuation_joins_bullet(mod):
+    body = "## Acceptance\n\n- first part\nsecond part\n- other\n"
+    out = mod.parse_acceptance(body)
+    assert out["bullets"] == ["first part second part", "other"]
+
+
+def test_indented_continuation_after_blank_line(mod):
+    body = "## Acceptance\n\n- one\n\n  continued detail\n- two\n"
+    out = mod.parse_acceptance(body)
+    assert out["bullets"] == ["one continued detail", "two"]
+
+
+def test_blank_lines_are_invisible_to_continuations(mod):
+    """readable_body drops blank lines, so an unindented line after a blank
+    is indistinguishable from a lazy continuation — it joins. Only an
+    indented line NEEDS the indent clause; both paths are exercised above."""
+    body = "## Acceptance\n\n- one\n\nnot part of it\n- two\n"
+    out = mod.parse_acceptance(body)
+    assert out["bullets"] == ["one not part of it", "two"]
+
+
+def test_too_many_hashes_is_not_a_section(mod):
+    out = mod.parse_acceptance("####### Acceptance\n\n- x\n")
+    assert out["present"] is False
+    assert "no ## Acceptance section" in out["problems"]
+
+
+def test_heading_needs_whitespace(mod):
+    out = mod.parse_acceptance("##Acceptance\n\n- x\n")
+    assert out["present"] is False
+    assert "no ## Acceptance section" in out["problems"]
+
+
 # ── Source pointer ──────────────────────────────────────────────────
 
 
@@ -172,10 +205,40 @@ def test_issue_pointer_with_trailing_text_is_not_a_pointer(mod):
     assert out["source"] is None
 
 
+def test_spec_value_trailing_punctuation_is_stripped(mod):
+    # Trailing sentence punctuation on a pointer is valid (owner decision).
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nSpec: foo!\n")
+    assert out["source"] == {"kind": "spec", "value": "foo"}
+
+
 def test_invalid_spec_name_wins_over_later_pointer(mod):
-    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nSpec: foo!\nCloses #3\n")
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nSpec: foo?bar\nCloses #3\n")
     assert out["source"] is None
     assert "spec/plan pointer is not a valid name" in out["problems"]
+
+
+def test_spec_with_spaces_is_a_malformed_attempt(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nSpec: foo bar\nCloses #3\n")
+    assert out["source"] is None
+    assert "spec/plan pointer is not a valid name" in out["problems"]
+
+
+def test_pointer_only_bullet_is_not_a_criterion(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- Closes #5\n")
+    assert out["present"] is False
+    assert out["bullets"] == []
+    assert "## Acceptance has no bullets" in out["problems"]
+    assert out["source"] == {"kind": "issue", "value": "5"}
+
+
+def test_fullwidth_digits_are_not_an_issue_number(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nCloses #１２\n")
+    assert out["source"] is None
+
+
+def test_trailing_period_issue_pointer(mod):
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n\nCloses #2770.\n")
+    assert out["source"] == {"kind": "issue", "value": "2770"}
 
 
 def test_no_pointer(mod):
@@ -217,6 +280,29 @@ def test_marker_regexes_match_repo_pulse(mod):
         )
         assert m, f"{name} not found in repo_pulse.py"
         assert getattr(mod, name).pattern == ast.literal_eval(m.group(1))
+
+
+# ── Shared scanner wiring ───────────────────────────────────────────
+
+
+def test_scanner_is_check_cc_pin_receipts_readable_body(mod):
+    """Visibility comes from the sibling scanner, not a local copy."""
+    fn = mod._readable_body()
+    assert callable(fn)
+    assert fn.__module__ == "_cc_pin_receipts_for_acceptance"
+    assert fn.__name__ == "readable_body"
+
+
+def test_load_failure_reports_problem(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_READABLE_BODY_FN", mod._READABLE_BODY_UNSET)
+    monkeypatch.setattr(mod, "_load_sibling_readable_body", lambda: None)
+    out = mod.parse_acceptance("## Acceptance\n\n- x\n")
+    assert out["present"] is False
+    assert out["source"] is None
+    assert out["problems"] == [
+        "cannot load readable_body from check_cc_pin_receipts.py"
+    ]
+    monkeypatch.setattr(mod, "_READABLE_BODY_FN", mod._READABLE_BODY_UNSET)
 
 
 # ── Never raises ────────────────────────────────────────────────────

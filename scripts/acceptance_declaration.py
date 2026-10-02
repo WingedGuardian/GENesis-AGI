@@ -1,44 +1,53 @@
 """The `## Acceptance` section and source-pointer PR-body parser (issue #2736).
 
-Sibling to `e2e_declaration.py`: same body bound, same fence handling, same
-"never truncate" rule — except this reader REFUSES an oversized body rather than
-scanning a prefix, because a section that sits past the bound must not be
-reported absent.
+Sibling to `e2e_declaration.py`: same body bound — except this reader REFUSES
+an oversized body rather than scanning a prefix, because a section that sits
+past the bound must not be reported absent.
+
+Visibility — which lines a human actually reads — comes from the SHARED
+scanner: ``readable_body`` in ``scripts/check_cc_pin_receipts.py``, loaded
+repo-locally the way ``e2e_declaration.py`` does (registered in ``sys.modules``
+before ``exec_module``, popped on failure, cached). There is deliberately NO
+local fallback: a second scanner is a second contract, and "same scanner"
+must not be a claim that is false whenever the sibling fails to import. If
+the load fails the parse reports it instead of guessing.
 
 Two things are read:
 
-  * The FIRST heading matching ``^#{2,}\\s*Acceptance\\s*$`` (case-insensitive),
-    outside fenced code blocks. Its list items are the acceptance criteria.
+  * The FIRST heading matching ``^#{2,6}[ \\t]+Acceptance[ \\t]*$``
+    (case-insensitive). Its list items are the acceptance criteria, with
+    continuation lines joined in.
   * A source pointer naming where the work came from: ``Closes #N`` (or
     Fixes/Resolves/Refs/Part of), a ``Ledger: <32-hex>`` row, a
-    ``Follow-up: <32-hex>`` row, or a ``Spec:``/``Plan:`` name.
+    ``Follow-up: <32-hex>`` row, or a ``Spec:``/``Plan:`` name. Pointers may
+    be wrapped (``>``, a list marker, ``**…**``) but carry no trailing text.
 
 Wiring this into the merge gate and `gh pr create` is maintainer work, out of
-scope here. Pure functions, stdlib only, no I/O.
+scope here. Pure functions, stdlib only (no third-party packages), no I/O.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
+import sys
+from pathlib import Path
 
 #: GitHub's PR-body cap. A body over this is refused, never truncated.
 _MAX_BODY = 65_536
 
-_COMMENT_OPEN, _COMMENT_CLOSE = "<!--", "-->"
-_FENCE_MARKS = ("```", "~~~")
-
-_HEADING_RE = re.compile(r"^#{2,}\s*Acceptance\s*$", re.IGNORECASE)
+_HEADING_RE = re.compile(r"^#{2,6}[ \t]+Acceptance[ \t]*$", re.IGNORECASE)
 _ANY_HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
-_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_BULLET_RE = re.compile(r"^\s*(?:[-*+]|[0-9]+[.)])\s+(.*)$")
 _TASK_MARKER_RE = re.compile(r"^\[[ xX]\]\s*")
-_COMMENT_SPAN_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 _ISSUE_RE = re.compile(
-    r"^[ \t]*(?:Closes|Fixes|Resolves|Refs|Part of)[ \t]+#(\d+)[ \t]*$",
+    r"^[ \t]*(?:Closes|Fixes|Resolves|Refs|Part of)[ \t]+#([0-9]+)[ \t]*$",
     re.IGNORECASE,
 )
-_SPEC_RE = re.compile(r"^[ \t]*(Spec|Plan):[ \t]*(\S[^ \t]*)[ \t]*$")
+_SPEC_LINE_RE = re.compile(r"^(Spec|Plan):(.*)$")
 _SPEC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+_TRAILING_PUNCT_RE = re.compile(r"[ \t]*[.,;:!?]+[ \t]*$")
 
 #: Copied verbatim from src/genesis/session_awareness/repo_pulse.py — the test
 #: asserts equality by ``.pattern`` so the two readers can never drift.
@@ -47,55 +56,55 @@ FOLLOWUP_MARKER_RE = re.compile(
     r"^[ \t]*(?i:follow-?up):[ \t]*([0-9a-f]{32})[ \t]*$", re.MULTILINE
 )
 
+_READABLE_BODY_UNSET = object()
+_READABLE_BODY_FN = _READABLE_BODY_UNSET
 
-def _visible_lines(body: str) -> list[str]:
-    """Body lines with fenced blocks removed and HTML comments stripped.
 
-    Same rules as the sibling's scanner: a fenced line is opaque and never
-    interpreted; an unterminated comment opener hides to the end of the line.
-    """
-    visible: list[str] = []
-    in_comment = False
-    fence: str | None = None
-    for line in body.splitlines():
-        if fence is not None:
-            if line.strip().startswith(fence):
-                fence = None
-            continue
-        out: list[str] = []
-        rest = line
-        while rest:
-            if in_comment:
-                close = rest.find(_COMMENT_CLOSE)
-                if close == -1:
-                    rest = ""
-                    break
-                in_comment = False
-                rest = rest[close + len(_COMMENT_CLOSE) :]
-                continue
-            open_at = rest.find(_COMMENT_OPEN)
-            if open_at == -1:
-                out.append(rest)
-                break
-            out.append(rest[:open_at])
-            in_comment = True
-            rest = rest[open_at + len(_COMMENT_OPEN) :]
-        kept = "".join(out)
-        stripped = kept.strip()
-        for mark in _FENCE_MARKS:
-            if stripped.startswith(mark):
-                fence = mark
-                break
-        else:
-            visible.append(kept)
-    return visible
+def _load_sibling_readable_body():
+    """``readable_body`` from ``check_cc_pin_receipts.py`` — the SAME scanner the
+    pin gate and the E2E reader use, so all body-readers share one contract."""
+    name = "_cc_pin_receipts_for_acceptance"
+    try:
+        path = Path(__file__).resolve().parent / "check_cc_pin_receipts.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        if not (spec and spec.loader):
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Registered BEFORE exec: that module's dataclasses resolve their own
+        # module out of sys.modules, so exec-ing an unregistered module raises.
+        # On failure the half-initialised entry is removed.
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(name, None)
+            raise
+        fn = getattr(mod, "readable_body", None)
+        return fn if callable(fn) else None
+    except Exception:
+        return None
+
+
+def _readable_body():
+    global _READABLE_BODY_FN
+    if _READABLE_BODY_FN is _READABLE_BODY_UNSET:
+        _READABLE_BODY_FN = _load_sibling_readable_body()
+    return _READABLE_BODY_FN
 
 
 def _acceptance_bullets(lines: list[str]) -> tuple[bool, list[str]]:
-    """Locate the Acceptance section and collect its list items."""
+    """Locate the Acceptance section and collect its list items.
+
+    A non-blank, non-bullet, non-heading line inside the section is a
+    CONTINUATION: it joins the current bullet (single space, each part
+    stripped) when no blank line has intervened, or when it is indented by
+    two or more spaces. Otherwise it ends the current item.
+    """
     in_section = False
     found = False
     bullets: list[str] = []
+    item_open = False
+    blank_since_item = False
     for line in lines:
         if _ANY_HEADING_RE.match(line):
             if in_section:
@@ -107,14 +116,27 @@ def _acceptance_bullets(lines: list[str]) -> tuple[bool, list[str]]:
         if not in_section:
             continue
         m = _BULLET_RE.match(line)
-        if not m:
+        if m:
+            text = m.group(1).strip()
+            stripped = _TASK_MARKER_RE.sub("", text)
+            # An empty/comment-only/task-only line is not a criterion, and a
+            # bullet that is only a source pointer is not one either — the
+            # pointer still counts via the whole-body scan.
+            if stripped and _match_pointer(stripped) is None:
+                bullets.append(text)
+                item_open = True
+            else:
+                item_open = False
+            blank_since_item = False
             continue
-        text = _COMMENT_SPAN_RE.sub("", m.group(1)).strip()
-        # An unchecked/checked task marker alone is not a criterion; the
-        # marker is stripped for the emptiness test only — a kept bullet
-        # keeps its text as written.
-        if _TASK_MARKER_RE.sub("", text):
-            bullets.append(text)
+        if not line.strip():
+            blank_since_item = True
+            continue
+        if item_open and (not blank_since_item or len(line) - len(line.lstrip()) >= 2):
+            bullets[-1] = bullets[-1] + " " + line.strip()
+            blank_since_item = False
+        else:
+            item_open = False
     return found, bullets
 
 
@@ -137,27 +159,43 @@ def _unwrap(line: str) -> str:
     return line
 
 
+def _match_pointer(line: str) -> tuple[dict | None, str | None] | None:
+    """Match one line against the pointer shapes.
+
+    Returns ``None`` when the line is not a pointer attempt at all; otherwise
+    ``(source, None)`` on a match or ``(None, problem)`` when the attempt is
+    malformed — the first pointer wins even when malformed, so a problem
+    stops the scan just like a hit does.
+    """
+    line = _unwrap(line)
+    m = _SPEC_LINE_RE.match(line)
+    if m:
+        kind = m.group(1).lower()
+        value = _TRAILING_PUNCT_RE.sub("", m.group(2)).strip()
+        if _SPEC_NAME_RE.fullmatch(value):
+            return {"kind": kind, "value": value}, None
+        if "/" in value:
+            return None, "spec/plan pointer must be a name, not a path"
+        return None, "spec/plan pointer is not a valid name"
+    line = _TRAILING_PUNCT_RE.sub("", line)
+    m = _ISSUE_RE.match(line)
+    if m:
+        return {"kind": "issue", "value": m.group(1)}, None
+    m = MARKER_RE.search(line)
+    if m and not line[: m.start()].strip() and not line[m.end() :].strip():
+        return {"kind": "ledger", "value": m.group(1)}, None
+    m = FOLLOWUP_MARKER_RE.match(line)
+    if m:
+        return {"kind": "follow_up", "value": m.group(1)}, None
+    return None
+
+
 def _source_pointer(lines: list[str]) -> tuple[dict | None, str | None]:
     """First source-pointer line wins; returns (source, problem)."""
     for raw in lines:
-        line = _unwrap(raw)
-        m = _ISSUE_RE.match(line)
-        if m:
-            return {"kind": "issue", "value": m.group(1)}, None
-        m = MARKER_RE.search(line)
-        if m and not line[: m.start()].strip() and not line[m.end() :].strip():
-            return {"kind": "ledger", "value": m.group(1)}, None
-        m = FOLLOWUP_MARKER_RE.match(line)
-        if m:
-            return {"kind": "follow_up", "value": m.group(1)}, None
-        m = _SPEC_RE.match(line)
-        if m:
-            kind, value = m.group(1).lower(), m.group(2)
-            if _SPEC_NAME_RE.fullmatch(value):
-                return {"kind": kind, "value": value}, None
-            if "/" in value:
-                return None, "spec/plan pointer must be a name, not a path"
-            return None, "spec/plan pointer is not a valid name"
+        result = _match_pointer(raw)
+        if result is not None:
+            return result
     return None, None
 
 
@@ -178,7 +216,12 @@ def parse_acceptance(body: str | None) -> dict:
         problems.append(f"body too large to verify ({len(body)} chars)")
         return result
 
-    lines = _visible_lines(body.replace("\r\n", "\n").replace("\r", "\n"))
+    readable_body = _readable_body()
+    if readable_body is None:
+        problems.append("cannot load readable_body from check_cc_pin_receipts.py")
+        return result
+
+    lines = readable_body(body.replace("\r\n", "\n").replace("\r", "\n")).split("\n")
 
     found, bullets = _acceptance_bullets(lines)
     if not found:
