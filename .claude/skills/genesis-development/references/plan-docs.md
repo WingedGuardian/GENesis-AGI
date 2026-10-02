@@ -88,6 +88,9 @@ exactly the failure CLAUDE.md's evidence principle names.
 
 ## The one body rule
 
+The body also answers the five plan-time premise questions in
+`.claude/docs/premise-check.md`, "At plan and issue time".
+
 ```
 ## ═══ SUPERSEDED BELOW ═══
 ```
