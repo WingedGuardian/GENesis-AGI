@@ -32,10 +32,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_GOLDEN = Path.home() / ".genesis" / "output" / "reflection_quality_golden.jsonl"
 
 
-async def run(golden_path: Path) -> None:
+async def run(golden_path: Path, *, strict_references: bool = False) -> None:
     """Run calibration and print results."""
     from genesis.eval.calibration import run_calibration
 
+    if strict_references:
+        from genesis.eval.calibration import _load_golden_set
+        from genesis.eval.rubrics import get_rubric
+
+        # Reject the entire file before allocating a provider client.
+        _load_golden_set(golden_path, strict_rubric=get_rubric("reflection_quality"))
     router = StandaloneLiteLLMRouter(DEFAULT_JUDGE_PROVIDER)
 
     try:
@@ -43,6 +49,7 @@ async def run(golden_path: Path) -> None:
             rubric="reflection_quality",
             golden_set_path=golden_path,
             router=router,
+            strict_references=strict_references,
         )
     finally:
         await router.close()
@@ -84,8 +91,15 @@ def main() -> None:
         description="Run reflection_quality rubric calibration",
     )
     parser.add_argument(
-        "--golden", type=Path, default=DEFAULT_GOLDEN,
+        "--golden",
+        type=Path,
+        default=DEFAULT_GOLDEN,
         help=f"Path to golden set JSONL (default: {DEFAULT_GOLDEN})",
+    )
+    parser.add_argument(
+        "--strict-references",
+        action="store_true",
+        help="Validate declared human reference provenance before any judge calls",
     )
     args = parser.parse_args()
 
@@ -97,7 +111,7 @@ def main() -> None:
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("litellm").setLevel(logging.WARNING)
 
-    asyncio.run(run(args.golden))
+    asyncio.run(run(args.golden, strict_references=args.strict_references))
 
 
 if __name__ == "__main__":

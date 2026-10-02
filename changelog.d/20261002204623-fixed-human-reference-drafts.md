@@ -1,0 +1,1 @@
+- Generated reflection reference datasets now remain unapproved drafts instead of assigning machine grades as human labels. Existing files are preserved, and calibration offers strict reference validation before judge calls.

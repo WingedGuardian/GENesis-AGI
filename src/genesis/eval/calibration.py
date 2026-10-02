@@ -105,7 +105,7 @@ class CalibrationResult:
     outcomes: list[CalibrationCaseOutcome] = field(default_factory=list)
 
 
-def _load_golden_set(path: Path) -> list[dict]:
+def _load_golden_set(path: Path, *, strict_rubric: Rubric | None = None) -> list[dict]:
     """Read a JSONL golden set. Empty lines and lines starting with ``#``
     are skipped — comments + blank lines keep hand-graded files readable.
     """
@@ -124,16 +124,57 @@ def _load_golden_set(path: Path) -> list[dict]:
             msg = f"{path}:{lineno}: invalid JSON: {exc}"
             raise ValueError(msg) from exc
 
+        if not isinstance(case, dict):
+            raise ValueError(f"{path}:{lineno}: case must be a JSON object")
+
         for required in ("id", "actual", "user_passed"):
             if required not in case:
-                msg = (
-                    f"{path}:{lineno}: case missing required field "
-                    f"{required!r}"
-                )
+                msg = f"{path}:{lineno}: case missing required field {required!r}"
                 raise ValueError(msg)
 
         cases.append(case)
+    if strict_rubric is not None:
+        _validate_references(cases, strict_rubric)
     return cases
+
+
+def _validate_references(cases: list[dict], rubric: Rubric) -> None:
+    """Validate declared human references, not authenticated approval.
+
+    Strict schema/provenance is necessary but cannot establish independent
+    grading, blindness, class balance, adequate coverage or qualification.
+    The scorer resolves the registered rubric, so a differing instance is
+    rejected rather than reporting a contract it did not actually grade.
+    """
+    if get_rubric(rubric.name) != rubric:
+        raise ValueError("strict references require the registered rubric")
+    seen: set[str] = set()
+    for index, case in enumerate(cases, 1):
+        prefix = f"reference case {index}"
+        for key in ("id", "actual"):
+            if not isinstance(case.get(key), str) or not case[key].strip():
+                raise ValueError(f"{prefix}: {key} must be a nonblank string")
+        if case["id"] in seen:
+            raise ValueError(f"{prefix}: duplicate id {case['id']!r}")
+        seen.add(case["id"])
+        if type(case["user_passed"]) is not bool:
+            raise ValueError(f"{prefix}: user_passed must be a boolean human label")
+        if not isinstance(case.get("expected", ""), str):
+            raise ValueError(f"{prefix}: expected must be a string")
+        config = case.get("scorer_config")
+        if not isinstance(config, dict) or config.get("rubric_name") != rubric.name:
+            raise ValueError(f"{prefix}: scorer_config must name rubric {rubric.name!r}")
+        for name in rubric.extra_placeholders:
+            if not isinstance(config.get(name), str) or not config[name].strip():
+                raise ValueError(f"{prefix}: context {name!r} must be a nonblank string")
+        provenance = case.get("reference_provenance")
+        if not isinstance(provenance, dict) or provenance.get("label_source") != "human":
+            raise ValueError(f"{prefix}: reference_provenance must declare human grading")
+        reviewer = provenance.get("reviewer")
+        if not isinstance(reviewer, str) or not reviewer.strip():
+            raise ValueError(f"{prefix}: human reviewer must be a nonblank string")
+        if provenance.get("rubric_version") != rubric.version:
+            raise ValueError(f"{prefix}: reference rubric_version must be {rubric.version!r}")
 
 
 async def run_calibration(
@@ -142,6 +183,7 @@ async def run_calibration(
     golden_set_path: Path,
     router: Router,
     threshold: float = DEFAULT_AGREEMENT_THRESHOLD,
+    strict_references: bool = False,
 ) -> CalibrationResult:
     """Run ``rubric`` against the golden set and report agreement.
 
@@ -150,6 +192,9 @@ async def run_calibration(
         golden_set_path: Path to the JSONL golden set.
         router: Routing dispatcher used to invoke the judge call site.
         threshold: Minimum agreement rate to mark the rubric calibrated.
+        strict_references: Validate declared human labels and rubric/context
+            provenance for the entire file before issuing judge calls. This
+            does not authenticate approval or establish model qualification.
 
     Returns:
         A CalibrationResult. Inspect ``threshold_met`` before promoting
@@ -162,7 +207,10 @@ async def run_calibration(
     if isinstance(rubric, str):
         rubric = get_rubric(rubric)
 
-    cases = _load_golden_set(golden_set_path)
+    cases = _load_golden_set(
+        golden_set_path,
+        strict_rubric=rubric if strict_references else None,
+    )
     if not cases:
         msg = (
             f"golden set {golden_set_path} contains no graded cases — "

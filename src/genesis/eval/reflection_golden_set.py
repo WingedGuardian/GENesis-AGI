@@ -1,8 +1,8 @@
-"""Generate a synthetic golden set for the reflection_quality rubric.
+"""Generate an unapproved reference draft for the reflection_quality rubric.
 
 Samples deep reflection observations from the DB, uses an LLM judge to
-grade each one, then writes the results to a JSONL file suitable for
-``calibration.run_calibration()``.
+grade each one, then writes proposed labels to a private JSONL draft. Human grading is
+required before the draft can be used by ``calibration.run_calibration()``.
 
 The golden set is written to ``~/.genesis/output/`` (NOT the repo)
 because it contains private system context.
@@ -63,7 +63,7 @@ def _ensure_secrets() -> None:
             os.environ.setdefault(_GENESIS_TO_LITELLM[key], value)
 
 
-DEFAULT_OUTPUT = Path.home() / ".genesis" / "output" / "reflection_quality_golden.jsonl"
+DEFAULT_OUTPUT = Path.home() / ".genesis" / "output" / "reflection_quality_draft.jsonl"
 DEFAULT_COUNT = 50
 
 # Threshold from the rubric — observations scoring >= this are "pass".
@@ -243,6 +243,11 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
 
     Returns a summary dict with counts and pass/fail distribution.
     """
+    if output_path.exists():
+        raise FileExistsError(f"refusing to overwrite reference file: {output_path}")
+    from genesis.eval.rubrics import get_rubric
+
+    rubric = get_rubric("reflection_quality")
     # genesis_db_path() resolves relative to CWD which may be a worktree.
     # The real DB is always at ~/genesis/data/genesis.db.
     db_path = str(Path.home() / "genesis" / "data" / "genesis.db")
@@ -268,7 +273,8 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
 
             try:
                 score, rationale, model_used = await _grade_observation(
-                    content, session_context,
+                    content,
+                    session_context,
                 )
             except Exception as exc:
                 logger.warning("Error grading %s: %s", obs_id, exc)
@@ -285,7 +291,11 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
                 "id": obs_id,
                 "actual": content,
                 "expected": "deep_reflection_observation",
-                "user_passed": user_passed,
+                "proposed_passed": user_passed,
+                "reference_provenance": {
+                    "label_source": "model",
+                    "rubric_version": rubric.version,
+                },
                 "scorer_config": {
                     "rubric_name": "reflection_quality",
                     "session_context": session_context,
@@ -302,15 +312,18 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
             if i % 10 == 0:
                 logger.info(
                     "Progress: %d/%d (pass=%d, fail=%d, error=%d)",
-                    i, len(observations), passed_count, failed_count,
+                    i,
+                    len(observations),
+                    passed_count,
+                    failed_count,
                     error_count,
                 )
     finally:
         await db.close()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as f:
-        f.write("# Golden set for the reflection_quality rubric.\n")
+    with output_path.open("x") as f:
+        f.write("# Unapproved draft for the reflection_quality rubric.\n")
         f.write(f"# Generated: {count} sampled, {len(results)} graded\n")
         f.write(f"# Pass: {passed_count}, Fail: {failed_count}, Error: {error_count}\n")
         f.write("#\n")
@@ -325,7 +338,7 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
         "errors": error_count,
         "output": str(output_path),
     }
-    logger.info("Golden set written to %s: %s", output_path, summary)
+    logger.info("Unapproved reference draft written to %s: %s", output_path, summary)
     return summary
 
 

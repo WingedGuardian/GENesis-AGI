@@ -2454,6 +2454,15 @@ verified: 788dd9a9 2026-09-06
   Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
+- **eval reference integrity**: `eval/reflection_golden_set.py` generates
+  private unapproved drafts (`proposed_passed`, no automatic `user_passed`),
+  preserving historical files. `eval/calibration.py` exposes opt-in
+  `strict_references` whole-file schema, rubric/context and declared human
+  provenance checks before scoring. Reflection calibration CLI exposes
+  `--strict-references`; legacy reports remain compatible. Declared provenance
+  is not authenticated approval or model qualification. See
+  `docs/reference/golden-reference-integrity.md`.
+
 - **calibration/**: the pure ECE/MCE + confidence-bucket primitives
   (`metrics.py`, `types.py`), consumed by the WS-2 ledger (`ledger/cells.py`) and
   the ego-ECE path (`feedback/calibration.py`). **Four distinct "calibration"
