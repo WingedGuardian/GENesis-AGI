@@ -1712,6 +1712,52 @@ async def test_queue_drop_losing_reuse_cas_does_not_append_or_create_fallback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("loss_index", [0, 1, 2])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_queue_drop_reuse_race_discards_whole_stale_drop(
+    db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch, loss_index, restart,
+):
+    from genesis.inbox.scanner import compute_hash
+
+    mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=1)
+    source = inbox_dir / "Genesis.md"
+    urls = [f"https://example.com/{name}" for name in ("a", "b", "c")]
+    source.write_text("\n\n".join(urls))
+    # The held identity can have moved earlier OR later in the newly computed
+    # delta. Positional row reuse does not establish identity correspondence.
+    held_url = urls[1 if loss_index == 0 else 0]
+    for idx in range(loss_index + 1):
+        await inbox_items.create(
+            db, id=f"raced-{idx}", file_path=str(source), content_hash="old", status="failed",
+            created_at=f"2026-06-30T11:00:0{idx}+00:00", error_message="ordinary failure",
+            batch_items=inbox_items.serialize_batch_items([held_url if idx == loss_index else urls[idx]]),
+        )
+    real_reuse = inbox_items.reuse_as_pending
+
+    async def racing_reuse(conn, item_id, **kwargs):
+        if item_id == f"raced-{loss_index}":
+            await conn.execute("UPDATE inbox_items SET error_message='replay_unsafe: raced' WHERE id=?", (item_id,))
+            await conn.commit()
+        return await real_reuse(conn, item_id, **kwargs)
+
+    monkeypatch.setattr(inbox_items, "reuse_as_pending", racing_reuse)
+    unrelated = object()
+    pending = [unrelated]
+    await mon._queue_drop(str(source), source.read_text(), compute_hash(source), mon._clock().isoformat(), pending)
+    assert pending == [unrelated]
+    assert (await (await db.execute("SELECT COUNT(*) FROM inbox_items")).fetchone())[0] == loss_index + 1
+    # Durable earlier rows are recovered on the next scan, not dispatched from
+    # the stale delta; the held identity is subtracted before normal dispatch.
+    monkeypatch.setattr(inbox_items, "reuse_as_pending", real_reuse)
+    if restart:
+        mon = _monitor(db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, items_per_eval=1)
+    await mon.check_once()
+    assert mock_invoker.run.await_count == 2
+    assert all(held_url not in call.args[0].prompt for call in mock_invoker.run.call_args_list)
+    assert (await inbox_items.get_by_id(db, f"raced-{loss_index}"))["error_message"] == "replay_unsafe: raced"
+
+
+@pytest.mark.asyncio
 async def test_retry_lane_park_spares_non_url_failures(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path,
 ):

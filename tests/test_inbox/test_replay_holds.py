@@ -174,13 +174,13 @@ async def test_operator_does_not_recreate_db_disappearing_after_inspection(tmp_p
                        (str(source), compute_hash(source)))
     await conn.commit()
     await conn.close()
-    original_admission = replay_hold.assert_admitted
+    original_connect = replay_hold.connect_aiosqlite_rw
 
-    def remove_between_inspection_and_writer(db_path):
+    def remove_between_inspection_and_writer(db_path, **kwargs):
         path.rename(backup)
-        original_admission(db_path)
+        return original_connect(db_path, **kwargs)
 
-    monkeypatch.setattr(replay_hold, "assert_admitted", remove_between_inspection_and_writer)
+    monkeypatch.setattr(replay_hold, "connect_aiosqlite_rw", remove_between_inspection_and_writer)
     with pytest.raises(sqlite3.OperationalError, match="unable to open"):
         await replay_hold.operate(path, "held", release=True, acknowledge=True)
     assert not path.exists() and backup.is_file()

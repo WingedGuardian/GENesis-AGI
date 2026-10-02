@@ -1336,6 +1336,7 @@ class InboxMonitor:
             max_retries=self._config.max_retries,
         )
         drop_id = str(uuid.uuid4())
+        pending_start = len(pending_items)
         for idx, batch in enumerate(batches):
             # Runtime content stays plain, while the durable column carries a
             # versioned item array. Legacy single-newline storage destroyed the
@@ -1358,8 +1359,12 @@ class InboxMonitor:
                 if not reused:
                     # Eligibility changed since selection (for example, a
                     # concurrent attempt put the row on a replay hold).
-                    # Never dispatch stale in-memory work or create a bypass.
-                    continue
+                    # Positional reuse does not bind old item identities to
+                    # new batches. Discard this WHOLE stale drop, including
+                    # earlier siblings; the next scan recovers durable pending
+                    # rows and re-derives a delta excluding the new hold.
+                    del pending_items[pending_start:]
+                    return
             else:
                 row_id = str(uuid.uuid4())
                 await inbox_items.create(

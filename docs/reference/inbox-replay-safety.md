@@ -19,6 +19,9 @@ item blocks suppress duplicate deltas, but do not enter the completed baseline.
 An unreadable held payload blocks dispatch for that source file, including
 after an edit; unrelated source files can still run. An owner alert identifies
 the held batch without exposing URL query strings or raw diagnostic text.
+If failed-row reuse loses its eligibility race, the entire in-memory drop is
+discarded, not just that batch. The next scan recovers any earlier durable
+pending rows and rebuilds the delta with the hold excluded.
 
 ## Inspect and deliberately release one batch
 
@@ -33,6 +36,9 @@ The default database is the existing install database (`genesis_db_path()`);
 `--db /absolute/path/genesis.db` selects an existing database explicitly.
 Inspection is read-only and prints no item URLs or raw error text. Review the
 batch and any actions it may already have executed before acknowledging replay.
+Release uses the canonical guarded async connector with `existing_only=True`:
+it cannot create a replacement if the database disappears between inspection
+and writable open, and retains quarantine checks before and after opening.
 
 Release refuses absent/non-held items, unreadable item boundaries, missing or
 changed source content, and a concurrently changed row. It resets only the

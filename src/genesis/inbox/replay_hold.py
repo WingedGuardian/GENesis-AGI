@@ -10,8 +10,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.db.admission import assert_admitted
-from genesis.db.connection import open_ro_connection
+from genesis.db.connection import connect_aiosqlite_rw, open_ro_connection
 from genesis.db.crud import inbox_items
 from genesis.env import db_busy_timeout_ms, genesis_db_path
 from genesis.inbox.scanner import compute_hash
@@ -49,11 +48,9 @@ async def operate(
         raise ValueError("Source is missing or unreadable; hold retained.") from exc
     if not unchanged:
         raise ValueError("Source changed since this attempt; hold retained.")
-    # Unlike the runtime factory, this recovery command must never create a
+    # Keep canonical pre/post-open quarantine admission, but never create a
     # replacement DB if the inspected file disappears before the writer opens.
-    # Admission remains mandatory; URI encoding preserves literal path bytes.
-    assert_admitted(db_path)
-    writer = await aiosqlite.connect(db_path.resolve().as_uri() + "?mode=rw", uri=True)
+    writer = await connect_aiosqlite_rw(db_path, existing_only=True)
     try:
         writer.row_factory = aiosqlite.Row
         await writer.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
