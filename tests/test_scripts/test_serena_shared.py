@@ -196,22 +196,25 @@ def test_unit_line_injection_refuses(path):
         shared.quote_unit(path)
 
 
+@pytest.mark.parametrize("home_kind", ["absolute", "empty", "unset", "tilde"])
 @pytest.mark.parametrize("enabled", [True, False, "invalid", None])
-def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, enabled):
+def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, enabled, home_kind):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "serena").write_text("#!/bin/sh\nexit 0\n")
     (bindir / "uv").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n')
     for executable in bindir.iterdir():
         executable.chmod(0o755)
-    settings = tmp_path / "config/serena-shared.json"
-    settings.parent.mkdir()
+    home = tmp_path / (".genesis" if home_kind in ("empty", "unset") else "state")
+    settings = home / "config/serena-shared.json"
+    settings.parent.mkdir(parents=True)
     if enabled is not None:
         settings.write_text(json.dumps({"enabled": enabled}))
     calls = tmp_path / "calls"
-    env = dict(
-        os.environ, GENESIS_HOME=str(tmp_path), PATH=f"{bindir}:{os.defpath}", CALLS=str(calls)
-    )
+    env = dict(os.environ, HOME=str(tmp_path), PATH=f"{bindir}:{os.defpath}", CALLS=str(calls))
+    env.pop("GENESIS_HOME", None)
+    if home_kind != "unset":
+        env["GENESIS_HOME"] = {"absolute": str(home), "empty": "", "tilde": "~/state"}[home_kind]
     helper = SCRIPT.parent / "lib/serena_install.sh"
     subprocess.run(
         ["bash", "-c", 'source "$1"; _install_serena', "bash", str(helper)], env=env, check=True
@@ -229,7 +232,9 @@ def test_legacy_project_registration_migrates_without_touching_custom_entry(
     root = checkout(tmp_path / "project")
     alias = tmp_path / "alias"
     alias.symlink_to(root, target_is_directory=True)
-    stored_project = {"canonical": root, "symlink": alias, "other": tmp_path / "other"}[project_path]
+    stored_project = {"canonical": root, "symlink": alias, "other": tmp_path / "other"}[
+        project_path
+    ]
     entry = {
         "command": "serena",
         "args": ["start-mcp-server", "--context", "claude-code", "--project", str(stored_project)],
@@ -334,7 +339,7 @@ def configured_paths(tmp_path, monkeypatch):
     return settings
 
 
-@pytest.mark.parametrize("failure", ["startup", "publication"])
+@pytest.mark.parametrize("failure", ["snapshot", "startup", "publication"])
 def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
     tmp_path, monkeypatch, configured_paths, failure
 ):
@@ -354,6 +359,12 @@ def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
         if failure == "startup" and args[0] == "enable":
             raise subprocess.CalledProcessError(1, "enable services")
 
+    if failure == "snapshot":
+
+        def fail_snapshot(*args):
+            raise OSError("snapshot failed")
+
+        monkeypatch.setattr(shared, "install_units", fail_snapshot)
     monkeypatch.setattr(shared, "write_settings", write_settings)
     monkeypatch.setattr(shared, "systemctl", systemctl)
     with pytest.raises((OSError, subprocess.CalledProcessError)):
@@ -430,3 +441,40 @@ def test_disable_sharing_does_not_require_readable_git_metadata(tmp_path, config
     main = tmp_path / "missing-checkout"
     shared.configure(main, False)
     assert shared.read_settings(configured_paths)["enabled"] is False
+
+
+@pytest.mark.parametrize("override", [None, "", "~/state", "absolute"])
+def test_settings_home_matches_canonical_env_semantics(tmp_path, monkeypatch, override):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GENESIS_HOME", raising=False)
+    if override is not None:
+        monkeypatch.setenv(
+            "GENESIS_HOME", str(tmp_path / "state") if override == "absolute" else override
+        )
+    expected = tmp_path / ("state" if override else ".genesis") / "config/serena-shared.json"
+    assert shared.settings_path() == expected
+
+
+@pytest.mark.parametrize("existing_config", [False, True])
+def test_missing_project_entry_registered_despite_user_scope_server(tmp_path, existing_config):
+    root = checkout(tmp_path / "project")
+    config = root / ".mcp.json"
+    unrelated = {"mcpServers": {"other": {"command": "/operator/other"}}}
+    if existing_config:
+        config.write_text(json.dumps(unrelated))
+    user = {"mcpServers": {"serena": {"command": "/operator/serena"}}}
+    user_file = tmp_path / ".claude.json"
+    user_file.write_text(json.dumps(user))
+    helper = SCRIPT.parent / "lib/mcp_register.sh"
+    subprocess.run(
+        ["bash", "-e", "-c", 'source "$1"; _register_serena "$2"', "bash", str(helper), str(root)],
+        env=dict(os.environ, HOME=str(tmp_path), PATH=os.defpath),
+        check=True,
+    )
+    result = json.loads(config.read_text())
+    assert result["mcpServers"].pop("serena") == {
+        "command": str(root / ".claude/mcp/run-serena"),
+        "args": ["--context", "claude-code"],
+    }
+    assert result == (unrelated if existing_config else {"mcpServers": {}})
+    assert json.loads(user_file.read_text()) == user

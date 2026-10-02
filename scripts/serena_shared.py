@@ -31,7 +31,8 @@ def project_root(start: Path) -> Path | None:
 
 def settings_path() -> Path:
     return (
-        Path(os.environ.get("GENESIS_HOME", Path.home() / ".genesis")) / "config/serena-shared.json"
+        Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser()
+        / "config/serena-shared.json"
     )
 
 
@@ -292,8 +293,8 @@ def configure(project: Path, enable: bool) -> None:
     binary("terse")
     # No old checkout may route to a new service if startup/publication fails.
     write_settings(config_file, project, False)
-    install_units(project, config_file, serena)
     try:
+        install_units(project, config_file, serena)
         systemctl("daemon-reload")
         systemctl("enable", "--now", *(unit_name(x) for x in PROFILES))
         write_settings(config_file, project, True)

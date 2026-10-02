@@ -101,8 +101,10 @@ from pathlib import Path
 root = Path(sys.argv[1]).resolve()
 config = root / ".mcp.json"
 try:
-    data = json.loads(config.read_text())
-    entry = data["mcpServers"]["serena"]
+    data = json.loads(config.read_text()) if config.exists() else {"mcpServers": {}}
+    servers = data.setdefault("mcpServers", {})
+    present = "serena" in servers
+    entry = servers.get("serena", {})
     args = entry.get("args")
     project_matches = (isinstance(args, list) and len(args) == 5
                        and args[:4] == ["start-mcp-server", "--context", "claude-code", "--project"]
@@ -111,21 +113,24 @@ try:
     legacy = (entry.get("command") == "serena" and project_matches
               and entry.get("type", "stdio") == "stdio" and not entry.get("env"))
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
-    legacy = False
-if legacy:
+    print("failed")
+    sys.exit(0)
+if not present or legacy:
     # One atomic update; remove/add would lose the old entry on CLI failure.
     temporary = None
     try:
         fd, name = tempfile.mkstemp(dir=root, prefix=".mcp.json.")
         temporary = Path(name)
         with os.fdopen(fd, "w") as output:
-            os.fchmod(output.fileno(), stat.S_IMODE(config.stat().st_mode))
+            if config.exists():
+                os.fchmod(output.fileno(), stat.S_IMODE(config.stat().st_mode))
             entry["command"] = str(root / ".claude/mcp/run-serena")
             entry["args"] = ["--context", "claude-code"]
+            servers["serena"] = entry
             json.dump(data, output, indent=2)
             output.write("\n")
         os.replace(temporary, config)
-        print("migrated")
+        print("migrated" if legacy else "registered")
     except OSError:
         print("failed")
     finally:
@@ -134,10 +139,11 @@ if legacy:
 PYCODE
 )" || outcome=failed
     case "$outcome" in
+        registered) echo "  Serena: registered project launcher"; return 0 ;;
         migrated) echo "  Serena: migrated legacy project registration"; return 0 ;;
         failed) echo "  WARNING: Serena migration failed; existing registration retained"; return 0 ;;
     esac
-    _register_mcp serena project "$root/.claude/mcp/run-serena" --context claude-code
+    echo "  Serena: existing custom project registration retained"
 )
 
 _register_mcp() {

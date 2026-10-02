@@ -5,7 +5,7 @@ _install_serena() {
     sharing="$(python3 - <<'PY'
 import json, os
 from pathlib import Path
-path = Path(os.environ.get("GENESIS_HOME", str(Path.home() / ".genesis"))) / "config/serena-shared.json"
+path = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser() / "config/serena-shared.json"
 try:
     config = json.loads(path.read_text())
     enabled = config["enabled"]
