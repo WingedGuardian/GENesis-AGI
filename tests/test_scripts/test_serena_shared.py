@@ -210,7 +210,7 @@ def test_unit_line_injection_refuses(path):
         shared.quote_unit(path)
 
 
-@pytest.mark.parametrize("home_kind", ["absolute", "empty", "unset", "tilde"])
+@pytest.mark.parametrize("home_kind", ["absolute", "empty", "unset", "tilde", "relative"])
 @pytest.mark.parametrize("enabled", [True, False, "invalid", None])
 def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, enabled, home_kind):
     bindir = tmp_path / "bin"
@@ -231,12 +231,20 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
     env = dict(os.environ, HOME=str(tmp_path), PATH=f"{bindir}:{os.defpath}", CALLS=str(calls))
     env.pop("GENESIS_HOME", None)
     if home_kind != "unset":
-        env["GENESIS_HOME"] = {"absolute": str(home), "empty": "", "tilde": "~/state"}[home_kind]
+        env["GENESIS_HOME"] = {
+            "absolute": str(home),
+            "empty": "",
+            "tilde": "~/state",
+            "relative": "state",
+        }[home_kind]
     helper = SCRIPT.parent / "lib/serena_install.sh"
     subprocess.run(
-        ["bash", "-c", 'source "$1"; _install_serena', "bash", str(helper)], env=env, check=True
+        ["bash", "-c", 'source "$1"; _install_serena', "bash", str(helper)],
+        cwd=tmp_path,
+        env=env,
+        check=True,
     )
-    assert calls.exists() == (enabled is False or enabled is None)
+    assert calls.exists() == (home_kind != "relative" and enabled in (False, None))
     if calls.exists():
         assert calls.read_text() == "tool upgrade serena-agent\n"
 
@@ -484,6 +492,48 @@ def test_settings_home_matches_canonical_env_semantics(tmp_path, monkeypatch, ov
         )
     expected = tmp_path / ("state" if override else ".genesis") / "config/serena-shared.json"
     assert shared.settings_path() == expected
+
+
+@pytest.mark.parametrize("home", ["state", "../state"])
+@pytest.mark.parametrize("command", ["claude-code", "codex", "enable", "disable"])
+def test_relative_runtime_home_refuses_before_provider_or_marker_mutation(tmp_path, home, command):
+    main = checkout(tmp_path / "main")
+    caller = tmp_path / "elsewhere/caller"
+    caller.mkdir(parents=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("serena", "terse", "systemctl"):
+        executable = bindir / name
+        executable.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$CALLS"\n')
+        executable.chmod(0o755)
+    calls = tmp_path / "calls"
+    for cwd in (caller, main):
+        marker = (cwd / home).resolve() / "config/serena-shared.json"
+        marker.parent.mkdir(parents=True)
+        original = json.dumps({"enabled": True, "main": str(main)})
+        marker.write_text(original)
+        args = (
+            ["launch", "--context", command]
+            if command in shared.PROFILES
+            else ["configure", "--main", str(main)] + (["--enable"] if command == "enable" else [])
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            cwd=cwd,
+            env=dict(
+                os.environ,
+                HOME=str(tmp_path),
+                GENESIS_HOME=home,
+                PATH=f"{bindir}:{os.defpath}",
+                CALLS=str(calls),
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1 and "absolute GENESIS_HOME" in result.stderr
+        assert not result.stdout and not calls.exists()
+        assert marker.read_text() == original
 
 
 @pytest.mark.parametrize("existing_config", [False, True])
@@ -1427,8 +1477,9 @@ def test_configuration_cancels_activation_before_replacing_unit_files(
 @pytest.mark.parametrize("filename", ["bootstrap.sh", "install.sh"])
 @pytest.mark.parametrize("marker", [None, False, True, "invalid"])
 @pytest.mark.parametrize("provider", [False, True])
+@pytest.mark.parametrize("home_kind", ["absolute", "relative"])
 def test_installer_registration_preserves_shared_launcher_without_provider_path(
-    tmp_path, filename, marker, provider
+    tmp_path, filename, marker, provider, home_kind
 ):
     root = checkout(tmp_path / "project")
     unrelated = {"mcpServers": {"other": {"command": "/operator/other"}}}
@@ -1463,13 +1514,16 @@ def test_installer_registration_preserves_shared_launcher_without_provider_path(
         env=dict(
             os.environ,
             PATH=f"{bindir}:{os.defpath}",
-            GENESIS_HOME=str(home),
+            GENESIS_HOME=str(home) if home_kind == "absolute" else "state",
             GENESIS_ROOT=str(root),
             REPO_DIR=str(root),
         ),
+        cwd=tmp_path,
         check=True,
     )
     result = json.loads((root / ".mcp.json").read_text())
-    assert ("serena" in result["mcpServers"]) is (provider or marker is True)
+    assert ("serena" in result["mcpServers"]) is (
+        provider or (home_kind == "absolute" and marker is True)
+    )
     result["mcpServers"].pop("serena", None)
     assert result == unrelated

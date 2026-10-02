@@ -31,10 +31,10 @@ def project_root(start: Path) -> Path | None:
 
 
 def settings_path() -> Path:
-    return (
-        Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser()
-        / "config/serena-shared.json"
-    )
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser()
+    if not home.is_absolute():
+        raise ValueError("Serena sharing requires an absolute GENESIS_HOME")
+    return home / "config/serena-shared.json"
 
 
 def read_settings(path: Path) -> dict | None:

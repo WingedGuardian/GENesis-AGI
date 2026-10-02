@@ -97,8 +97,11 @@ _serena_registration_available() {
     python3 - <<'PYCODE'
 import json, os, shutil, sys
 from pathlib import Path
-path = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser() / "config/serena-shared.json"
 try:
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser()
+    if not home.is_absolute():
+        raise ValueError("Serena sharing requires an absolute GENESIS_HOME")
+    path = home / "config/serena-shared.json"
     sharing = json.loads(path.read_text()).get("enabled") is True
 except (OSError, ValueError, AttributeError):
     sharing = False

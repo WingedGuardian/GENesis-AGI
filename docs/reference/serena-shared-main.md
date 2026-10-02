@@ -22,7 +22,9 @@ and records opt-in settings in `~/.genesis/config/serena-shared.json`.
 Native custom modes, prompt templates and global memories remain linked to
 their original provider home so customizations and memory edits are preserved.
 An existing resource containing data is never silently replaced.
-`GENESIS_HOME` relocates the settings/provider-home root. Both profiles use
+`GENESIS_HOME` relocates the settings/provider-home root and must expand to an
+absolute path; relative overrides are refused to prevent configuration and launch
+from selecting different markers in different working directories. Both profiles use
 native single-project mode; the Codex context retains its native name for
 OpenAI tool schemas. Dashboard and GUI surfaces are disabled. Ports 9165 and
 9166 must be free. Checkout paths ending in whitespace or a backslash are
