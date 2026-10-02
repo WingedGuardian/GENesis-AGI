@@ -63,6 +63,7 @@ def _profile(
     watchdog: object = True,
     tailscaled: object = None,
     ts_watchdog: object = None,
+    ts_service: object = None,
     cc_tmp_isolated: object = True,
     container: object = "lxc",
     age_days: float = 0.0,
@@ -99,6 +100,7 @@ def _profile(
                     "network_watchdog_enabled": watchdog,
                     "tailscaled_loaded": tailscaled,
                     "tailscale_watchdog_unit_state": ts_watchdog,
+                    "tailscale_watchdog_service_unit_state": ts_service,
                 },
             },
             "virt": {"status": "ok", "facts": {"container": container}},
@@ -636,5 +638,22 @@ def test_tailscale_watchdog_absent_where_tailscaled_runs(state):
 def test_tailscale_watchdog_rule_silent_otherwise(tailscaled, state):
     assert "tailscale_watchdog_absent" not in _infra_missing_protections(
         _profile(tailscaled=tailscaled, ts_watchdog=state)
+    )
+
+
+@pytest.mark.parametrize("masked", ["masked", "masked-runtime"])
+def test_a_masked_tailscale_watchdog_service_is_deliberately_off(masked):
+    """The installer leaves a masked service alone (the operator's off switch),
+    so a masked service must not read as an absent watchdog even when the timer
+    was never installed."""
+    assert "tailscale_watchdog_absent" not in _infra_missing_protections(
+        _profile(tailscaled=True, ts_watchdog="", ts_service=masked)
+    )
+
+
+def test_an_unmasked_service_does_not_hide_an_absent_timer():
+    """A merely static service is not an off switch: the timer is still absent."""
+    assert "tailscale_watchdog_absent" in _infra_missing_protections(
+        _profile(tailscaled=True, ts_watchdog="", ts_service="static")
     )
 

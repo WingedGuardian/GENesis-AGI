@@ -784,7 +784,7 @@ def _run_removal(tmp_path: Path, **env) -> subprocess.CompletedProcess:
 
 def test_uninstall_removes_the_root_watchdog_and_reports_nothing_left(tmp_path):
     result = _run_removal(tmp_path, SUDO_OK="1")
-    assert (result.returncode, result.stdout) == (0, "")
+    assert (result.returncode, result.stdout) == (0, "root watchdog removal done\n")
     assert not any((tmp_path / "root").rglob("genesis-*watchdog*"))
     assert not (tmp_path / "root/usr/local/lib/genesis/tailscale-watchdog.py").exists()
 
@@ -802,6 +802,43 @@ def test_uninstall_reports_a_timer_still_running_after_its_files_are_gone(tmp_pa
     result = _run_removal(tmp_path, SUDO_OK="1", ACTIVE_TIMERS="genesis-network-watchdog.timer")
     assert result.returncode == 1
     assert result.stdout.strip() == "root watchdog still present: genesis-network-watchdog.timer"
+
+
+def test_uninstall_reports_a_still_running_service_not_just_a_timer(tmp_path):
+    """A oneshot .service whose `disable --now` failed is just as much left
+    behind as an active .timer — the old check looked at timers only."""
+    result = _run_removal(
+        tmp_path, SUDO_OK="1", ACTIVE_TIMERS="genesis-tailscale-watchdog.service"
+    )
+    assert result.returncode == 1
+    assert result.stdout.strip() == (
+        "root watchdog still present: genesis-tailscale-watchdog.service"
+    )
+
+
+def _report(tmp_path: Path, out: str) -> subprocess.CompletedProcess:
+    """Run report_root_watchdog_removal on ``out`` with warn/ok stubbed."""
+    block = (
+        'eval "$(sed -n "/^# BEGIN root-watchdog-remove/,/^CONTAINER_USER=/p" '
+        f'"{UNINSTALL}")"; '
+        'warn() { echo "WARNING: $*"; }; ok() { echo "+ $*"; }; REMOVED=(); '
+        f'report_root_watchdog_removal "{out}"'
+    )
+    return subprocess.run(
+        ["/bin/bash", "-c", block], capture_output=True, text=True, timeout=30
+    )
+
+
+def test_uninstall_report_treats_output_with_no_verdict_as_failure(tmp_path):
+    """On the container path `incus exec`/`su` failing before the command runs
+    prints nothing and returns 0 — output with neither marker is a failure,
+    not a successful removal."""
+    silent = _report(tmp_path, "")
+    assert "Removed root network and Tailscale watchdog timers" not in silent.stdout
+    assert "Could not verify" in silent.stdout
+    # And a positive DONE marker is the success verdict.
+    done = _report(tmp_path, "root watchdog removal done")
+    assert "Removed root network and Tailscale watchdog timers" in done.stdout
 
 
 def test_both_uninstall_paths_report_instead_of_claiming_success():

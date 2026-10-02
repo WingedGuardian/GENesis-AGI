@@ -458,6 +458,25 @@ async def test_collect_network_suppresses_when_networkmanager(tmp_path, monkeypa
     assert result.facts["networkd_default_route_keepconfig"] is False
 
 
+async def test_collect_network_reports_the_watchdog_service_unit_state(tmp_path, monkeypatch):
+    """The posture rule needs the SERVICE's unit-file state as well as the
+    timer's: a masked service is the operator's off switch, which the timer's
+    state alone cannot show."""
+    async def fake(*argv, **_kw):
+        if argv[:2] == ("systemctl", "show"):
+            if argv[2] == "genesis-tailscale-watchdog.service":
+                return "masked"
+            if argv[2] == "genesis-tailscale-watchdog.timer":
+                return ""
+            return None  # tailscaled.service
+        return None
+
+    monkeypatch.setattr(_container, "_run_cmd", fake)
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["tailscale_watchdog_service_unit_state"] == "masked"
+    assert result.facts["tailscale_watchdog_unit_state"] == ""
+
+
 # ── cc-tmp isolation (blast-radius split) ──────────────────────────────────
 
 

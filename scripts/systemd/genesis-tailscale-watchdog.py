@@ -301,6 +301,17 @@ def daemon_identity(ctx: Ctx) -> tuple | None:
     return _identity(unit_props(ctx, "tailscaled", *_IDENTITY))
 
 
+def _start_time(props: dict | None) -> float | None:
+    """tailscaled's start in CLOCK_MONOTONIC seconds, or None when unreadable.
+    Weaker than ``_identity``: usable even when the InvocationID is not, so it
+    can still vouch for (or void) a run whose full identity could not be read."""
+    try:
+        start = int((props or {}).get("ActiveEnterTimestampMonotonic", ""))
+    except ValueError:
+        return None
+    return start / 1e6 if start > 0 else None
+
+
 def same_daemon(expected: tuple, now: tuple | None) -> bool:
     """Whether ``now`` is the same running tailscaled as ``expected``: same
     invocation, same start, still active. Unreadable is not the same."""
@@ -333,6 +344,11 @@ def restart_tailscaled(ctx: Ctx, expected: tuple) -> tuple[str, int | None]:
     now = daemon_identity(ctx)
     if now is None:
         return "not-attempted", None
+    if expected is None:
+        # The scan-start identity was unreadable: a restart's outcome cannot
+        # be judged against the daemon the scan saw, so it is not worth the
+        # dropped sessions.
+        return "not-attempted", None
     if not same_daemon(expected, now):
         return "daemon-changed", None
     before = now[0]
@@ -343,11 +359,17 @@ def restart_tailscaled(ctx: Ctx, expected: tuple) -> tuple[str, int | None]:
     )
     deadline = ctx.mono() + ctx.settings["NETWD_TS_POLL_SEC"]
     while True:
-        after = unit_props(ctx, "tailscaled", *props) or {}
-        settled = not after.get("Job") and after.get("ActiveState") not in _TRANSITIONAL
+        after = unit_props(ctx, "tailscaled", *props)
+        # A failed read is not "settled": keep polling until the window ends.
+        settled = (
+            after is not None
+            and not after.get("Job")
+            and after.get("ActiveState") not in _TRANSITIONAL
+        )
         if settled or ctx.mono() >= deadline:
             break
         ctx.sleep(1)
+    after = after or {}
     if not after.get("InvocationID"):
         return "unverified", rc
     if after.get("Job") or after.get("ActiveState") in _TRANSITIONAL:
@@ -703,10 +725,12 @@ def run_once(ctx: Ctx) -> int:
     def finish(action: str, event: dict | None = None, exit_code: int = 0) -> int:
         nonlocal events, heal_count
         # Blind: the status could not be read, or there were suspects and not
-        # one of them could be judged (scan limits, or every ping hanging).
-        judged = counters["probed"] - counters["unjudged"]
-        waiting = counters["skipped"] + counters["unjudged"]
-        blind = action in BLIND_ACTIONS or (waiting > 0 and judged == 0)
+        # one of them could be judged (scan limits, or every ping hanging), or
+        # every peer entry was malformed — and NOTHING vouched a verdict at
+        # all. A fresh handshake judged "ok" without a ping is still a judged
+        # tunnel, so unjudged/malformed peers beside it do not count as blind.
+        waiting = counters["skipped"] + counters["unjudged"] + counters["malformed_peers"]
+        blind = action in BLIND_ACTIONS or (waiting > 0 and not evidence)
         if event is not None:
             events = (events + [event])[-MAX_EVENTS:]
             if event["action"] == "healed":
@@ -756,7 +780,10 @@ def run_once(ctx: Ctx) -> int:
         return finish("unavailable")
     unit = unit_props(ctx, "tailscaled", "UnitFileState", *_IDENTITY) or {}
     # The daemon this run's verdicts describe, read BEFORE the status they rest on.
+    # judged_start is usable even when the full identity is not (an unreadable
+    # InvocationID): it is the weaker check an unknown initial identity gets.
     judged_daemon = _identity(unit)
+    judged_start = judged_daemon[2] if judged_daemon is not None else _start_time(unit)
     if unit.get("ActiveState") != "active":
         # Stopped (not crashed: "failed") AND disabled or masked: off on purpose.
         if (
@@ -771,7 +798,7 @@ def run_once(ctx: Ctx) -> int:
     if rc != 0 or not status.strip():
         return finish("unavailable")
     stale = ctx.settings["NETWD_TS_STALE_SEC"]
-    started = judged_daemon[2] if judged_daemon else None
+    started = judged_start
     zero_ok = started is not None and ctx.mono() - started > stale
     found = read_peers(status, ctx.wall(), stale, zero_ok=zero_ok)
     if found is None:
@@ -811,12 +838,29 @@ def run_once(ctx: Ctx) -> int:
     # A post-scan read that fails keeps the verdicts (one flaky systemctl call
     # should not blank a run); the check immediately before try-restart still
     # refuses to heal on anything but the same daemon.
-    after_scan = daemon_identity(ctx)
-    if (
-        judged_daemon is not None
-        and after_scan is not None
-        and not same_daemon(judged_daemon, after_scan)
-    ):
+    after_props = unit_props(ctx, "tailscaled", *_IDENTITY)
+    after_scan = _identity(after_props)
+    if judged_daemon is None:
+        # The identity could not be read at scan start: the verdicts stand only
+        # when a post-scan read still vouches for the daemon they describe —
+        # the same InvocationID, or the same start time on an active unit.
+        # A failed read or no matching marker voids them: an unseen restart
+        # would let "offline" or "ok" verdicts resolve an open alert about a
+        # daemon that is gone.
+        vouched = (
+            after_props is not None
+            and after_props.get("ActiveState") == "active"
+            and (
+                (
+                    unit.get("InvocationID")
+                    and after_props.get("InvocationID") == unit["InvocationID"]
+                )
+                or (judged_start is not None and _start_time(after_props) == judged_start)
+            )
+        )
+        if not vouched:
+            return void("tailscaled's identity is unreadable, so the verdicts cannot be vouched for")
+    elif after_scan is not None and not same_daemon(judged_daemon, after_scan):
         return void("tailscaled restarted or stopped during the scan")
     evidence.update(verdicts)
     if len(evidence) > MAX_PEERS:
