@@ -171,6 +171,10 @@ class LiteLLMDelegate:
             profile_registry if profile_registry is not None else _load_profile_registry()
         )
 
+    def for_config(self, config: RoutingConfig) -> LiteLLMDelegate:
+        """Bind a new delegate without mutating one held by in-flight requests."""
+        return type(self)(config, profile_registry=self._profiles)
+
     def _cost_from_profile(self, cfg, usage) -> tuple[float, bool]:
         """Fallback cost from model_profiles cost_per_mtok when litellm can't
         price the model. Returns ``(cost_usd, cost_known)``."""
