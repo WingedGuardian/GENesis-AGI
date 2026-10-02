@@ -98,6 +98,13 @@ _LINE_ENDS = re.compile(r"\r\n|\r|\n")
 #: opener's character and be at least as long. Mirrors the sibling scanner.
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 
+
+def _fence_indent_ok(line: str) -> bool:
+    """A fence delimiter lives at zero-to-three leading spaces; four or more
+    is an indented code block. Mirrors the sibling scanner."""
+    expanded = line.expandtabs(4)
+    return len(expanded) - len(expanded.lstrip(" ")) <= 3
+
 #: Words that state an omission rather than a decision. `none` is deliberately NOT
 #: here — it is a VALID declaration when it carries a reason, and is classified
 #: before this set is consulted.
@@ -215,8 +222,14 @@ def _local_readable_body(body: str) -> str:
     fence: str | None = None
     for line in _LINE_ENDS.split(body[:_MAX_BODY]):
         if fence is not None:
-            closer = _FENCE_RUN.match(line.strip())
-            if closer and closer.group(0)[0] == fence[0] and len(closer.group(0)) >= len(fence):
+            stripped_close = line.strip()
+            closer = _FENCE_RUN.match(stripped_close) if _fence_indent_ok(line) else None
+            if (
+                closer
+                and closer.group(0)[0] == fence[0]
+                and len(closer.group(0)) >= len(fence)
+                and not stripped_close[closer.end() :].strip()
+            ):
                 fence = None
             continue
         out: list[str] = []
@@ -239,7 +252,7 @@ def _local_readable_body(body: str) -> str:
             rest = rest[open_at + len(_COMMENT_OPEN) :]
         kept = "".join(out)
         stripped = kept.strip()
-        run = _FENCE_RUN.match(stripped)
+        run = _FENCE_RUN.match(stripped) if _fence_indent_ok(kept) else None
         if run:
             fence = run.group(0)
         else:

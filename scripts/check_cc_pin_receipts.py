@@ -185,6 +185,17 @@ _LINE_ENDS = re.compile(r"\r\n|\r|\n")
 #: documented example inside one read as visible text.
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
 
+
+def _fence_indent_ok(line: str) -> bool:
+    """A fence delimiter lives at zero-to-three leading spaces.
+
+    Four or more (a tab expands to up to four columns) makes the line an
+    indented CODE block, not a fence — without the check, an indented run opens
+    a phantom fence that hides real receipts, and an indented line closes a
+    fence the renderer never closed."""
+    expanded = line.expandtabs(4)
+    return len(expanded) - len(expanded.lstrip(" ")) <= 3
+
 #: GitHub's PR-body limit. Bound the work regardless of the scanner's O(n).
 _MAX_BODY = 65_536
 
@@ -337,8 +348,16 @@ def readable_body(body: str) -> str:
         # there is no comment stripping to apply, and Markdown wants the marker at
         # the start of the line regardless.
         if fence is not None:
-            closer = _FENCE_RUN.match(line.strip())
-            if closer and closer.group(0)[0] == fence[0] and len(closer.group(0)) >= len(fence):
+            stripped_close = line.strip()
+            closer = _FENCE_RUN.match(stripped_close) if _fence_indent_ok(line) else None
+            if (
+                closer
+                and closer.group(0)[0] == fence[0]
+                and len(closer.group(0)) >= len(fence)
+                # CommonMark allows NOTHING but spaces after a closing marker —
+                # ````python is an example's content line, not a closer.
+                and not stripped_close[closer.end() :].strip()
+            ):
                 fence = None
             continue
 
@@ -359,7 +378,7 @@ def readable_body(body: str) -> str:
         # block, which is how a receipt below a mismatched closer stayed
         # rendered-as-code while counting as visible. (The close is handled at the
         # top of the loop; this is the OPEN.)
-        if stripped.startswith(_FENCE_MARKS):
+        if stripped.startswith(_FENCE_MARKS) and _fence_indent_ok(rendered):
             # Record the whole RUN, not three characters: the closer must be
             # the same character at least as long as the opener.
             fence = _FENCE_RUN.match(stripped).group(0)

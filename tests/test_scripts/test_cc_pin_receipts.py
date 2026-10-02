@@ -520,6 +520,34 @@ def test_cr_and_crlf_still_end_a_line() -> None:
     assert receipts.readable_body("a\rb\r\nc\n") == "a\nb\nc"
 
 
+def test_a_closer_with_trailing_text_does_not_close() -> None:
+    """Devin Review: CommonMark allows NOTHING but spaces after a closing
+    marker, so ````python inside a ```` fence is an example's content line —
+    the fence stays open and its receipts stay hidden."""
+    body = f"````\n````python\n{BOTH}````\n"
+    _assert_blocked(_evaluate(body=body), "receipts")
+    assert receipts.readable_body("````\n````python\nhidden\n````\nvisible\n") == "visible"
+
+
+@pytest.mark.parametrize("indent", ["    ", "\t"])
+def test_an_indented_marker_is_indented_code_not_a_fence(indent: str) -> None:
+    """Devin Review: a delimiter preceded by 4+ columns is indented code.
+    Both directions corrupt the scan without the check — a stray indented run
+    opens a PHANTOM fence hiding real receipts, and an indented line inside a
+    fence closes it early, exposing the example."""
+    # Phantom opener: the indented run must NOT hide the receipt below it.
+    body = f"{indent}```\n{BOTH}"
+    _assert_passes(_evaluate(body=body))
+    # Phantom closer: the indented run inside a real fence must NOT close it.
+    fenced = f"````\n{indent}````\n{BOTH}````\n"
+    _assert_blocked(_evaluate(body=fenced), "receipts")
+
+
+def test_a_delimiter_at_three_spaces_still_counts() -> None:
+    """The indent rule tops out at three spaces — a fence there is real."""
+    _assert_blocked(_evaluate(body=f"   ```\n{BOTH}   ```\n"), "receipts")
+
+
 def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
     """MEASURED over-rejection, on a gate with no override sigil.
 

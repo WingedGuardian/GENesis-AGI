@@ -69,6 +69,10 @@ def test_the_two_scanners_agree_on_marker_visibility(e2e):
         "````\n```\nE2E: inside a longer fence\n```\n````\n",
         "prose\x85E2E: joined by NEL\n",
         "prose\u2028E2E: joined by a line separator\n",
+        # Devin Review on #2777 — a closer may carry no trailing text, and a
+        # 4-space-indented run is indented code, not a delimiter.
+        "````\n````python\nE2E: inside a mis-marked fence\n````\n",
+        "    ```\nE2E: under an indented marker\n",
     ]
     for body in bodies:
         shared = e2e.readable_body(body)
