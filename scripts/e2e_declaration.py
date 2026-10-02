@@ -249,7 +249,8 @@ def _local_readable_body(body: str) -> str:
         run = _FENCE_RUN.match(stripped)
         if run:
             fence = run.group(0)
-        else:
+        elif stripped:
+            # The sibling drops empty lines — blank and comment-only alike.
             visible.append(kept)
     return "\n".join(visible)
 
