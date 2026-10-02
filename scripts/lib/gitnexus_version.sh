@@ -23,10 +23,22 @@ genesis_gitnexus_node_version_supported() {
 # Optional machine selection shared by analyzer and MCP readers. A single-line
 # absolute node path selects only this process's PATH, never global Node.
 genesis_gitnexus_select_node() {
-    local selected="${GITNEXUS_NODE_BIN:-}" config="${GENESIS_HOME:-${HOME:-}/.genesis}/gitnexus-node" version
-    if [ -z "$selected" ] && { [ -e "$config" ] || [ -L "$config" ]; }; then
-        selected="$(cat -- "$config")" || return 1
-        [ -n "$selected" ] || { printf 'GitNexus: empty Node selection: %s\n' "$config" >&2; return 1; }
+    local selected="${GITNEXUS_NODE_BIN:-}" config version machine_home resolved_home
+    if [ -z "$selected" ]; then
+        machine_home="${GENESIS_HOME:-}"
+        if [ -z "$machine_home" ]; then
+            resolved_home="${HOME:-}"
+            if [ -z "$resolved_home" ]; then
+                resolved_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || return 1
+                [ -n "$resolved_home" ] || { printf 'GitNexus: user home unavailable for Node selection\n' >&2; return 1; }
+            fi
+            machine_home="$resolved_home/.genesis"
+        fi
+        config="$machine_home/gitnexus-node"
+        if [ -e "$config" ] || [ -L "$config" ]; then
+            selected="$(cat -- "$config")" || return 1
+            [ -n "$selected" ] || { printf 'GitNexus: empty Node selection: %s\n' "$config" >&2; return 1; }
+        fi
     fi
     [ -n "$selected" ] || return 0
     if [[ "$selected" != /* || "${selected##*/}" != node ]] || [[ "$selected" == *$'\n'* || "$selected" == *:* ]] || [ ! -x "$selected" ]; then

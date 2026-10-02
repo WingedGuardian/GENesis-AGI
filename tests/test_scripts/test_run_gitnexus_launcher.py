@@ -321,3 +321,36 @@ genesis_gitnexus_select_node || exit 1
 '''
     result = subprocess.run(["bash", "-c", script, "bash", str(library)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("passwd_available", [True, False])
+def test_node_selection_when_home_scrubbed(tmp_path, passwd_available):
+    binary, log = _fake_gitnexus(tmp_path, "1.6.12")
+    home_dir = tmp_path / "passwd-home"
+    config_dir = home_dir / ".genesis"
+    config_dir.mkdir(parents=True)
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    node = selected_dir / "node"
+    node.write_text("#!/bin/sh\necho v22.23.2\n")
+    node.chmod(0o755)
+    (config_dir / "gitnexus-node").write_text(str(node)+"\n")
+    fakebin = tmp_path / "incoming"
+    fakebin.mkdir()
+    wrong_node = fakebin / "node"
+    wrong_node.write_text("#!/bin/sh\necho v23.0.0\n")
+    wrong_node.chmod(0o755)
+    getent = fakebin / "getent"
+    getent.write_text(f"#!/bin/sh\necho 'test:x:1000:1000::{home_dir}:/bin/bash'\n" if passwd_available else "#!/bin/sh\nexit 1\n")
+    getent.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fakebin}:/usr/bin:/bin", "GITNEXUS_BIN": str(binary)}
+    for key in ["HOME", "GENESIS_HOME", "GITNEXUS_NODE_BIN"]:
+        env.pop(key, None)
+    result = subprocess.run([str(LAUNCHER), "mcp"], env=env, capture_output=True, text=True)
+    if passwd_available:
+        assert result.returncode == 0, result.stderr
+        assert log.read_text() == "mcp\n"
+    else:
+        assert result.returncode != 0
+        assert "home unavailable" in result.stderr
+        assert not log.exists()
