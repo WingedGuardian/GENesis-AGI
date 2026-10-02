@@ -41,7 +41,7 @@ _RETRY_BASE_S = 5.0
 # provider DIRECTLY (offline harnesses: reflection calibration, bench, skill-
 # replay, experiment guards), bypassing the runtime `judge` YAML chain, so it
 # must name a V4-pro provider explicitly. `nvidia-nim-deepseek` now serves
-# V4-flash (NIM EOL'd V4-pro), so use the paid OpenRouter V4-pro to keep the
+# V4.1-flash (NIM EOL'd V4-pro), so use the paid OpenRouter V4-pro to keep the
 # offline eval baseline comparable.
 DEFAULT_GEN_PROVIDER = "groq-free"
 DEFAULT_JUDGE_PROVIDER = "openrouter-deepseek-v4"
@@ -54,7 +54,7 @@ def _default_config_path() -> Path:
 def default_judge_chain(judge_provider: str | None = None) -> list[str]:
     """The offline judge fallback chain — mirrors the runtime ``judge`` call
     site EXACTLY by reading it from the shipped routing config, so it can never
-    drift (calibrated V4-pro first, then NIM V4-flash + paid V4-flash for
+    drift (calibrated V4-pro first, then NIM V4.1-flash + paid V4.1-flash for
     resilience). Deriving from config (rather than hardcoding
     ``[DEFAULT_JUDGE_PROVIDER, ...]``) also means the primary can never be
     duplicated in the chain — a duplicate would make StandaloneLiteLLMRouter

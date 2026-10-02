@@ -654,6 +654,14 @@ gate works, its exemption categories, and the unit rules for size bounds:
   One line is enough when building is right (`BUILD — cognitive core, no
   external substitute, searched: <terms>`); the point is that the question gets
   asked BEFORE the effort, which is the only moment it is cheap to answer.
+  **A plan or issue that specifies work answers the five premise questions
+  before work starts** — the plan-time half of the check in
+  `.claude/docs/premise-check.md`:
+  1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
+  2. Was the repo searched for existing code that already does this, with the result written down?
+  3. Do the scope limits block the obvious shared code?
+  4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
+  5. Does every number say how it was measured (what was counted, by which script)?
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for

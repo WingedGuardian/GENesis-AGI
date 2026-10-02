@@ -1386,14 +1386,15 @@ def _commit_budget_reason(result: dict) -> str:
     if result.get("gate_surface"):
         # Unlike the push guard's gate-surface branch, this one has no
         # still-within-budget sub-state to get wrong: reaching here needs
-        # `commit_approval`, which is `count > GATE_DISCOVERY_ROUND_LIMIT`, while
-        # `confirmation_exempt` requires `count == GATE_DISCOVERY_ROUND_LIMIT`. The
+        # `commit_approval`, which is `count > GATE_DISCOVERY_ROUND_LIMIT` or the
+        # limit with its one confirmation already spent, while
+        # `confirmation_exempt` requires the limit with it UNSPENT. The
         # two are mutually exclusive, so the budget genuinely IS spent and the
         # terminal decision is the truthful thing to name. Recorded so the next
         # audit does not re-raise the push guard's defect against this branch.
         return (
-            f"PR #{pr} changes the review-gate surface and has {count} distinct "
-            f"reviewed heads. Its {review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery "
+            f"PR #{pr} changes the review-gate surface and has {count} review "
+            f"rounds. Its {review_budget.GATE_DISCOVERY_ROUND_LIMIT} discovery "
             "rounds plus confirmation are spent. "
             f"{review_budget.TERMINAL_DECISION} Approve this one additional fix "
             "commit only; earlier approval does not carry forward."
@@ -1403,7 +1404,7 @@ def _commit_budget_reason(result: dict) -> str:
         # STRONGLY_DISCOURAGED_REVIEWED_HEADS, so the rule's "there is no ordinary
         # round 5" would be rendered to someone who already holds five heads.
         return (
-            f"PR #{pr} has {count} distinct reviewed heads — past the terminal "
+            f"PR #{pr} has {count} review rounds — past the terminal "
             "boundary. Further work is strongly discouraged: stop, narrow or "
             "redesign, accept documented residue, or abandon it. "
             f"{review_budget.TERMINAL_DECISION} Approve only this single additional "
@@ -1415,7 +1416,7 @@ def _commit_budget_reason(result: dict) -> str:
     # the sentence after it. The boundary claim is true in this branch, where the
     # count is exactly the ordinary limit.
     return (
-        f"PR #{pr} has {count} distinct reviewed heads; standing authorization ended "
+        f"PR #{pr} has {count} review rounds; standing authorization ended "
         f"after {review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
         f"{review_budget.ORDINARY_TERMINAL_RULE} Approve this single fix commit only — "
         "it authorizes no review round, and a previous approval cannot authorize "

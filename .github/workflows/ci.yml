@@ -1079,4 +1079,31 @@ jobs:
         # after the last test-adding edit, not against an earlier state of the
         # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
         # ceiling does not move. Floor: 23582 + 24 = 23606.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23606
+        #
+        # UNION with the entity apply-rails PR (#1729). Measured against main's
+        # versions with --collect-only, after the last test-adding edit:
+        #   test_entity_adjudication.py         50 -> 62   (+12)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
+        #   test_entity_adjudication_config.py  13 -> 15   (+2)
+        #   test_migration_0065_...             14 -> 14   (0)
+        # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
+        # superseded by this count. No new skips, so the ceiling holds.
+        # Floor: 23606 + 38 = 23644.
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        # GitNexus routine refresh: focused edited files collect 123 -> 135
+        # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
+        # Routing generations: 143 collected across the four new generation files.
+        # Floor 23721 + 143 = 23864; skip ceiling remains 102.
+        # #2735 stacked-PR contract: test_ci_triggers.py 0 -> 5 (+5: main-only
+        # PR trigger, no edited type, push/schedule/dispatch unchanged,
+        # cc-pin merge-base, and the origin/main line allowlist); no added
+        # skips. Floor: 23864 + 5 = 23869.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23869

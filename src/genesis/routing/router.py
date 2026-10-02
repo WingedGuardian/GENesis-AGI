@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 
 from genesis.db.crud.events import MSG_GROUP_PREFIX_LEN
@@ -18,6 +19,8 @@ from genesis.routing.daily_budget import DailyBudgetLedger
 from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.degradation import DegradationTracker
 from genesis.routing.essential import build_essential_provider_map
+from genesis.routing.litellm_delegate import LiteLLMDelegate
+from genesis.routing.provider_identity import provider_identity, retirement_failure
 from genesis.routing.rate_gate import RateGateRegistry
 from genesis.routing.retry import classify_error, compute_delay
 from genesis.routing.types import (
@@ -98,6 +101,7 @@ class Router:
         dead_letter: DeadLetterQueue | None = None,
         daily_budget: DailyBudgetLedger | None = None,
     ) -> None:
+        self._routing_lock = threading.RLock()
         self.config = config
         self.breakers = breakers
         self.cost_tracker = cost_tracker
@@ -118,39 +122,49 @@ class Router:
                 registry.register(name, provider.rpm_limit)
         return registry
 
+    def health_snapshot(self) -> tuple[RoutingConfig, dict]:
+        """Bind health readers/probes to the same generation as routed calls."""
+        with self._routing_lock:
+            return self.config, {name: self.breakers.get(name) for name in self.config.providers}
+
+    def health_resilience(self, config: RoutingConfig, captured_breakers, state_machine) -> dict:
+        """Render captured health; only the current generation projects live state.
+
+        The identity check and projection share reload's publication lock, so a
+        concurrent reload cannot publish between validation and the cloud update.
+        """
+        from genesis.observability.snapshots.infrastructure import resilience_state_detail
+
+        with self._routing_lock:
+            machine = state_machine if self.config is config else None
+            return resilience_state_detail(captured_breakers, machine)
+
     def set_activity_tracker(self, tracker: ProviderActivityTracker) -> None:
         """Inject activity tracker for per-provider call metrics."""
         self._activity_tracker = tracker
 
     def reload_config(self, new_config: RoutingConfig) -> None:
-        """Hot-swap routing config. Preserves circuit breaker state.
+        """Publish coherent request bindings while retaining runtime registries.
 
-        Safe for asyncio — single-threaded, reference swap is atomic.
-        Note: in-flight route_call() may hold references to old config's
-        call sites but looks up providers from self.config. Ensure removed
-        providers are not referenced by in-flight calls (practically safe
-        since provider removal is rare and asyncio is cooperative).
-
-        This method is intentionally synchronous to preserve the existing
-        Flask sync-route contract. Callers that want the proactive DLQ
-        orphan scan (which complements the reactive call_site_id cleanup
-        inside ``DeadLetterQueue.redispatch``) should call
-        ``scan_dlq_orphans_after_reload()`` immediately after this.
+        Existing requests capture their config/delegate/gates/breakers before
+        yielding. Removed or replaced breakers are detached from live callbacks.
+        Preparation failure leaves the previous bindings in place. Callers may
+        separately run ``scan_dlq_orphans_after_reload()`` after this sync method.
         """
-        old_sites = set(self.config.call_sites)
-        new_sites = set(new_config.call_sites)
-        self.config = new_config
-        self._rate_gates = self._build_rate_gates(new_config)
-
-        # Update breaker registry so get() can create breakers for new providers
-        self.breakers.update_providers(new_config.providers)
-        # Which essential sites are blocked is a property of the config, so the
-        # coverage map is rebuilt with it (a no-op for a registry built without one).
-        self.breakers.refresh_essential_sites(build_essential_provider_map(new_config))
-
-        # Ensure circuit breakers exist for all providers
-        for name in new_config.providers:
-            self.breakers.get(name)  # get-or-create
+        with self._routing_lock:
+            old_sites = set(self.config.call_sites)
+            new_sites = set(new_config.call_sites)
+            delegate = (
+                self.delegate.for_config(new_config)
+                if isinstance(self.delegate, LiteLLMDelegate) else self.delegate
+            )
+            gates = self._rate_gates.reconfigured(new_config.providers, self.breakers._alias_target)
+            essential_sites = build_essential_provider_map(new_config)
+            self.breakers.update_providers(new_config.providers)
+            self.breakers.refresh_essential_sites(essential_sites)
+            self.config = new_config
+            self.delegate = delegate
+            self._rate_gates = gates
 
         # The onboarding floor derives its accepted LLM provider types from this
         # config's call-site chains (lru-cached). Invalidate here — inside
@@ -272,8 +286,14 @@ class Router:
         **kwargs,
     ) -> RoutingResult:
         """Route a call through the provider chain (the actual routing logic)."""
+        with self._routing_lock:
+            config = self.config
+            delegate = self.delegate
+            rate_gates = self._rate_gates
+            breaker_bindings = {name: self.breakers.get(name) for name in config.providers}
+
         # 1. Check call site exists
-        if call_site_id not in self.config.call_sites:
+        if call_site_id not in config.call_sites:
             return RoutingResult(
                 success=False,
                 call_site_id=call_site_id,
@@ -288,13 +308,13 @@ class Router:
                 error=f"Degradation level {self.degradation.current_level} skips {call_site_id}",
             )
 
-        site = self.config.call_sites[call_site_id]
-        policy = self.config.retry_profiles.get(site.retry_profile)
+        site = config.call_sites[call_site_id]
+        policy = config.retry_profiles.get(site.retry_profile)
         if policy is None:
-            policy = self.config.retry_profiles["default"]
+            policy = config.retry_profiles["default"]
 
         # 3. Filter chain (and rotate for parallelization)
-        chain = self._filter_chain(site)
+        chain = self._filter_chain(site, config)
         if not chain:
             return RoutingResult(
                 success=False,
@@ -337,7 +357,7 @@ class Router:
             # provider always gets a shot; later providers are gated.
             if deadline is not None and time.monotonic() >= deadline:
                 break
-            provider_cfg = self.config.providers[provider_name]
+            provider_cfg = config.providers[provider_name]
 
             # Skip providers with no API key — treat as down-by-config.
             # Same effect as a tripped CB: no LiteLLM call, no failure
@@ -349,7 +369,7 @@ class Router:
                 continue
 
             # Skip if circuit breaker is open
-            cb = self.breakers.get(provider_name)
+            cb = breaker_bindings[provider_name]
             if not cb.is_available():
                 failed_providers.append(provider_name)
                 skipped.append((provider_name, "breaker open"))
@@ -384,7 +404,7 @@ class Router:
                 continue
 
             # Rate gate — pace requests per provider RPM limit
-            await self._rate_gates.acquire(provider_name)
+            await rate_gates.acquire(provider_name)
 
             # RECHECK after the gate. The check above happened BEFORE a sleep
             # that can last seconds, and `acquire` queues concurrent callers —
@@ -405,9 +425,10 @@ class Router:
 
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
+            retirement_evidence: list[bool] = []
             result = await self._try_with_retry(
                 provider_name, provider_cfg.model_id, messages, policy,
-                deadline=deadline, **kwargs,
+                deadline=deadline, delegate=delegate, retirement_evidence=retirement_evidence, **kwargs,
             )
             latency_ms = (time.monotonic() - t0) * 1000
             attempts += 1
@@ -543,13 +564,19 @@ class Router:
                 if category not in (
                     ErrorCategory.RATE_LIMITED, ErrorCategory.BAD_REQUEST,
                 ):
-                    tripped = cb.record_failure(category)
-                    if tripped and self._event_bus:
+                    tripped = cb.record_failure(category, retirement=bool(retirement_evidence) and all(retirement_evidence))
+                    # Late outcomes retain their old result identity, but must
+                    # not publish current-health events for a replacement alias.
+                    with self._routing_lock:
+                        current = self.breakers._breakers.get(provider_name) is cb
+                    if tripped and current and self._event_bus:
                         await self._event_bus.emit(
                             Subsystem.ROUTING, Severity.WARNING,
                             "breaker.tripped",
                             f"Circuit breaker tripped for {provider_name}",
                             provider=provider_name,
+                            health_identity=provider_identity(provider_cfg),
+                            incident_identity=cb._incident_identity,
                             call_site=call_site_id,
                         )
 
@@ -643,15 +670,17 @@ class Router:
             dead_lettered=dead_lettered,
         )
 
-    def _filter_chain(self, site) -> list[str]:
+    def _filter_chain(self, site, config: RoutingConfig | None = None) -> list[str]:
         """Filter chain based on never_pays constraint."""
+        config = config or self.config
         if site.never_pays:
-            return [p for p in site.chain if self.config.providers[p].is_free]
+            return [p for p in site.chain if config.providers[p].is_free]
         return list(site.chain)
 
     async def _try_with_retry(
         self, provider: str, model_id: str, messages: list[dict], policy,
-        *, deadline: float | None = None, **kwargs,
+        *, deadline: float | None = None, delegate: CallDelegate | None = None,
+        retirement_evidence: list[bool] | None = None, **kwargs,
     ) -> CallResult:
         """Try calling a provider with retries. Returns last result."""
         # reached_provider=False: nothing was called yet. Unreachable at the
@@ -662,6 +691,7 @@ class Router:
         last_result = CallResult(
             success=False, error="no attempts made", reached_provider=False
         )
+        delegate = delegate or self.delegate
         max_attempts = policy.max_retries + 1
 
         for attempt in range(max_attempts):
@@ -671,10 +701,12 @@ class Router:
             # in-flight call.
             if attempt > 0 and deadline is not None and time.monotonic() >= deadline:
                 return last_result
-            result = await self.delegate.call(provider, model_id, messages, **kwargs)
+            result = await delegate.call(provider, model_id, messages, **kwargs)
             if result.success:
                 return result
 
+            if retirement_evidence is not None:
+                retirement_evidence.append(retirement_failure(result, model_id))
             last_result = result
             category = classify_error(result.status_code, result.error or "")
 

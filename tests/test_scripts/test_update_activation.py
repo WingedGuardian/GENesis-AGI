@@ -669,7 +669,7 @@ def test_the_rollback_saves_edits_before_its_reset():
     body = text[start : text.index("\n}\n", start)]
     body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
     save = body.index('_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"')
-    reset = body.index('reset --hard "$ROLLBACK_TAG"')
+    reset = body.index('checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"')
     assert save < reset
 
 

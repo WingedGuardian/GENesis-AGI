@@ -232,6 +232,106 @@ def test_an_unreadable_status_returns_2_not_a_clean_tree(tmp_path):
     assert r.stdout.startswith("RC=2"), r.stdout
 
 
+def _hide(root: Path, flag: str, change: str, path: str = "code.py") -> None:
+    """Flag <path> and then change it in the working tree, the way git status
+    cannot see (both flags hide the change from it; measured, git 2.43)."""
+    _git(root, "update-index", f"--{flag}", path)
+    p = root / path
+    if change == "content":
+        p.write_text("hidden edit\n")
+    elif change == "chmod":
+        p.chmod(0o755)
+    elif change == "symlink":
+        p.unlink()
+        p.symlink_to("elsewhere")
+    elif change == "delete":
+        p.unlink()
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+@pytest.mark.parametrize("change", ["content", "chmod", "symlink", "delete"])
+def test_a_change_hidden_behind_a_flag_is_dirty(repos, flag, change):
+    """A deploy, or a restart after a rollback, must not run on code git status
+    hides. The real index keeps its flag: the comparison uses a scratch copy."""
+    root = repos["primary"]
+    _hide(root, flag, change)
+    plain = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True
+    ).stdout
+    assert plain == "", f"control: git status hides the change ({plain!r})"
+    r = _dirty(root)
+    assert r.stdout.startswith("RC=0\n") and r.stdout.rstrip().endswith("code.py"), r.stdout
+    tag = "h" if flag == "assume-unchanged" else "S"
+    assert _git(root, "ls-files", "-v", "code.py") == f"{tag} code.py"
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+def test_a_flagged_but_unchanged_path_is_clean(repos, flag):
+    root = repos["primary"]
+    _git(root, "update-index", f"--{flag}", "code.py")
+    (root / "code.py").touch()
+    r = _dirty(root)
+    assert r.stdout == "RC=0\n", r.stdout
+
+
+def test_an_ordinary_edit_is_listed_once_beside_a_hidden_one(repos):
+    """The second read adds only what status hid: a visible edit already in the
+    status listing is not repeated."""
+    root = repos["primary"]
+    _hide(root, "assume-unchanged", "content")
+    (root / "AGENTS.md").write_text("x\n")
+    _git(root, "update-index", "--no-assume-unchanged", "code.py")
+    (root / "extra.py").write_text("e\n")
+    _git(root, "add", "extra.py")
+    _git(root, "commit", "-qm", "extra")
+    _git(root, "update-index", "--assume-unchanged", "code.py")
+    (root / "extra.py").write_text("visible edit\n")
+    r = _dirty(root)
+    lines = r.stdout.splitlines()[1:]
+    assert sorted(lines) == [" M code.py", " M extra.py"], r.stdout
+
+
+@pytest.mark.parametrize("edited", [False, True])
+def test_a_listing_larger_than_a_pipe_buffer_still_reads(tmp_path, edited):
+    """The flag search must not end early inside a pipeline: an early-exiting grep
+    makes git die of SIGPIPE on a listing over a pipe buffer, which pipefail (the
+    callers' shell options, set by _bash) turned into "status unreadable", so one
+    flagged entry refused every deploy. The flagged entry sorts FIRST, so the
+    search finds it within the first buffer."""
+    root = tmp_path / "big"
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    (root / "aaa_first.py").write_text("x = 1\n")
+    many = root / "many"
+    many.mkdir()
+    for i in range(3000):
+        (many / f"file_with_a_reasonably_long_name_{i:05d}.txt").write_text("")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "init")
+    listing = _git(root, "ls-files", "-v")
+    assert len(listing) > 128 * 1024, "control: the listing must exceed a pipe buffer"
+    _git(root, "update-index", "--assume-unchanged", "aaa_first.py")
+    if edited:
+        (root / "aaa_first.py").write_text("hidden\n")
+    r = _dirty(root)
+    assert r.stdout == ("RC=0\n M aaa_first.py" if edited else "RC=0\n"), r.stdout
+
+
+def test_flagged_entries_are_detected_for_the_refusal_hint(repos, tmp_path):
+    root = repos["primary"]
+    probe = 'genesis_has_flagged_entries "{}" && echo YES || echo NO'
+    assert _bash(probe.format(root)).stdout == "NO\n"
+    _git(root, "update-index", "--skip-worktree", "code.py")
+    assert _bash(probe.format(root)).stdout == "YES\n"
+    assert _bash(probe.format(tmp_path / "not-a-repo")).stdout == "NO\n"
+
+
+def test_a_hidden_change_to_an_excused_path_is_still_excused(repos):
+    root = repos["primary"]
+    _hide(root, "assume-unchanged", "content", path="AGENTS.md")
+    r = _dirty(root)
+    assert r.stdout == "RC=0\n", r.stdout
+
+
 # ── genesis_range_collisions ────────────────────────────────────────────────
 
 
