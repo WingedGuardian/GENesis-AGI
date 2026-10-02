@@ -42,9 +42,7 @@ def _run_text(job: dict) -> str:
 
 def _env_text(job: dict) -> str:
     return "\n".join(
-        str(v)
-        for step in job.get("steps", [])
-        for v in (step.get("env") or {}).values()
+        str(v) for step in job.get("steps", []) for v in (step.get("env") or {}).values()
     )
 
 
@@ -82,26 +80,58 @@ def test_no_job_hardcodes_main_as_pr_base():
 
     On pull_request events the comparison base is the PR's own base commit;
     `origin/main` is only legitimate on push/schedule/dispatch, where the PR
-    base SHA does not exist. Each remaining literal use is allowlisted with
-    its reason.
+    base SHA does not exist. Each remaining literal use is allowlisted by
+    EXACT command line — a new use inside an already-exempted job still
+    trips this test, and a renamed command leaves a dead exemption behind,
+    which the stale-guard assertion rejects.
     """
-    allowlist = {
-        "cc-pin-receipts": (
+    allowlist: dict[tuple[str, str], str] = {
+        (
+            "cc-pin-receipts",
+            'base="$(git merge-base origin/main HEAD 2>/dev/null || true)"',
+        ): (
             "PR runs check out the merge ref, whose first parent is main at "
             "CI time, so merge-base origin/main HEAD is the PR's base; "
             "pull_request.base.sha lags main (#2774)"
         ),
-        "migration-check": (
+        (
+            "migration-check",
+            'if [[ -z "$base" ]] && git rev-parse --verify -q origin/main >/dev/null \\',
+        ): (
+            "origin/main is reached only when PR_BASE_SHA (a pull_request event "
+            "field, base-branch-relative) and PUSH_BEFORE_SHA are both absent — "
+            "i.e. schedule/dispatch, where main is the correct anchor"
+        ),
+        (
+            "migration-check",
+            '&& [[ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]]; then',
+        ): (
+            "origin/main is reached only when PR_BASE_SHA (a pull_request event "
+            "field, base-branch-relative) and PUSH_BEFORE_SHA are both absent — "
+            "i.e. schedule/dispatch, where main is the correct anchor"
+        ),
+        (
+            "migration-check",
+            'base="origin/main"',
+        ): (
             "origin/main is reached only when PR_BASE_SHA (a pull_request event "
             "field, base-branch-relative) and PUSH_BEFORE_SHA are both absent — "
             "i.e. schedule/dispatch, where main is the correct anchor"
         ),
     }
+    seen: set[tuple[str, str]] = set()
     offenders = []
     for name, job in _load()["jobs"].items():
-        if "origin/main" in _run_text(job) and name not in allowlist:
-            offenders.append(name)
+        for line in _run_text(job).split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#") or "origin/main" not in stripped:
+                continue
+            if (name, stripped) in allowlist:
+                seen.add((name, stripped))
+            else:
+                offenders.append((name, stripped))
     assert not offenders, (
-        f"step scripts using literal origin/main without an allowlisted reason: "
-        f"{offenders}"
+        f"step-script lines using literal origin/main without an allowlisted reason: {offenders}"
     )
+    stale = set(allowlist) - seen
+    assert not stale, f"allowlist entries no longer present in ci.yml: {stale}"

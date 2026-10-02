@@ -1100,4 +1100,8 @@ jobs:
         # Floor: 23644 + 65 = 23709.
         # GitNexus routine refresh: focused edited files collect 123 -> 135
         # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23721
+        # #2735 stacked-PR contract: test_ci_triggers.py 0 -> 5 (+5: main-only
+        # PR trigger, no edited type, push/schedule/dispatch unchanged,
+        # cc-pin merge-base, and the origin/main line allowlist); no added
+        # skips. Floor: 23721 + 5 = 23726.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23726
