@@ -110,12 +110,17 @@ try:
                        and args[:4] == ["start-mcp-server", "--context", "claude-code", "--project"]
                        and isinstance(args[4], str) and Path(args[4]).is_absolute()
                        and Path(args[4]).resolve() == root)
+    command = entry.get("command")
+    managed = (isinstance(command, str) and Path(command).is_absolute()
+               and Path(command).parts[-3:] == (".claude", "mcp", "run-serena")
+               and args == ["--context", "claude-code"])
     legacy = (entry.get("command") == "serena" and project_matches
               and entry.get("type", "stdio") == "stdio" and not entry.get("env"))
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
     print("failed")
     sys.exit(0)
-if not present or legacy:
+managed = managed and entry.get("type", "stdio") == "stdio" and not entry.get("env")
+if not present or legacy or (managed and command != str(root / ".claude/mcp/run-serena")):
     # One atomic update; remove/add would lose the old entry on CLI failure.
     temporary = None
     try:
@@ -143,7 +148,7 @@ PYCODE
         migrated) echo "  Serena: migrated legacy project registration"; return 0 ;;
         failed) echo "  WARNING: Serena migration failed; existing registration retained"; return 0 ;;
     esac
-    echo "  Serena: existing custom project registration retained"
+    echo "  Serena: existing project registration retained"
 )
 
 _register_mcp() {

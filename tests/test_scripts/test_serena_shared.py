@@ -224,7 +224,9 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
         assert calls.read_text() == "tool upgrade serena-agent\n"
 
 
-@pytest.mark.parametrize("project_path", ["canonical", "symlink", "other"])
+@pytest.mark.parametrize(
+    "project_path", ["canonical", "symlink", "other", "moved", "deleted", "current"]
+)
 @pytest.mark.parametrize("custom,fail_publication", [(False, False), (True, False), (False, True)])
 def test_legacy_project_registration_migrates_without_touching_custom_entry(
     tmp_path, custom, fail_publication, project_path
@@ -233,18 +235,29 @@ def test_legacy_project_registration_migrates_without_touching_custom_entry(
     alias = tmp_path / "alias"
     alias.symlink_to(root, target_is_directory=True)
     stored_project = {"canonical": root, "symlink": alias, "other": tmp_path / "other"}[
-        project_path
+        project_path if project_path in ("canonical", "symlink", "other") else "canonical"
     ]
     entry = {
         "command": "serena",
         "args": ["start-mcp-server", "--context", "claude-code", "--project", str(stored_project)],
     }
+    if project_path in ("moved", "deleted", "current"):
+        old = (
+            root / ".claude/mcp/run-serena"
+            if project_path == "current"
+            else tmp_path / "old/.claude/mcp/run-serena"
+        )
+        if project_path == "moved":
+            old.parent.mkdir(parents=True)
+            old.write_text("operator checkout launcher")
+        entry = {"command": str(old), "args": ["--context", "claude-code"]}
     if custom:
         entry["env"] = {"CUSTOM": "preserve"}
     other = {"command": "/operator/other", "args": ["preserve"]}
     config = root / ".mcp.json"
     config.write_text(json.dumps({"mcpServers": {"serena": entry, "other": other}}))
     config.chmod(0o640)
+    original = config.read_bytes()
     user_config = {"mcpServers": {"serena": {"command": "/operator/serena"}}}
     (tmp_path / ".claude.json").write_text(json.dumps(user_config))
     bindir = tmp_path / "bin"
@@ -288,6 +301,8 @@ exec(compile(sys.stdin.read(), '<registration helper>', 'exec'))
         if custom or fail_publication or project_path == "other"
         else {"command": str(root / ".claude/mcp/run-serena"), "args": ["--context", "claude-code"]}
     )
+    if custom or fail_publication or project_path in ("other", "current"):
+        assert config.read_bytes() == original
     assert config.stat().st_mode & 0o777 == 0o640
     assert list(root.glob(".mcp.json.*")) == []
 
@@ -478,3 +493,34 @@ def test_missing_project_entry_registered_despite_user_scope_server(tmp_path, ex
     }
     assert result == (unrelated if existing_config else {"mcpServers": {}})
     assert json.loads(user_file.read_text()) == user
+
+
+@pytest.mark.parametrize("path", ["direct", "host"])
+def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path):
+    source = (SCRIPT.parent / "uninstall.sh").read_text()
+    if path == "direct":
+        helper = source[
+            source.index("safe_disable_service() {") : source.index("# Run a command inside")
+        ]
+        start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
+        commands = source[start : source.index("        # Persistent= timers", start)]
+    else:
+        helper = 'container_exec() { bash -c "$1"; }\n'
+        start = source.index(
+            '            container_exec "', source.index("# Stop all services (timers first")
+        )
+        commands = source[start : source.index('            ok "Stopped Genesis services"', start)]
+    calls = tmp_path / "calls"
+    executable = tmp_path / "systemctl"
+    executable.write_text('#!/bin/sh\nprintf "%s\n" "$*" >> "$CALLS"\n')
+    executable.chmod(0o755)
+    subprocess.run(
+        ["bash", "-e", "-c", "DRY_RUN=false; ok() { :; }; skip() { :; };\n" + helper + commands],
+        env=dict(os.environ, CALLS=str(calls), PATH=f"{tmp_path}:{os.defpath}"),
+        check=True,
+    )
+    recorded = [line.split() for line in calls.read_text().splitlines()]
+    for context in shared.PROFILES:
+        unit = shared.unit_name(context)
+        for operation in ("stop", "disable"):
+            assert any(args[:2] == ["--user", operation] and unit in args[2:] for args in recorded)
