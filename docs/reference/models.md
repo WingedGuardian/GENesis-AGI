@@ -774,3 +774,7 @@ pacing admissions survive same-name repoints and registered alias renames. Route
 trip events include health identity, and escalation ignores retired identities.
 Retirement checking handles the observed LiteLLM APIError wrapper conservatively;
 unknown or qualified statements retain the hold.
+
+Captured API-key health retains breaker reasons and essential-site severity. Proven
+retirement replacement begins a fresh escalation/notification incident and retires
+old rows explicitly; ordinary account holds keep their existing incident history.

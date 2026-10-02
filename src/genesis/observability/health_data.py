@@ -12,7 +12,6 @@ import logging
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -382,7 +381,9 @@ class HealthDataService:
         routing_config, breakers = self._routing_config, self._breakers
         if self._routing_snapshot:
             routing_config, bindings = self._routing_snapshot()
-            breakers = SimpleNamespace(get=bindings.__getitem__)
+            from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+
+            breakers = CircuitBreakerRegistry.health_view(routing_config, bindings)
 
         now = datetime.now(UTC).isoformat()
 

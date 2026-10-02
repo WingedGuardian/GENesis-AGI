@@ -418,3 +418,28 @@ accuracy claim and performs no live Fusion inference.
 `tests/test_routing/test_routing_generation_http.py` verifies real LiteLLM HTTP
 dispatch, old/new result identity, token usage and SQLite cost recording against a
 localhost server. It performs no external model inference.
+
+Captured dashboard health uses the full `CircuitBreakerRegistry.health_view()`
+interface, including breaker aggregation and essential-site coverage derived from
+the captured configuration. Constructing a view does not restore or persist state.
+
+A proven retirement replacement also starts a fresh persisted incident namespace.
+Legacy incidents keep their existing hashes; authentication, quota, operator and
+ambiguous holds retain their namespace and accumulated escalation evidence. Every
+retirement transition gets a new namespace, including a switch back to a previous
+model, so historical trip counts and notification acknowledgments cannot suppress
+or prematurely escalate the replacement. Restart restores the namespace.
+
+Retirement resolves the old incident's failure and notification rows with an
+explicit `auto-retired` reason, never a claim of observed recovery. Deferred old
+observation/notification writes check the namespace and retire an obsolete write.
+The awareness notification sweep reads the current namespace, so its outage clock
+and deduplication apply to the current incident. Existing separately committed
+recovery/resolve failure behavior remains unchanged; a database failure is logged,
+and retirement resolution is not a new transactional guarantee.
+
+The shared current-incident predicate treats a missing provider binding as obsolete,
+distinct from a live legacy incident whose namespace is `None`. This applies before
+and after both deferred failure and notification writes, including registered alias
+renames and removal while a database write waits. Cleanup resolves the obsolete
+row without claiming a successful provider call.

@@ -38,12 +38,14 @@ def init(rt: GenesisRuntime) -> None:
         escalation = ProviderEscalation(
             db=rt._db, event_bus=rt._event_bus,
             current_identity=lambda name: breakers.current_identity(name),
+            current_incident_identity=lambda name: breakers.current_incident_identity(name),
         )
         from genesis.routing.essential import build_essential_provider_map
 
         breakers = CircuitBreakerRegistry(
             config.providers,
             on_recovery=escalation.record_recovery,
+            on_retirement=escalation.record_retirement,
             essential_sites=build_essential_provider_map(config),
         )
         escalation.attach()

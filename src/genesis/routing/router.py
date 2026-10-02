@@ -568,6 +568,7 @@ class Router:
                             f"Circuit breaker tripped for {provider_name}",
                             provider=provider_name,
                             health_identity=provider_identity(provider_cfg),
+                            incident_identity=cb._incident_identity,
                             call_site=call_site_id,
                         )
 

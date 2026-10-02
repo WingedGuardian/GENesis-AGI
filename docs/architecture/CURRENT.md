@@ -2550,7 +2550,7 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: cdd7009bf 2026-10-01
+verified: b8201e30f 2026-10-02
 ```
 
 - **Coherent routing reloads** (`Router.reload_config`,
@@ -2568,6 +2568,9 @@ verified: cdd7009bf 2026-10-01
   across model repoints. Shared pacing gates retain admissions across reloads and
   known alias renames. Routed trip events carry health identity; escalation rejects
   retired-model events even when event-bus dispatch waits before consuming them.
+  Full captured registry views preserve API-key breaker/essential coverage. Proven
+  retirement starts a fresh persisted incident namespace and retires old rows;
+  account/operator holds retain their escalation and notification history.
 - **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,

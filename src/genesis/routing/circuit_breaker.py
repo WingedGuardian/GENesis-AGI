@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from genesis.routing.provider_identity import provider_identity, restored_provenance, valid_identity
@@ -80,6 +82,8 @@ class CircuitBreaker:
         self._opened_by_call: bool = False
         self._failure_cause: str | None = None
         self._failure_identity: str | None = None
+        # Legacy/account incidents retain None; retirement creates a fresh namespace.
+        self._incident_identity: str | None = None
 
     @property
     def consecutive_failures(self) -> int:
@@ -399,12 +403,15 @@ class CircuitBreakerRegistry:
         on_recovery: object = None,
         persist: bool = True,
         essential_sites: dict[str, list[str]] | None = None,
+        restore_state: bool = True,
+        on_retirement: object = None,
     ) -> None:
         self._lock = threading.RLock()
         self._providers = dict(providers)
         self._clock = clock
         self._state_file = Path(state_file) if state_file else _STATE_FILE
         self._on_recovery = on_recovery
+        self._on_retirement = on_retirement
         # persist=False → read-only registry (MCP child processes): load shared
         # state at construction but never write it, so only the server owns the
         # file and concurrent children can't clobber it (WS-3c).
@@ -423,7 +430,22 @@ class CircuitBreakerRegistry:
         # essential site, so it cannot stand in for this.
         self._manages_coverage = essential_sites is not None
         self._breakers: dict[str, CircuitBreaker] = {}
-        self.load_state()
+        if restore_state:
+            self.load_state()
+
+    @classmethod
+    def health_view(cls, config, bindings: dict[str, CircuitBreaker]):
+        """Read captured bindings through the full health registry interface.
+
+        No disk restoration, persistence or recovery callbacks belong to a
+        request's view. Coverage uses the same captured routing configuration.
+        """
+        from genesis.routing.essential import build_essential_provider_map
+
+        view = cls(config.providers, persist=False, restore_state=False,
+                   essential_sites=build_essential_provider_map(config))
+        view._breakers = dict(bindings)
+        return view
 
     def _alias_target(self, name: str, known) -> str | None:
         """The key in ``known`` that ``name``'s persisted/held state belongs to, or None.
@@ -492,6 +514,9 @@ class CircuitBreakerRegistry:
             # Reset without invoking callbacks for an unobserved model.
             replacement._on_state_change = None
             replacement.force_close()
+            replacement._incident_identity = self._new_incident_identity()
+            if self._on_retirement:
+                self._on_retirement(old._provider.name, old._incident_identity)
         replacement._on_state_change = self.save_state if self._persist else None
         replacement._on_recovery = self._on_recovery
         return replacement
@@ -502,6 +527,14 @@ class CircuitBreakerRegistry:
             cause == "retirement" and valid_identity(identity)
             and identity != provider_identity(cfg)
         )
+
+    @staticmethod
+    def _new_incident_identity() -> str:
+        return hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+
+    def current_incident_identity(self, provider: str) -> str | None:
+        with self._lock:
+            return self.get(provider)._incident_identity
 
     def current_identity(self, provider: str) -> str | None:
         """Identity of a current binding, without recreating removed providers."""
@@ -560,6 +593,7 @@ class CircuitBreakerRegistry:
                 "identity": provider_identity(cb._provider),
                 "failure_cause": cb._failure_cause,
                 "failure_identity": cb._failure_identity,
+                "incident_identity": cb._incident_identity,
             }
         try:
             atomic_write_text(self._state_file, json.dumps(data, indent=2))
@@ -601,6 +635,7 @@ class CircuitBreakerRegistry:
                 if target:
                     ordered.append((name, info, target))
 
+            retired_during_restore = False
             for name, info, target in ordered:
                 if target in restored:
                     logger.info(
@@ -618,9 +653,16 @@ class CircuitBreakerRegistry:
                     )
                 cfg = self._providers[target]
                 cause, identity = restored_provenance(info, True)
-                if self._retired_identity_changed(cause, identity, cfg):
-                    continue
+                saved_incident = info.get("incident_identity")
+                incident = saved_incident if valid_identity(saved_incident) else None
                 cb = self.get(target)
+                if self._retired_identity_changed(cause, identity, cfg):
+                    cb._incident_identity = self._new_incident_identity()
+                    retired_during_restore = True
+                    if self._on_retirement:
+                        self._on_retirement(name, incident)
+                    continue
+                cb._incident_identity = incident
                 saved_state = info.get("state", "CLOSED")
                 # BOTH non-closed states restore. Restoring only OPEN made
                 # the guarantee below expire at the next restart, by an
@@ -746,6 +788,8 @@ class CircuitBreakerRegistry:
                         saved_cat, name,
                     )
                     cb._last_failure_category = None
+            if retired_during_restore:
+                self.save_state()
             logger.info("Circuit breaker state restored from %s", self._state_file)
         except Exception:
             logger.warning("Failed to load circuit breaker state", exc_info=True)
