@@ -335,6 +335,7 @@ def cleanup_units() -> None:
                     systemctl("stop", unit)  # A removed unit file can still have a live process.
             else:
                 systemctl("disable", "--now", unit)
+            remove_managed_enablement(unit)
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             errors.append((unit, error))
     if errors:
@@ -342,6 +343,26 @@ def cleanup_units() -> None:
         for unit, error in errors[1:]:
             first.add_note(f"cleanup also failed for {unit}: {error}")
         raise first
+
+
+def remove_managed_enablement(unit: str) -> None:
+    # These are the only enablement links rendered by this integration.
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    roots = tuple(dict.fromkeys((unit_directory().resolve(), (runtime / "systemd/user").resolve())))
+    targets = {root / unit for root in roots}
+    links = []
+    for root in roots:
+        link = root / "default.target.wants" / unit
+        if link.is_symlink():
+            if link.resolve() not in targets:
+                raise ValueError(f"foreign Serena enablement link preserved: {link}")
+            links.append(link)
+        elif link.exists():
+            raise ValueError(f"non-symlink Serena enablement entry preserved: {link}")
+    for link in links:
+        link.unlink()
+    if links:
+        systemctl("daemon-reload")
 
 
 def read_unit_state(unit: str) -> dict[str, str]:

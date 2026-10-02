@@ -621,7 +621,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
-                systemctl --user disable genesis-server.service genesis-bridge.service \
+                for u in genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-tmp-watchgod.service \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
@@ -630,7 +630,9 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
+                    systemctl --user disable \"\$u\" 2>/dev/null || true;
+                done
             "
             ok "Stopped Genesis services"
 

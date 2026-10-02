@@ -23,6 +23,7 @@ native_read_unit_state = shared.read_unit_state
 @pytest.fixture(autouse=True)
 def private_user_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setattr(
         shared, "read_unit_state", lambda unit: {"LoadState": "loaded", "ActiveState": "inactive"}
     )
@@ -510,7 +511,8 @@ def test_missing_project_entry_registered_despite_user_scope_server(tmp_path, ex
 
 
 @pytest.mark.parametrize("path", ["direct", "host"])
-def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path):
+@pytest.mark.parametrize("serena_present", [False, True])
+def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path, serena_present):
     source = (SCRIPT.parent / "uninstall.sh").read_text()
     if path == "direct":
         helper = source[
@@ -526,15 +528,32 @@ def test_uninstall_stops_and_disables_both_shared_services(tmp_path, path):
         commands = source[start : source.index('            ok "Stopped Genesis services"', start)]
     calls = tmp_path / "calls"
     executable = tmp_path / "systemctl"
-    executable.write_text('#!/bin/sh\nprintf "%s\n" "$*" >> "$CALLS"\n')
+    disabled = tmp_path / "disabled"
+    executable.write_text("""#!/usr/bin/env python3
+import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with Path(os.environ['CALLS']).open('a') as f:f.write(' '.join(args)+'\\n')
+missing=any('genesis-serena-' in arg for arg in args) and os.environ['SERENA_PRESENT']=='False'
+if missing:sys.exit(1)
+if args[1]=='disable':
+ with Path(os.environ['DISABLED']).open('a') as f:f.write(' '.join(args[2:])+'\\n')
+""")
     executable.chmod(0o755)
     subprocess.run(
         ["bash", "-e", "-c", "DRY_RUN=false; ok() { :; }; skip() { :; };\n" + helper + commands],
-        env=dict(os.environ, CALLS=str(calls), PATH=f"{tmp_path}:{os.defpath}"),
+        env=dict(
+            os.environ,
+            CALLS=str(calls),
+            DISABLED=str(disabled),
+            SERENA_PRESENT=str(serena_present),
+            PATH=f"{tmp_path}:{os.defpath}",
+        ),
         check=True,
     )
+    assert "genesis-server.service" in disabled.read_text().split()
     recorded = [line.split() for line in calls.read_text().splitlines()]
-    for context in shared.PROFILES:
+    for context in shared.PROFILES if serena_present else ():
         unit = shared.unit_name(context)
         for operation in ("stop", "disable"):
             assert any(args[:2] == ["--user", operation] and unit in args[2:] for args in recorded)
@@ -1052,3 +1071,140 @@ def test_embedded_backslash_checkout_remains_literal(tmp_path, configured_paths)
     for context in shared.PROFILES:
         text = (shared.unit_directory() / shared.unit_name(context)).read_text()
         assert f"WorkingDirectory={main}\n" in text
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+@pytest.mark.parametrize("link_root", ["persistent", "runtime"])
+@pytest.mark.parametrize("target_root", ["persistent", "runtime"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_cleanup_removes_managed_links_from_both_enablement_scopes(
+    tmp_path, monkeypatch, link_root, target_root, relative, loaded
+):
+    roots = {"persistent": shared.unit_directory(), "runtime": tmp_path / "runtime/systemd/user"}
+    unit = shared.unit_name("claude-code")
+    link = roots[link_root] / "default.target.wants" / unit
+    link.parent.mkdir(parents=True)
+    target = roots[target_root] / unit
+    link.symlink_to(os.path.relpath(target, link.parent) if relative else target)
+    assert link.is_symlink() and not link.exists()
+    if loaded:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("preserve unit file")
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda name: {
+            "LoadState": "loaded" if loaded and name == unit else "not-found",
+            "ActiveState": "inactive",
+        },
+    )
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.cleanup_units()
+    assert not link.is_symlink()
+    expected = [("disable", "--now", unit)] if loaded else []
+    assert calls == expected + [("daemon-reload",)]
+    if loaded:
+        assert target.read_text() == "preserve unit file"
+    else:
+        shared.cleanup_units()
+        assert calls == [("daemon-reload",)], "repeated cleanup is a no-op"
+
+
+@pytest.mark.parametrize("root", ["persistent", "runtime"])
+@pytest.mark.parametrize("kind", ["foreign-symlink", "regular-file"])
+def test_absent_unit_cleanup_preserves_unowned_enablement_entries(
+    tmp_path, monkeypatch, root, kind
+):
+    roots = {"persistent": shared.unit_directory(), "runtime": tmp_path / "runtime/systemd/user"}
+    unit = shared.unit_name("claude-code")
+    link = roots[root] / "default.target.wants" / unit
+    link.parent.mkdir(parents=True)
+    if kind == "foreign-symlink":
+        link.symlink_to(tmp_path / "foreign.service")
+    else:
+        link.write_text("preserve foreign entry")
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda unit: {"LoadState": "not-found", "ActiveState": "inactive"},
+    )
+    monkeypatch.setattr(shared, "systemctl", lambda *args: None)
+    with pytest.raises(ValueError, match="preserved"):
+        shared.cleanup_units()
+    assert (
+        link.is_symlink()
+        if kind == "foreign-symlink"
+        else link.read_text() == "preserve foreign entry"
+    )
+
+
+def test_absent_active_stop_failure_preserves_enablement_link(tmp_path, monkeypatch):
+    unit = shared.unit_name("claude-code")
+    link = shared.unit_directory() / "default.target.wants" / unit
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shared.unit_directory() / unit)
+    monkeypatch.setattr(shared, "PROFILES", ("claude-code",))
+    monkeypatch.setattr(
+        shared, "read_unit_state", lambda unit: {"LoadState": "not-found", "ActiveState": "active"}
+    )
+    calls = []
+
+    def fail(*args):
+        calls.append(args)
+        raise OSError("stop failed")
+
+    monkeypatch.setattr(shared, "systemctl", fail)
+    with pytest.raises(OSError, match="stop failed"):
+        shared.cleanup_units()
+    assert link.is_symlink()
+    assert calls == [("stop", unit)]
+
+
+def test_manual_unlink_reload_failure_still_attempts_other_profile(tmp_path, monkeypatch):
+    links = []
+    for context in shared.PROFILES:
+        unit = shared.unit_name(context)
+        link = shared.unit_directory() / "default.target.wants" / unit
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(shared.unit_directory() / unit)
+        links.append(link)
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda unit: {"LoadState": "not-found", "ActiveState": "inactive"},
+    )
+    calls = []
+
+    def reload(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("reload failed")
+
+    monkeypatch.setattr(shared, "systemctl", reload)
+    with pytest.raises(OSError, match="reload failed"):
+        shared.cleanup_units()
+    assert len(calls) == 2
+    assert all(not link.is_symlink() for link in links)
+
+
+def test_aliased_runtime_unit_root_is_cleaned_once(tmp_path, monkeypatch):
+    persistent = shared.unit_directory()
+    persistent.mkdir(parents=True)
+    runtime = tmp_path / "runtime/systemd/user"
+    runtime.parent.mkdir(parents=True)
+    runtime.symlink_to(persistent, target_is_directory=True)
+    unit = shared.unit_name("claude-code")
+    link = persistent / "default.target.wants" / unit
+    link.parent.mkdir()
+    link.symlink_to(persistent / unit)
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda unit: {"LoadState": "not-found", "ActiveState": "inactive"},
+    )
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.cleanup_units()
+    assert not link.is_symlink()
+    assert calls == [("daemon-reload",)]
