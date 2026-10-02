@@ -36,20 +36,24 @@ from deploy_candidates_core import (  # noqa: E402
 )
 
 
-def carries(mine: set[str], theirs: set[str], others: set[str]) -> bool:
-    """Does a branch whose unmerged commits are ``mine`` carry the code of an
-    excluded one whose unmerged commits are ``theirs``? ``others`` are the
-    commits that belong to some third candidate both are stacked on.
+def shared_with(repo: Repo, base: str, heads: dict[str, str]) -> dict[str, list[str]]:
+    """For each branch, the other branches it shares an UNMERGED commit with
+    (one reachable from both heads and not from ``base``), in ``heads`` order.
 
-    It does when they share a commit that ``others`` does not account for,
-    UNLESS every commit of ``mine`` is in ``theirs``: then the excluded branch
-    is stacked ON this one, and its commits are this one's own.
-
-    Git cannot say which of two branches OWNS a commit both hold. A branch cut
-    from an early commit of another, and a branch the other was cut from that
-    then gained a commit, are the same graph; both read as carrying it, and the
-    rule excludes (the safe side, reported by name)."""
-    return bool((mine & theirs) - others) and not mine <= theirs
+    Two candidates may not share one. Git cannot say which of two branches owns
+    a commit both hold, so with two listed there is no answer to "is this code
+    live?" once one of them is excluded, dropped or retired: a stack goes in as
+    its TOP branch, one candidate carrying all of its commits. A head whose
+    object is gone has no commits to compare (it is excluded as missing)."""
+    commits = {b: set(repo.rev_list(h, "--not", base)) for b, h in heads.items() if repo.resolve(h)}
+    names = list(commits)
+    result: dict[str, list[str]] = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            if commits[a] & commits[b]:
+                result.setdefault(a, []).append(b)
+                result.setdefault(b, []).append(a)
+    return result
 
 
 def build_plan(
@@ -58,167 +62,134 @@ def build_plan(
     cands: list[tuple[str, str]],
     rebuild_id: str,
     sticky: dict[str, str] | None = None,
-    removed: dict[str, str] | None = None,
 ) -> Plan:
     """Merge each (branch, head) onto ``base`` in order. ``sticky`` maps a
     candidate to why it is excluded before any merge (missing branch, failed
-    admission or gate). ``removed`` maps a branch that is NOT a candidate any
-    more (a drop) to its head: its code must not stay live through another
-    candidate either. Raises Refusal on a merge git cannot even attempt.
+    admission or gate). Raises Refusal on a merge git cannot even attempt.
 
-    DERIVATION. A candidate carrying an excluded candidate's unmerged commits
-    carries its code, and is excluded with it. It is derived only from a ROOT
-    exclusion (a sticky one, a conflict, or a removed branch), never from
-    another derived one, so two candidates cannot exclude each other. The
-    commits a third candidate accounts for (``others``) come only from
-    candidates still going live whose head is an ANCESTOR of the excluded
-    candidate's head: what both siblings share because both are stacked on a
-    live third candidate is that candidate's code.
-
-    A conflict is recomputed on every pass (a candidate that conflicted only
-    with one excluded later can merge after all), and a derived exclusion whose
-    source stops being excluded is released once; after that it stays, so the
-    loop ends."""
-    sticky = dict(sticky or {})
-    removed = dict(removed or {})
-    heads = dict(cands)
-    all_heads = {**removed, **heads}
-    # A head whose object is gone (a deleted, garbage-collected branch) has no
-    # commits to compare; it is already excluded as a missing branch.
-    commits = {
-        b: set(repo.rev_list(h, "--not", base)) for b, h in all_heads.items() if repo.resolve(h)
-    }
-    anc: dict[tuple[str, str], bool] = {}
-
-    def is_anc(x: str, e: str) -> bool:
-        key = (all_heads[x], all_heads[e])
-        if key not in anc:
-            anc[key] = repo.is_ancestor(*key)
-        return anc[key]
-
-    derived: dict[str, tuple[str, str]] = {}  # branch -> (source, reason)
-    released: set[str] = set()
-    while True:
-        excluded = dict(sticky)
-        excluded.update({b: r for b, (_, r) in derived.items()})
-        tip = base
-        merged: list[tuple[str, str]] = []
-        contained: list[str] = []
-        conflicts: set[str] = set()
-        for b, head in cands:
-            if b in excluded:
-                continue
-            # Nothing to merge: the head is already in the tip (a branch at
-            # origin/main, or one an earlier candidate contains). A merge
-            # commit with that head as second parent collapses to ONE parent
-            # when head == tip, which later rebuilds would read as foreign.
-            if repo.is_ancestor(head, tip):
-                contained.append(b)
-                continue
-            # git's global --attr-source: the in-tree merge rules come from the reviewed base,
-            # never from the checkout's index, which on `live` holds candidate
-            # code ($GIT_DIR/info/attributes and core.attributesFile, which only
-            # the install's owner writes, still apply): a
-            # candidate's `.gitattributes` (`merge=union`) would otherwise merge two
-            # conflicting candidates into an unreviewed concatenation (MEASURED,
-            # git 2.43).
-            p = repo.git(
-                f"--attr-source={base}",
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                "--no-messages",
-                tip,
-                head,
-                check=False,
+    Candidates that share an unmerged commit are ALL excluded, by name (see
+    shared_with): `add` refuses that, so it arises only from a hand-edited
+    manifest or a base that moved backwards, and no rule can say whose code
+    the shared commits are. Nothing is derived from another exclusion: a
+    candidate carrying no other candidate's commits carries no other
+    candidate's code."""
+    excluded = dict(sticky or {})
+    shared = shared_with(repo, base, dict(cands))
+    for b, _ in cands:
+        if b in shared and b not in excluded:
+            excluded[b] = (
+                f"shares unmerged commits with {', '.join(shared[b])}: two candidates may not "
+                "(a stack goes in as its top branch); drop all but one"
             )
-            if p.returncode == 1:
-                files = [ln for ln in p.stdout.splitlines()[1:] if ln.strip()]
-                excluded[b] = (
-                    "conflicts with origin/main or an earlier candidate"
-                    + (f" in {', '.join(files)}" if files else "")
-                    + "; merge origin/main into it"
-                )
-                conflicts.add(b)
-                continue
-            if p.returncode != 0:
-                raise Refusal(
-                    f"git merge-tree could not merge {b} ({head[:12]}): {p.stderr.strip()} — nothing changed."
-                )
-            tree = p.stdout.splitlines()[0].strip()
-            msg = (
-                f"Deploy rebuild {rebuild_id}: merge {b} ({head[:12]})\n\n"
-                f"{TRAILER_KEY}: {rebuild_id}\n{CANDIDATE_KEY}: {b}\n"
-            )
-            tip = repo.git(
-                "commit-tree", tree, "-p", tip, "-p", head, input=msg, extra_env=IDENTITY
-            ).stdout.strip()
-            merged.append((b, head))
-        roots = [e for e in (*sticky, *conflicts, *removed) if e in commits]
-        going_live = [m for m, _ in merged] + contained
-        changed = False
-        for b, (src, _) in list(derived.items()):
-            if src not in roots and b not in released:
-                del derived[b]
-                released.add(b)
-                changed = True
-        for b in going_live:
-            for e in roots:
-                if e == b:
-                    continue
-                others = set().union(
-                    *(commits[x] for x in going_live if x not in (b, e) and is_anc(x, e))
-                )
-                if carries(commits[b], commits[e], others):
-                    verb = "dropped" if e in removed else "excluded"
-                    derived[b] = (e, f"derived from {verb} {e} (it carries {e}'s unmerged commits)")
-                    changed = True
-                    break
-        if not changed:
-            return Plan(base=base, tip=tip, merged=merged, excluded=excluded, contained=contained)
-
-
-def stacked_on(repo: Repo, base: str, dropped_head: str, others: dict[str, str]) -> list[str]:
-    """Which of ``others`` (branch -> head) carry ``dropped_head``'s unmerged
-    commits, by the same rule build_plan derives exclusions with."""
-    plan_heads = {"\0dropped": dropped_head, **others}
-    commits = {b: set(repo.rev_list(h, "--not", base)) for b, h in plan_heads.items()}
-    theirs = commits["\0dropped"]
-    result = []
-    for b in others:
-        acc = set().union(
-            *(commits[x] for x in others if x != b and repo.is_ancestor(others[x], dropped_head))
+    tip = base
+    merged: list[tuple[str, str]] = []
+    contained: list[str] = []
+    for b, head in cands:
+        if b in excluded:
+            continue
+        # Nothing to merge: the head is already in origin/main. (A head inside
+        # an earlier candidate shares its commits and is excluded above.) A merge
+        # commit with that head as second parent would collapse to ONE parent
+        # when head == tip, which later rebuilds would read as foreign.
+        if repo.is_ancestor(head, tip):
+            contained.append(b)
+            continue
+        # git's global --attr-source: the in-tree merge rules come from the
+        # reviewed base, never from the checkout's index, which on `live` holds
+        # candidate code ($GIT_DIR/info/attributes and core.attributesFile, which
+        # only the install's owner writes, still apply): a candidate's
+        # `.gitattributes` (`merge=union`) would otherwise merge two conflicting
+        # candidates into an unreviewed concatenation (MEASURED, git 2.43).
+        p = repo.git(
+            f"--attr-source={base}",
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            tip,
+            head,
+            check=False,
         )
-        if carries(commits[b], theirs, acc):
-            result.append(b)
-    return result
+        if p.returncode == 1:
+            files = [ln for ln in p.stdout.splitlines()[1:] if ln.strip()]
+            excluded[b] = (
+                "conflicts with origin/main or an earlier candidate"
+                + (f" in {', '.join(files)}" if files else "")
+                + "; merge origin/main into it"
+            )
+            continue
+        if p.returncode != 0:
+            raise Refusal(
+                f"git merge-tree could not merge {b} ({head[:12]}): {p.stderr.strip()} — nothing changed."
+            )
+        tree = p.stdout.splitlines()[0].strip()
+        msg = (
+            f"Deploy rebuild {rebuild_id}: merge {b} ({head[:12]})\n\n"
+            f"{TRAILER_KEY}: {rebuild_id}\n{CANDIDATE_KEY}: {b}\n"
+        )
+        tip = repo.git(
+            "commit-tree", tree, "-p", tip, "-p", head, input=msg, extra_env=IDENTITY
+        ).stdout.strip()
+        merged.append((b, head))
+    return Plan(base=base, tip=tip, merged=merged, excluded=excluded, contained=contained)
 
 
 def move_blockers(repo: Repo, tip: str) -> list[str]:
-    """Paths the move to ``tip`` would have to overwrite on disk: files ``tip``
-    adds that already exist untracked or ignored (or a file where it needs a
-    directory). `git switch --no-overwrite-ignore` refuses on these; checking
-    first lets a command refuse BEFORE it writes the manifest."""
+    """Paths the move to ``tip`` would have to overwrite on disk: a path ``tip``
+    adds where an UNTRACKED or IGNORED file already is (at it, or under it when
+    it is a directory now), or an untracked file where ``tip`` needs a
+    directory, or a tracked path with uncommitted changes that ``tip`` changes
+    (the dirty check excuses machine-written ones such as AGENTS.md, and git
+    refuses to overwrite them). `git switch --no-overwrite-ignore` refuses on
+    all of these; checking first lets a command refuse BEFORE it writes the
+    manifest. Clean tracked content in the way is git's to replace (a tracked
+    directory that becomes a file, or the reverse: MEASURED, git 2.43 `switch`
+    does both), so it is not a blocker."""
     head = repo.resolve("HEAD")
     if not head:
         return []
+    blockers = []
+    changed = set(
+        p
+        for p in repo.git("diff", "--no-renames", "--name-only", "-z", head, tip).stdout.split("\0")
+        if p
+    )
+    status = repo.git("status", "--porcelain", "--no-renames", "-z").stdout
+    for rec in [r for r in status.split("\0") if r]:
+        if not rec.startswith(("??", "!!")) and rec[3:] in changed:
+            blockers.append(
+                f"{rec[3:]} (it has uncommitted changes, which the move would overwrite)"
+            )
     text = repo.git(
         "diff", "--no-renames", "--name-only", "--diff-filter=A", "-z", head, tip
     ).stdout
-    blockers = []
     for path in [p for p in text.split("\0") if p]:
         full = repo.root / path
-        if full.exists() or full.is_symlink():
+        found = _untracked_at(repo, path) if (full.exists() or full.is_symlink()) else []
+        if found == [path]:
             blockers.append(path)
+            continue
+        if found:
+            more = f", and {len(found) - 10} more" if len(found) > 10 else ""
+            blockers.append(f"{path} (untracked content under it: {', '.join(found[:10])}{more})")
             continue
         parent = Path(path).parent
         while str(parent) not in ("", "."):
             pf = repo.root / parent
             if pf.is_symlink() or (pf.exists() and not pf.is_dir()):
-                blockers.append(f"{path} (a file is in the way at {parent})")
+                if repo.blob_at(head, str(parent)) is None:
+                    blockers.append(f"{path} (an untracked file is in the way at {parent})")
                 break
             parent = parent.parent
     return blockers
+
+
+def _untracked_at(repo: Repo, path: str) -> list[str]:
+    """The untracked or ignored files at ``path``, or under it (none: []).
+    (`ls-files --others` without --exclude-standard lists ignored files too;
+    :(literal) keeps a name from being read as a pattern.)"""
+    p = repo.git("ls-files", "-z", "--others", "--", f":(literal){path}")
+    return [f for f in p.stdout.split("\0") if f]
 
 
 def ensure_reflog_kept(repo: Repo) -> None:

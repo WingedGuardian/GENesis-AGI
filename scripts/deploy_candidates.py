@@ -28,9 +28,9 @@ Commands:
         candidate from `live`: SUBTRACT-ONLY and OFFLINE, on the base `live` is
         already on, with the heads already live. No fetch and no GitHub,
         so it works during an outage and from a plain shell
-        (`env -i`). It can only remove: anything that then conflicts, or carries
-        the dropped commits, goes out too, named. The repair path for a
-        candidate whose hook blocks every session.
+        (`env -i`). It can only remove: anything that then conflicts, or that
+        shares the dropped candidate's unmerged commits, goes out too, named.
+        The repair path for a candidate whose hook blocks every session.
   rebuild
         fetch origin main (a failed fetch refuses: nothing moves); check the
         install is READY; retire candidates whose PR is proven in the fetched
@@ -46,12 +46,6 @@ Commands:
         rebuild would do with it (included, excluded and why, retired, or
         unknown), and its PR's state (stale after 7 days without an update).
         Writes only unreachable objects.
-  adopt <new-branch> --owner <who>
-        Snapshot the checkout's uncommitted TRACKED edits as one commit on a new
-        branch, without touching the checkout. On `live` the edits are carried
-        onto the base `live` sits on, so the branch never carries a rebuild
-        merge. Then report, file by file, whether each snapshotted file equals
-        origin/main, an open PR's head, or neither.
 
 The one rule (deploy_candidates_gate.py): a decision about a candidate is never
 recorded at `add` and trusted later. Every rebuild re-derives, for every
@@ -59,6 +53,15 @@ candidate: the branch still points at the head it was added at; admission; its
 PR (if any) is OPEN against main with exactly that head. A
 known negative EXCLUDES the candidate, by name. An UNKNOWN (an unreadable PR
 or a failed fetch) REFUSES the whole command: nothing moves.
+
+ONE CANDIDATE PER COMMIT: two candidates may not share an unmerged commit (git
+cannot say which of them owns it, so whether its code is live would have no
+answer once one of them leaves). A stack goes in as its TOP branch. `add`
+refuses a branch that shares one with a listed candidate; a rebuild excludes
+every candidate in such a pair (a hand-edited manifest, or a base that moved
+backwards), by name. A merged candidate in such a pair is not retired: it
+stays listed and excluded with the other until one of them is dropped, since
+retiring it would leave the other to carry its commits live alone.
 
 READINESS (add and rebuild): the commits in deploy_candidates_gate.REQUIRED_MERGED
 and PR C's file (PR_C_MARKER) are in the server's base (merge-base of the
@@ -145,7 +148,6 @@ import deploy_candidates_plan as plan  # noqa: E402
 from deploy_candidates_core import (  # noqa: E402
     BASE_BRANCH,
     BASE_REF,
-    IDENTITY,
     LIVE_BRANCH,
     LIVE_REF,
     STALE_DAYS,
@@ -155,9 +157,6 @@ from deploy_candidates_core import (  # noqa: E402
     Unknown,
     out,
 )
-
-carries = plan.carries  # re-exported for tests and readers
-ADOPT_REF_PREFIX = "refs/deploy-candidates/adopt/"
 
 
 def _err(msg: str) -> None:
@@ -235,7 +234,8 @@ class Engine(Repo):
         if dirty:
             reasons.append(
                 f"{self.root} has uncommitted tracked changes; a rebuild never stashes or discards them. "
-                "Turn them into a candidate with `scripts/deploy_candidates adopt <branch> --owner <who>`:\n"
+                "Commit them on a branch cut from origin/main (never from `live`: `add` refuses a "
+                "branch carrying rebuild merges), then `add` it, or set them aside, and retry:\n"
                 + "\n".join("  " + ln for ln in dirty)
             )
         return reasons
@@ -244,8 +244,9 @@ class Engine(Repo):
         """What `live` runs now: (the commit its rebuild merges sit on, [(branch,
         head)]), or (None, []) when there is no `live`. A candidate counts when a
         rebuild merge names it, OR when its pinned head is reachable from `live`
-        without being in that base: a candidate an earlier one already carries is
-        CONTAINED, so no merge names it, yet its code is live. Listed candidates
+        without being in that base (a hand-edited manifest can list one an
+        earlier candidate carries: no merge names it, yet its code is live).
+        Listed candidates
         come in manifest order; a merged branch the manifest no longer lists
         follows, since its code is live too. drop and status both read this."""
         live_base, merged = self.live_chain(base)
@@ -280,9 +281,7 @@ class Engine(Repo):
         for b, head in p.merged:
             out(f"  live:     {b} ({head[:12]})")
         for b in p.contained:
-            out(
-                f"  contained: {b} — already in origin/main or an earlier candidate; nothing to merge"
-            )
+            out(f"  contained: {b} — already in origin/main; nothing to merge")
         for b, reason in p.excluded.items():
             out(f"  EXCLUDED: {b} — {reason}")
         for b in retired or []:
@@ -340,6 +339,34 @@ class Engine(Repo):
         why = gate.gate_failure(self, base, cand)
         if why:
             raise Refusal(f"{branch} cannot go live: {why}")
+        listed = {
+            c["branch"]: c["verified_head"]
+            for c in (self.store.load() or {}).get("candidates", [])
+            if c["branch"] != branch
+        }
+        sharing = plan.shared_with(self, base, {branch: head, **listed}).get(branch, [])
+        if sharing:
+            # The remedy depends on how the two relate: one stacked on the other
+            # (one head contains the other), or both cut from a third branch.
+            carriers = [b for b in sharing if self.is_ancestor(head, listed[b])]
+            stacked_on = [b for b in sharing if self.is_ancestor(listed[b], head)]
+            if carriers:
+                remedy = (
+                    f"{', '.join(carriers)}, already listed, carries {branch}'s commits: there is "
+                    f"nothing to add (to list {branch} instead, drop {', '.join(carriers)} first)."
+                )
+            elif len(stacked_on) == len(sharing):
+                remedy = f"A stack goes in as its top branch: drop {', '.join(sharing)}, then add {branch}."
+            else:
+                remedy = (
+                    f"They were cut from one branch that is not in origin/main. If that branch has "
+                    f"merged, rebase {branch} onto a freshly fetched origin/main (`git fetch origin "
+                    "main`); otherwise combine them on one branch."
+                )
+            raise Refusal(
+                f"{branch} shares unmerged commits with {', '.join(sharing)}: two candidates may "
+                f"not (git cannot say whose code a shared commit is). {remedy}"
+            )
         result = {}
 
         def change(data: dict | None) -> dict:
@@ -384,8 +411,8 @@ class Engine(Repo):
             out(f"{branch} dropped from {self.store.path}.")
             core.after_move(
                 f"{branch} WAS dropped from the manifest",
-                "checking which candidates carry its commits",
-                lambda: self._warn_stacked(branch, data, after),
+                "checking which candidates share its commits",
+                lambda: self._warn_shared(branch, data, after),
             )
             out(
                 "The checkout is not rebuilt"
@@ -402,25 +429,28 @@ class Engine(Repo):
         live_base, live_now = self.live_set(walk_base, data)
         if live_base is None:
             raise Refusal("`live` does not exist; nothing to rebuild.")
-        # Contained candidates count: dropping one that an earlier candidate
-        # carries takes that carrier out too (it carries the dropped commits),
-        # and dropping the carrier keeps the contained one, which merges alone.
-        dropped_head = dict(live_now).get(branch)
+        # Subtract-only by construction: a candidate still live that shares the
+        # dropped one's unmerged commits would carry them straight back, so it
+        # goes out with it, by name. A rebuild never leaves such a pair live, but
+        # live_set also counts a listed candidate whose code an earlier one
+        # carries (a hand-edited manifest), and drop must not trust how `live`
+        # was built.
         remaining = [(b, h) for b, h in live_now if b != branch]
+        dropped_head = dict(live_now).get(branch)
+        sticky: dict[str, str] = {}
+        if dropped_head:
+            for b in plan.shared_with(
+                self, live_base, {branch: dropped_head, **dict(remaining)}
+            ).get(branch, []):
+                sticky[b] = f"shares dropped {branch}'s unmerged commits; drop it too"
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
-        p = plan.build_plan(
-            self,
-            live_base,
-            remaining,
-            rebuild_id,
-            removed={branch: dropped_head} if dropped_head else None,
-        )
+        p = plan.build_plan(self, live_base, remaining, rebuild_id, sticky=sticky)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
         )
         self._print_plan(p)
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
-        self.store.update(remove)
+        after = self.store.update(remove)
         out(f"  {branch} dropped from {self.store.path}.")
         try:
             plan.move_checkout(self, p, LIVE_BRANCH)
@@ -429,6 +459,11 @@ class Engine(Repo):
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
                 "runs it: fix the above, then run scripts/deploy_candidates rebuild."
             ) from exc
+        core.after_move(
+            f"{branch} WAS dropped from the manifest and from `live`",
+            "checking which candidates share its commits",
+            lambda: self._warn_shared(branch, data, after),
+        )
         gone = [b for b in p.excluded if b != branch]
         if gone:
             out(
@@ -445,26 +480,21 @@ class Engine(Repo):
         )
         return 0
 
-    def _warn_stacked(self, branch: str, before: dict, after: dict | None) -> None:
-        """Name the candidates that carry the dropped one's unmerged commits: the
-        next rebuild keeps them, and their code with it, unless they go too."""
+    def _warn_shared(self, branch: str, before: dict, after: dict | None) -> None:
+        """Name the candidates that share the dropped one's unmerged commits: they
+        were kept out of `live` while both were listed, and the next rebuild puts
+        them live WITH those commits unless they go too."""
         base = self.resolve(BASE_REF)
         dropped = next((c for c in before["candidates"] if c["branch"] == branch), None)
-        if not (base and dropped and after and self.resolve(dropped["verified_head"])):
+        if not (base and dropped and after):
             return
-        others = {
-            c["branch"]: c["verified_head"]
-            for c in after["candidates"]
-            if self.resolve(c["verified_head"])
-        }
-        try:
-            stacked = plan.stacked_on(self, base, dropped["verified_head"], others)
-        except Refusal as exc:
-            out(f"  NOTE: could not check which candidates carry {branch}'s commits ({exc}).")
-            return
-        for b in stacked:
+        heads = {branch: dropped["verified_head"]}
+        heads.update({c["branch"]: c["verified_head"] for c in after["candidates"]})
+        for b in plan.shared_with(self, base, heads).get(branch, []):
             out(
-                f"  WARNING: {b} carries {branch}'s unmerged commits: drop it too to take that code out."
+                f"  WARNING: {b} shares {branch}'s unmerged commits; the next rebuild puts it live "
+                "WITH them (unless its PR has merged: then that rebuild retires it). Drop it too to "
+                "keep that code out."
             )
 
     def cmd_rebuild(self) -> int:
@@ -500,6 +530,9 @@ class Engine(Repo):
             reason = gate.gate_failure(self, base, c)
             if reason:
                 sticky[c["branch"]] = reason
+        held = self._retirements_held(base, data["candidates"], {c["branch"] for c in retire})
+        sticky.update(held)
+        retire = [c for c in retire if c["branch"] not in held]
         gone = {c["branch"] for c in retire}
         cands = [
             (c["branch"], c["verified_head"]) for c in data["candidates"] if c["branch"] not in gone
@@ -525,6 +558,29 @@ class Engine(Repo):
             "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
         )
         return 0
+
+    def _retirements_held(
+        self, base: str, candidates: list[dict], retiring: set[str]
+    ) -> dict[str, str]:
+        """A merged candidate is NOT retired while a listed candidate that stays
+        shares its unmerged commits (a squash merge leaves them unmerged):
+        retiring it would leave the other alone, and the next rebuild would put
+        those commits live with it, reverted upstream or not. It stays listed
+        and excluded, and the pair stays out until one is dropped. Only a
+        hand-edited manifest gets here; `add` refuses sharers."""
+        if not retiring:
+            return {}
+        shared = plan.shared_with(self, base, {c["branch"]: c["verified_head"] for c in candidates})
+        held: dict[str, str] = {}
+        for b in sorted(retiring):
+            partners = [p for p in shared.get(b, []) if p not in retiring]
+            if partners:
+                held[b] = (
+                    f"merged upstream, not retired: {', '.join(partners)} shares its unmerged "
+                    f"commits; drop {b} to let {', '.join(partners)} go live with them, or drop "
+                    f"{', '.join(partners)}"
+                )
+        return held
 
     def _save_retirements(self, retire: list[dict]) -> None:
         """Retirements are saved only once `live` no longer holds them, and only
@@ -638,12 +694,13 @@ class Engine(Repo):
             return 0
         verdict: dict[str, str] = {}
         sticky: dict[str, str] = {}
+        retiring: set[str] = set()
         for c in data["candidates"]:
             b = c["branch"]
             try:
                 done, why = gate.retirement(self, base, c)
                 if done:
-                    verdict[b] = "retires at the next rebuild (its PR is in origin/main)"
+                    retiring.add(b)
                     continue
                 reason = (
                     f"merged upstream, not retired: {why}"
@@ -658,6 +715,16 @@ class Engine(Repo):
                 continue
             if reason:
                 sticky[b] = reason
+        # The same hold rebuild applies, so status never predicts a retirement
+        # the rebuild would withhold.
+        try:
+            held = self._retirements_held(base, data["candidates"], retiring)
+        except Refusal as exc:  # Unknown included
+            held = {}
+            refusals.append(f"cannot check which retirements would be held: {exc}")
+        sticky.update(held)
+        for b in retiring - set(held):
+            verdict[b] = "retires at the next rebuild (its PR is in origin/main)"
         cands = [
             (c["branch"], c["verified_head"])
             for c in data["candidates"]
@@ -685,7 +752,7 @@ class Engine(Repo):
             elif b in p.excluded:
                 out(f"    next rebuild: EXCLUDED — {p.excluded[b]}")
             elif b in p.contained:
-                out("    next rebuild: contained (already in origin/main or an earlier candidate)")
+                out("    next rebuild: contained (already in origin/main)")
             else:
                 out("    next rebuild: included")
             cur = self.resolve(f"refs/heads/{b}")
@@ -714,202 +781,6 @@ class Engine(Repo):
         )
         return p.returncode == 0 and p.stdout.splitlines()[0].strip() == self.tree(base)
 
-    def cmd_adopt(self, branch: str, owner: str) -> int:
-        if not core.valid_candidate_name(branch):
-            raise Refusal(f"{branch!r} cannot be the adopted branch's name.")
-        owner = owner.strip()
-        if not owner:
-            raise Refusal("--owner is empty: name the session or person who owns these edits.")
-        if self.resolve(f"refs/heads/{branch}"):
-            raise Refusal(f"the branch {branch} already exists; choose a new name.")
-        head = self.resolve("HEAD")
-        if not head:
-            raise Refusal("HEAD does not resolve.")
-        dirty = self.dirty_lines()
-        if not dirty:
-            raise Refusal("no uncommitted tracked edits: nothing to adopt.")
-        paths = [ln[3:] for ln in dirty]
-        idx = (
-            Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
-            / f"deploy-candidates-adopt.{os.getpid()}.index"
-        )
-        try:
-            env = {"GIT_INDEX_FILE": str(idx), "GIT_LITERAL_PATHSPECS": "1"}
-            self.git("read-tree", head, extra_env=env)
-            self.git("add", "-A", "--", *paths, extra_env=env)
-            tree = self.git("write-tree", extra_env=env).stdout.strip()
-        finally:
-            idx.unlink(missing_ok=True)
-
-        def msg(on: str) -> str:
-            return (
-                "adopt: uncommitted edits from the live checkout\n\n"
-                f"A snapshot of {len(paths)} tracked file(s) edited in place on top of {on[:12]}.\n\n"
-                f"Adopted-by: {owner}\n"
-            )
-
-        snapshot = self.git(
-            "commit-tree", tree, "-p", head, input=msg(head), extra_env=IDENTITY
-        ).stdout.strip()
-        parent, commit = head, snapshot
-        live_base = self._adopt_base(head)
-        if live_base and live_base != head:
-            # On `live`: carry only the edits (HEAD -> snapshot) onto the base `live`
-            # sits on, so the new branch carries no rebuild merge (admission refuses
-            # those) and none of the other candidates' code.
-            p = self.git(
-                f"--attr-source={live_base}",
-                "merge-tree",
-                "--write-tree",
-                "--no-messages",
-                f"--merge-base={head}",
-                live_base,
-                snapshot,
-                check=False,
-            )
-            if p.returncode == 1:
-                raise Refusal(
-                    "the edits touch lines a candidate on `live` changed, so they cannot be separated from "
-                    "it: commit them to that candidate's branch instead. Nothing was written."
-                )
-            if p.returncode != 0:
-                raise Refusal(f"git merge-tree could not carry the edits: {p.stderr.strip()}")
-            parent = live_base
-            commit = self.git(
-                "commit-tree",
-                p.stdout.splitlines()[0].strip(),
-                "-p",
-                live_base,
-                input=msg(live_base),
-                extra_env=IDENTITY,
-            ).stdout.strip()
-        # Create, never overwrite: an empty old value refuses an existing ref.
-        self.git(
-            "update-ref",
-            "-m",
-            f"deploy-candidates: adopt by {owner}",
-            f"refs/heads/{branch}",
-            commit,
-            "",
-        )
-        out(
-            f"adopted {len(paths)} file(s) as {branch} at {commit[:12]} (on top of {parent[:12]}); "
-            "the checkout is untouched."
-        )
-        try:
-            core.after_move(
-                f"{branch} WAS created at {commit[:12]}",
-                "the per-file report",
-                lambda: self._adopt_report(paths, snapshot),
-            )
-        finally:
-            self._adopt_cleanup()
-        out("Next: decide which edits still need to go live (the report above), then")
-        out(f"  scripts/deploy_candidates add {branch} --owner {owner}")
-        return 0
-
-    def _adopt_base(self, head: str) -> str | None:
-        """The base `live` sits on, when HEAD carries rebuild merges; else None."""
-        base = self.resolve(BASE_REF) or head
-        live_base, merged = self.live_chain(base) if self.resolve(LIVE_REF) else (None, [])
-        if not merged or self.resolve(LIVE_REF) != head:
-            return None
-        return live_base
-
-    def _adopt_report(self, paths: list[str], snapshot: str) -> None:
-        """Each snapshotted file compared with origin/main and every open PR's
-        head. Its fetches land in refs/deploy-candidates/adopt/ (removed after),
-        never origin/main's ref, so it needs no lock and races no rebuild."""
-        notes = []
-        ok, why = self.fetch(f"+refs/heads/{BASE_BRANCH}:{self._adopt_ns()}main")
-        base = self.resolve(f"{self._adopt_ns()}main") if ok else self.resolve(BASE_REF)
-        if not ok:
-            notes.append(f"{why}; compared with the last-fetched origin/main")
-        prs: list[tuple[int, str]] = []
-        rc, text, err = self._gh(
-            ["pr", "list", "--state", "open", "--limit", "1000", "--json", "number,headRefOid"],
-            str(self.root),
-            self.env,
-        )
-        if rc != 0:
-            notes.append(
-                f"open PR heads unavailable ({' '.join((err or text).split())}): no file was compared with a PR"
-            )
-        else:
-            try:
-                rows = json.loads(text)
-                prs = [(int(r["number"]), str(r["headRefOid"])) for r in rows]
-                if len(rows) >= 1000:
-                    notes.append(
-                        "the open PR list hit its limit of 1000: some PRs were not compared"
-                    )
-            except (ValueError, KeyError, TypeError):
-                notes.append("the open PR list is unreadable: no file was compared with a PR")
-        available: list[tuple[int, str]] = []
-        missing: list[str] = []
-        for n, sha in prs:
-            if not self.resolve(sha):
-                self.fetch(f"+refs/pull/{n}/head:{self._adopt_ns()}pr/{n}")
-            if self.resolve(sha):
-                available.append((n, sha))
-            else:
-                missing.append(f"#{n}")
-        if missing:
-            notes.append(
-                f"the heads of {len(missing)} open PR(s) could not be fetched and were not compared: {' '.join(missing)}"
-            )
-        out("Per file (the snapshot compared with origin/main and each open PR's head):")
-        width = max(len(p) for p in paths)
-        for path in paths:
-            mine = self.blob_at(snapshot, path)
-            verdict = []
-            if base is not None and self.blob_at(base, path) == mine:
-                verdict.append("equals origin/main")
-            for n, sha in available:
-                if self.blob_at(sha, path) == mine:
-                    verdict.append(f"equals PR #{n}'s head")
-            out(
-                f"  {path.ljust(width)}  {', '.join(verdict) if verdict else 'neither (not origin/main, not an open PR head)'}"
-            )
-        for note in notes:
-            out(f"  NOTE: {note}.")
-
-    def _adopt_ns(self) -> str:
-        """This run's own ref namespace: two adopts at once (adopt takes no lock)
-        never fetch into, or clean up, each other's refs."""
-        return f"{ADOPT_REF_PREFIX}{os.getpid()}/"
-
-    def _adopt_cleanup(self) -> None:
-        """Remove this run's refs, and those of any adopt whose process is gone
-        (killed mid-run), so their objects do not stay reachable for ever. A
-        live process's refs are never touched."""
-        mine = str(os.getpid())
-
-        def gone(ns: str) -> bool:
-            if ns == mine:
-                return True
-            if not ns.isdigit() or int(ns) <= 1:  # never probe 0 (own group) or 1 (init)
-                return False
-            try:
-                os.kill(int(ns), 0)  # signal 0: an existence probe, nothing is sent
-            except ProcessLookupError:
-                return True
-            except OSError:  # alive, owned by someone else
-                return False
-            return False
-
-        refs = [
-            r
-            for r in self.git(
-                "for-each-ref", "--format=%(refname)", ADOPT_REF_PREFIX, check=False
-            ).stdout.split()
-            if gone(r[len(ADOPT_REF_PREFIX) :].split("/", 1)[0])
-        ]
-        if refs:
-            self.git(
-                "update-ref", "--stdin", input="".join(f"delete {r}\n" for r in refs), check=False
-            )
-
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -926,9 +797,6 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("list")
     sub.add_parser("status")
     sub.add_parser("rebuild")
-    ad = sub.add_parser("adopt")
-    ad.add_argument("branch")
-    ad.add_argument("--owner", required=True)
     return p
 
 
@@ -969,8 +837,6 @@ def main(
             return engine.cmd_drop(args.branch, args.no_rebuild)
         if args.cmd == "rebuild":
             return engine.cmd_rebuild()
-        if args.cmd == "adopt":
-            return engine.cmd_adopt(args.branch, args.owner)
     except Unknown as exc:
         _err(
             f"ERROR: {exc}\nThis could not be established, so nothing changed; retry once it can be."

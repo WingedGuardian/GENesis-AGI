@@ -62,9 +62,9 @@ def test_git_variables_from_the_caller_cannot_redirect_the_engine(dc, dc_ready):
     assert shown == "good\n"
 
 
-def test_a_graft_cannot_change_which_candidates_carry_whose_code(dc, dc_ready, capsys):
+def test_a_graft_cannot_change_which_candidates_share_commits(dc, dc_ready, capsys):
     """A graft that made feat/a appear to descend from the conflicting feat/x
-    would exclude feat/a as carrying feat/x's code."""
+    would make the two share feat/x's commit and exclude feat/a with it."""
     w = dc_ready
     hx = w.candidate("feat/x", {"a.txt": "a1\nX-SIDE\na3\n"})
     ha = w.candidate("feat/a", {"n.txt": "independent\n"})
@@ -206,52 +206,45 @@ def test_an_upstream_force_push_is_fetched_and_named(dc, dc_ready, capsys):
 # ── B. what is live ────────────────────────────────────────────────────────
 
 
-def _descendant_listed_first(w):
+def _stack(w):
+    """feat/a stacked on feat/b: the two share feat/b's commit."""
     hb = w.candidate("feat/b", {"bb.txt": "b\n"})
     ha = w.candidate("feat/a", {"a2.txt": "a\n"}, base=hb)
-    w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])
     return ha, hb
 
 
-def test_dropping_a_contained_candidate_takes_out_what_carries_it(dc, dc_ready, capsys):
-    w = dc_ready
-    ha, hb = _descendant_listed_first(w)
-    assert w.run(dc, "rebuild") == 0
-    assert "contained: feat/b" in capsys.readouterr().out
-    assert w.run(dc, "drop", "feat/b") == 0
-    out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/a .*derived from dropped feat/b", out), out
-    assert w.live_merges() == []
-    assert not (w.root / "bb.txt").exists()
-
-
-def test_dropping_the_carrier_keeps_the_contained_candidate(dc, dc_ready):
-    w = dc_ready
-    ha, hb = _descendant_listed_first(w)
-    assert w.run(dc, "rebuild") == 0
-    assert w.run(dc, "drop", "feat/a") == 0
-    assert w.live_merges() == [("feat/b", hb)]
-    assert (w.root / "bb.txt").exists() and not (w.root / "a2.txt").exists()
-
-
-def test_dropping_one_of_two_candidates_at_one_commit_keeps_the_other(dc, dc_ready):
+def test_two_candidates_at_one_commit_both_go_out(dc, dc_ready, capsys):
     w = dc_ready
     hx = w.candidate("feat/x", {"x.txt": "x\n"})
     w.git(w.root, "branch", "feat/y", hx)
-    w.write_manifest([w.entry("feat/x"), w.entry("feat/y")])
+    hc = w.candidate("feat/c", {"c.txt": "c\n"})
+    w.write_manifest([w.entry("feat/x"), w.entry("feat/y"), w.entry("feat/c")])
     assert w.run(dc, "rebuild") == 0
-    assert w.run(dc, "drop", "feat/x") == 0
-    assert w.live_merges() == [("feat/y", hx)]
+    out = capsys.readouterr().out
+    assert re.search(r"EXCLUDED: feat/x .*shares unmerged commits with feat/y", out), out
+    assert re.search(r"EXCLUDED: feat/y .*shares unmerged commits with feat/x", out), out
+    assert w.live_merges() == [("feat/c", hc)]
 
 
-def test_status_reports_a_contained_candidate_as_live(dc, dc_ready, capsys):
+def test_status_reports_a_carried_candidate_live_and_both_sharers_excluded_next(
+    dc, dc_ready, capsys
+):
+    """A manifest edited by hand to list feat/b while feat/a (which carries it)
+    is live: status says feat/b's code IS live, and that the next rebuild
+    excludes both."""
     w = dc_ready
-    ha, hb = _descendant_listed_first(w)
+    ha, hb = _stack(w)
+    w.write_manifest([w.entry("feat/a")])
     assert w.run(dc, "rebuild") == 0
+    w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])
     capsys.readouterr()
     assert w.run(dc, "status") == 0
-    block_b = capsys.readouterr().out.split("feat/b  ", 1)[1]
-    assert f"live at {hb[:12]}" in block_b.split("\n", 2)[1]
+    out = capsys.readouterr().out
+    block_b = out.split("feat/b  ", 1)[1]
+    assert f"live at {hb[:12]}" in block_b.split("\n", 2)[1], out
+    assert "next rebuild: EXCLUDED — shares unmerged commits with feat/a" in block_b, out
+    block_a = out.split("feat/a  ", 1)[1].split("feat/b  ", 1)[0]
+    assert "next rebuild: EXCLUDED — shares unmerged commits with feat/b" in block_a, out
 
 
 # ── C. the commit point ────────────────────────────────────────────────────
@@ -439,23 +432,11 @@ def _boom(*_a, **_k):
     raise RuntimeError("boom")
 
 
-def test_a_failing_adopt_report_after_the_branch_exists_is_a_warning(
-    dc, dc_ready, capsys, monkeypatch
-):
-    w = dc_ready
-    (w.root / "b.txt").write_text("edited\n")
-    monkeypatch.setattr(dc.Engine, "_adopt_report", _boom)
-    assert w.run(dc, "adopt", "adopt/x", "--owner", "s") == 0
-    out = capsys.readouterr().out
-    assert "WARNING: adopt/x WAS created at" in out and "the per-file report failed" in out
-    assert w.rev("refs/heads/adopt/x")
-
-
-def test_a_failing_stacked_check_after_drop_is_a_warning(dc, dc_ready, capsys, monkeypatch):
+def test_a_failing_shared_check_after_drop_is_a_warning(dc, dc_ready, capsys, monkeypatch):
     w = dc_ready
     w.candidate("feat/a", {"p.txt": "p\n"})
     w.write_manifest([w.entry("feat/a")])
-    monkeypatch.setattr(dc.Engine, "_warn_stacked", _boom)
+    monkeypatch.setattr(dc.Engine, "_warn_shared", _boom)
     assert w.run(dc, "drop", "feat/a", "--no-rebuild") == 0
     out = capsys.readouterr().out
     assert "WARNING: feat/a WAS dropped from the manifest" in out

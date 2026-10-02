@@ -131,7 +131,7 @@ class Plan:
     tip: str
     merged: list[tuple[str, str]] = field(default_factory=list)  # (branch, head)
     excluded: dict[str, str] = field(default_factory=dict)  # branch -> reason
-    contained: list[str] = field(default_factory=list)  # already in the tip: nothing to merge
+    contained: list[str] = field(default_factory=list)  # already in origin/main: nothing to merge
 
 
 def out(msg: str = "") -> None:

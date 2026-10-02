@@ -6,7 +6,6 @@
 #        scripts/deploy_candidates drop <branch> [--no-rebuild] [--wait N]
 #        scripts/deploy_candidates rebuild [--wait N]
 #        scripts/deploy_candidates list | status
-#        scripts/deploy_candidates adopt <new-branch> --owner <who>
 #
 # This shell is thin on purpose. For every command that writes the manifest or
 # moves the checkout (rebuild, drop in every form, add) it takes update.lock

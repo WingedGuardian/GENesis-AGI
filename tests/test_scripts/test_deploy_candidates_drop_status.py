@@ -1,5 +1,5 @@
-"""deploy_candidates: drop, adopt and status; admission and its completeness
-locks; the shell entry.
+"""deploy_candidates: drop and status; admission and its completeness locks;
+the shell entry.
 
 The scratch world is tests/test_scripts/_deploy_candidates_world.py.
 """
@@ -71,21 +71,27 @@ def test_drop_works_offline_and_never_admits_anything(dc, dc_ready, capsys, orig
     assert w.gh_calls == []
 
 
-def test_drop_takes_out_what_carries_the_dropped_code_and_says_it_returns(dc, dc_ready, capsys):
+def test_drop_takes_out_a_live_candidate_that_shares_the_dropped_commits(dc, dc_ready, capsys):
+    """Subtract-only by construction. A rebuild never leaves two sharers live,
+    but a hand-edited manifest can list feat/s while feat/t, stacked on it, is
+    live, and the drop then counts feat/s as live (carried). Dropping feat/s
+    must not re-merge feat/t, which would put feat/s's commits straight back."""
     w = dc_ready
-    a1 = w.candidate("feat/a", {"p.txt": "a's code\n"})
-    w.candidate("feat/a", {"a2.txt": "a2\n"})
-    w.candidate("feat/c", {"z.txt": "z\n"}, base=a1)
+    s1 = w.candidate("feat/s", {"s.txt": "s's code\n"})
+    w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
     hb = w.candidate("feat/b", {"y.txt": "y\n"})
-    w.write_manifest([w.entry("feat/a"), w.entry("feat/c"), w.entry("feat/b")])
+    w.write_manifest([w.entry("feat/t"), w.entry("feat/b")])
     assert w.run(dc, "rebuild") == 0
+    assert (w.root / "s.txt").exists()
+    w.write_manifest([w.entry("feat/s"), w.entry("feat/t"), w.entry("feat/b")])
     capsys.readouterr()
-    assert w.run(dc, "drop", "feat/a") == 0
+    assert w.run(dc, "drop", "feat/s") == 0
     out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/c .*derived from dropped feat/a", out), out
+    assert re.search(r"EXCLUDED: feat/t .*shares dropped feat/s's unmerged commits", out), out
     assert "come back at the next rebuild" in out
+    assert "WARNING: feat/t shares feat/s's unmerged commits" in out
     assert w.live_merges() == [("feat/b", hb)]
-    assert not (w.root / "p.txt").exists()
+    assert not (w.root / "s.txt").exists() and (w.root / "y.txt").exists()
 
 
 def test_a_drop_that_cannot_move_the_checkout_changes_nothing(dc, dc_ready, capsys):
@@ -106,6 +112,25 @@ def test_a_drop_that_cannot_move_the_checkout_changes_nothing(dc, dc_ready, caps
     assert (w.root / "b.txt").read_text() == "untracked, in the way\n"
 
 
+def test_a_drop_that_would_overwrite_an_excused_edit_changes_nothing(dc, dc_ready, capsys):
+    """The dirty check excuses machine-written tracked files (AGENTS.md); git
+    still refuses to overwrite one with uncommitted changes. A drop that would
+    take the candidate's AGENTS.md away refuses BEFORE the manifest changes."""
+    w = dc_ready
+    w.candidate("feat/a", {"AGENTS.md": "from the candidate\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0
+    (w.root / "AGENTS.md").write_text("rewritten by the indexer\n")
+    before = w.manifest_path.read_text()
+    tip = w.rev("refs/heads/live")
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/a") == 1
+    err = capsys.readouterr().err
+    assert "AGENTS.md (it has uncommitted changes" in err, err
+    assert w.manifest_path.read_text() == before and w.rev("refs/heads/live") == tip
+    assert (w.root / "AGENTS.md").read_text() == "rewritten by the indexer\n"
+
+
 def test_a_drop_on_a_dirty_checkout_changes_nothing(dc, dc_ready, capsys):
     w = dc_ready
     _two_live(w, dc)
@@ -123,7 +148,7 @@ def test_drop_without_a_manifest_writes_nothing(dc, dc_world, capsys):
     assert sorted(p.name for p in (w.home / ".genesis").iterdir()) == ["locks"]
 
 
-def test_drop_off_live_names_a_candidate_stacked_on_the_dropped_one(dc, dc_ready, capsys):
+def test_drop_off_live_names_every_candidate_sharing_the_dropped_commits(dc, dc_ready, capsys):
     w = dc_ready
     a1 = w.candidate("feat/a", {"p.txt": "p\n"})
     w.candidate("feat/c", {"z.txt": "z\n"}, base=a1)
@@ -131,9 +156,8 @@ def test_drop_off_live_names_a_candidate_stacked_on_the_dropped_one(dc, dc_ready
     w.write_manifest([w.entry("feat/a"), w.entry("feat/c"), w.entry("feat/d")])
     assert w.run(dc, "drop", "feat/a", "--no-rebuild") == 0
     out = capsys.readouterr().out
-    # Both siblings: neither counts as the other's shared base.
-    assert "WARNING: feat/c carries feat/a's unmerged commits" in out
-    assert "WARNING: feat/d carries feat/a's unmerged commits" in out
+    assert "WARNING: feat/c shares feat/a's unmerged commits" in out
+    assert "WARNING: feat/d shares feat/a's unmerged commits" in out
 
 
 # ── status ─────────────────────────────────────────────────────────────────
@@ -180,141 +204,19 @@ def test_status_names_a_candidate_whose_change_is_already_on_main(dc, dc_ready, 
     assert "adds nothing beyond origin/main" in capsys.readouterr().out
 
 
-# ── adopt ──────────────────────────────────────────────────────────────────
+# ── adopt is gone ──────────────────────────────────────────────────────────
 
 
-def _work_tree_id(w: World) -> str:
-    """The tree of HEAD plus every tracked working-tree edit, via a scratch index."""
-    idx = w.tmp / "probe.index"
-    env = dict(w.env, GIT_INDEX_FILE=str(idx))
-    subprocess.run(["git", "-C", str(w.root), "read-tree", "HEAD"], env=env, check=True)
-    subprocess.run(["git", "-C", str(w.root), "add", "-u"], env=env, check=True)
-    subprocess.run(["git", "-C", str(w.root), "add", "hand.txt"], env=env, check=True)
-    return subprocess.run(
-        ["git", "-C", str(w.root), "write-tree"],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def test_adopt_sweeps_refs_of_a_killed_adopt_and_leaves_a_running_ones(dc, dc_ready, capsys):
-    """Each adopt fetches into its own refs/deploy-candidates/adopt/<pid>/. A run
-    killed mid-way leaves its refs behind; the next adopt removes them, and never
-    the refs of an adopt that is still running."""
+def test_adopt_is_not_a_command(dc, dc_ready, capsys):
+    """Round 4 removed adopt entirely (owner, 2026-10-02): a dirty checkout is
+    committed on a branch by hand and added like any other."""
     w = dc_ready
-    dead = subprocess.Popen(["true"])
-    dead.wait()  # reaped: its pid names no process now
-    alive = subprocess.Popen(["sleep", "60"])
-    try:
-        main = w.rev("refs/remotes/origin/main")
-        for pid in (dead.pid, alive.pid):
-            w.git(w.root, "update-ref", f"refs/deploy-candidates/adopt/{pid}/main", main)
-        (w.root / "b.txt").write_text("edited\n")
-        assert w.run(dc, "adopt", "adopt/x", "--owner", "s") == 0, capsys.readouterr()
-        left = w.git(w.root, "for-each-ref", "--format=%(refname)", "refs/deploy-candidates/")
-        assert left.stdout.split() == [f"refs/deploy-candidates/adopt/{alive.pid}/main"]
-    finally:
-        alive.kill()
-        alive.wait()
-
-
-def test_adopt_snapshots_the_dirty_edits_and_classifies_each_file(dc, dc_ready, capsys):
-    w = dc_ready
-    w.advance_main({"a.txt": "a1\nmerged\na3\n"})
-    w.git(w.root, "fetch", "-q", "origin")
-    pr_head = w.candidate("feat/p", {"b.txt": "from the PR\n"})
-    w.pr(9, "feat/p", pr_head)
-    (w.root / "a.txt").write_text("a1\nmerged\na3\n")  # equals origin/main
-    (w.root / "b.txt").write_text("from the PR\n")  # equals PR #9's head
-    (w.root / "hand.txt").write_text("by hand\n")
-    w.git(w.root, "add", "-N", "hand.txt")  # intent-to-add: tracked now
-    dirty_tree = _work_tree_id(w)
-    origin_main = w.rev("refs/remotes/origin/main")
-    assert w.run(dc, "adopt", "adopt/live-edits", "--owner", "sess-z") == 0, capsys.readouterr()
-    out = capsys.readouterr().out
-    snap = w.rev("refs/heads/adopt/live-edits")
-    assert w.rev(f"{snap}^{{tree}}") == dirty_tree
-    assert w.rev(f"{snap}^") == w.rev("HEAD")
-    assert re.search(r"a\.txt\s+equals origin/main", out), out
-    assert re.search(r"b\.txt\s+equals PR #9", out), out
-    assert re.search(r"hand\.txt\s+neither", out), out
-    assert (w.root / "b.txt").read_text() == "from the PR\n"  # the checkout is untouched
-    # Its fetches never move origin/main's ref, and its private refs are gone.
-    assert w.rev("refs/remotes/origin/main") == origin_main
-    assert w.git(w.root, "for-each-ref", "refs/deploy-candidates/").stdout == ""
-    capsys.readouterr()
-    assert w.run(dc, "adopt", "adopt/live-edits", "--owner", "sess-z") == 1
-    assert "exists" in capsys.readouterr().err
-
-
-def test_adopt_reports_the_snapshot_not_the_working_tree(dc, dc_ready, capsys, monkeypatch):
-    """A file edited again while the report runs is reported as snapshotted."""
-    w = dc_ready
-    (w.root / "a.txt").write_text("edited\n")
-    real = dc.Engine._adopt_report
-
-    def edit_then_report(self, paths, snapshot):
-        (w.root / "a.txt").write_text("a1\na2\na3\n")  # back to origin/main's content
-        return real(self, paths, snapshot)
-
-    monkeypatch.setattr(dc.Engine, "_adopt_report", edit_then_report)
-    assert w.run(dc, "adopt", "adopt/x", "--owner", "s") == 0
-    assert re.search(r"a\.txt\s+neither", capsys.readouterr().out)
-
-
-def test_adopt_on_live_carries_only_the_edits_onto_the_base(dc, dc_ready, capsys):
-    """On `live` the snapshot's branch sits on the base `live` is on: no rebuild
-    merge (admission would refuse it) and no other candidate's code."""
-    w = dc_ready
-    _two_live(w, dc)
-    live_base = w.rev("refs/remotes/origin/main")
-    (w.root / "b.txt").write_text("edited on live\n")
-    assert w.run(dc, "adopt", "adopt/on-live", "--owner", "s") == 0, capsys.readouterr()
-    head = w.rev("refs/heads/adopt/on-live")
-    assert w.rev(f"{head}^") == live_base
-    files = set(w.git(w.root, "ls-tree", "-r", "--name-only", head).stdout.split())
-    assert "x.txt" not in files and "y.txt" not in files
-    assert w.git(w.root, "show", f"{head}:b.txt").stdout == "edited on live\n"
-    capsys.readouterr()
-    assert w.add(dc, "adopt/on-live") == 0, capsys.readouterr()
-
-
-def test_adopt_on_live_refuses_edits_it_cannot_separate_from_a_candidate(dc, dc_ready, capsys):
-    w = dc_ready
-    w.candidate("feat/a", {"b.txt": "b from a\n"})
-    w.write_manifest([w.entry("feat/a")])
-    assert w.run(dc, "rebuild") == 0
-    (w.root / "b.txt").write_text("b from a, edited\n")
-    assert w.run(dc, "adopt", "adopt/x", "--owner", "s") == 1
-    assert "cannot be separated" in capsys.readouterr().err
-    assert (
-        w.git(w.root, "rev-parse", "--verify", "-q", "refs/heads/adopt/x", check=False).returncode
-        != 0
-    )
-
-
-def test_adopt_reads_paths_literally_never_as_patterns(dc, dc_ready, capsys):
-    w = dc_ready
-    w.commit(w.root, {"w*": "one\n"}, "a file with a glob character in its name")
-    w.serving_sha = w.rev("HEAD")
-    (w.root / "w*").write_text("two\n")
-    (w.root / "wz.txt").write_text("untracked\n")
-    assert w.run(dc, "adopt", "adopt/glob", "--owner", "s") == 0, capsys.readouterr()
-    names = w.git(w.root, "ls-tree", "--name-only", "refs/heads/adopt/glob").stdout.split("\n")
-    assert "w*" in names and "wz.txt" not in names
-
-
-@pytest.mark.parametrize(
-    ("argv", "why"), [((), "nothing to adopt"), (("--owner", " "), "--owner is empty")]
-)
-def test_adopt_refuses(dc, dc_ready, capsys, argv, why):
-    w = dc_ready
-    if argv:
-        (w.root / "a.txt").write_text("edit\n")
-    assert w.run(dc, "adopt", "adopt/x", *(argv or ("--owner", "s"))) == 1
-    assert why in capsys.readouterr().err
+    (w.root / "a.txt").write_text("edit\n")
+    assert w.run(dc, "adopt", "adopt/x", "--owner", "s") == 2
+    assert "invalid choice: 'adopt'" in capsys.readouterr().err
+    assert w.git(
+        w.root, "rev-parse", "--verify", "-q", "refs/heads/adopt/x", check=False
+    ).returncode
 
 
 # ── admission ──────────────────────────────────────────────────────────────

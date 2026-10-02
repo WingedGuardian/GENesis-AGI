@@ -238,7 +238,7 @@ def test_a_dirty_checkout_refuses_and_names_the_files(dc, dc_ready, capsys):
     (w.root / "AGENTS.md").write_text("machine-written\n")  # untracked: not dirty
     assert w.run(dc, "rebuild") == 1
     err = capsys.readouterr().err
-    assert "b.txt" in err and "adopt" in err
+    assert "b.txt" in err and "a branch cut from origin/main (never from `live`" in err
     assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
     # Control: an excused (ephemeral) tracked edit alone does not refuse.
     w.git(w.root, "checkout", "-q", "--", "b.txt")
@@ -266,6 +266,100 @@ def test_an_ignored_file_in_the_way_refuses_before_anything_changes(dc, dc_ready
     assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
     got = w.git(w.root, "config", "--get", "gc.refs/heads/live.reflogExpire", check=False)
     assert got.stdout == ""
+
+
+def _track_dir(w) -> None:
+    """origin/main and the checkout hold a tracked directory d/ (one file)."""
+    w.advance_main({"d/one.txt": "one\n"})
+    w.git(w.root, "pull", "-q", "--ff-only")
+    w.serving_sha = w.rev("HEAD")
+
+
+def _dir_becomes_file(w) -> str:
+    """A candidate that replaces the tracked directory d/ with a file d."""
+    w.candidate("feat/f", {"d/one.txt": None})
+    (w.tmp / "wt-feat-f" / "d").rmdir()
+    return w.candidate("feat/f", {"d": "now a file\n"})
+
+
+def test_a_tracked_file_that_becomes_a_directory_moves(dc, dc_ready, capsys):
+    """Tracked content in the way is git's to replace: b.txt (tracked) becomes
+    the directory b.txt/."""
+    w = dc_ready
+    h = w.candidate("feat/d", {"b.txt": None, "b.txt/inner.txt": "inner\n"})
+    w.write_manifest([w.entry("feat/d")])
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert w.live_merges() == [("feat/d", h)]
+    assert (w.root / "b.txt" / "inner.txt").read_text() == "inner\n"
+
+
+def test_a_tracked_directory_that_becomes_a_file_moves(dc, dc_ready, capsys):
+    w = dc_ready
+    _track_dir(w)
+    h = _dir_becomes_file(w)
+    w.write_manifest([w.entry("feat/f")])
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert w.live_merges() == [("feat/f", h)]
+    assert (w.root / "d").read_text() == "now a file\n"
+
+
+def test_an_untracked_file_where_a_directory_must_go_refuses_first(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/d", {"u.txt/inner.txt": "inner\n"})
+    w.write_manifest([w.entry("feat/d")])
+    (w.root / "u.txt").write_text("untracked, in the way\n")
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert "untracked file is in the way at u.txt" in err, err
+    assert (w.root / "u.txt").read_text() == "untracked, in the way\n"
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+
+
+def test_an_untracked_file_inside_a_directory_that_becomes_a_file_refuses_first(
+    dc, dc_ready, capsys
+):
+    w = dc_ready
+    _track_dir(w)
+    _dir_becomes_file(w)
+    w.write_manifest([w.entry("feat/f")])
+    (w.root / "d" / "extra.txt").write_text("untracked, in the way\n")
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    # The refusal names the untracked file itself, not just the directory.
+    assert "in the way" in err and "d/extra.txt" in err, err
+    assert (w.root / "d" / "extra.txt").read_text() == "untracked, in the way\n"
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+
+
+def test_a_large_untracked_tree_in_the_way_is_named_by_count(dc, dc_ready, capsys):
+    """An ignored tree the size of node_modules would otherwise print every
+    file: the refusal names ten and counts the rest."""
+    w = dc_ready
+    _track_dir(w)
+    _dir_becomes_file(w)
+    w.write_manifest([w.entry("feat/f")])
+    for i in range(12):
+        (w.root / "d" / f"extra{i:02}.txt").write_text("untracked\n")
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert "d/extra09.txt, and 2 more" in err and "extra10" not in err, err
+
+
+def test_an_excused_edit_the_move_would_overwrite_refuses_first(dc, dc_ready, capsys):
+    """The dirty check excuses machine-written tracked files (AGENTS.md), but git
+    refuses to overwrite one with uncommitted changes: the move refuses first."""
+    w = dc_ready
+    w.advance_main({"AGENTS.md": "tracked\n"})
+    w.git(w.root, "pull", "-q", "--ff-only")
+    w.serving_sha = w.rev("HEAD")
+    w.candidate("feat/a", {"AGENTS.md": "from the candidate\n"})
+    w.write_manifest([w.entry("feat/a")])
+    (w.root / "AGENTS.md").write_text("rewritten by the indexer\n")
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert "AGENTS.md (it has uncommitted changes" in err, err
+    assert (w.root / "AGENTS.md").read_text() == "rewritten by the indexer\n"
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
 
 
 def test_live_checked_out_in_another_worktree_refuses_the_rebuild(dc, dc_ready, capsys):
@@ -320,158 +414,90 @@ def test_a_hand_made_commit_carrying_the_trailer_is_still_foreign(dc, dc_ready, 
     assert "neither a rebuild merge" in capsys.readouterr().err
 
 
-# ── derivation: a candidate carrying an excluded one's code goes out with it ──
+# ── one candidate per commit: a shared unmerged commit excludes every sharer ──
 
 
-def test_a_candidate_derived_from_an_excluded_one_is_excluded_too(dc, dc_ready, capsys):
+def _sharers(w, shape: str) -> list[str]:
+    """Candidates that share feat/s's first commit, in the shape named."""
+    s1 = w.candidate("feat/s", {"s.txt": "shared\n"})
+    w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    if shape == "fork":  # a second branch cut from the same commit
+        w.candidate("feat/u", {"u.txt": "u\n"}, base=s1)
+        return ["feat/s", "feat/t", "feat/u"]
+    if shape == "dependency-gained":  # feat/s moved on after feat/t was cut from it
+        w.candidate("feat/s", {"s2.txt": "s2\n"})
+    return ["feat/s", "feat/t"]
+
+
+@pytest.mark.parametrize("shape", ["stack", "fork", "dependency-gained"])
+def test_candidates_sharing_an_unmerged_commit_all_go_out_by_name(dc, dc_ready, capsys, shape):
+    """Git cannot say whose code a shared commit is, so no rule could keep one
+    sharer live and leave the other out: every sharer is excluded, named, and an
+    independent control goes live."""
     w = dc_ready
-    a1 = w.candidate("feat/a", {"p.txt": "p\n"})
-    w.candidate("feat/a", {"a.txt": "a1\nA-SIDE\na3\n"})
-    w.candidate("feat/c", {"z.txt": "z\n"}, base=a1)
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    hb = w.candidate("feat/b", {"y.txt": "y\n"})
-    w.write_manifest([w.entry("feat/c"), w.entry("feat/a"), w.entry("feat/b")])
-    assert w.run(dc, "rebuild") == 0
-    out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/a .*conflict", out), out
-    assert re.search(r"EXCLUDED: feat/c .*derived from .*feat/a", out), out
-    assert w.live_merges() == [("feat/b", hb)]
-    assert not (w.root / "p.txt").exists()
-
-
-def test_a_dependency_of_an_excluded_candidate_stays_live(dc, dc_ready, capsys):
-    w = dc_ready
-    hb = w.candidate("feat/b", {"y.txt": "y\n"})
-    w.candidate("feat/a", {"a.txt": "a1\nA-SIDE\na3\n"}, base="feat/b")
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry("feat/b"), w.entry("feat/a")])
-    assert w.run(dc, "rebuild") == 0
-    out = capsys.readouterr().out
-    assert "EXCLUDED: feat/b" not in out
-    assert w.live_merges() == [("feat/b", hb)]
-
-
-def test_siblings_stacked_on_a_live_shared_candidate_do_not_exclude_each_other(
-    dc, dc_ready, capsys
-):
-    w = dc_ready
+    names = _sharers(w, shape)
     hc = w.candidate("feat/c", {"c.txt": "c\n"})
-    w.candidate("feat/a", {"a.txt": "a1\nA-SIDE\na3\n"}, base="feat/c")
-    hb = w.candidate("feat/b", {"y.txt": "y\n"}, base=hc)
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry("feat/c"), w.entry("feat/a"), w.entry("feat/b")])
+    w.write_manifest([w.entry(n) for n in names] + [w.entry("feat/c")])
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
-    assert "EXCLUDED: feat/b" not in out and "EXCLUDED: feat/c" not in out, out
-    assert w.live_merges() == [("feat/c", hc), ("feat/b", hb)]
+    for n in names:
+        assert re.search(rf"EXCLUDED: {re.escape(n)} .*shares unmerged commits with", out), out
+    assert w.live_merges() == [("feat/c", hc)]
+    assert not (w.root / "s.txt").exists() and (w.root / "c.txt").exists()
 
 
-def test_two_siblings_cut_from_an_excluded_candidate_both_go_out(dc, dc_ready, capsys):
-    """A fork: B and C are both cut from E's first commit. Each also carries E's
-    code, and the other sibling must not count as the shared third candidate."""
+def test_a_stack_listed_by_its_top_branch_goes_live_whole(dc, dc_ready, capsys):
     w = dc_ready
-    e1 = w.candidate("feat/e", {"p.txt": "e's code\n"})
-    w.candidate("feat/e", {"a.txt": "a1\nE-SIDE\na3\n"})
-    w.candidate("feat/b", {"b2.txt": "b\n"}, base=e1)
-    w.candidate("feat/c", {"c2.txt": "c\n"}, base=e1)
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry("feat/e"), w.entry("feat/b"), w.entry("feat/c")])
+    s1 = w.candidate("feat/s", {"s.txt": "shared\n"})
+    ht = w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    w.write_manifest([w.entry("feat/t")])
     assert w.run(dc, "rebuild") == 0
-    out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/b .*derived from .*feat/e", out), out
-    assert re.search(r"EXCLUDED: feat/c .*derived from .*feat/e", out), out
-    assert w.live_merges() == []
-    assert not (w.root / "p.txt").exists()
+    assert w.live_merges() == [("feat/t", ht)], capsys.readouterr().out
+    assert (w.root / "s.txt").exists() and (w.root / "t.txt").exists()
 
 
-def test_a_linear_stack_on_an_excluded_candidate_goes_out_whole(dc, dc_ready, capsys):
-    """E <- F <- B, F cut from E's first commit: F and B both carry E's code."""
+def test_a_commit_shared_only_through_origin_main_is_not_shared(dc, dc_ready, capsys):
+    """Two branches cut from one commit that has since landed upstream share
+    nothing unmerged: both go live."""
     w = dc_ready
-    e1 = w.candidate("feat/e", {"p.txt": "e's code\n"})
-    w.candidate("feat/e", {"a.txt": "a1\nE-SIDE\na3\n"})
-    f1 = w.candidate("feat/f", {"f.txt": "f\n"}, base=e1)
-    w.candidate("feat/b", {"b2.txt": "b\n"}, base=f1)
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry("feat/e"), w.entry("feat/f"), w.entry("feat/b")])
+    s1 = w.candidate("feat/s", {"s.txt": "shared\n"})
+    ht = w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    hu = w.candidate("feat/u", {"u.txt": "u\n"}, base=s1)
+    w.git(w.root, "push", "-q", str(w.origin), f"{s1}:refs/heads/main")
+    w.write_manifest([w.entry("feat/t"), w.entry("feat/u")])
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/f .*derived from .*feat/e", out), out
-    assert re.search(r"EXCLUDED: feat/b .*derived from .*feat/e", out), out
-    assert not (w.root / "p.txt").exists()
+    assert "shares unmerged commits" not in out, out
+    assert w.live_merges() == [("feat/t", ht), ("feat/u", hu)]
 
 
-def test_two_excluded_candidates_sharing_a_commit_do_not_cancel_out(dc, dc_ready, capsys):
-    """E1 and E2 (both excluded) and B all hold commit s: B carries their code."""
+def test_sharing_and_conflict_exclusions_combine(dc, dc_ready, capsys):
     w = dc_ready
-    s = w.candidate("feat/s", {"s.txt": "shared\n"})
-    w.candidate("feat/e1", {"a.txt": "a1\nE1\na3\n"}, base=s)
-    w.candidate("feat/e2", {"b.txt": "E2\n"}, base=s)
-    w.candidate("feat/b", {"b2.txt": "b\n"}, base=s)
-    w.advance_main({"a.txt": "a1\nMAIN\na3\n", "b.txt": "MAIN\n"})
-    w.write_manifest([w.entry("feat/e1"), w.entry("feat/e2"), w.entry("feat/b")])
-    assert w.run(dc, "rebuild") == 0
-    out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/b .*derived from", out), out
-    assert not (w.root / "s.txt").exists()
-
-
-def test_a_conflict_with_a_later_excluded_candidate_is_recomputed(dc, dc_ready, capsys):
-    w = dc_ready
-    a1 = w.candidate("feat/a", {"p.txt": "p\n"})
-    w.candidate("feat/a", {"a.txt": "a1\nA-SIDE\na3\n"})
-    w.candidate("feat/b", {"q.txt": "from b\n"}, base=a1)
-    hc = w.candidate("feat/c", {"q.txt": "from c\n"})
+    names = _sharers(w, "stack")
+    w.candidate("feat/x", {"a.txt": "a1\nX-SIDE\na3\n"})
     w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry("feat/a"), w.entry("feat/b"), w.entry("feat/c")])
+    hc = w.candidate("feat/c", {"c.txt": "c\n"})
+    w.write_manifest([w.entry(n) for n in names] + [w.entry("feat/x"), w.entry("feat/c")])
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
-    assert re.search(r"EXCLUDED: feat/b .*derived from .*feat/a", out), out
+    for n in names:
+        assert re.search(rf"EXCLUDED: {re.escape(n)} .*shares unmerged commits with", out), out
+    assert re.search(r"EXCLUDED: feat/x .*conflict", out), out
     assert w.live_merges() == [("feat/c", hc)]
 
 
-def test_an_exclusion_derived_from_a_lifted_conflict_is_released(dc, dc_ready, capsys):
-    """X conflicts; B carries X's code; C conflicts only with B (in its SECOND
-    commit); D was cut from C's first commit, so D merges cleanly on the first
-    pass and is excluded there only as carrying C's code. Once B is out, C
-    merges, so D's exclusion no longer has a source and must be released: the
-    answer is C and D live, never D held out by a conflict that no longer
-    exists."""
+def test_shared_with_pairs_every_sharer_and_skips_a_head_that_is_gone(dc, dc_ready):
     w = dc_ready
-    x1 = w.candidate("feat/x", {"px.txt": "x\n"})
-    w.candidate("feat/x", {"a.txt": "a1\nX-SIDE\na3\n"})
-    w.candidate("feat/b", {"q.txt": "from b\n"}, base=x1)
-    c1 = w.candidate("feat/c", {"c1.txt": "c1\n"})
-    hc = w.candidate("feat/c", {"q.txt": "from c\n"})
-    hd = w.candidate("feat/d", {"d.txt": "d\n"}, base=c1)
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry(b) for b in ("feat/x", "feat/b", "feat/c", "feat/d")])
-    assert w.run(dc, "rebuild") == 0
-    out = capsys.readouterr().out
-    assert dict(w.live_merges()) == {"feat/c": hc, "feat/d": hd}, out
-    assert "derived from excluded feat/c" not in out and "derived from excluded feat/d" not in out
-
-
-def test_a_dependency_that_gained_commits_reads_as_carrying_the_excluded_code(dc, dc_ready, capsys):
-    """feat/a was cut from feat/b's first commit, then b gained one. Git cannot
-    tell this from b having been cut from a's first commit, so b goes out with
-    a: the conservative side, reported by name. Pinned so changing it is a
-    decision, not a drift."""
-    w = dc_ready
-    b1 = w.candidate("feat/b", {"y.txt": "y\n"})
-    w.candidate("feat/a", {"a.txt": "a1\nA-SIDE\na3\n"}, base=b1)
-    w.candidate("feat/b", {"y2.txt": "y2\n"})
-    w.advance_main({"a.txt": "a1\nMAIN-SIDE\na3\n"})
-    w.write_manifest([w.entry("feat/b"), w.entry("feat/a")])
-    assert w.run(dc, "rebuild") == 0
-    assert re.search(r"EXCLUDED: feat/b .*derived from .*feat/a", capsys.readouterr().out)
-
-
-def test_carries_is_the_derived_dependency_rule(dc):
-    assert dc.carries({"a1", "c1"}, {"a1", "a2"}, set())
-    assert dc.carries({"a1", "a2", "c1"}, {"a1", "a2"}, set())
-    assert not dc.carries({"b1"}, {"b1", "a1"}, set())
-    assert not dc.carries({"c1"}, {"a1"}, set())
-    assert not dc.carries({"c1", "b1"}, {"c1", "a1"}, {"c1"})
+    s1 = w.candidate("feat/s", {"s.txt": "shared\n"})
+    ht = w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    hc = w.candidate("feat/c", {"c.txt": "c\n"})
+    base = w.rev("refs/remotes/origin/main")
+    engine = dc.Engine(w.root, w.env)
+    heads = {"feat/s": s1, "feat/t": ht, "feat/c": hc, "feat/gone": "f" * 40}
+    assert dc.plan.shared_with(engine, base, heads) == {
+        "feat/s": ["feat/t"],
+        "feat/t": ["feat/s"],
+    }
 
 
 # ── per-candidate checks re-derived at every rebuild ─────────────────────────
@@ -589,6 +615,45 @@ def test_a_squash_merged_pr_retires_whatever_main_did_afterwards(dc, dc_ready, c
     assert "retired: feat/a" in capsys.readouterr().out
     assert w.manifest()["candidates"] == []
     assert w.live_merges() == []
+
+
+def test_a_merged_candidate_is_not_retired_while_a_listed_one_shares_its_commits(
+    dc, dc_ready, capsys
+):
+    """A hand-listed pair [feat/s, feat/t stacked on it]: feat/s squash-merges and
+    main then reverts it. Retiring feat/s would leave feat/t alone, and the next
+    rebuild would put s's reverted code back with it. So feat/s stays listed and
+    both stay out until one is dropped; status says the same."""
+    w = dc_ready
+    s1 = w.candidate("feat/s", {"s.txt": "s\n"})
+    w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    w.pr(5, "feat/s", s1)
+    w.write_manifest([w.entry("feat/s", pr=5), w.entry("feat/t")])
+    assert w.run(dc, "rebuild") == 0
+    sq = w.squash_merge("feat/s")
+    w.git(w.up, "revert", "--no-edit", sq)
+    w.git(w.up, "push", "-q", "origin", "main")
+    w.gh_states[5].update(state="MERGED", mergeCommit={"oid": sq})
+    w.git(w.root, "fetch", "-q", "origin")  # status judges the last-fetched main
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    out = capsys.readouterr().out
+    assert "retires at the next rebuild" not in out, out
+    assert "not retired: feat/t shares its unmerged commits" in out, out
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert re.search(r"EXCLUDED: feat/s .*not retired: feat/t shares its unmerged commits", out), (
+        out
+    )
+    assert re.search(r"EXCLUDED: feat/t ", out) and "retired: feat/s" not in out, out
+    assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/s", "feat/t"]
+    assert w.live_merges() == [] and not (w.root / "s.txt").exists()
+    # Control: listed alone, the same merged feat/s retires.
+    w.write_manifest([w.entry("feat/s", pr=5, head=s1)])
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert "retired: feat/s" in capsys.readouterr().out
+    assert w.manifest()["candidates"] == []
 
 
 def test_a_retirement_names_commits_the_branch_gained_after_its_pinned_head(dc, dc_ready, capsys):
@@ -784,7 +849,26 @@ def test_readiness_checks_the_directory_git_runs_hooks_from(dc, dc_ready, capsys
     elsewhere.mkdir()
     w.git(w.root, "config", "core.hooksPath", str(elsewhere))
     assert w.add(dc, "feat/a") == 1
-    assert "hooks-elsewhere" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "core.hooksPath points git at" in err and "hooks-elsewhere" in err, err
+    assert "sync-hooks.sh installs into" in err
+    assert "set core.hooksPath in this repository to" in err, err  # a global setting
+    # Control: a hooksPath that resolves to the directory sync-hooks.sh installs
+    # into is not a divergence. git resolves this symlink itself when it prints
+    # an absolute path, so this case passes even without the realpath compare.
+    link = tmp_path / "hooks-link"
+    link.symlink_to(w.root / ".git" / "hooks")
+    w.git(w.root, "config", "core.hooksPath", str(link))
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    # Control that only the realpath compare passes: no core.hooksPath, but
+    # .git/hooks is itself a symlink. git names the link's target, while
+    # sync-hooks.sh installs into $GIT_COMMON_DIR/hooks and writes through the
+    # link, so both are one directory.
+    w.git(w.root, "config", "--unset", "core.hooksPath")
+    moved = tmp_path / "hooks-moved"
+    (w.root / ".git" / "hooks").rename(moved)
+    (w.root / ".git" / "hooks").symlink_to(moved)
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
 
 
 def test_the_dirty_list_matches_the_deploy_scripts_pipeline(dc, dc_ready):

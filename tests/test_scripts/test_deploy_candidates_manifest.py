@@ -103,6 +103,58 @@ def test_re_adding_moves_the_pin_to_the_new_head_and_keeps_added_at(dc, dc_ready
     assert "re-verified" in capsys.readouterr().out
 
 
+def test_add_refuses_a_branch_sharing_an_unmerged_commit_with_a_listed_one(dc, dc_ready, capsys):
+    """One candidate per commit: a stack goes in as its top branch."""
+    w = dc_ready
+    s1 = w.candidate("feat/s", {"s.txt": "s\n"})
+    w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    assert w.add(dc, "feat/s") == 0, capsys.readouterr()
+    before = w.manifest_path.read_text()
+    capsys.readouterr()
+    assert w.add(dc, "feat/t") == 1
+    err = capsys.readouterr().err
+    assert "feat/t shares unmerged commits with feat/s" in err and "top branch" in err, err
+    assert "drop feat/s, then add feat/t" in err, err
+    assert w.manifest_path.read_text() == before
+    # Controls: an independent branch is added, and re-adding feat/s after it
+    # moved on does not count feat/s against itself.
+    w.candidate("feat/c", {"c.txt": "c\n"})
+    assert w.add(dc, "feat/c") == 0, capsys.readouterr()
+    # A re-add is judged at the branch's NEW head: feat/c, listed while it was
+    # independent, then merges feat/s. Judged at its listed head it would pass.
+    w.git(w.tmp / "wt-feat-c", "merge", "-q", "--no-edit", "feat/s")
+    before = w.manifest_path.read_text()
+    capsys.readouterr()
+    assert w.add(dc, "feat/c") == 1
+    err = capsys.readouterr().err
+    assert "feat/c shares unmerged commits with feat/s" in err, err
+    assert w.manifest_path.read_text() == before
+    h2 = w.candidate("feat/s", {"s2.txt": "s2\n"})
+    assert w.add(dc, "feat/s") == 0, capsys.readouterr()
+    assert {c["branch"]: c["verified_head"] for c in w.manifest()["candidates"]}["feat/s"] == h2
+
+
+def test_add_refusal_names_the_remedy_for_each_way_two_branches_share_commits(dc, dc_ready, capsys):
+    """Three shapes share commits, and each has a different remedy: the top is
+    already listed (nothing to add), and two siblings cut from one branch (no
+    top: rebase or combine). The stacked-top-added-last shape is in the test
+    above."""
+    w = dc_ready
+    s1 = w.candidate("feat/s", {"s.txt": "s\n"})
+    w.candidate("feat/t", {"t.txt": "t\n"}, base=s1)
+    w.candidate("feat/u", {"u.txt": "u\n"}, base=s1)
+    assert w.add(dc, "feat/t") == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.add(dc, "feat/s") == 1
+    err = capsys.readouterr().err
+    assert "feat/t, already listed, carries feat/s's commits" in err, err
+    assert w.add(dc, "feat/u") == 1
+    err = capsys.readouterr().err
+    assert "cut from one branch" in err and "freshly fetched origin/main" in err, err
+    assert "top branch" not in err, err
+    assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/t"]
+
+
 def test_add_refuses_a_pr_that_is_not_open_against_main_with_this_head(dc, dc_ready, capsys):
     w = dc_ready
     head = w.candidate("feat/x", {"x.txt": "x\n"})

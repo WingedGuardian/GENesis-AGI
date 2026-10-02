@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from pathlib import Path
 
 # Imported only through deploy_candidates.py, whose finder resolves the
 # sibling modules from this directory: scripts/ is never on sys.path.
@@ -212,6 +213,18 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
         fails.append(str(exc))
         return fails
     hooks_dir = repo.hooks_dir()
+    installs_into = Path(repo.common_dir()) / "hooks"
+    if os.path.realpath(hooks_dir) != os.path.realpath(installs_into):
+        # sync-hooks.sh installs into $GIT_COMMON_DIR/hooks, so with
+        # core.hooksPath set a rebuild would sync hooks git never runs, and
+        # the guards git does run would stay as they are.
+        fails.append(
+            f"core.hooksPath points git at {hooks_dir}, but sync-hooks.sh installs into "
+            f"{installs_into}: the hooks a rebuild syncs would not be the ones git runs. "
+            "Unset core.hooksPath to use `live` (or, if it is set globally, set core.hooksPath "
+            f"in this repository to {installs_into})."
+        )
+        return fails
     for name in names:
         want = repo.blob_at("HEAD", f"scripts/hooks/{name}")
         if want is None:
