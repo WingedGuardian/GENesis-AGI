@@ -1056,18 +1056,22 @@ VENV_PYTHON="$VENV_PATH/bin/python"
 
 # .claude/settings.json ships tracked in the repo — hooks are pre-configured on
 # every clone, so there is no template to render here. (VENV_PYTHON stays defined:
-# the .mcp.json render below still substitutes it.)
+# the .mcp.json render below runs under it.)
 
-# .mcp.json — MCP server configuration for Claude Code
+# .mcp.json — MCP server configuration for Claude Code. Rendered by the same code
+# bootstrap.sh runs (scripts/setup_claude_config.py), never by a text
+# substitution here: the interactive render leaves out servers only a dispatch
+# profile uses (INTERACTIVE_EXCLUDED_SERVERS there), which a sed cannot do.
 MCP_TEMPLATE="$REPO_DIR/config/mcp.json.template"
 MCP_TARGET="$REPO_DIR/.mcp.json"
 if [ -f "$MCP_TEMPLATE" ]; then
     if [ -f "$MCP_TARGET" ]; then
         echo "    . .mcp.json already exists (not overwriting)"
-    else
-        sed "s|{{VENV_PYTHON}}|$VENV_PYTHON|g; s|{{GENESIS_ROOT}}|$REPO_DIR|g" \
-            "$MCP_TEMPLATE" > "$MCP_TARGET"
+    elif "$VENV_PYTHON" "$REPO_DIR/scripts/setup_claude_config.py" --mcp-only \
+            --genesis-root "$REPO_DIR" >/dev/null && [ -f "$MCP_TARGET" ]; then
         echo "    + MCP server config generated (.mcp.json)"
+    else
+        echo "    - .mcp.json render failed (run scripts/bootstrap.sh to render it)"
     fi
 else
     echo "    - MCP template not found (skipping)"
