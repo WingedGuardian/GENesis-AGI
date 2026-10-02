@@ -181,6 +181,14 @@ def _force_rmtree(path: str) -> None:
     if os.path.islink(path):
         with contextlib.suppress(OSError):
             os.unlink(path)
+        # A failed unlink (an unwritable parent) must not read as success: the
+        # same warning the directory path gives, never an exception.
+        if os.path.lexists(path):
+            _warn_without_escalating(
+                f"genesis: could not remove the stale pytest temp link at {path}; "
+                "its parent is not writable by this user. It will be retried on "
+                "the next run."
+            )
         return
 
     shutil.rmtree(path, onexc=_swallow)
@@ -322,6 +330,7 @@ def pytest_configure(config):
     if not should_redirect_pytest_basetemp(
         current_basetemp=config.option.basetemp,
         ci_env=os.environ.get("CI"),
+        tmpdir_env=os.environ.get("TMPDIR"),
     ):
         return
     # Scope the leaf per-process. pytest CLEARS an explicit basetemp at session

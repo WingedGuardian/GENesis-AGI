@@ -36,6 +36,7 @@ def big_tmp_dir() -> str:
 def should_redirect_pytest_basetemp(
     current_basetemp: str | None,
     ci_env: str | None,
+    tmpdir_env: str | None = None,
 ) -> bool:
     """Whether pytest's basetemp should be steered to ``~/tmp``. Pure — no I/O.
 
@@ -66,7 +67,11 @@ def should_redirect_pytest_basetemp(
       * an explicit ``--basetemp`` (``current_basetemp is not None``) — never
         override a caller who named a location;
       * CI (``ci_env`` set to anything but a falsey spelling) — a hosted runner
-        keeps its own ample temp, and its ``$HOME`` may be read-only.
+        keeps its own ample temp, and its ``$HOME`` may be read-only. EXCEPT when
+        ``tmpdir_env`` points inside ``~/.genesis/cc-tmp``: no hosted runner has
+        that directory, so a CI-marked run there is a LOCAL run (``CI=true
+        pytest`` inside a CC session), and exempting it would put the suite's
+        temp tree into the policed directory this redirect exists to protect.
 
     Enumerating hazardous locations instead would be a denylist, and the next
     small temp dir to appear would silently not be on it.
@@ -84,7 +89,21 @@ def should_redirect_pytest_basetemp(
     """
     if current_basetemp is not None:
         return False
-    return not _is_ci(ci_env)
+    return not _is_ci(ci_env) or _in_cc_tmp(tmpdir_env)
+
+
+#: The budget-policed working temp (see the module docstring), as a template.
+_CC_TMP = os.path.join("~", ".genesis", "cc-tmp")
+
+
+def _in_cc_tmp(tmpdir_env: str | None) -> bool:
+    """Whether a raw ``$TMPDIR`` value names cc-tmp or a path under it. Pure:
+    lexical (``expanduser`` + ``normpath``), so it never touches the filesystem."""
+    if not tmpdir_env:
+        return False
+    cc_tmp = os.path.normpath(os.path.expanduser(_CC_TMP))
+    target = os.path.normpath(os.path.expanduser(tmpdir_env))
+    return target == cc_tmp or target.startswith(cc_tmp + os.sep)
 
 
 # ``CI`` is the de-facto cross-vendor signal; GitHub Actions (this repo's only CI —

@@ -93,6 +93,26 @@ def test_noredirect_on_ci():
     assert should_redirect_pytest_basetemp(None, "TRUE") is False
 
 
+def test_ci_inside_cc_tmp_still_redirects(monkeypatch):
+    """A CI-marked run whose TMPDIR is the policed cc-tmp is a LOCAL run (no
+    hosted runner has that directory), so the CI exemption must not apply."""
+    monkeypatch.setenv("HOME", "/home/someone")
+    cc_tmp = "/home/someone/.genesis/cc-tmp"
+    assert should_redirect_pytest_basetemp(None, "true", cc_tmp) is True
+    assert should_redirect_pytest_basetemp(None, "true", cc_tmp + "/claude-1000") is True
+    assert should_redirect_pytest_basetemp(None, "true", "~/.genesis/cc-tmp/x") is True
+
+
+def test_ci_outside_cc_tmp_stays_exempt(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/someone")
+    assert should_redirect_pytest_basetemp(None, "true", "/tmp") is False
+    assert should_redirect_pytest_basetemp(None, "true", None) is False
+    # A sibling whose name merely starts with "cc-tmp" is not inside it.
+    assert should_redirect_pytest_basetemp(None, "true", "/home/someone/.genesis/cc-tmp2") is False
+    # An explicit --basetemp still wins, even inside cc-tmp.
+    assert should_redirect_pytest_basetemp("/x", "true", "/home/someone/.genesis/cc-tmp") is False
+
+
 def test_ci_falsey_spellings_are_not_ci():
     """`CI=false` is the conventional way tooling opts a run OUT of CI behaviour.
     Reading it as "on CI" would invert the operator's intent."""
@@ -181,6 +201,8 @@ def test_call_site_reads_the_CI_variable(tmp_path, monkeypatch):
     big = tmp_path / "big"
     monkeypatch.setenv("GENESIS_BIG_TMP", str(big))
     monkeypatch.setenv("CI", "true")
+    # Outside cc-tmp, so the CI exemption applies whatever this run's own TMPDIR is.
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "runner-tmp"))
     monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
 
     config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
@@ -188,6 +210,27 @@ def test_call_site_reads_the_CI_variable(tmp_path, monkeypatch):
     try:
         assert config.option.basetemp is None, "CI must be exempt, read from $CI"
         assert not (big / "pytest").exists(), "the no-op path must create nothing"
+    finally:
+        mod.pytest_unconfigure(config)
+
+
+def test_call_site_reads_TMPDIR_for_the_cc_tmp_case(tmp_path, monkeypatch):
+    """Pins that the call site passes $TMPDIR: CI=true with TMPDIR inside
+    cc-tmp must still redirect (a local CI-marked run)."""
+    mod = _load_conftest()
+
+    big = tmp_path / "big"
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GENESIS_BIG_TMP", str(big))
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("TMPDIR", str(home / ".genesis" / "cc-tmp"))
+    monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
+
+    config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
+    mod.pytest_configure(config)
+    try:
+        assert config.option.basetemp == str(big / "pytest" / str(os.getpid()))
     finally:
         mod.pytest_unconfigure(config)
 
@@ -478,6 +521,27 @@ def test_cleanup_removes_a_sealed_directory_nested_inside_another(tmp_path):
         for d in (leaf / "a" / "b", leaf / "a"):
             with contextlib.suppress(OSError):
                 d.chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the permission bits under test")
+def test_cleanup_warns_when_a_symlink_leaf_cannot_be_unlinked(tmp_path):
+    """The symlink branch returns early, so it must report a failed unlink
+    itself: a read-only parent leaves the link in place, and that must warn
+    like the directory path does, never pass as a clean removal."""
+    target = tmp_path / "somewhere-else"
+    target.mkdir()
+    link = tmp_path / "pytest" / "999009"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    link.parent.chmod(0o500)  # no write on the parent: unlink fails
+    try:
+        mod = _load_conftest()
+        with pytest.warns(RuntimeWarning, match="could not remove the stale pytest temp link"):
+            mod._force_rmtree(str(link))
+        assert os.path.lexists(link)
+        assert target.is_dir(), "the link's target must never be touched"
+    finally:
+        link.parent.chmod(0o700)
 
 
 def test_cleanup_unlinks_a_leaf_that_is_itself_a_symlink(tmp_path):
