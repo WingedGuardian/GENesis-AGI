@@ -200,3 +200,126 @@ def test_service_startup_refuses_unsafe_exposed_capabilities(monkeypatch):
 def test_unit_line_injection_refuses(path):
     with pytest.raises(ValueError):
         shared.quote_unit(path)
+
+
+@pytest.mark.parametrize("enabled", [True, False, "invalid", None])
+def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, enabled):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "serena").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "uv").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+    for executable in bindir.iterdir():
+        executable.chmod(0o755)
+    settings = tmp_path / "config/serena-shared.json"
+    settings.parent.mkdir()
+    if enabled is not None:
+        settings.write_text(json.dumps({"enabled": enabled}))
+    calls = tmp_path / "calls"
+    env = dict(
+        os.environ, GENESIS_HOME=str(tmp_path), PATH=f"{bindir}:{os.defpath}", CALLS=str(calls)
+    )
+    helper = SCRIPT.parent / "lib/serena_install.sh"
+    subprocess.run(
+        ["bash", "-c", 'source "$1"; _install_serena', "bash", str(helper)], env=env, check=True
+    )
+    assert calls.exists() == (enabled is False or enabled is None)
+    if calls.exists():
+        assert calls.read_text() == "tool upgrade serena-agent\n"
+
+
+@pytest.mark.parametrize("custom,fail_remove", [(False, False), (True, False), (False, True)])
+def test_legacy_project_registration_migrates_without_touching_custom_entry(
+    tmp_path, custom, fail_remove
+):
+    root = checkout(tmp_path / "project")
+    entry = {
+        "command": "serena",
+        "args": ["start-mcp-server", "--context", "claude-code", "--project", str(root)],
+    }
+    if custom:
+        entry["env"] = {"CUSTOM": "preserve"}
+    (root / ".mcp.json").write_text(json.dumps({"mcpServers": {"serena": entry}}))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    cli = bindir / "claude"
+    cli.write_text("""#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+config = Path.cwd() / '.mcp.json'
+data = json.loads(config.read_text())
+if sys.argv[2] == 'list':
+    if 'serena' in data['mcpServers']: print('serena: existing')
+else:
+    with open(os.environ['CALLS'], 'a') as log: log.write(str(Path.cwd()) + ':' + ' '.join(sys.argv[1:]) + '\\n')
+    if sys.argv[2] == 'remove':
+        if os.environ['FAIL_REMOVE'] == '1': sys.exit(1)
+        del data['mcpServers']['serena']
+    else:
+        args = sys.argv[sys.argv.index('--') + 1:]
+        data['mcpServers']['serena'] = {'command': args[0], 'args': args[1:]}
+    config.write_text(json.dumps(data))
+""")
+    cli.chmod(0o755)
+    helper = SCRIPT.parent / "lib/mcp_register.sh"
+    env = dict(
+        os.environ,
+        HOME=str(tmp_path),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+        FAIL_REMOVE=str(int(fail_remove)),
+    )
+    subprocess.run(
+        ["bash", "-e", "-c", 'source "$1"; _register_serena "$2"', "bash", str(helper), str(root)],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+    )
+    assert calls.exists() == (not custom)
+    if calls.exists():
+        expected = [f"{root}:mcp remove serena -s project"]
+        if not fail_remove:
+            expected.append(
+                f"{root}:mcp add serena -s project -- {root}/.claude/mcp/run-serena --context claude-code"
+            )
+        assert calls.read_text().splitlines() == expected
+    actual = json.loads((root / ".mcp.json").read_text())["mcpServers"]["serena"]
+    assert actual == (
+        entry
+        if custom or fail_remove
+        else {"command": str(root / ".claude/mcp/run-serena"), "args": ["--context", "claude-code"]}
+    )
+
+
+def test_reconfigure_removes_deleted_native_settings_snapshot(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    source = tmp_path / "original"
+    source.mkdir()
+    native = source / "serena_config.yml"
+    native.write_text("custom_setting: true\n")
+    settings = tmp_path / "state/config/serena-shared.json"
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SERENA_HOME", str(source))
+    monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared, "snapshot_context", lambda *args: None)
+    monkeypatch.setattr(shared, "systemctl", lambda *args: None)
+    shared.configure(main, True)
+    snapshots = [
+        settings.parent.parent / "serena-shared" / profile / "serena_config.yml"
+        for profile in shared.PROFILES
+    ]
+    assert all(p.read_text() == native.read_text() for p in snapshots)
+    native.unlink()
+    shared.configure(main, True)
+    assert all(not p.exists() for p in snapshots)
+
+
+@pytest.mark.parametrize("filename", ["bootstrap.sh", "install.sh"])
+def test_both_install_paths_use_shared_upgrade_and_migration_helpers(filename):
+    source = (SCRIPT.parent / filename).read_text()
+    assert '. "$SCRIPT_DIR/lib/serena_install.sh"' in source
+    assert "_install_serena" in source
+    assert "_register_serena" in source
+    assert "uv tool upgrade serena-agent" not in source

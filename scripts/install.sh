@@ -730,16 +730,10 @@ if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
+# shellcheck source=lib/serena_install.sh
+. "$SCRIPT_DIR/lib/serena_install.sh"
 if command -v uv &>/dev/null; then
-    if ! command -v serena &>/dev/null; then
-        uv tool install serena-agent 2>/dev/null \
-            && echo "    + Serena installed" \
-            || echo "    NOTE: Serena unavailable (optional)"
-    else
-        uv tool upgrade serena-agent 2>/dev/null \
-            && echo "    + Serena upgraded" \
-            || echo "    NOTE: Serena upgrade skipped (already current or failed)"
-    fi
+    _install_serena
 fi
 
 # Python venv — prefer python3.12 for venv creation
@@ -1107,7 +1101,7 @@ if command -v claude &>/dev/null; then
         fi
     fi
     command -v serena &>/dev/null && \
-        _register_mcp "serena" "project" "$REPO_DIR/.claude/mcp/run-serena" "--context" "claude-code"
+        _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
     # repos. Registered under a Genesis-owned name, not the generic `grep`, so
     # an operator's own grep server is never touched.

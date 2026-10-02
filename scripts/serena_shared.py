@@ -275,6 +275,8 @@ def configure(project: Path, enable: bool) -> None:
         source = source_home / "serena_config.yml"
         if source.exists():
             shutil.copyfile(source, home / "serena_config.yml")
+        else:
+            (home / "serena_config.yml").unlink(missing_ok=True)
         snapshot_context(serena, context, home / "contexts" / f"{context}.yml")
         for resource in ("modes", "prompt_templates", "memories/global"):
             link_resource(home / resource, source_home / resource)

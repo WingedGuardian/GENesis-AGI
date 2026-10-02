@@ -1,7 +1,9 @@
 # Shared Serena for the main checkout
 
 Serena 1.7.0 can serve multiple MCP clients through native Streamable HTTP.
-This integration is opt-in and shares only the canonical main checkout. It
+This integration is opt-in and shares only the canonical main checkout.
+The loopback services trust local users and processes. Profile separation is
+configuration separation, not authentication or a cross-user security boundary. It
 maintains separate Claude and Codex profiles; linked worktrees use native stdio
 against their nearest project boundary. Editing a shared checkout changes the
 same files for all its clients, as it does without sharing.

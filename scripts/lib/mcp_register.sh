@@ -92,6 +92,32 @@ else:
 PYEOF
 }
 
+_register_serena() (
+    local root="$1" legacy
+    cd -- "$root" || return 1
+    legacy="$(python3 - "$root" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+try:
+    entry = json.loads((root / ".mcp.json").read_text())["mcpServers"]["serena"]
+    args = ["start-mcp-server", "--context", "claude-code", "--project", str(root)]
+    # Exact old Genesis registration only; preserve custom commands/env/transports.
+    print("legacy" if entry.get("command") == "serena" and entry.get("args") == args
+          and entry.get("type", "stdio") == "stdio" and not entry.get("env") else "")
+except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    print("")
+PY
+)" || legacy=""
+    if [ "$legacy" = legacy ] && command -v claude >/dev/null 2>&1; then
+        if ! claude mcp remove serena -s project; then
+            echo "  WARNING: Serena legacy registration could not be migrated; keeping existing entry."
+            return 0
+        fi
+    fi
+    _register_mcp serena project "$root/.claude/mcp/run-serena" --context claude-code
+)
+
 _register_mcp() {
     local name="$1" scope="$2"
     shift 2

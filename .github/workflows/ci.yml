@@ -1100,6 +1100,6 @@ jobs:
         # Floor: 23644 + 65 = 23709.
         # GitNexus routine refresh: focused edited files collect 123 -> 135
         # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
-        # Shared Serena: new test_serena_shared.py collects 27 tests (0 -> 27).
-        # Floor: 23721 + 27 = 23748; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23748
+        # Shared Serena: new test_serena_shared.py collects 37 tests (0 -> 37).
+        # Floor: 23721 + 37 = 23758; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23758
