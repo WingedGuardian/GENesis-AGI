@@ -243,15 +243,41 @@ def link_resource(destination: Path, source: Path) -> None:
     destination.symlink_to(source, target_is_directory=True)
 
 
+def validate_main(project: Path) -> None:
+    if str(project).rstrip() != str(project):
+        raise ValueError("checkout path cannot end in whitespace")
+    try:
+        metadata = subprocess.check_output(
+            [
+                "git",
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ],
+            cwd=project,
+            text=True,
+        ).splitlines()
+    except subprocess.CalledProcessError as error:
+        raise ValueError("configure requires the canonical main checkout") from error
+    if (
+        len(metadata) != 3
+        or Path(metadata[0]).resolve() != Path(metadata[1]).resolve()
+        or Path(metadata[2]).resolve() != project
+        or project_root(project) != project
+    ):
+        raise ValueError("configure requires the canonical main checkout, not a linked worktree")
+
+
 def configure(project: Path, enable: bool) -> None:
     config_file = settings_path()
-    if project_root(project) != project or not (project / ".git").is_dir():
-        raise ValueError("configure requires the canonical main checkout, not a linked worktree")
     if not enable:
         # Recovery must not depend on a working/current provider or proxy.
         write_settings(config_file, project, False)
         systemctl("disable", "--now", *(unit_name(x) for x in PROFILES))
         return
+    validate_main(project)
     for port in PORTS.values():
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -264,6 +290,8 @@ def configure(project: Path, enable: bool) -> None:
                 ) from error
     serena = binary("serena")
     binary("terse")
+    # No old checkout may route to a new service if startup/publication fails.
+    write_settings(config_file, project, False)
     directory = Path.home() / ".config/systemd/user"
     directory.mkdir(parents=True, exist_ok=True)
     home_root = config_file.parent.parent / "serena-shared"

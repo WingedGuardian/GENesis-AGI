@@ -22,7 +22,7 @@ def checkout(path, linked=False):
     if linked:
         (path / ".git").write_text("gitdir: ../main/.git/worktrees/branch\n")
     else:
-        (path / ".git").mkdir()
+        subprocess.run(["git", "init", "--quiet", str(path)], check=True)
     return path.resolve()
 
 
@@ -110,12 +110,6 @@ def test_disable_works_without_provider_or_proxy(tmp_path, monkeypatch):
     assert calls == [
         ("disable", "--now", "genesis-serena-claude-code.service", "genesis-serena-codex.service")
     ]
-
-
-def test_configure_rejects_linked_worktree(tmp_path):
-    branch = checkout(tmp_path / "branch", linked=True)
-    with pytest.raises(ValueError, match="canonical main"):
-        shared.configure(branch, True)
 
 
 def test_unit_preserves_literal_path_and_resource_ownership(tmp_path):
@@ -227,9 +221,9 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
         assert calls.read_text() == "tool upgrade serena-agent\n"
 
 
-@pytest.mark.parametrize("custom,fail_remove", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("custom,fail_publication", [(False, False), (True, False), (False, True)])
 def test_legacy_project_registration_migrates_without_touching_custom_entry(
-    tmp_path, custom, fail_remove
+    tmp_path, custom, fail_publication
 ):
     root = checkout(tmp_path / "project")
     entry = {
@@ -238,36 +232,37 @@ def test_legacy_project_registration_migrates_without_touching_custom_entry(
     }
     if custom:
         entry["env"] = {"CUSTOM": "preserve"}
-    (root / ".mcp.json").write_text(json.dumps({"mcpServers": {"serena": entry}}))
+    other = {"command": "/operator/other", "args": ["preserve"]}
+    config = root / ".mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"serena": entry, "other": other}}))
+    config.chmod(0o640)
+    user_config = {"mcpServers": {"serena": {"command": "/operator/serena"}}}
+    (tmp_path / ".claude.json").write_text(json.dumps(user_config))
     bindir = tmp_path / "bin"
     bindir.mkdir()
     calls = tmp_path / "calls"
     cli = bindir / "claude"
-    cli.write_text("""#!/usr/bin/python3
-import json, os, sys
-from pathlib import Path
-config = Path.cwd() / '.mcp.json'
-data = json.loads(config.read_text())
-if sys.argv[2] == 'list':
-    if 'serena' in data['mcpServers']: print('serena: existing')
-else:
-    with open(os.environ['CALLS'], 'a') as log: log.write(str(Path.cwd()) + ':' + ' '.join(sys.argv[1:]) + '\\n')
-    if sys.argv[2] == 'remove':
-        if os.environ['FAIL_REMOVE'] == '1': sys.exit(1)
-        del data['mcpServers']['serena']
-    else:
-        args = sys.argv[sys.argv.index('--') + 1:]
-        data['mcpServers']['serena'] = {'command': args[0], 'args': args[1:]}
-    config.write_text(json.dumps(data))
-""")
+    cli.write_text(
+        '#!/bin/sh\nif [ "$2" = list ]; then echo "serena: existing"; else echo mutation >> "$CALLS"; fi\n'
+    )
     cli.chmod(0o755)
+    python = bindir / "python3"
+    python.write_text("""#!/usr/bin/python3
+import os, sys
+sys.argv = sys.argv[1:]
+if os.environ['FAIL_PUBLICATION'] == '1':
+    def fail(*args): raise OSError('publication failed')
+    os.replace = fail
+exec(compile(sys.stdin.read(), '<registration helper>', 'exec'))
+""")
+    python.chmod(0o755)
     helper = SCRIPT.parent / "lib/mcp_register.sh"
     env = dict(
         os.environ,
         HOME=str(tmp_path),
         PATH=f"{bindir}:{os.defpath}",
         CALLS=str(calls),
-        FAIL_REMOVE=str(int(fail_remove)),
+        FAIL_PUBLICATION=str(int(fail_publication)),
     )
     subprocess.run(
         ["bash", "-e", "-c", 'source "$1"; _register_serena "$2"', "bash", str(helper), str(root)],
@@ -275,20 +270,17 @@ else:
         env=env,
         check=True,
     )
-    assert calls.exists() == (not custom)
-    if calls.exists():
-        expected = [f"{root}:mcp remove serena -s project"]
-        if not fail_remove:
-            expected.append(
-                f"{root}:mcp add serena -s project -- {root}/.claude/mcp/run-serena --context claude-code"
-            )
-        assert calls.read_text().splitlines() == expected
-    actual = json.loads((root / ".mcp.json").read_text())["mcpServers"]["serena"]
-    assert actual == (
+    assert not calls.exists()
+    actual = json.loads(config.read_text())["mcpServers"]
+    assert json.loads((tmp_path / ".claude.json").read_text()) == user_config
+    assert actual["other"] == other
+    assert actual["serena"] == (
         entry
-        if custom or fail_remove
+        if custom or fail_publication
         else {"command": str(root / ".claude/mcp/run-serena"), "args": ["--context", "claude-code"]}
     )
+    assert config.stat().st_mode & 0o777 == 0o640
+    assert list(root.glob(".mcp.json.*")) == []
 
 
 def test_reconfigure_removes_deleted_native_settings_snapshot(tmp_path, monkeypatch):
@@ -323,3 +315,106 @@ def test_both_install_paths_use_shared_upgrade_and_migration_helpers(filename):
     assert "_install_serena" in source
     assert "_register_serena" in source
     assert "uv tool upgrade serena-agent" not in source
+
+
+@pytest.fixture
+def configured_paths(tmp_path, monkeypatch):
+    settings = tmp_path / "state/config/serena-shared.json"
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SERENA_HOME", str(tmp_path / "provider"))
+    monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared, "snapshot_context", lambda *args: None)
+    monkeypatch.setattr(shared, "systemctl", lambda *args: None)
+    return settings
+
+
+@pytest.mark.parametrize("failure", ["startup", "publication"])
+def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
+    tmp_path, monkeypatch, configured_paths, failure
+):
+    old = checkout(tmp_path / "old")
+    new = checkout(tmp_path / "new")
+    shared.write_settings(configured_paths, old, True)
+    original_write = shared.write_settings
+
+    def write_settings(path, project, enabled):
+        if failure == "publication" and enabled:
+            raise OSError("publication failed")
+        original_write(path, project, enabled)
+
+    def systemctl(*args):
+        if failure == "startup" and args[0] == "enable":
+            raise subprocess.CalledProcessError(1, "enable services")
+
+    monkeypatch.setattr(shared, "write_settings", write_settings)
+    monkeypatch.setattr(shared, "systemctl", systemctl)
+    with pytest.raises((OSError, subprocess.CalledProcessError)):
+        shared.configure(new, True)
+    assert shared.read_settings(configured_paths) == {"main": str(new), "enabled": False}
+    captured = []
+    monkeypatch.setattr(shared.os, "execv", lambda executable, argv: captured.append(argv))
+    shared.launch("claude-code", old)
+    assert captured[0][0] == "/bin/serena"
+    assert captured[0][-2:] == ["--project", str(old)]
+
+
+@pytest.mark.parametrize("suffix", [" ", "\t"])
+def test_trailing_checkout_whitespace_rejected_before_mutation(tmp_path, configured_paths, suffix):
+    main = checkout(tmp_path / ("main" + suffix))
+    with pytest.raises(ValueError, match="end in whitespace"):
+        shared.configure(main, True)
+    assert not configured_paths.exists()
+
+
+def test_separate_git_directory_is_a_supported_main_checkout(tmp_path, configured_paths):
+    main = checkout(tmp_path / "main")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "init",
+            "--quiet",
+            "--separate-git-dir",
+            str(tmp_path / "metadata"),
+        ],
+        check=True,
+    )
+    assert (main / ".git").is_file()
+    shared.configure(main, True)
+    assert shared.read_settings(configured_paths)["enabled"] is True
+
+
+def test_actual_linked_worktree_cannot_be_shared_main(tmp_path, configured_paths):
+    main = checkout(tmp_path / "main")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", "--quiet", "--detach", str(linked)], check=True
+    )
+    with pytest.raises(ValueError, match="linked worktree"):
+        shared.configure(linked, True)
+    assert not configured_paths.exists()
+
+
+def test_disable_sharing_does_not_require_readable_git_metadata(tmp_path, configured_paths):
+    main = tmp_path / "missing-checkout"
+    shared.configure(main, False)
+    assert shared.read_settings(configured_paths)["enabled"] is False

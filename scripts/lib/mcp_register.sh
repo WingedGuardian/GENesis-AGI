@@ -93,28 +93,46 @@ PYEOF
 }
 
 _register_serena() (
-    local root="$1" legacy
+    local root="$1" outcome
     cd -- "$root" || return 1
-    legacy="$(python3 - "$root" <<'PY'
-import json, sys
+    outcome="$(python3 - "$root" <<'PYCODE'
+import json, os, stat, sys, tempfile
 from pathlib import Path
 root = Path(sys.argv[1]).resolve()
+config = root / ".mcp.json"
 try:
-    entry = json.loads((root / ".mcp.json").read_text())["mcpServers"]["serena"]
+    data = json.loads(config.read_text())
+    entry = data["mcpServers"]["serena"]
     args = ["start-mcp-server", "--context", "claude-code", "--project", str(root)]
-    # Exact old Genesis registration only; preserve custom commands/env/transports.
-    print("legacy" if entry.get("command") == "serena" and entry.get("args") == args
-          and entry.get("type", "stdio") == "stdio" and not entry.get("env") else "")
+    legacy = (entry.get("command") == "serena" and entry.get("args") == args
+              and entry.get("type", "stdio") == "stdio" and not entry.get("env"))
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
-    print("")
-PY
-)" || legacy=""
-    if [ "$legacy" = legacy ] && command -v claude >/dev/null 2>&1; then
-        if ! claude mcp remove serena -s project; then
-            echo "  WARNING: Serena legacy registration could not be migrated; keeping existing entry."
-            return 0
-        fi
-    fi
+    legacy = False
+if legacy:
+    # One atomic update; remove/add would lose the old entry on CLI failure.
+    temporary = None
+    try:
+        fd, name = tempfile.mkstemp(dir=root, prefix=".mcp.json.")
+        temporary = Path(name)
+        with os.fdopen(fd, "w") as output:
+            os.fchmod(output.fileno(), stat.S_IMODE(config.stat().st_mode))
+            entry["command"] = str(root / ".claude/mcp/run-serena")
+            entry["args"] = ["--context", "claude-code"]
+            json.dump(data, output, indent=2)
+            output.write("\n")
+        os.replace(temporary, config)
+        print("migrated")
+    except OSError:
+        print("failed")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+PYCODE
+)" || outcome=failed
+    case "$outcome" in
+        migrated) echo "  Serena: migrated legacy project registration"; return 0 ;;
+        failed) echo "  WARNING: Serena migration failed; existing registration retained"; return 0 ;;
+    esac
     _register_mcp serena project "$root/.claude/mcp/run-serena" --context claude-code
 )
 
