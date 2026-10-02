@@ -89,6 +89,15 @@ _MAX_BODY = 65_536
 _COMMENT_OPEN, _COMMENT_CLOSE = "<!--", "-->"
 _FENCE_MARKS = ("```", "~~~")
 
+#: Markdown line endings ONLY (``\n``, ``\r\n``, ``\r``) — ``splitlines()``
+#: also breaks on ``\x85``/``\u2028``/``\u2029``, which the rendered view does
+#: not. Mirrors the sibling scanner.
+_LINE_ENDS = re.compile(r"\r\n|\r|\n")
+
+#: A fence marker RUN: three or more of one character. The closer must use the
+#: opener's character and be at least as long. Mirrors the sibling scanner.
+_FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+
 #: Words that state an omission rather than a decision. `none` is deliberately NOT
 #: here — it is a VALID declaration when it carries a reason, and is classified
 #: before this set is consulted.
@@ -204,9 +213,10 @@ def _local_readable_body(body: str) -> str:
     visible: list[str] = []
     in_comment = False
     fence: str | None = None
-    for line in body[:_MAX_BODY].splitlines():
+    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
         if fence is not None:
-            if line.strip().startswith(fence):
+            closer = _FENCE_RUN.match(line.strip())
+            if closer and closer.group(0)[0] == fence[0] and len(closer.group(0)) >= len(fence):
                 fence = None
             continue
         out: list[str] = []
@@ -229,13 +239,11 @@ def _local_readable_body(body: str) -> str:
             rest = rest[open_at + len(_COMMENT_OPEN) :]
         kept = "".join(out)
         stripped = kept.strip()
-        for mark in _FENCE_MARKS:
-            if stripped.startswith(mark):
-                fence = mark
-                break
+        run = _FENCE_RUN.match(stripped)
+        if run:
+            fence = run.group(0)
         else:
             visible.append(kept)
-            continue
     return "\n".join(visible)
 
 

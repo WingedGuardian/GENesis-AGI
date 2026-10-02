@@ -171,6 +171,20 @@ _PLACEHOLDERS = frozenset(
 _COMMENT_OPEN, _COMMENT_CLOSE = "<!--", "-->"
 _FENCE_MARKS = ("```", "~~~")
 
+#: Markdown line endings ONLY: ``\n``, ``\r\n`` and ``\r`` (CommonMark 0.31.2,
+#: "Characters and lines"). ``str.splitlines()`` also splits on ``\x85``,
+#: ``\u2028``, ``\u2029`` and the other Unicode separators a rendered body does
+#: NOT break on — text joined by one of them read as a standalone line, so a
+#: declaration in the middle of a rendered line could satisfy the marker's
+#: line-start anchor.
+_LINE_ENDS = re.compile(r"\r\n|\r|\n")
+
+#: A fence marker RUN: three or more of one character. CommonMark's close rule
+#: is a run of the SAME character as the opener and AT LEAST as long — a
+#: four-backtick block does not end at a three-backtick line, so the
+#: documented example inside one read as visible text.
+_FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+
 #: GitHub's PR-body limit. Bound the work regardless of the scanner's O(n).
 _MAX_BODY = 65_536
 
@@ -308,7 +322,7 @@ def readable_body(body: str) -> str:
     in_comment = False
     fence: str | None = None
 
-    for line in body[:_MAX_BODY].splitlines():
+    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
         # A FENCED line is OPAQUE — checked before comment state is touched, and its
         # own text is never interpreted. Markdown treats `<!--` inside a fence as
         # literal characters, so letting it open a comment here made the scanner and
@@ -323,7 +337,8 @@ def readable_body(body: str) -> str:
         # there is no comment stripping to apply, and Markdown wants the marker at
         # the start of the line regardless.
         if fence is not None:
-            if line.strip().startswith(fence):
+            closer = _FENCE_RUN.match(line.strip())
+            if closer and closer.group(0)[0] == fence[0] and len(closer.group(0)) >= len(fence):
                 fence = None
             continue
 
@@ -345,7 +360,9 @@ def readable_body(body: str) -> str:
         # rendered-as-code while counting as visible. (The close is handled at the
         # top of the loop; this is the OPEN.)
         if stripped.startswith(_FENCE_MARKS):
-            fence = stripped[:3]
+            # Record the whole RUN, not three characters: the closer must be
+            # the same character at least as long as the opener.
+            fence = _FENCE_RUN.match(stripped).group(0)
             continue
 
         if stripped:

@@ -483,6 +483,43 @@ def test_a_fence_is_closed_only_by_its_own_marker() -> None:
     _assert_blocked(_evaluate(body=f"~~~\n{BOTH}```\n"), "receipts")
 
 
+def test_a_longer_fence_is_not_closed_by_a_shorter_run() -> None:
+    """MEASURED (issue #2773): CommonMark requires the closing fence to be the
+    same character AT LEAST as long as the opener. A ```` block wrapping a
+    ``` example closed at the inner ``` — the example's content read as
+    visible, so a documented receipt asserted a real one."""
+    body = f"````\n```\n{BOTH}```\n````\n"
+    _assert_blocked(_evaluate(body=body), "receipts")
+    assert receipts.readable_body("````\n```\nhidden\n```\n````\nvisible\n") == "visible"
+
+
+def test_a_tilde_fence_needs_a_tilde_run_at_least_as_long() -> None:
+    """The same length rule on the other character: `~~~~` is not closed by
+    `~~~`, so the text between them is still code."""
+    assert receipts.readable_body("~~~~\n~~~\nhidden\n~~~~\nvisible\n") == "visible"
+
+
+def test_a_backtick_fence_is_not_closed_by_a_tilde_run() -> None:
+    """The close must use the opener's CHARACTER too — a tilde run of any
+    length cannot close a backtick fence."""
+    assert receipts.readable_body("```\n~~~\nhidden\n```\nvisible\n") == "visible"
+
+
+@pytest.mark.parametrize("sep", ["\x85", "\u2028", "\u2029"], ids=["NEL", "LS", "PS"])
+def test_unicode_line_separators_do_not_split_a_rendered_line(sep: str) -> None:
+    """MEASURED (issue #2773): `str.splitlines()` breaks on NEL and the Unicode
+    line/paragraph separators, which Markdown does not treat as line endings.
+    Text joined by one renders as ONE line — it must not read as two."""
+    body = f"prose{sep}CC-Gate-Changelog: x"
+    assert receipts.readable_body(body) == body
+
+
+def test_cr_and_crlf_still_end_a_line() -> None:
+    """The narrowing to Markdown's line endings must keep the endings Markdown
+    does define: `\\r\\n` and a lone `\\r` still split."""
+    assert receipts.readable_body("a\rb\r\nc\n") == "a\nb\nc"
+
+
 def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
     """MEASURED over-rejection, on a gate with no override sigil.
 

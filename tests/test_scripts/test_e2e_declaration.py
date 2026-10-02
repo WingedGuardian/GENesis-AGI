@@ -64,6 +64,11 @@ def test_the_two_scanners_agree_on_marker_visibility(e2e):
         "<!--\nE2E: hidden in a comment\n-->\nreal text\n",
         "```\nE2E: inside a fence\n```\n",
         "intro\n<!-- unterminated\nE2E: after an open comment\n",
+        # Issue #2773 — both scanners fixed together: a ```` fence does not end
+        # at an inner ```, and NEL/LS/PS do not split a rendered line.
+        "````\n```\nE2E: inside a longer fence\n```\n````\n",
+        "prose\x85E2E: joined by NEL\n",
+        "prose\u2028E2E: joined by a line separator\n",
     ]
     for body in bodies:
         shared = e2e.readable_body(body)
