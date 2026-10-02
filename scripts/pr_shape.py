@@ -5,46 +5,95 @@ added and removed lines excluding tests, changelog fragments, prose, binary
 files, blanks, full-line comments, and lines moved verbatim elsewhere in the
 same diff (a move counts once, as the addition).
 
-Pure, stdlib-only, no subprocess — wiring it into ``gh pr create`` and the
-merge report is maintainer work done elsewhere.
+Two classifiers are borrowed repo-locally rather than re-invented:
+``review_scope.py`` supplies the file-kind judgements (its lane taxonomy is
+the same one the review budget uses), and ``readable_body`` from
+``check_cc_pin_receipts.py`` supplies PR-body visibility for ``parse_shape``,
+so every body-reader in the repo shares one scanner. Both load through
+``sys.modules``-registered importlib specs; a failed load raises
+``RuntimeError`` rather than silently degrading into a second contract.
+
+Pure functions otherwise, stdlib only (no third-party packages), no
+subprocess — wiring it into ``gh pr create`` and the merge report is
+maintainer work done elsewhere.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import importlib.util
 import re
+import sys
 from collections import Counter
+from pathlib import Path
 
 SHAPE_AT = 500
 OVERRIDE_AT = 1001
 
-_PROSE_EXTS = {".md", ".rst", ".adoc", ".txt"}
-_PROSE_NAMES = {"README", "LICENSE", "CHANGELOG", "NOTICE"}
 _COMMENT_EXTS = {".py", ".sh", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
 _SLASH_COMMENT_EXTS = {".js", ".ts"}
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _QUOTED_TOKEN_RE = re.compile(r'^"(?:[^"\\]|\\.)*"')
 _SHAPE_RE = re.compile(r"^\s*shape\s*:\s*(.*)$", re.IGNORECASE)
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
 def _basename(path: str) -> str:
     return path.rsplit("/", 1)[-1]
 
 
+_MOD_CACHE: dict[str, object] = {}
+
+
+def _load_sibling(filename: str, name: str):
+    """Import a scripts/ sibling by file path, registered before exec.
+
+    Registered in ``sys.modules`` BEFORE ``exec_module`` — dataclasses in the
+    sibling resolve their own module out of sys.modules, so exec-ing an
+    unregistered module raises. Cached; a failed load raises ``RuntimeError``
+    instead of silently degrading into a second contract.
+    """
+    if name in _MOD_CACHE:
+        return _MOD_CACHE[name]
+    try:
+        path = Path(__file__).resolve().parent / filename
+        spec = importlib.util.spec_from_file_location(name, path)
+        if not (spec and spec.loader):
+            raise RuntimeError(f"cannot load {filename}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(name, None)
+            raise
+    except Exception as exc:
+        raise RuntimeError(f"cannot load {filename}") from exc
+    _MOD_CACHE[name] = mod
+    return mod
+
+
 def _exclusion_reason(path: str) -> str | None:
-    """Why a file is excluded from the count, or None."""
+    """Why a file is excluded from the count, or None.
+
+    Order: changelog, then test (fixture corpus, review_scope's category,
+    or this counter's own basename/dir rule generalized past .py), then
+    prose via review_scope's lane-light rule — which counts `.txt` files
+    as code unless the stem is a prose stem (LICENSE, COPYING…).
+    """
+    scope = _load_sibling("review_scope.py", "_review_scope_for_pr_shape")
     name = _basename(path)
-    stem = name.rsplit(".", 1)[0] if "." in name else name
-    if "tests" in path.split("/")[:-1] or fnmatch.fnmatchcase(name, "test_*.py") or fnmatch.fnmatchcase(
-        name, "*_test.py"
+    if name == "CHANGELOG.md" or "changelog.d" in path.split("/")[:-1]:
+        return "changelog"
+    if (
+        scope._is_lane_fixture_corpus(path)
+        or scope._category(path) in ("test", "fixture")
+        or "tests" in path.split("/")[:-1]
+        or fnmatch.fnmatchcase(name, "test_*.*")
+        or fnmatch.fnmatchcase(name, "*_test.*")
     ):
         return "test"
-    if path == "CHANGELOG.md" or "changelog.d" in path.split("/")[:-1]:
-        return "changelog"
-    ext = "." + name.rsplit(".", 1)[1] if "." in name else ""
-    if ext in _PROSE_EXTS or (not ext and stem in _PROSE_NAMES):
+    if scope._is_lane_light(path):
         return "prose"
     return None
 
@@ -82,9 +131,17 @@ def _unquote(s: str) -> str:
                     i = j
                     continue
                 out.extend(
-                    {"n": b"\n", "t": b"\t", "\\": b"\\", '"': b'"'}.get(
-                        nxt, b"\\" + nxt.encode("utf-8", "replace")
-                    )
+                    {
+                        "n": b"\n",
+                        "t": b"\t",
+                        "a": b"\a",
+                        "b": b"\b",
+                        "v": b"\v",
+                        "f": b"\f",
+                        "r": b"\r",
+                        "\\": b"\\",
+                        '"': b'"',
+                    }.get(nxt, b"\\" + nxt.encode("utf-8", "replace"))
                 )
                 i += 2
                 continue
@@ -126,6 +183,7 @@ class _FileState:
         self.binary = False
         self.unparseable = False
         self.in_hunk = False
+        self.seen_hunk = False
         self.old_rem = 0
         self.new_rem = 0
         self.added: list[str] = []
@@ -211,8 +269,15 @@ def count_diff(diff_text: str) -> dict:
                 current.old_rem = int(m.group(2) or 1)
                 current.new_rem = int(m.group(4) or 1)
                 current.in_hunk = current.old_rem > 0 or current.new_rem > 0
+                current.seen_hunk = True
             else:
                 current.unparseable = True
+            continue
+        if current.seen_hunk and line.startswith(("+", "-")):
+            # A change line after the file's hunks have all completed: the
+            # `---`/`+++` headers belong BEFORE the first `@@`; afterwards a
+            # `+`/`-` line outside a hunk means the diff is malformed.
+            current.unparseable = True
             continue
 
     # A file still inside a hunk at EOF was truncated mid-hunk.
@@ -263,23 +328,17 @@ def count_diff(diff_text: str) -> dict:
 def parse_shape(body: str | None) -> str | None:
     """Return the text after a ``Shape:`` line, or None.
 
-    Lines inside fenced code blocks are ignored; an empty value after the
-    colon returns None.
+    Visibility (fences, HTML comments) is the shared ``readable_body`` — a
+    fenced ``Shape:`` is documentation, not an assertion. An empty value
+    masks nothing: the first non-empty one wins.
     """
     if not body:
         return None
-    fence: str | None = None
-    for line in body.splitlines():
-        m = _FENCE_RE.match(line)
-        if fence is None:
-            if m:
-                fence = m.group(1)
-            else:
-                match = _SHAPE_RE.match(line)
-                # An empty Shape: value masks nothing — keep scanning for the
-                # first non-empty one.
-                if match and match.group(1).strip():
-                    return match.group(1).strip()
-        elif m and m.group(1) == fence:
-            fence = None
+    readable_body = _load_sibling(
+        "check_cc_pin_receipts.py", "_cc_pin_receipts_for_pr_shape"
+    ).readable_body
+    for line in readable_body(body).split("\n"):
+        match = _SHAPE_RE.match(line)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
     return None

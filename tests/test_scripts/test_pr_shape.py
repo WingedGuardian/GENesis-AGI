@@ -224,6 +224,75 @@ def test_parse_shape_empty_then_nonempty():
     assert ps.parse_shape("Shape:\nShape: real explanation") == "real explanation"
 
 
+def test_parse_shape_fenced_line_ignored_via_readable_body():
+    assert ps.parse_shape("```\nShape: hidden\n```\nShape: shown") == "shown"
+    assert ps.parse_shape("```\nShape: hidden\n```") is None
+
+
+def test_shell_test_scripts_excluded():
+    diff = _diff("scripts/test_cc_cli.sh", _hunk(["+echo hi"])) + _diff(
+        "scripts/spike_caveat_fixes_test.sh", _hunk(["+echo hi"])
+    )
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {
+        "scripts/test_cc_cli.sh": "test",
+        "scripts/spike_caveat_fixes_test.sh": "test",
+    }
+
+
+def test_txt_counts_as_code_now():
+    diff = _diff("requirements.txt", _hunk(["+flask==3.0"])) + _diff(
+        "config/az-pip-constraints.txt", _hunk(["+urllib3>=2.7"])
+    )
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {}
+    assert result["counted"] == 2
+
+
+def test_other_prose_spellings_excluded():
+    diff = _diff("docs/guide.markdown", _hunk(["+# T"])) + _diff(
+        "COPYING", _hunk(["+text"])
+    )
+    result = ps.count_diff(diff)
+    assert result["excluded"] == {"docs/guide.markdown": "prose", "COPYING": "prose"}
+
+
+def test_dot_test_js_is_a_test():
+    diff = _diff("web/foo.test.js", _hunk(["+it('x')"]))
+    assert ps.count_diff(diff)["excluded"] == {"web/foo.test.js": "test"}
+
+
+def test_change_lines_after_completed_hunk_unparseable():
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+a = 1\n"
+        "+b = 2\n"
+    )
+    assert ps.count_diff(diff)["excluded"] == {"x.py": "unparseable"}
+
+
+def test_unquote_decodes_c_escapes():
+    for esc, byte in (("a", 7), ("b", 8), ("v", 11), ("f", 12), ("r", 13), ("n", 10), ("t", 9)):
+        out = ps._unquote(f'"a/x\\{esc}y"')
+        assert out == f"a/x{chr(byte)}y", (esc, out)
+
+
+def test_load_failure_raises_runtime_error(monkeypatch):
+    def boom(filename, name):
+        raise RuntimeError(f"cannot load {filename}")
+
+    monkeypatch.setattr(ps, "_load_sibling", boom)
+    import pytest
+
+    with pytest.raises(RuntimeError, match="cannot load review_scope.py"):
+        ps.count_diff(_diff("x.py", _hunk(["+a = 1"])))
+    with pytest.raises(RuntimeError, match="cannot load check_cc_pin_receipts.py"):
+        ps.parse_shape("Shape: x")
+
+
 def test_parse_shape_fence_mismatch_does_not_close():
     body = "```\n~~~\nShape: hidden\n```\nShape: shown"
     assert ps.parse_shape(body) == "shown"
