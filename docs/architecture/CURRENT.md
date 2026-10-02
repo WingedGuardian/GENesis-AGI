@@ -577,7 +577,7 @@ verified: 33b49a105 2026-09-26
   `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
   Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
   `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
-  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; every `web_fetch` MCP result, from any backend, is returned inside the keyed untrusted-content boundary (`web_tools._wrap_fetch_result`), and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; every `web_fetch` MCP result, from any backend, is returned inside the keyed untrusted-content boundary (`web_tools._wrap_fetch_result`), and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain; a LinkedIn post keeps its ordinary page fetch, unchanged, and gets its video's caption track in a separate `video_transcript` field, or `video_error` when it cannot be read, with yt-dlp's "no video" message as the only sign of a text post (`knowledge/processors/linkedin.py` + `mcp/health/linkedin_route.py`, the same yt-dlp argv with the LinkedIn extractor, caption tracks only from `*.licdn.com`, never audio)); if the
   MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
   judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
@@ -2550,9 +2550,32 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: ee9ebf85c 2026-09-05
+verified: 39f1cc9ef 2026-10-02
 ```
 
+- **Coherent routing reloads** (`Router.reload_config`,
+  `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
+  bindings before yielding. Replacement/rename breakers preserve holds while
+  detaching old callbacks; recovery names the current alias. Persisted identity
+  digests and retirement-only provenance permit a replacement reset only with
+  explicit retirement evidence, preserving auth/quota/operator/mixed/legacy holds.
+  Runtime health probes and dashboard snapshots read generation-bound config and
+  breakers; late probes cannot alter replacement health. Daily accounting preserves
+  exact-name rows across same-alias model changes with synchronized pure reads;
+  cross-alias budget migration is deferred. See the model-routing
+  registry reference's reload section and `test_routing_generation.py`.
+- **Reload controls**: registry-locked dashboard toggles preserve operator actions
+  across model repoints. Shared pacing gates retain admissions across reloads and
+  known alias renames. Routed trip events carry health identity; escalation rejects
+  retired-model events even when event-bus dispatch waits before consuming them.
+  Full captured registry views preserve API-key breaker/essential coverage. Proven
+  retirement starts a fresh persisted incident namespace and retires old rows;
+  account/operator holds retain their escalation and notification history.
+  Continuing registered renames preserve persisted incident ownership and user
+  acknowledgments; fresh sibling aliases cannot claim historical ownership.
+  Captured pacing intervals stay immutable while admission locks/history are shared.
+  Current health snapshots update the live cloud axis under the reload lock in both
+  full and readonly runtimes; stale generations render without changing live state.
 - **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
   each a free-first → paid-last chain; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,
@@ -3030,7 +3053,8 @@ verified: f24c15e9 2026-09-05
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md). The root Tailscale watchdog
-  (`genesis-tailscale-watchdog.timer`) is reported by its unit-file state only
+  (`genesis-tailscale-watchdog.timer`) is reported by its effective unit-file
+  state—the timer's, or the service's when masked
   (`tailscale_watchdog_unit_state`, beside `tailscaled_loaded`, which gates the
   `tailscale_watchdog_absent` posture rule); its `/run` file is event data for the
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into

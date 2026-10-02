@@ -757,3 +757,37 @@ noted co-orchestrator potential and disagreement gate use case for Genesis.
 2026-03-03 — added Grok 4, GPT-5.2, GPT-5 Nano/Mini, Qwen 3.5 Plus,
 Qwen3-Max-Thinking; added Mistral/Groq/OpenRouter free tiers; updated
 Gemini entries; cross-referenced model routing registry
+
+### Routing changes while requests are active
+
+Model configuration reloads bind each request to one routing generation. An active
+request finishes with its original delegate/model and reports that identity;
+subsequent requests use the replacement. Same-alias model replacement preserves daily usage,
+operator/account/authentication/quota holds and ambiguous legacy health. Only proven
+retirement-only failure history can be cleared for a changed request identity.
+See [reload and persisted health](../architecture/genesis-v3-model-routing-registry.md#reload-model-replacement-and-persisted-health)
+for migration and rollback semantics. This behavior does not qualify any replacement
+model for evaluation judging or novelty suppression.
+
+Operator toggles act on current breaker bindings atomically with reload. Existing
+pacing admissions survive same-name repoints and registered alias renames; each
+captured generation retains its RPM interval. Current health snapshots project live
+cloud resilience atomically with reload in full and readonly runtimes, while stale
+snapshots remain read-only. Routed
+trip events include health identity, and escalation ignores retired identities.
+Retirement checking handles the observed LiteLLM APIError wrapper conservatively;
+unknown or qualified statements retain the hold.
+
+Captured API-key health retains breaker reasons and essential-site severity. Proven
+retirement replacement begins a fresh escalation/notification incident and retires
+old rows explicitly; ordinary account holds keep their existing incident history.
+
+Ordinary provider renames retain incident ownership, outage age and notification
+acknowledgments through restart; adding an independent sibling does not inherit
+that history. Partial recovery persists cleared retirement provenance without
+changing the existing two-success recovery threshold.
+
+
+Daily counters retain exact configured names; cross-alias counter migration is separate
+follow-up work. Removed provider bindings retire ownerless incidents. Restoration writes
+only completed state, and validated pre-trip failure evidence survives restart.
