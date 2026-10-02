@@ -662,28 +662,19 @@ jobs:
           # Attacker-controlled text: passed via env, NEVER interpolated into
           # `run`. Same handling the leak-detector job uses for PR_BASE_SHA.
           PR_BODY: ${{ github.event.pull_request.body }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          # PR events compare against the PR's own base commit; push/schedule/
-          # dispatch use merge-base with origin/main. merge-base, NOT HEAD^1:
-          # parent count is not a reliable "this is the merge ref" signal, and
-          # scripts/ci/leak_scan_added_lines.py rejects that inference for the
-          # same reason.
+          # merge-base, NOT HEAD^1: parent count is not a reliable "this is the
+          # merge ref" signal, and scripts/ci/leak_scan_added_lines.py rejects
+          # that inference for the same reason.
           #
           # BOTH commands are guarded. Under `set -e` an unresolvable origin/main
-          # (or no common ancestor, or an event SHA not present in this checkout)
-          # would kill the step and turn this job RED — in a job whose entire
-          # justification is that it cannot fail. An empty base is handled by the
-          # checker itself: advisory mode reports "no base SHA to compare
-          # against" and exits 0.
-          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
-            base="$PR_BASE_SHA"
-          else
-            git fetch --no-tags --quiet origin main || true
-            base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
-          fi
+          # (or no common ancestor) would kill the step and turn this job RED —
+          # in a job whose entire justification is that it cannot fail. An empty
+          # base is handled by the checker itself: advisory mode reports "no base
+          # SHA to compare against" and exits 0.
+          git fetch --no-tags --quiet origin main || true
+          base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
           python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
 
   test:
@@ -1098,4 +1089,13 @@ jobs:
         # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
         # superseded by this count. No new skips, so the ceiling holds.
         # Floor: 23606 + 38 = 23644.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23644
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23709

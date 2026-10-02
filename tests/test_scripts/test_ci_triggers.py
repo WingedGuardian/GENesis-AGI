@@ -6,9 +6,9 @@ Loads ci.yml with PyYAML (no network) and asserts the current contract:
   * `edited` is not a listed activity type — a retarget or title/body edit
     does not re-run CI, so a passing verdict cannot be silently erased,
   * push-to-main / schedule / workflow_dispatch are untouched,
-  * the cc-pin-receipts advisory compares against the PR's own base commit on
-    pull_request events and falls back to merge-base with origin/main on
-    push/schedule/dispatch, and
+  * the cc-pin-receipts advisory diffs against merge-base origin/main HEAD —
+    on PR runs HEAD is the merge ref, whose first parent is main at CI time,
+    so merge-base is the PR's base; pull_request.base.sha lags main, and
   * no other job step diffs against a literal `origin/main` where the PR base
     could differ — remaining uses are allowlisted with a reason.
 """
@@ -64,14 +64,17 @@ def test_push_schedule_dispatch_unchanged():
     assert "workflow_dispatch" in on
 
 
-def test_cc_pin_uses_pr_base_sha():
-    """The cc-pin-receipts advisory uses the PR's own base commit on
-    pull_request events, falling back to merge-base origin/main elsewhere."""
+def test_cc_pin_uses_merge_base_with_main():
+    """The cc-pin-receipts advisory diffs against merge-base origin/main HEAD.
+
+    On pull_request runs the checkout is the merge ref, whose first parent is
+    main at CI time — merge-base IS the PR's base. `pull_request.base.sha`
+    lags main and must not appear in the job.
+    """
     job = _load()["jobs"]["cc-pin-receipts"]
-    assert "github.event.pull_request.base.sha" in _env_text(job)
-    run = _run_text(job)
-    assert "PR_BASE_SHA" in run
-    assert "merge-base origin/main" in run
+    assert "git merge-base origin/main HEAD" in _run_text(job)
+    assert "github.event.pull_request.base.sha" not in _run_text(job)
+    assert "github.event.pull_request.base.sha" not in _env_text(job)
 
 
 def test_no_job_hardcodes_main_as_pr_base():
@@ -84,8 +87,9 @@ def test_no_job_hardcodes_main_as_pr_base():
     """
     allowlist = {
         "cc-pin-receipts": (
-            "origin/main only on push/schedule/dispatch; PR events use the "
-            "PR base SHA"
+            "PR runs check out the merge ref, whose first parent is main at "
+            "CI time, so merge-base origin/main HEAD is the PR's base; "
+            "pull_request.base.sha lags main (#2774)"
         ),
         "migration-check": (
             "origin/main is reached only when PR_BASE_SHA (a pull_request event "
