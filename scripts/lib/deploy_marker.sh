@@ -18,6 +18,7 @@
 # (a dashboard update, update.sh's direct path, another restore) is refused, never
 # clobbered, and the marker is removed only while it still holds OUR pid.
 DEPLOY_MARKER_FILE="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid"
+# shellcheck disable=SC2034 # Read by deploy_code_only.sh and restore.sh to name the refusing holder.
 DEPLOY_MARKER_HOLDER=""
 _DEPLOY_MARKER_HELD=false
 
@@ -54,6 +55,7 @@ _acquire_deploy_marker() {
         _other="$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || true)"
         if [[ "$_other" =~ ^[0-9]+$ ]] && [ "$_other" -gt 1 ] && [ "$_other" != "$$" ] \
             && _deploy_marker_holder_live "$_other"; then
+            # shellcheck disable=SC2034 # Read by deploy_code_only.sh and restore.sh to name the refusing holder.
             DEPLOY_MARKER_HOLDER="$_other"
             return 1
         fi
@@ -83,4 +85,5 @@ _release_deploy_marker() {
 #     `src/genesis/identity/USER.md` (install-local files that were once tracked;
 #     transitional while installs carry them through the de-tracking).
 # update.sh documents each entry's history where it clears them before its merge.
+# shellcheck disable=SC2034 # Read by deploy_code_only.sh and lib/deploy_checkout.sh to filter known-ephemeral dirty paths.
 EPHEMERAL_DIRTY_RE=' AGENTS\.md$| config/procedure_triggers\.yaml$| \.claude/settings\.local\.json$| \.serena/project\.yml$| src/genesis/identity/USER\.md$'

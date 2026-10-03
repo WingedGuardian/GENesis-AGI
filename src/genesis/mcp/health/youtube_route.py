@@ -54,9 +54,9 @@ def _format(result) -> str:
 async def fetch_youtube(url: str, max_chars: int) -> tuple[dict | None, str | None]:
     """``(result, None)`` on success, ``(None, error)`` when the caller should
     fall back to the ordinary fetch chain; ``(None, None)`` for a non-YouTube URL."""
-    url = (url or "").strip()
-    if url and not url.startswith(("http://", "https://")):
-        url = "https://" + url  # the same normalization _impl_web_fetch applies
+    from genesis.mcp.health.web_tools import with_scheme
+
+    url = with_scheme(url) if (url or "").strip() else ""
     if not is_youtube_video_url(url):
         return None, None
     start = time.monotonic()

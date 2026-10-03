@@ -359,3 +359,129 @@ from "how we ask for it" and serves as acceptance tests for model changes.
 ## Related Documents
 
 - [genesis-v3-build-phases.md](genesis-v3-build-phases.md) — Phase 2: compute routing
+
+## Reload, model replacement and persisted health
+
+`Router.reload_config()` prepares the production delegate, rate gates and breaker
+bindings before publishing configuration. Each request captures its configuration,
+delegate, pacing and full breaker map before its first await. An old request
+therefore finishes with the model identity it actually requested, even if a provider
+is removed or repointed while it waits. Custom delegates retain their existing
+`CallDelegate` contract; the router still supplies the generation's model ID.
+
+Existing account pacing locks and last admissions are shared across reloads and
+registered alias renames; configured RPM changes update that shared gate.
+Dashboard toggles select and change the current breaker under the registry lock,
+so reload cannot discard a reported operator action. Routed trip events carry a
+health identity; escalation rejects events for retired identities, including events
+held up by another event-bus listener.
+
+The runtime's registry object stays in place. Replaced or renamed breakers receive
+copies of raw hold state with the new provider binding; old persistence and recovery
+callbacks are detached. Recovery after a rename reports the current alias. Registry
+updates own their provider dictionary rather than mutating the delegate's old config.
+Previously, shared-dictionary mutation indirectly refreshed the delegate for normal
+same-alias reloads; it did not provide coherent in-flight routing.
+
+Persisted health carries SHA-256 request identity (provider type, model ID and
+endpoint) plus bounded failure provenance. It stores neither raw errors nor endpoint
+credentials. A changed identity clears only retirement-only history evidenced by a
+provider response with HTTP 410 and an exact affirmative model-retirement statement.
+The exact observed `litellm.APIError: ` wrapper is removed once before checking;
+unknown wrappers and appended qualifications remain ambiguous.
+Every failed retry must establish retirement; a mixed 500/410 visit stays held.
+Negated, account-related or otherwise ambiguous statements stay held. Persisted
+retirement provenance must agree with its saved identity and transient call failure. A generic
+410, 404, authentication, quota, entitlement, operator, mixed or ambiguous legacy
+hold stays held. Alias-only renames do not count as model replacement. Existing
+operator hold expiry and restart backoff caps still apply. Returning to a sole
+legacy alias also preserves its hold.
+
+Daily usage remains independent of model health and keyed by the exact configured
+provider name. Same-name model replacement and late completion preserve its row;
+removing an explicitly independent alias does not transfer its counts to a survivor.
+UTC rollover, persistence and limit semantics are unchanged. A reentrant lock and
+copied pure views protect concurrent dashboard reads. Registered cross-alias budget
+migration is deferred: it needs durable historical ownership captured with requests,
+not inference from the current alias set. A rename can therefore undercount a shared
+account until UTC rollover, as before this change; vendor rate limits remain the backstop.
+
+Runtime provider probes and dashboard health snapshots use the router's current
+config and breaker bindings. A probe started before reload is discarded rather
+than changing replacement health; reload invalidates cached routing health.
+
+Probe support, credential configuration and breaker authority are separate
+evidence. The health API's provider results expose `configured`,
+`probe_supported` and `can_affect_breaker` alongside the existing reachability,
+model-listing, latency and error fields. Unsupported probing does not imply a
+missing key or outage: a configured chain entry omits `probe_status`, records
+`probe_reason: unsupported_probe`, and retains the established breaker-based
+display. Actual missing credentials retain `not_configured/no_api_key`.
+
+NVIDIA's public `/v1/models` catalog is supported but observational only
+(`can_affect_breaker: false`), for both successful and failed observations.
+Its listing cannot validate credentials, prove callable completion access or
+clear held health state. Other supported providers retain their existing
+probe-synchronization policy. No routing chain, model default, daily usage,
+failure provenance or breaker-restoration policy changes with this distinction.
+
+Verification uses local HTTP responses and mocked provider completions with the production delegate and
+disposable SQLite/JSON state. `tests/test_routing/test_routing_generation.py` covers
+reload/restart identity, suspension at budget/rate/retry/completion, late callbacks,
+hold preservation, preparation failure and alias accounting. It makes no provider
+accuracy claim and performs no live Fusion inference.
+
+`tests/test_routing/test_routing_generation_http.py` verifies real LiteLLM HTTP
+dispatch, old/new result identity, token usage and SQLite cost recording against a
+localhost server. It performs no external model inference.
+
+Captured dashboard health uses the full `CircuitBreakerRegistry.health_view()`
+interface, including breaker aggregation and essential-site coverage derived from
+the captured configuration. Constructing a view does not restore or persist state.
+
+A proven retirement replacement also starts a fresh persisted incident namespace.
+Legacy incidents keep their existing hashes; authentication, quota, operator and
+ambiguous holds retain their namespace and accumulated escalation evidence. Every
+retirement transition gets a new namespace, including a switch back to a previous
+model, so historical trip counts and notification acknowledgments cannot suppress
+or prematurely escalate the replacement. Restart restores the namespace.
+
+Retirement resolves the old incident's failure and notification rows with an
+explicit `auto-retired` reason, never a claim of observed recovery. Deferred old
+observation/notification writes check the namespace and retire an obsolete write.
+The awareness notification sweep reads the current namespace, so its outage clock
+and deduplication apply to the current incident. Existing separately committed
+recovery/resolve failure behavior remains unchanged; a database failure is logged,
+and retirement resolution is not a new transactional guarantee.
+
+The shared current-incident predicate treats a missing provider binding as obsolete,
+distinct from a live legacy incident whose namespace is `None`. This applies before
+and after both deferred failure and notification writes, including registered alias
+renames and removal while a database write waits. Cleanup resolves the obsolete
+row without claiming a successful provider call.
+
+Ordinary registered renames preserve a persisted incident owner (the original
+provider alias) as well as its namespace. Escalation hashes, outage timestamps and
+user acknowledgments therefore remain valid across rename/restart/rollback without
+rewriting observation rows. Fresh configured-alias lookup remains direct-first;
+historical evidence resolves by its owned alias/namespace pair. Adding a formerly
+used alias as an independent sibling assigns a distinct namespace if needed and
+does not take ownership of the continuing incident. Partial HALF_OPEN recovery
+persists changed failure provenance even before the two-success close threshold.
+
+Resilience, call-site and API-key rendering use the same captured breaker view.
+Snapshot rendering does not publish stale cloud-axis updates; the awareness tick
+continues deriving the live cloud axis independently from the live registry.
+
+
+State restoration suppresses persistence until all saved bindings and incident fields
+have been applied, then atomically saves the completed registry. CLOSED pre-trip
+failures retain validated provenance with their counters without asserting a call-opened
+hold. Removing a provider retires only historical incidents that have no continuing
+owner; an ordinary rename keeps its incident intact.
+
+Captured pacing policy is immutable across reload: old and new generations share
+admission serialization and timestamps, while each retains its configured RPM.
+Health snapshots project cloud resilience only while their routing generation is
+current, under the reload publication lock. Full and readonly runtimes inject this
+projector; standalone live-registry health services retain their existing updates.

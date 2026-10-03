@@ -25,6 +25,7 @@ def init(rt: GenesisRuntime) -> None:
 
                 provider_health_checker = ProviderHealthChecker(
                     routing_config, breakers=rt._circuit_breakers,
+                    routing_snapshot=rt._router.health_snapshot,
                 )
                 rt._provider_health_checker = provider_health_checker
             except Exception:
@@ -33,6 +34,8 @@ def init(rt: GenesisRuntime) -> None:
         rt._health_data = HealthDataService(
             circuit_breakers=rt._circuit_breakers,
             routing_config=routing_config,
+            routing_snapshot=rt._router.health_snapshot if rt._router else None,
+            routing_resilience=rt._router.health_resilience if rt._router else None,
             cost_tracker=rt._cost_tracker,
             cc_budget=rt._cc_budget_tracker,
             deferred_queue=rt._deferred_work_queue,

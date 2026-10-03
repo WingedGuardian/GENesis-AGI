@@ -6,6 +6,7 @@ description: >-
   release, or says "clog code update". Routes to the canonical, standardized process in
   docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every
   time. Do NOT use for general "what changed in CC" trivia with no intent to update.
+keywords: [bump, pin, clog]
 ---
 
 # CC Update — start from the canonical source, don't rediscover

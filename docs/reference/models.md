@@ -427,17 +427,21 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Free tier limits can change without warning (Google cut limits 50-80% in Dec 2025)
 
 ### Nvidia NIM
-- **Endpoint:** build.nvidia.com
-- **Setup:** Create Nvidia developer account — no payment required
-- **Rate limits:** 40 RPM, ~5,000 total API credits (NOT unlimited despite marketing)
-- No daily cap, but credit-capped (credits do not refresh)
-- **Available models:** Kimi K2.5, Llama 4 Scout, DeepSeek V3.2, GLM-5
-- Best for testing and prototyping only. Not production-ready.
-- Once credits exhausted, must pay or create new account
-- **2026-08 routing probe:** DeepSeek V4-Pro EOL'd (HTTP 410) and free Kimi K2.6
-  404s for our account; Genesis now routes NIM to `deepseek-ai/deepseek-v4-flash-0731`
-  (fast, free, valid JSON on live probe). GLM-5.2 / MiniMax-M3 respond but are too
-  slow (~50-70s) for latency-sensitive primaries.
+- **API endpoint:** `https://integrate.api.nvidia.com/v1`; model cards at build.nvidia.com.
+- **Health evidence:** the checker uses `GET /v1/models` with the existing NVIDIA key convention. The catalog also answers without authentication, so a listing proves endpoint reachability and model membership, not credential validity, completion entitlement or remaining trial credits. NVIDIA catalog probes are observational: they do not suspect or heal breakers, including operator and ambiguous legacy holds. A configured provider whose probe target is unsupported falls back to breaker-based display instead of being labeled as missing credentials; genuinely absent keys remain disabled.
+- **Access:** NVIDIA developer trial access; credits and rate limits depend on the account. Genesis retains a conservative local 20 RPM cap; this is not a measured account quota or availability guarantee.
+- **2026-10-01 live checks:** `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, and `moonshotai/kimi-k3` returned the requested JSON with the install's credentials. Genesis's existing `nvidia-nim-deepseek` alias now selects V4.1 Flash.
+- **Structured-output limitation:** a V4.1 Flash probe using `response_format=json_object` returned its JSON in `reasoning_content` with empty answer content. The same prompt without that option returned usable JSON. Current Genesis routing callers request JSON in their prompts and do not send this option; do not infer support for forced JSON mode from the prompt-based probes.
+- `deepseek-ai/deepseek-v4-flash-0731` returned HTTP 410, reporting retirement on September 21. The previous August repoint to this model is no longer usable.
+- The authenticated catalog listed 81 models and no Xiaomi/MiMo model. Nemotron 3.5 Lightning was listed but its bounded probe timed out; a catalog entry alone does not prove working inference.
+
+### October 2026 public routing refresh
+
+The stable `openrouter-mimo` alias now selects `xiaomi/mimo-v2.6-pro` for eight ordinary DeepSeek Pro chain references, including executor quality review and Desk's primary route. Both Fusion panels use this model too. The novelty-suppression route and evaluation judge retain their DeepSeek Pro baseline pending separate qualification with independently labeled cases; the reflection golden set alone cannot establish replacement accuracy.
+
+OpenRouter's catalog on October 1 listed MiMo at **$0.435 input / $0.87 output per million tokens**, versus DeepSeek V4.1 Flash at $0.03 / $0.50. MiMo is therefore substantially more expensive for uncached input, despite remaining inexpensive in absolute terms. JSON output worked through the Genesis delegate; tool/schema support and the 1,050,000-token context are catalog metadata, not workload-quality or full-context measurements. Historical profiles remain available for local overrides, which can supersede shipped defaults.
+
+Sources: [OpenRouter model catalog](https://openrouter.ai/api/v1/models), [MiMo model page](https://openrouter.ai/xiaomi/mimo-v2.6-pro), [NVIDIA API reference](https://docs.api.nvidia.com/nim/reference/llm-apis), and authenticated completion probes on October 1.
 
 ### Z.AI / BigModel (GLM-5)
 - **Endpoint:** api.z.ai (international) / open.bigmodel.cn (China)
@@ -757,3 +761,37 @@ noted co-orchestrator potential and disagreement gate use case for Genesis.
 2026-03-03 — added Grok 4, GPT-5.2, GPT-5 Nano/Mini, Qwen 3.5 Plus,
 Qwen3-Max-Thinking; added Mistral/Groq/OpenRouter free tiers; updated
 Gemini entries; cross-referenced model routing registry
+
+### Routing changes while requests are active
+
+Model configuration reloads bind each request to one routing generation. An active
+request finishes with its original delegate/model and reports that identity;
+subsequent requests use the replacement. Same-alias model replacement preserves daily usage,
+operator/account/authentication/quota holds and ambiguous legacy health. Only proven
+retirement-only failure history can be cleared for a changed request identity.
+See [reload and persisted health](../architecture/genesis-v3-model-routing-registry.md#reload-model-replacement-and-persisted-health)
+for migration and rollback semantics. This behavior does not qualify any replacement
+model for evaluation judging or novelty suppression.
+
+Operator toggles act on current breaker bindings atomically with reload. Existing
+pacing admissions survive same-name repoints and registered alias renames; each
+captured generation retains its RPM interval. Current health snapshots project live
+cloud resilience atomically with reload in full and readonly runtimes, while stale
+snapshots remain read-only. Routed
+trip events include health identity, and escalation ignores retired identities.
+Retirement checking handles the observed LiteLLM APIError wrapper conservatively;
+unknown or qualified statements retain the hold.
+
+Captured API-key health retains breaker reasons and essential-site severity. Proven
+retirement replacement begins a fresh escalation/notification incident and retires
+old rows explicitly; ordinary account holds keep their existing incident history.
+
+Ordinary provider renames retain incident ownership, outage age and notification
+acknowledgments through restart; adding an independent sibling does not inherit
+that history. Partial recovery persists cleared retirement provenance without
+changing the existing two-success recovery threshold.
+
+
+Daily counters retain exact configured names; cross-alias counter migration is separate
+follow-up work. Removed provider bindings retire ownerless incidents. Restoration writes
+only completed state, and validated pre-trip failure evidence survives restart.

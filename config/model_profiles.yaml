@@ -845,6 +845,67 @@ profiles:
   # longer points at qwen/qwen-2.5-72b-instruct (repointed to a curated gemma /
   # nemotron :free pool), leaving this profile orphaned. See gemma-4-26b below.
 
+  # Provider metadata checked against the OpenRouter catalog and live delegate
+  # on 2026-10-01. Capability ratings retain the prior MiMo planning defaults;
+  # this is not calibration for the novelty gate or evaluation judge.
+  mimo-v2.6-pro:
+    display_name: "MiMo V2.6 Pro"
+    provider: xiaomi
+    api_id: "xiaomi/mimo-v2.6-pro"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 1050000
+    cost_tier: cheap
+    # https://openrouter.ai/api/v1/models, checked 2026-10-01; per MTok.
+    cost_per_mtok_in: 0.435
+    cost_per_mtok_out: 0.87
+    latency: moderate
+    strengths:
+      - structured JSON output (live delegate probe)
+      - tool calling and structured outputs (OpenRouter catalog)
+      - long context (catalog; full-length context not probed)
+    weaknesses:
+      - novelty suppression and rubric accuracy not yet qualified
+    best_for: [code_work, fresh_eyes_review, task_retrospective, foreground_conversation]
+    avoid_for: [calibrated_judging, procedure_novelty]
+    free_tier:
+      available: false
+    last_reviewed: "2026-10-01"
+    review_source: openrouter_catalog_and_live_delegate
+
+  # Stable provider alias nvidia-nim-deepseek now selects V4.1 Flash. Historical
+  # profiles below remain readable for install-local overrides. Capability
+  # ratings retain the previous NIM planning defaults, not a new calibration.
+  nvidia-nim-deepseek-v4.1-flash:
+    display_name: "DeepSeek V4.1 Flash (NIM)"
+    provider: nvidia_nim
+    api_id: "deepseek-ai/deepseek-v4.1-flash"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    # Conservative planning ceiling inherited from the previous NIM profile;
+    # the deployed endpoint's maximum context has not been measured.
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - structured JSON output (live delegate probe)
+    weaknesses:
+      - trial availability and rate limits can change
+      - not the DeepSeek Pro evaluation baseline
+    best_for: [code_work, triage, fast_reasoning, fallback_reasoning]
+    avoid_for: [calibrated_judging, foreground_conversation, outreach_draft]
+    free_tier:
+      available: true
+      limits: "NVIDIA trial access; account-dependent limits"
+    last_reviewed: "2026-10-01"
+    review_source: nvidia_catalog_and_live_delegate
+
   mimo-v2.5-pro:
     display_name: "MiMo V2.5 Pro"
     provider: xiaomi

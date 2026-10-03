@@ -1656,7 +1656,13 @@ class DirectSessionRunner:
         # servers. Honor an EXPLICIT mcp_profile="full" (a deliberate, trusted
         # install-local overlay choice — build_mcp_config returns None there so CC uses
         # its full default config) by opting that dispatch OUT of strict: "full" must
-        # mean full. Every other profile stays strict, so a None returned for an
+        # mean full. "Full" is NOT the repo's .mcp.json: this dispatch runs in
+        # background_session_dir(), outside the repo, so CC resolves only the
+        # user-scope (~/.claude.json) servers, plugins and claude.ai connectors
+        # there. A profile that
+        # needs a Genesis server (discord-bot included) names an _MCP_PROFILES
+        # entry instead.
+        # Every other profile stays strict, so a None returned for an
         # unknown/failed profile fails CLOSED to zero servers (never a silent full-leak).
         strict_mcp = mcp_profile != "full"
 

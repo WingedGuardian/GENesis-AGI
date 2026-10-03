@@ -343,9 +343,15 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-
-verified: 33b49a105 2026-09-26
+verified: b0867170e 2026-10-02
 ```
+
+- **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
+  durable parking.** Stream truncation and overloads with known-work or MCP
+  evidence share this boundary; provider diagnosis remains available as a
+  cause. Missing/unusable overload turn counts remain retryable by explicit
+  policy, not proof of pre-work failure. See `cc/exceptions.py`,
+  `cc/transient_retry.py` and `docs/reference/inbox-replay-safety.md`.
 
 - **`gh` holds NO GitHub credential in any dispatched session — the SESSION may
   still reach one** (`cc/invoker.py` `_sealed_gh_config_dir` / `_gh_hardening` /
@@ -361,6 +367,12 @@ verified: 33b49a105 2026-09-26
   would beat the seal. Pinning `GH_TOKEN` ALONE was the first version and was
   bypassed: MEASURED, `GITHUB_TOKEN` wins over an empty `GH_TOKEN`, and gh
   documents the pair on one line.
+  **Pinned again at the settings level**: Claude Code applies settings `env`
+  AFTER launch, so a user or project settings file could otherwise restore a
+  credential or `GH_CONFIG_DIR`. Every dispatch passes `--settings` carrying the
+  same pins (`_settings_env_pins`, written by `cc_span_settings_path` to a file
+  named by a hash of the pins). MEASURED on CC 2.1.280: `--settings` env beats
+  both project settings env and the inherited environment.
   **Enforced by `_assert_no_gh_credentials` at the launch gate, UNCONDITIONALLY** —
   not by `_assert_hardening_present`, which `_launch_env` calls only for an
   invocation declaring a Bash allowlist. The credentials were briefly inside the
@@ -422,7 +434,6 @@ verified: 33b49a105 2026-09-26
   de-authenticate). Widening that pin by origin was measured wrong twice over and
   is documented in `.claude/docs/background-sessions.md`; the remedy is denying
   `Bash`, not an env pin.
-
 - **NO dispatch profile grants Bash** (`cc/direct_session.py`,
   `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
   to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
@@ -654,7 +665,7 @@ verified: 33b49a105 2026-09-26
   `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
   Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
   `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
-  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; every `web_fetch` MCP result, from any backend, is returned inside the keyed untrusted-content boundary (`web_tools._wrap_fetch_result`), and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; every `web_fetch` MCP result, from any backend, is returned inside the keyed untrusted-content boundary (`web_tools._wrap_fetch_result`), and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain; a LinkedIn post keeps its ordinary page fetch, unchanged, and gets its video's caption track in a separate `video_transcript` field, or `video_error` when it cannot be read, with yt-dlp's "no video" message as the only sign of a text post (`knowledge/processors/linkedin.py` + `mcp/health/linkedin_route.py`, the same yt-dlp argv with the LinkedIn extractor, caption tracks only from `*.licdn.com`, never audio)); if the
   MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
   judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
@@ -1121,7 +1132,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 640c4f2e3 2026-09-18
+verified: b0867170e 2026-10-02
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1177,6 +1188,12 @@ verified: 640c4f2e3 2026-09-18
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Replay-unsafe batches persist a hold independent of the retry cap; readable
+  held blocks are excluded from future deltas without becoming completed
+  baseline content, while unreadable holds block their source file. The
+  operator-only per-item release requires explicit replay acknowledgement and
+  an unchanged source, then returns through normal approval/claim handling.
+  Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -2531,6 +2548,19 @@ verified: 788dd9a9 2026-09-06
   Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
+- **eval reference integrity**: `eval/reflection_golden_set.py` generates
+  private unapproved drafts (`proposed_passed`, no automatic `user_passed`),
+  preserving historical files. `eval/calibration.py` exposes opt-in
+  `strict_references` whole-file schema, rubric/context and declared human
+  provenance and exact grading-question uniqueness checks before scoring.
+  Zero-case generation leaves no output, allowing retry. Complete drafts are
+  synced and closed in sibling staging before atomic no-overwrite publication. Reflection CLI and both
+  MCP experiment consumers retain the separate historical reference default.
+  Reflection calibration CLI exposes
+  `--strict-references`; legacy reports remain compatible. Declared provenance
+  is not authenticated approval or model qualification. See
+  `docs/reference/golden-reference-integrity.md`.
+
 - **calibration/**: the pure ECE/MCE + confidence-bucket primitives
   (`metrics.py`, `types.py`), consumed by the WS-2 ledger (`ledger/cells.py`) and
   the ego-ECE path (`feedback/calibration.py`). **Four distinct "calibration"
@@ -2627,11 +2657,46 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: ee9ebf85c 2026-09-05
+verified: b0867170e8e3 2026-10-02
 ```
 
-- **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
-  each a free-first → paid-last chain; `never_pays` sites are filtered to
+- **Provider health evidence**: NVIDIA's `/v1/models` catalog is supported
+  but observational only; success, failure and probe exceptions do not mutate
+  its breakers. Probe support, credential presence and breaker authority are
+  serialized separately. Unsupported configured targets retain breaker-based
+  display instead of a false missing-key status. Listing membership does not
+  establish completion entitlement, credential validity or remaining quota.
+- **October 2026 model refresh**: the stable NVIDIA DeepSeek alias selects
+  V4.1 Flash after the old Flash endpoint returned HTTP 410. Eight ordinary
+  Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
+  suppressor's exact validated pair and standalone evaluation judge remain
+  DeepSeek Pro. Candidate compatibility has been probed; candidate quality for
+  these protected judgments has not been qualified.
+- **Coherent routing reloads** (`Router.reload_config`,
+  `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
+  bindings before yielding. Replacement/rename breakers preserve holds while
+  detaching old callbacks; recovery names the current alias. Persisted identity
+  digests and retirement-only provenance permit a replacement reset only with
+  explicit retirement evidence, preserving auth/quota/operator/mixed/legacy holds.
+  Runtime health probes and dashboard snapshots read generation-bound config and
+  breakers; late probes cannot alter replacement health. Daily accounting preserves
+  exact-name rows across same-alias model changes with synchronized pure reads;
+  cross-alias budget migration is deferred. See the model-routing
+  registry reference's reload section and `test_routing_generation.py`.
+- **Reload controls**: registry-locked dashboard toggles preserve operator actions
+  across model repoints. Shared pacing gates retain admissions across reloads and
+  known alias renames. Routed trip events carry health identity; escalation rejects
+  retired-model events even when event-bus dispatch waits before consuming them.
+  Full captured registry views preserve API-key breaker/essential coverage. Proven
+  retirement starts a fresh persisted incident namespace and retires old rows;
+  account/operator holds retain their escalation and notification history.
+  Continuing registered renames preserve persisted incident ownership and user
+  acknowledgments; fresh sibling aliases cannot claim historical ownership.
+  Captured pacing intervals stay immutable while admission locks/history are shared.
+  Current health snapshots update the live cloud axis under the reload lock in both
+  full and readonly runtimes; stale generations render without changing live state.
+- **routing/**: `config/model_routing.yaml` defines 63 call sites,
+  with free-first and explicitly paid-first chains; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
   the provider's OWN unit and never converted between them. As SHIPPED today:
@@ -2804,7 +2869,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: f24c15e9 2026-09-05
+verified: b0867170e 2026-10-02
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -2849,6 +2914,11 @@ verified: f24c15e9 2026-09-05
   helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`, because
   the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks` where a
   sibling import is the only one that resolves.
+  The guarded async factory also accepts `existing_only=True` for recovery
+  writers: encoded `mode=rw` refuses a missing database without dropping either
+  pre/post-open quarantine check. Inbox hold release uses this opt-in; ordinary
+  callers retain create-capable behavior. It is not a replacement/maintenance
+  fence and does not pin a database inode across inspection and release.
   Two AST-locked boundaries rather than conventional ones:
   `test_db/test_connection_admission_lock.py` pins the open-time connect set
   (a NEW factory fails until classified — it exists because a hand enumeration
@@ -3107,7 +3177,8 @@ verified: f24c15e9 2026-09-05
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md). The root Tailscale watchdog
-  (`genesis-tailscale-watchdog.timer`) is reported by its unit-file state only
+  (`genesis-tailscale-watchdog.timer`) is reported by its effective unit-file
+  state—the timer's, or the service's when masked
   (`tailscale_watchdog_unit_state`, beside `tailscaled_loaded`, which gates the
   `tailscale_watchdog_absent` posture rule); its `/run` file is event data for the
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
@@ -3136,7 +3207,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 2ac29c19 2026-09-14
+verified: 5e8dc977 2026-10-01
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3152,7 +3223,12 @@ verified: 2ac29c19 2026-09-14
   scheduler — `skill_injection_hook._ensure_catalog_fresh` spawns a detached
   regen when the catalog is missing or >1h stale, `_CATALOG_MAX_AGE_S=3600`,
   serving the next prompt), consumed by the injection hook and by
-  autonomous-session resources. Skill refinement is
+  autonomous-session resources. The hook scores only whole-word skill-NAME
+  tokens and frontmatter `keywords:` (never description prose); everyday words
+  in `_NAME_TOKEN_STOPLIST` never score as name tokens, and a library skill in a
+  vendor plugin bundle (`skill-library/<vendor>/<bundle>/skills/<skill>`)
+  scores only when the prompt names that vendor (`_vendor_of`,
+  `_VENDOR_ALIASES`; the stoplist is skipped once it does). Skill refinement is
   propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
   review and never writes a skill file. Recording it as a tracked
   cognitive-file modification is DEFERRED — no ledger pre-image is captured
@@ -3166,6 +3242,12 @@ verified: 2ac29c19 2026-09-14
   `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
   edits under `~/.genesis/premerge-backups/` first — so the block must live in
   the commit).
+  Codex's local CLI also has a budget-only shell action hook in
+  `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
+  existing commit/request budget decisions, denies approval-required or unknown
+  evidence, and returns control to the user without native approval or Genesis
+  lifecycle registration. It does not enforce the future reflection gates or
+  cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

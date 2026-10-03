@@ -105,7 +105,7 @@ Fields:
 #   task deliverables. Part of a 3-gate pipeline: (1) programmatic checks,
 #   (2) this site, (3) 20_adversarial_counterargument. Cross-vendor by
 #   design (different model family than the task author). PAID chain
-#   (DeepSeek V4 Pro + Qwen 3.6+ via OpenRouter).
+#   (MiMo V2.6 Pro + Qwen 3.6+ via OpenRouter).
 #   Live caller: autonomy/executor/review.py:37
 #                (_CALL_SITE_EXECUTOR_REVIEW constant)
 #   Renamed from: 17_fresh_eyes_review (2026-05-10)
@@ -357,7 +357,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["21_embeddings", "21b_query_embedding"],
     },
     "44_task_premortem": {
-        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Paid-primary dual chain (DeepSeek V4 Pro + free fallback). Caller: autonomy/executor/review.py:101 (TaskReviewer).",
+        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Free-primary chain with MiMo V2.6 Pro among the paid fallbacks. Caller: autonomy/executor/review.py:101 (TaskReviewer).",
         "category": "assessment",
         "frequency": "Per task (pre-execution)",
         "model_tier": "frontier",
@@ -390,7 +390,7 @@ _CALL_SITE_META: dict[str, dict] = {
     },
     # ── PARTIALLY WIRED: code exists, conditions haven't triggered yet ─
     "27_pre_execution_assessment": {
-        "description": "Pre-execution plan sanity-check (executor TaskReviewer.review_plan + autonomy/decomposer.py). The PRIMARY path is the CC invoker (Opus) directly; THIS call site is the API-dual fallback (GLM 5.1 / MiniMax M2.5 / DeepSeek V4 Flash) routed via route_call when the CC invoker is unavailable. Cost auto-derives from that chain — it is NOT a CC-subscription site (the prior dispatch=cli/cc_model=Opus meta was stale and mislabeled it).",
+        "description": "Pre-execution plan sanity-check (executor TaskReviewer.review_plan + autonomy/decomposer.py). The PRIMARY path is the CC invoker (Opus) directly; THIS call site is the API-dual fallback (GLM 5.3 / DeepSeek V4.1 Flash) routed via route_call when the CC invoker is unavailable. Cost auto-derives from that chain — it is NOT a CC-subscription site (the prior dispatch=cli/cc_model=Opus meta was stale and mislabeled it).",
         "category": "reasoning",
         "frequency": "Per task (pre-execution)",
         "model_tier": "frontier",
@@ -483,7 +483,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "WIRED_DIFFERENT_MECHANISM",
     },
     "17_executor_review": {
-        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: DeepSeek V4 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
+        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: MiMo V2.6 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",
@@ -500,7 +500,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "V4_PLACEHOLDER",
     },
     "20_adversarial_counterargument": {
-        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 5.5 primary, DeepSeek V4 Pro + Qwen 3.6+ fallback via OpenRouter.",
+        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 6 Astra primary, MiMo V2.6 Pro + Qwen 3.6+ fallback via OpenRouter.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",

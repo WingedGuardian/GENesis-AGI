@@ -26,9 +26,11 @@ from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
+    CCOverloadedError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCReplayUnsafeError,
     CCSessionError,
     CCStreamTruncatedError,
     CCTimeoutError,
@@ -51,6 +53,75 @@ from genesis.util.proc_kill import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Free-text status matching in ``_classify_error``. A bare substring match on
+# "429" also hit identifiers that merely contain the digits (UUIDs, request
+# ids), so the code is matched as a whole token. The overload pattern is
+# narrower still, because it drives a RE-RUN: "529" counts only beside the
+# word "overloaded" or after "API Error:", and the word "overloaded" alone does
+# not count at all (a model's own text can say a queue "looks overloaded").
+# The CLI's JSON result is classified from its structured fields instead (see
+# ``_cli_result_payload``), so this only sees stderr and error prose.
+_OVERLOADED_RE = re.compile(r"overloaded_error|\b529\b\W{0,3}overloaded\b|\bapi error:?\s*529\b")
+_STATUS_429_RE = re.compile(r"\b429\b")
+
+
+def _cli_result_payload(stdout_text: str) -> dict | None:
+    """Select the last raw CLI result, allowing trailing cleanup diagnostics.
+
+    Never call on decoded model prose. Physical LF framing keeps Unicode line
+    separators inside JSON strings from forging protocol records.
+    """
+    for line in reversed(stdout_text.split("\n")):
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(data, dict) and data.get("type") == "result":
+            return data
+    return None
+
+
+def _result_error_texts(payload: dict) -> list[str]:
+    """The human-readable error strings a CLI result object carries."""
+    texts: list[str] = []
+    for key in ("result", "error"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            texts.append(value)
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        texts.extend(e for e in errors if isinstance(e, str))
+    return texts
+
+
+def _int_or_none(value: object) -> int | None:
+    """An int from a JSON field: a real int, or a string of digits. Never a bool."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _overload_error(message: str, raw_text: str, payload: dict | None) -> CCError:
+    """Keep replay eligibility separate from the original overload diagnosis."""
+    from genesis.cc.transient_retry import replay_unsafe
+
+    overload = CCOverloadedError(
+        message, raw_text=raw_text, raw_event=payload,
+        num_turns=_int_or_none(payload.get("num_turns")) if payload else None,
+    )
+    if replay_unsafe(overload):
+        return CCReplayUnsafeError(message, cause=overload)
+    return overload
 
 
 # From CC 2.1.277 a headless resume RESTORES the CC session's saved totals — its
@@ -1468,8 +1539,9 @@ async def _emit_invocation_failed_event(
     Called from ``CCInvoker.run`` / ``run_streaming`` on the way out of a failed
     invocation, immediately before the error is re-raised — so every CC call
     site gets one central failure signal without each caller emitting its own.
-    Rate-limit / quota errors are WARNING (expected, self-recovering); every
-    other CCError is ERROR. A liveness probe's EXPECTED answer (a rate-limit /
+    Rate-limit / quota errors — including a provider overload, which is a
+    ``CCRateLimitError`` subclass — are WARNING (expected, self-recovering);
+    every other CCError is ERROR. A liveness probe's EXPECTED answer (a rate-limit /
     quota error while the home model is still limited) is skipped; any other
     probe failure is a malfunction and is emitted. Coalescing applies only to
     TAGGED callers — an untagged call has no identity to key on, and pooling
@@ -2490,7 +2562,12 @@ class CCInvoker:
             proc.send_signal(signal.SIGINT)
 
     @staticmethod
-    def _classify_error(stderr_text: str, stdout_text: str = "") -> CCError:
+    def _classify_error(
+        stderr_text: str,
+        stdout_text: str = "",
+        *,
+        result: dict | None = None,
+    ) -> CCError:
         """Classify CC output into a typed CC exception.
 
         Checks both stderr and stdout — when CC runs in streaming-JSON
@@ -2499,9 +2576,28 @@ class CCInvoker:
         Limiting classification to stderr would mis-categorize those as
         generic CCProcessError and skip downstream retry branches that
         key off the typed exception.
+
+        ``stdout_text`` must be the subprocess's RAW stdout (or empty).
+        ``result`` is the CLI's already-parsed result object, for callers that
+        parsed it themselves; it wins over one parsed from ``stdout_text``.
         """
         combined = f"{stderr_text}\n{stdout_text}"
-        lower = combined.lower()
+        # When stdout ends with the CLI's JSON result object, classify from its
+        # structured fields and its error TEXT, never from the serialized blob:
+        # the blob carries dozens of numbers (durations, token counts, costs)
+        # and UUIDs, so a text match over it can read "output_tokens":529 as an
+        # overload or a UUID's "429" as a rate limit.
+        parsed_stdout = _cli_result_payload(stdout_text)
+        payload = result if isinstance(result, dict) else parsed_stdout
+        pattern_parts = [stderr_text]
+        if parsed_stdout is None:
+            pattern_parts.append(stdout_text)
+        if payload is not None:
+            pattern_parts.extend(_result_error_texts(payload))
+        lower = "\n".join(pattern_parts).lower()
+        status = _int_or_none(payload.get("api_error_status")) if payload is not None else None
+        if status == 529:
+            return _overload_error(stderr_text or stdout_text, combined, payload)
         # Session expiry
         if "session" in lower and ("not found" in lower or "expired" in lower):
             return CCSessionError(stderr_text or stdout_text)
@@ -2526,18 +2622,36 @@ class CCInvoker:
             "session limit",
             "weekly limit",
         )
+        # A server-side throttle whose own text says it is NOT the usage limit
+        # ("Server is temporarily limiting requests (not your usage limit)")
+        # must not match the "usage limit" quota pattern below: that parks on
+        # the hours-long quota horizon for a transient capacity condition.
+        if "not your usage limit" in lower or "temporarily limiting requests" in lower:
+            return CCRateLimitError(stderr_text or stdout_text, raw_text=combined)
         if any(p in lower for p in _QUOTA_PATTERNS):
             return CCQuotaExhaustedError(stderr_text or stdout_text, raw_text=combined)
+        # Provider overload (HTTP 529) in free text: "API Error: 529 Overloaded.
+        # This is a server-side issue, usually temporary", "Repeated 529
+        # Overloaded errors", or the API body type ``overloaded_error``. The
+        # structured ``api_error_status`` is handled above. Checked before the
+        # rate-limit family because it is the more specific signal, and typed as
+        # retry-eligible overloads retain rate-limit behavior; known-work or
+        # MCP-backed overloads leave through the non-replayable boundary.
+        if _OVERLOADED_RE.search(lower):
+            return _overload_error(stderr_text or stdout_text, combined, payload)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
             "rate limit",
             "rate_limit",
-            "429",
             "hit your limit",
             "hit the limit",
         )
-        if any(p in lower for p in _RATE_LIMIT_PATTERNS):
+        if (
+            status == 429
+            or any(p in lower for p in _RATE_LIMIT_PATTERNS)
+            or _STATUS_429_RE.search(lower)
+        ):
             return CCRateLimitError(stderr_text or stdout_text, raw_text=combined)
         # MCP server error
         source = stderr_text or stdout_text
@@ -2891,7 +3005,12 @@ class CCInvoker:
             await _emit_bg_truncation_event(output.session_id)
         if output.is_error:
             error_text = output.error_message or output.text or "CC error"
-            err = self._classify_error(error_text)
+            # The structured result (status code, turn count) comes from the
+            # raw stdout; error_text is prose and is never parsed as JSON.
+            err = self._classify_error(
+                error_text + "\n" + stderr.decode(errors="replace"),
+                result=_cli_result_payload(stdout.decode(errors="replace")),
+            )
             await self._notify_status_change(err)
             raise err
 
@@ -3445,7 +3564,9 @@ class CCInvoker:
             if output.is_error:
                 stderr_hint = stderr_data.decode(errors="replace") if stderr_data else ""
                 error_text = output.error_message or output.text or stderr_hint or "CC error"
-                err = self._classify_error(error_text)
+                # result_data is the CLI's own result event (structured status
+                # and turn count); error_text is prose, never parsed as JSON.
+                err = self._classify_error(error_text + "\n" + stderr_hint, result=result_data)
                 await self._notify_status_change(err)
                 if oversized_dropped:
                     raise _unreplayable_after_drop(
@@ -3688,18 +3809,7 @@ class CCInvoker:
             ...
         }
         """
-        result_data = None
-        for line in reversed(raw.strip().splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict) and parsed.get("type") == "result":
-                    result_data = parsed
-                    break
-            except json.JSONDecodeError:
-                continue
+        result_data = _cli_result_payload(raw)
 
         if result_data is not None:
             return self._parse_result_dict(result_data, inv, elapsed_ms)

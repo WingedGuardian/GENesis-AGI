@@ -56,7 +56,8 @@ class _GuardedAiosqliteConnector:
     """Preserve aiosqlite's dual await/context API with open-time guards."""
 
     def __init__(
-        self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None
+        self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None,
+        *, existing_only: bool = False,
     ) -> None:
         self._db_path = db_path
         # The caller's ORIGINAL spelling, kept for admission checks only, so
@@ -64,6 +65,7 @@ class _GuardedAiosqliteConnector:
         # it resolves to.
         self._admission_path = admission_path if admission_path is not None else db_path
         self._kwargs = kwargs
+        self._existing_only = existing_only
         self._connection: aiosqlite.Connection | None = None
 
     async def _open(self) -> aiosqlite.Connection:
@@ -72,7 +74,11 @@ class _GuardedAiosqliteConnector:
         # Construction and opening are separate for aiosqlite.  Re-check here
         # so a connector retained before admission changed cannot open after.
         assert_admitted(self._admission_path)
-        connection = await aiosqlite.connect(str(self._db_path), **self._kwargs)
+        target = (
+            self._db_path.as_uri() + "?mode=rw"
+            if self._existing_only else str(self._db_path)
+        )
+        connection = await aiosqlite.connect(target, **self._kwargs)
         try:
             # Quarantine may have become active while the worker thread
             # opened SQLite.  Never return that newly opened writable handle.
@@ -98,15 +104,27 @@ class _GuardedAiosqliteConnector:
 
 
 def connect_aiosqlite_rw(
-    path: str | Path = DEFAULT_DB_PATH, **kwargs: Any
+    path: str | Path = DEFAULT_DB_PATH, *, existing_only: bool = False, **kwargs: Any
 ) -> _GuardedAiosqliteConnector:
-    """Return an awaitable/context-manager guarded through actual DB open."""
+    """Return an awaitable/context-manager guarded through actual DB open.
+
+    The default remains create-capable. ``existing_only=True`` opens an encoded
+    file URI in SQLite's ``mode=rw`` so a missing database cannot be created,
+    while retaining the same pre/post-open quarantine checks. This option
+    requires URI handling; explicitly disabling it is an error.
+    """
     from genesis.db.admission import assert_admitted
 
+    if existing_only:
+        if not kwargs.get("uri", True):
+            raise ValueError("existing_only requires uri=True")
+        kwargs["uri"] = True
     admission_path = Path(path).expanduser()
     assert_admitted(admission_path)
     db_path = admission_path.resolve()
-    return _GuardedAiosqliteConnector(db_path, kwargs, admission_path=admission_path)
+    return _GuardedAiosqliteConnector(
+        db_path, kwargs, admission_path=admission_path, existing_only=existing_only,
+    )
 
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
