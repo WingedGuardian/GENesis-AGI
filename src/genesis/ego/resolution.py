@@ -28,9 +28,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-#: Cap for stored decision content — rulings are constraints, not essays.
-_DECISION_CONTENT_MAX = 500
-
 
 def decision_prefix(proposal: dict) -> str:
     """Stable dedup prefix for a proposal's theme: ``[action_type/category]``,
@@ -194,14 +191,8 @@ async def _capture_decision(
         tag=prefix,
         ego_target=ego_target,
     )
-    exact = ego_crud.decision_text_key(key[:_DECISION_CONTENT_MAX])
-    suffixed = ego_crud.decision_text_key(key) + " (rejected proposal:"
     existing = next(
-        (
-            r
-            for r in same_tag
-            if (k := ego_crud.decision_text_key(r["content"])) == exact or k.startswith(suffixed)
-        ),
+        (r for r in same_tag if ego_crud.decision_matches_ruling(r, key)),
         None,
     )
     if existing:
@@ -217,10 +208,10 @@ async def _capture_decision(
     snippet = (proposal.get("content") or "")[:150]
     content = key
     if standing_rule is None:
-        content += f" (rejected proposal: {snippet})"
+        content += f"{ego_crud.REJECTION_PROVENANCE} {snippet})"
     decision_id = await ego_crud.create_decision(
         db,
-        content=content[:_DECISION_CONTENT_MAX],
+        content=content[: ego_crud.DECISION_CONTENT_MAX],
         ego_target=ego_target,
         source_proposal_id=proposal.get("id"),
     )

@@ -837,7 +837,7 @@ async def ego_decision(
                     "status": "error",
                     "reason": "content must be a distilled ruling (>=10 chars)",
                 }
-            stored = text[:500]
+            stored = text[: ego_crud.DECISION_CONTENT_MAX]
             same_tag: list[dict] = []
             match = None
             if text.startswith("[") and "]" in text:
@@ -847,9 +847,8 @@ async def ego_decision(
                     tag=tag,
                     ego_target=ego_target,
                 )
-                want = ego_crud.decision_text_key(stored)
                 match = next(
-                    (r for r in same_tag if ego_crud.decision_text_key(r["content"]) == want),
+                    (r for r in same_tag if ego_crud.decision_matches_ruling(r, text)),
                     None,
                 )
             if match:

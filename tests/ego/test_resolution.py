@@ -523,3 +523,47 @@ async def test_find_tagged_decisions_is_literal(db):
     assert [row["id"] for row in await ego_crud.find_tagged_decisions(db, tag="[dev/x]")] == [first]
     assert [row["id"] for row in await ego_crud.find_tagged_decisions(db, tag="[dev_x]")] == [under]
     assert await ego_crud.find_tagged_decisions(db, tag="[d%]") == []
+
+
+@pytest.mark.parametrize("key_length", [480, 481, 488, 499, 500])
+async def test_repeat_rejection_reaffirms_when_truncation_cuts_the_marker(db, key_length):
+    """A ``[tag] reason`` key of 481-498 chars keeps only part of the provenance
+    marker after the 500-char cap; the repeat must still reaffirm. Only 481 and
+    488 reach the cut-marker branch: 480 keeps the whole marker, 499 leaves a
+    trailing space the key strips, and 500 keeps no marker at all."""
+    first = await _proposal(db, pid="t0", content="synthetic proposal one")
+    reason = "r" * (key_length - len(decision_prefix(first)) - 1)
+    await handle_proposal_resolution(db, first, "rejected", reason=reason, source="mcp")
+    second = await _proposal(db, pid="t1", content="synthetic proposal two")
+    await handle_proposal_resolution(db, second, "rejected", reason=reason, source="mcp")
+
+    rows, total = await _decisions(db)
+    assert total == 1
+    assert rows[0]["reaffirm_count"] == 1
+
+
+def test_decision_matches_ruling_rejects_a_longer_ruling():
+    def match(content, ruling, source="p0"):
+        row = {"content": content, "source_proposal_id": source}
+        return ego_crud.decision_matches_ruling(row, ruling)
+
+    assert match("[t] keep x (rejected proposal: drop x)", "[t] keep x")
+    assert not match("[t] keep x and y", "[t] keep x")
+    # A partial marker counts only on a row the cap actually truncated.
+    assert not match("[t] keep x (rejected p", "[t] keep x")
+    assert not match("[t] keep x (rejected proposals are fine)", "[t] keep x")
+    # A manual ruling (no source proposal) that contains the marker text is
+    # its own ruling, not a captured copy of a shorter one.
+    assert not match("[t] keep x (rejected proposal: weekends only)", "[t] keep x", None)
+    cut = ("[t] " + "a" * 494 + " (except weekends)")[: ego_crud.DECISION_CONTENT_MAX]
+    assert not match(cut, "[t] " + "a" * 494, None)
+    assert match(cut, "[t] " + "a" * 494)
+
+
+async def test_find_tagged_decisions_puts_recent_affirmation_first(db):
+    older = await ego_crud.create_decision(db, content="[dev/x] older ruling")
+    newer = await ego_crud.create_decision(db, content="[dev/x] newer ruling")
+    await ego_crud.reaffirm_decision(db, older)
+
+    rows = await ego_crud.find_tagged_decisions(db, tag="[dev/x]")
+    assert [row["id"] for row in rows] == [older, newer]

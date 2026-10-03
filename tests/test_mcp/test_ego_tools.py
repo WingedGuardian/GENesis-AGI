@@ -362,3 +362,66 @@ class TestEgoDecisionRecord:
         assert first["related"] == second["related"] == []
         assert first["related_total"] == second["related_total"] == 0
         assert (await self._list())["total_active"] == 2
+
+    async def test_manual_repeat_reaffirms_a_captured_rejection(self, decision_db):
+        async with aiosqlite.connect(str(decision_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            captured = await ego_crud.create_decision(
+                conn,
+                content="[dev/x] Keep the goal active (rejected proposal: Pause it)",
+                source_proposal_id="p-captured",
+            )
+
+        repeated = await self._record("[dev/x] keep the goal active")
+
+        assert repeated["action"] == "reaffirmed"
+        assert repeated["decision_id"] == captured
+        assert (await self._list())["total_active"] == 1
+
+    async def test_tag_case_does_not_split_a_repeat(self, decision_db):
+        first = await self._record("[Dev/X] always publish under the real name")
+        repeated = await self._record("[dev/x] always publish under the real name")
+
+        assert repeated["action"] == "reaffirmed"
+        assert repeated["decision_id"] == first["decision_id"]
+
+    async def test_rejection_reaffirms_a_manual_ruling(self, decision_db):
+        from genesis.ego.resolution import handle_proposal_resolution
+
+        manual = await self._record("[content_publishing/marketing] Keep the goal active")
+        async with aiosqlite.connect(str(decision_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await ego_crud.create_proposal(
+                conn,
+                id="p-manual",
+                action_type="content_publishing",
+                action_category="marketing",
+                content="Pause it",
+                confidence=0.8,
+                ego_source="user_ego_cycle",
+            )
+            await ego_crud.resolve_proposal(conn, "p-manual", status="rejected", user_response="r")
+            proposal = await ego_crud.get_proposal(conn, "p-manual")
+            await handle_proposal_resolution(
+                conn,
+                proposal,
+                "rejected",
+                reason="Keep the goal active",
+                source="mcp",
+            )
+
+        listed = await self._list()
+        assert listed["total_active"] == 1
+        assert listed["decisions"][0]["id"] == manual["decision_id"]
+        assert listed["decisions"][0]["reaffirm_count"] == 1
+
+    async def test_related_keeps_a_recently_reaffirmed_ruling(self, decision_db):
+        oldest = await self._record("[dev/x] ruling 0 settled")
+        for index in range(1, 6):
+            await self._record(f"[dev/x] ruling {index} settled")
+        await self._record("[dev/x] ruling 0 settled")
+
+        seventh = await self._record("[dev/x] ruling seven, distinct")
+
+        assert seventh["related_total"] == 6
+        assert seventh["related"][0]["id"] == oldest["decision_id"]
