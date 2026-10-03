@@ -90,11 +90,14 @@ needs no explicit user request. It is never a way to hold work that was already
 unfinished when the PR opened.
 
 **A PR in draft returns to regular once the blocker that put it there is
-resolved.** That holds for drafts opened before this rule and for drafts the
-automated openers create. Whoever resolves the blocker marks it ready
-(`gh pr ready <N>`) and requests review (`@codex review`), because marking a
-draft ready is not a step to rely on for triggering review. A draft is never
-abandoned in that state.
+resolved.** That holds for drafts opened before this rule. A draft from one of
+the automated openers is different: it has no blocker to clear, neither opener
+ever marks a PR ready, and the closing session counts and lists drafts without
+closing them, so marking it ready is the owner's decision, which the closing
+session's draft list is there to surface. Whoever resolves a blocker marks the
+PR ready (`gh pr ready <N>`) and requests review (`@codex review`), because
+marking a draft ready is not a step to rely on for triggering review. A draft
+is never abandoned in that state.
 
 CI and external review that run after opening, and verification explicitly
 required after merge, remain their normal gates; waiting for those is not a
