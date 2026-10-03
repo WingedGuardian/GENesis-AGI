@@ -15,6 +15,7 @@ trees to pick the right one.
 | `follow_up_create` | Deferred USER-OWNED work needing tracking + completion | Follow-up ledger | "Finish the deck I asked for" |
 | `gh issue create` | Deferred GENESIS-REPO work (code, tests, docs, infra) | Public GitHub tracker | "Adapter for provider X is hardcoded" |
 | `open_question_raise` | A genuine OWNER FORK that blocks or shapes work — not work itself | Local open-questions store (never GitHub) | "Bind the API to loopback or the tailnet?" |
+| `board_promote` | A private ledger row / follow-up should become PUBLIC board work | Held for owner approval, then a public issue on the work board | "Promote follow-up 1a2b3c4d as a card" |
 
 **Quick rule:** If it's about the user → `memory_store`. If it's a finding
 during work → `observation_write`. If it's an external source to learn
@@ -302,10 +303,10 @@ it, the work it unblocks becomes a follow-up or a board card.
 | A genuine owner fork that stops the work now | Ask the owner (foreground) or stop as blocked (dispatched) |
 
 `blocks` entries are `ledger:<id>`, `follow_up:<id>` (full id or a unique 8+
-hex prefix) or `card:owner/repo#N`. Today a block is ADVISORY:
+hex prefix) or `card:owner/repo#N`. `board_promote` REFUSES to promote a
+blocked record; everywhere else a block is advisory —
 `open_question_list(target=...)` answers whether something is blocked, and by
 what, and the morning report counts unverified questions so a parked one is
-never invisible. Board promotion will refuse a blocked record once it lands —
-until then nothing refuses on a block, so do not rely on one. Close with
+never invisible. Close with
 `open_question_resolve` and say what settled it — an assumption is not an
 answer. The store is LOCAL ONLY; nothing here reaches GitHub.

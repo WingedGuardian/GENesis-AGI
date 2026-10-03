@@ -3,7 +3,7 @@
 Mirrors the WS-8 email gate watcher (:mod:`genesis.autonomy.email_gate_watcher`).
 A periodic drain (``CronTrigger`` */5min, ``max_instances=1`` — no in-drain
 races) resolves each ``pending_issue_posts`` ``held`` row against its linked
-approval, honoring the ``contributor_worklog`` mode lever (read live each tick):
+approval, honoring the lever of the row's LANE (read live each tick):
 
 - **approved + ``live``**       → post the issue to GitHub below the gate + mark posted.
 - **approved + ``propose_only``**→ shadow-observe once + mark ``dry_run`` (TERMINAL — never
@@ -14,18 +14,32 @@ approval, honoring the ``contributor_worklog`` mode lever (read live each tick):
 - **orphaned** (approval gone)   → expire, never post.
 - **pending**                    → still awaiting the owner; leave held.
 
+Two lanes share this ONE drain (spec: one drain, dispatching on ``source``):
+
+* the Contributor Work-Log (``source`` ``follow_up`` / ``codebase``), governed by
+  ``contributor_worklog`` — unchanged;
+* WORK-BOARD PROMOTIONS (``source='board'``, written by
+  :mod:`genesis.board.promotion`), governed by the ``board`` lever. A board row
+  additionally: posts only on a HUMAN-resolved approval (a system or
+  self-approval is refused); is deduped by the opaque marker in its body, not
+  by title, and adopts an existing marked issue only when the account itself
+  authored it; is NOT subject to the contributor daily cap (each one was
+  approved individually); and, once its issue exists, writes the ``board_links``
+  pointer + a ``promotion`` event — re-tried every tick for a posted row whose
+  pointer a crash left unwritten.
+
 Public-repo dup-safety (stronger than the email pattern, because a duplicate
 public issue is more visible than a duplicate email):
 
 1. ``mark_posted`` runs BEFORE ``mark_consumed`` — a crash after the GitHub post
    can't re-post next cycle, because the row has already left ``held`` (and
    ``list_held`` won't return it).
-2. A pre-post ``gh issue list`` open-issue dedup doubles as crash-idempotency:
-   a normalized title already open on the repo is ADOPTED (mark_posted with its
-   number) instead of re-created — so a crash in the narrow window between
-   ``gh issue create`` and ``mark_posted`` self-heals on the next cycle rather
-   than opening a second issue. If the dedup LIST call fails we do NOT post
-   (can't verify) — the row stays held and retries next cycle.
+2. A pre-post open-issue dedup doubles as crash-idempotency: an issue already
+   carrying this row's identity is ADOPTED (mark_posted with its number) instead
+   of re-created — so a crash in the narrow window between ``gh issue create``
+   and ``mark_posted`` self-heals on the next cycle rather than opening a second
+   issue. If the dedup lookup fails we do NOT post (can't verify) — the row stays
+   held and retries next cycle.
 
 The drain reads ONLY the sanitized ``pending_issue_posts`` row (never re-reads
 any source), so the read-private / write-public boundary is enforced at the
@@ -35,6 +49,8 @@ table. ``gh`` uses ambient server-side auth (same idiom as
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -48,16 +64,27 @@ from genesis.autonomy.contributor_worklog_config import (
     load_config,
     normalize_title,
 )
+from genesis.board import config as board_config
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import pending_issue_posts as pip
 
 logger = logging.getLogger(__name__)
 
 _ISSUE_NUM_RE = re.compile(r"/issues/(\d+)\b")
+_MARKER_RE = re.compile(r"<!-- genesis-board:([0-9a-f]{24}) -->")
 # GROUNDWORK(autonomous-distribution): the GitHub issue-create egress door. Every
 # autonomous external post routes through the shadow-gate (observe) before the gh
 # call; the capability cell is observe-only today (enforce stage later).
 _GH_TIMEOUT = 60
+BOARD_SOURCE = "board"
+#: One page of a dedup SEARCH. A full page means "possibly more", so it is
+#: treated as unverified, never as a complete answer.
+_SEARCH_PAGE = 100
+
+
+def _board_mode() -> str:
+    """The board lane's lever (a module-level seam, patched in tests)."""
+    return board_config.effective_mode()
 
 
 def _run_gh(args: list[str], *, timeout: int = _GH_TIMEOUT) -> tuple[int, str, str]:
@@ -79,6 +106,14 @@ def _run_gh(args: list[str], *, timeout: int = _GH_TIMEOUT) -> tuple[int, str, s
         return 127, "", "gh binary not found"
 
 
+async def _gh(args: list[str]) -> tuple[int, str, str]:
+    """``_run_gh`` OFF the event loop. The drain runs as a job on the server's
+    loop; a blocking gh call there (0.7-1.3 s MEASURED, up to the 60 s timeout on
+    a network stall) would freeze every coroutine, Telegram approval buttons
+    included. ``_run_gh`` stays the sync seam tests patch."""
+    return await asyncio.to_thread(_run_gh, args)
+
+
 def _issue_number_from_url(url: str) -> int | None:
     m = _ISSUE_NUM_RE.search(url or "")
     return int(m.group(1)) if m else None
@@ -97,47 +132,109 @@ def _normalize_ts(raw: str | None) -> str | None:
         return None
 
 
-def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, dict | None]:
-    """Look for an OPEN issue on *repo* whose normalized title matches. Returns
-    ``(ok, issue|None)`` — ``ok=False`` means the lookup itself failed (caller
-    must NOT post, since dedup can't be verified).
-
-    Scope note: ``--limit 200`` covers the 200 most-recently-created open issues
-    (gh's default order). This fully covers the crash-idempotency case (a just-
-    created issue is necessarily recent). The only gap is a PRE-EXISTING open
-    issue (human- or long-ago-opened) with a matching title on a repo with >200
-    OPEN issues — well beyond current scale, and the DB-side dedup already stops
-    Genesis re-proposing its own. Tracked for a search-based upgrade before the
-    repo approaches that ceiling (follow-up)."""
-    rc, out, err = _run_gh(
-        [
-            "issue",
-            "list",
-            "--repo",
-            repo,
-            "--state",
-            "open",
-            "--json",
-            "number,title,url,createdAt",
-            "--limit",
-            "200",
-        ]
-    )
+async def _gh_issue_list(
+    repo: str, *, state: str, fields: str, limit: int, search: str | None = None
+) -> list[dict] | None:
+    """One ``gh issue list`` call; None when it fails or its output is unparseable."""
+    args = [
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        state,
+        "--json",
+        fields,
+        "--limit",
+        str(limit),
+    ]
+    if search is not None:
+        args += ["--search", search]
+    rc, out, err = await _gh(args)
     if rc != 0:
         logger.warning("gh issue list failed for %s rc=%s: %s", repo, rc, err.strip())
-        return False, None
+        return None
     try:
         issues = json.loads(out or "[]")
     except (ValueError, TypeError):
         logger.warning("gh issue list returned unparseable JSON for %s", repo)
+        return None
+    return issues if isinstance(issues, list) else None
+
+
+async def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, dict | None]:
+    """Look for an OPEN issue on *repo* whose normalized title matches. Returns
+    ``(ok, issue|None)`` — ``ok=False`` means a lookup itself failed (caller
+    must NOT post, since dedup can't be verified).
+
+    TWO reads, because each is blind where the other sees:
+
+    * the 200 most-recently-created open issues — covers the crash-idempotency
+      case (an issue created seconds ago), which a search may not have indexed;
+    * a title SEARCH across every open issue — covers a pre-existing issue
+      outside that window. The window alone was the original design, sized for
+      a repo with far fewer than 200 open issues; MEASURED 638 open on the live
+      repo (2026-10-02), so a title collision outside it was reachable.
+
+    The search's own matching is fuzzy, so its results are re-checked with the
+    exact normalized-title comparison. The title is searched as a QUOTED phrase:
+    MEASURED 2026-10-03, unquoted ``<title> in:title`` found 0 of 2 exact-title
+    open issues on the live repo (both ``type(scope): ...`` style) where the
+    quoted form found 2 of 2 — and quoting also stops title words being read as
+    search qualifiers. A search that fills its page is NOT a complete answer, so
+    a saturated read counts as unverified (the row waits) rather than as "no
+    match"."""
+    fields = "number,title,url,createdAt"
+    recent = await _gh_issue_list(repo, state="open", fields=fields, limit=200)
+    if recent is None:
         return False, None
-    for issue in issues:
+    for issue in recent:
+        if normalize_title(issue.get("title", "")) == title_norm:
+            return True, issue
+    phrase = title_norm.replace('"', " ").strip()
+    searched = await _gh_issue_list(
+        repo, state="open", fields=fields, limit=_SEARCH_PAGE, search=f'"{phrase}" in:title'
+    )
+    if searched is None or len(searched) >= _SEARCH_PAGE:
+        return False, None
+    for issue in searched:
         if normalize_title(issue.get("title", "")) == title_norm:
             return True, issue
     return True, None
 
 
-def _create_issue(
+async def _find_issue_by_marker(repo: str, marker_digest: str) -> tuple[bool, dict | None]:
+    """Find an issue (ANY state — a closed one still must not be re-created)
+    whose body carries this board row's marker. Same two-read shape as the
+    title lookup: the recent window catches a just-created issue a search has
+    not indexed; the search covers everything older (MEASURED 2026-10-03: once
+    indexed, a body search finds the digest inside the HTML-comment marker, in
+    unquoted, quoted and prefixed forms alike)."""
+    fields = "number,url,createdAt,body,author"
+    recent = await _gh_issue_list(repo, state="all", fields=fields, limit=100)
+    if recent is None:
+        return False, None
+    for issue in recent:
+        if marker_digest in _MARKER_RE.findall(issue.get("body") or ""):
+            return True, issue
+    searched = await _gh_issue_list(
+        repo, state="all", fields=fields, limit=_SEARCH_PAGE, search=f'"{marker_digest}" in:body'
+    )
+    if searched is None or len(searched) >= _SEARCH_PAGE:
+        return False, None
+    for issue in searched:
+        if marker_digest in _MARKER_RE.findall(issue.get("body") or ""):
+            return True, issue
+    return True, None
+
+
+async def _viewer_login() -> str | None:
+    rc, out, _ = await _gh(["api", "user", "-q", ".login"])
+    login = out.strip()
+    return login if rc == 0 and login else None
+
+
+async def _create_issue(
     repo: str, title: str, body: str, labels: list[str]
 ) -> tuple[int | None, str | None, str | None]:
     """Create the issue via ``gh issue create``. Returns ``(number, url, error)``;
@@ -145,7 +242,7 @@ def _create_issue(
     args = ["issue", "create", "--repo", repo, "--title", title, "--body", body]
     for label in labels:
         args += ["--label", label]
-    rc, out, err = _run_gh(args)
+    rc, out, err = await _gh(args)
     if rc != 0:
         return None, None, (err or out or "unknown gh error").strip()
     url = out.strip().splitlines()[-1] if out.strip() else None
@@ -165,13 +262,97 @@ def _labels_of(row: dict) -> list[str]:
         return []
 
 
-async def _resolve_approved(
-    rt_db, row: dict, mode: str, now: str, *, max_posts_per_day: int
+async def _link_board(
+    rt_db, row: dict, approval: dict | None, *, issue_number: int, adopted: bool, now: str
 ) -> bool:
-    """Handle an approved hold. *mode* is the CURRENT lever (``effective_mode``
-    at this tick); ``row['mode']`` is the lever STAMPED at propose time. Returns
-    True iff the row was resolved (posted / dry-run / adopted); returns False
-    (leaves the row held) on a transient failure so it retries next cycle.
+    """Write the ``board_links`` pointer + a ``promotion`` event for a posted
+    board row. Returns False (retried next tick by the reconcile pass) when the
+    board tables are missing or the write fails — never raises into the drain."""
+    from genesis.db.crud import board as board_crud
+
+    try:
+        if not await board_crud.tables_available(rt_db):
+            return False
+        kind, _, source_id = (row.get("source_ref") or "").partition(":")
+        context = {}
+        if approval and approval.get("context"):
+            try:
+                context = json.loads(approval["context"])
+            except (TypeError, ValueError):
+                context = {}
+        receipt = context.get("scan_receipt") or {"ok": True, "note": "receipt not recorded"}
+        link = await board_crud.record_link(
+            rt_db,
+            source_kind=kind,
+            source_id=source_id,
+            repo=row["repo"],
+            issue_number=issue_number,
+            promoted_by=(approval or {}).get("resolved_by") or "unknown",
+            scan_receipt=receipt,
+            body_sha256=hashlib.sha256(row["body"].encode()).hexdigest(),
+            now=now,
+            adopted=adopted,
+            approval_id=row["request_id"],
+        )
+        await board_crud.append_event(
+            rt_db,
+            event="promotion",
+            now=now,
+            repo=row["repo"],
+            issue_number=issue_number,
+            worker="genesis",
+            detail={"link_id": link["id"], "adopted": adopted},
+        )
+        return True
+    except Exception:
+        logger.error(
+            "board link for posted row %s failed — retried next tick", row.get("id"), exc_info=True
+        )
+        return False
+
+
+async def _reconcile_board_links(rt_db, now: str) -> int:
+    """Write the pointer for every POSTED board row that lacks one (a crash
+    between ``mark_posted`` and the link write). Returns how many it wrote."""
+    from genesis.db.crud import board as board_crud
+
+    try:
+        if not await board_crud.tables_available(rt_db):
+            return 0
+        cur = await rt_db.execute(
+            "SELECT p.* FROM pending_issue_posts p WHERE p.source = ? AND p.status = 'posted' "
+            "AND p.issue_number IS NOT NULL AND NOT EXISTS (SELECT 1 FROM board_links b "
+            "WHERE b.source_kind || ':' || b.source_id = p.source_ref)",
+            (BOARD_SOURCE,),
+        )
+        names = [d[0] for d in cur.description]
+        rows = [dict(zip(names, r, strict=True)) for r in await cur.fetchall()]
+    except Exception:
+        logger.error("board link reconcile query failed", exc_info=True)
+        return 0
+    written = 0
+    for row in rows:
+        approval = await approval_crud.get_by_id(rt_db, row["request_id"])
+        if await _link_board(
+            rt_db,
+            row,
+            approval,
+            issue_number=int(row["issue_number"]),
+            adopted=bool(row["adopted"]),
+            now=now,
+        ):
+            written += 1
+    return written
+
+
+async def _resolve_approved(
+    rt_db, row: dict, mode: str, now: str, *, max_posts_per_day: int, approval: dict | None = None
+) -> bool:
+    """Handle an approved hold. *mode* is the CURRENT lever of the row's lane
+    (``effective_mode`` / ``_board_mode`` at this tick); ``row['mode']`` is the
+    lever STAMPED at propose time. Returns True iff the row was resolved
+    (posted / dry-run / adopted); returns False (leaves the row held) on a
+    transient failure so it retries next cycle.
 
     Dry-run-terminal invariant: a row proposed under ``propose_only`` is
     dry-run-terminal REGARDLESS of a later flip to live — the STAMPED mode, not
@@ -185,6 +366,8 @@ async def _resolve_approved(
     repo = row["repo"]
     title = row["title"]
     body = row["body"]
+    is_board = row.get("source") == BOARD_SOURCE
+    lever = _board_mode if is_board else effective_mode
 
     row_mode = row.get("mode") or mode  # stamped at propose; fall back for legacy rows
 
@@ -202,7 +385,7 @@ async def _resolve_approved(
         )
         if await pip.mark_dry_run(rt_db, row["id"], dry_run_at=now):
             await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
-            logger.info("Contributor issue %s dry-run (propose_only) — not posted", row["id"])
+            logger.info("Issue hold %s dry-run (propose_only) — not posted", row["id"])
             return True
         return False
 
@@ -211,8 +394,44 @@ async def _resolve_approved(
     if mode != "live":
         return False
 
-    title_norm = normalize_title(title)
-    ok, existing = _find_open_issue_by_title(repo, title_norm)
+    if is_board:
+        # Re-check open-question blocks at POST time: a question raised after the
+        # proposal (spec §3.4 "hard at promotion") holds the row until it is
+        # resolved, instead of posting work the owner has since questioned.
+        from genesis.db.crud import board as board_crud
+
+        kind, _, source_id = (row.get("source_ref") or "").partition(":")
+        try:
+            blocked = await board_crud.tables_available(rt_db) and bool(
+                await board_crud.blocking_questions(rt_db, target_kind=kind, target_id=source_id)
+            )
+        except ValueError:
+            blocked = True  # an unparseable source_ref never posts
+        if blocked:
+            logger.info("Board hold %s is blocked by an open question — left held", row["id"])
+            return False
+        digests = _MARKER_RE.findall(body)
+        if len(digests) != 1:
+            logger.error(
+                "Board hold %s carries %d markers (want 1) — left held", row["id"], len(digests)
+            )
+            return False
+        ok, existing = await _find_issue_by_marker(repo, digests[0])
+        if ok and existing is not None:
+            # A marked issue exists. Adopt it ONLY if this account authored it
+            # (a crash between create and mark_posted); a marker on anyone
+            # else's issue is never trusted as ours.
+            viewer = await _viewer_login()
+            author = (existing.get("author") or {}).get("login")
+            if viewer is None or author != viewer:
+                logger.error(
+                    "Board hold %s: marked issue #%s is not authored by this account — left held",
+                    row["id"],
+                    existing.get("number"),
+                )
+                return False
+    else:
+        ok, existing = await _find_open_issue_by_title(repo, normalize_title(title))
     if not ok:
         # Dedup couldn't be verified — do NOT post (would risk a duplicate). Retry.
         return False
@@ -256,10 +475,12 @@ async def _resolve_approved(
         ):
             await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
             logger.info(
-                "Contributor issue %s adopted existing open issue #%s (dedup/idempotency)",
-                row["id"],
-                num,
+                "Issue hold %s adopted existing issue #%s (dedup/idempotency)", row["id"], num
             )
+            if is_board and num:
+                await _link_board(
+                    rt_db, row, approval, issue_number=int(num), adopted=True, now=now
+                )
             return True
         return False
 
@@ -272,23 +493,26 @@ async def _resolve_approved(
     # row's count includes it) and the count survives a mid-window restart. At the cap
     # → leave held, retry next window. ``max_posts_per_day`` is knob_int-coerced ≥ 1 by
     # the caller, so a mistyped/0/negative value can never uncap the poster.
-    since = (datetime.fromisoformat(now) - timedelta(hours=24)).isoformat()
-    posted_recent = await pip.count_posted_since(rt_db, since=since)
-    if posted_recent >= max_posts_per_day:
-        logger.info(
-            "Contributor issue %s deferred — daily post cap reached (%d/%d in last 24h)",
-            row["id"],
-            posted_recent,
-            max_posts_per_day,
-        )
-        return False
+    # A BOARD row is exempt: the cap bounds AUTONOMOUS posting, and every board row
+    # was approved individually by a human (refused otherwise, in the drain loop).
+    if not is_board:
+        since = (datetime.fromisoformat(now) - timedelta(hours=24)).isoformat()
+        posted_recent = await pip.count_posted_since(rt_db, since=since)
+        if posted_recent >= max_posts_per_day:
+            logger.info(
+                "Contributor issue %s deferred — daily post cap reached (%d/%d in last 24h)",
+                row["id"],
+                posted_recent,
+                max_posts_per_day,
+            )
+            return False
 
-    # Kill-switch recheck: re-read the mode LIVE immediately before the external
-    # create so a ``mode: off`` / env-kill flipped mid-tick halts THIS post too — not
-    # just at the next tick boundary. Makes the STOP effective per-create, so the
-    # worst a mid-tick flip can leak is an in-flight create already past this point.
-    if effective_mode() != "live":
-        logger.info("Contributor issue %s deferred — lever no longer live at post time", row["id"])
+    # Kill-switch recheck: re-read the lane's mode LIVE immediately before the
+    # external create so a ``mode: off`` / env-kill flipped mid-tick halts THIS post
+    # too — not just at the next tick boundary. Makes the STOP effective per-create, so
+    # the worst a mid-tick flip can leak is an in-flight create already past this point.
+    if lever() != "live":
+        logger.info("Issue hold %s deferred — lever no longer live at post time", row["id"])
         return False
 
     # Observe the egress, THEN post. mark_posted BEFORE mark_consumed so a crash
@@ -301,28 +525,34 @@ async def _resolve_approved(
         target=repo,
         content=f"{title}\n\n{body}",
     )
-    number, url, error = _create_issue(repo, title, body, _labels_of(row))
+    number, url, error = await _create_issue(repo, title, body, _labels_of(row))
     if error is not None:
-        logger.warning("Contributor issue %s post failed — retry next cycle: %s", row["id"], error)
+        logger.warning("Issue hold %s post failed — retry next cycle: %s", row["id"], error)
         return False
     if await pip.mark_posted(rt_db, row["id"], issue_number=number, issue_url=url, posted_at=now):
         await approval_crud.mark_consumed(rt_db, row["request_id"], consumed_at=now)
-        logger.info("Contributor issue %s posted → %s (#%s)", row["id"], url, number)
+        logger.info("Issue hold %s posted → %s (#%s)", row["id"], url, number)
+        if is_board and number:
+            await _link_board(
+                rt_db, row, approval, issue_number=int(number), adopted=False, now=now
+            )
         return True
     return False
 
 
 async def drain_pending_issue_posts(rt: object) -> int:
-    """Resolve all held contributor-issue posts. Returns the number resolved.
+    """Resolve all held issue posts (both lanes). Returns the number resolved.
 
-    ``off`` mode short-circuits (poster paused — every hold left untouched).
+    Each row follows its own lane's lever; when BOTH levers are ``off`` the
+    drain short-circuits (every hold left untouched).
     """
     db = getattr(rt, "_db", None)
     if db is None:
         return 0
 
     mode = effective_mode()
-    if mode == "off":
+    board_mode = _board_mode()
+    if mode == "off" and board_mode == "off":
         return 0
 
     # Rate-cap VALUE read once per tick (live, no cache); the per-row COUNT that
@@ -332,6 +562,10 @@ async def drain_pending_issue_posts(rt: object) -> int:
 
     resolved = 0
     for row in await pip.list_held(db):
+        is_board = row.get("source") == BOARD_SOURCE
+        lane_mode = board_mode if is_board else mode
+        if lane_mode == "off":
+            continue  # this lane's poster is paused; the hold waits
         now = datetime.now(UTC).isoformat()
         approval = await approval_crud.get_by_id(db, row["request_id"])
 
@@ -339,7 +573,7 @@ async def drain_pending_issue_posts(rt: object) -> int:
             # Orphaned hold — the approval row vanished. Never post.
             if await pip.mark_rejected(db, row["id"], rejected_at=now, expired=True):
                 resolved += 1
-            logger.warning("Contributor issue %s orphaned (approval missing) — expired", row["id"])
+            logger.warning("Issue hold %s orphaned (approval missing) — expired", row["id"])
             continue
 
         status = approval.get("status")
@@ -353,11 +587,23 @@ async def drain_pending_issue_posts(rt: object) -> int:
                 if await pip.mark_rejected(db, row["id"], rejected_at=now, expired=True):
                     resolved += 1
                 logger.warning(
-                    "Contributor issue %s approval already consumed — expired without re-post",
-                    row["id"],
+                    "Issue hold %s approval already consumed — expired without re-post", row["id"]
                 )
                 continue
-            if await _resolve_approved(db, row, mode, now, max_posts_per_day=cap):
+            if is_board and approval_crud.classify_resolver(approval.get("resolved_by")) != "human":
+                # A board promotion is human-only (spec §3.3). A system / self /
+                # unclassifiable resolver is refused outright, fail-closed.
+                if await pip.mark_rejected(db, row["id"], rejected_at=now, expired=True):
+                    resolved += 1
+                logger.error(
+                    "Board hold %s approved by a non-human resolver %r — refused, never posted",
+                    row["id"],
+                    approval.get("resolved_by"),
+                )
+                continue
+            if await _resolve_approved(
+                db, row, lane_mode, now, max_posts_per_day=cap, approval=approval
+            ):
                 resolved += 1
         elif status in ("rejected", "cancelled"):
             if await pip.mark_rejected(db, row["id"], rejected_at=now):
@@ -367,4 +613,6 @@ async def drain_pending_issue_posts(rt: object) -> int:
                 resolved += 1
         # status == 'pending' → still awaiting the owner; leave held.
 
+    if board_mode != "off":
+        await _reconcile_board_links(db, datetime.now(UTC).isoformat())
     return resolved

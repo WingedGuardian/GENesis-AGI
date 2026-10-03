@@ -3249,10 +3249,55 @@ verified: 4cc75d50 2026-08-05
 The work board lives on a GitHub Projects v2 board: GitHub owns the cards,
 columns, positions and dependencies (native `blockedBy` / sub-issues), and
 Genesis mirrors none of them. Genesis keeps three local stores and the glue
-around them. **What exists today:** the stores, the `board` mode lever, and the
-open-question tools. The Projects v2 adapter, promotion onto the board and the
-reconciler are follow-on work. Nothing writes to GitHub yet, and the shipped
-mode is `off`.
+around them. **What exists today:**
+- the stores, the `board` mode lever, and the open-question tools;
+- the Projects v2 adapter and its idempotent setup script;
+- promotion of a private record onto the board.
+
+The reconciler (adding repo items, the bookkeeping move, the Genesis status) is
+follow-on work. The shipped mode is `off`.
+
+- **Projects v2 adapter** (`board/projects_v2.py`):
+  - GraphQL travels over `gh api graphql --input -`, so nothing reaches argv;
+  - every `errors` entry raises, so an error is never read as empty data;
+  - an items read that comes up short against `totalCount` raises;
+  - a single-select options update always re-sends existing option ids, so no
+    card loses its value.
+  Query shapes are adapted from precursor-kanban (MIT).
+- **`scripts/board_setup.py`** (dry run unless `--apply`; `--write-config` records
+  `project_owner`/`project_number` in the user overlay, the only writer:
+  `settings_update` rejects both keys, as it rejects `mode: live`):
+  - one project per title; with two it refuses;
+  - Status columns Proposed / Ready / In Progress / In Review / Done;
+  - the `Genesis` single-select and `Genesis note` text fields;
+  - deletes the "Pull request linked to issue" and "Item added to project"
+    default workflows;
+  - requires "Pull request merged" and "Item closed" (there is no API to
+    enable a workflow, so a missing one exits non-zero with the UI step);
+  - creates the `Active` and `Backlog` views.
+- **Promotion** (`board/promotion.py`, MCP `board_promote`):
+  - **Refused when:** the board mode is off; the source does not resolve; an
+    UNVERIFIED open question blocks it (the one place a block is enforced);
+    it is already linked or pending; or the privacy scan finds something (the
+    reply names line and scanner only).
+  - **The public body** carries an opaque marker, a salted hash of `kind:id`.
+    The private id never appears. The marker itself is left out of the scan,
+    because detect-secrets reads its hex as a secret (MEASURED).
+  - **The hold** is a `pending_issue_posts` row with `source='board'`, behind an
+    approval that is NEVER self-approved.
+- **The shared drain** (`autonomy/contributor_issue_watcher.py`) has one lever
+  per lane, and board rows:
+  - post only on a HUMAN resolver (`classify_resolver`), so a system or self
+    approval expires the hold unposted;
+  - dedup by marker (recent window + search, any state), adopting a marked
+    issue only when this account authored it;
+  - are exempt from the contributor daily cap;
+  - write the `board_links` pointer and a `promotion` event once the issue
+    exists, with each tick re-linking any posted row a crash left unlinked.
+- `approve_all_pending` excludes board promotions, because a sweep's resolver is
+  human and only the exclusion keeps them per-item.
+- The contributor lane's title dedup gained a search read beside its 200-issue
+  recent window (the repo had 638 open issues, MEASURED 2026-10-02).
 
 ```yaml subsystem-map
 entry: work-board
@@ -3288,8 +3333,9 @@ verified: b67423bd 2026-10-03
   first. Card targets and stored repo names are lowercased, because GitHub
   names are case-insensitive. A test pins that the module has no GitHub or
   subprocess path. `open_question_list` is on the reflection read allowlist.
-  **A block is ADVISORY today:** nothing refuses on one until board promotion
-  lands. The morning report's ground-truth section counts unverified questions
+  **A block is enforced at promotion** (`board_promote` refuses a blocked
+  record) and is advisory everywhere else. The morning report's ground-truth
+  section counts unverified questions
   (count and oldest age only, never the text); that line is the push surface
   that keeps a parked question from being a silent drop.
 - **Retention:** `scripts/prune_board.py` on the disk-hygiene timer prunes

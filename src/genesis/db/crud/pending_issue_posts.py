@@ -139,9 +139,15 @@ async def count_posted_since(db: aiosqlite.Connection, *, since: str) -> int:
     a mid-window restart — an in-memory counter would not). Mirrors
     ``autonomous_email_sends.count_for_cell_since``. Global (not repo-scoped): the
     cautious-rollout intent is total owner exposure, and this install posts to one
-    repo — global generalizes cleanly to a multi-repo future."""
+    repo — global generalizes cleanly to a multi-repo future.
+
+    Work-board promotions (``source='board'``) are EXCLUDED: the cap bounds
+    AUTONOMOUS posting, and each board row is approved individually by a human —
+    it is exempt from the cap, so it must not consume the contributor lane's
+    allowance either."""
     cursor = await db.execute(
-        "SELECT COUNT(*) FROM pending_issue_posts WHERE status = 'posted' AND posted_at >= ?",
+        "SELECT COUNT(*) FROM pending_issue_posts WHERE status = 'posted' AND posted_at >= ? "
+        "AND source != 'board'",
         (since,),
     )
     row = await cursor.fetchone()
@@ -153,15 +159,18 @@ async def list_dedup_active(db: aiosqlite.Connection, repo: str) -> list[dict]:
     owner review ('held') or already live ('posted'). ``dry_run`` deliberately
     does NOT block — a dry-run hold is re-proposed under 'live' mode to actually
     post it; ``rejected``/``expired`` also don't block (an item may be
-    re-drafted). Returns id/title/source_ref/status for the caller to normalize
-    and compare (bounded small by the ``max_held`` backpressure knob).
+    re-drafted). Returns id/title/source/source_ref/status for the caller to
+    normalize and compare (bounded small by the ``max_held`` backpressure knob).
+    Work-board rows are included on purpose — a contributor proposal titled like
+    a promoted issue IS a duplicate — and carry ``source`` so the caller can keep
+    them out of its own backpressure count.
 
     The ``repo`` comparison is ``COLLATE NOCASE`` (mirroring
     ``posted_index_for_repo``): the proposer stores the repo lowercased while the
     dedup call passes the raw config slug, so a case-sensitive match would miss
     every existing row and silently bypass ``max_held`` backpressure."""
     cursor = await db.execute(
-        "SELECT id, title, source_ref, status FROM pending_issue_posts "
+        "SELECT id, title, source, source_ref, status FROM pending_issue_posts "
         "WHERE repo = ? COLLATE NOCASE AND status IN ('held', 'posted')",
         (repo,),
     )

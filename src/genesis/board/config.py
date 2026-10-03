@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +53,13 @@ _CONFIG_NAME = "board.yaml"
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "mode": "off",
+    # Which Projects v2 board: written by scripts/board_setup.py into the user
+    # overlay. Install-specific, so the shipped config never carries a value.
+    "project_owner": None,
+    "project_number": None,
 }
+
+_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 
 
 def _base_path() -> Path:
@@ -113,3 +120,30 @@ def effective_mode() -> str:
 def writes_allowed() -> bool:
     """True only in ``live`` — the single predicate a GitHub writer checks."""
     return effective_mode() == "live"
+
+
+def valid_login(value: object) -> bool:
+    return isinstance(value, str) and bool(_LOGIN.match(value))
+
+
+def valid_project_number(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+# GROUNDWORK(board-reconciler): read by the board reconciler (the next board PR)
+# to find the project scripts/board_setup.py recorded.
+def project_ref() -> tuple[str, int] | None:
+    """``(owner_login, project_number)`` of the configured board, or None when
+    setup has not run (or the overlay holds a malformed value, logged)."""
+    cfg = load_config()
+    owner, number = cfg.get("project_owner"), cfg.get("project_number")
+    if owner is None and number is None:
+        return None
+    if not (valid_login(owner) and valid_project_number(number)):
+        logger.warning(
+            "board project_owner/project_number malformed (%r, %r) — treated as unset",
+            owner,
+            number,
+        )
+        return None
+    return owner, number

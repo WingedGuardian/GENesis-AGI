@@ -5,11 +5,12 @@ does not belong on the work board (which holds confirmed work only), and it is
 not a follow-up (which is work). It lives here, LOCAL ONLY — nothing in this
 module ever touches GitHub — and it can BLOCK work as a graph edge:
 
-* TODAY a block is ADVISORY: ``open_question_list(target=...)`` answers whether
-  a record is blocked, and the morning report counts unverified questions.
-  Once board promotion lands, it will REFUSE to promote a blocked ledger row or
-  follow-up, and a blocked card will show the block (never moving the card).
-  No path refuses anything yet — do not rely on one.
+* board promotion (``board_promote``) REFUSES to promote a ledger row or
+  follow-up that an unverified question blocks — the one place a block is
+  enforced;
+* everywhere else a block is advisory: ``open_question_list(target=...)``
+  answers whether a record is blocked, and the morning report counts
+  unverified questions. A blocked card never moves because of it.
 
 A session parks a genuine, non-urgent owner fork here rather than guessing
 (triage bucket 4 of the question-triage protocol) — and, in a foreground
@@ -220,10 +221,9 @@ async def open_question_raise(
 
     ``blocks`` lists what the question blocks: ``ledger:<id>``,
     ``follow_up:<id>`` (full id or unique 8+ hex prefix) or
-    ``card:owner/repo#N``. Today a block is advisory (read it back with
-    ``open_question_list(target=...)``); board promotion will refuse a blocked
-    record once it lands. ``raised_by`` names the asker (a session id or
-    "owner").
+    ``card:owner/repo#N``. ``board_promote`` refuses a blocked record; read a
+    block back with ``open_question_list(target=...)``. ``raised_by`` names the
+    asker (a session id or "owner").
     """
     return await _impl_open_question_raise(
         _db_or_none(),
