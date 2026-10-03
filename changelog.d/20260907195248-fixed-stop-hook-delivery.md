@@ -41,7 +41,9 @@
   complete". And naming a check that has not happened yet — testing planned for
   next session, verification deferred or blocked — no longer buys silence from
   the reminder that exists for exactly that case; only a check reported as done
-  does.
+  does. The same holds for a check reported as not having run ("did not run",
+  "timed out", "errored"), even when the same sentence says something else
+  passed.
 
   Deliberately unchanged: a reply that phrases finishing in the negative ("I
   won't merge without your go-ahead") still gets the reminder. Measured against
