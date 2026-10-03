@@ -4461,7 +4461,7 @@ async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
     import genesis.cc.invoker as inv_mod
 
     _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
-    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: None)
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: None)
     with pytest.raises(RuntimeError, match="could not be prepared"):
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
@@ -4566,7 +4566,7 @@ def test_the_launch_gate_refuses_an_env_that_lost_its_hardening(invoker, monkeyp
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
     inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
     env = invoker._build_env(inv)
 
@@ -4719,7 +4719,7 @@ def test_build_env_itself_refuses_when_a_binary_cannot_be_confined(invoker, monk
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: None)
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: None)
     with pytest.raises(RuntimeError, match="could not be prepared"):
         invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
@@ -4766,7 +4766,7 @@ def test_the_gh_confinement_pins_the_extension_data_dir(monkeypatch):
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
     hardened = inv_mod._gh_hardening()
     assert hardened is not None
     assert hardened["XDG_DATA_HOME"] == "/seal", (
@@ -4792,7 +4792,7 @@ def test_the_gh_confinement_pins_every_documented_program_route(monkeypatch):
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
     hardened = inv_mod._gh_hardening()
     assert hardened is not None
     assert hardened == {
@@ -4848,7 +4848,7 @@ def test_the_confinement_reaches_the_env_a_dispatch_would_receive(invoker, monke
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda: "/seal")
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
     env = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
     assert env["XDG_DATA_HOME"] == "/seal"
     assert env["GH_CONFIG_DIR"] == "/seal"
@@ -5948,7 +5948,7 @@ def test_reconcile_does_not_even_CALL_the_sealer_on_a_symlinked_seal(monkeypatch
 
     calls: list[str] = []
     monkeypatch.setattr(
-        inv_mod, "_sealed_gh_config_dir", lambda: calls.append("called") or "x"
+        inv_mod, "_sealed_gh_config_dir", lambda **_k: calls.append("called") or "x"
     )
 
     # CONTROL: an ordinary seal DOES reach the sealer.
@@ -6352,15 +6352,15 @@ def test_settings_env_pins_add_the_confinement_of_an_allowlisted_binary(monkeypa
     assert all(pins[var] == "" for var in inv_mod._GH_CREDENTIAL_ENV)
 
 
-def test_settings_env_pins_skip_a_binary_whose_hardening_cannot_be_prepared(monkeypatch):
-    """No pins, no exception: the launch env check is what refuses that session."""
+def test_settings_env_pins_refuse_when_hardening_cannot_be_prepared(monkeypatch):
+    """A seal that cannot be prepared refuses the launch here. Writing a settings
+    file without the seal pins would let a transient failure that clears before
+    _build_env pass every launch check with the seal unpinned."""
     import genesis.cc.invoker as inv_mod
 
     monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: None)
-    assert inv_mod._settings_env_pins(("gh",)) == {
-        **{var: "" for var in inv_mod._GH_CREDENTIAL_ENV},
-        "GENESIS_BASH_ALLOWLIST": "gh",
-    }
+    with pytest.raises(RuntimeError):
+        inv_mod._settings_env_pins(("gh",))
 
 
 def test_cc_span_settings_path_with_pins_writes_a_sibling_env_file(monkeypatch, tmp_path):
@@ -6898,3 +6898,32 @@ def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, mon
     with pytest.raises(RuntimeError, match="could not be written"):
         invoker._verify_allowlist_enforceable_blocking(inv, pins)
     assert seen == [pins]
+
+
+def test_reconcile_gh_seal_does_not_hang_boot_on_a_held_lock(monkeypatch, tmp_path, caplog):
+    """Boot reconcile takes the seal lock non-blocking: a lock held by a stuck
+    process must not hang server startup. It logs and leaves the seal as it was."""
+    import fcntl
+    import logging
+    import threading
+
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "gh-sealed"
+    target.mkdir()
+    (target / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML, encoding="utf-8")
+    (target / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n", encoding="utf-8")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    lock_path = target.parent / f"{target.name}.lock"
+    with open(lock_path, "a+") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        done = threading.Event()
+        worker = threading.Thread(target=lambda: (inv_mod.reconcile_gh_seal(), done.set()))
+        with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+            worker.start()
+            finished = done.wait(timeout=10)
+        assert finished, "boot reconcile blocked on a held seal lock"
+        worker.join(timeout=5)
+    assert (target / "hosts.yml").exists(), "nothing may change while another holder has the lock"
+    assert "could not be reconciled" in caplog.text

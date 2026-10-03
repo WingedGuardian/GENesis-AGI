@@ -522,7 +522,7 @@ def _purge_dir_entries(dir_fd: int, label: Path, depth: int = 0) -> None:
         os.unlink(entry.name, dir_fd=dir_fd)
 
 
-def _sealed_gh_config_dir() -> str | None:
+def _sealed_gh_config_dir(*, wait_for_lock: bool = True) -> str | None:
     """A read-only ``GH_CONFIG_DIR`` that keeps ``gh`` from spawning a shell.
 
     THE PROBLEM. ``gh`` can be told to run arbitrary commands through its own
@@ -648,7 +648,12 @@ def _sealed_gh_config_dir() -> str | None:
             os.close(lock_fd)
             raise
         with lock_file as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            # `wait_for_lock=False` is the boot path (`reconcile_gh_seal`): a
+            # lock held by a stuck process must not hang server startup before
+            # secrets and the database initialise. LOCK_NB raises
+            # BlockingIOError, an OSError, which the handler below turns into a
+            # logged None, and the next boot retries.
+            fcntl.flock(lock, fcntl.LOCK_EX if wait_for_lock else fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Re-check under the lock: the writer we queued behind may have
             # already produced exactly what we want.
             if _seal_matches(target, desired):
@@ -856,7 +861,7 @@ def reconcile_gh_seal() -> None:
                 points_at,
             )
             return
-        if _sealed_gh_config_dir() is None:
+        if _sealed_gh_config_dir(wait_for_lock=False) is None:
             logger.warning(
                 "gh seal at %s could not be reconciled; if it holds a copied "
                 "credential from an older version, that copy is still present",
@@ -1344,8 +1349,11 @@ def _settings_env_pins(bash_allowlist: tuple[str, ...]) -> dict[str, str]:
     Managed (administrator) settings still outrank ``--settings``; they are the
     operator's own policy and out of scope here.
 
-    A binary whose hardening cannot be prepared contributes nothing: the launch
-    env check refuses that session, so there is no launch to pin.
+    A binary whose hardening cannot be prepared RAISES here, refusing the
+    launch. Swallowing it would write a settings file without the seal pins,
+    and a transient failure that clears before ``_build_env`` runs would then
+    pass every launch check while user or project settings reopen the
+    operator's gh config.
 
     ``GENESIS_BASH_ALLOWLIST`` is pinned too, with exactly the value
     ``_build_env`` exports: the PreToolUse guard reads it, so a settings file
@@ -1359,10 +1367,7 @@ def _settings_env_pins(bash_allowlist: tuple[str, ...]) -> dict[str, str]:
     if bash_allowlist:
         pins["GENESIS_BASH_ALLOWLIST"] = ",".join(bash_allowlist)
     for entry in bash_allowlist:
-        try:
-            required = _required_hardening(entry)
-        except RuntimeError:
-            continue
+        required = _required_hardening(entry)
         if required:
             pins.update(required)
     return pins
