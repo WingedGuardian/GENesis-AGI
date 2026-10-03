@@ -83,6 +83,8 @@ class HealthDataService:
         *,
         circuit_breakers: CircuitBreakerRegistry | None = None,
         routing_config: RoutingConfig | None = None,
+        routing_snapshot=None,
+        routing_resilience=None,
         cost_tracker: CostTracker | None = None,
         cc_budget: CCBudgetTracker | None = None,
         deferred_queue: DeferredWorkQueue | None = None,
@@ -97,6 +99,9 @@ class HealthDataService:
     ) -> None:
         self._breakers = circuit_breakers
         self._routing_config = routing_config
+        self._routing_snapshot = routing_snapshot
+        self._routing_resilience = routing_resilience
+        self._cache_config = routing_config
         self._cost_tracker = cost_tracker
         self._cc_budget = cc_budget
         self._deferred_queue = deferred_queue
@@ -187,6 +192,11 @@ class HealthDataService:
         the accurate one.
         """
         while True:
+            if self._routing_snapshot:
+                current = self._routing_snapshot()[0]
+                if current is not self._cache_config:
+                    self.invalidate()
+                    self._cache_config = current
             # ONE read of the field, reused — never test one load and return a
             # second. Every field here is normally written on the loop thread,
             # but `invalidate_snapshot_cache()` documents a loop-less fallback
@@ -254,8 +264,10 @@ class HealthDataService:
         finished tasks is safe today only because of this placement, and nothing
         at that call site would say so.
         """
+        config = self._routing_snapshot()[0] if self._routing_snapshot else self._routing_config
         result = await self._compute_snapshot()
-        if asyncio.current_task() is not self._stale_task:
+        current = self._routing_snapshot()[0] if self._routing_snapshot else self._routing_config
+        if asyncio.current_task() is not self._stale_task and current is config:
             self._cache = result
             self._cache_ts = time.monotonic()
         return result
@@ -368,6 +380,13 @@ class HealthDataService:
             surplus_status,
         )
 
+        routing_config, breakers = self._routing_config, self._breakers
+        if self._routing_snapshot:
+            routing_config, bindings = self._routing_snapshot()
+            from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+
+            breakers = CircuitBreakerRegistry.health_view(routing_config, bindings)
+
         now = datetime.now(UTC).isoformat()
 
         # Probe providers if cache is stale (probes are free — /v1/models endpoints)
@@ -389,14 +408,14 @@ class HealthDataService:
         results = await asyncio.gather(
             call_sites(
                 self._db,
-                self._routing_config,
-                self._breakers,
+                routing_config,
+                breakers,
                 probe_results=probe_results,
                 state_machine=self._state_machine,
             ),
             cc_sessions(self._db, self._cc_budget, self._state_machine),
             infrastructure(
-                self._db, self._routing_config, self._learning_scheduler, self._state_machine
+                self._db, routing_config, self._learning_scheduler, self._state_machine
             ),
             queues(self._db, self._deferred_queue, self._dead_letter, self._event_bus),
             surplus_status(self._db, self._surplus),
@@ -466,7 +485,7 @@ class HealthDataService:
             "timestamp": now,
             "call_sites": r_call_sites,
             "cc_sessions": r_cc_sessions,
-            "resilience": self._resilience_state(),
+            "resilience": self._resilience_state(breakers, routing_config),
             "infrastructure": r_infrastructure,
             "queues": r_queues,
             "surplus": r_surplus,
@@ -475,8 +494,8 @@ class HealthDataService:
             "outreach_stats": r_outreach,
             "services": r_services,
             "api_keys": api_key_health(
-                self._routing_config,
-                breakers=self._breakers,
+                routing_config,
+                breakers=breakers,
                 recent_fallbacks=recent_fallbacks,
             ),
             "mcp_servers": r_mcp,
@@ -580,14 +599,24 @@ class HealthDataService:
             for name, r in self._provider_health.results.items()
         }
 
-    def _resilience_state(self) -> dict:
+    def _resilience_state(self, captured_breakers=None, captured_config=None) -> dict:
         """Compute resilience state with detail from circuit breaker registry."""
         from genesis.observability.snapshots.infrastructure import resilience_state_detail
 
-        return resilience_state_detail(self._breakers, self._state_machine)
+        if captured_breakers is not None and self._routing_snapshot:
+            if self._routing_resilience:
+                return self._routing_resilience(
+                    captured_config, captured_breakers, self._state_machine,
+                )
+            # A snapshot-only client cannot prove ownership atomically. Keep its
+            # historical rendering pure; production injects the guarded projector.
+            return resilience_state_detail(captured_breakers, None)
+        breakers = captured_breakers if captured_breakers is not None else self._breakers
+        return resilience_state_detail(breakers, self._state_machine)
 
     async def validate_api_keys(self) -> None:
         """Test each provider's API key with a lightweight call. Cache results."""
         from genesis.observability.snapshots.api_keys import validate_api_keys
 
-        await validate_api_keys(self._routing_config)
+        config = self._routing_snapshot()[0] if self._routing_snapshot else self._routing_config
+        await validate_api_keys(config)

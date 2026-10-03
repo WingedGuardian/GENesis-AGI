@@ -92,6 +92,7 @@ class TestUpdateHistoryRecent:
 
         assert result["count"] == 0
         assert result["success_rate"] is None
+        assert result["server_not_restarted_count"] == 0
         assert result["entries"] == []
         assert "not found" in result["note"].lower()
 
@@ -106,6 +107,7 @@ class TestUpdateHistoryRecent:
         result = await _impl_update_history_recent()
         assert result["count"] == 0
         assert result["success_rate"] is None
+        assert result["server_not_restarted_count"] == 0
         assert result["entries"] == []
         assert "update_history" in result["note"]
 
@@ -132,6 +134,8 @@ class TestUpdateHistoryRecent:
         assert result["entries"][0]["status"] == "success"
         assert result["entries"][0]["old_tag"] == "v0.3.0"
         assert result["entries"][0]["new_tag"] == "v0.3.1"
+        # No not-restarted marker → no restart claim (no positive evidence).
+        assert result["entries"][0]["server_restarted"] is None
 
     @pytest.mark.asyncio
     async def test_mixed_status_success_rate(self, tmp_db) -> None:
@@ -210,3 +214,58 @@ class TestUpdateHistoryRecent:
         entry = result["entries"][0]
         assert entry["failure_reason"] == "health check timeout after 60s"
         assert entry["degraded_subsystems"] == "awareness,memory"
+
+    @pytest.mark.asyncio
+    async def test_orders_by_instant_across_dst_fallback(self, tmp_db) -> None:
+        """DST fall-back: 01:10 -05:00 (06:10Z) is NEWER than 01:30 -04:00
+        (05:30Z) even though text sort says otherwise."""
+        await _init_update_history(tmp_db)
+        await _insert_entry(
+            tmp_db, id="earlier-instant", status="success",
+            started_at="2026-11-01T01:30:00-04:00",
+        )
+        await _insert_entry(
+            tmp_db, id="later-instant", status="success",
+            started_at="2026-11-01T01:10:00-05:00",
+        )
+
+        result = await _impl_update_history_recent()
+        assert result["entries"][0]["id"] == "later-instant"
+        assert result["entries"][1]["id"] == "earlier-instant"
+
+    @pytest.mark.asyncio
+    async def test_orders_by_instant_across_offset_formats(self, tmp_db) -> None:
+        """Live-format mix: 14:34:35-04:00 (18:34:35Z) beats 18:00:00+00:00."""
+        await _init_update_history(tmp_db)
+        await _insert_entry(
+            tmp_db, id="utc", status="success",
+            started_at="2026-10-01T18:00:00+00:00",
+        )
+        await _insert_entry(
+            tmp_db, id="offset", status="success",
+            started_at="2026-10-01T14:34:35-04:00",
+        )
+
+        result = await _impl_update_history_recent()
+        assert result["entries"][0]["id"] == "offset"
+        assert result["entries"][1]["id"] == "utc"
+
+    @pytest.mark.asyncio
+    async def test_not_restarted_success_row_facts(self, tmp_db) -> None:
+        """A success row carrying genesis-server-not-restarted keeps its
+        activation credit but is reported as NOT a live-server success."""
+        await _init_update_history(tmp_db)
+        await _insert_entry(
+            tmp_db, id="nr1", status="success",
+            degraded_subsystems="genesis-server-not-restarted",
+        )
+
+        result = await _impl_update_history_recent()
+        entry = result["entries"][0]
+        assert entry["status"] == "success"
+        assert entry["code_applied"] is True
+        assert entry["activation_applied"] is True
+        assert entry["server_restarted"] is False
+        assert result["server_not_restarted_count"] == 1
+        # Still counted as a success — activation baseline semantics.
+        assert result["success_rate"] == 1.0

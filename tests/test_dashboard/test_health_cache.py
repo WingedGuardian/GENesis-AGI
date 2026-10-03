@@ -357,6 +357,7 @@ def test_provider_toggle_invalidates_the_snapshot_cache():
 
     breakers = MagicMock()
     breakers.get.return_value = cb
+    breakers.toggle.return_value = ProviderState.CLOSED
 
     rt = MagicMock()
     rt.is_bootstrapped = True
@@ -374,7 +375,7 @@ def test_provider_toggle_invalidates_the_snapshot_cache():
     # A MagicMock absorbed the OLD `cb._state = ...` assignments and absorbs
     # the NEW `cb.force_close()` with equal silence, so without this the route
     # could be reverted to poking private fields and nothing here would fail.
-    cb.force_close.assert_called_once_with()
+    breakers.toggle.assert_called_once_with("qdrant")
     assert not cb.force_open.called, "re-enable branch must not force OPEN"
 
     assert inval.called, (

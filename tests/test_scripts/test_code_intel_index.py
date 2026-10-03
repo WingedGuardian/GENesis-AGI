@@ -1890,3 +1890,31 @@ def test_a_bad_value_still_refuses_the_leg_that_does_read_it(tmp_path, leg, env_
         f"{leg} was NOT refused by a value it reads ({sorted(env_extra)})"
         f"\n{res.stdout}\n{res.stderr}"
     )
+
+
+@pytest.mark.parametrize("selection", ["selected", "relative/node", "/missing/node"])
+def test_gitnexus_scope_uses_machine_node_selection(tmp_path, selection):
+    repo = _make_repo(tmp_path)
+    fakebin = tmp_path / "bin"
+    log = tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    # The incoming Node is unsupported, so only applying the selection lets
+    # GitNexus run. CBM must still see the original PATH.
+    _write_exec(fakebin / "node", "#!/bin/sh\necho v23.0.0\n")
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    selected = _write_exec(selected_dir / "node", "#!/bin/sh\necho v22.23.2\n")
+    for name in ["gitnexus", "codebase-memory-mcp"]:
+        tool = fakebin / name
+        source = tool.read_text()
+        source += f'echo "{name} NODE:$(node --version)" >> "{log}"\n'
+        tool.write_text(source)
+    setting = str(selected) if selection == "selected" else selection
+    result = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra={"GITNEXUS_NODE_BIN": setting})
+    assert "codebase-memory-mcp NODE:v23.0.0" in log.read_text()
+    if selection == "selected":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "gitnexus NODE:v22.23.2" in log.read_text()
+    else:
+        assert result.returncode == 4, result.stdout + result.stderr
+        assert "gitnexus ARGS:analyze" not in log.read_text()

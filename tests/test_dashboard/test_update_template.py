@@ -19,3 +19,20 @@ def test_orchestrator_template_compiles():
     )
     # compile() raises SyntaxError on invalid Python
     compile(code, "<orchestrator-template>", "exec")
+
+
+def test_backup_tab_surfaces_not_restarted_success():
+    """The Last Update status span must distinguish a not-restarted success."""
+    from pathlib import Path
+
+    from genesis.dashboard.routes import updates
+
+    html = (
+        Path(updates.__file__).parent.parent
+        / "templates" / "partials" / "tabs" / "backup.html"
+    ).read_text()
+    assert "server not restarted" in html
+    assert "server_restarted === false" in html
+    # A failed row reconciled to success must be labelled, not plain green.
+    assert "reconciled" in html
+    assert " (reconciled)" in html

@@ -24,6 +24,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+def render_rubric_prompt(rubric: Rubric, actual: str, expected: str, config: dict) -> str:
+    """Render the judge question identically for scoring and reference preflight."""
+    # Build prompt — base placeholders + any rubric-declared extras
+    # pulled from scorer_config. Missing extras are an explicit error
+    # rather than silent KeyError from str.format.
+    format_kwargs = {"actual": actual, "expected": expected}
+    for placeholder in rubric.extra_placeholders:
+        if placeholder not in config:
+            msg = (
+                f"rubric {rubric.name!r} declares extra placeholder "
+                f"{placeholder!r} but it is missing from scorer_config"
+            )
+            raise ValueError(msg)
+        format_kwargs[placeholder] = config[placeholder]
+
+    return rubric.prompt_template.format(**format_kwargs)
+
+
 # Common LLM slop phrases that indicate low-quality output
 _SLOP_PHRASES: list[str] = [
     "as an ai",
@@ -314,20 +332,7 @@ class LLMJudgeScorer(Scorer):
 
         rubric: Rubric = get_rubric(rubric_name)
 
-        # Build prompt — base placeholders + any rubric-declared extras
-        # pulled from scorer_config. Missing extras are an explicit error
-        # rather than silent KeyError from str.format.
-        format_kwargs = {"actual": actual, "expected": expected}
-        for placeholder in rubric.extra_placeholders:
-            if placeholder not in cfg:
-                msg = (
-                    f"rubric {rubric.name!r} declares extra placeholder "
-                    f"{placeholder!r} but it is missing from scorer_config"
-                )
-                raise ValueError(msg)
-            format_kwargs[placeholder] = cfg[placeholder]
-
-        prompt = rubric.prompt_template.format(**format_kwargs)
+        prompt = render_rubric_prompt(rubric, actual, expected, cfg)
         messages = [{"role": "user", "content": prompt}]
 
         result = await self._router.route_call(

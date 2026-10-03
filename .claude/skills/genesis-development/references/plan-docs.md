@@ -119,6 +119,9 @@ a tool-appended status block at end-of-file is not plan content and is current
 by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.
 
+A plan doc's body answers the five plan-time premise questions in
+`.claude/docs/premise-check.md`, "At plan and issue time".
+
 ## What each field is for
 
 **`status`** — a `superseded`, `done` or `stalled` plan is not deleted; it is
