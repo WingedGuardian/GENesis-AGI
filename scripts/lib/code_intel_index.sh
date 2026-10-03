@@ -117,7 +117,7 @@ case "$_CODE_INTEL_ENTRYPOINT" in
     */*)
         _code_intel_entry_dir="${_CODE_INTEL_ENTRYPOINT%/*}"
         _code_intel_entry_base="${_CODE_INTEL_ENTRYPOINT##*/}"
-        _code_intel_entry_dir="$(cd -P -- "$_code_intel_entry_dir" 2>/dev/null && pwd)" \
+        _code_intel_entry_dir="$(unset CDPATH; cd -P -- "$_code_intel_entry_dir" 2>/dev/null && pwd)" \
             || { printf '%s\n' "code-intel: cannot resolve entrypoint path" >&2; exit 1; }
         _CODE_INTEL_ENTRYPOINT="$_code_intel_entry_dir/$_code_intel_entry_base"
         ;;
@@ -578,7 +578,7 @@ esac
 
 # Physical path (-P): the single-flight lock is keyed on this, and a symlinked
 # spelling of the same repo must not get a second lock (= second concurrent index).
-REPO_PATH="$(cd "$REPO_PATH" && pwd -P)"
+REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
 
 # ── 1. Worktree skip ────────────────────────────────────────────────────
 # In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.

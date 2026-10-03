@@ -402,7 +402,7 @@ fi
 echo ""
 echo "[2/14] Setting up code..."
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
 
 # If already running from the install dir (e.g. host-setup.sh cloned directly
 # into INSTALL_DIR), skip the copy — code is already in place.
@@ -710,7 +710,7 @@ fi
 # zram already active, masked unit, no sudo). Opt out permanently with:
 # sudo systemctl mask zram-swap.service
 # shellcheck source=lib/host_swap.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/host_swap.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/host_swap.sh"
 host_swap_apply
 
 # ── Step 10: Install gateway script ────────────────────────────────────

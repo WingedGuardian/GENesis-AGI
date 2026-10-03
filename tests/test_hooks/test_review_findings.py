@@ -209,11 +209,13 @@ def test_is_substitute_candidate(login, user_type, expected):
 
 
 @pytest.fixture
-def guard():
+def guard(monkeypatch):
     sys.path.insert(0, str(_ROOT / "scripts" / "hooks"))
     import git_push_guard
 
     assert sys.modules[git_push_guard.enforced_logins.__module__] is rf
+    # Imports are cached across tests; an earlier merge check may have expired.
+    monkeypatch.setattr(git_push_guard, "_merge_deadline", None)
     return git_push_guard
 
 
