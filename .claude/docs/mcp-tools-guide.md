@@ -14,6 +14,8 @@ trees to pick the right one.
 | `procedure_store` | Reusable multi-step workflows with confidence | Procedural memory | "Deploy pattern: steps 1-5" |
 | `follow_up_create` | Deferred USER-OWNED work needing tracking + completion | Follow-up ledger | "Finish the deck I asked for" |
 | `gh issue create` | Deferred GENESIS-REPO work (code, tests, docs, infra) | Public GitHub tracker | "Adapter for provider X is hardcoded" |
+| `open_question_raise` | A genuine OWNER FORK that blocks or shapes work — not work itself | Local open-questions store (never GitHub) | "Bind the API to loopback or the tailnet?" |
+| `board_promote` | A private ledger row / follow-up should become PUBLIC board work | Held for owner approval, then a public issue on the work board | "Promote follow-up 1a2b3c4d as a card" |
 
 **Quick rule:** If it's about the user → `memory_store`. If it's a finding
 during work → `observation_write`. If it's an external source to learn
@@ -285,3 +287,30 @@ See `.claude/docs/background-sessions.md` for the full guide. Quick rule:
 | `observation_write` | A finding, insight, or detection — informational, feeds the perception pipeline |
 
 Follow-ups are accountability. Observations are awareness.
+
+## Open Questions vs Follow-ups vs Asking Now
+
+An **open question** is a decision only the owner can make, parked so it is
+neither guessed at nor asked mid-flow. It is not work: when the owner settles
+it, the work it unblocks becomes a follow-up or a board card.
+
+| Situation | Tool |
+|-----|------|
+| Answerable from code, logs, docs or measurement | Answer it yourself, citing the evidence |
+| Covered by a standing rule or pre-approval | Proceed; say which rule |
+| Low-stakes and reversible | Decide, and note it for review at the next checkpoint |
+| A genuine owner fork, not urgent | `open_question_raise`, with `blocks` naming the work it holds up — and in a foreground session, tell the owner you parked it |
+| A genuine owner fork that stops the work now | Ask the owner (foreground) or stop as blocked (dispatched) |
+
+`blocks` entries are `ledger:<id>`, `follow_up:<id>` (full id or a unique 8+
+hex prefix) or `card:owner/repo#N`. `board_promote` REFUSES to promote a
+blocked record; everywhere else a block is advisory —
+`open_question_list(target=...)` answers whether something is blocked, and by
+what, and the morning report counts unverified questions so a parked one is
+never invisible. Close with
+`open_question_resolve` and say what settled it — an assumption is not an
+answer. Resolving, and removing a block, are the OWNER's call: a dispatched
+session is refused both, so it parks the question and leaves it. Background
+sessions attach blocks when they raise (`blocks=`); `open_question_block` as a
+whole is withheld from them, because the same tool also removes blocks. The store is
+LOCAL ONLY; nothing here reaches GitHub.

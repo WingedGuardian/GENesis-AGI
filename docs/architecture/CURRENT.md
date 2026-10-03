@@ -3273,6 +3273,132 @@ verified: 4cc75d50 2026-08-05
   is now live (manual dismissals, PR-2c); its diagnose/fix/promotion verdict
   points remain groundwork.
 
+## 15. Work board — Projects v2 front end and open questions
+
+The work board lives on a GitHub Projects v2 board: GitHub owns the cards,
+columns, positions and dependencies (native `blockedBy` / sub-issues), and
+Genesis mirrors none of them. Genesis keeps three local stores and the glue
+around them. **What exists today:**
+- the stores, the `board` mode lever, and the open-question tools;
+- the Projects v2 adapter and its idempotent setup script;
+- promotion of a private record onto the board.
+
+The reconciler (adding repo items, the bookkeeping move, the Genesis status) is
+follow-on work. The shipped mode is `off`.
+
+- **Projects v2 adapter** (`board/projects_v2.py`):
+  - GraphQL travels over `gh api graphql --input -`, so nothing reaches argv;
+  - every `errors` entry raises, so an error is never read as empty data;
+  - an items read that comes up short against `totalCount` raises;
+  - a single-select options update always re-sends existing option ids, so no
+    card loses its value.
+  Query shapes are adapted from precursor-kanban (MIT).
+- **`scripts/board_setup.py`** (dry run unless `--apply`; `--write-config` records
+  `project_owner`/`project_number` in the user overlay, the only writer:
+  `settings_update` rejects both keys, as it rejects `mode: live`):
+  - one project per title; with two it refuses;
+  - Status columns Proposed / Ready / In Progress / In Review / Done;
+  - the `Genesis` single-select and `Genesis note` text fields;
+  - deletes the "Pull request linked to issue" and "Item added to project"
+    default workflows;
+  - requires "Pull request merged" and "Item closed" (there is no API to
+    enable a workflow, so a missing one exits non-zero with the UI step);
+  - creates the `Active` and `Backlog` views.
+- **Promotion** (`board/promotion.py`, MCP `board_promote`):
+  - **Refused when:** the board mode is off; the source does not resolve; an
+    UNVERIFIED open question blocks it (the one place a block is enforced);
+    it is already linked or pending; or the privacy scan finds something (the
+    reply names line and scanner only).
+  - **The public body** carries an opaque marker, a salted hash of `kind:id`.
+    The private id never appears. The marker itself is left out of the scan,
+    because detect-secrets reads its hex as a secret (MEASURED).
+  - **The hold** is a `pending_issue_posts` row with `source='board'`, behind an
+    approval that is NEVER self-approved.
+- **The shared drain** (`autonomy/contributor_issue_watcher.py`) has one lever
+  per lane, and board rows:
+  - post only on a HUMAN resolver (`classify_resolver`), so a system or self
+    approval expires the hold unposted;
+  - dedup by marker (recent window + search, any state), adopting a marked
+    issue only when this account authored it;
+  - are exempt from the contributor daily cap;
+  - write the `board_links` pointer and a `promotion` event once the issue
+    exists, with each tick re-linking any posted row a crash left unlinked.
+- `approve_all_pending` excludes board promotions, because a sweep's resolver is
+  human and only the exclusion keeps them per-item.
+- The contributor lane's title dedup gained a search read beside its 200-issue
+  recent window (the repo had 638 open issues, MEASURED 2026-10-02).
+
+```yaml subsystem-map
+entry: work-board
+modules: [board]
+verified: b67423bd 2026-10-03
+```
+
+- **Stores** (`db/crud/board.py`; New-Store justification and retention in
+  migration `20261003010926_board_stores`):
+  - `board_links` — private ledger row / follow-up -> public issue, written
+    only once the issue exists, with the promotion audit (who approved it, the
+    privacy-scan receipt, the hash of the body that was scanned);
+  - `open_questions` + `open_question_blocks` — local-only owner decisions
+    and the work each one blocks (an edge, not a list entry);
+  - `board_events` — the append-only event log.
+  Each vocabulary is enforced in the CRUD module; `board_events.event` has no
+  CHECK because SQLite cannot alter one. A partial UNIQUE index on
+  `(event, observed_change_key)` dedups a re-read GitHub change.
+- **Mode lever** `board/config.py` (`off | propose_only | live`, re-read per
+  call; overlay `~/.genesis/config/board.local.yaml`; kill switch
+  `GENESIS_BOARD_DISABLED=1`). An invalid value degrades to `propose_only`:
+  reads stay on and writes stay off. `writes_allowed()` is the one predicate a
+  GitHub writer checks. `live` is OVERLAY-ONLY: the settings validator rejects
+  it (the `marketing_outreach` precedent), and it rejects `enabled: true`
+  too (that would re-arm a live overlay the owner paused), so a session can
+  only turn the board down, never arm it. The master `enabled` fails closed
+  unless it is the literal `true`. Board promotion (`board_promote` and the
+  drain) reads it on every call; the reconciler's entry points carry
+  `GROUNDWORK(board-reconciler)` tags until it lands.
+- **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
+  `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
+  write only local rows. A target id prefix must resolve uniquely against its
+  own table. Every target is validated first. Every WRITE (raise, resolve,
+  block add/remove) runs on a connection the tool owns, never the server's
+  shared one, because the health MCP middleware rolls the shared connection
+  back after any failed tool call and could discard or split a write already
+  reported saved. Each write is one `BEGIN IMMEDIATE` transaction (a raise:
+  the question and all its blocks, or nothing). Only taking the lock is
+  retried, so a write is never repeated; a lock reported after a durable WAL
+  commit counts as committed; the read-back runs after the commit and a failed
+  one is reported as "saved, not read back". A close is guarded on the
+  observed status, so a second answer never overwrites the first, and a closed
+  question's edges are history (not removable). Resolving and removing a block
+  are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile
+  (overlay profiles included) and refused server-side for a dispatched,
+  unsupervised session (`guard_human_gate`). Listing is denied on the
+  external-ingesting profiles, and raising on the untrusted-inbound perimeter.
+  `open_question_list` pages (50 default, 200 max, `next_offset`). Card targets
+  and stored repo names are lowercased, because GitHub names are
+  case-insensitive. A test pins that the module has no GitHub or subprocess
+  path. `open_question_list` is on the reflection read allowlist.
+  **A block is enforced at promotion** (`board_promote` refuses a blocked
+  record) and is advisory everywhere else. The morning report's ground-truth
+  section counts unverified questions
+  (count and oldest age only, never the text); that line is the push surface
+  that keeps a parked question from being a silent drop.
+- **Retention:** `scripts/prune_board.py` on the disk-hygiene timer prunes
+  closed questions (and their edges) after 90 d and events after 180 d.
+  Unverified questions and promotion pointers are never pruned.
+- **Do not:** write any card, column or status into a local table (the spec
+  allows exactly these three stores), or make Genesis move a card into
+  In Progress (only a human starts work).
+- **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
+  project):
+  - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,
+    for UI drags or API writes alike. Change detection therefore keys on the
+    Status value's `updatedAt`, which is why the event log stores an
+    `observed_change_key`;
+  - a new user project gets a default workflow, "Pull request linked to issue",
+    that sets Status to In Progress on its own, and setup must delete it;
+  - project reads lag writes briefly.
+
 ---
 
 *Maintenance: run `python scripts/check_subsystem_map.py` from the repo root;
