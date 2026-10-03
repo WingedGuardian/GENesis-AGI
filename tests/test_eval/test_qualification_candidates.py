@@ -21,6 +21,14 @@ FLASH = "openrouter-deepseek-flash"
 MODELS = {MIMO: "xiaomi/mimo-v2.6-pro", FLASH: "deepseek/deepseek-v4.1-flash"}
 
 
+@pytest.fixture(autouse=True)
+def isolated_openrouter_credentials(monkeypatch):
+    # A higher-priority alias can be inherited from another test or the host.
+    # Restore all aliases afterward; keep the production resolver unchanged.
+    for name in ("API_KEY_OPENROUTER", "OPENROUTER_API_KEY", "OPENROUTER_API_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="module", params=[MIMO, FLASH])
 async def candidate(request, tmp_path_factory):
     spec = synthetic_spec()

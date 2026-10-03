@@ -19,6 +19,9 @@ from genesis.eval.qualification import contracts, manifest, runner, transport
 from genesis.eval.qualification.__main__ import main
 from genesis.eval.qualification.evidence import Journal, currency_sum, digest
 from tests.test_eval.test_qualification import first, priced, response, synthetic_spec
+from tests.test_eval.test_qualification_candidates import (
+    isolated_openrouter_credentials as isolated_openrouter_credentials,
+)
 from tests.test_eval.test_qualification_gates import full as full
 
 FLASH = "openrouter-deepseek-flash"
