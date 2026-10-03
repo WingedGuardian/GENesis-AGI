@@ -16,8 +16,8 @@ Two modes × two presets, all probe-confirmed live (2026-06-24; orchestrator slu
   {answer, consensus, dissent[], blind_spots[], confidence}. Default preset: **strong**.
 
 Presets control the panel (who deliberates) — explicit, custom-defined model lists (see _PRESET_PANELS):
-**strong** = a frontier panel (opus/gpt/gemini-pro/grok/deepseek/kimi) judged by gpt; **budget** = a
-mid-tier panel (deepseek/gpt-mini/grok/qwen/kimi/gemini-flash) judged by sonnet (cheaper/faster). Passed
+**strong** = a frontier panel (opus/gpt/gemini-pro/grok/mimo/kimi) judged by gpt; **budget** = a
+mid-tier panel (mimo/gpt-mini/grok/qwen/kimi/gemini-flash) judged by sonnet (cheaper/faster). Passed
 as `analysis_models` (panel) + `model` (judge) via the fusion `plugins` entry (synthesis) or the
 server-tool `parameters` (analysis). Edit _PRESET_PANELS to recompose the chorus.
 
@@ -66,14 +66,14 @@ _PRESET_PANELS: dict[str, dict] = {
             "~openai/gpt-latest",
             "~google/gemini-pro-latest",
             "~x-ai/grok-latest",
-            "deepseek/deepseek-v4-pro",
+            "xiaomi/mimo-v2.6-pro",
             "~moonshotai/kimi-latest",
         ],
         "model": "~openai/gpt-latest",  # judge
     },
     "budget": {
         "analysis_models": [
-            "deepseek/deepseek-v4-pro",
+            "xiaomi/mimo-v2.6-pro",
             "~openai/gpt-mini-latest",
             "~x-ai/grok-latest",
             "qwen/qwen3-235b-a22b-thinking-2507",

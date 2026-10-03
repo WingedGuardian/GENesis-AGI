@@ -89,8 +89,9 @@ root ignores the whole file (warning); a non-mapping section ignores that sectio
 | `lm_studio_url()` | env `LM_STUDIO_URL` | yaml `network.lm_studio_url` | `http://localhost:1234/v1` | non-empty |
 | `lm_studio_health_url()` | env `LM_STUDIO_HEALTH_URL` | derived from `lm_studio_url()` | — | present (empty → `""`) |
 | `qdrant_url()` | env `QDRANT_URL` | *(no yaml layer)* | `http://localhost:6333` | present |
-| `ollama_enabled()` | env `GENESIS_ENABLE_OLLAMA` | yaml `network.ollama_enabled` | `False` | **present** |
-| `embed_priority_tier()` | env `GENESIS_EMBED_PRIORITY_TIER` | yaml `memory.embed_priority_tier` | `True` | **present** |
+| `ollama_enabled()` | env `GENESIS_ENABLE_OLLAMA` | yaml `network.ollama_enabled` | `False` | non-empty |
+| `embed_priority_tier()` | env `GENESIS_EMBED_PRIORITY_TIER` | yaml `memory.embed_priority_tier` | `True` | non-empty |
+| `embed_local_first()` | env `GENESIS_EMBED_LOCAL_FIRST` | yaml `memory.embed_local_first` | `False` | non-empty |
 | `build_lane_enabled()` | env `GENESIS_BUILD_LANE_ENABLED` | yaml `build_lane.enabled` | `False` | **present** |
 | `models_md_synthesis_enabled()` | env `GENESIS_MODELS_MD_SYNTHESIS_OFF` (inverted) | yaml `models_md_synthesis.enabled` | `True` | present |
 | `github_user()` | env `GENESIS_GITHUB_USER` | yaml `github.user` | `""` | non-empty |
@@ -212,9 +213,12 @@ names, so an overlay of a read-only file is editable (#2446).
   `scripts/setup_claude_config.py --global` applies `config/cc-global-settings.yaml`, and
   `scripts/cc_settings_align.sh` re-asserts the auto-updater keys daily). How they merge is
   Claude Code's rule, not Genesis's. `.mcp.json` is rendered from
-  `config/mcp.json.template`: `install.sh` leaves an existing file alone, but
-  `scripts/bootstrap.sh` runs `scripts/setup_claude_config.py`, which REWRITES it whenever
-  it differs from the template, so custom entries do not survive a bootstrap. Its Genesis servers carry
+  `config/mcp.json.template` by `scripts/setup_claude_config.py`, minus the servers only a
+  dispatch profile uses (`INTERACTIVE_EXCLUDED_SERVERS` there, today `discord-bot`): the
+  template stays the single source, and dispatched sessions get their servers from it
+  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone, but
+  `scripts/bootstrap.sh` runs the same script, which REWRITES it whenever
+  it differs from that render, so custom entries do not survive a bootstrap. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---
@@ -226,8 +230,11 @@ names, so an overlay of a read-only file is editable (#2446).
    that anything re-reads the file (`daily_budget_disabled`, `memory_rerank_off`,
    `skill_gate_off` in `src/genesis/env.py` have no in-process setter).
 2. **Empty is not unset.** `KEY=` in `secrets.env` shadows `genesis.yaml` for every
-   "present" helper, and turns `GENESIS_ENABLE_OLLAMA`, `GENESIS_BUILD_LANE_ENABLED` and
-   `GENESIS_EMBED_PRIORITY_TIER` **on**. To defer to the yaml, comment the line out.
+   "present" helper, and turns `GENESIS_BUILD_LANE_ENABLED` **on**. To defer to the
+   yaml, comment the line out. The embedding-chain levers (`GENESIS_ENABLE_OLLAMA`,
+   `GENESIS_EMBED_PRIORITY_TIER`, `GENESIS_EMBED_LOCAL_FIRST`) are the exception: they
+   are "non-empty" helpers, because the memory MCP child drops empty values before
+   they reach its environment, and the server and the child must agree.
 3. **Timezone is inverted.** `genesis.yaml` beats `USER_TIMEZONE`; changing the env var
    on an install whose file has a valid zone does nothing.
 4. **The overlay is not always where you think.** Settings domains read

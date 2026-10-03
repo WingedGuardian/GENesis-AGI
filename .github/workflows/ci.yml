@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-29: 66 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-02: 67 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1058,6 +1058,54 @@ jobs:
         #   test_update_tier2_baseline.py goes 5 -> 8 (unreadable history, no
         #   history table, and no interpreter for the reader are each a new case).
         # test_update_rollback_recovery.py is edited count-neutrally (8 == 8).
-        # So the floor is 23476 + 13 = 23489. No new test carries a skipif, so
-        # the ceiling does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23489
+        # So that floor is 23476 + 13 = 23489.
+        #
+        # The deploy-checkout lib branch adds three test files that do not exist on
+        # main, so each delta is its FULL collected count, and edits seven others
+        # count-neutrally (each re-measured, branch == main):
+        #   pytest tests/test_scripts/test_deploy_checkout.py --collect-only -q
+        #     -> 36 tests collected
+        #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
+        #     -> 28 tests collected
+        #   pytest tests/test_scripts/test_update_checkout_moved.py --collect-only -q
+        #     -> 29 tests collected
+        # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
+        # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
+        # does not move.
+        #
+        # UNION with the deploy-guidance PR (#2101): it changes one existing test
+        # file, tests/test_hooks/test_bash_timeout_guidance.py, which collects 3
+        # tests on main and 27 here, so its DELTA is +24 (measured against main,
+        # after the last test-adding edit, not against an earlier state of the
+        # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
+        # ceiling does not move. Floor: 23582 + 24 = 23606.
+        #
+        # UNION with the entity apply-rails PR (#1729). Measured against main's
+        # versions with --collect-only, after the last test-adding edit:
+        #   test_entity_adjudication.py         50 -> 62   (+12)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
+        #   test_entity_adjudication_config.py  13 -> 15   (+2)
+        #   test_migration_0065_...             14 -> 14   (0)
+        # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
+        # superseded by this count. No new skips, so the ceiling holds.
+        # Floor: 23606 + 38 = 23644.
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        # GitNexus routine refresh: focused edited files collect 123 -> 135
+        # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
+        # Routing generations: 143 collected across the four new generation files.
+        # Floor 23721 + 143 = 23864; skip ceiling remains 102.
+        # #2735 stacked-PR contract: test_ci_triggers.py 0 -> 5 (+5: main-only
+        # PR trigger, no edited type, push/schedule/dispatch unchanged,
+        # cc-pin merge-base, and the origin/main line allowlist); no added
+        # skips. Floor: 23864 + 5 = 23869.
+        # Shared Serena: new test_serena_shared.py collects 256 tests (0 -> 256).
+        # Floor: 23869 + 284 = 24153; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24153

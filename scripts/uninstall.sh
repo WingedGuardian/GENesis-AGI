@@ -64,9 +64,10 @@ genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer"
 # shape how the network behaves, and removing one needs a networkd restart.
 #
 # Every step needs sudo and tolerates failure, so the command then CHECKS: a
-# unit file or script still present, or a timer still active, is printed after
-# GENESIS_ROOT_WATCHDOG_LEFT and the command exits 1. The callers report that
-# instead of success (on the incus path the exit status does not come back).
+# unit file or script still present, or an active, transitional, or unreadable
+# watchdog state, is printed after GENESIS_ROOT_WATCHDOG_LEFT and exits 1. The
+# callers report that instead of success (on the incus path the exit status
+# does not come back).
 # BEGIN root-watchdog-remove
 _WD_ROOT="${GENESIS_ROOT_WATCHDOG_PREFIX:-}"  # test seam; empty = the real root
 _WD_UNITS="genesis-tailscale-watchdog.timer genesis-tailscale-watchdog.service genesis-network-watchdog.timer genesis-network-watchdog.service"
@@ -76,24 +77,42 @@ $_WD_ROOT/usr/local/lib/genesis/tailscale-watchdog.py $_WD_ROOT/usr/local/lib/ge
 _WD_RUN_FILES="$_WD_ROOT/run/genesis-tailscale-watchdog.json $_WD_ROOT/run/genesis-tailscale-watchdog-status.json \
 $_WD_ROOT/run/genesis-network-watchdog.json $_WD_ROOT/run/genesis-network-watchdog.last"
 GENESIS_ROOT_WATCHDOG_LEFT="root watchdog still present:"
+GENESIS_ROOT_WATCHDOG_DONE="root watchdog removed: nothing left"
 GENESIS_ROOT_WATCHDOG_REMOVE="for u in $_WD_UNITS; do sudo -n systemctl disable --now \"\$u\" 2>/dev/null || true; done; \
 sudo -n rm -f $_WD_FILES $_WD_RUN_FILES 2>/dev/null || true; \
 sudo -n systemctl daemon-reload 2>/dev/null || true; \
 left=''; for f in $_WD_FILES; do if [ -e \"\$f\" ] || [ -L \"\$f\" ]; then left=\"\$left \$f\"; fi; done; \
-for u in $_WD_UNITS; do case \"\$u\" in *.timer) if systemctl is-active --quiet \"\$u\" 2>/dev/null; then left=\"\$left \$u\"; fi ;; esac; done; \
-if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi"
+for u in $_WD_UNITS; do st=\$(systemctl show \"\$u\" -p ActiveState --value 2>/dev/null); rc=\$?; \
+case \"\$rc:\$st\" in 0:|0:inactive|0:failed) ;; *) left=\"\$left \$u\" ;; esac; done; \
+if [ -n \"\$left\" ]; then echo \"$GENESIS_ROOT_WATCHDOG_LEFT\$left\"; exit 1; fi; \
+echo \"$GENESIS_ROOT_WATCHDOG_DONE\""
 # END root-watchdog-remove
 
-# report_root_watchdog_removal <output> — the removal command's verdict. It
-# never aborts the uninstall: the rest of Genesis still comes out.
+# report_root_watchdog_removal <output> — report LEFT or require the DONE marker
+# before claiming removal. It never aborts the uninstall.
 report_root_watchdog_removal() {
-    local out="$1"
+    local out="$1" line remaining="" found_done=false
     if [[ "$out" == *"$GENESIS_ROOT_WATCHDOG_LEFT"* ]]; then
         warn "The root network/Tailscale watchdog was NOT fully removed, and can keep restarting tailscaled (dropping SSH sessions). Needs root:${out#*"$GENESIS_ROOT_WATCHDOG_LEFT"}"
         warn "Remove it as root: systemctl disable --now $_WD_UNITS; then delete the files listed above."
         return 0
     fi
-    [ -n "$out" ] && echo "$out"
+    while IFS= read -r line; do
+        if [ "$line" = "$GENESIS_ROOT_WATCHDOG_DONE" ]; then
+            found_done=true
+        elif [ -z "$remaining" ]; then
+            remaining="$line"
+        else
+            remaining+=$'\n'"$line"
+        fi
+    done <<< "$out"
+    if [ "$found_done" != true ]; then
+        [ -n "$out" ] && echo "$out"
+        warn "Could not confirm root watchdog removal: the command did not report back, so it may still be restarting tailscaled (dropping SSH sessions)."
+        warn "Check/remove as root: systemctl status $_WD_UNITS; systemctl disable --now $_WD_UNITS"
+        return 0
+    fi
+    [ -n "$remaining" ] && echo "$remaining"
     ok "Removed root network and Tailscale watchdog timers"
     REMOVED+=("root watchdog timers")
 }
@@ -193,6 +212,27 @@ safe_disable_service() {
     else
         skip "$unit"
     fi
+}
+
+# Remove only this integration's known enablement links, including dangling ones.
+remove_serena_enablement() {
+    local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" root unit link target persistent runtime_target
+    for root in "$HOME/.config/systemd/user" "$runtime/systemd/user"; do
+        for unit in genesis-serena-claude-code.service genesis-serena-codex.service; do
+            link="$root/default.target.wants/$unit"
+            [ -L "$link" ] || continue
+            target="$(readlink -m -- "$link")" || return 1
+            persistent="$(readlink -m -- "$HOME/.config/systemd/user/$unit")" || return 1
+            runtime_target="$(readlink -m -- "$runtime/systemd/user/$unit")" || return 1
+            if [ "$target" != "$persistent" ] && [ "$target" != "$runtime_target" ]; then
+                echo "  WARNING: foreign Serena enablement link preserved: $link"
+            elif [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would remove Serena enablement: $link"
+            else
+                rm -- "$link" || return 1
+            fi
+        done
+    done
 }
 
 # Run a command inside the container (from host). Tolerates container issues.
@@ -496,11 +536,13 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
         done
+        remove_serena_enablement
 
         # Persistent= timers keep a stamp file under
         # ~/.local/share/systemd/timers/. Removing the unit file does NOT remove
@@ -598,22 +640,33 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
                 systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
+                systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
-                systemctl --user disable genesis-server.service genesis-bridge.service \
+                for u in genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-tmp-watchgod.service \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
+                    systemctl --user disable \"\$u\" 2>/dev/null || true;
+                done;
+                DRY_RUN=false;
+                $(declare -f remove_serena_enablement);
+                remove_serena_enablement
             "
             ok "Stopped Genesis services"
 
             # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
-            report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
+            if [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would disable and remove the root network and Tailscale watchdog timers"
+            else
+                report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
+            fi
 
             # Persistent= timers keep a stamp file under
             # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it

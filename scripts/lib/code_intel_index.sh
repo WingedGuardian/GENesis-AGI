@@ -852,6 +852,8 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
     _GN=""
     if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
         _log "GitNexus pin metadata unavailable — refusing dynamic resolver"
+    elif ! declare -F genesis_gitnexus_select_node >/dev/null || ! genesis_gitnexus_select_node; then
+        _log "GitNexus Node selection refused — refusing index"
     elif ! genesis_gitnexus_node_supported; then
         _log "GitNexus ${GENESIS_GITNEXUS_VERSION} does not support Node $(node --version 2>/dev/null || echo unavailable) — refusing index"
     elif genesis_gitnexus_installed_is_pinned; then

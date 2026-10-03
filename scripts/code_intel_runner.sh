@@ -83,6 +83,20 @@ _finish_outcome() {
     printf '%s\n' "$state"
 }
 
+# Check at each queue boundary; the sentinel can change while a tick runs.
+# Unresolvable configuration defers CBM, as the entrypoint does.
+_cbm_disabled() {
+    local sentinel
+    if ! declare -F genesis_cbm_disable_file >/dev/null; then
+        return 0
+    fi
+    sentinel="$(genesis_cbm_disable_file)" || return 0
+    [ -e "$sentinel" ]
+}
+
+# shellcheck source=lib/cbm_disable_file.sh
+[ ! -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ] || . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+
 # Returns 0 (idle enough to run) or 1. Relaxed gate once a marker is starved.
 _idle_ok() {
     local age_s="$1" load iowait claude_cpu load_max iowait_max
@@ -160,6 +174,13 @@ for line in "${_MARKERS[@]}"; do
         continue
     fi
 
+    # Deferral leaves the pending generation untouched. If a new GitNexus
+    # request coalesces after this snapshot, the next tick sees it.
+    if [ "$_l_tools" = "cbm" ] && _cbm_disabled; then
+        _log "CBM disabled — leaving request pending: $_l_repo"
+        continue
+    fi
+
     if ! _idle_ok "${age:-0}"; then
         continue
     fi
@@ -177,6 +198,14 @@ for line in "${_MARKERS[@]}"; do
         # Without the claim nonce a terminal event cannot be safely bound to
         # this generation. Reconciliation on the next tick will recover it.
         exit 76
+    fi
+
+    # Authoritative tools may differ from the snapshot, and disablement can
+    # race claim. Restore durably before any escalation or tool invocation.
+    if [ "$tools" = "cbm" ] && _cbm_disabled; then
+        _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
+        _log "CBM disabled after claim — restored request: $repo"
+        continue
     fi
 
     # Escalate a fast marker to full when the graph is due (and not backed off),

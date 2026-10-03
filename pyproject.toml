@@ -204,6 +204,19 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Remove a PASSING test's tmp_path at that test's teardown; keep only failures'
+# for debugging. Without it every run with its own --basetemp keeps every test
+# directory forever (pytest clears a basetemp only when the same name is
+# reused): MEASURED on one install, 131 such basetemps, 10.2 GB, in 7 days.
+# The removal is best-effort (rmtree with ignore_errors), so it never fails a
+# test. Limits, both pytest's or the conftest's rather than this setting's: a
+# test that errors in SETUP or TEARDOWN (not in its body) counts as passed for
+# this purpose, so its directory is removed too; and a default local run
+# (tests/conftest.py's basetemp redirect) removes its whole basetemp at exit,
+# failures included, as it did before. To keep everything, run with an explicit
+# --basetemp and `-o tmp_path_retention_policy=all`.
+# Pinned by tests/test_pytest_retention_policy.py.
+tmp_path_retention_policy = "failed"
 # PER-TEST ceiling (pytest-timeout), not a suite budget — a hung test is killed
 # and the suite carries on.
 #

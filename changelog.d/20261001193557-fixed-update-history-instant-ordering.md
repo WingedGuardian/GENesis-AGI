@@ -1,0 +1,1 @@
+- Update-history readers (MCP tool, dashboard status, backup tab) now order by true instant via datetime(started_at) and expose per-row deploy facts; a success row carrying genesis-server-not-restarted is surfaced as "server not restarted" instead of a plain live success.

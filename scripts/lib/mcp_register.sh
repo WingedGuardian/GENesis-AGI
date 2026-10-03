@@ -92,6 +92,82 @@ else:
 PYEOF
 }
 
+# A shared provider remains usable even when bootstrap cannot find its binary.
+_serena_registration_available() {
+    python3 - <<'PYCODE'
+import json, os, shutil, sys
+from pathlib import Path
+try:
+    home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser()
+    if not home.is_absolute():
+        raise ValueError("Serena sharing requires an absolute GENESIS_HOME")
+    path = home / "config/serena-shared.json"
+    sharing = json.loads(path.read_text()).get("enabled") is True
+except (OSError, ValueError, AttributeError):
+    sharing = False
+sys.exit(0 if sharing or shutil.which("serena") else 1)
+PYCODE
+}
+
+_register_serena() (
+    local root="$1" outcome
+    cd -- "$root" || return 1
+    outcome="$(python3 - "$root" <<'PYCODE'
+import json, os, stat, sys, tempfile
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+config = root / ".mcp.json"
+try:
+    data = json.loads(config.read_text()) if config.exists() else {"mcpServers": {}}
+    servers = data.setdefault("mcpServers", {})
+    present = "serena" in servers
+    entry = servers.get("serena", {})
+    args = entry.get("args")
+    project_matches = (isinstance(args, list) and len(args) == 5
+                       and args[:4] == ["start-mcp-server", "--context", "claude-code", "--project"]
+                       and isinstance(args[4], str) and Path(args[4]).is_absolute()
+                       and Path(args[4]).resolve() == root)
+    command = entry.get("command")
+    managed = (isinstance(command, str) and Path(command).is_absolute()
+               and Path(command).parts[-3:] == (".claude", "mcp", "run-serena")
+               and args == ["--context", "claude-code"])
+    legacy = (entry.get("command") == "serena" and project_matches
+              and entry.get("type", "stdio") == "stdio" and not entry.get("env"))
+except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    print("failed")
+    sys.exit(0)
+managed = managed and entry.get("type", "stdio") == "stdio" and not entry.get("env")
+if not present or legacy or (managed and command != str(root / ".claude/mcp/run-serena")):
+    # One atomic update; remove/add would lose the old entry on CLI failure.
+    temporary = None
+    try:
+        fd, name = tempfile.mkstemp(dir=root, prefix=".mcp.json.")
+        temporary = Path(name)
+        with os.fdopen(fd, "w") as output:
+            if config.exists():
+                os.fchmod(output.fileno(), stat.S_IMODE(config.stat().st_mode))
+            entry["command"] = str(root / ".claude/mcp/run-serena")
+            entry["args"] = ["--context", "claude-code"]
+            servers["serena"] = entry
+            json.dump(data, output, indent=2)
+            output.write("\n")
+        os.replace(temporary, config)
+        print("migrated" if legacy else "registered")
+    except OSError:
+        print("failed")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+PYCODE
+)" || outcome=failed
+    case "$outcome" in
+        registered) echo "  Serena: registered project launcher"; return 0 ;;
+        migrated) echo "  Serena: migrated legacy project registration"; return 0 ;;
+        failed) echo "  WARNING: Serena migration failed; existing registration retained"; return 0 ;;
+    esac
+    echo "  Serena: existing project registration retained"
+)
+
 _register_mcp() {
     local name="$1" scope="$2"
     shift 2

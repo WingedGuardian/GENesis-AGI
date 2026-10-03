@@ -35,7 +35,24 @@ _COLS = (
     "applied_at",
     "approved_at",
     "approved_by",
+    "policy",
 )
+
+
+#: Adjudication-policy version stamped on every verdict write. Bump when the
+#: prompt POLICY changes meaning (not on wording tweaks): rows carrying an
+#: older/absent stamp were judged under different rules, and settled_pair_keys
+#: uses that to re-open pre-policy 'distinct' verdicts (MW-3 PR-2b — the
+#: Option-1 same-referent policy superseded the sub-item-vs-parent rule that
+#: had settled the containment-class pairs as distinct).
+#:
+#: SIZE OF THE RE-OPEN, because an earlier note said "~400" and that is not
+#: what the predicate does: it unsettles EVERY 'distinct' row with a NULL or
+#: older policy, not only the containment class. MEASURED on a live store
+#: (2026-09-06): 3,180 'distinct' rows and no policy column yet, so all 3,180
+#: enter the re-openable class the moment the migration lands. That is the
+#: number to size the sweep's budget and the drainer's cost against.
+POLICY_VERSION = "mw3-option1"
 
 
 def pair_key(entity_a: str, entity_b: str) -> str:
@@ -80,8 +97,8 @@ async def record_verdict(
         """INSERT INTO entity_adjudications
            (id, pair_key, entity_a, entity_b, loser_id, survivor_id, verdict,
             reasoning, provider, mode, norm_a, norm_b, updated_a, updated_b,
-            created_at, applied_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, applied_at, policy)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(pair_key) DO UPDATE SET
              entity_a = excluded.entity_a,
              entity_b = excluded.entity_b,
@@ -96,6 +113,13 @@ async def record_verdict(
              updated_a = excluded.updated_a,
              updated_b = excluded.updated_b,
              applied_at = excluded.applied_at,
+             -- policy MUST be stamped in the conflict-update too: a re-judged
+             -- pre-policy row left at NULL would stay outside settled_pair_keys
+             -- and be re-nominated every sweep — an infinite re-judge loop
+             -- eating the whole drain budget (designed out at plan time,
+             -- 2026-08-12 red-team; locked by
+             -- test_rejudged_pre_policy_row_is_stamped).
+             policy = excluded.policy,
              -- Approval INVALIDATION on a semantically-changed re-adjudication.
              -- Preserve the human approval ONLY when every field the apply path
              -- reads to execute the destructive merge is unchanged. If a re-judge
@@ -153,6 +177,7 @@ async def record_verdict(
             updated_b,
             now,
             applied_at,
+            POLICY_VERSION,
         ),
     )
     if _commit:
@@ -189,7 +214,28 @@ async def settled_pair_keys(db: aiosqlite.Connection) -> set[str]:
     prior judgment no longer holds (identity drifted), so the sweep SHOULD
     rediscover the pair and the drainer re-adjudicate it — otherwise a stale pair
     would be a permanent dead end."""
-    cursor = await db.execute("SELECT pair_key FROM entity_adjudications WHERE verdict != 'stale'")
+    cursor = await db.execute(
+        # Re-open rule for 'distinct' verdicts, two axes:
+        # 1. STALE POLICY — a NULL stamp predates the Option-1 same-referent
+        #    prompt (MW-3 PR-2b); a non-NULL stamp that isn't POLICY_VERSION is
+        #    just as superseded after the next version bump — only
+        #    current-policy judgments stay settled (Devin BUG_0002, #1729).
+        # 2. HUMAN REJECTS — a pre-migration reject() wrote verdict='distinct'
+        #    with policy NULL but reasoning 'human-reject: …'. Reopening those
+        #    would have the sweep re-propose a merge a human already declined
+        #    and overwrite their recorded reasoning (Codex P2, #1729); the
+        #    prefix is the durable marker that survives the migration.
+        # merge/proposed_merge rows stay settled whatever their stamp
+        # (re-running a merge decision buys nothing and risks churn).
+        # Self-limiting: re-judged rows get stamped by record_verdict.
+        "SELECT pair_key FROM entity_adjudications WHERE verdict != 'stale' "
+        "AND NOT ("
+        "    verdict = 'distinct' "
+        "    AND (policy IS NULL OR policy != ?) "
+        "    AND (reasoning IS NULL OR reasoning NOT LIKE 'human-reject:%')"
+        ")",
+        (POLICY_VERSION,),
+    )
     return {r[0] for r in await cursor.fetchall()}
 
 
@@ -262,9 +308,16 @@ async def reject(
 
     guard_human_gate("entity_adjudication_reject")
     cursor = await db.execute(
-        "UPDATE entity_adjudications SET verdict = 'distinct', approved_at = NULL, "
-        "approved_by = NULL, reasoning = ? WHERE pair_key = ? AND verdict = 'proposed_merge'",
-        (f"human-reject: {reason}", pair_key),
+        # policy is stamped here too: a human reject of a PRE-policy row left at
+        # NULL would land in the re-open lane (settled_pair_keys excludes
+        # NULL-policy distinct), so the sweep would re-judge — and possibly
+        # re-propose — the very merge the human just declined, overwriting
+        # their recorded reasoning. The re-open exists for OLD-PROMPT LLM
+        # judgments; a human verdict is never a prompt-policy artifact.
+        "UPDATE entity_adjudications SET verdict = 'distinct', policy = ?, "
+        "approved_at = NULL, approved_by = NULL, reasoning = ? "
+        "WHERE pair_key = ? AND verdict = 'proposed_merge'",
+        (POLICY_VERSION, f"human-reject: {reason}", pair_key),
     )
     if _commit:
         await db.commit()
