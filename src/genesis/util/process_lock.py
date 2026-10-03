@@ -37,6 +37,7 @@ class ProcessLock:
 
     @property
     def lock_path(self) -> Path:
+        """Return the path to the lock file."""
         return self._lock_path
 
     @staticmethod

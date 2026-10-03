@@ -46,6 +46,18 @@ DEFAULTS: dict[str, Any] = {
 # Public: the settings-domain validator imports this (with MODES) to check knobs.
 INT_KNOBS = ("drain_budget", "sweep_slice_size", "sweep_enqueue_cap")
 
+# Public: why `live` is fenced. live's new-pair auto-merge lane decides safety
+# from a queue-payload flag read when the row is claimed, and a pair whose
+# human approval went stale can still reach it (the in-flight race found in
+# #1729's review). Until a merge-time check on durable pair state lands, the
+# drainer runs propose_only. Approved merges still apply via
+# entity_adjudication_apply.
+LIVE_FENCED_REASON = (
+    "entity_adjudication 'live' mode is fenced until #2742 (a merge-time check "
+    "on durable pair state) lands; running propose_only. Approved merges still "
+    "apply via entity_adjudication_apply."
+)
+
 
 def _base_path() -> Path:
     return repo_root() / "config" / _CONFIG_NAME
@@ -80,6 +92,8 @@ def effective_mode() -> str:
     Env kill switch → ``off``. Master ``enabled: false`` → ``off``. An invalid
     value degrades to ``propose_only`` (observable, no write authority — never a
     silent ``off`` that would hide the feature, never a silent ``live``).
+    ``live`` itself is FENCED to ``propose_only`` (with a warning) until #2742
+    lands a merge-time stale check; see ``LIVE_FENCED_REASON``.
     """
     if os.environ.get(_ENV_KILL_SWITCH) == "1":
         return "off"
@@ -92,6 +106,9 @@ def effective_mode() -> str:
         return "off"
     if mode not in MODES:
         logger.warning("entity_adjudication has invalid mode %r — degrading to propose_only", mode)
+        return "propose_only"
+    if mode == "live":
+        logger.warning(LIVE_FENCED_REASON)
         return "propose_only"
     return mode
 

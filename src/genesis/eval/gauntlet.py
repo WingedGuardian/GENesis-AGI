@@ -20,7 +20,8 @@ Design (see plan Phase 6):
   returned ``CCOutput`` with tests-still-red or a mutated protected surface is a
   genuine FAIL.
 - Throwaway sessions are isolated: no MCP (``profile="none"``), a dedicated Bash
-  sandbox tmpdir (so genesis-tmp-watchgod can't SIGKILL a live session), and a
+  sandbox tmpdir (so a fixture cannot fill the cc-tmp volume live sessions
+  share), and a
   per-model file lock so a manual run and the scheduled job can't interleave.
 
 Results are recorded via the shared ``eval/db.py`` (dataset ``"gauntlet"``,
@@ -31,8 +32,6 @@ from selection/failover.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import fcntl
 import hashlib
 import json
 import logging
@@ -62,6 +61,7 @@ from genesis.eval.types import (
 )
 from genesis.util import pytest_lock
 from genesis.util.proc_kill import kill_process_group, reap_bounded
+from genesis.util.run_lock import acquire_run_lock, release_run_lock
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -188,24 +188,19 @@ def _safe(name: str) -> str:
 
 
 def _acquire_lock(model_name: str):
-    """Non-blocking per-model advisory lock (CLI vs scheduled mutual exclusion)."""
-    lock_path = Path.home() / "tmp" / f".gauntlet-{_safe(model_name)}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")  # noqa: SIM115 — held for the run, closed in _release_lock
+    """Non-blocking per-model advisory lock (CLI vs scheduled mutual exclusion),
+    ``~/.genesis/locks/gauntlet-<model>.lock``."""
+    safe = _safe(model_name)
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return acquire_run_lock(f"gauntlet-{safe}.lock", legacy_name=f".gauntlet-{safe}.lock")
     except BlockingIOError as e:
-        fh.close()
         raise GauntletBusyError(
             f"another gauntlet run for {model_name!r} is already in progress"
         ) from e
-    return fh
 
 
-def _release_lock(fh) -> None:
-    with contextlib.suppress(Exception):
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+def _release_lock(lock) -> None:
+    release_run_lock(lock)
 
 
 def _release_late_lock(future: asyncio.Future) -> None:
@@ -229,10 +224,13 @@ async def _run_pytest(workdir: Path, basetemp: Path) -> tuple[int, str]:
     edited): pytest wipes ``--basetemp`` before collection, so a basetemp nested
     in the project would delete any top-level file/dir of the same name the
     fixture or the model's solution legitimately created → a false failure. It is
-    also off cc-tmp — this foreign fixture has its own rootdir, so the genesis
-    ``tests/conftest.py`` redirect never loads for it (see
-    ``genesis.util.tmp.should_redirect_pytest_basetemp``); without an explicit
-    basetemp its tmp would default to ``$TMPDIR`` (watchgod-policed cc-tmp).
+    also kept off every policed temp dir, and that is this call's own job rather
+    than something it inherits: a foreign fixture has its own rootdir, so the
+    genesis ``tests/conftest.py`` redirect never loads for it (see
+    ``genesis.util.tmp.should_redirect_pytest_basetemp``). Without an explicit
+    basetemp its tmp would follow ``$TMPDIR`` — the quota-capped cc-tmp in a
+    CC session, and pytest's default, commonly a small tmpfs ``/tmp``, anywhere
+    else.
 
     That same "own rootdir" fact is why the box-wide test lock is taken HERE
     explicitly: the genesis ``tests/conftest.py`` that normally acquires it

@@ -22,6 +22,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
+# update.sh sources this before defining _clear_deploy_state.
+MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
 
 
 @pytest.fixture(scope="module")
@@ -52,7 +54,9 @@ def test_no_unconditional_marker_rm_remains(text: str) -> None:
     )
 
 
-def _run_clear(tmp_path: Path, text: str, marker_pid: str | None) -> tuple[bool, bool]:
+def _run_clear(
+    tmp_path: Path, text: str, marker_pid: str | None, marker_mtime: float | None = None
+) -> tuple[bool, bool]:
     """Run the shipped _clear_deploy_state with a given marker state.
     Returns (marker_still_exists, state_still_exists)."""
     home = tmp_path / "home"
@@ -62,9 +66,12 @@ def _run_clear(tmp_path: Path, text: str, marker_pid: str | None) -> tuple[bool,
     state.write_text("{}")
     if marker_pid is not None:
         marker.write_text(marker_pid)
+        if marker_mtime is not None:
+            os.utime(marker, (marker_mtime, marker_mtime))
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="{state}"
+. "{MARKER_LIB}"
 {_extract_func(text, "_clear_deploy_state")}
 _clear_deploy_state
 """
@@ -90,6 +97,7 @@ def test_deletes_marker_we_own(tmp_path: Path, text: str) -> None:
 set -Eeuo pipefail
 STATE_FILE="{state}"
 echo "$$" > "{marker}"      # marker holds OUR pid → owned
+. "{MARKER_LIB}"
 {_extract_func(text, "_clear_deploy_state")}
 _clear_deploy_state
 """
@@ -122,3 +130,160 @@ def test_deletes_dead_marker(tmp_path: Path, text: str) -> None:
 def test_no_marker_is_safe(tmp_path: Path, text: str) -> None:
     marker_exists, state_exists = _run_clear(tmp_path, text, None)
     assert not marker_exists and not state_exists
+
+
+@pytest.fixture
+def zombie_pid():
+    """The pid of a child that has exited and that its parent never reaps: a
+    zombie, on which `kill -0` still succeeds."""
+    import sys
+    import time
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, time\npid = os.fork()\nif pid == 0:\n    os._exit(0)\n"
+            "print(pid, flush=True)\ntime.sleep(30)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        zpid = int(holder.stdout.readline())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            stat = Path(f"/proc/{zpid}/stat").read_text()
+            if stat[stat.rindex(")") + 2] == "Z":
+                break
+            time.sleep(0.05)
+        assert subprocess.run(["kill", "-0", str(zpid)]).returncode == 0, "control: kill -0 lies"
+        yield zpid
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_deletes_a_zombie_holders_marker(tmp_path: Path, text: str, zombie_pid: int) -> None:
+    """A killed holder its parent never reaped is dead, though `kill -0` still
+    succeeds on it (round-2 review on #2494): the stale marker is cleaned."""
+    marker_exists, _ = _run_clear(tmp_path, text, str(zombie_pid))
+    assert not marker_exists, "a zombie holder's marker must be cleaned"
+
+
+def test_keeps_a_live_holders_marker_however_old(tmp_path: Path, text: str) -> None:
+    """No clock comparison: a live holder's marker whose mtime is far behind the
+    holder's start (what a forward clock step produces) is kept."""
+    marker_exists, _ = _run_clear(tmp_path, text, str(os.getpid()), marker_mtime=1_000_000_000)
+    assert marker_exists, "a live holder's marker must survive a clock step"
+
+
+# ── The acquire side: restore.sh takes the marker through
+# _acquire_deploy_marker, a different call site from update.sh's cleanup above.
+
+
+def _run_acquire(
+    tmp_path: Path, marker_pid: str, marker_mtime: float | None = None
+) -> tuple[int, str]:
+    """Source the shipped lib and acquire over a marker holding `marker_pid`.
+    Returns the exit status and what the marker holds afterwards, with the
+    harness's own pid written as the literal `SELF`."""
+    home = tmp_path / "home"
+    marker = home / ".genesis" / "update_in_progress.pid"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(marker_pid + "\n")
+    if marker_mtime is not None:
+        os.utime(marker, (marker_mtime, marker_mtime))
+    script = tmp_path / "acquire.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"source {MARKER_LIB}\n"
+        "rc=0; _acquire_deploy_marker || rc=$?\n"
+        'held="$(cat "$DEPLOY_MARKER_FILE")"\n'
+        '[ "$held" = "$$" ] && held=SELF\n'
+        'echo "$rc $held"\n'
+    )
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOME"}
+    out = subprocess.run(
+        ["bash", str(script)],
+        env={**env, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.split()
+    return int(out[0]), out[1]
+
+
+def test_acquire_refuses_a_live_holder(tmp_path: Path) -> None:
+    """Control for the zombie case below: a live holder (this pytest process) is
+    refused and left in place."""
+    rc, held = _run_acquire(tmp_path, str(os.getpid()))
+    assert (rc, held) == (1, str(os.getpid()))
+
+
+def test_acquire_replaces_a_zombie_holder(tmp_path: Path, zombie_pid: int) -> None:
+    rc, held = _run_acquire(tmp_path, str(zombie_pid))
+    assert (rc, held) == (0, "SELF"), "a zombie holder is stale; the marker is taken"
+
+
+def test_acquire_refuses_a_live_holder_however_old_its_marker(tmp_path: Path) -> None:
+    """A clock step must not hand a live holder's marker to a second deploy."""
+    rc, held = _run_acquire(tmp_path, str(os.getpid()), marker_mtime=1_000_000_000)
+    assert (rc, held) == (1, str(os.getpid()))
+
+
+def test_update_sources_the_holder_check_before_its_cleanup_can_run(text: str) -> None:
+    """update.sh's _clear_deploy_state calls _deploy_marker_holder_live, which only
+    the lib defines. Without the lib, the call fails with status 127, `!` turns that
+    into "dead", and the cleanup deletes a LIVE foreign holder's marker. The tests
+    above source the lib themselves, so they cannot see a dropped source line; this
+    pins the line, and its position ahead of every call of the cleanup."""
+    source_at = text.find('. "$SCRIPT_DIR/lib/deploy_marker.sh"')
+    assert source_at != -1, "update.sh no longer sources scripts/lib/deploy_marker.sh"
+    calls = [m.start() for m in re.finditer(r"^\s+_clear_deploy_state\s*$", text, re.M)]
+    assert calls, "no call of _clear_deploy_state found; update this test"
+    assert source_at < min(calls), "the lib must be sourced before the cleanup can run"
+    assert "_deploy_marker_holder_live()" in MARKER_LIB.read_text()
+
+
+def _acquire_where_the_marker_cannot_be_written(tmp_path: Path, block: str) -> list[str]:
+    """Acquire when the marker cannot be written, then report the exit status, the
+    held flag and the named holder. `block` makes the write impossible for any uid,
+    root included: a DIRECTORY at the marker path (the write fails) or a FILE where
+    the state directory should be (the mkdir fails)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    if block == "marker-is-a-directory":
+        (home / ".genesis" / "update_in_progress.pid").mkdir(parents=True)
+    else:
+        (home / ".genesis").write_text("not a directory\n")
+    script = tmp_path / "acquire.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"source {MARKER_LIB}\n"
+        "rc=0; _acquire_deploy_marker || rc=$?\n"
+        'echo "$rc $_DEPLOY_MARKER_HELD holder=${DEPLOY_MARKER_HOLDER:-none}"\n'
+    )
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOME"}
+    return subprocess.run(
+        ["bash", str(script)],
+        env={**env, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.split()
+
+
+@pytest.mark.parametrize("block", ["marker-is-a-directory", "state-dir-is-a-file"])
+def test_acquire_fails_when_the_marker_cannot_be_written(tmp_path: Path, block: str) -> None:
+    """An unwritten marker must never read as held. The watchdog defers only on a
+    marker it can read, so a deploy that went ahead without one could have its
+    server restarted mid-deploy. Status 2 separates this from a live foreign
+    holder (status 1), which is the only case that names a holder."""
+    assert _acquire_where_the_marker_cannot_be_written(tmp_path, block) == [
+        "2",
+        "false",
+        "holder=none",
+    ]

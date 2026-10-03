@@ -142,9 +142,11 @@ def sanitize_detail(text: str | None, limit: int) -> str:
         return ""
     # Strip the characters the TAG GRAMMAR owns, not only the bracket pair.
     # Brackets alone stop a forged LINE; the grammar is
-    # `[Concurrent | <src> <model> | <id>] <topic> - <digest>`, so a peer value
-    # containing "|" still forges an extra FIELD inside the surviving line --
-    # including the id position, which a reader attributes to the tag itself.
+    # `[Concurrent | <src> <model> | <id> -> <address>] <topic> - <digest>`, so a
+    # peer value containing "|" still forges an extra FIELD inside the surviving
+    # line -- including the id position, which a reader attributes to the tag
+    # itself. (The address is not passed through here: a name is an address, so
+    # session_awareness.peer_address allowlists it and omits it whole, never cuts.)
     # Substituted rather than deleted so the text stays readable.
     flattened = _WHITESPACE_RUN.sub(" ", text.translate(_TAG_GRAMMAR_CHARS)).strip()
     if limit <= 1:

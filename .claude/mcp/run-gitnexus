@@ -25,6 +25,11 @@ if ! source "$PIN_FILE" \
     exit 1
 fi
 
+if ! declare -F genesis_gitnexus_select_node >/dev/null || ! genesis_gitnexus_select_node; then
+    printf 'run-gitnexus: Node selection refused; refusing to start\n' >&2
+    exit 1
+fi
+
 # STDERR IS NOT DISCARDED. The resolver refuses for several different reasons --
 # nothing found, conflicting installations, a candidate whose version cannot be
 # read -- and only it knows which. Sending its diagnostic to /dev/null and

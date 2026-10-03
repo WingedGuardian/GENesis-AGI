@@ -25,6 +25,10 @@ Fields:
                   when every provider in a site's chain has has_api_key=False;
                   intrinsic statuses defined in _CALL_SITE_META take
                   precedence (setdefault).
+  tile:           False for an entry that is NOT a call site of its own (an
+                  alias whose runs record under another id, or a work-type
+                  tag). It never produces call-site data, so the neural
+                  monitor must not give it a grid tile. Omit otherwise.
   see_also:       Sibling call-site IDs to cross-reference. Populated for
                   confusable-vocabulary families. Rendered as clickable
                   links in the neural monitor detail panel.
@@ -101,7 +105,7 @@ Fields:
 #   task deliverables. Part of a 3-gate pipeline: (1) programmatic checks,
 #   (2) this site, (3) 20_adversarial_counterargument. Cross-vendor by
 #   design (different model family than the task author). PAID chain
-#   (DeepSeek V4 Pro + Qwen 3.6+ via OpenRouter).
+#   (MiMo V2.6 Pro + Qwen 3.6+ via OpenRouter).
 #   Live caller: autonomy/executor/review.py:37
 #                (_CALL_SITE_EXECUTOR_REVIEW constant)
 #   Renamed from: 17_fresh_eyes_review (2026-05-10)
@@ -306,12 +310,14 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["2_triage", "29_retrospective_triage", "30_triage_calibration"],
     },
     "bookmark_enrichment": {
+        "tile": False,  # runs record under 33_skill_refiner (routing/router.py)
         "description": "Generates rich summaries of shelved sessions for bookmarks. Routes through 33_skill_refiner chain (free APIs). Runs during surplus idle time.",
         "category": "content",
         "frequency": "On bookmark enrichment",
         "model_tier": "slm",
     },
     "embedding_recovery": {
+        "tile": False,  # no LLM call; the name is a source tag
         "description": "Drains pending FTS5-only memories to Qdrant when embedding provider recovers. Background recovery worker.",
         "category": "embedding",
         "frequency": "On provider recovery",
@@ -351,7 +357,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["21_embeddings", "21b_query_embedding"],
     },
     "44_task_premortem": {
-        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Paid-primary dual chain (DeepSeek V4 Pro + free fallback). Caller: autonomy/executor/review.py:101 (TaskReviewer).",
+        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Free-primary chain with MiMo V2.6 Pro among the paid fallbacks. Caller: autonomy/executor/review.py:101 (TaskReviewer).",
         "category": "assessment",
         "frequency": "Per task (pre-execution)",
         "model_tier": "frontier",
@@ -384,7 +390,7 @@ _CALL_SITE_META: dict[str, dict] = {
     },
     # ── PARTIALLY WIRED: code exists, conditions haven't triggered yet ─
     "27_pre_execution_assessment": {
-        "description": "Pre-execution plan sanity-check (executor TaskReviewer.review_plan + autonomy/decomposer.py). The PRIMARY path is the CC invoker (Opus) directly; THIS call site is the API-dual fallback (GLM 5.1 / MiniMax M2.5 / DeepSeek V4 Flash) routed via route_call when the CC invoker is unavailable. Cost auto-derives from that chain — it is NOT a CC-subscription site (the prior dispatch=cli/cc_model=Opus meta was stale and mislabeled it).",
+        "description": "Pre-execution plan sanity-check (executor TaskReviewer.review_plan + autonomy/decomposer.py). The PRIMARY path is the CC invoker (Opus) directly; THIS call site is the API-dual fallback (GLM 5.3 / DeepSeek V4.1 Flash) routed via route_call when the CC invoker is unavailable. Cost auto-derives from that chain — it is NOT a CC-subscription site (the prior dispatch=cli/cc_model=Opus meta was stale and mislabeled it).",
         "category": "reasoning",
         "frequency": "Per task (pre-execution)",
         "model_tier": "frontier",
@@ -477,7 +483,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "WIRED_DIFFERENT_MECHANISM",
     },
     "17_executor_review": {
-        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: DeepSeek V4 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
+        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: MiMo V2.6 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",
@@ -494,7 +500,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "V4_PLACEHOLDER",
     },
     "20_adversarial_counterargument": {
-        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 5.5 primary, DeepSeek V4 Pro + Qwen 3.6+ fallback via OpenRouter.",
+        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 6 Astra primary, MiMo V2.6 Pro + Qwen 3.6+ fallback via OpenRouter.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",
@@ -580,6 +586,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "TEMP_DISABLED",
     },
     "outreach_fallback": {
+        "tile": False,  # a deferred-work type, not a routed call
         "description": "Deferred outreach delivery retry. Enqueue active (outreach/pipeline.py:_defer → deferred-work work_type='outreach_delivery'). Consumer = OutreachRecoveryWorker (resilience/outreach_recovery.py): polls the deferred-work queue, retries via the pipeline with exponential backoff (max 5 attempts), and writes an observation on exhaustion. Wired at runtime/init/outreach.py (started whenever the deferred-work queue is present).",
         "category": "content",
         "frequency": "On outreach failure",
@@ -659,5 +666,48 @@ _CALL_SITE_META: dict[str, dict] = {
         "cost_policy": "Paid (OpenRouter Fusion)",
         "model_tier": "frontier",
         "status_reason": "WIRED",
+    },
+    # ── Retired ids that only survive as stale call_site_last_run rows ──
+    # Without an entry here the snapshot resurrects each one as a live
+    # "active" tile from its last historical run.
+    "23_fresh_eyes_review": {
+        "description": "RENAMED 2026-05-10 to 23_outreach_review. Stale history row only.",
+        "category": "assessment",
+        "frequency": "Was: per outreach message",
+        "model_tier": "slm",
+        "wired": False,
+        "status_reason": "DEPRECATED_REMOVED",
+    },
+    "contingency_inbox": {
+        "description": "REMOVED: no caller in src/. Last recorded run 2026-04-10; stale history row only.",
+        "category": "processing",
+        "frequency": "Was: on CC outage",
+        "model_tier": "slm",
+        "wired": False,
+        "status_reason": "DEPRECATED_REMOVED",
+    },
+    "email_triage": {
+        "description": "REMOVED: no caller in src/ (outreach_email_triage is the live site). Last recorded run 2026-04-13; stale history row only.",
+        "category": "classification",
+        "frequency": "Was: per email",
+        "model_tier": "slm",
+        "wired": False,
+        "status_reason": "DEPRECATED_REMOVED",
+    },
+    "models_md_synthesis": {
+        "description": "NO LONGER A CALL SITE: removed from routing when it became a direct Claude Code session dispatch (recon/models_md_synthesis.py), which writes no call-site data. The job still runs; its last routed run left a stale history row (2026-05-25).",
+        "category": "surplus",
+        "frequency": "Was: surplus schedule",
+        "model_tier": "cc",
+        "wired": False,
+        "status_reason": "DEPRECATED_REMOVED",
+    },
+    "embedding": {
+        "description": "REMOVED: superseded by 21_embeddings / 21b_query_embedding; nothing records runs under this id. Last recorded run 2026-03-21.",
+        "category": "processing",
+        "frequency": "Was: per memory write",
+        "model_tier": "embedding",
+        "wired": False,
+        "status_reason": "DEPRECATED_REMOVED",
     },
 }

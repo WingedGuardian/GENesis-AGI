@@ -952,15 +952,20 @@ def test_a_real_merge_also_does_not_suppress_rounds(repo, _isolate_rounds):
     assert review_state.bump_review_round(str(repo), source="external") == 2
 
 
-# ── Round-7 terminal: the LIFETIME counter and its gate ───────────────────
+# ── The LIFETIME counter and its gate ─────────────────────────────────────
 #
-# The consecutive streak alone has no terminal. `# escalation-ack` calls
-# reset_review_round (review_enforcement_commit.py), so the cap is
-# indefinitely repeatable: rounds 1-2-3, ack, 4-5-6, ack, 7-8-9, ack, forever.
-# A PR can grind through fifteen external rounds and the gate never says
-# "enough" — only "enough, for now". The lifetime counter is what closes that:
-# acks never reset it, so round 7 forces a terminal decision (accept the
-# remaining findings and merge, or abandon and start from a clean design).
+# ⚠ HISTORICAL. The "round 7" terminal these tests were built around is a tier
+# RETIRED 2026-09-25 — `FINAL_ROUND_CAP` is deleted (see
+# `test_final_round_cap_is_gone_but_its_state_helpers_remain` below) and the live
+# terminal is FOUR reviewed heads. The tests still pin real lifetime-counter
+# behaviour, which is why they stay; read the round numbers below as archaeology.
+#
+# The reasoning that motivated them, and which still holds for the counter itself:
+# the consecutive streak alone has no terminal. `# escalation-ack` calls
+# reset_review_round (review_enforcement_commit.py), so that cap is indefinitely
+# repeatable: rounds 1-2-3, ack, 4-5-6, ack, forever. A PR could grind through
+# fifteen external rounds and the gate never says "enough" — only "enough, for
+# now". The lifetime counter is what closes that, because acks never reset it.
 
 
 def test_lifetime_survives_the_escalation_ack_reset(repo, _isolate_rounds):
@@ -1025,9 +1030,38 @@ def test_lifetime_absent_in_legacy_file_reads_zero(repo, _isolate_rounds):
     assert review_state.get_review_lifetime(cwd=str(repo)) == 0
 
 
-def test_legacy_final_round_symbols_remain_for_stale_worktrees():
-    """Old hook trees may still import these names while a worktree is in flight."""
-    assert review_state.FINAL_ROUND_CAP == 7
+def test_final_round_cap_is_gone_but_its_state_helpers_remain():
+    """`FINAL_ROUND_CAP` is DELETED; the legacy state helpers are not (yet).
+
+    The constant was consulted by no gate, and its value was chosen to avoid
+    colliding with the four-head boundary — so a retired tier was still shaping
+    the live one and reading as though a seventh round existed. Deleting it is
+    safe for a stale worktree, for a reason worth stating since it is why the old
+    assertion existed: the guard and `review_state` are always CO-TREE. The
+    launcher resolves `HOOK_ROOT` to the MAIN worktree — `.claude/hooks/genesis-hook`
+    sets `HOOK_ROOT="$MAIN_ROOT"` unless `GENESIS_HOOK_DEV_LOCAL=1`, so a stale
+    worktree runs MAIN's guard rather than its own — and `git_push_guard.py` then
+    inserts its OWN `dirname(dirname(__file__))` at `sys.path[0]`, so whichever tree
+    wins supplies BOTH halves. A mixed old-guard/new-`review_state` pair is therefore
+    unreachable in production, and a hand-constructed one degrades rather than
+    raising (the import is wrapped; MEASURED both directions).
+
+    An earlier version of this docstring said a stale worktree "imports its OWN
+    tree's `review_state`", which is the opposite of what the launcher does and is
+    exactly the belief its comment block was written to kill. The conclusion was
+    right and the mechanism was wrong — which is worse than saying nothing, because
+    the next audit re-derives from it. Nothing cross-tree reads this name, and the
+    `final-round-accept` refusal paths reference no cap.
+
+    The three helpers below are dead in production too, but they carry real
+    behavioural tests above and belong to the streak-store retirement, not to
+    this change. Asserting they REMAIN is what keeps that a deliberate later
+    decision rather than a side effect of this one.
+    """
+    assert not hasattr(review_state, "FINAL_ROUND_CAP"), (
+        "FINAL_ROUND_CAP is retired — re-adding it reintroduces a tier no gate "
+        "consults, which is what made the round doctrine ambiguous"
+    )
     assert callable(review_state.get_review_lifetime)
     assert callable(review_state.get_final_accept_consumed)
     assert callable(review_state.consume_final_accept)

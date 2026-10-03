@@ -16,7 +16,7 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   slug and leaves only a `wt-<id>.jsonl` stub behind, so the conversation
   disappears from `/resume` in the main repo (it looks "lost"). A PreToolUse
   hook (`worktree_cwd_guard.py --enter-worktree`) hard-blocks it. To isolate
-  work while staying findable: `git worktree add .claude/worktrees/<name> -b
+  work while staying findable: `git worktree add --no-track .claude/worktrees/<name> -b
   <scope>/<desc> origin/main`, then edit via the worktree's ABSOLUTE paths and
   run tests with `PYTHONPATH=<worktree>/src pytest <files>` — your session stays
   in the main repo and in `/resume`. For parallel isolated work, dispatch a

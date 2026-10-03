@@ -21,9 +21,10 @@ inbox_monitor:
   timeout_s: 1200
   # URL-coverage gate: "shadow" (log the verdict, act on nothing) or "enforce"
   # (re-queue an item whose response never quotes one of its input URLs).
-  # Starts in shadow — the gate is new, and enforcing it without compliance
-  # data risks parking notepads silently. See PR #1820.
-  url_coverage_mode: "shadow"
+  # Enforce since 0 of the first 42 evaluations under the **Source:** prompt
+  # contract would have been re-queued. A parked item alerts the owner. Set
+  # "shadow" here or in the local overlay to observe without acting.
+  url_coverage_mode: "enforce"
   # max_retries: 3        # Max retry attempts before permanently excluding a failed item
   # recursive: false      # Set true to scan subdirectories recursively
   # timezone uses system setting from ~/.genesis/config/genesis.yaml

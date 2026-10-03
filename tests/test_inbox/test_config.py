@@ -44,10 +44,12 @@ inbox_monitor:
     assert cfg.enabled is True
     assert cfg.max_retries == 3
     assert cfg.recursive is False
-    # The gate must default to SHADOW through the config LAYER, not only through
-    # the dataclass — this is the path an install takes whose inbox_monitor.yaml
-    # predates the key, which is every existing install on first pull.
-    assert cfg.url_coverage_mode == "shadow"
+    # The gate defaults to ENFORCE through the config LAYER, not only through the
+    # dataclass — the path an install takes whose inbox_monitor.yaml predates the
+    # key. Deliberately changed from shadow once measured: 0 of 42 evaluations
+    # under the **Source:** contract would have been re-queued, and parking now
+    # alerts the owner, so a false flag is visible rather than a silent stall.
+    assert cfg.url_coverage_mode == "enforce"
 
 
 def test_invalid_url_coverage_mode_coerces_to_shadow_loudly(caplog):
@@ -112,3 +114,74 @@ something_else:
 def test_invalid_yaml_type_raises():
     with pytest.raises(ValueError, match="YAML mapping"):
         load_inbox_config_from_string("just a string")
+
+
+def test_defaults_have_one_source_of_truth():
+    """#1953: every parse default must equal the dataclass default, so the two
+    can never drift apart again (timeout_s once read 3600/600/900 in three
+    places). A minimal config parses to exactly the dataclass defaults."""
+    import dataclasses
+
+    from genesis.inbox.types import InboxConfig
+
+    cfg = load_inbox_config_from_string('inbox_monitor:\n  watch_path: "/tmp/x"\n')
+    for f in dataclasses.fields(InboxConfig):
+        if f.name == "watch_path":
+            continue
+        assert getattr(cfg, f.name) == f.default, f.name
+
+
+def test_coverage_gate_defaults_to_enforce():
+    cfg = load_inbox_config_from_string('inbox_monitor:\n  watch_path: "/tmp/x"\n')
+    assert cfg.url_coverage_mode == "enforce"
+
+
+def test_shadow_remains_selectable():
+    cfg = load_inbox_config_from_string(
+        'inbox_monitor:\n  watch_path: "/tmp/x"\n  url_coverage_mode: shadow\n'
+    )
+    assert cfg.url_coverage_mode == "shadow"
+
+
+@pytest.mark.parametrize("key", ["items_per_eval", "max_retries", "timeout_s",
+                                 "check_interval_seconds"])
+@pytest.mark.parametrize("bad", [0, -3])
+def test_non_positive_int_falls_back_to_default(key, bad, caplog):
+    """A hand-edited 0 or negative used to be coerced with a bare int() and
+    accepted: items_per_eval=0 would divide a drop into nothing."""
+    import dataclasses
+
+    from genesis.inbox.types import InboxConfig
+
+    default = {f.name: f.default for f in dataclasses.fields(InboxConfig)}[key]
+    cfg = load_inbox_config_from_string(
+        f'inbox_monitor:\n  watch_path: "/tmp/x"\n  {key}: {bad}\n'
+    )
+    assert getattr(cfg, key) == default
+    assert key in caplog.text
+
+
+@pytest.mark.parametrize("key", ["items_per_eval", "max_retries"])
+@pytest.mark.parametrize("bad", ["true", "2.7", ".inf", "-.inf", ".nan"])
+def test_non_integer_int_falls_back_to_default(key, bad, caplog):
+    """#2447 round 1 (Devin, CodeRabbit): int() turned YAML `true` into 1 and
+    truncated 2.7 to 2 without a word, and `.inf` raised OverflowError, which
+    crashed config loading instead of degrading to the default."""
+    import dataclasses
+
+    from genesis.inbox.types import InboxConfig
+
+    default = {f.name: f.default for f in dataclasses.fields(InboxConfig)}[key]
+    cfg = load_inbox_config_from_string(
+        f'inbox_monitor:\n  watch_path: "/tmp/x"\n  {key}: {bad}\n'
+    )
+    assert getattr(cfg, key) == default
+    assert key in caplog.text
+
+
+def test_integral_float_is_accepted_as_an_int():
+    """Negative control: 4.0 is an integer written as a float, not an error."""
+    cfg = load_inbox_config_from_string(
+        'inbox_monitor:\n  watch_path: "/tmp/x"\n  max_retries: 4.0\n'
+    )
+    assert cfg.max_retries == 4 and isinstance(cfg.max_retries, int)

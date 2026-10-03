@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from genesis.routing.config import load_config
+from genesis.routing.config import _resolve_provider_alias, load_config
 from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.types import RoutingConfig
 
@@ -41,7 +41,7 @@ _RETRY_BASE_S = 5.0
 # provider DIRECTLY (offline harnesses: reflection calibration, bench, skill-
 # replay, experiment guards), bypassing the runtime `judge` YAML chain, so it
 # must name a V4-pro provider explicitly. `nvidia-nim-deepseek` now serves
-# V4-flash (NIM EOL'd V4-pro), so use the paid OpenRouter V4-pro to keep the
+# V4.1-flash (NIM EOL'd V4-pro), so use the paid OpenRouter V4-pro to keep the
 # offline eval baseline comparable.
 DEFAULT_GEN_PROVIDER = "groq-free"
 DEFAULT_JUDGE_PROVIDER = "openrouter-deepseek-v4"
@@ -54,7 +54,7 @@ def _default_config_path() -> Path:
 def default_judge_chain(judge_provider: str | None = None) -> list[str]:
     """The offline judge fallback chain — mirrors the runtime ``judge`` call
     site EXACTLY by reading it from the shipped routing config, so it can never
-    drift (calibrated V4-pro first, then NIM V4-flash + paid V4-flash for
+    drift (calibrated V4-pro first, then NIM V4.1-flash + paid V4.1-flash for
     resilience). Deriving from config (rather than hardcoding
     ``[DEFAULT_JUDGE_PROVIDER, ...]``) also means the primary can never be
     duplicated in the chain — a duplicate would make StandaloneLiteLLMRouter
@@ -63,8 +63,21 @@ def default_judge_chain(judge_provider: str | None = None) -> list[str]:
     lever); it is de-duplicated so a lead that already appears can't repeat.
     """
     cfg = load_config(_default_config_path())
-    chain = list(cfg.call_sites["judge"].chain)
+    # `.get`, not `[...]`. A KeyError here would be an unhandled crash on an
+    # offline path, and the `judge` call site is now SKIPPABLE: `_parse` drops a
+    # call site whose entry is not a usable mapping rather than failing the whole
+    # router, so a half-edited config can leave this name absent. An empty chain
+    # is a usable answer for a fallback chain — the caller's own lead still gets
+    # tried — where a traceback is not.
+    site = cfg.call_sites.get("judge")
+    chain = list(site.chain) if site is not None else []
     if judge_provider:
+        # Normalized BEFORE it is spliced in, or a legacy override adds a dead
+        # first rung ahead of a working chain — the router would spend a real
+        # attempt (and possibly a timeout) on a name that resolves to nothing.
+        # De-duplication then only works if both sides are in the same
+        # vocabulary, which is why this runs before the comparison below.
+        judge_provider = _resolve_provider_alias(judge_provider, cfg.providers)
         chain = [judge_provider, *[p for p in chain if p != judge_provider]]
     return chain
 
@@ -116,6 +129,13 @@ class StandaloneLiteLLMRouter:
             config = load_config(_default_config_path())
 
         def _resolve(name: str) -> tuple[str, str]:
+            # A provider name reaching HERE came from outside the config — a
+            # saved experiment spec, a bench judge override, an MCP argument —
+            # so it can predate a rename. This boundary was recorded as NOT
+            # needing the alias on the grounds that it "looks up a name it just
+            # read FROM the config"; that was wrong, and two reviewers said so
+            # independently. It takes a CALLER's name.
+            name = _resolve_provider_alias(name, config.providers)
             cfg = config.providers.get(name)
             if cfg is None:
                 raise ValueError(

@@ -739,3 +739,126 @@ async def test_query_with_total_issues_exactly_one_statement():
     )
     assert "WITH matched AS MATERIALIZED" in conn.statements[0]
     assert "CROSS JOIN total" in conn.statements[0]
+
+
+
+_HASHED = dict(
+    source="tunnel_monitor",
+    type="infrastructure_alert",
+    category="tunnel_down",
+    content="tunnel stuck",
+    priority="critical",
+    created_at="2026-01-01T00:00:00",
+)
+
+
+async def _hashed(db, oid, content_hash, **extra):
+    await observations.create(
+        db, id=oid, **{**_HASHED, "content": f"alert {oid}", "content_hash": content_hash, **extra}
+    )
+
+
+async def _open(db, oid) -> bool:
+    return (await observations.get_by_id(db, oid))["resolved"] == 0
+
+
+async def test_resolve_by_source_and_type_only_the_named_hashes(db):
+    await _hashed(db, "h1", "hash-a")
+    await _hashed(db, "h2", "hash-b")
+    n = await observations.resolve_by_source_and_type(
+        db,
+        source="tunnel_monitor",
+        type="infrastructure_alert",
+        category="tunnel_down",
+        content_hashes={"hash-a"},
+        resolved_at="2026-01-02T00:00:00",
+        resolution_notes="tunnel answers",
+    )
+    assert n == 1
+    assert not await _open(db, "h1")
+    assert await _open(db, "h2")
+
+
+async def test_resolve_by_source_and_type_an_empty_hash_list_names_no_row(db):
+    """An empty collection names no row, so nothing resolves: it must never be
+    read as 'no hash filter', which would resolve every alert."""
+    await _hashed(db, "h3", "hash-a")
+    n = await observations.resolve_by_source_and_type(
+        db,
+        source="tunnel_monitor",
+        type="infrastructure_alert",
+        content_hashes=set(),
+        resolved_at="2026-01-02T00:00:00",
+        resolution_notes="x",
+    )
+    assert n == 0
+    assert await _open(db, "h3")
+
+
+async def test_resolve_by_source_and_type_excludes_and_filters_priority(db):
+    await _hashed(db, "h4", "hash-a")
+    await _hashed(db, "h5", "hash-b")
+    await _hashed(db, "h6", "hash-c", priority="high")
+    n = await observations.resolve_by_source_and_type(
+        db,
+        source="tunnel_monitor",
+        type="infrastructure_alert",
+        exclude_content_hashes=["hash-a"],
+        priority="critical",
+        resolved_at="2026-01-02T00:00:00",
+        resolution_notes="left the tailnet",
+    )
+    assert n == 1
+    assert await _open(db, "h4")  # excluded
+    assert not await _open(db, "h5")
+    assert await _open(db, "h6")  # other priority
+
+
+async def test_latest_by_hash_sees_resolved_rows_and_picks_the_newest(db):
+    assert await observations.latest_by_hash(db, source="tunnel_monitor", content_hash="hash-a") is None
+    await _hashed(db, "old", "hash-a", created_at="2026-01-01T00:00:00")
+    await _hashed(db, "new", "hash-a", created_at="2026-01-03T00:00:00")
+    await observations.resolve(db, "new", resolved_at="2026-01-04T00:00:00", resolution_notes="ok")
+    row = await observations.latest_by_hash(db, source="tunnel_monitor", content_hash="hash-a")
+    assert row["id"] == "new" and row["resolved"] == 1
+    assert await observations.latest_by_hash(db, source="other", content_hash="hash-a") is None
+
+
+async def test_reopen_clears_the_resolution_and_keeps_surfaced_at(db):
+    await _hashed(db, "r1", "hash-a")
+    await observations.mark_surfaced(db, ["r1"], "2026-01-01T01:00:00")
+    surfaced = (await observations.get_by_id(db, "r1"))["surfaced_at"]
+    assert surfaced
+    await observations.resolve(db, "r1", resolved_at="2026-01-02T00:00:00", resolution_notes="x")
+    assert await observations.reopen(db, "r1", expires_at="2026-01-05T00:00:00") is True
+    row = await observations.get_by_id(db, "r1")
+    assert row["resolved"] == 0
+    assert row["resolved_at"] is None and row["resolution_notes"] is None
+    assert row["expires_at"] == "2026-01-05T00:00:00"
+    assert row["surfaced_at"] == surfaced
+    assert await observations.reopen(db, "r1") is False  # already open
+    assert await observations.reopen(db, "missing") is False
+
+
+async def test_set_expires_at_moves_only_an_open_row(db):
+    await _hashed(db, "e1", "hash-a")
+    assert await observations.set_expires_at(db, "e1", "2026-01-09T00:00:00") is True
+    assert (await observations.get_by_id(db, "e1"))["expires_at"] == "2026-01-09T00:00:00"
+    await observations.resolve(db, "e1", resolved_at="2026-01-02T00:00:00", resolution_notes="x")
+    assert await observations.set_expires_at(db, "e1", "2026-02-01T00:00:00") is False
+    assert (await observations.get_by_id(db, "e1"))["expires_at"] == "2026-01-09T00:00:00"
+
+
+async def test_update_content_rewrites_only_an_open_row_and_keeps_surfacing(db):
+    await _hashed(db, "c1", "hash-a")
+    await observations.mark_surfaced(db, ["c1"], "2026-01-01T01:00:00")
+    assert await observations.update_content(db, "c1", "new text") is True
+    row = await observations.get_by_id(db, "c1")
+    assert (row["content"], row["content_hash"], row["surfaced_at"]) == (
+        "new text",
+        "hash-a",
+        "2026-01-01T01:00:00",
+    )
+    assert await observations.update_content(db, "c1", "new text") is False  # unchanged
+    await observations.resolve(db, "c1", resolved_at="2026-01-02T00:00:00", resolution_notes="x")
+    assert await observations.update_content(db, "c1", "later") is False

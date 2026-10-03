@@ -17,6 +17,7 @@ plus one functional test of the recovery DECISION logic.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -113,8 +114,20 @@ def test_noop_path_clears_stale_failure_signals_when_server_was_up(text: str) ->
 
 def _extract_recovery_block(text: str) -> str:
     seg = text[text.find("_OPERATOR_STOP=false") : text.find("# ── Restart services")]
-    # Run against python3 + a test DB (drop the venv-specific interpreter path).
-    return seg.replace('"$VENV_DIR/bin/python"', "python3")
+    # The block reads the latest status through `_latest_update_status`, which is
+    # defined once, elsewhere, and shared with the no-change path so the two
+    # readers cannot drift. Supply that REAL definition beside the slice, plus the
+    # interpreter selector it shares with the history writer. (The reader is
+    # driven for its own contract in test_update_success_records.py.)
+    helpers = re.search(
+        r"# BEGIN deploy-outcome-probes[^\n]*\n(.*?)# END deploy-outcome-probes",
+        text,
+        re.DOTALL,
+    )
+    assert helpers, "deploy-outcome-probes block not found in update.sh"
+    start = text.index("_metadata_python() {")
+    selector = text[start : text.index("\n}\n", start) + 3]
+    return selector + helpers.group(1) + seg
 
 
 def _run_recovery(tmp_path: Path, text: str, *, artifact: bool, last_status: str | None) -> bool:
@@ -138,6 +151,8 @@ def _run_recovery(tmp_path: Path, text: str, *, artifact: bool, last_status: str
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 WERE_RUNNING=()
+GENESIS_ROOT="{home / "genesis"}"
+VENV_DIR="{tmp_path / "missing-venv"}"
 {_extract_recovery_block(text)}
 printf '%s\\n' "${{WERE_RUNNING[@]:-}}"
 """

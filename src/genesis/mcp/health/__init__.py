@@ -124,6 +124,7 @@ _impl_session_charter = _session_charter_tools._impl_session_charter
 _impl_session_charter_update = _session_charter_tools._impl_session_charter_update
 _impl_session_ledger_add = _session_charter_tools._impl_session_ledger_add
 _impl_session_ledger_update = _session_charter_tools._impl_session_ledger_update
+_impl_session_address = _session_charter_tools._impl_session_address
 _impl_settings_list = _settings._impl_settings_list
 _impl_settings_get = _settings._impl_settings_get
 _impl_settings_update = _settings._impl_settings_update
@@ -186,6 +187,7 @@ __all__ = [
     "_impl_session_charter_update",
     "_impl_session_ledger_add",
     "_impl_session_ledger_update",
+    "_impl_session_address",
     "_impl_settings_list",
     "_impl_settings_get",
     "_impl_settings_update",

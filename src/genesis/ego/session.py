@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.proposal_gate import gate_failure_is_blocking
+from genesis.cc.transient_retry import run_with_overload_retry
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -305,6 +306,9 @@ class EgoSession:
             context_builder=self._context_builder,
             context_weights=focus.context_weights if focus else None,
             focus_id=focus.focus_id if focus else None,
+            # Same tag store_cycle() writes as ego_source, so the
+            # "previous assessment" read is this ego's own last cycle.
+            ego_source=self._source_tag,
         )
 
         # Focus-specific prompt
@@ -351,6 +355,7 @@ class EgoSession:
             working_dir=background_session_dir(),
             mcp_config=self._mcp_config_path,
             disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS),
+            caller_tag=self._cc_caller_tag("cycle"),
         )
 
         # Autonomous dispatch check
@@ -395,7 +400,9 @@ class EgoSession:
                 return None
 
             try:
-                output = await self._invoker.run(invocation)
+                # Below route(): an overload re-runs this same approved
+                # dispatch; the approval gate is never consulted again.
+                output = await run_with_overload_retry(self._invoker, invocation)
             except Exception:
                 logger.error("Ego CC invocation failed (unified)", exc_info=True)
                 try:
@@ -478,8 +485,10 @@ class EgoSession:
         # Fetch recent focuses from ego_cycle_outcomes for context
         recent_focuses: list[dict[str, str]] = []
         try:
+            # Scoped to this ego: both egos share ego_cycle_outcomes, and an
+            # unscoped read tells this ego to avoid the OTHER ego's picks.
             rows = await ego_crud.list_cycle_outcomes(
-                self._db, limit=5,
+                self._db, limit=5, ego_source=self._source_tag,
             )
             recent_focuses = [
                 {
@@ -1389,6 +1398,15 @@ class EgoSession:
 
     # -- Helpers -----------------------------------------------------------
 
+    def _cc_caller_tag(self, stage: str) -> str:
+        """``cc.invocation_failed`` caller tag naming THIS ego and the stage.
+
+        Both egos share this class, so a fixed tag would make their failures
+        unattributable and coalesce one behind the other. Derived from the
+        per-instance source tag: ``user_ego_cycle`` -> ``user_ego.<stage>``.
+        """
+        return f"{self._source_tag.removesuffix('_cycle')}.{stage}"
+
     async def _run_gate_cc(self, prompt: str, *, label: str):
         """Run a lightweight in-cycle gate CC call (reconcile/realist), returning
         the CC output or None on error. Mirrors the realist's fail-open envelope
@@ -1404,8 +1422,9 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=self._cc_caller_tag(f"gate.{label.lower()}"),
             )
-            output = await self._invoker.run(invocation)
+            output = await run_with_overload_retry(self._invoker, invocation)
             if output.is_error:
                 logger.warning("%s CC call failed: %s", label, output.error_message)
                 return None
@@ -1991,8 +2010,9 @@ class EgoSession:
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
+                caller_tag=self._cc_caller_tag("realist"),
             )
-            output = await self._invoker.run(invocation)
+            output = await run_with_overload_retry(self._invoker, invocation)
             # Track realist cost for cycle accounting
             self._last_realist_cost_usd = output.cost_usd
             if output.is_error:
@@ -2446,6 +2466,27 @@ class EgoSession:
                 # Infer from proposal action_type if available
                 brief_action = brief.get("action_type", "")
                 profile = _infer_profile(brief_action)
+                # SAY SO. The substitute has a DIFFERENT tool scope, not a smaller
+                # one: measured against the removed `steward`, `research` gains
+                # `Write` and `interact` gains `Write` plus browser tools, while
+                # both correctly lose Bash. So the work runs with capabilities the
+                # brief did not ask for, and the session's outcome is recorded as
+                # this proposal's outcome — a proposal can be marked executed by a
+                # session that could not do what it described.
+                #
+                # Logged rather than refused because refusing is a design decision
+                # about what the ego's dispatchable set IS, not a repair; that is
+                # tracked separately. The unknown-MODEL fallback nine lines below
+                # already warns on exactly this shape, so this is the missing half
+                # of an existing convention, not a new one.
+                if brief_profile:
+                    logger.warning(
+                        "Execution brief %s requested profile %r, which is not "
+                        "registered — running as %r instead, whose tool scope "
+                        "differs. The outcome will be recorded against this "
+                        "proposal regardless.",
+                        proposal_id, brief_profile, profile,
+                    )
             # Resolve straight from the enum so any valid tier (incl. fable) is
             # honored; an unknown value logs and falls back to sonnet rather than
             # silently downgrading a real tier.

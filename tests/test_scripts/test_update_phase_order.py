@@ -29,10 +29,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 
 # Command-line markers (unique real statements, not comment prose).
-FETCH = 'git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main'
+# The fetch is an explicit refspec continued onto the next line; the merge takes
+# the head pinned from that fetch (see test_update_activation.py).
+FETCH = 'git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" \\'
 STOP = "--- Stopping services for update ---"
 TRAP = "\ntrap _on_err ERR"
-MERGE = 'git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit'
+MERGE = 'git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit'
 RESTART = "--- Restarting services ---"
 REFRESH = "--- Refreshing Network Identity in ~/.claude/CLAUDE.md ---"
 DONE = '\n_write_state "done"'
@@ -92,8 +94,11 @@ def test_pre_stop_fetch_is_post_merge_gated(text):
     """The hoisted fetch must be inside an ``if [[ "$POST_MERGE" == "false" ]]``
     so the --post-merge CC-conflict re-entry (code already merged) skips it."""
     f = _idx(text, FETCH)
-    preamble = text[max(0, f - 300) : f]
-    assert '[[ "$POST_MERGE" == "false" ]]' in preamble, "pre-stop fetch must be POST_MERGE-gated"
+    # The nearest gate opener before the fetch, with no column-0 `fi` closing it
+    # in between: the fetch sits INSIDE that block, however long the comments.
+    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]; then', 0, f)
+    assert gate != -1, "pre-stop fetch must be POST_MERGE-gated"
+    assert "\nfi\n" not in text[gate:f], "the POST_MERGE gate closes before the fetch"
 
 
 def test_fetch_failure_cleans_up_and_exits_without_rollback(text):

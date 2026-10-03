@@ -88,6 +88,7 @@ HOOKS_TO_SYNC=(
     "pre-commit"
     "prepare-commit-msg"
     "pre-push"
+    "pre-merge-commit"
 )
 # Colocated helpers (called by the hooks via $(dirname $0)/helper.py).
 #
