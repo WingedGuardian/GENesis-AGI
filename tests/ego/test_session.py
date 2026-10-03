@@ -1640,3 +1640,96 @@ async def test_parse_failure_still_ages_intentions(ego_session, monkeypatch):
     output = _cc_output(text="this is definitely not json")
     await ego_session._process_cycle_output(output, CCModel.SONNET, None)
     spy.assert_awaited_once_with({})
+
+
+# ---------------------------------------------------------------------------
+# Overloaded (529) retry at the three ego CC call sites
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_overload_sleep(monkeypatch):
+    from genesis.cc import transient_retry
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(transient_retry, "_sleep", _fake_sleep)
+    return slept
+
+
+class TestOverloadRetry:
+    """A 529 is re-run at the SAME already-approved dispatch: the cycle's
+    approval gate (``route()``) is consulted once, never re-asked."""
+
+    async def test_cycle_retries_overload_without_re_routing(
+        self, ego_session, mock_invoker, mock_session_manager, no_overload_sleep,
+    ):
+        from types import SimpleNamespace
+
+        from genesis.cc.exceptions import CCOverloadedError
+
+        route = AsyncMock(return_value=SimpleNamespace(mode="cli", reason=""))
+        ego_session.set_autonomous_dispatcher(SimpleNamespace(route=route))
+        outcomes = [CCOverloadedError("529 Overloaded")]
+
+        async def _run(_invocation):
+            # First call overloads; every later call (the retry, and any gate
+            # the cycle output triggers) succeeds.
+            if outcomes:
+                raise outcomes.pop(0)
+            return _cc_output()
+
+        mock_invoker.run.side_effect = _run
+
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
+
+        assert cycle is not None
+        assert route.await_count == 1, "approval gate must be consulted exactly once"
+        first, second = mock_invoker.run.call_args_list[:2]
+        assert first.args[0] is second.args[0], "the same invocation is re-run"
+        assert no_overload_sleep == [30]
+        mock_session_manager.create_background.assert_awaited_once()
+        mock_session_manager.fail.assert_not_called()
+
+    async def test_cycle_does_not_retry_rate_limit(
+        self, ego_session, mock_invoker, mock_session_manager, no_overload_sleep,
+    ):
+        from genesis.cc.exceptions import CCRateLimitError
+
+        mock_invoker.run.side_effect = CCRateLimitError("429")
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
+
+        assert cycle is None
+        assert mock_invoker.run.call_count == 1
+        assert no_overload_sleep == []
+        mock_session_manager.fail.assert_called_once()
+
+    async def test_gate_call_retries_overload(
+        self, ego_session, mock_invoker, no_overload_sleep,
+    ):
+        from genesis.cc.exceptions import CCOverloadedError
+
+        out = _cc_output(text="{}")
+        mock_invoker.run.side_effect = [CCOverloadedError("529"), out]
+        assert await ego_session._run_gate_cc("prompt", label="Reconcile") is out
+        assert mock_invoker.run.call_count == 2
+        assert no_overload_sleep == [30]
+
+    async def test_realist_retries_overload(
+        self, ego_session, mock_invoker, no_overload_sleep,
+    ):
+        from genesis.cc.exceptions import CCOverloadedError
+
+        proposals = [{"action_type": "investigate", "content": "x"}]
+        mock_invoker.run.side_effect = [
+            CCOverloadedError("529"),
+            _cc_output(text="not json"),
+        ]
+        out = await ego_session._filter_proposals(proposals)
+        # Unparseable verdicts pass through; what matters is the retry ran.
+        assert out == proposals
+        assert mock_invoker.run.call_count == 2
+        assert no_overload_sleep == [30]

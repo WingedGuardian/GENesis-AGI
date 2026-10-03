@@ -343,9 +343,15 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 33b49a105 2026-09-26
+verified: b0867170e 2026-10-02
 ```
 
+- **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
+  durable parking.** Stream truncation and overloads with known-work or MCP
+  evidence share this boundary; provider diagnosis remains available as a
+  cause. Missing/unusable overload turn counts remain retryable by explicit
+  policy, not proof of pre-work failure. See `cc/exceptions.py`,
+  `cc/transient_retry.py` and `docs/reference/inbox-replay-safety.md`.
 - **NO dispatch profile grants Bash** (`cc/direct_session.py`,
   `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
   to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
@@ -1044,7 +1050,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 640c4f2e3 2026-09-18
+verified: b0867170e 2026-10-02
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1100,6 +1106,12 @@ verified: 640c4f2e3 2026-09-18
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Replay-unsafe batches persist a hold independent of the retry cap; readable
+  held blocks are excluded from future deltas without becoming completed
+  baseline content, while unreadable holds block their source file. The
+  operator-only per-item release requires explicit replay acknowledgement and
+  an unchanged source, then returns through normal approval/claim handling.
+  Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -2769,7 +2781,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: f24c15e9 2026-09-05
+verified: b0867170e 2026-10-02
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -2814,6 +2826,11 @@ verified: f24c15e9 2026-09-05
   helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`, because
   the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks` where a
   sibling import is the only one that resolves.
+  The guarded async factory also accepts `existing_only=True` for recovery
+  writers: encoded `mode=rw` refuses a missing database without dropping either
+  pre/post-open quarantine check. Inbox hold release uses this opt-in; ordinary
+  callers retain create-capable behavior. It is not a replacement/maintenance
+  fence and does not pin a database inode across inspection and release.
   Two AST-locked boundaries rather than conventional ones:
   `test_db/test_connection_admission_lock.py` pins the open-time connect set
   (a NEW factory fails until classified — it exists because a hand enumeration

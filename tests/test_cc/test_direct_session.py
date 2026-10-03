@@ -39,6 +39,36 @@ class TestDirectSessionRequest:
             DirectSessionRequest(prompt="test", profile="admin")
 
 
+@pytest.mark.asyncio
+async def test_replay_unsafe_session_fails_without_durable_park(db, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from genesis.cc import rate_limit_park
+    from genesis.cc.exceptions import CCOverloadedError, CCReplayUnsafeError
+    from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    park = AsyncMock()
+    monkeypatch.setattr(rate_limit_park, "park_direct_session", park)
+    invoker = AsyncMock()
+    unsafe = CCReplayUnsafeError("after tools", cause=CCOverloadedError("529", num_turns=5))
+    invoker.run_streaming.side_effect = unsafe
+    sm = SessionManager(db=db, invoker=invoker, day_boundary_hour=0)
+    runner = DirectSessionRunner(
+        invoker=invoker, session_manager=sm, config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    session = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK, model=CCModel.SONNET, effort=EffortLevel.MEDIUM,
+    )
+    with pytest.raises(CCReplayUnsafeError):
+        await runner._run_session(DirectSessionRequest(prompt="t"), session["id"])
+    park.assert_not_awaited()
+    assert invoker.run_streaming.await_count == 1
+    assert (await cc_sessions.get_by_id(db, session["id"]))["status"] == "failed"
+
+
 class TestSpawnRecordsSkillSignal:
     """spawn() must record the resolved skills into session metadata so the
     skill-evolution effectiveness analyzer has usage signal. Regression guard
