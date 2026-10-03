@@ -343,7 +343,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: b0867170e 2026-10-02
+verified: 691a10d44 2026-10-03
 ```
 
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
@@ -3167,7 +3167,12 @@ verified: b0867170e 2026-10-02
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
   laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
-  installs (see docs/reference/memory-resilience.md). Network-resilience
+  installs (see docs/reference/memory-resilience.md). Default-disabled
+  `CODE_INTEL_WORKLOAD_SLICE=1` routes only indexing batch scopes into the dormant
+  `genesis-workload.slice`; both launch paths verify actual scope membership before
+  execution and retain refusal outcomes. This does not replace broad OOM monitors
+  or certify core/recovery exclusion (see docs/reference/index-workload-routing.md).
+  Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
   `network_watchdog_installed` (any-link/file-present facts for the annotation
   layer) alongside the posture check's *effective* variants
