@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 # v0.11.0 Linux x86_64 portable release, independently matched to release digest.
-BUILD = "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510"
+BUILD = "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510"  # pragma: allowlist secret (public executable digest, not a secret)
 MAX_RESPONSE = 1024 * 1024
 
 
