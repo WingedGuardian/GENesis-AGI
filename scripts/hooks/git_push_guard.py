@@ -6229,6 +6229,7 @@ def _bind_pr_files_cache_head(head: str) -> None:
     if head != _PR_FILES_CACHE_HEAD:
         _PR_FILES_CACHE.clear()
         _PR_RENAME_CACHE.clear()
+        _PR_STATUS_CACHE.clear()
         _PR_FILES_CACHE_HEAD = head
 
 
@@ -6237,6 +6238,7 @@ def _reset_pr_files_cache() -> None:
     global _PR_FILES_CACHE_HEAD
     _PR_FILES_CACHE.clear()
     _PR_RENAME_CACHE.clear()
+    _PR_STATUS_CACHE.clear()
     _PR_FILES_CACHE_HEAD = None
 
 
@@ -6254,7 +6256,10 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
                     "--paginate",
                     "--jq",
-                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                    # `status` feeds only the advisory `main-reverts` row (which
+                    # needs to know a file was ADDED); no gate reads it.
+                    ".[] | {filename: .filename, previous_filename: .previous_filename, "
+                    "status: .status}",
                 ],
                 capture_output=True,
                 text=True,
@@ -6288,6 +6293,7 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
     # fetching twice removes it. Published through `_pr_rename_map`, which reads
     # this cache and never calls out.
     renames: dict[str, str] = {}
+    statuses: dict[str, str] = {}
     rows = 0
     for line in (raw or "").splitlines():
         line = line.strip()
@@ -6315,6 +6321,11 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
                 return None
             files.append(prev)
             renames[prev] = fname
+        # Optional and advisory: a missing or odd status is simply not recorded,
+        # never a reason to fail the read every gate shares.
+        status = obj.get("status")
+        if isinstance(status, str) and status:
+            statuses[fname] = status
     if rows >= 3000:
         # The cap applies to API ROWS, not the expanded path list (renames
         # contribute two paths per row — Codex P2, round 1): at the documented
@@ -6325,6 +6336,7 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
     # a later reader to mistake for a complete one. Keyed exactly as the file memo
     # is, and cleared by the same `_reset_pr_files_cache`.
     _PR_RENAME_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = renames
+    _PR_STATUS_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = statuses
     return files
 
 
@@ -6334,6 +6346,21 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
 #: paths) rather than None, because there is no verdict here to fail closed on.
 #: Keyed and cleared exactly as ``_PR_FILES_CACHE`` is.
 _PR_RENAME_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+#: filename -> GitHub file status ("added", "modified", "removed", "renamed", …)
+#: for the PR's changed files, written by the same parse as ``_PR_RENAME_CACHE``
+#: and keyed and cleared exactly as it is. Read only by the advisory
+#: ``main-reverts`` row; an absent entry means "status unknown", never "modified".
+_PR_STATUS_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+
+def _pr_file_statuses(pr_num: str, repo: str | None = None) -> dict[str, str]:
+    """filename -> status for this PR's changed files, ``{}`` when unknown.
+
+    Reads the memo ``_pr_changed_files`` fills and never calls out; call it after
+    that read. Keyed exactly as the file memo is.
+    """
+    return _PR_STATUS_CACHE.get((pr_num, repo, os.environ.get("_TEST_GH_PR_FILES")), {})
 
 
 def _pr_rename_map(pr_num: str, repo: str | None = None) -> dict[str, str]:
@@ -9575,6 +9602,345 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
         return False, f"NOTE: {verdict.message} Pin DIRECTION not verified."
 
     return verdict.blocked, verdict.message
+
+
+# --- main-reverts: a merge-from-main that kept the branch's stale copies (#2809) ---
+
+#: The four states `_check_main_reverts` reports (guard failure semantics, rule 1).
+#: Kept distinct so no caller can render "could not check" as "clean".
+MAIN_REVERTS_FINDINGS = "findings"
+MAIN_REVERTS_CLEAN = "clean"
+MAIN_REVERTS_UNCHECKED = "could-not-check"
+MAIN_REVERTS_NA = "n/a"
+
+#: GitHub's documented ceilings. ``pulls/N/commits`` returns at most 250 commits;
+#: ``commits/<sha>`` lists at most 3000 files. A read that reaches either cannot
+#: prove the unseen remainder did not touch a file, so it is COULD-NOT-CHECK.
+_PR_COMMITS_CAP = 250
+_COMMIT_FILES_CAP = 3000
+
+#: How many files the report names before stating how many it left out.
+_MAIN_REVERTS_LIST_MAX = 10
+
+#: How many uncovered ADDED files get a main-history lookup (one call each). The
+#: rest stay findings: unknown is never resolved toward clean.
+_MAIN_REVERTS_HISTORY_LOOKUPS = 20
+
+
+def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[str, int]] | None, str]:
+    """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``.
+
+    A saturated read (``>= _PR_COMMITS_CAP`` rows) is returned as None with the cap
+    named: GitHub stops at 250 here, so the commits beyond it are unknown. An EMPTY
+    read is also None — every PR has a commit, so empty is a degraded response.
+
+    Tests inject via ``_TEST_GH_PR_COMMITS`` (one JSON object per line:
+    ``{"sha": ..., "parents": <int>}``; the literal ``__error__`` simulates an API
+    error).
+    """
+    raw = os.environ.get("_TEST_GH_PR_COMMITS")
+    if raw == "__error__":
+        return None, "the PR's commit list could not be read (gh error)"
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {sha: .sha, parents: (.parents | length)}",
+                ],
+                capture_output=True,
+                text=True,
+                # Report-only (never on the merge path): one paginated read.
+                timeout=_gh_timeout(15),
+            )
+        except Exception:
+            return None, "the PR's commit list could not be read (gh did not answer)"
+        if result.returncode != 0:
+            return None, "the PR's commit list could not be read (gh error)"
+        raw = result.stdout
+    commits: list[tuple[str, int]] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None, "the PR's commit list was malformed"
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        parents = obj.get("parents") if isinstance(obj, dict) else None
+        if not isinstance(sha, str) or not sha or not isinstance(parents, int):
+            return None, "the PR's commit list was malformed"
+        commits.append((sha, parents))
+    if not commits:
+        return None, "the PR's commit list came back empty"
+    if len(commits) >= _PR_COMMITS_CAP:
+        return None, (
+            f"the PR has at least {_PR_COMMITS_CAP} commits, GitHub's cap on "
+            f"pulls/N/commits, so the commits beyond it are unknown"
+        )
+    return commits, ""
+
+
+def _commit_touched_files(sha: str, repo: str | None = None) -> tuple[set[str] | None, str]:
+    """Every path one commit touched (rename sources included), or ``(None, reason)``.
+
+    For a non-merge commit GitHub's list is its diff against its only parent.
+    Saturated at ``_COMMIT_FILES_CAP`` → None, naming the cap.
+
+    Tests inject via ``_TEST_GH_COMMIT_FILES``: a JSON object mapping sha → list of
+    ``{filename, previous_filename}`` or the literal ``"__error__"``. A sha the map
+    does not name is an error, so a test can never pass on an unseeded read.
+    """
+    raw = os.environ.get("_TEST_GH_COMMIT_FILES")
+    short = sha[:12]
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(sha)
+        except Exception:
+            got = None
+        if not isinstance(got, list):
+            return None, f"commit {short}'s file list could not be read (gh error)"
+        rows = got
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits/{sha}",
+                    "--paginate",
+                    "--jq",
+                    ".files[]? | {filename: .filename, previous_filename: .previous_filename}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(15),
+            )
+        except Exception:
+            return None, f"commit {short}'s file list could not be read (gh did not answer)"
+        if result.returncode != 0:
+            return None, f"commit {short}'s file list could not be read (gh error)"
+        rows = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                return None, f"commit {short}'s file list was malformed"
+    if len(rows) >= _COMMIT_FILES_CAP:
+        return None, (
+            f"commit {short} touches at least {_COMMIT_FILES_CAP} files, GitHub's cap "
+            f"on a commit's file list"
+        )
+    paths: set[str] = set()
+    for obj in rows:
+        name = obj.get("filename") if isinstance(obj, dict) else None
+        if not isinstance(name, str) or not name:
+            return None, f"commit {short}'s file list was malformed"
+        paths.add(name)
+        prev = obj.get("previous_filename")
+        if isinstance(prev, str) and prev:
+            paths.add(prev)
+    return paths, ""
+
+
+def _path_in_base_history(path: str, base_sha: str, repo: str | None = None) -> bool | None:
+    """Has any commit reachable from the base tip ever touched ``path``? None = unknown.
+
+    ``commits?path=<p>&sha=<base>&per_page=1`` — one commit is enough to answer.
+    Tests inject via ``_TEST_GH_PATH_ON_BASE`` (a JSON object path → bool; a path it
+    does not name is unknown).
+    """
+    raw = os.environ.get("_TEST_GH_PATH_ON_BASE")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(path)
+        except Exception:
+            return None
+        return got if isinstance(got, bool) else None
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repo or ':owner/:repo'}/commits",
+                "-f",
+                f"path={path}",
+                "-f",
+                f"sha={base_sha}",
+                "-f",
+                "per_page=1",
+                "--jq",
+                "length",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip()) > 0
+    except ValueError:
+        return None
+
+
+def _safe_path(path: str) -> str:
+    """A PR-author-controlled path, with terminal-acting characters neutralised."""
+    return "".join("?" if _gate_text_unsafe(ch) else ch for ch in path)
+
+
+def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]:
+    """Does the PR's diff carry files that only a MERGE put there? (issue #2809)
+
+    THE DEFECT: a branch's "merge main in" commit resolves by keeping the branch's
+    stale copy of files main has since changed. The PR diff then reverts main's
+    later edits to those files, and a squash merge would land the revert. MEASURED
+    on a real PR: its head was a merge whose second parent was main, its diff listed
+    126 files, and its own commits touched 4; 122 files arrived only through the
+    merge.
+
+    THE RULE: on a correctly merged branch, every file in the PR's diff was touched
+    by one of the PR's own NON-merge commits — a merge that takes main's side for a
+    file the branch never touched leaves that file out of the diff entirely. A diff
+    file no non-merge commit touched reached the diff only through a merge
+    resolution. MEASURED 2026-10-03 across all 46 open PRs: the bare rule fired on
+    4; one was the stale merge above, and the other three were each a changelog
+    fragment written inside a merge commit. Hence one refinement: an uncovered file
+    the PR ADDS that main's history never contained cannot be a revert of main, so
+    it is named in a note rather than counted. An added file main DID once hold is
+    a revert of main deleting it, and stays a finding.
+
+    Returns ``(state, message)``; state is one of the four ``MAIN_REVERTS_*``
+    constants. Line 0 of the message carries counts and fixed text only — it is
+    printed unsanitized — and every path goes on lines 1+, which the report
+    sanitizes.
+
+    GUARD AXIOMS, stated because every gate change owes them:
+      * VERDICT: **advisory** (owner decision on #2809: the ADVISORY form only).
+        Nothing blocks on it, no sigil exists, and the merge arm does not call it.
+        The report prints it as a row that never counts toward ``failures``.
+      * AUDIENCE: the agent driving the merge. The detail names the files (bounded,
+        with the total stated) and the remedy, because "merge main again" is the
+        intuitive fix and does not work.
+      * BACKGROUND: none — background sessions cannot merge, and the row runs only
+        in the ``--check-pr`` report, never on a hook path.
+
+    STATES (guard failure semantics, rule 1 — never collapsed):
+      * OUT-OF-SCOPE (``n/a``): the commit list is complete and has no merge commit,
+        so the diff is exactly the union of the commits and the defect cannot occur.
+        Decided from the commit list alone; nothing else is read.
+      * COULD-NOT-CHECK: any read failed, or reached a GitHub cap (250 commits on
+        ``pulls/N/commits``, 3000 files on ``pulls/N/files`` or on one commit).
+        Never rendered as clean.
+      * CHECKED-CLEAN and FINDINGS: as named.
+
+    KNOWN LIMITS: a partial revert INSIDE a file the PR's own commits also touched
+    is invisible to this rule (the file is covered). A deliberate edit made inside a
+    merge (a semantic-conflict fix to a file the branch never touched) is reported,
+    and the message says that case exists.
+    """
+    commits, why = _pr_commit_list(pr_num, repo)
+    if commits is None:
+        return MAIN_REVERTS_UNCHECKED, why
+    merges = [sha for sha, parents in commits if parents > 1]
+    if not merges:
+        return MAIN_REVERTS_NA, "no merge commits in the PR, so nothing can arrive through one"
+    diff_files = _pr_changed_files(pr_num, repo)
+    if diff_files is None:
+        return MAIN_REVERTS_UNCHECKED, (
+            "the PR's changed-file list could not be read (gh error, or GitHub's "
+            "3000-file cap on pulls/N/files)"
+        )
+    own = [sha for sha, parents in commits if parents <= 1]
+    touched: set[str] = set()
+    if own:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # One read per commit; run them side by side so a long branch stays quick.
+        with ThreadPoolExecutor(max_workers=min(6, len(own))) as pool:
+            results = list(pool.map(lambda sha: _commit_touched_files(sha, repo), own))
+        for paths, reason in results:
+            if paths is None:
+                return MAIN_REVERTS_UNCHECKED, reason
+            touched |= paths
+    uncovered = sorted(set(diff_files) - touched)
+
+    # Refinement: an uncovered file the PR ADDS that main never held is not a
+    # revert. Only an "added" status qualifies, and unknown history keeps it a
+    # finding.
+    statuses = _pr_file_statuses(pr_num, repo)
+    added = [p for p in uncovered if statuses.get(p) == "added"]
+    new_in_merge: list[str] = []
+    if added:
+        base_sha = _pr_base_sha(pr_num, repo=repo)
+        if base_sha:
+            for path in added[:_MAIN_REVERTS_HISTORY_LOOKUPS]:
+                if _path_in_base_history(path, base_sha, repo) is False:
+                    new_in_merge.append(path)
+    not_reverts = set(new_in_merge)
+    reverted = [p for p in uncovered if p not in not_reverts]
+
+    def _listing(paths: list[str]) -> list[str]:
+        shown = [f"  - {_safe_path(p)}" for p in paths[:_MAIN_REVERTS_LIST_MAX]]
+        if len(paths) > _MAIN_REVERTS_LIST_MAX:
+            shown.append(
+                f"  … and {len(paths) - _MAIN_REVERTS_LIST_MAX} more "
+                f"({len(paths)} in total; the first {_MAIN_REVERTS_LIST_MAX} are shown)"
+            )
+        return shown
+
+    note: list[str] = []
+    if new_in_merge:
+        note = [
+            f"{len(new_in_merge)} file(s) were added only inside a merge commit and "
+            f"never existed on the base branch — not a revert, but invisible to a "
+            f"commit-by-commit review:",
+            *_listing(new_in_merge),
+        ]
+    if not reverted:
+        if new_in_merge:
+            head = (
+                f"no revert of the base branch: every file in the diff except the "
+                f"{len(new_in_merge)} added-in-merge file(s) below was touched by one "
+                f"of the PR's {len(own)} own commit(s)"
+            )
+        else:
+            head = (
+                f"every file in the diff was touched by one of the PR's "
+                f"{len(own)} own commit(s)"
+            )
+        return MAIN_REVERTS_CLEAN, "\n".join([head, *note])
+
+    base = _pr_base_ref(pr_num, repo=repo) or "<base-branch>"
+    lines = [
+        f"{len(reverted)} file(s) in the PR diff were touched by none of the PR's "
+        f"{len(own)} own commit(s) — they arrive only through a merge, which usually "
+        f"means the merge kept the branch's stale copy and the PR reverts the base "
+        f"branch's later edits to them",
+        f"Files (sorted; {len(reverted)} in total):",
+        *_listing(reverted),
+        "Remedy: restore the base branch's version of every listed file the PR did "
+        f"not mean to change (`git checkout origin/{base} -- <path>`), commit that, "
+        "then merge the base branch again.",
+        f"Merging {base} again alone does not fix it: git treats the stale copies as "
+        "the branch's intended content, so they survive every later merge.",
+        "If a listed file was edited inside a merge on purpose (a semantic-conflict "
+        "fix), move that edit into an ordinary commit so the PR's own history shows it.",
+        *note,
+        "Advisory only: this row never blocks a merge.",
+    ]
+    return MAIN_REVERTS_FINDINGS, "\n".join(lines)
 
 
 def _check_base_is_default(
@@ -13215,6 +13581,25 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
+    # Merge-from-main reverts (#2809) — ADVISORY, like `e2e-plan` and `rounds`: it
+    # NEVER touches `failures`, and the merge arm does not run it, so the report and
+    # enforcement cannot disagree about it. Four states, rendered distinctly so a
+    # check that could not run never reads as `ok`. An advisory row must never take
+    # the report down, hence the catch-all.
+    try:
+        mr_state, mr_msg = _check_main_reverts(pr_num, repo=repo)
+    except Exception as exc:  # noqa: BLE001 - an advisory row never takes the report down.
+        mr_state, mr_msg = MAIN_REVERTS_UNCHECKED, f"the check raised {type(exc).__name__}"
+    mr_head = mr_msg.splitlines()[0] if mr_msg else ""
+    if mr_state == MAIN_REVERTS_FINDINGS:
+        print(f"main-reverts   : advisory — {mr_head}")
+    elif mr_state == MAIN_REVERTS_CLEAN:
+        print(f"main-reverts   : ok ({mr_head})")
+    elif mr_state == MAIN_REVERTS_NA:
+        print(f"main-reverts   : n/a ({mr_head})")
+    else:
+        print(f"main-reverts   : could not check — {mr_head}")
+    _print_gate_detail(mr_msg)
     # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
     # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
