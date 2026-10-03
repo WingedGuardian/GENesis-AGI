@@ -811,7 +811,7 @@ PYEOF
                 T="$(readlink "$SHADOW" 2>/dev/null || true)"
                 case "$T" in
                     *@anthropic-ai/claude-code*)
-                        PKG="$(cd "$(dirname "$SHADOW")" 2>/dev/null && cd "$(dirname "$T")" 2>/dev/null && pwd || true)"
+                        PKG="$(unset CDPATH; cd "$(dirname "$SHADOW")" 2>/dev/null && cd "$(dirname "$T")" 2>/dev/null && pwd || true)"
                         PKG="${PKG%%/@anthropic-ai/claude-code*}/@anthropic-ai/claude-code"
                         rm -f "$SHADOW"
                         case "$PKG" in

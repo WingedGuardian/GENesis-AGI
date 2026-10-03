@@ -1,0 +1,1529 @@
+"""Routing and recovery contracts for the native shared Serena boundary."""
+
+import fcntl
+import importlib.util
+import json
+import os
+import selectors
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts/serena_shared.py"
+spec = importlib.util.spec_from_file_location("serena_shared", SCRIPT)
+shared = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(shared)
+native_read_unit_state = shared.read_unit_state
+
+
+@pytest.fixture(autouse=True)
+def private_user_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setattr(
+        shared, "read_unit_state", lambda unit: {"LoadState": "loaded", "ActiveState": "inactive"}
+    )
+
+
+def checkout(path, linked=False):
+    path.mkdir()
+    if linked:
+        (path / ".git").write_text("gitdir: ../main/.git/worktrees/branch\n")
+    else:
+        subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+    return path.resolve()
+
+
+def test_nearest_worktree_wins_over_parent_project(tmp_path):
+    main = checkout(tmp_path / "main")
+    branch = checkout(main / "branch", linked=True)
+    child = branch / "src"
+    child.mkdir()
+    assert shared.project_root(child) == branch
+
+
+def test_canonical_symlink_resolves_to_same_checkout(tmp_path):
+    main = checkout(tmp_path / "main")
+    alias = tmp_path / "alias"
+    alias.symlink_to(main, target_is_directory=True)
+    assert shared.project_root(alias) == main
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize("which", ["main", "linked", "none"])
+def test_launch_routes_only_exact_main(tmp_path, monkeypatch, context, which):
+    main = checkout(tmp_path / "main")
+    linked = checkout(main / "linked", linked=True)
+    monkeypatch.setattr(shared, "read_settings", lambda _: {"main": str(main), "enabled": True})
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(shared, "active_project", lambda unit: main)
+    captured = []
+    monkeypatch.setattr(shared.os, "execv", lambda executable, argv: captured.append(argv))
+    project = {"main": main, "linked": linked, "none": None}[which]
+    shared.launch(context, project)
+    argv = captured[0]
+    if which == "main":
+        assert argv[0] == "/bin/terse"
+        assert argv[-1] == f"http://127.0.0.1:{shared.PORTS[context]}/mcp"
+    else:
+        assert argv[:4] == ["/bin/serena", "start-mcp-server", "--context", context]
+        assert argv[4:] == (["--project", str(linked)] if project else ["--project-from-cwd"])
+
+
+def test_failed_shared_service_does_not_spawn_stdio_duplicate(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    monkeypatch.setattr(shared, "read_settings", lambda _: {"main": str(main), "enabled": True})
+    monkeypatch.setattr(shared.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=3))
+    with pytest.raises(ValueError, match="unavailable"):
+        shared.launch("claude-code", main)
+    with (shared.unit_directory() / ".genesis-serena.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["null", '{"enabled": 1, "main": "/repo"}', '{"enabled": true, "main": "relative"}', "{"],
+)
+def test_malformed_settings_refuse(tmp_path, content):
+    path = tmp_path / "settings.json"
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        shared.read_settings(path)
+
+
+def test_missing_settings_keep_native_mode(tmp_path):
+    assert shared.read_settings(tmp_path / "absent") is None
+
+
+def test_failed_settings_publication_preserves_previous_and_cleans_temp(tmp_path, monkeypatch):
+    settings = tmp_path / "settings.json"
+    settings.write_text("previous")
+
+    def fail_replace(*args):
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="publication failed"):
+        shared.write_settings(settings, tmp_path, True)
+    assert settings.read_text() == "previous"
+    assert list(tmp_path.iterdir()) == [settings]
+
+
+def test_disable_works_without_provider_or_proxy(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    settings = tmp_path / "config/settings.json"
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.configure(main, False)
+    assert json.loads(settings.read_text()) == {"enabled": False, "main": str(main)}
+    assert calls == [("disable", "--now", shared.unit_name(x)) for x in shared.PROFILES]
+
+
+def test_unit_preserves_literal_path_and_resource_ownership(tmp_path):
+    project = tmp_path / 'work % $name "quoted"'
+    text = shared.render_unit(project, "codex", tmp_path / "provider", "/bin/serena", "/bin")
+    assert 'work %% $name \\"quoted\\"' in text
+    assert "ExecStart=:" in text
+    assert f"WorkingDirectory={str(project).replace('%', '%%')}\n" in text
+    assert "MemoryMax=4G" in text and "MemorySwapMax=0" in text
+    assert "KillMode=control-group" in text and "StartLimitBurst=3" in text
+
+
+def test_provider_upgrade_requires_revalidation(tmp_path, monkeypatch):
+    monkeypatch.setattr(shared.subprocess, "check_output", lambda *a, **k: "Serena 2.0.0\n")
+    with pytest.raises(ValueError, match="revalidate"):
+        shared.serve(tmp_path, "codex", "/bin/serena")
+
+
+def test_custom_resources_remain_in_original_store(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "custom.yml").write_text("customized: true\n")
+    destination = tmp_path / "snapshot/modes"
+    shared.link_resource(destination, source)
+    shared.link_resource(destination, source)
+    assert (destination / "custom.yml").read_text() == "customized: true\n"
+    (destination / "new.yml").write_text("live: true\n")
+    assert (source / "new.yml").read_text() == "live: true\n"
+
+
+def test_existing_resource_data_is_never_discarded(tmp_path):
+    destination = tmp_path / "global"
+    destination.mkdir()
+    (destination / "important.md").write_text("preserve")
+    with pytest.raises(ValueError, match="preserve/reconcile"):
+        shared.link_resource(destination, tmp_path / "original")
+    assert (destination / "important.md").read_text() == "preserve"
+
+
+def test_readiness_accepts_only_provider_owned_loopback_listener():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        assert shared.owns_listener(os.getpid(), port)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert not shared.owns_listener(child.pid, port)
+        finally:
+            child.terminate()
+            child.wait()
+
+
+def test_foreign_active_listener_refuses_before_config_mutation(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    settings = tmp_path / "settings.json"
+    settings.write_text("original")
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        monkeypatch.setattr(shared, "PORTS", {"claude-code": listener.getsockname()[1]})
+        with pytest.raises(ValueError, match="foreign listener"):
+            shared.configure(main, True)
+    assert settings.read_text() == "original"
+
+
+def test_service_startup_refuses_unsafe_exposed_capabilities(monkeypatch):
+    monkeypatch.setenv("MAINPID", "123")
+    monkeypatch.setattr(shared, "owns_listener", lambda *args: True)
+
+    def unsafe(*args):
+        raise subprocess.CalledProcessError(1, "native capability check")
+
+    monkeypatch.setattr(shared, "check_capabilities", unsafe)
+    with pytest.raises(subprocess.CalledProcessError):
+        shared.ready(9165, "/bin/serena")
+
+
+@pytest.mark.parametrize("path", ["line\nbreak", "line\rbreak", "nul\x00byte"])
+def test_unit_line_injection_refuses(path):
+    with pytest.raises(ValueError):
+        shared.quote_unit(path)
+
+
+@pytest.mark.parametrize("home_kind", ["absolute", "empty", "unset", "tilde", "relative"])
+@pytest.mark.parametrize("enabled", [True, False, "invalid", None])
+def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, enabled, home_kind):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "serena").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "uv").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+    (bindir / "systemctl").write_text(
+        "#!/bin/sh\nprintf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\n"
+    )
+    for executable in bindir.iterdir():
+        executable.chmod(0o755)
+    home = tmp_path / (".genesis" if home_kind in ("empty", "unset") else "state")
+    settings = home / "config/serena-shared.json"
+    settings.parent.mkdir(parents=True)
+    if enabled is not None:
+        settings.write_text(json.dumps({"enabled": enabled}))
+    calls = tmp_path / "calls"
+    env = dict(os.environ, HOME=str(tmp_path), PATH=f"{bindir}:{os.defpath}", CALLS=str(calls))
+    env.pop("GENESIS_HOME", None)
+    if home_kind != "unset":
+        env["GENESIS_HOME"] = {
+            "absolute": str(home),
+            "empty": "",
+            "tilde": "~/state",
+            "relative": "state",
+        }[home_kind]
+    helper = SCRIPT.parent / "lib/serena_install.sh"
+    subprocess.run(
+        ["bash", "-c", 'source "$1"; _install_serena', "bash", str(helper)],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+    )
+    assert calls.exists() == (home_kind != "relative" and enabled in (False, None))
+    if calls.exists():
+        assert calls.read_text() == "tool upgrade serena-agent\n"
+
+
+@pytest.mark.parametrize(
+    "project_path", ["canonical", "symlink", "other", "moved", "deleted", "current"]
+)
+@pytest.mark.parametrize("custom,fail_publication", [(False, False), (True, False), (False, True)])
+def test_legacy_project_registration_migrates_without_touching_custom_entry(
+    tmp_path, custom, fail_publication, project_path
+):
+    root = checkout(tmp_path / "project")
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    stored_project = {"canonical": root, "symlink": alias, "other": tmp_path / "other"}[
+        project_path if project_path in ("canonical", "symlink", "other") else "canonical"
+    ]
+    entry = {
+        "command": "serena",
+        "args": ["start-mcp-server", "--context", "claude-code", "--project", str(stored_project)],
+    }
+    if project_path in ("moved", "deleted", "current"):
+        old = (
+            root / ".claude/mcp/run-serena"
+            if project_path == "current"
+            else tmp_path / "old/.claude/mcp/run-serena"
+        )
+        if project_path == "moved":
+            old.parent.mkdir(parents=True)
+            old.write_text("operator checkout launcher")
+        entry = {"command": str(old), "args": ["--context", "claude-code"]}
+    if custom:
+        entry["env"] = {"CUSTOM": "preserve"}
+    other = {"command": "/operator/other", "args": ["preserve"]}
+    config = root / ".mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"serena": entry, "other": other}}))
+    config.chmod(0o640)
+    original = config.read_bytes()
+    user_config = {"mcpServers": {"serena": {"command": "/operator/serena"}}}
+    (tmp_path / ".claude.json").write_text(json.dumps(user_config))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    cli = bindir / "claude"
+    cli.write_text(
+        '#!/bin/sh\nif [ "$2" = list ]; then echo "serena: existing"; else echo mutation >> "$CALLS"; fi\n'
+    )
+    cli.chmod(0o755)
+    python = bindir / "python3"
+    python.write_text("""#!/usr/bin/python3
+import os, sys
+sys.argv = sys.argv[1:]
+if os.environ['FAIL_PUBLICATION'] == '1':
+    def fail(*args): raise OSError('publication failed')
+    os.replace = fail
+exec(compile(sys.stdin.read(), '<registration helper>', 'exec'))
+""")
+    python.chmod(0o755)
+    helper = SCRIPT.parent / "lib/mcp_register.sh"
+    env = dict(
+        os.environ,
+        HOME=str(tmp_path),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+        FAIL_PUBLICATION=str(int(fail_publication)),
+    )
+    subprocess.run(
+        ["bash", "-e", "-c", 'source "$1"; _register_serena "$2"', "bash", str(helper), str(root)],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+    )
+    assert not calls.exists()
+    actual = json.loads(config.read_text())["mcpServers"]
+    assert json.loads((tmp_path / ".claude.json").read_text()) == user_config
+    assert actual["other"] == other
+    assert actual["serena"] == (
+        entry
+        if custom or fail_publication or project_path == "other"
+        else {"command": str(root / ".claude/mcp/run-serena"), "args": ["--context", "claude-code"]}
+    )
+    if custom or fail_publication or project_path in ("other", "current"):
+        assert config.read_bytes() == original
+    assert config.stat().st_mode & 0o777 == 0o640
+    assert list(root.glob(".mcp.json.*")) == []
+
+
+def test_reconfigure_removes_deleted_native_settings_snapshot(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    source = tmp_path / "original"
+    source.mkdir()
+    native = source / "serena_config.yml"
+    native.write_text("custom_setting: true\n")
+    settings = tmp_path / "state/config/serena-shared.json"
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SERENA_HOME", str(source))
+    monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared, "validate_version", lambda *args: None)
+    monkeypatch.setattr(shared, "snapshot_context", lambda *args: None)
+    monkeypatch.setattr(shared, "systemctl", lambda *args: None)
+    shared.configure(main, True)
+    snapshots = [
+        settings.parent.parent / "serena-shared" / profile / "serena_config.yml"
+        for profile in shared.PROFILES
+    ]
+    assert all(p.read_text() == native.read_text() for p in snapshots)
+    native.unlink()
+    shared.configure(main, True)
+    assert all(not p.exists() for p in snapshots)
+
+
+@pytest.mark.parametrize("filename", ["bootstrap.sh", "install.sh"])
+def test_both_install_paths_use_shared_upgrade_and_migration_helpers(filename):
+    source = (SCRIPT.parent / filename).read_text()
+    assert '. "$SCRIPT_DIR/lib/serena_install.sh"' in source
+    assert "_install_serena" in source
+    assert "_register_serena" in source
+    assert "uv tool upgrade serena-agent" not in source
+
+
+@pytest.fixture
+def configured_paths(tmp_path, monkeypatch):
+    settings = tmp_path / "state/config/serena-shared.json"
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SERENA_HOME", str(tmp_path / "provider"))
+    monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    monkeypatch.setattr(shared, "validate_version", lambda *args: None)
+    monkeypatch.setattr(shared, "snapshot_context", lambda *args: None)
+    monkeypatch.setattr(shared, "systemctl", lambda *args: None)
+    return settings
+
+
+@pytest.mark.parametrize("failure", ["snapshot", "startup", "publication"])
+def test_failed_checkout_transition_never_routes_old_clients_to_new_tree(
+    tmp_path, monkeypatch, configured_paths, failure
+):
+    old = checkout(tmp_path / "old")
+    new = checkout(tmp_path / "new")
+    shared.write_settings(configured_paths, old, True)
+    original_write = shared.write_settings
+    unit_calls = []
+
+    def write_settings(path, project, enabled):
+        if failure == "publication" and enabled:
+            raise OSError("publication failed")
+        original_write(path, project, enabled)
+
+    def systemctl(*args):
+        unit_calls.append(args)
+        if failure == "startup" and args[0] == "enable":
+            raise subprocess.CalledProcessError(1, "enable services")
+
+    if failure == "snapshot":
+
+        def fail_snapshot(*args):
+            raise OSError("snapshot failed")
+
+        monkeypatch.setattr(shared, "install_units", fail_snapshot)
+    monkeypatch.setattr(shared, "write_settings", write_settings)
+    monkeypatch.setattr(shared, "systemctl", systemctl)
+    with pytest.raises((OSError, subprocess.CalledProcessError)):
+        shared.configure(new, True)
+    assert shared.read_settings(configured_paths) == {"main": str(new), "enabled": False}
+    assert unit_calls[-2:] == [("disable", "--now", shared.unit_name(x)) for x in shared.PROFILES]
+    captured = []
+    monkeypatch.setattr(shared.os, "execv", lambda executable, argv: captured.append(argv))
+    shared.launch("claude-code", old)
+    assert captured[0][0] == "/bin/serena"
+    assert captured[0][-2:] == ["--project", str(old)]
+
+
+@pytest.mark.parametrize("suffix", [" ", "\t", "\\"])
+def test_unsupported_checkout_path_ending_rejected_before_mutation(
+    tmp_path, configured_paths, suffix
+):
+    main = checkout(tmp_path / ("main" + suffix))
+    with pytest.raises(ValueError, match="end in whitespace"):
+        shared.configure(main, True)
+    assert not configured_paths.exists()
+
+
+def test_separate_git_directory_is_a_supported_main_checkout(tmp_path, configured_paths):
+    main = checkout(tmp_path / "main")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "init",
+            "--quiet",
+            "--separate-git-dir",
+            str(tmp_path / "metadata"),
+        ],
+        check=True,
+    )
+    assert (main / ".git").is_file()
+    shared.configure(main, True)
+    assert shared.read_settings(configured_paths)["enabled"] is True
+
+
+def test_actual_linked_worktree_cannot_be_shared_main(tmp_path, configured_paths):
+    main = checkout(tmp_path / "main")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", "--quiet", "--detach", str(linked)], check=True
+    )
+    with pytest.raises(ValueError, match="linked worktree"):
+        shared.configure(linked, True)
+    assert not configured_paths.exists()
+
+
+def test_disable_sharing_does_not_require_readable_git_metadata(tmp_path, configured_paths):
+    main = tmp_path / "missing-checkout"
+    shared.configure(main, False)
+    assert shared.read_settings(configured_paths)["enabled"] is False
+
+
+@pytest.mark.parametrize("override", [None, "", "~/state", "absolute"])
+def test_settings_home_matches_canonical_env_semantics(tmp_path, monkeypatch, override):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GENESIS_HOME", raising=False)
+    if override is not None:
+        monkeypatch.setenv(
+            "GENESIS_HOME", str(tmp_path / "state") if override == "absolute" else override
+        )
+    expected = tmp_path / ("state" if override else ".genesis") / "config/serena-shared.json"
+    assert shared.settings_path() == expected
+
+
+@pytest.mark.parametrize("home", ["state", "../state"])
+@pytest.mark.parametrize("command", ["claude-code", "codex", "enable", "disable"])
+def test_relative_runtime_home_refuses_before_provider_or_marker_mutation(tmp_path, home, command):
+    main = checkout(tmp_path / "main")
+    caller = tmp_path / "elsewhere/caller"
+    caller.mkdir(parents=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("serena", "terse", "systemctl"):
+        executable = bindir / name
+        executable.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$CALLS"\n')
+        executable.chmod(0o755)
+    calls = tmp_path / "calls"
+    for cwd in (caller, main):
+        marker = (cwd / home).resolve() / "config/serena-shared.json"
+        marker.parent.mkdir(parents=True)
+        original = json.dumps({"enabled": True, "main": str(main)})
+        marker.write_text(original)
+        args = (
+            ["launch", "--context", command]
+            if command in shared.PROFILES
+            else ["configure", "--main", str(main)] + (["--enable"] if command == "enable" else [])
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            cwd=cwd,
+            env=dict(
+                os.environ,
+                HOME=str(tmp_path),
+                GENESIS_HOME=home,
+                PATH=f"{bindir}:{os.defpath}",
+                CALLS=str(calls),
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1 and "absolute GENESIS_HOME" in result.stderr
+        assert not result.stdout and not calls.exists()
+        assert marker.read_text() == original
+
+
+@pytest.mark.parametrize("existing_config", [False, True])
+def test_missing_project_entry_registered_despite_user_scope_server(tmp_path, existing_config):
+    root = checkout(tmp_path / "project")
+    config = root / ".mcp.json"
+    unrelated = {"mcpServers": {"other": {"command": "/operator/other"}}}
+    if existing_config:
+        config.write_text(json.dumps(unrelated))
+    user = {"mcpServers": {"serena": {"command": "/operator/serena"}}}
+    user_file = tmp_path / ".claude.json"
+    user_file.write_text(json.dumps(user))
+    helper = SCRIPT.parent / "lib/mcp_register.sh"
+    subprocess.run(
+        ["bash", "-e", "-c", 'source "$1"; _register_serena "$2"', "bash", str(helper), str(root)],
+        env=dict(os.environ, HOME=str(tmp_path), PATH=os.defpath),
+        check=True,
+    )
+    result = json.loads(config.read_text())
+    assert result["mcpServers"].pop("serena") == {
+        "command": str(root / ".claude/mcp/run-serena"),
+        "args": ["--context", "claude-code"],
+    }
+    assert result == (unrelated if existing_config else {"mcpServers": {}})
+    assert json.loads(user_file.read_text()) == user
+
+
+def uninstall_commands(path):
+    source = (SCRIPT.parent / "uninstall.sh").read_text()
+    if path == "direct":
+        helper = source[
+            source.index("safe_disable_service() {") : source.index("# Run a command inside")
+        ]
+        start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
+        commands = source[start : source.index("        # Persistent= timers", start)]
+    else:
+        helper = source[
+            source.index("remove_serena_enablement() {") : source.index("# Run a command inside")
+        ]
+        helper += 'container_exec() { [ "$DRY_RUN" = true ] || bash -c "$1"; }\n'
+        start = source.index(
+            '            container_exec "', source.index("# Stop all services (timers first")
+        )
+        commands = source[start : source.index('            ok "Stopped Genesis services"', start)]
+    return helper, commands
+
+
+def uninstall_enablement_entries(tmp_path, entry):
+    links = []
+    roots = (shared.unit_directory(), tmp_path / "runtime/systemd/user")
+    for root in roots:
+        (root / "default.target.wants").mkdir(parents=True)
+        for index, context in enumerate(shared.PROFILES):
+            link = root / "default.target.wants" / shared.unit_name(context)
+            if entry == "regular":
+                link.write_text("preserved")
+            else:
+                target = (
+                    roots[index] / shared.unit_name(context)
+                    if entry == "managed"
+                    else tmp_path / "foreign.service"
+                )
+                link.symlink_to(target)
+            links.append(link)
+    return links
+
+
+@pytest.mark.parametrize("path", ["direct", "host"])
+@pytest.mark.parametrize("serena_present", [False, True])
+@pytest.mark.parametrize("entry", ["managed", "foreign", "regular"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_uninstall_stops_and_disables_both_shared_services(
+    tmp_path, path, serena_present, entry, dry_run
+):
+    helper, commands = uninstall_commands(path)
+    links = uninstall_enablement_entries(tmp_path, entry)
+    calls = tmp_path / "calls"
+    executable = tmp_path / "systemctl"
+    disabled = tmp_path / "disabled"
+    executable.write_text("""#!/usr/bin/env python3
+import os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with Path(os.environ['CALLS']).open('a') as f:f.write(' '.join(args)+'\\n')
+missing=any('genesis-serena-' in arg for arg in args) and os.environ['SERENA_PRESENT']=='False'
+if missing:sys.exit(1)
+if args[1]=='disable':
+ with Path(os.environ['DISABLED']).open('a') as f:f.write(' '.join(args[2:])+'\\n')
+""")
+    executable.chmod(0o755)
+    subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-c",
+            f"DRY_RUN={str(dry_run).lower()}; ok() {{ :; }}; skip() {{ :; }};\n"
+            + helper
+            + commands,
+        ],
+        env=dict(
+            os.environ,
+            CALLS=str(calls),
+            DISABLED=str(disabled),
+            SERENA_PRESENT=str(serena_present),
+            PATH=f"{tmp_path}:{os.defpath}",
+        ),
+        check=True,
+    )
+    for link in links:
+        if not dry_run and entry == "managed":
+            assert not link.is_symlink()
+        else:
+            assert link.is_symlink() if entry != "regular" else link.read_text() == "preserved"
+    if dry_run:
+        assert not disabled.exists()
+        return
+    assert "genesis-server.service" in disabled.read_text().split()
+    recorded = [line.split() for line in calls.read_text().splitlines()]
+    for context in shared.PROFILES if serena_present else ():
+        unit = shared.unit_name(context)
+        for operation in ("stop", "disable"):
+            assert any(args[:2] == ["--user", operation] and unit in args[2:] for args in recorded)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+@pytest.mark.parametrize("first_enable", [False, True])
+@pytest.mark.parametrize("second_enable", [False, True])
+@pytest.mark.parametrize("first_fails", [False, True])
+def test_configuration_process_lock_covers_all_transitions_and_releases_on_error(
+    tmp_path, first_enable, second_enable, first_fails, locked
+):
+    code = """import importlib.util, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('shared', sys.argv[1])
+shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
+native_lock=shared.fcntl.flock
+def lock(fd, operation):
+    print('locking', flush=True)
+    if sys.argv[5] == 'True': native_lock(fd, operation)
+shared.fcntl.flock=lock
+def action(project, enabled):
+    print(str(project), flush=True)
+    sys.stdin.buffer.read(1)
+    if sys.argv[4] == 'True': raise OSError('owned failure')
+shared.configure_locked=action
+shared.configure(Path(sys.argv[2]), sys.argv[3] == 'True')
+"""
+    clients = []
+    with selectors.DefaultSelector() as ready:
+        try:
+            for number, enable, fails in [
+                (1, first_enable, first_fails),
+                (2, second_enable, False),
+            ]:
+                client = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        code,
+                        str(SCRIPT),
+                        str(number),
+                        str(enable),
+                        str(fails),
+                        str(locked),
+                    ],
+                    env=dict(os.environ, GENESIS_HOME=str(tmp_path / str(number))),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                clients.append(client)
+                ready.register(client.stdout, selectors.EVENT_READ)
+                assert ready.select(5)
+                assert client.stdout.readline().strip() == b"locking"
+                if number == 1:
+                    assert ready.select(5)
+                    assert client.stdout.readline().strip() == b"1"
+                    ready.unregister(client.stdout)
+                elif locked:
+                    assert client.wait(timeout=5) == 1
+                    assert b"configuration busy" in client.stderr.read()
+                else:
+                    assert ready.select(5), "no-op control did not enter the overlapping transition"
+                    assert client.stdout.readline().strip() == b"2"
+            clients[0].stdin.write(b"x")
+            clients[0].stdin.flush()
+            assert clients[0].wait(timeout=5) == int(first_fails)
+            if not locked:
+                clients[1].stdin.write(b"x")
+                clients[1].stdin.flush()
+                assert clients[1].wait(timeout=5) == 0
+        finally:
+            for client in clients:
+                if client.poll() is None:
+                    client.kill()
+                client.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+def test_stale_configuration_root_refuses_service_for_another_checkout(
+    tmp_path, monkeypatch, context
+):
+    first = checkout(tmp_path / "first")
+    second = checkout(tmp_path / "second")
+    state = tmp_path / "state-first"
+    shared.write_settings(state / "config/serena-shared.json", first, True)
+    shared.write_settings(tmp_path / "state-second/config/serena-shared.json", second, True)
+    monkeypatch.setenv("GENESIS_HOME", str(state))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=second)
+    monkeypatch.setattr(
+        shared.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
+    )
+    monkeypatch.setattr(shared.subprocess, "check_output", lambda *args, **kwargs: str(child.pid))
+    try:
+        with pytest.raises(ValueError, match="different checkout"):
+            shared.launch(context, first)
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def test_unsupported_provider_refuses_before_configuration_changes(tmp_path, monkeypatch):
+    main = checkout(tmp_path / "main")
+    settings = tmp_path / "config/serena-shared.json"
+    shared.write_settings(settings, main, True)
+    original = settings.read_bytes()
+    monkeypatch.setattr(shared, "PORTS", dict.fromkeys(shared.PROFILES, 0))
+    monkeypatch.setattr(shared, "settings_path", lambda: settings)
+    monkeypatch.setattr(shared, "binary", lambda name: "/bin/" + name)
+    native_output = shared.subprocess.check_output
+
+    def output(command, **kwargs):
+        return (
+            "Serena 2.0.0\n"
+            if command == ["/bin/serena", "--version"]
+            else native_output(command, **kwargs)
+        )
+
+    monkeypatch.setattr(shared.subprocess, "check_output", output)
+    with pytest.raises(ValueError, match="revalidate"):
+        shared.configure(main, True)
+    assert settings.read_bytes() == original
+    assert not list(shared.unit_directory().glob("*.service"))
+
+
+def test_installer_skips_active_configuration_without_waiting_or_mutating_provider(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    scripts = {
+        "serena": "#!/bin/sh\nexit 0\n",
+        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "flock": '#!/bin/sh\necho locking\nexec /usr/bin/flock "$@"\n',
+    }
+    for name, content in scripts.items():
+        executable = bindir / name
+        executable.write_text(content)
+        executable.chmod(0o755)
+    env = dict(
+        os.environ,
+        GENESIS_HOME=str(tmp_path / "state"),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+    )
+    code = """import importlib.util, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('shared',sys.argv[1])
+shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
+def action(project,enabled):
+    print('entered',flush=True);sys.stdin.buffer.read(1)
+    shared.write_settings(shared.settings_path(),project,True)
+shared.configure_locked=action
+shared.configure(Path('/main'),True)
+"""
+    clients = []
+    with selectors.DefaultSelector() as ready:
+        try:
+            first = subprocess.Popen(
+                [sys.executable, "-c", code, str(SCRIPT)],
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            clients.append(first)
+            ready.register(first.stdout, selectors.EVENT_READ)
+            assert ready.select(5) and first.stdout.readline().strip() == b"entered"
+            ready.unregister(first.stdout)
+            second = subprocess.Popen(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; _install_serena',
+                    "bash",
+                    str(SCRIPT.parent / "lib/serena_install.sh"),
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            clients.append(second)
+            ready.register(second.stdout, selectors.EVENT_READ)
+            assert ready.select(5) and second.stdout.readline().strip() == b"locking"
+            stdout, stderr = second.communicate(timeout=5)
+            assert second.returncode == 0 and b"clients or configuration active" in stdout, stderr
+            assert not calls.exists()
+            first.stdin.write(b"x")
+            first.stdin.flush()
+            assert first.wait(timeout=5) == 0
+            assert not calls.exists()
+        finally:
+            for client in clients:
+                if client.poll() is None:
+                    client.kill()
+                client.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize(
+    "state,upgrade",
+    [
+        ("LoadState=not-found\nActiveState=inactive\nUnitFileState=\n", True),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n", True),
+        ("LoadState=loaded\nActiveState=failed\nUnitFileState=disabled\n", True),
+        ("LoadState=masked\nActiveState=inactive\nUnitFileState=masked\n", True),
+        ("LoadState=loaded\nActiveState=active\nUnitFileState=disabled\n", False),
+        ("LoadState=loaded\nActiveState=activating\nUnitFileState=disabled\n", False),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\n", False),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled-runtime\n", False),
+        ("LoadState=masked\nActiveState=inactive\nUnitFileState=masked-runtime\n", False),
+        ("LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", False),
+        ("unreadable", False),
+        ("malformed", False),
+    ],
+)
+def test_global_provider_upgrade_requires_both_services_stopped_and_disabled(
+    tmp_path, context, state, upgrade
+):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    scripts = {
+        "serena": "#!/bin/sh\nexit 0\n",
+        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "systemctl": (
+            '#!/bin/sh\nif [ "$3" = "$SELECTED" ]; then\n'
+            '  [ "$STATE" != unreadable ] || exit 1\n  printf "%s" "$STATE"\n'
+            "else\n  printf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\nfi\n"
+        ),
+    }
+    for name, content in scripts.items():
+        executable = bindir / name
+        executable.write_text(content)
+        executable.chmod(0o755)
+    env = dict(
+        os.environ,
+        GENESIS_HOME=str(tmp_path / "other-config-root"),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+        SELECTED=shared.unit_name(context),
+        STATE=state,
+    )
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; _install_serena',
+            "bash",
+            str(SCRIPT.parent / "lib/serena_install.sh"),
+        ],
+        env=env,
+        check=True,
+    )
+    assert calls.exists() is upgrade
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+def test_configure_then_installer_in_another_root_preserves_global_provider(
+    tmp_path, configured_paths, context
+):
+    shared.configure(checkout(tmp_path / "main"), True)
+    assert shared.read_settings(configured_paths)["enabled"] is True
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls"
+    scripts = {
+        "serena": "#!/bin/sh\nexit 0\n",
+        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "systemctl": (
+            '#!/bin/sh\nif [ "$3" = "$SELECTED" ]; then\n'
+            "printf 'LoadState=loaded\\nActiveState=active\\nUnitFileState=enabled\\n'\n"
+            "else\nprintf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\nfi\n"
+        ),
+    }
+    for name, content in scripts.items():
+        executable = bindir / name
+        executable.write_text(content)
+        executable.chmod(0o755)
+    subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; _install_serena',
+            "bash",
+            str(SCRIPT.parent / "lib/serena_install.sh"),
+        ],
+        env=dict(
+            os.environ,
+            GENESIS_HOME=str(tmp_path / "root-b"),
+            PATH=f"{bindir}:{os.defpath}",
+            CALLS=str(calls),
+            SELECTED=shared.unit_name(context),
+        ),
+        check=True,
+    )
+    assert not calls.exists()
+    assert shared.read_settings(configured_paths)["enabled"] is True
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize("use_shared", [False, True])
+def test_launcher_binds_checkout_through_proxy_exec_and_releases_native_mode(
+    tmp_path, context, use_shared
+):
+    code = """import importlib.util, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('shared',sys.argv[1])
+shared=importlib.util.module_from_spec(spec);spec.loader.exec_module(shared)
+def command(context,project):
+    print('validated',flush=True);sys.stdin.buffer.read(1)
+    return [sys.executable,'-c',"import sys;print('proxy',flush=True);sys.stdin.buffer.read(1)"],sys.argv[3]=='True'
+shared.launch_command=command
+shared.launch(sys.argv[2],Path('/main'))
+"""
+    client = subprocess.Popen(
+        [sys.executable, "-c", code, str(SCRIPT), context, str(use_shared)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    lock_path = shared.unit_directory() / ".genesis-serena.lock"
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(client.stdout, selectors.EVENT_READ)
+            assert ready.select(5) and client.stdout.readline().strip() == b"validated"
+            with lock_path.open("a") as lock:
+                # Even before exec, a replacement cannot pass the checked identity.
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                client.stdin.write(b"x")
+                client.stdin.flush()
+                assert ready.select(5) and client.stdout.readline().strip() == b"proxy"
+                if use_shared:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                client.stdin.write(b"x")
+                client.stdin.flush()
+                assert client.wait(timeout=5) == 0
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if client.poll() is None:
+            client.kill()
+        client.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("use_shared", [False, True])
+def test_failed_exec_releases_configuration_lock(tmp_path, monkeypatch, use_shared):
+    monkeypatch.setattr(shared, "launch_command", lambda *args: (["/missing"], use_shared))
+
+    def fail_exec(*args):
+        raise OSError("execution failed")
+
+    monkeypatch.setattr(shared.os, "execv", fail_exec)
+    with pytest.raises(OSError, match="execution failed"):
+        shared.launch("codex", tmp_path)
+    with (shared.unit_directory() / ".genesis-serena.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("resource", ["modes", "prompt_templates", "memories/global"])
+def test_absent_source_resource_is_created_before_native_directory_access(tmp_path, resource):
+    source = tmp_path / "source" / resource
+    destination = tmp_path / "snapshot" / resource
+    shared.link_resource(destination, source)
+    assert destination.is_symlink() and source.is_dir()
+    source.rmdir()
+    shared.link_resource(destination, source)
+    assert source.is_dir(), "existing dangling link must also be repaired"
+    # This is the pinned provider's global-memory initialization operation.
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "first.md").write_text("shared resource")
+    assert (source / "first.md").read_text() == "shared resource"
+
+
+@pytest.mark.parametrize("value", [None, "", " \t ", "custom", " \tcustom \n"])
+def test_resource_snapshot_matches_native_provider_home_normalization(
+    tmp_path, monkeypatch, configured_paths, value
+):
+    source = tmp_path / ("custom" if value and value.strip() else ".serena")
+    source.mkdir()
+    (source / "serena_config.yml").write_text("native: true\n")
+    if value is None:
+        monkeypatch.delenv("SERENA_HOME", raising=False)
+    else:
+        monkeypatch.setenv("SERENA_HOME", value.replace("custom", str(source)))
+    shared.configure(checkout(tmp_path / "main"), True)
+    for context in shared.PROFILES:
+        home = configured_paths.parent.parent / "serena-shared" / context
+        assert (home / "serena_config.yml").read_text() == "native: true\n"
+        for resource in ("modes", "prompt_templates", "memories/global"):
+            assert (home / resource).resolve() == source / resource
+            assert (home / resource).is_dir()
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize(
+    "load,active",
+    [
+        ("not-found", "inactive"),
+        ("not-found", "active"),
+        ("not-found", "failed"),
+        ("loaded", "inactive"),
+        ("loaded", "active"),
+    ],
+)
+def test_cleanup_handles_missing_inactive_and_removed_active_unit_files(
+    monkeypatch, context, load, active
+):
+    unit = shared.unit_name(context)
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda name: (
+            {"LoadState": load, "ActiveState": active}
+            if name == unit
+            else {"LoadState": "not-found", "ActiveState": "inactive"}
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.cleanup_units()
+    expected = (
+        []
+        if (load, active) == ("not-found", "inactive")
+        else [("stop", unit)]
+        if load == "not-found"
+        else [("disable", "--now", unit)]
+    )
+    assert calls == expected
+
+
+@pytest.mark.parametrize("failure", ["query", "stop", "disable"])
+def test_cleanup_attempts_second_profile_after_first_profile_failure(monkeypatch, failure):
+    first = shared.unit_name("claude-code")
+    second = shared.unit_name("codex")
+    error = OSError("owned cleanup failure")
+
+    def state(unit):
+        if unit == first and failure == "query":
+            raise error
+        return {
+            "LoadState": "not-found" if unit == first and failure == "stop" else "loaded",
+            "ActiveState": "active",
+        }
+
+    calls = []
+
+    def control(*args):
+        calls.append(args)
+        if args[-1] == first:
+            raise error
+
+    monkeypatch.setattr(shared, "read_unit_state", state)
+    monkeypatch.setattr(shared, "systemctl", control)
+    with pytest.raises(OSError) as caught:
+        shared.cleanup_units()
+    assert caught.value is error
+    assert ("disable", "--now", second) in calls
+
+
+@pytest.mark.parametrize("shared_error", [False, True])
+def test_configuration_failure_remains_primary_when_cleanup_also_fails(
+    tmp_path, monkeypatch, configured_paths, shared_error
+):
+    original = OSError("original snapshot failure")
+    original.add_note("original note")
+    cleanup = original if shared_error else OSError("secondary cleanup failure")
+
+    def fail_install(*args):
+        raise original
+
+    cleanups = []
+
+    def fail_cleanup():
+        cleanups.append(True)
+        if len(cleanups) > 1:
+            raise cleanup
+
+    monkeypatch.setattr(shared, "install_units", fail_install)
+    monkeypatch.setattr(shared, "cleanup_units", fail_cleanup)
+    with pytest.raises(OSError) as caught:
+        shared.configure(checkout(tmp_path / "main"), True)
+    assert caught.value is original
+    assert "original note" in original.__notes__
+    assert any("Serena cleanup failed" in note for note in original.__notes__)
+    assert len(original.__notes__) <= 4
+    if not shared_error:
+        assert any("secondary cleanup failure" in note for note in original.__notes__)
+    assert shared.read_settings(configured_paths)["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "output,valid",
+    [
+        ("LoadState=not-found\nActiveState=inactive\n", True),
+        ("LoadState=loaded\n", False),
+        ("garbage", False),
+        ("LoadState=loaded\nActiveState=\n", False),
+    ],
+)
+def test_native_unit_state_requires_complete_manager_response(monkeypatch, output, valid):
+    monkeypatch.setattr(shared.subprocess, "check_output", lambda *args, **kwargs: output)
+    if valid:
+        assert native_read_unit_state("owned.service") == {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+        }
+    else:
+        with pytest.raises(ValueError):
+            native_read_unit_state("owned.service")
+
+
+def test_embedded_backslash_checkout_remains_literal(tmp_path, configured_paths):
+    main = checkout(tmp_path / r"main\x20checkout")
+    shared.configure(main, True)
+    assert shared.read_settings(configured_paths)["enabled"] is True
+    for context in shared.PROFILES:
+        text = (shared.unit_directory() / shared.unit_name(context)).read_text()
+        assert f"WorkingDirectory={main}\n" in text
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+@pytest.mark.parametrize("link_root", ["persistent", "runtime"])
+@pytest.mark.parametrize("target_root", ["persistent", "runtime"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_cleanup_removes_managed_links_from_both_enablement_scopes(
+    tmp_path, monkeypatch, link_root, target_root, relative, loaded
+):
+    roots = {"persistent": shared.unit_directory(), "runtime": tmp_path / "runtime/systemd/user"}
+    unit = shared.unit_name("claude-code")
+    link = roots[link_root] / "default.target.wants" / unit
+    link.parent.mkdir(parents=True)
+    target = roots[target_root] / unit
+    link.symlink_to(os.path.relpath(target, link.parent) if relative else target)
+    assert link.is_symlink() and not link.exists()
+    if loaded:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("preserve unit file")
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda name: {
+            "LoadState": "loaded" if loaded and name == unit else "not-found",
+            "ActiveState": "inactive",
+        },
+    )
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.cleanup_units()
+    assert not link.is_symlink()
+    expected = [("disable", "--now", unit)] if loaded else []
+    assert calls == expected + [("daemon-reload",)]
+    if loaded:
+        assert target.read_text() == "preserve unit file"
+    else:
+        shared.cleanup_units()
+        assert calls == [("daemon-reload",)], "repeated cleanup is a no-op"
+
+
+@pytest.mark.parametrize("root", ["persistent", "runtime"])
+@pytest.mark.parametrize("kind", ["foreign-symlink", "regular-file"])
+def test_absent_unit_cleanup_preserves_unowned_enablement_entries(
+    tmp_path, monkeypatch, root, kind
+):
+    roots = {"persistent": shared.unit_directory(), "runtime": tmp_path / "runtime/systemd/user"}
+    unit = shared.unit_name("claude-code")
+    link = roots[root] / "default.target.wants" / unit
+    link.parent.mkdir(parents=True)
+    if kind == "foreign-symlink":
+        link.symlink_to(tmp_path / "foreign.service")
+    else:
+        link.write_text("preserve foreign entry")
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda unit: {"LoadState": "not-found", "ActiveState": "inactive"},
+    )
+    monkeypatch.setattr(shared, "systemctl", lambda *args: None)
+    with pytest.raises(ValueError, match="preserved"):
+        shared.cleanup_units()
+    assert (
+        link.is_symlink()
+        if kind == "foreign-symlink"
+        else link.read_text() == "preserve foreign entry"
+    )
+
+
+def test_absent_active_stop_failure_preserves_enablement_link(tmp_path, monkeypatch):
+    unit = shared.unit_name("claude-code")
+    link = shared.unit_directory() / "default.target.wants" / unit
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shared.unit_directory() / unit)
+    monkeypatch.setattr(shared, "PROFILES", ("claude-code",))
+    monkeypatch.setattr(
+        shared, "read_unit_state", lambda unit: {"LoadState": "not-found", "ActiveState": "active"}
+    )
+    calls = []
+
+    def fail(*args):
+        calls.append(args)
+        raise OSError("stop failed")
+
+    monkeypatch.setattr(shared, "systemctl", fail)
+    with pytest.raises(OSError, match="stop failed"):
+        shared.cleanup_units()
+    assert link.is_symlink()
+    assert calls == [("stop", unit)]
+
+
+def test_manual_unlink_reload_failure_still_attempts_other_profile(tmp_path, monkeypatch):
+    links = []
+    for context in shared.PROFILES:
+        unit = shared.unit_name(context)
+        link = shared.unit_directory() / "default.target.wants" / unit
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(shared.unit_directory() / unit)
+        links.append(link)
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda unit: {"LoadState": "not-found", "ActiveState": "inactive"},
+    )
+    calls = []
+
+    def reload(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("reload failed")
+
+    monkeypatch.setattr(shared, "systemctl", reload)
+    with pytest.raises(OSError, match="reload failed"):
+        shared.cleanup_units()
+    assert len(calls) == 2
+    assert all(not link.is_symlink() for link in links)
+
+
+def test_aliased_runtime_unit_root_is_cleaned_once(tmp_path, monkeypatch):
+    persistent = shared.unit_directory()
+    persistent.mkdir(parents=True)
+    runtime = tmp_path / "runtime/systemd/user"
+    runtime.parent.mkdir(parents=True)
+    runtime.symlink_to(persistent, target_is_directory=True)
+    unit = shared.unit_name("claude-code")
+    link = persistent / "default.target.wants" / unit
+    link.parent.mkdir()
+    link.symlink_to(persistent / unit)
+    monkeypatch.setattr(
+        shared,
+        "read_unit_state",
+        lambda unit: {"LoadState": "not-found", "ActiveState": "inactive"},
+    )
+    calls = []
+    monkeypatch.setattr(shared, "systemctl", lambda *args: calls.append(args))
+    shared.cleanup_units()
+    assert not link.is_symlink()
+    assert calls == [("daemon-reload",)]
+
+
+@pytest.mark.parametrize("manager", ["missing", "failed"])
+@pytest.mark.parametrize("tool", ["absent", "installed", "broken-link", "unknown"])
+@pytest.mark.parametrize("marker", [False, True, "invalid"])
+def test_fresh_install_without_manager_preserves_existing_or_uncertain_provider(
+    tmp_path, manager, tool, marker
+):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # Isolate PATH so the real installed provider and user manager cannot participate.
+    for name in ("python3", "flock", "mkdir"):
+        (bindir / name).symlink_to(shutil.which(name))
+    calls = tmp_path / "calls"
+    tools = tmp_path / "tools "  # Native tool-dir output must preserve path whitespace.
+    tools.mkdir()
+    if tool == "installed":
+        (tools / "serena-agent").mkdir()
+    elif tool == "broken-link":
+        (tools / "serena-agent").symlink_to(tmp_path / "deleted")
+    uv = bindir / "uv"
+    uv.write_text(
+        '#!/bin/sh\nif [ "$*" = "tool dir" ]; then\n'
+        '  [ "$TOOL" != unknown ] || exit 1\n  printf "%s\\n" "$TOOLS"\n'
+        'else\n  printf "%s\\n" "$*" >> "$CALLS"\nfi\n'
+    )
+    uv.chmod(0o755)
+    if manager == "failed":
+        systemctl = bindir / "systemctl"
+        systemctl.write_text("#!/bin/sh\nexit 1\n")
+        systemctl.chmod(0o755)
+    state = tmp_path / "state"
+    (state / "config").mkdir(parents=True)
+    (state / "config/serena-shared.json").write_text(json.dumps({"enabled": marker}))
+    subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            'source "$1"; _install_serena',
+            "bash",
+            str(SCRIPT.parent / "lib/serena_install.sh"),
+        ],
+        env=dict(
+            os.environ,
+            PATH=str(bindir),
+            GENESIS_HOME=str(state),
+            CALLS=str(calls),
+            TOOLS=str(tools),
+            TOOL=tool,
+        ),
+        check=True,
+    )
+    if marker is False and tool == "absent":
+        assert calls.read_text() == "tool install serena-agent\n"
+    else:
+        assert not calls.exists()
+
+
+@pytest.mark.parametrize("value", ["provider", "~/provider"])
+def test_relative_provider_resources_and_contexts_use_main_when_configuring_elsewhere(
+    tmp_path, monkeypatch, configured_paths, value
+):
+    main = checkout(tmp_path / "main")
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    for root, content in ((main, "main"), (caller, "caller")):
+        source = root / value
+        source.mkdir(parents=True)
+        (source / "serena_config.yml").write_text(content)
+    monkeypatch.setenv("SERENA_HOME", value)
+    monkeypatch.chdir(caller)
+    contexts = []
+
+    def snapshot(serena, context, destination, project):
+        contexts.append((context, project))
+
+    monkeypatch.setattr(shared, "snapshot_context", snapshot)
+    shared.configure(main, True)
+    assert contexts == [(context, main) for context in shared.PROFILES]
+    for context in shared.PROFILES:
+        home = configured_paths.parent.parent / "serena-shared" / context
+        assert (home / "serena_config.yml").read_text() == "main"
+        for resource in ("modes", "prompt_templates", "memories/global"):
+            assert (home / resource).resolve() == main / value / resource
+
+
+def test_native_context_snapshot_launches_from_fixed_main(tmp_path, monkeypatch):
+    main = tmp_path / "main"
+    main.mkdir()
+    destination = tmp_path / "context.yml"
+    monkeypatch.setattr(shared, "provider_python", lambda binary: sys.executable)
+    calls = []
+
+    def output(command, **kwargs):
+        calls.append((command, kwargs))
+        return "name: claude-code\nsingle_project: true\n"
+
+    monkeypatch.setattr(shared.subprocess, "check_output", output)
+    shared.snapshot_context("/bin/serena", "claude-code", destination, main)
+    assert calls[0][1]["cwd"] == main
+    assert destination.read_text() == "name: claude-code\nsingle_project: true\n"
+
+
+@pytest.mark.parametrize("name", ["serena", "terse"])
+@pytest.mark.parametrize("path", ["relative", "empty"])
+def test_discovered_binary_is_fixed_before_provider_cwd_changes(tmp_path, monkeypatch, name, path):
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    directory = caller / "tools" if path == "relative" else caller
+    directory.mkdir(exist_ok=True)
+    executable = directory / name
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.chdir(caller)
+    monkeypatch.setenv("PATH", "tools" if path == "relative" else ":")
+    assert shared.binary(name) == str(executable)
+
+
+@pytest.mark.parametrize("context", shared.PROFILES)
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_configuration_cancels_activation_before_replacing_unit_files(
+    tmp_path, monkeypatch, configured_paths, context, stop_fails
+):
+    old = checkout(tmp_path / "old")
+    main = checkout(tmp_path / "main")
+    shared.write_settings(configured_paths, old, True)
+    states = {shared.unit_name(profile): "inactive" for profile in shared.PROFILES}
+    states[shared.unit_name(context)] = "activating"
+    monkeypatch.setattr(
+        shared, "read_unit_state", lambda unit: {"LoadState": "loaded", "ActiveState": states[unit]}
+    )
+    installed = []
+
+    def systemctl(*args):
+        if args[0] == "disable":
+            if stop_fails and args[-1] == shared.unit_name(context):
+                raise OSError("stop failed")
+            states[args[-1]] = "inactive"
+
+    def install(*args):
+        assert all(state == "inactive" for state in states.values())
+        assert shared.read_settings(configured_paths)["enabled"] is False
+        installed.append(args)
+
+    monkeypatch.setattr(shared, "systemctl", systemctl)
+    monkeypatch.setattr(shared, "install_units", install)
+    if stop_fails:
+        with pytest.raises(OSError, match="stop failed"):
+            shared.configure(main, True)
+        assert not installed
+        assert shared.read_settings(configured_paths)["enabled"] is False
+    else:
+        shared.configure(main, True)
+        assert len(installed) == 1
+        assert shared.read_settings(configured_paths) == {"main": str(main), "enabled": True}
+
+
+@pytest.mark.parametrize("filename", ["bootstrap.sh", "install.sh"])
+@pytest.mark.parametrize("marker", [None, False, True, "invalid"])
+@pytest.mark.parametrize("provider", [False, True])
+@pytest.mark.parametrize("home_kind", ["absolute", "relative"])
+def test_installer_registration_preserves_shared_launcher_without_provider_path(
+    tmp_path, filename, marker, provider, home_kind
+):
+    root = checkout(tmp_path / "project")
+    unrelated = {"mcpServers": {"other": {"command": "/operator/other"}}}
+    (root / ".mcp.json").write_text(json.dumps(unrelated))
+    home = tmp_path / "state"
+    if marker is not None:
+        settings = home / "config/serena-shared.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"enabled": marker, "main": str(root)}))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    if provider:
+        executable = bindir / "serena"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+    source = (SCRIPT.parent / filename).read_text()
+    if filename == "bootstrap.sh":
+        start = source.index("if _serena_registration_available; then")
+        block = source[start : source.index("\nfi", start) + 3]
+    else:
+        start = source.index("    _serena_registration_available &&")
+        block = source[start : source.index("\n    # grep-app", start)]
+    subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-c",
+            'source "$1"; ' + block + "\n:",
+            "bash",
+            str(SCRIPT.parent / "lib/mcp_register.sh"),
+        ],
+        env=dict(
+            os.environ,
+            PATH=f"{bindir}:{os.defpath}",
+            GENESIS_HOME=str(home) if home_kind == "absolute" else "state",
+            GENESIS_ROOT=str(root),
+            REPO_DIR=str(root),
+        ),
+        cwd=tmp_path,
+        check=True,
+    )
+    result = json.loads((root / ".mcp.json").read_text())
+    assert ("serena" in result["mcpServers"]) is (
+        provider or (home_kind == "absolute" and marker is True)
+    )
+    result["mcpServers"].pop("serena", None)
+    assert result == unrelated

@@ -214,6 +214,27 @@ safe_disable_service() {
     fi
 }
 
+# Remove only this integration's known enablement links, including dangling ones.
+remove_serena_enablement() {
+    local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" root unit link target persistent runtime_target
+    for root in "$HOME/.config/systemd/user" "$runtime/systemd/user"; do
+        for unit in genesis-serena-claude-code.service genesis-serena-codex.service; do
+            link="$root/default.target.wants/$unit"
+            [ -L "$link" ] || continue
+            target="$(readlink -m -- "$link")" || return 1
+            persistent="$(readlink -m -- "$HOME/.config/systemd/user/$unit")" || return 1
+            runtime_target="$(readlink -m -- "$runtime/systemd/user/$unit")" || return 1
+            if [ "$target" != "$persistent" ] && [ "$target" != "$runtime_target" ]; then
+                echo "  WARNING: foreign Serena enablement link preserved: $link"
+            elif [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would remove Serena enablement: $link"
+            else
+                rm -- "$link" || return 1
+            fi
+        done
+    done
+}
+
 # Run a command inside the container (from host). Tolerates container issues.
 container_exec() {
     local cmd="$1"
@@ -515,11 +536,13 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
             safe_disable_service "$unit"
         done
+        remove_serena_enablement
 
         # Persistent= timers keep a stamp file under
         # ~/.local/share/systemd/timers/. Removing the unit file does NOT remove
@@ -617,17 +640,24 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
                 systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
+                systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
-                systemctl --user disable genesis-server.service genesis-bridge.service \
+                for u in genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-tmp-watchgod.service \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
+                    genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service 2>/dev/null || true
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
+                    systemctl --user disable \"\$u\" 2>/dev/null || true;
+                done;
+                DRY_RUN=false;
+                $(declare -f remove_serena_enablement);
+                remove_serena_enablement
             "
             ok "Stopped Genesis services"
 

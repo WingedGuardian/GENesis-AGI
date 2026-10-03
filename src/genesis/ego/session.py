@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.proposal_gate import gate_failure_is_blocking
+from genesis.cc.transient_retry import run_with_overload_retry
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -399,7 +400,9 @@ class EgoSession:
                 return None
 
             try:
-                output = await self._invoker.run(invocation)
+                # Below route(): an overload re-runs this same approved
+                # dispatch; the approval gate is never consulted again.
+                output = await run_with_overload_retry(self._invoker, invocation)
             except Exception:
                 logger.error("Ego CC invocation failed (unified)", exc_info=True)
                 try:
@@ -1421,7 +1424,7 @@ class EgoSession:
                 working_dir=background_session_dir(),
                 caller_tag=self._cc_caller_tag(f"gate.{label.lower()}"),
             )
-            output = await self._invoker.run(invocation)
+            output = await run_with_overload_retry(self._invoker, invocation)
             if output.is_error:
                 logger.warning("%s CC call failed: %s", label, output.error_message)
                 return None
@@ -2009,7 +2012,7 @@ class EgoSession:
                 working_dir=background_session_dir(),
                 caller_tag=self._cc_caller_tag("realist"),
             )
-            output = await self._invoker.run(invocation)
+            output = await run_with_overload_retry(self._invoker, invocation)
             # Track realist cost for cycle accounting
             self._last_realist_cost_usd = output.cost_usd
             if output.is_error:
