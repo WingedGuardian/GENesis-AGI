@@ -10,7 +10,6 @@ mutated by this suite, no network, no live DB.
 
 from __future__ import annotations
 
-import importlib.util
 import subprocess
 import sys
 import textwrap
@@ -18,24 +17,29 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import private_module
+
 _REPO = Path(__file__).resolve().parent.parent.parent
-_MOD = _REPO / "scripts" / "mutation_sweep.py"
+# Under `scripts/ci/` because CI invokes it as a required check: an
+# implementation behind a required check sits in the critical review lane, and
+# `test_required_check_implementations_are_critical` derives that from ci.yml.
+_MOD = _REPO / "scripts" / "ci" / "mutation_sweep.py"
+
+# Via conftest so the module name is restored after loading rather than left
+# registered for the rest of the session.
+ms = private_module("_mutation_sweep", _MOD)
 
 
-def _load():
-    spec = importlib.util.spec_from_file_location("_mutation_sweep", _MOD)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["_mutation_sweep"] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        sys.modules.pop("_mutation_sweep", None)
-        raise
-    return mod
+@pytest.fixture(autouse=True)
+def _private_home(tmp_path_factory, monkeypatch):
+    """Keep the sweep's snapshot directories out of the real ``~/tmp``.
 
-
-ms = _load()
+    `sweep` puts snapshots under ``Path.home() / "tmp"`` and deliberately KEEPS
+    them on a crash or a CONFLICT -- which several tests here provoke on
+    purpose. Without this, every run of this file left a dozen recovery
+    directories in the developer's real home.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
 
 
 @pytest.fixture
@@ -722,3 +726,401 @@ def test_a_baseline_that_MODIFIES_the_target_refuses_to_mutate(project, monkeypa
     with pytest.raises(RuntimeError, match="MODIFIED before any mutation"):
         ms.sweep([_case(project)], cwd=project, python=sys.executable,
                  env={"PYTHONPATH": str(project)}, timeout=120, check_baseline=True)
+
+
+# --------------------------------------------------------------------------
+# THE FILE'S IDENTITY. Every finding in the third review round sat on one seam:
+# the harness identified "the file" by a flattened path string (the snapshot
+# name) and its content hash (drift and restore checks), wrote the mutation
+# outside the scope that restores it, and restored by copying bytes onto a
+# pathname. A file is more than that -- a type, a mode, an inode, a link count --
+# and each of these tests is one way the narrower identity damaged it.
+# --------------------------------------------------------------------------
+
+def test_a_failed_mutation_write_leaves_the_source_intact(project, monkeypatch):
+    """A write that fails part-way (disk full, a file-size limit) used to sit
+    BEFORE the restoring `finally`: the in-place write had already truncated the
+    source, the exception escaped, and nothing put it back. Reproduced with a
+    real EFBIG from RLIMIT_FSIZE rather than a mocked write, so the test does not
+    depend on which write primitive the harness uses."""
+    import resource
+    import signal
+
+    target = project / "guard.py"
+    before = target.read_bytes()
+    snap = project.parent / "guard.snapshot"
+    snap.write_bytes(before)
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    old_handler = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    real_validate = ms._validate
+
+    def limit_then_validate(case, text):
+        # Armed immediately before the write, after every read the case does.
+        resource.setrlimit(resource.RLIMIT_FSIZE, (16, hard))
+        return real_validate(case, text)
+
+    monkeypatch.setattr(ms, "_validate", limit_then_validate)
+    try:
+        result = ms.run_case(_case(project), snap, cwd=project,
+                             python=sys.executable, timeout=120)
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        signal.signal(signal.SIGXFSZ, old_handler)
+    assert target.read_bytes() == before, "a failed write left the source damaged"
+    assert result.outcome == ms.ABORTED
+    assert "could not write the mutation" in result.detail
+    assert not [p for p in project.iterdir() if p.name.startswith(".guard.py.")], (
+        "the staging file of a failed write was left behind"
+    )
+
+
+def test_a_hard_linked_target_is_REFUSED(project, monkeypatch):
+    """A second hard link shares the inode the mutation writes. If the child then
+    deletes THIS pathname, the restore recreates only this name and the other
+    link stays mutated permanently while the case reports BIT."""
+    target = project / "guard.py"
+    alias = project / "guard_alias.py"
+    alias.hardlink_to(target)
+    before = target.read_bytes()
+    real_run = ms.subprocess.run
+
+    def delete_then_run(*a, **k):
+        if target.exists():
+            target.unlink()
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", delete_then_run)
+    result = _sweep(project, [_case(project)])
+    # The damage first, so a RED names it rather than a message mismatch.
+    assert alias.read_bytes() == before, "the other link was left mutated"
+    assert target.read_bytes() == before
+    assert result.results[0].outcome == ms.ABORTED
+    assert "HARD-LINKED" in result.results[0].detail
+
+
+def test_a_target_replaced_by_a_DIRECTORY_is_a_conflict_and_keeps_the_snapshot(
+    project, monkeypatch, capsys
+):
+    """`copy2(snapshot, target)` onto a directory writes the snapshot INSIDE it:
+    the source stays unusable, the case reports its verdict as though the restore
+    worked, and the completed sweep deletes the only copy."""
+    target = project / "guard.py"
+    before = target.read_bytes()
+    real_run = ms.subprocess.run
+
+    def replace_with_dir(*a, **k):
+        proc = real_run(*a, **k)
+        target.unlink()
+        target.mkdir()
+        return proc
+
+    monkeypatch.setattr(ms.subprocess, "run", replace_with_dir)
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.CONFLICT
+    assert list(target.iterdir()) == [], "the restore wrote into the directory"
+    err = capsys.readouterr().err
+    assert "baselines PRESERVED" in err, "the only copy of the source was deleted"
+    snap_dir = Path(err.split("baselines PRESERVED for recovery:")[1].strip().split()[0])
+    assert [p.read_bytes() for p in snap_dir.rglob("guard.py")] == [before]
+
+
+def test_a_mode_only_peer_edit_is_a_CONFLICT_not_overwritten(project, monkeypatch):
+    """The content hash cannot see a chmod. A peer making a hook executable while
+    the test ran was silently reverted by the restore."""
+    import os as _os
+    import stat as _stat
+
+    target = project / "guard.py"
+    _os.chmod(target, 0o644)
+    real_run = ms.subprocess.run
+
+    def chmod_then_run(*a, **k):
+        _os.chmod(target, 0o755)
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", chmod_then_run)
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.CONFLICT
+    assert _stat.S_IMODE(target.stat().st_mode) == 0o755, "the peer's chmod was reverted"
+
+
+def test_a_mode_drift_before_the_case_aborts_it(project):
+    """The drift check has the same blind spot: a mode change after the snapshot
+    was taken is drift, not a file that still matches its baseline."""
+    import os as _os
+    import shutil as _shutil
+
+    target = project / "guard.py"
+    _os.chmod(target, 0o644)
+    snap = project.parent / "guard.snapshot"
+    _shutil.copy2(target, snap)
+    _os.chmod(target, 0o755)
+    result = ms.run_case(_case(project), snap, cwd=project,
+                         python=sys.executable, timeout=120)
+    assert result.outcome == ms.ABORTED
+    assert "differs from the sweep baseline" in result.detail
+
+
+def test_snapshot_names_cannot_collide(project):
+    """`pkg/guard.py` and `pkg__guard.py` flattened to the same snapshot name, so
+    the later copy overwrote the earlier and a valid case aborted against
+    another file's contents."""
+    pkg = project / "pkg"
+    pkg.mkdir()
+    (pkg / "guard.py").write_text(
+        (project / "guard.py").read_text(encoding="utf-8") + "# nested\n",
+        encoding="utf-8")
+    (project / "pkg__guard.py").write_text(
+        (project / "guard.py").read_text(encoding="utf-8") + "# flat\n",
+        encoding="utf-8")
+    (project / "test_pair.py").write_text(
+        "import pkg.guard\nimport pkg__guard\n"
+        "def test_nested():\n    assert pkg.guard.is_allowed('dangerous') is False\n"
+        "def test_flat():\n    assert pkg__guard.is_allowed('dangerous') is False\n",
+        encoding="utf-8")
+    nested = _case(project, label="nested", path=pkg / "guard.py",
+                   test="test_pair.py::test_nested")
+    flat = _case(project, label="flat", path=project / "pkg__guard.py",
+                 test="test_pair.py::test_flat")
+    result = _sweep(project, [nested, flat])
+    assert [r.outcome for r in result.results] == [ms.BIT, ms.BIT], [
+        r.detail for r in result.results]
+
+
+def test_a_deep_target_path_does_not_overflow_the_snapshot_name(project):
+    """The whole absolute path was flattened into ONE filename, which overflows
+    the single-component limit long before the path limit."""
+    deep = project
+    for i in range(6):
+        deep = deep / (f"d{i}" * 25)
+    deep.mkdir(parents=True)
+    target = deep / "guard.py"
+    target.write_bytes((project / "guard.py").read_bytes())
+    (project / "test_deep.py").write_text(
+        "import importlib.util, pathlib\n"
+        f"P = pathlib.Path({str(target)!r})\n"
+        "def test_blocks():\n"
+        "    spec = importlib.util.spec_from_file_location('deep_guard', P)\n"
+        "    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "    assert m.is_allowed('dangerous') is False\n",
+        encoding="utf-8")
+    result = _sweep(project, [_case(project, path=target, test="test_deep.py::test_blocks")])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+
+
+# --------------------------------------------------------------------------
+# THE TEST MUST RUN AGAINST THE MUTATED COPY.
+# --------------------------------------------------------------------------
+
+def test_a_stale_bytecode_cache_cannot_mask_the_mutation(project, monkeypatch):
+    """PYTHONDONTWRITEBYTECODE stops WRITING caches, not READING them. A
+    timestamp-valid .pyc for the baseline, plus a same-length mutation written
+    inside the source's recorded mtime second, makes the child import the
+    BASELINE code -- a real catch reported as SURVIVED. The same-second window
+    is made deterministic by putting the original mtime back before the run."""
+    import os as _os
+    import py_compile
+
+    target = project / "guard.py"
+    # TIMESTAMP explicitly: under SOURCE_DATE_EPOCH py_compile defaults to a
+    # checked-hash pyc, which is never stale and would make this test vacuous.
+    py_compile.compile(str(target), doraise=True,
+                       invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    st = target.stat()
+    real_run = ms.subprocess.run
+
+    def same_second_then_run(*a, **k):
+        _os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", same_second_then_run)
+    # Same LENGTH as the anchor, so the cached (mtime, size) pair still matches.
+    case = _case(project, anchor='startswith("danger")',
+                 replacement='startswith("dangeX")')
+    result = _sweep(project, [case])
+    assert result.results[0].outcome == ms.BIT, result.results[0].stdout
+
+
+def test_a_relative_repo_argument_still_reaches_the_source(project):
+    """`--repo <relative>` gave the child cwd=<repo> but PYTHONPATH=<repo>/src,
+    which the child then resolved against its OWN cwd: <repo>/<repo>/src."""
+    (project / "src").mkdir()
+    (project / "guard.py").rename(project / "src" / "guard.py")
+    (project / "tests").mkdir()
+    (project / "test_guard.py").rename(project / "tests" / "test_guard.py")
+    manifest = project.parent / "m.json"
+    manifest.write_text(
+        '{"cases": [{"label": "l", "path": "src/guard.py", '
+        '"anchor": "if name.startswith(\\"danger\\"):", "replacement": "if False:", '
+        '"validator": "python", '
+        '"test": "tests/test_guard.py::test_blocks_danger", "why": "w"}]}',
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_MOD), str(manifest), "--repo", project.name],
+        cwd=str(project.parent), capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 bit" in proc.stdout
+
+
+# --------------------------------------------------------------------------
+# SOURCE ENCODING. A valid target must be mutable, and must come back in its
+# own encoding.
+# --------------------------------------------------------------------------
+
+def test_a_utf8_bom_target_is_swept_and_keeps_its_bom(project, monkeypatch):
+    target = project / "guard.py"
+    target.write_bytes(b"\xef\xbb\xbf" + target.read_bytes())
+    before = target.read_bytes()
+    seen = {}
+    real_run = ms.subprocess.run
+
+    def capture(*a, **k):
+        seen["bytes"] = target.read_bytes()
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", capture)
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert seen["bytes"].startswith(b"\xef\xbb\xbf"), "the mutation dropped the BOM"
+    assert target.read_bytes() == before
+
+
+def test_a_pep263_latin1_target_is_swept_in_its_own_encoding(project, monkeypatch):
+    target = project / "guard.py"
+    target.write_bytes(
+        b"# -*- coding: latin-1 -*-\n# caf\xe9\n" + target.read_bytes())
+    before = target.read_bytes()
+    seen = {}
+    real_run = ms.subprocess.run
+
+    def capture(*a, **k):
+        seen["bytes"] = target.read_bytes()
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", capture)
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert b"# caf\xe9\n" in seen["bytes"], "the mutation re-encoded the source"
+    assert target.read_bytes() == before
+
+
+def test_an_undecodable_target_ABORTS_rather_than_crashing_the_sweep(project):
+    target = project / "thing.sh"
+    target.write_bytes(b"#!/bin/bash\n# \xff\xfe not utf-8\necho ok\n")
+    case = ms.Case(label="sh", path=target, anchor="echo ok", replacement="echo no",
+                   test="test_guard.py::test_blocks_danger", why="w", validator="bash")
+    result = _sweep(project, [case, _case(project, label="ordinary")])
+    assert result.results[0].outcome == ms.ABORTED
+    assert "decode" in result.results[0].detail
+    assert result.results[1].outcome == ms.BIT, "one bad case killed the sweep"
+
+
+# --------------------------------------------------------------------------
+# MANIFEST INPUT DOMAIN. A malformed case is refused, never quietly weakened.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("kw", [
+    {"anchor": None, "replacement": "x",
+     "edits": (("if name", "if not name"),)},          # replacement silently ignored
+    {"anchor": "if name", "replacement": None},       # omission became a deletion
+], ids=["replacement-without-anchor", "anchor-without-replacement"])
+def test_anchor_and_replacement_must_come_together(kw):
+    edits = tuple(ms.Edit(a, r) for a, r in kw.pop("edits", ()))
+    with pytest.raises(ValueError, match="together"):
+        ms.Case(label="x", path=Path("a.py"), test="t", why="w",
+                validator="python", edits=edits, **kw)
+
+
+def test_an_explicit_empty_replacement_is_still_a_deletion():
+    case = ms.Case(label="x", path=Path("a.py"), anchor="a", replacement="",
+                   test="t", why="w", validator="python")
+    assert case.edits == (ms.Edit("a", ""),)
+
+
+@pytest.mark.parametrize("validator", ["none:", "none:   ", "none : "])
+def test_none_requires_a_NONEMPTY_reason(validator):
+    with pytest.raises(ValueError, match="WHY"):
+        ms.Case(label="x", path=Path("a.tmpl"), anchor="a", replacement="b",
+                test="t", why="w", validator=validator)
+
+
+@pytest.mark.parametrize("path", ["../outside.py", "/etc/hostname", "sub/../../x.py"])
+def test_a_manifest_path_may_not_escape_the_repository(tmp_path, path):
+    doc = {"cases": [{"label": "l", "path": path, "anchor": "a", "replacement": "b",
+                      "validator": "python", "test": "t", "why": "w"}]}
+    with pytest.raises(ValueError, match="outside the repository"):
+        ms.cases_from_json(doc, tmp_path)
+
+
+def test_a_manifest_path_through_a_symlinked_directory_may_not_escape(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    doc = {"cases": [{"label": "l", "path": "linked/x.py", "anchor": "a",
+                      "replacement": "b", "validator": "python", "test": "t",
+                      "why": "w"}]}
+    with pytest.raises(ValueError, match="outside the repository"):
+        ms.cases_from_json(doc, repo)
+
+
+# --------------------------------------------------------------------------
+# RESULT CLASSIFICATION AND POLICY.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stdout", [
+    "ERROR test_guard.py::test_blocks_danger - RuntimeError: boom",
+    "1 Error in 0.2s",
+])
+def test_an_error_line_in_any_case_is_not_a_result(stdout):
+    assert ms._has_result_line(stdout) is False
+
+
+def test_the_per_case_timeout_defaults_to_the_house_floor():
+    """The repo's timeout floor is 7200s; 900s turned a legitimately slow test
+    into an ABORT that reads as a broken gate."""
+    import inspect
+
+    for fn in (ms.run_case, ms.sweep):
+        assert inspect.signature(fn).parameters["timeout"].default >= 7200, fn
+    ap_default = ms.build_parser().parse_args(["m.json"]).timeout
+    assert ap_default >= 7200
+
+
+def test_the_mutation_job_does_not_persist_checkout_credentials():
+    """The job runs repository tests and needs no git credential afterwards."""
+    import yaml
+
+    doc = yaml.safe_load((_REPO / ".github" / "workflows" / "ci.yml").read_text())
+    steps = doc["jobs"]["mutation-gate"]["steps"]
+    checkout = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+    assert checkout, "precondition: the job checks out the repository"
+    assert all(s.get("with", {}).get("persist-credentials") is False for s in checkout)
+
+
+def test_an_atomic_rewrite_of_the_SAME_bytes_is_still_restored(project, monkeypatch):
+    """The control for leaving the inode OUT of the fingerprint. A fixture that
+    atomically rewrites the target with the very bytes the mutation wrote has not
+    edited anything; reading it as a CONFLICT would leave the mutation in the
+    tree."""
+    import os as _os
+
+    target = project / "guard.py"
+    before = target.read_bytes()
+    real_run = ms.subprocess.run
+
+    def atomic_same_bytes_then_run(*a, **k):
+        staged = project / "staged.tmp"
+        staged.write_bytes(target.read_bytes())
+        _os.chmod(staged, target.stat().st_mode & 0o7777)
+        _os.replace(staged, target)
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(ms.subprocess, "run", atomic_same_bytes_then_run)
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert target.read_bytes() == before
