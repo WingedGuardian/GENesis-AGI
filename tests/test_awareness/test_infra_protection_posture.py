@@ -66,6 +66,7 @@ def _profile(
     cc_tmp_isolated: object = True,
     falkordb_active: object = None,
     falkordb_socket: object = False,
+    falkordb_enabled: object = None,
     container: object = "lxc",
     age_days: float = 0.0,
     collected_at: object = "auto",
@@ -113,7 +114,10 @@ def _profile(
                 # Volatile states live in METRICS (infra_profile/types.py):
                 # facts are hashed, and hashing a value that flips on every
                 # engine restart bills an LLM annotation each time.
-                "facts": {"unit": "genesis-falkordb.service"},
+                "facts": {
+                    "unit": "genesis-falkordb.service",
+                    "unit_enabled": falkordb_enabled,
+                },
                 "metrics": {
                     "unit_active_state": falkordb_active,
                     "socket_present": falkordb_socket,
@@ -522,6 +526,26 @@ async def test_unavailable_empty_section_does_not_block_resolve(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unarmed_engine_collector_failure_does_not_block_resolve(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+
+        # The memory defect is fixed while the falkordb collector errors on an
+        # install that never armed the engine: its retained facts are non-empty
+        # (unit name, socket path) but fed no rule, so recovery must land.
+        healed = _profile(falkordb_active="inactive", falkordb_enabled="disabled")
+        healed["sections"]["falkordb"]["status"] = "error"
+        _use_profile(monkeypatch, healed)
+        await _check_infra_protection_posture(db)
+        assert _open(await _alerts(db)) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_alert_notes_unverifiable_planes(monkeypatch):
     db = await _setup()
     try:
@@ -586,6 +610,40 @@ def test_falkordb_stale_section_holds_the_all_clear():
     assert "falkordb" in _loop._infra_unverifiable_planes(prof)
 
 
+def test_falkordb_armed_and_failed_alerts():
+    """Type=notify never reports `active` for an engine that cannot load its
+    module or never signals readiness: the unit cycles through the start
+    limiter into `failed`. Armed (enabled), that is the failure to surface."""
+    for enabled in ("enabled", "enabled-runtime"):
+        found = _infra_missing_protections(
+            _profile(falkordb_active="failed", falkordb_enabled=enabled)
+        )
+        assert "falkordb_unit_failed" in found, enabled
+
+
+def test_falkordb_failed_but_never_armed_is_silent():
+    for enabled in (None, "disabled", "static", "masked"):
+        found = _infra_missing_protections(
+            _profile(falkordb_active="failed", falkordb_enabled=enabled)
+        )
+        assert "falkordb_unit_failed" not in found, enabled
+
+
+def test_an_unarmed_engine_never_holds_the_all_clear():
+    """The collector always records the unit name and socket path, so retained
+    facts are non-empty on every install. An engine that was never armed fed
+    no rule, and its collector failing must not stall unrelated recovery."""
+    prof = _profile(falkordb_active="inactive", falkordb_enabled="disabled")
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" not in _loop._infra_unverifiable_planes(prof)
+
+
+def test_an_armed_engine_still_holds_the_all_clear():
+    prof = _profile(falkordb_active="failed", falkordb_enabled="enabled")
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" in _loop._infra_unverifiable_planes(prof)
+
+
 # ── coverage guardrails (provision-or-surface convention) ──────────────────
 
 
@@ -601,6 +659,12 @@ def test_every_rule_slug_has_detail_text():
     prof_blocked = _profile(**_ALL_DEFECTS)
     prof_blocked["sections"]["storage"]["facts"]["cc_tmp_apply_blocked_on_cc"] = True
     producible |= set(_infra_missing_protections(prof_blocked))
+    # The graph engine has two exclusive branches; cover the armed-and-failed one.
+    producible |= set(
+        _infra_missing_protections(
+            _profile(falkordb_active="failed", falkordb_enabled="enabled")
+        )
+    )
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
@@ -630,6 +694,7 @@ def test_resilience_facts_are_covered():
         # to the rule; a rename on either side disarms the alert silently.
         "unit_active_state",
         "socket_present",
+        "unit_enabled",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 

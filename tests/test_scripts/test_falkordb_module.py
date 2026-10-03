@@ -17,6 +17,7 @@ from tests.test_scripts.falkordb_stubs import (
     PINNED_SHA,
     REPO_ROOT,
     UNIT_TEMPLATE,
+    _apt_log,
     _run,
     _stage,
 )
@@ -124,7 +125,9 @@ def test_an_already_present_module_repairs_a_missing_execute_bit(tmp_path):
 
     target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
     target.parent.mkdir(parents=True)
-    target.write_bytes(b"x")
+    # The pinned bytes: a cached file is re-hashed, so only a VERIFIED module
+    # reaches the execute-bit repair at all.
+    target.write_bytes(artifact.read_bytes())
     target.chmod(0o644)
 
     result = _run(
@@ -207,6 +210,65 @@ def test_download_failure_leaves_no_half_file(tmp_path):
 
 def test_the_pinned_digest_is_the_one_we_load_tested():
     assert PINNED_SHA in LIB.read_text()
+
+
+def _pin_the_fake(tmp_path) -> str:
+    """A shell prefix that pins the staged fake artifact's real digest."""
+    artifact = tmp_path / "release" / "v4.20.4" / "falkordb-x64.so"
+    sha = subprocess.run(
+        ["sha256sum", str(artifact)], capture_output=True, text=True, check=True
+    ).stdout.split()[0]
+    return f'_falkordb_expected_sha() {{ printf "{sha}"; }}; '
+
+
+def test_a_cached_module_is_rehashed_not_trusted(tmp_path):
+    """The file is native code the unit loads, so the digest binds every run,
+    not only the first download: bytes that no longer match are replaced."""
+    env = _stage(tmp_path)
+    target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"substituted")
+    target.chmod(0o755)
+
+    result = _run(_pin_the_fake(tmp_path) + "falkordb_module_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "already present" not in result.stdout, "trusted unverified bytes"
+    assert target.read_bytes() == b"pretend-module", "kept a module off its pin"
+    assert target.stat().st_mode & 0o111
+
+
+def test_a_cached_mismatch_that_cannot_be_refetched_is_removed(tmp_path):
+    env = _stage(tmp_path)
+    env["FALKORDB_RELEASE_BASE"] = f"file://{tmp_path / 'nonexistent'}"
+    target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"substituted")
+    target.chmod(0o755)
+
+    result = _run(_pin_the_fake(tmp_path) + "falkordb_module_install", env)
+    assert result.returncode == 0, result.stderr
+    assert not target.exists(), "left a module that fails its digest in place"
+
+
+def test_a_module_that_fails_verification_changes_nothing_on_the_system(tmp_path):
+    """The module is the reason redis is wanted, so it goes first: a failed
+    download or digest leaves no apt repo and no daemon behind."""
+    env = _stage(tmp_path)  # fake artifact => fails the real pin
+    result = _run("falkordb_provision", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "checksum MISMATCH" in result.stdout
+    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "repo added for a dead engine"
+    assert "apt-get" not in _apt_log(env), "apt ran before the module verified"
+
+
+def test_a_verified_module_still_provisions_redis(tmp_path):
+    env = _stage(tmp_path)
+    result = _run(_pin_the_fake(tmp_path) + "falkordb_provision", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so").is_file()
+    assert "apt-get install" in _apt_log(env), result.stdout
 
 
 # --- wiring ----------------------------------------------------------------
@@ -412,15 +474,21 @@ def test_the_server_waits_for_the_engine_but_does_not_require_it():
 
 
 def test_unit_write_scope_is_narrow():
-    """ReadWritePaths=%h would grant the engine the whole home."""
-    unit = UNIT_TEMPLATE.read_text()
-    rw = [ln for ln in unit.splitlines() if ln.startswith("ReadWritePaths=")]
-    assert rw, "no ReadWritePaths — ProtectSystem=strict would block the socket"
-    for line in rw:
-        assert line != "ReadWritePaths=%h", (
-            "grants write to the repo, secrets.env, ~/.ssh and ~/.claude"
-        )
-        assert line.startswith("ReadWritePaths=%h/.genesis")
+    """The engine may write its data dir and nothing else in the home.
+
+    ProtectSystem=strict does NOT cover /home, /root or /run/user — systemd's
+    strict table leaves them to ProtectHome= — so without ProtectHome the
+    allowlist narrows nothing and the whole home stays writable.
+    """
+    lines = UNIT_TEMPLATE.read_text().splitlines()
+    assert "ProtectHome=read-only" in lines, "strict alone leaves the home writable"
+    rw = [ln for ln in lines if ln.startswith("ReadWritePaths=")]
+    assert rw == ["ReadWritePaths=%h/.genesis/falkordb"], rw
+    # The data dir must exist before the sandbox is built (a missing
+    # ReadWritePaths entry fails namespace setup), and a sandboxed mkdir could
+    # not create it under a read-only home — so the mkdir runs unsandboxed.
+    pre = [ln for ln in lines if ln.startswith("ExecStartPre=")]
+    assert pre == ["ExecStartPre=+/bin/mkdir -p __HOME__/.genesis/falkordb"], pre
 
 
 def test_bootstrap_does_not_arm_the_engine():

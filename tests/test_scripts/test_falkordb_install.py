@@ -49,8 +49,10 @@ def test_redis_we_provisioned_does_not_replay_the_operator_decision(tmp_path):
     """
     env = _stage(tmp_path)
     env["DPKG_QUERY_STATUS"] = "installed"
-    # OUR marker, not the apt list file: SETUP.md tells operators to create that
-    # list themselves, so branching on it would claim credit for their work.
+    # OUR marker AND a live stamp for THIS package — the state a completed run
+    # leaves. The list alone is not enough: SETUP.md tells operators to create
+    # it themselves, so branching on it would claim credit for their work.
+    _mark_ours(env)
     Path(env["FALKORDB_PROVISION_MARKER"]).write_text("2026-09-06T00:00:00Z\n")
 
     result = _run("falkordb_redis_install", env)
@@ -58,6 +60,20 @@ def test_redis_we_provisioned_does_not_replay_the_operator_decision(tmp_path):
     assert "already provisioned" in result.stdout
     assert "your call" not in result.stdout
     assert "apt-get" not in _apt_log(env)
+
+
+def test_a_completion_marker_never_vouches_for_a_replaced_redis(tmp_path):
+    """The marker records that OUR install finished; it says nothing about the
+    redis on the box now. Without a live stamp the package is not ours, and
+    the operator gets the >= 8.0.0 warning instead of a false OK."""
+    env = _stage(tmp_path)
+    env["DPKG_QUERY_STATUS"] = "installed"  # a redis we have no stamp for
+    Path(env["FALKORDB_PROVISION_MARKER"]).write_text("2026-09-06T00:00:00Z\n")
+
+    result = _run("falkordb_redis_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "already provisioned" not in result.stdout, "marker trusted alone"
+    assert "your call" in result.stdout
 
 
 def test_system_provisioning_is_opt_in(tmp_path):

@@ -24,7 +24,9 @@
   binary lives elsewhere no longer gets a unit that fails to execute with
   nothing explaining why. `genesis-server` now ORDERS itself after the engine —
   ordering only, deliberately without pulling it in, so an install that never
-  opted in still never starts it.
+  opted in still never starts it. An armed engine that never becomes ready (a
+  module that will not load, for instance) raises the infrastructure alert; an
+  engine you never armed stays silent.
 
   Even with consent, every step declines rather than forces. **If you already
   run redis-server, Genesis leaves it and the apt repo completely alone** --
@@ -32,7 +34,10 @@
   which is not ours to do; you get printed instructions instead. No passwordless
   sudo, an unsupported architecture, an unrecognised distro, or a failed download
   each skip with a note and let bootstrap continue. The module is verified
-  against a pinned digest, because upstream publishes no checksums of its own.
+  against a pinned digest, because upstream publishes no checksums of its own,
+  and re-verified on every run; it is installed first, so a module that does not
+  verify leaves no apt repo or daemon behind. The armed service can write only
+  its own data directory -- the rest of your home is read-only to it.
 
   Nothing reads the engine yet, so its service unit is written but left
   **disabled** and the memory graph keeps using its in-process projection

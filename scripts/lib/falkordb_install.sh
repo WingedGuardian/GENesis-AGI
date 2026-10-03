@@ -211,6 +211,30 @@ _falkordb_expected_sha() {
     esac
 }
 
+# _falkordb_sha256 <file> — its digest, or "" when it cannot be computed.
+# `|| true`: under pipefail the pipeline's status would reach the caller;
+# 2>/dev/null hides the message, not the status.
+_falkordb_sha256() {
+    command -v sha256sum >/dev/null 2>&1 || return 0
+    sha256sum "$1" 2>/dev/null | awk '{print $1}' || true
+}
+
+# _falkordb_module_verified — rc 0 only when the module the unit will load is
+# on disk, executable, AND hashes to the pinned digest right now. Presence is
+# not proof: the file is native code, so the digest binds every run rather
+# than only the download that first placed it.
+_falkordb_module_verified() {
+    local arch expected target actual
+    arch="$(_falkordb_arch)"
+    [ -n "$arch" ] || return 1
+    expected="$(_falkordb_expected_sha "$FALKORDB_VERSION" "$arch")"
+    [ -n "$expected" ] || return 1
+    target="$FALKORDB_DEPS_DIR/$FALKORDB_VERSION/falkordb.so"
+    [ -f "$target" ] && [ -x "$target" ] || return 1
+    actual="$(_falkordb_sha256 "$target")"
+    [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
 # falkordb_module_install — fetch + verify the engine module. No sudo: it lands
 # under ~/.genesis/deps, the established home for downloaded dependencies.
 falkordb_module_install() {
@@ -234,20 +258,38 @@ falkordb_module_install() {
     dest="$FALKORDB_DEPS_DIR/$FALKORDB_VERSION"
     target="$dest/falkordb.so"
     if [ -f "$target" ]; then
-        # The file is the sentinel for "installed", but redis refuses a module
-        # without the execute bit — verify the bit rather than trusting it.
-        if [ -x "$target" ]; then
-            echo "  OK: FalkorDB module $FALKORDB_VERSION already present."
+        # A file on disk is a CLAIM that it was verified once. Re-hash it:
+        # corruption, a truncation that kept the mode, or hand-seeded bytes
+        # would otherwise be loaded as native code indefinitely.
+        actual="$(_falkordb_sha256 "$target")"
+        if [ -z "$actual" ]; then
+            echo "  WARNING: cannot verify the cached FalkorDB module (sha256sum unavailable)"
+            echo "           — left in place but UNVERIFIED; redis will not be installed for it."
             return 0
         fi
-        if chmod +x "$target" 2>/dev/null; then
-            echo "  OK: FalkorDB module $FALKORDB_VERSION already present (restored +x)."
+        if [ "$actual" != "$expected" ]; then
+            if ! rm -f "$target" 2>/dev/null || [ -e "$target" ]; then
+                echo "  WARNING: cached $target fails the pinned digest and could not be"
+                echo "           removed — FalkorDB module NOT verified."
+                return 0
+            fi
+            echo "  WARNING: cached FalkorDB module failed the pinned digest — removed; re-downloading."
+        else
+            # Verified bytes, but redis refuses a module without the execute
+            # bit — verify the bit rather than trusting it.
+            if [ -x "$target" ]; then
+                echo "  OK: FalkorDB module $FALKORDB_VERSION already present."
+                return 0
+            fi
+            if chmod +x "$target" 2>/dev/null; then
+                echo "  OK: FalkorDB module $FALKORDB_VERSION already present (restored +x)."
+                return 0
+            fi
+            rm -f "$target" 2>/dev/null || true
+            echo "  WARNING: $target exists without the execute bit and could not be"
+            echo "           repaired — removed so the next run reinstalls cleanly."
             return 0
         fi
-        rm -f "$target" 2>/dev/null || true
-        echo "  WARNING: $target exists without the execute bit and could not be"
-        echo "           repaired — removed so the next run reinstalls cleanly."
-        return 0
     fi
 
     if ! command -v curl >/dev/null 2>&1; then
@@ -273,12 +315,7 @@ falkordb_module_install() {
         return 0
     fi
 
-    actual=""
-    if command -v sha256sum >/dev/null 2>&1; then
-        # `|| true`: under pipefail the pipeline's status would reach the
-        # caller; 2>/dev/null hides the message, not the status.
-        actual="$(sha256sum "$target.partial" 2>/dev/null | awk '{print $1}' || true)"
-    fi
+    actual="$(_falkordb_sha256 "$target.partial")"
     if [ -z "$actual" ]; then
         rm -f "$target.partial" 2>/dev/null || true
         echo "  WARNING: cannot verify the FalkorDB module (sha256sum unavailable)"
@@ -343,10 +380,12 @@ falkordb_redis_install() {
         # operator-decision message about a decision that was already made —
         # misleading, and the kind of message that trains people to ignore
         # output.
-        if [ -f "$FALKORDB_PROVISION_MARKER" ]; then
-            echo "  OK: redis-server already provisioned."
-            return 0
-        fi
+        #
+        # Ownership is decided by the stamp alone, BEFORE the completion
+        # marker is consulted: the marker records that an install of ours once
+        # finished, not which redis is on the box now. Read first, a purged or
+        # replaced package would be reported as provisioned and the operator
+        # would never see the >= $FALKORDB_MIN_REDIS warning below.
         stamp=""
         if [ -f "$FALKORDB_APT_LIST" ]; then
             stamp="$(_falkordb_redis_pkg_stamp || true)"
@@ -359,7 +398,9 @@ falkordb_redis_install() {
                 stamp=""
             fi
         fi
-        if [ -n "$stamp" ]; then
+        if [ -n "$stamp" ] && [ -f "$FALKORDB_PROVISION_MARKER" ]; then
+            echo "  OK: redis-server already provisioned."
+        elif [ -n "$stamp" ]; then
             # Ours, unfinished, and the fingerprint still matches THIS package:
             # retry JUST the stand-down. The operator-decision message below is
             # for a redis that is not ours, and printing it here would abandon
@@ -573,27 +614,34 @@ falkordb_provision() {
         return 0
     fi
     mkdir -p "$FALKORDB_DATA_DIR" 2>/dev/null || true
-    # Preflight before touching the system: the module half refuses any
+    # Preflight before touching anything: the module half refuses any
     # version/arch pair with no pinned digest, so a box that can never install
     # the module (an architecture we ship no asset for, or an unpinned pair
-    # like 4.20.4/arm64v8 while only x64 is pinned) has no business gaining an
-    # apt repo and a database first. Installing redis on such a box is a
-    # system change for an engine that can never load. A module already on
-    # disk was verified when it landed, so it counts as supportable.
+    # like 4.20.4/arm64v8 while only x64 is pinned) has nothing to provision.
     arch="$(_falkordb_arch)"
     if [ -z "$arch" ]; then
         echo "  Skipped: no FalkorDB module ships for $(uname -m 2>/dev/null || echo 'this architecture') —"
         echo "           nothing provisioned."
         return 0
     fi
-    if [ -z "$(_falkordb_expected_sha "$FALKORDB_VERSION" "$arch")" ] \
-        && [ ! -f "$FALKORDB_DEPS_DIR/$FALKORDB_VERSION/falkordb.so" ]; then
+    if [ -z "$(_falkordb_expected_sha "$FALKORDB_VERSION" "$arch")" ]; then
         echo "  Skipped: no pinned checksum for FalkorDB $FALKORDB_VERSION/$arch —"
         echo "           the module cannot be verified, so no system changes were made."
         echo "           To adopt this build, pin its digest in _falkordb_expected_sha."
         return 0
     fi
-    falkordb_redis_install
+    # The MODULE first, and the system half only once it verifies: the module
+    # is the reason redis is wanted, so a failed download, digest, or chmod
+    # must not leave an apt repo and a daemon behind for an engine that cannot
+    # start. A redis that is already on the box is the exception — that path
+    # installs nothing, and it is where an unfinished stand-down of OUR
+    # system unit gets retried, which a broken module must not postpone.
     falkordb_module_install
+    if _falkordb_module_verified || _falkordb_redis_present; then
+        falkordb_redis_install
+    else
+        echo "  Skipped: graph-engine server — the module is not installed and verified,"
+        echo "           so no system changes were made. Re-run once it installs."
+    fi
     return 0
 }

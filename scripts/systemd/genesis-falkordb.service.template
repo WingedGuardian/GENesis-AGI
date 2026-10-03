@@ -52,7 +52,10 @@ TimeoutStartSec=20
 # RSS around the 1G ceiling and is still ~6x the measured peak for this graph's
 # size. noeviction: silently evicting graph keys would corrupt the projection —
 # a write that cannot fit must fail loudly and be repaired by a re-project.
-ExecStartPre=/bin/mkdir -p __HOME__/.genesis/falkordb
+# `+` runs this one command outside the sandbox below: ReadWritePaths names
+# the data dir itself, a missing ReadWritePaths entry fails namespace setup,
+# and under ProtectHome=read-only a sandboxed mkdir could not create it.
+ExecStartPre=+/bin/mkdir -p __HOME__/.genesis/falkordb
 ExecStart=__REDIS_SERVER__ \
     --port 0 \
     --unixsocket __HOME__/.genesis/falkordb/falkordb.sock \
@@ -79,13 +82,16 @@ LimitNOFILE=65536
 # same as the user manager. Real protection needs a drop-in on user@.service.
 NoNewPrivileges=yes
 ProtectSystem=strict
-# Narrowed to what the comment actually claims. `%h` would grant write to the
-# whole home — the repo and its secrets.env, ~/.ssh, ~/.claude — which defeats
-# the point of ProtectSystem=strict. --save "" does not close that: an explicit
-# BGSAVE after CONFIG SET dir writes wherever dir points, and the module is
-# native code. ~/.genesis (not the falkordb subdir) so ExecStartPre can create
-# the data dir when it is missing.
-ReadWritePaths=%h/.genesis
+# ProtectSystem=strict does NOT cover /home, /root or /run/user: systemd's
+# strict table leaves them writable for ProtectHome= to manage (src/core/
+# namespace.c, protect_system_strict_table). Without ProtectHome the allowlist
+# below narrows nothing and the repo and its secrets.env, ~/.ssh and ~/.claude
+# all stay writable. --save "" does not close that: an explicit BGSAVE after
+# CONFIG SET dir writes wherever dir points, and the module is native code.
+# So the home is read-only and the data dir is the one writable path. The
+# module under ~/.genesis/deps only needs to be READ.
+ProtectHome=read-only
+ReadWritePaths=%h/.genesis/falkordb
 RestrictAddressFamilies=AF_UNIX
 PrivateTmp=yes
 ProtectKernelTunables=yes
