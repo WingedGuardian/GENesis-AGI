@@ -372,3 +372,41 @@ def test_guidance_names_both_forms_and_the_seam(e2e):
     g = e2e.GUIDANCE
     assert "E2E: <one-line plan" in g and "E2E: none —" in g
     assert "validator" in g.lower()
+
+
+# ── keep_blank (issue #2786) ─────────────────────────────────────────────────
+
+_KEEP_BLANK_BODIES = [
+    ("a\n\nb", "a\n\nb"),
+    ("a\n   \nb", "a\n\nb"),
+    ("a\n```\nx\n```\nb", "a\nb"),
+    ("a\n<!--x-->\nb", "a\nb"),
+    ("a\n<!--\nx\n-->\nb", "a\nb"),
+    ("a\n<!-- c -->\n\nb", "a\n\nb"),
+    ("a\n<!-- open\n\nstill\nb", "a"),
+]
+
+
+def test_keep_blank_agrees_across_both_scanners(e2e):
+    """Shared scanner and local fallback must give identical keep_blank output on
+    every case — the whole point of sharing the scanner is that the two cannot
+    disagree about what is visible."""
+    for body, want in _KEEP_BLANK_BODIES:
+        assert e2e._local_readable_body(body, keep_blank=True) == want, body
+        shared = e2e._load_sibling_readable_body()
+        assert shared is not None
+        assert shared(body, keep_blank=True) == want, body
+
+
+def test_wrapper_forwards_keep_blank_to_the_shared_scanner(e2e):
+    for body, want in _KEEP_BLANK_BODIES:
+        assert e2e.readable_body(body, keep_blank=True) == want, body
+
+
+def test_wrapper_forwards_keep_blank_to_the_fallback(e2e, monkeypatch):
+    """Same result when the sibling cannot load: patch the loader to None and the
+    wrapper must still honour keep_blank identically."""
+    monkeypatch.setattr(e2e, "_load_sibling_readable_body", lambda: None)
+    for body, want in _KEEP_BLANK_BODIES:
+        assert e2e.readable_body(body, keep_blank=True) == want, body
+    assert e2e.readable_body("a\n\nb") == "a\nb"
