@@ -308,4 +308,6 @@ what, and the morning report counts unverified questions so a parked one is
 never invisible. Board promotion will refuse a blocked record once it lands —
 until then nothing refuses on a block, so do not rely on one. Close with
 `open_question_resolve` and say what settled it — an assumption is not an
-answer. The store is LOCAL ONLY; nothing here reaches GitHub.
+answer. Resolving, and removing a block, are the OWNER's call: a dispatched
+session is refused both, so it parks the question and leaves it. The store is
+LOCAL ONLY; nothing here reaches GitHub.

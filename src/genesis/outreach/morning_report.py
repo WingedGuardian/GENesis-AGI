@@ -554,7 +554,10 @@ class MorningReportGenerator:
                     age = f" (oldest {days}d)"
                 lines.append(f"- Open questions awaiting your decision: {oq['unverified']}{age}")
         except Exception:
+            # Never let a failed read look like "no questions": this line is the
+            # only push surface for parked owner decisions.
             logger.warning("Ground truth: open-question count failed", exc_info=True)
+            lines.append("- Open questions awaiting your decision: unavailable (read failed)")
 
         try:
             # Reads the SHARED assembler rather than re-deriving the counts, so

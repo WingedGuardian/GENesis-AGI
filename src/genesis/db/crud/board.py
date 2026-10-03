@@ -79,8 +79,7 @@ MAX_DETAIL_BYTES = 64 * 1024
 MAX_LABEL_CHARS = 200
 MAX_REASON_CHARS = 4000
 #: Edges per question in one raise. Real questions block one to a handful of
-#: things; the bound keeps one call from holding a long write transaction on
-#: the shared connection.
+#: things; the bound keeps one raise from holding the database write lock long.
 MAX_BLOCKS = 50
 
 
@@ -282,7 +281,25 @@ async def raise_question(
     """Record a new unverified question, and the ``(kind, target_id)`` edges it
     blocks, in ONE transaction; returns its id. Every target is validated before
     anything is written, so a question can never land with only some of its
-    blocks (which would under-block promotion) and a retry never duplicates it."""
+    blocks (which would under-block promotion).
+
+    ``db`` must be a connection the CALLER OWNS (``get_raw_db``), with no
+    transaction open (refused: the ``BEGIN`` would fail), never the server's shared
+    ``SerializedConnection``: that one serialises single
+    statements but holds no lock across several, so another call's
+    ``commit()`` or ``rollback()`` (the health MCP middleware rolls the shared
+    connection back after any failed tool) could land between this function's
+    inserts and save a question without its blocks, or discard one already
+    reported saved. The shared connection is refused outright rather than
+    trusted to be idle."""
+    from genesis.db.connection import SerializedConnection
+
+    if isinstance(db, SerializedConnection):
+        raise TypeError(
+            "raise_question needs a connection it owns (get_raw_db), not the shared one"
+        )
+    if db.in_transaction:
+        raise ValueError("raise_question needs an idle connection; commit or roll back first")
     question = (question or "").strip()
     if not question:
         raise ValueError("question is required")
@@ -295,13 +312,11 @@ async def raise_question(
         raise ValueError(f"{len(blocks)} blocks in one raise; the limit is {MAX_BLOCKS}")
     edges = sorted({(kind, normalize_target(kind, tid)) for kind, tid in (blocks or [])})
     qid = uuid.uuid4().hex
-    # A SAVEPOINT, not a rollback: on a shared connection a ROLLBACK would also
-    # discard a caller's unrelated pending writes; this undoes only this unit.
-    await db.execute("SAVEPOINT open_question_raise")
+    await db.execute("BEGIN IMMEDIATE")
     try:
         await db.execute(
-            "INSERT INTO open_questions (id, question, context, status, raised_by, created_at, "
-            "updated_at) VALUES (?,?,?,'unverified',?,?,?)",
+            "INSERT INTO open_questions (id, question, context, status, raised_by, "
+            "created_at, updated_at) VALUES (?,?,?,'unverified',?,?,?)",
             (qid, question, context, raised_by, now, now),
         )
         for kind, tid in edges:
@@ -310,12 +325,12 @@ async def raise_question(
                 "created_at) VALUES (?,?,?,?)",
                 (qid, kind, tid, now),
             )
-    except Exception:
-        await db.execute("ROLLBACK TO open_question_raise")
-        await db.execute("RELEASE open_question_raise")
+        await db.commit()
+    except BaseException:
+        # CancelledError included: it skips `except Exception`, and an owned
+        # transaction left open would hold the write lock until the close.
+        await db.rollback()
         raise
-    await db.execute("RELEASE open_question_raise")
-    await db.commit()
     return qid
 
 
@@ -341,6 +356,11 @@ async def close_question(
     observed status, so a race is a no-op, never a clobber of the first answer.
     Closing a question releases its blocks (they stop counting) but keeps the
     edges, so the record shows what it had blocked."""
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    # Answering an owner fork IS owner authority: a dispatched / unsupervised
+    # session is refused here, below every MCP wrapper (DispatchGateRefused).
+    guard_human_gate("open_question_resolve")
     _one_of("status", status, TERMINAL_QUESTION_STATUSES)
     resolution = (resolution or "").strip()
     if not resolution:
@@ -389,10 +409,18 @@ async def add_block(
 async def remove_block(
     db: aiosqlite.Connection, *, question_id: str, target_kind: str, target_id: str
 ) -> bool:
+    """Drop an edge from an UNVERIFIED question. A closed question's edges are
+    its history (close_question keeps them), so they are never removed — the
+    delete itself re-checks the status, so a close racing this cannot lose one.
+    Unblocking work is owner authority: refused for a dispatched session."""
+    from genesis.security.immunity_shadow import guard_human_gate
+
+    guard_human_gate("open_question_unblock")
     target_id = normalize_target(target_kind, target_id)
     cur = await db.execute(
-        "DELETE FROM open_question_blocks WHERE question_id = ? AND target_kind = ? AND target_id = ?",
-        (question_id, target_kind, target_id),
+        "DELETE FROM open_question_blocks WHERE question_id = ? AND target_kind = ? AND target_id = ? "
+        "AND EXISTS (SELECT 1 FROM open_questions WHERE id = ? AND status = 'unverified')",
+        (question_id, target_kind, target_id, question_id),
     )
     await db.commit()
     return cur.rowcount == 1
@@ -424,31 +452,54 @@ async def blocking_questions(
     return await _all(cur)
 
 
+#: Ids per ``IN (...)`` query: below SQLite's oldest bound-variable limit (999).
+_IN_CHUNK = 500
+
+
 async def list_questions(
     db: aiosqlite.Connection,
     *,
     status: str | None = "unverified",
     limit: int | None = None,
+    offset: int = 0,
 ) -> dict:
-    """Questions (newest first) with their blocks, plus the FULL total for the
-    filter — ``listed`` vs ``total`` so a paged read is never mistaken for the
-    whole set. ``status=None`` lists every status."""
+    """One page of questions (newest first) with their blocks, plus the FULL
+    total for the filter — ``listed`` vs ``total`` so a page is never mistaken
+    for the whole set. ``status=None`` lists every status. Blocks for the whole
+    page come back in ONE query, not one per question."""
     if status is not None:
         _one_of("status", status, QUESTION_STATUSES)
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
         raise ValueError("limit must be a positive int or None")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative int")
     where, params = ("WHERE status = ?", (status,)) if status is not None else ("", ())
     cur = await db.execute(f"SELECT COUNT(*) FROM open_questions {where}", params)
     total = (await cur.fetchone())[0]
     sql = f"SELECT * FROM open_questions {where} ORDER BY created_at DESC, id"
     if limit is not None:
-        sql += f" LIMIT {int(limit)}"
+        sql += f" LIMIT {int(limit)} OFFSET {int(offset)}"
+    elif offset:
+        sql += f" LIMIT -1 OFFSET {int(offset)}"
     cur = await db.execute(sql, params)
-    items = []
-    for item in await _all(cur):
-        item["blocks"] = await blocks_of(db, item["id"])
-        items.append(item)
-    return {"items": items, "listed": len(items), "total": total}
+    items = await _all(cur)
+    edges: dict[str, list[dict]] = {item["id"]: [] for item in items}
+    ids = [item["id"] for item in items]
+    # Chunked: an unpaged read (limit=None) must not outgrow SQLite's
+    # bound-variable limit, which is 999 on older builds.
+    for start in range(0, len(ids), _IN_CHUNK):
+        chunk = ids[start : start + _IN_CHUNK]
+        cur = await db.execute(
+            "SELECT question_id, target_kind, target_id, created_at FROM open_question_blocks "
+            f"WHERE question_id IN ({','.join('?' for _ in chunk)}) "
+            "ORDER BY created_at, target_kind, target_id",
+            chunk,
+        )
+        for edge in await _all(cur):
+            edges[edge.pop("question_id")].append(edge)
+    for item in items:
+        item["blocks"] = edges[item["id"]]
+    return {"items": items, "listed": len(items), "total": total, "offset": offset}
 
 
 async def question_summary(db: aiosqlite.Connection) -> dict:

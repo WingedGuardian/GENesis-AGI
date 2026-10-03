@@ -4,6 +4,7 @@ open-question tools) lean on."""
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import re
 
@@ -21,6 +22,16 @@ REPO = "owner/repo"
 SRC = "a" * 32
 SRC2 = "b" * 32
 SHA = "c" * 64
+
+
+@pytest.fixture(autouse=True)
+def _attended_session(monkeypatch):
+    """Run as an owner-attended session whatever the developer's shell says: a
+    test run from inside a dispatched session would otherwise inherit its
+    markers and have every owner-authority call refused. Tests of the refusal
+    set the markers themselves."""
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
 
 
 @pytest.fixture
@@ -283,33 +294,139 @@ async def test_raise_with_blocks_is_all_or_nothing(db):
     )
 
 
-async def test_raise_rolls_back_only_its_own_unit_on_a_mid_write_failure(db):
-    """A failure after the question row is written (forced here on the first
-    edge insert, the shape of a "database is locked") undoes the question too —
-    and leaves a caller's earlier, uncommitted write on the same connection
-    alone (a full ROLLBACK would have discarded it)."""
-    await db.execute(
-        "INSERT INTO board_events (event, created_at) VALUES ('override', ?)", (NOW,)
-    )  # the caller's pending, uncommitted write on the shared connection
+@pytest.mark.parametrize("exc", [aiosqlite.OperationalError("locked"), asyncio.CancelledError()])
+async def test_a_raise_interrupted_mid_write_leaves_nothing_and_no_open_transaction(db, exc):
+    """Interrupt the raise AFTER its question row and first edge are written but
+    before the second edge (an error, or a cancellation — CancelledError is a
+    BaseException and skips `except Exception`). The transaction is rolled
+    back: no question, no edge, and the connection is not left holding the
+    write lock."""
     real_execute = db.execute
-    calls = {"n": 0}
+    edges = {"n": 0}
 
     async def flaky(sql, *args):
         if sql.startswith("INSERT INTO open_question_blocks"):
-            calls["n"] += 1
-            raise aiosqlite.OperationalError("database is locked")
+            edges["n"] += 1
+            if edges["n"] == 2:
+                raise exc
         return await real_execute(sql, *args)
 
     db.execute = flaky
     try:
-        with pytest.raises(aiosqlite.OperationalError):
-            await board.raise_question(db, question="q", now=NOW, blocks=[("follow_up", SRC)])
+        with pytest.raises(type(exc)):
+            await board.raise_question(
+                db, question="q", now=NOW, blocks=[("follow_up", SRC), ("follow_up", SRC2)]
+            )
     finally:
         db.execute = real_execute
-    assert calls["n"] == 1
+    assert edges["n"] == 2, "the failure landed mid-write, after a written edge"
+    assert not db.in_transaction, "rolled back, not left open"
+    await db.commit()  # whatever a later commit on this connection would persist
     assert (await board.list_questions(db, status=None))["total"] == 0
-    await db.commit()
-    assert (await board.list_events(db))["total"] == 1, "the caller's own write survived"
+    cur = await db.execute("SELECT COUNT(*) FROM open_question_blocks")
+    assert (await cur.fetchone())[0] == 0
+
+
+async def test_raise_refuses_the_shared_serialized_connection(db):
+    """On the shared connection another call's commit or rollback can land
+    between the inserts; a raise must be handed a connection its caller owns."""
+    from genesis.db.connection import SerializedConnection
+
+    with pytest.raises(TypeError, match="owns"):
+        await board.raise_question(SerializedConnection(db), question="q", now=NOW)
+    assert (await board.list_questions(db, status=None))["total"] == 0
+
+
+async def test_a_closed_questions_edges_are_history_and_cannot_be_removed(db):
+    qid = await board.raise_question(db, question="q", now=NOW, blocks=[("follow_up", SRC)])
+    await board.close_question(db, question_id=qid, status="resolved", resolution="r", now=NOW)
+    assert (
+        await board.remove_block(db, question_id=qid, target_kind="follow_up", target_id=SRC)
+        is False
+    )
+    assert (await board.get_question(db, qid))["blocks"] != []
+
+
+@pytest.mark.parametrize(
+    "act",
+    [
+        lambda db, qid: board.close_question(
+            db, question_id=qid, status="resolved", resolution="r", now=NOW
+        ),
+        lambda db, qid: board.remove_block(
+            db, question_id=qid, target_kind="follow_up", target_id=SRC
+        ),
+    ],
+    ids=["resolve", "unblock"],
+)
+async def test_owner_authority_is_refused_for_a_dispatched_session(db, monkeypatch, act):
+    from genesis.security.immunity_shadow import DispatchGateRefused
+
+    qid = await board.raise_question(db, question="q", now=NOW, blocks=[("follow_up", SRC)])
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    with pytest.raises(DispatchGateRefused):
+        await act(db, qid)
+    q = await board.get_question(db, qid)
+    assert q["status"] == "unverified" and q["blocks"] != []
+    monkeypatch.setenv("GENESIS_SESSION_SUPERVISED", "1")  # owner-attended: allowed
+    await act(db, qid)
+
+
+async def test_list_questions_pages_with_offset_and_batches_blocks(db):
+    ids = []
+    for i in range(5):
+        ids.append(
+            await board.raise_question(
+                db,
+                question=f"q{i}",
+                now=f"2026-10-03T12:0{i}:00+00:00",
+                blocks=[("card", f"o/r#{i + 1}")],
+            )
+        )
+    first = await board.list_questions(db, limit=2)
+    second = await board.list_questions(db, limit=2, offset=2)
+    tail = await board.list_questions(db, offset=4)
+    assert [q["question"] for q in first["items"]] == ["q4", "q3"]
+    assert [q["question"] for q in second["items"]] == ["q2", "q1"]
+    assert [q["question"] for q in tail["items"]] == ["q0"] and tail["total"] == 5
+    assert all(len(q["blocks"]) == 1 for q in first["items"] + second["items"] + tail["items"])
+    assert first["items"][0]["blocks"][0]["target_id"] == "o/r#5", (
+        "each page's blocks belong to its own rows"
+    )
+    with pytest.raises(ValueError):
+        await board.list_questions(db, offset=-1)
+
+
+async def test_an_unpaged_list_fetches_blocks_in_bounded_chunks(db, monkeypatch):
+    """The block fetch is chunked, so an unpaged read never outgrows SQLite's
+    bound-variable limit; every row still gets exactly its own blocks."""
+    monkeypatch.setattr(board, "_IN_CHUNK", 2)
+    for i in range(5):
+        await board.raise_question(
+            db,
+            question=f"q{i}",
+            now=f"2026-10-03T12:0{i}:00+00:00",
+            blocks=[("card", f"o/r#{i + 1}")],
+        )
+    listing = await board.list_questions(db, limit=None)
+    assert listing["listed"] == 5
+    assert {q["question"]: [b["target_id"] for b in q["blocks"]] for q in listing["items"]} == {
+        f"q{i}": [f"o/r#{i + 1}"] for i in range(5)
+    }
+
+
+async def test_raise_refuses_a_connection_with_a_transaction_open(db):
+    """A raise owns its transaction; it never folds in (or commits) a caller's
+    pending work."""
+    await db.execute("INSERT INTO board_events (event, created_at) VALUES ('override', ?)", (NOW,))
+    with pytest.raises(ValueError, match="idle connection"):
+        await board.raise_question(db, question="q", now=NOW)
+    await db.rollback()
+    assert (await board.list_events(db))["total"] == 0, (
+        "the caller's pending write was not committed"
+    )
+    assert (await board.list_questions(db, status=None))["total"] == 0
 
 
 async def test_card_targets_are_case_insensitive(db):

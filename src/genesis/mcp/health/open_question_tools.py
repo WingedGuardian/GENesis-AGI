@@ -80,6 +80,46 @@ async def _parse_target(db, raw: str) -> tuple[tuple[str, str] | None, str | Non
     return (kind, full), None
 
 
+class _Busy(Exception):
+    """The write lost the database lock on every retry; nothing was written."""
+
+
+async def _owned(db, unit):
+    """Run ``unit(own)`` on a connection this call OWNS and return its result.
+
+    Every open-question WRITE goes through here, never through the server's
+    shared connection: that one serialises single statements but not a unit of
+    them, and the health MCP middleware rolls it back after any failed tool call
+    — so a write there could be discarded after this tool reported it saved, or
+    (for a raise) split from its blocks. The owned connection opens the same
+    file as the shared one. A lost lock race is retried as a WHOLE unit on a
+    fresh connection, on the shared connection's retry schedule; each unit is
+    all-or-nothing (a failed commit leaves nothing), so a retry never doubles a
+    write.
+    """
+    import asyncio
+    import sqlite3
+
+    from genesis.db.connection import _WRITE_RETRY_DELAYS, _is_lock_error, get_raw_db
+    from genesis.env import genesis_db_path
+
+    path = getattr(db, "_db_path", None) or genesis_db_path()
+    for delay in (*_WRITE_RETRY_DELAYS, None):
+        try:
+            async with get_raw_db(path) as own:
+                return await unit(own)
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc):
+                raise
+            if delay is None:
+                raise _Busy(str(exc)) from exc
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+_BUSY = "database busy (lock lost on every retry); nothing was changed — try again"
+
+
 async def _ready(db) -> str | None:
     from genesis.db.crud import board as board_crud
 
@@ -106,19 +146,25 @@ async def _impl_open_question_raise(
         if error:
             return _err(error)  # validate EVERY target before writing anything
         parsed.append(target)
-    try:
-        # One transaction: the question and every edge land together, or none do.
+
+    async def unit(own):
         qid = await board_crud.raise_question(
-            db,
+            own,
             question=question,
             context=context or None,
             raised_by=raised_by or None,
             now=now,
             blocks=parsed,
         )
+        return await board_crud.get_question(own, qid)
+
+    try:
+        saved = await _owned(db, unit)
+    except _Busy:
+        return _err(_BUSY)
     except ValueError as exc:
         return _err(str(exc))
-    return {"status": "ok", "question": await board_crud.get_question(db, qid)}
+    return {"status": "ok", "question": saved}
 
 
 async def _impl_open_question_resolve(
@@ -131,13 +177,21 @@ async def _impl_open_question_resolve(
     qid, error = await _resolve_id(db, "open_questions", question_id, "question")
     if error:
         return _err(error)
-    try:
+
+    async def unit(own):
         changed = await board_crud.close_question(
-            db, question_id=qid, status=status, resolution=resolution, now=now
+            own, question_id=qid, status=status, resolution=resolution, now=now
         )
+        return changed, await board_crud.get_question(own, qid)
+
+    try:
+        changed, question = await _owned(db, unit)
+    except PermissionError as exc:  # DispatchGateRefused: owner authority
+        return _err(f"refused: resolving an open question is the owner's call ({exc})")
+    except _Busy:
+        return _err(_BUSY)
     except ValueError as exc:
         return _err(str(exc))
-    question = await board_crud.get_question(db, qid)
     if not changed:
         return _err(f"question {qid} is already {question['status']}; it was not changed")
     return {"status": "ok", "question": question}
@@ -157,21 +211,43 @@ async def _impl_open_question_block(
     if error:
         return _err(error)
     kind, target_id = parsed
-    try:
+
+    async def unit(own):
         if remove:
             changed = await board_crud.remove_block(
-                db, question_id=qid, target_kind=kind, target_id=target_id
+                own, question_id=qid, target_kind=kind, target_id=target_id
             )
         else:
             changed = await board_crud.add_block(
-                db, question_id=qid, target_kind=kind, target_id=target_id, now=now
+                own, question_id=qid, target_kind=kind, target_id=target_id, now=now
             )
+        return changed, await board_crud.get_question(own, qid)
+
+    try:
+        changed, question = await _owned(db, unit)
+    except PermissionError as exc:  # DispatchGateRefused: unblocking is owner authority
+        return _err(f"refused: removing a block is the owner's call ({exc})")
+    except _Busy:
+        return _err(_BUSY)
     except ValueError as exc:
         return _err(str(exc))
-    return {"status": "ok", "changed": changed, "question": await board_crud.get_question(db, qid)}
+    if remove and not changed and question["status"] != "unverified":
+        return _err(
+            f"question {qid} is {question['status']}; its edges are history and are not removed"
+        )
+    return {"status": "ok", "changed": changed, "question": question}
 
 
-async def _impl_open_question_list(db, *, status: str, target: str, limit: int | None) -> dict:
+#: Page bounds for open_question_list. Unverified questions are never pruned, so
+#: an unpaged read would grow with the backlog; a page of 50 covers any normal
+#: review, and 200 bounds one response. ``next_offset`` pages through the rest.
+DEFAULT_PAGE = 50
+MAX_PAGE = 200
+
+
+async def _impl_open_question_list(
+    db, *, status: str, target: str, limit: int | None, offset: int = 0
+) -> dict:
     from genesis.db.crud import board as board_crud
 
     if (problem := await _ready(db)) is not None:
@@ -188,11 +264,17 @@ async def _impl_open_question_list(db, *, status: str, target: str, limit: int |
             "blocked": bool(blocking),
             "blocking_questions": blocking,
         }
+    page = DEFAULT_PAGE if limit is None else limit
+    if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= MAX_PAGE:
+        return _err(f"limit must be 1..{MAX_PAGE}")
     try:
-        listing = await board_crud.list_questions(db, status=status or None, limit=limit)
+        listing = await board_crud.list_questions(
+            db, status=status or None, limit=page, offset=offset
+        )
     except ValueError as exc:
         return _err(str(exc))
-    return {"status": "ok", **listing}
+    more = offset + listing["listed"] < listing["total"]
+    return {"status": "ok", **listing, "next_offset": offset + listing["listed"] if more else None}
 
 
 def _db_or_none():
@@ -259,12 +341,17 @@ async def open_question_block(question_id: str, target: str, remove: bool = Fals
 
 @mcp.tool()
 async def open_question_list(
-    status: str = "unverified", target: str = "", limit: int | None = None
+    status: str = "unverified", target: str = "", limit: int | None = None, offset: int = 0
 ) -> dict:
-    """List open questions (newest first, with their blocks; ``total`` is the
-    full count for the filter, ``listed`` what this page holds). ``status`` is
-    ``unverified`` / ``resolved`` / ``dropped``, or empty for all. With
-    ``target`` (``ledger:<id>`` / ``follow_up:<id>`` / ``card:owner/repo#N``)
-    it answers instead whether that target is blocked, and by which
-    unverified questions."""
-    return await _impl_open_question_list(_db_or_none(), status=status, target=target, limit=limit)
+    """List open questions, one page at a time (newest first, with their
+    blocks). ``total`` is the full count for the filter and ``listed`` what this
+    page holds; ``next_offset`` is set while more remain (default page 50,
+    max 200). Pages are offsets: a question raised or closed between two calls
+    shifts the later pages by one, so if ``total`` changed, re-read from 0
+    rather than trusting the walk. ``status`` is ``unverified`` / ``resolved`` / ``dropped``, or
+    empty for all. With ``target`` (``ledger:<id>`` / ``follow_up:<id>`` /
+    ``card:owner/repo#N``) it answers instead whether that target is blocked,
+    and by which unverified questions."""
+    return await _impl_open_question_list(
+        _db_or_none(), status=status, target=target, limit=limit, offset=offset
+    )

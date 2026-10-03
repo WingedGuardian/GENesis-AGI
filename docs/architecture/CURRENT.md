@@ -3282,12 +3282,23 @@ verified: b67423bd 2026-10-03
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its
-  own table. A question and all its blocks are written in one SAVEPOINT, so
-  every target is validated first and none land unless all do. A close is
-  guarded on the observed status, so a second answer never overwrites the
-  first. Card targets and stored repo names are lowercased, because GitHub
-  names are case-insensitive. A test pins that the module has no GitHub or
-  subprocess path. `open_question_list` is on the reflection read allowlist.
+  own table. Every target is validated first. Every WRITE (raise, resolve,
+  block add/remove) runs on a connection the tool owns, never the server's
+  shared one, because the health MCP middleware rolls the shared connection
+  back after any failed tool call and could discard or split a write already
+  reported saved. A raise is one `BEGIN IMMEDIATE` transaction (the question
+  and all its blocks, or nothing). A lost lock race retries the whole unit and
+  reports "nothing was changed" if it never wins. A close is guarded on the
+  observed status, so a second answer never overwrites the first, and a closed
+  question's edges are history (not removable). Resolving and removing a block
+  are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile
+  (overlay profiles included) and refused server-side for a dispatched,
+  unsupervised session (`guard_human_gate`). Listing is denied on the
+  external-ingesting profiles, and raising on the untrusted-inbound perimeter.
+  `open_question_list` pages (50 default, 200 max, `next_offset`). Card targets
+  and stored repo names are lowercased, because GitHub names are
+  case-insensitive. A test pins that the module has no GitHub or subprocess
+  path. `open_question_list` is on the reflection read allowlist.
   **A block is ADVISORY today:** nothing refuses on one until board promotion
   lands. The morning report's ground-truth section counts unverified questions
   (count and oldest age only, never the text); that line is the push surface
