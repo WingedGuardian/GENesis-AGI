@@ -21,8 +21,6 @@ Isolation invariants enforced EVERY run, not just in E2E:
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import fcntl
 import json
 import logging
 import shutil
@@ -54,6 +52,7 @@ from genesis.eval.bench.types import (
     BenchTask,
 )
 from genesis.eval.types import EvalRunSummary, EvalTrigger, ScoredOutput, ScorerType, TaskCategory
+from genesis.util.run_lock import acquire_run_lock, release_run_lock
 
 logger = logging.getLogger(__name__)
 
@@ -69,22 +68,15 @@ class BenchBusyError(RuntimeError):
 
 
 def _acquire_lock():
-    """Non-blocking global bench lock (gauntlet's advisory-flock pattern)."""
-    lock_path = Path.home() / "tmp" / ".bench.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")  # noqa: SIM115 — held for the run
+    """Non-blocking global bench lock (``~/.genesis/locks/bench.lock``)."""
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return acquire_run_lock("bench.lock", legacy_name=".bench.lock")
     except BlockingIOError as e:
-        fh.close()
         raise BenchBusyError("another bench run is already in progress") from e
-    return fh
 
 
-def _release_lock(fh) -> None:
-    with contextlib.suppress(Exception):
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+def _release_lock(lock) -> None:
+    release_run_lock(lock)
 
 
 async def run_arm(

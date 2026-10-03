@@ -63,7 +63,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VENV_PY="$REPO_DIR/.venv/bin/python"
@@ -206,10 +206,11 @@ reclaim_unlock() { { exec 8>&-; } 2>/dev/null || true; }
 # deletes anything itself.
 pressure_main() {
     local last_resort="${1:-}"
-    # The standard (ORANGE) pass pins --last-resort-above past 100 %: left to
-    # disk_reclaim.py's own 95 % default, an ORANGE pass on a >=95 % disk
-    # deleted the code-intel indexes before RED ever fired (review finding,
-    # #2521 item 1). Only the last-resort (RED) pass clears them.
+    # The standard (ORANGE) pass pins --last-resort-above past 100 %. That is
+    # disk_reclaim.py's own default now (#2567), but it stays explicit: an
+    # ORANGE pass that inherited the old 95 % default deleted the code-intel
+    # indexes before RED ever fired (review finding, #2521 item 1). Only the
+    # last-resort (RED) pass clears them.
     local -a reclaim=(--apply --if-above 0 --fail-above 101 --last-resort-above 101)
     # "last-resort" is the systemd instance name (%i); "--last-resort" the CLI form.
     if [ "$last_resort" = "--last-resort" ] || [ "$last_resort" = "last-resort" ]; then
@@ -462,6 +463,23 @@ main() {
             \( -name 'memory_reconcile_ghost_export-*.jsonl' -o -name 'd0008_ghost_export.jsonl' \) \
             -mtime +45 -delete 2>/dev/null \
             || echo "reconcile ghost-export prune exited $?"
+    fi
+
+    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
+    # update.sh saves local edits to the tracked ephemeral files it discards before
+    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
+    # run. Written once and never touched again, so a directory's mtime is its age.
+    # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
+    # which spares a tree that is or holds a mount), over the CANONICAL root.
+    if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then
+        :
+    elif ! _pmb_mounts="$(mount_targets "$_pmb_root")"; then
+        echo "premerge-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+    else
+        while IFS= read -r -d '' _pmb_dir; do
+            remove_tree_one_fs "$_pmb_dir" "$_pmb_mounts" 1 \
+                || echo "premerge-backups prune failed or spared $_pmb_dir"
+        done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
     fi
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"

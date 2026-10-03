@@ -795,3 +795,88 @@ def test_a_result_arriving_during_shutdown_is_not_discarded():
         out = _result_while_loop_lives(landed_late, dying_loop, timeout=1.0, poll=0.01)
 
     assert out == "the late answer"
+
+
+# --- only the NEWEST user turn is ever forwarded ---
+
+
+class TestNewestUserTurnOnly:
+    """An unusable newest user turn must NOT fall back to an older one.
+
+    Clients of this shape send the full history on every request, while
+    ConversationLoop keeps its own history, so whatever this returns is
+    submitted as a NEW turn. Walking back past an empty, image-only or
+    malformed newest turn returned an earlier instruction, which the loop
+    then executed again -- repeating any side effect it had the first time.
+    """
+
+    _HISTORY_PREFIX = [
+        {"role": "user", "content": "delete the staging branch"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    def _extract(self, newest):
+        from genesis.hosting.openai_messages import extract_last_user_message
+
+        return extract_last_user_message([*self._HISTORY_PREFIX, newest])
+
+    def test_empty_newest_turn_does_not_replay_older(self):
+        assert self._extract({"role": "user", "content": "   "}) is None
+
+    def test_image_only_newest_turn_does_not_replay_older(self):
+        newest = {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}},
+        ]}
+        assert self._extract(newest) is None
+
+    def test_malformed_newest_content_does_not_replay_older(self):
+        assert self._extract({"role": "user", "content": 42}) is None
+
+    def test_control_valid_newest_turn_is_returned(self):
+        assert self._extract({"role": "user", "content": "now the prod one"}) == "now the prod one"
+
+    def test_trailing_assistant_entry_means_no_new_turn(self):
+        """A request that ends in an assistant entry carries no new user turn."""
+        assert self._extract({"role": "assistant", "content": "x"}) is None
+
+    def test_trailing_non_dict_entry_means_no_new_turn(self):
+        assert self._extract("hello") is None
+
+    def test_trailing_capitalised_role_is_not_a_user_turn(self):
+        assert self._extract({"role": "User", "content": "x"}) is None
+
+    def test_control_trailing_system_entry_is_skipped(self):
+        """System/developer entries are instructions, not turns, so they are skipped."""
+        from genesis.hosting.openai_messages import extract_last_user_message
+
+        out = extract_last_user_message(
+            [
+                *self._HISTORY_PREFIX,
+                {"role": "user", "content": "the question"},
+                {"role": "system", "content": "be brief"},
+            ]
+        )
+        assert out == "the question"
+
+    @pytest.mark.parametrize("role", [[], {}, ["system"]])
+    def test_unhashable_role_is_malformed_not_a_crash(self, role):
+        """A JSON list/object role cannot be looked up in a set; it is malformed."""
+        assert self._extract({"role": role, "content": "x"}) is None
+
+    def test_route_returns_400_for_unhashable_role(self, client, mock_rt):
+        with patch("genesis.runtime.GenesisRuntime") as MockRT:
+            MockRT.instance.return_value = mock_rt
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"messages": [*self._HISTORY_PREFIX, {"role": [], "content": "x"}]},
+            )
+        assert resp.status_code == 400
+
+    def test_route_returns_400_for_unusable_newest_turn(self, client, mock_rt):
+        with patch("genesis.runtime.GenesisRuntime") as MockRT:
+            MockRT.instance.return_value = mock_rt
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"messages": [*self._HISTORY_PREFIX, {"role": "user", "content": ""}]},
+            )
+        assert resp.status_code == 400

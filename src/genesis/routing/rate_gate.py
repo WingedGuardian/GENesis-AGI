@@ -13,8 +13,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _AdmissionState:
+    """Shared serialization and history; policy belongs to each captured gate."""
+
+    last_request: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class ProviderRateGate:
@@ -24,13 +33,30 @@ class ProviderRateGate:
     Thread-safe via asyncio.Lock (one request at a time per provider).
     """
 
-    __slots__ = ("_interval", "_last_request", "_lock", "_provider")
+    __slots__ = ("_interval", "_admission", "_provider")
 
     def __init__(self, provider: str, rpm: int) -> None:
         self._provider = provider
         self._interval = 60.0 / rpm
-        self._last_request = 0.0
-        self._lock = asyncio.Lock()
+        self._admission = _AdmissionState()
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        return self._admission.lock
+
+    @property
+    def _last_request(self) -> float:
+        return self._admission.last_request
+
+    @_last_request.setter
+    def _last_request(self, value: float) -> None:
+        self._admission.last_request = value
+
+    def reconfigured(self, provider: str, rpm: int) -> ProviderRateGate:
+        """Capture new policy without resetting or mutating shared admissions."""
+        gate = ProviderRateGate(provider, rpm)
+        gate._admission = self._admission
+        return gate
 
     async def acquire(self) -> float:
         """Wait until it's safe to send a request. Returns wait time in seconds."""
@@ -79,6 +105,23 @@ class RateGateRegistry:
             rpm,
             60.0 / rpm,
         )
+
+    def reconfigured(self, providers, alias_target) -> RateGateRegistry:
+        """Retain shared pacing locks/admissions across reload and known renames."""
+        registry = RateGateRegistry()
+        for name, cfg in providers.items():
+            if cfg.rpm_limit is None or cfg.rpm_limit <= 0:
+                continue
+            prior = name if name in self._gates else None
+            if prior is None:
+                prior = next((old for old in self._gates if old not in providers
+                              and alias_target(old, providers) == name), None)
+            gate = self._gates.get(prior)
+            if gate is None:
+                registry.register(name, cfg.rpm_limit)
+            else:
+                registry._gates[name] = gate.reconfigured(name, cfg.rpm_limit)
+        return registry
 
     async def acquire(self, provider: str) -> float:
         """Acquire rate gate for provider. Returns 0.0 if no gate configured."""

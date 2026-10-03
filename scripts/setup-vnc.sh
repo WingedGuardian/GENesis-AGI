@@ -18,7 +18,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 VNC_PASSWD="$HOME/.genesis/vnc_passwd"

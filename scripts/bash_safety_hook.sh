@@ -32,7 +32,7 @@
 #     (GENESIS_CC_SESSION=1) keep this belt until project-hook coverage in
 #     autonomous sessions is separately verified.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Capture the payload ONCE — jq consumes stdin, and the rm delegation below
 # needs the verbatim payload to re-feed the Python guards.
@@ -70,7 +70,7 @@ if [ -z "$CMD" ]; then
     exit 0
 fi
 
-# Bash allowlist gate — scoped background profiles (e.g. "steward") export
+# Bash allowlist gate — a scoped background profile exports
 # GENESIS_BASH_ALLOWLIST. The predicate itself lives in hooks/bash_allowlist_lib.sh
 # so that this global chokepoint and the hook injected into dispatched sessions
 # (hooks/bash_allowlist_guard.sh) share ONE implementation and cannot drift;
@@ -107,7 +107,7 @@ fi
 _in_genesis=0
 _gc=$(git rev-parse --git-common-dir 2>/dev/null)
 if [ -n "$_gc" ]; then
-    _main_root=$(cd "$(dirname "$_gc")" 2>/dev/null && pwd)
+    _main_root=$(unset CDPATH; cd "$(dirname "$_gc")" 2>/dev/null && pwd)
     [ -n "$_main_root" ] && [ -f "$_main_root/scripts/hooks/git_push_guard.py" ] && _in_genesis=1
 fi
 

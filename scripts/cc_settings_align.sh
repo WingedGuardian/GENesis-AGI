@@ -51,7 +51,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-GENESIS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GENESIS_ROOT="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CC_ENV="$GENESIS_ROOT/scripts/lib/cc_version.sh"
 
 # ── OUTCOME PERSISTENCE — read the previous state, and define the ONE writer ──

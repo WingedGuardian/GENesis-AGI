@@ -164,7 +164,9 @@ Easy-to-forget mechanisms:
   digit-guard rules out numeric-suffix pairs, then a two-model LLM judgment
   (`entity_adjudication` + flipped-provider `entity_adjudication_challenge`, both
   must agree) decides merge-vs-distinct. `propose_only` by default (records, does
-  not apply); `live` applies via `merge_entity`. A cursor-managed reconcile sweep
+  not apply); `live` would apply new-pair merges via `merge_entity` unattended,
+  but is FENCED (runs as `propose_only`, settings lever refuses it) until
+  issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
   rediscovers historical fuzzy pairs. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
@@ -341,9 +343,34 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 18e41e1e1 2026-09-23
+verified: b0867170e 2026-10-02
 ```
 
+- **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
+  durable parking.** Stream truncation and overloads with known-work or MCP
+  evidence share this boundary; provider diagnosis remains available as a
+  cause. Missing/unusable overload turn counts remain retryable by explicit
+  policy, not proof of pre-work failure. See `cc/exceptions.py`,
+  `cc/transient_retry.py` and `docs/reference/inbox-replay-safety.md`.
+- **NO dispatch profile grants Bash** (`cc/direct_session.py`,
+  `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
+  to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
+  run (0 sessions, vs 257/167/154 for the three busiest). Removed rather than
+  confined because four MEASURED facts converge on one unbuilt mechanism: `gh` runs
+  arbitrary programs via its own config (closed by the retained seal); `gh` READS
+  arbitrary files via `-F`/`--input`, so a tool-scope denial of `Read`/`Glob`/`Grep`
+  cannot make "no file reads" true while `gh` is permitted; `gh` WRITES to
+  caller-chosen paths; and per-profile denials are re-enablable via
+  `tool_exceptions` absent a protected set. All four want a SUBCOMMAND-level
+  allowlist. An operator lever gating the profile was built and discarded — a lever
+  moves the decision without making the enabled state safe.
+  **The mechanism is retained and is NOT dead code**: the allowlist map, the guard
+  registration and `_BINARY_HARDENING` all key on the BINARY, so an install granting
+  `gh` to its own profile via `genesis.cc.profile_overlay` still gets the sealed
+  config dir and the program-route pins. An empty map is a statement about shipped
+  profiles, never about the machinery. Rationale, and the bar for re-adding one:
+  `.claude/docs/background-sessions.md`, "Why the one Bash-enabled profile was
+  removed".
 - **The slot door heals a bare slot — by CONSENT, never silently**
   (`scripts/cc-slot.sh`, the block above every latch; probe:
   `cc/slot_liveness.py`, a /proc walk for a live claude under any pane pid —
@@ -556,7 +583,7 @@ verified: 18e41e1e1 2026-09-23
   `observation_write`. (1) `Bash` is denied: the YouTube fetch it was kept for now runs in
   Python behind the genesis `web_fetch` MCP tool (`knowledge/processors/youtube.py` via
   `mcp/health/youtube_route.py`: one fixed yt-dlp argv, `--ignore-config`, no cookies,
-  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; the video text is returned inside the keyed untrusted-content boundary, and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain); if the
+  YouTube extractor and hosts only, caption keys held to language-tag characters, levers in `config/youtube_fetch.yaml`: `tls` certificate handling and `audio_max_minutes`, which caps audio transcription in knowledge ingestion only (the web_fetch route never transcribes audio) for the captionless-video audio fallback; every `web_fetch` MCP result, from any backend, is returned inside the keyed untrusted-content boundary (`web_tools._wrap_fetch_result`), and a `urls` batch stays one batch call with transcripts overlaid, never a per-URL fallback chain; a LinkedIn post keeps its ordinary page fetch, unchanged, and gets its video's caption track in a separate `video_transcript` field, or `video_error` when it cannot be read, with yt-dlp's "no video" message as the only sign of a text post (`knowledge/processors/linkedin.py` + `mcp/health/linkedin_route.py`, the same yt-dlp argv with the LinkedIn extractor, caption tracks only from `*.licdn.com`, never audio)); if the
   MCP registry enumeration fails the denylist drops both MCP servers wholesale and the
   judge has no YouTube path (fail-closed). RESIDUALS on the inbox judge:
   (2) the PRIVILEGED-WRITE consumers of forged observations are now gated (the
@@ -1023,7 +1050,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 640c4f2e3 2026-09-18
+verified: b0867170e 2026-10-02
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1032,8 +1059,11 @@ verified: 640c4f2e3 2026-09-18
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
-- **inbox/**: file-drop monitor with approval-gated dispatch. Before any DB,
-  approval, response, or baseline mutation, it composes and validates one
+- **inbox/**: file-drop monitor with approval-gated dispatch.
+  `monitor.py` owns scanning, approval, retries and baseline writes;
+  `batch_runner.py` executes one approved batch and post-processes its output,
+  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
   precedence footer. A missing, unreadable, or empty component fails the scan
@@ -1076,6 +1106,12 @@ verified: 640c4f2e3 2026-09-18
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Replay-unsafe batches persist a hold independent of the retry cap; readable
+  held blocks are excluded from future deltas without becoming completed
+  baseline content, while unreadable holds block their source file. The
+  operator-only per-item release requires explicit replay acknowledgement and
+  an unchanged source, then returns through normal approval/claim handling.
+  Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -2430,6 +2466,19 @@ verified: 788dd9a9 2026-09-06
   Tier taxonomy is load-bearing: Tier-1 ground truth outranks user approval.
   `record_outcome` must never raise. Deliberately "observation, not
   reinforcement" — don't rename toward RL.
+- **eval reference integrity**: `eval/reflection_golden_set.py` generates
+  private unapproved drafts (`proposed_passed`, no automatic `user_passed`),
+  preserving historical files. `eval/calibration.py` exposes opt-in
+  `strict_references` whole-file schema, rubric/context and declared human
+  provenance and exact grading-question uniqueness checks before scoring.
+  Zero-case generation leaves no output, allowing retry. Complete drafts are
+  synced and closed in sibling staging before atomic no-overwrite publication. Reflection CLI and both
+  MCP experiment consumers retain the separate historical reference default.
+  Reflection calibration CLI exposes
+  `--strict-references`; legacy reports remain compatible. Declared provenance
+  is not authenticated approval or model qualification. See
+  `docs/reference/golden-reference-integrity.md`.
+
 - **calibration/**: the pure ECE/MCE + confidence-bucket primitives
   (`metrics.py`, `types.py`), consumed by the WS-2 ledger (`ledger/cells.py`) and
   the ego-ECE path (`feedback/calibration.py`). **Four distinct "calibration"
@@ -2526,11 +2575,40 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: ee9ebf85c 2026-09-05
+verified: 1ff7c3e3c 2026-10-02
 ```
 
-- **routing/**: `config/model_routing.yaml` defines 61 numbered call sites,
-  each a free-first → paid-last chain; `never_pays` sites are filtered to
+- **October 2026 model refresh**: the stable NVIDIA DeepSeek alias selects
+  V4.1 Flash after the old Flash endpoint returned HTTP 410. Eight ordinary
+  Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
+  suppressor's exact validated pair and standalone evaluation judge remain
+  DeepSeek Pro. Candidate compatibility has been probed; candidate quality for
+  these protected judgments has not been qualified.
+- **Coherent routing reloads** (`Router.reload_config`,
+  `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
+  bindings before yielding. Replacement/rename breakers preserve holds while
+  detaching old callbacks; recovery names the current alias. Persisted identity
+  digests and retirement-only provenance permit a replacement reset only with
+  explicit retirement evidence, preserving auth/quota/operator/mixed/legacy holds.
+  Runtime health probes and dashboard snapshots read generation-bound config and
+  breakers; late probes cannot alter replacement health. Daily accounting preserves
+  exact-name rows across same-alias model changes with synchronized pure reads;
+  cross-alias budget migration is deferred. See the model-routing
+  registry reference's reload section and `test_routing_generation.py`.
+- **Reload controls**: registry-locked dashboard toggles preserve operator actions
+  across model repoints. Shared pacing gates retain admissions across reloads and
+  known alias renames. Routed trip events carry health identity; escalation rejects
+  retired-model events even when event-bus dispatch waits before consuming them.
+  Full captured registry views preserve API-key breaker/essential coverage. Proven
+  retirement starts a fresh persisted incident namespace and retires old rows;
+  account/operator holds retain their escalation and notification history.
+  Continuing registered renames preserve persisted incident ownership and user
+  acknowledgments; fresh sibling aliases cannot claim historical ownership.
+  Captured pacing intervals stay immutable while admission locks/history are shared.
+  Current health snapshots update the live cloud axis under the reload lock in both
+  full and readonly runtimes; stale generations render without changing live state.
+- **routing/**: `config/model_routing.yaml` defines 63 call sites,
+  with free-first and explicitly paid-first chains; `never_pays` sites are filtered to
   free-only. **Daily free-tier budgets** (`daily_budget.py`,
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
   the provider's OWN unit and never converted between them. As SHIPPED today:
@@ -2703,7 +2781,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: f24c15e9 2026-09-05
+verified: b0867170e 2026-10-02
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -2748,6 +2826,11 @@ verified: f24c15e9 2026-09-05
   helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`, because
   the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks` where a
   sibling import is the only one that resolves.
+  The guarded async factory also accepts `existing_only=True` for recovery
+  writers: encoded `mode=rw` refuses a missing database without dropping either
+  pre/post-open quarantine check. Inbox hold release uses this opt-in; ordinary
+  callers retain create-capable behavior. It is not a replacement/maintenance
+  fence and does not pin a database inode across inspection and release.
   Two AST-locked boundaries rather than conventional ones:
   `test_db/test_connection_admission_lock.py` pins the open-time connect set
   (a NEW factory fails until classified — it exists because a hand enumeration
@@ -3006,7 +3089,8 @@ verified: f24c15e9 2026-09-05
   stays silent on NetworkManager installs), plus a volatile `watchdog`
   heal-telemetry metric from `/run/genesis-network-watchdog.json` (see
   docs/reference/network-resilience.md). The root Tailscale watchdog
-  (`genesis-tailscale-watchdog.timer`) is reported by its unit-file state only
+  (`genesis-tailscale-watchdog.timer`) is reported by its effective unit-file
+  state—the timer's, or the service's when masked
   (`tailscale_watchdog_unit_state`, beside `tailscaled_loaded`, which gates the
   `tailscale_watchdog_absent` posture rule); its `/run` file is event data for the
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
@@ -3035,7 +3119,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 2ac29c19 2026-09-14
+verified: 5e8dc977 2026-10-01
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3051,7 +3135,12 @@ verified: 2ac29c19 2026-09-14
   scheduler — `skill_injection_hook._ensure_catalog_fresh` spawns a detached
   regen when the catalog is missing or >1h stale, `_CATALOG_MAX_AGE_S=3600`,
   serving the next prompt), consumed by the injection hook and by
-  autonomous-session resources. Skill refinement is
+  autonomous-session resources. The hook scores only whole-word skill-NAME
+  tokens and frontmatter `keywords:` (never description prose); everyday words
+  in `_NAME_TOKEN_STOPLIST` never score as name tokens, and a library skill in a
+  vendor plugin bundle (`skill-library/<vendor>/<bundle>/skills/<skill>`)
+  scores only when the prompt names that vendor (`_vendor_of`,
+  `_VENDOR_ALIASES`; the stoplist is skipped once it does). Skill refinement is
   propose-only: `learning/skills/applicator.py` STAGES a proposal for human/CC
   review and never writes a skill file. Recording it as a tracked
   cognitive-file modification is DEFERRED — no ledger pre-image is captured
@@ -3062,7 +3151,15 @@ verified: 2ac29c19 2026-09-14
   inventory (skills + action tools, never memory/brain) into a managed
   `<!-- genesis:skills -->` block in `AGENTS.md` for Cursor/Codex/other
   runtimes — on-demand and committed (re-run when skills/MCP tools change;
-  `update.sh` restores AGENTS.md to HEAD, so the block must live in the commit).
+  `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
+  edits under `~/.genesis/premerge-backups/` first — so the block must live in
+  the commit).
+  Codex's local CLI also has a budget-only shell action hook in
+  `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
+  existing commit/request budget decisions, denies approval-required or unknown
+  evidence, and returns control to the user without native approval or Genesis
+  lifecycle registration. It does not enforce the future reflection gates or
+  cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

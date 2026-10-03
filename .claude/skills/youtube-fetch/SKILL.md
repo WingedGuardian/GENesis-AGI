@@ -21,8 +21,9 @@ CC's built-in WebFetch only gets the page shell, not what the video says
 **Primary path — the genesis `web_fetch` MCP tool.** Call
 `mcp__genesis-health__web_fetch` with the video URL (or `urls=[...]` for a
 batch). For a YouTube video it runs yt-dlp in Python and returns the title,
-channel, description and transcript, choosing captions in the video's own
-language (manual over automatic), with a
+channel, description and transcript, preferring captions in the video's own
+language (manual over automatic; a track chosen without language evidence is
+labelled `provenance: unknown`), with a
 `Transcript source` line and a `caption` field giving the track and its
 provenance. It needs no shell, so it also works in background sessions. The
 video text arrives inside `<external-content>` markers, because captions and

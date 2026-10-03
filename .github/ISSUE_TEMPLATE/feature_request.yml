@@ -27,3 +27,15 @@ body:
         - Channels (Telegram, Gmail, etc.)
         - Install / Setup
         - Other
+  - type: textarea
+    id: premises
+    attributes:
+      label: Premise checks
+      description: |
+        1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
+        2. Was the repo searched for existing code that already does this, with the result written down?
+        3. Do the scope limits block the obvious shared code?
+        4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
+        5. Does every number say how it was measured (what was counted, by which script)?
+    validations:
+      required: false
