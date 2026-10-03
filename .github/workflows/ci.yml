@@ -502,9 +502,39 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  mutation-gate:
+    # Verify-RED, enforced. A guard's test can stop pinning the property it is
+    # named for -- through a refactor, a widened assertion, a sibling layer that
+    # starts masking it -- and nothing goes red, because the test still passes.
+    # This breaks a handful of load-bearing guard decisions on purpose and fails
+    # if the test does NOT notice. An ABORT is a failure too: a case that could
+    # not run has established nothing, which is the confident false negative this
+    # class is famous for. See scripts/ci/mutation_sweep.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The job runs repository tests and needs no git credential after
+          # the checkout, so none is left on disk for them to read.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        # MUST mirror the `test` job. The ROOT tests/conftest.py imports
+        # aiosqlite, so a minimal install fails collection and every case
+        # ABORTS -- a job red for the wrong reason. `--noconftest` is not the
+        # escape either: the guard tests use fixtures from
+        # tests/test_hooks/conftest.py.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Mutation gate
+        run: python scripts/ci/mutation_sweep.py config/mutation_gate.json --repo .
+
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-02: 68 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-03: 69 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1112,4 +1142,12 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24332
+        # Mutation-sweep harness (#1851): tests/test_scripts/test_mutation_sweep.py
+        # is branch-new and collects 88 (`pytest --collect-only`), no skips.
+        # Floor: 24332 + 88 = 24420; skip ceiling remains 102.
+        # Its summary-grammar fix replaces the two substring tables (13 cases)
+        # with exact-keyword parser/verdict tables and a strict-xfail end-to-end
+        # case (25 + 29 + 20 + 1 = 75): the file collects 150
+        # (`pytest --collect-only -q`, 88 - 13 + 75 = 150),
+        # no skips. Floor: 24420 + 62 = 24482; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24482
