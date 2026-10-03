@@ -8,14 +8,33 @@ second is the dangerous one -- redirecting the echo away turns a loud failure
 into a silently wrong root, which is why the remedy is `unset CDPATH` INSIDE the
 substitution (a subshell, so it leaks nothing) rather than a redirect.
 
-Polarity is ALLOWLIST. Anything matching the shape is relative-capable by
-construction, so there is no allowlist and no judgement call about whether a
-particular site is "reachable enough" -- reachability is a property of the
-CALLER, and a caller can change to a relative invocation at any time.
+The check is the EXACT REMEDY TEXT, not a grammar of safe spellings. Every
+`cd [opts] "$(dirname ...` must sit immediately after `$(unset CDPATH; ` or
+`$(CDPATH= ` -- the two spellings the tree uses (51 and 1 dirname-cd sites,
+plus the 3 allowlisted lines, measured 2026-10-02 with `_classify`;
+`CDPATH=''`/`CDPATH=""` had 0). Anything else is a violation, so a
+spelling nobody has written yet fails by default. An earlier revision accepted a
+grammar of equivalent spellings through a quote-aware parser; every review
+finding on it was a new edge of that grammar (`CDPATH=""/decoy`,
+`unset CDPATH=foo`, a `$'...'` string), and the grammar bought nothing the two
+literals do not. A valid but unusual spelling (`unset -v CDPATH`) is flagged
+and has to be rewritten, which is acceptable for a style check.
+
+There is no reachability judgement: anything matching the shape is
+relative-capable by construction, and a caller can change to a relative
+invocation at any time. The exceptions (a second cd inside a substitution that
+already ran `unset CDPATH;`) are listed in `_ALLOWED_LINES` with their reason,
+and a test fails if any listed line stops existing.
+
+A cd at TOP LEVEL has no accepted spelling, because both accepted prefixes open
+a substitution. Write it as `cd -- "$(unset CDPATH; cd -- "$(dirname -- "$0")"
+&& pwd)"`: the outer cd's argument is not the dirname shape, so it is not
+matched, and the inner capture carries the remedy.
 
 What the shape covers, and what it does not:
 
-  COVERED    `cd` inside a command substitution whose argument is a
+  COVERED    `cd` anywhere on a line (top level or inside a command
+             substitution) whose argument is a
              `"$(dirname ...)"` -- whatever the dirname argument is, whether
              `$0`, `${BASH_SOURCE[0]}`, or a variable. The variable form matters:
              scripts/cc-slot.sh resolves its own directory from
@@ -25,9 +44,9 @@ What the shape covers, and what it does not:
   NOT COVERED  three classes, each searched for in the tree and each currently
              having NO member, so this is a stated bound rather than live debt:
 
-             * a capture split across multiple lines. MEASURED: 66 of the 1266
-               `$( )` spans in the scan roots are multi-line, and 0 of those 66
-               contain a `cd`.
+             * a capture split across multiple lines. MEASURED (with the span parser
+               an earlier revision of this PR shipped): 66 of the 1266 `$( )` spans in the scan
+               roots were multi-line, and 0 of those 66 contained a `cd`.
              * a `cd` into a caller-supplied path with no dirname at all
                (`cd "$REPO_PATH"`, `cd "$BACKUP_DIR"`). Those carry the same
                defect but not the same shape, and covering them would need an
@@ -38,7 +57,9 @@ What the shape covers, and what it does not:
                two-step `d="$(dirname "$0")"; cd "$d"`, and `$( dirname` with a
                space after `$(`. Each was inserted into a scratch copy and
                confirmed unflagged; each was then searched for repo-wide and
-               found nowhere.
+               found nowhere. Also unseen, and also absent from the tree:
+               `pushd "$(dirname ...)"` and a quoted command name (`"cd"`,
+               `'cd'`), both of which bash still resolves through CDPATH.
 
              The COVERED paragraph above says "whatever the dirname argument is",
              which is true of the ARGUMENT and must not be read as "whatever the
@@ -48,7 +69,9 @@ WHAT THE REMEDY DOES NOT COVER: a `readonly CDPATH`.
 
 `unset CDPATH` fails with "cannot unset: readonly variable" and returns 1; the
 capture's `cd` still runs, because the two are separated by `;`, so the search
-happens against the unchanged CDPATH and the fix is INERT. MEASURED: with
+happens against the unchanged CDPATH and the fix is INERT. The other accepted
+spelling has the same limit: `CDPATH= cd` reports the readonly error and still
+runs the cd against the unchanged CDPATH. MEASURED: with
 CDPATH readonly and pointed at a decoy, the remediated capture resolves into the
 decoy exactly as the un-remediated one does.
 
@@ -89,36 +112,32 @@ _SCAN_ROOTS = (
     REPO_ROOT / ".claude" / "mcp",
 )
 
-# A `cd` command word: not preceded by a word char / dot / slash / equals /
-# dollar, and not followed by one. Deliberately over-matches (a `cd` inside a
-# string still matches) because a false candidate costs a read while a missed
-# one costs the class.
-_CD_WORD = re.compile(r"(?<![\w./=$-])cd(?![\w-])")
-# The cd argument is a command substitution running dirname.
-_DIRNAME_ARG = re.compile(r'\bcd\s+(?:-\S+\s+)*"\$\(dirname\b')
-# An ACCEPTED REMEDY, anchored to the head of the substitution so it must
-# actually precede the cd it protects. An unanchored `CDPATH` substring match
-# classified four unsafe spellings as compliant -- a remedy placed after the cd,
-# `unset CDPATHX`, `MY_CDPATH=1`, and a remedy separated from a later unprotected
-# cd -- while flagging the valid `unset -v CDPATH`. Measured against the shipped
-# corpus this anchored form changes nothing: 0 of the fixed sites newly flagged.
-#
-# The `CDPATH=` alternative requires an ACTUALLY EMPTY assignment -- a
-# whitespace lookahead or an explicit `''`/`""`. Without it the prefix matched
-# `$(CDPATH=/decoy cd ...)`, which is not a remedy at all: bash searches /decoy
-# and can resolve into the wrong tree. That is a FALSE NEGATIVE in this guard,
-# i.e. exactly what it exists to prevent in future code (Codex P2, PR #2171).
-# The spellings are pinned as table arms below.
-#
-# The `unset` alternative is restricted to the option that actually clears a
-# VARIABLE: bare `unset` or `-v` only. `unset -f CDPATH` targets a function and
-# leaves the variable set, `-n` removes the nameref attribute without clearing
-# the value, and an invalid option (`unset -x CDPATH`) fails outright -- while
-# the `;` still runs the `cd`, so each passed the guard while the capture stayed
-# hijackable (Codex P2 / CodeRabbit Major, PR #2171).
-_REMEDY = re.compile(
-    r"^\$\(\s*(?:unset\s+(?:-v\s+)*CDPATH\b|CDPATH=(?:''|\"\"|(?=\s)))"
-)
+# A `cd` (with any options) whose argument is a command substitution running
+# dirname. `(?<![\w./=$-])` keeps `abcd`, `x=$cd` and `./cd` out of it.
+_DIRNAME_CD = re.compile(r'(?<![\w./=$-])cd\s+(?:-\S+\s+)*"\$\(dirname\b')
+# The ONLY accepted text immediately before such a cd. Literal on purpose: see
+# the module docstring for why a grammar of equivalent spellings was removed.
+_REMEDY_PREFIXES = ("$(unset CDPATH; ", "$(CDPATH= ")
+
+# Lines that match the shape without the literal prefix and are safe for a
+# reason the literal rule cannot see, keyed by (path, stripped line).
+_ALLOWED_LINES = {
+    (
+        ".claude/hooks/genesis-hook",
+        'MAIN_ROOT="$(unset CDPATH; cd "$GENESIS_ROOT" 2>/dev/null && cd '
+        '"$(dirname "$_common_dir")" 2>/dev/null && pwd)" || MAIN_ROOT=""',
+    ): "the second cd runs inside the same substitution, after `unset CDPATH;`",
+    (
+        "scripts/guardian-gateway.sh",
+        'PKG="$(unset CDPATH; cd "$(dirname "$SHADOW")" 2>/dev/null && cd '
+        '"$(dirname "$T")" 2>/dev/null && pwd || true)"',
+    ): "the second cd runs inside the same substitution, after `unset CDPATH;`",
+    (
+        "scripts/lib/cc_version.sh",
+        'pkg_dir="$(unset CDPATH; cd "$(dirname "$candidate")" 2>/dev/null && cd '
+        '"$(dirname "$target")" 2>/dev/null && pwd)"',
+    ): "the second cd runs inside the same substitution, after `unset CDPATH;`",
+}
 
 # A site that MUST be found. If the matcher stops matching the corpus, this
 # disappears and the test fails LOUDLY instead of passing over an empty scan --
@@ -147,103 +166,57 @@ def _shell_files():
                 yield path
 
 
-def _substitutions(line: str):
-    """Balanced ``$( )`` spans on one line.
+def _classify(line: str) -> list[str]:
+    """``compliant``/``violation`` for each dirname-cd on a line ([] if none).
 
-    If the parens never balance, the rest of the line is treated as one span --
-    over-including is the safe direction for a guard whose job is to find things.
+    A cd is compliant only when the text immediately before it is one of
+    ``_REMEDY_PREFIXES``. Comment lines are not shell and are skipped.
     """
-    i, n = 0, len(line)
-    while i < n:
-        if line.startswith("$(", i):
-            j = _command_sub_end(line, i)
-            yield line[i:j]
-            i = j
-            continue
-        i += 1
-
-
-def _command_sub_end(line: str, i: int) -> int:
-    """Index one past the ``)`` closing the ``$(`` at ``i`` (or ``len(line)``).
-
-    Parens inside shell quoting are DATA, not structure: without this,
-    ``X="$(printf ')'; cd ...)"`` ends the span at printf's argument and the
-    unsafe cd is never seen (Codex P2, PR #2171). And quoting is a STACK, not a
-    flag -- ``"$(dirname "$0")"`` nests a substitution inside double quotes that
-    carries its own quoting, which a single state variable flattens and
-    mis-balances. Each nested ``$(`` therefore recurses with a fresh state.
-    """
-    j, n, depth = i + 2, len(line), 1
-    while j < n and depth:
-        ch = line[j]
-        if ch == "'":
-            k = line.find("'", j + 1)
-            j = n if k == -1 else k + 1
-            continue
-        if ch == "\\":
-            j += 2
-            continue
-        if ch == '"':
-            j = _dquote_end(line, j)
-            continue
-        if line.startswith("$(", j):
-            j = _command_sub_end(line, j)
-            continue
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        j += 1
-    return j
-
-
-def _dquote_end(line: str, i: int) -> int:
-    """Index one past the ``"`` closing the ``"`` at ``i`` (or ``len(line)``).
-
-    Parens are literal inside double quotes; a nested ``$(`` still opens a
-    substitution and is stepped over with its own quoting state.
-    """
-    j, n = i + 1, len(line)
-    while j < n:
-        ch = line[j]
-        if ch == "\\":
-            j += 2
-            continue
-        if ch == '"':
-            return j + 1
-        if line.startswith("$(", j):
-            j = _command_sub_end(line, j)
-            continue
-        j += 1
-    return n
+    if line.lstrip().startswith("#"):
+        return []
+    return [
+        "compliant" if line[: m.start()].endswith(_REMEDY_PREFIXES) else "violation"
+        for m in _DIRNAME_CD.finditer(line)
+    ]
 
 
 def _violations():
-    """Every dirname-argument cd inside a substitution that does not clear CDPATH."""
-    found, bad = [], []
+    """Every dirname-argument cd that is not immediately preceded by a remedy."""
+    found, bad, allowed_seen = [], [], set()
     for path in _shell_files():
         rel = path.relative_to(REPO_ROOT).as_posix()
         for lineno, line in enumerate(
             path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
         ):
-            if line.lstrip().startswith("#"):
+            verdicts = _classify(line)
+            found.extend(rel for _ in verdicts)
+            if "violation" not in verdicts:
                 continue
-            for sub in _substitutions(line):
-                if not _CD_WORD.search(sub) or not _DIRNAME_ARG.search(sub):
-                    continue
-                found.append(rel)
-                if not _REMEDY.search(sub):
-                    bad.append(f"{rel}:{lineno}: {' '.join(sub.split())[:90]}")
-    return found, bad
+            key = (rel, line.strip())
+            if key in _ALLOWED_LINES:
+                allowed_seen.add(key)
+                continue
+            bad.append(f"{rel}:{lineno}: {' '.join(line.split())[:110]}")
+    return found, bad, allowed_seen
 
 
 def test_every_dirname_cd_capture_clears_cdpath():
-    """No `$(cd "$(dirname ...)" ...)` may run without clearing CDPATH."""
-    _, bad = _violations()
+    """No `cd "$(dirname ...)"` may run without the exact remedy before it."""
+    _, bad, _ = _violations()
     assert not bad, (
-        "cd into a dirname result without clearing CDPATH -- `cd` will SEARCH "
-        "CDPATH and can resolve into a different tree:\n  " + "\n  ".join(bad)
+        "cd into a dirname result without `$(unset CDPATH; ` or `$(CDPATH= ` "
+        "directly before it -- `cd` will SEARCH CDPATH and can resolve into a "
+        "different tree. At top level, write `cd -- \"$(unset CDPATH; cd -- "
+        "\"$(dirname -- \"$0\")\" && pwd)\"`:\n  " + "\n  ".join(bad)
     )
+
+
+def test_every_allowed_line_still_exists():
+    """An allowlist entry whose line is gone (or was respelled) is stale and
+    must be removed, so the exception list cannot outlive its reason."""
+    _, _, allowed_seen = _violations()
+    stale = set(_ALLOWED_LINES) - allowed_seen
+    assert not stale, f"allowlisted lines no longer present: {sorted(stale)}"
 
 
 def test_the_scan_actually_looked_at_the_corpus():
@@ -254,7 +227,7 @@ def test_the_scan_actually_looked_at_the_corpus():
     one returned zero matches for a pattern that should have matched dozens,
     another skipped whole files and missed 14 real sites.
     """
-    found, _ = _violations()
+    found, _, _ = _violations()
     assert _CANARY in found, (
         f"{_CANARY} was not found by the matcher -- the scan is not seeing the "
         f"corpus it is supposed to guard (found {len(found)} sites)"
@@ -280,22 +253,38 @@ def test_the_scan_actually_looked_at_the_corpus():
         ('X="$(cd "$(dirname "$0")/.." && pwd)"', "violation"),
         ('. "$(cd "$(dirname "$0")" && pwd)/lib/x.sh"', "violation"),
         ('X="$(cd -- "$(dirname "$0")" && pwd)"', "violation"),
-        # --- the shape, already remediated: matches, must NOT be a finding ---
+        # --- the two accepted spellings ---
         ('X="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"', "compliant"),
         ('X="$(CDPATH= cd "$(dirname "$0")" && pwd)"', "compliant"),
-        # --- a NON-empty CDPATH assignment is NOT a remedy: bash searches it ---
+        ('X="$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)"', "compliant"),
+        # --- every spelling a review finding raised is a violation by
+        # construction: none of them is one of the two literals ---
         ('X="$(CDPATH=/decoy cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(CDPATH=$HOME cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(CDPATH=. cd "$(dirname "$0")" && pwd)"', "violation"),
-        # --- an unset that does NOT clear the variable is NOT a remedy: the
-        # option makes unset miss CDPATH (or fail) while `;` still runs cd ---
+        ('X="$(CDPATH=\'\'decoy cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(CDPATH=""decoy cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(CDPATH=""/decoy cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(unset CDPATH=foo; cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(unset -f CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(unset -n CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
         ('X="$(unset -x CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
-        ('X="$(unset -f -v CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
-        # --- a quoted `)` is DATA, not the end of the substitution: if the span
-        # ends at printf's argument the unsafe cd is never seen at all ---
         ('X="$(printf \')\'; cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(printf $\'\\\' )\'; cd "$(dirname "$0")" && pwd)"', "violation"),
+        # a remedy on a DIFFERENT, earlier command does not protect a later cd
+        ('A="$(unset CDPATH; true)"; X="$(cd "$(dirname "$0")" && pwd)"', "violation"),
+        # a valid but unusual spelling is flagged too: rewrite it to a literal
+        ('X="$(unset -v CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(unset -f -v CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        # the `$(` is part of the literal: a look-alike variable is not a remedy
+        ('X="$(MY_CDPATH= cd "$(dirname "$0")" && pwd)"', "violation"),
+        ('X="$(unset MY_CDPATH; cd "$(dirname "$0")" && pwd)"', "violation"),
+        # a remedy AFTER the cd protects nothing
+        ('X="$(cd "$(dirname "$0")"; unset CDPATH; pwd)"', "violation"),
+        # `CDPATH= ` protects only the one cd it prefixes; every cd is checked
+        ('X="$(CDPATH= cd "$(dirname "$0")" && cd "$(dirname "$1")" && pwd)"', "violation"),
+        # a correct top-level form: the outer cd is not the shape, the inner is remedied
+        ('cd -- "$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)"', "compliant"),
         # --- not the shape: a cd with no dirname is out of this guard's scope ---
         ('X="$(cd "$SCRIPT_DIR/.." && pwd)"', "ignored"),
         ('X="$(cd "$HOME/genesis" && pwd)"', "ignored"),
@@ -303,6 +292,9 @@ def test_the_scan_actually_looked_at_the_corpus():
         # --- not a cd at all ---
         ("cdrom=/dev/sr0", "ignored"),
         ("x=$cd", "ignored"),
+        # the lookbehind keeps a longer word or a path ending in cd out of it
+        ('abcd "$(dirname "$0")"', "ignored"),
+        ('./cd "$(dirname "$0")"', "ignored"),
         ('# cd "$(dirname "$0")" && pwd', "ignored"),
     ],
 )
@@ -312,23 +304,16 @@ def test_matcher_recall_and_precision(line: str, expected: str) -> None:
     THREE outcomes, not two. A remediated line MATCHES the shape and is safe
     because of the remedy; collapsing "matches" into "violation" would assert
     that the fix's own output is a finding.
-
-    The violation arms are the coverage proof -- a corpus replay only ever shows
-    shapes already in the tree, so a spelling nobody has written yet is
-    invisible to it by construction.
     """
-    hits = [
-        sub for sub in _substitutions(line) if _CD_WORD.search(sub) and _DIRNAME_ARG.search(sub)
-    ]
+    verdicts = _classify(line)
     if expected == "ignored":
-        assert not hits, f"matcher flagged a non-member: {line!r}"
+        assert not verdicts, f"matcher flagged a non-member: {line!r}"
         return
-    assert hits, f"matcher MISSED a spelling it must catch: {line!r}"
-    violated = any(not _REMEDY.search(sub) for sub in hits)
+    assert verdicts, f"matcher MISSED a spelling it must catch: {line!r}"
     if expected == "violation":
-        assert violated, f"matcher did not flag an unremediated spelling: {line!r}"
+        assert "violation" in verdicts, f"not flagged: {line!r}"
     else:
-        assert not violated, f"matcher flagged a remediated spelling: {line!r}"
+        assert verdicts == ["compliant"] * len(verdicts), f"remediated line flagged: {line!r}"
 
 
 # ── functional arm: EXECUTE the shipped line, do not just read it ───────────
