@@ -1346,8 +1346,18 @@ def _settings_env_pins(bash_allowlist: tuple[str, ...]) -> dict[str, str]:
 
     A binary whose hardening cannot be prepared contributes nothing: the launch
     env check refuses that session, so there is no launch to pin.
+
+    ``GENESIS_BASH_ALLOWLIST`` is pinned too, with exactly the value
+    ``_build_env`` exports: the PreToolUse guard reads it, so a settings file
+    that emptied or widened it would switch the guard off after every launch
+    check had passed.
+
+    Does filesystem work and may block on the seal lock when an allowlisted
+    binary needs hardening, so async callers run it in a worker thread.
     """
     pins = {var: "" for var in _GH_CREDENTIAL_ENV}
+    if bash_allowlist:
+        pins["GENESIS_BASH_ALLOWLIST"] = ",".join(bash_allowlist)
     for entry in bash_allowlist:
         try:
             required = _required_hardening(entry)
@@ -2011,7 +2021,9 @@ class CCInvoker:
                 f"drop the bash_allowlist and confine the profile another way."
             )
 
-    async def verify_allowlist_enforceable(self, inv: CCInvocation) -> None:
+    async def verify_allowlist_enforceable(
+        self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
+    ) -> None:
         """The EXPENSIVE half of the allowlist check, kept off the event loop.
 
         ``_build_args`` stays synchronous — the tests call it directly, and the
@@ -2034,12 +2046,21 @@ class CCInvoker:
         """
         if not inv.bash_allowlist:
             return
-        await asyncio.to_thread(self._verify_allowlist_enforceable_blocking, inv)
+        await asyncio.to_thread(self._verify_allowlist_enforceable_blocking, inv, settings_pins)
 
-    def _verify_allowlist_enforceable_blocking(self, inv: CCInvocation) -> None:
-        """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread."""
+    def _verify_allowlist_enforceable_blocking(
+        self, inv: CCInvocation, settings_pins: dict[str, str] | None = None
+    ) -> None:
+        """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread.
+
+        ``settings_pins`` are the pins the spawn path already handed to
+        ``_build_args``. Reusing them makes the settings file checked here the
+        file that launches: recomputing could land on a different, hash-named
+        file if seal preparation failed on one of the two calls.
+        """
         allowlist = ",".join(inv.bash_allowlist)
-        span_settings = cc_span_settings_path(_settings_env_pins(tuple(inv.bash_allowlist)))
+        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        span_settings = cc_span_settings_path(pins)
         if span_settings is None:
             raise RuntimeError(
                 f"Refusing to launch: this invocation restricts Bash to "
@@ -2191,7 +2212,9 @@ class CCInvoker:
                 f"refusing on its behalf."
             )
 
-    def _build_args(self, inv: CCInvocation) -> list[str]:
+    def _build_args(
+        self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
+    ) -> list[str]:
         args = [self._claude_path, "-p"]
         # Roster routing: when model_id_override is set, model selection comes
         # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
@@ -2247,9 +2270,21 @@ class CCInvoker:
         # The same file pins the session's credential and confinement env at the
         # settings level, which outranks user and project settings: see
         # _settings_env_pins.
-        span_settings = cc_span_settings_path(_settings_env_pins(tuple(inv.bash_allowlist)))
+        # The async run paths compute the pins in a worker thread (the seal
+        # preparation behind them can block on a lock) and pass them in.
+        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        span_settings = cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
+        else:
+            # No settings FILE (launcher absent, ~/.genesis unwritable): the hooks
+            # cannot be registered, but the env pins still must not be lost — a
+            # session launched without them lets a user or project settings file
+            # restore a credential. Pass them inline (`--settings` takes JSON as
+            # well as a path; the precedence probe used exactly this form). A
+            # Bash-restricted profile is still refused just below, because its
+            # guard is one of the hooks that could not be registered.
+            args += ["--settings", json.dumps({"env": dict(sorted(pins.items()))})]
         self._refuse_unenforceable_allowlist(inv, span_settings)
         if inv.skip_permissions:
             args.append("--dangerously-skip-permissions")
@@ -2862,9 +2897,12 @@ class CCInvoker:
         return env
 
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
-        args = self._build_args(invocation)
+        # Off the event loop: the pins may prepare the gh seal (filesystem
+        # work behind a blocking lock) for a Bash-restricted profile.
+        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        args = self._build_args(invocation, settings_pins=pins)
         # Off the event loop: settings read, seal write, two probes.
-        await self.verify_allowlist_enforceable(invocation)
+        await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
         env = self._launch_env(env, invocation)
@@ -3079,9 +3117,12 @@ class CCInvoker:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
-        args = self._build_args(invocation)
+        # Off the event loop: the pins may prepare the gh seal (filesystem
+        # work behind a blocking lock) for a Bash-restricted profile.
+        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        args = self._build_args(invocation, settings_pins=pins)
         # Off the event loop: settings read, seal write, two probes.
-        await self.verify_allowlist_enforceable(invocation)
+        await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
         # Override output format to stream-json (requires --verbose with -p).
         # Target the --output-format value by its flag, not a bare args.index("json")
         # scan — other args (e.g. --settings .../cc-span-settings.json) can contain

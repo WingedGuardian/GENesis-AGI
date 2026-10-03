@@ -122,13 +122,15 @@ def test_build_args_includes_span_settings(invoker, monkeypatch):
     assert args[args.index("--settings") + 1] == "/tmp/cc-span-settings.json"
 
 
-def test_build_args_omits_span_settings_when_unavailable(invoker, monkeypatch):
-    """No --settings when the span-hook file can't be generated (None)."""
+def test_build_args_pins_inline_when_the_settings_file_is_unavailable(invoker, monkeypatch):
+    """No settings FILE (launcher absent, unwritable ~/.genesis): the env pins
+    still reach the session, inline, so no dispatch launches unpinned."""
     import genesis.cc.invoker as inv_mod
 
     monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
     args = invoker._build_args(CCInvocation(prompt="hi"))
-    assert "--settings" not in args
+    inline = json.loads(args[args.index("--settings") + 1])
+    assert inline == {"env": {var: "" for var in sorted(inv_mod._GH_CREDENTIAL_ENV)}}
 
 
 def _fake_genesis_hook_repo(tmp_path):
@@ -550,7 +552,7 @@ def test_build_args_allows_a_missing_settings_file_without_an_allowlist(invoker,
 
     monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
     args = invoker._build_args(CCInvocation(prompt="hi"))
-    assert "--settings" not in args
+    assert "env" in json.loads(args[args.index("--settings") + 1])
 
 
 def test_build_env_strips_claudecode(invoker):
@@ -6356,7 +6358,8 @@ def test_settings_env_pins_skip_a_binary_whose_hardening_cannot_be_prepared(monk
 
     monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: None)
     assert inv_mod._settings_env_pins(("gh",)) == {
-        var: "" for var in inv_mod._GH_CREDENTIAL_ENV
+        **{var: "" for var in inv_mod._GH_CREDENTIAL_ENV},
+        "GENESIS_BASH_ALLOWLIST": "gh",
     }
 
 
@@ -6824,3 +6827,74 @@ async def test_invocation_failed_attributes_pre_routed_non_roster_calls(
     with pytest.raises(CCTimeoutError):
         await invoker.run(CCInvocation(prompt="x", caller_tag="t", **overrides))
     assert fail_bus.events[0][4]["roster_model"] == expected
+
+
+def test_settings_env_pins_pin_the_bash_allowlist_itself(monkeypatch):
+    """The guard reads GENESIS_BASH_ALLOWLIST; a settings file must not be able
+    to empty or widen it after the launch checks, so it is pinned with exactly
+    the value _build_env exports."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: {"GH_CONFIG_DIR": "/sealed"})
+    pins = inv_mod._settings_env_pins(("gh", "jq"))
+    assert pins["GENESIS_BASH_ALLOWLIST"] == "gh,jq"
+    assert "GENESIS_BASH_ALLOWLIST" not in inv_mod._settings_env_pins(())
+
+
+def test_allowlist_pin_matches_the_launch_env(invoker, monkeypatch):
+    """Pinned value and exported value come from one expression; assert they agree."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: {"GH_CONFIG_DIR": "/sealed"})
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh", "jq"))
+    env = invoker._build_env(inv)
+    assert inv_mod._settings_env_pins(tuple(inv.bash_allowlist))["GENESIS_BASH_ALLOWLIST"] == env["GENESIS_BASH_ALLOWLIST"]
+
+
+def test_build_args_uses_precomputed_pins_without_recomputing(invoker, monkeypatch, tmp_path):
+    """The async run paths compute the pins in a worker thread and hand them in;
+    _build_args must not redo that work on the event loop."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", tmp_path / "settings.json")
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("pins recomputed on the event loop")
+
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", _must_not_run)
+    pins = {"GH_TOKEN": "", "PROBE": "x"}
+    args = invoker._build_args(CCInvocation(prompt="hi"), settings_pins=pins)
+    assert json.loads(Path(args[args.index("--settings") + 1]).read_text())["env"] == pins
+
+
+async def test_run_paths_compute_pins_in_a_worker_thread(invoker, monkeypatch):
+    """Both run paths hand _settings_env_pins to asyncio.to_thread."""
+    import inspect
+
+    import genesis.cc.invoker as inv_mod
+
+    for name in ("_run_inner", "_run_streaming_inner"):
+        src = inspect.getsource(getattr(inv_mod.CCInvoker, name))
+        assert "asyncio.to_thread(_settings_env_pins" in src, name
+        assert "settings_pins=pins" in src, name
+        assert "verify_allowlist_enforceable(invocation, settings_pins=pins)" in src, name
+
+
+def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, monkeypatch):
+    """The binding check must read the file built from the SAME pins the
+    launch used, not recompute them (a recomputation can hash to another file)."""
+    import genesis.cc.invoker as inv_mod
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("pins recomputed in the binding check")
+
+    seen = []
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", _must_not_run)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda pins=None: seen.append(pins))
+    pins = {"GH_TOKEN": "", "GENESIS_BASH_ALLOWLIST": "gh"}
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
+    with pytest.raises(RuntimeError, match="could not be written"):
+        invoker._verify_allowlist_enforceable_blocking(inv, pins)
+    assert seen == [pins]
