@@ -913,6 +913,7 @@ def test_watchdog_full_mode_uses_longer_wall_cap(tmp_path):
 
 _ALLOWED = {
     Path("scripts/lib/code_intel_index.sh"),
+    Path("scripts/lib/code_intel_cbm_worker.py"),  # scope-verified stock worker companion
     Path("scripts/code_intel_runner.sh"),  # the sole entrypoint caller (queue consumer)
     Path("tests/test_scripts/test_code_intel_index.py"),
 }
