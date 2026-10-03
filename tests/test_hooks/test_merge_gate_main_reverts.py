@@ -116,8 +116,14 @@ class TestDetection:
         )
         state, msg = gpg._check_main_reverts("100", REPO)
         assert state == gpg.MAIN_REVERTS_FINDINGS
-        assert "git checkout origin/main -- <path>" in msg
         assert "merging main again alone does not fix it" in msg.lower()
+        # No copy-pasteable command: the row cannot know which remote holds the
+        # checked repository, a base-deleted file needs removal rather than a
+        # checkout, and a base-side rename makes the finding a false positive
+        # that a restore would turn into lost work.
+        assert "git checkout" not in msg
+        assert "renamed" in msg.lower()
+        assert "deleted" in msg.lower()
 
     def test_correct_merge_is_clean(self, monkeypatch):
         """NEGATIVE: merges present, but every diff file was touched by an own commit."""

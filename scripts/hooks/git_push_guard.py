@@ -9865,7 +9865,11 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
       * CHECKED-CLEAN and FINDINGS: as named.
 
     KNOWN LIMITS: a partial revert INSIDE a file the PR's own commits also touched
-    is invisible to this rule (the file is covered). A deliberate edit made inside a
+    is invisible to this rule (the file is covered). A file the BASE renamed after
+    the branch edited it under its old path is reported as a false positive (paths
+    are compared literally, not traced across the merge), so the remedy text tells
+    the reader to check for a rename before restoring anything, and deliberately
+    prints no copy-paste command. A deliberate edit made inside a
     merge (a semantic-conflict fix to a file the branch never touched) is reported,
     and the message says that case exists.
     """
@@ -9969,9 +9973,12 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
         f"branch's later edits to them",
         f"Files (sorted; {len(reverted)} in total):",
         *_listing(reverted),
-        "Remedy: restore the base branch's version of every listed file the PR did "
-        f"not mean to change (`git checkout origin/{base} -- <path>`), commit that, "
-        "then merge the base branch again.",
+        "Check each listed file before acting: if the base branch renamed or moved "
+        "it, the branch's edit may be correct and this listing is a false positive "
+        "(renames are not tracked across the merge), so do not overwrite it.",
+        f"Remedy for a real revert: give each such file the content it has on "
+        f"{base} in the repository this report checked (a file {base} deleted is "
+        "removed instead), commit that, then merge the base branch again.",
         f"Merging {base} again alone does not fix it: git treats the stale copies as "
         "the branch's intended content, so they survive every later merge.",
         "If a listed file was edited inside a merge on purpose (a semantic-conflict "
