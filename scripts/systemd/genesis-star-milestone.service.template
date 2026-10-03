@@ -23,12 +23,17 @@ TimeoutStartSec=7200
 Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=journal
 StandardError=journal
-# Writes exactly two things: the observation (the database under the repo's data
-# dir) and its own state file under ~/.genesis — so those are the only two paths
-# it may write. %h would also hand it shell profiles and SSH configuration.
+# Writes exactly two things: the observation (the database) and its own state
+# file (under the runtime home). Both locations follow env overrides the script
+# resolves at run time — GENESIS_DB_PATH and GENESIS_HOME — and ReadWritePaths=
+# cannot expand an environment variable, so an allow-list naming the default
+# paths (%h/.genesis, the repo's data dir) refuses the write on any install
+# that relocates either one. %h is the same envelope genesis-server, the
+# database's primary writer, runs under: any database location the server can
+# write, this unit can too, and one outside $HOME is unwritable by both.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.genesis __REPO_DIR__/data
+ReadWritePaths=%h
 
 # No [Install] section, deliberately — driven only by its paired timer, matching
 # genesis-cc-settings-align.service.template. The bootstrap loop enables

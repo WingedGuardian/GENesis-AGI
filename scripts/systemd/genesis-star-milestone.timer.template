@@ -9,8 +9,8 @@ Description=Genesis star-milestone watcher — daily check
 #
 # Persistent=true so a box powered off across the scheduled hour replays the
 # missed run on the next activation — a milestone crossed while the machine was
-# down must still be announced, since the script compares against the highest
-# already-announced value rather than against yesterday's count.
+# down must still be announced, since the script compares against the
+# milestones already announced rather than against yesterday's count.
 #
 # Deliberately NO OnBootSec, for the reason written out at length in
 # genesis-cc-settings-align.timer.template: it is boot-relative, so a moment

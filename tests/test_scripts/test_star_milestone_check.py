@@ -51,7 +51,9 @@ def wired(monkeypatch, tmp_path):
 
     Returns a dict the test reads back: every announcement the module attempted.
     """
-    monkeypatch.setattr(mod, "_STATE_PATH", tmp_path / "star_milestones.json")
+    # The state file lives under GENESIS_HOME, resolved at call time.
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    monkeypatch.delenv("GENESIS_STAR_MILESTONES", raising=False)
     monkeypatch.setattr(mod, "_slug", lambda: "owner/repo")
     announced: list[tuple[int, int]] = []
 
@@ -292,7 +294,137 @@ def test_valid_json_that_is_not_an_object_announces_rather_than_crashing(
 )
 def test_a_highest_announced_that_is_not_a_plain_nonnegative_int_reads_as_zero(wired, bad):
     wired["state"].write_text(json.dumps({"slug": "owner/repo", "highest_announced": bad}))
-    assert mod._already_announced("owner/repo") == 0
+    assert mod._already_announced("owner/repo", [200, 500]) == set()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[200, True], [200, -1], [200, "500"], [2.5], "200", {"200": 1}],
+    ids=["bool", "negative", "string", "float", "not-a-list", "object"],
+)
+def test_an_announced_set_with_any_bad_member_reads_as_nothing_announced(wired, bad):
+    """A partly-valid list is still a file `_remember` did not write. Reading
+    the valid part would trust a corrupt file; the documented fail direction
+    for corrupt state is to announce, with the database id as the backstop."""
+    wired["state"].write_text(
+        json.dumps({"slug": "owner/repo", "announced": bad, "highest_announced": 500})
+    )
+    assert mod._already_announced("owner/repo", [200, 500]) == set()
+
+
+# ---------------------------------------------------------------------------
+# ANNOUNCEMENT STATE IS PER THRESHOLD. The observation id is already keyed on
+# the milestone; a single high-water mark in the state file made every number
+# below it read as announced, including one configured after the fact.
+# ---------------------------------------------------------------------------
+
+
+def test_a_threshold_added_below_the_high_water_mark_still_announces(wired, monkeypatch):
+    """500 announced under the defaults; the operator then adds 300. A fresh
+    watcher at the same count would announce 300, so this one must too."""
+    _at(monkeypatch, 600)
+    assert mod.main() == 0
+    assert wired["announced"] == [(500, 600)]
+
+    monkeypatch.setenv("GENESIS_STAR_MILESTONES", "200,300,500")
+    assert mod.main() == 0
+    assert wired["announced"] == [(500, 600), (300, 600)]
+
+    # And once announced, it is announced.
+    assert mod.main() == 0
+    assert wired["announced"] == [(500, 600), (300, 600)]
+
+
+def test_milestones_jumped_over_are_not_announced_later(wired, monkeypatch):
+    """The other half of the same contract. A jump announces only the highest
+    crossing; the lower ones it passed are COVERED by that announcement, not
+    queued behind it to fire one per day."""
+    _at(monkeypatch, 2600)
+    assert mod.main() == 0
+    assert mod.main() == 0
+    assert wired["announced"] == [(2500, 2600)]
+    state = json.loads(wired["state"].read_text())
+    assert state["announced"] == [200, 500, 1000, 2500]
+    assert state["highest_announced"] == 2500
+
+
+def test_a_legacy_high_water_state_covers_every_threshold_below_it(wired, monkeypatch):
+    """A state file from before the per-threshold set carries only
+    `highest_announced`. It must keep meaning what it meant when written —
+    everything at or below it was announced — or the upgrade re-fires 200."""
+    wired["state"].write_text(json.dumps({"slug": "owner/repo", "highest_announced": 500}))
+    _at(monkeypatch, 600)
+    assert mod.main() == 0
+    assert wired["announced"] == []
+
+
+# ---------------------------------------------------------------------------
+# STATE LIVES UNDER GENESIS_HOME, resolved when it is used. An import-time
+# `~/.genesis` path lets a relocated install read another install's state and
+# stay silent about its own crossing.
+# ---------------------------------------------------------------------------
+
+
+def test_state_follows_genesis_home_not_the_default_tree(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    default_state = home / ".genesis" / "star_milestones.json"
+    # Another install's state in the DEFAULT tree, for the same repository.
+    default_state.write_text(json.dumps({"slug": "owner/repo", "highest_announced": 200}))
+    relocated = tmp_path / "relocated"
+    relocated.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GENESIS_HOME", str(relocated))
+    monkeypatch.delenv("GENESIS_STAR_MILESTONES", raising=False)
+
+    # A fresh copy of the module, loaded with HOME pointed at tmp, so nothing
+    # resolved at import time can reach the real home directory.
+    fresh = _load()
+    try:
+        announced: list[tuple[int, int]] = []
+        monkeypatch.setattr(fresh, "_slug", lambda: "owner/repo")
+        monkeypatch.setattr(fresh, "_star_count", lambda slug: 201)
+        monkeypatch.setattr(
+            fresh, "asyncio", type("A", (), {"run": staticmethod(lambda coro: coro)})()
+        )
+        monkeypatch.setattr(
+            fresh, "_announce", lambda s, m, c: announced.append((m, c)) or True
+        )
+        assert fresh.main() == 0
+        assert announced == [(200, 201)], "read another install's state from the default tree"
+        assert (relocated / "star_milestones.json").exists(), "state not written under GENESIS_HOME"
+        assert json.loads(default_state.read_text()) == {
+            "slug": "owner/repo", "highest_announced": 200
+        }, "overwrote the default tree's state"
+    finally:
+        sys.modules["_star_milestone_check"] = mod
+
+
+# ---------------------------------------------------------------------------
+# THE SANDBOX MUST ADMIT THE PATHS THE SCRIPT RESOLVES. The database and the
+# state file both follow env overrides (GENESIS_DB_PATH, GENESIS_HOME) that the
+# unit cannot expand, so a fixed allow-list names the default tree only.
+# ---------------------------------------------------------------------------
+
+
+def _read_write_paths(template: str) -> set[str]:
+    text = (_REPO / "scripts" / "systemd" / template).read_text(encoding="utf-8")
+    out: set[str] = set()
+    for line in text.splitlines():
+        if line.startswith("ReadWritePaths="):
+            out.update(line.split("=", 1)[1].split())
+    return out
+
+
+def test_the_unit_may_write_wherever_the_server_may_write_the_database():
+    """genesis-server is the database's primary writer. Any database location
+    it can write, this unit must be able to write too, or the first crossing on
+    an install with a relocated database fails every day while the server is
+    fine."""
+    server = _read_write_paths("genesis-server.service.template")
+    watcher = _read_write_paths("genesis-star-milestone.service.template")
+    assert server, "genesis-server's allow-list was not found"
+    assert server <= watcher, f"watcher allow-list {sorted(watcher)} is narrower than {sorted(server)}"
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +457,74 @@ def test_the_public_remote_is_found_whatever_casing_it_was_cloned_with(monkeypat
     assert mod._slug_from_remotes("GENesis-AGI") == "wingedguardian/genesis-agi"
 
 
+# ---------------------------------------------------------------------------
+# A FORK KEEPS THE UPSTREAM NAME BY DEFAULT. Matching on the repository name
+# alone cannot tell `alice/GENesis-AGI` from the public repo, and the remote
+# that sorts first would win. The match is on owner/name, and with no owner
+# configured an ambiguous name is not resolved by guessing.
+# ---------------------------------------------------------------------------
+
+_FORK_AND_PUBLIC = (
+    # `origin` (the fork) sorts before `upstream` (the public repo): git prints
+    # remotes in name order, and a name-only match took the first it saw.
+    "origin\thttps://github.com/alice/GENesis-AGI.git (fetch)\n"
+    "origin\thttps://github.com/alice/GENesis-AGI.git (push)\n"
+    "upstream\tgit@github.com:WingedGuardian/GENesis-AGI.git (fetch)\n"
+    "upstream\tgit@github.com:WingedGuardian/GENesis-AGI.git (push)\n"
+)
+
+
+def test_an_owner_qualified_name_picks_the_public_remote_over_a_same_named_fork(monkeypatch):
+    _remotes(monkeypatch, _FORK_AND_PUBLIC)
+    assert mod._slug_from_remotes("wingedguardian/genesis-agi") == "WingedGuardian/GENesis-AGI"
+
+
+def test_a_bare_name_matching_two_repositories_is_not_guessed(monkeypatch, caplog):
+    """With no owner configured there is no fact that says which of the two is
+    the public repo. Picking one watches the wrong repo for as long as the unit
+    stays green; the documented answer for an install that has not said which
+    repo it owns is the clean no-op, and the log names the key that resolves it."""
+    _remotes(monkeypatch, _FORK_AND_PUBLIC)
+    with caplog.at_level("WARNING", logger="star_milestone"):
+        assert mod._slug_from_remotes("GENesis-AGI") is None
+    assert "github.user" in caplog.text
+    assert "alice/GENesis-AGI" in caplog.text and "WingedGuardian/GENesis-AGI" in caplog.text
+
+
+def test_one_repository_reached_through_two_remotes_is_not_ambiguous(monkeypatch):
+    """Same repo over https and ssh, typed in different casing, is ONE match."""
+    _remotes(
+        monkeypatch,
+        "a\thttps://github.com/WingedGuardian/GENesis-AGI.git (fetch)\n"
+        "b\tgit@github.com:wingedguardian/genesis-agi (fetch)\n",
+    )
+    assert mod._slug_from_remotes("GENesis-AGI") == "WingedGuardian/GENesis-AGI"
+
+
+def test_a_single_same_named_remote_is_still_found_by_name(monkeypatch):
+    """The topology the fallback was built for — `origin` only, no
+    `github.user` — keeps working: one candidate is not a guess."""
+    _remotes(
+        monkeypatch,
+        "origin\thttps://github.com/WingedGuardian/GENesis-AGI.git (fetch)\n"
+        "origin\thttps://github.com/WingedGuardian/GENesis-AGI.git (push)\n",
+    )
+    assert mod._slug_from_remotes("GENesis-AGI") == "WingedGuardian/GENesis-AGI"
+
+
+def test_an_owner_qualified_name_no_remote_carries_is_still_that_repository(monkeypatch):
+    """owner/name fully names a repository; the remotes only confirm spelling.
+    Falling back to `origin` here would watch a repo the config did not name."""
+    _remotes(monkeypatch, "origin\thttps://github.com/alice/GENesis-AGI.git (fetch)\n")
+    assert mod._slug_from_remotes("WingedGuardian/GENesis-AGI") == "WingedGuardian/GENesis-AGI"
+
+
 def test_state_written_under_another_casing_of_the_same_repo_still_counts(wired):
     """Config spelling and remote spelling can differ for the SAME repository.
     Reading that as a different repo would re-announce a milestone already
     announced."""
     wired["state"].write_text(json.dumps({"slug": "Owner/Repo", "highest_announced": 200}))
-    assert mod._already_announced("owner/repo") == 200
+    assert mod._already_announced("owner/repo", [200, 500]) == {200}
 
 
 def test_the_observation_identity_does_not_depend_on_slug_casing():

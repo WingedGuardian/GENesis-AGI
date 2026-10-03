@@ -62,12 +62,29 @@ logger = logging.getLogger("star_milestone")
 #: care about a different number without editing shipped code.
 _DEFAULT_MILESTONES = (200, 500, 1000, 2500, 5000, 10000)
 
-#: Where the highest already-announced milestone is remembered. Top level of
-#: ~/.genesis, beside backup_status.json and bootstrap_manifest.json.
-_STATE_PATH = Path(os.path.expanduser("~/.genesis/star_milestones.json"))
+#: The state file's name. It lives at the top level of the runtime home, beside
+#: backup_status.json and bootstrap_manifest.json — see `_state_path`.
+_STATE_NAME = "star_milestones.json"
 
 _API = "https://api.github.com"
 _TIMEOUT_S = 30
+
+
+def _genesis_env():
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from genesis import env  # noqa: PLC0415 — path must be set first
+
+    return env
+
+
+def _state_path() -> Path:
+    """Where the announced milestones are remembered, resolved per call.
+
+    Through `genesis_home()`, never a `~/.genesis` fixed at import: an install
+    relocated with GENESIS_HOME would otherwise read another install's state —
+    and stay silent about its own crossing — then overwrite that state.
+    """
+    return _genesis_env().genesis_home() / _STATE_NAME
 
 
 def _milestones() -> list[int]:
@@ -107,8 +124,7 @@ def _slug() -> str | None:
     exiting 0 — every other silence is an error, because a run that could not
     read the count must never look like a run that found no news.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-    from genesis import env  # noqa: PLC0415 — path must be set first
+    env = _genesis_env()
 
     owner = (env.github_user() or "").strip()
     repo = (env.github_public_repo() or "").strip()
@@ -125,10 +141,10 @@ def _slug() -> str | None:
     # The remote to read is the one pointing at the PUBLIC repo — an install
     # whose `origin` is a private fork keeps a second remote for it, and the
     # fork's star count (or its 404) is not the milestone anyone parked work
-    # behind. `github_public_repo` selects it, the same rule the update
-    # collector's `_update_remote()` applies. Config still wins when both keys
-    # are set, for the install that deliberately watches something other than
-    # its own repo.
+    # behind. `github_public_repo` selects it by owner/name — see
+    # `_slug_from_remotes` for why the name alone is not enough. Config still
+    # wins when both keys are set, for the install that deliberately watches
+    # something other than its own repo.
     return _slug_from_remotes(env.github_public_repo())
 
 
@@ -156,12 +172,32 @@ def _parse_github_slug(url: str) -> str | None:
 def _slug_from_remotes(public_repo: str = "") -> str | None:
     """owner/repo for the public repo, resolved from this checkout's remotes.
 
-    Preference order: the remote whose fetch URL names *public_repo* (the
-    supported private-fork topology — `origin` is the fork, a second remote
-    carries the public repo), then `origin`, then any other GitHub remote.
-    None when no remote parses, which is the same clean no-op as an
-    unconfigured install.
+    Every fetch URL is resolved to owner/name and compared, case-insensitively,
+    against *public_repo*:
+
+      - `owner/name` names one repository exactly. The remote carrying it
+        supplies the spelling; if none does, the configured value is still the
+        answer, since it fully names the repo.
+      - A bare `name` (the shipped default) matches a fork too: GitHub forks
+        keep the upstream name unless renamed, so `alice/GENesis-AGI` and the
+        public repo are indistinguishable by name. One distinct repository with
+        that name is the answer. TWO OR MORE is not resolved by guessing — not
+        by remote order, not by preferring or avoiding `origin` — because
+        nothing in the checkout says which one is public, and a wrong pick
+        watches a fork for as long as the unit stays green. It returns None,
+        the same clean no-op as an install that has not said which repo it
+        owns (which is what it is), and logs a WARNING naming the candidates
+        and the key that settles it.
+      - No remote with that name: `origin`, then any other GitHub remote.
+
+    None also when no remote parses.
     """
+    wanted = public_repo.strip().strip("/")
+    # An owner-qualified value is parsed through the same rule as a remote URL,
+    # so `owner/name.git` or a stray path segment cannot match differently.
+    qualified = (
+        _parse_github_slug(f"https://github.com/{wanted}") if "/" in wanted else None
+    )
     try:
         out = subprocess.run(
             ["git", "-C", str(Path(__file__).resolve().parent.parent),
@@ -169,9 +205,9 @@ def _slug_from_remotes(public_repo: str = "") -> str | None:
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return qualified
     if out.returncode != 0:
-        return None
+        return qualified
     fetch_slugs: dict[str, str] = {}
     for line in out.stdout.splitlines():
         if "(fetch)" not in line:
@@ -182,15 +218,32 @@ def _slug_from_remotes(public_repo: str = "") -> str | None:
         slug = _parse_github_slug(fields[1])
         if slug:
             fetch_slugs.setdefault(fields[0], slug)
+    if qualified is not None:
+        for slug in fetch_slugs.values():
+            if _repo_key(slug) == _repo_key(qualified):
+                return slug
+        return qualified
     if not fetch_slugs:
         return None
-    if public_repo:
+    if wanted and "/" not in wanted:
         # casefold: GitHub repo names are case-insensitive, and a clone URL
-        # keeps whatever casing it was typed with.
-        wanted = public_repo.casefold()
+        # keeps whatever casing it was typed with. Keyed by repository, so one
+        # repo reached through two remotes (https and ssh) is one candidate.
+        candidates: dict[str, str] = {}
         for slug in fetch_slugs.values():
-            if slug.rsplit("/", 1)[-1].casefold() == wanted:
-                return slug
+            if slug.rsplit("/", 1)[-1].casefold() == wanted.casefold():
+                candidates.setdefault(_repo_key(slug), slug)
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        if len(candidates) > 1:
+            logger.warning(
+                "remotes carry %d repositories named %s (%s) and no owner is "
+                "configured, so which one is public is unknown; not guessing. "
+                "Set github.user (or GENESIS_GITHUB_USER) to the public repo's "
+                "owner to watch it.",
+                len(candidates), wanted, ", ".join(sorted(candidates.values())),
+            )
+            return None
     if "origin" in fetch_slugs:
         return fetch_slugs["origin"]
     return next(iter(fetch_slugs.values()))
@@ -229,17 +282,25 @@ def _observation_key(slug: str, milestone: int) -> str:
     return f"star-milestone|{_repo_key(slug)}|{milestone}"
 
 
-def _already_announced(slug: str) -> int:
+def _already_announced(slug: str, milestones: list[int]) -> set[int]:
+    """The milestones already announced (or covered by an announcement).
+
+    PER THRESHOLD, not a high-water mark. A single "highest announced" made
+    every number below it read as announced — including one an operator adds
+    to GENESIS_STAR_MILESTONES afterwards, which a fresh watcher at the same
+    count would announce. The observation id was already keyed per milestone;
+    the state now agrees with it.
+    """
     try:
-        data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(_state_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return 0
+        return set()
     # Any shape other than the object `_remember` writes is corrupt state, and
     # corrupt state reads as "nothing announced" (see FAIL DIRECTIONS). Valid
     # JSON can still be the wrong shape — `[]`, `null`, `200` — and a crash on
     # it would repeat every day, since the file stays on disk.
     if not isinstance(data, dict):
-        return 0
+        return set()
     # State belongs to a repository. A file written for a different slug — or
     # one written before slugs were recorded — must not suppress this repo's
     # milestones: repo A's announced 500 is no reason repo B at 200 stays silent.
@@ -247,23 +308,40 @@ def _already_announced(slug: str) -> int:
     # again here cannot double-post a milestone the database remembers.
     recorded = data.get("slug")
     if not isinstance(recorded, str) or _repo_key(recorded) != _repo_key(slug):
-        return 0
-    value = data.get("highest_announced")
+        return set()
     # `type(...) is int` for the same reason as `_star_count`: bool subclasses
     # int, and a negative is not a milestone anyone announced.
-    return value if type(value) is int and value >= 0 else 0
+    if "announced" in data:
+        members = data["announced"]
+        # All or nothing. A list with one bad member is a file `_remember` did
+        # not write, and trusting its valid part would trust a corrupt file.
+        if not isinstance(members, list) or not all(
+            type(m) is int and m > 0 for m in members
+        ):
+            return set()
+        return set(members)
+    # A file written before the per-threshold set carries only the high-water
+    # mark. Read it as what it meant when written: everything at or below it
+    # was announced — otherwise the upgrade re-fires every lower milestone.
+    value = data.get("highest_announced")
+    if type(value) is not int or value < 0:
+        return set()
+    return {m for m in milestones if m <= value}
 
 
-def _remember(slug: str, milestone: int, count: int) -> None:
+def _remember(slug: str, announced: set[int], count: int) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from genesis.util.atomic import atomic_write_text  # noqa: PLC0415
 
     atomic_write_text(
-        _STATE_PATH,
+        _state_path(),
         json.dumps(
             {
                 "slug": slug,
-                "highest_announced": milestone,
+                "announced": sorted(announced),
+                # Kept beside the set for a human reading the file; the set is
+                # what `_already_announced` trusts when both are present.
+                "highest_announced": max(announced),
                 "stars_at_announcement": count,
                 "announced_at": datetime.now(UTC).isoformat(),
             },
@@ -360,17 +438,20 @@ def main() -> int:
         return 1
 
     milestones = _milestones()
-    announced = _already_announced(slug)
-    crossed = [m for m in milestones if m <= count and m > announced]
+    announced = _already_announced(slug, milestones)
+    crossed = [m for m in milestones if m <= count and m not in announced]
     if not crossed:
         logger.info(
-            "%s at %d stars; nothing new crossed (highest announced: %d)", slug, count, announced
+            "%s at %d stars; nothing new crossed (announced: %s)",
+            slug, count, sorted(announced) or "none",
         )
         return 0
 
     # Announce only the HIGHEST newly-crossed milestone. A repo that gains a
     # thousand stars between two runs should produce one observation, not four —
     # and the highest is the one whose parked work is most likely to matter.
+    # The lower ones it passed are COVERED by that announcement and recorded
+    # with it, so they do not fire one per day afterwards.
     top = crossed[-1]
     try:
         fired = asyncio.run(_announce(slug, top, count))
@@ -378,7 +459,7 @@ def main() -> int:
         logger.error("could not write the milestone observation: %s", exc)
         return 1
 
-    _remember(slug, top, count)
+    _remember(slug, announced | {m for m in milestones if m <= top}, count)
     logger.info(
         "%s crossed %d stars (now %d) — observation %s",
         slug,
