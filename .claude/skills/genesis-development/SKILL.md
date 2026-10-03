@@ -55,8 +55,10 @@ before publication. If unfinished work or an unresolved prerequisite prevents
 normal review from proceeding, keep the change local, resolve the blocker, and
 then open its PR. A draft PR is not a place to park incomplete or blocked work.
 
-**Open ready work as a normal, non-draft PR.** Do not pass `--draft` unless the
-user explicitly requests a draft. CI and external review that run after opening,
+**Every PR opens in regular, non-draft mode.** Never create a PR with `--draft`.
+Draft status may be applied only after the PR has opened in regular mode; it
+does not require an explicit user request. The permitted transition is regular
+to draft, not draft to regular. CI and external review that run after opening,
 and verification explicitly required after merge, remain their normal gates;
 waiting for those is not a reason to use draft mode. Distinguish a blocker to
 entering review from a check that review or merge will subsequently require.
