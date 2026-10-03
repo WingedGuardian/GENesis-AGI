@@ -115,7 +115,7 @@ def test_build_args_includes_span_settings(invoker, monkeypatch):
     monkeypatch.setattr(
         inv_mod,
         "cc_span_settings_path",
-        lambda: "/tmp/cc-span-settings.json",
+        lambda *_a, **_k: "/tmp/cc-span-settings.json",
     )
     args = invoker._build_args(CCInvocation(prompt="hi"))
     assert "--settings" in args
@@ -126,7 +126,7 @@ def test_build_args_omits_span_settings_when_unavailable(invoker, monkeypatch):
     """No --settings when the span-hook file can't be generated (None)."""
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
     args = invoker._build_args(CCInvocation(prompt="hi"))
     assert "--settings" not in args
 
@@ -299,7 +299,7 @@ def test_build_args_refuses_an_allowlist_it_cannot_enforce(invoker, monkeypatch)
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
     with pytest.raises(RuntimeError, match="Refusing to launch"):
         invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
@@ -355,7 +355,7 @@ def test_build_args_refuses_an_allowlist_under_a_hook_disabling_flag(
     import genesis.cc.invoker as inv_mod
 
     settings = _settings_registering(tmp_path, f"bash {_REAL_GUARD}")
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
     with pytest.raises(RuntimeError, match=expected):
         invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",), **{flag: True}))
 
@@ -367,7 +367,7 @@ def test_build_args_refuses_when_env_overrides_would_blank_the_allowlist(
     import genesis.cc.invoker as inv_mod
 
     settings = _settings_registering(tmp_path, f"bash {_REAL_GUARD}")
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
     with pytest.raises(RuntimeError, match="env_overrides sets"):
         invoker._build_args(
             CCInvocation(
@@ -390,7 +390,7 @@ async def test_build_args_refuses_when_the_guard_was_rewritten_out_of_the_settin
     import genesis.cc.invoker as inv_mod
 
     settings = _settings_registering(tmp_path, "some-other-hook.py")
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
     with pytest.raises(RuntimeError, match="does not register"):
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
@@ -408,7 +408,7 @@ def _arm(monkeypatch, tmp_path, argv):
     import genesis.cc.invoker as inv_mod
 
     settings = _settings_registering(tmp_path, shlex.join(argv))
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
     monkeypatch.setattr(inv_mod, "_allowlist_guard_argv", lambda: list(argv))
     return settings
 
@@ -440,7 +440,7 @@ async def test_build_args_refuses_a_hook_registered_by_someone_else(invoker, mon
     planted = tmp_path / "planted.sh"
     planted.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
     settings = _settings_registering(tmp_path, f"bash {planted} {inv_mod._ALLOWLIST_GUARD_SCRIPT}")
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: settings)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
     with pytest.raises(RuntimeError, match="does not register"):
         await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
 
@@ -540,7 +540,7 @@ def test_build_args_allows_hook_disabling_flags_without_an_allowlist(invoker, mo
     """
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: "/tmp/s.json")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: "/tmp/s.json")
     invoker._build_args(CCInvocation(prompt="hi", **{flag: True}))
 
 
@@ -548,7 +548,7 @@ def test_build_args_allows_a_missing_settings_file_without_an_allowlist(invoker,
     """An unwritable settings file is not itself fatal — only unenforceability is."""
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
     args = invoker._build_args(CCInvocation(prompt="hi"))
     assert "--settings" not in args
 
@@ -6321,3 +6321,77 @@ def test_seal_rewrites_are_serialised_against_a_concurrent_writer(monkeypatch, t
     assert done.wait(timeout=10), "the rewrite never completed after the lock was freed"
     worker.join(timeout=5)
     assert inv_mod._seal_matches(target, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML})
+
+
+# ── Settings-level env pins (#2385 round 4) ──────────────────────────
+
+
+def test_settings_env_pins_empty_every_credential_for_every_session():
+    """Every session pins all four gh credential variables to "" — the same
+    values the launch env carries — with no allowlist required."""
+    import genesis.cc.invoker as inv_mod
+
+    pins = inv_mod._settings_env_pins(())
+    assert pins == {var: "" for var in inv_mod._GH_CREDENTIAL_ENV}
+    assert len(pins) == 4
+
+
+def test_settings_env_pins_add_the_confinement_of_an_allowlisted_binary(monkeypatch):
+    """An allowlisted gh session also pins its sealed config at the settings
+    level, so a user or project settings GH_CONFIG_DIR cannot reopen it."""
+    import genesis.cc.invoker as inv_mod
+
+    sealed = {"GH_CONFIG_DIR": "/sealed", "XDG_DATA_HOME": "/sealed"}
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: dict(sealed))
+
+    pins = inv_mod._settings_env_pins(("gh",))
+    assert pins["GH_CONFIG_DIR"] == "/sealed"
+    assert pins["XDG_DATA_HOME"] == "/sealed"
+    assert all(pins[var] == "" for var in inv_mod._GH_CREDENTIAL_ENV)
+
+
+def test_settings_env_pins_skip_a_binary_whose_hardening_cannot_be_prepared(monkeypatch):
+    """No pins, no exception: the launch env check is what refuses that session."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: None)
+    assert inv_mod._settings_env_pins(("gh",)) == {
+        var: "" for var in inv_mod._GH_CREDENTIAL_ENV
+    }
+
+
+def test_cc_span_settings_path_with_pins_writes_a_sibling_env_file(monkeypatch, tmp_path):
+    """Pins go to a content-named sibling with an `env` block; the legacy
+    hooks-only file is neither written nor changed, so a process on older code
+    rewriting it cannot strip the pins."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    legacy = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", legacy)
+
+    pins = {"GH_TOKEN": "", "GITHUB_TOKEN": ""}
+    first = inv_mod.cc_span_settings_path(pins)
+    again = inv_mod.cc_span_settings_path(dict(reversed(list(pins.items()))))
+    other = inv_mod.cc_span_settings_path({"GH_TOKEN": "", "GH_CONFIG_DIR": "/sealed"})
+
+    assert first == again, "the same pins must map to the same file"
+    assert first != other and first != str(legacy)
+    assert not legacy.exists()
+    data = json.loads(Path(first).read_text())
+    assert data["env"] == pins
+    assert data["hooks"]["PostToolUse"], "the dispatch hooks must stay registered"
+
+
+def test_build_args_passes_the_pinned_settings_file(invoker, monkeypatch, tmp_path):
+    """The file handed to --settings is the one carrying the credential pins."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", tmp_path / "settings.json")
+
+    args = invoker._build_args(CCInvocation(prompt="hi"))
+    data = json.loads(Path(args[args.index("--settings") + 1]).read_text())
+    assert data["env"] == {var: "" for var in inv_mod._GH_CREDENTIAL_ENV}

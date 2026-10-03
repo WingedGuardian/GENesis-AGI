@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -1259,6 +1260,33 @@ def _required_hardening(entry: str) -> dict[str, str] | None:
     return required
 
 
+def _settings_env_pins(bash_allowlist: tuple[str, ...]) -> dict[str, str]:
+    """The env a dispatched session's ``--settings`` layer pins.
+
+    The same values the launch env carries: every credential variable in
+    ``_GH_CREDENTIAL_ENV`` empty, for every session, plus the confinement env of
+    each allowlisted binary from ``_required_hardening``. Pinned a second time
+    because Claude Code applies settings ``env`` after launch: without this a
+    user or project settings file could restore a credential, or point
+    ``GH_CONFIG_DIR`` back at the operator's own config, after
+    ``_assert_no_gh_credentials`` and ``_assert_hardening_present`` passed.
+    Managed (administrator) settings still outrank ``--settings``; they are the
+    operator's own policy and out of scope here.
+
+    A binary whose hardening cannot be prepared contributes nothing: the launch
+    env check refuses that session, so there is no launch to pin.
+    """
+    pins = {var: "" for var in _GH_CREDENTIAL_ENV}
+    for entry in bash_allowlist:
+        try:
+            required = _required_hardening(entry)
+        except RuntimeError:
+            continue
+        if required:
+            pins.update(required)
+    return pins
+
+
 def _unreviewed_binary_message(entry: str, canonical: str) -> str:
     """Refusal text for an allowlist entry nobody has classified."""
     return (
@@ -1527,10 +1555,14 @@ async def _emit_invocation_failed_event(
         logger.debug("cc.invocation_failed event emit failed", exc_info=True)
 
 
-def cc_span_settings_path() -> str | None:
+def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
     """Generate (idempotently) the minimal CC settings file injected into every
     dispatched session, and return its absolute path — or ``None`` if the
     launcher is unavailable.
+
+    ``env_pins`` adds a settings ``env`` block (see ``_settings_env_pins``) and
+    writes it to a sibling file named for its content; without it the legacy
+    hooks-only file is written, unchanged.
 
     (The name is historical: the span hook was this file's first tenant. It now
     carries the small set of hooks a dispatch cannot otherwise receive.)
@@ -1582,67 +1614,79 @@ def cc_span_settings_path() -> str | None:
     if guard_argv is None:  # pragma: no cover - same existence test as above
         return None
 
-    desired = json.dumps(
-        {
-            "hooks": {
-                "PreToolUse": [
-                    {
-                        # ANCHORED, and measured rather than assumed: a matcher
-                        # is a REGEX (probed on CC 2.1.246 — a hook registered
-                        # as "^Bash$" fires on a Bash call), so a bare "Bash"
-                        # also matches "BashOutput". That tool carries no
-                        # .tool_input.command, so under an allowlist it would
-                        # hit this guard's fail-closed leg and be refused with a
-                        # message about a command it never had. The ~15 hooks in
-                        # .claude/settings.json using a bare "Bash" do not show
-                        # this because they all fail OPEN on an unreadable
-                        # payload.
-                        "matcher": "^Bash$",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                # Built from the same helper the pre-launch
-                                # binding check uses, so the command that is
-                                # registered and the command that is verified
-                                # cannot drift. shlex.join quotes it: an install
-                                # root containing a space would otherwise
-                                # produce a command CC's shell cannot resolve —
-                                # exit 127, which is non-blocking, i.e. a
-                                # permit.
-                                "command": shlex.join(guard_argv),
-                                # Generous by ~300x against the guard's real cost
-                                # (an env test, one jq, one awk — well under a
-                                # tenth of a second), because the failure
-                                # direction is asymmetric: a PreToolUse hook that
-                                # exceeds its declared timeout is killed and the
-                                # call PROCEEDS, so a tight bound on a
-                                # containment hook converts it into a silent
-                                # permit. Bounded rather than omitted so a hook
-                                # that somehow hangs cannot stall the session
-                                # indefinitely.
-                                "timeout": 30,
-                            },
-                        ],
-                    },
-                ],
-                "PostToolUse": [
-                    {
-                        "matcher": ".*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": f"{genesis_hook} hooks/cc_span_hook.py",
-                                "timeout": 500,
-                            },
-                        ],
-                    },
-                ],
-            },
+    payload: dict[str, object] = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    # ANCHORED, and measured rather than assumed: a matcher
+                    # is a REGEX (probed on CC 2.1.246 — a hook registered
+                    # as "^Bash$" fires on a Bash call), so a bare "Bash"
+                    # also matches "BashOutput". That tool carries no
+                    # .tool_input.command, so under an allowlist it would
+                    # hit this guard's fail-closed leg and be refused with a
+                    # message about a command it never had. The ~15 hooks in
+                    # .claude/settings.json using a bare "Bash" do not show
+                    # this because they all fail OPEN on an unreadable
+                    # payload.
+                    "matcher": "^Bash$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            # Built from the same helper the pre-launch
+                            # binding check uses, so the command that is
+                            # registered and the command that is verified
+                            # cannot drift. shlex.join quotes it: an install
+                            # root containing a space would otherwise
+                            # produce a command CC's shell cannot resolve —
+                            # exit 127, which is non-blocking, i.e. a
+                            # permit.
+                            "command": shlex.join(guard_argv),
+                            # Generous by ~300x against the guard's real cost
+                            # (an env test, one jq, one awk — well under a
+                            # tenth of a second), because the failure
+                            # direction is asymmetric: a PreToolUse hook that
+                            # exceeds its declared timeout is killed and the
+                            # call PROCEEDS, so a tight bound on a
+                            # containment hook converts it into a silent
+                            # permit. Bounded rather than omitted so a hook
+                            # that somehow hangs cannot stall the session
+                            # indefinitely.
+                            "timeout": 30,
+                        },
+                    ],
+                },
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{genesis_hook} hooks/cc_span_hook.py",
+                            "timeout": 500,
+                        },
+                    ],
+                },
+            ],
         },
-        indent=2,
-    )
-
+    }
     path = _CC_SPAN_SETTINGS_PATH
+    if env_pins:
+        # Settings `env` is applied AFTER launch and outranks every lower
+        # settings level and the inherited environment, so this is the layer
+        # that decides what the session's tools see. MEASURED on CC 2.1.280: a
+        # project `.claude/settings.local.json` that plants GH_TOKEN reaches
+        # Bash (length 18) when the launcher only cleared the launch env; with
+        # the same key pinned to "" here, Bash sees length 0, also when the
+        # variable is exported in the inherited environment. Per-content file
+        # name: the content is constant for a given pin set, so concurrent
+        # writers agree, and a process on older code — which rewrites the
+        # legacy path with its own hooks-only payload — never touches it.
+        payload["env"] = dict(sorted(env_pins.items()))
+        digest = hashlib.sha256(json.dumps(payload["env"]).encode()).hexdigest()[:12]
+        path = path.with_name(f"{path.stem}-{digest}{path.suffix}")
+    desired = json.dumps(payload, indent=2)
+
     try:
         if path.exists() and path.read_text(encoding="utf-8") == desired:
             return str(path)
@@ -1923,7 +1967,7 @@ class CCInvoker:
     def _verify_allowlist_enforceable_blocking(self, inv: CCInvocation) -> None:
         """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread."""
         allowlist = ",".join(inv.bash_allowlist)
-        span_settings = cc_span_settings_path()
+        span_settings = cc_span_settings_path(_settings_env_pins(tuple(inv.bash_allowlist)))
         if span_settings is None:
             raise RuntimeError(
                 f"Refusing to launch: this invocation restricts Bash to "
@@ -2128,7 +2172,10 @@ class CCInvoker:
         # repo, so CC never loads the repo's .claude/settings.json; --settings
         # injects just these hooks and CC merges them with the user's settings.
         # Both no-op unless their env var is set. See cc_span_settings_path.
-        span_settings = cc_span_settings_path()
+        # The same file pins the session's credential and confinement env at the
+        # settings level, which outranks user and project settings: see
+        # _settings_env_pins.
+        span_settings = cc_span_settings_path(_settings_env_pins(tuple(inv.bash_allowlist)))
         if span_settings:
             args += ["--settings", span_settings]
         self._refuse_unenforceable_allowlist(inv, span_settings)
