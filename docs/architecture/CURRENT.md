@@ -2575,9 +2575,15 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: 1ff7c3e3c 2026-10-02
+verified: b0867170e8e3 2026-10-02
 ```
 
+- **Provider health evidence**: NVIDIA's `/v1/models` catalog is supported
+  but observational only; success, failure and probe exceptions do not mutate
+  its breakers. Probe support, credential presence and breaker authority are
+  serialized separately. Unsupported configured targets retain breaker-based
+  display instead of a false missing-key status. Listing membership does not
+  establish completion entitlement, credential validity or remaining quota.
 - **October 2026 model refresh**: the stable NVIDIA DeepSeek alias selects
   V4.1 Flash after the old Flash endpoint returned HTTP 410. Eight ordinary
   Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
