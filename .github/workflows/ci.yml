@@ -1106,4 +1106,6 @@ jobs:
         # PR trigger, no edited type, push/schedule/dispatch unchanged,
         # cc-pin merge-base, and the origin/main line allowlist); no added
         # skips. Floor: 23864 + 5 = 23869.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23869
+        # NVIDIA provider health: new test_provider_health_probes.py collects
+        # 87 tests (0 -> 87); no added skips. Floor: 23869 + 87 = 23956.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23956
