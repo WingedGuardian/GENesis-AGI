@@ -152,9 +152,57 @@ extension callbacks, and it was measured inert: with a planted value an
 ordinary read still ran the real `gh`, and with extensions unreachable it
 redirects nothing.
 
-The credential file is copied into the sealed directory because it is the only
-place `gh` looks for it; the copy is owner-only, inside an owner-only
-directory, so it is no more reachable than the original. Hardening is keyed by
+NO CREDENTIAL IS IN THE SEALED DIRECTORY, as of 2026-09-25. It used to hold a
+copy of `hosts.yml`, because that is the only place `gh` looks for the token —
+owner-only inside an owner-only directory, so the copy widened nobody's read
+access. It was removed anyway: the reachability argument was sound and answered
+the wrong question, because it handed a session that reads external pull requests
+a token with the operator's full scopes (on the install where this was measured:
+`delete_repo`, `gist`, `read:org`, `repo`, `workflow` — the list is a property of
+that `gh auth login`, not of this code; what generalises is that the session held
+whatever the operator held). On an ALLOWLISTED session `gh` now holds no
+credential (MEASURED: `gh auth status` under the seal reports "not logged into any
+GitHub hosts", against a control that authenticates). That is a claim about `gh`,
+not about the session — the same profile permits `Read`, and the operator's own gh
+config is still on disk.
+
+**All four** of gh's documented credential variables are pinned to the empty
+string for EVERY dispatched session, not only allowlisted ones, because
+`_build_env` starts from an unfiltered copy of this process's environment and `gh`
+resolves them AHEAD of `hosts.yml` (MEASURED: a bogus token returns 401 against a
+good `hosts.yml`). An empty value reads as UNSET, so the pin neutralises an
+inherited token without inventing one.
+
+The set is enumerated from `gh help environment` (gh 2.100.0, consulted
+2026-09-26) and lives in
+`_GH_CREDENTIAL_ENV`: `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+`GITHUB_ENTERPRISE_TOKEN`. The first version pinned `GH_TOKEN` alone and was
+bypassed — MEASURED, `GH_TOKEN="" GITHUB_TOKEN=<value> gh auth token` returns the
+fallback, and gh documents the two on the same line. If a gh release adds a
+credential variable, add it there and cite the release; a name recalled without a
+citation is how this broke.
+
+**Read this before assuming a non-allowlisted session is unauthenticated — it is
+not.** MEASURED: with no `GH_CONFIG_DIR` pin, a session with `GH_TOKEN=""` is
+STILL FULLY AUTHENTICATED, because `gh` falls back to `hosts.yml` on disk. The
+deciding variable is `GH_CONFIG_DIR`, and it is pinned ONLY on the allowlisted
+path. So a dispatched session that has `Bash` without a declared allowlist — the
+common case, since the allowlist is set at exactly one call site — still reaches
+the operator's GitHub credential.
+
+Pinning `GH_CONFIG_DIR` more widely was tried and rejected, for two reasons worth
+keeping. Keying it on `origin == external_untrusted` reads tight and is not:
+MEASURED, that origin covers six dispatch profiles and every non-owner-attended
+conversation channel, dashboard included, and the pin would also have pointed
+`XDG_DATA_HOME` — a process-global base directory — at a read-only tree for all
+of them. And pinning the SEAL is a fail-OPEN on exactly the installs that need
+it, because a rewrite that fails before its stale sweep leaves a pre-heal seal
+still holding the copied credential. The honest fix for that surface is denying
+`Bash` on the one path that processes external content: unrestricted `Bash` can
+read the config file whatever `GH_CONFIG_DIR` says, so an env pin buys the loss
+of AMBIENT authentication and never confinement.
+
+Hardening is keyed by
 binary in `_BINARY_HARDENING` (`src/genesis/cc/invoker.py`) and applied in
 `_build_env`, which REFUSES to return an environment whose hardening it could
 not prepare or that a later override stripped — the environment that was
@@ -201,17 +249,37 @@ profile name.
 **Still NOT confined — and this is the sentence to read before granting any
 scoped shell.** The allowlist is enforced, which is a real improvement over a
 restriction nothing applied. It is not a sandbox. The permitted binary writes
-files to caller-chosen paths and makes authenticated API calls as the operator,
-so `Write`/`Edit` being blocked describes the TOOLS, not everything that can put
-bytes on disk or reach the network. Two consequences worth stating plainly
-rather than leaving to be discovered:
+files to caller-chosen paths and makes API calls, so `Write`/`Edit` being blocked
+describes the TOOLS, not everything that can put bytes on disk or reach the
+network.
+
+**And mind the difference between "`gh` holds no credential" and "the session is
+unauthenticated" — they are not the same claim, and only the first is this
+change's to make.** The credential is gone from the seal and the environment, so
+`gh` cannot authenticate. Whether the SESSION can reach a credential is decided by
+its TOOL SCOPE: a profile permitting `Read` (or `Glob`/`Grep`), with permission
+prompts skipped and any outbound tool available, can be instructed by the external
+content it ingests to read an owner-readable credential file and send it onward.
+No environment pin touches that, and this change does not close it — a separate
+one removes the Bash-granting profile outright, which is what actually ends the
+exposure on this repository. Stated in the present tense on purpose: as of THIS
+change, a profile permitting `Read` with an outbound tool can still be told by the
+content it ingests to read a credential file and send it onward. "We removed the
+credential from the environment" is not a substitute, and a future Bash-granting
+profile needs the tool-scope treatment regardless of what the environment says.
+
+Two consequences worth stating plainly rather than leaving to be discovered:
 
 - a scoped session can modify files on this host, INCLUDING files that take
   effect on a later run, so "it can only comment on pull requests" is not a
   property the allowlist gives you;
 - the profile that has this grant also ingests external, attacker-authored
-  content, so treat its capability as "acts with the operator's credentials",
-  not as "reads and replies".
+  content, so treat its capability as "acts with whatever credential it was
+  armed with, plus filesystem write", not as "reads and replies". Unarmed,
+  `gh` itself holds no GitHub credential; the SESSION can still read the
+  operator's credential file through its tool scope. That is the floor, not the
+  confinement — and the distinction is the one drawn above, restated here
+  because this bullet is the line a reader skims for the verdict.
 
 Bounding this properly needs a SUBCOMMAND-level allowlist rather than a
 first-token one. Until that exists, do not write a safety argument that rests
