@@ -186,7 +186,7 @@ def report(journal) -> dict:
             "repetitions": reps,
         }
     # Reports grade the frozen historical run. Live source and price expiry
-    # checks belong to execute, so upgrades do not erase measured evidence.
+    # checks belong to dry-run/execute, so upgrades do not erase measured evidence.
     issues = frozen_issues(manifest)
     unresolved = [k for k, a in journal.attempts.items() if "charge" not in a]
     route_status = {}

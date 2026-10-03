@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import subprocess
 from datetime import UTC, datetime
 from unittest.mock import patch
 
@@ -545,3 +546,211 @@ async def test_sandbox_case_admission_failure_keeps_template_isolated(tmp_path):
             await sandbox.database(case)
         assert sandbox.template.exists()
     assert list((tmp_path / "scratch").iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("labeler", "approver"),
+    [
+        ("José", "Jose\u0301"),
+        ("Jose\u0301", "José"),
+        ("  JOSÉ\t", "jose\u0301"),
+        ("\u212b", "A\u030a"),
+        ("\uac00", "\u1100\u1161"),
+        ("\u0390", "\u03b9\u0308\u0301"),
+        ("a\u0301\u0323", "a\u0323\u0301"),
+        ("\u03b1\u0345\u0301", "\u03b1\u0301\u0345"),
+        ("\u03b7\u0345\u0301", "\u03b7\u0301\u0345"),
+        ("\u03c9\u0345\u0301", "\u03c9\u0301\u0345"),
+    ],
+)
+def test_canonically_equivalent_reviewers_cannot_approve_own_labels(labeler, approver):
+    cases = [{"reference_provenance": {"reviewer": labeler}}]
+    approval = {
+        "approved": True,
+        "independent": True,
+        "corpus_hash": digest(cases),
+        "reviewer": approver,
+        "evidence": "synthetic test control",
+    }
+    assert manifest.approval_issues(cases, approval) == [
+        "independent reference approval is missing"
+    ]
+    approval["reviewer"] = "different-synthetic-reviewer"
+    assert manifest.approval_issues(cases, approval) == []
+
+
+def recorded_attempt(journal, key, *, generation="gen-synthetic-reconcile"):
+    """Public unresolved response fixture, as after a crash before settlement."""
+    data = journal.manifest
+    task = data["schedule"][key]
+    journal.append("reserve", attempt=key, reservation=task["maximum_usd"])
+    journal.append("dispatch", attempt=key)
+    journal.append(
+        "observation",
+        attempt=key,
+        request_hash=digest(
+            {"model": data["model_id"], "messages": task["messages"], **task["parameters"]}
+        ),
+        request_url=data["endpoint"] + "/chat/completions",
+        model=data["model_id"],
+        generation_id=generation,
+        usage={"prompt_tokens": 20, "completion_tokens": 10},
+        content='{"score":1}',
+        http_status=200,
+    )
+
+
+@pytest.mark.parametrize("state", ["empty", "reserved", "dispatched", "no-id", "settled"])
+def test_no_work_reconcile_cli_is_offline_and_preserves_report(
+    frozen, tmp_path, monkeypatch, capsys, state
+):
+    data = priced(frozen)
+    campaign = tmp_path / "campaign"
+    key = first(data)
+    with Journal(campaign) as journal:
+        journal.initialize(data)
+        if state in ("no-id", "settled"):
+            recorded_attempt(journal, key, generation=None if state == "no-id" else "gen-settled")
+        elif state != "empty":
+            journal.append("reserve", attempt=key, reservation=data["schedule"][key]["maximum_usd"])
+            if state == "dispatched":
+                journal.append("dispatch", attempt=key)
+        if state == "settled":
+            journal.append(
+                "settle",
+                attempt=key,
+                billing={
+                    "source": "openrouter.generation",
+                    "id": "gen-settled",
+                    "model": data["model_id"],
+                    "total_cost": "0.01",
+                },
+            )
+        expected = runner.report(journal)
+    before = (campaign / "events.jsonl").read_bytes()
+    for name in CREDENTIALS:
+        monkeypatch.delenv(name, raising=False)
+    with (
+        patch.object(
+            transport, "qualification_key", side_effect=AssertionError("credential lookup")
+        ),
+        patch.object(httpx, "AsyncClient", side_effect=AssertionError("HTTP client")),
+    ):
+        assert main(["reconcile", str(campaign)]) == 2  # Deliberately incomplete synthetic corpus.
+    assert json.loads(capsys.readouterr().out) == expected
+    assert (campaign / "events.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "error_type", [httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError]
+)
+def test_reconcile_network_errors_cli_retains_liability_on_restart(
+    frozen, tmp_path, monkeypatch, capsys, error_type
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-not-a-real-key")
+    data = priced(frozen)
+    key = first(data)
+    campaign = tmp_path / "campaign"
+    with Journal(campaign) as journal:
+        journal.initialize(data)
+        recorded_attempt(journal, key)
+    before = (campaign / "events.jsonl").read_bytes()
+    seen = []
+
+    def broken(request):
+        seen.append(request)
+        assert request.method == "GET"
+        raise error_type("synthetic-not-a-real-key private detail", request=request)
+
+    original = transport.reconcile
+
+    async def mocked_reconcile(journal):
+        await original(journal, transport=httpx.MockTransport(broken))
+
+    with patch.object(transport, "reconcile", side_effect=mocked_reconcile):
+        assert main(["reconcile", str(campaign)]) == 2
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["status"] == "incomplete"
+    assert (
+        result["execution_error"]["reason"]
+        == "generation billing request failed; reservation retained"
+    )
+    assert "synthetic-not-a-real-key" not in captured.out + captured.err
+    assert len(seen) == 1
+    assert result["unresolved_attempts"] == [key]
+    assert result["committed_usd"] == "0.05"
+    assert result["event_counts"]["dispatch"] == 1
+    assert (campaign / "events.jsonl").read_bytes() == before
+    with Journal(campaign) as journal:
+        assert journal.committed == manifest.money("0.05")
+        assert "charge" not in journal.attempts[key]
+
+
+@pytest.mark.parametrize("generation", [123, ["generation"], "[REDACTED]-generation", "   "])
+async def test_invalid_generation_reconcile_stops_before_credentials_or_http(
+    frozen, tmp_path, generation
+):
+    with Journal(tmp_path / "campaign") as journal:
+        data = priced(frozen)
+        journal.initialize(data)
+        recorded_attempt(journal, first(data), generation=generation)
+        with (
+            patch.object(transport, "qualification_key", side_effect=AssertionError("credentials")),
+            patch.object(httpx, "AsyncClient", side_effect=AssertionError("HTTP")),
+            pytest.raises(Incomplete, match="generation identity"),
+        ):
+            await transport.reconcile(journal)
+        assert journal.committed == manifest.money("0.05")
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError, AssertionError])
+async def test_reconcile_preserves_cancellation_and_programming_errors(frozen, tmp_path, error):
+    with Journal(tmp_path / "campaign") as journal:
+        data = priced(frozen)
+        journal.initialize(data)
+        recorded_attempt(journal, first(data))
+
+        def broken(request):
+            raise error("synthetic error")
+
+        with (
+            patch.object(transport, "qualification_key", return_value="synthetic-key"),
+            pytest.raises(error),
+        ):
+            await transport.reconcile(journal, transport=httpx.MockTransport(broken))
+        assert journal.committed == manifest.money("0.05")
+
+
+def test_git_identity_failure_prepare_cli_is_safe_incomplete(tmp_path, capsys):
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(synthetic_spec()))
+    failure = subprocess.CalledProcessError(
+        128, ["git"], stderr="synthetic private checkout path and credential"
+    )
+    with (
+        patch.object(manifest.subprocess, "check_output", side_effect=failure),
+        patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("HTTP")),
+    ):
+        assert (
+            main(
+                [
+                    "prepare",
+                    str(tmp_path / "campaign"),
+                    "--spec",
+                    str(path),
+                    "--temp-root",
+                    str(tmp_path / "scratch"),
+                ]
+            )
+            == 2
+        )
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result == {
+        "status": "incomplete",
+        "error": "Incomplete",
+        "reason": "source commit identity unavailable",
+    }
+    assert "synthetic private" not in captured.out + captured.err
+    assert not (tmp_path / "campaign").exists()

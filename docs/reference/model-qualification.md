@@ -38,6 +38,10 @@ Preparation normally reports incomplete until every prerequisite is present and
 all scheduled repetitions have been scored. `preflight_issues` identifies missing
 prerequisites. A small smoke corpus cannot qualify or authorize a paid run.
 
+`dry-run` rechecks current source, contract, provider and library identities and
+pricing expiry without network access. `report` evaluates frozen historical
+evidence, so later upgrades or expired prices do not erase a completed result.
+
 The JSON spec contains:
 
 | Key | Contract |
@@ -134,6 +138,9 @@ Completion and reconciliation share the production delegate's credential order:
 `API_KEY_OPENROUTER`, then `OPENROUTER_API_KEY`, then `OPENROUTER_API_TOKEN`.
 The serialized completion authorization must match the selected credential before
 egress. Credential values are never included in the manifest or journal.
+Reconciliation requires credentials only when an unresolved observed generation
+can be queried; an invocation with no eligible generation leaves the report and
+journal unchanged. Network failures retain reservations and report incomplete.
 
 One exclusive writer holds the campaign lock. Each reservation is appended and
 fsynced before dispatch. Settled charges plus unresolved reservations plus the

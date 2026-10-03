@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import unicodedata
 from dataclasses import asdict
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -64,10 +65,14 @@ def source_identity(root: Path) -> dict:
             for p in (root / folder).glob("*.py")
         ],
     ]
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.PIPE
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise Incomplete("source commit identity unavailable") from exc
     return {
-        "commit": subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "commit": commit,
         "files": {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in sorted(paths)},
     }
 
@@ -185,15 +190,20 @@ def maximum_charge(pricing: dict, body: dict) -> Decimal:
     )
 
 
+def reviewer_identity(value: str) -> str:
+    """Compare declared identities across case, whitespace and canonical Unicode."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", value.strip()).casefold())
+
+
 def approval_issues(cases, approval) -> list[str]:
-    labelers = {c["reference_provenance"]["reviewer"].strip().casefold() for c in cases}
+    labelers = {reviewer_identity(c["reference_provenance"]["reviewer"]) for c in cases}
     if not isinstance(approval, dict) or (
         approval.get("approved") is not True
         or approval.get("independent") is not True
         or approval.get("corpus_hash") != digest(cases)
         or not isinstance(approval.get("reviewer"), str)
         or not approval["reviewer"].strip()
-        or approval["reviewer"].strip().casefold() in labelers
+        or reviewer_identity(approval["reviewer"]) in labelers
         or not isinstance(approval.get("evidence"), str)
         or not approval["evidence"].strip()
     ):

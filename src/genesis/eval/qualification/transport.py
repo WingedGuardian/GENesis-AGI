@@ -333,20 +333,34 @@ class QualificationRouter:
 
 async def reconcile(journal, *, transport=None):
     """GET billing for already observed IDs; never submit another completion."""
+    pending = [
+        (attempt, record["observation"])
+        for attempt, record in journal.attempts.items()
+        if "charge" not in record and record.get("observation", {}).get("generation_id")
+    ]
+    if not pending:
+        return
+    if any(
+        not isinstance(observed["generation_id"], str) or not observed["generation_id"].strip()
+        for _, observed in pending
+    ):
+        raise Incomplete("invalid generation identity; reservation retained")
+    if any("[REDACTED]" in observed["generation_id"] for _, observed in pending):
+        raise Incomplete("redacted generation identity; reservation retained")
     key = qualification_key()
     with private_logs():
         async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
-            for attempt, record in journal.attempts.items():
-                if "charge" in record or not record.get("observation", {}).get("generation_id"):
-                    continue
-                observed = record["observation"]
-                if "[REDACTED]" in observed["generation_id"]:
-                    raise Incomplete("redacted generation identity; reservation retained")
-                response = await client.get(
-                    ENDPOINT + "/generation",
-                    params={"id": observed["generation_id"]},
-                    headers={"Authorization": f"Bearer {key}"},
-                )
+            for attempt, observed in pending:
+                try:
+                    response = await client.get(
+                        ENDPOINT + "/generation",
+                        params={"id": observed["generation_id"]},
+                        headers={"Authorization": f"Bearer {key}"},
+                    )
+                except httpx.HTTPError as exc:
+                    raise Incomplete(
+                        "generation billing request failed; reservation retained"
+                    ) from exc
                 if response.status_code != 200:
                     raise Incomplete("generation billing unavailable; reservation retained")
                 raw = load_json(response.content, exact_numbers=True)

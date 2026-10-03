@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
+from contextlib import ExitStack
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from genesis.eval.qualification import contracts, manifest, runner, transport
+from genesis.eval.qualification.__main__ import main
 from genesis.eval.qualification.evidence import Incomplete, Journal, digest
 from tests.test_eval.test_qualification import call, first, priced, synthetic_spec
 
@@ -159,6 +163,68 @@ async def test_preflight_recomputes_prerequisites_not_cached_status(full):
         task["maximum_usd"] = "0.01"
     data["maximum_campaign_usd"] = "22.50"
     assert any("exceeds $5 by $17.50" in issue for issue in manifest.preflight(data))
+
+
+@pytest.mark.parametrize(
+    "drift", ["none", "pricing", "source", "provider", "libraries", "contracts"]
+)
+def test_dry_run_live_preflight_and_historical_report_are_separate(
+    full, tmp_path, monkeypatch, capsys, drift
+):
+    import httpx
+
+    data = copy.deepcopy(full)
+    if drift == "pricing":
+        data["pricing"]["valid_until"] = "2000-01-01T00:00:00+00:00"
+    campaign = tmp_path / "campaign"
+    with Journal(campaign) as journal:
+        journal.initialize(data)
+    before = (campaign / "events.jsonl").read_bytes()
+    for name in ("API_KEY_OPENROUTER", "OPENROUTER_API_KEY", "OPENROUTER_API_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("HTTP"))
+        )
+        stack.enter_context(
+            patch.object(transport, "qualification_key", side_effect=AssertionError("credentials"))
+        )
+        if drift == "source":
+            changed = copy.deepcopy(data["source"])
+            changed["commit"] = "0" * 40
+            stack.enter_context(patch.object(manifest, "source_identity", return_value=changed))
+        elif drift == "provider":
+            config = copy.deepcopy(manifest.routing())
+            config.providers[data["provider"]] = replace(
+                config.providers[data["provider"]], params={"top_p": 0.9}
+            )
+            stack.enter_context(patch.object(manifest, "routing", return_value=config))
+        elif drift == "libraries":
+            stack.enter_context(patch.object(manifest, "version", return_value="changed-version"))
+        elif drift == "contracts":
+            changed = {**data["contracts"], "new-contract": "1.0"}
+            stack.enter_context(patch.object(manifest, "versions", return_value=changed))
+        assert main(["report", str(campaign)]) == 2  # No completion attempts exist.
+        historical = json.loads(capsys.readouterr().out)
+        assert historical["preflight_issues"] == []
+        assert main(["dry-run", str(campaign)]) == 2
+        current = json.loads(capsys.readouterr().out)
+        expected = {
+            "pricing": "expired verified maximum-charge evidence",
+            "source": "source identity changed",
+            "provider": "provider configuration changed",
+            "libraries": "transport library version changed",
+            "contracts": "contract inventory changed",
+        }
+        if drift == "none":
+            assert current["preflight_issues"] == []
+        else:
+            assert any(expected[drift] in issue for issue in current["preflight_issues"])
+        assert current["status"] == "incomplete"
+        assert "attempts" not in current
+        assert main(["report", str(campaign)]) == 2
+        assert json.loads(capsys.readouterr().out) == historical
+    assert (campaign / "events.jsonl").read_bytes() == before
 
 
 @pytest.mark.parametrize("point", ["reserve", "dispatch", "observation", "settle"])

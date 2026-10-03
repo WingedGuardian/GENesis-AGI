@@ -30,7 +30,7 @@ def parser():
 
 
 async def run(args):
-    from genesis.eval.qualification.manifest import prepare
+    from genesis.eval.qualification.manifest import preflight, prepare
     from genesis.eval.qualification.runner import execute, report
     from genesis.eval.qualification.transport import reconcile, safe_text
 
@@ -41,11 +41,14 @@ async def run(args):
         if manifest is not None:
             journal.initialize(manifest)
         failure = None
+        live_issues = None
         try:
             if args.command == "execute":
                 await execute(journal, temp_root=args.temp_root)
             elif args.command == "reconcile":
                 await reconcile(journal)
+            elif args.command == "dry-run":
+                live_issues = preflight(journal.manifest)
         except (Incomplete, OSError, ValueError, KeyError, TypeError) as exc:
             if journal._file is None:
                 raise  # In-memory state may not reflect a failed durable write.
@@ -53,6 +56,10 @@ async def run(args):
             if isinstance(exc, Incomplete):
                 failure["reason"] = safe_text(str(exc))
         result = report(journal)
+        if live_issues is not None:
+            result["preflight_issues"] = live_issues
+            if live_issues:
+                result["status"] = "incomplete"
         if failure:
             result.update(status="incomplete", execution_error=failure)
         if args.command in ("prepare", "dry-run"):
