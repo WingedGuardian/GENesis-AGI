@@ -37,8 +37,13 @@ from genesis.dashboard._blueprint import blueprint
 
 
 @pytest.fixture()
-def app(monkeypatch):
+def app(monkeypatch, tmp_path):
     monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.delenv("GENESIS_DASHBOARD_API_AUTH", raising=False)
+    # The bearer tests mint the internal API token: keep it in tmp_path and
+    # start from an empty in-process cache, never the install's real token.
+    monkeypatch.setattr("genesis.env.internal_api_token_path", lambda: tmp_path / "internal_api_token")
+    monkeypatch.setattr(auth_mod, "_internal_token_cache", None)
     flask_app = Flask(__name__)
     flask_app.secret_key = "test-secret-key"
     flask_app.register_blueprint(blueprint)
@@ -386,3 +391,60 @@ def test_both_bearer_gates_share_one_implementation(monkeypatch):
         "the mutation gate has re-grown its own bearer compare — the two gates "
         "can now drift apart, which is exactly what the helper prevents"
     )
+
+
+# ── The mutation kill switch, and names above the root ───────────────
+
+
+def test_mutation_kill_switch_reopens_writes_but_not_reads(app, tmp_path, monkeypatch):
+    """``GENESIS_DASHBOARD_API_AUTH=off`` restores a legacy machine caller's
+    mutations, as it does at the app-level gate; reads stay behind the gate."""
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    monkeypatch.setenv("GENESIS_DASHBOARD_API_AUTH", "off")
+    app.before_request(auth_mod.check_api_mutation_auth)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "notes.md").write_text("hello")
+    monkeypatch.setattr(files_mod, "_ALLOWED_ROOTS", [root])
+    client = app.test_client()
+
+    write = client.put(
+        "/api/genesis/files/write", json={"path": str(root / "notes.md"), "content": "x"}
+    )
+    read = client.get(f"/api/genesis/files/read?path={root / 'notes.md'}")
+
+    assert write.status_code == 200, write.get_json(silent=True)
+    assert (root / "notes.md").read_text() == "x"
+    assert read.status_code == 403
+
+
+def test_kill_switch_on_still_refuses_an_anonymous_write(app, tmp_path, monkeypatch):
+    """Control for the test above: with the switch at its default the same
+    anonymous write is refused."""
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "notes.md").write_text("hello")
+    monkeypatch.setattr(files_mod, "_ALLOWED_ROOTS", [root])
+
+    resp = app.test_client().put(
+        "/api/genesis/files/write", json={"path": str(root / "notes.md"), "content": "x"}
+    )
+
+    assert resp.status_code == 403
+    assert (root / "notes.md").read_text() == "hello"
+
+
+@pytest.mark.parametrize("ancestor", ["token", "deploy.env", "my-secret-home"])
+def test_names_above_the_root_do_not_lock_the_root(tmp_path, monkeypatch, ancestor):
+    """Only components at or below the allowed root are judged by name."""
+    root = tmp_path / ancestor / "root"
+    root.mkdir(parents=True)
+    (root / "notes.md").write_text("hello")
+    monkeypatch.setattr(files_mod, "_ALLOWED_ROOTS", [root])
+
+    assert files_mod._is_allowed(root / "notes.md")
+    assert files_mod._is_allowed(root)
+    # ...while the same names below the root are still refused.
+    (root / ancestor).mkdir()
+    assert not files_mod._is_allowed(root / ancestor / "notes.md")

@@ -376,6 +376,15 @@ def _check_auth():
 # unsetting the dashboard password, if an unforeseen machine caller breaks.
 _API_AUTH_OFF = ("off", "0", "false", "no")
 
+
+def api_mutation_auth_disabled() -> bool:
+    """Has the operator switched the /api mutation gate off (``GENESIS_DASHBOARD_API_AUTH``)?
+
+    One reading for every gate that guards a mutation, so the escape hatch
+    reopens the same requests everywhere it is honoured.
+    """
+    return os.environ.get("GENESIS_DASHBOARD_API_AUTH", "on").strip().lower() in _API_AUTH_OFF
+
 # Genesis-OWNED API route prefixes the gate protects. Scoped deliberately: in Agent
 # Zero hosting mode the gate is installed on AZ's host-owned Flask app, so a broad
 # "/api/" match would also reject AZ's OWN native /api/* routes. Every Genesis
@@ -454,7 +463,7 @@ def check_api_mutation_auth():
     """
     if not get_dashboard_password():
         return None
-    if os.environ.get("GENESIS_DASHBOARD_API_AUTH", "on").strip().lower() in _API_AUTH_OFF:
+    if api_mutation_auth_disabled():
         return None
 
     path = request.path

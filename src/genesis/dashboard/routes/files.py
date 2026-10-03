@@ -15,7 +15,11 @@ from pathlib import Path
 from flask import jsonify, request, send_file
 
 from genesis.dashboard._blueprint import blueprint
-from genesis.dashboard.auth import has_internal_bearer, is_authenticated
+from genesis.dashboard.auth import (
+    api_mutation_auth_disabled,
+    has_internal_bearer,
+    is_authenticated,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -488,8 +492,16 @@ def _auth_or_403():
     exposure is a property of choosing not to configure a credential, it
     predates this gate, and nothing in this module can close it — the operator
     has declined to supply the thing a gate would check.
+
+    The operator's mutation kill switch (``GENESIS_DASHBOARD_API_AUTH=off``)
+    reopens the MUTATING routes here exactly as it does at the app-level
+    mutation gate, so the documented escape hatch still restores a legacy
+    machine caller. Reads stay behind this gate whatever the switch says: the
+    switch was never a disclosure control.
     """
     if is_authenticated() or has_internal_bearer():
+        return None
+    if request.method not in ("GET", "HEAD", "OPTIONS") and api_mutation_auth_disabled():
         return None
     return jsonify({"error": "authentication required"}), 403
 
@@ -514,12 +526,26 @@ def _is_allowed(path: Path) -> bool:
     and reorder it.)
     """
     resolved = path.resolve()
-    if not any(resolved.is_relative_to(root.resolve()) for root in _ALLOWED_ROOTS):
+    root = next(
+        (
+            r
+            for r in (allowed.resolve() for allowed in _ALLOWED_ROOTS)
+            if resolved.is_relative_to(r)
+        ),
+        None,
+    )
+    if root is None:
         return False
     if resolved.name.lower() in _BLOCKED_NAMES:
         return False
+    # The name rules below judge only the components AT OR BELOW the allowed
+    # root. Its ancestors are the install's own layout (a home directory, a
+    # deployment path), not something a caller chose, and judging them would
+    # lock the operator out of every root at once on an install whose home
+    # happened to carry a matching name.
+    below = resolved.relative_to(root).parts
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
-    for part in resolved.parts:
+    for part in below:
         if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
             return False
     # Same idea for credential-bearing names, anchored — see
@@ -528,7 +554,7 @@ def _is_allowed(path: Path) -> bool:
     # so without this the files remained readable on exactly the configuration
     # where they were found being served. It is not a substitute for that gate
     # and does nothing for the write routes — see ``_auth_or_403``.
-    if any(_is_credential_component(part) for part in resolved.parts):
+    if any(_is_credential_component(part) for part in below):
         return False
     # DIRECTORIES ARE EXEMPT from both database rules, and this is checked BEFORE
     # them. A directory cannot be opened as a database, so it cannot trigger the
