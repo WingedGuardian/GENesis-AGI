@@ -213,9 +213,12 @@ names, so an overlay of a read-only file is editable (#2446).
   `scripts/setup_claude_config.py --global` applies `config/cc-global-settings.yaml`, and
   `scripts/cc_settings_align.sh` re-asserts the auto-updater keys daily). How they merge is
   Claude Code's rule, not Genesis's. `.mcp.json` is rendered from
-  `config/mcp.json.template`: `install.sh` leaves an existing file alone, but
-  `scripts/bootstrap.sh` runs `scripts/setup_claude_config.py`, which REWRITES it whenever
-  it differs from the template, so custom entries do not survive a bootstrap. Its Genesis servers carry
+  `config/mcp.json.template` by `scripts/setup_claude_config.py`, minus the servers only a
+  dispatch profile uses (`INTERACTIVE_EXCLUDED_SERVERS` there, today `discord-bot`): the
+  template stays the single source, and dispatched sessions get their servers from it
+  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone, but
+  `scripts/bootstrap.sh` runs the same script, which REWRITES it whenever
+  it differs from that render, so custom entries do not survive a bootstrap. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---

@@ -662,6 +662,12 @@ _WIRED = {Path(rel).name for _g, rel, _c, _e, _l in _CASES}
 #: path was never in the population to begin with. That is the difference between an
 #: exemption and a question that was asked wrongly.
 _NOT_WIRED = {
+    # Codex runs the shell launcher, not this Python evaluator directly. Its
+    # explicit-allow protocol converts an evaluator import crash to exit 2.
+    # Measured for all six bare sibling imports by
+    # test_codex_review_stop::test_launcher_denies_each_module_scope_import_failure;
+    # test_project_config_wires_fallback_launcher checks the actual entry point.
+    "codex_review_stop.py": "Codex shell launcher converts every sibling import crash to exit 2",
     # Its remaining bare import is `shell_parse`, and its only usable degraded token
     # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
     # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded

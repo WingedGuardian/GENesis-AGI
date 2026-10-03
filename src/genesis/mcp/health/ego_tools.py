@@ -789,7 +789,11 @@ async def ego_decision(
         action: "record" | "supersede" | "list".
         content: For record — the distilled ruling, one sentence, prefixed
             "[type/category]" (e.g. "[content/publishing] Publish under the
-            user's own name; OBA compliance is settled").
+            user's own name; OBA compliance is settled"). Record reaffirms
+            only a repeat of the same ruling (case/whitespace-insensitive);
+            otherwise it records a new ruling and returns ``related`` (other
+            active rulings under the same tag, max 5) plus ``related_total``.
+            If the user's new ruling replaces a related one, supersede that id.
         decision_id: For supersede — the id of the ruling being replaced.
         reason: For supersede — why the user revoked/replaced it.
         ego_target: "user_ego" (default) or "genesis_ego".
@@ -833,28 +837,51 @@ async def ego_decision(
                     "status": "error",
                     "reason": "content must be a distilled ruling (>=10 chars)",
                 }
-            # Dedup on the [type/category] prefix when present.
-            if text.startswith("["):
-                prefix = text.split("]", 1)[0] + "]"
-                existing = await ego_crud.find_active_decision(
-                    db, prefix=prefix, ego_target=ego_target,
+            stored = text[: ego_crud.DECISION_CONTENT_MAX]
+            same_tag: list[dict] = []
+            match = None
+            if text.startswith("[") and "]" in text:
+                tag = text.split("]", 1)[0] + "]"
+                same_tag = await ego_crud.find_tagged_decisions(
+                    db,
+                    tag=tag,
+                    ego_target=ego_target,
                 )
-                if existing:
-                    await ego_crud.reaffirm_decision(db, existing["id"])
-                    return {
-                        "status": "ok",
-                        "action": "reaffirmed",
-                        "decision_id": existing["id"],
-                        "existing_content": existing["content"][:200],
-                    }
-            decision_id_new = await ego_crud.create_decision(
-                db, content=text[:500], ego_target=ego_target,
-            )
-            return {
-                "status": "ok",
-                "action": "recorded",
-                "decision_id": decision_id_new,
-            }
+                match = next(
+                    (r for r in same_tag if ego_crud.decision_matches_ruling(r, text)),
+                    None,
+                )
+            if match:
+                await ego_crud.reaffirm_decision(db, match["id"])
+                result = {
+                    "status": "ok",
+                    "action": "reaffirmed",
+                    "decision_id": match["id"],
+                    "existing_content": match["content"][:200],
+                }
+                others = [r for r in same_tag if r["id"] != match["id"]]
+            else:
+                new_id = await ego_crud.create_decision(
+                    db,
+                    content=stored,
+                    ego_target=ego_target,
+                )
+                result = {
+                    "status": "ok",
+                    "action": "recorded",
+                    "decision_id": new_id,
+                }
+                others = same_tag
+            result["related"] = [
+                {
+                    "id": r["id"],
+                    "content": r["content"][:200],
+                    "reaffirm_count": r.get("reaffirm_count", 0),
+                }
+                for r in others[:5]
+            ]
+            result["related_total"] = len(others)
+            return result
 
         # supersede
         if not decision_id.strip():

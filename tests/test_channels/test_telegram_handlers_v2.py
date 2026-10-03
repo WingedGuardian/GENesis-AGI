@@ -325,6 +325,11 @@ def test_format_error_type_dispatch():
     assert "taking too long" in _format_error(CCTimeoutError("test"))
     assert "usage limit" in _format_error(CCQuotaExhaustedError("test"))
     assert "Rate limit" in _format_error(CCRateLimitError("test"))
+    from genesis.cc.exceptions import CCOverloadedError
+
+    # A subclass of CCRateLimitError, but a different cause: capacity, not a limit.
+    overloaded = _format_error(CCOverloadedError("test"))
+    assert "overloaded" in overloaded and "Rate limit" not in overloaded
     assert "Tool server error" in _format_error(CCMCPError("test"))
     # Generic Exception should hit fallback
     assert "something went wrong" in _format_error(Exception("unknown")).lower()

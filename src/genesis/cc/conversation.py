@@ -18,6 +18,7 @@ from genesis.cc.exceptions import (
     CCNetworkOfflineError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCReplayUnsafeError,
     CCStreamTruncatedError,
     CCTimeoutError,
 )
@@ -70,7 +71,7 @@ def _bg_notice(output) -> str:
 # their decision rather than an invisible default.
 
 class _Unreplayable:
-    """The failover peer TRUNCATED after it had already done work.
+    """The failover peer stopped with a replay-unsafe outcome.
 
     A third outcome, distinct from both "here is the answer" (a string) and
     "the peer chain is exhausted, try contingency" (None), because neither of
@@ -85,7 +86,10 @@ class _Unreplayable:
     one `is not None` away from being delivered to a user (Codex P1, #1625).
     """
 
-    __slots__ = ()
+    __slots__ = ("notice",)
+
+    def __init__(self, notice: str | None = None):
+        self.notice = notice
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostic only
         return "<unreplayable: peer truncated after doing work>"
@@ -101,6 +105,16 @@ _TRUNCATION_NOTICE = (
     "tools the first attempt already ran would run again. Send it again if "
     "you want another attempt."
 )
+
+
+def _replay_notice(exc: CCReplayUnsafeError) -> str:
+    if isinstance(exc, CCStreamTruncatedError):
+        return _TRUNCATION_NOTICE
+    return (
+        "⚠️ This attempt stopped after work may already have run. "
+        "It is not being retried automatically, to avoid repeating actions. "
+        "Review what happened before requesting another attempt."
+    )
 
 
 # Nudge for dispatched, delivery-addressable (Telegram) channels: route long research/bg work
@@ -527,7 +541,7 @@ class ConversationLoop:
                     invocation, session=session, channel=channel,
                     model=model, effort=effort, prompt_text=prompt_text,
                 )
-                if roster_reply is UNREPLAYABLE:
+                if isinstance(roster_reply, _Unreplayable):
                     # The peer truncated AFTER doing work. Tool-less contingency
                     # is still allowed; PARKING is not, because a park schedules
                     # a full-tools replay of side effects that already ran.
@@ -543,7 +557,7 @@ class ConversationLoop:
                         "parking, because a park would replay its writes: %s",
                         e, exc_info=True,
                     )
-                    return _TRUNCATION_NOTICE
+                    return roster_reply.notice or _TRUNCATION_NOTICE
                 if roster_reply is not None:
                     return roster_reply
                 fallback = await self._try_contingency(
@@ -570,7 +584,7 @@ class ConversationLoop:
                     effort=effort,
                 )
                 return outcome.copy
-            except CCStreamTruncatedError as e:
+            except CCReplayUnsafeError as e:
                 # Ahead of the terminal `except CCError`, which would otherwise
                 # dead-end this turn on raw internal prose. See the handler.
                 return await self._handle_stream_truncated(
@@ -939,7 +953,7 @@ class ConversationLoop:
                         model=model, effort=effort, prompt_text=prompt_text,
                         on_event=_failover_tracked, streamed=streamed,
                     )
-                    if roster_reply is UNREPLAYABLE:
+                    if isinstance(roster_reply, _Unreplayable):
                         # The peer truncated AFTER doing work. Tool-less contingency
                         # is still allowed; PARKING is not, because a park schedules
                         # a full-tools replay of side effects that already ran.
@@ -955,7 +969,7 @@ class ConversationLoop:
                             "parking, because a park would replay its writes: %s",
                             e, exc_info=True,
                         )
-                        return _TRUNCATION_NOTICE
+                        return roster_reply.notice or _TRUNCATION_NOTICE
                     if roster_reply is not None:
                         return roster_reply
                 fallback = await self._try_contingency(
@@ -982,7 +996,7 @@ class ConversationLoop:
                     effort=effort,
                 )
                 return outcome.copy
-            except CCStreamTruncatedError as e:
+            except CCReplayUnsafeError as e:
                 # Ahead of the terminal `except CCError`, which would otherwise
                 # dead-end this turn on raw internal prose. `streamed` is passed
                 # so the handler can tell whether contingency would answer over
@@ -1103,13 +1117,10 @@ class ConversationLoop:
             # retry fresh (which would also just re-raise offline). Let the
             # caller's terminal handler deal with it.
             raise
-        except CCStreamTruncatedError:
-            # PROPHYLACTIC, and say so rather than implying it fires today:
-            # `run()` reads with `communicate()` and has no drop loop, so this
-            # type cannot currently reach here. The streaming twin's tuple
-            # carries it, and the asymmetry is the trap — the day truncation is
-            # classified on the non-streaming path too, its absence here would
-            # SILENTLY restore the full stale-resume replay this PR removed.
+        except CCReplayUnsafeError:
+            # Known-work/MCP-backed overloads can reach the buffered path too.
+            # Never mistake their partial work for a stale session and rerun it.
+            # This also preserves the existing prophylactic truncation guard.
             raise
         except CCError:
             if not was_resume:
@@ -1151,7 +1162,7 @@ class ConversationLoop:
             CCQuotaExhaustedError,
             CCTimeoutError,
             CCNetworkOfflineError,
-            CCStreamTruncatedError,
+            CCReplayUnsafeError,
         ):
             # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
             # a timeout retry just burns a second full window (2026-06-30 DM). A
@@ -1351,7 +1362,7 @@ class ConversationLoop:
             CCRateLimitError,
             CCQuotaExhaustedError,
             CCNetworkOfflineError,
-            CCStreamTruncatedError,
+            CCReplayUnsafeError,
         ):
             # Offline joins the fast-re-raise (same class as CAVEAT A): a dead
             # network is not a stale peer resume — retrying fresh won't help and
@@ -1415,14 +1426,15 @@ class ConversationLoop:
         """STICKY conversation failover.
 
         RETURNS one of three things, and the distinction is load-bearing:
-        a STRING (the peer answered — deliver it), ``UNREPLAYABLE`` (the peer
-        truncated after doing work — tool-less contingency may run, but the
+        a STRING (the peer answered — deliver it), an ``_Unreplayable`` (the peer
+        stopped after work may have run — tool-less contingency may run, but the
         turn must NOT be parked), or ``None`` (the chain is exhausted and
         nothing ran — contingency and parking are both fine).
 
         ``UNREPLAYABLE`` is TRUTHY, so a caller written as
         ``if reply is not None`` treats it as an answer and re-opens the park
-        hazard. Branch on ``is UNREPLAYABLE`` first (PR #1625 merge audit).
+        hazard. Branch on ``isinstance(reply, _Unreplayable)`` first; the
+        original truncation sentinel remains one member of this outcome type.
  During an account-wide home-model outage,
         run the turn on a roster peer (full tools) BEFORE the degraded contingency
         path. Returns the formatted reply on success, or None to fall through to
@@ -1593,7 +1605,9 @@ class ConversationLoop:
                         # would stack a SECOND answer on the first.
                         return ""
                     continue  # this peer is also down → try the next one
-                except CCStreamTruncatedError:
+                except CCReplayUnsafeError as unsafe:
+                    if unsafe.__cause__ is not None:
+                        await _record_peer(peer_availability.note_failure, peer_name, unsafe.__cause__)
                     # The SAME hazard as the re-run inside `_run_failover_peer`,
                     # one level out: re-raising there only stopped the sticky
                     # retry on THIS peer, and the generic `except CCError` below
@@ -1627,8 +1641,9 @@ class ConversationLoop:
                         # user, so on a channel whose streamer is a no-op an
                         # empty return shows nothing at all. A sentence is safe
                         # either way; silence is not.
-                        await _record_peer(peer_availability.note_success, peer_name)
-                        return _TRUNCATION_NOTICE
+                        if isinstance(unsafe, CCStreamTruncatedError):
+                            await _record_peer(peer_availability.note_success, peer_name)
+                        return _replay_notice(unsafe)
                     # UNREPLAYABLE, not None. Contingency may still run — it
                     # is TOOL-LESS (`contingency.dispatch_conversation`: "no
                     # CC tool access"), so it cannot repeat what the peer
@@ -1639,7 +1654,8 @@ class ConversationLoop:
                     # the writes and sends the truncated peer had already
                     # performed. The same hazard this PR exists to prevent,
                     # reached by a later route (Codex P1, PR #1625).
-                    return UNREPLAYABLE
+                    return (UNREPLAYABLE if isinstance(unsafe, CCStreamTruncatedError)
+                            else _Unreplayable(_replay_notice(unsafe)))
                 except CCError as exc:
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     # Routed through the SAME classifier on purpose: a local fault
@@ -2094,7 +2110,7 @@ class ConversationLoop:
 
     async def _handle_stream_truncated(
         self,
-        exc: CCStreamTruncatedError,
+        exc: CCReplayUnsafeError,
         *,
         session: dict,
         system_prompt: str | None,
@@ -2103,7 +2119,10 @@ class ConversationLoop:
         was_resume: bool,
         streamed: dict | None = None,
     ) -> str:
-        """Degrade a size-truncated turn without replaying it ANYWHERE.
+        """Degrade a replay-unsafe turn without rerunning its full-tools work.
+
+        Handles stream truncation and known-work/MCP-backed overloads. The
+        private method name is retained for existing callers and tests.
 
         Typing this failure is what stops stale-resume recovery and roster
         failover re-running tool calls the first attempt already made. But the
@@ -2126,12 +2145,16 @@ class ConversationLoop:
         replay, which is the hazard itself. A truncated turn degrades or says
         so; it never queues itself for a re-run.
         """
-        self._fire_failure_detection("stream_truncated")
+        self._fire_failure_detection(
+            "stream_truncated" if isinstance(exc, CCStreamTruncatedError) else "replay_unsafe"
+        )
         # The provider's own classification survives as ``__cause__`` — the
         # raise sites chain it precisely so this bookkeeping is RECOVERED here
         # rather than guessed from the message text.
         cause = exc.__cause__
-        if isinstance(cause, CCRateLimitError | CCQuotaExhaustedError):
+        from genesis.cc.peer_availability import mentions_mcp
+
+        if isinstance(cause, CCRateLimitError | CCQuotaExhaustedError) and not mentions_mcp(cause):
             try:
                 from datetime import UTC, datetime
                 await cc_sessions.update_rate_limit(
@@ -2159,10 +2182,10 @@ class ConversationLoop:
             # answer, so it is safe when text DID reach the user and it is the
             # only output when it did not. Strictly better than "" in both.
             logger.warning(
-                "CC stream truncated after text was streamed — contingency "
+                "CC replay-unsafe failure after text was streamed — contingency "
                 "suppressed, returning the notice only: %s", exc,
             )
-            return _TRUNCATION_NOTICE
+            return _replay_notice(exc)
         fallback = await self._try_contingency(
             prompt_text, system_prompt, channel, session_id=session["id"],
             was_resume=was_resume,
@@ -2170,9 +2193,9 @@ class ConversationLoop:
         if fallback is not None:
             return fallback
         logger.error(
-            "CC stream truncated and contingency unavailable: %s", exc, exc_info=True,
+            "CC replay-unsafe failure and contingency unavailable: %s", exc, exc_info=True,
         )
-        return _TRUNCATION_NOTICE
+        return _replay_notice(exc)
 
     async def _try_contingency(
         self,
