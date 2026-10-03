@@ -185,8 +185,11 @@ def _slug_from_remotes(public_repo: str = "") -> str | None:
     if not fetch_slugs:
         return None
     if public_repo:
+        # casefold: GitHub repo names are case-insensitive, and a clone URL
+        # keeps whatever casing it was typed with.
+        wanted = public_repo.casefold()
         for slug in fetch_slugs.values():
-            if slug.rsplit("/", 1)[-1] == public_repo:
+            if slug.rsplit("/", 1)[-1].casefold() == wanted:
                 return slug
     if "origin" in fetch_slugs:
         return fetch_slugs["origin"]
@@ -214,20 +217,41 @@ def _star_count(slug: str) -> int:
     return count
 
 
+def _repo_key(slug: str) -> str:
+    """One repository, one key. GitHub treats `Owner/Repo` and `owner/repo` as
+    the same repo, and config and a remote URL can spell it differently — so
+    every comparison and every persisted identity goes through this."""
+    return slug.casefold()
+
+
+def _observation_key(slug: str, milestone: int) -> str:
+    """The seed of the observation's deterministic id and content_hash."""
+    return f"star-milestone|{_repo_key(slug)}|{milestone}"
+
+
 def _already_announced(slug: str) -> int:
     try:
         data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return 0
+    # Any shape other than the object `_remember` writes is corrupt state, and
+    # corrupt state reads as "nothing announced" (see FAIL DIRECTIONS). Valid
+    # JSON can still be the wrong shape — `[]`, `null`, `200` — and a crash on
+    # it would repeat every day, since the file stays on disk.
+    if not isinstance(data, dict):
+        return 0
     # State belongs to a repository. A file written for a different slug — or
     # one written before slugs were recorded — must not suppress this repo's
     # milestones: repo A's announced 500 is no reason repo B at 200 stays silent.
-    # The observation id and content_hash already key on slug, so announcing
+    # The observation id and content_hash already key on the repo, so announcing
     # again here cannot double-post a milestone the database remembers.
-    if data.get("slug") != slug:
+    recorded = data.get("slug")
+    if not isinstance(recorded, str) or _repo_key(recorded) != _repo_key(slug):
         return 0
     value = data.get("highest_announced")
-    return int(value) if isinstance(value, int) else 0
+    # `type(...) is int` for the same reason as `_star_count`: bool subclasses
+    # int, and a negative is not a milestone anyone announced.
+    return value if type(value) is int and value >= 0 else 0
 
 
 def _remember(slug: str, milestone: int, count: int) -> None:
@@ -257,10 +281,20 @@ async def _announce(slug: str, milestone: int, count: int) -> bool:
     # one and every unit test passed, because they all stubbed this function
     # whole. The first LIVE run is what surfaced it. That is why the acceptance
     # check below the tests is not optional here.
+    #
+    # The open goes through `connect_aiosqlite_rw`, never a raw
+    # `aiosqlite.connect`: that factory is the database ADMISSION check, and it
+    # refuses a database the integrity layer has quarantined — before the open
+    # and again after it. A timer runs with nobody watching, which is exactly
+    # the writer class that must not reach a quarantined file. The refusal
+    # RAISES, so `main` exits non-zero and records nothing; tomorrow retries.
+    # `existing_only` because a missing database is a wrong path, not one to
+    # create empty and write a single row into.
     import aiosqlite  # noqa: PLC0415
 
-    from genesis.db.connection import DEFAULT_DB_PATH  # noqa: PLC0415
+    from genesis.db.connection import connect_aiosqlite_rw  # noqa: PLC0415
     from genesis.db.crud import observations  # noqa: PLC0415
+    from genesis.env import genesis_db_path  # noqa: PLC0415
 
     content = (
         f"{slug} has passed {milestone} GitHub stars (now {count}). "
@@ -270,12 +304,14 @@ async def _announce(slug: str, milestone: int, count: int) -> bool:
         f"rule can move while a trigger waits."
     )
     now = datetime.now(UTC).isoformat()
-    async with aiosqlite.connect(str(DEFAULT_DB_PATH), timeout=10) as db:
+    digest = hashlib.sha256(_observation_key(slug, milestone).encode()).hexdigest()
+    obs_id = digest[:32]
+    async with connect_aiosqlite_rw(genesis_db_path(), existing_only=True, timeout=10) as db:
         await db.execute("PRAGMA busy_timeout=5000")
         try:
             created = await observations.create(
                 db,
-                id=hashlib.sha256(f"star-milestone|{slug}|{milestone}".encode()).hexdigest()[:32],
+                id=obs_id,
                 source="star_milestone_check",
                 type="repo_milestone_reached",
                 content=content,
@@ -284,15 +320,26 @@ async def _announce(slug: str, milestone: int, count: int) -> bool:
                 category="repo",
                 # Stable across runs, so a lost state file cannot produce a second
                 # announcement of the same milestone.
-                content_hash=hashlib.sha256(f"star-milestone|{slug}|{milestone}".encode()).hexdigest(),
+                content_hash=digest,
                 skip_if_duplicate=True,
             )
         except aiosqlite.IntegrityError:
-            # The deterministic id already exists but the dedup clause let the
-            # INSERT through: the prior announcement was RESOLVED manually
-            # (dedup matches only resolved = 0 rows), and the primary key still
-            # rejects the retry. A resolved milestone stays announced —
-            # resurrecting it would re-fire a wake-up somebody dismissed.
+            # The one refusal that means "announced before": the deterministic
+            # id already exists but the dedup clause let the INSERT through,
+            # because the prior announcement was RESOLVED manually (dedup
+            # matches only resolved = 0 rows) and the primary key still rejects
+            # the retry. A resolved milestone stays announced — resurrecting it
+            # would re-fire a wake-up somebody dismissed.
+            #
+            # CONFIRM that is what happened rather than assume it. Any other
+            # constraint refusal wrote nothing, and treating it as "announced"
+            # would let `main` record a milestone that never was — a silent
+            # miss, the one outcome worse than announcing twice.
+            async with db.execute(
+                "SELECT 1 FROM observations WHERE id = ?", (obs_id,)
+            ) as cur:
+                if await cur.fetchone() is None:
+                    raise
             logger.info(
                 "%s milestone %d was announced before and resolved; not re-announcing",
                 slug, milestone,

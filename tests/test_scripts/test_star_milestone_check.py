@@ -261,3 +261,209 @@ def test_the_observation_type_is_permanent(monkeypatch):
     assert "repo_milestone_reached" not in observations.INTERNAL_OBS_TYPES, (
         "a milestone the user never sees cannot wake anything up"
     )
+
+
+# ---------------------------------------------------------------------------
+# THE STATE FILE IS UNTRUSTED INPUT. Any shape other than the one `_remember`
+# writes reads as "nothing announced" — the documented fail direction for a
+# corrupt file — never as a crash that repeats every day.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["[]", "null", "200", "true", '"owner/repo"'],
+    ids=["array", "null", "number", "bool", "string"],
+)
+def test_valid_json_that_is_not_an_object_announces_rather_than_crashing(
+    wired, monkeypatch, raw
+):
+    """`json.loads` accepts these, and `.get` on them raises. The state stays on
+    disk, so a crash here would repeat on every run and the crossing would
+    never be announced — the silent miss this script exists to prevent."""
+    wired["state"].write_text(raw)
+    _at(monkeypatch, 201)
+    assert mod.main() == 0
+    assert wired["announced"] == [(200, 201)]
+
+
+@pytest.mark.parametrize(
+    "bad", [True, -1, "500", 2.5], ids=["bool", "negative", "string", "float"]
+)
+def test_a_highest_announced_that_is_not_a_plain_nonnegative_int_reads_as_zero(wired, bad):
+    wired["state"].write_text(json.dumps({"slug": "owner/repo", "highest_announced": bad}))
+    assert mod._already_announced("owner/repo") == 0
+
+
+# ---------------------------------------------------------------------------
+# REPOSITORY IDENTITY IS CASE-INSENSITIVE. GitHub treats `Owner/Repo` and
+# `owner/repo` as one repository, and a clone URL keeps whichever casing it
+# was typed with — so every place this script compares or keys on a slug must
+# agree with GitHub, or one repository reads as two.
+# ---------------------------------------------------------------------------
+
+
+def _remotes(monkeypatch, text: str) -> None:
+    class _Out:
+        returncode = 0
+        stdout = text
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Out())
+
+
+def test_the_public_remote_is_found_whatever_casing_it_was_cloned_with(monkeypatch):
+    """Private-fork topology: `origin` is the fork, a second remote carries the
+    public repo in different casing. An exact compare misses it and watches the
+    fork instead."""
+    _remotes(
+        monkeypatch,
+        "origin\thttps://github.com/alice/private-fork.git (fetch)\n"
+        "origin\thttps://github.com/alice/private-fork.git (push)\n"
+        "public\thttps://github.com/wingedguardian/genesis-agi.git (fetch)\n"
+        "public\thttps://github.com/wingedguardian/genesis-agi.git (push)\n",
+    )
+    assert mod._slug_from_remotes("GENesis-AGI") == "wingedguardian/genesis-agi"
+
+
+def test_state_written_under_another_casing_of_the_same_repo_still_counts(wired):
+    """Config spelling and remote spelling can differ for the SAME repository.
+    Reading that as a different repo would re-announce a milestone already
+    announced."""
+    wired["state"].write_text(json.dumps({"slug": "Owner/Repo", "highest_announced": 200}))
+    assert mod._already_announced("owner/repo") == 200
+
+
+def test_the_observation_identity_does_not_depend_on_slug_casing():
+    """The id and content_hash are the database-side duplicate guard. If they
+    differ by casing, a slug spelled differently writes a SECOND observation
+    for a milestone already announced."""
+    assert mod._observation_key("Owner/Repo", 200) == mod._observation_key("owner/repo", 200)
+    assert mod._observation_key("owner/repo", 200) != mod._observation_key("owner/repo", 500)
+
+
+# ---------------------------------------------------------------------------
+# THE WRITE GOES THROUGH DATABASE ADMISSION, against a real schema. These do
+# not stub `_announce`: both earlier write-path defects in this file were
+# invisible to tests that replaced it whole.
+# ---------------------------------------------------------------------------
+
+
+def _scratch_db(path: Path, *, abort_trigger: bool = False) -> None:
+    import asyncio
+
+    import aiosqlite
+
+    sys.path.insert(0, str(_REPO / "src"))
+    from genesis.db.schema._migrations import create_all_tables
+
+    async def _build():
+        async with aiosqlite.connect(str(path)) as db:
+            await create_all_tables(db)
+            if abort_trigger:
+                # A constraint refusal that is NOT the deterministic primary key.
+                await db.execute(
+                    "CREATE TRIGGER refuse_obs BEFORE INSERT ON observations "
+                    "BEGIN SELECT RAISE(ABORT, 'refused by test'); END"
+                )
+            await db.commit()
+
+    asyncio.run(_build())
+
+
+def _obs_ids(path: Path) -> list[str]:
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        return [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM observations WHERE source = 'star_milestone_check'"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def scratch_db(monkeypatch, tmp_path):
+    """A real-schema database the script resolves as ITS database, with the
+    quarantine marker home isolated to tmp."""
+    db = tmp_path / "data" / "genesis.db"
+    db.parent.mkdir()
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / ".genesis"))
+    sys.path.insert(0, str(_REPO / "src"))
+    import genesis.db.connection as conn_mod
+    import genesis.env as env_mod
+
+    # The seam the script resolves at call time (the suite's autouse isolation
+    # already points it at tmp; this names THIS test's database).
+    monkeypatch.setattr(env_mod, "genesis_db_path", lambda: db)
+    # An opener resolved at import time must not escape to a real database.
+    monkeypatch.setattr(conn_mod, "DEFAULT_DB_PATH", db)
+    return db
+
+
+def test_announce_writes_one_row_on_an_unfenced_database(scratch_db):
+    """CONTROL for the quarantine test below: the real write path writes here,
+    so a refusal there is the fence, not a broken fixture."""
+    import asyncio
+
+    _scratch_db(scratch_db)
+    assert asyncio.run(mod._announce("owner/repo", 200, 201)) is True
+    assert len(_obs_ids(scratch_db)) == 1
+
+
+def test_announce_refuses_a_quarantined_database(scratch_db, tmp_path):
+    """A database that failed an integrity check takes no write from a timer
+    that runs with nobody watching. The refusal must RAISE, so `main` exits
+    non-zero and records nothing — tomorrow retries."""
+    import asyncio
+
+    from genesis.db.integrity import DatabaseIntegrityError, quarantine_database
+
+    _scratch_db(scratch_db)
+    (tmp_path / ".genesis").mkdir(exist_ok=True)
+    quarantine_database(scratch_db, source="test", detail="unit")
+    with pytest.raises(DatabaseIntegrityError):
+        asyncio.run(mod._announce("owner/repo", 200, 201))
+    assert _obs_ids(scratch_db) == [], "wrote to a quarantined database"
+
+
+def test_a_resolved_milestone_is_not_reannounced(scratch_db):
+    """State lost after the milestone's observation was resolved by hand: the
+    retry hits the retained primary key. That is 'already announced', not a
+    failure, and certainly not a second wake-up."""
+    import asyncio
+
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    _scratch_db(scratch_db)
+    assert asyncio.run(mod._announce("owner/repo", 200, 201)) is True
+    (row_id,) = _obs_ids(scratch_db)
+
+    async def _resolve():
+        async with aiosqlite.connect(str(scratch_db)) as db:
+            await observations.resolve(
+                db, row_id, resolved_at="2026-01-01T00:00:00+00:00", resolution_notes="test"
+            )
+
+    asyncio.run(_resolve())
+    assert asyncio.run(mod._announce("owner/repo", 200, 205)) is False
+    assert _obs_ids(scratch_db) == [row_id]
+
+
+def test_an_integrity_error_that_is_not_the_retained_row_is_a_failure(scratch_db):
+    """Only the deterministic id already existing means 'announced before'. Any
+    other constraint refusal wrote NOTHING; swallowing it would let `main`
+    record a milestone that was never announced — the one outcome worse than
+    announcing twice."""
+    import asyncio
+    import sqlite3
+
+    _scratch_db(scratch_db, abort_trigger=True)
+    with pytest.raises(sqlite3.IntegrityError):
+        asyncio.run(mod._announce("owner/repo", 200, 201))
+    assert _obs_ids(scratch_db) == []

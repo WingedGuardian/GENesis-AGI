@@ -2,5 +2,7 @@
   milestone**, so work parked behind "revisit at N stars" wakes up on its own
   instead of waiting to be remembered. It reads the count unauthenticated, writes
   a permanent observation on the transition, and stays silent otherwise; an
-  install with no repo configured falls back to the checkout's own `origin`, and
-  one with neither is a clean no-op rather than a daily failing unit.
+  install with no repo configured falls back to the checkout's remote for the
+  public repo (then `origin`), and one with neither is a clean no-op rather than
+  a daily failing unit. It never writes to a database the integrity check has
+  quarantined.
