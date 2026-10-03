@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +19,7 @@ from genesis.eval.calibration import _validate_references
 from genesis.eval.j9_batch import _RELEVANCE_PROMPT_VERSION, J9EvalBatchExecutor
 from genesis.eval.qualification.evidence import Incomplete, digest, load_json
 from genesis.eval.rubrics import get_rubric, list_rubrics
-from genesis.eval.scorers import LLMJudgeScorer
+from genesis.eval.scorers import LLMJudgeScorer, _extract_json
 from genesis.learning.procedural import extractor, judge
 from genesis.learning.procedural.embedding import EMBEDDING_DIM, pack_embedding
 from genesis.routing.types import RoutingResult
@@ -50,7 +51,7 @@ def validate_cases(cases: list[dict]):
             raise Incomplete("missing or duplicate case identity")
         seen.add(case["id"])
         contract = case.get("contract")
-        if contract not in versions():
+        if not isinstance(contract, str) or contract not in versions():
             raise Incomplete("unknown contract")
         grouped.setdefault(contract, []).append(case)
         if contract not in (RELEVANCE, NOVELTY):
@@ -87,6 +88,8 @@ def validate_novelty(case: dict):
     names, ids = set(), set()
     principles = set()
     for row in [candidate, *existing]:
+        if not isinstance(row, dict):
+            raise Incomplete("procedure must be a JSON object")
         for key in ("task_type", "principle"):
             if (
                 not isinstance(row.get(key), str)
@@ -112,7 +115,7 @@ def validate_novelty(case: dict):
         if (
             not isinstance(vec, list)
             or not 1 <= len(vec) <= EMBEDDING_DIM
-            or any(type(v) not in (int, float) or not math.isfinite(v) for v in vec)
+            or any(not valid_embedding_number(v) for v in vec)
             or not any(vec)
         ):
             raise Incomplete("invalid deterministic embedding")
@@ -120,8 +123,28 @@ def validate_novelty(case: dict):
         if not isinstance(row.get("id"), str) or not row["id"] or row["id"] in ids:
             raise Incomplete("invalid procedure ID")
         ids.add(row["id"])
-    if case.get("expected_target") is not None and case["expected_target"] not in ids:
+    if case.get("expected_target") is not None and (
+        not isinstance(case["expected_target"], str) or case["expected_target"] not in ids
+    ):
         raise Incomplete("reference target absent from candidate population")
+
+
+def valid_embedding_number(value):
+    # SQLite stores float32 embeddings; finite float64 alone is insufficient.
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and abs(value) <= 3.4028234663852886e38
+    except OverflowError:
+        return False
+
+
+def validate_raw_score(content, key, *, rubric=False):
+    parsed = load_json(_extract_json(content) if rubric else content, decimal_numbers=True)
+    value = parsed.get(key) if isinstance(parsed, dict) else None
+    # Range comparison safely rejects enormous integers before any float conversion.
+    if type(value) not in (int, Decimal) or not 0 <= value <= 1:
+        raise Incomplete("invalid raw judge score")
 
 
 def coverage(cases: list[dict], *, names=None) -> list[str]:
@@ -232,18 +255,12 @@ async def exercise(case, router, sandbox=None):
         score, detail, model = await J9EvalBatchExecutor(router=router)._judge_relevance(
             case["query"], case["memory_content"]
         )
-        # J9's clamp can turn NaN into a finite boundary value. Preserve the
-        # production parser but count invalid raw numbers as qualification errors.
+        # Production clamps/coerces scores. Qualification must retain malformed
+        # raw judgments as errors even if that parser returns a finite value.
         if isinstance(router, Recorder) and router.calls:
-            parsed = load_json(router.content)
-            if (
-                not isinstance(parsed, dict)
-                or type(parsed.get("relevance")) not in (int, float)
-                or not math.isfinite(parsed["relevance"])
-            ):
-                raise Incomplete("invalid raw relevance score")
+            validate_raw_score(router.content, "relevance")
         return {
-            "prediction": score >= 0.7 if score is not None else None,
+            "prediction": score >= 0.5 if score is not None else None,
             "error": detail if score is None else None,
             "score": score,
             "model": model,
@@ -263,10 +280,17 @@ async def exercise(case, router, sandbox=None):
             return {"current_novel": result[0], "fell_open": result[3]}
         finally:
             await db.close()
-    passed, score, detail = await LLMJudgeScorer(router=router).score_async(
-        case["actual"], case.get("expected", ""), case["scorer_config"]
-    )
+    try:
+        passed, score, detail = await LLMJudgeScorer(router=router).score_async(
+            case["actual"], case.get("expected", ""), case["scorer_config"]
+        )
+    except OverflowError:
+        if isinstance(router, Recorder) and router.calls:
+            validate_raw_score(router.content, "score", rubric=True)
+        raise
     detail = json.loads(detail)
+    if not detail.get("error") and isinstance(router, Recorder) and router.calls:
+        validate_raw_score(router.content, "score", rubric=True)
     return {"prediction": passed, "score": score, "error": detail.get("error"), "detail": detail}
 
 

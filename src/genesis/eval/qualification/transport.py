@@ -36,8 +36,11 @@ def check_callback_isolation():
             "input_callback",
             "success_callback",
             "failure_callback",
+            "_async_input_callback",
             "_async_success_callback",
             "_async_failure_callback",
+            "pre_call_rules",
+            "post_call_rules",
         )
     ):
         raise Incomplete("global LiteLLM observers are active; use a fresh isolated CLI process")
@@ -346,7 +349,10 @@ async def reconcile(journal, *, transport=None):
                 )
                 if response.status_code != 200:
                     raise Incomplete("generation billing unavailable; reservation retained")
-                data = load_json(response.content, exact_numbers=True)["data"]
+                raw = load_json(response.content, exact_numbers=True)
+                if not isinstance(raw, dict) or not isinstance(raw.get("data"), dict):
+                    raise Incomplete("invalid generation billing response; reservation retained")
+                data = raw["data"]
                 billing = safe_evidence(
                     {
                         "source": "openrouter.generation",

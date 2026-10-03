@@ -35,6 +35,7 @@ SOURCE_FILES = (
     "src/genesis/eval/scorers.py",
     "src/genesis/eval/calibration.py",
     "src/genesis/eval/j9_batch.py",
+    "src/genesis/eval/j9_aggregator.py",
     "src/genesis/learning/procedural/extractor.py",
     "src/genesis/learning/procedural/judge.py",
     "src/genesis/learning/procedural/operations.py",
@@ -85,7 +86,8 @@ def effective(parameters: dict, call: dict, provider_params: dict | None):
         raise Incomplete("explicit output cap required")
     policy = body.get("provider", {})
     if (
-        set(policy) != {"only", "allow_fallbacks", "require_parameters"}
+        not isinstance(policy, dict)
+        or set(policy) != {"only", "allow_fallbacks", "require_parameters"}
         or policy.get("allow_fallbacks") is not False
         or policy.get("require_parameters") is not True
     ):
@@ -158,14 +160,14 @@ def maximum_charge(pricing: dict, body: dict) -> Decimal:
 
 
 def approval_issues(cases, approval) -> list[str]:
-    labelers = {c["reference_provenance"]["reviewer"] for c in cases}
+    labelers = {c["reference_provenance"]["reviewer"].strip().casefold() for c in cases}
     if not isinstance(approval, dict) or (
         approval.get("approved") is not True
         or approval.get("independent") is not True
         or approval.get("corpus_hash") != digest(cases)
         or not isinstance(approval.get("reviewer"), str)
         or not approval["reviewer"].strip()
-        or approval["reviewer"] in labelers
+        or approval["reviewer"].strip().casefold() in labelers
         or not isinstance(approval.get("evidence"), str)
         or not approval["evidence"].strip()
     ):
@@ -174,6 +176,8 @@ def approval_issues(cases, approval) -> list[str]:
 
 
 def validate_manifest(manifest: dict):
+    if not isinstance(manifest, dict):
+        raise Incomplete("manifest must be a JSON object")
     if (
         manifest.get("format") != "genesis.qualification.v1"
         or manifest.get("ceiling_usd") != "5"
@@ -181,6 +185,13 @@ def validate_manifest(manifest: dict):
         or manifest.get("endpoint") != ENDPOINT
     ):
         raise Incomplete("invalid campaign identity")
+    for key in ("parameters", "provider_config", "source", "libraries"):
+        if not isinstance(manifest.get(key), dict):
+            raise Incomplete("invalid frozen object field")
+    if manifest["provider_config"].get("params") is not None and not isinstance(
+        manifest["provider_config"]["params"], dict
+    ):
+        raise Incomplete("invalid frozen provider parameters")
     # Reopening historical evidence must not depend on today's rubric registry.
     # Strict production reference validation runs at prepare and execute only.
     contracts = manifest.get("contracts")
@@ -192,18 +203,27 @@ def validate_manifest(manifest: dict):
         )
     ):
         raise Incomplete("invalid frozen contract inventory")
+    validate_frozen_corpus(manifest, contracts)
+    validate_frozen_schedule(manifest)
+
+
+def validate_frozen_corpus(manifest, contracts):
     cases = manifest.get("cases")
     if not isinstance(cases, list) or not cases:
         raise Incomplete("missing frozen corpus")
     seen = set()
     for case in cases:
+        if not isinstance(case, dict):
+            raise Incomplete("frozen case must be a JSON object")
         name = case.get("contract")
         provenance = case.get("reference_provenance", {})
         if (
             not isinstance(case.get("id"), str)
             or not case["id"].strip()
             or case["id"] in seen
+            or not isinstance(name, str)
             or name not in contracts
+            or not isinstance(provenance, dict)
             or provenance.get("rubric_version") != contracts[name]
             or provenance.get("label_source") != "human"
             or not isinstance(provenance.get("reviewer"), str)
@@ -215,12 +235,19 @@ def validate_manifest(manifest: dict):
         seen.add(case["id"])
     if manifest["corpus_hash"] != digest(manifest["cases"]):
         raise Incomplete("corpus hash mismatch")
+
+
+def validate_frozen_schedule(manifest):
+    if not isinstance(manifest.get("schedule"), dict):
+        raise Incomplete("frozen schedule must be a JSON object")
     expected_keys = set()
     for index, case in enumerate(manifest["cases"]):
         for repetition in (1, 2, 3):
             key = digest([case["contract"], case["id"], repetition])
             expected_keys.add(key)
             task = manifest["schedule"].get(key, {})
+            if not isinstance(task, dict) or not isinstance(task.get("kwargs"), dict):
+                raise Incomplete("frozen task must be a JSON object")
             if any(
                 task.get(k) != v
                 for k, v in {
@@ -236,6 +263,7 @@ def validate_manifest(manifest: dict):
     if (
         not isinstance(manifest.get("order"), list)
         or len(manifest["order"]) != len(expected_keys)
+        or any(not isinstance(key, str) for key in manifest["order"])
         or set(manifest["order"]) != expected_keys
     ):
         raise Incomplete("invalid frozen schedule order")
@@ -281,6 +309,8 @@ def frozen_issues(manifest: dict) -> list[str]:
 
 
 async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
+    if not isinstance(spec, dict):
+        raise Incomplete("spec must be a JSON object")
     cases = spec.get("cases")
     validate_cases(cases)
     provider = spec.get("provider", "openrouter-mimo")
@@ -296,6 +326,8 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
         raise Incomplete("unexpected MiMo provider identity")
     parameters = spec.get("parameters", {})
     pricing = spec.get("pricing", {})
+    if not isinstance(parameters, dict) or not isinstance(pricing, dict):
+        raise Incomplete("parameters and pricing must be JSON objects")
     issues = coverage(cases) + pricing_issues(pricing, parameters, cfg.model_id)
     approval = spec.get("reference_approval", {})
     issues.extend(approval_issues(cases, approval))
@@ -364,14 +396,21 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
     }
 
 
-def preflight(manifest: dict, *, root=ROOT) -> list[str]:
+def preflight(manifest: dict, *, root=ROOT, check_expiry=True) -> list[str]:
     issues = frozen_issues(manifest)
     validate_cases(manifest["cases"])
     if manifest["contracts"] != versions():
         issues.append("contract inventory changed; prepare a new campaign")
     if manifest["source"] != source_identity(root):
         issues.append("source identity changed; prepare a new campaign")
-    issues.extend(pricing_issues(manifest["pricing"], manifest["parameters"], manifest["model_id"]))
+    issues.extend(
+        pricing_issues(
+            manifest["pricing"],
+            manifest["parameters"],
+            manifest["model_id"],
+            check_expiry=check_expiry,
+        )
+    )
     if manifest["libraries"] != {name: version(name) for name in ("litellm", "httpx")}:
         issues.append("transport library version changed")
     if manifest["provider_config"] != asdict(routing(root).providers[manifest["provider"]]):

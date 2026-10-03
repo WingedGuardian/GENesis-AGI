@@ -32,7 +32,7 @@ def parser():
 async def run(args):
     from genesis.eval.qualification.manifest import prepare
     from genesis.eval.qualification.runner import execute, report
-    from genesis.eval.qualification.transport import qualification_key, reconcile, safe_text
+    from genesis.eval.qualification.transport import reconcile, safe_text
 
     manifest = None
     if args.command == "prepare":
@@ -43,7 +43,6 @@ async def run(args):
         failure = None
         try:
             if args.command == "execute":
-                qualification_key()
                 await execute(journal, temp_root=args.temp_root)
             elif args.command == "reconcile":
                 await reconcile(journal)

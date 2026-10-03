@@ -26,7 +26,7 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
-def load_json(data: str | bytes, *, exact_numbers=False):
+def load_json(data: str | bytes, *, exact_numbers=False, decimal_numbers=False):
     def pairs(items):
         result = {}
         for key, value in items:
@@ -42,7 +42,7 @@ def load_json(data: str | bytes, *, exact_numbers=False):
         data,
         object_pairs_hook=pairs,
         parse_constant=nonfinite,
-        **({"parse_float": str} if exact_numbers else {}),
+        parse_float=Decimal if decimal_numbers else str if exact_numbers else float,
     )
 
 

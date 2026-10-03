@@ -13,7 +13,11 @@ from genesis.eval.qualification.contracts import (
 )
 from genesis.eval.qualification.evidence import Incomplete, currency_sum
 from genesis.eval.qualification.manifest import frozen_issues, preflight, pricing_issues, routing
-from genesis.eval.qualification.transport import QualificationRouter, check_callback_isolation
+from genesis.eval.qualification.transport import (
+    QualificationRouter,
+    check_callback_isolation,
+    qualification_key,
+)
 
 
 async def score_record(journal, key, sandbox):
@@ -50,39 +54,52 @@ async def score_record(journal, key, sandbox):
 
 
 async def execute(journal, *, temp_root: Path, transport=None):
-    issues = preflight(journal.manifest)
+    issues = preflight(journal.manifest, check_expiry=False)
     if issues:
         raise Incomplete("; ".join(issues))
-    check_callback_isolation()
-    if any("charge" not in record for record in journal.attempts.values()):
-        raise Incomplete("unresolved prior attempt; reconcile without resending")
-    config = routing()
     async with Sandbox(temp_root) as sandbox:
+        # Recover all locally available answers before considering another request.
+        # Neither credentials nor unexpired prices are needed to replay paid answers.
+        for key, record in journal.attempts.items():
+            if "charge" in record and "score" not in record:
+                await score_record(journal, key, sandbox)
+        if any("charge" not in record for record in journal.attempts.values()):
+            raise Incomplete("unresolved prior attempt; reconcile without resending")
+        if all(key in journal.attempts for key in journal.manifest["order"]):
+            return
+        check_callback_isolation()
+        qualification_key()  # Before reserving funds for any new request.
+        config = routing()
         for key in journal.manifest["order"]:
-            task = journal.manifest["schedule"][key]
-            if key in journal.attempts:
-                record = journal.attempts[key]
-                if "charge" not in record:
-                    raise Incomplete("unresolved prior attempt; reconcile without resending")
-                if "score" not in record:
-                    await score_record(journal, key, sandbox)
-                continue
-            issues = pricing_issues(
-                journal.manifest["pricing"],
-                journal.manifest["parameters"],
-                journal.manifest["model_id"],
-            )
-            if issues:
-                raise Incomplete("; ".join(issues))
-            journal.append("reserve", attempt=key, reservation=task["maximum_usd"])
-            router = QualificationRouter(journal, key, config, transport=transport)
-            case = journal.manifest["cases"][task["case_index"]]
-            # Production parsers may absorb errors. The ledger independently
-            # verifies settlement even when the contract fails open.
-            await exercise(case, router, sandbox)
-            if not router.called or "charge" not in journal.attempts[key]:
-                raise Incomplete("attempt did not settle; reservation retained")
-            await score_record(journal, key, sandbox)
+            if key not in journal.attempts:
+                await execute_attempt(journal, key, config, sandbox, transport=transport)
+
+
+async def execute_attempt(journal, key, config, sandbox, *, transport=None):
+    task = journal.manifest["schedule"][key]
+    issues = pricing_issues(
+        journal.manifest["pricing"],
+        journal.manifest["parameters"],
+        journal.manifest["model_id"],
+    )
+    if issues:
+        raise Incomplete("; ".join(issues))
+    journal.append("reserve", attempt=key, reservation=task["maximum_usd"])
+    router = QualificationRouter(journal, key, config, transport=transport)
+    case = journal.manifest["cases"][task["case_index"]]
+    # Production parsers may absorb errors. The ledger independently
+    # verifies settlement even when the contract fails open.
+    try:
+        await exercise(case, router, sandbox)
+    except Exception as exc:
+        record = journal.attempts[key]
+        if not router.called or "charge" not in record:
+            raise  # Ambiguous transport/billing failure retains the reservation.
+        if "failure" not in record:
+            journal.append("failure", attempt=key, error=type(exc).__name__)
+    if not router.called or "charge" not in journal.attempts[key]:
+        raise Incomplete("attempt did not settle; reservation retained")
+    await score_record(journal, key, sandbox)
 
 
 def report(journal) -> dict:

@@ -239,3 +239,36 @@ async def test_j9_invalid_raw_scores_are_qualification_errors(content):
     recorder = contracts.Recorder(content)
     with pytest.raises(Incomplete):
         await contracts.exercise(case, recorder)
+
+
+@pytest.mark.parametrize("score", [0, 0.499999, 0.5, 0.6, 0.7, 1])
+async def test_j9_decision_matches_actual_production_aggregation(score):
+    """The relevance parser emits a score; its consumer sets binary meaning."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from genesis.eval import j9_aggregator
+
+    case = next(c for c in synthetic_spec()["cases"] if c["contract"] == contracts.RELEVANCE)
+    result = await contracts.exercise(case, contracts.Recorder(json.dumps({"relevance": score})))
+    event = {
+        "metrics": {
+            "recall_event_id": "synthetic-recall",
+            "memory_id": "synthetic-memory",
+            "relevance": score,
+            "rank": 0,
+        }
+    }
+    with (
+        patch.object(j9_aggregator, "_recall_entrenchment", AsyncMock(return_value={})),
+        patch.object(j9_aggregator, "_pool_counts_safe", AsyncMock(return_value={})),
+        patch.object(j9_aggregator.j9_eval, "get_events", AsyncMock(side_effect=[[event], []])),
+    ):
+        metrics, recalls = await j9_aggregator._compute_memory_quality(
+            None, "synthetic-start", "synthetic-end"
+        )
+    assert recalls == 1
+    assert result["prediction"] is (metrics["precision_at_5"] == 1)
+    assert result["prediction"] is (metrics["precision_at_3"] == 1)
+    assert result["prediction"] is (metrics["hit_rate"] == 1)
+    assert result["prediction"] is (metrics["mrr"] == 1)

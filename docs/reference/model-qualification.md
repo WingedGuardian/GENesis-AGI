@@ -57,10 +57,13 @@ copy a machine score into a human label. Labels and independent approval must
 come from their real reviewers.
 
 J9 cases use `query`, `memory_content`, boolean `user_passed` (relevance at least
-0.7), and human provenance naming the current J9 prompt version. The runner uses
-J9's actual truncation, rendering and parser. Duplicate rendered questions are
+0.5, matching production J9 aggregation), and human provenance naming the current
+J9 prompt version. The runner uses J9's actual truncation, rendering and parser. Duplicate rendered questions are
 rejected. Invalid raw relevance numbers are qualification errors even if the
-current J9 parser clamps them to a finite value.
+current J9 parser clamps them to a finite value. All seven judge contracts require
+an actual JSON number in [0, 1]; exact decimal checks reject values outside the
+range before float rounding, and strings and booleans cannot become valid scores.
+Production parse-error sentinels remain qualification errors.
 
 Novelty cases use `new` and an ordered `existing` list of procedures with
 `task_type`, `principle`, `steps`, and an explicit deterministic `embedding` vector.
@@ -152,7 +155,10 @@ is restored on every exit. Transport references:
 Missing identity or billing is never zero cost. Interruptions are not retried.
 Any unresolved attempt blocks new dispatch; known generation IDs may be
 reconciled by GET. A crash after settlement can recover scoring without sending
-the completion again. A torn journal, conflicting manifest, duplicated generation
+the completion again, without credentials or unexpired prices. Local scoring still
+requires matching source/configuration and valid references; it runs before new
+request checks. Missing credentials cannot reserve money for a new request.
+A torn journal, conflicting manifest, duplicated generation
 ID, unexpected charge or charge exceeding a reservation stops the campaign and
 reports incomplete. Reservations with no known generation ID remain unresolved;
 do not release them on the assumption that the request was free.
