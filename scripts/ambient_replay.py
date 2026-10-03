@@ -166,7 +166,7 @@ async def replay(args) -> dict:
     from genesis.memory.embeddings import EmbeddingProvider
 
     provider = EmbeddingProvider(
-        backends=EmbeddingProvider.build_chain(ollama_first=False),
+        backends=EmbeddingProvider.build_chain(),
         cache_dir=None,
     )
     cache = EmbedCache(_CACHE_PATH)

@@ -130,9 +130,21 @@ def _config_run(values: dict, default: tuple = (1, "")):
     """A ``subprocess.run`` side_effect mapping a git-config KEY (the last argv
     token) to ``(rc, stdout)``. Unlisted keys resolve to ``default`` = ``(1, "")``
     (git's "unset" signal). Order/count-independent — robust to how many config
-    reads _push_config_is_simple performs."""
+    reads _push_config_is_simple performs.
+
+    ``git remote get-url [--push] --all <remote>`` (the push-URL-vs-probe check)
+    is keyed as ``get-url`` / ``get-url --push`` and defaults to one identical
+    URL for both, i.e. no pushurl / pushInsteadOf divergence. ``git rev-parse
+    --git-common-dir`` (the legacy remote-file check) resolves to a directory
+    that does not exist, i.e. no legacy remote file."""
 
     def run(argv, **kwargs):
+        if "--git-common-dir" in argv:
+            return _proc(0, "/nonexistent-git-common-dir")
+        if "get-url" in argv:
+            key = "get-url --push" if "--push" in argv else "get-url"
+            rc, out = values.get(key, (0, "https://example.invalid/r.git"))
+            return _proc(rc, out)
         key = argv[-1]
         rc, out = values.get(key, default)
         return _proc(rc, out)
@@ -617,7 +629,24 @@ class TestPushTargetsCurrentBranch:
     def _t(self, guard_module, cmd, cur):
         return guard_module._push_targets_current_branch(_push_seg(cmd), cur, "origin")
 
-    # ── explicit `<remote> <cur>` → no config subprocess ──
+    # ── explicit `<remote> <cur>` → gated on the same config check as bare ──
+    # git remaps a colon-free local-branch refspec through remote.<r>.push and
+    # push.default=upstream, so the explicit form is not config-immune. Pinned
+    # simple here so these rows do not depend on the host repo's own config;
+    # the bare/remote-only rows below patch it themselves.
+
+    @pytest.fixture(autouse=True)
+    def _simple_config(self, request, guard_module):
+        name = request.node.name
+        if name.startswith("test_bare_") or "remote_only" in name:
+            yield
+            return
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
+            yield
+
+    def test_explicit_current_branch_needs_simple_config(self, guard_module):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
+            assert self._t(guard_module, "git push origin feat", "feat") is False
 
     def test_explicit_current_branch(self, guard_module):
         assert self._t(guard_module, "git push origin feat", "feat") is True

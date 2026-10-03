@@ -39,7 +39,13 @@ async def db():
 
 
 def _ago(days: float) -> str:
-    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    """An ISO timestamp ``days`` ago, plus one minute.
+
+    The query floors ``julianday('now') - jd`` to whole days. An age of exactly
+    N days lands at N or just under it after SQLite's millisecond rounding and
+    the float subtraction, so about half the time it floors to N - 1. The extra
+    minute keeps every whole-day age safely inside its day."""
+    return (datetime.now(UTC) - timedelta(days=days, minutes=1)).isoformat()
 
 
 async def _run(

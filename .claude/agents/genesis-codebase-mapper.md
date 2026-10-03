@@ -87,3 +87,25 @@ You are a codebase mapping agent. Your job is to produce a comprehensive, accura
   logs). State confidence as capped by enumeration completeness. (Full protocol:
   procedure `codebase_audit` / CC memory `audit-enumerate-not-spotcheck`;
   motivated by a 2026-06-30 audit that missed CRAG and the live reranker.)
+
+<!-- scratch-rule -->
+## Scratch files
+
+If your task has you create scratch files (repro scripts, fixtures, test runs,
+downloads; not files the task asks you to write), put them in ONE directory you
+make for this run: `mkdir -p ~/tmp && mktemp -d -p ~/tmp genesis-codebase-mapper-XXXX`. Note the
+absolute path it prints and reuse that literal path: shell variables do not carry
+over between calls. Pass it explicitly every time (`mktemp -p <dir>`,
+`tempfile.mkdtemp(dir=<dir>)`, `pytest --basetemp <dir>/pt`) and never rely on
+the default temp location. That is usually Claude Code's working temp, which
+every session on the machine shares, and filling it, with bytes or with many
+small files, breaks all of them at once. This overrides any harness-provided
+"scratchpad directory": it lives on that same shared temp, so keep it for small
+notes only.
+
+- Never export or persistently change `TMPDIR`. When code you run (not your own)
+  uses the default temp location, prefix that one command: `TMPDIR=<dir> <cmd>`.
+- A reproduction that creates many files or large files (load, fuzzing, DoS,
+  "N files" cases) caps the count and size, and stays inside that directory.
+- Remove the directory when you finish, unless the caller needs its contents;
+  then give its path in your report.

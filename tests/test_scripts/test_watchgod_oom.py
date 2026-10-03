@@ -118,8 +118,20 @@ def _run(home, bind, snippet, extra_env=None):
     )
 
 
-# The snippet prefix: override queue_alert to a call-log.
-_PRELUDE = 'queue_alert() { echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
+# The snippet prefix: override the enqueue to a call-log. The OOM path uses
+# queue_alert_try (it must know whether the page was queued, #2514), so that is
+# the stub; queue_alert keeps its real "swallow the status" shape on top of it.
+# $HOME/.genesis/alerts/FAIL makes every enqueue fail; FAIL_N holding a count
+# fails that many calls, then succeeds.
+_PRELUDE = (
+    "queue_alert_try() { "
+    '[[ -e "$HOME/.genesis/alerts/FAIL" ]] && return 1; '
+    'local _n_file="$HOME/.genesis/alerts/FAIL_N" _n=0; '
+    '[[ -f "$_n_file" ]] && _n=$(cat "$_n_file"); '
+    'if (( _n > 0 )); then echo $(( _n - 1 )) > "$_n_file"; return 1; fi; '
+    'echo "ALERT $*" >> "$HOME/.genesis/alerts/calls.log"; }; '
+    'queue_alert() { queue_alert_try "$@" || true; }; '
+)
 
 
 # ── Fix 4: durable OOM capture ───────────────────────────────────────────
@@ -1104,3 +1116,183 @@ def test_oom_drain_survives_a_failed_first_resolution(tmp_path):
     # ...and the successful tick-2 query re-anchored the cursor.
     cursor = home / ".genesis" / "logs" / ".oom_journal_cursor"
     assert cursor.exists() and cursor.read_text().startswith("s=stub")
+
+
+# ── #2514: a page whose enqueue failed is owed, not lost ─────────────────
+
+
+def _alerts(home):
+    return home / ".genesis" / "alerts"
+
+
+def _calls(home) -> str:
+    f = _alerts(home) / "calls.log"
+    return f.read_text() if f.exists() else ""
+
+
+def test_failed_enqueue_owes_the_page_in_the_spec(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "3:0:0:0:0"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    spec = out.stdout.split("B=")[1].strip()
+    # The decision advanced (counter 5) and the undelivered page is carried.
+    assert spec.startswith("5:") and spec.endswith(":owed=3-5"), spec
+    assert _calls(home) == ""
+    log = (home / ".genesis" / "logs").glob("*.log")
+    assert any("could not be queued" in p.read_text() for p in log)
+
+
+def test_owed_page_is_retried_next_tick_and_then_cleared(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE
+        + 'r1=$(check_oom_events "3:0:0:0:0"); echo "B1=$r1"; '
+        + 'rm -f "$HOME/.genesis/alerts/FAIL"; '
+        + 'r2=$(check_oom_events "$r1"); echo "B2=$r2"; '
+        + 'r3=$(check_oom_events "$r2"); echo "B3=$r3"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert out.stdout.split("B1=")[1].split()[0].endswith(":owed=3-5"), out.stdout
+    b2 = out.stdout.split("B2=")[1].split()[0]
+    b3 = out.stdout.split("B3=")[1].split()[0]
+    assert "owed=" not in b2 and "owed=" not in b3, out.stdout
+    calls = _calls(home)
+    # Exactly one page, delivered late, under the same dedupe key the original
+    # would have used, and nothing re-paged on the quiet tick after it.
+    assert calls.count("emergency watchgod:oom") == 1, calls
+    assert "delayed page" in calls and "oom_kill 3->5" in calls, calls
+    assert calls.rstrip().endswith("watchgod:oom:5"), calls
+
+
+def test_new_kill_while_owed_folds_both_ranges_into_one_page(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 7)
+    # The retry fails, then the new page succeeds: one page names both.
+    (_alerts(home) / "FAIL_N").write_text("1")
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "5:0:0:0:0:owed=3-5"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    spec = out.stdout.split("B=")[1].strip()
+    assert spec.startswith("7:") and "owed=" not in spec, spec
+    calls = _calls(home)
+    assert calls.count("emergency watchgod:oom") == 1, calls
+    assert "oom_kill 5->7" in calls and "oom_kill 3->5" in calls, calls
+    assert calls.rstrip().endswith("watchgod:oom:7"), calls
+
+
+def test_new_kill_while_still_failing_extends_the_owed_range(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 7)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "5:0:0:0:0:owed=3-5"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert out.stdout.split("B=")[1].strip().endswith(":owed=3-7"), out.stdout
+    assert _calls(home) == ""
+
+
+def test_successful_retry_and_a_new_kill_page_separately(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 7)
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "5:0:0:0:0:owed=3-5"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert "owed=" not in out.stdout.split("B=")[1], out.stdout
+    lines = [ln for ln in _calls(home).splitlines() if "emergency watchgod:oom" in ln]
+    assert len(lines) == 2, lines
+    assert lines[0].endswith("watchgod:oom:5") and "delayed page" in lines[0], lines
+    # The new page does not repeat the range the retry already delivered.
+    assert lines[1].endswith("watchgod:oom:7") and "oom_kill 3->5" not in lines[1], lines
+
+
+def test_unreadable_counter_keeps_what_is_owed(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "5:0:0:0:0:owed=3-5"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(tmp_path / "absent")},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert out.stdout.split("B=")[1].strip() == "5:0:0:0:0:owed=3-5", out.stdout
+
+
+def test_unreadable_counter_still_delivers_what_is_owed(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "5:0:0:0:0:owed=3-5"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(tmp_path / "absent")},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert out.stdout.split("B=")[1].strip() == "5:0:0:0:0", out.stdout
+    assert "delayed page" in _calls(home)
+
+
+def test_malformed_counter_field_keeps_what_is_owed(tmp_path):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "garbage:0:0:0:0:owed=3-4"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom)},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    # The garbage counter re-arms late (no new kill decided), the owed page stays.
+    assert out.stdout.split("B=")[1].strip().endswith(":owed=3-4"), out.stdout
+
+
+def test_owed_page_survives_a_contained_kill_tick(tmp_path):
+    # The one non-paging path through a kill: the retry fails and the new kill
+    # is contained (no page decided), so what is owed must carry through.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 5)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "4:0:0:0:0:owed=2-3"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": _KILL_LINE},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    spec = out.stdout.split("B=")[1].strip()
+    assert spec.startswith("5:") and spec.endswith(":owed=2-3"), spec
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "contained in [" in wg_log, wg_log  # the kill really was the contained path
+
+
+def test_unqueued_page_logs_who_was_killed(tmp_path):
+    # The delayed page cannot carry the journal attribution, and it points the
+    # operator at the watchgod log, so the log line must name the units.
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, 4)
+    (_alerts(home) / "FAIL").touch()
+    out = _run(
+        home, bind,
+        _PRELUDE + 'r=$(check_oom_events "3:0:0:0:0"); echo "B=$r"',
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": "worker.service: Failed with result 'oom-kill'."},
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    assert out.stdout.split("B=")[1].strip().endswith(":owed=3-4"), out.stdout
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    line = next(ln for ln in wg_log.splitlines() if "could not be queued" in ln)
+    assert "worker.service" in line, line

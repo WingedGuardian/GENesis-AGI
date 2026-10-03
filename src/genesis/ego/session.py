@@ -305,6 +305,9 @@ class EgoSession:
             context_builder=self._context_builder,
             context_weights=focus.context_weights if focus else None,
             focus_id=focus.focus_id if focus else None,
+            # Same tag store_cycle() writes as ego_source, so the
+            # "previous assessment" read is this ego's own last cycle.
+            ego_source=self._source_tag,
         )
 
         # Focus-specific prompt
@@ -479,8 +482,10 @@ class EgoSession:
         # Fetch recent focuses from ego_cycle_outcomes for context
         recent_focuses: list[dict[str, str]] = []
         try:
+            # Scoped to this ego: both egos share ego_cycle_outcomes, and an
+            # unscoped read tells this ego to avoid the OTHER ego's picks.
             rows = await ego_crud.list_cycle_outcomes(
-                self._db, limit=5,
+                self._db, limit=5, ego_source=self._source_tag,
             )
             recent_focuses = [
                 {
@@ -2458,6 +2463,27 @@ class EgoSession:
                 # Infer from proposal action_type if available
                 brief_action = brief.get("action_type", "")
                 profile = _infer_profile(brief_action)
+                # SAY SO. The substitute has a DIFFERENT tool scope, not a smaller
+                # one: measured against the removed `steward`, `research` gains
+                # `Write` and `interact` gains `Write` plus browser tools, while
+                # both correctly lose Bash. So the work runs with capabilities the
+                # brief did not ask for, and the session's outcome is recorded as
+                # this proposal's outcome — a proposal can be marked executed by a
+                # session that could not do what it described.
+                #
+                # Logged rather than refused because refusing is a design decision
+                # about what the ego's dispatchable set IS, not a repair; that is
+                # tracked separately. The unknown-MODEL fallback nine lines below
+                # already warns on exactly this shape, so this is the missing half
+                # of an existing convention, not a new one.
+                if brief_profile:
+                    logger.warning(
+                        "Execution brief %s requested profile %r, which is not "
+                        "registered — running as %r instead, whose tool scope "
+                        "differs. The outcome will be recorded against this "
+                        "proposal regardless.",
+                        proposal_id, brief_profile, profile,
+                    )
             # Resolve straight from the enum so any valid tier (incl. fable) is
             # honored; an unknown value logs and falls back to sonnet rather than
             # silently downgrading a real tier.

@@ -380,6 +380,68 @@ class TestConnectionReuse:
         assert backend._client is sentinel
 
 
+@pytest.fixture
+def embed_order(monkeypatch):
+    """Pin the install-local order, so this box's own config cannot leak in."""
+    import genesis.env as env_mod
+
+    def _set(local_first: bool | None) -> None:
+        monkeypatch.delenv("GENESIS_EMBED_LOCAL_FIRST", raising=False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        cfg = {} if local_first is None else {"memory": {"embed_local_first": local_first}}
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", cfg)
+
+    _set(None)
+    return _set
+
+
+class TestBuildChainFollowsInstallOrder:
+    """The order is an install-local setting; only an explicit argument beats it."""
+
+    def _names(self, chain) -> list[str]:
+        return [b.name for b in chain]
+
+    def test_unset_is_cloud_first(self, monkeypatch, embed_order) -> None:
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+        names = self._names(EmbeddingProvider.build_chain())
+        assert names.index("deepinfra_embedding") < names.index("ollama_embedding"), names
+
+    def test_local_first_setting_moves_the_default_chain(self, monkeypatch, embed_order) -> None:
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+        embed_order(True)
+        names = self._names(EmbeddingProvider.build_chain())
+        assert names.index("ollama_embedding") < names.index("deepinfra_embedding"), names
+
+    def test_local_first_setting_moves_a_bare_provider(self, monkeypatch, embed_order) -> None:
+        """`_build_default_chain` is a separate line from `build_chain()`; both
+        must follow the setting, or the fifteen implicit callers would split."""
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+        embed_order(True)
+        names = self._names(EmbeddingProvider(cache_dir=None)._backends)
+        assert names.index("ollama_embedding") < names.index("deepinfra_embedding"), names
+
+    def test_an_explicit_argument_beats_the_setting(self, monkeypatch, embed_order) -> None:
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+        embed_order(True)
+        names = self._names(EmbeddingProvider.build_chain(ollama_first=False))
+        assert names.index("deepinfra_embedding") < names.index("ollama_embedding"), names
+
+    def test_the_order_never_changes_the_vector_space(self, monkeypatch, embed_order) -> None:
+        """Reordering happens WITHIN the corpus space; the setting must not let
+        the order pick which model writes."""
+        monkeypatch.setenv("API_KEY_DEEPINFRA", "k")
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "true")
+        spaces_cloud = {b.vector_space for b in EmbeddingProvider.build_chain()}
+        embed_order(True)
+        spaces_local = {b.vector_space for b in EmbeddingProvider.build_chain()}
+        assert spaces_cloud == spaces_local and len(spaces_local) == 1, (spaces_cloud, spaces_local)
+
+
+@pytest.mark.usefixtures("embed_order")
 class TestBuildChainPriorityTier:
     """WHICH chain pays for priority, and which does not.
 
@@ -496,6 +558,29 @@ class TestBuildChainPriorityTier:
         assert self._deepinfra(chain)._service_tier is None
 
 
+def test_embedding_levers_reach_the_memory_mcp_child() -> None:
+    """The memory MCP child loads secrets.env only through its `_MCP_VARS`
+    allowlist, and it builds embedding chains that read both levers. A lever
+    missing from the allowlist is silently dropped when set only in secrets.env,
+    so the child would disagree with the main runtime. Parsed from the source:
+    importing the server would drag in the whole MCP stack."""
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "scripts/genesis_mcp_server.py").read_text()
+    allow: set[str] = set()
+    for node in ast.walk(ast.parse(src)):
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "_MCP_VARS" for t in node.targets)
+            and isinstance(node.value, ast.Set)
+        ):
+            allow |= {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+    assert allow, "_MCP_VARS set literal not found"
+    for lever in ("GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER"):
+        assert lever in allow, f"{lever} is read by the child but missing from _MCP_VARS"
+
+
 class TestRecallChainWiring:
     """The WIRING, not the capability — 'built != wired'.
 
@@ -523,7 +608,9 @@ class TestRecallChainWiring:
         assert "recall_backends = EmbeddingProvider.build_chain(" in src
         recall_call = src.split("recall_backends = EmbeddingProvider.build_chain(")[1]
         recall_call = recall_call.split(")")[0]
-        assert "ollama_first=False" in recall_call
+        assert "ollama_first" not in recall_call, (
+            "the order is the install's setting; a hard-coded order here ignores it"
+        )
         assert "priority_tier=priority" in recall_call, (
             "the recall chain must pass the tier — without this line the fix is inert"
         )
@@ -537,22 +624,21 @@ class TestRecallChainWiring:
             "storage is a background write with no deadline — it must not pay 1.5x"
         )
 
-    def test_the_storage_chain_is_cloud_first(self) -> None:
-        """The one line the flip exists for, and it was unlocked.
+    def test_the_storage_chain_takes_the_install_order(self) -> None:
+        """The runtime caller must leave the order to the install's setting.
 
-        MEASURED: reverting `storage_backends` to `ollama_first=True` left all
-        59 tests in this file green — including the three added with the flip,
-        because those bind the BUILDER default and this binds the CALLER. The
-        purpose-built harness for exactly this was sitting twenty lines above
-        and went unused.
+        MEASURED when storage was flipped cloud-first: reverting this caller
+        left every builder-level test green, because those bind the BUILDER and
+        this binds the CALLER. The same holds now: a hard-coded order here would
+        silently override `memory.embed_local_first` for the runtime alone.
         """
         src = self._init_source()
         assert "storage_backends = EmbeddingProvider.build_chain(" in src
         storage_call = src.split("storage_backends = EmbeddingProvider.build_chain(")[1]
         storage_call = storage_call.split(")")[0]
-        assert "ollama_first=False" in storage_call, (
-            "storage must lead with the cloud backend — without this line the "
-            "flip is inert for the runtime, whatever the builder default says"
+        assert "ollama_first" not in storage_call, (
+            "storage must take the install order — a hard-coded order here makes "
+            "the runtime ignore memory.embed_local_first"
         )
 
     def test_the_tier_decision_reads_the_config_lever(self) -> None:
@@ -562,6 +648,7 @@ class TestRecallChainWiring:
         assert "priority = embed_priority_tier()" in src
 
 
+@pytest.mark.usefixtures("embed_order")
 class TestOneVectorSpacePerChain:
     """A chain may only contain backends that produce vectors in ONE space.
 

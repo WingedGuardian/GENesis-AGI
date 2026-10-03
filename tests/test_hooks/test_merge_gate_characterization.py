@@ -1418,6 +1418,30 @@ def test_check_pr_report_includes_scheduled_line_ok(monkeypatch, capsys):
     assert rc == 0
 
 
+@pytest.mark.parametrize(
+    "result, shown",
+    [
+        (
+            {"status": "ok", "count": 5, "gate_surface": False, "rounds": [], "legacy_heads": 0},
+            "PAST TERMINAL",
+        ),
+        ({"status": "unknown", "errors": ["graphql_unreadable"]}, "unreadable (graphql_unreadable)"),
+    ],
+)
+def test_the_rounds_row_is_advisory_and_never_moves_the_verdict(monkeypatch, capsys, result, shown):
+    """Past-terminal and unreadable rounds still leave an otherwise green report
+    green: the round budget is enforced where it acts (the review-request ask and
+    the commit gate), never a second time here."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    monkeypatch.delenv("_TEST_ROUNDS_ROW", raising=False)
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **k: result)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    row = next(ln for ln in out.splitlines() if ln.startswith("rounds"))
+    assert shown in row
+    assert rc == 0, out
+
+
 def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     """An absent scheduled review is a FAILURE line and flips the report's verdict —
     the report must not diverge from the always-fail-closed enforcement gate."""

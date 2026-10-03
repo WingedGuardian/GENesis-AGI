@@ -193,6 +193,7 @@ _COMMENTED_BUT_SETTABLE = [
     "LM_STUDIO_URL",
     "LM_STUDIO_HEALTH_URL",
     "GENESIS_EMBED_PRIORITY_TIER",
+    "GENESIS_EMBED_LOCAL_FIRST",
     # These four were already commented — and already invisible — before the
     # local-inference URLs joined them. The gap predates that change.
     "TTS_ELEVENLABS_STABILITY",
@@ -246,7 +247,12 @@ def test_prose_is_not_mistaken_for_a_key():
 def test_optional_overrides_are_flagged_clearable():
     """The commented keys — and only those — advertise that they can be cleared."""
     by_key = {d.key: d for d in _parse_example_file()}
-    for key in ("OLLAMA_URL", "LM_STUDIO_URL", "GENESIS_EMBED_PRIORITY_TIER"):
+    for key in (
+        "OLLAMA_URL",
+        "LM_STUDIO_URL",
+        "GENESIS_EMBED_PRIORITY_TIER",
+        "GENESIS_EMBED_LOCAL_FIRST",
+    ):
         assert by_key[key].is_optional_override is True, key
     # The control. A required credential must NOT be clearable, or the editor would
     # happily blank an API key and report success.

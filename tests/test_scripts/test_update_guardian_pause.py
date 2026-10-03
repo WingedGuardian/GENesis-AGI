@@ -77,7 +77,7 @@ def test_update_sh_sources_the_lib_before_the_pause(text: str) -> None:
     source = _idx(text, '. "$SCRIPT_DIR/lib/guardian_pause.sh"')
     call = re.search(r"^\s+_guardian_pause\n", text, re.MULTILINE)
     assert call and source < call.start()
-    fetch = _idx(text, 'timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main')
+    fetch = _idx(text, 'timeout 120 git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" \\')
     assert source < fetch, "source the lib before the fetch (and so before any merge)"
 
 
