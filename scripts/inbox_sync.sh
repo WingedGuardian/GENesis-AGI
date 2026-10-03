@@ -16,7 +16,7 @@
 #                        listing data so error text can never join a
 #                        membership decision)
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DROPBOX_PATH="Apps/remotely-save/1/Genesis"
 LOCAL_PATH="${GENESIS_INBOX_PATH:-$HOME/inbox}"

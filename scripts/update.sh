@@ -57,7 +57,7 @@ if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ] \
     export GENESIS_UPDATE_FROM_TEMP=1
     export GENESIS_UPDATE_SELF_COPY="$TEMP_COPY"
     # Pass original script dir so GENESIS_ROOT resolves correctly
-    export GENESIS_UPDATE_ORIG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    export GENESIS_UPDATE_ORIG_DIR="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
     exec "$TEMP_COPY" "$@"
 fi
 # Running from temp copy — clean up on exit. Bind the path NOW: bash expands
@@ -85,7 +85,7 @@ for _arg in "$@"; do
     [[ "$_arg" == "--post-merge" ]] && POST_MERGE=true
 done
 
-GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)}"
 # The last piece of the copy handshake, spent now that GENESIS_ROOT is set.
 unset GENESIS_UPDATE_ORIG_DIR
 SCRIPT_DIR="$GENESIS_ROOT/scripts"
