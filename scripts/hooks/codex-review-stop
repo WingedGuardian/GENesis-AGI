@@ -1,0 +1,11 @@
+#!/bin/bash
+# Codex continues after ordinary hook failures. Convert evaluator failure to an
+# explicit deny, including missing/broken Python imports. Never emit ask JSON.
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
+if decision=$(python3 "$hook_dir/codex_review_stop.py"); then
+    if [ "$decision" = "allow" ]; then
+        exit 0
+    fi
+fi
+printf '%s\n' 'BLOCKED: Codex review-budget evaluation did not allow this action. Stop and handoff to the user.' >&2
+exit 2
