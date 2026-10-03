@@ -767,3 +767,35 @@ def test_the_live_pin_file_is_readable_by_the_checker() -> None:
     text = (_REPO_ROOT / "scripts" / "lib" / "cc_version.sh").read_text()
 
     assert receipts._pin_of(text, where="live") is not None
+
+
+# ── keep_blank (issue #2786) ─────────────────────────────────────────────────
+# Paragraph-aware callers (#2762's Acceptance parser) end a list item at a blank
+# line — CommonMark 0.31.2 "Blank lines" / "List items" — so they need the
+# boundaries the default scanner drops.
+
+
+def test_keep_blank_preserves_paragraph_boundaries() -> None:
+    assert receipts.readable_body("a\n\nb", keep_blank=True) == "a\n\nb"
+    # Whitespace-only still counts as blank and is emitted as "".
+    assert receipts.readable_body("a\n   \nb", keep_blank=True) == "a\n\nb"
+
+
+def test_keep_blank_drops_what_a_fence_or_comment_hides() -> None:
+    # A fence leaves no blank behind — its markers and content are all dropped.
+    assert receipts.readable_body("a\n```\nx\n```\nb", keep_blank=True) == "a\nb"
+    # Single-line and multi-line comments alike.
+    assert receipts.readable_body("a\n<!--x-->\nb", keep_blank=True) == "a\nb"
+    assert receipts.readable_body("a\n<!--\nx\n-->\nb", keep_blank=True) == "a\nb"
+    # A line emptied ONLY by comment removal renders as nothing, not a blank.
+    assert receipts.readable_body("a\n<!-- c -->\n\nb", keep_blank=True) == "a\n\nb"
+    # A blank inside an OPEN comment is hidden like any other commented text.
+    assert receipts.readable_body("a\n<!-- open\n\nstill\nb", keep_blank=True) == "a"
+
+
+def test_keep_blank_default_is_unchanged() -> None:
+    """The default call drops every blank line exactly as before — the existing
+    callers (`missing_receipts`, the E2E reader, pr_shape) are unchanged by
+    construction."""
+    assert receipts.readable_body("a\n\nb") == "a\nb"
+    assert receipts.readable_body("a\n   \nb") == "a\nb"
