@@ -1110,4 +1110,7 @@ jobs:
         # Human-reference integrity: 32 initial +49 first repair +11 atomic
         # publication =92 cases across three branch-new files, no added skips.
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24245
+        # db-transaction primitive (#1881), re-counted with --collect-only at
+        # this merge: tests/test_db/test_connection.py collects 56 on the
+        # branch vs 15 on main (+41); no added skips. Floor: 24245 + 41 = 24286.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24286

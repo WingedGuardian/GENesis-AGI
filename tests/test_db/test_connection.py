@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import sqlite3
 
 import aiosqlite
 import pytest
@@ -18,7 +19,14 @@ async def sconn():
     await raw.commit()
     conn = SerializedConnection(raw)
     yield conn
-    await raw.close()
+    # Close the LIVE connection, not just the one handed in. `_conn` is
+    # replaced when the proxy quarantines and reconnects, so closing `raw`
+    # alone can leave the real one open — its aiosqlite worker thread then
+    # outlives the event loop and raises "Event loop is closed" from a
+    # teardown nobody is watching.
+    for handle in {id(raw): raw, id(conn._conn): conn._conn}.values():
+        with contextlib.suppress(Exception):
+            await handle.close()
 
 
 async def test_basic_execute_and_commit(sconn):
@@ -234,3 +242,822 @@ async def test_get_db_foreign_keys_opt_out(tmp_path):
         assert (await cur.fetchone())[0] == 0
     finally:
         await db.close()
+
+
+# ── transaction(): multi-statement atomicity (F1) ─────────────────────────
+
+
+async def test_transaction_commits_on_clean_exit(sconn):
+    """Statements inside the block are committed as a unit on clean exit."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'a')")
+        await sconn.execute("INSERT INTO t VALUES (2, 'b')")
+    # visible AFTER the block (single commit at exit)
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 2
+
+
+async def test_transaction_rolls_back_on_error(sconn):
+    """ANY exception in the block rolls the WHOLE transaction back — the first
+    insert must not survive when the block later raises."""
+    with contextlib.suppress(RuntimeError):
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (1, 'a')")
+            raise RuntimeError("boom")
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 0  # rolled back
+    # connection is not wedged — a later normal write still works
+    await sconn.execute("INSERT INTO t VALUES (9, 'ok')")
+    await sconn.commit()
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_execute_is_reentrant_inside_transaction(sconn):
+    """execute() from the OWNING task inside the block runs on the held lock
+    (does not deadlock re-acquiring the non-reentrant lock)."""
+    async with sconn.transaction():
+        # would hang forever if execute() tried to re-acquire self._lock
+        await asyncio.wait_for(
+            sconn.execute("INSERT INTO t VALUES (1, 'reentrant')"), timeout=2.0
+        )
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 1")
+    assert (await cur.fetchone())["val"] == "reentrant"
+
+
+async def test_transaction_holds_lock_across_body(sconn):
+    """The core mechanism: while task A is INSIDE an open transaction (paused
+    between statements), task B's execute() on the same connection BLOCKS until
+    A's transaction commits — no peer can interleave.
+
+    Verify-RED: make _maybe_lock always yield (never take the lock) and B is no
+    longer blocked, so 'b-done' appears before A is released and the final order
+    assertion fails."""
+    order: list[str] = []
+    a_inside = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def task_a():
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (100, 'a1')")
+            order.append("a-mid")
+            a_inside.set()
+            await release_a.wait()  # hold the transaction open
+            await sconn.execute("INSERT INTO t VALUES (101, 'a2')")
+            order.append("a-commit")
+
+    async def task_b():
+        await a_inside.wait()
+        order.append("b-attempt")
+        await sconn.execute("INSERT INTO t VALUES (200, 'b')")  # must block on held lock
+        order.append("b-done")
+
+    ta = asyncio.create_task(task_a())
+    tb = asyncio.create_task(task_b())
+    await a_inside.wait()
+    await asyncio.sleep(0.05)  # give B every chance to run — it must be blocked
+    assert "b-attempt" in order and "b-done" not in order
+    release_a.set()
+    await asyncio.gather(ta, tb)
+    # A's ENTIRE transaction committed before B's write ran
+    assert order == ["a-mid", "b-attempt", "a-commit", "b-done"]
+
+
+async def test_transaction_isolates_peer_from_uncommitted_write(sconn):
+    """ACCEPTANCE BAR — a deterministic replay of the exact fork defect F1 fixes.
+
+    A peer coroutine's ROLLBACK must not discard an uncommitted write that
+    belongs to another coroutine's atomic unit. Task A opens a transaction and
+    writes r1, then pauses (mid read-modify-write). While A is paused a peer B
+    issues rollback() on the SAME shared connection. With transaction() holding
+    the lock, B's rollback BLOCKS until A commits, so BOTH of A's rows survive.
+
+    Verify-RED: this is the real known-positive. Break the mechanism (make
+    transaction() release the lock during the body, i.e. the pre-F1 per-call
+    behavior) and B's rollback lands between A's two writes and discards r1 — the
+    final count is 1, not 2. Confirmed RED during development against a
+    lock-releasing transaction()."""
+    a_wrote_r1 = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def task_a():
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (1, 'a1')")
+            a_wrote_r1.set()
+            await release_a.wait()  # pause mid-unit, transaction still open
+            await sconn.execute("INSERT INTO t VALUES (2, 'a2')")
+
+    ta = asyncio.create_task(task_a())
+    await a_wrote_r1.wait()
+
+    # Peer rollback while A is paused — must block on the held transaction lock.
+    tb = asyncio.create_task(sconn.rollback())
+    await asyncio.sleep(0.05)
+    assert not tb.done()  # B's rollback is blocked, cannot nuke A's uncommitted r1
+
+    release_a.set()
+    await asyncio.gather(ta, tb)  # A commits both rows, THEN B's rollback no-ops
+
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 2  # both survived — no peer contamination
+
+
+async def test_transaction_is_not_reentrant(sconn):
+    """A nested transaction() on the SAME task raises rather than deadlocking or
+    silently sharing the transaction."""
+    with pytest.raises(RuntimeError, match="not re-entrant"):
+        async with sconn.transaction():
+            async with sconn.transaction():
+                pass
+
+
+async def test_transaction_waits_out_concurrent_implicit_txn(sconn):
+    """Repro (Codex P1, PR #1576): ordinary CRUD does execute();commit() as TWO
+    lock acquisitions, so the connection sits inside an IMPLICIT transaction
+    (legacy isolation mode) between them with the lock released. A peer's
+    transaction() entering that window used to raise 'cannot start a transaction
+    within a transaction' (an error _retry_locked does not retry — it retries
+    lock errors only). transaction() must instead wait the implicit transaction
+    out and then proceed."""
+    # open an implicit transaction the way every CRUD helper does (no commit yet)
+    await sconn.execute("INSERT INTO t VALUES (1, 'implicit')")
+    assert sconn.in_transaction
+
+    async def peer_txn():
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (2, 'txn')")
+
+    tb = asyncio.create_task(peer_txn())
+    await asyncio.sleep(0.05)
+    # not failed — waiting for the implicit transaction to resolve
+    assert not tb.done()
+    await sconn.commit()  # the CRUD pair's second half lands
+    await asyncio.wait_for(tb, timeout=5.0)  # transaction() proceeds and commits
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 2
+
+
+async def test_transaction_raises_loud_when_implicit_txn_never_resolves(sconn, monkeypatch):
+    """Bounded, not infinite: an implicit transaction a peer opened and never
+    commits (errored between execute and commit) can only be closed by a later
+    commit/rollback — transaction() gives up LOUDLY once the stall budget is
+    spent, instead of blocking every caller forever. The error must name the
+    WEDGE hypothesis, which is the true one here (no op completes)."""
+    from genesis.db import connection as conn_mod
+
+    slept: list[float] = []
+
+    async def fast_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", fast_sleep)
+    await sconn.execute("INSERT INTO t VALUES (1, 'wedged')")  # never committed
+    with pytest.raises(sqlite3.OperationalError, match="never committed/rolled back"):
+        async with sconn.transaction():
+            pass  # pragma: no cover — must not be reached
+    # spent exactly the stall budget (N checks → N-1 backoffs), no more
+    assert len(slept) == len(conn_mod._WRITE_RETRY_DELAYS)
+    # the lock is RELEASED on the exhaustion path — a leak here would surface as
+    # a HANG in a later test rather than a failure, so assert it explicitly
+    assert not sconn._lock.locked()
+    # the connection is not wedged further: resolving the implicit txn works
+    await sconn.commit()
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (2, 'after')")
+
+
+async def test_transaction_wait_is_progress_aware_not_blind(sconn, monkeypatch):
+    """A CONTENDED connection is not a wedged one. While peers keep completing
+    ops, the stall budget must RESET rather than burn down — a progress-blind
+    bound fails transaction() entries while nothing is actually wrong. Here a
+    peer holds an implicit transaction open across far more checks than the
+    stall budget, but keeps executing, so entry keeps waiting; when the peer
+    finally commits, the transaction proceeds."""
+    from genesis.db import connection as conn_mod
+
+    ticks = 0
+
+    async def peer_progresses_then_commits(d):
+        # Stand in for the backoff sleep: each time the waiter backs off, the
+        # peer completes another op (progress), until it finally commits.
+        nonlocal ticks
+        ticks += 1
+        if ticks <= 3 * (len(conn_mod._WRITE_RETRY_DELAYS) + 1):
+            await sconn.execute(f"INSERT INTO t VALUES ({100 + ticks}, 'peer')")
+        else:
+            await sconn.commit()
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", peer_progresses_then_commits)
+    await sconn.execute("INSERT INTO t VALUES (1, 'peer-open')")  # implicit txn open
+    async with sconn.transaction():  # must NOT raise despite many busy checks
+        await sconn.execute("INSERT INTO t VALUES (2, 'mine')")
+    # waited out far more checks than a progress-blind budget would have allowed
+    assert ticks > len(conn_mod._WRITE_RETRY_DELAYS) + 1
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t WHERE val = 'mine'")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_transaction_contention_bound_is_the_busy_timeout(sconn, monkeypatch):
+    """Contention still has an outer bound (a permanently-saturated connection
+    must not starve the waiter forever), and it is the connection's configured
+    busy_timeout — not an invented number. When peers keep progressing past
+    that budget, the error names CONTENTION, not a wedge."""
+    from genesis.db import connection as conn_mod
+
+    clock = {"t": 0.0}
+
+    async def progress_and_advance_clock(d):
+        # peer completes an op every backoff (so the stall budget never fires)
+        await sconn.execute("INSERT INTO t VALUES (NULL, 'peer')")
+        clock["t"] += 10.0  # blow past any plausible busy_timeout budget
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", progress_and_advance_clock)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: clock["t"])
+    await sconn.execute("INSERT INTO t VALUES (1, 'peer-open')")  # implicit txn open
+    with pytest.raises(sqlite3.OperationalError, match="contention, not a wedge"):
+        async with sconn.transaction():
+            pass  # pragma: no cover — must not be reached
+    assert not sconn._lock.locked()  # released on this exhaustion path too
+
+
+async def test_txn_control_sql_refused_inside_transaction(sconn):
+    """Raw transaction-control SQL through execute()/executemany() inside an
+    owned transaction() block bypassed _refuse_inside_txn — an early COMMIT
+    breaks the all-or-nothing unit (a later exception can't roll back what was
+    already committed), and a raw ROLLBACK discards the unit while the context
+    manager still reports success. Refuse the verbs, same as commit()/rollback()."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'x')")
+        for bad in (
+            "COMMIT",
+            "commit",
+            "  ROLLBACK",
+            "BEGIN IMMEDIATE",
+            "END",
+            "-- sneaky\nCOMMIT",
+            "/* c */ COMMIT",
+            "SAVEPOINT sp1",
+            "RELEASE sp1",
+        ):
+            with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+                await sconn.execute(bad)
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await sconn.executemany("COMMIT", [()])
+    # the refused statements didn't break the unit — it committed intact
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_txn_control_sql_allowed_outside_transaction(sconn):
+    """Control: OUTSIDE a transaction() block the refusal must not fire — the
+    migration runner and precompact legitimately issue BEGIN IMMEDIATE/COMMIT/
+    ROLLBACK through execute() on connections with no owned transaction."""
+    await sconn.execute("BEGIN IMMEDIATE")
+    await sconn.execute("INSERT INTO t VALUES (1, 'manual')")
+    await sconn.execute("COMMIT")
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_commit_rollback_close_refused_inside_transaction(sconn):
+    """commit/rollback/close/executescript are refused inside the block — the
+    context manager owns the single commit/rollback, so a body cannot silently
+    early-commit or discard the transaction. (F-B)"""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'x')")
+        for bad in ("commit", "rollback", "close"):
+            with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+                await getattr(sconn, bad)()
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await sconn.executescript("SELECT 1")
+    # the block still committed normally despite the refused calls
+    cur = await sconn.execute("SELECT count(*) as cnt FROM t")
+    assert (await cur.fetchone())["cnt"] == 1
+
+
+async def test_every_sql_taking_method_refuses_transaction_control(sconn):
+    """Every public method that forwards SQL to the driver must refuse
+    transaction-control verbs inside a transaction.
+
+    The guard was originally added to `execute` and `executemany` only, and two
+    sibling helpers taking the same first argument were missed — an early COMMIT
+    through either one persists the body's writes, so a later exception can no
+    longer roll them back and the all-or-nothing contract breaks silently.
+
+    The surface is asserted as an EXPLICIT SET rather than a floor: a `>= N`
+    bound passes just as happily when a method is LOST as when one is added, and
+    introspection keyed on the parameter name `sql` cannot see a sibling someone
+    spells `statement`. An exact set fails loudly in both directions and forces
+    whoever changed the surface to come here and decide.
+    """
+    import inspect
+
+    forwards_sql = {
+        name
+        for name, fn in inspect.getmembers(type(sconn), inspect.isfunction)
+        if not name.startswith("_") and "sql" in inspect.signature(fn).parameters
+    }
+    expected = {"execute", "executemany", "execute_fetchall", "execute_insert", "executescript"}
+    assert forwards_sql == expected, (
+        f"the SQL-forwarding surface changed: {forwards_sql ^ expected}. Guard the new "
+        "method with _refuse_txn_control_sql (or _refuse_inside_txn for a whole-method "
+        "refusal) and update this set."
+    )
+
+    await sconn.execute("CREATE TABLE IF NOT EXISTS t2 (id INTEGER PRIMARY KEY)")
+    async with sconn.transaction() as tx:
+        for name in sorted(forwards_sql):
+            fn = getattr(tx, name)
+            # Supply whatever else the signature REQUIRES, so a missing argument
+            # cannot masquerade as a refusal: a TypeError satisfies neither
+            # pytest.raises(RuntimeError) nor the match, but a laxer assertion
+            # here would have let one through.
+            sig = inspect.signature(fn)
+            extra = [
+                []
+                for pname, param in sig.parameters.items()
+                if pname != "sql" and param.default is inspect.Parameter.empty
+            ]
+            with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+                await fn("COMMIT", *extra)
+
+
+async def test_a_cursor_from_execute_cannot_commit_the_transaction(sconn):
+    """`execute()` returns a cursor, so guarding `cursor()` alone is theatre.
+
+    MEASURED before the wrapper existed: three separate escapes ended the
+    transaction through a cursor obtained from the ordinary query path —
+    `await cur.execute("COMMIT")`, the same through `async with`, and
+    `cur.executescript(...)`. All three are pinned here, because the class of
+    defect is "a guard that closes one of four doors while claiming to be the
+    only door".
+    """
+    await sconn.execute("CREATE TABLE IF NOT EXISTS t3 (id INTEGER PRIMARY KEY)")
+
+    async with sconn.transaction() as tx:
+        cur = await tx.execute("SELECT 1")
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await cur.execute("COMMIT")
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await cur.executescript("SELECT 1")
+
+    async with sconn.transaction() as tx, tx.execute("SELECT 1") as cur2:
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await cur2.execute("COMMIT")
+
+    # And the cursor still WORKS for ordinary statements, or the guard is just a
+    # removal of the feature.
+    async with sconn.transaction() as tx:
+        cur3 = await tx.execute("INSERT INTO t3 (id) VALUES (7)")
+        assert cur3.rowcount == 1
+        rows = await (await tx.execute("SELECT id FROM t3 WHERE id = 7")).fetchall()
+        assert len(rows) == 1
+
+
+async def test_a_byte_order_mark_cannot_smuggle_a_commit(sconn):
+    r"""`\ufeff` is not matched by Python's `\s` but IS skipped by SQLite.
+
+    So a BOM-prefixed COMMIT read as verbless to the guard and then executed for
+    real (MEASURED). Reachable whenever SQL comes from a file: Python's
+    `open(encoding="utf-8")` keeps a BOM — only `utf-8-sig` strips it.
+    """
+    async with sconn.transaction() as tx:
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await tx.execute("\ufeffCOMMIT")
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await tx.execute("\ufeff  /* c */ ROLLBACK")
+
+
+async def test_a_cursor_outside_a_transaction_is_unwrapped(sconn):
+    """Outside a transaction nothing changes shape — the wrapper is scoped to
+    the case it exists for, so the hot path is untouched."""
+    cur = await sconn.cursor()
+    assert type(cur).__name__ != "_GuardedCursor"
+    cur2 = await sconn.execute("SELECT 1")
+    assert type(cur2).__name__ != "_GuardedCursor"
+    # transaction-control SQL still passes through outside a transaction
+    await sconn.execute("BEGIN")
+    await sconn.execute("ROLLBACK")
+
+
+async def test_a_chained_cursor_stays_guarded(sconn):
+    """`cur = await cur.execute(...)` must not rebind to the RAW cursor —
+    aiosqlite's Cursor.execute returns the cursor itself, so returning it leaks
+    an unguarded handle that can COMMIT mid-transaction."""
+    async with sconn.transaction() as tx:
+        cur = await tx.execute("SELECT 1")
+        cur = await cur.execute("SELECT 1")
+        assert type(cur).__name__ == "_GuardedCursor"
+        with pytest.raises(RuntimeError, match="not allowed inside transaction"):
+            await cur.execute("COMMIT")
+        cur = await cur.executemany("INSERT INTO t (val) VALUES (?)", [("x",)])
+        assert type(cur).__name__ == "_GuardedCursor"
+
+
+async def test_a_landed_begin_is_rolled_back_when_the_await_was_cancelled(sconn):
+    """Cancelling the BEGIN await does not stop the aiosqlite worker: the BEGIN
+    can land anyway. The exit path must resolve that outcome and roll back —
+    not leave an open ownerless transaction."""
+    raw = sconn._conn
+    real_execute = raw.execute
+    fired = False
+
+    def begin_that_lands_anyway(sql, parameters=None):
+        nonlocal fired
+        if sql.startswith("BEGIN"):
+            fired = True
+
+            async def landed_then_cancelled():
+                await real_execute(sql, parameters)
+                raise asyncio.CancelledError()
+
+            return landed_then_cancelled()
+        return real_execute(sql, parameters)
+
+    import unittest.mock as mock
+
+    with (
+        mock.patch.object(raw, "execute", side_effect=begin_that_lands_anyway),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        async with sconn.transaction():
+            pass  # pragma: no cover
+    assert fired
+    assert not raw.in_transaction
+
+
+async def test_a_landed_commit_is_not_rolled_back_when_the_await_was_cancelled(sconn):
+    """The COMMIT analogue: a cancelled commit await whose op already landed
+    must NOT roll back durable work, and the CancelledError still propagates."""
+    raw = sconn._conn
+    real_commit = raw.commit
+    import unittest.mock as mock
+
+    async def commit_that_lands_anyway():
+        await real_commit()
+        raise asyncio.CancelledError()
+
+    await sconn.execute("INSERT INTO t (id, val) VALUES (42, 'kept')")
+    await sconn.commit()  # close the implicit transaction before patching commit
+    with (
+        mock.patch.object(raw, "commit", side_effect=commit_that_lands_anyway),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        async with sconn.transaction() as tx:
+            await tx.execute("UPDATE t SET val = 'mutated' WHERE id = 42")
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 42")
+    assert (await cur.fetchone())["val"] == "mutated"
+
+
+async def test_a_failed_rollback_quarantines_the_connection(tmp_path):
+    """A rollback that fails after the body wrote must not return a possibly
+    open transaction to the pool: close it and swap in a reconnected one."""
+    import unittest.mock as mock
+
+    db = tmp_path / "q.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    replacement = await aiosqlite.connect(str(db))
+
+    async def reconnect():
+        return replacement
+
+    conn = SerializedConnection(raw, reconnect_fn=reconnect)
+    with (
+        mock.patch.object(
+            raw, "rollback", side_effect=sqlite3.OperationalError("cannot rollback")
+        ),
+        pytest.raises(ValueError),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+            raise ValueError("body blew up")
+    assert conn._conn is replacement
+    # Both handles are closed because this test builds them itself rather than
+    # taking the fixture. Left open, each keeps an aiosqlite WORKER THREAD
+    # alive past the event loop and raises "Event loop is closed" from teardown
+    # — a warning attributed to whichever test happens to run last, which is
+    # why it stayed invisible until an unrelated change shifted the ordering.
+    for handle in (raw, replacement):
+        with contextlib.suppress(Exception):
+            await handle.close()
+
+
+async def test_a_failed_begin_still_allows_reconnection(tmp_path, monkeypatch):
+    """_txn_owner is claimed only after BEGIN lands, so a BEGIN that exhausts
+    its retries is not an 'open transaction' and the reconnect path still
+    fires."""
+    import genesis.db.connection as conn_mod
+
+    db = tmp_path / "r.db"
+    raw = await aiosqlite.connect(str(db))
+    replacement = await aiosqlite.connect(str(db))
+    reconnected = False
+
+    async def reconnect():
+        nonlocal reconnected
+        reconnected = True
+        return replacement
+
+    conn = SerializedConnection(raw, reconnect_fn=reconnect)
+    object.__setattr__(conn, "_max_errors", 1)
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(conn_mod, "_async_sleep", no_sleep)
+    real_execute = raw.execute
+    import unittest.mock as mock
+
+    def locked_begin(sql, parameters=None):
+        if sql.startswith("BEGIN"):
+            raise sqlite3.OperationalError("database is locked")
+        return real_execute(sql, parameters)
+
+    with (
+        mock.patch.object(raw, "execute", side_effect=locked_begin),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        async with conn.transaction():
+            pass  # pragma: no cover
+    assert reconnected
+    assert conn._conn is replacement
+    for handle in (raw, replacement):  # see the note in the test above
+        with contextlib.suppress(Exception):
+            await handle.close()
+
+
+# ---------------------------------------------------------------------------
+# The transaction guard is SQLite's own AUTHORIZER, not a SQL-verb parser.
+#
+# Codex P1 x2, PR #1881: the wrapper forwarded aiosqlite's `Cursor.connection`,
+# so `await cur.connection.commit()` bypassed every guard; and the verb parser
+# mis-lexed prefixes SQLite accepts — `"; COMMIT"` is an empty statement then a
+# COMMIT, and a BOM after whitespace or a comment is skipped by SQLite but not
+# by a one-shot `lstrip`. Both are one class: a hand-rolled predicate that does
+# not match the real semantics of the thing it guards, over an OPEN set of
+# spellings, which is why each round produced another one.
+#
+# MEASURED before this change: SQLite's authorizer denies all of them by ACTION
+# (SQLITE_TRANSACTION, SQLITE_SAVEPOINT) — including the C-level
+# `Connection.commit()`, which no amount of SQL inspection can ever see.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_guard_survives_a_failing_body(sconn):
+    """THE catastrophic failure mode, tested first and deliberately.
+
+    The guard is per-CONNECTION state on a SHARED connection. If a body raises
+    and the guard is not removed, every later caller inherits a connection that
+    can never commit — far worse than the bypass it prevents. The disarm has to
+    hold on the error path, not only the happy one.
+    """
+    with contextlib.suppress(RuntimeError):
+        async with sconn.transaction():
+            await sconn.execute("INSERT INTO t VALUES (1, 'x')")
+            raise RuntimeError("body blew up")
+    await sconn.execute("INSERT INTO t VALUES (2, 'after')")
+    await sconn.commit()
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 2")
+    assert (await cur.fetchone())["val"] == "after"
+
+
+async def test_the_reachable_commit_hatch_is_closed(sconn):
+    """The escape hatch that ACTUALLY fires, and it is not the one reported.
+
+    Codex P1 named `await cur.connection.commit()`. MEASURED: that vector is
+    inert today — aiosqlite's `Cursor.connection` returns the RAW
+    `sqlite3.Connection`, which is thread-affine, so touching it from the event
+    loop raises `ProgrammingError` before any guard is consulted. Pinned
+    separately below, because it is an ACCIDENTAL defence.
+
+    The reachable one is the aiosqlite connection itself: MEASURED
+    `await sconn._conn.commit()` SUCCEEDED mid-transaction and ended the unit.
+    The authorizer denies it, and the assertion below matches "not authorized"
+    rather than a bare `DatabaseError` on purpose — `DatabaseError` would also
+    be satisfied by the thread-affinity error, i.e. by the guard doing nothing.
+    """
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'kept')")
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            await sconn._conn.commit()
+    cur = await sconn.execute("SELECT val FROM t WHERE id = 1")
+    assert (await cur.fetchone())["val"] == "kept", "the unit still committed once"
+
+
+async def test_the_raw_cursor_connection_vector_is_inert_by_thread_affinity(sconn):
+    """Pin an ACCIDENTAL defence so a later change cannot open it in silence.
+
+    Nothing in this module blocks `cur.connection`; SQLite's own thread check
+    does, because the object is the raw `sqlite3.Connection` and aiosqlite runs
+    it on a worker thread. That is not a guard — it is a property of a default
+    (`check_same_thread`) that someone could reasonably flip while tuning
+    performance, with no test objecting. This is that test.
+    """
+    async with sconn.transaction():
+        cur = await sconn.execute("SELECT 1")
+        raw = cur.connection
+        assert isinstance(raw, sqlite3.Connection), (
+            "if this becomes the aiosqlite Connection, the thread check no longer "
+            "applies and this vector needs the authorizer instead"
+        )
+        with pytest.raises(sqlite3.ProgrammingError, match="same thread"):
+            raw.commit()
+
+
+@pytest.mark.parametrize(
+    ("label", "sql", "caught_by"),
+    [
+        # The parser reads these correctly, so the caller gets its MESSAGE,
+        # which names the remedy. That is the only thing the parser is for now.
+        ("plain", "COMMIT", "parser"),
+        ("bom-at-zero", "﻿COMMIT", "parser"),
+        ("comment-first", "/*c*/ COMMIT", "parser"),
+        ("rollback", "ROLLBACK", "parser"),
+        ("begin", "BEGIN", "parser"),
+        ("savepoint", "SAVEPOINT sp", "parser"),
+        ("release", "RELEASE sp", "parser"),
+        # The parser MISSES these and always will — `"; COMMIT"` is an empty
+        # statement so it reads no verb at all, and SQLite skips a BOM after
+        # whitespace where a one-shot `lstrip` cannot. MEASURED: both reached
+        # the database before the authorizer existed. (Codex P1, PR #1881.)
+        ("empty-statement-first", "; COMMIT", "authorizer"),
+        ("bom-after-space", " ﻿COMMIT", "authorizer"),
+        # SQLITE_SAVEPOINT is a SEPARATE authorizer action from
+        # SQLITE_TRANSACTION, and every other savepoint row above is caught by
+        # the parser — so without a spelling that REACHES the authorizer,
+        # dropping that action code from the deny set would not fail a single
+        # test. MEASURED: denying only SQLITE_TRANSACTION leaves `SAVEPOINT s1`
+        # allowed. This row is what makes the second action code load-bearing.
+        ("empty-statement-then-savepoint", "; SAVEPOINT sp", "authorizer"),
+    ],
+)
+async def test_transaction_control_is_refused_however_it_is_spelled(sconn, label, sql, caught_by):
+    """Two layers with DIFFERENT jobs, and the test pins which one fires.
+
+    The parser is the front door: it produces a message naming the remedy, and
+    it is now ADVISORY — a spelling it misreads is no longer a bypass, which is
+    why its open-set imprecision stopped being a defect instead of needing yet
+    another prefix rule.
+
+    The authorizer is the guard: it refuses by SQLite ACTION after SQLite has
+    lexed the statement, so there is no spelling left to enumerate.
+
+    Asserting the LAYER, not just "refused", is deliberate. A test that only
+    checked for an exception would stay green if the authorizer silently
+    stopped being armed — the parser would cover the seven easy cases and hide
+    it. These two rows are the ones that prove the guard is live.
+    """
+    expected = RuntimeError if caught_by == "parser" else sqlite3.DatabaseError
+    match = "not allowed inside transaction" if caught_by == "parser" else "not authorized"
+    async with sconn.transaction():
+        with pytest.raises(expected, match=match):
+            await sconn.execute(sql)
+
+
+async def test_ordinary_statements_are_untouched_inside_a_transaction(sconn):
+    """Negative control. Without it an authorizer that denied EVERYTHING would
+    pass every test above."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (7, 'ok')")
+        cur = await sconn.execute("SELECT val FROM t WHERE id = 7")
+        assert (await cur.fetchone())["val"] == "ok"
+
+
+async def test_the_guard_is_removed_after_the_block(sconn):
+    """Ordinary commit/rollback must work again once the unit is over — the
+    disarm is what keeps the shared connection reusable."""
+    async with sconn.transaction():
+        await sconn.execute("INSERT INTO t VALUES (1, 'a')")
+    await sconn.execute("INSERT INTO t VALUES (2, 'b')")
+    await sconn.commit()  # would raise if the authorizer were still armed
+    await sconn.execute("INSERT INTO t VALUES (3, 'c')")
+    await sconn.rollback()
+    cur = await sconn.execute("SELECT COUNT(*) AS n FROM t")
+    assert (await cur.fetchone())["n"] == 2
+
+
+async def test_a_disarm_failure_never_commits_the_replacement(tmp_path):
+    """If the authorizer will not come off, the connection is quarantined and
+    swapped — committing afterward would run on the replacement (whose queue is
+    empty) while the block reports success. The unit must surface an error
+    instead (Devin BUG, #1881)."""
+    import unittest.mock as mock
+
+    db = tmp_path / "d.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    replacement = await aiosqlite.connect(str(db))
+
+    async def reconnect():
+        return replacement
+
+    real_set_authorizer = raw.set_authorizer
+
+    async def set_authorizer(cb):
+        if cb is None:
+            raise sqlite3.OperationalError("authorizer stuck")
+        return await real_set_authorizer(cb)
+
+    conn = SerializedConnection(raw, reconnect_fn=reconnect)
+    with (
+        mock.patch.object(raw, "set_authorizer", side_effect=set_authorizer),
+        pytest.raises(RuntimeError, match="transaction guard"),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+    assert conn._conn is replacement
+    # The swapped-in connection never carried the unit.
+    cur = await replacement.execute("SELECT COUNT(*) AS n FROM t")
+    assert (await cur.fetchone())[0] == 0
+    for handle in {id(raw): raw, id(conn._conn): conn._conn}.values():
+        with contextlib.suppress(Exception):
+            await handle.close()
+
+
+async def test_a_failed_authorizer_arm_rolls_back_and_clears_ownership(tmp_path):
+    """set_authorizer sits AFTER BEGIN: if it raises, the open transaction must
+    still be rolled back and _txn_owner cleared — otherwise the lock releases
+    with ownership stranded (Devin BUG, #1881)."""
+    import unittest.mock as mock
+
+    db = tmp_path / "a.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    conn = SerializedConnection(raw)
+    with (
+        mock.patch.object(
+            raw, "set_authorizer", side_effect=sqlite3.OperationalError("no auth")
+        ),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+    assert conn._txn_owner is None
+    assert not raw.in_transaction
+    # The connection is healthy again: a normal write commits.
+    await conn.execute("INSERT INTO t (id) VALUES (2)")
+    await conn.commit()
+    cur = await conn.execute("SELECT COUNT(*) AS n FROM t")
+    assert (await cur.fetchone())[0] == 1
+    with contextlib.suppress(Exception):
+        await conn._conn.close()
+
+
+async def test_a_cancelled_rollback_still_propagates_cancellation(tmp_path):
+    """When the cleanup rollback await is cancelled AND the transaction stayed
+    open, quarantine must run AND the CancelledError must still propagate —
+    returning normally would let the caller's bare `raise` surface the wrong
+    exception (Codex P2, #1881)."""
+    import unittest.mock as mock
+
+    db = tmp_path / "c.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    conn = SerializedConnection(raw)
+    with (
+        mock.patch.object(
+            raw, "rollback", side_effect=asyncio.CancelledError()
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        async with conn.transaction() as tx:
+            await tx.execute("INSERT INTO t (id) VALUES (1)")
+            raise ValueError("body blew up")
+    with contextlib.suppress(Exception):
+        await conn._conn.close()
+
+
+async def test_a_cursor_rechecks_quarantine_after_the_lock_wait(tmp_path):
+    """cursor() quarantine-checks BEFORE _maybe_lock; if the database is
+    quarantined while the call waits behind a held transaction, the cursor must
+    still be refused — the check is repeated after the wait (Codex P1, #1881)."""
+    from genesis.db.integrity import (
+        DatabaseIntegrityError,
+        _clear_quarantine_for,
+        quarantine_database,
+    )
+
+    db = tmp_path / "q2.db"
+    raw = await aiosqlite.connect(str(db))
+    await raw.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    await raw.commit()
+    conn = SerializedConnection(raw, db_path=db)
+    await conn._lock.acquire()
+    try:
+        task = asyncio.create_task(conn.cursor())
+        await asyncio.sleep(0)  # let cursor() pass the pre-check and block
+        quarantine_database(db, source="test", detail="simulated corruption")
+        conn._lock.release()
+        with pytest.raises(DatabaseIntegrityError):
+            await task
+    finally:
+        conn._lock.release() if conn._lock.locked() else None
+        _clear_quarantine_for(db)
+        with contextlib.suppress(Exception):
+            await conn._conn.close()
