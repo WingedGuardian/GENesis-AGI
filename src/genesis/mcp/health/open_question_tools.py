@@ -35,6 +35,7 @@ from genesis.mcp.health import mcp
 logger = logging.getLogger(__name__)
 
 _PREFIX = re.compile(r"^[0-9a-f]{8,32}$")
+_FULL_ID = re.compile(r"^[0-9a-f]{32}$")
 _TARGET_TABLES = {"ledger": "session_ledger", "follow_up": "follow_ups"}
 # One literal query per table: no table name is ever interpolated into SQL.
 _PREFIX_SQL = {
@@ -63,7 +64,13 @@ async def _resolve_id(db, table: str, raw: str, label: str) -> tuple[str | None,
     return rows[0][0], None
 
 
-async def _parse_target(db, raw: str) -> tuple[tuple[str, str] | None, str | None]:
+async def _parse_target(
+    db, raw: str, *, must_exist: bool = True
+) -> tuple[tuple[str, str] | None, str | None]:
+    """``(kind, id)`` or an error. With ``must_exist=False`` (removing an edge)
+    a FULL 32-hex id is taken as written, without looking the row up: the
+    edge is stored by full id, and its ledger row or follow-up may since have
+    been purged, which must not strand the edge. A prefix still resolves."""
     from genesis.db.crud import board as board_crud
 
     kind, sep, value = (raw or "").strip().partition(":")
@@ -76,6 +83,8 @@ async def _parse_target(db, raw: str) -> tuple[tuple[str, str] | None, str | Non
             return ("card", board_crud.normalize_target("card", value)), None
         except ValueError as exc:
             return None, str(exc)
+    if not must_exist and _FULL_ID.match(value.strip().lower()):
+        return (kind, value.strip().lower()), None
     full, error = await _resolve_id(db, _TARGET_TABLES[kind], value, kind)
     if error:
         return None, error
@@ -203,7 +212,7 @@ async def _impl_open_question_block(
     qid, error = await _resolve_id(db, "open_questions", question_id, "question")
     if error:
         return _err(error)
-    parsed, error = await _parse_target(db, target)
+    parsed, error = await _parse_target(db, target, must_exist=not remove)
     if error:
         return _err(error)
     kind, target_id = parsed
@@ -256,21 +265,31 @@ async def _impl_open_question_list(
 
     if (problem := await _ready(db)) is not None:
         return {"status": "unavailable", "message": problem}
+    page = DEFAULT_PAGE if limit is None else limit
+    if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= MAX_PAGE:
+        return _err(f"limit must be 1..{MAX_PAGE}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return _err("offset must be a non-negative int")
     if target:
         parsed, error = await _parse_target(db, target)
         if error:
             return _err(error)
         kind, target_id = parsed
         blocking = await board_crud.blocking_questions(db, target_kind=kind, target_id=target_id)
+        # Bounded like the plain list: any number of questions can block one
+        # target, and each carries its prose. `total` is the full count.
+        shown = blocking[offset : offset + page]
+        more = offset + len(shown) < len(blocking)
         return {
             "status": "ok",
             "target": f"{kind}:{target_id}",
             "blocked": bool(blocking),
-            "blocking_questions": blocking,
+            "total": len(blocking),
+            "listed": len(shown),
+            "offset": offset,
+            "blocking_questions": shown,
+            "next_offset": offset + len(shown) if more else None,
         }
-    page = DEFAULT_PAGE if limit is None else limit
-    if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= MAX_PAGE:
-        return _err(f"limit must be 1..{MAX_PAGE}")
     try:
         listing = await board_crud.list_questions(
             db, status=status or None, limit=page, offset=offset

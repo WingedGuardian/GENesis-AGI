@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 TABLES = ("board_links", "open_questions", "open_question_blocks", "board_events")
 
@@ -280,7 +283,20 @@ class WriteBusy(Exception):
     """The write lock was lost on every attempt; NOTHING was written."""
 
 
-async def _begin_immediate(db: aiosqlite.Connection, what: str) -> None:
+def _check_owned(db: aiosqlite.Connection, what: str) -> None:
+    """Refuse the server's shared connection, and a connection already inside
+    a transaction (a unit must never fold in, commit or roll back a caller's
+    pending work). Checked BEFORE the unit's rollback envelope opens, so a
+    refusal never touches that caller's transaction."""
+    from genesis.db.connection import SerializedConnection
+
+    if isinstance(db, SerializedConnection):
+        raise TypeError(f"{what} needs a connection it owns (get_raw_db), not the shared one")
+    if db.in_transaction:
+        raise ValueError(f"{what} needs an idle connection; commit or roll back first")
+
+
+async def _begin_immediate(db: aiosqlite.Connection) -> None:
     """Take the write lock before writing anything, retrying a lost lock race on
     the shared connection's schedule. This is the ONLY retried step: until it
     succeeds nothing has been written, so a retry can never repeat a write."""
@@ -291,14 +307,9 @@ async def _begin_immediate(db: aiosqlite.Connection, what: str) -> None:
         _JITTER_HIGH,
         _JITTER_LOW,
         _WRITE_RETRY_DELAYS,
-        SerializedConnection,
         _is_lock_error,
     )
 
-    if isinstance(db, SerializedConnection):
-        raise TypeError(f"{what} needs a connection it owns (get_raw_db), not the shared one")
-    if db.in_transaction:
-        raise ValueError(f"{what} needs an idle connection; commit or roll back first")
     for delay in (*_WRITE_RETRY_DELAYS, None):
         try:
             await db.execute("BEGIN IMMEDIATE")
@@ -364,13 +375,23 @@ async def _write_unit(db: aiosqlite.Connection, what: str):
     saved while the caller sees CancelledError (measured, aiosqlite 0.22.1).
     A raise has no idempotency key, so a caller that retries after a cancel
     can raise the same question twice."""
-    await _begin_immediate(db, what)
+    _check_owned(db, what)
     try:
+        # BEGIN is inside the envelope: aiosqlite queues each call on its worker
+        # thread before awaiting it, so a cancellation during BEGIN can leave the
+        # BEGIN to complete after CancelledError has escaped. The rollback below
+        # is queued behind it and undoes it.
+        await _begin_immediate(db)
         yield
         await _commit(db)
     except BaseException:
-        if db.in_transaction:
+        # Unconditional, for the same reason: `in_transaction` may not yet show
+        # a BEGIN still on the worker thread. Rolling back with no transaction
+        # open is a no-op. A failed rollback never masks the original error.
+        try:
             await db.rollback()
+        except Exception:
+            logger.warning("rollback after a failed %s did not complete", what, exc_info=True)
         raise
 
 
@@ -730,9 +751,7 @@ async def prune(
             f"DELETE FROM open_question_blocks WHERE question_id IN ({doomed})", (q_cutoff,)
         )
         blocks = cur.rowcount
-        cur = await db.execute(
-            f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,)
-        )
+        cur = await db.execute(f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,))
         questions = cur.rowcount
         cur = await db.execute("DELETE FROM board_events WHERE created_at < ?", (e_cutoff,))
         events = cur.rowcount

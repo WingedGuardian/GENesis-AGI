@@ -1257,6 +1257,8 @@ def test_open_question_tool_scope_by_profile_origin():
             want |= reads
         if name in perimeter:
             want |= reads | raise_
+        if name == "observe":
+            want |= raise_  # read-only: it writes no question rows either
         if missing := want - denied:
             gaps[name] = sorted(missing)
     assert not gaps, f"profile(s) can reach open-question tools they must not: {gaps}"

@@ -791,3 +791,63 @@ async def test_owned_connection_opens_the_same_file_and_refuses_memory(db):
         with pytest.raises(ValueError, match="in-memory"):
             async with board.owned_connection(mem):
                 pass
+
+
+async def test_a_cancel_while_begin_is_queued_never_leaves_the_lock_held(db):
+    """aiosqlite queues each call on its worker thread before awaiting it, so a
+    BEGIN can complete after the caller's await was cancelled. The unit's
+    rollback is queued behind it, so the connection never keeps the write lock."""
+    real_execute = db.execute
+
+    def begin_then_cancelled(sql, *args):
+        if sql == "BEGIN IMMEDIATE":
+
+            async def go():
+                await real_execute(sql, *args)  # the BEGIN lands...
+                raise asyncio.CancelledError()  # ...after the await was cancelled
+
+            return go()
+        return real_execute(sql, *args)
+
+    db.execute = begin_then_cancelled
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await board.raise_question(db, question="q", now=NOW)
+    finally:
+        db.execute = real_execute
+    assert not db.in_transaction, "the abandoned BEGIN was rolled back"
+    assert (await board.list_questions(db, status=None))["total"] == 0
+
+
+async def test_a_cancel_while_begin_is_still_queued_is_rolled_back_behind_it(db):
+    """The harder case: the BEGIN is still QUEUED on aiosqlite's worker thread
+    when the cancel lands, so `in_transaction` cannot show it yet. The rollback
+    must be queued unconditionally, behind it, or the BEGIN lands afterwards
+    and keeps the write lock."""
+    import time
+
+    real_execute = db.execute
+    pending: list[asyncio.Future] = []
+
+    def begin_queued_then_cancelled(sql, *args):
+        if sql == "BEGIN IMMEDIATE":
+
+            async def go():
+                # Occupy the worker so the BEGIN waits in its queue.
+                pending.append(asyncio.ensure_future(db._execute(time.sleep, 0.3)))
+                await asyncio.sleep(0)
+                pending.append(asyncio.ensure_future(real_execute(sql, *args)))
+                await asyncio.sleep(0)  # the BEGIN is queued, not yet run
+                raise asyncio.CancelledError()
+
+            return go()
+        return real_execute(sql, *args)
+
+    db.execute = begin_queued_then_cancelled
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await board.raise_question(db, question="q", now=NOW)
+        await asyncio.gather(*pending)
+    finally:
+        db.execute = real_execute
+    assert not db.in_transaction, "the queued BEGIN was rolled back behind it"
