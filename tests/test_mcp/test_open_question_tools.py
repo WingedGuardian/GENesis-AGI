@@ -341,3 +341,44 @@ def test_read_tool_is_on_the_reflection_read_allowlist_and_writers_are_not():
         not {"open_question_raise", "open_question_resolve", "open_question_block"}
         & _REFLECTION_READ_MCP
     )
+
+
+async def test_the_per_target_answer_is_paged_with_its_total(db):
+    """Any number of questions can block one target, each with its prose: the
+    target answer is bounded like the plain list, and says how many there are."""
+    for i in range(3):
+        await _raise(db, question=f"q{i}", blocks=[f"follow_up:{FOLLOW}"])
+    first = await oq._impl_open_question_list(
+        db, status="", target=f"follow_up:{FOLLOW}", limit=2, offset=0
+    )
+    assert first["blocked"] and first["total"] == 3 and first["listed"] == 2
+    assert first["next_offset"] == 2
+    rest = await oq._impl_open_question_list(
+        db, status="", target=f"follow_up:{FOLLOW}", limit=2, offset=2
+    )
+    assert rest["listed"] == 1 and rest["next_offset"] is None
+    default = await oq._impl_open_question_list(
+        db, status="", target=f"follow_up:{FOLLOW}", limit=None
+    )
+    assert default["listed"] == 3  # under the default page
+
+
+async def test_an_edge_to_a_purged_follow_up_can_still_be_removed(db):
+    """follow_ups.purge_completed deletes old rows; an open question's edge to
+    one must stay removable by its full id (a prefix needs the row to resolve)."""
+    qid = (await _raise(db, blocks=[f"follow_up:{FOLLOW}", f"ledger:{LEDGER}"]))["question"]["id"]
+    await db.execute("DELETE FROM follow_ups WHERE id = ?", (FOLLOW,))
+    await db.commit()
+    by_prefix = await oq._impl_open_question_block(
+        db, question_id=qid, target=f"follow_up:{FOLLOW[:10]}", remove=True, now=NOW
+    )
+    assert by_prefix["status"] == "error"
+    out = await oq._impl_open_question_block(
+        db, question_id=qid, target=f"follow_up:{FOLLOW}", remove=True, now=NOW
+    )
+    assert out["status"] == "ok" and out["changed"] is True
+    assert {b["target_kind"] for b in out["question"]["blocks"]} == {"ledger"}
+    added = await oq._impl_open_question_block(
+        db, question_id=qid, target=f"follow_up:{FOLLOW}", remove=False, now=NOW
+    )
+    assert added["status"] == "error", "adding an edge still needs the row to exist"

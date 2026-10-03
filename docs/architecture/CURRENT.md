@@ -3328,8 +3328,11 @@ verified: b67423bd 2026-10-03
   are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile
   (overlay profiles included) and refused server-side for a dispatched,
   unsupervised session (`guard_human_gate`). Listing is denied on the
-  external-ingesting profiles, and raising on the untrusted-inbound perimeter.
-  `open_question_list` pages (50 default, 200 max, `next_offset`). Card targets
+  external-ingesting profiles, and raising on the untrusted-inbound perimeter
+  and on read-only `observe`.
+  `open_question_list` pages (50 default, 200 max, `next_offset`), its
+  per-target blocker answer included. Removing an edge accepts a full id even
+  when the ledger row or follow-up behind it has since been purged. Card targets
   and stored repo names are lowercased, because GitHub names are
   case-insensitive. A test pins that the module has no GitHub or subprocess
   path. `open_question_list` is on the reflection read allowlist.

@@ -332,7 +332,8 @@ _NO_MARKETING_SEND = [
 #     through that profile's outbound channel;
 #   * raising one is legitimate work for a background session (it parks a fork
 #     rather than guessing), but NOT from the untrusted-inbound perimeter, where
-#     the "question" would be attacker-authored text landing in the owner's queue.
+#     the "question" would be attacker-authored text landing in the owner's queue,
+#     and NOT from read-only `observe`, which writes nothing.
 _NO_OPEN_QUESTION_READS = ["mcp__genesis-health__open_question_list"]
 _NO_OPEN_QUESTION_RAISE = ["mcp__genesis-health__open_question_raise"]
 
@@ -354,6 +355,7 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_RAISE  # observe is read-only: no question rows either
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
