@@ -10,7 +10,7 @@ substitution (a subshell, so it leaks nothing) rather than a redirect.
 
 The check is the EXACT REMEDY TEXT, not a grammar of safe spellings. Every
 `cd [opts] "$(dirname ...` must sit immediately after `$(unset CDPATH; ` or
-`$(CDPATH= ` -- the two spellings the tree uses (51 and 1 dirname-cd sites,
+`$(CDPATH= ` -- the two spellings the tree uses (52 and 1 dirname-cd sites,
 plus the 3 allowlisted lines, measured 2026-10-02 with `_classify`;
 `CDPATH=''`/`CDPATH=""` had 0). Anything else is a violation, so a
 spelling nobody has written yet fails by default. An earlier revision accepted a
